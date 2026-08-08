@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AiDev.Workflow.Api/AiDev.Workflow.Api.csproj" />
+    <Project Path="src/AiDev.Workflow.Application/AiDev.Workflow.Application.csproj" />
+    <Project Path="src/AiDev.Workflow.Domain/AiDev.Workflow.Domain.csproj" />
+    <Project Path="src/AiDev.Workflow.Infrastructure/AiDev.Workflow.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AiDev.Workflow.IntegrationTests/AiDev.Workflow.IntegrationTests.csproj" />
+    <Project Path="tests/AiDev.Workflow.UnitTests/AiDev.Workflow.UnitTests.csproj" />
+  </Folder>
+</Solution>
