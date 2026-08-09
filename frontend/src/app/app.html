@@ -1,3 +1,12 @@
-<a2ui-v09-surface surfaceId="spec-content" />
-<a2ui-v09-surface surfaceId="plan-content" />
+<mat-tab-group>
+  <mat-tab label="Requirements">
+    <app-requirements-tab />
+  </mat-tab>
+  <mat-tab label="Spec Review" [disabled]="!gateState.specReady()">
+    <a2ui-v09-surface surfaceId="spec-content" />
+  </mat-tab>
+  <mat-tab label="Plan Review" [disabled]="!gateState.planReady()">
+    <a2ui-v09-surface surfaceId="plan-content" />
+  </mat-tab>
+</mat-tab-group>
 <copilot-sidebar mode="docked" position="right" title="AI Dev Workflow" />

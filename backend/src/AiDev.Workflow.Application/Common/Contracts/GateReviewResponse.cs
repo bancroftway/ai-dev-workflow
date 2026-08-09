@@ -3,11 +3,14 @@ using AiDev.Workflow.Domain.Enums;
 namespace AiDev.Workflow.Application.Common.Contracts;
 
 /// <summary>
-/// The human's answer to a GateReviewRequest. QuestionAnswers maps ClarifyingQuestion.Id to the
-/// human's answer for that question; FreeformNote is an extra revision comment not tied to any
-/// specific question. Both feed directly into the next turn's SpecLlmInput/PlanLlmInput.
+/// The human's answer to a GateReviewRequest. OutputJson is GateReviewRequest.OutputJson echoed
+/// back unchanged — the client never parses or constructs it, just holds and resends it, so
+/// Approve resolution doesn't depend on the gate executor's own instance state. On Continue,
+/// UpdatedRawRequirementsText carries the current (possibly edited) evergreen requirements text;
+/// there is no more separate structured Q&amp;A/revision-note payload — the human's only editable
+/// input is the requirements text itself.
 /// </summary>
 public sealed record GateReviewResponse(
 	GateDecision Decision,
-	IReadOnlyDictionary<string, string>? QuestionAnswers,
-	string? FreeformNote);
+	string OutputJson,
+	string? UpdatedRawRequirementsText);

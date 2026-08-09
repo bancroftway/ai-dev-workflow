@@ -42,7 +42,6 @@ public static class WorkflowGraphBuilder
 		var specReviseAdapter = new SpecReviseAdapter(specAgentNodeId);
 		var specApprovedToPlanAdapter = new SpecApprovedToPlanAdapter(planAgentNodeId);
 		var planGate = new PlanGateExecutor(options.MaxGateIterations);
-		var planReviseAdapter = new PlanReviseAdapter(planAgentNodeId);
 		var terminal = new WorkflowTerminalExecutor();
 
 		return new WorkflowBuilder(specAgent)
@@ -56,9 +55,10 @@ public static class WorkflowGraphBuilder
 			.AddEdge(planAgent, planGate)
 			.AddEdge(planGate, WorkflowPorts.PlanGate)
 			.AddEdge(WorkflowPorts.PlanGate, planGate)
-			.AddEdge(planGate, planReviseAdapter)
+			// PlanGate's Continue also loops back through SpecAgent (via the same specReviseAdapter
+			// SpecGate uses), not PlanAgent directly — see PlanGateExecutor's doc comment.
+			.AddEdge(planGate, specReviseAdapter)
 			.AddEdge(planGate, terminal)
-			.AddEdge(planReviseAdapter, planAgent)
 			.WithOutputFrom(terminal)
 			.WithName(WorkflowName)
 			.Build();

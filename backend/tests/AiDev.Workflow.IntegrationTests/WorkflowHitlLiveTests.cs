@@ -51,7 +51,7 @@ public class WorkflowHitlLiveTests(ITestOutputHelper output)
 		// --- Turn 2: approve the spec ---
 		var approveSpec = new ChatMessage(ChatRole.Tool,
 		[
-			new FunctionResultContent(specCall.CallId, JsonSerializer.Serialize(new GateReviewResponse(GateDecision.Approve, QuestionAnswers: null, FreeformNote: null), AIJsonUtilities.DefaultOptions)),
+			new FunctionResultContent(specCall.CallId, JsonSerializer.Serialize(new GateReviewResponse(GateDecision.Approve, GetOutputJson(specCall.Arguments), UpdatedRawRequirementsText: null), AIJsonUtilities.DefaultOptions)),
 		]);
 		var planCall = await RunStreamingAndFindCallAsync(agent, [approveSpec], session, "PlanGate")
 			?? throw new InvalidOperationException("Expected a pending PlanGate function call.");
@@ -60,11 +60,21 @@ public class WorkflowHitlLiveTests(ITestOutputHelper output)
 		// --- Turn 3: approve the plan -> workflow should complete ---
 		var approvePlan = new ChatMessage(ChatRole.Tool,
 		[
-			new FunctionResultContent(planCall.CallId, JsonSerializer.Serialize(new GateReviewResponse(GateDecision.Approve, QuestionAnswers: null, FreeformNote: null), AIJsonUtilities.DefaultOptions)),
+			new FunctionResultContent(planCall.CallId, JsonSerializer.Serialize(new GateReviewResponse(GateDecision.Approve, GetOutputJson(planCall.Arguments), UpdatedRawRequirementsText: null), AIJsonUtilities.DefaultOptions)),
 		]);
 		var finalText = await RunStreamingAndCollectTextAsync(agent, [approvePlan], session);
 		output.WriteLine($"Final response text: {finalText}");
 		Assert.False(string.IsNullOrWhiteSpace(finalText));
+	}
+
+	private static string GetOutputJson(IDictionary<string, object?>? arguments)
+	{
+		if (arguments is null || !arguments.TryGetValue("outputJson", out var value) || value is null)
+		{
+			throw new InvalidOperationException("Gate request arguments did not include outputJson.");
+		}
+
+		return value.ToString() ?? throw new InvalidOperationException("outputJson argument was not a string.");
 	}
 
 	private void LogGateRequestArgs(string label, IDictionary<string, object?>? arguments)

@@ -8,7 +8,7 @@ namespace AiDev.Workflow.Application.Common.Contracts;
 /// </summary>
 public sealed record PlanLlmOutput(
 	string Overview,
-	IReadOnlyList<string> Steps,
+	IReadOnlyList<PlanStep> Steps,
 	IReadOnlyList<string> RiskNotes,
 	IReadOnlyList<ClarifyingQuestion> ClarifyingQuestions,
 	bool ReadyForApproval,

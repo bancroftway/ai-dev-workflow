@@ -12,16 +12,18 @@ namespace AiDev.Workflow.Infrastructure.Workflow.Executors;
 
 /// <summary>
 /// Sits on both sides of the spec HITL gate: parses SpecAgent's structured turn output, validates
-/// its LLM-authored A2ui payload, and forwards it to the human as a GateReviewRequest; then — once
-/// the RequestPort resolves — decides whether to loop back to SpecAgent (revise) or forward the
-/// approved spec (structured, not flattened — see ApprovedSpec) to PlanAgent. One executor instance
-/// handles both edges since the approved-spec forwarding needs the output captured on the request
-/// side, which GateReviewResponse doesn't carry back on its own.
-/// Instance fields are safe: executors are long-lived for the life of one workflow run.
+/// its LLM-authored A2ui payload, and forwards it to the human as a GateReviewRequest (including the
+/// turn's serialized output, so the human's eventual response can echo it back — see
+/// GateReviewRequest/GateReviewResponse); then, once the RequestPort resolves, either forwards the
+/// approved spec (structured, not flattened — see ApprovedSpec) to PlanAgent, or loops back to
+/// SpecAgent with the human's updated requirements text. Deliberately holds no per-run instance
+/// state beyond the iteration counter (a process-lifetime loop-guard, not run-scoped data) — this
+/// executor is a DI singleton shared across every thread (see WorkflowGraphBuilder), so anything
+/// that needs to survive from the request half of a gate to the response half must travel through
+/// the DTOs themselves, not an instance field.
 /// </summary>
 internal sealed class SpecGateExecutor(int maxIterations) : Executor(WorkflowExecutorIds.SpecGateResponse)
 {
-	private SpecLlmOutput? _lastOutput;
 	private int _iterations;
 
 	protected override ProtocolBuilder ConfigureProtocol(ProtocolBuilder protocolBuilder) =>
@@ -33,7 +35,7 @@ internal sealed class SpecGateExecutor(int maxIterations) : Executor(WorkflowExe
 				.AddHandler<List<ChatMessage>>(HandleSpecTurnAsync, overwrite: false)
 				.AddHandler<string>(HandleGateResponseAsync, overwrite: false));
 
-	private async ValueTask HandleSpecTurnAsync(List<ChatMessage> messages, IWorkflowContext context, CancellationToken cancellationToken)
+	private static async ValueTask HandleSpecTurnAsync(List<ChatMessage> messages, IWorkflowContext context, CancellationToken cancellationToken)
 	{
 		// specAgent forwards both the user's input message and its own assistant response as
 		// separate single-message deliveries — confirmed via live diagnostic logging. Only the
@@ -48,14 +50,18 @@ internal sealed class SpecGateExecutor(int maxIterations) : Executor(WorkflowExe
 		var output = JsonSerializer.Deserialize<SpecLlmOutput>(json, AIJsonUtilities.DefaultOptions)
 			?? throw new InvalidOperationException("SpecAgent returned an empty or unparseable structured response.");
 
-		_lastOutput = output;
-
 		var validation = A2UiSchemaValidator.Validate(output.A2ui, A2UiSurfaceIds.SpecContent);
 		var a2ui = validation.IsValid
 			? output.A2ui
 			: A2UiSchemaValidator.BuildFallback(A2UiSurfaceIds.SpecContent, "The specification content couldn't be displayed. See the summary below.");
 
-		var request = new GateReviewRequest(WorkflowPorts.SpecGateId, BuildContentSnapshot(output.Spec), output.ClarifyingQuestions, a2ui);
+		var request = new GateReviewRequest(
+			WorkflowPorts.SpecGateId,
+			BuildContentSnapshot(output.Spec),
+			output.ClarifyingQuestions,
+			a2ui,
+			JsonSerializer.Serialize(output, AIJsonUtilities.DefaultOptions),
+			output.ReadyForApproval);
 		await context.SendMessageAsync(request, WorkflowPorts.SpecGateId, cancellationToken).ConfigureAwait(false);
 	}
 
@@ -66,20 +72,18 @@ internal sealed class SpecGateExecutor(int maxIterations) : Executor(WorkflowExe
 
 		_iterations++;
 		var forceApprove = _iterations >= maxIterations && response.Decision != GateDecision.Approve;
-		var approved = response.Decision == GateDecision.Approve || forceApprove;
 
-		if (approved)
+		if (response.Decision == GateDecision.Approve || forceApprove)
 		{
-			if (_lastOutput is null)
-			{
-				throw new InvalidOperationException("Spec gate received an approval before any spec turn was recorded.");
-			}
+			var output = JsonSerializer.Deserialize<SpecLlmOutput>(response.OutputJson, AIJsonUtilities.DefaultOptions)
+				?? throw new InvalidOperationException("Spec gate could not recover the approved spec from the review response.");
 
-			return context.SendMessageAsync(_lastOutput.Spec, WorkflowExecutorIds.SpecApprovedToPlanAdapter, cancellationToken);
+			return context.SendMessageAsync(output.Spec, WorkflowExecutorIds.SpecApprovedToPlanAdapter, cancellationToken);
 		}
 
-		var input = new SpecLlmInput(RawRequirementsText: null, response.QuestionAnswers, response.FreeformNote);
-		return context.SendMessageAsync(JsonSerializer.Serialize(input, AIJsonUtilities.DefaultOptions), WorkflowExecutorIds.SpecReviseAdapter, cancellationToken);
+		var updatedRawRequirementsText = response.UpdatedRawRequirementsText
+			?? throw new InvalidOperationException("Spec gate received a Continue response with no updated requirements text.");
+		return context.SendMessageAsync(updatedRawRequirementsText, WorkflowExecutorIds.SpecReviseAdapter, cancellationToken);
 	}
 
 	private static string BuildContentSnapshot(ApprovedSpec spec)

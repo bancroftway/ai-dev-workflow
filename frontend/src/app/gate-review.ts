@@ -18,6 +18,8 @@ export const GateReviewRequestSchema = z
     contentSnapshot: z.string(),
     clarifyingQuestions: z.array(ClarifyingQuestionSchema),
     a2ui: z.array(z.record(z.string(), z.unknown())),
+    readyForApproval: z.boolean(),
+    outputJson: z.string(),
   })
   .catchall(z.unknown());
 
@@ -52,9 +54,14 @@ export function unwrapGateReviewRequest(args: unknown): GateReviewRequestArgs | 
 /** Mirrors AiDev.Workflow.Domain.Enums.GateDecision. */
 export type GateDecision = 'Continue' | 'Approve';
 
-/** Mirrors AiDev.Workflow.Application.Common.Contracts.GateReviewResponse. */
+/**
+ * Mirrors AiDev.Workflow.Application.Common.Contracts.GateReviewResponse. outputJson must be
+ * GateReviewRequestArgs.outputJson echoed back unchanged — the client never parses or constructs
+ * it. updatedRawRequirementsText carries the current evergreen requirements text on Continue, and
+ * is null on Approve.
+ */
 export interface GateReviewResponse {
   decision: GateDecision;
-  questionAnswers: Record<string, string> | null;
-  freeformNote: string | null;
+  outputJson: string;
+  updatedRawRequirementsText: string | null;
 }

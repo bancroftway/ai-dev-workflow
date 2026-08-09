@@ -38,31 +38,25 @@ public static class A2UiPromptFragment
 		ChoicePicker, Slider. Any other component name will fail validation.
 
 		Data binding: a property can be a literal value, or `{"path": "/some/path"}` to bind to the
-		surface's data model (JSON Pointer). Input components (`TextField`, `ChoicePicker`, `CheckBox`,
-		etc.) use this to read/write user input. Bind each clarifying question's answer to
-		`/answers/<questionId>` so a human can draft an answer in place before submitting. Use
-		`TextField` for an open-ended question; use `ChoicePicker` only when the question has discrete
-		choices. `ChoicePicker` REQUIRES both `options` (array of `{"label":..., "value":...}`) and
-		`value` — and `value` binds to an ARRAY in the data model (one element for a single-select
-		question with `variant: "mutuallyExclusive"`, e.g. `["optionValue"]`), never a bare string.
+		surface's data model (JSON Pointer). This surface is a read-only display of your output's
+		content — do not include input components (`TextField`, `ChoicePicker`, `CheckBox`, etc.), data
+		bindings, or clarifying questions here. Clarifying questions are shown to the human elsewhere,
+		answered by editing their requirements text directly, not through this surface.
 
 		Do NOT include Approve/Continue/Submit buttons or any action that finalizes the human's
-		decision — that control lives outside this surface, in the review sidebar, and is added by the
-		host application, not by you.
+		decision — that control lives outside this surface and is added by the host application, not
+		by you.
 
-		Example envelope pair (a card showing a title, a summary, and two clarifying questions — one
-		open-ended with a bound TextField, one multiple-choice with a bound ChoicePicker):
+		Example envelope pair (a card showing a title, a summary, and a couple of content sections):
 		```json
 		{"version":"v0.9.1","createSurface":{"surfaceId":"__SURFACE_ID__","catalogId":"__CATALOG_ID__"}}
 		{"version":"v0.9.1","updateComponents":{"surfaceId":"__SURFACE_ID__","components":[
 		  {"id":"root","component":"Card","child":"body"},
-		  {"id":"body","component":"Column","children":["title_text","summary_text","q1_label","q1_field","q2_label","q2_field"]},
+		  {"id":"body","component":"Column","children":["title_text","summary_text","section1_title","section1_text"]},
 		  {"id":"title_text","component":"Text","text":"Support Ticket Triage Tool","variant":"h2"},
 		  {"id":"summary_text","component":"Text","text":"A tool for..."},
-		  {"id":"q1_label","component":"Text","text":"What should the tool be called?","variant":"caption"},
-		  {"id":"q1_field","component":"TextField","label":"Your answer","value":{"path":"/answers/q1"}},
-		  {"id":"q2_label","component":"Text","text":"Should urgency be configurable by admins?","variant":"caption"},
-		  {"id":"q2_field","component":"ChoicePicker","variant":"mutuallyExclusive","options":[{"label":"Yes","value":"yes"},{"label":"No","value":"no"}],"value":{"path":"/answers/q2"}}
+		  {"id":"section1_title","component":"Text","text":"Overview","variant":"h3"},
+		  {"id":"section1_text","component":"Text","text":"..."}
 		]}}
 		```
 		""";

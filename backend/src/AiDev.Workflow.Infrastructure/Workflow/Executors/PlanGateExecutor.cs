@@ -10,11 +10,18 @@ using Microsoft.Extensions.AI;
 
 namespace AiDev.Workflow.Infrastructure.Workflow.Executors;
 
-/// <summary>Mirrors SpecGateExecutor for the plan gate. On approve, forwards to the terminal
-/// executor instead of another adapter — there's no third step after the plan.</summary>
+/// <summary>
+/// Mirrors SpecGateExecutor for the plan gate, with two differences: on Approve it forwards to the
+/// terminal executor instead of another adapter (there's no third step after the plan), and on
+/// Continue it targets SpecReviseAdapter — NOT a plan-specific revise adapter. The evergreen
+/// requirements text is the single source of truth for both spec and plan, so any edit (even one
+/// made while reviewing the Plan tab) restarts at SpecAgent; if the spec genuinely didn't need to
+/// change, SpecAgent's own id-stability behavior re-emits it near-unchanged and the cascade quickly
+/// reaches PlanAgent again. See SpecGateExecutor for why this holds no per-run instance state beyond
+/// the iteration counter.
+/// </summary>
 internal sealed class PlanGateExecutor(int maxIterations) : Executor(WorkflowExecutorIds.PlanGateResponse)
 {
-	private PlanLlmOutput? _lastOutput;
 	private int _iterations;
 
 	protected override ProtocolBuilder ConfigureProtocol(ProtocolBuilder protocolBuilder) =>
@@ -25,7 +32,7 @@ internal sealed class PlanGateExecutor(int maxIterations) : Executor(WorkflowExe
 				.AddHandler<List<ChatMessage>>(HandlePlanTurnAsync, overwrite: false)
 				.AddHandler<string>(HandleGateResponseAsync, overwrite: false));
 
-	private async ValueTask HandlePlanTurnAsync(List<ChatMessage> messages, IWorkflowContext context, CancellationToken cancellationToken)
+	private static async ValueTask HandlePlanTurnAsync(List<ChatMessage> messages, IWorkflowContext context, CancellationToken cancellationToken)
 	{
 		// See SpecGateExecutor.HandleSpecTurnAsync — planAgent forwards both the seed user message
 		// and its own assistant response as separate single-message deliveries; only the assistant
@@ -40,14 +47,18 @@ internal sealed class PlanGateExecutor(int maxIterations) : Executor(WorkflowExe
 		var output = JsonSerializer.Deserialize<PlanLlmOutput>(json, AIJsonUtilities.DefaultOptions)
 			?? throw new InvalidOperationException("PlanAgent returned an empty or unparseable structured response.");
 
-		_lastOutput = output;
-
 		var validation = A2UiSchemaValidator.Validate(output.A2ui, A2UiSurfaceIds.PlanContent);
 		var a2ui = validation.IsValid
 			? output.A2ui
 			: A2UiSchemaValidator.BuildFallback(A2UiSurfaceIds.PlanContent, "The plan content couldn't be displayed. See the summary below.");
 
-		var request = new GateReviewRequest(WorkflowPorts.PlanGateId, BuildContentSnapshot(output), output.ClarifyingQuestions, a2ui);
+		var request = new GateReviewRequest(
+			WorkflowPorts.PlanGateId,
+			BuildContentSnapshot(output),
+			output.ClarifyingQuestions,
+			a2ui,
+			JsonSerializer.Serialize(output, AIJsonUtilities.DefaultOptions),
+			output.ReadyForApproval);
 		await context.SendMessageAsync(request, WorkflowPorts.PlanGateId, cancellationToken).ConfigureAwait(false);
 	}
 
@@ -58,20 +69,18 @@ internal sealed class PlanGateExecutor(int maxIterations) : Executor(WorkflowExe
 
 		_iterations++;
 		var forceApprove = _iterations >= maxIterations && response.Decision != GateDecision.Approve;
-		var approved = response.Decision == GateDecision.Approve || forceApprove;
 
-		if (approved)
+		if (response.Decision == GateDecision.Approve || forceApprove)
 		{
-			if (_lastOutput is null)
-			{
-				throw new InvalidOperationException("Plan gate received an approval before any plan turn was recorded.");
-			}
+			var output = JsonSerializer.Deserialize<PlanLlmOutput>(response.OutputJson, AIJsonUtilities.DefaultOptions)
+				?? throw new InvalidOperationException("Plan gate could not recover the approved plan from the review response.");
 
-			return context.SendMessageAsync(BuildContentSnapshot(_lastOutput), WorkflowExecutorIds.WorkflowTerminal, cancellationToken);
+			return context.SendMessageAsync(BuildContentSnapshot(output), WorkflowExecutorIds.WorkflowTerminal, cancellationToken);
 		}
 
-		var input = new PlanLlmInput(ApprovedSpec: null, response.QuestionAnswers, response.FreeformNote);
-		return context.SendMessageAsync(JsonSerializer.Serialize(input, AIJsonUtilities.DefaultOptions), WorkflowExecutorIds.PlanReviseAdapter, cancellationToken);
+		var updatedRawRequirementsText = response.UpdatedRawRequirementsText
+			?? throw new InvalidOperationException("Plan gate received a Continue response with no updated requirements text.");
+		return context.SendMessageAsync(updatedRawRequirementsText, WorkflowExecutorIds.SpecReviseAdapter, cancellationToken);
 	}
 
 	private static string BuildContentSnapshot(PlanLlmOutput output)
@@ -84,7 +93,7 @@ internal sealed class PlanGateExecutor(int maxIterations) : Executor(WorkflowExe
 		sb.AppendLine("## Steps");
 		foreach (var step in output.Steps)
 		{
-			sb.AppendLine(CultureInfo.InvariantCulture, $"- {step}");
+			sb.AppendLine(CultureInfo.InvariantCulture, $"- [{step.Id}] {step.Description}");
 		}
 
 		if (output.RiskNotes.Count > 0)

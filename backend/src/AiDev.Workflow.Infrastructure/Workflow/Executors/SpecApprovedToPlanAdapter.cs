@@ -18,7 +18,7 @@ internal sealed class SpecApprovedToPlanAdapter(string planAgentNodeId) : Execut
 
 	private async ValueTask HandleAsync(ApprovedSpec approvedSpec, IWorkflowContext context, CancellationToken cancellationToken)
 	{
-		var input = new PlanLlmInput(approvedSpec, QuestionAnswers: null, FreeformNote: null);
+		var input = new PlanLlmInput(approvedSpec);
 		var messages = new List<ChatMessage>
 		{
 			new(ChatRole.User, JsonSerializer.Serialize(input, AIJsonUtilities.DefaultOptions)),
