@@ -1,0 +1,12 @@
+# Per-stage, per-role GitHub Copilot model selection (SPECIFICATION.md Section 3.4).
+#
+# `null` lets the Copilot SDK pick its own default model for that call.
+# `audit_model` should differ from `draft_model` -- the adversarial audit pass exists to get a
+# second opinion from a *different* model. If left null, the audit pass still runs, just with
+# the same model as draft_model (a warning is logged).
+specification:
+  draft_model: null
+  audit_model: null
+plan:
+  draft_model: null
+  audit_model: null

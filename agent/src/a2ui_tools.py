@@ -32,28 +32,47 @@ SPECIFICATION_SURFACE_ID = "specification"
 PLAN_SURFACE_ID = "plan"
 
 
-def build_specification_envelope(specification: dict) -> dict:
+def build_specification_envelope(specification: dict, audit_findings: list[str] | None = None) -> dict:
     return {
         A2UI_OPERATIONS_KEY: [
             create_surface(SPECIFICATION_SURFACE_ID, CATALOG_ID),
             update_components(
                 SPECIFICATION_SURFACE_ID,
-                [{"id": "root", "component": "SpecificationSurface", "specification": {"path": "/"}}],
+                [
+                    {
+                        "id": "root",
+                        "component": "SpecificationSurface",
+                        "specification": {"path": "/specification"},
+                        "audit_findings": {"path": "/audit_findings"},
+                    }
+                ],
             ),
-            update_data_model(SPECIFICATION_SURFACE_ID, specification),
+            update_data_model(
+                SPECIFICATION_SURFACE_ID,
+                {"specification": specification, "audit_findings": audit_findings or []},
+            ),
         ]
     }
 
 
-def build_plan_envelope(plan: dict) -> dict:
+def build_plan_envelope(plan: dict, audit_findings: list[str] | None = None) -> dict:
     return {
         A2UI_OPERATIONS_KEY: [
             create_surface(PLAN_SURFACE_ID, CATALOG_ID),
             update_components(
                 PLAN_SURFACE_ID,
-                [{"id": "root", "component": "PlanSurface", "plan": {"path": "/"}}],
+                [
+                    {
+                        "id": "root",
+                        "component": "PlanSurface",
+                        "plan": {"path": "/plan"},
+                        "audit_findings": {"path": "/audit_findings"},
+                    }
+                ],
             ),
-            update_data_model(PLAN_SURFACE_ID, plan),
+            update_data_model(
+                PLAN_SURFACE_ID, {"plan": plan, "audit_findings": audit_findings or []}
+            ),
         ]
     }
 

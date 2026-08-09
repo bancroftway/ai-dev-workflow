@@ -41,13 +41,38 @@ const ImplementationPlanSchema = z.object({
 type Specification = z.infer<typeof SpecificationSchema>;
 type ImplementationPlan = z.infer<typeof ImplementationPlanSchema>;
 
-export function SpecificationSurfaceRenderer({ specification: spec }: { specification: Specification }) {
+function AuditNotes({ findings }: { findings: string[] }) {
+  if (findings.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-sky-200 bg-sky-50 p-4">
+      <h4 className="text-sm font-medium text-sky-900">Audit Notes</h4>
+      <p className="mt-0.5 text-xs text-sky-700">
+        Gaps a second, independently-configured model found and revised before this draft reached you.
+      </p>
+      <ul className="mt-2 list-inside list-disc space-y-1 text-sm text-sky-900">
+        {findings.map((finding, index) => (
+          <li key={index}>{finding}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function SpecificationSurfaceRenderer({
+  specification: spec,
+  auditFindings = [],
+}: {
+  specification: Specification;
+  auditFindings?: string[];
+}) {
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-xl font-semibold">{spec.title}</h2>
         <p className="mt-1 text-neutral-600">{spec.summary}</p>
       </div>
+
+      <AuditNotes findings={auditFindings} />
 
       <div className="space-y-4">
         {spec.user_stories.map((story) => (
@@ -94,13 +119,21 @@ export function SpecificationSurfaceRenderer({ specification: spec }: { specific
   );
 }
 
-export function PlanSurfaceRenderer({ plan }: { plan: ImplementationPlan }) {
+export function PlanSurfaceRenderer({
+  plan,
+  auditFindings = [],
+}: {
+  plan: ImplementationPlan;
+  auditFindings?: string[];
+}) {
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-xl font-semibold">Implementation Plan</h2>
         <p className="mt-1 text-neutral-600">{plan.overview}</p>
       </div>
+
+      <AuditNotes findings={auditFindings} />
 
       <ol className="space-y-3">
         {plan.plan_steps.map((step) => (
@@ -128,11 +161,11 @@ export function PlanSurfaceRenderer({ plan }: { plan: ImplementationPlan }) {
 const definitions = {
   SpecificationSurface: {
     description: "Read-only rendering of the current Specification draft.",
-    props: z.object({ specification: SpecificationSchema }),
+    props: z.object({ specification: SpecificationSchema, audit_findings: z.array(z.string()) }),
   },
   PlanSurface: {
     description: "Read-only rendering of the current Implementation Plan draft.",
-    props: z.object({ plan: ImplementationPlanSchema }),
+    props: z.object({ plan: ImplementationPlanSchema, audit_findings: z.array(z.string()) }),
   },
 };
 
@@ -147,13 +180,30 @@ const definitions = {
 export const catalog = createCatalog(
   definitions,
   {
-    SpecificationSurface: ({ props }) => <SpecificationSurfaceRenderer specification={props.specification} />,
-    PlanSurface: ({ props }) => <PlanSurfaceRenderer plan={props.plan} />,
+    SpecificationSurface: ({ props }) => (
+      <SpecificationSurfaceRenderer specification={props.specification} auditFindings={props.audit_findings} />
+    ),
+    PlanSurface: ({ props }) => <PlanSurfaceRenderer plan={props.plan} auditFindings={props.audit_findings} />,
   },
   { catalogId: CATALOG_ID, includeBasicCatalog: false },
 );
 
+interface SpecificationSurfaceData {
+  specification: Specification;
+  audit_findings: string[];
+}
+interface PlanSurfaceData {
+  plan: ImplementationPlan;
+  audit_findings: string[];
+}
+
 export const SURFACE_COMPONENT_MAP: Record<string, (data: unknown) => ReactElement> = {
-  SpecificationSurface: (data) => <SpecificationSurfaceRenderer specification={data as Specification} />,
-  PlanSurface: (data) => <PlanSurfaceRenderer plan={data as ImplementationPlan} />,
+  SpecificationSurface: (data) => {
+    const { specification, audit_findings } = data as SpecificationSurfaceData;
+    return <SpecificationSurfaceRenderer specification={specification} auditFindings={audit_findings} />;
+  },
+  PlanSurface: (data) => {
+    const { plan, audit_findings } = data as PlanSurfaceData;
+    return <PlanSurfaceRenderer plan={plan} auditFindings={audit_findings} />;
+  },
 };

@@ -146,8 +146,9 @@ Each requirement below is a user story followed by its acceptance criteria.
 **Acceptance Criteria**
 - AC-1.1: The system presents exactly one text input for requirements, empty by default, accepting arbitrary free-form text.
 - AC-1.2: A submit action is available and is only usable when the text field is non-empty (after trimming leading/trailing whitespace).
-- AC-1.3: Submitting sends the current, complete text of the field to the Specification Agent as the entire basis for its first draft — no other input accompanies this submission.
+- AC-1.3: Submitting sends the current, complete text of the field to the Specification Agent as the entire basis for its first draft, along with any attachments from that same submission (AC-1.5) — no other input accompanies this submission.
 - AC-1.4: While a submission is being processed, the submit action is disabled or otherwise prevented from being triggered again, so that a second, overlapping submission cannot be created by the same input.
+- AC-1.5: The requirements area accepts optional screenshot/document attachments (images, PDFs, and common document formats) alongside the free-form text, uploaded in that same area. Attached files are forwarded to the Specification Agent's model as part of that submission's content, not merely recorded by filename, so the agent can draw on their actual content when drafting. Attachments are scoped to the submission they were attached to — they are not required to persist across a later revision's resubmission.
 
 ### US-2 — Receive and resolve clarifying questions
 
@@ -281,7 +282,6 @@ The following are deliberately not part of this system. An implementation should
 - Multiple simultaneous human users, roles, permissions, or any concept of authentication/authorization.
 - Any stage beyond the Plan (e.g., generating tests, generating implementation code, running quality/security scans, adversarial review). The workflow's terminal state, *for the functional requirements defined in this document*, is an Approved Plan — even though the architecture must not preclude appending further stages later (Section 5.1, BR-7). Do not build any of those anticipated later stages now; only build for the graph shape not resisting their later addition.
 - Version history or the ability to browse/restore earlier Specification or Plan drafts once superseded.
-- File, image, or other attachment upload as part of the requirements input.
 - Real-time collaboration or simultaneous editing by more than one person.
 - Any AI self-override of a human approval decision, or any AI action that bypasses the human review gates described in Section 6.
 

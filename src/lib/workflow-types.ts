@@ -22,6 +22,7 @@ export interface StageState {
   approved_content: unknown;
   ever_ready_for_review: boolean;
   used_ids: string[];
+  audit_findings: string[];
 }
 
 export interface WorkflowState {

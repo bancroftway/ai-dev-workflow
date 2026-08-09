@@ -27,3 +27,4 @@ agent/.venv/
 
 # gstack
 .gstack/browse-audit.jsonl
+.gstack/

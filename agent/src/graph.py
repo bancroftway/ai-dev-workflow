@@ -29,9 +29,16 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt
 
 from . import config as workflow_config
+from . import model_config
 from .a2ui_tools import build_plan_envelope, build_specification_envelope, present_surface_messages
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
-from .schemas import PlanDraftResponse, SpecificationDraftResponse
+from .prompt_loader import load_prompt
+from .schemas import (
+    PlanAuditResponse,
+    PlanDraftResponse,
+    SpecificationAuditResponse,
+    SpecificationDraftResponse,
+)
 
 StageStatus = Literal[
     "not_started", "drafting", "needs_clarification", "ready_for_review", "approved"
@@ -47,11 +54,16 @@ class StageState(TypedDict):
     approved_content: dict[str, Any] | None
     ever_ready_for_review: bool
     used_ids: list[str]
+    audit_findings: list[str]
 
 
 class GraphState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     raw_requirements_text: str
+    # Non-text InputContent parts (screenshots/documents) from the latest submission's
+    # HumanMessage, if any -- only ever consumed by the specification stage's draft prompt
+    # (BR-2: the plan stage's input is the approved Specification, never raw attachments).
+    requirements_attachments: list[dict[str, Any]]
     stages: dict[str, StageState]
 
 
@@ -65,6 +77,7 @@ def default_stage_state() -> StageState:
         "approved_content": None,
         "ever_ready_for_review": False,
         "used_ids": [],
+        "audit_findings": [],
     }
 
 
@@ -80,43 +93,24 @@ def _extract_ids(value: Any, out: set[str]) -> None:
             _extract_ids(item, out)
 
 
-SPEC_SYSTEM_PROMPT = """You are the Specification Agent in a spec-and-plan drafting workflow.
-Read the Human Operator's Raw Requirements Text and produce a Specification: a title, a short
-summary, a list of User Stories (each with a stable id, a title, a narrative in the form
-"As a <role>, I want <capability>, so that <benefit>", and a list of Acceptance Criteria, each
-with a stable id scoped to its parent User Story and a description of one specific, testable
-condition), a list of stated Assumptions, and a list of items explicitly marked Out of Scope.
+SPEC_SYSTEM_PROMPT = load_prompt("specification_draft")
 
-If the Raw Requirements Text is insufficient to draft confidently, set readiness to false and
-include specific Clarifying Questions instead of (or alongside) a draft. Only set readiness to
-true when the draft is complete enough to be worth a human review.
-
-Identity preservation: if you are given your own immediately-prior draft, reuse the exact same
-id for any User Story or Acceptance Criterion whose meaning is unchanged (even if wording is
-polished), mint a new id (never one already listed as used) for anything genuinely new, and
-simply omit anything that no longer applies. Never reuse a previously-used id for something
-unrelated."""
-
-PLAN_SYSTEM_PROMPT = """You are the Planning Agent in a spec-and-plan drafting workflow.
-Read the given approved Specification's full structured content and produce an Implementation
-Plan: an overview, an ordered list of Plan Steps (each with a stable id and a description of one
-concrete action, referencing the id(s) of any Acceptance Criteria it fulfills wherever that
-traceability is meaningful), and a list of Risk Notes.
-
-If the Specification is insufficient to plan from, set readiness to false and include specific
-Clarifying Questions instead of (or alongside) a draft. Only set readiness to true when the draft
-is complete enough to be worth a human review.
-
-Identity preservation: if you are given your own immediately-prior draft, reuse the exact same id
-for any Plan Step whose meaning is unchanged, mint a new id (never one already listed as used) for
-anything genuinely new, and simply omit anything that no longer applies."""
+PLAN_SYSTEM_PROMPT = load_prompt("plan_draft")
 
 
 def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
+    requirements_text = f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"
+    attachments = state.get("requirements_attachments") or []
+    # Attachments (screenshots/documents) ride alongside the text as a multimodal content list
+    # so copilot_chat_model.py's translator can forward them to the model as real attachments,
+    # not just note their existence -- a plain string content here would lose them entirely.
+    requirements_content: str | list[dict[str, Any]] = (
+        [{"type": "text", "text": requirements_text}, *attachments] if attachments else requirements_text
+    )
     messages: list[BaseMessage] = [
         SystemMessage(content=SPEC_SYSTEM_PROMPT),
-        HumanMessage(content=f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"),
+        HumanMessage(content=requirements_content),
     ]
     if stage["draft"] is not None:
         messages.append(
@@ -147,15 +141,42 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
     return messages
 
 
+SPEC_AUDIT_SYSTEM_PROMPT = load_prompt("specification_audit")
+
+PLAN_AUDIT_SYSTEM_PROMPT = load_prompt("plan_audit")
+
+
+def _build_specification_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["specification"]
+    return [
+        SystemMessage(content=SPEC_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"),
+        HumanMessage(content=f"Draft Specification to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+def _build_plan_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    spec_stage = state["stages"]["specification"]
+    plan_stage = state["stages"]["plan"]
+    return [
+        SystemMessage(content=PLAN_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
+        HumanMessage(content=f"Draft Plan to audit (JSON):\n{plan_stage['draft']}"),
+    ]
+
+
 @dataclass(frozen=True)
 class StageSpec:
     key: str
     response_schema: type[SpecificationDraftResponse] | type[PlanDraftResponse]
     content_field: str
     surface_tool_name: str
-    build_envelope: Callable[[dict[str, Any]], dict[str, Any]]
+    build_envelope: Callable[[dict[str, Any], list[str] | None], dict[str, Any]]
     build_prompt: Callable[[GraphState], list[BaseMessage]]
     max_cycles: int
+    audit_response_schema: type[SpecificationAuditResponse] | type[PlanAuditResponse]
+    audit_content_field: str
+    build_audit_prompt: Callable[[GraphState], list[BaseMessage]]
 
 
 STAGES: list[StageSpec] = [
@@ -167,6 +188,9 @@ STAGES: list[StageSpec] = [
         build_envelope=build_specification_envelope,
         build_prompt=_build_specification_prompt,
         max_cycles=workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
+        audit_response_schema=SpecificationAuditResponse,
+        audit_content_field="revised_specification",
+        build_audit_prompt=_build_specification_audit_prompt,
     ),
     StageSpec(
         key="plan",
@@ -176,10 +200,32 @@ STAGES: list[StageSpec] = [
         build_envelope=build_plan_envelope,
         build_prompt=_build_plan_prompt,
         max_cycles=workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
+        audit_response_schema=PlanAuditResponse,
+        audit_content_field="revised_plan",
+        build_audit_prompt=_build_plan_audit_prompt,
     ),
 ]
 
 _STAGE_BY_KEY = {stage.key: stage for stage in STAGES}
+
+
+def _split_text_and_attachments(content: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Split a HumanMessage's content into its text and any non-text (AG-UI InputContent)
+    parts. A plain string (every submission before multimodal attachments existed, and every
+    text-only submission since) passes through unchanged with no attachments.
+    """
+    if isinstance(content, str):
+        return content, []
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        attachments: list[dict[str, Any]] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text", "")))
+            elif isinstance(part, dict):
+                attachments.append(part)
+        return "\n".join(text_parts), attachments
+    return str(content), []
 
 
 def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
@@ -200,14 +246,25 @@ def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     # The Raw Requirements Text (AC-1.3/AC-6.2) is submitted as an ordinary
     # chat message — the human's "submit" action is agent.addMessage(...) +
     # runAgent() on the frontend — so every run's current, complete text is
-    # simply the latest HumanMessage, never a delta.
+    # simply the latest HumanMessage, never a delta. That message's content is a plain string
+    # for a text-only submission, or a multimodal InputContent list when screenshots/documents
+    # were attached in the Requirements area -- either way, only the text half becomes
+    # raw_requirements_text; any attachments are carried separately (see GraphState) since they
+    # only matter to this specific run's specification draft, not the persisted text itself.
     raw_requirements_text = state.get("raw_requirements_text", "")
+    requirements_attachments: list[dict[str, Any]] = []
     for message in reversed(state.get("messages", [])):
         if isinstance(message, HumanMessage):
-            raw_requirements_text = str(message.content)
+            raw_requirements_text, requirements_attachments = _split_text_and_attachments(
+                message.content
+            )
             break
 
-    return {"stages": stages, "raw_requirements_text": raw_requirements_text}
+    return {
+        "stages": stages,
+        "raw_requirements_text": raw_requirements_text,
+        "requirements_attachments": requirements_attachments,
+    }
 
 
 def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
@@ -215,8 +272,10 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         thread_id = config["configurable"]["thread_id"]
         model = get_chat_model_for_thread(
             thread_id,
+            stage_spec.key,
+            "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=workflow_config.COPILOT_MODEL_NAME,
+            model_name=model_config.get_model_name(stage_spec.key, "draft"),
         )
 
         prompt_messages = stage_spec.build_prompt(state)
@@ -237,24 +296,65 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         stage["readiness"] = response.readiness
         stage["used_ids"] = sorted(used_ids)
 
-        extra_messages: list[BaseMessage] = []
+        # Note: no A2UI envelope is built here even when readiness=true. That happens once, in
+        # make_audit_node, against the *audited* (revised) content -- building it here too would
+        # double-emit the surface (once pre-audit, once post-audit) for every ready draft.
         if response.readiness:
             stage["status"] = "ready_for_review"
             stage["ever_ready_for_review"] = True
-            if content_dict is not None:
-                envelope = stage_spec.build_envelope(content_dict)
-                extra_messages = present_surface_messages(stage_spec.surface_tool_name, envelope)
         else:
             stage["status"] = "needs_clarification"
             stage["cycle_count"] = stage["cycle_count"] + 1
 
         stages[stage_spec.key] = stage
-        result: dict[str, Any] = {"stages": stages}
-        if extra_messages:
-            result["messages"] = extra_messages
-        return result
+        return {"stages": stages}
 
     return draft_node
+
+
+def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
+    """Stringent second-opinion pass (SPECIFICATION.md-adjacent, see plan doc) run once per draft
+    that reaches readiness=true, by a separately-configured model, before the human ever sees it.
+
+    Only wired onto the "gate" routing branch (see build_graph) -- a draft forced through via
+    auto_approve (the clarification-cycle safety cap) skips the audit entirely; it's already
+    known-incomplete, and an adversarial pass over admittedly-incomplete content mostly just
+    re-describes its own incompleteness.
+    """
+
+    async def audit_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        thread_id = config["configurable"]["thread_id"]
+        model = get_chat_model_for_thread(
+            thread_id,
+            stage_spec.key,
+            "audit",
+            github_token=os.environ.get("GITHUB_TOKEN"),
+            model_name=model_config.get_model_name(stage_spec.key, "audit"),
+        )
+
+        prompt_messages = stage_spec.build_audit_prompt(state)
+        response = await ainvoke_structured(model, prompt_messages, stage_spec.audit_response_schema)
+
+        stages = {key: dict(value) for key, value in state["stages"].items()}
+        stage = stages[stage_spec.key]
+
+        revised_content = getattr(response, stage_spec.audit_content_field)
+        content_dict = revised_content.model_dump(mode="json")
+
+        used_ids: set[str] = set(stage["used_ids"])
+        _extract_ids(content_dict, used_ids)
+
+        stage["draft"] = content_dict
+        stage["used_ids"] = sorted(used_ids)
+        stage["audit_findings"] = list(response.audit_findings)
+        stages[stage_spec.key] = stage
+
+        envelope = stage_spec.build_envelope(content_dict, stage["audit_findings"])
+        extra_messages = present_surface_messages(stage_spec.surface_tool_name, envelope)
+
+        return {"stages": stages, "messages": extra_messages}
+
+    return audit_node
 
 
 def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]:
@@ -310,19 +410,22 @@ def build_graph() -> StateGraph:
 
     for index, stage_spec in enumerate(STAGES):
         draft_name = f"{stage_spec.key}_draft"
+        audit_name = f"{stage_spec.key}_audit"
         gate_name = f"{stage_spec.key}_gate"
         auto_approve_name = f"{stage_spec.key}_auto_approve"
         next_draft_name = f"{STAGES[index + 1].key}_draft" if index + 1 < len(STAGES) else END
 
         builder.add_node(draft_name, make_draft_node(stage_spec))
+        builder.add_node(audit_name, make_audit_node(stage_spec))
         builder.add_node(gate_name, make_gate_node(stage_spec))
         builder.add_node(auto_approve_name, make_auto_approve_node(stage_spec))
 
         builder.add_conditional_edges(
             draft_name,
             make_route_after_draft(stage_spec),
-            {"gate": gate_name, "auto_approve": auto_approve_name, "needs_clarification": END},
+            {"gate": audit_name, "auto_approve": auto_approve_name, "needs_clarification": END},
         )
+        builder.add_edge(audit_name, gate_name)
         builder.add_edge(gate_name, next_draft_name)
         builder.add_edge(auto_approve_name, next_draft_name)
 

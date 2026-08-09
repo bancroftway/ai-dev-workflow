@@ -73,3 +73,21 @@ class PlanDraftResponse(BaseModel):
     plan: ImplementationPlan | None = Field(
         default=None, description="Present whenever a draft was produced, ready or not."
     )
+
+
+class SpecificationAuditResponse(BaseModel):
+    """Structured output contract for the Specification adversarial-audit node."""
+
+    revised_specification: Specification
+    audit_findings: list[str] = Field(
+        default_factory=list, description="Gaps found and fixed. Empty if none were found."
+    )
+
+
+class PlanAuditResponse(BaseModel):
+    """Structured output contract for the Plan adversarial-audit node."""
+
+    revised_plan: ImplementationPlan
+    audit_findings: list[str] = Field(
+        default_factory=list, description="Gaps found and fixed. Empty if none were found."
+    )

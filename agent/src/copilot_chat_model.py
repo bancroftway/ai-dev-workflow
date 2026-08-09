@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import uuid
 from typing import Any, TypeVar
 
 from copilot import CopilotClient, CopilotSession
-from copilot.session import PermissionHandler
+from copilot.session import Attachment, BlobAttachment, ExitPlanModeRequest, ExitPlanModeResult, PermissionHandler
 from copilot.session_events import SessionEventType
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -33,6 +34,14 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Huma
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import BaseModel, PrivateAttr
 
+logger = logging.getLogger(__name__)
+
+# Sessions are keyed by "{thread_id}:{stage}:{role}", not bare thread_id -- a single LangGraph
+# thread runs both the specification and plan stages, each with a draft and an audit role, and
+# each of those four (stage, role) combinations can be configured with a different model
+# (SPECIFICATION.md Section 3.4 / models.yaml). Keying by thread_id alone would let whichever
+# (stage, role) creates its session first silently lock in its model for every later call on the
+# same thread.
 _clients: dict[str, CopilotClient] = {}
 _sessions: dict[str, CopilotSession] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
@@ -40,21 +49,88 @@ _session_locks: dict[str, asyncio.Lock] = {}
 _SESSION_IDLE_TIMEOUT_SECONDS = 300.0
 
 
-def _messages_to_prompt(messages: list[BaseMessage]) -> str:
-    """Flatten a LangChain message list into a single Copilot session prompt."""
+async def _on_exit_plan_mode_request(
+    request: ExitPlanModeRequest, _context: dict[str, str]
+) -> ExitPlanModeResult:
+    """Auto-approve GitHub Copilot's own Plan Mode exit requests.
+
+    BR-6 (SPECIFICATION.md Section 7): the model provider must never introduce its own
+    approval pause outside this app's own Gates. Registering this handler (rather than leaving
+    it unset) is required, not cosmetic -- create_session sends requestExitPlanMode=False to the
+    runtime when no handler is registered, which appears to suppress routing exit-plan-mode
+    requests to the client at all rather than auto-approving them.
+    """
+    logger.info("Copilot Plan Mode exit requested: %s", request.get("summary"))
+    return {"approved": True}
+
+
+def _content_part_to_attachment(part: dict[str, Any]) -> Attachment | None:
+    """Translate one non-text LangChain multimodal content part into a Copilot SDK Attachment.
+
+    By the time a HumanMessage's content reaches this module, ag_ui_langgraph has already
+    converted the wire-level AG-UI InputContent parts into LangChain's own multimodal
+    convention -- verified directly against the installed ag_ui_langgraph's
+    convert_agui_multimodal_to_langchain() (utils.py): every non-text media type (image,
+    document, etc.) is routed through a single {"type": "image_url", "image_url": {"url":
+    "data:<mime>;base64,<data>"}} shape, since "image_url" is the only media block type
+    LangChain itself supports -- not the AG-UI-native {"source": {"type": "data", ...}} shape.
+    A remote (non data:) URL isn't translated here; the Copilot SDK's FileAttachment/
+    DirectoryAttachment expect a local filesystem path, not an arbitrary remote URL.
+    """
+    if part.get("type") != "image_url":
+        return None
+    image_url = part.get("image_url")
+    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, _, data = url.partition(",")
+    mime_type = header[len("data:") :].split(";")[0] or "application/octet-stream"
+
+    metadata = part.get("metadata")
+    display_name = metadata.get("filename") if isinstance(metadata, dict) else None
+    attachment: BlobAttachment = {"type": "blob", "data": data, "mimeType": mime_type}
+    if display_name:
+        attachment["displayName"] = display_name
+    return attachment
+
+
+def _messages_to_prompt(messages: list[BaseMessage]) -> tuple[str, list[Attachment]]:
+    """Flatten a LangChain message list into a single Copilot session prompt plus any
+    multimodal attachments found in list-shaped message content (see graph.py's
+    _build_specification_prompt, which is the only prompt builder that can produce these).
+    """
     parts: list[str] = []
+    attachments: list[Attachment] = []
     for message in messages:
-        if isinstance(message, SystemMessage):
-            parts.append(f"Instructions:\n{message.content}")
+        content = message.content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    text_parts.append(str(item.get("text", "")))
+                    continue
+                attachment = _content_part_to_attachment(item)
+                if attachment is not None:
+                    attachments.append(attachment)
+            text = "\n".join(text_parts)
         else:
-            parts.append(str(message.content))
-    return "\n\n".join(parts)
+            text = str(content)
+
+        if isinstance(message, SystemMessage):
+            parts.append(f"Instructions:\n{text}")
+        else:
+            parts.append(text)
+    return "\n\n".join(parts), attachments
 
 
 class CopilotChatModel(BaseChatModel):
     """A LangChain chat model driving a persistent GitHub Copilot SDK session."""
 
     thread_id: str
+    stage: str
+    role: str
     model_name: str | None = None
     github_token: str | None = None
 
@@ -64,23 +140,29 @@ class CopilotChatModel(BaseChatModel):
     def _llm_type(self) -> str:
         return "github-copilot"
 
+    @property
+    def _session_key(self) -> str:
+        return f"{self.thread_id}:{self.stage}:{self.role}"
+
     async def _get_session(self) -> CopilotSession:
-        lock = _session_locks.setdefault(self.thread_id, asyncio.Lock())
+        session_key = self._session_key
+        lock = _session_locks.setdefault(session_key, asyncio.Lock())
         async with lock:
-            existing = _sessions.get(self.thread_id)
+            existing = _sessions.get(session_key)
             if existing is not None:
                 return existing
 
             client = CopilotClient(github_token=self.github_token, log_level="error")
             await client.__aenter__()
-            _clients[self.thread_id] = client
+            _clients[session_key] = client
 
             session = await client.create_session(
                 on_permission_request=PermissionHandler.approve_all,
+                on_exit_plan_mode_request=_on_exit_plan_mode_request,
                 model=self.model_name,
                 streaming=True,
             )
-            _sessions[self.thread_id] = session
+            _sessions[session_key] = session
             return session
 
     async def _agenerate(
@@ -91,7 +173,7 @@ class CopilotChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         session = await self._get_session()
-        prompt = _messages_to_prompt(messages)
+        prompt, attachments = _messages_to_prompt(messages)
         message_id = f"run-{uuid.uuid4().hex}"
 
         delta_parts: list[str] = []
@@ -119,7 +201,7 @@ class CopilotChatModel(BaseChatModel):
 
         unsubscribe = session.on(handler)
         try:
-            await session.send(prompt)
+            await session.send(prompt, agent_mode="plan", attachments=attachments or None)
             await asyncio.wait_for(done.wait(), timeout=_SESSION_IDLE_TIMEOUT_SECONDS)
         finally:
             unsubscribe()
@@ -141,21 +223,35 @@ class CopilotChatModel(BaseChatModel):
 
 
 def get_chat_model_for_thread(
-    thread_id: str, *, github_token: str | None = None, model_name: str | None = None
+    thread_id: str,
+    stage: str,
+    role: str,
+    *,
+    github_token: str | None = None,
+    model_name: str | None = None,
 ) -> CopilotChatModel:
-    """Return the (cached) chat model bound to the given LangGraph thread's Copilot session."""
-    return CopilotChatModel(thread_id=thread_id, github_token=github_token, model_name=model_name)
+    """Return the chat model for the given LangGraph thread's (stage, role) Copilot session.
+
+    stage/role together (e.g. "specification"/"draft" vs "plan"/"audit") identify which of the
+    up-to-four persistent Copilot sessions a single thread can have open at once -- see the
+    module docstring on _sessions for why bare thread_id isn't a fine-grained-enough key.
+    """
+    return CopilotChatModel(
+        thread_id=thread_id, stage=stage, role=role, github_token=github_token, model_name=model_name
+    )
 
 
 async def close_thread_session(thread_id: str) -> None:
-    """Close and forget the Copilot session for a thread (call on graph run completion/error)."""
-    session = _sessions.pop(thread_id, None)
-    client = _clients.pop(thread_id, None)
-    _session_locks.pop(thread_id, None)
-    if session is not None:
-        await session.disconnect()
-    if client is not None:
-        await client.__aexit__(None, None, None)
+    """Close and forget every Copilot session for a thread (call on graph run completion/error)."""
+    prefix = f"{thread_id}:"
+    for session_key in [key for key in _sessions if key.startswith(prefix)]:
+        session = _sessions.pop(session_key, None)
+        client = _clients.pop(session_key, None)
+        _session_locks.pop(session_key, None)
+        if session is not None:
+            await session.disconnect()
+        if client is not None:
+            await client.__aexit__(None, None, None)
 
 
 _STRUCTURED_OUTPUT_INSTRUCTION = (
@@ -191,7 +287,12 @@ async def ainvoke_structured(
 
     last_error: Exception | None = None
     for attempt in range(max_attempts):
-        response = await model.ainvoke(request_messages)
+        # emit-messages=False (ag_ui_langgraph's convention, agent.py:993) keeps this raw
+        # JSON-schema-constrained output out of the AG-UI text-message stream -- with the
+        # CopilotSidebar now showing a real chat transcript (unlike the old top-banner-only
+        # UI), an unsuppressed stream would render this structured output as if it were
+        # assistant chat prose, which it was never meant to be.
+        response = await model.ainvoke(request_messages, config={"metadata": {"emit-messages": False}})
         raw = _CODE_FENCE_RE.sub("", str(response.content)).strip()
         try:
             return schema.model_validate_json(raw)
