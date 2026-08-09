@@ -4,9 +4,17 @@
 # `audit_model` should differ from `draft_model` -- the adversarial audit pass exists to get a
 # second opinion from a *different* model. If left null, the audit pass still runs, just with
 # the same model as draft_model (a warning is logged).
+#
+# Valid model ids depend on your GitHub Copilot account/plan -- list what's actually available
+# with `CopilotClient.list_models()` (agent/.venv, `uv run python -c "..."`), not this comment,
+# since the roster changes over time. As of this writing, this account has access to:
+#   auto, claude-sonnet-5, claude-sonnet-4.6, claude-sonnet-4.5, claude-haiku-4.5,
+#   claude-opus-5, gpt-5.6-terra, gpt-5.6-luna, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini,
+#   gpt-5-mini, mai-code-1-flash-picker, gemini-3.1-pro-preview, gemini-3.6-flash,
+#   gemini-3.5-flash, kimi-k2.7-code
 specification:
-  draft_model: null
-  audit_model: null
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
 plan:
-  draft_model: null
-  audit_model: null
+  draft_model: gpt-5.4
+  audit_model: gemini-3.1-pro-preview

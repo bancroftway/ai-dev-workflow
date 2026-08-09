@@ -152,6 +152,7 @@ class CopilotChatModel(BaseChatModel):
             if existing is not None:
                 return existing
 
+            logger.info("Creating Copilot session %r with model=%r", session_key, self.model_name)
             client = CopilotClient(github_token=self.github_token, log_level="error")
             await client.__aenter__()
             _clients[session_key] = client

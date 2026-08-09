@@ -6,12 +6,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import logging
 import os
 
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
 from copilotkit import LangGraphAGUIAgent
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# INFO level so per-role model selection (copilot_chat_model.py) and Plan Mode exit events are
+# actually visible -- Python's root logger defaults to WARNING, which silently drops them.
+logging.basicConfig(level=logging.INFO)
 
 from src.graph import graph
 
