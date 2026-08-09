@@ -1,0 +1,32 @@
+{
+  "name": "ai-dev-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@ag-ui/a2ui-middleware": "^0.0.10",
+    "@ag-ui/langgraph": "^0.0.42",
+    "@copilotkit/a2ui-renderer": "^1.66.4",
+    "@copilotkit/react-core": "^1.66.4",
+    "@copilotkit/runtime": "^1.66.4",
+    "next": "16.3.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
