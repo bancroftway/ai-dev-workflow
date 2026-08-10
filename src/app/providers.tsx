@@ -1,15 +1,20 @@
 "use client";
 
-import { CopilotKit } from "@copilotkit/react-core/v2";
-import "@copilotkit/react-core/v2/styles.css";
-import { A2UIProvider } from "@copilotkit/a2ui-renderer";
+import { SessionProvider } from "next-auth/react";
+import type { Session } from "next-auth";
 import type { ReactNode } from "react";
-import { catalog } from "@/a2ui/catalog";
 
-export function Providers({ children }: { children: ReactNode }) {
-  return (
-    <CopilotKit runtimeUrl="/api/copilotkit" a2ui={{ catalog }}>
-      <A2UIProvider catalog={catalog}>{children}</A2UIProvider>
-    </CopilotKit>
-  );
+// CopilotKit/A2UIProvider deliberately live in workspace/providers.tsx, not
+// here: mounting them app-wide made the client fetch runtime info from
+// /api/copilotkit on every page, including the public, unauthenticated
+// homepage -- which now correctly 401s that request, surfacing as a
+// runtime_info_fetch_failed error where no CopilotKit UI is even rendered.
+export function Providers({
+  children,
+  session,
+}: {
+  children: ReactNode;
+  session?: Session | null;
+}) {
+  return <SessionProvider session={session}>{children}</SessionProvider>;
 }
