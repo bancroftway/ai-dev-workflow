@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 
 from src.graph import graph
+from src.sessions_api import router as sessions_router
 
 app = FastAPI()
 app.add_middleware(
@@ -27,6 +28,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(sessions_router)
 
 add_langgraph_fastapi_endpoint(
     app=app,

@@ -65,7 +65,7 @@ export default function Home() {
         <form
           action={async () => {
             "use server";
-            await signIn("github", { redirectTo: "/workspace" });
+            await signIn("github", { redirectTo: "/select" });
           }}
           className="mt-10"
         >
@@ -130,7 +130,7 @@ export default function Home() {
           <form
             action={async () => {
               "use server";
-              await signIn("github", { redirectTo: "/workspace" });
+              await signIn("github", { redirectTo: "/select" });
             }}
             className="mt-8"
           >

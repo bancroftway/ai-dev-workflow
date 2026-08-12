@@ -3,6 +3,7 @@
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import type { ReactNode } from "react";
 import { SURFACE_COMPONENT_MAP } from "@/a2ui/catalog";
+import { useWorkflowThread } from "@/lib/workflow-thread-context";
 
 /**
  * Renders the A2UI fixed-schema envelope this system's drafting nodes emit
@@ -62,8 +63,11 @@ function findSurfaceData(
 }
 
 export function A2UISurfaceView({ surfaceId, fallback }: { surfaceId: string; fallback: ReactNode }) {
+  // agentId only -- see RequirementsView.tsx's comment: AppShell already registered this
+  // proxied agent, re-registering the same id throws.
+  const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({
-    agentId: "workflow",
+    agentId: localAgentId,
     updates: [UseAgentUpdate.OnMessagesChanged],
   });
 

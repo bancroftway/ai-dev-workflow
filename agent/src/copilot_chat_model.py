@@ -25,7 +25,7 @@ import re
 import uuid
 from typing import Any, TypeVar
 
-from copilot import CopilotClient, CopilotSession
+from copilot import CopilotClient, CopilotSession, RuntimeConnection
 from copilot.session import Attachment, BlobAttachment, ExitPlanModeRequest, ExitPlanModeResult, PermissionHandler
 from copilot.session_events import SessionEventType
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
@@ -33,6 +33,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import BaseModel, PrivateAttr
+
+from .sandbox import SandboxSession
 
 logger = logging.getLogger(__name__)
 
@@ -126,13 +128,27 @@ def _messages_to_prompt(messages: list[BaseMessage]) -> tuple[str, list[Attachme
 
 
 class CopilotChatModel(BaseChatModel):
-    """A LangChain chat model driving a persistent GitHub Copilot SDK session."""
+    """A LangChain chat model driving a persistent GitHub Copilot SDK session.
+
+    When ``sandbox`` is set, the Copilot runtime is NOT spawned as a local child process of this
+    (agent) process -- it connects over the network to a `copilot --server` process already
+    running inside that sandbox (architecture plan Section C.1). This is not a drop-in swap:
+    per CopilotClient's own docstring, "Options are ignored when connecting to an existing
+    runtime via RuntimeConnection.for_uri" -- concretely, `github_token` is only ever written
+    into a locally-spawned child process's environment (client.py's _start_cli_server), which is
+    skipped entirely for a for_uri connection. So `github_token` on this model is only honored
+    in local/stdio mode (no sandbox); once a sandbox is set, auth is instead whatever
+    COPILOT_SDK_AUTH_TOKEN the *sandbox's own* `copilot --server` process was started with (see
+    agent/sandbox-image/entrypoint.sh) -- github_token is silently inert in that case, by SDK
+    design, not a bug here.
+    """
 
     thread_id: str
     stage: str
     role: str
     model_name: str | None = None
     github_token: str | None = None
+    sandbox: SandboxSession | None = None
 
     _closing: bool = PrivateAttr(default=False)
 
@@ -144,6 +160,15 @@ class CopilotChatModel(BaseChatModel):
     def _session_key(self) -> str:
         return f"{self.thread_id}:{self.stage}:{self.role}"
 
+    def _build_client(self) -> CopilotClient:
+        if self.sandbox is not None:
+            connection = RuntimeConnection.for_uri(
+                f"{self.sandbox.host}:{self.sandbox.port}",
+                connection_token=self.sandbox.connection_token,
+            )
+            return CopilotClient(connection=connection, log_level="error")
+        return CopilotClient(github_token=self.github_token, log_level="error")
+
     async def _get_session(self) -> CopilotSession:
         session_key = self._session_key
         lock = _session_locks.setdefault(session_key, asyncio.Lock())
@@ -152,8 +177,13 @@ class CopilotChatModel(BaseChatModel):
             if existing is not None:
                 return existing
 
-            logger.info("Creating Copilot session %r with model=%r", session_key, self.model_name)
-            client = CopilotClient(github_token=self.github_token, log_level="error")
+            logger.info(
+                "Creating Copilot session %r with model=%r sandbox=%s",
+                session_key,
+                self.model_name,
+                self.sandbox.session_id if self.sandbox else None,
+            )
+            client = self._build_client()
             await client.__aenter__()
             _clients[session_key] = client
 
@@ -230,15 +260,25 @@ def get_chat_model_for_thread(
     *,
     github_token: str | None = None,
     model_name: str | None = None,
+    sandbox: SandboxSession | None = None,
 ) -> CopilotChatModel:
     """Return the chat model for the given LangGraph thread's (stage, role) Copilot session.
 
     stage/role together (e.g. "specification"/"draft" vs "plan"/"audit") identify which of the
     up-to-four persistent Copilot sessions a single thread can have open at once -- see the
     module docstring on _sessions for why bare thread_id isn't a fine-grained-enough key.
+
+    sandbox, when provided, routes this session's Copilot runtime to the given per-session
+    sandbox instead of spawning Copilot locally -- see CopilotChatModel's docstring for why
+    github_token becomes inert once sandbox is set.
     """
     return CopilotChatModel(
-        thread_id=thread_id, stage=stage, role=role, github_token=github_token, model_name=model_name
+        thread_id=thread_id,
+        stage=stage,
+        role=role,
+        github_token=github_token,
+        model_name=model_name,
+        sandbox=sandbox,
     )
 
 

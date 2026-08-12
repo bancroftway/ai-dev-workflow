@@ -5,13 +5,17 @@ import { useState } from "react";
 import { PlanView } from "@/components/PlanView";
 import { RequirementsView } from "@/components/RequirementsView";
 import { SpecificationView } from "@/components/SpecificationView";
+import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
 type ViewId = "requirements" | "specification" | "plan";
 
 export function AppShell() {
+  const { threadId, runtimeAgentId, localAgentId } = useWorkflowThread();
   const { agent } = useAgent({
-    agentId: "workflow",
+    agentId: localAgentId,
+    runtimeAgentId,
+    threadId,
     updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged],
   });
   const [activeView, setActiveView] = useState<ViewId>("requirements");
@@ -33,7 +37,7 @@ export function AppShell() {
   // correctly (it drives the tab-enablement logic below, which is correct), so it's the more
   // trustworthy source for display purposes.
   useInterrupt<never>({
-    agentId: "workflow",
+    agentId: localAgentId,
     render: ({ resolve }) => {
       const label = plan?.status === "ready_for_review" ? "Implementation Plan" : "Specification";
       return (
@@ -84,7 +88,7 @@ export function AppShell() {
         </main>
       </div>
 
-      <CopilotSidebar agentId="workflow" />
+      <CopilotSidebar agentId={localAgentId} />
     </div>
   );
 }

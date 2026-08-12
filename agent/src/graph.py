@@ -16,6 +16,7 @@ resumed and is abandoned by construction (BR-4's cascade).
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Annotated, Any, Callable, Literal, TypedDict
@@ -29,16 +30,23 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt
 
 from . import config as workflow_config
+from . import git_ops
 from . import model_config
+from . import workflow_persistence
 from .a2ui_tools import build_plan_envelope, build_specification_envelope, present_surface_messages
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
+from .markdown_render import render_plan_markdown, render_specification_markdown
 from .prompt_loader import load_prompt
+from .sandbox import registry as sandbox_registry
+from .sandbox.factory import get_sandbox_provider
 from .schemas import (
     PlanAuditResponse,
     PlanDraftResponse,
     SpecificationAuditResponse,
     SpecificationDraftResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 StageStatus = Literal[
     "not_started", "drafting", "needs_clarification", "ready_for_review", "approved"
@@ -177,6 +185,7 @@ class StageSpec:
     audit_response_schema: type[SpecificationAuditResponse] | type[PlanAuditResponse]
     audit_content_field: str
     build_audit_prompt: Callable[[GraphState], list[BaseMessage]]
+    render_markdown: Callable[[dict[str, Any]], str]
 
 
 STAGES: list[StageSpec] = [
@@ -191,6 +200,7 @@ STAGES: list[StageSpec] = [
         audit_response_schema=SpecificationAuditResponse,
         audit_content_field="revised_specification",
         build_audit_prompt=_build_specification_audit_prompt,
+        render_markdown=render_specification_markdown,
     ),
     StageSpec(
         key="plan",
@@ -203,10 +213,42 @@ STAGES: list[StageSpec] = [
         audit_response_schema=PlanAuditResponse,
         audit_content_field="revised_plan",
         build_audit_prompt=_build_plan_audit_prompt,
+        render_markdown=render_plan_markdown,
     ),
 ]
 
 _STAGE_BY_KEY = {stage.key: stage for stage in STAGES}
+_STAGE_KEYS = [stage.key for stage in STAGES]
+_RENDER_MARKDOWN_BY_STAGE = {stage.key: stage.render_markdown for stage in STAGES}
+
+
+async def _persist_if_sandboxed(
+    thread_id: str, state: GraphState, stages: dict[str, Any], commit_message: str
+) -> None:
+    """Best-effort persistence (architecture plan Section B) -- a no-op when no sandbox is
+    registered for this thread (Section A not wired up, or the thread predates sandboxing).
+
+    Failures are logged and swallowed, not raised: this runs inside gate/audit/auto_approve
+    nodes, and a transient persistence failure (e.g. the sandbox idled out between provisioning
+    and this gate resolving -- flagged as an open gap in the plan's Section B, "re-provision
+    sandbox on demand" is not implemented here) should not block the human's actual approval
+    action, which is durable in the in-memory checkpoint regardless.
+    """
+    sandbox = sandbox_registry.get(thread_id)
+    if sandbox is None:
+        return
+    try:
+        provider = get_sandbox_provider()
+        await workflow_persistence.persist_state(
+            provider,
+            thread_id,
+            raw_requirements_text=state.get("raw_requirements_text", ""),
+            stages=stages,
+            render_markdown=_RENDER_MARKDOWN_BY_STAGE,
+        )
+        await git_ops.commit_ai_dev_workflow(provider, thread_id, commit_message)
+    except Exception:
+        logger.warning("Failed to persist workflow state for thread_id=%s", thread_id, exc_info=True)
 
 
 def _split_text_and_attachments(content: Any) -> tuple[str, list[dict[str, Any]]]:
@@ -228,8 +270,21 @@ def _split_text_and_attachments(content: Any) -> tuple[str, list[dict[str, Any]]
     return str(content), []
 
 
-def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+    thread_id = config["configurable"]["thread_id"]
     stages = {key: dict(value) for key, value in state.get("stages", {}).items()}
+
+    # Hydration (architecture plan Section B.2): only when this thread has never had any stage
+    # state in this process's memory yet -- i.e. genuinely the first invoke for this thread since
+    # the agent process started, whether because it's a returning session after a restart, or a
+    # different session picking up the same repo/branch/user. A thread already mid-session (any
+    # prior invoke populated `stages`) never re-hydrates; its in-memory checkpoint is authoritative.
+    if not stages and sandbox_registry.get(thread_id) is not None:
+        hydrated = await workflow_persistence.hydrate_state(get_sandbox_provider(), thread_id, _STAGE_KEYS)
+        if hydrated is not None:
+            stages = hydrated
+            logger.info("intake_node: hydrated prior workflow state for thread_id=%s", thread_id)
+
     for stage_spec in STAGES:
         stages.setdefault(stage_spec.key, default_stage_state())
 
@@ -276,6 +331,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name(stage_spec.key, "draft"),
+            sandbox=sandbox_registry.get(thread_id),
         )
 
         prompt_messages = stage_spec.build_prompt(state)
@@ -330,6 +386,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             "audit",
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name(stage_spec.key, "audit"),
+            sandbox=sandbox_registry.get(thread_id),
         )
 
         prompt_messages = stage_spec.build_audit_prompt(state)
@@ -351,6 +408,11 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         envelope = stage_spec.build_envelope(content_dict, stage["audit_findings"])
         extra_messages = present_surface_messages(stage_spec.surface_tool_name, envelope)
+
+        thread_id = config["configurable"]["thread_id"]
+        await _persist_if_sandboxed(
+            thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} draft revised (audit)"
+        )
 
         return {"stages": stages, "messages": extra_messages}
 
@@ -382,6 +444,10 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         approved["approved_content"] = approved["draft"]
         approved["cycle_count"] = 0
         stages[stage_spec.key] = approved
+
+        thread_id = config["configurable"]["thread_id"]
+        await _persist_if_sandboxed(thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} approved")
+
         return {"stages": stages}
 
     return gate_node
@@ -397,6 +463,12 @@ def make_auto_approve_node(stage_spec: StageSpec) -> Callable[[GraphState, Runna
         stage["approved_content"] = stage["draft"]
         stage["cycle_count"] = 0
         stages[stage_spec.key] = stage
+
+        thread_id = config["configurable"]["thread_id"]
+        await _persist_if_sandboxed(
+            thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} auto-approved (safety cap)"
+        )
+
         return {"stages": stages}
 
     return auto_approve_node

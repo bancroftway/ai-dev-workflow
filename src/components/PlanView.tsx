@@ -3,10 +3,14 @@
 import { useAgent } from "@copilotkit/react-core/v2";
 import { A2UISurfaceView } from "@/components/A2UISurfaceView";
 import { PLAN_SURFACE_ID } from "@/lib/a2ui-surface-ids";
+import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
 export function PlanView() {
-  const { agent } = useAgent({ agentId: "workflow" });
+  // agentId only -- see RequirementsView.tsx's comment: AppShell already registered this
+  // proxied agent, re-registering the same id throws.
+  const { localAgentId } = useWorkflowThread();
+  const { agent } = useAgent({ agentId: localAgentId });
   const state = (agent.state ?? {}) as WorkflowState;
   const plan = state.stages?.plan;
 

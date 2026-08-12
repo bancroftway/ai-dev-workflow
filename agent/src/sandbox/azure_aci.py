@@ -1,0 +1,288 @@
+"""Azure Container Instances (ACI)-backed SandboxProvider for production (architecture plan
+Section C/D).
+
+Uses the `az` CLI via subprocess, matching LocalDockerProvider's shape -- `az` already works for
+both local testing (interactive `az login`) and production (a Container App's managed identity
+via `az login --identity`, or DefaultAzureCredential-equivalent ambient auth), so this avoids a
+separate SDK dependency and its own auth wiring.
+
+Grounded in a live validation session against a real Azure subscription (plan Section C.3's Open
+Risk #1): plain Container Apps ingress -- even "TCP transport" -- could not carry
+RuntimeConnection.for_uri's raw TCP protocol (a connect() timeout, reproduced 4x). A plain ACI
+container group could, cleanly, with both a public IP and (separately) a VNET-injected private
+IP. This provider targets ACI specifically because of that result, not any Container Apps
+primitive.
+
+Known gap, not resolved here: `exec_in_sandbox` uses the same `sh -c <command>` pattern as
+LocalDockerProvider, but `az container exec`'s underlying command-line handling has not been
+verified to preserve shell operators (`&&`, `|`, `>`) the way `docker exec` does -- ACI's
+container-*create*-time `--command-line` was empirically found to naively whitespace-split
+rather than invoke a shell (this cost real debugging time during the Open Risk #1 investigation;
+see the architecture plan). If `exec_in_sandbox` breaks the same way when actually exercised by
+workflow_persistence.py/git_ops.py, that is the next thing to fix here, not a surprise to treat
+as a new investigation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import secrets
+import shutil
+import time
+from dataclasses import dataclass, field
+
+from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_copilot_ready
+
+logger = logging.getLogger(__name__)
+
+_COPILOT_PORT_IN_CONTAINER = 3000
+_CONTAINER_NAME_PREFIX = "aidevworkflow-sandbox-"
+_IP_WAIT_TIMEOUT_SECONDS = 60.0
+_REAP_POLL_SECONDS = 60.0
+WORKSPACE_DIR_IN_CONTAINER = "/workspace/repo"
+
+
+def _container_group_name(session_id: str) -> str:
+    # ACI container group names must be <= 63 chars, lowercase alphanumeric + hyphens -- a
+    # raw thread_id (a sha256 hex digest already, per src/lib/workflow-thread.ts) is already
+    # hex/lowercase, but hash again here so this doesn't silently assume that about every caller.
+    digest = hashlib.sha256(session_id.encode()).hexdigest()[:24]
+    return f"{_CONTAINER_NAME_PREFIX}{digest}"
+
+
+def _resolve_az_executable() -> str:
+    # asyncio.create_subprocess_exec bypasses the shell entirely, so on Windows -- where `az` is
+    # actually `az.cmd`, a batch wrapper -- it must be given the exact resolved filename; only a
+    # real shell (which this deliberately isn't, to avoid a whole other class of quoting issues)
+    # auto-tries PATHEXT extensions the way typing `az` at a prompt does.
+    #
+    # Resolved lazily (on first real use), not at import time: this module is imported
+    # unconditionally by sandbox/factory.py regardless of SANDBOX_PROVIDER, so an eager resolution
+    # would break `SANDBOX_PROVIDER=local` too on any host/image without the az CLI installed
+    # (agent/Dockerfile does not install it today -- required before this provider is usable in
+    # a real deployment, not just for local testing against this module).
+    resolved = shutil.which("az")
+    if resolved is None:
+        raise RuntimeError("az CLI not found on PATH")
+    return resolved
+
+
+async def _run_az(*args: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        _resolve_az_executable(), *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode or 0, stdout.decode().strip(), stderr.decode().strip()
+
+
+@dataclass
+class _RunningSandbox:
+    container_name: str
+    ip: str
+    connection_token: str
+    last_active: float = field(default_factory=time.monotonic)
+
+
+class AzureContainerInstanceProvider(SandboxProvider):
+    """Environment variables (the agent's own env, not the sandbox's):
+
+    Required:
+      AZURE_RESOURCE_GROUP     -- resource group to create/delete ACI container groups in.
+      AZURE_ACI_SANDBOX_IMAGE  -- e.g. myacr.azurecr.io/ai-dev-workflow-sandbox:latest.
+    Optional (production should set both; omitting them falls back to a public IP, only
+    appropriate for throwaway testing -- see the plan's Section C.3 note on why private+VNET is
+    the production requirement):
+      AZURE_ACI_VNET_NAME, AZURE_ACI_SUBNET_NAME
+    Optional, for a private (non-public) registry -- prefer AZURE_ACI_IDENTITY (a pre-created
+    user-assigned managed identity's resource ID, already granted AcrPull -- see infra/main.bicep)
+    over registry username/password, which exists mainly for this implementation's own ad hoc
+    validation against a registry with the admin account enabled:
+      AZURE_ACI_IDENTITY  -- resource ID of a user-assigned identity with AcrPull; used for both
+                             the container group's own identity and its ACR pull credential.
+      AZURE_ACI_REGISTRY_SERVER, AZURE_ACI_REGISTRY_USERNAME, AZURE_ACI_REGISTRY_PASSWORD
+                          -- used only if AZURE_ACI_IDENTITY is unset.
+    Optional:
+      AZURE_ACI_LOCATION -- defaults to the resource group's own location if unset.
+    """
+
+    def __init__(self, *, idle_timeout_seconds: float = 1800.0) -> None:
+        self._resource_group = os.environ["AZURE_RESOURCE_GROUP"]
+        self._sandbox_image = os.environ["AZURE_ACI_SANDBOX_IMAGE"]
+        self._vnet_name = os.environ.get("AZURE_ACI_VNET_NAME")
+        self._subnet_name = os.environ.get("AZURE_ACI_SUBNET_NAME")
+        self._identity = os.environ.get("AZURE_ACI_IDENTITY")
+        self._registry_server = os.environ.get("AZURE_ACI_REGISTRY_SERVER")
+        self._registry_username = os.environ.get("AZURE_ACI_REGISTRY_USERNAME")
+        self._registry_password = os.environ.get("AZURE_ACI_REGISTRY_PASSWORD")
+        self._location = os.environ.get("AZURE_ACI_LOCATION")
+        self._idle_timeout_seconds = idle_timeout_seconds
+        self._sandboxes: dict[str, _RunningSandbox] = {}
+        self._lock = asyncio.Lock()
+        self._reaper_task: asyncio.Task[None] | None = None
+
+    async def provision(
+        self,
+        *,
+        session_id: str,
+        repo_clone_url: str,
+        branch: str,
+        git_user_token: str,
+        copilot_auth_token: str,
+        image: str | None = None,
+    ) -> SandboxSession:
+        async with self._lock:
+            existing = self._sandboxes.get(session_id)
+            if existing is not None:
+                existing.last_active = time.monotonic()
+                return SandboxSession(session_id, existing.ip, _COPILOT_PORT_IN_CONTAINER, existing.connection_token)
+
+            name = _container_group_name(session_id)
+            connection_token = secrets.token_urlsafe(32)
+
+            # Best-effort cleanup of a stale container group from a previous, uncleanly-terminated
+            # run under the same session_id -- `az container create --name` fails outright if a
+            # group with that name still exists.
+            await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
+
+            args = [
+                "container", "create",
+                "--resource-group", self._resource_group,
+                "--name", name,
+                "--image", image or self._sandbox_image,
+                "--os-type", "Linux",
+                "--cpu", "1",
+                "--memory", "2",
+                "--restart-policy", "Never",
+                "--ports", str(_COPILOT_PORT_IN_CONTAINER),
+                "--environment-variables",
+                f"REPO_BRANCH={branch}",
+                f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
+                "--secure-environment-variables",
+                f"REPO_CLONE_URL={repo_clone_url}",
+                f"GIT_USER_TOKEN={git_user_token}",
+                f"COPILOT_SDK_AUTH_TOKEN={copilot_auth_token}",
+                f"COPILOT_CONNECTION_TOKEN={connection_token}",
+            ]
+            if self._location:
+                args += ["--location", self._location]
+            if self._vnet_name and self._subnet_name:
+                args += ["--vnet", self._vnet_name, "--subnet", self._subnet_name, "--ip-address", "Private"]
+            else:
+                logger.warning(
+                    "AZURE_ACI_VNET_NAME/AZURE_ACI_SUBNET_NAME not set -- provisioning session_id=%s "
+                    "with a PUBLIC IP. Fine for testing, wrong for production (plan Section C.3).",
+                    session_id,
+                )
+                args += ["--ip-address", "Public"]
+            if self._identity:
+                # Preferred, production path: the container group pulls the image using its own
+                # user-assigned identity (already granted AcrPull -- infra/main.bicep), no
+                # credential of any kind passed at create time.
+                args += ["--assign-identity", self._identity, "--acr-identity", self._identity]
+            elif self._registry_server:
+                args += [
+                    "--registry-login-server", self._registry_server,
+                    "--registry-username", self._registry_username or "",
+                    "--registry-password", self._registry_password or "",
+                ]
+
+            returncode, stdout, stderr = await _run_az(*args)
+            if returncode != 0:
+                raise RuntimeError(f"az container create failed for session {session_id!r}: {stderr}")
+
+            try:
+                ip = await self._resolve_ip(name, create_output=stdout)
+                await wait_for_copilot_ready(ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
+            except Exception:
+                await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
+                raise
+
+            self._sandboxes[session_id] = _RunningSandbox(name, ip, connection_token)
+            self._ensure_reaper_running()
+            logger.info("Provisioned ACI sandbox session_id=%s container_group=%s ip=%s", session_id, name, ip)
+            return SandboxSession(session_id, ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
+
+    async def _resolve_ip(self, container_group_name: str, *, create_output: str) -> str:
+        """`az container create`'s own JSON output usually already has the IP; fall back to
+        polling `container show` for cases where allocation completes a moment after create
+        returns (observed during the Open Risk #1 validation session for private/VNET IPs)."""
+        try:
+            parsed = json.loads(create_output)
+            ip = parsed.get("ipAddress", {}).get("ip")
+            if ip:
+                return ip
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        deadline = time.monotonic() + _IP_WAIT_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            returncode, stdout, _stderr = await _run_az(
+                "container", "show",
+                "--resource-group", self._resource_group,
+                "--name", container_group_name,
+                "--query", "ipAddress.ip",
+                "--output", "tsv",
+            )
+            if returncode == 0 and stdout:
+                return stdout
+            await asyncio.sleep(1.0)
+        raise RuntimeError(f"container group {container_group_name!r} never got an IP assigned")
+
+    async def touch(self, session_id: str) -> None:
+        async with self._lock:
+            sandbox = self._sandboxes.get(session_id)
+            if sandbox is not None:
+                sandbox.last_active = time.monotonic()
+
+    async def terminate(self, session_id: str) -> None:
+        async with self._lock:
+            sandbox = self._sandboxes.pop(session_id, None)
+        if sandbox is None:
+            return
+        logger.info("Terminating ACI sandbox session_id=%s container_group=%s", session_id, sandbox.container_name)
+        await _run_az(
+            "container", "delete",
+            "--resource-group", self._resource_group,
+            "--name", sandbox.container_name,
+            "--yes",
+        )
+
+    async def list_active(self) -> list[str]:
+        async with self._lock:
+            return list(self._sandboxes.keys())
+
+    async def exec_in_sandbox(self, session_id: str, command: str) -> ExecResult:
+        async with self._lock:
+            sandbox = self._sandboxes.get(session_id)
+        if sandbox is None:
+            raise RuntimeError(f"no active sandbox for session_id={session_id!r}")
+
+        returncode, stdout, stderr = await _run_az(
+            "container", "exec",
+            "--resource-group", self._resource_group,
+            "--name", sandbox.container_name,
+            "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {command}\"",
+        )
+        return ExecResult(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _ensure_reaper_running(self) -> None:
+        if self._reaper_task is None or self._reaper_task.done():
+            self._reaper_task = asyncio.create_task(self._reap_idle_sandboxes())
+
+    async def _reap_idle_sandboxes(self) -> None:
+        while True:
+            await asyncio.sleep(_REAP_POLL_SECONDS)
+            async with self._lock:
+                now = time.monotonic()
+                idle_session_ids = [
+                    sid
+                    for sid, sandbox in self._sandboxes.items()
+                    if now - sandbox.last_active > self._idle_timeout_seconds
+                ]
+            for session_id in idle_session_ids:
+                logger.info("Reaping idle ACI sandbox session_id=%s", session_id)
+                await self.terminate(session_id)

@@ -3,10 +3,16 @@
 import { useAgent, useAttachments, useCopilotKit } from "@copilotkit/react-core/v2";
 import type { InputContent } from "@ag-ui/core";
 import { useEffect, useRef, useState } from "react";
+import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
 export function RequirementsView() {
-  const { agent } = useAgent({ agentId: "workflow" });
+  // agentId only, not the full {agentId, runtimeAgentId, threadId} triple: AppShell (always
+  // mounted above this) already registers the proxied agent once -- registerProxiedAgent throws
+  // "already registered" if a second call site re-registers the same agentId (confirmed live),
+  // so every other consumer just binds to the existing registration by id.
+  const { localAgentId } = useWorkflowThread();
+  const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
   const [text, setText] = useState("");
   const [submitting, setSubmitting] = useState(false);
