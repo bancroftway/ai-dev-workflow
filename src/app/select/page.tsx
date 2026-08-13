@@ -11,11 +11,19 @@ export default function SelectPage() {
   const [repos, setRepos] = useState<RepoSummary[] | null>(null);
   const [reposError, setReposError] = useState<string | null>(null);
   const [selectedFullName, setSelectedFullName] = useState<string>("");
+  const [filter, setFilter] = useState("");
 
   const selectedRepo = useMemo(
     () => repos?.find((r) => r.fullName === selectedFullName) ?? null,
     [repos, selectedFullName],
   );
+
+  // Already sorted updated-desc by the API's own octokit query -- filter only, no re-sort needed.
+  const filteredRepos = useMemo(() => {
+    if (!repos) return repos;
+    const q = filter.trim().toLowerCase();
+    return q ? repos.filter((r) => r.fullName.toLowerCase().includes(q)) : repos;
+  }, [repos, filter]);
 
   useEffect(() => {
     fetch("/api/github/repos")
@@ -40,16 +48,24 @@ export default function SelectPage() {
 
       <label className="flex flex-col gap-1">
         <span className="text-sm font-medium text-neutral-700">Repository</span>
-        <select
+        <input
+          type="text"
           className="rounded-md border border-neutral-300 px-3 py-2 text-sm"
+          placeholder="Filter repositories…"
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          disabled={!repos}
+        />
+        <select
+          className="mt-1 rounded-md border border-neutral-300 px-3 py-2 text-sm"
           value={selectedFullName}
           onChange={(event) => setSelectedFullName(event.target.value)}
           disabled={!repos}
+          size={Math.min(filteredRepos?.length ?? 1, 8) || 1}
         >
-          <option value="" disabled>
-            {repos ? "Choose a repository…" : "Loading repositories…"}
-          </option>
-          {repos?.map((r) => (
+          {!repos && <option disabled>Loading repositories…</option>}
+          {repos && filteredRepos?.length === 0 && <option disabled>No matches</option>}
+          {filteredRepos?.map((r) => (
             <option key={r.fullName} value={r.fullName}>
               {r.fullName}
               {r.private ? " (private)" : ""}

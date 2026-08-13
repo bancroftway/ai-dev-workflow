@@ -5,6 +5,7 @@ import { SandboxSessionBoot } from "@/components/SandboxSessionBoot";
 import { WorkspaceHeader } from "@/components/WorkspaceHeader";
 import { deriveThreadId } from "@/lib/workflow-thread";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
+import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
 import { WorkflowProviders } from "../../../providers";
 
 export default async function WorkflowPage({
@@ -26,11 +27,13 @@ export default async function WorkflowPage({
   return (
     <WorkflowThreadProvider threadId={threadId}>
       <WorkflowProviders>
-        <div className="flex min-h-full flex-1 flex-col">
-          <WorkspaceHeader />
-          <SandboxSessionBoot owner={owner} repo={repo} branch={branch} />
-          <AppShell />
-        </div>
+        <SandboxStatusProvider>
+          <div className="flex min-h-full flex-1 flex-col">
+            <WorkspaceHeader />
+            <SandboxSessionBoot owner={owner} repo={repo} branch={branch} />
+            <AppShell />
+          </div>
+        </SandboxStatusProvider>
       </WorkflowProviders>
     </WorkflowThreadProvider>
   );

@@ -23,10 +23,19 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from copilot import CopilotClient, CopilotSession, RuntimeConnection
-from copilot.session import Attachment, BlobAttachment, ExitPlanModeRequest, ExitPlanModeResult, PermissionHandler
+from copilot.session import (
+    Attachment,
+    BlobAttachment,
+    ExitPlanModeRequest,
+    ExitPlanModeResult,
+    MCPServerConfig,
+    PermissionHandler,
+    PreToolUseHandler,
+    SessionHooks,
+)
 from copilot.session_events import SessionEventType
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -34,6 +43,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Huma
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import BaseModel, PrivateAttr
 
+from . import config
 from .sandbox import SandboxSession
 
 logger = logging.getLogger(__name__)
@@ -150,7 +160,26 @@ class CopilotChatModel(BaseChatModel):
     github_token: str | None = None
     sandbox: SandboxSession | None = None
 
+    # Agent Plugin / write-access controls (Part A of the plugin plan). All default to today's
+    # behavior -- specification/plan pass none of these and are unaffected. Phase A0's spike
+    # found available_tools (an allowlist) is the only reliable read-only boundary: excluded_tools
+    # (a blocklist) is incomplete, since a write-capable model can reach create/bash/edit/
+    # apply_patch interchangeably. available_tools/excluded_tools entries must be source-qualified
+    # ("builtin:<name>"), never bare names (confirmed via copilot._mode.ToolSet).
+    agent_mode: Literal["interactive", "plan", "autopilot", "shell"] = "plan"
+    available_tools: list[str] | None = None
+    excluded_tools: list[str] | None = None
+    pre_tool_use_hook: PreToolUseHandler | None = None
+    mcp_servers: dict[str, MCPServerConfig] | None = None
+
     _closing: bool = PrivateAttr(default=False)
+    # Confirmed real by Phase A0's spike (SessionEventType.ASSISTANT_USAGE carries actual measured
+    # token/cost data, not an estimate). Captures the LAST ASSISTANT_USAGE event seen during the
+    # most recent _agenerate call -- P14's token tracking reads this right after a node's own
+    # model call. A real, stated limitation: ainvoke_structured's validate-and-retry loop can call
+    # _agenerate more than once per logical "turn"; only the final (successful) call's usage is
+    # kept, so a turn that needed retries under-reports its true token cost.
+    _last_usage: dict[str, Any] | None = PrivateAttr(default=None)
 
     @property
     def _llm_type(self) -> str:
@@ -187,11 +216,23 @@ class CopilotChatModel(BaseChatModel):
             await client.__aenter__()
             _clients[session_key] = client
 
+            # plugin_directories only means anything inside the sandbox's own filesystem -- a
+            # locally-spawned (no-sandbox) Copilot process has no such content to point at.
+            plugin_directories = config.COPILOT_PLUGIN_DIRECTORIES if self.sandbox is not None else None
+            hooks: SessionHooks | None = (
+                {"on_pre_tool_use": self.pre_tool_use_hook} if self.pre_tool_use_hook is not None else None
+            )
+
             session = await client.create_session(
                 on_permission_request=PermissionHandler.approve_all,
                 on_exit_plan_mode_request=_on_exit_plan_mode_request,
                 model=self.model_name,
                 streaming=True,
+                plugin_directories=plugin_directories,
+                available_tools=self.available_tools,
+                excluded_tools=self.excluded_tools,
+                hooks=hooks,
+                mcp_servers=self.mcp_servers,
             )
             _sessions[session_key] = session
             return session
@@ -224,6 +265,17 @@ class CopilotChatModel(BaseChatModel):
                     )
             elif event.type == SessionEventType.ASSISTANT_MESSAGE:
                 final_text.append(event.data.content)
+            elif event.type == SessionEventType.ASSISTANT_USAGE:
+                usage = event.data
+                self._last_usage = {
+                    "model": usage.model,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "reasoning_tokens": usage.reasoning_tokens,
+                    "cache_read_tokens": usage.cache_read_tokens,
+                    "cache_write_tokens": usage.cache_write_tokens,
+                    "cost": usage.cost,
+                }
             elif event.type == SessionEventType.SESSION_IDLE:
                 done.set()
             elif event.type == SessionEventType.SESSION_ERROR:
@@ -232,7 +284,7 @@ class CopilotChatModel(BaseChatModel):
 
         unsubscribe = session.on(handler)
         try:
-            await session.send(prompt, agent_mode="plan", attachments=attachments or None)
+            await session.send(prompt, agent_mode=self.agent_mode, attachments=attachments or None)
             await asyncio.wait_for(done.wait(), timeout=_SESSION_IDLE_TIMEOUT_SECONDS)
         finally:
             unsubscribe()
@@ -261,6 +313,11 @@ def get_chat_model_for_thread(
     github_token: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
+    agent_mode: Literal["interactive", "plan", "autopilot", "shell"] = "plan",
+    available_tools: list[str] | None = None,
+    excluded_tools: list[str] | None = None,
+    pre_tool_use_hook: PreToolUseHandler | None = None,
+    mcp_servers: dict[str, MCPServerConfig] | None = None,
 ) -> CopilotChatModel:
     """Return the chat model for the given LangGraph thread's (stage, role) Copilot session.
 
@@ -271,6 +328,12 @@ def get_chat_model_for_thread(
     sandbox, when provided, routes this session's Copilot runtime to the given per-session
     sandbox instead of spawning Copilot locally -- see CopilotChatModel's docstring for why
     github_token becomes inert once sandbox is set.
+
+    agent_mode/available_tools/excluded_tools/pre_tool_use_hook/mcp_servers all default to
+    today's read-only "plan"-mode, no-restriction behavior -- a caller only needs to pass these
+    for a stage that genuinely needs write access or a narrower tool allowlist (Part A of the
+    plugin plan; Phase A0's spike found available_tools, not excluded_tools, is the reliable
+    read-only boundary -- see config.READ_ONLY_AVAILABLE_TOOLS).
     """
     return CopilotChatModel(
         thread_id=thread_id,
@@ -279,6 +342,11 @@ def get_chat_model_for_thread(
         github_token=github_token,
         model_name=model_name,
         sandbox=sandbox,
+        agent_mode=agent_mode,
+        available_tools=available_tools,
+        excluded_tools=excluded_tools,
+        pre_tool_use_hook=pre_tool_use_hook,
+        mcp_servers=mcp_servers,
     )
 
 

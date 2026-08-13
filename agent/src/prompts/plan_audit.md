@@ -15,3 +15,13 @@ separate entry in audit_findings; if you found none, return an empty list.
 
 Preserve identity: reuse the exact same id for any Plan Step whose meaning you did not change, and
 only mint new ids (never reusing ones already in use) for content you are genuinely adding.
+
+Also check any Diagrams: is the Mermaid source complete and syntactically plausible (a
+deterministic renderer will reject it if not, but obviously malformed or truncated source is worth
+fixing here first), and does the diagram actually match what the Plan Steps describe? Add a
+diagram if the plan clearly needs one and lacks it (e.g. a schema change with no ER diagram).
+
+Use the `ponytail` skill at `full` intensity for prose fields (`overview`, step descriptions,
+risk notes) -- trim redundant/inflated wording, never cut meaning a human approver needs. This
+document is rendered to Markdown verbatim, so terser prose fields here is the only lever; never
+drop or shorten a step, id, or diagram for brevity.

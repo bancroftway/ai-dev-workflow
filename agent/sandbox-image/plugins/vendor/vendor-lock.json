@@ -1,0 +1,44 @@
+{
+  "vendored": [
+    {
+      "name": "superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers.git",
+      "sourcePath": "skills/",
+      "ref": "main",
+      "sha": "b36e0829c6d0140e93cfef2ca599b1b07d4a7797",
+      "vendoredAt": "2026-08-12",
+      "vendoredBy": "jbliss1234@gmail.com",
+      "notes": "All 14 skills copied verbatim with the repo's own .claude-plugin/plugin.json. hooks/, assets/, docs/, scripts/, tests/, and other-platform (.codex-plugin/, .cursor-plugin/, etc.) directories stripped."
+    },
+    {
+      "name": "ponytail",
+      "sourceUrl": "https://github.com/dietrichgebert/ponytail.git",
+      "sourcePath": "skills/",
+      "ref": "main",
+      "sha": "2ed6c52c9d7e5e56942508591085fd45dea277d3",
+      "vendoredAt": "2026-08-12",
+      "vendoredBy": "jbliss1234@gmail.com",
+      "notes": "Source repo has no .claude-plugin/plugin.json (uses a root-level plugin.json + plugin.yaml for a different, multi-platform packaging convention) -- a minimal .claude-plugin/plugin.json wrapper was authored fresh for this vendored copy (not a patch to skill content). commands/ (TOML format, not Claude Code's .md convention) and hooks/ were not vendored -- unvalidated mechanisms; the plugin_directories -> skill-loading path is what Phase A0 actually confirmed works. ponytail-mcp/ (a bundled MCP server) was also not vendored -- flagged as a future enhancement, not validated here."
+    },
+    {
+      "name": "caveman",
+      "sourceUrl": "https://github.com/JuliusBrussee/caveman.git",
+      "sourcePath": "skills/caveman/",
+      "ref": "main",
+      "sha": "099327780ef69ad88c4cfc15c54314579ac367a4",
+      "vendoredAt": "2026-08-12",
+      "vendoredBy": "jbliss1234@gmail.com",
+      "notes": "Only the caveman skill itself was vendored, per explicit direction -- the source repo is a large monorepo (browser extension, proxy server, compression engine, MCP server, multiple other caveman-* skills). LICENSING.md confirms skills/ is MIT while the engine/proxy/browse/mcp components are BSL-1.1 -- vendoring only the skill keeps this cleanly within the MIT-licensed surface. No .claude-plugin/plugin.json in source; wrapper authored fresh, same reasoning as ponytail."
+    },
+    {
+      "name": "security-review",
+      "sourceUrl": "https://github.com/github/awesome-copilot.git",
+      "sourcePath": "skills/security-review/",
+      "ref": "main",
+      "sha": "0a6e37e4e242c944380228fa29dbd14e64ac1b63",
+      "vendoredAt": "2026-08-12",
+      "vendoredBy": "jbliss1234@gmail.com",
+      "notes": "Skill + its references/ subfolder (bundled reference docs, a legitimate skill component) copied verbatim. No .claude-plugin/plugin.json in source (it's one skill among many in a shared collection repo); wrapper authored fresh."
+    }
+  ]
+}

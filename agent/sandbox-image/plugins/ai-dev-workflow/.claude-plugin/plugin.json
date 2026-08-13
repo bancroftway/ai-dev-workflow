@@ -1,0 +1,7 @@
+{
+  "name": "ai-dev-workflow",
+  "description": "First-party skill pack for the AI Dev Workflow SDLC pipeline (P0-P15): tech-stack detection, brownfield baseline reverse-engineering, stable-ID spec syncing, AC-to-test authoring guidance, code quality/security triage, and license auditing.",
+  "author": {
+    "name": "AI Dev Workflow"
+  }
+}

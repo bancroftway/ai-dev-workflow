@@ -17,7 +17,24 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = Path(__file__).parent.parent / "config" / "models.yaml"
 
-Stage = Literal["specification", "plan"]
+Stage = Literal[
+    "tech-stack",
+    "raw-requirements",
+    "specification",
+    "plan",
+    "ac-to-tests",
+    "minimal-code-to-green",
+    "p11a-adversarial-audit",
+    "p11b-dedup",
+    "p11d-license-audit",
+    "p15-exit",
+    "p0-brownfield",
+    "p8-quality",
+    "p10-security",
+    "p11c-upgrade",
+    "p13-flake-triage",
+    "p14-metrics",
+]
 Role = Literal["draft", "audit"]
 
 

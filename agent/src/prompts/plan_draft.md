@@ -16,3 +16,10 @@ yourself.
 Identity preservation: if you are given your own immediately-prior draft, reuse the exact same id
 for any Plan Step whose meaning is unchanged, mint a new id (never one already listed as used) for
 anything genuinely new, and simply omit anything that no longer applies.
+
+Include Diagrams where they make the plan meaningfully easier to review: an ER diagram when the
+change touches data models/schema, an architecture diagram when it introduces or rewires
+components, a user-flow diagram for a multi-step UI interaction. Each diagram is complete, valid
+Mermaid source (its own type declaration line included, e.g. `erDiagram` or `flowchart TD`) --
+write real Mermaid syntax, not pseudo-diagram prose; a deterministic step renders it and will
+reject invalid syntax. Skip diagrams entirely for a trivial change where one wouldn't add value.

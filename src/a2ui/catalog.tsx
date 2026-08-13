@@ -41,26 +41,13 @@ const ImplementationPlanSchema = z.object({
 type Specification = z.infer<typeof SpecificationSchema>;
 type ImplementationPlan = z.infer<typeof ImplementationPlanSchema>;
 
-function AuditNotes({ findings }: { findings: string[] }) {
-  if (findings.length === 0) return null;
-  return (
-    <div className="rounded-lg border border-sky-200 bg-sky-50 p-4">
-      <h4 className="text-sm font-medium text-sky-900">Audit Notes</h4>
-      <p className="mt-0.5 text-xs text-sky-700">
-        Gaps a second, independently-configured model found and revised before this draft reached you.
-      </p>
-      <ul className="mt-2 list-inside list-disc space-y-1 text-sm text-sky-900">
-        {findings.map((finding, index) => (
-          <li key={index}>{finding}</li>
-        ))}
-      </ul>
-    </div>
-  );
-}
+// Audit findings are deliberately never rendered: the pipeline's design intent is that a human
+// reviewer only ever sees final, gap-addressed content, never the intermediate list of what the
+// audit pass found and fixed (see the plan's "Audit findings hidden from the user" requirement).
+// Still accepted in props below (the backend still sends it in every envelope), just unused here.
 
 export function SpecificationSurfaceRenderer({
   specification: spec,
-  auditFindings = [],
 }: {
   specification: Specification;
   auditFindings?: string[];
@@ -71,8 +58,6 @@ export function SpecificationSurfaceRenderer({
         <h2 className="text-xl font-semibold">{spec.title}</h2>
         <p className="mt-1 text-neutral-600">{spec.summary}</p>
       </div>
-
-      <AuditNotes findings={auditFindings} />
 
       <div className="space-y-4">
         {spec.user_stories.map((story) => (
@@ -121,7 +106,6 @@ export function SpecificationSurfaceRenderer({
 
 export function PlanSurfaceRenderer({
   plan,
-  auditFindings = [],
 }: {
   plan: ImplementationPlan;
   auditFindings?: string[];
@@ -132,8 +116,6 @@ export function PlanSurfaceRenderer({
         <h2 className="text-xl font-semibold">Implementation Plan</h2>
         <p className="mt-1 text-neutral-600">{plan.overview}</p>
       </div>
-
-      <AuditNotes findings={auditFindings} />
 
       <ol className="space-y-3">
         {plan.plan_steps.map((step) => (

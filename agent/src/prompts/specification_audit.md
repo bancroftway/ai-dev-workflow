@@ -13,6 +13,14 @@ found -- never just a critique or a list of complaints. If the draft is already 
 minimally and say so in your findings. List each specific gap you found and fixed as a separate
 entry in audit_findings; if you found none, return an empty list.
 
-Preserve identity: reuse the exact same id for any User Story or Acceptance Criterion whose
-meaning you did not change, and only mint new ids (never reusing ones already in use) for content
-you are genuinely adding.
+Preserve identity per the `spec-sync` skill: keep the exact same `existing_us_id`/`existing_ac_id`
+citation the draft used for any User Story or Acceptance Criterion whose meaning you did not
+change, and only leave it `null` (never invent a `US-####`/`AC-####.#` number yourself) for
+content you are genuinely adding. A deterministic system resolves and validates the real id from
+these citations after you return your response -- your job is only to cite correctly, not to
+number anything.
+
+Use the `ponytail` skill at `full` intensity for prose fields (`summary`, narratives) -- trim
+redundant/inflated wording, never cut meaning a human approver needs. This document is rendered to
+Markdown verbatim, so terser prose fields here is the only lever; never drop or shorten an
+Acceptance Criterion, id, or citation for brevity.

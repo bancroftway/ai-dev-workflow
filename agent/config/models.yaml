@@ -12,9 +12,51 @@
 #   claude-opus-5, gpt-5.6-terra, gpt-5.6-luna, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini,
 #   gpt-5-mini, mai-code-1-flash-picker, gemini-3.1-pro-preview, gemini-3.6-flash,
 #   gemini-3.5-flash, kimi-k2.7-code
+tech-stack:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
+raw-requirements:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
 specification:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5
 plan:
   draft_model: gpt-5.4
   audit_model: gemini-3.1-pro-preview
+ac-to-tests:
+  draft_model: gpt-5.4
+  audit_model: claude-sonnet-5
+minimal-code-to-green:
+  draft_model: gpt-5.4
+  audit_model: claude-sonnet-5
+p11a-adversarial-audit:
+  draft_model: claude-sonnet-5
+  audit_model: gpt-5.6-terra
+p11b-dedup:
+  draft_model: gpt-5.4
+  audit_model: claude-sonnet-5
+p11d-license-audit:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
+p15-exit:
+  draft_model: claude-sonnet-5
+  audit_model: gpt-5.6-terra
+p0-brownfield:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
+p8-quality:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
+p10-security:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
+p11c-upgrade:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
+p13-flake-triage:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5
+p14-metrics:
+  draft_model: gpt-5.6-terra
+  audit_model: claude-sonnet-5

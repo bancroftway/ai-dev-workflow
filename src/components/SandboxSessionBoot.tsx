@@ -1,14 +1,16 @@
 "use client";
 
-import { useEffect, useState } from "react";
-
-type BootStatus = "provisioning" | "ready" | "error";
+import { useEffect } from "react";
+import { useSandboxStatus } from "@/lib/sandbox-status-context";
 
 /**
  * Fires sandbox provisioning (architecture plan Section C) in the background when a workflow
  * session opens. Non-blocking: graph.py falls back to local-stdio Copilot execution when no
  * sandbox is registered yet for a thread, so the rest of the page is fully usable while this is
  * still in flight -- this only surfaces a small status banner, it never blocks rendering.
+ *
+ * Status lives in SandboxStatusProvider (not local state) so AppShell's auto-trigger effect can
+ * gate on the same readiness signal without prop-drilling.
  */
 export function SandboxSessionBoot({
   owner,
@@ -19,7 +21,7 @@ export function SandboxSessionBoot({
   repo: string;
   branch: string;
 }) {
-  const [status, setStatus] = useState<BootStatus>("provisioning");
+  const [status, setStatus] = useSandboxStatus();
 
   useEffect(() => {
     let cancelled = false;
@@ -38,7 +40,7 @@ export function SandboxSessionBoot({
     return () => {
       cancelled = true;
     };
-  }, [owner, repo, branch]);
+  }, [owner, repo, branch, setStatus]);
 
   if (status === "ready") return null;
 

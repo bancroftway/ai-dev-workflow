@@ -1,0 +1,248 @@
+"""P13 -- full test suite + flake quarantine. A deterministic run node (with retries) + one
+narrow read-only LLM node for judgment (filing tickets), exactly as scoped in the plan, nothing
+more.
+
+Chain: p13_run_tests (deterministic, retries) -> route(any stable_fail -> p13_regression_gate
+[hard interrupt, out of P13's own scope to resolve] | else -> p13_flake_triage) ->
+p13_flake_triage (read-only) -> p13_mint_tickets (deterministic: allocates real US-#### ids via
+spec_ledger.py, never the LLM) -> p13_exit_check (deterministic) -> route(pass -> next | fail ->
+p13_exit_escalate [should not normally happen, since mint_tickets always links every entry --
+included so this stage never silently proceeds on an unexpected gap]).
+
+Verification status: NOT exercised against a real sandbox, same caveat as P8/P10/P11. trx (.NET)
+and vitest-json (JS/TS) parsing are both written from documented schema shape, not confirmed live.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, TypedDict
+
+import defusedxml.ElementTree as ET
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import interrupt
+
+from . import git_ops, model_config, repo_files, spec_ledger
+from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
+from .prompt_loader import load_prompt
+from .sandbox import registry as sandbox_registry
+from .sandbox.factory import get_sandbox_provider
+from .schemas_p13 import FlakeTriageResponse
+
+P13_TOTAL_ATTEMPTS = int(os.environ.get("P13_TOTAL_ATTEMPTS", "3"))  # 1 initial + 2 retries
+FLAKE_QUARANTINE_PATH = ".ai-dev-workflow/p13/flake-quarantine.json"
+
+P13_FLAKE_TRIAGE_SYSTEM_PROMPT = load_prompt("p13_flake_triage")
+
+
+class P13State(TypedDict):
+    attempt: int
+    test_outcomes: dict[str, list[str]]  # test_name -> ["pass"|"fail", ...] across attempts
+    stable_fail: list[str]
+    flaky: list[str]
+    flake_quarantine: dict[str, dict[str, Any]]  # test_name -> {ticket_id, title, narrative}
+    last_exit_ok: bool
+
+
+def default_p13_state() -> P13State:
+    return {"attempt": 0, "test_outcomes": {}, "stable_fail": [], "flaky": [], "flake_quarantine": {}, "last_exit_ok": False}
+
+
+def _resolve_test_command(tech_stack: dict[str, Any], attempt: int) -> tuple[str, str] | None:
+    """Returns (command, result_file_path) or None if no mapping."""
+    if tech_stack.get("dotnet_detected"):
+        path = f"agent-work/p13-attempt{attempt}.trx"
+        return f"dotnet test --logger 'trx;LogFileName={os.path.basename(path)}' --results-directory agent-work 2>&1", path
+    languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
+    if "typescript" in languages or "javascript" in languages:
+        path = f"agent-work/p13-attempt{attempt}.json"
+        return f"npx --yes vitest run --reporter=json --outputFile={path} 2>&1", path
+    return None
+
+
+def _parse_trx(raw_xml: str) -> dict[str, str]:
+    """testName -> 'pass'|'fail', from a Visual Studio Test Results (.trx) file."""
+    try:
+        root = ET.fromstring(raw_xml)
+    except ET.ParseError:
+        return {}
+    ns = {"t": "http://microsoft.com/schemas/VisualStudio/TeamTest/2010"}
+    results: dict[str, str] = {}
+    for result in root.findall(".//t:UnitTestResult", ns) or root.findall(".//UnitTestResult"):
+        name = result.get("testName", "unknown")
+        outcome = result.get("outcome", "")
+        results[name] = "pass" if outcome.lower() == "passed" else "fail"
+    return results
+
+
+def _parse_vitest_json(raw_json: str) -> dict[str, str]:
+    try:
+        doc = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return {}
+    results: dict[str, str] = {}
+    for test_result in doc.get("testResults", []):
+        for assertion in test_result.get("assertionResults", []):
+            name = assertion.get("fullName") or assertion.get("title", "unknown")
+            results[name] = "pass" if assertion.get("status") == "passed" else "fail"
+    return results
+
+
+async def p13_run_tests_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    thread_id = config["configurable"]["thread_id"]
+    p13 = dict(state.get("p13") or default_p13_state())
+    if sandbox_registry.get(thread_id) is None:
+        p13["last_exit_ok"] = True
+        return {"p13": p13}
+
+    provider = get_sandbox_provider()
+    raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
+    tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
+
+    await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work")
+    outcomes: dict[str, list[str]] = {}
+    for attempt in range(P13_TOTAL_ATTEMPTS):
+        resolved = _resolve_test_command(tech_stack, attempt)
+        if resolved is None:
+            p13["last_exit_ok"] = True
+            return {"p13": p13}
+        command, result_path = resolved
+        await provider.exec_in_sandbox(thread_id, command)
+        raw_result = await repo_files.read_repo_file(provider, thread_id, result_path)
+        if raw_result is None:
+            continue
+        per_test = _parse_trx(raw_result) if result_path.endswith(".trx") else _parse_vitest_json(raw_result)
+        for test_name, outcome in per_test.items():
+            outcomes.setdefault(test_name, []).append(outcome)
+
+    stable_fail = [name for name, results in outcomes.items() if results and all(r == "fail" for r in results)]
+    flaky = [name for name, results in outcomes.items() if len(set(results)) > 1]
+
+    p13["test_outcomes"] = outcomes
+    p13["stable_fail"] = stable_fail
+    p13["flaky"] = flaky
+    for name in flaky:
+        p13["flake_quarantine"].setdefault(name, {"linked_id": None, "ticket_title": "", "ticket_narrative": ""})
+
+    await repo_files.write_repo_file(provider, thread_id, FLAKE_QUARANTINE_PATH, json.dumps(p13["flake_quarantine"], indent=2) + "\n")
+    await repo_files.append_ledger_entry(
+        provider, thread_id, {"stage": "p13", "node": "run_tests", "stable_fail_count": len(stable_fail), "flaky_count": len(flaky)}
+    )
+    return {"p13": p13}
+
+
+def make_p13_route_after_run() -> Any:
+    def route(state: dict[str, Any]) -> str:
+        p13 = state.get("p13") or default_p13_state()
+        if p13.get("last_exit_ok") and not p13.get("test_outcomes"):
+            return "triage"  # no test-command mapping or no sandbox -- nothing to gate on
+        if p13["stable_fail"]:
+            return "regression"
+        return "triage"
+
+    return route
+
+
+async def p13_regression_gate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    """A real regression (consistently failing across every attempt) is out of P13's own scope to
+    resolve -- a hard human/upstream interrupt, never auto-handled here."""
+    p13 = state.get("p13") or default_p13_state()
+    interrupt({"stage": "p13", "type": "stable_test_regression", "stable_fail": p13["stable_fail"]})
+    return {}
+
+
+async def p13_flake_triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    thread_id = config["configurable"]["thread_id"]
+    p13 = dict(state.get("p13") or default_p13_state())
+    untriaged = [name for name, entry in p13["flake_quarantine"].items() if entry.get("linked_id") is None and not entry.get("ticket_title")]
+    if not untriaged or sandbox_registry.get(thread_id) is None:
+        return {"p13": p13}
+
+    model = get_chat_model_for_thread(
+        thread_id,
+        "p13-flake-triage",
+        "draft",
+        github_token=os.environ.get("GITHUB_TOKEN"),
+        model_name=model_config.get_model_name("p13-flake-triage", "draft"),
+        sandbox=sandbox_registry.get(thread_id),
+        available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:task_complete", "builtin:ask_user", "builtin:skill"],
+    )
+    prompt = f"Flaky tests needing triage: {json.dumps(untriaged)}"
+    response = await ainvoke_structured(
+        model, [SystemMessage(content=P13_FLAKE_TRIAGE_SYSTEM_PROMPT), HumanMessage(content=prompt)], FlakeTriageResponse
+    )
+    quarantine = dict(p13["flake_quarantine"])
+    for decision in response.decisions:
+        entry = dict(quarantine.get(decision.test_name, {"linked_id": None, "ticket_title": "", "ticket_narrative": ""}))
+        if decision.likely_duplicate_of:
+            entry["linked_id"] = decision.likely_duplicate_of
+        else:
+            entry["ticket_title"] = decision.new_ticket_title
+            entry["ticket_narrative"] = decision.new_ticket_narrative
+        quarantine[decision.test_name] = entry
+    p13["flake_quarantine"] = quarantine
+    provider = get_sandbox_provider()
+    await repo_files.append_ledger_entry(provider, thread_id, {"stage": "p13", "node": "flake_triage", "token_usage": model._last_usage})
+    return {"p13": p13}
+
+
+async def p13_mint_tickets_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    """Deterministic: allocates the actual US-#### id for every net-new ticket the triage node
+    proposed -- never LLM-authored, per spec_ledger.py's own allocation contract."""
+    thread_id = config["configurable"]["thread_id"]
+    p13 = dict(state.get("p13") or default_p13_state())
+    if sandbox_registry.get(thread_id) is None:
+        return {"p13": p13}
+
+    provider = get_sandbox_provider()
+    ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+    quarantine = dict(p13["flake_quarantine"])
+    run_id = state.get("run_id", "unknown")
+
+    for test_name, entry in quarantine.items():
+        if entry.get("linked_id") or not entry.get("ticket_title"):
+            continue
+        new_id = spec_ledger.allocate_next_id(ledger_entries, "user_story")
+        ledger_entries.append(
+            {
+                "id": new_id,
+                "kind": "user_story",
+                "status": "active",
+                "title": f"[Flaky test] {entry['ticket_title']}",
+                "first_seen_run_id": run_id,
+                "last_revised_run_id": run_id,
+            }
+        )
+        quarantine[test_name] = {**entry, "linked_id": new_id}
+
+    p13["flake_quarantine"] = quarantine
+    await spec_ledger.save_ledger(provider, thread_id, ledger_entries)
+    await repo_files.write_repo_file(provider, thread_id, FLAKE_QUARANTINE_PATH, json.dumps(quarantine, indent=2) + "\n")
+    await git_ops.commit_paths(provider, thread_id, [spec_ledger.LEDGER_PATH, FLAKE_QUARANTINE_PATH], "ai-dev-workflow: p13 flake tickets")
+    return {"p13": p13}
+
+
+async def p13_exit_check_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    p13 = dict(state.get("p13") or default_p13_state())
+    all_linked = all(entry.get("linked_id") for entry in p13["flake_quarantine"].values())
+    p13["last_exit_ok"] = not p13["stable_fail"] and all_linked
+    return {"p13": p13}
+
+
+def make_p13_route_after_exit() -> Any:
+    def route(state: dict[str, Any]) -> str:
+        p13 = state.get("p13") or default_p13_state()
+        return "next" if p13.get("last_exit_ok") else "escalate"
+
+    return route
+
+
+async def p13_exit_escalate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    """Should not normally fire -- p13_mint_tickets links every entry deterministically. Present
+    so an unexpected gap (e.g. the triage LLM never returned a decision for some test) surfaces
+    as a real human decision rather than silently passing the gate."""
+    p13 = state.get("p13") or default_p13_state()
+    interrupt({"stage": "p13", "type": "flake_quarantine_incomplete", "flake_quarantine": p13["flake_quarantine"]})
+    return {}

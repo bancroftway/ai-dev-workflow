@@ -16,10 +16,12 @@ resumed and is abandoned by construction (BR-4's cascade).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
-from typing import Annotated, Any, Callable, Literal, TypedDict
+from typing import Annotated, Any, Awaitable, Callable, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -29,22 +31,83 @@ from langgraph.graph.message import add_messages
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt
 
+from . import approvals
 from . import config as workflow_config
 from . import git_ops
 from . import model_config
+from . import preflight_nodes
+from . import repo_files
+from . import requirements_nodes
+from . import p11c_nodes
+from . import p13_nodes
+from . import p14_nodes
+from . import p15_nodes
+from . import rebuild
+from . import spec_ledger
 from . import workflow_persistence
-from .a2ui_tools import build_plan_envelope, build_specification_envelope, present_surface_messages
+from .gates import p11_gates
+from .quality_security import p8_nodes, p10_nodes
+from .gates.diagram_gate import verify_plan_diagrams
+from .gates.test_coverage_gate import verify_coverage
+from .gates.write_scope_gate import pre_tool_use_write_scope_hook, verify_ac_to_tests
+from .a2ui_tools import (
+    build_ac_to_tests_envelope,
+    build_adversarial_audit_envelope,
+    build_dedup_envelope,
+    build_exit_envelope,
+    build_license_audit_envelope,
+    build_minimal_code_to_green_envelope,
+    build_p0_baseline_envelope,
+    build_plan_envelope,
+    build_raw_requirements_envelope,
+    build_specification_envelope,
+    build_tech_stack_envelope,
+    present_surface_messages,
+)
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
-from .markdown_render import render_plan_markdown, render_specification_markdown
+from .markdown_render import (
+    render_ac_to_tests_markdown,
+    render_adversarial_audit_markdown,
+    render_dedup_markdown,
+    render_exit_markdown,
+    render_license_audit_markdown,
+    render_minimal_code_to_green_markdown,
+    render_p0_baseline_markdown,
+    render_plan_markdown,
+    render_raw_requirements_markdown,
+    render_specification_markdown,
+    render_tech_stack_markdown,
+)
 from .prompt_loader import load_prompt
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
+from .sandbox.provider import SandboxProvider
 from .schemas import (
     PlanAuditResponse,
     PlanDraftResponse,
+    RawRequirementsAuditResponse,
+    RawRequirementsDraftResponse,
     SpecificationAuditResponse,
     SpecificationDraftResponse,
+    TechStackAuditResponse,
+    TechStackDraftResponse,
 )
+from .schemas_codegen import (
+    AcceptanceCriteriaTestsAuditResponse,
+    AcceptanceCriteriaTestsDraftResponse,
+    MinimalCodeToGreenAuditResponse,
+    MinimalCodeToGreenDraftResponse,
+)
+from .schemas_p11 import (
+    AdversarialAuditAuditResponse,
+    AdversarialAuditDraftResponse,
+    DedupAuditResponse,
+    DedupDraftResponse,
+    LicenseAuditAuditResponse,
+    LicenseAuditDraftResponse,
+)
+from .schemas_p0_brownfield import P0BaselineAuditResponse, P0BaselineDraftResponse
+from .schemas_p15 import ExitAuditResponse, ExitDraftResponse
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +126,51 @@ class StageState(TypedDict):
     ever_ready_for_review: bool
     used_ids: list[str]
     audit_findings: list[str]
+    # Independent of cycle_count (the LLM's own clarification-loop counter) -- tracks retries
+    # through a StageSpec.deterministic_verify gate, when one is set (unused by specification/plan).
+    verify_cycle_count: int
+    last_verification: dict[str, Any] | None
+    # Set once per run by make_draft_node when StageSpec.capture_baseline_commit is True (P4's
+    # write-scope gate); None for every other stage.
+    baseline_commit: str | None
 
 
 class GraphState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    # Minted fresh by intake_node on every genuinely new run (module docstring's definition of a
+    # "run" -- not regenerated across a gate-approval resume, since those don't re-enter intake).
+    # Used as the ledger/approvals systems' run identifier (spec_ledger.py's
+    # first_seen_run_id/last_revised_run_id, approvals.py's ApprovalRecord.run_id) and, later,
+    # P14/P15's history/<run_id>-*.json snapshot naming.
+    run_id: str
+    # Set by scaffold_node (preflight_nodes.py) -- manifest.json absence is the canonical
+    # "never onboarded before" signal, routing into P0's brownfield sub-flow.
+    manifest_exists: bool
+    # Deterministic schema/migration/route grep, grounding P0 brownfield's draft prompt.
+    p0_context: str
     raw_requirements_text: str
     # Non-text InputContent parts (screenshots/documents) from the latest submission's
     # HumanMessage, if any -- only ever consumed by the specification stage's draft prompt
     # (BR-2: the plan stage's input is the approved Specification, never raw attachments).
     requirements_attachments: list[dict[str, Any]]
     stages: dict[str, StageState]
+    # Keyed by RebuildSpec.key (rebuild.py) -- each R placement's own RebuildState. Accessed via
+    # .get("rebuild") or {} everywhere (rebuild.py's nodes tolerate it being absent on a thread
+    # that predates R), so this key is genuinely optional at the TypedDict level in practice.
+    rebuild: dict[str, Any]
+    # P8/P10's own bespoke-cluster state (quality_security/p8_nodes.py, p10_nodes.py) -- not a
+    # StageState, since neither is a StageSpec. Same absent-is-tolerated pattern as `rebuild` above.
+    p8: dict[str, Any]
+    p10: dict[str, Any]
+    # P11's own cross-substage scratch state (jscpd/license-scan reports for prompt grounding,
+    # exit-gate attempt tracking) -- see agent/src/gates/p11_gates.py.
+    p11: dict[str, Any]
+    # P11c's dependency-upgrade bespoke cluster state -- see agent/src/p11c_nodes.py.
+    p11c: dict[str, Any]
+    # P13's own bespoke-cluster state -- see agent/src/p13_nodes.py.
+    p13: dict[str, Any]
+    # P14's own metrics state -- see agent/src/p14_nodes.py.
+    p14: dict[str, Any]
 
 
 def default_stage_state() -> StageState:
@@ -86,7 +184,22 @@ def default_stage_state() -> StageState:
         "ever_ready_for_review": False,
         "used_ids": [],
         "audit_findings": [],
+        "verify_cycle_count": 0,
+        "last_verification": None,
+        "baseline_commit": None,
     }
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """Outcome of a StageSpec.deterministic_verify check -- never LLM self-attestation, always a
+    real script/parse. `feedback` is injected as extra prompt context on the next draft retry;
+    `report` is the full structured detail, persisted and surfaced to the frontend even though it
+    wasn't produced by an LLM call."""
+
+    passed: bool
+    feedback: str
+    report: dict[str, Any]
 
 
 def _extract_ids(value: Any, out: set[str]) -> None:
@@ -149,6 +262,40 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
     return messages
 
 
+_UI_FRAMEWORK_MARKERS = ("react", "vue", "angular", "blazor", "svelte", "next", "nuxt", "flutter", "swiftui", "jetpack compose")
+
+
+def _tech_stack_has_ui_framework(state: GraphState) -> bool:
+    """Shared signal for P3's Excalidraw MCP and P4's Playwright MCP -- both the plan's own
+    wording ("for UI-based applications"/"UI-relevant ACs") gate on whether this repo has a UI
+    framework at all, using P0's own TechStack.frameworks report (already available before either
+    stage's draft runs, unlike a per-diagram/per-AC ui_relevant flag the model hasn't produced
+    yet at session_options time -- a real, deliberate simplification from "only for UI-relevant
+    content specifically" to "only for UI-framework repos at all").
+    """
+    tech_stack = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
+    frameworks = [str(f).lower() for f in (tech_stack.get("frameworks") or [])]
+    return any(marker in fw for fw in frameworks for marker in _UI_FRAMEWORK_MARKERS)
+
+
+# MCP server configs -- confirmed real and working via a live spike (mcp_servers= reaches an
+# actual Copilot CLI session; tool names surface as "<server_key>-<tool_name>", e.g.
+# "playwright-browser_navigate"; "mcp:*" in available_tools is required to let them through an
+# allowlist-tier stage, otherwise the allowlist silently filters every MCP tool out -- caught by
+# testing, not guessed). Playwright MCP itself (spawns its own browser via npx, no external
+# service needed) was the one actually exercised; Excalidraw/SonarQube MCP below use the identical
+# config shape but have NOT been spike-tested (Excalidraw needs its own MCP server process;
+# SonarQube needs a live SonarQube server neither of which exists in this environment).
+PLAYWRIGHT_MCP_CONFIG: dict[str, Any] = {
+    "playwright": {"type": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated"], "tools": ["*"]}
+}
+EXCALIDRAW_MCP_CONFIG: dict[str, Any] = {
+    "excalidraw": {"type": "stdio", "command": "npx", "args": ["-y", "mcp-excalidraw"], "tools": ["*"]}
+}
+# SonarQube MCP config lives in quality_security/p8_nodes.py (its only user) -- avoids a circular
+# import, since p8_nodes.py is imported by this module, not the reverse.
+
+
 SPEC_AUDIT_SYSTEM_PROMPT = load_prompt("specification_audit")
 
 PLAN_AUDIT_SYSTEM_PROMPT = load_prompt("plan_audit")
@@ -173,22 +320,405 @@ def _build_plan_audit_prompt(state: GraphState) -> list[BaseMessage]:
     ]
 
 
+TECH_STACK_SYSTEM_PROMPT = load_prompt("tech_stack_draft")
+
+TECH_STACK_AUDIT_SYSTEM_PROMPT = load_prompt("tech_stack_audit")
+
+
+def _build_tech_stack_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["tech-stack"]
+    messages: list[BaseMessage] = [SystemMessage(content=TECH_STACK_SYSTEM_PROMPT)]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_tech_stack_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["tech-stack"]
+    return [
+        SystemMessage(content=TECH_STACK_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft tech stack to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+P0_BASELINE_SYSTEM_PROMPT = load_prompt("p0_baseline_draft")
+P0_BASELINE_AUDIT_SYSTEM_PROMPT = load_prompt("p0_baseline_audit")
+
+
+def _build_p0_baseline_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p0-brownfield"]
+    messages: list[BaseMessage] = [
+        SystemMessage(content=P0_BASELINE_SYSTEM_PROMPT),
+        HumanMessage(content=state.get("p0_context") or "(no grounding context available)"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_p0_baseline_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p0-brownfield"]
+    return [
+        SystemMessage(content=P0_BASELINE_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=state.get("p0_context") or "(no grounding context available)"),
+        HumanMessage(content=f"Draft baseline to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+RAW_REQUIREMENTS_SYSTEM_PROMPT = load_prompt("raw_requirements_draft")
+
+RAW_REQUIREMENTS_AUDIT_SYSTEM_PROMPT = load_prompt("raw_requirements_audit")
+
+
+def _build_raw_requirements_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["raw-requirements"]
+    messages: list[BaseMessage] = [SystemMessage(content=RAW_REQUIREMENTS_SYSTEM_PROMPT)]
+    seed_text = state.get("raw_requirements_text", "")
+    if seed_text:
+        messages.append(HumanMessage(content=f"Human-submitted requirements text (seed/edit):\n\n{seed_text}"))
+    if stage["approved_content"] is not None:
+        messages.append(
+            HumanMessage(
+                content=f"Previously approved Raw Requirements document (JSON), being revised:\n"
+                f"{stage['approved_content']}"
+            )
+        )
+    elif stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_raw_requirements_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["raw-requirements"]
+    return [
+        SystemMessage(content=RAW_REQUIREMENTS_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft Raw Requirements document to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+async def _verify_specification_ledger(
+    thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider
+) -> VerificationResult:
+    """StageSpec.deterministic_verify for the specification stage: resolves/validates every User
+    Story's and Acceptance Criterion's id against spec/ledger.json (spec_ledger.py's real logic --
+    this is just the SandboxProvider-I/O wrapper) and persists the ledger on success.
+
+    content_dict is stage["draft"] (the just-audited, revised Specification, mutated in place by
+    sync_ledger to carry ledger-resolved ids).
+    """
+    entries = await spec_ledger.load_ledger(provider, thread_id)
+    user_stories = content_dict.get("user_stories") or []
+    result = spec_ledger.sync_ledger(entries, user_stories, run_id)
+    if result.passed:
+        await spec_ledger.save_ledger(provider, thread_id, result.updated_entries)
+        await git_ops.commit_paths(provider, thread_id, [spec_ledger.LEDGER_PATH], "ai-dev-workflow: spec ledger sync")
+    return VerificationResult(
+        passed=result.passed,
+        feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
+        report={"reasons": result.reasons, "ledger_entry_count": len(result.updated_entries)},
+    )
+
+
+AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft")
+
+AC_TO_TESTS_AUDIT_SYSTEM_PROMPT = load_prompt("ac_to_tests_audit")
+
+
+def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
+    spec_stage = state["stages"]["specification"]
+    plan_stage = state["stages"]["plan"]
+    stage = state["stages"]["ac-to-tests"]
+    messages: list[BaseMessage] = [
+        SystemMessage(content=AC_TO_TESTS_SYSTEM_PROMPT),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
+        HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    if stage.get("last_verification"):
+        messages.append(
+            HumanMessage(content=f"The last verification attempt failed with: {stage['last_verification'].get('feedback')}")
+        )
+    return messages
+
+
+def _build_ac_to_tests_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["ac-to-tests"]
+    return [
+        SystemMessage(content=AC_TO_TESTS_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft AC-to-Tests suite to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_draft")
+
+MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_audit")
+
+
+def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
+    spec_stage = state["stages"]["specification"]
+    plan_stage = state["stages"]["plan"]
+    tests_stage = state["stages"]["ac-to-tests"]
+    stage = state["stages"]["minimal-code-to-green"]
+    messages: list[BaseMessage] = [
+        SystemMessage(content=MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
+        HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
+        HumanMessage(content=f"Approved Test Suite from P4 (JSON):\n\n{tests_stage['approved_content']}"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior iteration (JSON):\n{stage['draft']}"))
+    if stage.get("last_verification"):
+        messages.append(
+            HumanMessage(content=f"The last coverage verification failed with: {stage['last_verification'].get('feedback')}")
+        )
+    return messages
+
+
+def _build_minimal_code_to_green_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["minimal-code-to-green"]
+    return [
+        SystemMessage(content=MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft code-change iteration to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+ADVERSARIAL_AUDIT_SYSTEM_PROMPT = load_prompt("adversarial_audit_draft")
+ADVERSARIAL_AUDIT_AUDIT_SYSTEM_PROMPT = load_prompt("adversarial_audit_audit")
+
+
+def _build_adversarial_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    spec_stage = state["stages"]["specification"]
+    plan_stage = state["stages"]["plan"]
+    stage = state["stages"]["p11a-adversarial-audit"]
+    messages: list[BaseMessage] = [
+        SystemMessage(content=ADVERSARIAL_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
+        HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior report (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_adversarial_audit_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p11a-adversarial-audit"]
+    return [
+        SystemMessage(content=ADVERSARIAL_AUDIT_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft divergence report to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+DEDUP_SYSTEM_PROMPT = load_prompt("dedup_draft")
+DEDUP_AUDIT_SYSTEM_PROMPT = load_prompt("dedup_audit")
+
+
+def _build_dedup_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p11b-dedup"]
+    jscpd_report = (state.get("p11") or {}).get("jscpd_report_for_dedup", "(no jscpd report available)")
+    messages: list[BaseMessage] = [
+        SystemMessage(content=DEDUP_SYSTEM_PROMPT),
+        HumanMessage(content=f"jscpd duplication-cluster report:\n\n{jscpd_report}"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_dedup_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p11b-dedup"]
+    return [
+        SystemMessage(content=DEDUP_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft de-dup result to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+LICENSE_AUDIT_SYSTEM_PROMPT = load_prompt("license_audit_draft")
+LICENSE_AUDIT_AUDIT_SYSTEM_PROMPT = load_prompt("license_audit_audit")
+
+
+def _build_license_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p11d-license-audit"]
+    scan_report = (state.get("p11") or {}).get("license_scan_report", "(no deterministic scan report available)")
+    messages: list[BaseMessage] = [
+        SystemMessage(content=LICENSE_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Deterministic license scan (declared/detected licenses per package):\n\n{scan_report}"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_license_audit_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p11d-license-audit"]
+    return [
+        SystemMessage(content=LICENSE_AUDIT_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft license classification report to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+EXIT_SYSTEM_PROMPT = load_prompt("exit_draft")
+EXIT_AUDIT_SYSTEM_PROMPT = load_prompt("exit_audit")
+
+
+def _build_exit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p15-exit"]
+    p14_metrics = (state.get("p14") or {}).get("metrics", {})
+    messages: list[BaseMessage] = [
+        SystemMessage(content=EXIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{state['stages']['specification']['approved_content']}"),
+        HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{state['stages']['plan']['approved_content']}"),
+        HumanMessage(content=f"P14 metrics summary (JSON):\n\n{json.dumps(p14_metrics)[:8000]}"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior report (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_exit_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["p15-exit"]
+    return [
+        SystemMessage(content=EXIT_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Draft merge-readiness report to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
 @dataclass(frozen=True)
 class StageSpec:
     key: str
-    response_schema: type[SpecificationDraftResponse] | type[PlanDraftResponse]
+    response_schema: (
+        type[SpecificationDraftResponse]
+        | type[PlanDraftResponse]
+        | type[TechStackDraftResponse]
+        | type[RawRequirementsDraftResponse]
+        | type[AcceptanceCriteriaTestsDraftResponse]
+        | type[MinimalCodeToGreenDraftResponse]
+        | type[AdversarialAuditDraftResponse]
+        | type[DedupDraftResponse]
+        | type[LicenseAuditDraftResponse]
+        | type[ExitDraftResponse]
+    )
     content_field: str
     surface_tool_name: str
     build_envelope: Callable[[dict[str, Any], list[str] | None], dict[str, Any]]
     build_prompt: Callable[[GraphState], list[BaseMessage]]
     max_cycles: int
-    audit_response_schema: type[SpecificationAuditResponse] | type[PlanAuditResponse]
+    audit_response_schema: (
+        type[SpecificationAuditResponse]
+        | type[PlanAuditResponse]
+        | type[TechStackAuditResponse]
+        | type[RawRequirementsAuditResponse]
+        | type[AcceptanceCriteriaTestsAuditResponse]
+        | type[MinimalCodeToGreenAuditResponse]
+        | type[AdversarialAuditAuditResponse]
+        | type[DedupAuditResponse]
+        | type[LicenseAuditAuditResponse]
+        | type[ExitAuditResponse]
+    )
     audit_content_field: str
     build_audit_prompt: Callable[[GraphState], list[BaseMessage]]
     render_markdown: Callable[[dict[str, Any]], str]
 
+    # Everything below is optional and defaults to today's exact behavior -- specification/plan
+    # pass none of these, so build_graph()'s generated segment for them is byte-identical to
+    # before. Added for the P0-P15 pipeline's stages that need something more than plain
+    # draft->audit->gate (Agent Plugin infrastructure plan, Part B).
+    requires_human_gate: bool = True
+    """False for stages that are supporting infrastructure with no tab to review them in (e.g.
+    tech-stack detection) -- make_gate_node skips the interrupt() and proceeds straight to
+    approved, same body that already runs post-interrupt-resolve for every other stage."""
+
+    post_audit_hook: Callable[[str, dict[str, Any], "GraphState", SandboxProvider], Awaitable[None]] | None = None
+    """Fire-and-forget side effect called at the end of make_audit_node, right after persistence
+    (thread_id, revised content dict, full GraphState, provider). Used for deterministic follow-up
+    writes driven by a stage's approved content (e.g. writing Directory.Build.props once tech-stack
+    detection reports dotnet_detected) or by this run's own input (e.g. raw-requirements
+    persisting the seed text that produced this draft, for its own hydrate_from_repo_file to
+    compare future runs against)."""
+
+    deterministic_verify: (
+        Callable[[str, dict[str, Any], str, str | None, SandboxProvider], Awaitable[VerificationResult]] | None
+    ) = None
+    """A routing-capable check (thread_id, revised content dict, run_id, baseline_commit,
+    provider) -> VerificationResult, inserted between audit and gate when set. baseline_commit is
+    the value StageSpec.capture_baseline_commit stored on this stage's StageState (None if that
+    flag is unset) -- write_scope_gate.py's write-scope check is the reason this exists; ledger-
+    /diagram-style checks that don't need it just ignore the argument. Never LLM self-attestation
+    -- a real script/parse. Failing routes back to draft (with VerificationResult.feedback as
+    context) up to max_verify_cycles, then to a human-interrupt escalation node -- never
+    auto-approved past a failed deterministic gate."""
+
+    max_verify_cycles: int = 3
+    """Safety cap for the verify->draft retry loop, independent of max_cycles (the LLM's own
+    clarification-loop cap)."""
+
+    hydrate_from_repo_file: Callable[[str, "GraphState", SandboxProvider], Awaitable[dict[str, Any] | None]] | None = None
+    """Idempotency short-circuit (thread_id, state, provider) -> pre-approved content dict, or
+    None to draft normally. Invoked by make_draft_node before it ever calls ainvoke_structured --
+    lets a stage skip its LLM call entirely and hydrate as already-approved when its own artifact
+    already exists on disk (and, where relevant, there's no fresh human-submitted input this run
+    that should override the skip)."""
+
+    session_options: Callable[[GraphState, str], dict[str, Any]] | None = None
+    """Extra kwargs (agent_mode/available_tools/excluded_tools/pre_tool_use_hook/mcp_servers) to
+    forward to get_chat_model_for_thread, called with (state, "draft"|"audit") so a stage can
+    give its audit pass different (typically stricter/read-only) options than its draft pass --
+    P4's audit is always read-only even though its draft gets real write access, per the
+    "adversarial second opinion never has more trust than it needs" principle every other audit
+    node already follows implicitly. None preserves today's behavior exactly (unrestricted "plan"
+    mode) -- set for a stage that needs the read-only available_tools allowlist (Phase A0's spike
+    finding: an allowlist, not a blocklist, is what actually enforces read-only) or, later, real
+    write access."""
+
+    capture_baseline_commit: bool = False
+    """When True, make_draft_node captures `git rev-parse HEAD` into this stage's StageState the
+    first time draft_node runs this run (guarded by "not already set," see make_draft_node) --
+    the write-scope gate's (agent/src/gates/write_scope_gate.py) "before this stage touched
+    anything" reference point. False (the default) preserves today's behavior for every stage
+    that doesn't need to diff its own writes against a pre-stage baseline."""
+
+    sign_approval: bool = False
+    """When True, make_gate_node appends a content-hash-signed row to APPROVALS.md (approvals.py)
+    on approval, in the same commit as the rest of that gate's persistence. False (the default)
+    preserves today's behavior for stages that don't need approval-integrity tracking (tech-stack,
+    raw-requirements) -- set for specification/plan, whose approved content other stages build on
+    and whose approval is worth being able to detect tampering/accidental edits against later."""
+
 
 STAGES: list[StageSpec] = [
+    StageSpec(
+        key="tech-stack",
+        response_schema=TechStackDraftResponse,
+        content_field="tech_stack",
+        surface_tool_name="present_tech_stack",
+        build_envelope=build_tech_stack_envelope,
+        build_prompt=_build_tech_stack_prompt,
+        max_cycles=workflow_config.TECH_STACK_MAX_CLARIFICATION_CYCLES,
+        audit_response_schema=TechStackAuditResponse,
+        audit_content_field="revised_tech_stack",
+        build_audit_prompt=_build_tech_stack_audit_prompt,
+        render_markdown=render_tech_stack_markdown,
+        requires_human_gate=False,
+        post_audit_hook=preflight_nodes.apply_dotnet_conventions_if_applicable,
+        hydrate_from_repo_file=preflight_nodes.hydrate_tech_stack_from_repo_file,
+        session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
+    ),
+    StageSpec(
+        key="raw-requirements",
+        response_schema=RawRequirementsDraftResponse,
+        content_field="raw_requirements",
+        surface_tool_name="present_raw_requirements",
+        build_envelope=build_raw_requirements_envelope,
+        build_prompt=_build_raw_requirements_prompt,
+        max_cycles=workflow_config.RAW_REQUIREMENTS_MAX_CLARIFICATION_CYCLES,
+        audit_response_schema=RawRequirementsAuditResponse,
+        audit_content_field="revised_raw_requirements",
+        build_audit_prompt=_build_raw_requirements_audit_prompt,
+        render_markdown=render_raw_requirements_markdown,
+        post_audit_hook=requirements_nodes.persist_raw_requirements_seed,
+        hydrate_from_repo_file=requirements_nodes.hydrate_raw_requirements_from_repo_file,
+        session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
+    ),
     StageSpec(
         key="specification",
         response_schema=SpecificationDraftResponse,
@@ -201,6 +731,8 @@ STAGES: list[StageSpec] = [
         audit_content_field="revised_specification",
         build_audit_prompt=_build_specification_audit_prompt,
         render_markdown=render_specification_markdown,
+        deterministic_verify=_verify_specification_ledger,
+        sign_approval=True,
     ),
     StageSpec(
         key="plan",
@@ -214,12 +746,62 @@ STAGES: list[StageSpec] = [
         audit_content_field="revised_plan",
         build_audit_prompt=_build_plan_audit_prompt,
         render_markdown=render_plan_markdown,
+        sign_approval=True,
+        deterministic_verify=verify_plan_diagrams,
+        session_options=lambda state, _role: (
+            {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS + ["mcp:*"], "mcp_servers": EXCALIDRAW_MCP_CONFIG}
+            if _tech_stack_has_ui_framework(state)
+            else {}
+        ),
+    ),
+    StageSpec(
+        key="ac-to-tests",
+        response_schema=AcceptanceCriteriaTestsDraftResponse,
+        content_field="test_suite",
+        surface_tool_name="present_ac_to_tests",
+        build_envelope=build_ac_to_tests_envelope,
+        build_prompt=_build_ac_to_tests_prompt,
+        max_cycles=workflow_config.AC_TO_TESTS_MAX_CLARIFICATION_CYCLES,
+        audit_response_schema=AcceptanceCriteriaTestsAuditResponse,
+        audit_content_field="revised_test_suite",
+        build_audit_prompt=_build_ac_to_tests_audit_prompt,
+        render_markdown=render_ac_to_tests_markdown,
+        requires_human_gate=False,
+        capture_baseline_commit=True,
+        deterministic_verify=verify_ac_to_tests,
+        session_options=lambda state, role: (
+            {
+                "agent_mode": "autopilot",
+                "excluded_tools": ["builtin:bash"],
+                "pre_tool_use_hook": pre_tool_use_write_scope_hook,
+                **({"mcp_servers": PLAYWRIGHT_MCP_CONFIG} if _tech_stack_has_ui_framework(state) else {}),
+            }
+            if role == "draft"
+            else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
+        ),
+    ),
+    StageSpec(
+        key="minimal-code-to-green",
+        response_schema=MinimalCodeToGreenDraftResponse,
+        content_field="iteration",
+        surface_tool_name="present_minimal_code_to_green",
+        build_envelope=build_minimal_code_to_green_envelope,
+        build_prompt=_build_minimal_code_to_green_prompt,
+        max_cycles=workflow_config.MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES,
+        audit_response_schema=MinimalCodeToGreenAuditResponse,
+        audit_content_field="revised_iteration",
+        build_audit_prompt=_build_minimal_code_to_green_audit_prompt,
+        render_markdown=render_minimal_code_to_green_markdown,
+        deterministic_verify=verify_coverage,
+        # Draft gets full, unscoped write access -- "minimal code to green" is definitionally a
+        # code-writing task (Part A Decisions point 6, tier (iii)). Audit stays read-only, same
+        # asymmetry as P4's session_options.
+        session_options=lambda _state, role: (
+            {"agent_mode": "autopilot"} if role == "draft" else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
+        ),
     ),
 ]
 
-_STAGE_BY_KEY = {stage.key: stage for stage in STAGES}
-_STAGE_KEYS = [stage.key for stage in STAGES]
-_RENDER_MARKDOWN_BY_STAGE = {stage.key: stage.render_markdown for stage in STAGES}
 
 
 async def _persist_if_sandboxed(
@@ -242,7 +824,6 @@ async def _persist_if_sandboxed(
         await workflow_persistence.persist_state(
             provider,
             thread_id,
-            raw_requirements_text=state.get("raw_requirements_text", ""),
             stages=stages,
             render_markdown=_RENDER_MARKDOWN_BY_STAGE,
         )
@@ -285,12 +866,22 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
             stages = hydrated
             logger.info("intake_node: hydrated prior workflow state for thread_id=%s", thread_id)
 
-    for stage_spec in STAGES:
+    # _ALL_STAGE_SPECS (STAGES + every standalone StageSpec: P11a/b/d, P15, P0-brownfield) is
+    # assigned near the bottom of this module, after all of them are defined -- referencing it
+    # here is fine, since intake_node only ever runs after the module has finished loading. Fixes
+    # a real bug: standalone StageSpecs were never getting a default_stage_state() here at all,
+    # so the first node touching e.g. stages["p11a-adversarial-audit"] would KeyError.
+    for stage_spec in _ALL_STAGE_SPECS:
         stages.setdefault(stage_spec.key, default_stage_state())
 
     # AC-6.3: a Plan that had already advanced is reset to Not Started; its
     # last content stays visible (AC-8.4) but is no longer current/approved.
-    for stage_spec in STAGES[1:]:
+    # tech-stack and raw-requirements are both supporting/evergreen artifacts (not "review this
+    # run's draft" stages the way specification/plan still are) -- once approved, they stay
+    # approved across every later fresh run on the same thread; each one's own draft node
+    # idempotency check (not this reset loop) is what decides whether it needs to redraft. Every
+    # other stage (STAGES[2:] plus every standalone StageSpec) resets on a fresh run.
+    for stage_spec in STAGES[2:] + _STANDALONE_STAGE_SPECS:
         stage = stages[stage_spec.key]
         if stage["status"] in ("ready_for_review", "approved"):
             stage["status"] = "not_started"
@@ -317,6 +908,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
 
     return {
         "stages": stages,
+        "run_id": uuid.uuid4().hex[:8],
         "raw_requirements_text": raw_requirements_text,
         "requirements_attachments": requirements_attachments,
     }
@@ -325,6 +917,39 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
 def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     async def draft_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = config["configurable"]["thread_id"]
+
+        if stage_spec.hydrate_from_repo_file is not None and sandbox_registry.get(thread_id) is not None:
+            hydrated = await stage_spec.hydrate_from_repo_file(thread_id, state, get_sandbox_provider())
+            if hydrated is not None:
+                stages = {key: dict(value) for key, value in state["stages"].items()}
+                stage = stages[stage_spec.key]
+                used_ids: set[str] = set(stage["used_ids"])
+                _extract_ids(hydrated, used_ids)
+                stage["draft"] = hydrated
+                stage["approved_content"] = hydrated
+                stage["status"] = "approved"
+                stage["readiness"] = True
+                stage["ever_ready_for_review"] = True
+                stage["used_ids"] = sorted(used_ids)
+                stages[stage_spec.key] = stage
+                return {"stages": stages}
+
+        if (
+            stage_spec.capture_baseline_commit
+            and state["stages"][stage_spec.key].get("baseline_commit") is None
+            and sandbox_registry.get(thread_id) is not None
+        ):
+            # Captured once (guarded by "not already set," not by cycle count) -- persists across
+            # retry cycles within this run via LangGraph's checkpointed state; only reset to None
+            # by an escalate node when a human is assumed to have intervened out-of-band. This is
+            # the write-scope gate's (agent/src/gates/write_scope_gate.py) "before this stage
+            # touched anything" reference point.
+            provider = get_sandbox_provider()
+            head_result = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD")
+            stages = {key: dict(value) for key, value in state["stages"].items()}
+            stages[stage_spec.key]["baseline_commit"] = head_result.stdout.strip() if head_result.ok else None
+            state = {**state, "stages": stages}
+
         model = get_chat_model_for_thread(
             thread_id,
             stage_spec.key,
@@ -332,6 +957,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name(stage_spec.key, "draft"),
             sandbox=sandbox_registry.get(thread_id),
+            **(stage_spec.session_options(state, "draft") if stage_spec.session_options is not None else {}),
         )
 
         prompt_messages = stage_spec.build_prompt(state)
@@ -363,6 +989,17 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stage["cycle_count"] = stage["cycle_count"] + 1
 
         stages[stage_spec.key] = stage
+
+        if sandbox_registry.get(thread_id) is not None:
+            # P14's token-consumption tracking reads these ledger entries. model._last_usage is
+            # None if no ASSISTANT_USAGE event fired (shouldn't happen in practice, but the field
+            # is optional upstream, so tolerated here rather than assumed).
+            await repo_files.append_ledger_entry(
+                get_sandbox_provider(),
+                thread_id,
+                {"stage": stage_spec.key, "node": "draft", "readiness": response.readiness, "token_usage": model._last_usage},
+            )
+
         return {"stages": stages}
 
     return draft_node
@@ -387,6 +1024,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name(stage_spec.key, "audit"),
             sandbox=sandbox_registry.get(thread_id),
+            **(stage_spec.session_options(state, "audit") if stage_spec.session_options is not None else {}),
         )
 
         prompt_messages = stage_spec.build_audit_prompt(state)
@@ -406,22 +1044,139 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         stage["audit_findings"] = list(response.audit_findings)
         stages[stage_spec.key] = stage
 
-        envelope = stage_spec.build_envelope(content_dict, stage["audit_findings"])
-        extra_messages = present_surface_messages(stage_spec.surface_tool_name, envelope)
+        # A stage with a deterministic_verify gate (e.g. specification's ledger sync) can still
+        # rewrite this exact content_dict's own ids/fields between here and the gate -- building
+        # the human-facing A2UI surface now would show content that's about to change out from
+        # under it. Those stages instead build+send their surface from make_verify_node, once
+        # verification has actually passed and the content is final. Every other stage's behavior
+        # (build+send here) is byte-identical to before deterministic_verify existed.
+        extra_messages: list[BaseMessage] = []
+        if stage_spec.deterministic_verify is None:
+            envelope = stage_spec.build_envelope(content_dict, stage["audit_findings"])
+            extra_messages = present_surface_messages(stage_spec.surface_tool_name, envelope)
 
         thread_id = config["configurable"]["thread_id"]
         await _persist_if_sandboxed(
             thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} draft revised (audit)"
         )
 
+        if sandbox_registry.get(thread_id) is not None:
+            await repo_files.append_ledger_entry(
+                get_sandbox_provider(),
+                thread_id,
+                {"stage": stage_spec.key, "node": "audit", "audit_findings_count": len(stage["audit_findings"]), "token_usage": model._last_usage},
+            )
+
+        if stage_spec.post_audit_hook is not None and sandbox_registry.get(thread_id) is not None:
+            await stage_spec.post_audit_hook(thread_id, content_dict, state, get_sandbox_provider())
+
         return {"stages": stages, "messages": extra_messages}
 
     return audit_node
 
 
+def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
+    """Runs stage_spec.deterministic_verify (a real script/parse, never LLM self-attestation)
+    between audit and gate. Only wired in when the StageSpec sets deterministic_verify -- see
+    build_graph()."""
+
+    async def verify_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        assert stage_spec.deterministic_verify is not None
+        thread_id = config["configurable"]["thread_id"]
+        provider = get_sandbox_provider()
+
+        stages = {key: dict(value) for key, value in state["stages"].items()}
+        stage = stages[stage_spec.key]
+
+        result = await stage_spec.deterministic_verify(
+            thread_id, stage["draft"], state.get("run_id", "unknown"), stage.get("baseline_commit"), provider
+        )
+        stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
+        if not result.passed:
+            stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
+        stages[stage_spec.key] = stage
+
+        extra_messages: list[BaseMessage] = []
+        if result.passed:
+            # deterministic_verify (e.g. spec_ledger.sync_ledger) may have mutated stage["draft"]
+            # in place (ids resolved/overwritten) -- build+send the human-facing surface only now,
+            # against the final, ledger-correct content (see make_audit_node's matching comment).
+            envelope = stage_spec.build_envelope(stage["draft"], stage["audit_findings"])
+            extra_messages = present_surface_messages(stage_spec.surface_tool_name, envelope)
+            await _persist_if_sandboxed(
+                thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} draft revised (verify)"
+            )
+
+        if sandbox_registry.get(thread_id) is not None:
+            await repo_files.append_ledger_entry(
+                provider,
+                thread_id,
+                {
+                    "stage": stage_spec.key,
+                    "node": "verify",
+                    "passed": result.passed,
+                    "cycle": stage["verify_cycle_count"],
+                },
+            )
+
+        return {"stages": stages, "messages": extra_messages}
+
+    return verify_node
+
+
+def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str]:
+    def route(state: GraphState) -> str:
+        stage = state["stages"][stage_spec.key]
+        last = stage.get("last_verification")
+        if last is not None and last.get("passed"):
+            return "gate"
+        if stage.get("verify_cycle_count", 0) < stage_spec.max_verify_cycles:
+            return "retry"
+        return "escalate"
+
+    return route
+
+
+def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
+    """Deterministic-verify cap exhaustion, e.g. a gate that keeps failing a real check (coverage,
+    write-scope, ledger-sync). Never auto-approved past a failed deterministic gate -- pauses for
+    an explicit human decision, distinct from the normal approval gate's interrupt payload shape
+    so the frontend can render it differently. On resume, retries from draft with the cycle
+    counter reset (the human is assumed to have intervened, e.g. fixed something out-of-band)."""
+
+    async def escalate_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        stage = state["stages"][stage_spec.key]
+        last = stage.get("last_verification") or {}
+        interrupt(
+            {
+                "stage": stage_spec.key,
+                "type": "verification_cap_exceeded",
+                "draft": stage["draft"],
+                "report": last.get("report"),
+                "feedback": last.get("feedback"),
+            }
+        )
+
+        stages = {key: dict(value) for key, value in state["stages"].items()}
+        stages[stage_spec.key]["verify_cycle_count"] = 0
+        return {"stages": stages}
+
+    return escalate_node
+
+
 def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     def route(state: GraphState) -> str:
         stage = state["stages"][stage_spec.key]
+        # A hydrate_from_repo_file short-circuit (see make_draft_node) marks the stage "approved"
+        # directly, in draft_node itself -- this content was already audited and approved in a
+        # prior run, so it must bypass BOTH audit_node and gate_node entirely. Routing on
+        # readiness alone (the pre-hydrate design) would send it through audit_node anyway,
+        # re-running a live, non-deterministic LLM call on already-approved content on every
+        # single idempotent re-run -- caught by real end-to-end testing (a second, unaffected
+        # gate re-interrupt and slightly-reworded "approved" content on a run that should have
+        # been a no-op), not by inspection.
+        if stage["status"] == "approved":
+            return "already_approved"
         if stage["readiness"]:
             return "gate"
         if stage["cycle_count"] >= stage_spec.max_cycles:
@@ -435,8 +1190,12 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
     async def gate_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         stage = state["stages"][stage_spec.key]
         # Pauses here (BR-4/Section 6 Gate) until the frontend's useInterrupt
-        # resolve(payload) resumes this exact node with that payload.
-        interrupt({"stage": stage_spec.key, "draft": stage["draft"]})
+        # resolve(payload) resumes this exact node with that payload -- unless this stage is
+        # supporting infrastructure with no tab to review it in (requires_human_gate=False), in
+        # which case it proceeds straight through to the same approved-marking body every other
+        # stage already runs post-interrupt-resolve.
+        if stage_spec.requires_human_gate:
+            interrupt({"stage": stage_spec.key, "draft": stage["draft"]})
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         approved = stages[stage_spec.key]
@@ -447,6 +1206,15 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
 
         thread_id = config["configurable"]["thread_id"]
         await _persist_if_sandboxed(thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} approved")
+
+        if stage_spec.sign_approval and sandbox_registry.get(thread_id) is not None:
+            provider = get_sandbox_provider()
+            await approvals.record_approval(
+                provider, thread_id, stage_spec.key, state.get("run_id", "unknown"), approved["approved_content"]
+            )
+            await git_ops.commit_paths(
+                provider, thread_id, [approvals.APPROVALS_PATH], f"ai-dev-workflow: {stage_spec.key} approval signed"
+            )
 
         return {"stages": stages}
 
@@ -474,32 +1242,438 @@ def make_auto_approve_node(stage_spec: StageSpec) -> Callable[[GraphState, Runna
     return auto_approve_node
 
 
+# R placements (agent/src/rebuild.py). Keyed by the STAGES entry whose gate/auto_approve should
+# route into R instead of straight to the next stage's draft -- see build_graph()'s use of this
+# dict below. "After P4" uses fix_scope="scaffold_only" since brand-new tests against
+# not-yet-existing production symbols won't compile at all, TDD-red or not -- that fix node may
+# only add compile-enabling stubs, never real behavior (see rebuild.py's own docstring). "After
+# P6" gets a full-scope fix, real bug-fixing being exactly what a failed rebuild after real
+# implementation work calls for. Both currently route to END on success since P8 (the next real
+# stage after P6) doesn't exist yet -- update REBUILD_AFTER_P6.next_node the moment P8 is wired in.
+REBUILD_AFTER_AC_TO_TESTS = rebuild.RebuildSpec(
+    key="r_ac_to_tests",
+    max_fix_cycles=3,
+    fix_prompt_addendum="",  # unused for scaffold_only -- rebuild.py substitutes its own addendum
+    fix_scope="scaffold_only",
+    next_node="minimal-code-to-green_draft",
+)
+
+REBUILD_AFTER_P6 = rebuild.RebuildSpec(
+    key="r_minimal_code_to_green",
+    max_fix_cycles=3,
+    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
+    fix_scope="full",
+    next_node="p8_scan",
+)
+
+# Maps a STAGES entry's key -> the R placement immediately after it, so build_graph()'s per-stage
+# loop can route that stage's gate/auto_approve into R instead of straight to the next draft node.
+POST_STAGE_REBUILD: dict[str, rebuild.RebuildSpec] = {
+    "ac-to-tests": REBUILD_AFTER_AC_TO_TESTS,
+    "minimal-code-to-green": REBUILD_AFTER_P6,
+}
+
+# R(p8): sits between p8_fix and p8_gate_check in the plan's own chain (p8_scan -> p8_triage ->
+# p8_ledger_write -> p8_fix -> R(p8) -> p8_gate_check -> loop|human_gate). Full fix scope --
+# genuine bug-fixing after a real quality-fix pass, same reasoning as REBUILD_AFTER_P6.
+REBUILD_FOR_P8 = rebuild.RebuildSpec(
+    key="r_p8",
+    max_fix_cycles=3,
+    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
+    fix_scope="full",
+    next_node="p8_gate_check",
+)
+
+# R(p10): same placement pattern as R(p8), between p10_fix and p10_gate_check.
+REBUILD_FOR_P10 = rebuild.RebuildSpec(
+    key="r_p10",
+    max_fix_cycles=3,
+    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
+    fix_scope="full",
+    next_node="p10_gate_check",
+)
+
+
+def _wire_p8(builder: StateGraph) -> None:
+    """Wires P8's bespoke node cluster (quality_security/p8_nodes.py) -- NOT exercised against a
+    real sandbox yet, see p8_nodes.py's own module docstring for exactly what's unverified.
+    p8_gate_check's "next" routes into P10's own scan node."""
+    builder.add_node("p8_scan", p8_nodes.p8_scan_node)
+    builder.add_node("p8_triage", p8_nodes.p8_triage_node)
+    builder.add_node("p8_ledger_write", p8_nodes.p8_ledger_write_node)
+    builder.add_node("p8_fix", p8_nodes.p8_fix_node)
+    builder.add_node("p8_gate_check", p8_nodes.p8_gate_check_node)
+    builder.add_node("p8_human_gate", p8_nodes.p8_human_gate_node)
+
+    r_p8_entry_name = _wire_rebuild(builder, REBUILD_FOR_P8)
+
+    builder.add_edge("p8_scan", "p8_triage")
+    builder.add_edge("p8_triage", "p8_ledger_write")
+    builder.add_edge("p8_ledger_write", "p8_fix")
+    builder.add_edge("p8_fix", r_p8_entry_name)
+    builder.add_conditional_edges(
+        "p8_gate_check",
+        p8_nodes.make_p8_route_after_gate(),
+        {"next": "p10_scan", "retry": "p8_scan", "escalate": "p8_human_gate"},
+    )
+    builder.add_edge("p8_human_gate", "p8_scan")
+
+
+ADVERSARIAL_AUDIT_SPEC = StageSpec(
+    key="p11a-adversarial-audit",
+    response_schema=AdversarialAuditDraftResponse,
+    content_field="report",
+    surface_tool_name="present_adversarial_audit",
+    build_envelope=build_adversarial_audit_envelope,
+    build_prompt=_build_adversarial_audit_prompt,
+    max_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES,
+    audit_response_schema=AdversarialAuditAuditResponse,
+    audit_content_field="revised_report",
+    build_audit_prompt=_build_adversarial_audit_audit_prompt,
+    render_markdown=render_adversarial_audit_markdown,
+    # requires_human_gate defaults True -- P11a's own human review of divergence findings, per
+    # the pipeline diagram (the one interactive checkpoint inside P11 besides low-confidence
+    # license findings).
+)
+
+DEDUP_SPEC = StageSpec(
+    key="p11b-dedup",
+    response_schema=DedupDraftResponse,
+    content_field="result",
+    surface_tool_name="present_dedup",
+    build_envelope=build_dedup_envelope,
+    build_prompt=_build_dedup_prompt,
+    max_cycles=workflow_config.DEDUP_MAX_CLARIFICATION_CYCLES,
+    audit_response_schema=DedupAuditResponse,
+    audit_content_field="revised_result",
+    build_audit_prompt=_build_dedup_audit_prompt,
+    render_markdown=render_dedup_markdown,
+    requires_human_gate=False,  # bounded by jscpd's objective re-check at P11's exit gate instead
+    post_audit_hook=p11_gates.rerun_jscpd_after_dedup,
+    session_options=lambda _state, role: (
+        {"agent_mode": "autopilot"} if role == "draft" else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
+    ),
+)
+
+LICENSE_AUDIT_SPEC = StageSpec(
+    key="p11d-license-audit",
+    response_schema=LicenseAuditDraftResponse,
+    content_field="report",
+    surface_tool_name="present_license_audit",
+    build_envelope=build_license_audit_envelope,
+    build_prompt=_build_license_audit_prompt,
+    max_cycles=workflow_config.LICENSE_AUDIT_MAX_CLARIFICATION_CYCLES,
+    audit_response_schema=LicenseAuditAuditResponse,
+    audit_content_field="revised_report",
+    build_audit_prompt=_build_license_audit_audit_prompt,
+    render_markdown=render_license_audit_markdown,
+    requires_human_gate=False,  # the "gate" for flagged packages IS the deterministic_verify escalate below
+    deterministic_verify=p11_gates.verify_license_audit,
+    max_verify_cycles=0,  # any flagged package escalates immediately -- redrafting can't change a license
+)
+
+EXIT_SPEC = StageSpec(
+    key="p15-exit",
+    response_schema=ExitDraftResponse,
+    content_field="report",
+    surface_tool_name="present_exit",
+    build_envelope=build_exit_envelope,
+    build_prompt=_build_exit_prompt,
+    max_cycles=workflow_config.EXIT_MAX_CLARIFICATION_CYCLES,
+    audit_response_schema=ExitAuditResponse,
+    audit_content_field="revised_report",
+    build_audit_prompt=_build_exit_audit_prompt,
+    render_markdown=render_exit_markdown,
+    # requires_human_gate defaults True -- the final human checkpoint of the entire pipeline.
+    sign_approval=True,  # APPROVALS.md covers P2/P3/P15 per the plan -- p15_finalize_node also reads this row
+)
+
+
+def _wire_p15(builder: StateGraph) -> None:
+    """Wires P15: EXIT_SPEC (a StageSpec, reusing the standard draft->audit->gate template for
+    consistency with every other stage -- the plan's own diagram sketched a single LLM box, but an
+    adversarial second opinion on "is this merge-ready" is worth having here too) -> p15_finalize
+    (deterministic: manifest.json + CHANGELOG.md + commit, never the model's job) -> END.
+
+    Verification status: NOT exercised against a real sandbox, same caveat as every P8+ cluster.
+    """
+    builder.add_node("p15_finalize", p15_nodes.p15_finalize_node)
+    _wire_stage(builder, EXIT_SPEC, "p15_finalize")
+    builder.add_edge("p15_finalize", END)
+
+
+P0_BASELINE_SPEC = StageSpec(
+    key="p0-brownfield",
+    response_schema=P0BaselineDraftResponse,
+    content_field="baseline",
+    surface_tool_name="present_p0_baseline",
+    build_envelope=build_p0_baseline_envelope,
+    build_prompt=_build_p0_baseline_prompt,
+    max_cycles=2,
+    audit_response_schema=P0BaselineAuditResponse,
+    audit_content_field="revised_baseline",
+    build_audit_prompt=_build_p0_baseline_audit_prompt,
+    render_markdown=render_p0_baseline_markdown,
+    # requires_human_gate defaults True -- ratification is what flips manifest.json from absent
+    # to present (p0_write_manifest_node, wired as this stage's own next_draft_name below).
+    session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
+)
+
+
+def _wire_p0(builder: StateGraph) -> None:
+    """Wires P0's brownfield sub-flow: only reached when scaffold's manifest_exists check finds
+    no manifest.json (build_graph()'s own conditional edge from "scaffold", not this function,
+    does that branch). p0_baseline_pre (deterministic schema/migration/route grep) -> P0_BASELINE_SPEC
+    (draft->audit->gate) -> p0_write_manifest (deterministic: ratification IS what creates
+    manifest.json) -> tech-stack's own draft node, same entry point a manifest-already-exists run
+    uses. Verification status: NOT exercised against a real sandbox."""
+    builder.add_node("p0_baseline_pre", preflight_nodes.p0_baseline_context_node)
+    builder.add_node("p0_write_manifest", preflight_nodes.p0_write_manifest_node)
+    _wire_stage(builder, P0_BASELINE_SPEC, "p0_write_manifest")
+    builder.add_edge("p0_baseline_pre", "p0-brownfield_draft")
+    builder.add_edge("p0_write_manifest", f"{STAGES[0].key}_draft")
+
+
+REBUILD_FOR_P11 = rebuild.RebuildSpec(
+    key="r_p11",
+    max_fix_cycles=3,
+    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
+    fix_scope="full",
+    next_node="p13_run_tests",
+)
+
+
+def _wire_p11(builder: StateGraph) -> None:
+    """Wires all of P11: p11a (StageSpec) -> p11b_pre (deterministic) -> p11b (StageSpec) ->
+    p11c (bespoke verify-loop cluster, p11c_nodes.py) -> p11d_pre (deterministic) -> p11d
+    (StageSpec) -> p11_exit_gate (deterministic, retry-once-then-escalate) -> R(p11) -> END.
+
+    p11a/p11b/p11d are standalone StageSpec instances, not appended to the flat STAGES list --
+    P11c's bespoke cluster interrupts what would otherwise be linear STAGES-style chaining, so
+    _wire_stage (extracted from build_graph()'s STAGES loop) is called directly here with each
+    stage's own explicit next_draft_name instead.
+
+    Verification status: NOT exercised against a real sandbox -- same caveat as P8/P10.
+    """
+    builder.add_node("p11b_pre", p11_gates.p11b_pre_node)
+    builder.add_node("p11c_pre", p11c_nodes.p11c_pre_node)
+    builder.add_node("p11c_draft", p11c_nodes.p11c_draft_node)
+    builder.add_node("p11c_verify", p11c_nodes.p11c_verify_node)
+    builder.add_node("p11c_audit", p11c_nodes.p11c_audit_node)
+    builder.add_node("p11c_revert", p11c_nodes.p11c_revert_node)
+    builder.add_node("p11c_notice_gate", p11c_nodes.p11c_notice_gate_node)
+    builder.add_node("p11d_pre", p11_gates.p11d_pre_node)
+    builder.add_node("p11_exit_gate", p11_gates.p11_exit_gate_node)
+    builder.add_node("p11_exit_human_gate", p11_gates.p11_exit_human_gate_node)
+
+    r_p11_entry_name = _wire_rebuild(builder, REBUILD_FOR_P11)
+
+    _wire_stage(builder, ADVERSARIAL_AUDIT_SPEC, "p11b_pre")
+    builder.add_edge("p11b_pre", "p11b-dedup_draft")
+    _wire_stage(builder, DEDUP_SPEC, "p11c_pre")
+
+    builder.add_edge("p11c_pre", "p11c_draft")
+    builder.add_edge("p11c_draft", "p11c_verify")
+    builder.add_conditional_edges(
+        "p11c_verify",
+        p11c_nodes.make_p11c_route_after_verify(),
+        {"audit": "p11c_audit", "retry": "p11c_draft", "revert": "p11c_revert"},
+    )
+    builder.add_edge("p11c_audit", "p11d_pre")
+    builder.add_edge("p11c_revert", "p11c_notice_gate")
+    builder.add_edge("p11c_notice_gate", "p11d_pre")  # informational gate -- never blocks P11
+
+    builder.add_edge("p11d_pre", "p11d-license-audit_draft")
+    _wire_stage(builder, LICENSE_AUDIT_SPEC, "p11_exit_gate")
+
+    builder.add_conditional_edges(
+        "p11_exit_gate",
+        p11_gates.make_p11_exit_route(),
+        {"next": r_p11_entry_name, "retry": "p11_exit_gate", "escalate": "p11_exit_human_gate"},
+    )
+    builder.add_edge("p11_exit_human_gate", "p11_exit_gate")
+
+
+def _wire_p14(builder: StateGraph) -> None:
+    """Wires P14's metrics + traceability + token-tracking node, plus the one named LLM
+    exception (ponytail-gain). Routes into P15's own draft node. Verification status: NOT
+    exercised against a real sandbox, same caveat as P8/P10/P11/P13."""
+    builder.add_node("p14_metrics", p14_nodes.p14_metrics_node)
+    builder.add_node("p14_ponytail_gain", p14_nodes.p14_ponytail_gain_node)
+    builder.add_edge("p14_metrics", "p14_ponytail_gain")
+    builder.add_edge("p14_ponytail_gain", "p15-exit_draft")
+
+
+def _wire_p13(builder: StateGraph) -> None:
+    """Wires P13's node cluster (p13_nodes.py). "next" from p13_exit_check routes to END for now
+    (P14, the real next stage, doesn't exist yet). Verification status: NOT exercised against a
+    real sandbox, same caveat as P8/P10/P11."""
+    builder.add_node("p13_run_tests", p13_nodes.p13_run_tests_node)
+    builder.add_node("p13_regression_gate", p13_nodes.p13_regression_gate_node)
+    builder.add_node("p13_flake_triage", p13_nodes.p13_flake_triage_node)
+    builder.add_node("p13_mint_tickets", p13_nodes.p13_mint_tickets_node)
+    builder.add_node("p13_exit_check", p13_nodes.p13_exit_check_node)
+    builder.add_node("p13_exit_escalate", p13_nodes.p13_exit_escalate_node)
+
+    builder.add_conditional_edges(
+        "p13_run_tests", p13_nodes.make_p13_route_after_run(), {"regression": "p13_regression_gate", "triage": "p13_flake_triage"}
+    )
+    builder.add_edge("p13_regression_gate", "p13_run_tests")  # resumes to re-run after a human fixes the regression out-of-band
+    builder.add_edge("p13_flake_triage", "p13_mint_tickets")
+    builder.add_edge("p13_mint_tickets", "p13_exit_check")
+    builder.add_conditional_edges(
+        "p13_exit_check", p13_nodes.make_p13_route_after_exit(), {"next": "p14_metrics", "escalate": "p13_exit_escalate"}
+    )
+    builder.add_edge("p13_exit_escalate", "p13_flake_triage")
+
+
+def _wire_p10(builder: StateGraph) -> None:
+    """Wires P10's bespoke node cluster (quality_security/p10_nodes.py) -- NOT exercised against a
+    real sandbox yet, see p10_nodes.py's own module docstring for exactly what's unverified.
+    p10_gate_check's "next" routes into P11a's own draft node."""
+    builder.add_node("p10_scan", p10_nodes.p10_scan_node)
+    builder.add_node("p10_triage", p10_nodes.p10_triage_node)
+    builder.add_node("p10_ledger_write", p10_nodes.p10_ledger_write_node)
+    builder.add_node("p10_fix", p10_nodes.p10_fix_node)
+    builder.add_node("p10_gate_check", p10_nodes.p10_gate_check_node)
+    builder.add_node("p10_human_gate", p10_nodes.p10_human_gate_node)
+
+    r_p10_entry_name = _wire_rebuild(builder, REBUILD_FOR_P10)
+
+    builder.add_edge("p10_scan", "p10_triage")
+    builder.add_edge("p10_triage", "p10_ledger_write")
+    builder.add_edge("p10_ledger_write", "p10_fix")
+    builder.add_edge("p10_fix", r_p10_entry_name)
+    builder.add_conditional_edges(
+        "p10_gate_check",
+        p10_nodes.make_p10_route_after_gate(),
+        {"next": "p11a-adversarial-audit_draft", "retry": "p10_scan", "escalate": "p10_human_gate"},
+    )
+    builder.add_edge("p10_human_gate", "p10_scan")
+
+
+def _wire_rebuild(builder: StateGraph, spec: rebuild.RebuildSpec) -> str:
+    """Adds one RebuildSpec's rebuild/fix/escalate nodes and routing to `builder`. Returns the
+    rebuild node's own name -- the edge callers should route *into* to enter this R placement."""
+    rebuild_name = f"{spec.key}_rebuild"
+    fix_name = f"{spec.key}_fix"
+    escalate_name = f"{spec.key}_escalate"
+
+    builder.add_node(rebuild_name, rebuild.make_rebuild_node(spec))
+    builder.add_node(fix_name, rebuild.make_fix_node(spec))
+    builder.add_node(escalate_name, rebuild.make_escalate_node(spec))
+
+    builder.add_conditional_edges(
+        rebuild_name,
+        rebuild.make_route_after_rebuild(spec),
+        {"next": spec.next_node, "fix": fix_name, "escalate": escalate_name},
+    )
+    builder.add_edge(fix_name, rebuild_name)
+    builder.add_edge(escalate_name, rebuild_name)
+    return rebuild_name
+
+
+def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str) -> None:
+    """Registers one StageSpec's full draft->audit->[verify]->gate/auto_approve subgraph and
+    routes its exit into `next_draft_name`. Extracted from build_graph()'s STAGES loop (which
+    still computes next_draft_name for each STAGES entry and calls this) so P11a/b/d -- which sit
+    outside the flat STAGES list because P11c's bespoke cluster interrupts the otherwise-linear
+    chain -- can reuse the exact same per-stage wiring with an explicit custom next target,
+    without fighting STAGES' automatic "next entry in the list" assumption."""
+    draft_name = f"{stage_spec.key}_draft"
+    audit_name = f"{stage_spec.key}_audit"
+    gate_name = f"{stage_spec.key}_gate"
+    auto_approve_name = f"{stage_spec.key}_auto_approve"
+
+    builder.add_node(draft_name, make_draft_node(stage_spec))
+    builder.add_node(audit_name, make_audit_node(stage_spec))
+    builder.add_node(gate_name, make_gate_node(stage_spec))
+    builder.add_node(auto_approve_name, make_auto_approve_node(stage_spec))
+
+    builder.add_conditional_edges(
+        draft_name,
+        make_route_after_draft(stage_spec),
+        {
+            "gate": audit_name,
+            "auto_approve": auto_approve_name,
+            "needs_clarification": END,
+            "already_approved": next_draft_name,
+        },
+    )
+
+    if stage_spec.deterministic_verify is not None:
+        # Real script/parse gate inserted between audit and gate -- fail routes back to draft
+        # (with feedback context) up to max_verify_cycles, then to a human-interrupt
+        # escalation, never straight through to gate/auto_approve. Byte-identical to today
+        # when deterministic_verify is unset (the `else` branch below).
+        verify_name = f"{stage_spec.key}_verify"
+        escalate_name = f"{stage_spec.key}_escalate"
+        builder.add_node(verify_name, make_verify_node(stage_spec))
+        builder.add_node(escalate_name, make_escalate_node(stage_spec))
+        builder.add_edge(audit_name, verify_name)
+        builder.add_conditional_edges(
+            verify_name,
+            make_route_after_verify(stage_spec),
+            {"gate": gate_name, "retry": draft_name, "escalate": escalate_name},
+        )
+        builder.add_edge(escalate_name, draft_name)
+    else:
+        builder.add_edge(audit_name, gate_name)
+
+    builder.add_edge(gate_name, next_draft_name)
+    builder.add_edge(auto_approve_name, next_draft_name)
+
+
+# Every standalone StageSpec (not in the flat STAGES list, because a bespoke cluster sits between
+# it and its neighbors -- see P11's own note above). intake_node's setdefault/reset loops need
+# every stage key that will ever appear in GraphState.stages, not just STAGES' own five.
+_STANDALONE_STAGE_SPECS: list[StageSpec] = [
+    P0_BASELINE_SPEC,
+    ADVERSARIAL_AUDIT_SPEC,
+    DEDUP_SPEC,
+    LICENSE_AUDIT_SPEC,
+    EXIT_SPEC,
+]
+_ALL_STAGE_SPECS: list[StageSpec] = STAGES + _STANDALONE_STAGE_SPECS
+_STAGE_KEYS = [stage.key for stage in _ALL_STAGE_SPECS]
+_RENDER_MARKDOWN_BY_STAGE = {stage.key: stage.render_markdown for stage in _ALL_STAGE_SPECS}
+
+
+def _route_after_scaffold(state: GraphState) -> str:
+    return f"{STAGES[0].key}_draft" if state.get("manifest_exists", True) else "p0_baseline_pre"
+
+
 def build_graph() -> StateGraph:
     builder = StateGraph(GraphState)
     builder.add_node("intake", intake_node)
+    builder.add_node("scaffold", preflight_nodes.scaffold_node)
     builder.add_edge(START, "intake")
-    builder.add_edge("intake", f"{STAGES[0].key}_draft")
+    builder.add_edge("intake", "scaffold")
+    builder.add_conditional_edges(
+        "scaffold", _route_after_scaffold, {f"{STAGES[0].key}_draft": f"{STAGES[0].key}_draft", "p0_baseline_pre": "p0_baseline_pre"}
+    )
+
+    post_stage_rebuild_entry_name = {key: _wire_rebuild(builder, spec) for key, spec in POST_STAGE_REBUILD.items()}
+    _wire_p0(builder)
+    _wire_p8(builder)
+    _wire_p10(builder)
+    _wire_p11(builder)
+    _wire_p13(builder)
+    _wire_p14(builder)
+    _wire_p15(builder)
 
     for index, stage_spec in enumerate(STAGES):
-        draft_name = f"{stage_spec.key}_draft"
-        audit_name = f"{stage_spec.key}_audit"
-        gate_name = f"{stage_spec.key}_gate"
-        auto_approve_name = f"{stage_spec.key}_auto_approve"
-        next_draft_name = f"{STAGES[index + 1].key}_draft" if index + 1 < len(STAGES) else END
+        if stage_spec.key in post_stage_rebuild_entry_name:
+            # This stage has an R placement immediately after it -- route into R's rebuild node,
+            # never straight to the next stage's draft (checked before the plain "next stage in
+            # STAGES" case below, since R's own next_node is what eventually reaches that draft).
+            next_draft_name = post_stage_rebuild_entry_name[stage_spec.key]
+        elif index + 1 < len(STAGES):
+            next_draft_name = f"{STAGES[index + 1].key}_draft"
+        else:
+            next_draft_name = END
 
-        builder.add_node(draft_name, make_draft_node(stage_spec))
-        builder.add_node(audit_name, make_audit_node(stage_spec))
-        builder.add_node(gate_name, make_gate_node(stage_spec))
-        builder.add_node(auto_approve_name, make_auto_approve_node(stage_spec))
-
-        builder.add_conditional_edges(
-            draft_name,
-            make_route_after_draft(stage_spec),
-            {"gate": audit_name, "auto_approve": auto_approve_name, "needs_clarification": END},
-        )
-        builder.add_edge(audit_name, gate_name)
-        builder.add_edge(gate_name, next_draft_name)
-        builder.add_edge(auto_approve_name, next_draft_name)
+        _wire_stage(builder, stage_spec, next_draft_name)
 
     return builder
 

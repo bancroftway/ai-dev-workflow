@@ -13,11 +13,11 @@ module existed.
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from typing import Any, Callable
 
+from . import repo_files
 from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
@@ -50,20 +50,11 @@ def _stage_file(stage_key: str, kind: str) -> str:
 
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
-    result = await provider.exec_in_sandbox(thread_id, f"cat {WORKFLOW_DIR}/{relative_path} 2>/dev/null")
-    if not result.ok:
-        return None
-    return result.stdout
+    return await repo_files.read_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}")
 
 
 async def _write_file(provider: SandboxProvider, thread_id: str, relative_path: str, content: str) -> None:
-    # base64 round-trip avoids shell-quoting hazards entirely for arbitrary JSON/Markdown content
-    # (quotes, backticks, `$`, newlines) rather than trying to escape it into a shell string.
-    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    command = f"mkdir -p {WORKFLOW_DIR} && echo {encoded} | base64 -d > {WORKFLOW_DIR}/{relative_path}"
-    result = await provider.exec_in_sandbox(thread_id, command)
-    if not result.ok:
-        raise RuntimeError(f"failed to write {WORKFLOW_DIR}/{relative_path}: {result.stderr}")
+    await repo_files.write_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}", content)
 
 
 async def hydrate_state(
@@ -136,6 +127,12 @@ async def hydrate_state(
             "ever_ready_for_review": stored.get("ever_ready_for_review", False),
             "used_ids": stored.get("used_ids", []),
             "audit_findings": stored.get("audit_findings", []),
+            # Added after this module's initial version -- .get() with graph.py's
+            # default_stage_state() defaults so an older state.json (predating these fields)
+            # hydrates cleanly instead of producing a stage dict missing keys later code expects.
+            "verify_cycle_count": stored.get("verify_cycle_count", 0),
+            "last_verification": stored.get("last_verification"),
+            "baseline_commit": stored.get("baseline_commit"),
         }
 
     logger.info("Hydrated workflow state for thread_id=%s from %s", thread_id, WORKFLOW_DIR)
@@ -146,17 +143,22 @@ async def persist_state(
     provider: SandboxProvider,
     thread_id: str,
     *,
-    raw_requirements_text: str,
     stages: dict[str, dict[str, Any]],
     render_markdown: dict[str, Callable[[dict[str, Any]], str]],
 ) -> None:
-    """Writes the given stages (and raw requirements text) into `.ai-dev-workflow/`.
+    """Writes the given stages into `.ai-dev-workflow/`.
 
     Does not commit -- writing files and committing are separate steps (git_ops.py) so a commit
     failure never leaves the caller unsure whether the files themselves were actually written.
-    """
-    await _write_file(provider, thread_id, "raw-requirements.md", raw_requirements_text)
 
+    raw-requirements.md/.draft.json/.approved.json are owned exclusively by the raw-requirements
+    StageSpec entry below (via the generic per-stage render below) -- there is deliberately no
+    separate hardcoded write of the raw requirements text here anymore. Before the raw-requirements
+    stage existed, this function unconditionally overwrote raw-requirements.md with
+    state["raw_requirements_text"] on every single persist call, including Specification/Plan
+    revision cycles whose chat text had nothing to do with the requirements document -- a real
+    write collision, resolved by giving raw-requirements.md exactly one writer.
+    """
     stored_stages: dict[str, dict[str, Any]] = {}
     for stage_key, stage in stages.items():
         draft = stage.get("draft")
@@ -187,6 +189,9 @@ async def persist_state(
             "ever_ready_for_review": stage.get("ever_ready_for_review", False),
             "used_ids": stage.get("used_ids", []),
             "audit_findings": stage.get("audit_findings", []),
+            "verify_cycle_count": stage.get("verify_cycle_count", 0),
+            "last_verification": stage.get("last_verification"),
+            "baseline_commit": stage.get("baseline_commit"),
         }
 
     state_doc = {"schema_version": SCHEMA_VERSION, "stages": stored_stages}

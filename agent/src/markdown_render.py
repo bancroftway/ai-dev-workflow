@@ -67,4 +67,183 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
         lines.extend(f"- {note}" for note in risk_notes)
         lines.append("")
 
+    diagrams = content.get("diagrams") or []
+    if diagrams:
+        lines.append("## Diagrams")
+        lines.append("")
+        for diagram in diagrams:
+            lines.append(f"### {diagram.get('name', '')} ({diagram.get('kind', '')})")
+            lines.append("")
+            lines.append("```mermaid")
+            lines.append((diagram.get("mermaid_source") or "").strip())
+            lines.append("```")
+            lines.append("")
+
     return "\n".join(lines).strip() + "\n"
+
+
+def render_tech_stack_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# Tech Stack", "", content.get("summary", ""), ""]
+
+    for field, heading in (
+        ("languages", "Languages"),
+        ("frameworks", "Frameworks"),
+        ("package_managers", "Package Managers"),
+        ("testing_frameworks", "Testing Frameworks"),
+    ):
+        values = content.get(field) or []
+        if values:
+            lines.append(f"## {heading}")
+            lines.append("")
+            lines.extend(f"- {v}" for v in values)
+            lines.append("")
+
+    conventions = content.get("conventions") or []
+    if conventions:
+        lines.append("## Conventions")
+        lines.append("")
+        lines.extend(f"- {c}" for c in conventions)
+        lines.append("")
+
+    lines.append("## .NET")
+    lines.append("")
+    if content.get("dotnet_detected"):
+        root = content.get("dotnet_solution_root")
+        lines.append(f"Detected. Solution root: `{root}`" if root else "Detected, but no confident solution root.")
+    else:
+        lines.append("Not detected.")
+    lines.append("")
+
+    conventions_applied = content.get("conventions_applied") or []
+    if conventions_applied:
+        lines.append("## Conventions Applied This Run")
+        lines.append("")
+        lines.extend(f"- {c}" for c in conventions_applied)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_ac_to_tests_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# Acceptance-Criteria Test Suite", "", content.get("summary", ""), ""]
+
+    test_files = content.get("test_files") or []
+    if test_files:
+        lines.append("## Test Files")
+        lines.append("")
+        for tf in test_files:
+            lines.append(f"- `{tf.get('path', '')}` ({tf.get('test_framework', '')}) -- covers: {', '.join(tf.get('ac_ids') or [])}")
+        lines.append("")
+
+    skipped = content.get("skipped_ac_ids") or []
+    if skipped:
+        lines.append("## Skipped Acceptance Criteria")
+        lines.append("")
+        for s in skipped:
+            lines.append(f"- **{s.get('ac_id', '')}**: {s.get('reason', '')}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_minimal_code_to_green_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# Minimal Code to Green", "", content.get("approach_summary", ""), ""]
+
+    changed_files = content.get("changed_files") or []
+    if changed_files:
+        lines.append("## Changed Files")
+        lines.append("")
+        for cf in changed_files:
+            lines.append(f"- **{cf.get('change_kind', '')}** `{cf.get('path', '')}` -- {cf.get('summary', '')}")
+        lines.append("")
+
+    known_gaps = content.get("known_gaps") or []
+    if known_gaps:
+        lines.append("## Known Gaps")
+        lines.append("")
+        lines.extend(f"- {gap}" for gap in known_gaps)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_adversarial_audit_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# Adversarial Audit", "", content.get("plan_conformance_summary", ""), "", f"**Overall verdict:** {content.get('overall_verdict', '')}", ""]
+    findings = content.get("divergence_findings") or []
+    if findings:
+        lines.append("## Divergence Findings")
+        lines.append("")
+        for f in findings:
+            lines.append(f"- **[{f.get('severity', '')}] {f.get('id', '')}** ({f.get('plan_reference', '')}): {f.get('description', '')} -- {f.get('proposed_resolution', '')}")
+        lines.append("")
+    risk_notes = content.get("unresolved_risk_notes") or []
+    if risk_notes:
+        lines.append("## Unresolved Risk Notes")
+        lines.append("")
+        lines.extend(f"- {n}" for n in risk_notes)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_dedup_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# De-dup / Simplify", "", content.get("approach_summary", ""), ""]
+    before, after = content.get("duplication_percent_before"), content.get("duplication_percent_after")
+    lines.append(f"Duplication: {before if before is not None else '?'}% -> {after if after is not None else '?'}%")
+    lines.append(f"Regression risk: {content.get('regression_risk', '')}")
+    lines.append("")
+    for cf in content.get("changed_files") or []:
+        lines.append(f"- **{cf.get('change_kind', '')}** `{cf.get('path', '')}` -- {cf.get('summary', '')}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_license_audit_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# License Audit", "", content.get("summary", ""), ""]
+    for c in content.get("classifications") or []:
+        flag = " ⚠️ dual/exception" if c.get("dual_or_exception_flag") else ""
+        lines.append(f"- **{c.get('package_name', '')}** ({c.get('ecosystem', '')}): {c.get('detected_license', '')} -- {c.get('bucket', '')} [{c.get('confidence', '')}]{flag}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_p0_baseline_markdown(content: dict[str, Any]) -> str:
+    spec = content.get("as_built_spec") or {}
+    plan = content.get("as_built_plan") or {}
+    lines: list[str] = ["# As-Built Baseline (inferred)", "", "Every story below is `origin: inferred` -- derived from existing code, not a requirements spec.", ""]
+    for s in spec.get("user_stories") or []:
+        lines.append(f"### {s.get('us_id', '')}: {s.get('title', '')} [{s.get('confidence', '')}]")
+        lines.append(s.get("narrative", ""))
+        lines.append("")
+    for ac in spec.get("acceptance_criteria") or []:
+        lines.append(f"- **{ac.get('ac_id', '')}** [{ac.get('confidence', '')}]: {ac.get('description', '')} (test: {ac.get('backing_test') or 'none'})")
+    if plan.get("file_inventory"):
+        lines.append("")
+        lines.append("## File Inventory")
+        lines.extend(f"- {f}" for f in plan["file_inventory"])
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_exit_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# Merge Readiness", "", f"**Ready to merge:** {content.get('merge_ready', False)}", ""]
+    blocking = content.get("blocking_reasons") or []
+    if blocking:
+        lines.append("## Blocking Reasons")
+        lines.append("")
+        lines.extend(f"- {r}" for r in blocking)
+        lines.append("")
+    lines.append(f"## {content.get('pr_title', '')}")
+    lines.append("")
+    lines.append(content.get("pr_description_markdown", ""))
+    lines.append("")
+    risk_notes = content.get("risk_notes") or []
+    if risk_notes:
+        lines.append("## Risk Notes")
+        lines.append("")
+        lines.extend(f"- {n}" for n in risk_notes)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_raw_requirements_markdown(content: dict[str, Any]) -> str:
+    """The document's own `content` field is already Markdown prose (unlike every other stage's
+    structured fields) -- this renderer is a passthrough, kept only so raw-requirements fits the
+    same render_markdown-per-stage convention every other stage uses."""
+    return (content.get("content") or "").strip() + "\n"

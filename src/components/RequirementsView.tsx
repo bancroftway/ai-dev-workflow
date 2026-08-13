@@ -39,26 +39,32 @@ export function RequirementsView() {
   });
 
   const state = (agent.state ?? {}) as WorkflowState;
+  const rawRequirements = state.stages?.["raw-requirements"];
+  // The document as ai-dev-workflow's own P1 stage sees it: its approved content once approved,
+  // otherwise its latest draft (the same "approved-else-draft" precedence workflow_persistence.py
+  // uses for the .md render) -- falls back to the raw seed text only before P1 has ever drafted
+  // anything (a brand new thread's very first paint).
+  const rawRequirementsContent =
+    ((rawRequirements?.approved_content ?? rawRequirements?.draft) as { content?: string } | null)?.content ??
+    state.raw_requirements_text;
 
   // Rehydrate the textarea once from server state (e.g. after a remount),
   // without ever clobbering text the human is actively editing.
   useEffect(() => {
-    if (!syncedRef.current && state.raw_requirements_text) {
-      setText(state.raw_requirements_text);
+    if (!syncedRef.current && rawRequirementsContent) {
+      setText(rawRequirementsContent);
       syncedRef.current = true;
     }
-  }, [state.raw_requirements_text]);
+  }, [rawRequirementsContent]);
   // Question ids are only stable "within the turn that produced it" (per the domain model),
-  // scoped to their own stage -- concatenating both stages' lists can produce the same id twice
-  // (e.g. both stages' latest turn independently minting a "CQ-1"), so the React key is
-  // stage-qualified rather than the bare id.
-  const questions = [
-    ...(state.stages?.specification?.clarifying_questions ?? []).map((q) => ({
-      ...q,
-      reactKey: `specification-${q.id}`,
-    })),
-    ...(state.stages?.plan?.clarifying_questions ?? []).map((q) => ({ ...q, reactKey: `plan-${q.id}` })),
-  ];
+  // scoped to their own stage -- concatenating multiple stages' lists can produce the same id
+  // twice (e.g. two stages' latest turn independently minting a "CQ-1"), so the React key is
+  // stage-qualified rather than the bare id. Only raw-requirements' own questions show here --
+  // specification/plan's questions surface on their own tabs, not this one.
+  const questions = (rawRequirements?.clarifying_questions ?? []).map((q) => ({
+    ...q,
+    reactKey: `raw-requirements-${q.id}`,
+  }));
 
   const disabled = text.trim().length === 0 || agent.isRunning || submitting;
 

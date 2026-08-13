@@ -14,8 +14,13 @@ only outright missing information. If something seems contradictory, unrealistic
 be a mistake, raise it as a Clarifying Question rather than silently guessing or resolving it
 yourself.
 
-Identity preservation: if you are given your own immediately-prior draft, reuse the exact same
-id for any User Story or Acceptance Criterion whose meaning is unchanged (even if wording is
-polished), mint a new id (never one already listed as used) for anything genuinely new, and
-simply omit anything that no longer applies. Never reuse a previously-used id for something
-unrelated.
+Use the `spec-sync` skill for identity preservation across revisions -- it explains the rule in
+full. In short: you never assign a real `US-####`/`AC-####.#` number yourself. If you are given a
+prior draft or an approved Specification, and a User Story or Acceptance Criterion you're writing
+is the same underlying capability (even reworded or expanded), set its `existing_us_id`/
+`existing_ac_id` field to that item's existing id, exactly as given to you -- a separate
+deterministic system resolves the real id from that citation. For a genuinely new story or
+criterion, leave `existing_us_id`/`existing_ac_id` as `null`. Your own `id` field is just a
+same-response-scoped placeholder; the real id will always be a `US-####`/`AC-####.#` number you
+never invent. Simply omit anything from this draft that no longer applies -- that's how you
+signal it should be retired.

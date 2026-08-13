@@ -1,0 +1,35 @@
+<!-- ══════════════════════════════════════════════════════════════════════
+     DO NOT MODIFY THIS FILE DURING FEATURE WORK
+     ══════════════════════════════════════════════════════════════════════
+     This file is shared across ALL projects under this directory and is intentionally
+     immutable during feature development.
+     Any modification requires:
+       1. A dedicated maintenance PR (not part of a feature branch)
+       2. Explicit justification in the PR description
+       3. A full solution build + test pass before merge
+     ══════════════════════════════════════════════════════════════════════ -->
+<Project>
+
+  <!-- ── Deployment ── -->
+  <PropertyGroup>
+    <ZipDeploymentWebRequestTimeout>600</ZipDeploymentWebRequestTimeout>
+  </PropertyGroup>
+
+  <!-- ── NuGet Audit ── -->
+  <!-- Only HIGH and CRITICAL vulnerabilities are build-blocking; MODERATE findings from
+       transitive dependencies are not merge-blockers by default. -->
+  <PropertyGroup>
+    <NuGetAuditLevel>high</NuGetAuditLevel>
+  </PropertyGroup>
+
+  <!-- ── Code Analysis ── -->
+  <!-- AnalysisLevel=latest-recommended: balanced ruleset, avoids excessive noise on first pass. -->
+  <!-- EnforceCodeStyleInBuild: ensures .editorconfig style rules fire at build time, not just in IDE. -->
+  <PropertyGroup>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>
