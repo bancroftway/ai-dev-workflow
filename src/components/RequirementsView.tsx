@@ -66,7 +66,11 @@ export function RequirementsView() {
     reactKey: `raw-requirements-${q.id}`,
   }));
 
-  const disabled = text.trim().length === 0 || agent.isRunning || submitting;
+  // A rejection is a hard stop, not a gate: resubmitting the same repository cannot change the
+  // verdict, so the submit button goes down with it. The only way forward is to point the session
+  // at a repository containing a runnable app -- or add one and start a new session.
+  const rejection = state.app_rejection ?? null;
+  const disabled = text.trim().length === 0 || agent.isRunning || submitting || rejection !== null;
 
   async function handleSubmit() {
     const trimmed = text.trim();
@@ -104,6 +108,31 @@ export function RequirementsView() {
           clarifying questions below.
         </p>
       </div>
+
+      {rejection && (
+        <div className="space-y-3 rounded-lg border border-red-300 bg-red-50 p-4">
+          <h2 className="text-sm font-medium text-red-900">
+            ai-dev-workflow cannot run on this repository
+          </h2>
+          <ul className="list-disc space-y-2 pl-5">
+            {rejection.reasons.map((reason, index) => (
+              <li key={index} className="text-sm text-red-900">
+                {reason}
+              </li>
+            ))}
+          </ul>
+          {rejection.found.length > 0 && (
+            <div className="text-xs text-red-700">
+              Found:{" "}
+              {rejection.found.map((app) => `${app.path} (${app.app_class})`).join(", ")}
+            </div>
+          )}
+          <p className="text-xs text-red-700">
+            This workflow only applies to repositories containing a startable web app, API, or
+            Azure Function. No changes were made to the repository.
+          </p>
+        </div>
+      )}
 
       {questions.length > 0 && (
         <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 p-4">

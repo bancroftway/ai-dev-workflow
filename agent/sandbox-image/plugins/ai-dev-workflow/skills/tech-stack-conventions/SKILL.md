@@ -1,6 +1,6 @@
 ---
 name: tech-stack-conventions
-description: Analyzes a repository's tech stack -- programming languages, frameworks, package managers, testing frameworks, existing coding conventions, and (for .NET repos) the shared solution root where a Directory.Build.props file belongs. Use this skill whenever asked to detect, identify, summarize, or report on a codebase's tech stack, languages, frameworks, dependencies, or build/test tooling, or whenever asked to locate a .NET solution root, a shared MSBuild props location, or "what stack is this repo built on." Also trigger on requests like "what languages/frameworks does this project use," "analyze this codebase's tech stack," or "profile this repository." This skill is read-only analysis -- it never writes, creates, or edits any file, and should be used even when the calling context has no write access at all.
+description: Analyzes a repository's tech stack -- programming languages, frameworks, package managers, testing frameworks, existing coding conventions, and the shared config roots where a repo-wide config file belongs (a .NET solution root for Directory.Build.props, a Node workspace root for eslint.config.mjs, a Python project root for ruff.toml/mypy.ini). Use this skill whenever asked to detect, identify, summarize, or report on a codebase's tech stack, languages, frameworks, dependencies, or build/test tooling, or whenever asked to locate a .NET solution root, a Node workspace root, a Python project root, a shared MSBuild props location, or "what stack is this repo built on." Also trigger on requests like "what languages/frameworks does this project use," "analyze this codebase's tech stack," or "profile this repository." This skill is read-only analysis -- it never writes, creates, or edits any file, and should be used even when the calling context has no write access at all.
 ---
 
 # Tech Stack Conventions
@@ -45,7 +45,15 @@ guess from filenames alone when the answer is one file-read away.
   file states them. A convention that's only ever been followed by habit is still worth reporting
   -- just note that it's observed, not declared.
 
-## .NET solution root detection
+## Shared-config root detection
+
+Several ecosystems need a *shared build-settings location*: one directory where a config file
+applies to every project beneath it. Someone else's deterministic code writes real files at the
+paths you report and commits them, so report only roots you actually verified, and say so plainly
+when you can't find a confident one. A missing root costs a repo one config file; a wrong root
+puts a config where it silently governs the wrong projects.
+
+### .NET solution root
 
 If the repo contains any `.csproj` or `.sln` files, find the **solution root**: the common
 ancestor directory of every `.csproj` file in the repo. This is where a shared
@@ -62,6 +70,25 @@ parent that makes sense as a build-settings root -- say so explicitly rather tha
 wrong guess here is worse than an honest "not confident," because nobody will double-check your
 answer before acting on it.
 
+### Node / TypeScript workspace root
+
+If the repo contains any `package.json`, report the directory holding the **workspace root** one:
+the `package.json` that declares `workspaces` (npm/yarn) or the directory holding
+`pnpm-workspace.yaml`, if either exists; otherwise the `package.json` nearest the repository root
+that the actual application code sits under. This is where a shared `eslint.config.mjs` belongs,
+and it is also where dev-dependencies get installed — so it must be a directory that really
+contains a `package.json`, not merely a common ancestor of several.
+
+A repo with several genuinely independent packages and no workspace declaration has no single
+root: say so rather than picking the first one you found.
+
+### Python project root
+
+If the repo contains Python source, report the directory holding `pyproject.toml`, `setup.cfg`, or
+`requirements.txt` — that is where a shared `ruff.toml`/`mypy.ini` belongs. If several exist,
+prefer the one whose directory is an ancestor of most of the `.py` files. If Python is only a
+handful of loose scripts with no manifest at all, the repository root (`""`) is the right answer.
+
 ## Reporting your findings
 
 End your response with a clear, complete summary covering every field below -- the caller extracts
@@ -77,13 +104,14 @@ structured data from what you say, so state each one explicitly rather than leav
 - **dotnet_detected**: whether you found any `.csproj`/`.sln` files at all.
 - **dotnet_solution_root**: the path from the section above, or an explicit statement of low
   confidence if you couldn't determine one.
+- **convention_roots**: the `node` and `python` roots from the sections above, as repo-relative
+  paths (`""` means the repository root). Report only the ones you're confident about, and omit a
+  key entirely rather than guessing.
 
-## Extending this skill for a new language's shared-convention detection
+## Extending this skill for another ecosystem
 
-This skill currently only knows how to locate a *shared build-settings location* for one
-ecosystem: .NET's solution root, for a `Directory.Build.props`. If a similar need comes up for
-another language -- e.g. a shared `pyproject.toml` root for a Python monorepo, or a repo-wide
-`.eslintrc` location for a JS/TS monorepo with multiple packages -- extend this section with the
-same shape: how to detect the relevant marker files, how to find their true common ancestor, and
-what confidence caveats matter for that ecosystem. Keep the "report the location, never write
-there yourself" boundary the same regardless of which language you're extending this for.
+The shared-config sections above cover .NET, Node/TypeScript and Python. If a similar need comes
+up for another ecosystem -- a Go module root, a Gradle settings root -- add a section in the same
+shape: which marker files identify the root, how to resolve one when several exist, and what
+confidence caveat matters for that ecosystem. Keep the "report the location, never write there
+yourself" boundary the same regardless of which one you're adding.

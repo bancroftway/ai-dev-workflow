@@ -20,6 +20,12 @@ EXIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("EXIT_MAX_CLARIFICATION_CYCLE
 # Small default: tech-stack detection is autonomous codebase study, not human-clarification-driven,
 # so this safety cap should rarely if ever trigger.
 TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFICATION_CYCLES", "2"))
+# Deliberately 1, and load-bearing: with a not-ready draft, make_route_after_draft sends
+# cycle_count >= max_cycles to auto_approve rather than to needs_clarification -> END. App
+# discovery gates the entire pipeline, so a model that withholds readiness must not be able to
+# halt the run silently -- an empty report reaches the decide node, which fails closed with a
+# reason that names the real cause.
+APP_DISCOVERY_MAX_CLARIFICATION_CYCLES = int(os.environ.get("APP_DISCOVERY_MAX_CLARIFICATION_CYCLES", "1"))
 
 # In-container path the sandbox image bakes the Agent Plugin content to (agent/sandbox-image/
 # Dockerfile's COPY plugins/ -> this path). Overridable for local spikes without a code change.

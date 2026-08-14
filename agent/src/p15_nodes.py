@@ -17,11 +17,11 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from . import approvals, git_ops, repo_files, spec_ledger
+from . import approvals, git_ops, preflight_nodes, repo_files, spec_ledger
+from .preflight_nodes import MANIFEST_PATH
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 
-MANIFEST_PATH = ".ai-dev-workflow/manifest.json"
 CHANGELOG_PATH = "CHANGELOG.md"
 
 
@@ -78,18 +78,25 @@ async def p15_finalize_node(state: dict[str, Any], config: RunnableConfig) -> di
     exit_stage = (state.get("stages") or {}).get("p15-exit", {})
     merge_readiness = exit_stage.get("approved_content")
 
-    manifest = {
-        "run_id": run_id,
-        "timestamp": timestamp,
-        "requirements_content_hash": _hash_content(raw_requirements),
-        "approval_hashes": {
-            "specification": spec_approval.content_sha256 if spec_approval else None,
-            "plan": plan_approval.content_sha256 if plan_approval else None,
+    # Read-modify-write, never a wholesale overwrite: manifest.json is co-owned. P0 owns
+    # `onboarded`, app discovery owns `app_check`, and this node owns the keys below. Overwriting
+    # the file (as this node used to) deleted `onboarded` at the end of every run, silently
+    # re-triggering brownfield onboarding on the next one.
+    await preflight_nodes.update_manifest(
+        provider,
+        thread_id,
+        {
+            "run_id": run_id,
+            "timestamp": timestamp,
+            "requirements_content_hash": _hash_content(raw_requirements),
+            "approval_hashes": {
+                "specification": spec_approval.content_sha256 if spec_approval else None,
+                "plan": plan_approval.content_sha256 if plan_approval else None,
+            },
+            "metrics_summary": metrics_summary.get("traceability_summary"),
+            "merge_readiness": merge_readiness,
         },
-        "metrics_summary": metrics_summary.get("traceability_summary"),
-        "merge_readiness": merge_readiness,
-    }
-    await repo_files.write_repo_file(provider, thread_id, MANIFEST_PATH, json.dumps(manifest, indent=2) + "\n")
+    )
 
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
     snapshot_path = f".ai-dev-workflow/history/{run_id}-ledger-snapshot.json"

@@ -52,6 +52,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "ag-ui-langgraph" },
     { name = "copilotkit" },
+    { name = "defusedxml" },
     { name = "fastapi" },
     { name = "github-copilot-sdk" },
     { name = "langchain-core" },
@@ -65,6 +66,7 @@ dependencies = [
 requires-dist = [
     { name = "ag-ui-langgraph", specifier = ">=0.0.42" },
     { name = "copilotkit", specifier = ">=0.1.94" },
+    { name = "defusedxml", specifier = ">=0.7.1" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "github-copilot-sdk", specifier = ">=1.0.9" },
     { name = "langchain-core", specifier = ">=1.5.3" },
@@ -213,6 +215,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/68/e3/d40a7f8698e29efaa5eeb2064a68c1d8a51f1346390021d5cc76fc08d8a2/copilotkit-0.1.94.tar.gz", hash = "sha256:a60a56aeba8127f3eb382337e5799a9bc4b31fb506bc308045c0050abc6a4488", size = 49487, upload-time = "2026-06-04T17:41:36.766Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/51/48/b22f4cbd7f8a6e2f3e80260e6aef06d845fa38f469ac4dd1bf2e14e44766/copilotkit-0.1.94-py3-none-any.whl", hash = "sha256:424e657118bebc055d5f89d1e93290773ff33c05860a3da242653ed8446affa8", size = 58434, upload-time = "2026-06-04T17:41:35.479Z" },
+]
+
+[[package]]
+name = "defusedxml"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/d5/c66da9b79e5bdb124974bfe172b4daf3c984ebd9c2a06e2b8a4dc7331c72/defusedxml-0.7.1.tar.gz", hash = "sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69", size = 75520, upload-time = "2021-03-08T10:59:26.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl", hash = "sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61", size = 25604, upload-time = "2021-03-08T10:59:24.45Z" },
 ]
 
 [[package]]

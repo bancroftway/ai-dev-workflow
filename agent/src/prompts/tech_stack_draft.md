@@ -9,6 +9,14 @@ language/framework/package-manager/testing-framework you found evidence for, the
 observed (each with a short reason), whether any `.csproj`/`.sln` files exist (`dotnet_detected`),
 and — if so — the repo-relative path to the common ancestor of all `.csproj` files
 (`dotnet_solution_root`), or an explicit statement that you couldn't determine one confidently.
+
+Also report `convention_roots`: the repo-relative directory where each non-.NET ecosystem's shared
+config file belongs — `node` (the workspace root holding `package.json`) and `python` (the project
+root holding `pyproject.toml`/`setup.cfg`/`requirements.txt`). Use `""` for the repository root
+itself. Omit a key entirely when that ecosystem isn't present, or when the repo has several
+unrelated roots and no single one is the obvious home — deterministic code writes real files at
+these paths, so a wrong root is worse than a missing one.
+
 Leave `conventions_applied` empty — that field is populated later, by deterministic code, not by
 you.
 

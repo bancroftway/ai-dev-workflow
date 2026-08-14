@@ -5,14 +5,24 @@ the generic StageSpec template nor RebuildSpec express on their own.
 Chain: p8_scan -> p8_triage -> p8_ledger_write -> p8_fix -> R(p8) -> p8_gate_check ->
 (loop to p8_scan | p8_human_gate).
 
+The non-.NET half of the scan is delegated to src/repo_scan.py's `quality` profile (jscpd
+duplication + lizard per-function complexity), so there is one implementation of each tool
+invocation rather than one per caller. The two `dotnet` commands stay here on purpose: they are
+build-coupled, not scan-coupled, and hoisting them into the scanner would drag rebuild.py's
+per-stack build resolution along with them for nothing.
+
+Quality findings gate on what *this pipeline introduced*, measured against the baseline scan taken
+at the top of the graph -- a brownfield repo's pre-existing complexity debt is reported on the
+dashboard and burned down over time, not treated as a reason its first gate can never pass. With
+no baseline (a greenfield repo, or a repo predating repo_scan) every finding gates, which is the
+same rule. Analyzer errors and the duplication threshold remain absolute, exactly as before.
+
 Verification status, stated plainly: this module has NOT been exercised against a real sandbox.
-The exact analyzer invocation (dotnet build's SARIF ErrorLog path, jscpd's CLI flags, dotnet
-format's report format) is written to the best of available documentation, not confirmed live --
-unlike P0/P1/P2/P4's node clusters, all of which were verified against a real running container.
-The sandbox image also does not yet install jscpd or ship any SonarAnalyzer package reference --
-both would need to be added (jscpd via a Dockerfile `npm install -g jscpd`; SonarAnalyzer.CSharp
-is a NuGet package a target .NET repo would need itself, not something the sandbox image installs)
-before this can run for real.
+The exact analyzer invocation (dotnet build's SARIF ErrorLog path, dotnet format's report format)
+is written to the best of available documentation, not confirmed live -- unlike P0/P1/P2/P4's node
+clusters, all of which were verified against a real running container. The sandbox image does not
+ship any SonarAnalyzer package reference (SonarAnalyzer.CSharp is a NuGet package a target .NET
+repo would need itself, not something the sandbox image installs).
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
-from .. import git_ops, model_config, repo_files
+from .. import git_ops, model_config, repo_files, repo_scan
 from ..copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 
 # SonarQube MCP -- code-complete, UNVERIFIED (no live SonarQube server in this environment to spike
@@ -54,7 +64,11 @@ _SEVERITY_MAP = {"error": "error", "warning": "warning", "note": "info", "none":
 
 SARIF_PATH = "agent-work/analyzers.sarif"
 FORMAT_REPORT_PATH = "agent-work/format-report.json"
-JSCPD_REPORT_PATH = "agent-work/jscpd/jscpd-report.json"
+
+# Categories gated on the baseline delta rather than absolutely. `duplication` is deliberately not
+# here: it is already gated absolutely by P8_MAX_DUPLICATION_PERCENT below, and counting it twice
+# would just make one threshold breach fail two checks.
+QUALITY_GATE_CATEGORIES = frozenset({"maintainability"})
 
 
 class P8State(TypedDict):
@@ -64,6 +78,9 @@ class P8State(TypedDict):
     duplication_percent: float | None
     format_clean: bool | None
     baseline_commit: str | None
+    # Quality finding ids present in the repo *before* this pipeline touched it. None means no
+    # baseline was recorded, in which case every quality finding gates.
+    baseline_quality_ids: list[str] | None
     build_ok: bool
     last_gate_report: dict[str, Any] | None
 
@@ -76,9 +93,24 @@ def default_p8_state() -> P8State:
         "duplication_percent": None,
         "format_clean": None,
         "baseline_commit": None,
+        "baseline_quality_ids": None,
         "build_ok": True,
         "last_gate_report": None,
     }
+
+
+async def _baseline_quality_ids(provider: Any, thread_id: str) -> list[str] | None:
+    raw = await repo_files.read_repo_file(provider, thread_id, repo_scan.BASELINE_PATH)
+    if raw is None:
+        return None
+    try:
+        baseline = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    findings = baseline.get("findings")
+    if findings is None:
+        return None
+    return sorted(f["id"] for f in findings if f.get("category") in QUALITY_GATE_CATEGORIES)
 
 
 async def p8_scan_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -126,20 +158,15 @@ async def p8_scan_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         p8["build_ok"] = True
         p8["format_clean"] = True
 
-    jscpd_result = await provider.exec_in_sandbox(
-        thread_id,
-        f"mkdir -p agent-work/jscpd && npx --yes jscpd . --threshold {P8_MAX_DUPLICATION_PERCENT} "
-        f"--reporters json --output agent-work/jscpd 2>&1",
-    )
-    raw_jscpd = await repo_files.read_repo_file(provider, thread_id, JSCPD_REPORT_PATH)
-    if raw_jscpd is not None:
-        try:
-            jscpd_doc = json.loads(raw_jscpd)
-            p8["duplication_percent"] = jscpd_doc.get("statistics", {}).get("total", {}).get("percentage")
-        except json.JSONDecodeError:
-            p8["duplication_percent"] = None
-    elif not jscpd_result.ok:
-        p8["duplication_percent"] = None
+    # jscpd (duplication) + lizard (per-function complexity), through the shared scanner so these
+    # invocations live in exactly one place. include_metrics=True because the duplication *number*
+    # is what the gate compares, not just the finding.
+    scan = await repo_scan.run_repo_scan(provider, thread_id, profile="quality", include_metrics=True)
+    findings.extend(scan.findings)
+    p8["duplication_percent"] = (scan.metrics.get("duplication") or {}).get("percent")
+
+    if p8["baseline_quality_ids"] is None:
+        p8["baseline_quality_ids"] = await _baseline_quality_ids(provider, thread_id)
 
     # Only findings not already decided this run carry forward for triage -- bounds token cost
     # across loop iterations, per the plan's own design intent.
@@ -310,16 +337,37 @@ async def p8_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> d
     provider = get_sandbox_provider()
     no_silent = await check_no_silent_suppression(provider, thread_id, p8["baseline_commit"])
 
-    unsuppressed_errors = [
-        f for f in p8["findings"]
-        if f["severity"] == "error" and p8["decisions"].get(f["finding_key"], {}).get("decision") != "suppress"
+    def _unsuppressed(finding: dict[str, Any]) -> bool:
+        return p8["decisions"].get(finding["finding_key"], {}).get("decision") != "suppress"
+
+    unsuppressed_errors = [f for f in p8["findings"] if f["severity"] == "error" and _unsuppressed(f)]
+
+    # Introduced-only, per the module docstring. A corroborated finding is still one real finding
+    # here -- dedup collapses duplicates, never the issue itself, so this can't drop a count below
+    # the bar and pass a tree that should have failed.
+    baseline_ids = p8.get("baseline_quality_ids")
+    quality_findings = [f for f in p8["findings"] if f.get("category", "sast") in QUALITY_GATE_CATEGORIES]
+    introduced_quality = [
+        f for f in quality_findings
+        if (baseline_ids is None or f["finding_key"] not in baseline_ids) and _unsuppressed(f)
     ]
+
     duplication_ok = p8["duplication_percent"] is None or p8["duplication_percent"] <= P8_MAX_DUPLICATION_PERCENT
 
-    passed = p8["build_ok"] and not unsuppressed_errors and (p8["format_clean"] is not False) and duplication_ok and no_silent.passed
+    passed = (
+        p8["build_ok"]
+        and not unsuppressed_errors
+        and not introduced_quality
+        and (p8["format_clean"] is not False)
+        and duplication_ok
+        and no_silent.passed
+    )
     report = {
         "passed": passed,
         "unsuppressed_errors": [f["finding_key"] for f in unsuppressed_errors],
+        "introduced_quality_findings": [f["finding_key"] for f in introduced_quality],
+        "pre_existing_quality_findings": len(quality_findings) - len(introduced_quality),
+        "quality_gate_scope": "introduced_only" if baseline_ids is not None else "absolute_no_baseline",
         "format_clean": p8["format_clean"],
         "duplication_percent": p8["duplication_percent"],
         "no_silent_suppression": {"bare_markers": no_silent.bare_markers, "dangling_refs": no_silent.dangling_refs},

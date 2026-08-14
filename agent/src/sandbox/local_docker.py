@@ -34,6 +34,31 @@ _CONTAINER_NAME_PREFIX = "ai-dev-workflow-sandbox-"
 WORKSPACE_DIR_IN_CONTAINER = "/workspace/repo"
 
 
+# Package-cache volume, mounted at the image's own AIDW_CACHE_DIR. Scoped per repo *owner* rather
+# than globally or per session: a global volume would let one customer's repo write package
+# tarballs a different customer's session later reads, and a per-session volume caches nothing.
+# Only the cache is shared -- /opt/aidw/tools (executables) deliberately stays in the container's
+# writable layer, since an executable on PATH is what would actually carry an attack across
+# sessions. See the Dockerfile's /opt/aidw section.
+# ponytail: no eviction -- these grow without bound. Add a size check plus `npm cache verify` /
+# `mise cache clear` on provision if a dev machine ever notices.
+_CACHE_DIR_IN_CONTAINER = "/opt/aidw/cache"
+_CACHE_VOLUME_PREFIX = "aidw-cache-"
+
+
+def _cache_volume_name(repo_clone_url: str) -> str:
+    """Docker volume name for this repo's owner, derived from the clone URL.
+
+    Falls back to a single "shared" volume only when no owner can be parsed -- never to a
+    per-customer guess.
+    """
+    trimmed = repo_clone_url.rstrip("/").removesuffix(".git")
+    parts = [segment for segment in trimmed.split("/") if segment]
+    owner = parts[-2] if len(parts) >= 2 else ""
+    slug = "".join(char if char.isalnum() or char in "-_" else "-" for char in owner.lower())
+    return f"{_CACHE_VOLUME_PREFIX}{slug or 'shared'}"
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -101,6 +126,11 @@ class LocalDockerProvider(SandboxProvider):
                 container_name,
                 "-p",
                 f"{host_port}:{_COPILOT_PORT_IN_CONTAINER}",
+                # Created on demand by Docker; nothing pre-provisions it. The container works
+                # identically without this mount (every cache path is an ENV in the image), so
+                # this is purely a warm-start accelerator.
+                "-v",
+                f"{_cache_volume_name(repo_clone_url)}:{_CACHE_DIR_IN_CONTAINER}",
                 "-e",
                 f"REPO_CLONE_URL={repo_clone_url}",
                 "-e",
@@ -113,6 +143,11 @@ class LocalDockerProvider(SandboxProvider):
                 f"COPILOT_CONNECTION_TOKEN={connection_token}",
                 "-e",
                 f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
+                # Stamped into bootstrap.sh's toolchain report, so a "this repo needed a toolchain
+                # the image lacks" finding is attributable to a specific image rather than to the
+                # fleet in general.
+                "-e",
+                f"AIDW_IMAGE_REF={image or self._image}",
                 image or self._image,
             )
             if returncode != 0:

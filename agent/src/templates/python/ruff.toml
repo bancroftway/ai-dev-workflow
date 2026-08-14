@@ -1,0 +1,50 @@
+# ══════════════════════════════════════════════════════════════════════
+# DO NOT MODIFY THIS FILE DURING FEATURE WORK
+# aidw-template-version: 1
+# ══════════════════════════════════════════════════════════════════════
+# Written by ai-dev-workflow as this repo's shared quality/security baseline, and intentionally
+# immutable during feature development -- the same policy as .NET's Directory.Build.props.
+# Any modification requires:
+#   1. A dedicated maintenance PR (not part of a feature branch)
+#   2. Explicit justification in the PR description
+#   3. A full lint + typecheck + test pass before merge
+#
+# Enforced as a build failure: the pipeline runs `ruff check .`, whose non-zero exit is what makes
+# a violation impossible to report as finished.
+# ══════════════════════════════════════════════════════════════════════
+
+line-length = 120
+
+exclude = [".venv", "venv", "node_modules", "build", "dist", ".git", "migrations", "agent-work"]
+
+[lint]
+# S is the bandit port -- the security ruleset is the reason bandit is NOT installed separately;
+# running both would double-report every finding.
+select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "W",     # pycodestyle warnings
+    "I",     # import sorting
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # bugbear
+    "A",     # builtin shadowing
+    "C4",    # comprehensions
+    "S",     # bandit (security)
+    "ASYNC", # async correctness
+    "SIM",   # simplification
+    "RET",   # return consistency
+    "PTH",   # pathlib over os.path
+    "PL",    # pylint subset
+    "RUF",   # ruff-specific
+]
+# E501 is left to the formatter: a long line is a formatting fact, not a defect, and erroring on it
+# spends the agent's fix cycles on reflow instead of on real findings.
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# assert IS the mechanism in a test, so S101 there is noise by construction.
+"**/test_*.py" = ["S101"]
+"**/*_test.py" = ["S101"]
+"**/tests/**" = ["S101"]
+"**/conftest.py" = ["S101"]

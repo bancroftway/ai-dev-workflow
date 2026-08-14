@@ -114,11 +114,58 @@ def render_tech_stack_markdown(content: dict[str, Any]) -> str:
         lines.append("Not detected.")
     lines.append("")
 
+    convention_roots = content.get("convention_roots") or {}
+    if convention_roots:
+        lines.append("## Shared Config Roots")
+        lines.append("")
+        lines.extend(
+            f"- `{key}`: `{value or '(repository root)'}`" for key, value in sorted(convention_roots.items())
+        )
+        lines.append("")
+
     conventions_applied = content.get("conventions_applied") or []
     if conventions_applied:
         lines.append("## Conventions Applied This Run")
         lines.append("")
         lines.extend(f"- {c}" for c in conventions_applied)
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_app_discovery_markdown(content: dict[str, Any]) -> str:
+    lines: list[str] = ["# Runnable Applications", ""]
+
+    apps = content.get("apps") or []
+    if not apps:
+        lines.append("No applications were found in this repository.")
+        lines.append("")
+    for app in apps:
+        lines.append(f"## {app.get('name') or app.get('path')} (`{app.get('path')}`)")
+        lines.append("")
+        lines.append(f"- Class: {app.get('app_class')}")
+        lines.append(f"- Runtime: {app.get('runtime')}")
+        lines.append(f"- Start command: `{app.get('start_command')}`" if app.get("start_command") else "- Start command: none")
+        if app.get("port"):
+            lines.append(f"- Port: {app['port']}")
+        lines.append(f"- Confidence: {app.get('confidence')}")
+        evidence = app.get("evidence") or []
+        if evidence:
+            lines.append("- Evidence:")
+            lines.extend(f"  - {e}" for e in evidence)
+        lines.append("")
+
+    reasons = content.get("rejection_reasons") or []
+    if reasons:
+        lines.append("## Why this repository is not suitable")
+        lines.append("")
+        lines.extend(f"- {r}" for r in reasons)
+        lines.append("")
+
+    if content.get("notes"):
+        lines.append("## Notes")
+        lines.append("")
+        lines.append(content["notes"])
         lines.append("")
 
     return "\n".join(lines).strip() + "\n"

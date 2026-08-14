@@ -432,7 +432,9 @@ No custom **agents** (LangGraph subagents, distinct from skills) are used anywhe
 
 **Prompt** (`agent/src/prompts/tech_stack_draft.md`): names the `tech-stack-conventions` skill explicitly, read-only.
 
-**`post_audit_hook`** (`preflight_nodes.apply_dotnet_conventions_if_applicable`): writes `Directory.Build.props` at the reported solution root if `dotnet_detected` and confidently rooted; appends idempotent `AGENTS.md` guidance paragraph. ⚠️ See [Known Issues](#known-issues) — the solution-root path is interpolated unquoted into a shell command.
+**`post_approve_hook`** (`preflight_nodes.apply_stack_conventions`): writes each detected ecosystem's build-blocking config — `Directory.Build.props` at the reported .NET solution root, `eslint.config.mjs` (plus its dev-dependencies) at the Node root, `ruff.toml`/`mypy.ini` at the Python root — and appends one idempotent `AGENTS.md` paragraph per ecosystem. ⚠️ See [Known Issues](#known-issues) — the solution-root path is interpolated unquoted into a shell command.
+
+Moved from `post_audit_hook` deliberately: hydration marks the stage approved inside `make_draft_node` and routes `already_approved` past both the audit and gate nodes, so a `post_audit_hook` never fires again for a repo that has been onboarded once — every already-onboarded repo would have silently missed both new ecosystems and any updated .NET template. Files carry an `aidw-template-version` stamp so a bumped template re-applies; a file lacking our header sentinel is treated as human-authored and never touched.
 
 **Idempotency**: `tech-stack.approved.json` existing gates the skip via `hydrate_from_repo_file` — ✅ working correctly (post-fix).
 
@@ -694,7 +696,7 @@ Several places in code written this session interpolated LLM-controlled or other
 
 - `agent/src/repo_files.py::write_repo_file`/`read_repo_file`/`reset_ledger`/`append_ledger_entry` — added `validate_repo_relative_path()` (rejects leading `/`, `..` traversal, and any character outside a conservative allowlist) plus `shlex.quote()` on every interpolated path.
 - `agent/src/git_ops.py::commit_paths` — replaced manual backslash-escaping with `shlex.quote()` on every path and the commit message, plus `validate_repo_relative_path()` per path, plus `git add --` (prevents a path starting with `-` from being read as a flag).
-- `agent/src/preflight_nodes.py::apply_dotnet_conventions_if_applicable` — no code change needed here specifically; it was already protected once `write_repo_file` itself validates/quotes its `path` argument (the fix is in the shared helper, not each caller).
+- `agent/src/preflight_nodes.py::apply_stack_conventions` (then named `apply_dotnet_conventions_if_applicable`) — no code change needed here specifically; it was already protected once `write_repo_file` itself validates/quotes its `path` argument (the fix is in the shared helper, not each caller).
 - `agent/src/gates/diagram_gate.py::_render_one` — added a strict `^[A-Za-z0-9_-]{1,64}$` validation on the model-reported diagram `name` (rejecting, not silently sanitizing, an unsafe name) plus `shlex.quote()` on the mmdc command's file paths.
 
 Verified with a small standalone script confirming real repo-relative paths pass and path-traversal/shell-metacharacter payloads (`../../etc/passwd`, `foo; rm -rf /`, `` foo`whoami` ``, `foo$(whoami)`) are all rejected by `validate_repo_relative_path`.

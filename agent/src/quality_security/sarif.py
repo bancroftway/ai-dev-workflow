@@ -2,6 +2,11 @@
 each of which speaks SARIF, into one common `Finding` shape (plan's own design intent: "one
 shared parser"). gitleaks does not emit SARIF -- P10's own scan node parses its native JSON
 report separately and constructs `Finding`s directly, reusing `finding_key` for consistency.
+
+`Finding` carries a second, optional tier of fields (category/cve/aliases/package/...) used by
+repo_scan.py's cross-tool dedup and dashboard report. They are deliberately optional and are
+omitted from `to_dict()` when left at their defaults, so P8/P10's triage prompts -- which
+json.dumps() these dicts straight into an LLM context -- do not grow a tail of nulls.
 """
 
 from __future__ import annotations
@@ -25,8 +30,19 @@ class Finding:
     cwe: str | None = None
     status: str = "open"
 
+    # Optional second tier -- see module docstring. Tuples, not lists: this dataclass is frozen.
+    category: str = "sast"
+    title: str = ""
+    end_line: int | None = None
+    cve: str | None = None
+    aliases: tuple[str, ...] = ()
+    package: dict[str, Any] | None = None
+    severity_source: str = "native"
+    sources: tuple[str, ...] = ()
+    occurrences: int = 1
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        base = {
             "finding_key": self.finding_key,
             "tool": self.tool,
             "rule_id": self.rule_id,
@@ -38,6 +54,24 @@ class Finding:
             "cwe": self.cwe,
             "status": self.status,
         }
+        for name, default in _OPTIONAL_FIELDS:
+            value = getattr(self, name)
+            if value != default:
+                base[name] = list(value) if isinstance(value, tuple) else value
+        return base
+
+
+_OPTIONAL_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("category", "sast"),
+    ("title", ""),
+    ("end_line", None),
+    ("cve", None),
+    ("aliases", ()),
+    ("package", None),
+    ("severity_source", "native"),
+    ("sources", ()),
+    ("occurrences", 1),
+)
 
 
 def make_finding_key(tool: str, rule_id: str, file: str) -> str:

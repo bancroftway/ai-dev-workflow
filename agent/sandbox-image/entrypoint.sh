@@ -48,6 +48,13 @@ EOF
   unset GIT_USER_TOKEN
 
   cd "$WORKSPACE_DIR"
+
+  # Toolchain bootstrap runs here specifically: after the credential material is gone (it acts on
+  # repo-supplied content, and must never see the token) and before the Copilot runtime is exec'd
+  # (so a repo's pinned Node/.NET version is already on PATH for every later build and test).
+  # Non-fatal by design -- see bootstrap.sh's own header.
+  ai-dev-workflow-bootstrap.sh "$WORKSPACE_DIR" || \
+    echo "entrypoint: bootstrap reported a failure -- continuing (a missing toolchain surfaces as a real build error later)" >&2
 else
   echo "entrypoint: REPO_CLONE_URL not set -- skipping clone, starting a bare sandbox"
   mkdir -p "$WORKSPACE_DIR"

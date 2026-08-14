@@ -148,6 +148,16 @@ class TechStack(BaseModel):
         description="Repo-relative path to the common ancestor of all .csproj files (where "
         "Directory.Build.props belongs), or None if not confidently determined.",
     )
+    convention_roots: dict[str, str] = Field(
+        default_factory=dict,
+        description="Repo-relative directory where each non-.NET ecosystem's shared config file "
+        "belongs, keyed by ecosystem: 'node' (the workspace root holding package.json) and "
+        "'python' (the project root holding pyproject.toml/setup.cfg/requirements.txt). Use \"\" "
+        "for the repository root itself. Omit a key entirely when the ecosystem isn't present or "
+        "no confident common root exists -- a wrong root is worse than a missing one. .NET keeps "
+        "its own dotnet_solution_root field above rather than a key here, because several "
+        "pipeline stages already read that field by name.",
+    )
     conventions_applied: list[str] = Field(
         default_factory=list,
         description="Which language-specific convention files were actually written this run "

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
-from .. import repo_files
+from .. import repo_files, repo_scan
 from ..sandbox import registry as sandbox_registry
 from ..sandbox.factory import get_sandbox_provider
 from ..sandbox.provider import SandboxProvider
@@ -70,19 +70,10 @@ async def _write_license_approvals(
 
 
 async def _run_jscpd(provider: SandboxProvider, thread_id: str) -> float | None:
-    await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work/jscpd")
-    await provider.exec_in_sandbox(
-        thread_id,
-        f"npx --yes jscpd . --threshold {P11_MAX_DUPLICATION_PERCENT} --reporters json --output agent-work/jscpd 2>&1",
-    )
-    raw = await repo_files.read_repo_file(provider, thread_id, "agent-work/jscpd/jscpd-report.json")
-    if raw is None:
-        return None
-    try:
-        doc = json.loads(raw)
-        return doc.get("statistics", {}).get("total", {}).get("percentage")
-    except json.JSONDecodeError:
-        return None
+    """Through the shared scanner (src/repo_scan.py), so jscpd's invocation and report parsing
+    exist in one place rather than here *and* in P8's scan node."""
+    scan = await repo_scan.run_repo_scan(provider, thread_id, tools=["jscpd"], include_metrics=True)
+    return (scan.metrics.get("duplication") or {}).get("percent")
 
 
 async def rerun_jscpd_after_dedup(thread_id: str, content_dict: dict[str, Any], _state: "GraphState", provider: SandboxProvider) -> None:
@@ -175,18 +166,19 @@ async def p11b_pre_node(state: dict[str, Any], config: RunnableConfig) -> dict[s
         p11["jscpd_report_for_dedup"] = "(no sandbox -- nothing to scan)"
         return {"p11": p11}
     provider = get_sandbox_provider()
-    await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work/jscpd")
-    result = await provider.exec_in_sandbox(
-        thread_id, f"npx --yes jscpd . --threshold {P11_MAX_DUPLICATION_PERCENT} --reporters json,console --output agent-work/jscpd 2>&1"
-    )
-    p11["jscpd_report_for_dedup"] = (result.stdout or result.stderr or "(jscpd produced no output)")[-6000:]
+    scan = await repo_scan.run_repo_scan(provider, thread_id, tools=["jscpd"], include_metrics=True)
+    duplication = scan.metrics.get("duplication") or {}
+    # The parsed clone list rather than a truncated console tail: same underlying report, but the
+    # model gets file/line pairs it can act on instead of 6000 characters cut mid-table.
+    p11["jscpd_report_for_dedup"] = json.dumps(duplication, indent=2) if duplication else "(jscpd produced no report)"
     return {"p11": p11}
 
 
 def _resolve_license_scan_command(tech_stack: dict[str, Any]) -> str | None:
     if tech_stack.get("dotnet_detected"):
-        # Best-effort -- requires the nuget-license dotnet tool to already be available; not
-        # installed by the sandbox image today (same caveat as P8/P10's uninstalled scanners).
+        # Best-effort -- requires the nuget-license dotnet tool to already be available; it is
+        # pulled as a `dotnet tool` in the target repo at scan time, not baked into the image
+        # (no target repo exists at image-build time), so absence here is tolerated, not fatal.
         return "dotnet tool run nuget-license --output json 2>&1"
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if "typescript" in languages or "javascript" in languages:

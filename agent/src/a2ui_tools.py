@@ -39,6 +39,7 @@ DEDUP_SURFACE_ID = "p11b-dedup"
 LICENSE_AUDIT_SURFACE_ID = "p11d-license-audit"
 EXIT_SURFACE_ID = "p15-exit"
 P0_BASELINE_SURFACE_ID = "p0-brownfield"
+APP_DISCOVERY_SURFACE_ID = "app-discovery"
 
 
 def _build_generic_envelope(surface_id: str, component_name: str, data_field: str, data: dict, audit_findings: list[str] | None = None) -> dict:
@@ -71,6 +72,10 @@ def build_exit_envelope(report: dict, audit_findings: list[str] | None = None) -
 
 def build_p0_baseline_envelope(baseline: dict, audit_findings: list[str] | None = None) -> dict:
     return _build_generic_envelope(P0_BASELINE_SURFACE_ID, "P0BaselineSurface", "baseline", baseline, audit_findings)
+
+
+def build_app_discovery_envelope(report: dict, audit_findings: list[str] | None = None) -> dict:
+    return _build_generic_envelope(APP_DISCOVERY_SURFACE_ID, "AppDiscoverySurface", "report", report, audit_findings)
 
 
 

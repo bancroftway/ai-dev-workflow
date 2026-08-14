@@ -25,9 +25,20 @@ export interface StageState {
   audit_findings: string[];
 }
 
+/** Set by agent/src/app_discovery.py's decide node when the repository contains no startable
+ * application. The one hard stop in the pipeline -- the run ends rather than pausing, so this is
+ * the only signal the human gets, alongside the chat message the reject node posts. */
+export interface AppRejection {
+  reasons: string[];
+  found: { path: string; app_class: string }[];
+  checked_at: string;
+}
+
 export interface WorkflowState {
   raw_requirements_text?: string;
+  app_rejection?: AppRejection | null;
   stages?: {
+    "app-discovery"?: StageState;
     "p0-brownfield"?: StageState;
     "tech-stack"?: StageState;
     "raw-requirements"?: StageState;
@@ -49,6 +60,7 @@ export interface WorkflowState {
 // intentionally absent here -- the Session Overview panel reads state.stages dynamically, so their
 // absence from this static list doesn't hide them from that panel, only from this ordered lookup.
 export const PIPELINE_STAGE_ORDER: { key: keyof NonNullable<WorkflowState["stages"]>; label: string }[] = [
+  { key: "app-discovery", label: "Runnable App Check" },
   { key: "p0-brownfield", label: "Preflight Baseline" },
   { key: "tech-stack", label: "Tech Stack" },
   { key: "raw-requirements", label: "Raw Requirements" },

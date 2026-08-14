@@ -2,12 +2,21 @@
 parameterized differently. Chain: p10_scan -> p10_triage -> p10_ledger_write -> p10_fix -> R(p10)
 -> p10_gate_check -> (loop to p10_scan | p10_human_gate).
 
+The tool invocations themselves now live in src/repo_scan.py's `security` profile (semgrep, trivy,
+gitleaks, and -- new here -- osv-scanner), which runs them fully offline against databases baked
+into the sandbox image, normalizes their three different severity models into one, and
+deduplicates across them. That dedup is the reason osv-scanner can be added at all: it and trivy
+agree on most advisories but name them differently, and without reconciliation the triage step
+would be asked to decide the same CVE twice under two names.
+
+Unlike P8's, this gate is absolute rather than delta-scoped: a vulnerability inherited from the
+repository's baseline is still an exploitable vulnerability.
+
 Verification status, stated plainly, same caveat as P8: NOT exercised against a real sandbox.
-Semgrep/Trivy/gitleaks are not installed by agent/sandbox-image/Dockerfile today -- all three
-would need adding (Semgrep and gitleaks are both pip/binary installs; Trivy is a binary release
-download, similar to how the Dockerfile already fetches the Copilot CLI binary) before this can
-run for real. Severity normalization is a real simplification from the plan's stated intent -- see
-severity.py's own docstring.
+Severity normalization is now a real mapping rather than the level-based approximation
+severity.py's docstring describes -- repo_scan.py parses trivy's JSON (which carries the vendor's
+own CRITICAL/HIGH/... tier) instead of its SARIF, and computes a CVSS v3.1 base score for OSV
+findings that carry only a vector.
 """
 
 from __future__ import annotations
@@ -20,25 +29,26 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
-from .. import git_ops, model_config, repo_files
+from .. import git_ops, model_config, repo_files, repo_scan
 from ..copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from ..sandbox import registry as sandbox_registry
 from ..sandbox.factory import get_sandbox_provider
-from .sarif import Finding, make_finding_key, parse_sarif
+from .sarif import Finding
 from .schemas import TriageResponse
-from .severity import GITLEAKS_SEVERITY, SEMGREP_SEVERITY_MAP, TRIVY_SEVERITY_MAP, meets_or_exceeds
+from .severity import meets_or_exceeds
 from .suppressions import append_suppression, check_no_silent_suppression
 
 P10_MAX_CYCLES = int(os.environ.get("P10_MAX_CYCLES", "3"))
-# The strict gate: zero unsuppressed findings of this severity or above (raised from
-# high/critical-only, per the plan's explicit "Stricter security gate" decision). INFO-tier
-# findings remain advisory-only, never blocking.
-P10_SEVERITY_FLOOR = os.environ.get("P10_SEVERITY_FLOOR", "low")
+# The strict gate: zero unsuppressed findings of this severity or above.
+#
+# Deliberately raised from "low" to "medium", and worth naming as a *relaxation* rather than
+# letting it slip in as a side effect: a low floor across semgrep plus two vulnerability databases
+# produces a long tail of advisory noise, and a triage step drowning in it is a triage step under
+# pressure to rubber-stamp suppressions. Nothing is lost from the dashboard -- low and info
+# findings are still collected, deduplicated and reported, they just do not block.
+P10_SEVERITY_FLOOR = os.environ.get("P10_SEVERITY_FLOOR", "medium")
 
-SEMGREP_SARIF_PATH = "agent-work/semgrep.sarif"
-TRIVY_SARIF_PATH = "agent-work/trivy.sarif"
 TRIVY_SBOM_PATH = ".ai-dev-workflow/sbom.cyclonedx.json"
-GITLEAKS_REPORT_PATH = "agent-work/gitleaks.json"
 
 
 class P10State(TypedDict):
@@ -61,32 +71,6 @@ def default_p10_state() -> P10State:
     }
 
 
-def _parse_gitleaks(raw_json: str) -> list[Finding]:
-    try:
-        entries = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(entries, list):
-        return []
-    findings: list[Finding] = []
-    for entry in entries:
-        rule_id = entry.get("RuleID", "gitleaks-secret")
-        file_path = entry.get("File", "unknown")
-        findings.append(
-            Finding(
-                finding_key=make_finding_key("gitleaks", rule_id, file_path),
-                tool="gitleaks",
-                rule_id=rule_id,
-                severity=GITLEAKS_SEVERITY,
-                raw_severity=GITLEAKS_SEVERITY,
-                file=file_path,
-                line=entry.get("StartLine"),
-                message=entry.get("Description", "Potential secret detected"),
-            )
-        )
-    return findings
-
-
 async def p10_scan_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     p10 = dict(state.get("p10") or default_p10_state())
@@ -99,32 +83,19 @@ async def p10_scan_node(state: dict[str, Any], config: RunnableConfig) -> dict[s
         head = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD")
         p10["baseline_commit"] = head.stdout.strip() if head.ok else None
 
-    findings: list[Finding] = []
-
     await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work .ai-dev-workflow")
-    await provider.exec_in_sandbox(
-        thread_id, f"semgrep scan --config auto --config p/security-audit --sarif --output {SEMGREP_SARIF_PATH} 2>&1"
+    # include_metrics=False: this is a gate, it wants findings, not a size/churn profile.
+    scan = await repo_scan.run_repo_scan(
+        provider, thread_id, profile="security", include_metrics=False
     )
-    raw_semgrep = await repo_files.read_repo_file(provider, thread_id, SEMGREP_SARIF_PATH)
-    if raw_semgrep is not None:
-        findings.extend(parse_sarif(raw_semgrep, SEMGREP_SEVERITY_MAP))
+    findings = list(scan.findings)
 
-    await provider.exec_in_sandbox(
-        thread_id, f"trivy fs --scanners vuln,misconfig,license --format sarif --output {TRIVY_SARIF_PATH} . 2>&1"
+    # The SBOM is a deliverable, not a finding -- kept here rather than folded into the scanner,
+    # and its failure is a hard infra assertion of its own (see p10_gate_check_node).
+    sbom_result = await provider.exec_in_sandbox(
+        thread_id, f"trivy fs --offline-scan --skip-db-update --format cyclonedx -o {TRIVY_SBOM_PATH} . 2>&1"
     )
-    raw_trivy = await repo_files.read_repo_file(provider, thread_id, TRIVY_SARIF_PATH)
-    if raw_trivy is not None:
-        findings.extend(parse_sarif(raw_trivy, TRIVY_SEVERITY_MAP))
-
-    sbom_result = await provider.exec_in_sandbox(thread_id, f"trivy fs --format cyclonedx -o {TRIVY_SBOM_PATH} . 2>&1")
     p10["sbom_ok"] = sbom_result.ok
-
-    # --no-git: working-tree-only, fast per-cycle re-scans -- a one-time full-history secret scan
-    # is a separate, out-of-scope item (flagged explicitly by the plan, not silently dropped).
-    await provider.exec_in_sandbox(thread_id, f"gitleaks detect --report-format json --report-path {GITLEAKS_REPORT_PATH} --no-git 2>&1")
-    raw_gitleaks = await repo_files.read_repo_file(provider, thread_id, GITLEAKS_REPORT_PATH)
-    if raw_gitleaks is not None:
-        findings.extend(_parse_gitleaks(raw_gitleaks))
 
     existing_keys = set(p10["decisions"].keys())
     p10["findings"] = [f.to_dict() for f in findings if f.finding_key not in existing_keys] + [
@@ -158,8 +129,8 @@ async def p10_triage_node(state: dict[str, Any], config: RunnableConfig) -> dict
     )
     prompt = (
         "Use the `security-triage` skill and, where relevant, the `security-review` skill's "
-        "reasoning. NEVER-SUPPRESS RULE: any finding with tool=gitleaks (a leaked secret) must be "
-        "decision=fix (rotate/remove) unless you can prove the value is an already-rotated, "
+        "reasoning. NEVER-SUPPRESS RULE: any finding with category=secret (a leaked credential) "
+        "must be decision=fix (rotate/remove) unless you can prove the value is an already-rotated, "
         "non-functional test fixture -- this is the single highest-risk rubber-stamp target. For "
         "every other finding, decide fix or suppress with specific, rule-aware, exploitability-"
         "based reasoning (never a rubber stamp). Findings:\n\n" + json.dumps(open_findings, indent=2)
@@ -172,9 +143,11 @@ async def p10_triage_node(state: dict[str, Any], config: RunnableConfig) -> dict
     findings_by_key = {f["finding_key"]: f for f in p10["findings"]}
     for decision in response.decisions:
         finding = findings_by_key.get(decision.finding_key)
-        if finding and finding["tool"] == "gitleaks" and decision.decision == "suppress":
+        if finding and finding.get("category") == "secret" and decision.decision == "suppress":
             # Never-suppress rule enforced deterministically, not just by prompt instruction --
-            # a triage response can't override this by asserting it anyway.
+            # a triage response can't override this by asserting it anyway. Keyed on the category
+            # rather than tool=gitleaks: after cross-tool dedup a secret found by both gitleaks and
+            # trivy carries whichever tool won the merge, and this rule must not depend on that.
             continue
         decisions[decision.finding_key] = {
             "decision": decision.decision,

@@ -41,11 +41,31 @@ def default_rebuild_state() -> RebuildState:
     return {"status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "", "last_exit_ok": False}
 
 
+# Each fragment is guarded by a test for the config file preflight_nodes.apply_stack_conventions
+# writes. That test, not a state flag, is what keeps a repo whose install failed (or whose own
+# lint config this pipeline deliberately deferred to) from being asked to pass a check that was
+# never set up -- the file's presence on disk is the only signal that is always true.
+_ESLINT_FRAGMENT = (
+    "if [ -f eslint.config.mjs ]; then npx --yes eslint . --max-warnings=0; "
+    "else echo 'no ai-dev-workflow eslint config -- skipping lint'; fi"
+)
+# `-p . --strict` verified to be a legal combination: the CLI flag overrides tsconfig's own
+# setting, so a repo that opted out of strict mode is still type-checked strictly here without
+# this pipeline rewriting its tsconfig.json.
+_TSC_FRAGMENT = "if [ -f tsconfig.json ]; then npx --yes tsc -p . --noEmit --strict; fi"
+_RUFF_FRAGMENT = "if [ -f ruff.toml ]; then ruff check .; fi"
+_MYPY_FRAGMENT = "if [ -f mypy.ini ]; then mypy .; fi"
+
+
 def _resolve_build_command(tech_stack: dict[str, Any]) -> str:
     """Parameterized by the tech-stack detection stage's own reported fields, not hardcoded to
-    one stack -- .NET gets a real clean+build, everything else currently falls back to a Node/TS
-    check (tsc --noEmit, or the repo's own `build` npm script if one exists) or, absent both
-    signals, a no-op success (nothing to gate on is not the same as a build failure)."""
+    one stack -- .NET gets a real clean+build, Node/TS gets its own build (or tsc) plus the lint
+    and strict typecheck that make analyzer findings fatal, Python gets ruff + mypy, and absent
+    any signal a no-op success (nothing to gate on is not the same as a build failure).
+
+    The non-.NET checks exist for the same reason `-warnaserror` does: an LLM only reliably fixes
+    what a deterministic tool refuses to accept. A lint warning that does not fail the build is
+    advice, and advice gets reported as "done"."""
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if tech_stack.get("dotnet_detected"):
         return "dotnet clean && dotnet build -warnaserror"
@@ -53,9 +73,10 @@ def _resolve_build_command(tech_stack: dict[str, Any]) -> str:
         return (
             "if [ -f package.json ] && node -e \"process.exit(require('./package.json').scripts?.build?0:1)\"; "
             "then npm run build; else npx --yes tsc --noEmit; fi"
+            f" && {_TSC_FRAGMENT} && {_ESLINT_FRAGMENT}"
         )
     if "python" in languages:
-        return "python -m py_compile $(git ls-files '*.py')"
+        return f"python -m py_compile $(git ls-files '*.py') && {_RUFF_FRAGMENT} && {_MYPY_FRAGMENT}"
     return "echo 'no build-command mapping for this stack -- nothing to check' && true"
 
 

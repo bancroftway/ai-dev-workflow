@@ -44,6 +44,8 @@ _CONTAINER_NAME_PREFIX = "aidevworkflow-sandbox-"
 _IP_WAIT_TIMEOUT_SECONDS = 60.0
 _REAP_POLL_SECONDS = 60.0
 WORKSPACE_DIR_IN_CONTAINER = "/workspace/repo"
+# Matches the image's own AIDW_CACHE_DIR and LocalDockerProvider's mount point.
+_CACHE_DIR_IN_CONTAINER = "/opt/aidw/cache"
 
 
 def _container_group_name(session_id: str) -> str:
@@ -107,6 +109,9 @@ class AzureContainerInstanceProvider(SandboxProvider):
                           -- used only if AZURE_ACI_IDENTITY is unset.
     Optional:
       AZURE_ACI_LOCATION -- defaults to the resource group's own location if unset.
+    Optional, and off by default -- the package-cache share mounted at /opt/aidw/cache (all three
+    must be set together, or none):
+      AIDW_CACHE_SHARE, AIDW_CACHE_STORAGE_ACCOUNT, AIDW_CACHE_STORAGE_KEY
     """
 
     def __init__(self, *, idle_timeout_seconds: float = 1800.0) -> None:
@@ -119,6 +124,9 @@ class AzureContainerInstanceProvider(SandboxProvider):
         self._registry_username = os.environ.get("AZURE_ACI_REGISTRY_USERNAME")
         self._registry_password = os.environ.get("AZURE_ACI_REGISTRY_PASSWORD")
         self._location = os.environ.get("AZURE_ACI_LOCATION")
+        self._cache_share = os.environ.get("AIDW_CACHE_SHARE")
+        self._cache_storage_account = os.environ.get("AIDW_CACHE_STORAGE_ACCOUNT")
+        self._cache_storage_key = os.environ.get("AIDW_CACHE_STORAGE_KEY")
         self._idle_timeout_seconds = idle_timeout_seconds
         self._sandboxes: dict[str, _RunningSandbox] = {}
         self._lock = asyncio.Lock()
@@ -161,6 +169,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 "--environment-variables",
                 f"REPO_BRANCH={branch}",
                 f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
+                f"AIDW_IMAGE_REF={image or self._sandbox_image}",
                 "--secure-environment-variables",
                 f"REPO_CLONE_URL={repo_clone_url}",
                 f"GIT_USER_TOKEN={git_user_token}",
@@ -169,6 +178,19 @@ class AzureContainerInstanceProvider(SandboxProvider):
             ]
             if self._location:
                 args += ["--location", self._location]
+            # Package-cache share, the ACI counterpart to LocalDockerProvider's named volume.
+            # OFF unless AIDW_CACHE_SHARE names a share, and deliberately so: Azure Files is SMB,
+            # whose many-small-file throughput is poor enough that a package cache on it can be
+            # slower than re-downloading. Turn it on after measuring, not on assumption.
+            # /opt/aidw/tools is never placed here -- exec bits and symlinks do not survive
+            # faithfully, and mise-installed toolchains need both.
+            if self._cache_share and self._cache_storage_account and self._cache_storage_key:
+                args += [
+                    "--azure-file-volume-share-name", self._cache_share,
+                    "--azure-file-volume-account-name", self._cache_storage_account,
+                    "--azure-file-volume-account-key", self._cache_storage_key,
+                    "--azure-file-volume-mount-path", _CACHE_DIR_IN_CONTAINER,
+                ]
             if self._vnet_name and self._subnet_name:
                 args += ["--vnet", self._vnet_name, "--subnet", self._subnet_name, "--ip-address", "Private"]
             else:

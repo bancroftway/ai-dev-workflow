@@ -1,8 +1,13 @@
 """P14 -- deterministic metrics + traceability matrix + token tracking. No LLM at all, with one
 named exception (ponytail-gain), exactly as the plan specifies.
 
-Verification status: NOT exercised against a real sandbox, same caveat as P8/P10/P11/P13. `scc`
-and `lizard` are not installed by the sandbox image today.
+The tool-running half now lives in src/repo_scan.py, which runs the whole licence-vetted tool set
+offline, deduplicates findings across tools, and returns one structured report. P14 is where that
+report becomes the *final* repo metrics, alongside the delta against the baseline measured at the
+top of the graph -- the improvement story, not just the end state.
+
+Verification status: NOT exercised against a real sandbox, same caveat as P8/P10/P11/P13. The
+scanner's own pure half is self-checked (`uv run python -m src.repo_scan`).
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
-from . import git_ops, model_config, repo_files, spec_ledger
+from . import git_ops, model_config, repo_files, repo_scan, spec_ledger
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -29,33 +34,17 @@ _AC_ID_IN_TEST_NAME_RE = re.compile(r"Test_AC_(\d{4})_(\d+)_|\[AC-(\d{4})\.(\d+)
 _ID_IN_COMMIT_RE = re.compile(r"\b(US-\d{4}|AC-\d{4}\.\d+)\b")
 
 
-async def _run_scc(provider: Any, thread_id: str) -> dict[str, Any] | None:
-    result = await provider.exec_in_sandbox(thread_id, "scc --format json . 2>&1")
-    if not result.ok:
+async def _read_baseline(provider: Any, thread_id: str) -> dict[str, Any] | None:
+    """The baseline written once at the top of the graph by repo_scan_baseline_node. Absent on a
+    repo that ran the pipeline before repo_scan existed -- in which case the delta is omitted with
+    a reason, never fabricated as a zero-delta."""
+    raw = await repo_files.read_repo_file(provider, thread_id, repo_scan.BASELINE_PATH)
+    if raw is None:
         return None
     try:
-        return json.loads(result.stdout)
+        return json.loads(raw)
     except json.JSONDecodeError:
         return None
-
-
-async def _run_lizard(provider: Any, thread_id: str) -> str | None:
-    result = await provider.exec_in_sandbox(thread_id, "lizard --csv . 2>&1")
-    return result.stdout if result.ok else None
-
-
-async def _count_sarif_findings(provider: Any, thread_id: str) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for label, path in [("p8", "agent-work/analyzers.sarif"), ("p10_semgrep", "agent-work/semgrep.sarif"), ("p10_trivy", "agent-work/trivy.sarif")]:
-        raw = await repo_files.read_repo_file(provider, thread_id, path)
-        if raw is None:
-            continue
-        try:
-            doc = json.loads(raw)
-            counts[label] = sum(len(run.get("results", [])) for run in doc.get("runs", []))
-        except json.JSONDecodeError:
-            continue
-    return counts
 
 
 async def _read_coverage_summary(provider: Any, thread_id: str) -> dict[str, float | None]:
@@ -148,18 +137,20 @@ async def p14_metrics_node(state: dict[str, Any], config: RunnableConfig) -> dic
         return {"p14": {"metrics": {}}}
 
     provider = get_sandbox_provider()
-    scc_report = await _run_scc(provider, thread_id)
-    lizard_report = await _run_lizard(provider, thread_id)
-    finding_counts = await _count_sarif_findings(provider, thread_id)
+    scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full", report_path=repo_scan.LATEST_PATH)
+    scan_report = scan.to_dashboard_dict()
+    baseline = await _read_baseline(provider, thread_id)
+    delta = repo_scan.diff_scans(baseline, scan_report)
+
     coverage = await _read_coverage_summary(provider, thread_id)
     traceability_rows = await _build_traceability_matrix(provider, thread_id)
     token_usage_summary = await _sum_token_usage(provider, thread_id)
 
     metrics = {
         "run_id": run_id,
-        "scc": scc_report,
-        "lizard_csv_tail": (lizard_report or "")[-4000:],
-        "finding_counts": finding_counts,
+        "repo_scan": scan_report,
+        "repo_scan_delta": delta,
+        "repo_scan_delta_reason": None if delta else "no baseline recorded for this repository",
         "coverage": coverage,
         "traceability_summary": {
             "total": len(traceability_rows),
@@ -170,13 +161,22 @@ async def p14_metrics_node(state: dict[str, Any], config: RunnableConfig) -> dic
         "token_usage_summary": token_usage_summary,
     }
 
-    await repo_files.write_repo_file(provider, thread_id, f".ai-dev-workflow/history/{run_id}-metrics.json", json.dumps(metrics, indent=2) + "\n")
-    await repo_files.write_repo_file(provider, thread_id, METRICS_LATEST_PATH, json.dumps(metrics, indent=2) + "\n")
+    history_path = f".ai-dev-workflow/history/{run_id}-metrics.json"
+    await repo_files.write_repo_file(provider, thread_id, history_path, json.dumps(metrics, indent=2, default=str) + "\n")
+    await repo_files.write_repo_file(provider, thread_id, METRICS_LATEST_PATH, json.dumps(metrics, indent=2, default=str) + "\n")
+    if delta is not None:
+        await repo_files.write_repo_file(provider, thread_id, repo_scan.DELTA_PATH, json.dumps(delta, indent=2, default=str) + "\n")
     await repo_files.write_repo_file(provider, thread_id, TRACEABILITY_MATRIX_PATH, _render_traceability_matrix(traceability_rows))
-    await repo_files.append_ledger_entry(provider, thread_id, {"stage": "p14", "node": "metrics", "traceability_summary": metrics["traceability_summary"]})
+    await repo_files.append_ledger_entry(
+        provider, thread_id,
+        {"stage": "p14", "node": "metrics", "traceability_summary": metrics["traceability_summary"],
+         "health_score": scan_report["summary"]["health_score"], "finding_count": len(scan.findings)},
+    )
     await git_ops.commit_paths(
-        provider, thread_id, [f".ai-dev-workflow/history/{run_id}-metrics.json", METRICS_LATEST_PATH, TRACEABILITY_MATRIX_PATH],
-        "ai-dev-workflow: p14 metrics + traceability matrix",
+        provider, thread_id,
+        [history_path, METRICS_LATEST_PATH, TRACEABILITY_MATRIX_PATH, repo_scan.LATEST_PATH]
+        + ([repo_scan.DELTA_PATH] if delta is not None else []),
+        "ai-dev-workflow: p14 metrics + repo scan + traceability matrix",
     )
     return {"p14": {"metrics": metrics}}
 

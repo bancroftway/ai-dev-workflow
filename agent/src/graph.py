@@ -31,12 +31,14 @@ from langgraph.graph.message import add_messages
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt
 
+from . import app_discovery
 from . import approvals
 from . import config as workflow_config
 from . import git_ops
 from . import model_config
 from . import preflight_nodes
 from . import repo_files
+from . import repo_scan
 from . import requirements_nodes
 from . import p11c_nodes
 from . import p13_nodes
@@ -53,6 +55,7 @@ from .gates.write_scope_gate import pre_tool_use_write_scope_hook, verify_ac_to_
 from .a2ui_tools import (
     build_ac_to_tests_envelope,
     build_adversarial_audit_envelope,
+    build_app_discovery_envelope,
     build_dedup_envelope,
     build_exit_envelope,
     build_license_audit_envelope,
@@ -68,6 +71,7 @@ from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import (
     render_ac_to_tests_markdown,
     render_adversarial_audit_markdown,
+    render_app_discovery_markdown,
     render_dedup_markdown,
     render_exit_markdown,
     render_license_audit_markdown,
@@ -106,6 +110,7 @@ from .schemas_p11 import (
     LicenseAuditAuditResponse,
     LicenseAuditDraftResponse,
 )
+from .schemas_app_discovery import AppDiscoveryAuditResponse, AppDiscoveryDraftResponse
 from .schemas_p0_brownfield import P0BaselineAuditResponse, P0BaselineDraftResponse
 from .schemas_p15 import ExitAuditResponse, ExitDraftResponse
 
@@ -144,8 +149,20 @@ class GraphState(TypedDict):
     # P14/P15's history/<run_id>-*.json snapshot naming.
     run_id: str
     # Set by scaffold_node (preflight_nodes.py) -- manifest.json absence is the canonical
-    # "never onboarded before" signal, routing into P0's brownfield sub-flow.
+    # "never onboarded before" signal, routing into P0's brownfield sub-flow. Read once at
+    # scaffold time and routed on from state, never re-read: app discovery writes to manifest.json
+    # mid-run, so a fresh read at the branch point would always report "onboarded".
     manifest_exists: bool
+    # `git rev-parse HEAD` captured by scaffold_node before this run writes anything -- the
+    # reference point app_discovery's reject path resets back to, so a rejected repository is left
+    # exactly as it arrived.
+    run_baseline_commit: str | None
+    # app_discovery.py's deterministic scan output (candidates/evidence/fingerprint), grounding the
+    # discovery stage's prompt and bounding which paths its report may cite.
+    app_scan: dict[str, Any]
+    # Set only when the repository has no runnable application: the one hard stop in this graph.
+    # Read by _route_after_app_discovery and by the frontend's rejection banner.
+    app_rejection: dict[str, Any] | None
     # Deterministic schema/migration/route grep, grounding P0 brownfield's draft prompt.
     p0_context: str
     raw_requirements_text: str
@@ -171,6 +188,8 @@ class GraphState(TypedDict):
     p13: dict[str, Any]
     # P14's own metrics state -- see agent/src/p14_nodes.py.
     p14: dict[str, Any]
+    # The baseline repo scan taken once at the top of the graph -- see agent/src/repo_scan.py.
+    repo_scan: dict[str, Any]
 
 
 def default_stage_state() -> StageState:
@@ -338,6 +357,36 @@ def _build_tech_stack_audit_prompt(state: GraphState) -> list[BaseMessage]:
     return [
         SystemMessage(content=TECH_STACK_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Draft tech stack to audit (JSON):\n{stage['draft']}"),
+    ]
+
+
+APP_DISCOVERY_SYSTEM_PROMPT = load_prompt("app_discovery_draft")
+
+APP_DISCOVERY_AUDIT_SYSTEM_PROMPT = load_prompt("app_discovery_audit")
+
+
+def _build_app_discovery_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"][app_discovery.STAGE_KEY]
+    scan = state.get("app_scan") or {}
+    messages: list[BaseMessage] = [
+        SystemMessage(content=APP_DISCOVERY_SYSTEM_PROMPT),
+        HumanMessage(
+            content=f"Deterministic scan -- candidate applications:\n\n{json.dumps(scan.get('candidates') or [], indent=2)}"
+        ),
+        HumanMessage(content=f"Deterministic scan -- marker file contents:\n\n{scan.get('evidence') or '(nothing found)'}"),
+    ]
+    if stage["draft"] is not None:
+        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    return messages
+
+
+def _build_app_discovery_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"][app_discovery.STAGE_KEY]
+    scan = state.get("app_scan") or {}
+    return [
+        SystemMessage(content=APP_DISCOVERY_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Deterministic scan -- marker file contents:\n\n{scan.get('evidence') or '(nothing found)'}"),
+        HumanMessage(content=f"Draft runnable-application report to audit (JSON):\n{stage['draft']}"),
     ]
 
 
@@ -597,6 +646,7 @@ class StageSpec:
         | type[DedupDraftResponse]
         | type[LicenseAuditDraftResponse]
         | type[ExitDraftResponse]
+        | type[AppDiscoveryDraftResponse]
     )
     content_field: str
     surface_tool_name: str
@@ -614,6 +664,7 @@ class StageSpec:
         | type[DedupAuditResponse]
         | type[LicenseAuditAuditResponse]
         | type[ExitAuditResponse]
+        | type[AppDiscoveryAuditResponse]
     )
     audit_content_field: str
     build_audit_prompt: Callable[[GraphState], list[BaseMessage]]
@@ -635,6 +686,21 @@ class StageSpec:
     detection reports dotnet_detected) or by this run's own input (e.g. raw-requirements
     persisting the seed text that produced this draft, for its own hydrate_from_repo_file to
     compare future runs against)."""
+
+    post_approve_hook: Callable[[str, dict[str, Any], "GraphState", SandboxProvider], Awaitable[None]] | None = None
+    """Same signature as post_audit_hook, but fired from every place a stage reaches "approved" --
+    gate_node, auto_approve_node, AND make_draft_node's hydrate_from_repo_file short-circuit.
+
+    That last one is the reason this exists as a separate hook rather than more post_audit_hook
+    users: hydration marks a stage approved inside draft_node and routes "already_approved"
+    straight to the next stage, bypassing audit_node entirely -- so a post_audit_hook never runs
+    again for a repo that has been onboarded once. Deterministic follow-up writes that must stay
+    applied for the life of the repo (tech-stack's convention files) therefore belong here, not
+    there; writes that are genuinely about *this run's* draft (raw-requirements' seed text) stay
+    on post_audit_hook.
+
+    Called with the stage's approved content, after persistence, and must be idempotent -- it runs
+    on every single run, including pure no-op re-runs."""
 
     deterministic_verify: (
         Callable[[str, dict[str, Any], str, str | None, SandboxProvider], Awaitable[VerificationResult]] | None
@@ -699,7 +765,7 @@ STAGES: list[StageSpec] = [
         build_audit_prompt=_build_tech_stack_audit_prompt,
         render_markdown=render_tech_stack_markdown,
         requires_human_gate=False,
-        post_audit_hook=preflight_nodes.apply_dotnet_conventions_if_applicable,
+        post_approve_hook=preflight_nodes.apply_stack_conventions,
         hydrate_from_repo_file=preflight_nodes.hydrate_tech_stack_from_repo_file,
         session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
     ),
@@ -832,6 +898,28 @@ async def _persist_if_sandboxed(
         logger.warning("Failed to persist workflow state for thread_id=%s", thread_id, exc_info=True)
 
 
+async def _run_post_approve_hook(
+    stage_spec: "StageSpec", thread_id: str, content: dict[str, Any] | None, state: GraphState
+) -> None:
+    """Fires StageSpec.post_approve_hook from all three places a stage becomes "approved"
+    (gate_node, auto_approve_node, and make_draft_node's hydrate short-circuit).
+
+    Failures are logged and swallowed for the same reason _persist_if_sandboxed swallows its own:
+    a convention file that couldn't be written must not take down a run whose approval already
+    happened. The hook itself is expected to record its own partial failures where they matter.
+    """
+    if stage_spec.post_approve_hook is None or not content:
+        return
+    if sandbox_registry.get(thread_id) is None:
+        return
+    try:
+        await stage_spec.post_approve_hook(thread_id, content, state, get_sandbox_provider())
+    except Exception:
+        logger.warning(
+            "post_approve_hook failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True
+        )
+
+
 def _split_text_and_attachments(content: Any) -> tuple[str, list[dict[str, Any]]]:
     """Split a HumanMessage's content into its text and any non-text (AG-UI InputContent)
     parts. A plain string (every submission before multimodal attachments existed, and every
@@ -911,6 +999,9 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         "run_id": uuid.uuid4().hex[:8],
         "raw_requirements_text": raw_requirements_text,
         "requirements_attachments": requirements_attachments,
+        # Cleared explicitly: a rejection is a verdict about one run's view of the repository, and
+        # a repo that has since gained an application must get a fresh assessment, not a stale no.
+        "app_rejection": None,
     }
 
 
@@ -932,6 +1023,10 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 stage["ever_ready_for_review"] = True
                 stage["used_ids"] = sorted(used_ids)
                 stages[stage_spec.key] = stage
+                # The whole point of post_approve_hook (vs post_audit_hook): this branch routes
+                # "already_approved" straight past audit_node and gate_node, so this is the ONLY
+                # place a hook can run for a repo that has been onboarded before.
+                await _run_post_approve_hook(stage_spec, thread_id, hydrated, state)
                 return {"stages": stages}
 
         if (
@@ -1216,6 +1311,7 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                 provider, thread_id, [approvals.APPROVALS_PATH], f"ai-dev-workflow: {stage_spec.key} approval signed"
             )
 
+        await _run_post_approve_hook(stage_spec, thread_id, approved["approved_content"], state)
         return {"stages": stages}
 
     return gate_node
@@ -1237,6 +1333,7 @@ def make_auto_approve_node(stage_spec: StageSpec) -> Callable[[GraphState, Runna
             thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} auto-approved (safety cap)"
         )
 
+        await _run_post_approve_hook(stage_spec, thread_id, stage["approved_content"], state)
         return {"stages": stages}
 
     return auto_approve_node
@@ -1402,6 +1499,90 @@ def _wire_p15(builder: StateGraph) -> None:
     builder.add_edge("p15_finalize", END)
 
 
+APP_DISCOVERY_SPEC = StageSpec(
+    key=app_discovery.STAGE_KEY,
+    response_schema=AppDiscoveryDraftResponse,
+    content_field="app_detection",
+    surface_tool_name="present_app_discovery",
+    build_envelope=build_app_discovery_envelope,
+    build_prompt=_build_app_discovery_prompt,
+    max_cycles=workflow_config.APP_DISCOVERY_MAX_CLARIFICATION_CYCLES,
+    audit_response_schema=AppDiscoveryAuditResponse,
+    audit_content_field="revised_app_detection",
+    build_audit_prompt=_build_app_discovery_audit_prompt,
+    render_markdown=render_app_discovery_markdown,
+    # No human gate: the verdict is app_discovery_decide_node's deterministic policy, and there is
+    # nothing here for a human to approve -- either the repository has a runnable app or it does
+    # not.
+    requires_human_gate=False,
+    hydrate_from_repo_file=app_discovery.hydrate_from_manifest,
+    # Read-only, but with real sandbox tools on purpose: the deterministic scan's marker table has
+    # no rules for Go/Rails/Spring/PHP, and a false rejection is unrecoverable within a run. The
+    # model exploring past the evidence blob is the safety margin.
+    session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
+)
+
+
+def _route_after_app_discovery(state: GraphState) -> str:
+    return "reject" if state.get("app_rejection") else "next"
+
+
+def _route_after_tech_stack(state: GraphState) -> str:
+    """The brownfield branch, moved here from scaffold: app discovery and tech-stack detection both
+    run before P0 now, so an unsuitable repository is rejected before any human is asked to ratify
+    a baseline -- and before anything is written to the repo."""
+    return "next" if state.get("manifest_exists", True) else "p0_baseline_pre"
+
+
+async def _manifest_branch_node(_state: GraphState, _config: RunnableConfig) -> dict[str, Any]:
+    """Pass-through branch point. `_wire_stage` gives every stage a plain gate -> next edge, so a
+    conditional branch after tech-stack needs a node of its own to hang the edges on."""
+    return {}
+
+
+def _wire_app_discovery(builder: StateGraph) -> None:
+    """Wires the suitability gate and the repo-write ordering that depends on it:
+
+    scaffold (read-mostly) -> app_discovery_pre (deterministic scan) -> APP_DISCOVERY_SPEC
+    (draft -> audit -> auto-gate) -> app_discovery_decide -> either app_discovery_reject -> END
+    (the one hard stop in this graph) or scaffold_finalize -> tech-stack -> manifest_branch ->
+    (P0 brownfield | app_check_record) -> repo_scan_baseline -> raw-requirements.
+
+    repo_scan_baseline sits at the convergence point of both branches and immediately before P1,
+    so it measures the repository as it arrived: the clone exists, the tech stack is known, and
+    nothing has written application code yet. It is idempotent on its own committed artifact
+    because this node -- like every node on the main path -- is re-entered on every clarification
+    round; see repo_scan.repo_scan_baseline_node's docstring for why that matters.
+
+    Verification status: the deterministic scan and the reject path have NOT been exercised
+    against a real sandbox; app_discovery.py's own self-check covers the pure half only.
+    """
+    builder.add_node("app_discovery_pre", app_discovery.app_discovery_pre_node)
+    builder.add_node("app_discovery_decide", app_discovery.app_discovery_decide_node)
+    builder.add_node("app_discovery_reject", app_discovery.app_discovery_reject_node)
+    builder.add_node("app_check_record", app_discovery.app_check_record_node)
+    builder.add_node("repo_scan_baseline", repo_scan.repo_scan_baseline_node)
+    builder.add_node("scaffold_finalize", preflight_nodes.scaffold_finalize_node)
+    builder.add_node("manifest_branch", _manifest_branch_node)
+
+    builder.add_edge("app_discovery_pre", f"{APP_DISCOVERY_SPEC.key}_draft")
+    _wire_stage(builder, APP_DISCOVERY_SPEC, "app_discovery_decide")
+    builder.add_conditional_edges(
+        "app_discovery_decide",
+        _route_after_app_discovery,
+        {"reject": "app_discovery_reject", "next": "scaffold_finalize"},
+    )
+    builder.add_edge("app_discovery_reject", END)
+    builder.add_edge("scaffold_finalize", f"{STAGES[0].key}_draft")
+    builder.add_conditional_edges(
+        "manifest_branch",
+        _route_after_tech_stack,
+        {"next": "app_check_record", "p0_baseline_pre": "p0_baseline_pre"},
+    )
+    builder.add_edge("app_check_record", "repo_scan_baseline")
+    builder.add_edge("repo_scan_baseline", f"{STAGES[1].key}_draft")
+
+
 P0_BASELINE_SPEC = StageSpec(
     key="p0-brownfield",
     response_schema=P0BaselineDraftResponse,
@@ -1422,16 +1603,16 @@ P0_BASELINE_SPEC = StageSpec(
 
 def _wire_p0(builder: StateGraph) -> None:
     """Wires P0's brownfield sub-flow: only reached when scaffold's manifest_exists check finds
-    no manifest.json (build_graph()'s own conditional edge from "scaffold", not this function,
+    no manifest.json (_wire_app_discovery's "manifest_branch" conditional edge, not this function,
     does that branch). p0_baseline_pre (deterministic schema/migration/route grep) -> P0_BASELINE_SPEC
     (draft->audit->gate) -> p0_write_manifest (deterministic: ratification IS what creates
-    manifest.json) -> tech-stack's own draft node, same entry point a manifest-already-exists run
-    uses. Verification status: NOT exercised against a real sandbox."""
+    manifest.json) -> app_check_record, where both branches converge before raw-requirements.
+    Verification status: NOT exercised against a real sandbox."""
     builder.add_node("p0_baseline_pre", preflight_nodes.p0_baseline_context_node)
     builder.add_node("p0_write_manifest", preflight_nodes.p0_write_manifest_node)
     _wire_stage(builder, P0_BASELINE_SPEC, "p0_write_manifest")
     builder.add_edge("p0_baseline_pre", "p0-brownfield_draft")
-    builder.add_edge("p0_write_manifest", f"{STAGES[0].key}_draft")
+    builder.add_edge("p0_write_manifest", "app_check_record")
 
 
 REBUILD_FOR_P11 = rebuild.RebuildSpec(
@@ -1628,6 +1809,7 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
 # it and its neighbors -- see P11's own note above). intake_node's setdefault/reset loops need
 # every stage key that will ever appear in GraphState.stages, not just STAGES' own five.
 _STANDALONE_STAGE_SPECS: list[StageSpec] = [
+    APP_DISCOVERY_SPEC,
     P0_BASELINE_SPEC,
     ADVERSARIAL_AUDIT_SPEC,
     DEDUP_SPEC,
@@ -1639,21 +1821,19 @@ _STAGE_KEYS = [stage.key for stage in _ALL_STAGE_SPECS]
 _RENDER_MARKDOWN_BY_STAGE = {stage.key: stage.render_markdown for stage in _ALL_STAGE_SPECS}
 
 
-def _route_after_scaffold(state: GraphState) -> str:
-    return f"{STAGES[0].key}_draft" if state.get("manifest_exists", True) else "p0_baseline_pre"
-
-
 def build_graph() -> StateGraph:
     builder = StateGraph(GraphState)
     builder.add_node("intake", intake_node)
     builder.add_node("scaffold", preflight_nodes.scaffold_node)
     builder.add_edge(START, "intake")
     builder.add_edge("intake", "scaffold")
-    builder.add_conditional_edges(
-        "scaffold", _route_after_scaffold, {f"{STAGES[0].key}_draft": f"{STAGES[0].key}_draft", "p0_baseline_pre": "p0_baseline_pre"}
-    )
+    # Suitability first: app discovery decides whether this workflow applies at all, before
+    # tech-stack detection, before P0's human ratification gate, and before anything is written to
+    # the repository (see preflight_nodes.scaffold_finalize_node).
+    builder.add_edge("scaffold", "app_discovery_pre")
 
     post_stage_rebuild_entry_name = {key: _wire_rebuild(builder, spec) for key, spec in POST_STAGE_REBUILD.items()}
+    _wire_app_discovery(builder)
     _wire_p0(builder)
     _wire_p8(builder)
     _wire_p10(builder)
@@ -1663,7 +1843,11 @@ def build_graph() -> StateGraph:
     _wire_p15(builder)
 
     for index, stage_spec in enumerate(STAGES):
-        if stage_spec.key in post_stage_rebuild_entry_name:
+        if stage_spec.key == STAGES[0].key:
+            # tech-stack exits into the brownfield branch, not straight into raw-requirements --
+            # _wire_app_discovery owns that edge (and everything before it).
+            next_draft_name = "manifest_branch"
+        elif stage_spec.key in post_stage_rebuild_entry_name:
             # This stage has an R placement immediately after it -- route into R's rebuild node,
             # never straight to the next stage's draft (checked before the plain "next stage in
             # STAGES" case below, since R's own next_node is what eventually reaches that draft).
