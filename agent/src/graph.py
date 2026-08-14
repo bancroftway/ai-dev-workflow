@@ -1633,7 +1633,7 @@ def _route_after_tech_stack(state: GraphState) -> str:
     return "next" if state.get("manifest_exists", True) else "brownfield_baseline_pre"
 
 
-async def _manifest_branch_node(_state: GraphState, _config: RunnableConfig) -> dict[str, Any]:
+async def _manifest_branch_node(_state: GraphState) -> dict[str, Any]:
     """Pass-through branch point. `_wire_stage` gives every stage a plain gate -> next edge, so a
     conditional branch after tech-stack needs a node of its own to hang the edges on."""
     return {}

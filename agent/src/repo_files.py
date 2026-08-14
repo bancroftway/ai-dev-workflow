@@ -27,6 +27,9 @@ from .sandbox.provider import SandboxProvider
 
 LEDGER_PATH = ".ai-dev-workflow/ledger.jsonl"
 
+# Keep each exec's command line well under Windows' ~32K CreateProcess cap (WinError 206).
+_EXEC_CMD_BUDGET = 16000
+
 # Repo-relative paths only: no leading "/", no ".." traversal, and a conservative character
 # allowlist -- closes a real command-injection gap (found by automated security review) where a
 # model-reported string (e.g. TechStack.dotnet_solution_root, a PlanDiagram's own `name`) could
@@ -66,10 +69,24 @@ async def write_repo_file(provider: SandboxProvider, thread_id: str, path: str, 
     validate_repo_relative_path(path)
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     parent_dir = path.rsplit("/", 1)[0] if "/" in path else "."
-    command = f"mkdir -p {shlex.quote(parent_dir)} && echo {encoded} | base64 -d > {shlex.quote(path)}"
-    result = await provider.exec_in_sandbox(thread_id, command)
-    if not result.ok:
-        raise RuntimeError(f"failed to write {path}: {result.stderr}")
+    quoted = shlex.quote(path)
+    if len(encoded) <= _EXEC_CMD_BUDGET:
+        commands = [f"mkdir -p {shlex.quote(parent_dir)} && echo {encoded} | base64 -d > {quoted}"]
+    else:
+        # The whole payload used to ride in one exec's argv; Windows' CreateProcess caps the
+        # command line at ~32K chars (WinError 206 on a large repo-scan JSON), so large payloads
+        # are appended to a sidecar in argv-sized chunks and decoded once at the end.
+        tmp = shlex.quote(path + ".b64part")
+        commands = [f"mkdir -p {shlex.quote(parent_dir)} && : > {tmp}"]
+        commands += [
+            f"printf %s {encoded[i:i + _EXEC_CMD_BUDGET]} >> {tmp}"
+            for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
+        ]
+        commands.append(f"base64 -d < {tmp} > {quoted} && rm -f {tmp}")
+    for command in commands:
+        result = await provider.exec_in_sandbox(thread_id, command)
+        if not result.ok:
+            raise RuntimeError(f"failed to write {path}: {result.stderr}")
 
 
 async def reset_ledger(provider: SandboxProvider, thread_id: str) -> None:
