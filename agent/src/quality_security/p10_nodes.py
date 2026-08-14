@@ -29,6 +29,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
+from .. import config as workflow_config
 from .. import git_ops, model_config, repo_files, repo_scan
 from ..copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from ..sandbox import registry as sandbox_registry
@@ -125,7 +126,7 @@ async def p10_triage_node(state: dict[str, Any], config: RunnableConfig) -> dict
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("p10-security", "draft"),
         sandbox=sandbox_registry.get(thread_id),
-        available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:task_complete", "builtin:ask_user", "builtin:skill"],
+        available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
     prompt = (
         "Use the `security-triage` skill and, where relevant, the `security-review` skill's "
@@ -205,9 +206,12 @@ async def p10_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     ]
 
     if to_fix or to_suppress:
+        # Own session key (p10-fix:draft), not plan:draft -- sharing it returned plan's cached
+        # read-only session so this autopilot fixer silently couldn't write. No dedicated
+        # models.yaml entry, so keep plan's model explicitly.
         model = get_chat_model_for_thread(
             thread_id,
-            "plan",
+            "p10-fix",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("plan", "draft"),
@@ -235,6 +239,8 @@ def make_p10_route_after_gate():
     def route(state: dict[str, Any]) -> str:
         p10 = state.get("p10") or default_p10_state()
         report = p10.get("last_gate_report") or {}
+        if report.get("cannot_verify"):
+            return "escalate"  # no sandbox -- never loop or pass, a human must see it
         if report.get("passed"):
             return "next"
         if p10["cycle_count"] < P10_MAX_CYCLES:
@@ -248,7 +254,11 @@ async def p10_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> 
     thread_id = config["configurable"]["thread_id"]
     p10 = dict(state.get("p10") or default_p10_state())
 
-    if sandbox_registry.get(thread_id) is None or p10["baseline_commit"] is None:
+    if sandbox_registry.get(thread_id) is None:
+        # No sandbox means the security gate could not actually run. Escalate rather than pass green.
+        p10["last_gate_report"] = {"passed": False, "cannot_verify": True, "reason": "no sandbox -- security gate did not run"}
+        return {"p10": p10}
+    if p10["baseline_commit"] is None:
         p10["last_gate_report"] = {"passed": True}
         return {"p10": p10}
 

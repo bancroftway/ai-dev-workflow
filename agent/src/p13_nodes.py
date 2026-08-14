@@ -24,6 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
+from . import config as workflow_config
 from . import git_ops, model_config, repo_files, spec_ledger
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt
@@ -44,10 +45,11 @@ class P13State(TypedDict):
     flaky: list[str]
     flake_quarantine: dict[str, dict[str, Any]]  # test_name -> {ticket_id, title, narrative}
     last_exit_ok: bool
+    cannot_verify: bool  # sandbox missing at run time -- the suite never ran, escalate not pass
 
 
 def default_p13_state() -> P13State:
-    return {"attempt": 0, "test_outcomes": {}, "stable_fail": [], "flaky": [], "flake_quarantine": {}, "last_exit_ok": False}
+    return {"attempt": 0, "test_outcomes": {}, "stable_fail": [], "flaky": [], "flake_quarantine": {}, "last_exit_ok": False, "cannot_verify": False}
 
 
 def _resolve_test_command(tech_stack: dict[str, Any], attempt: int) -> tuple[str, str] | None:
@@ -94,7 +96,10 @@ async def p13_run_tests_node(state: dict[str, Any], config: RunnableConfig) -> d
     thread_id = config["configurable"]["thread_id"]
     p13 = dict(state.get("p13") or default_p13_state())
     if sandbox_registry.get(thread_id) is None:
-        p13["last_exit_ok"] = True
+        # No sandbox means the test suite could not run. Escalate to a human rather than treat an
+        # unrun suite as green (route reads cannot_verify).
+        p13["last_exit_ok"] = False
+        p13["cannot_verify"] = True
         return {"p13": p13}
 
     provider = get_sandbox_provider()
@@ -136,8 +141,10 @@ async def p13_run_tests_node(state: dict[str, Any], config: RunnableConfig) -> d
 def make_p13_route_after_run() -> Any:
     def route(state: dict[str, Any]) -> str:
         p13 = state.get("p13") or default_p13_state()
+        if p13.get("cannot_verify"):
+            return "regression"  # no sandbox -- the suite never ran; a human must see it
         if p13.get("last_exit_ok") and not p13.get("test_outcomes"):
-            return "triage"  # no test-command mapping or no sandbox -- nothing to gate on
+            return "triage"  # no test-command mapping for this stack -- nothing to gate on
         if p13["stable_fail"]:
             return "regression"
         return "triage"
@@ -149,7 +156,10 @@ async def p13_regression_gate_node(state: dict[str, Any], config: RunnableConfig
     """A real regression (consistently failing across every attempt) is out of P13's own scope to
     resolve -- a hard human/upstream interrupt, never auto-handled here."""
     p13 = state.get("p13") or default_p13_state()
-    interrupt({"stage": "p13", "type": "stable_test_regression", "stable_fail": p13["stable_fail"]})
+    if p13.get("cannot_verify"):
+        interrupt({"stage": "p13", "type": "cannot_verify", "reason": "no sandbox -- test suite did not run"})
+    else:
+        interrupt({"stage": "p13", "type": "stable_test_regression", "stable_fail": p13["stable_fail"]})
     return {}
 
 
@@ -167,7 +177,7 @@ async def p13_flake_triage_node(state: dict[str, Any], config: RunnableConfig) -
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("p13-flake-triage", "draft"),
         sandbox=sandbox_registry.get(thread_id),
-        available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:task_complete", "builtin:ask_user", "builtin:skill"],
+        available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
     prompt = f"Flaky tests needing triage: {json.dumps(untriaged)}"
     response = await ainvoke_structured(

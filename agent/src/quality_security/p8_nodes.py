@@ -36,21 +36,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
+from .. import config as workflow_config
 from .. import git_ops, model_config, repo_files, repo_scan
 from ..copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
-
-# SonarQube MCP -- code-complete, UNVERIFIED (no live SonarQube server in this environment to spike
-# against, unlike Playwright MCP which was verified live; same config shape confirmed real via that
-# spike). SONARQUBE_URL/SONARQUBE_TOKEN must be set in the sandbox's env for this to actually connect.
-SONARQUBE_MCP_CONFIG: dict[str, Any] = {
-    "sonarqube": {
-        "type": "stdio",
-        "command": "npx",
-        "args": ["-y", "sonarqube-mcp-server@latest"],
-        "env": {"SONARQUBE_URL": os.environ.get("SONARQUBE_URL", ""), "SONARQUBE_TOKEN": os.environ.get("SONARQUBE_TOKEN", "")},
-        "tools": ["*"],
-    }
-}
 from ..sandbox import registry as sandbox_registry
 from ..sandbox.factory import get_sandbox_provider
 from .sarif import Finding, parse_sarif
@@ -198,14 +186,11 @@ async def p8_triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("p8-quality", "draft"),
         sandbox=sandbox_registry.get(thread_id),
-        available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:task_complete", "builtin:ask_user", "builtin:skill", "mcp:*"],
-        mcp_servers=SONARQUBE_MCP_CONFIG,
+        available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
     prompt = (
         "Use the `quality-triage` skill. For every finding below, decide fix or suppress with a "
-        "specific, rule-aware justification (never a rubber stamp under ~15 words). You may query "
-        "the SonarQube MCP server for deeper smell/complexity/duplication reasoning on any finding "
-        "you're uncertain about. Findings:\n\n"
+        "specific, rule-aware justification (never a rubber stamp under ~15 words). Findings:\n\n"
         + json.dumps(open_findings, indent=2)
     )
     response = await ainvoke_structured(
@@ -279,9 +264,12 @@ async def p8_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[str
     ]
 
     if to_fix or to_suppress:
+        # Own session key (p8-fix:draft), not plan:draft -- sharing it returned plan's cached
+        # read-only session so this autopilot fixer silently couldn't write. No dedicated
+        # models.yaml entry, so keep plan's model explicitly.
         model = get_chat_model_for_thread(
             thread_id,
-            "plan",
+            "p8-fix",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("plan", "draft"),
@@ -315,6 +303,8 @@ def make_p8_route_after_gate():
     def route(state: dict[str, Any]) -> str:
         p8 = state.get("p8") or default_p8_state()
         report = p8.get("last_gate_report") or {}
+        if report.get("cannot_verify"):
+            return "escalate"  # no sandbox -- never loop or pass, a human must see it
         if report.get("passed"):
             return "next"
         if not p8.get("build_ok", True):
@@ -330,7 +320,13 @@ async def p8_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> d
     thread_id = config["configurable"]["thread_id"]
     p8 = dict(state.get("p8") or default_p8_state())
 
-    if sandbox_registry.get(thread_id) is None or p8["baseline_commit"] is None:
+    if sandbox_registry.get(thread_id) is None:
+        # No sandbox means the quality gate could not actually run. Failing OPEN here would let a
+        # run report green having checked nothing -- escalate to a human instead (route reads
+        # cannot_verify).
+        p8["last_gate_report"] = {"passed": False, "cannot_verify": True, "reason": "no sandbox -- quality gate did not run"}
+        return {"p8": p8}
+    if p8["baseline_commit"] is None:
         p8["last_gate_report"] = {"passed": True}
         return {"p8": p8}
 

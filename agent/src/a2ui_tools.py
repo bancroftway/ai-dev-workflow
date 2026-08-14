@@ -43,8 +43,10 @@ APP_DISCOVERY_SURFACE_ID = "app-discovery"
 
 
 def _build_generic_envelope(surface_id: str, component_name: str, data_field: str, data: dict, audit_findings: list[str] | None = None) -> dict:
-    """Shared by P11a/b/d's inert (no frontend renderer yet) envelopes -- same parity-only
-    rationale as build_tech_stack_envelope/build_ac_to_tests_envelope."""
+    """Every surface's envelope. All twelve differ only in the surface id, the component name, and
+    the name of the single data field -- which is exactly this function's parameter list, so each
+    builder below is one line. `_demo()` pins the shape against a hand-built copy of what the
+    expanded versions used to produce."""
     return {
         A2UI_OPERATIONS_KEY: [
             create_surface(surface_id, CATALOG_ID),
@@ -80,48 +82,11 @@ def build_app_discovery_envelope(report: dict, audit_findings: list[str] | None 
 
 
 def build_specification_envelope(specification: dict, audit_findings: list[str] | None = None) -> dict:
-    return {
-        A2UI_OPERATIONS_KEY: [
-            create_surface(SPECIFICATION_SURFACE_ID, CATALOG_ID),
-            update_components(
-                SPECIFICATION_SURFACE_ID,
-                [
-                    {
-                        "id": "root",
-                        "component": "SpecificationSurface",
-                        "specification": {"path": "/specification"},
-                        "audit_findings": {"path": "/audit_findings"},
-                    }
-                ],
-            ),
-            update_data_model(
-                SPECIFICATION_SURFACE_ID,
-                {"specification": specification, "audit_findings": audit_findings or []},
-            ),
-        ]
-    }
+    return _build_generic_envelope(SPECIFICATION_SURFACE_ID, "SpecificationSurface", "specification", specification, audit_findings)
 
 
 def build_plan_envelope(plan: dict, audit_findings: list[str] | None = None) -> dict:
-    return {
-        A2UI_OPERATIONS_KEY: [
-            create_surface(PLAN_SURFACE_ID, CATALOG_ID),
-            update_components(
-                PLAN_SURFACE_ID,
-                [
-                    {
-                        "id": "root",
-                        "component": "PlanSurface",
-                        "plan": {"path": "/plan"},
-                        "audit_findings": {"path": "/audit_findings"},
-                    }
-                ],
-            ),
-            update_data_model(
-                PLAN_SURFACE_ID, {"plan": plan, "audit_findings": audit_findings or []}
-            ),
-        ]
-    }
+    return _build_generic_envelope(PLAN_SURFACE_ID, "PlanSurface", "plan", plan, audit_findings)
 
 
 def build_tech_stack_envelope(tech_stack: dict, audit_findings: list[str] | None = None) -> dict:
@@ -129,98 +94,29 @@ def build_tech_stack_envelope(tech_stack: dict, audit_findings: list[str] | None
     per the pipeline's own design -- requires_human_gate=False on its StageSpec) -- emitted for
     parity with every other stage's audit node and so a future session-overview panel can read
     it, but harmless/inert until a catalog entry exists client-side."""
-    return {
-        A2UI_OPERATIONS_KEY: [
-            create_surface(TECH_STACK_SURFACE_ID, CATALOG_ID),
-            update_components(
-                TECH_STACK_SURFACE_ID,
-                [
-                    {
-                        "id": "root",
-                        "component": "TechStackSurface",
-                        "tech_stack": {"path": "/tech_stack"},
-                        "audit_findings": {"path": "/audit_findings"},
-                    }
-                ],
-            ),
-            update_data_model(
-                TECH_STACK_SURFACE_ID, {"tech_stack": tech_stack, "audit_findings": audit_findings or []}
-            ),
-        ]
-    }
+    return _build_generic_envelope(TECH_STACK_SURFACE_ID, "TechStackSurface", "tech_stack", tech_stack, audit_findings)
 
 
 def build_raw_requirements_envelope(raw_requirements: dict, audit_findings: list[str] | None = None) -> dict:
-    return {
-        A2UI_OPERATIONS_KEY: [
-            create_surface(RAW_REQUIREMENTS_SURFACE_ID, CATALOG_ID),
-            update_components(
-                RAW_REQUIREMENTS_SURFACE_ID,
-                [
-                    {
-                        "id": "root",
-                        "component": "RawRequirementsSurface",
-                        "raw_requirements": {"path": "/raw_requirements"},
-                        "audit_findings": {"path": "/audit_findings"},
-                    }
-                ],
-            ),
-            update_data_model(
-                RAW_REQUIREMENTS_SURFACE_ID,
-                {"raw_requirements": raw_requirements, "audit_findings": audit_findings or []},
-            ),
-        ]
-    }
+    return _build_generic_envelope(
+        RAW_REQUIREMENTS_SURFACE_ID, "RawRequirementsSurface", "raw_requirements", raw_requirements, audit_findings
+    )
 
 
 def build_ac_to_tests_envelope(test_suite: dict, audit_findings: list[str] | None = None) -> dict:
     """No frontend renderer registered yet (P4 has requires_human_gate=False, no tab of its own,
     per the pipeline diagram's own design) -- emitted for parity with every other stage's audit/
     verify node, same rationale as build_tech_stack_envelope."""
-    return {
-        A2UI_OPERATIONS_KEY: [
-            create_surface(AC_TO_TESTS_SURFACE_ID, CATALOG_ID),
-            update_components(
-                AC_TO_TESTS_SURFACE_ID,
-                [
-                    {
-                        "id": "root",
-                        "component": "AcToTestsSurface",
-                        "test_suite": {"path": "/test_suite"},
-                        "audit_findings": {"path": "/audit_findings"},
-                    }
-                ],
-            ),
-            update_data_model(
-                AC_TO_TESTS_SURFACE_ID, {"test_suite": test_suite, "audit_findings": audit_findings or []}
-            ),
-        ]
-    }
+    return _build_generic_envelope(AC_TO_TESTS_SURFACE_ID, "AcToTestsSurface", "test_suite", test_suite, audit_findings)
 
 
 def build_minimal_code_to_green_envelope(iteration: dict, audit_findings: list[str] | None = None) -> dict:
     """No frontend renderer registered yet -- P6 has requires_human_gate=True per the pipeline
     diagram, so this *will* eventually need a real tab, unlike P4/tech-stack's inert parity-only
     envelopes; not yet built here since the frontend redesign work hasn't started."""
-    return {
-        A2UI_OPERATIONS_KEY: [
-            create_surface(MINIMAL_CODE_TO_GREEN_SURFACE_ID, CATALOG_ID),
-            update_components(
-                MINIMAL_CODE_TO_GREEN_SURFACE_ID,
-                [
-                    {
-                        "id": "root",
-                        "component": "MinimalCodeToGreenSurface",
-                        "iteration": {"path": "/iteration"},
-                        "audit_findings": {"path": "/audit_findings"},
-                    }
-                ],
-            ),
-            update_data_model(
-                MINIMAL_CODE_TO_GREEN_SURFACE_ID, {"iteration": iteration, "audit_findings": audit_findings or []}
-            ),
-        ]
-    }
+    return _build_generic_envelope(
+        MINIMAL_CODE_TO_GREEN_SURFACE_ID, "MinimalCodeToGreenSurface", "iteration", iteration, audit_findings
+    )
 
 
 def present_surface_messages(tool_name: str, envelope: dict) -> list[BaseMessage]:
@@ -234,3 +130,77 @@ def present_surface_messages(tool_name: str, envelope: dict) -> list[BaseMessage
     ai_message = AIMessage(content="", tool_calls=[{"name": tool_name, "args": {}, "id": call_id}])
     tool_message = ToolMessage(content=json.dumps(envelope), tool_call_id=call_id, name=tool_name)
     return [ai_message, tool_message]
+
+
+def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.a2ui_tools`
+    """Pins the wire format the frontend reads.
+
+    Every builder above used to be this expression written out by hand. Rebuilding it here and
+    asserting equality is what makes collapsing them onto `_build_generic_envelope` safe: if the
+    payload shape ever drifts from what `src/a2ui/catalog.tsx` expects, this fails instead of the
+    surface silently rendering nothing.
+    """
+
+    def expanded(surface_id: str, component_name: str, data_field: str, data: dict, audit_findings: list[str]) -> dict:
+        return {
+            A2UI_OPERATIONS_KEY: [
+                create_surface(surface_id, CATALOG_ID),
+                update_components(
+                    surface_id,
+                    [
+                        {
+                            "id": "root",
+                            "component": component_name,
+                            data_field: {"path": f"/{data_field}"},
+                            "audit_findings": {"path": "/audit_findings"},
+                        }
+                    ],
+                ),
+                update_data_model(surface_id, {data_field: data, "audit_findings": audit_findings}),
+            ]
+        }
+
+    spec = {"title": "T", "summary": "S", "user_stories": [], "assumptions": [], "out_of_scope": []}
+    findings = ["a finding"]
+    assert build_specification_envelope(spec, findings) == expanded(
+        "specification", "SpecificationSurface", "specification", spec, findings
+    )
+
+    plan = {"overview": "O", "plan_steps": [], "risk_notes": []}
+    assert build_plan_envelope(plan, findings) == expanded("plan", "PlanSurface", "plan", plan, findings)
+
+    # Omitted audit_findings must serialize as [], never null -- the catalog's Zod props declare
+    # `audit_findings: z.array(z.string())`, so a null would fail validation client-side.
+    assert build_plan_envelope(plan) == expanded("plan", "PlanSurface", "plan", plan, [])
+
+    # The surface ids the frontend pins in src/lib/a2ui-surface-ids.ts.
+    assert (SPECIFICATION_SURFACE_ID, PLAN_SURFACE_ID, CATALOG_ID) == (
+        "specification", "plan", "urn:ai-dev-workflow:catalog",
+    )
+
+    # Every builder is reachable and produces the same three-operation envelope.
+    builders = [
+        (build_tech_stack_envelope, "tech-stack", "TechStackSurface", "tech_stack"),
+        (build_raw_requirements_envelope, "raw-requirements", "RawRequirementsSurface", "raw_requirements"),
+        (build_ac_to_tests_envelope, "ac-to-tests", "AcToTestsSurface", "test_suite"),
+        (build_minimal_code_to_green_envelope, "minimal-code-to-green", "MinimalCodeToGreenSurface", "iteration"),
+        (build_adversarial_audit_envelope, "p11a-adversarial-audit", "AdversarialAuditSurface", "report"),
+        (build_dedup_envelope, "p11b-dedup", "DedupSurface", "result"),
+        (build_license_audit_envelope, "p11d-license-audit", "LicenseAuditSurface", "report"),
+        (build_exit_envelope, "p15-exit", "ExitSurface", "report"),
+        (build_p0_baseline_envelope, "p0-brownfield", "P0BaselineSurface", "baseline"),
+        (build_app_discovery_envelope, "app-discovery", "AppDiscoverySurface", "report"),
+    ]
+    payload = {"k": "v"}
+    for build, surface_id, component, field in builders:
+        assert build(payload, findings) == expanded(surface_id, component, field, payload, findings), surface_id
+
+    messages = present_surface_messages("present_specification", build_specification_envelope(spec))
+    assert len(messages) == 2
+    assert messages[0].tool_calls[0]["id"] == messages[1].tool_call_id, "tool call and result must pair up"
+
+    print("a2ui_tools self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

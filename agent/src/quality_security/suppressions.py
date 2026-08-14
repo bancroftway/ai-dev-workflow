@@ -62,7 +62,12 @@ async def append_suppression(
     ref = new_ref()
     existing = await repo_files.read_repo_file(provider, thread_id, SUPPRESSIONS_PATH)
     row = f"| {ref} | {stage} | {finding.tool} | {finding.rule_id} | {finding.file} | {finding.severity} | {justification} |\n"
-    await repo_files.write_repo_file(provider, thread_id, SUPPRESSIONS_PATH, (existing if existing is not None else _HEADER) + row)
+    # read_repo_file strips the trailing newline, so a bare concat fuses this row onto the previous
+    # row's line and load_suppression_refs then mis-reads the ref. Guarantee a newline boundary.
+    base = existing if existing is not None else _HEADER
+    if base and not base.endswith("\n"):
+        base += "\n"
+    await repo_files.write_repo_file(provider, thread_id, SUPPRESSIONS_PATH, base + row)
     return ref
 
 

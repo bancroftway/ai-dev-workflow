@@ -308,7 +308,15 @@ COPY bootstrap.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh
 # the matching in-container path this must stay in sync with.
 COPY plugins/ /opt/ai-dev-workflow-plugins/
 RUN chmod +x /usr/local/bin/ai-dev-workflow-entrypoint.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh && \
-    mkdir -p /workspace && chown -R vscode:vscode /workspace /opt/ai-dev-workflow-plugins /opt/aidw
+    mkdir -p /workspace && chown -R vscode:vscode /workspace /opt/ai-dev-workflow-plugins /opt/aidw && \
+    # /opt/aidw/tools/bin is first on PATH (see the ENV PATH above) but nothing installs into it --
+    # at build or at runtime (runtime toolchains land in /opt/aidw/tools/dotnet and mise's own shims
+    # dir). Left vscode-writable it is a free shadowing slot: an autopilot session could drop
+    # /opt/aidw/tools/bin/semgrep (or trivy/gitleaks/git) and silence every later gate. Re-assert
+    # root ownership, no group/other write, so a PATH-first empty dir can't be weaponised. mise's
+    # shims stay vscode-writable by necessity, but mise only shims repo-declared toolchains, not the
+    # root-owned gate binaries in /usr/local/bin.
+    chown root:root /opt/aidw/tools/bin && chmod 0755 /opt/aidw/tools/bin
 
 USER vscode
 WORKDIR /workspace

@@ -20,6 +20,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
@@ -195,7 +196,7 @@ async def p14_ponytail_gain_node(state: dict[str, Any], config: RunnableConfig) 
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("p14-metrics", "draft"),
         sandbox=sandbox_registry.get(thread_id),
-        available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:task_complete", "builtin:ask_user", "builtin:skill"],
+        available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
     response = await model.ainvoke(
         [

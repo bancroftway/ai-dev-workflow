@@ -280,6 +280,9 @@ class AzureContainerInstanceProvider(SandboxProvider):
     async def exec_in_sandbox(self, session_id: str, command: str) -> ExecResult:
         async with self._lock:
             sandbox = self._sandboxes.get(session_id)
+            if sandbox is not None:
+                # Every exec is activity: keep the idle reaper from killing a live run.
+                sandbox.last_active = time.monotonic()
         if sandbox is None:
             raise RuntimeError(f"no active sandbox for session_id={session_id!r}")
 

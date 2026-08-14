@@ -302,17 +302,18 @@ def _tech_stack_has_ui_framework(state: GraphState) -> bool:
 # "playwright-browser_navigate"; "mcp:*" in available_tools is required to let them through an
 # allowlist-tier stage, otherwise the allowlist silently filters every MCP tool out -- caught by
 # testing, not guessed). Playwright MCP itself (spawns its own browser via npx, no external
-# service needed) was the one actually exercised; Excalidraw/SonarQube MCP below use the identical
-# config shape but have NOT been spike-tested (Excalidraw needs its own MCP server process;
-# SonarQube needs a live SonarQube server neither of which exists in this environment).
+# service needed) was the one actually exercised; Excalidraw below uses the identical config shape
+# but has NOT been spike-tested (it needs its own MCP server process, which doesn't exist here).
 PLAYWRIGHT_MCP_CONFIG: dict[str, Any] = {
     "playwright": {"type": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated"], "tools": ["*"]}
 }
 EXCALIDRAW_MCP_CONFIG: dict[str, Any] = {
     "excalidraw": {"type": "stdio", "command": "npx", "args": ["-y", "mcp-excalidraw"], "tools": ["*"]}
 }
-# SonarQube MCP config lives in quality_security/p8_nodes.py (its only user) -- avoids a circular
-# import, since p8_nodes.py is imported by this module, not the reverse.
+# P8 used to attach a SonarQube MCP server here too. Deleted rather than left dormant: it was never
+# spike-tested, needed SONARQUBE_URL/SONARQUBE_TOKEN that nothing sets, fetched unpinned
+# `sonarqube-mcp-server@latest` over the network into a container running untrusted repositories,
+# and SonarQube is LGPL-3.0 -- the same bar that kept it out of repo_scan.py's tool set.
 
 
 SPEC_AUDIT_SYSTEM_PROMPT = load_prompt("specification_audit")
@@ -1183,6 +1184,20 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
 
+        if sandbox_registry.get(thread_id) is None:
+            # Every deterministic_verify (ledger sync, mermaid render, write-scope/AC-coverage git
+            # diff, coverage run, license scan) needs the sandbox. Without one the check cannot run,
+            # so escalate to a human rather than let the stage pass unverified (route reads
+            # cannot_verify).
+            stage["last_verification"] = {
+                "passed": False,
+                "cannot_verify": True,
+                "feedback": "no sandbox -- deterministic verification did not run",
+                "report": {},
+            }
+            stages[stage_spec.key] = stage
+            return {"stages": stages}
+
         result = await stage_spec.deterministic_verify(
             thread_id, stage["draft"], state.get("run_id", "unknown"), stage.get("baseline_commit"), provider
         )
@@ -1222,8 +1237,10 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
 def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     def route(state: GraphState) -> str:
         stage = state["stages"][stage_spec.key]
-        last = stage.get("last_verification")
-        if last is not None and last.get("passed"):
+        last = stage.get("last_verification") or {}
+        if last.get("cannot_verify"):
+            return "escalate"  # no sandbox -- never loop or pass, a human must see it
+        if last.get("passed"):
             return "gate"
         if stage.get("verify_cycle_count", 0) < stage_spec.max_verify_cycles:
             return "retry"
@@ -1245,7 +1262,7 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
         interrupt(
             {
                 "stage": stage_spec.key,
-                "type": "verification_cap_exceeded",
+                "type": "cannot_verify" if last.get("cannot_verify") else "verification_cap_exceeded",
                 "draft": stage["draft"],
                 "report": last.get("report"),
                 "feedback": last.get("feedback"),

@@ -214,7 +214,9 @@ async def p11_exit_gate_node(state: dict[str, Any], config: RunnableConfig) -> d
     thread_id = config["configurable"]["thread_id"]
     p11 = dict(state.get("p11") or {"attempt_count": 0, "last_outcome": None})
     if sandbox_registry.get(thread_id) is None:
-        p11["last_outcome"] = {"passed": True, "reasons": [], "report": {}}
+        # No sandbox means the P11 exit checks (coverage, dedup, license) could not run. Escalate
+        # rather than pass green (route reads cannot_verify).
+        p11["last_outcome"] = {"passed": False, "cannot_verify": True, "reasons": ["no sandbox -- P11 exit gate did not run"], "report": {}}
         return {"p11": p11}
 
     provider = get_sandbox_provider()
@@ -230,6 +232,8 @@ def make_p11_exit_route():
     def route(state: dict[str, Any]) -> str:
         p11 = state.get("p11") or {"attempt_count": 0, "last_outcome": None}
         last = p11.get("last_outcome") or {}
+        if last.get("cannot_verify"):
+            return "escalate"  # no sandbox -- never loop or pass, a human must see it
         if last.get("passed"):
             return "next"
         # Exactly one automatic re-check before escalating -- attempt_count reaches 2 on the

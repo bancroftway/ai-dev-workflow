@@ -23,6 +23,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
+from . import config as workflow_config
 from . import git_ops, model_config, repo_files
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
@@ -86,12 +87,16 @@ async def p11c_draft_node(state: dict[str, Any], config: RunnableConfig) -> dict
         result = await get_sandbox_provider().exec_in_sandbox(thread_id, outdated_command)
         outdated_report = (result.stdout or result.stderr or "")[-4000:]
 
+    # Own session key (p11c-upgrade:draft), not plan:draft. Sharing plan's key returned plan's
+    # cached read-only session (tools lock at session creation) so this autopilot upgrade agent
+    # silently couldn't write, and it inherited plan's whole conversation. Uses its own dedicated
+    # models.yaml entry too, which was previously dead config.
     model = get_chat_model_for_thread(
         thread_id,
-        "plan",
+        "p11c-upgrade",
         "draft",
         github_token=os.environ.get("GITHUB_TOKEN"),
-        model_name=model_config.get_model_name("plan", "draft"),
+        model_name=model_config.get_model_name("p11c-upgrade", "draft"),
         sandbox=sandbox_registry.get(thread_id),
         agent_mode="autopilot",
     )
@@ -156,7 +161,7 @@ async def p11c_audit_node(state: dict[str, Any], config: RunnableConfig) -> dict
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("p11c-upgrade", "audit"),
         sandbox=sandbox_registry.get(thread_id),
-        available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:task_complete", "builtin:ask_user"],
+        available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
     response = await model.ainvoke(
         [
@@ -175,7 +180,12 @@ async def p11c_revert_node(state: dict[str, Any], config: RunnableConfig) -> dic
     p11c = dict(state.get("p11c") or default_p11c_state())
     if sandbox_registry.get(thread_id) is not None and p11c["pre_upgrade_commit"] is not None:
         provider = get_sandbox_provider()
-        await provider.exec_in_sandbox(thread_id, f"git checkout {p11c['pre_upgrade_commit']} -- . && git checkout {p11c['pre_upgrade_commit']}")
+        # `git checkout <sha>` would detach HEAD, orphaning every subsequent commit (P11d, P14,
+        # P15) so the run's output dies with the container. reset --hard rewinds tracked files to
+        # the pre-upgrade commit while keeping HEAD on the branch.
+        # ponytail: a brand-new lockfile the upgrade *created* (repo had none before) is untracked
+        # and survives this; add `git clean` scoped to lockfiles if that ever bites.
+        await provider.exec_in_sandbox(thread_id, f"git reset --hard {p11c['pre_upgrade_commit']}")
         await repo_files.append_ledger_entry(provider, thread_id, {"stage": "p11c", "node": "revert", "to": p11c["pre_upgrade_commit"]})
     return {"p11c": p11c}
 

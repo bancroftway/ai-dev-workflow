@@ -8,8 +8,7 @@ Callers select a subset with `profile=` (or an explicit `tools=`):
 
     quality  -> scc, lizard, jscpd                       (P8)
     security -> semgrep, trivy, gitleaks, osv-scanner    (P10)
-    history  -> git churn/ownership
-    full     -> all of the above                         (baseline node, P14)
+    full     -> those plus git churn/ownership           (baseline node, P14)
 
 Licence bar is permissive (MIT / Apache-2.0), with exactly one documented exception: semgrep is
 LGPL-2.1. Invoking it as a subprocess creates no derivative work, but it does not meet the bar, so
@@ -23,8 +22,10 @@ image and never updated at scan time, findings are sorted before serialization, 
 covers findings + metrics only -- never `generated_at` or per-tool durations. Two runs over an
 unchanged worktree in the same image must produce the same `content_hash`.
 
-Findings deliberately carry no tool attribution in `to_dashboard_dict()`. `to_gate_dict()` keeps
-`sources`, because P10's gate and any human debugging it need to know who said what.
+Findings deliberately carry no tool attribution in `to_dashboard_dict()`, the dashboard artifact.
+Gate callers read `ScanReport.findings` directly, where `Finding.to_dict()` still carries `tool`
+and `sources` -- P10's never-suppress rule and anyone debugging a false positive need to know who
+said what.
 
 Verification status: the pure half (parsers, dedup, severity normalization, scoring, diff) has an
 assert-based self-check, runnable with `uv run python -m src.repo_scan`. The sandbox-I/O half has
@@ -861,22 +862,6 @@ class ScanReport:
             "tools": list(self.tools),
         }
 
-    def to_gate_dict(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
-        """Keeps `sources`/`tool` -- P10's never-suppress rule keys off which tool reported a
-        finding, and a human debugging a false positive needs to know who to blame."""
-        return {
-            "summary": self.summary(severity_floor=severity_floor, introduced_ids=introduced_ids),
-            "findings": [
-                {
-                    **f.to_dict(),
-                    "gating": is_gating(f, severity_floor=severity_floor, introduced_ids=introduced_ids),
-                }
-                for f in self.findings
-            ],
-            "metrics": _public_metrics(self.metrics),
-            "tools": list(self.tools),
-        }
-
 
 def _dashboard_finding(finding: Finding, gating: bool) -> dict[str, Any]:
     """No `tool`, no `sources`: the dashboard shows the issue, not who found it."""
@@ -1117,7 +1102,6 @@ TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 PROFILES: dict[str, tuple[str, ...]] = {
     "quality": ("scc", "lizard", "jscpd"),
     "security": ("semgrep", "trivy", "gitleaks", "osv-scanner"),
-    "history": ("git-churn",),
     "full": tuple(tool.name for tool in TOOLS),
 }
 
@@ -1147,8 +1131,6 @@ async def run_repo_scan(
     *,
     profile: str = "full",
     tools: Sequence[str] | None = None,
-    severity_floor: str | None = None,
-    dedupe_findings: bool = True,
     include_metrics: bool = True,
     report_path: str | None = None,
 ) -> ScanReport:
@@ -1172,11 +1154,7 @@ async def run_repo_scan(
         if fragment:
             fragments.append(fragment)
 
-    deduped, collapsed = dedupe(findings) if dedupe_findings else (sort_findings(findings), 0)
-    floor = severity_floor or SECURITY_SEVERITY_FLOOR
-    if severity_floor:
-        deduped = [f for f in deduped if meets_or_exceeds(f.severity, severity_floor)]
-
+    deduped, collapsed = dedupe(findings)
     report = ScanReport(
         findings=tuple(deduped),
         metrics=_assemble_metrics(fragments),
@@ -1190,7 +1168,7 @@ async def run_repo_scan(
 
         await repo_files.write_repo_file(
             provider, thread_id, report_path,
-            json.dumps(report.to_dashboard_dict(severity_floor=floor), indent=2, default=str) + "\n",
+            json.dumps(report.to_dashboard_dict(), indent=2, default=str) + "\n",
         )
     return report
 
@@ -1459,7 +1437,8 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
         assert key in dashboard, key
     serialized = json.dumps(dashboard["findings"])
     assert '"tool"' not in serialized and '"sources"' not in serialized, "dashboard must not attribute tools"
-    assert '"tool"' in json.dumps(report.to_gate_dict()["findings"]), "gate payload must attribute tools"
+    # ...but the gate path, which reads Finding.to_dict() straight off ScanReport.findings, must.
+    assert '"tool"' in json.dumps([f.to_dict() for f in report.findings]), "gate payload must attribute tools"
     assert dashboard["summary"]["by_severity"]["critical"] == 1
     assert dashboard["summary"]["health_score"] < 100
 

@@ -75,7 +75,12 @@ async def record_approval(
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     row = f"| {record.stage} | {record.run_id} | {record.content_sha256} | {record.timestamp} |\n"
-    new_content = (existing if existing is not None else _HEADER) + row
+    # read_repo_file strips the trailing newline, so a bare concat fuses this row onto the previous
+    # row's line and _parse_rows then drops both. Guarantee a newline boundary first.
+    base = existing if existing is not None else _HEADER
+    if base and not base.endswith("\n"):
+        base += "\n"
+    new_content = base + row
     await repo_files.write_repo_file(provider, thread_id, APPROVALS_PATH, new_content)
     return record
 

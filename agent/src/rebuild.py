@@ -35,10 +35,11 @@ class RebuildState(TypedDict):
     last_stdout_tail: str
     last_stderr_tail: str
     last_exit_ok: bool
+    cannot_verify: bool  # sandbox missing at run time -- the build never ran, escalate not pass
 
 
 def default_rebuild_state() -> RebuildState:
-    return {"status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "", "last_exit_ok": False}
+    return {"status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "", "last_exit_ok": False, "cannot_verify": False}
 
 
 # Each fragment is guarded by a test for the config file preflight_nodes.apply_stack_conventions
@@ -97,8 +98,11 @@ def make_rebuild_node(spec: RebuildSpec):
         rb = rebuild.get(spec.key, default_rebuild_state())
 
         if sandbox_registry.get(thread_id) is None:
-            rb["status"] = "clean"
-            rb["last_exit_ok"] = True
+            # No sandbox means the build never ran. Escalate rather than declare it clean
+            # (route reads cannot_verify).
+            rb["status"] = "failed"
+            rb["last_exit_ok"] = False
+            rb["cannot_verify"] = True
             rebuild[spec.key] = rb
             return {"rebuild": rebuild}
 
@@ -124,6 +128,8 @@ def make_rebuild_node(spec: RebuildSpec):
 def make_route_after_rebuild(spec: RebuildSpec) -> Callable[[dict[str, Any]], str]:
     def route(state: dict[str, Any]) -> str:
         rb = (state.get("rebuild") or {}).get(spec.key, default_rebuild_state())
+        if rb.get("cannot_verify"):
+            return "escalate"  # no sandbox -- the build never ran; a human must see it
         if rb["last_exit_ok"]:
             return "next"
         if rb["fix_cycle_count"] < spec.max_fix_cycles:
@@ -157,9 +163,13 @@ def make_fix_node(spec: RebuildSpec):
             f"stdout (tail):\n{rb['last_stdout_tail']}\n\nstderr (tail):\n{rb['last_stderr_tail']}"
         )
 
+        # Own session key per placement (rebuild-<key>:draft), not plan:draft -- sharing plan's key
+        # returned its cached read-only session so this autopilot fixer silently couldn't write, and
+        # bled plan's conversation across every R placement. No dedicated model_config entry, so
+        # reuse plan's model explicitly.
         model = get_chat_model_for_thread(
             thread_id,
-            "plan",  # no dedicated model_config entry for R's fix nodes -- reuses plan's config
+            f"rebuild-{spec.key}",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("plan", "draft"),
@@ -184,7 +194,7 @@ def make_escalate_node(spec: RebuildSpec):
         interrupt(
             {
                 "stage": spec.key,
-                "type": "rebuild_cap_exceeded",
+                "type": "cannot_verify" if rb.get("cannot_verify") else "rebuild_cap_exceeded",
                 "stdout_tail": rb["last_stdout_tail"],
                 "stderr_tail": rb["last_stderr_tail"],
             }
