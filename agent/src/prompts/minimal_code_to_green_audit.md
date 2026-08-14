@@ -9,6 +9,10 @@ a virtue), a test that was weakened or disabled rather than genuinely satisfied,
 not really satisfied despite tests passing (a test can pass for the wrong reason), and anything the
 draft's own `known_gaps` list should have mentioned but didn't.
 
+Also review the draft's ponytail arbitration: `ponytail_rejected` entries with a stated reason are
+legitimate judgment calls -- but a rejection whose reason doesn't hold up, or a ponytail suggestion
+the draft silently ignored without recording it there, is itself a finding for `audit_findings`.
+
 Return a fully revised `revised_iteration` reflecting what you found and list each gap in
 `audit_findings`; if you found none, return an empty list. You cannot edit files yourself -- if you
 find something that must change in the actual code, say so explicitly in your findings so a later

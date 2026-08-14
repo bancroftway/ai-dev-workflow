@@ -32,10 +32,17 @@ const PlanStepSchema = z.object({
   description: z.string(),
 });
 
+const WireframeSchema = z.object({
+  screen: z.string(),
+  html_source: z.string(),
+});
+
 const ImplementationPlanSchema = z.object({
   overview: z.string(),
   plan_steps: z.array(PlanStepSchema),
   risk_notes: z.array(z.string()),
+  // Optional so envelopes from before wireframes existed still parse.
+  wireframes: z.array(WireframeSchema).optional().default([]),
 });
 
 type Specification = z.infer<typeof SpecificationSchema>;
@@ -136,7 +143,59 @@ export function PlanSurfaceRenderer({
           </ul>
         </div>
       )}
+
+      {(plan.wireframes ?? []).length > 0 && (
+        <div>
+          <h4 className="text-sm font-medium">Wireframes</h4>
+          <p className="mt-1 text-xs text-neutral-500">Click a thumbnail to open the full-size wireframe in a new tab.</p>
+          <div className="mt-2 flex flex-wrap gap-3">
+            {(plan.wireframes ?? []).map((wf) => (
+              <WireframeThumbnail key={wf.screen} screen={wf.screen} htmlSource={wf.html_source} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+/** Sandboxed thumbnail of a self-contained HTML wireframe. The empty `sandbox` attribute blocks
+ * scripts and same-origin access; pointer-events are disabled on the iframe so the overlay
+ * button gets the click. The gate's server-side denylist is hygiene only -- the sandbox
+ * attribute here is the actual security boundary. Never rendered with dangerouslySetInnerHTML.
+ *
+ * Full-size view: a blob URL inherits the app's origin, so the wireframe HTML is NEVER the blob
+ * document itself -- markup that slipped the gate would otherwise run app-origin script in the
+ * new tab. Instead the blob is a trusted static shell whose only dynamic content is the
+ * wireframe entity-escaped into a sandbox="" iframe srcdoc: same confinement as the thumbnail. */
+function WireframeThumbnail({ screen, htmlSource }: { screen: string; htmlSource: string }) {
+  function openFullSize() {
+    const escaped = htmlSource.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    const shell =
+      `<!doctype html><html><head><meta charset="utf-8"><title>${screen} wireframe</title>` +
+      `<style>html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%}</style></head>` +
+      `<body><iframe sandbox="" srcdoc="${escaped}"></iframe></body></html>`;
+    const url = URL.createObjectURL(new Blob([shell], { type: "text/html" }));
+    window.open(url, "_blank", "noopener");
+  }
+  return (
+    <button
+      type="button"
+      className="group relative block overflow-hidden rounded-lg border border-neutral-200 text-left hover:border-neutral-400"
+      onClick={openFullSize}
+      title={`Open ${screen} wireframe full-size`}
+    >
+      <iframe
+        sandbox=""
+        srcDoc={htmlSource}
+        className="pointer-events-none h-44 w-72 origin-top-left"
+        tabIndex={-1}
+        aria-hidden
+      />
+      <span className="absolute inset-x-0 bottom-0 bg-neutral-900/70 px-2 py-1 font-mono text-xs text-white">
+        {screen}
+      </span>
+    </button>
   );
 }
 

@@ -6,7 +6,7 @@ content and compare against the latest recorded row for that stage -- a post-app
 
 verify_approval is provided for that future consumer side; nothing in this codebase calls it yet
 (no stage currently re-reads another stage's already-approved artifact from disk mid-run --
-approved_content already lives in in-memory GraphState for the run that approved it), but P15's
+approved_content already lives in in-memory GraphState for the run that approved it), but exit's
 manifest finalization and any future stage that resumes a thread purely by rehydrating from disk
 (intake_node's hydrate_state path) are the intended callers once built.
 """

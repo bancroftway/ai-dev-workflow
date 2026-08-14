@@ -9,7 +9,7 @@ pipeline need two very different answers to "what is the fix node allowed to tou
 Kept as its own module (not folded into graph.py) since RebuildSpec/RebuildState are a genuinely
 different node shape from StageSpec's draft->audit->gate template -- graph.py's build_graph()
 wires make_rebuild_node/make_fix_node in at each of R's several placements (after P4, after P6,
-after P8, after P10, after P11), each with a different fix_scope and next_node.
+after quality-remediation, after security-remediation, after audit-cluster), each with a different fix_scope and next_node.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from .prompt_loader import load_prompt_pair, render_prompt
 from langgraph.types import interrupt
 
 from . import model_config, repo_files
@@ -120,6 +121,11 @@ def make_rebuild_node(spec: RebuildSpec):
         await repo_files.append_ledger_entry(
             provider, thread_id, {"stage": spec.key, "node": "rebuild", "ok": result.ok, "cycle": rb["fix_cycle_count"]}
         )
+        if result.ok:
+            # A green build is the checkpoint where the code-writing sessions' source changes
+            # (codegen, fixes) become worth keeping -- the artifact-only commit sites never stage
+            # source, so without this the pushed work branch would carry no code at all.
+            await git_ops.commit_all(provider, thread_id, f"ai-dev-workflow: {spec.key} source changes (build green)")
         return {"rebuild": rebuild}
 
     return rebuild_node
@@ -156,11 +162,12 @@ def make_fix_node(spec: RebuildSpec):
         rb = rebuild.get(spec.key, default_rebuild_state())
 
         addendum = _SCAFFOLD_ONLY_ADDENDUM if spec.fix_scope == "scaffold_only" else spec.fix_prompt_addendum
-        prompt = (
-            "The build/compile step failed. Use the `systematic-debugging` skill: form a hypothesis "
-            "from the actual error before changing anything, verify your fix actually resolves it.\n\n"
-            f"{addendum}\n\n"
-            f"stdout (tail):\n{rb['last_stdout_tail']}\n\nstderr (tail):\n{rb['last_stderr_tail']}"
+        system, template = load_prompt_pair("rebuild_build_fix")
+        prompt = render_prompt(
+            template,
+            addendum=addendum,
+            stdout_tail=rb["last_stdout_tail"],
+            stderr_tail=rb["last_stderr_tail"],
         )
 
         # Own session key per placement (rebuild-<key>:draft), not plan:draft -- sharing plan's key
@@ -176,7 +183,7 @@ def make_fix_node(spec: RebuildSpec):
             sandbox=sandbox_registry.get(thread_id),
             agent_mode="autopilot",
         )
-        await model.ainvoke([SystemMessage(content="You are the Build Fix Agent."), HumanMessage(content=prompt)])
+        await model.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)])
 
         rb["fix_cycle_count"] = rb["fix_cycle_count"] + 1
         rb["status"] = "fixing"

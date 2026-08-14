@@ -1,8 +1,8 @@
 """P1 plain (non-LLM) helper: the raw-requirements stage's idempotency short-circuit.
 
-Kept as a separate module from preflight_nodes.py (P0's own plain-node module) since this one
+Kept as a separate module from preflight_nodes.py (brownfield-baseline's own plain-node module) since this one
 concern -- "does this run's fresh input warrant redrafting" -- is P1-specific and has nothing to
-do with P0's scaffold/tech-stack helpers; matches the existing one-concern-per-module convention.
+do with brownfield-baseline's scaffold/tech-stack helpers; matches the existing one-concern-per-module convention.
 """
 
 from __future__ import annotations

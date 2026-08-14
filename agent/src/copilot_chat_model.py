@@ -175,7 +175,7 @@ class CopilotChatModel(BaseChatModel):
     _closing: bool = PrivateAttr(default=False)
     # Confirmed real by Phase A0's spike (SessionEventType.ASSISTANT_USAGE carries actual measured
     # token/cost data, not an estimate). Captures the LAST ASSISTANT_USAGE event seen during the
-    # most recent _agenerate call -- P14's token tracking reads this right after a node's own
+    # most recent _agenerate call -- metrics-report's token tracking reads this right after a node's own
     # model call. A real, stated limitation: ainvoke_structured's validate-and-retry loop can call
     # _agenerate more than once per logical "turn"; only the final (successful) call's usage is
     # kept, so a turn that needed retries under-reports its true token cost.

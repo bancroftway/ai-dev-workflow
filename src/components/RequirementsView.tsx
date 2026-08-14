@@ -3,6 +3,8 @@
 import { useAgent, useAttachments, useCopilotKit } from "@copilotkit/react-core/v2";
 import type { InputContent } from "@ag-ui/core";
 import { useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -15,9 +17,11 @@ export function RequirementsView() {
   const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
   const [text, setText] = useState("");
+  const [mode, setMode] = useState<"edit" | "preview">("edit");
   const [submitting, setSubmitting] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const syncedRef = useRef(false);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const {
     attachments,
@@ -29,6 +33,7 @@ export function RequirementsView() {
     handleDrop,
     removeAttachment,
     consumeAttachments,
+    processFiles,
   } = useAttachments({
     config: {
       enabled: true,
@@ -56,21 +61,50 @@ export function RequirementsView() {
       syncedRef.current = true;
     }
   }, [rawRequirementsContent]);
-  // Question ids are only stable "within the turn that produced it" (per the domain model),
-  // scoped to their own stage -- concatenating multiple stages' lists can produce the same id
-  // twice (e.g. two stages' latest turn independently minting a "CQ-1"), so the React key is
-  // stage-qualified rather than the bare id. Only raw-requirements' own questions show here --
-  // specification/plan's questions surface on their own tabs, not this one.
-  const questions = (rawRequirements?.clarifying_questions ?? []).map((q) => ({
-    ...q,
-    reactKey: `raw-requirements-${q.id}`,
-  }));
 
   // A rejection is a hard stop, not a gate: resubmitting the same repository cannot change the
   // verdict, so the submit button goes down with it. The only way forward is to point the session
   // at a repository containing a runnable app -- or add one and start a new session.
   const rejection = state.app_rejection ?? null;
   const disabled = text.trim().length === 0 || agent.isRunning || submitting || rejection !== null;
+
+  /** Pasted images upload through the normal attachment queue AND insert a markdown ref at the
+   * cursor. Each pasted file is renamed to a unique name first -- clipboard images all arrive as
+   * "image.png", and the `attachment:` ref resolves by filename, so uniqueness is what keeps two
+   * pastes from resolving to the same image. Non-image pastes (text) proceed untouched. */
+  function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const images = Array.from(event.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (images.length === 0) return;
+    event.preventDefault();
+    const renamed = images.map(
+      (f, i) => new File([f], `pasted-${Date.now()}-${i + 1}.${(f.type.split("/")[1] ?? "png").split("+")[0]}`, { type: f.type }),
+    );
+    void processFiles(renamed);
+    const refs = renamed.map((f) => `![screenshot](attachment:${f.name})`).join("\n");
+    const el = textareaRef.current;
+    const start = el?.selectionStart ?? text.length;
+    const end = el?.selectionEnd ?? text.length;
+    const next = `${text.slice(0, start)}${refs}${text.slice(end)}`;
+    setText(next);
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(start + refs.length, start + refs.length);
+    });
+  }
+
+  /** Resolves attachment:<filename> refs in the preview to a renderable URL from the live
+   * attachment queue. Refs whose attachment is gone (e.g. after submit -- consumeAttachments
+   * clears the queue) render as the alt text, which is acceptable: the image itself already
+   * reached the pipeline as an InputContent part. */
+  function resolveUrl(url: string): string {
+    if (!url.startsWith("attachment:")) return url;
+    const name = decodeURIComponent(url.slice("attachment:".length));
+    const att = attachments.find((a) => a.filename === name);
+    if (!att) return "";
+    if (att.thumbnail) return att.thumbnail;
+    if (att.source.type === "data") return `data:${att.source.mimeType};base64,${att.source.value}`;
+    return att.source.value;
+  }
 
   async function handleSubmit() {
     const trimmed = text.trim();
@@ -105,7 +139,7 @@ export function RequirementsView() {
         <h1 className="text-lg font-semibold">Requirements</h1>
         <p className="text-sm text-neutral-500">
           Describe what you want built. Edit and resubmit at any time — including to answer
-          clarifying questions below.
+          clarifying questions below. Paste screenshots directly into the text.
         </p>
       </div>
 
@@ -134,27 +168,11 @@ export function RequirementsView() {
         </div>
       )}
 
-      {questions.length > 0 && (
-        <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 p-4">
-          <h2 className="text-sm font-medium text-amber-900">Clarifying Questions</h2>
-          <ul className="space-y-2">
-            {questions.map((q) => (
-              <li key={q.reactKey} className="text-sm text-amber-900">
-                <span className="mr-1 font-mono text-xs text-amber-700">{q.id}</span>
-                {q.question}
-                {q.suggested_choices.length > 0 && (
-                  <div className="mt-1 text-xs text-amber-700">
-                    Suggestions: {q.suggested_choices.join(", ")}
-                  </div>
-                )}
-              </li>
-            ))}
-          </ul>
-          <p className="text-xs text-amber-700">
-            Answer by editing the requirements text below, then resubmit.
-          </p>
-        </div>
-      )}
+      <ClarifyingQuestions
+        stageKey="raw-requirements"
+        questions={rawRequirements?.clarifying_questions ?? []}
+        hint="Answer by editing the requirements text below, then resubmit."
+      />
 
       <div
         ref={containerRef}
@@ -163,13 +181,30 @@ export function RequirementsView() {
         onDrop={handleDrop}
         className="rounded-lg border border-neutral-300 focus-within:ring-1 focus-within:ring-neutral-400"
       >
-        <textarea
-          className="min-h-[240px] w-full rounded-t-lg p-3 text-sm outline-none"
-          placeholder="Describe your software idea... (or drag screenshots/documents in)"
-          value={text}
-          onChange={(event) => setText(event.target.value)}
-          disabled={agent.isRunning || submitting}
-        />
+        <div className="flex items-center gap-1 border-b border-neutral-200 px-2 py-1">
+          <ModeButton label="Edit" active={mode === "edit"} onClick={() => setMode("edit")} />
+          <ModeButton label="Preview" active={mode === "preview"} onClick={() => setMode("preview")} />
+        </div>
+
+        {mode === "edit" ? (
+          <textarea
+            ref={textareaRef}
+            className="min-h-[240px] w-full p-3 text-sm outline-none"
+            placeholder="Describe your software idea... (markdown supported; paste or drag screenshots in)"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            onPaste={handlePaste}
+            disabled={agent.isRunning || submitting}
+          />
+        ) : (
+          <div className="prose prose-sm min-h-[240px] max-w-none p-3 [&_img]:max-h-80 [&_img]:rounded-md [&_img]:border">
+            {text.trim() ? (
+              <ReactMarkdown urlTransform={resolveUrl}>{text}</ReactMarkdown>
+            ) : (
+              <p className="text-sm text-neutral-400">Nothing to preview yet.</p>
+            )}
+          </div>
+        )}
 
         {attachments.length > 0 && (
           <ul className="flex flex-wrap gap-2 border-t border-neutral-200 p-2">
@@ -223,5 +258,20 @@ export function RequirementsView() {
         </button>
       </div>
     </div>
+  );
+}
+
+function ModeButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className={[
+        "rounded px-2 py-0.5 text-xs font-medium",
+        active ? "bg-neutral-900 text-white" : "text-neutral-500 hover:bg-neutral-100",
+      ].join(" ")}
+      onClick={onClick}
+    >
+      {label}
+    </button>
   );
 }

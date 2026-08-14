@@ -39,7 +39,7 @@ class AsBuiltPlan(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
-class P0BaselineCombined(BaseModel):
+class BrownfieldBaselineCombined(BaseModel):
     """One content_field for the StageSpec template (getattr(response, content_field) expects a
     single dumpable object, not two separate top-level fields)."""
 
@@ -47,12 +47,12 @@ class P0BaselineCombined(BaseModel):
     as_built_plan: AsBuiltPlan
 
 
-class P0BaselineDraftResponse(BaseModel):
+class BrownfieldBaselineDraftResponse(BaseModel):
     readiness: bool
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
-    baseline: P0BaselineCombined | None = Field(default=None)
+    baseline: BrownfieldBaselineCombined | None = Field(default=None)
 
 
-class P0BaselineAuditResponse(BaseModel):
-    revised_baseline: P0BaselineCombined
+class BrownfieldBaselineAuditResponse(BaseModel):
+    revised_baseline: BrownfieldBaselineCombined
     audit_findings: list[str] = Field(default_factory=list)

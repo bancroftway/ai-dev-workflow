@@ -33,33 +33,33 @@ ac-to-tests:
 minimal-code-to-green:
   draft_model: gpt-5.4
   audit_model: claude-sonnet-5
-p11a-adversarial-audit:
+adversarial-audit:
   draft_model: claude-sonnet-5
   audit_model: gpt-5.6-terra
-p11b-dedup:
+dedup-simplify:
   draft_model: gpt-5.4
   audit_model: claude-sonnet-5
-p11d-license-audit:
+license-audit:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5
-p15-exit:
+exit:
   draft_model: claude-sonnet-5
   audit_model: gpt-5.6-terra
-p0-brownfield:
+brownfield-baseline:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5
-p8-quality:
+quality-remediation:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5
-p10-security:
+security-remediation:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5
-p11c-upgrade:
+finding-cluster-upgrade:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5
-p13-flake-triage:
+test-hardening-flake-triage:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5
-p14-metrics:
+metrics-report:
   draft_model: gpt-5.6-terra
   audit_model: claude-sonnet-5

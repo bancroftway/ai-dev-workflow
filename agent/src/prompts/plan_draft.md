@@ -23,3 +23,13 @@ components, a user-flow diagram for a multi-step UI interaction. Each diagram is
 Mermaid source (its own type declaration line included, e.g. `erDiagram` or `flowchart TD`) --
 write real Mermaid syntax, not pseudo-diagram prose; a deterministic step renders it and will
 reject invalid syntax. Skip diagrams entirely for a trivial change where one wouldn't add value.
+
+Wireframes: when (and only when) this repository has a UI framework and the plan adds or changes
+user-facing screens, include one Wireframe per new/changed screen (at most 6). Each is a single
+complete, self-contained, high-fidelity HTML page: ALL styling inline in one `<style>` block, a
+system font stack (`-apple-system, Segoe UI, Roboto, sans-serif`), CSS shapes/gradients for any
+imagery. Absolutely no `<script>` tags, no inline event handlers, and no external URLs of any
+kind (no CDN css/js, no web fonts, no remote images) -- a deterministic step rejects violations
+and your draft will be sent back. Keep each under 30 KB; these ride along in every review prompt,
+so spend the bytes on layout fidelity, not boilerplate. Show realistic example content, not
+lorem ipsum. Skip wireframes entirely for non-UI plans.

@@ -3,6 +3,7 @@ import { LangGraphHttpAgent } from "@copilotkit/runtime/langgraph";
 import { CopilotRuntime, createCopilotRuntimeHandler } from "@copilotkit/runtime/v2";
 import { CATALOG_ID } from "@/lib/a2ui-surface-ids";
 import { auth } from "@/auth";
+import { E2E_MODE } from "@/lib/e2e";
 
 const AGENT_URL = process.env.AGENT_URL ?? "http://localhost:8123/";
 
@@ -37,6 +38,7 @@ const handler = createCopilotRuntimeHandler({
 // misconfiguration or route refactors, so the one real inbound entry point
 // into the app's AI functionality verifies the session itself too.
 async function requireAuth(): Promise<Response | null> {
+  if (E2E_MODE) return null;
   const session = await auth();
   if (!session?.user) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });

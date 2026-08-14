@@ -39,6 +39,16 @@
       "vendoredAt": "2026-08-12",
       "vendoredBy": "jbliss1234@gmail.com",
       "notes": "Skill + its references/ subfolder (bundled reference docs, a legitimate skill component) copied verbatim. No .claude-plugin/plugin.json in source (it's one skill among many in a shared collection repo); wrapper authored fresh."
+    },
+    {
+      "name": "impeccable",
+      "sourceUrl": "https://github.com/pbakaus/impeccable.git",
+      "sourcePath": "plugin/",
+      "ref": "main",
+      "sha": "5a149f3fdb1b5793f10567233b1dcab98fc305fd",
+      "vendoredAt": "2026-08-14",
+      "vendoredBy": "jbliss1234@gmail.com",
+      "notes": "Apache-2.0 (LICENSE + NOTICE.md copied to the plugin root per Apache attribution requirement). Source repo ships an official Claude plugin at plugin/ (v4.1.1); its .claude-plugin/plugin.json and skills/impeccable payload copied. Stripped as interactive/unvalidated in a headless pipeline: scripts/live* + scripts/live/ + live-browser*.js, reference/live.md, reference/live-setup.md, scripts/hook*.mjs, reference/hooks.md; the SKILL.md rows/paragraphs referencing them (live command row, Hooks paragraph, 'live' in argument-hint) were deleted so no instruction points at a stripped file. Patched: every '.claude/skills/impeccable' script-path fallback in SKILL.md and reference/*.md rewritten to the absolute in-container path /opt/ai-dev-workflow-plugins/vendor/pbakaus-impeccable/impeccable/skills/impeccable (Copilot CLI does not reliably report a skill base dir the way Claude Code does). scripts/ left byte-identical (they resolve their own paths relative to the module; the update check fails silently offline). Used by graph.py's UI-repo-gated prompt segments: shape (P3, methodology only), design rules + document (P6), critique (P11a), audit detectors + polish (P11b)."
     }
   ]
 }

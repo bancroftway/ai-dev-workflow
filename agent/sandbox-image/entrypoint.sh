@@ -43,6 +43,24 @@ EOF
   git -c credential.helper="$CRED_HELPER_SCRIPT" \
     clone --branch "$REPO_BRANCH" --single-branch "$REPO_CLONE_URL" "$WORKSPACE_DIR"
 
+  # The pipeline never commits on the user's selected branch: it works on a tool-owned branch
+  # named ai-dev-workflow/<selected-branch>. If that work branch already exists on origin (a
+  # brownfield re-entry), check it out so prior .ai-dev-workflow/ artifacts hydrate; otherwise
+  # branch off the fresh clone. Must run BEFORE the credential material is destroyed below --
+  # the existence probe and fetch both need auth. `git ls-remote --exit-code` guards the fetch:
+  # a plain fetch of a missing ref exits non-zero and would kill the container under `set -e`.
+  WORK_BRANCH="ai-dev-workflow/${REPO_BRANCH}"
+  if git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
+      ls-remote --exit-code origin "refs/heads/${WORK_BRANCH}" >/dev/null 2>&1; then
+    echo "entrypoint: work branch ${WORK_BRANCH} exists on origin -- checking it out"
+    git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
+      fetch origin "+refs/heads/${WORK_BRANCH}:refs/remotes/origin/${WORK_BRANCH}"
+    git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH" "origin/${WORK_BRANCH}"
+  else
+    echo "entrypoint: creating work branch ${WORK_BRANCH} off ${REPO_BRANCH}"
+    git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH"
+  fi
+
   rm -f "$CRED_HELPER_SCRIPT"
   trap - EXIT
   unset GIT_USER_TOKEN

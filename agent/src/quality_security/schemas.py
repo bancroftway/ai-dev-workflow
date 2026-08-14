@@ -1,4 +1,4 @@
-"""P8/P10 triage schemas -- the LLM's structured-output contract for deciding fix-vs-suppress per
+"""quality-remediation/security-remediation triage schemas -- the LLM's structured-output contract for deciding fix-vs-suppress per
 finding. Kept separate from schemas.py/schemas_codegen.py per the established one-domain-per-module
 convention.
 """

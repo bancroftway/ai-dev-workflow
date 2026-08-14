@@ -75,6 +75,19 @@ class PlanDiagram(BaseModel):
     mermaid_source: str = Field(description="Complete, valid Mermaid diagram source, including its own type declaration line (e.g. 'erDiagram', 'flowchart TD').")
 
 
+class Wireframe(BaseModel):
+    """A high-fidelity, fully self-contained HTML wireframe for one screen. A deterministic
+    post-verify step (gates/diagram_gate.py) rejects external references, scripts, and oversize
+    sources, then writes each one to .ai-dev-workflow/plan/wireframes/<screen>.html."""
+
+    screen: str = Field(description="Short, filename-safe screen name (e.g. 'login', 'dashboard').")
+    html_source: str = Field(
+        description="One complete self-contained HTML page: inline CSS only, system font stack, "
+        "CSS shapes/gradients for imagery. NO <script>, no external URLs (no CDN css/js, no web "
+        "fonts, no remote images). Keep it under 30 KB."
+    )
+
+
 class ImplementationPlan(BaseModel):
     overview: str
     plan_steps: list[PlanStep] = Field(default_factory=list)
@@ -83,6 +96,11 @@ class ImplementationPlan(BaseModel):
         default_factory=list,
         description="ER/architecture/user-flow diagrams as needed to make the plan reviewable. "
         "Empty is acceptable for a trivial change.",
+    )
+    wireframes: list[Wireframe] = Field(
+        default_factory=list,
+        description="One self-contained high-fidelity HTML wireframe per new or changed screen. "
+        "Empty for plans with no user-interface work. At most 6 screens.",
     )
 
 
@@ -129,7 +147,7 @@ class PlanAuditResponse(BaseModel):
 
 
 class TechStack(BaseModel):
-    """P0 tech-stack detection content model. Deliberately full and typed, never a thin summary --
+    """brownfield-baseline tech-stack detection content model. Deliberately full and typed, never a thin summary --
     this is what render_tech_stack_markdown writes tech-stack.md from (the sole writer, exactly
     like specification.md/plan.md), and what the tech-stack-conventions skill's analysis (invoked
     by name from the draft prompt, itself never writing files) is reported into."""

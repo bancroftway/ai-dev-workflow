@@ -1,4 +1,4 @@
-"""Shared suppression-ledger mechanics for P8 and P10: writing `.ai-dev-workflow/suppressions.md`
+"""Shared suppression-ledger mechanics for quality-remediation and security-remediation: writing `.ai-dev-workflow/suppressions.md`
 rows from deterministic Finding data (never from the model's free-text alone), and the
 no-silent-suppression gate that rejects any suppression marker in the diff without a matching
 ledger row.

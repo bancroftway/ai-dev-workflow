@@ -22,7 +22,9 @@ from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+# v2: stage keys renamed to stable IDs (p0-brownfield -> brownfield-baseline, p15-exit -> exit,
+# etc.). v1 state.json fails loud (HydrationError) rather than silently dropping approved stages.
+SCHEMA_VERSION = 2
 WORKFLOW_DIR = ".ai-dev-workflow"
 
 _README_CONTENT = """# .ai-dev-workflow

@@ -281,7 +281,7 @@ def decide_suitability(apps: list[dict[str, Any]]) -> SuitabilityDecision:
 async def collect_evidence(provider: SandboxProvider, thread_id: str) -> dict[str, Any]:
     """Bounded scan -> {"candidates": [...], "evidence": "...", "fingerprint": "..."}.
 
-    Bounds mirror preflight_nodes.p0_baseline_context_node: a capped `find`, then a capped number
+    Bounds mirror preflight_nodes.brownfield_baseline_context_node: a capped `find`, then a capped number
     of capped reads, then a capped blob -- a prompt-grounding artifact, not a repo dump.
     """
     listing = await provider.exec_in_sandbox(thread_id, _find_command())
@@ -460,9 +460,9 @@ async def _clean_up_repo(provider: SandboxProvider, thread_id: str, baseline: st
 async def app_check_record_node(state: "GraphState", config: RunnableConfig) -> dict[str, Any]:
     """Records the accepted apps in the manifest.
 
-    Placed after the P0 branch converges, never before it: scaffold_node treats the mere existence
+    Placed after the brownfield-baseline branch converges, never before it: scaffold_node treats the mere existence
     of manifest.json as "already onboarded", so creating the file earlier would let a run abandoned
-    mid-P0 skip brownfield ratification forever.
+    mid-brownfield-baseline skip brownfield ratification forever.
     """
     thread_id = config["configurable"]["thread_id"]
     if sandbox_registry.get(thread_id) is None:

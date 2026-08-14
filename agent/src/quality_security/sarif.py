@@ -1,11 +1,11 @@
-"""Shared SARIF 2.1.0 parser -- used by both P8 (Roslyn/SonarAnalyzer) and P10 (Semgrep/Trivy),
+"""Shared SARIF 2.1.0 parser -- used by both quality-remediation (Roslyn/SonarAnalyzer) and security-remediation (Semgrep/Trivy),
 each of which speaks SARIF, into one common `Finding` shape (plan's own design intent: "one
-shared parser"). gitleaks does not emit SARIF -- P10's own scan node parses its native JSON
+shared parser"). gitleaks does not emit SARIF -- security-remediation's own scan node parses its native JSON
 report separately and constructs `Finding`s directly, reusing `finding_key` for consistency.
 
 `Finding` carries a second, optional tier of fields (category/cve/aliases/package/...) used by
 repo_scan.py's cross-tool dedup and dashboard report. They are deliberately optional and are
-omitted from `to_dict()` when left at their defaults, so P8/P10's triage prompts -- which
+omitted from `to_dict()` when left at their defaults, so quality-remediation/security-remediation's triage prompts -- which
 json.dumps() these dicts straight into an LLM context -- do not grow a tail of nulls.
 """
 
@@ -87,8 +87,8 @@ def parse_sarif(raw_json: str, severity_map: dict[str, str] | None = None) -> li
     """Parses a SARIF log's runs[].results[] into Finding objects.
 
     severity_map translates a run's own SARIF `level` ("error"/"warning"/"note"/"none") into this
-    pipeline's normalized severity vocabulary. P8 doesn't need the low/medium/high/critical tiers
-    P10 does (its exit gate only cares about "error" vs everything else) -- callers pass whatever
+    pipeline's normalized severity vocabulary. quality-remediation doesn't need the low/medium/high/critical tiers
+    security-remediation does (its exit gate only cares about "error" vs everything else) -- callers pass whatever
     mapping their own severity.py module defines; unmapped levels pass through unchanged.
     """
     try:

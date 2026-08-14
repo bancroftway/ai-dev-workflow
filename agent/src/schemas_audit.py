@@ -1,4 +1,4 @@
-"""P11's four sub-stage schemas -- kept as one module since all four are tightly scoped to P11
+"""audit-cluster's four sub-stage schemas -- kept as one module since all four are tightly scoped to audit-cluster
 and none is large enough to warrant its own file (unlike schemas_codegen.py's P4/P6 split, which
 covers two genuinely separate stages each with several substantial types).
 """
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from .schemas import ClarifyingQuestion
 from .schemas_codegen import ChangedFile
 
-# --- P11a: adversarial audit -------------------------------------------------------------------
+# --- adversarial-audit: adversarial audit -------------------------------------------------------------------
 
 
 class DivergenceFinding(BaseModel):
@@ -45,7 +45,7 @@ class AdversarialAuditAuditResponse(BaseModel):
     audit_findings: list[str] = Field(default_factory=list)
 
 
-# --- P11b: de-dup/simplify ---------------------------------------------------------------------
+# --- dedup-simplify: de-dup/simplify ---------------------------------------------------------------------
 
 
 class DedupResult(BaseModel):
@@ -57,6 +57,10 @@ class DedupResult(BaseModel):
     duplication_percent_before: float | None = Field(default=None)
     duplication_percent_after: float | None = Field(
         default=None, description="Populated by the post_audit_hook's own deterministic jscpd re-run, never by the model."
+    )
+    ponytail_rejected: list[str] = Field(
+        default_factory=list,
+        description="Ponytail proposals evaluated and rejected, each with a one-line reason.",
     )
 
 
@@ -71,7 +75,7 @@ class DedupAuditResponse(BaseModel):
     audit_findings: list[str] = Field(default_factory=list)
 
 
-# --- P11d: license audit -----------------------------------------------------------------------
+# --- license-audit: license audit -----------------------------------------------------------------------
 
 LicenseBucket = Literal["allow", "review_required", "deny", "unknown"]
 LicenseConfidence = Literal["high", "medium", "low"]

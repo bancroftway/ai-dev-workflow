@@ -38,6 +38,14 @@ ARG OSV_SCANNER_VERSION=2.0.2
 # toolchain it doesn't ship -- Node 18, a second JDK, a Go version. See the /opt/aidw layout below
 # and bootstrap.sh for how it's driven. Pinned like every other tool here.
 ARG MISE_VERSION=2025.1.0
+# P4's Playwright MCP server (graph.py's PLAYWRIGHT_MCP_CONFIG), baked instead of `npx -y
+# @playwright/mcp@latest` at session time -- deterministic version, no runtime npm/browser fetch
+# inside a container running untrusted repos. PLAYWRIGHT_VERSION must equal @playwright/mcp's own
+# `playwright` dependency (npm view @playwright/mcp@$VER dependencies) so the browser build
+# `playwright install` downloads is the exact revision the MCP server drives; the MCP team pins
+# playwright alphas on purpose -- this is the same code `@latest` was fetching, now frozen.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.79
+ARG PLAYWRIGHT_VERSION=1.63.0-alpha-2026-08-05
 
 USER root
 
@@ -146,6 +154,20 @@ RUN set -eux; \
 RUN set -eux; \
     npm install -g jscpd "azure-functions-core-tools@${FUNC_CORE_TOOLS_MAJOR}" --unsafe-perm true; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep
+
+# Playwright MCP + its exact-matching browser build, baked at BUILD time. The browser lands in
+# /opt/playwright-browsers (root-owned, world-readable), deliberately NOT the runtime
+# PLAYWRIGHT_BROWSERS_PATH=/opt/aidw/cache/playwright set above: (a) that path is a per-owner
+# volume, and mounting a volume over a build-populated directory hides its contents (the exact
+# bug class the PUPPETEER_CACHE_DIR comment above records); (b) target repos' own `playwright
+# install` runs (P4/P13) must keep writing to the writable cache volume, which a root-owned baked
+# dir would break with EACCES. graph.py's PLAYWRIGHT_MCP_CONFIG points the MCP server -- and only
+# it -- at this baked path via the MCP server's own env. chromium-headless-shell, not full
+# chromium: the MCP runs --headless only, and the headless shell is roughly half the size.
+RUN set -eux; \
+    npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "playwright@${PLAYWRIGHT_VERSION}"; \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers playwright install chromium-headless-shell; \
+    chmod -R a+rX /opt/playwright-browsers
 
 # Front-end and Python quality toolchain. These are the deterministic signal for non-.NET repos:
 # preflight_nodes.apply_stack_conventions writes eslint.config.mjs / ruff.toml / mypy.ini into a

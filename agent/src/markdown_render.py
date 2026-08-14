@@ -211,6 +211,13 @@ def render_minimal_code_to_green_markdown(content: dict[str, Any]) -> str:
         lines.extend(f"- {gap}" for gap in known_gaps)
         lines.append("")
 
+    ponytail_rejected = content.get("ponytail_rejected") or []
+    if ponytail_rejected:
+        lines.append("## Ponytail Suggestions Rejected")
+        lines.append("")
+        lines.extend(f"- {item}" for item in ponytail_rejected)
+        lines.append("")
+
     return "\n".join(lines).strip() + "\n"
 
 
@@ -240,6 +247,12 @@ def render_dedup_markdown(content: dict[str, Any]) -> str:
     lines.append("")
     for cf in content.get("changed_files") or []:
         lines.append(f"- **{cf.get('change_kind', '')}** `{cf.get('path', '')}` -- {cf.get('summary', '')}")
+    ponytail_rejected = content.get("ponytail_rejected") or []
+    if ponytail_rejected:
+        lines.append("")
+        lines.append("## Ponytail Proposals Rejected")
+        lines.append("")
+        lines.extend(f"- {item}" for item in ponytail_rejected)
     return "\n".join(lines).strip() + "\n"
 
 
@@ -251,7 +264,7 @@ def render_license_audit_markdown(content: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def render_p0_baseline_markdown(content: dict[str, Any]) -> str:
+def render_brownfield_baseline_markdown(content: dict[str, Any]) -> str:
     spec = content.get("as_built_spec") or {}
     plan = content.get("as_built_plan") or {}
     lines: list[str] = ["# As-Built Baseline (inferred)", "", "Every story below is `origin: inferred` -- derived from existing code, not a requirements spec.", ""]

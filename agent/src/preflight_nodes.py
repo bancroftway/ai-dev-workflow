@@ -1,4 +1,4 @@
-"""P0 plain (non-LLM) nodes: scaffold_node (the true entry point of a fresh run) and the
+"""brownfield-baseline plain (non-LLM) nodes: scaffold_node (the true entry point of a fresh run) and the
 tech-stack stage's idempotency short-circuit / post-audit hook.
 
 Kept as a separate module from graph.py (not just more functions in it) since these are a
@@ -58,10 +58,10 @@ async def update_manifest(
 ) -> dict[str, Any]:
     """Read-modify-write of manifest.json -- the only sanctioned way to touch it.
 
-    Every writer goes through here (p0_write_manifest_node, app_discovery.app_check_record_node,
-    p15_nodes.p15_finalize_node) because the file is co-owned: P0 owns `onboarded`, app discovery
-    owns `app_check`, P15 owns the run/approval/metrics summary. A wholesale overwrite by any one
-    of them silently deletes the others' keys -- which is exactly the bug p15_finalize_node had,
+    Every writer goes through here (brownfield_write_manifest_node, app_discovery.app_check_record_node,
+    exit_nodes.exit_finalize_node) because the file is co-owned: brownfield-baseline owns `onboarded`, app discovery
+    owns `app_check`, exit owns the run/approval/metrics summary. A wholesale overwrite by any one
+    of them silently deletes the others' keys -- which is exactly the bug exit_finalize_node had,
     dropping `onboarded` at the end of every run and re-triggering brownfield onboarding on the
     next one.
 
@@ -110,7 +110,7 @@ async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str
     head = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD")
 
     # manifest.json absence is the canonical "never onboarded before" signal -- gates whether
-    # build_graph()'s conditional edge routes into P0's brownfield sub-flow. Read once, here, and
+    # build_graph()'s conditional edge routes into brownfield-baseline's brownfield sub-flow. Read once, here, and
     # routed on from state later: app discovery writes to this file mid-run, so a fresh read at
     # the branch point would always report "onboarded".
     manifest_exists = await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH) is not None
@@ -190,7 +190,7 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
       - durable facts (which tools this repo needed, whether the image had them) -> manifest.json,
         rewritten only when that set actually changes, so a re-run produces no commit churn;
       - per-run metrics (that this session installed them at all) -> ledger.jsonl, which is fresh
-        per session and already aggregated by P14;
+        per session and already aggregated by metrics-report;
       - everything, appended -> the host-side JSONL above, which outlives the container.
 
     Best-effort throughout: telemetry must never be the reason a run fails.
@@ -238,13 +238,13 @@ _MIGRATION_GLOBS = "*.sql,*.prisma,migrations/*,Migrations/*,schema.rb,*.dbml"
 _ROUTE_HINT_GLOBS = "routes.*,*Controller.cs,*.routes.ts,urls.py,routes/*"
 
 
-async def p0_baseline_context_node(state: "GraphState", config: RunnableConfig) -> dict[str, Any]:
-    """Deterministic pre-scan for P0's brownfield draft: greps for schema/migration/route files
+async def brownfield_baseline_context_node(state: "GraphState", config: RunnableConfig) -> dict[str, Any]:
+    """Deterministic pre-scan for brownfield-baseline's brownfield draft: greps for schema/migration/route files
     and hands their content as grounding context, rather than trusting the model to explore
     unaided (reduces ER-diagram hallucination risk)."""
     thread_id = config["configurable"]["thread_id"]
     if sandbox_registry.get(thread_id) is None:
-        return {"p0_context": ""}
+        return {"brownfield_context": ""}
     provider = get_sandbox_provider()
     find_cmd = " -o ".join(f"-iname {shlex.quote(g)}" for g in (_MIGRATION_GLOBS + "," + _ROUTE_HINT_GLOBS).split(","))
     result = await provider.exec_in_sandbox(thread_id, f"find . \\( {find_cmd} \\) -not -path '*/node_modules/*' 2>/dev/null | head -50")
@@ -254,12 +254,12 @@ async def p0_baseline_context_node(state: "GraphState", config: RunnableConfig) 
         content = await repo_files.read_repo_file(provider, thread_id, path.lstrip("./"))
         if content:
             chunks.append(f"--- {path} ---\n{content[:2000]}")
-    return {"p0_context": "\n\n".join(chunks)[:20000] or "(no schema/migration/route files found)"}
+    return {"brownfield_context": "\n\n".join(chunks)[:20000] or "(no schema/migration/route files found)"}
 
 
-async def p0_write_manifest_node(state: "GraphState", config: RunnableConfig) -> dict[str, Any]:
+async def brownfield_write_manifest_node(state: "GraphState", config: RunnableConfig) -> dict[str, Any]:
     """Ratification approval is what flips manifest.json from absent to present -- the literal
-    mechanism, per the plan's own design. Deterministic, runs right after P0 brownfield's gate."""
+    mechanism, per the plan's own design. Deterministic, runs right after brownfield-baseline brownfield's gate."""
     thread_id = config["configurable"]["thread_id"]
     if sandbox_registry.get(thread_id) is None:
         return {"manifest_exists": True}
@@ -520,7 +520,7 @@ async def _apply_node(
 
     An eslint.config.mjs whose plugins were never installed fails with "Cannot find package
     '@eslint/js'", which is a *config* error: no amount of the agent fixing its own code clears
-    it, and P8's build_ok short-circuit escalates to a human. So a failed install leaves the repo
+    it, and quality-remediation's build_ok short-circuit escalates to a human. So a failed install leaves the repo
     exactly as it arrived, and the failure is recorded instead.
     """
     for name in _FOREIGN_ESLINT_CONFIGS:

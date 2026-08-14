@@ -6,9 +6,9 @@ assembles a single structured report suitable for a repo metrics/health dashboar
 
 Callers select a subset with `profile=` (or an explicit `tools=`):
 
-    quality  -> scc, lizard, jscpd                       (P8)
-    security -> semgrep, trivy, gitleaks, osv-scanner    (P10)
-    full     -> those plus git churn/ownership           (baseline node, P14)
+    quality  -> scc, lizard, jscpd                       (quality-remediation)
+    security -> semgrep, trivy, gitleaks, osv-scanner    (security-remediation)
+    full     -> those plus git churn/ownership           (baseline node, metrics-report)
 
 Licence bar is permissive (MIT / Apache-2.0), with exactly one documented exception: semgrep is
 LGPL-2.1. Invoking it as a subprocess creates no derivative work, but it does not meet the bar, so
@@ -24,7 +24,7 @@ unchanged worktree in the same image must produce the same `content_hash`.
 
 Findings deliberately carry no tool attribution in `to_dashboard_dict()`, the dashboard artifact.
 Gate callers read `ScanReport.findings` directly, where `Finding.to_dict()` still carries `tool`
-and `sources` -- P10's never-suppress rule and anyone debugging a false positive need to know who
+and `sources` -- security-remediation's never-suppress rule and anyone debugging a false positive need to know who
 said what.
 
 Verification status: the pure half (parsers, dedup, severity normalization, scoring, diff) has an
@@ -67,15 +67,15 @@ DELTA_PATH = ".ai-dev-workflow/repo-scan-delta.json"
 SEMGREP_RULES_DIR = os.environ.get("AIDW_SEMGREP_RULES_DIR", "/opt/aidw/semgrep-rules")
 OSV_DB_DIR = os.environ.get("AIDW_OSV_DB_DIR", "/opt/aidw/osv-db")
 
-# Thresholds -- module constants with env overrides, matching p8_nodes.py's convention.
-MAX_DUPLICATION_PERCENT = float(os.environ.get("P8_MAX_DUPLICATION_PERCENT", "3.0"))
+# Thresholds -- module constants with env overrides, matching quality_nodes.py's convention.
+MAX_DUPLICATION_PERCENT = float(os.environ.get("QUALITY_MAX_DUPLICATION_PERCENT", "3.0"))
 LIZARD_MAX_CCN = int(os.environ.get("LIZARD_MAX_CCN", "15"))
 LIZARD_HIGH_CCN = int(os.environ.get("LIZARD_HIGH_CCN", "25"))
 CHURN_WINDOW_DAYS = int(os.environ.get("REPO_SCAN_CHURN_WINDOW_DAYS", "365"))
-SECURITY_SEVERITY_FLOOR = os.environ.get("P10_SEVERITY_FLOOR", "medium")
+SECURITY_SEVERITY_FLOOR = os.environ.get("SECURITY_SEVERITY_FLOOR", "medium")
 
 # Which categories a security gate is allowed to block on. `duplication`/`maintainability`/
-# `sast-quality` are P8's business and are gated on the baseline delta instead, never absolutely.
+# `sast-quality` are quality-remediation's business and are gated on the baseline delta instead, never absolutely.
 SECURITY_CATEGORIES = frozenset({"vulnerability", "secret", "sast", "misconfig", "license"})
 QUALITY_CATEGORIES = frozenset({"duplication", "maintainability"})
 
@@ -581,7 +581,7 @@ def _osv_finding(vuln: dict[str, Any], pkg: dict[str, Any], pkg_name: str, sourc
 
 
 def parse_semgrep(raw: str) -> ParseResult:
-    """Semgrep speaks SARIF, so this reuses the parser P8/P10 already share rather than adding a
+    """Semgrep speaks SARIF, so this reuses the parser quality-remediation/security-remediation already share rather than adding a
     second one. Only the category and source tagging are repo_scan-specific."""
     findings = [
         replace(f, category="sast", title=f.rule_id, sources=("semgrep",), severity_source="native")
@@ -1067,7 +1067,7 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         "gitleaks", "MIT", True,
         # --no-git: working-tree only. A full-history sweep is a separate, slower concern and is
-        # flagged rather than silently folded in, matching p10_nodes.py's existing decision.
+        # flagged rather than silently folded in, matching security_nodes.py's existing decision.
         "gitleaks detect --report-format json --report-path agent-work/gitleaks.json --no-git --exit-code 0",
         "agent-work/gitleaks.json", parse_gitleaks, "gitleaks version",
     ),
@@ -1238,7 +1238,7 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
     from the top again (which is why stages carry an `already_approved` short-circuit), so this
     node is re-entered many times per run -- once per clarification round on requirements, spec,
     plan, and everything after. Re-baselining on any of those would silently zero out the very
-    improvement the P14 delta exists to report, and it would fail *quietly*: the number would just
+    improvement the metrics-report delta exists to report, and it would fail *quietly*: the number would just
     come out small.
 
     Deliberately keyed on the committed file, not on graph state: compile_graph() uses
@@ -1250,14 +1250,25 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
     from .sandbox import registry as sandbox_registry
     from .sandbox.factory import get_sandbox_provider
 
+    # `repo_scan` is a plain LastValue channel (no reducer): every return REPLACES the whole dict.
+    # This node re-enters on every clarification round, so each branch must spread the prior dict
+    # and re-emit baseline_summary -- dropping it here would blank the frontend metrics bar mid-run.
+    prior = dict(state.get("repo_scan") or {})
+
     if sandbox_registry.get(thread_id) is None:
-        return {"repo_scan": {"baseline": None, "reason": "no_sandbox"}}
+        return {"repo_scan": {**prior, "baseline": None, "reason": "no_sandbox"}}
 
     provider = get_sandbox_provider()
     existing = await repo_files.read_repo_file(provider, thread_id, BASELINE_PATH)
     if existing is not None and existing.strip():
         logger.info("repo_scan: baseline already present, not re-measuring")
-        return {"repo_scan": {"baseline": "existing"}}
+        summary = prior.get("baseline_summary")
+        if summary is None:
+            try:
+                summary = json.loads(existing).get("summary")
+            except json.JSONDecodeError:
+                summary = None
+        return {"repo_scan": {**prior, "baseline": "existing", "baseline_summary": summary}}
 
     report = await run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
     await repo_files.append_ledger_entry(
@@ -1266,7 +1277,8 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
          "commit": report.repo.get("commit")},
     )
     await git_ops.commit_paths(provider, thread_id, [BASELINE_PATH], "ai-dev-workflow: repo-scan baseline")
-    return {"repo_scan": {"baseline": "written", "commit": report.repo.get("commit")}}
+    return {"repo_scan": {**prior, "baseline": "written", "commit": report.repo.get("commit"),
+                          "baseline_summary": report.to_dashboard_dict()["summary"]}}
 
 
 async def _repo_facts(provider: Any, thread_id: str) -> dict[str, Any]:

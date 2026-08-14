@@ -2,6 +2,7 @@
 
 import { useAgent } from "@copilotkit/react-core/v2";
 import { A2UISurfaceView } from "@/components/A2UISurfaceView";
+import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { PLAN_SURFACE_ID } from "@/lib/a2ui-surface-ids";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
@@ -20,6 +21,11 @@ export function PlanView() {
 
   return (
     <div className="mx-auto max-w-3xl space-y-4 p-6">
+      <ClarifyingQuestions
+        stageKey="plan"
+        questions={plan?.clarifying_questions ?? []}
+        hint="Answer via the chat sidebar — it unlocks whenever the agent is waiting on you."
+      />
       {isStale && (
         <div className="rounded-lg border border-neutral-300 bg-neutral-50 px-4 py-2 text-sm text-neutral-600">
           The requirements or Specification changed since this Plan was drafted. A new Plan will

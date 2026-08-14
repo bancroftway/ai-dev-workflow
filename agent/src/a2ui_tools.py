@@ -34,11 +34,11 @@ TECH_STACK_SURFACE_ID = "tech-stack"
 RAW_REQUIREMENTS_SURFACE_ID = "raw-requirements"
 AC_TO_TESTS_SURFACE_ID = "ac-to-tests"
 MINIMAL_CODE_TO_GREEN_SURFACE_ID = "minimal-code-to-green"
-ADVERSARIAL_AUDIT_SURFACE_ID = "p11a-adversarial-audit"
-DEDUP_SURFACE_ID = "p11b-dedup"
-LICENSE_AUDIT_SURFACE_ID = "p11d-license-audit"
-EXIT_SURFACE_ID = "p15-exit"
-P0_BASELINE_SURFACE_ID = "p0-brownfield"
+ADVERSARIAL_AUDIT_SURFACE_ID = "adversarial-audit"
+DEDUP_SURFACE_ID = "dedup-simplify"
+LICENSE_AUDIT_SURFACE_ID = "license-audit"
+EXIT_SURFACE_ID = "exit"
+BROWNFIELD_BASELINE_SURFACE_ID = "brownfield-baseline"
 APP_DISCOVERY_SURFACE_ID = "app-discovery"
 
 
@@ -72,8 +72,8 @@ def build_exit_envelope(report: dict, audit_findings: list[str] | None = None) -
     return _build_generic_envelope(EXIT_SURFACE_ID, "ExitSurface", "report", report, audit_findings)
 
 
-def build_p0_baseline_envelope(baseline: dict, audit_findings: list[str] | None = None) -> dict:
-    return _build_generic_envelope(P0_BASELINE_SURFACE_ID, "P0BaselineSurface", "baseline", baseline, audit_findings)
+def build_brownfield_baseline_envelope(baseline: dict, audit_findings: list[str] | None = None) -> dict:
+    return _build_generic_envelope(BROWNFIELD_BASELINE_SURFACE_ID, "BrownfieldBaselineSurface", "baseline", baseline, audit_findings)
 
 
 def build_app_discovery_envelope(report: dict, audit_findings: list[str] | None = None) -> dict:
@@ -184,11 +184,11 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.a2
         (build_raw_requirements_envelope, "raw-requirements", "RawRequirementsSurface", "raw_requirements"),
         (build_ac_to_tests_envelope, "ac-to-tests", "AcToTestsSurface", "test_suite"),
         (build_minimal_code_to_green_envelope, "minimal-code-to-green", "MinimalCodeToGreenSurface", "iteration"),
-        (build_adversarial_audit_envelope, "p11a-adversarial-audit", "AdversarialAuditSurface", "report"),
-        (build_dedup_envelope, "p11b-dedup", "DedupSurface", "result"),
-        (build_license_audit_envelope, "p11d-license-audit", "LicenseAuditSurface", "report"),
-        (build_exit_envelope, "p15-exit", "ExitSurface", "report"),
-        (build_p0_baseline_envelope, "p0-brownfield", "P0BaselineSurface", "baseline"),
+        (build_adversarial_audit_envelope, "adversarial-audit", "AdversarialAuditSurface", "report"),
+        (build_dedup_envelope, "dedup-simplify", "DedupSurface", "result"),
+        (build_license_audit_envelope, "license-audit", "LicenseAuditSurface", "report"),
+        (build_exit_envelope, "exit", "ExitSurface", "report"),
+        (build_brownfield_baseline_envelope, "brownfield-baseline", "BrownfieldBaselineSurface", "baseline"),
         (build_app_discovery_envelope, "app-discovery", "AppDiscoverySurface", "report"),
     ]
     payload = {"k": "v"}

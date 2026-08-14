@@ -7,5 +7,9 @@ over-aggressive abstraction the draft introduced while "simplifying" (an abstrac
 one caller is not simpler than the duplication it replaced). Set `regression_risk` to your honest
 assessment -- "none" only if you're confident no behavior changed.
 
+Also review the draft's ponytail arbitration: `ponytail_rejected` entries with a stated reason are
+legitimate judgment calls -- but a rejection whose reason doesn't hold up, or a ponytail proposal
+silently ignored without being recorded there, is itself a finding for `audit_findings`.
+
 Return a fully revised `revised_result` (you cannot edit files yourself, so note anything that must
 change in `audit_findings` instead) and list every gap found; empty if none.

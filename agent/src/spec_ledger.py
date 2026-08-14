@@ -2,7 +2,7 @@
 distinct from .ai-dev-workflow/ledger.jsonl (repo_files.py's workflow ACTION log). This one is
 cumulative across the repo's entire lifetime of using this tool: ids are never reused, even after
 a story is retired, and a story/AC's *meaning* stays associated with its id across every revision
-so P4's test names, P13's flake tickets, and P14's traceability matrix can all cite it forever.
+so P4's test names, test-hardening's flake tickets, and metrics-report's traceability matrix can all cite it forever.
 
 Deliberately independent of graph.py (no VerificationResult import, no SandboxProvider I/O
 coupling beyond the two thin load/save helpers below) so sync_ledger's actual allocation/

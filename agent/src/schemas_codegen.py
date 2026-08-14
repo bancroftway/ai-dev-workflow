@@ -73,6 +73,10 @@ class CodegenIterationResult(BaseModel):
     changed_files: list[ChangedFile] = Field(default_factory=list)
     subagent_tasks: list[SubagentTaskRecord] = Field(default_factory=list)
     known_gaps: list[str] = Field(default_factory=list)
+    ponytail_rejected: list[str] = Field(
+        default_factory=list,
+        description="Ponytail suggestions evaluated and rejected (including by subagents), each with a one-line reason.",
+    )
 
 
 class MinimalCodeToGreenDraftResponse(BaseModel):

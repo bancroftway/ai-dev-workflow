@@ -21,6 +21,15 @@ deterministic renderer will reject it if not, but obviously malformed or truncat
 fixing here first), and does the diagram actually match what the Plan Steps describe? Add a
 diagram if the plan clearly needs one and lacks it (e.g. a schema change with no ER diagram).
 
+Also review the Wireframes as part of this audit -- you are responsible for fixing them, not just
+flagging them. Check each against the Specification and the Plan Steps: does every new/changed
+user-facing screen have a wireframe (add any that are missing, if the repo has a UI framework)?
+Does each wireframe actually show the fields, actions, and states the Acceptance Criteria demand?
+Is it self-contained (inline CSS only, no scripts, no external URLs, under 30 KB) -- a
+deterministic step rejects violations, so fix them here first. Return the corrected wireframes in
+your revised plan; count each wireframe you fixed or added as an audit_findings entry. Remove
+wireframes only when their screen is genuinely out of the plan's scope.
+
 Use the `ponytail` skill at `full` intensity for prose fields (`overview`, step descriptions,
 risk notes) -- trim redundant/inflated wording, never cut meaning a human approver needs. This
 document is rendered to Markdown verbatim, so terser prose fields here is the only lever; never

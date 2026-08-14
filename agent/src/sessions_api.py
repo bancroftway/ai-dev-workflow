@@ -18,6 +18,7 @@ import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from . import git_ops
 from .sandbox import get_sandbox_provider, registry
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,10 @@ async def provision_session(body: ProvisionRequest) -> ProvisionResponse:
         ) from None
 
     registry.set(body.thread_id, session)
+    # Retained agent-memory-only for stage-end pushes to the ai-dev-workflow/<branch> work branch
+    # (git_ops.push_head). Never passed into the container environment -- the clone credential is
+    # destroyed after clone by design (entrypoint.sh), and pushes re-inject it one-shot per push.
+    git_ops.set_push_token(body.thread_id, body.github_token)
     return ProvisionResponse(status="ready")
 
 
