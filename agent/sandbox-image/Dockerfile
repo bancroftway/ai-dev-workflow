@@ -11,20 +11,15 @@
 # thin wrapper layered on top via `docker build --build-arg BASE_IMAGE=<repo's image>` instead of
 # this default -- that path still assumes an apt-based (Debian/Ubuntu) base, same as before.
 ARG BASE_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0
-FROM ${BASE_IMAGE}
 
+# ── Global version ARGs (declared pre-FROM so both stages can redeclare and inherit them) ──────
 # Pinned to match agent/.venv's installed github-copilot-sdk build (agent/.venv/Lib/site-packages/
 # copilot/_cli_version.py's CLI_VERSION) so the SDK's minimum protocol version check
 # (client.py's _MIN_PROTOCOL_VERSION) never rejects this server on a stale binary.
 ARG COPILOT_CLI_VERSION=1.0.78
-ARG NODE_MAJOR=22
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end
 # against a rebuilt image -- see each gate module's own docstring.
-# Azure Functions Core Tools: `func` is what actually builds and runs a Functions project, and
-# app discovery (agent/src/app_discovery.py) classifies Azure Functions repos as in scope. Pinned
-# to a major only -- nothing parses its output, same reasoning as jscpd/lizard below.
-ARG FUNC_CORE_TOOLS_MAJOR=4
 ARG SCC_VERSION=3.5.0
 ARG GITLEAKS_VERSION=8.21.2
 ARG TRIVY_VERSION=0.73.0
@@ -38,6 +33,59 @@ ARG OSV_SCANNER_VERSION=2.0.2
 # toolchain it doesn't ship -- Node 18, a second JDK, a Go version. See the /opt/aidw layout below
 # and bootstrap.sh for how it's driven. Pinned like every other tool here.
 ARG MISE_VERSION=2025.1.0
+
+# ── fetch stage: the six curl|tar binary installs, COPY'd into the final stage in one layer ────
+# Size win is ~0 (each RUN already deleted its tarball in-layer); the gains are parallel fetching
+# under BuildKit and six layers collapsing to one. All fetches stay arch-aware via
+# `dpkg --print-architecture`, hence ${BASE_IMAGE} (cached anyway) rather than a smaller fetcher.
+FROM ${BASE_IMAGE} AS fetch
+ARG COPILOT_CLI_VERSION
+ARG SCC_VERSION
+ARG GITLEAKS_VERSION
+ARG TRIVY_VERSION
+ARG OSV_SCANNER_VERSION
+ARG MISE_VERSION
+RUN set -eux; \
+    mkdir -p /out/bin; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) copilot_asset="copilot-linux-x64.tar.gz"; \
+               mise_asset="mise-v${MISE_VERSION}-linux-x64.tar.gz"; \
+               scc_asset="scc_Linux_x86_64.tar.gz"; \
+               gitleaks_asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"; \
+               trivy_asset="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; \
+               osv_asset="osv-scanner_linux_amd64" ;; \
+        arm64) copilot_asset="copilot-linux-arm64.tar.gz"; \
+               mise_asset="mise-v${MISE_VERSION}-linux-arm64.tar.gz"; \
+               scc_asset="scc_Linux_arm64.tar.gz"; \
+               gitleaks_asset="gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz"; \
+               trivy_asset="trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"; \
+               osv_asset="osv-scanner_linux_arm64" ;; \
+        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/github/copilot-cli/releases/download/v${COPILOT_CLI_VERSION}/${copilot_asset}" -o /tmp/copilot.tar.gz; \
+    tar -xzf /tmp/copilot.tar.gz -C /out/bin copilot; \
+    curl -fsSL "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/${mise_asset}" -o /tmp/mise.tar.gz; \
+    tar -xzf /tmp/mise.tar.gz -C /tmp; \
+    install -m 0755 /tmp/mise/bin/mise /out/bin/mise; \
+    curl -fsSL "https://github.com/boyter/scc/releases/download/v${SCC_VERSION}/${scc_asset}" -o /tmp/scc.tar.gz; \
+    tar -xzf /tmp/scc.tar.gz -C /out/bin scc; \
+    curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${gitleaks_asset}" -o /tmp/gitleaks.tar.gz; \
+    tar -xzf /tmp/gitleaks.tar.gz -C /out/bin gitleaks; \
+    curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${trivy_asset}" -o /tmp/trivy.tar.gz; \
+    tar -xzf /tmp/trivy.tar.gz -C /out/bin trivy; \
+    curl -fsSL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/${osv_asset}" -o /out/bin/osv-scanner; \
+    chmod +x /out/bin/copilot /out/bin/scc /out/bin/gitleaks /out/bin/trivy /out/bin/osv-scanner; \
+    rm -rf /tmp/copilot.tar.gz /tmp/mise /tmp/mise.tar.gz /tmp/scc.tar.gz /tmp/gitleaks.tar.gz /tmp/trivy.tar.gz
+
+# ── final stage ────────────────────────────────────────────────────────────────────────────────
+FROM ${BASE_IMAGE}
+
+ARG NODE_MAJOR=22
+# Azure Functions Core Tools: `func` is what actually builds and runs a Functions project, and
+# app discovery (agent/src/app_discovery.py) classifies Azure Functions repos as in scope. Pinned
+# to a major only -- nothing parses its output, same reasoning as jscpd/lizard below.
+ARG FUNC_CORE_TOOLS_MAJOR=4
 # P4's Playwright MCP server (graph.py's PLAYWRIGHT_MCP_CONFIG), baked instead of `npx -y
 # @playwright/mcp@latest` at session time -- deterministic version, no runtime npm/browser fetch
 # inside a container running untrusted repos. PLAYWRIGHT_VERSION must equal @playwright/mcp's own
@@ -48,6 +96,8 @@ ARG PLAYWRIGHT_MCP_VERSION=0.0.79
 ARG PLAYWRIGHT_VERSION=1.63.0-alpha-2026-08-05
 
 USER root
+
+COPY --from=fetch /out/bin/ /usr/local/bin/
 
 # ── /opt/aidw: where anything installed at *runtime* goes ──────────────────────────────────────
 # The image is immutable; a container is not. A repo that needs a toolchain this image doesn't
@@ -66,10 +116,6 @@ USER root
 # Both are created AND declared here rather than only at mount time, so the container behaves
 # identically with or without a volume attached -- the mount is purely an accelerator, never a
 # correctness dependency.
-#
-# Do NOT move PUPPETEER_CACHE_DIR (below) under /opt/aidw/cache: it is populated at *build* time,
-# and mounting a volume over a build-populated directory hides its contents -- the same class of
-# bug this file already records for /root/.cache/puppeteer.
 ENV AIDW_TOOLS_DIR=/opt/aidw/tools \
     AIDW_CACHE_DIR=/opt/aidw/cache \
     MISE_DATA_DIR=/opt/aidw/tools/mise \
@@ -94,9 +140,9 @@ RUN set -eux; \
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates gnupg python3 python3-pip; \
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
+    curl -fsSL --retry 5 --retry-all-errors "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
     apt-get install -y --no-install-recommends nodejs; \
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    curl -fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
     chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
@@ -105,42 +151,44 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends gh; \
     rm -rf /var/lib/apt/lists/*
 
+# Playwright MCP + its exact-matching browser build, baked at BUILD time. The browser lands in
+# /opt/playwright-browsers (root-owned, world-readable), deliberately NOT the runtime
+# PLAYWRIGHT_BROWSERS_PATH=/opt/aidw/cache/playwright set above: (a) that path is a per-owner
+# volume, and mounting a volume over a build-populated directory hides its contents; (b) target
+# repos' own `playwright install` runs (P4/P13) must keep writing to the writable cache volume,
+# which a root-owned baked dir would break with EACCES. graph.py's PLAYWRIGHT_MCP_CONFIG points
+# the MCP server -- and only it -- at this baked path via the MCP server's own env.
+# chromium-headless-shell, not full chromium: the MCP runs --headless only, and the headless
+# shell is roughly half the size.
+# The stable /usr/local/bin/aidw-headless-shell symlink exists for mermaid-cli's Puppeteer (next
+# layer), which reuses THIS browser read-only via PUPPETEER_EXECUTABLE_PATH instead of downloading
+# a second full Chromium (~450 MB saved). Read-only reuse of the baked path violates neither of
+# the two constraints above.
 RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-        amd64) asset="copilot-linux-x64.tar.gz" ;; \
-        arm64) asset="copilot-linux-arm64.tar.gz" ;; \
-        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/github/copilot-cli/releases/download/v${COPILOT_CLI_VERSION}/${asset}" \
-        -o /tmp/copilot.tar.gz; \
-    tar -xzf /tmp/copilot.tar.gz -C /usr/local/bin copilot; \
-    chmod +x /usr/local/bin/copilot; \
-    rm -f /tmp/copilot.tar.gz
+    npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "playwright@${PLAYWRIGHT_VERSION}"; \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers playwright install chromium-headless-shell; \
+    chmod -R a+rX /opt/playwright-browsers; \
+    ln -s "$(ls /opt/playwright-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell)" \
+        /usr/local/bin/aidw-headless-shell
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/aidw-headless-shell
 
 # P3's diagram-validation gate (agent/src/gates/diagram_gate.py) renders Mermaid source via
 # @mermaid-js/mermaid-cli, which needs a headless Chromium (Puppeteer). Real finding from a live
 # build: Ubuntu 24.04's `chromium` apt package is a snap-only stub with no actual browser inside
 # (`exec /snap/bin/chromium "$@"`, which doesn't exist in a container -- no snapd here) -- do NOT
 # apt-install `chromium` expecting a working binary. Instead: install the shared libs any headless
-# Chromium needs (Puppeteer's own troubleshooting docs list these as commonly missing) plus
-# `unzip` (puppeteer's browser installer needs it to extract its own download), and let Puppeteer
-# download and manage its own bundled Chromium build -- the actually-supported path, and the one
-# mermaid-puppeteer-config.json's args (not executablePath) now assumes.
-# PUPPETEER_CACHE_DIR fixed to a world-readable path, not the default $HOME/.cache/puppeteer --
-# this RUN executes as root (USER root above), but the container runs as `vscode` at runtime
-# (USER vscode below); a real end-to-end test caught puppeteer's downloaded Chromium landing in
-# /root/.cache/puppeteer, invisible to vscode's own $HOME/.cache/puppeteer at runtime. Setting it
-# via ENV (not just for this RUN) means every later user/process sees the same path.
-ENV PUPPETEER_CACHE_DIR=/opt/puppeteer-cache
+# Chromium needs (Puppeteer's own troubleshooting docs list these as commonly missing) and point
+# Puppeteer at the Playwright headless shell baked above (PUPPETEER_EXECUTABLE_PATH env +
+# "headless": "shell" in mermaid-puppeteer-config.json). Both skip-download spellings are set:
+# PUPPETEER_SKIP_DOWNLOAD is current, PUPPETEER_SKIP_CHROMIUM_DOWNLOAD covers older bundled
+# puppeteers -- mermaid-cli is installed unpinned.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        unzip libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+        libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
         libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
         libcairo2; \
-    npm install -g @mermaid-js/mermaid-cli; \
-    chmod -R a+rX "$PUPPETEER_CACHE_DIR"; \
+    PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1 npm install -g @mermaid-js/mermaid-cli; \
     rm -rf /var/lib/apt/lists/*
 
 # P8's quality scan: jscpd (duplication) via npm, lizard (per-function complexity) via pip.
@@ -154,20 +202,6 @@ RUN set -eux; \
 RUN set -eux; \
     npm install -g jscpd "azure-functions-core-tools@${FUNC_CORE_TOOLS_MAJOR}" --unsafe-perm true; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep
-
-# Playwright MCP + its exact-matching browser build, baked at BUILD time. The browser lands in
-# /opt/playwright-browsers (root-owned, world-readable), deliberately NOT the runtime
-# PLAYWRIGHT_BROWSERS_PATH=/opt/aidw/cache/playwright set above: (a) that path is a per-owner
-# volume, and mounting a volume over a build-populated directory hides its contents (the exact
-# bug class the PUPPETEER_CACHE_DIR comment above records); (b) target repos' own `playwright
-# install` runs (P4/P13) must keep writing to the writable cache volume, which a root-owned baked
-# dir would break with EACCES. graph.py's PLAYWRIGHT_MCP_CONFIG points the MCP server -- and only
-# it -- at this baked path via the MCP server's own env. chromium-headless-shell, not full
-# chromium: the MCP runs --headless only, and the headless shell is roughly half the size.
-RUN set -eux; \
-    npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "playwright@${PLAYWRIGHT_VERSION}"; \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers playwright install chromium-headless-shell; \
-    chmod -R a+rX /opt/playwright-browsers
 
 # Front-end and Python quality toolchain. These are the deterministic signal for non-.NET repos:
 # preflight_nodes.apply_stack_conventions writes eslint.config.mjs / ruff.toml / mypy.ini into a
@@ -191,74 +225,12 @@ RUN set -eux; \
     npm install -g pnpm yarn typescript eslint prettier @angular/cli --unsafe-perm true; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 ruff mypy
 
-# mise: the answer to "this image cannot ship every toolchain every repo needs". Driven at
-# container start by bootstrap.sh from files the repo itself declares (.tool-versions, mise.toml,
-# .nvmrc, .node-version) -- never from an LLM's guess -- and restricted there to mise's own tool
-# registry, because an arbitrary asdf plugin URL in a repo-supplied mise.toml is third-party shell
-# that would otherwise run automatically before anything else in the container starts.
-# Arch-aware release fetch, same pattern as scc/gitleaks/trivy above.
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-        amd64) asset="mise-v${MISE_VERSION}-linux-x64.tar.gz" ;; \
-        arm64) asset="mise-v${MISE_VERSION}-linux-arm64.tar.gz" ;; \
-        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/${asset}" -o /tmp/mise.tar.gz; \
-    tar -xzf /tmp/mise.tar.gz -C /tmp; \
-    install -m 0755 /tmp/mise/bin/mise /usr/local/bin/mise; \
-    rm -rf /tmp/mise /tmp/mise.tar.gz
-
-# P8/P14: scc (LOC/complexity). Go binary release, arch-aware like the Copilot CLI fetch above.
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-        amd64) asset="scc_Linux_x86_64.tar.gz" ;; \
-        arm64) asset="scc_Linux_arm64.tar.gz" ;; \
-        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/boyter/scc/releases/download/v${SCC_VERSION}/${asset}" -o /tmp/scc.tar.gz; \
-    tar -xzf /tmp/scc.tar.gz -C /usr/local/bin scc; \
-    chmod +x /usr/local/bin/scc; \
-    rm -f /tmp/scc.tar.gz
-
-# P10: gitleaks (secrets). Binary release, arch-aware.
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-        amd64) asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" ;; \
-        arm64) asset="gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz" ;; \
-        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}" -o /tmp/gitleaks.tar.gz; \
-    tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks; \
-    chmod +x /usr/local/bin/gitleaks; \
-    rm -f /tmp/gitleaks.tar.gz
-
-# P10: trivy (vuln/misconfig/license scan + SBOM). Binary release, arch-aware.
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-        amd64) asset="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" ;; \
-        arm64) asset="trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz" ;; \
-        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${asset}" -o /tmp/trivy.tar.gz; \
-    tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy; \
-    chmod +x /usr/local/bin/trivy; \
-    rm -f /tmp/trivy.tar.gz
-
-# P10/P14: osv-scanner (OSV.dev vulnerability database). Binary release, arch-aware.
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-        amd64) asset="osv-scanner_linux_amd64" ;; \
-        arm64) asset="osv-scanner_linux_arm64" ;; \
-        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/${asset}" \
-        -o /usr/local/bin/osv-scanner; \
-    chmod +x /usr/local/bin/osv-scanner
+# mise / scc / gitleaks / trivy / osv-scanner / copilot all arrive via the fetch stage's
+# COPY --from at the top of this stage. mise usage note: driven at container start by
+# bootstrap.sh from files the repo itself declares (.tool-versions, mise.toml, .nvmrc,
+# .node-version) -- never from an LLM's guess -- and restricted there to mise's own tool
+# registry, because an arbitrary asdf plugin URL in a repo-supplied mise.toml is third-party
+# shell that would otherwise run automatically before anything else in the container starts.
 
 # ── Offline scan data: the vulnerability databases and semgrep rules, baked at BUILD time ──────
 # Nothing in src/repo_scan.py touches the network at scan time. Two reasons, both load-bearing:
@@ -275,10 +247,12 @@ ENV AIDW_OSV_DB_DIR=/opt/aidw/osv-db \
     TRIVY_CACHE_DIR=/opt/aidw/trivy-cache
 # The two `test -n` lines fail the build loudly rather than shipping an image whose "offline" scan
 # silently finds nothing -- an empty database and a clean repository produce identical output.
+# java-db (~1 GB) deliberately not baked -- no Java repos in scope (this team is dotnet/node/
+# python, see the BASE_IMAGE header), and repo_scan.py runs trivy with --skip-java-db-update, so
+# trivy just skips JAR analysis with a warning instead of fetching.
 RUN set -eux; \
     mkdir -p "$TRIVY_CACHE_DIR" "$AIDW_OSV_DB_DIR"; \
     trivy image --download-db-only --cache-dir "$TRIVY_CACHE_DIR"; \
-    trivy image --download-java-db-only --cache-dir "$TRIVY_CACHE_DIR"; \
     ( cd /tmp && osv-scanner scan source --download-offline-databases \
         --local-db-path "$AIDW_OSV_DB_DIR" --offline-vulnerabilities . || true ); \
     chmod -R a+rX "$TRIVY_CACHE_DIR" "$AIDW_OSV_DB_DIR"; \

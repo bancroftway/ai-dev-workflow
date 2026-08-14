@@ -74,6 +74,10 @@ class SandboxProvider(abc.ABC):
     async def terminate(self, session_id: str) -> None:
         """Tear down the sandbox for session_id. No-op if it isn't running."""
 
+    async def discard_workspace(self, session_id: str) -> None:
+        """Delete any persistent workspace state for session_id (explicit user close only --
+        never called by idle reaping). Default no-op for providers without one."""
+
     @abc.abstractmethod
     async def touch(self, session_id: str) -> None:
         """Reset the idle-timeout clock for session_id's sandbox. No-op if it isn't running."""

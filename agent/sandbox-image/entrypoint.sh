@@ -2,12 +2,16 @@
 # Sandbox container entrypoint (architecture plan Section C/C.4).
 #
 # Responsibilities, in order:
-#   1. Clone REPO_BRANCH of the repo at REPO_CLONE_URL into /workspace, authenticating with
-#      GIT_USER_TOKEN via a one-shot git credential helper -- the token is only ever passed to
-#      this single `git clone` invocation (via `git -c credential.helper=...`), never written to
-#      a persistent .gitconfig or long-lived env var a later process could read. Skipped entirely
-#      when REPO_CLONE_URL is unset, so this image is also usable as a bare Copilot-runtime
-#      sandbox for testing the transport/connect mechanics on their own.
+#   1. Clone (or reuse -- /workspace may be a persistent named volume) REPO_BRANCH of the repo at
+#      REPO_CLONE_URL into /workspace/repo, authenticating with the clone credential via a
+#      one-shot git credential helper. The credential arrives either as a pre-start file
+#      (~/.aidw-git-token, local Docker provider -- never in Config.Env, so `docker inspect`
+#      shows nothing) or as the GIT_USER_TOKEN env var (Azure ACI secure env; env wins when both
+#      are present). Either way it is only ever passed per-invocation via
+#      `git -c credential.helper=...`, never written to a persistent .gitconfig, and both copies
+#      are destroyed before anything repo-supplied can run. Skipped entirely when REPO_CLONE_URL
+#      is unset, so this image is also usable as a bare Copilot-runtime sandbox for testing the
+#      transport/connect mechanics on their own.
 #   2. exec the Copilot CLI runtime in headless TCP server mode, authenticated with the shared
 #      COPILOT_SDK_AUTH_TOKEN (agent/src/graph.py's GITHUB_TOKEN) and gated by
 #      COPILOT_CONNECTION_TOKEN. `exec` (not a backgrounded process) so this process IS pid 1's
@@ -23,9 +27,18 @@ set -euo pipefail
 WORKSPACE_DIR="/workspace/repo"
 COPILOT_SERVER_PORT="${COPILOT_SERVER_PORT:-3000}"
 
+# Local Docker provider delivers the clone credential as a pre-start file (never in Config.Env,
+# so `docker inspect` shows nothing); Azure ACI delivers it as a secure env var. Env wins when
+# both are present. The file is deleted unconditionally, clone or no clone.
+GIT_TOKEN_FILE="$HOME/.aidw-git-token"
+if [[ -z "${GIT_USER_TOKEN:-}" && -f "$GIT_TOKEN_FILE" ]]; then
+  GIT_USER_TOKEN="$(cat "$GIT_TOKEN_FILE")"
+fi
+rm -f "$GIT_TOKEN_FILE"
+
 if [[ -n "${REPO_CLONE_URL:-}" ]]; then
   if [[ -z "${GIT_USER_TOKEN:-}" ]]; then
-    echo "entrypoint: REPO_CLONE_URL set but GIT_USER_TOKEN is empty -- refusing to clone anonymously" >&2
+    echo "entrypoint: REPO_CLONE_URL set but no clone credential (env or token file) -- refusing to clone anonymously" >&2
     exit 1
   fi
 
@@ -39,25 +52,67 @@ echo "password=${GIT_USER_TOKEN}"
 EOF
   chmod 700 "$CRED_HELPER_SCRIPT"
 
-  echo "entrypoint: cloning ${REPO_CLONE_URL} (branch ${REPO_BRANCH:?REPO_BRANCH is required when REPO_CLONE_URL is set}) into ${WORKSPACE_DIR}"
-  git -c credential.helper="$CRED_HELPER_SCRIPT" \
-    clone --branch "$REPO_BRANCH" --single-branch "$REPO_CLONE_URL" "$WORKSPACE_DIR"
+  : "${REPO_BRANCH:?REPO_BRANCH is required when REPO_CLONE_URL is set}"
 
   # The pipeline never commits on the user's selected branch: it works on a tool-owned branch
-  # named ai-dev-workflow/<selected-branch>. If that work branch already exists on origin (a
-  # brownfield re-entry), check it out so prior .ai-dev-workflow/ artifacts hydrate; otherwise
-  # branch off the fresh clone. Must run BEFORE the credential material is destroyed below --
-  # the existence probe and fetch both need auth. `git ls-remote --exit-code` guards the fetch:
-  # a plain fetch of a missing ref exits non-zero and would kill the container under `set -e`.
+  # named ai-dev-workflow/<selected-branch>-<session prefix>. The session suffix is what keeps
+  # two users of the same repo+branch on two DIFFERENT remote branches -- stage-end pushes are
+  # `--force`, so a shared branch would let them silently destroy each other's history.
   WORK_BRANCH="ai-dev-workflow/${REPO_BRANCH}"
-  if git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
-      ls-remote --exit-code origin "refs/heads/${WORK_BRANCH}" >/dev/null 2>&1; then
-    echo "entrypoint: work branch ${WORK_BRANCH} exists on origin -- checking it out"
-    git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
-      fetch origin "+refs/heads/${WORK_BRANCH}:refs/remotes/origin/${WORK_BRANCH}"
-    git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH" "origin/${WORK_BRANCH}"
-  else
-    echo "entrypoint: creating work branch ${WORK_BRANCH} off ${REPO_BRANCH}"
+  if [[ -n "${AIDW_SESSION_ID:-}" ]]; then
+    WORK_BRANCH="${WORK_BRANCH}-${AIDW_SESSION_ID:0:8}"
+  fi
+
+  # /workspace may be a reused named volume: a prior session's clone (reuse it), a corrupt or
+  # partial clone (nuke and re-clone), or empty (fresh clone). Reuse is best-effort end-to-end;
+  # re-clone is the correctness backstop -- a volume must never be able to crash-loop the
+  # container. A reused clone may hold uncommitted droppings from a killed run; the pipeline's
+  # own reset-hard paths handle dirty trees, so no `git clean` here.
+  if [[ -e "$WORKSPACE_DIR" ]] && ! git -C "$WORKSPACE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "entrypoint: $WORKSPACE_DIR exists but is not a valid git work tree -- removing"
+    rm -rf "$WORKSPACE_DIR"
+  fi
+
+  if [[ -d "$WORKSPACE_DIR/.git" ]]; then
+    echo "entrypoint: reusing existing clone in $WORKSPACE_DIR"
+    rm -f "$WORKSPACE_DIR/.git/index.lock"  # stale lock from a container killed mid-commit
+    if ! git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
+        fetch origin "+refs/heads/${REPO_BRANCH}:refs/remotes/origin/${REPO_BRANCH}"; then
+      echo "entrypoint: fetch on reused clone failed -- re-cloning"
+      rm -rf "$WORKSPACE_DIR"
+    fi
+  fi
+
+  if [[ ! -d "$WORKSPACE_DIR/.git" ]]; then
+    echo "entrypoint: cloning ${REPO_CLONE_URL} (branch ${REPO_BRANCH}) into ${WORKSPACE_DIR}"
+    git -c credential.helper="$CRED_HELPER_SCRIPT" \
+      clone --branch "$REPO_BRANCH" --single-branch "$REPO_CLONE_URL" "$WORKSPACE_DIR"
+  fi
+
+  # Work-branch setup. Must run BEFORE the credential material is destroyed below -- the
+  # existence probe and fetch both need auth. `git ls-remote --exit-code` guards the fetch: a
+  # plain fetch of a missing ref exits non-zero and would kill the container under `set -e`.
+  # A reused volume's local work branch is preferred over origin's copy (single tool-owned
+  # writer; local is newest and may hold commits a broken push never delivered). Any failure in
+  # the reuse-side checkout falls back to a full re-clone rather than crash-looping the volume.
+  if ! (
+    if git -C "$WORKSPACE_DIR" show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
+      git -C "$WORKSPACE_DIR" checkout "$WORK_BRANCH"
+    elif git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
+        ls-remote --exit-code origin "refs/heads/${WORK_BRANCH}" >/dev/null 2>&1; then
+      echo "entrypoint: work branch ${WORK_BRANCH} exists on origin -- checking it out"
+      git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
+        fetch origin "+refs/heads/${WORK_BRANCH}:refs/remotes/origin/${WORK_BRANCH}"
+      git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH" "origin/${WORK_BRANCH}"
+    else
+      echo "entrypoint: creating work branch ${WORK_BRANCH} off ${REPO_BRANCH}"
+      git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH"
+    fi
+  ); then
+    echo "entrypoint: work-branch setup failed on reused clone -- re-cloning from scratch"
+    rm -rf "$WORKSPACE_DIR"
+    git -c credential.helper="$CRED_HELPER_SCRIPT" \
+      clone --branch "$REPO_BRANCH" --single-branch "$REPO_CLONE_URL" "$WORKSPACE_DIR"
     git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH"
   fi
 

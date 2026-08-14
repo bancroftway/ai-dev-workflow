@@ -492,6 +492,14 @@ async def _detect_package_manager(provider: SandboxProvider, thread_id: str, roo
 
 _LOCKFILE_BY_MANAGER = {"npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "yarn": "yarn.lock"}
 
+# --no-audit/--no-fund are npm-only; pnpm rejects them outright ("Unknown options") and yarn has
+# no equivalent prompt to suppress -- per-manager commands, not per-manager verbs with shared flags.
+_INSTALL_CMD_BY_MANAGER = {
+    "npm": "npm install -D --no-audit --no-fund",
+    "pnpm": "pnpm add -D",
+    "yarn": "yarn add -D",
+}
+
 
 async def _write_if_outdated(
     provider: SandboxProvider, thread_id: str, path: str, template_path: str
@@ -541,10 +549,9 @@ async def _apply_node(
         return [], {"skipped": "repo has its own eslint.config.mjs"}
 
     deps = _node_dev_deps([str(item) for item in (tech_stack.get("frameworks") or [])])
-    add = "add -D" if manager in ("pnpm", "yarn") else "install -D"
     prefix = f"cd {shlex.quote(root)} && " if root else ""
     install = await provider.exec_in_sandbox(
-        thread_id, f"{prefix}{manager} {add} --no-audit --no-fund {' '.join(deps)} 2>&1"
+        thread_id, f"{prefix}{_INSTALL_CMD_BY_MANAGER[manager]} {' '.join(deps)} 2>&1"
     )
     if not install.ok:
         return [], {"install_failed": manager, "error": (install.stderr or install.stdout or "")[-500:]}

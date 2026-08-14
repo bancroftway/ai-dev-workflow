@@ -39,12 +39,15 @@ def get_last_push(thread_id: str) -> dict[str, Any] | None:
 
 
 async def push_head(provider: SandboxProvider, thread_id: str) -> None:
-    """Pushes HEAD (the ai-dev-workflow/<branch> work branch) to origin, log-and-continue.
+    """Pushes HEAD (the ai-dev-workflow/<branch>-<user> work branch) to origin, log-and-continue.
 
-    --force-with-lease because two pipeline paths legitimately `git reset --hard` the work branch
-    (finding-cluster's upgrade revert, app-discovery's reject cleanup); a plain push would be
-    rejected non-fast-forward forever after, silently. The branch is tool-owned -- no human
-    commits land on it directly -- so a leased force is safe.
+    --force (not --force-with-lease): the clone is --single-branch, so no remote-tracking ref for
+    the work branch ever exists or updates -- a bare lease compares against "branch must not
+    exist" and rejected literally every push as `stale info`. Force is needed at all because two
+    pipeline paths legitimately `git reset --hard` the work branch (finding-cluster's upgrade
+    revert, app-discovery's reject cleanup). The branch is tool-owned and user-scoped
+    (entrypoint.sh suffixes it with the session id), so it has exactly one writer -- plain force
+    is safe.
 
     The token transits the container as a one-shot credential-helper file in /tmp, deleted in the
     same shell invocation.
@@ -61,7 +64,7 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
     helper_b64 = base64.b64encode(helper_script.encode("utf-8")).decode("ascii")
     command = (
         f"printf %s {shlex.quote(helper_b64)} | base64 -d > {helper_path} && chmod 700 {helper_path} && "
-        f"git -c credential.helper={helper_path} push --force-with-lease --quiet -u origin HEAD; "
+        f"git -c credential.helper={helper_path} push --force --quiet -u origin HEAD; "
         f"rc=$?; rm -f {helper_path}; exit $rc"
     )
     result = await provider.exec_in_sandbox(thread_id, command)

@@ -46,6 +46,7 @@ from . import metrics_nodes
 from . import exit_nodes
 from . import rebuild
 from . import spec_ledger
+from . import telemetry
 from . import workflow_persistence
 from .gates import audit_gates
 from .quality_security import quality_nodes, security_nodes
@@ -1921,8 +1922,18 @@ _STAGE_KEYS = [stage.key for stage in _ALL_STAGE_SPECS]
 _RENDER_MARKDOWN_BY_STAGE = {stage.key: stage.render_markdown for stage in _ALL_STAGE_SPECS}
 
 
+class _TracedStateGraph(StateGraph):
+    """Wraps every node callable in a telemetry span at the single choke point all 51
+    add_node call sites flow through -- no per-node edits, no per-cluster wiring."""
+
+    def add_node(self, node, action=None, **kwargs):  # type: ignore[override]
+        if isinstance(node, str) and callable(action):
+            action = telemetry.traced_node(node, action)
+        return super().add_node(node, action, **kwargs)
+
+
 def build_graph() -> StateGraph:
-    builder = StateGraph(GraphState)
+    builder = _TracedStateGraph(GraphState)
     builder.add_node("intake", intake_node)
     builder.add_node("scaffold", preflight_nodes.scaffold_node)
     builder.add_edge(START, "intake")

@@ -44,6 +44,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from pydantic import BaseModel, PrivateAttr
 
 from . import config
+from . import telemetry
 from .sandbox import SandboxSession
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,33 @@ class CopilotChatModel(BaseChatModel):
             return session
 
     async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        with telemetry.tracer.start_as_current_span(
+            f"llm/{self.stage}/{self.role}",
+            attributes={
+                "thread_id": self.thread_id,
+                "stage": self.stage,
+                "role": self.role,
+                "gen_ai.request.model": self.model_name or "default",
+            },
+        ) as llm_span:
+            self._last_usage = None  # never attach a previous call's numbers to this span
+            result = await self._agenerate_inner(messages, stop=stop, run_manager=run_manager, **kwargs)
+            # Success path only, and only when a usage event actually arrived: _last_usage is a
+            # PrivateAttr that survives from the previous call, so reading it on error or absence
+            # would attach stale numbers.
+            if self._last_usage is not None:
+                llm_span.set_attribute("gen_ai.usage.input_tokens", self._last_usage["input_tokens"])
+                llm_span.set_attribute("gen_ai.usage.output_tokens", self._last_usage["output_tokens"])
+                llm_span.set_attribute("gen_ai.response.model", self._last_usage["model"])
+            return result
+
+    async def _agenerate_inner(
         self,
         messages: list[BaseMessage],
         stop: list[str] | None = None,

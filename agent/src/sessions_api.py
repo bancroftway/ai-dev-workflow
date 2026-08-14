@@ -68,5 +68,7 @@ async def provision_session(body: ProvisionRequest) -> ProvisionResponse:
 async def terminate_session(thread_id: str) -> ProvisionResponse:
     provider = get_sandbox_provider()
     await provider.terminate(thread_id)
+    # Explicit close discards the persistent workspace too (idle reaps deliberately keep it).
+    await provider.discard_workspace(thread_id)
     registry.pop(thread_id)
     return ProvisionResponse(status="terminated")

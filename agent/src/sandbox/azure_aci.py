@@ -35,6 +35,8 @@ import shutil
 import time
 from dataclasses import dataclass, field
 
+from . import registry
+from ..telemetry import traced_exec
 from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_copilot_ready
 
 logger = logging.getLogger(__name__)
@@ -170,6 +172,9 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 f"REPO_BRANCH={branch}",
                 f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
                 f"AIDW_IMAGE_REF={image or self._sandbox_image}",
+                # Suffixes the tool-owned work branch (entrypoint.sh) so two users on the same
+                # repo+branch never share -- and force-push over -- one remote branch.
+                f"AIDW_SESSION_ID={session_id}",
                 "--secure-environment-variables",
                 f"REPO_CLONE_URL={repo_clone_url}",
                 f"GIT_USER_TOKEN={git_user_token}",
@@ -263,6 +268,9 @@ class AzureContainerInstanceProvider(SandboxProvider):
     async def terminate(self, session_id: str) -> None:
         async with self._lock:
             sandbox = self._sandboxes.pop(session_id, None)
+        # The reaper routes through here too; without this pop the registry.get() guards across
+        # the pipeline kept seeing a phantom session after an idle reap.
+        registry.pop(session_id)
         if sandbox is None:
             return
         logger.info("Terminating ACI sandbox session_id=%s container_group=%s", session_id, sandbox.container_name)
@@ -277,6 +285,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
         async with self._lock:
             return list(self._sandboxes.keys())
 
+    @traced_exec
     async def exec_in_sandbox(self, session_id: str, command: str) -> ExecResult:
         async with self._lock:
             sandbox = self._sandboxes.get(session_id)
