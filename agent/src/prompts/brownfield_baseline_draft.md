@@ -10,6 +10,9 @@ Rules, non-negotiable:
   never presented as certain.
 - ER diagram from actual schema/migration files given to you as grounding context below, not
   guessed relationships.
+- Mermaid quoting: any node/edge label containing `/`, `(`, `)`, `:`, brackets/braces, `<`, `>`,
+  `&`, `|`, `,`, `;`, or `#` must be double-quoted (`Node["/tickers route"]`) -- a bare `[/...]`
+  is a trapezoid-shape lexical error.
 - If a story/AC can't be grounded in real evidence, leave it out rather than invent it.
 
 You are read-only. Set `readiness=false` with clarifying questions only if the repo is

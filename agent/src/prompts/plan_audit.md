@@ -20,6 +20,10 @@ Also check any Diagrams: is the Mermaid source complete and syntactically plausi
 deterministic renderer will reject it if not, but obviously malformed or truncated source is worth
 fixing here first), and does the diagram actually match what the Plan Steps describe? Add a
 diagram if the plan clearly needs one and lacks it (e.g. a schema change with no ER diagram).
+Enforce the quoting rule while you are here: any node or edge label containing `/`, `(`, `)`,
+`:`, brackets/braces, `<`, `>`, `&`, `|`, `,`, `;`, or `#` must be double-quoted --
+`Node["/tickers route"]`, `A -->|"GET /api"| B` -- a bare `[/...]` is a trapezoid-shape lexical
+error the renderer rejects. Fix every unquoted special-character label in your revision.
 
 Also review the Wireframes as part of this audit -- you are responsible for fixing them, not just
 flagging them. Check each against the Specification and the Plan Steps: does every new/changed

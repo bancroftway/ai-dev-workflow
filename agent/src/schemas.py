@@ -72,7 +72,12 @@ class PlanDiagram(BaseModel):
 
     name: str = Field(description="Short, filename-safe name (e.g. 'password-reset-er').")
     kind: str = Field(description="One of: er, architecture, user_flow.")
-    mermaid_source: str = Field(description="Complete, valid Mermaid diagram source, including its own type declaration line (e.g. 'erDiagram', 'flowchart TD').")
+    mermaid_source: str = Field(
+        description="Complete, valid Mermaid diagram source, including its own type declaration "
+        "line (e.g. 'erDiagram', 'flowchart TD'). Node/edge labels containing special characters "
+        "(/ ( ) : [ ] { } < > & | , ; #) MUST be double-quoted, e.g. Node[\"/tickers route\"] and "
+        "A -->|\"GET /api\"| B -- a bare [/...] is a trapezoid-shape lexical error."
+    )
 
 
 class Wireframe(BaseModel):

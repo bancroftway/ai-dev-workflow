@@ -24,6 +24,13 @@ Mermaid source (its own type declaration line included, e.g. `erDiagram` or `flo
 write real Mermaid syntax, not pseudo-diagram prose; a deterministic step renders it and will
 reject invalid syntax. Skip diagrams entirely for a trivial change where one wouldn't add value.
 
+HARD MERMAID RULE -- node labels with special characters MUST be double-quoted. Any label
+containing `/`, `(`, `)`, `:`, `[`, `]`, `{`, `}`, `<`, `>`, `&`, `|`, `,`, `;`, `#`, or `"` must
+be written as `Node["label text"]` (or `Node("...")`/`Node{"..."}` for those shapes), never bare:
+`Landing["/tickers route"]` is valid; `Landing[/tickers route]` is a lexical error because `[/`
+opens a trapezoid shape. The same applies to edge labels: `A -->|"GET /api"| B`. Keep labels
+short and put detail in prose instead of packing punctuation into the diagram.
+
 Wireframes: when (and only when) this repository has a UI framework and the plan adds or changes
 user-facing screens, include one Wireframe per new/changed screen (at most 6). Each is a single
 complete, self-contained, high-fidelity HTML page: ALL styling inline in one `<style>` block, a
