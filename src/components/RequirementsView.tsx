@@ -5,6 +5,7 @@ import type { InputContent } from "@ag-ui/core";
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
+import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -66,7 +67,12 @@ export function RequirementsView() {
   // verdict, so the submit button goes down with it. The only way forward is to point the session
   // at a repository containing a runnable app -- or add one and start a new session.
   const rejection = state.app_rejection ?? null;
-  const disabled = text.trim().length === 0 || agent.isRunning || submitting || rejection !== null;
+  // A run submitted while an interrupt is pending is silently dropped server-side (the endpoint
+  // re-emits the stored interrupt and never starts the graph), so Submit must go down while a
+  // review is open -- an enabled button there is a lie.
+  const { interrupt: openInterrupt } = useOpenInterrupt();
+  const disabled =
+    text.trim().length === 0 || agent.isRunning || submitting || rejection !== null || openInterrupt.open;
 
   /** Pasted images upload through the normal attachment queue AND insert a markdown ref at the
    * cursor. Each pasted file is renamed to a unique name first -- clipboard images all arrive as
@@ -248,7 +254,12 @@ export function RequirementsView() {
         </div>
       </div>
 
-      <div className="flex justify-end">
+      <div className="flex items-center justify-end gap-3">
+        {openInterrupt.open && (
+          <span className="text-xs text-neutral-500">
+            A review is waiting in the chat sidebar — approve or acknowledge it first, then edit and resubmit.
+          </span>
+        )}
         <button
           className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           disabled={disabled}

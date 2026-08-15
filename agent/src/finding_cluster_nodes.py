@@ -16,13 +16,15 @@ Verification status: NOT exercised against a real sandbox, same caveat as qualit
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import interrupt
+
+logger = logging.getLogger(__name__)
 
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files
@@ -191,10 +193,13 @@ async def finding_cluster_revert_node(state: dict[str, Any], config: RunnableCon
 
 
 async def finding_cluster_notice_gate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    """Informational human gate -- does NOT block the rest of audit-cluster (dependency freshness is
-    valuable-but-optional, not correctness-critical the way coverage/dup/license are). The graph
-    proceeds to license-audit regardless of how this interrupt resolves; it exists purely so a human sees
-    that the upgrade attempt was reverted, not to gate further progress."""
+    """Informational notice -- previously an interrupt, now just a log line. Dependency freshness
+    is valuable-but-optional, the graph proceeds to license-audit regardless, and the revert node
+    above already wrote the durable ledger entry; pausing a whole run to show a human a
+    non-blocking notice was the only cost. The two human checkpoints are specification and plan."""
     finding_cluster = state.get("finding_cluster") or default_finding_cluster_state()
-    interrupt({"stage": "finding_cluster", "type": "dependency_upgrade_reverted", "last_output_tail": finding_cluster["last_output_tail"]})
+    logger.warning(
+        "finding-cluster dependency upgrade was reverted; last output tail: %s",
+        (finding_cluster.get("last_output_tail") or "")[-500:],
+    )
     return {}

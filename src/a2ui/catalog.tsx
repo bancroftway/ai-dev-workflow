@@ -45,8 +45,21 @@ const ImplementationPlanSchema = z.object({
   wireframes: z.array(WireframeSchema).optional().default([]),
 });
 
-type Specification = z.infer<typeof SpecificationSchema>;
-type ImplementationPlan = z.infer<typeof ImplementationPlanSchema>;
+export type Specification = z.infer<typeof SpecificationSchema>;
+export type ImplementationPlan = z.infer<typeof ImplementationPlanSchema>;
+
+/** Safe parsers for rendering a stage's raw streamed `draft`/`approved_content` dict directly
+ * (the pre-approval fallback when no A2UI surface message exists yet). Zod validation, not a
+ * cast: a partial or clarifying-questions-only draft returns null instead of crashing `.map`. */
+export function parseSpecification(data: unknown): Specification | null {
+  const result = SpecificationSchema.safeParse(data);
+  return result.success ? result.data : null;
+}
+
+export function parseImplementationPlan(data: unknown): ImplementationPlan | null {
+  const result = ImplementationPlanSchema.safeParse(data);
+  return result.success ? result.data : null;
+}
 
 // Audit findings are deliberately never rendered: the pipeline's design intent is that a human
 // reviewer only ever sees final, gap-addressed content, never the intermediate list of what the

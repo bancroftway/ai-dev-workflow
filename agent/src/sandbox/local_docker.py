@@ -17,6 +17,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import secrets
 import socket
 import tarfile
@@ -139,7 +140,11 @@ class LocalDockerProvider(SandboxProvider):
         idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         self._image = image
-        self._idle_timeout_seconds = idle_timeout_seconds
+        # The reaper's idle clock only ticks on agent-side execs; a long silent autopilot turn
+        # (all activity inside the container over the Copilot TCP session) looks idle. Headless
+        # runs set this env high so an hour-long codegen turn doesn't get its sandbox reaped.
+        env_timeout = os.environ.get("AIDW_SANDBOX_IDLE_TIMEOUT")
+        self._idle_timeout_seconds = float(env_timeout) if env_timeout else idle_timeout_seconds
         self._sandboxes: dict[str, _RunningSandbox] = {}
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None

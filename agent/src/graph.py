@@ -864,6 +864,9 @@ STAGES: list[StageSpec] = [
         post_audit_hook=requirements_nodes.persist_raw_requirements_seed,
         hydrate_from_repo_file=requirements_nodes.hydrate_raw_requirements_from_repo_file,
         session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
+        # The human already wrote the seed text; gating its structured restatement was a
+        # redundant approval. Specification is the first human checkpoint.
+        requires_human_gate=False,
     ),
     StageSpec(
         key="specification",
@@ -943,6 +946,9 @@ STAGES: list[StageSpec] = [
         build_audit_prompt=_build_minimal_code_to_green_audit_prompt,
         render_markdown=render_minimal_code_to_green_markdown,
         deterministic_verify=verify_coverage,
+        # Coverage verification (the deterministic gate) is the real check; the human checkpoints
+        # are specification and plan only.
+        requires_human_gate=False,
         # Draft gets full, unscoped write access -- "minimal code to green" is definitionally a
         # code-writing task (Part A Decisions point 6, tier (iii)). Audit stays read-only, same
         # asymmetry as P4's session_options.
@@ -1146,6 +1152,19 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         )
 
         prompt_messages = stage_spec.build_prompt(state)
+        # Headless mode (run_headless.py): the runner cannot answer clarifying questions, so a
+        # not-ready draft would dead-end the run at the needs_clarification END edge. Checked at
+        # call time on purpose -- no import-order coupling. The injected message is never
+        # persisted (draft node returns only stages; audit prompts rebuild from the draft).
+        if os.environ.get("AIDW_HEADLESS"):
+            prompt_messages = [
+                *prompt_messages,
+                HumanMessage(
+                    content="Headless mode: clarifying questions are disallowed. Make reasonable "
+                    "engineering assumptions, record them in the document itself, and set "
+                    "readiness to true."
+                ),
+            ]
         response = await ainvoke_structured(model, prompt_messages, stage_spec.response_schema)
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
@@ -1534,9 +1553,9 @@ ADVERSARIAL_AUDIT_SPEC = StageSpec(
     audit_content_field="revised_report",
     build_audit_prompt=_build_adversarial_audit_audit_prompt,
     render_markdown=render_adversarial_audit_markdown,
-    # requires_human_gate defaults True -- adversarial-audit's own human review of divergence findings, per
-    # the pipeline diagram (the one interactive checkpoint inside audit-cluster besides low-confidence
-    # license findings).
+    # Divergence findings flow into dedup-simplify and the audit exit gate's objective re-checks;
+    # the human checkpoints are specification and plan only.
+    requires_human_gate=False,
 )
 
 DEDUP_SPEC = StageSpec(
@@ -1587,8 +1606,10 @@ EXIT_SPEC = StageSpec(
     audit_content_field="revised_report",
     build_audit_prompt=_build_exit_audit_prompt,
     render_markdown=render_exit_markdown,
-    # requires_human_gate defaults True -- the final human checkpoint of the entire pipeline.
-    sign_approval=True,  # APPROVALS.md covers P2/P3/exit per the plan -- exit_finalize_node also reads this row
+    # The merge-readiness report is written and signed automatically; the human checkpoints are
+    # specification and plan only. The report itself stays reviewable on the work branch.
+    requires_human_gate=False,
+    sign_approval=True,  # APPROVALS.md covers P2/P3/exit per the plan
 )
 
 
@@ -1638,6 +1659,21 @@ def _route_after_tech_stack(state: GraphState) -> str:
     run before brownfield-baseline now, so an unsuitable repository is rejected before any human is asked to ratify
     a baseline -- and before anything is written to the repo."""
     return "next" if state.get("manifest_exists", True) else "brownfield_baseline_pre"
+
+
+def _route_after_intake(state: GraphState) -> str:
+    """END for a blank run with nothing to do; scaffold otherwise.
+
+    "Nothing to do" = no requirements text this run (typed or carried in the latest
+    HumanMessage) AND nothing hydrated back out of the repo (a returning thread whose clone
+    holds an approved raw-requirements doc proceeds so downstream stages can hydrate/resume).
+    """
+    if (state.get("raw_requirements_text") or "").strip():
+        return "scaffold"
+    raw_req = (state.get("stages") or {}).get("raw-requirements") or {}
+    if raw_req.get("approved_content") or raw_req.get("draft"):
+        return "scaffold"
+    return END
 
 
 async def _manifest_branch_node(_state: GraphState) -> dict[str, Any]:
@@ -1701,8 +1737,9 @@ BROWNFIELD_BASELINE_SPEC = StageSpec(
     audit_content_field="revised_baseline",
     build_audit_prompt=_build_brownfield_baseline_audit_prompt,
     render_markdown=render_brownfield_baseline_markdown,
-    # requires_human_gate defaults True -- ratification is what flips manifest.json from absent
-    # to present (brownfield_write_manifest_node, wired as this stage's own next_draft_name below).
+    # Ratification (brownfield_write_manifest_node, this stage's next_draft_name below) now runs
+    # automatically after the audit -- the human checkpoints are specification and plan only.
+    requires_human_gate=False,
     session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
 )
 
@@ -1943,9 +1980,13 @@ def build_graph() -> StateGraph:
     builder.add_node("intake", intake_node)
     builder.add_node("scaffold", preflight_nodes.scaffold_node)
     builder.add_edge(START, "intake")
-    builder.add_edge("intake", "scaffold")
+    # The frontend fires a blank run on mount as its only reload/reattach transport (it re-emits
+    # a pending interrupt or rehydrates state). A blank run on a thread with NO requirements --
+    # neither typed text nor anything hydrated back out of the repo -- must be a free no-op, not
+    # a trip through app-discovery/tech-stack/baseline LLM stages on empty input.
+    builder.add_conditional_edges("intake", _route_after_intake, {"scaffold": "scaffold", END: END})
     # Suitability first: app discovery decides whether this workflow applies at all, before
-    # tech-stack detection, before brownfield-baseline's human ratification gate, and before anything is written to
+    # tech-stack detection, before brownfield-baseline's ratification, and before anything is written to
     # the repository (see preflight_nodes.scaffold_finalize_node).
     builder.add_edge("scaffold", "app_discovery_pre")
 

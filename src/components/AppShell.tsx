@@ -17,6 +17,7 @@ import { QualityView } from "@/components/QualityView";
 import { RequirementsView } from "@/components/RequirementsView";
 import { SessionOverview } from "@/components/SessionOverview";
 import { SpecificationView } from "@/components/SpecificationView";
+import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
@@ -84,66 +85,22 @@ export function AppShell({ metricThresholds }: { metricThresholds: MetricThresho
   // defaults to true, publishing into the CopilotSidebar's chat feed, which is mounted around
   // every view below.
   //
-  // Ordering: the escalation payload's own `type` is checked FIRST -- escalate/security-cap
-  // interrupts carry a typed payload (graph.py make_escalate_node, security gate) and rendering
-  // them as an approval gate was a real mislabel bug. Only the *label* of a plain approval gate
-  // still derives from agent.state rather than the event payload: empirically the payload
-  // observed in `render` does not reliably refresh across a second interrupt within the same
-  // session (see git history), while agent.state does update correctly. An ordered lookup, not a
-  // binary ternary -- the first stage in pipeline order sitting at ready_for_review is the one
-  // actually paused on the open interrupt.
+  // The backend delivers the interrupt payload as a JSON *string* (ag_ui_langgraph's
+  // dump_json_safe) -- parsing it is what makes the gate/escalation distinction work at all.
+  // Discrimination is presence of `type`: the plain approval gate payload (graph.py
+  // make_gate_node) has none; every escalation carries one.
   useInterrupt<EscalationPayload>({
     agentId: localAgentId,
     render: ({ resolve, event }) => {
-      const payload = (event?.value ?? {}) as EscalationPayload;
-      const escalationType = typeof payload === "object" && payload !== null ? payload.type : undefined;
-
-      if (escalationType === "cannot_verify" || escalationType === "verification_cap_exceeded" || escalationType === "security_cycle_cap_exceeded" || escalationType === "exit_gate_failed_twice") {
-        const failedStage = PIPELINE_STAGE_ORDER.find(
-          (s) => state.stages?.[s.key]?.last_verification && !state.stages[s.key]!.last_verification!.passed,
-        );
-        const label = (typeof payload.stage === "string" && payload.stage) || failedStage?.label || "this stage";
-        const feedback =
-          (typeof payload.feedback === "string" && payload.feedback) ||
-          failedStage?.key && state.stages?.[failedStage.key]?.last_verification?.feedback ||
-          "";
-        const heading =
-          escalationType === "cannot_verify"
-            ? `Cannot verify ${label} — no sandbox is available.`
-            : escalationType === "security_cycle_cap_exceeded"
-              ? "The security gate is still failing after its retry budget."
-              : escalationType === "exit_gate_failed_twice"
-                ? "The audit exit gate failed twice."
-                : `Verification for ${label} kept failing and needs your attention.`;
-        return (
-          <div className="space-y-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
-            <p className="text-sm font-medium text-red-900">{heading}</p>
-            {feedback && <p className="text-xs text-red-800">{feedback}</p>}
-            <button
-              className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
-              onClick={() => resolve({})}
-            >
-              Acknowledge &amp; retry
-            </button>
-          </div>
-        );
+      const raw: unknown = event?.value;
+      let payload: EscalationPayload = {};
+      try {
+        payload = (typeof raw === "string" ? JSON.parse(raw) : raw) ?? {};
+      } catch {
+        payload = {};
       }
-
-      const readyStage = PIPELINE_STAGE_ORDER.find((s) => state.stages?.[s.key]?.status === "ready_for_review");
-      const label = readyStage?.label ?? "this stage";
-      return (
-        <div className="flex items-center justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
-          <span className="text-sm text-amber-900">
-            The <strong>{label}</strong> is ready for your review.
-          </span>
-          <button
-            className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
-            onClick={() => resolve({ decision: "approved" })}
-          >
-            Approve
-          </button>
-        </div>
-      );
+      if (typeof payload !== "object" || payload === null) payload = {};
+      return <InterruptCard payload={payload} resolve={resolve} />;
     },
   });
 
@@ -175,6 +132,7 @@ export function AppShell({ metricThresholds }: { metricThresholds: MetricThresho
   };
 
   return (
+    <InterruptProvider>
     <div className="flex min-h-full flex-1">
       <div className="flex min-h-full flex-1 flex-col">
         {sandboxStatus === "error" && (
@@ -193,14 +151,14 @@ export function AppShell({ metricThresholds }: { metricThresholds: MetricThresho
           <TabButton
             label="Specification"
             active={activeView === "specification"}
-            disabled={!specification?.ever_ready_for_review}
+            disabled={!specification?.ever_ready_for_review && !specification?.clarifying_questions?.length}
             dot={dots.specification}
             onClick={() => setActiveView("specification")}
           />
           <TabButton
             label="Plan"
             active={activeView === "plan"}
-            disabled={!plan?.ever_ready_for_review}
+            disabled={!plan?.ever_ready_for_review && !plan?.clarifying_questions?.length}
             dot={dots.plan}
             onClick={() => setActiveView("plan")}
           />
@@ -236,6 +194,79 @@ export function AppShell({ metricThresholds }: { metricThresholds: MetricThresho
       </div>
 
       <CopilotSidebar agentId={localAgentId} input={GatedChatInput} />
+    </div>
+    </InterruptProvider>
+  );
+}
+
+/** The chat-feed card for an open interrupt. A real component (not inline JSX in the render
+ * prop) so hooks are legal: it publishes {open, stage, draft} into InterruptContext — Submit
+ * gating and the post-reload draft fallback both hang off that. */
+function InterruptCard({
+  payload,
+  resolve,
+}: {
+  payload: EscalationPayload;
+  resolve: (value: unknown) => void;
+}) {
+  const { setInterrupt } = useOpenInterrupt();
+  const stageKey = typeof payload.stage === "string" ? payload.stage : undefined;
+  const stageLabel = PIPELINE_STAGE_ORDER.find((s) => s.key === stageKey)?.label ?? stageKey ?? "this stage";
+  const draft = (payload as Record<string, unknown>).draft;
+
+  useEffect(() => {
+    setInterrupt({ open: true, stage: stageKey, draft });
+    return () => setInterrupt({ open: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- payload identity churns per render; stage is the real key
+  }, [stageKey]);
+
+  const done = (value: unknown) => {
+    setInterrupt({ open: false });
+    resolve(value);
+  };
+
+  if (payload.type) {
+    const rest: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+    delete rest.stage;
+    delete rest.type;
+    delete rest.draft; // huge; the views render it, not this card
+    const text = [rest.feedback, rest.reason].find((v) => typeof v === "string" && v) as string | undefined;
+    delete rest.feedback;
+    delete rest.reason;
+    return (
+      <div className="space-y-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
+        <p className="text-sm font-medium text-red-900">
+          {stageLabel}: {String(payload.type).replaceAll("_", " ")}
+        </p>
+        {text && <p className="text-xs text-red-800">{text}</p>}
+        {Object.keys(rest).length > 0 && (
+          <pre className="max-h-40 overflow-auto whitespace-pre-wrap text-xs text-red-800">
+            {JSON.stringify(rest, null, 2)}
+          </pre>
+        )}
+        {/* Scalar resume on purpose: an empty object is classified by LangGraph as an empty
+            resume MAP, delivering no value -- the interrupt would re-raise forever. */}
+        <button
+          className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
+          onClick={() => done("retry")}
+        >
+          Acknowledge &amp; retry
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+      <span className="text-sm text-amber-900">
+        The <strong>{stageLabel}</strong> is ready for your review.
+      </span>
+      <button
+        className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
+        onClick={() => done({ decision: "approved" })}
+      >
+        Approve
+      </button>
     </div>
   );
 }

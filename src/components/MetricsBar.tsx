@@ -70,7 +70,7 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
 
   const chips: React.ReactNode[] = [];
   if (health != null) {
-    chips.push(<Chip key="health" label="Health" value={String(health)} tone={grade(health, thresholds.healthGreen, thresholds.healthAmber)} />);
+    chips.push(<Chip key="health" label="Repo health" value={`${health}/100`} tone={grade(health, thresholds.healthGreen, thresholds.healthAmber)} />);
   }
   if (coverage != null) {
     chips.push(<Chip key="cov" label="Coverage" value={`${coverage.toFixed(0)}%`} tone={grade(coverage, thresholds.coverageGreen, thresholds.coverageAmber)} />);
@@ -82,7 +82,9 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
     chips.push(<Chip key="dup" label="Duplication" value={`${duplication}%`} tone={grade(duplication, thresholds.dupGreen, thresholds.dupAmber, true)} />);
   }
 
-  if (chips.length === 0) return null;
+  // The status/push lines matter before any metric exists (a needs_clarification stage was
+  // previously invisible exactly when no scan had streamed) -- only hide a truly empty strip.
+  if (chips.length === 0 && !activeStage && state.last_push?.ok !== false) return null;
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-1.5">

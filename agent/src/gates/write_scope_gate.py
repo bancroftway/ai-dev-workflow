@@ -50,6 +50,18 @@ def _is_test_path(path: str) -> bool:
     return any(pattern.search(path) for pattern in _ALL_PATTERNS)
 
 
+# Paths the PIPELINE ITSELF writes and commits between the baseline commit and this gate's diff
+# (stage artifacts, the action ledger, the spec id ledger). Observed live: every ac-to-tests
+# verify cycle flagged `.ai-dev-workflow/ac-to-tests.draft.json` etc. as scope violations the
+# model could never fix -- it didn't write them, workflow persistence did -- deadlocking the
+# stage at the verify cap. The scope rule is about the MODEL's writes only.
+_PIPELINE_OWNED_PREFIXES = (".ai-dev-workflow/", "spec/", "APPROVALS.md", "AGENTS.md")
+
+
+def _is_pipeline_owned(path: str) -> bool:
+    return path.startswith(_PIPELINE_OWNED_PREFIXES)
+
+
 @dataclass(frozen=True)
 class WriteScopeOutcome:
     passed: bool
@@ -67,7 +79,7 @@ async def check_write_scope(provider: SandboxProvider, thread_id: str, baseline_
 
     result = await provider.exec_in_sandbox(thread_id, f"git diff --name-only {baseline_commit} -- .")
     changed_paths = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-    violating = [p for p in changed_paths if not _is_test_path(p)]
+    violating = [p for p in changed_paths if not _is_test_path(p) and not _is_pipeline_owned(p)]
     return WriteScopeOutcome(passed=len(violating) == 0, violating_paths=violating, changed_paths=changed_paths)
 
 

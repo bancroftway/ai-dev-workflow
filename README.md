@@ -20,7 +20,7 @@ The pipeline opens with a suitability gate. `ai-dev-workflow` only applies to a 
 flowchart TD
     session["SESSION PROVISIONING &nbsp;·&nbsp; before the graph is ever invoked (agent/src/sessions_api.py)<br/>1. Next.js server route calls POST /sessions/provision with thread_id, owner, repo, branch<br/>2. sandbox factory picks a provider: local Docker or Azure ACI (agent/src/sandbox/)<br/>3. provider clones owner/repo at branch into /workspace/repo (a per-session named volume locally — the tree and any unpushed commits survive container removal; explicit session DELETE discards it), then checks out the tool-owned work branch ai-dev-workflow/&lt;branch&gt;-&lt;session prefix&gt; (session-suffixed so two users of the same repo+branch never share one force-pushed remote branch; reused from the volume when present, fetched from origin on brownfield re-entry, created fresh otherwise). The user's selected branch is never committed on. Copilot CLI token injected as env; the git clone token arrives as a one-shot pre-start file (never visible in docker inspect); per-owner package cache mounted at /opt/aidw/cache<br/>4. entrypoint runs bootstrap.sh: installs any toolchain the repo declares for itself (.tool-versions, mise.toml, .nvmrc, global.json) into /opt/aidw/tools — non-fatal, and never into the repo<br/>5. registry.set(thread_id, session); the GitHub token is retained agent-memory-only for stage-end pushes (git_ops.push_head) — every later node checks this registry before touching disk<br/>6. frontend does agent.addMessage(requirements) then runAgent() — this is what starts the graph"]
 
-    intake["INTAKE &nbsp;·&nbsp; normalize the run and decide what carries over from previous runs<br/>1. mint a fresh run_id (used by the spec ledger, APPROVALS.md and metrics-report/exit snapshots)<br/>2. first invoke for this thread: hydrate every stage's state back out of the repo (workflow_persistence.py)<br/>3. seed default state for every StageSpec that has none yet<br/>4. reset specification onward to not_started — tech-stack and raw-requirements stay approved across runs<br/>5. split the newest HumanMessage into raw_requirements_text plus any image/document attachments"]
+    intake["INTAKE &nbsp;·&nbsp; normalize the run and decide what carries over from previous runs<br/>1. mint a fresh run_id (used by the spec ledger, APPROVALS.md and metrics-report/exit snapshots)<br/>2. first invoke for this thread: hydrate every stage's state back out of the repo (workflow_persistence.py)<br/>3. seed default state for every StageSpec that has none yet<br/>4. reset specification onward to not_started — tech-stack and raw-requirements stay approved across runs<br/>5. split the newest HumanMessage into raw_requirements_text plus any image/document attachments<br/>6. a blank run with no requirements anywhere (the frontend's reload/reattach ping) ends here — zero LLM calls"]
 
     scaffold["SCAFFOLD &nbsp;·&nbsp; read-mostly entry point (preflight_nodes.py)<br/>1. reset the workflow action ledger (fresh per session)<br/>2. capture git rev-parse HEAD as this run's baseline — the point the reject path resets back to<br/>3. read .ai-dev-workflow/manifest.json — its absence is the canonical never-onboarded-before signal<br/>Nothing is written to the repo here. The repo-visible writes wait until the suitability gate passes"]
 
@@ -40,11 +40,11 @@ flowchart TD
 
     p0pre["BROWNFIELD PRE &nbsp;·&nbsp; brownfield grounding (only when manifest.json is missing)<br/>1. deterministic grep of the repo for schemas, migrations and route definitions<br/>2. store the result as brownfield_context, so the baseline draft is grounded in facts rather than guesses"]
 
-    p0["BROWNFIELD BASELINE &nbsp;·&nbsp; describe the existing system before changing it<br/>1. draft: read-only tool allowlist — skills: preflight-baseline, tech-stack-conventions, caveman<br/>2. audit: second model revises the baseline against the same grounding context<br/>3. gate: human ratifies the baseline<br/>4. brownfield_write_manifest: ratification is what actually creates .ai-dev-workflow/manifest.json"]
+    p0["BROWNFIELD BASELINE &nbsp;·&nbsp; describe the existing system before changing it<br/>1. draft: read-only tool allowlist — skills: preflight-baseline, tech-stack-conventions, caveman<br/>2. audit: second model revises the baseline against the same grounding context<br/>3. no human gate — ratification is automatic after the audit<br/>4. brownfield_write_manifest: what actually creates .ai-dev-workflow/manifest.json"]
 
     ts["TECH STACK &nbsp;·&nbsp; detect languages, frameworks and build/test commands once per repo<br/>1. hydrate short-circuit: if .ai-dev-workflow/tech-stack.approved.json already exists, mark approved and skip the LLM entirely<br/>2. draft: read-only tool allowlist — skill: tech-stack-conventions<br/>3. audit: second model revises the detected stack<br/>4. no human gate — supporting infrastructure, it has no review tab<br/>5. post-approve hook: write each detected ecosystem's build-blocking config and append one paragraph per ecosystem to AGENTS.md — .NET gets &lt;solution-root&gt;/Directory.Build.props, Node/TS gets &lt;root&gt;/eslint.config.mjs plus its dev-dependencies, Python gets &lt;root&gt;/ruff.toml and &lt;root&gt;/mypy.ini<br/>Runs on the approved path, not post-audit, so it still fires on the hydrate short-circuit — otherwise a repo onboarded once would never receive a new or updated convention<br/>Everything downstream reads this: build commands, test commands, and whether Playwright/Excalidraw MCP get attached"]
 
-    rr["RAW REQUIREMENTS &nbsp;·&nbsp; turn a human's rough ask into a structured requirements document<br/>1. hydrate short-circuit: an existing requirements file with no fresh human input skips the LLM<br/>2. draft: read-only tool allowlist — skill: brainstorming<br/>3. audit: second model revises the document<br/>4. gate: human approval<br/>5. post-audit hook: persist the seed text that produced this draft, so future runs can detect a change"]
+    rr["RAW REQUIREMENTS &nbsp;·&nbsp; turn a human's rough ask into a structured requirements document<br/>1. hydrate short-circuit: an existing requirements file with no fresh human input skips the LLM<br/>2. draft: read-only tool allowlist — skill: brainstorming<br/>3. audit: second model revises the document<br/>4. no human gate — the human already wrote the seed text; specification is the first checkpoint<br/>5. post-audit hook: persist the seed text that produced this draft, so future runs can detect a change"]
 
     spec["SPECIFICATION &nbsp;·&nbsp; user stories and acceptance criteria with permanently stable ids<br/>1. draft: requirements text plus any attachments (screenshots/documents) — skill: spec-sync<br/>2. audit: adversarial revision — skills: ponytail (prose), spec-sync<br/>3. verify (deterministic): sync every US/AC id against spec/ledger.json, then commit the ledger<br/>4. gate: human approval<br/>5. sign: append a content-hash-signed row to APPROVALS.md so later tampering is detectable"]
 
@@ -54,7 +54,7 @@ flowchart TD
 
     r4["R · REBUILD (scaffold-only fix) &nbsp;·&nbsp; the tree must still compile after new tests land<br/>1. run the stack's clean+build command; exit code is the whole gate — no LLM in the happy path<br/>&nbsp;&nbsp;&nbsp;.NET: dotnet build -warnaserror · Node/TS: build or tsc, then tsc --noEmit --strict and eslint --max-warnings=0 · Python: py_compile, then ruff check and mypy<br/>2. on failure, fix node may add compile-enabling stubs only, never real behavior — skill: systematic-debugging<br/>3. up to 3 fix cycles, then a human interrupt"]
 
-    p6["MINIMAL CODE TO GREEN &nbsp;·&nbsp; write the least code that turns the ac-to-tests tests green<br/>1. draft: autopilot, full unscoped write access — skills: executing-plans, subagent-driven-development, ponytail (ultra, ADVISORY: Copilot arbitrates each suggestion, implements only what it agrees with, records rejections in ponytail_rejected); UI-framework repos also get impeccable design rules plus a one-time PRODUCT.md/DESIGN.md bootstrap from the approved spec<br/>2. audit: read-only allowlist — also reviews the ponytail arbitration itself<br/>3. verify (deterministic): 95% line+branch coverage, plus an anti-gaming check that coverage-exclusion config was not broadened<br/>4. gate: human approval"]
+    p6["MINIMAL CODE TO GREEN &nbsp;·&nbsp; write the least code that turns the ac-to-tests tests green<br/>1. draft: autopilot, full unscoped write access — skills: executing-plans, subagent-driven-development, ponytail (ultra, ADVISORY: Copilot arbitrates each suggestion, implements only what it agrees with, records rejections in ponytail_rejected); UI-framework repos also get impeccable design rules plus a one-time PRODUCT.md/DESIGN.md bootstrap from the approved spec<br/>2. audit: read-only allowlist — also reviews the ponytail arbitration itself<br/>3. verify (deterministic): 95% line+branch coverage, plus an anti-gaming check that coverage-exclusion config was not broadened<br/>4. no human gate — the coverage verify is the gate"]
 
     r6["R · REBUILD (full fix) &nbsp;·&nbsp; clean build after real implementation work<br/>1. clean+build, gate on exit code<br/>2. on failure, full-scope fix — skill: systematic-debugging (4-phase root-cause analysis)<br/>3. up to 3 fix cycles, then a human interrupt"]
 
@@ -62,11 +62,11 @@ flowchart TD
 
     p10["SECURITY REMEDIATION &nbsp;·&nbsp; same shape as P8, tuned for vulnerabilities and secrets<br/>1. security_scan: repo_scan's security profile — semgrep against vendored rules, trivy for vuln/misconfig/license/secret, gitleaks, osv-scanner — all fully offline against databases baked into the image, deduplicated across tools, plus a CycloneDX SBOM; refreshes repo-scan-latest.json and streams the summary to the metrics bar<br/>2. security_triage: fix-or-suppress per finding — skills: security-triage, security-review — a secret can NEVER be suppressed, enforced on the finding's category rather than on which tool reported it<br/>3. security_ledger_write: justification recorded for every suppression<br/>4. security_fix: LLM fixes the findings triage marked fixable — then git add -A commit + push (commit_all)<br/>5. R(security): clean rebuild<br/>6. security_gate_check: absolute, not delta-scoped — an inherited CVE is still exploitable. Zero unsuppressed findings at or above the severity floor (default: medium), else loop or escalate"]
 
-    p11a["ADVERSARIAL AUDIT &nbsp;·&nbsp; does the code that now exists actually match the spec and plan?<br/>1. draft: compare approved Specification and Plan against the real repo, report divergences — skills: caveman, verification-before-completion; UI-framework repos also get an impeccable `critique`-style design review (read-only, no scripts), findings folded into the report<br/>2. audit: second model revises the divergence report<br/>3. gate: human review — the one interactive checkpoint inside the audit cluster"]
+    p11a["ADVERSARIAL AUDIT &nbsp;·&nbsp; does the code that now exists actually match the spec and plan?<br/>1. draft: compare approved Specification and Plan against the real repo, report divergences — skills: caveman, verification-before-completion; UI-framework repos also get an impeccable `critique`-style design review (read-only, no scripts), findings folded into the report<br/>2. audit: second model revises the divergence report<br/>3. no human gate — findings flow into de-dup and the audit exit gate's objective re-checks"]
 
     p11b["DE-DUP / SIMPLIFY &nbsp;·&nbsp; collapse the duplication the pipeline just introduced<br/>1. dedup_simplify_pre: run jscpd through repo_scan, feed the parsed clone pairs into the draft prompt<br/>2. draft: autopilot write access, refactor the clusters — jscpd findings are authoritative; ponytail ultra + ponytail-audit run as ADVISORY proposals Copilot arbitrates (rejections recorded in ponytail_rejected); UI-framework repos also run impeccable's deterministic design detector and an impeccable `polish` pass over adversarial-audit's design findings<br/>3. audit: read-only review of the refactor, including the arbitration itself<br/>4. no human gate — jscpd's objective re-check at the audit exit gate is the real bound<br/>5. post-audit hook: re-run jscpd and record the new duplication percentage"]
 
-    p11c["FINDING CLUSTER (DEPENDENCY UPGRADES) &nbsp;·&nbsp; verify-before-audit, because a bad upgrade is objectively detectable<br/>1. finding_cluster_pre: list outdated dependencies with the stack's own command<br/>2. finding_cluster_draft: write access — perform upgrades and regenerate lockfiles<br/>3. finding_cluster_verify: clean rebuild plus full test run<br/>4. pass, then finding_cluster_audit — read-only risk review of the upgrade<br/>5. fail with cycles left, then loop back to draft carrying the failure evidence<br/>6. fail at the cap, then finding_cluster_revert (git revert) and an informational human notice that never blocks the audit cluster"]
+    p11c["FINDING CLUSTER (DEPENDENCY UPGRADES) &nbsp;·&nbsp; verify-before-audit, because a bad upgrade is objectively detectable<br/>1. finding_cluster_pre: list outdated dependencies with the stack's own command<br/>2. finding_cluster_draft: write access — perform upgrades and regenerate lockfiles<br/>3. finding_cluster_verify: clean rebuild plus full test run<br/>4. pass, then finding_cluster_audit — read-only risk review of the upgrade<br/>5. fail with cycles left, then loop back to draft carrying the failure evidence<br/>6. fail at the cap, then finding_cluster_revert (git revert) and a logged notice (no interrupt) that never blocks the audit cluster"]
 
     p11d["LICENSE AUDIT &nbsp;·&nbsp; classify every dependency license against policy<br/>1. license_audit_pre: deterministic license scan, declared and detected licenses per package<br/>2. draft: classify each package against license-policy.json — skill: license-audit<br/>3. audit: second model revises the classification<br/>4. verify (deterministic): any flagged package escalates to a human immediately — max_verify_cycles is 0, since redrafting cannot change a license"]
 
@@ -78,7 +78,7 @@ flowchart TD
 
     p14["METRICS REPORT + TRACEABILITY &nbsp;·&nbsp; deterministic, with exactly one named LLM exception<br/>1. run repo_scan's full profile: size and language mix, per-function complexity, duplication, churn/hotspots/ownership, and every deduplicated security finding with its CVE and fix version<br/>2. diff it against the baseline taken at the top of the graph — what was fixed, what was introduced, what got worse, and each metric's direction declared rather than inferred (more code is neutral, more duplication is a regression)<br/>3. read the coverage summary<br/>4. build traceability-matrix.md by matching AC ids embedded in test names back to the ledger<br/>5. sum token consumption from every stage's ledger entries<br/>6. write repo-scan-latest.json, repo-scan-delta.json and metrics-latest.json<br/>7. metrics_ponytail_gain: the one LLM call — run /ponytail-gain for the code/cost/speed scorecard<br/>No baseline recorded means the delta is omitted with a reason, never fabricated as a zero"]
 
-    p15["EXIT &nbsp;·&nbsp; is this actually merge-ready?<br/>1. draft: merge-readiness report and PR description from the spec, plan and metrics-report metrics — skills: caveman, finishing-a-development-branch<br/>2. audit: adversarial second opinion on the readiness call<br/>3. gate: human approval — the final checkpoint of the entire pipeline<br/>4. sign: content-hash-signed row in APPROVALS.md<br/>5. exit_finalize (deterministic): update manifest.json, write the CHANGELOG entry from the ledger diff, commit"]
+    p15["EXIT &nbsp;·&nbsp; is this actually merge-ready?<br/>1. draft: merge-readiness report and PR description from the spec, plan and metrics-report metrics — skills: caveman, finishing-a-development-branch<br/>2. audit: adversarial second opinion on the readiness call<br/>3. no human gate — the report is signed and finalized automatically; specification and plan are the only two human checkpoints<br/>4. sign: content-hash-signed row in APPROVALS.md<br/>5. exit_finalize (deterministic): update manifest.json, write the CHANGELOG entry from the ledger diff, commit"]
 
     pause(["PAUSE FOR HUMAN INPUT<br/>Any draft that comes back not-ready emits clarifying questions and ends the run.<br/>The human answers in chat, and the next run re-enters at INTAKE from the top."])
 
@@ -90,17 +90,17 @@ flowchart TD
     ts -->|manifest.json exists| record
     ts -->|no manifest.json| p0pre
     p0pre --> p0
-    p0 -->|human| record
+    p0 --> record
     record --> rscan --> rr
-    rr -->|human| spec
+    rr --> spec
     spec -->|human| plan
     plan -->|human| p4
     p4 --> r4 --> p6
-    p6 -->|human| r6 --> p8
+    p6 --> r6 --> p8
     p8 --> p10 --> p11a
-    p11a -->|human| p11b --> p11c --> p11d --> p11exit --> r11 --> p13
+    p11a --> p11b --> p11c --> p11d --> p11exit --> r11 --> p13
     p13 --> p14 --> p15
-    p15 -->|human| done
+    p15 --> done
 
     p4 -.->|write-scope or AC-coverage failure, 3 tries then human escalation| p4
     p6 -.->|coverage below threshold, 3 tries then human escalation| p6
@@ -195,6 +195,22 @@ Cross-cutting behavior that is not drawn above, because it happens in nearly eve
 
 ---
 
+## Headless runner (full pipeline, no UI)
+
+Run the entire graph programmatically for a repo/branch — spec and plan auto-approve, clarifying
+questions are disallowed (drafts are told to make and record assumptions), and escalations are
+auto-resumed twice per (stage, type) before the run aborts with a report:
+
+```bash
+cd agent && uv run python run_headless.py <owner> <repo> <branch> --requirements-file req.md
+```
+
+Needs `GITHUB_TOKEN` (Copilot) and `E2E_GITHUB_TOKEN` (clone + push — must have push scope) in the
+root `.env`. Writes a JSON summary to `agent/agent-work/headless-<thread>.json`; exit code 0 only
+when the exit stage approved. Expect hours of wall time and real Copilot spend for a full run.
+
+---
+
 ## E2E test mode (bypassing GitHub OAuth + MFA)
 
 Automated browser tests cannot complete the real GitHub sign-in (OAuth + MFA). For local end-to-end testing only, set both:
@@ -221,4 +237,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 839693dbbb084326c6ee7a77c67119de315e255ea17f3749454240a823e3c3e7 -->
+<!-- graph-source-sha256: ce49455bba6c85a01f2a9ecb9f5a9ced9913b6ee18ce633611c33e586d4d53fb -->
