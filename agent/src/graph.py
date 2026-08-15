@@ -1060,6 +1060,12 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
             stage["cycle_count"] = 0
             stage["readiness"] = False
             stage["clarifying_questions"] = []
+        # Per-run mechanics reset unconditionally -- a stage whose previous run escalated at the
+        # verify cap otherwise re-enters every later run already AT the cap, so its first
+        # transient failure escalates instantly (observed live: spec verify logged cycle 3 on a
+        # fresh run's very first attempt).
+        stage["verify_cycle_count"] = 0
+        stage["last_verification"] = None
 
     # The Raw Requirements Text (AC-1.3/AC-6.2) is submitted as an ordinary
     # chat message — the human's "submit" action is agent.addMessage(...) +

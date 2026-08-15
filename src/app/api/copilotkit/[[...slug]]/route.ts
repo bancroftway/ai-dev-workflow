@@ -1,9 +1,17 @@
 import { A2UIMiddleware } from "@ag-ui/a2ui-middleware";
 import { LangGraphHttpAgent } from "@copilotkit/runtime/langgraph";
 import { CopilotRuntime, createCopilotRuntimeHandler } from "@copilotkit/runtime/v2";
+import { Agent as UndiciAgent, setGlobalDispatcher } from "undici";
 import { CATALOG_ID } from "@/lib/a2ui-surface-ids";
 import { auth } from "@/auth";
 import { E2E_MODE } from "@/lib/e2e";
+
+// The AG-UI stream from the agent goes silent for however long one LLM node runs -- a large
+// adversarial audit is 5-10 minutes with zero bytes. undici's default bodyTimeout (300s)
+// killed exactly those runs: BodyTimeoutError here -> client sees INCOMPLETE_STREAM ->
+// uvicorn cancels the graph mid-node. Disable idle body/headers timeouts for server-side
+// fetches; overall run length is still bounded by the agent's own per-node idle timeout.
+setGlobalDispatcher(new UndiciAgent({ bodyTimeout: 0, headersTimeout: 0 }));
 
 const AGENT_URL = process.env.AGENT_URL ?? "http://localhost:8123/";
 

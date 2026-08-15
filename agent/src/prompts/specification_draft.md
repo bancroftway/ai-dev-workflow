@@ -24,3 +24,9 @@ criterion, leave `existing_us_id`/`existing_ac_id` as `null`. Your own `id` fiel
 same-response-scoped placeholder; the real id will always be a `US-####`/`AC-####.#` number you
 never invent. Simply omit anything from this draft that no longer applies -- that's how you
 signal it should be retired.
+
+HARD RULE: if this prompt did NOT hand you an approved Specification or prior draft containing
+real `US-####`/`AC-####.#` ids, then no such ids exist yet -- every `existing_us_id` and
+`existing_ac_id` in your response MUST be `null`. Never cite an id you were not literally given
+in this conversation; the deterministic gate rejects invented citations and your draft will be
+bounced back to you.

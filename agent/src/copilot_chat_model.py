@@ -59,6 +59,10 @@ _clients: dict[str, CopilotClient] = {}
 _sessions: dict[str, CopilotSession] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
 
+# TRUE idle timeout: the clock resets on every session event (deltas, usage), so a long but
+# actively-streaming call never dies -- only genuine silence does. The old version was a flat
+# 300s cap on the whole call via wait_for(done.wait()), which killed legitimate large-input
+# audits mid-stream (observed live: specification_audit at ~100K input tokens).
 _SESSION_IDLE_TIMEOUT_SECONDS = 300.0
 
 
@@ -280,8 +284,10 @@ class CopilotChatModel(BaseChatModel):
         final_text: list[str] = []
         done = asyncio.Event()
         error_message: list[str] = []
+        last_event_at = [asyncio.get_running_loop().time()]
 
         def handler(event: Any) -> None:
+            last_event_at[0] = asyncio.get_running_loop().time()
             if event.type == SessionEventType.ASSISTANT_MESSAGE_DELTA:
                 delta_parts.append(event.data.delta_content)
                 if run_manager is not None:
@@ -313,7 +319,18 @@ class CopilotChatModel(BaseChatModel):
         unsubscribe = session.on(handler)
         try:
             await session.send(prompt, agent_mode=self.agent_mode, attachments=attachments or None)
-            await asyncio.wait_for(done.wait(), timeout=_SESSION_IDLE_TIMEOUT_SECONDS)
+            loop = asyncio.get_running_loop()
+            while not done.is_set():
+                remaining = _SESSION_IDLE_TIMEOUT_SECONDS - (loop.time() - last_event_at[0])
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Copilot session silent for {_SESSION_IDLE_TIMEOUT_SECONDS:.0f}s "
+                        f"(stage={self.stage} role={self.role})"
+                    )
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=min(remaining, 15.0))
+                except TimeoutError:
+                    continue  # no completion yet -- re-check the activity clock
         finally:
             unsubscribe()
 

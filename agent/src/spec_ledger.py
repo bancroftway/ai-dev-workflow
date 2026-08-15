@@ -13,8 +13,17 @@ one result out. graph.py's own _verify_specification_ledger wraps this as a dete
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
+
+# What a REAL ledger id looks like. The renumbering guards below only fire when the draft's own
+# `id` field is itself ledger-shaped: schemas.py documents `id` as a same-response placeholder
+# that is "ignored when existing_us_id is set", so a placeholder like 'draft-story-1' alongside a
+# valid citation is the DOCUMENTED contract, not an attempted renumbering. Enforcing equality for
+# placeholders made every revision round fail by construction (observed live: three verify cycles
+# burned on 'draft-story-1' != 'US-0001').
+_REAL_ID_RE = re.compile(r"^US-\d+(\.\d+)?$")
 
 from . import repo_files
 from .sandbox.provider import SandboxProvider
@@ -108,8 +117,17 @@ def sync_ledger(
     reasons: list[str] = []
     touched_ids: set[str] = set()
 
+    # Greenfield leniency: on an EMPTY ledger there is nothing an id citation could protect, and
+    # models reliably hallucinate `existing_us_id: "US-1"` on a first run (observed live: three
+    # verify cycles burned re-citing ids that never existed). Treat every citation as "new" then
+    # instead of deadlocking the gate. A non-empty ledger keeps the strict fail-closed behavior.
+    ledger_was_empty = not entries
     for story in draft_user_stories:
-        existing_us_id = story.get("existing_us_id")
+        existing_us_id = None if ledger_was_empty else story.get("existing_us_id")
+        if ledger_was_empty:
+            story["existing_us_id"] = None
+            for ac in story.get("acceptance_criteria") or []:
+                ac["existing_ac_id"] = None
         if existing_us_id is not None:
             entry = _find(updated, existing_us_id)
             if entry is None or entry.get("kind") != "user_story":
@@ -120,7 +138,7 @@ def sync_ledger(
                     f"existing_us_id {existing_us_id!r} refers to a retired story -- ids are never reused"
                 )
                 continue
-            if story.get("id") is not None and story["id"] != existing_us_id:
+            if story.get("id") is not None and _REAL_ID_RE.match(str(story["id"])) and story["id"] != existing_us_id:
                 reasons.append(
                     f"draft's own id {story.get('id')!r} does not match its cited existing_us_id "
                     f"{existing_us_id!r} -- do not renumber an existing story"
@@ -164,7 +182,7 @@ def sync_ledger(
                         f"existing_ac_id {existing_ac_id!r} refers to a retired AC -- ids are never reused"
                     )
                     continue
-                if ac.get("id") is not None and ac["id"] != existing_ac_id:
+                if ac.get("id") is not None and _REAL_ID_RE.match(str(ac["id"])) and ac["id"] != existing_ac_id:
                     reasons.append(
                         f"draft's own id {ac.get('id')!r} does not match its cited existing_ac_id "
                         f"{existing_ac_id!r} -- do not renumber an existing AC"

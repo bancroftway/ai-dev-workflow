@@ -494,10 +494,12 @@ _LOCKFILE_BY_MANAGER = {"npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "y
 
 # --no-audit/--no-fund are npm-only; pnpm rejects them outright ("Unknown options") and yarn has
 # no equivalent prompt to suppress -- per-manager commands, not per-manager verbs with shared flags.
+# pnpm: a workspace repo refuses a root add without -w (ERR_PNPM_ADDING_TO_ROOT, observed live)
+# while a non-workspace repo refuses -w -- try plain first, fall back to -w.
 _INSTALL_CMD_BY_MANAGER = {
-    "npm": "npm install -D --no-audit --no-fund",
-    "pnpm": "pnpm add -D",
-    "yarn": "yarn add -D",
+    "npm": "npm install -D --no-audit --no-fund {deps}",
+    "pnpm": "pnpm add -D {deps} || pnpm add -D -w {deps}",
+    "yarn": "yarn add -D {deps}",
 }
 
 
@@ -550,9 +552,8 @@ async def _apply_node(
 
     deps = _node_dev_deps([str(item) for item in (tech_stack.get("frameworks") or [])])
     prefix = f"cd {shlex.quote(root)} && " if root else ""
-    install = await provider.exec_in_sandbox(
-        thread_id, f"{prefix}{_INSTALL_CMD_BY_MANAGER[manager]} {' '.join(deps)} 2>&1"
-    )
+    install_cmd = _INSTALL_CMD_BY_MANAGER[manager].format(deps=" ".join(deps))
+    install = await provider.exec_in_sandbox(thread_id, f"{prefix}{install_cmd} 2>&1")
     if not install.ok:
         return [], {"install_failed": manager, "error": (install.stderr or install.stdout or "")[-500:]}
 

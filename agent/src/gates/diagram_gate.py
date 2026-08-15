@@ -85,6 +85,15 @@ def _looks_like_infra_failure(stderr: str) -> bool:
     return any(marker in lowered for marker in _INFRA_FAILURE_MARKERS)
 
 
+def _mermaid_error_summary(output: str) -> str:
+    """The actionable mermaid parse error ('Parse error on line N ... Expecting ...') is at the
+    TOP of mmdc's output; the tail is a useless puppeteer JS stack. Feeding the tail back to the
+    draft node burned three verify cycles live -- the model never saw what was wrong. Keep the
+    first meaningful lines, drop stack frames."""
+    lines = [l.strip() for l in output.splitlines() if l.strip() and not l.lstrip().startswith("at ")]
+    return " | ".join(lines[:10])[:700]
+
+
 _SAFE_DIAGRAM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -204,7 +213,7 @@ async def verify_plan_diagrams(
             f"{infra_failures[0].stderr_tail}"
         )
     else:
-        feedback = "; ".join(f"{o.name}: {o.stderr_tail[-400:]}" for o in failures)
+        feedback = "; ".join(f"{o.name}: {_mermaid_error_summary(o.stderr_tail)}" for o in failures)
 
     return VerificationResult(
         passed=False,
