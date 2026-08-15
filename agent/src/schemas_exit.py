@@ -20,6 +20,3 @@ class ExitDraftResponse(BaseModel):
     report: MergeReadinessReport | None = Field(default=None)
 
 
-class ExitAuditResponse(BaseModel):
-    revised_report: MergeReadinessReport
-    audit_findings: list[str] = Field(default_factory=list)

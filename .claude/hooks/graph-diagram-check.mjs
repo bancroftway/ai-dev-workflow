@@ -23,7 +23,6 @@ const files = [
   "agent/src/graph.py",
   "agent/src/rebuild.py",
   "agent/src/preflight_nodes.py",
-  "agent/src/requirements_nodes.py",
   "agent/src/finding_cluster_nodes.py",
   "agent/src/repo_scan.py",
   "agent/src/test_hardening_nodes.py",

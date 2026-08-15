@@ -133,6 +133,8 @@ export interface WorkflowState {
   metrics_report?: MetricsReportState;
   audit_cluster?: { last_outcome?: { passed?: boolean; [key: string]: unknown } | null; [key: string]: unknown };
   last_push?: PushStatus | null;
+  // Terminal failure: escalations no longer pause for a human -- the graph ENDs with this set.
+  run_failure?: EscalationPayload | null;
   stages?: {
     "app-discovery"?: StageState;
     "brownfield-baseline"?: StageState;
@@ -161,7 +163,6 @@ export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
   { key: "app-discovery", label: "Runnable App Check" },
   { key: "brownfield-baseline", label: "Preflight Baseline" },
   { key: "tech-stack", label: "Tech Stack" },
-  { key: "raw-requirements", label: "Raw Requirements" },
   { key: "specification", label: "Specification" },
   { key: "plan", label: "Implementation Plan" },
   { key: "ac-to-tests", label: "Acceptance Criteria to Tests" },
@@ -175,7 +176,7 @@ export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
 // Which StageState keys each tab's status dot derives from. The quality tab has no StageState
 // stages -- it reads the bespoke quality/security/test/metrics state keys directly (AppShell).
 export const TAB_STAGE_GROUPS: Record<string, StageKey[]> = {
-  requirements: ["raw-requirements"],
+  requirements: ["raw-requirements"], // recorded as-is (always "approved"); no gate ever surfaces
   specification: ["specification"],
   plan: ["plan"],
   build: ["ac-to-tests", "minimal-code-to-green"],
@@ -187,7 +188,6 @@ export interface GatePayload {
   stage:
     | "brownfield-baseline"
     | "tech-stack"
-    | "raw-requirements"
     | "specification"
     | "plan"
     | "ac-to-tests"

@@ -12,9 +12,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import interrupt
 
-from .. import repo_files, repo_scan
+from .. import git_ops, repo_files, repo_scan
 from ..sandbox import registry as sandbox_registry
 from ..sandbox.factory import get_sandbox_provider
 from ..sandbox.provider import SandboxProvider
@@ -77,9 +76,9 @@ async def _run_jscpd(provider: SandboxProvider, thread_id: str) -> float | None:
 
 
 async def rerun_jscpd_after_dedup(thread_id: str, content_dict: dict[str, Any], _state: "GraphState", provider: SandboxProvider) -> None:
-    """StageSpec.post_audit_hook for dedup-simplify: re-runs jscpd deterministically after the audit pass
-    resolves, and writes the result directly into content_dict['duplication_percent_after'] --
-    never asks the model to self-report this number."""
+    """StageSpec.post_approve_hook for dedup-simplify: re-runs jscpd deterministically once the
+    refactor is approved, and writes the result directly into content_dict['duplication_percent_after']
+    -- never asks the model to self-report this number."""
     content_dict["duplication_percent_after"] = await _run_jscpd(provider, thread_id)
 
 
@@ -182,7 +181,11 @@ def _resolve_license_scan_command(tech_stack: dict[str, Any]) -> str | None:
         return "dotnet tool run nuget-license --output json 2>&1"
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if "typescript" in languages or "javascript" in languages:
-        return "npx --yes license-checker --json 2>&1"
+        # --excludePrivatePackages: license policy governs THIRD-PARTY dependencies. Without it
+        # the repo's own private/UNLICENSED root package appears in the scan and the license
+        # verify flags the repo for containing itself (observed live, run 20 -- an unresolvable
+        # END since redrafting cannot relicense the repo under audit).
+        return "npx --yes license-checker --json --excludePrivatePackages 2>&1"
     return None
 
 
@@ -246,8 +249,12 @@ def make_audit_exit_route():
 
 
 async def audit_exit_human_gate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    """Two consecutive exit-gate failures END the run with run_failure set (no human pause --
+    spec/plan approval are the only human touchpoints). Counter reset rides in the same return."""
+    thread_id = config["configurable"]["thread_id"]
     audit_cluster = state.get("audit_cluster") or {"attempt_count": 0, "last_outcome": None}
-    interrupt({"stage": "audit_cluster", "type": "exit_gate_failed_twice", "outcome": audit_cluster.get("last_outcome")})
+    payload = {"stage": "audit_cluster", "type": "exit_gate_failed_twice", "outcome": audit_cluster.get("last_outcome")}
+    await git_ops.record_run_failure(thread_id, payload)
     reset = dict(audit_cluster)
     reset["attempt_count"] = 0
-    return {"audit_cluster": reset}
+    return {"audit_cluster": reset, "run_failure": payload}

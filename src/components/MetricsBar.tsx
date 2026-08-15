@@ -84,7 +84,7 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
 
   // The status/push lines matter before any metric exists (a needs_clarification stage was
   // previously invisible exactly when no scan had streamed) -- only hide a truly empty strip.
-  if (chips.length === 0 && !activeStage && state.last_push?.ok !== false) return null;
+  if (chips.length === 0 && !activeStage && state.last_push?.ok !== false && state.run_failure == null) return null;
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-1.5">
@@ -97,6 +97,12 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
       {state.last_push && state.last_push.ok === false && (
         <span className="rounded-full border border-red-300 bg-red-50 px-2.5 py-0.5 text-xs text-red-800">
           push failing — GitHub persistence off
+        </span>
+      )}
+      {state.run_failure && (
+        <span className="rounded-full border border-red-300 bg-red-50 px-2.5 py-0.5 text-xs text-red-800">
+          {state.run_failure.stage}: {state.run_failure.type} — run ended
+          {state.run_failure.type === "cannot_verify" ? " (sandbox lost — resubmit to restart)" : ""}
         </span>
       )}
     </div>

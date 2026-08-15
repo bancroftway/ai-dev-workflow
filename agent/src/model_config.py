@@ -20,7 +20,6 @@ _CONFIG_PATH = Path(__file__).parent.parent / "config" / "models.yaml"
 Stage = Literal[
     "app-discovery",
     "tech-stack",
-    "raw-requirements",
     "specification",
     "plan",
     "ac-to-tests",
@@ -35,6 +34,7 @@ Stage = Literal[
     "finding-cluster-upgrade",
     "test-hardening-flake-triage",
     "metrics-report",
+    "rebuild",
 ]
 Role = Literal["draft", "audit"]
 

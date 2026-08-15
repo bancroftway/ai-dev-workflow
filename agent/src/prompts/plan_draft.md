@@ -30,6 +30,9 @@ be written as `Node["label text"]` (or `Node("...")`/`Node{"..."}` for those sha
 `Landing["/tickers route"]` is valid; `Landing[/tickers route]` is a lexical error because `[/`
 opens a trapezoid shape. The same applies to edge labels: `A -->|"GET /api"| B`. Keep labels
 short and put detail in prose instead of packing punctuation into the diagram.
+Mermaid has NO backslash escapes: `\"` inside a label is a parse error, always. To show a
+literal double quote inside a quoted label, write `#quot;` -- or simply leave quotes out of
+label text.
 
 Wireframes: when (and only when) this repository has a UI framework and the plan adds or changes
 user-facing screens, include one Wireframe per new/changed screen (at most 6). Each is a single

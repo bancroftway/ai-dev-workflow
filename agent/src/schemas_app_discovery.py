@@ -66,8 +66,3 @@ class AppDiscoveryDraftResponse(BaseModel):
     app_detection: RunnableAppReport | None = Field(default=None)
 
 
-class AppDiscoveryAuditResponse(BaseModel):
-    revised_app_detection: RunnableAppReport
-    audit_findings: list[str] = Field(
-        default_factory=list, description="Gaps found and fixed. Empty if none were found."
-    )

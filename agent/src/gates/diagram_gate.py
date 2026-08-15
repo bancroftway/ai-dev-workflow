@@ -113,6 +113,10 @@ async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[s
         )
 
     source = diagram.get("mermaid_source") or ""
+    # Mermaid has NO backslash escapes -- \" inside a quoted label is always a parse error, and
+    # models emit it habitually (observed live: three redraft laps could not shake it). The
+    # sequence is never meaningful, so rewriting it to mermaid's own quote entity is lossless.
+    source = source.replace('\\"', "#quot;")
     mmd_path = f"{DIAGRAMS_DIR}/{name}.mmd"
     svg_path = f"{DIAGRAMS_DIR}/{name}.svg"
 

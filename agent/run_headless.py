@@ -1,13 +1,13 @@
 """Headless full-graph runner: executes the entire pipeline for (owner, repo, branch) with no
-frontend. Spec/plan gates are auto-approved; clarifying questions are disallowed via the
-AIDW_HEADLESS draft-prompt injection (graph.py make_draft_node); escalation interrupts are
-auto-resumed within a per-(stage, type) budget and abort the run with a report when exhausted.
+frontend. Spec/plan gates are auto-approved (the only interrupts left in the graph); clarifying
+questions are disallowed via the AIDW_HEADLESS draft-prompt injection (graph.py make_draft_node);
+an exhausted deterministic gate ENDs the run with `run_failure` set, which lands in the report.
 
 Runs IN-PROCESS on purpose: the sandbox registry, push-token map, and the graph's InMemorySaver
 checkpointer are all process-local, so provisioning and the graph must share one process.
 
     cd agent && uv run python run_headless.py <owner> <repo> <branch> \
-        --requirements-file req.md [--budget 2] [--discard-sandbox]
+        --requirements-file req.md [--discard-sandbox]
 
 Expectation: a full run is 25-40+ LLM calls -- hours of wall time and real Copilot spend.
 Docker Desktop and both tokens must survive the whole window.
@@ -48,8 +48,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("repo")
     parser.add_argument("branch")
     parser.add_argument("--requirements-file", required=True, help="markdown file with the requirements text")
-    parser.add_argument("--budget", type=int, default=2, help="auto-resumes per (stage, type) escalation before aborting")
     parser.add_argument("--discard-sandbox", action="store_true", help="terminate container + delete workspace volume at the end")
+    parser.add_argument(
+        "--thread",
+        default=None,
+        help="resume an earlier run's thread id: reattaches its sandbox/volume and skips every "
+        "stage already APPROVED there (sets AIDW_RESUME=1). Stages mid-flight redraft.",
+    )
     return parser.parse_args()
 
 
@@ -75,7 +80,10 @@ async def run(args: argparse.Namespace) -> int:
     # uuid chars FIRST: entrypoint.sh suffixes the remote work branch with the first 8 chars of
     # the session id -- a constant prefix would collapse every headless run onto one shared,
     # force-pushed branch that also rehydrates the previous run's state.
-    thread_id = uuid.uuid4().hex[:12]
+    thread_id = args.thread or uuid.uuid4().hex[:12]
+    if args.thread:
+        os.environ["AIDW_RESUME"] = "1"
+        logger.info("resuming thread %s -- approved stages will be skipped", thread_id)
     cfg = {"configurable": {"thread_id": thread_id}}
     started = time.monotonic()
 
@@ -91,7 +99,6 @@ async def run(args: argparse.Namespace) -> int:
     registry.set(thread_id, session)
     git_ops.set_push_token(thread_id, git_token)
 
-    escalations_hit: dict[tuple[str, str], int] = {}
     outcome: dict = {"thread_id": thread_id, "ok": False}
     try:
         stream_input: object = {"messages": [HumanMessage(content=requirements)]}
@@ -105,11 +112,11 @@ async def run(args: argparse.Namespace) -> int:
             if not snap.next:
                 values = snap.values
                 statuses = _stage_statuses(values)
-                rejection = values.get("app_rejection")
                 stuck = [k for k, s in statuses.items() if s == "needs_clarification"]
                 outcome.update(
                     stage_statuses=statuses,
-                    app_rejection=rejection,
+                    app_rejection=values.get("app_rejection"),
+                    run_failure=values.get("run_failure"),
                     needs_clarification=stuck,
                     ok=statuses.get("exit") == "approved",
                 )
@@ -121,23 +128,9 @@ async def run(args: argparse.Namespace) -> int:
                 outcome.update(stage_statuses=_stage_statuses(snap.values), error="paused_without_interrupt")
                 break
             payload = interrupts[0].value if isinstance(interrupts[0].value, dict) else {}
-
-            if not payload.get("type"):
-                logger.info("auto-approving gate: %s", payload.get("stage"))
-            else:
-                # Budget keyed on (stage, type), NOT Interrupt.id -- the id hashes checkpoint+step
-                # and changes on every retry lap, so an id-keyed budget never trips.
-                key = (str(payload.get("stage")), str(payload.get("type")))
-                escalations_hit[key] = escalations_hit.get(key, 0) + 1
-                if escalations_hit[key] > args.budget:
-                    logger.error("escalation budget exhausted for %s: %s", key, {k: v for k, v in payload.items() if k != "draft"})
-                    outcome.update(
-                        stage_statuses=_stage_statuses(snap.values),
-                        error="escalation_budget_exhausted",
-                        escalation={k: v for k, v in payload.items() if k != "draft"},
-                    )
-                    break
-                logger.warning("auto-resuming escalation %s (attempt %d/%d)", key, escalations_hit[key], args.budget)
+            # The only interrupts left are the spec/plan approval gates; failures END the run
+            # with run_failure instead of pausing.
+            logger.info("auto-approving gate: %s", payload.get("stage"))
             stream_input = Command(resume=True)
     finally:
         try:
@@ -148,7 +141,6 @@ async def run(args: argparse.Namespace) -> int:
             await provider.terminate(thread_id)
             await provider.discard_workspace(thread_id)
 
-    outcome["escalations_hit"] = {f"{s}:{t}": n for (s, t), n in escalations_hit.items()}
     outcome["wall_seconds"] = round(time.monotonic() - started, 1)
     report_dir = Path(__file__).parent / "agent-work"
     report_dir.mkdir(exist_ok=True)

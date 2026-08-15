@@ -1,5 +1,5 @@
 """P4's AC-coverage half of the deterministic_verify gate: every active Acceptance Criterion in
-spec/ledger.json must have at least one test whose name embeds its AC id, and that test must
+.ai-dev-workflow/spec/ledger.json must have at least one test whose name embeds its AC id, and that test must
 currently be FAILING (a passing "new" test before any implementation exists is almost certainly
 tautological -- this is TDD's RED step, checked mechanically rather than trusted to the model's
 own self-report).
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,13 +24,41 @@ from .. import repo_files
 from ..sandbox.provider import SandboxProvider
 from ..spec_ledger import LEDGER_PATH
 
-_AC_ID_RE = re.compile(r"AC-\d{4}\.\d+")
-
 # One line of a test runner's console output naming a test and its outcome -- covers dotnet test's
 # default console logger, vitest's default reporter, and jest/playwright's default reporters
 # closely enough for this purpose (all print a pass/fail glyph or word beside the test name).
 _FAIL_MARKERS = ("fail", "✗", "×", "FAILED")
 _PASS_MARKERS = ("pass", "✓", "√", "PASSED", "ok ")
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_PATH_TOKEN_RE = re.compile(r"[\w@./\\-]+\.[A-Za-z0-9]+")
+
+
+def _id_variants(ac_id: str) -> list[str]:
+    """Spellings a test name may legitimately use for one ledger id. Models re-prefix US-0003.6
+    as AC-0003.6 despite instructions (observed live, run 7), and identifier-safe names replace
+    -/. with _ (Test_US_0007_2). Numbering is what identifies the AC; tolerate the spellings."""
+    variants = {ac_id}
+    if ac_id.startswith("US-"):
+        variants.add("AC-" + ac_id[3:])
+    variants.update(v.replace("-", "_").replace(".", "_") for v in list(variants))
+    return sorted(variants)
+
+
+def _extract_failed_files(lines: list[str]) -> list[str]:
+    """File paths named on file-level FAIL/ERROR lines. Greenfield TDD-red tests routinely die at
+    IMPORT (the module under test doesn't exist yet, its dependency isn't installed yet) -- the
+    runner then prints one FAIL line per file and never reaches per-test name lines, so the ids
+    inside those files are invisible to the per-line scan and must be attributed via the files."""
+    failed: list[str] = []
+    for line in lines:
+        upper = line.upper()
+        if "FAIL" not in upper and "ERROR" not in upper:
+            continue
+        for token in _PATH_TOKEN_RE.findall(line):
+            if "/" in token and (".test." in token or ".spec." in token or "test" in token.lower()):
+                failed.append(token)
+    return sorted(set(failed))
 
 
 def _resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
@@ -65,7 +94,7 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
     if not active_ac_ids:
         return AcCoverageOutcome(
             passed=False,
-            feedback="spec/ledger.json has no active Acceptance Criteria -- P2 must be approved with real ACs before P4 can run.",
+            feedback=".ai-dev-workflow/spec/ledger.json has no active Acceptance Criteria -- P2 must be approved with real ACs before P4 can run.",
             report={},
         )
 
@@ -79,12 +108,18 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
 
     result = await provider.exec_in_sandbox(thread_id, command)
     output = (result.stdout or "") + "\n" + (result.stderr or "")
-    lines = output.splitlines()
+    # Strip ANSI color codes -- vitest/jest colorize even without a TTY here, and escapes sitting
+    # inside a line break naive marker/path matching.
+    lines = [_ANSI_RE.sub("", line) for line in output.splitlines()]
 
     # Per AC id: does any line naming it look like a FAIL, a PASS, or neither (ambiguous/no match).
+    # Matched by substring against the ledger's OWN ids, never a hardcoded id-format regex --
+    # observed live (headless run 3): the ledger mints US-0001.1-style ids while an AC-\d{4}
+    # regex found nothing, so every AC read as uncovered and the stage deadlocked at the cap.
     ac_line_status: dict[str, str] = {}
+    variants_by_id = {ac_id: _id_variants(ac_id) for ac_id in active_ac_ids}
     for line in lines:
-        ac_ids_in_line = set(_AC_ID_RE.findall(line))
+        ac_ids_in_line = {ac_id for ac_id, variants in variants_by_id.items() if any(v in line for v in variants)}
         if not ac_ids_in_line:
             continue
         lowered = line.lower()
@@ -99,6 +134,32 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
                 ac_line_status[ac_id] = "unknown"
 
     missing = [ac for ac in active_ac_ids if ac not in ac_line_status]
+
+    # Primary fallback for anything the per-line scan missed, and only while the suite as a
+    # whole is RED (result not ok -- in this stage's TDD-red contract it always is): an id
+    # embedded in ANY test file in the tree counts as covered-and-failing. Runner reporters
+    # differ in which per-file/per-test lines they print (observed live, run 9: one file's ids
+    # never appeared in the output the gate captured while a replay saw them) -- what actually
+    # matters, "the test exists and nothing is green", is checkable from the tree + exit code
+    # without trusting reporter formatting at all. Tautological (green) ids can't hide here:
+    # a green test printed its ✓ line and was classified "pass" above.
+    if missing and not result.ok:
+        listing = await provider.exec_in_sandbox(
+            thread_id, "git ls-files -co --exclude-standard | grep -iE '(test|spec)' || true"
+        )
+        all_test_files = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
+        if all_test_files:
+            id_patterns = " ".join(f"-e {shlex.quote(v)}" for ac in missing for v in variants_by_id[ac])
+            quoted_files = " ".join(shlex.quote(f) for f in all_test_files)
+            grep = await provider.exec_in_sandbox(
+                thread_id, f"grep -h -o -F {id_patterns} -- {quoted_files} 2>/dev/null | sort -u"
+            )
+            found_tokens = set((grep.stdout or "").split())
+            for ac in missing:
+                if found_tokens & set(variants_by_id[ac]):
+                    ac_line_status[ac] = "fail"
+            missing = [ac for ac in active_ac_ids if ac not in ac_line_status]
+
     tautological = [ac for ac in active_ac_ids if ac_line_status.get(ac) == "pass"]
 
     if missing or tautological:
@@ -113,7 +174,15 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
         return AcCoverageOutcome(
             passed=False,
             feedback="; ".join(reasons),
-            report={"missing": missing, "tautological": tautological, "active_ac_ids": active_ac_ids},
+            report={
+                "missing": missing,
+                "tautological": tautological,
+                "active_ac_ids": active_ac_ids,
+                # Diagnostics: enough to reconstruct WHY the scan missed an id without rerunning.
+                "runner_exit_ok": result.ok,
+                "failed_files_seen": _extract_failed_files(lines),
+                "output_tail": "\n".join(lines[-40:]),
+            },
         )
 
     return AcCoverageOutcome(

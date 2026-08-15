@@ -69,7 +69,12 @@ OSV_DB_DIR = os.environ.get("AIDW_OSV_DB_DIR", "/opt/aidw/osv-db")
 
 # Thresholds -- module constants with env overrides, matching quality_nodes.py's convention.
 MAX_DUPLICATION_PERCENT = float(os.environ.get("QUALITY_MAX_DUPLICATION_PERCENT", "3.0"))
-LIZARD_MAX_CCN = int(os.environ.get("LIZARD_MAX_CCN", "15"))
+# 20, not lizard's warn-level 15: this is a HARD gate (an introduced finding blocks the run),
+# and 15 flags ordinary dense-but-flat code -- observed live: a 14-line option-resolver at CCN 17
+# ping-ponged between the quality fixer and the gate, each refactor pushing the complexity into
+# a new helper. 15-19 is reviewer-attention territory, not block-the-pipeline territory; real
+# monsters (20+) still gate.
+LIZARD_MAX_CCN = int(os.environ.get("LIZARD_MAX_CCN", "20"))
 LIZARD_HIGH_CCN = int(os.environ.get("LIZARD_HIGH_CCN", "25"))
 CHURN_WINDOW_DAYS = int(os.environ.get("REPO_SCAN_CHURN_WINDOW_DAYS", "365"))
 SECURITY_SEVERITY_FLOOR = os.environ.get("SECURITY_SEVERITY_FLOOR", "medium")
@@ -353,11 +358,20 @@ def parse_gitleaks(raw: str) -> ParseResult:
     if not isinstance(entries, list):
         return [], {}
 
+    # Build/vendor output is machine-generated after clone and NEVER a leaked credential --
+    # Next.js writes random internal keys into .next/*manifest*.json on every build, which
+    # gitleaks flags as critical "generic-api-key" secrets. Secrets are unsuppressable by policy,
+    # so scanning generated output would deadlock the security gate on every built tree
+    # (observed live). Real secrets live in files humans/models AUTHOR, which are all scanned.
+    generated_prefixes = (".next/", "dist/", "build/", "out/", "node_modules/", "coverage/", ".wrangler/", ".ai-dev-workflow/", "agent-work/")
+
     findings = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         path = _norm_path(entry.get("File", ""))
+        if path.startswith(generated_prefixes) or "/.next/" in path or "/node_modules/" in path or "/dist/" in path:
+            continue
         rule_id = entry.get("RuleID", "gitleaks-secret")
         findings.append(
             Finding(
@@ -467,6 +481,11 @@ def _trivy_misconfigurations(result: dict[str, Any], target: str) -> list[Findin
 
 def _trivy_secrets(result: dict[str, Any], target: str) -> list[Finding]:
     findings = []
+    # Same generated-output filter as parse_gitleaks: build artifacts are not authored secrets,
+    # and an unsuppressable "secret" in .next/ manifests deadlocks the security gate.
+    normalized_target = _norm_path(target)
+    if normalized_target.startswith((".next/", "dist/", "build/", "out/", "node_modules/", "coverage/", ".wrangler/", ".ai-dev-workflow/", "agent-work/")) or "/.next/" in normalized_target or "/node_modules/" in normalized_target or "/dist/" in normalized_target:
+        return findings
     for secret in result.get("Secrets") or []:
         if not isinstance(secret, dict):
             continue
@@ -1061,7 +1080,16 @@ TOOLS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "jscpd", "MIT", True,
-        f"jscpd . --threshold {MAX_DUPLICATION_PERCENT} --reporters json --output agent-work/jscpd --silent",
+        # The ignore list is load-bearing: without it jscpd counts generated/lock/artifact files
+        # as clones (observed live: 37.6% "duplication" made of wrangler d.ts, pnpm-lock.yaml,
+        # drizzle migration snapshots, and the pipeline's OWN repo-scan-baseline.json) -- noise
+        # that would deadlock the 3% audit-exit gate on every run while measuring zero authored
+        # code. Duplication is a signal about code humans/models WROTE.
+        f"jscpd . --threshold {MAX_DUPLICATION_PERCENT} --reporters json --output agent-work/jscpd --silent "
+        "--format 'typescript,tsx,javascript,jsx,c-sharp,python' "
+        '--ignore "**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/out/**,**/.next/**,'
+        '**/coverage/**,**/*.min.js,**/*.d.ts,**/migrations/**,'
+        '**/.ai-dev-workflow/**,**/agent-work/**,**/drizzle/meta/**,**/.wrangler/**,**/*.snap"',
         "agent-work/jscpd/jscpd-report.json", parse_jscpd, "jscpd --version",
     ),
     ToolSpec(
@@ -1230,6 +1258,26 @@ def _extract_db_version(version_output: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+# Background baseline-scan tasks keyed by thread_id (same in-process pattern as
+# git_ops._PUSH_TOKENS). scaffold_finalize kicks the scan so it overlaps the tech-stack ->
+# brownfield LLM chain instead of serializing ~100s behind it; repo_scan_baseline_node awaits it.
+_BACKGROUND_SCANS: dict[str, "asyncio.Task[Any]"] = {}
+
+
+def start_background_scan(thread_id: str, provider: Any) -> None:
+    import asyncio
+
+    if thread_id in _BACKGROUND_SCANS:
+        return
+    _BACKGROUND_SCANS[thread_id] = asyncio.create_task(
+        run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
+    )
+
+
+def pop_background_scan(thread_id: str) -> "asyncio.Task[Any] | None":
+    return _BACKGROUND_SCANS.pop(thread_id, None)
+
+
 async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     """Measures the repository as it arrived, before P1 writes anything.
 
@@ -1259,8 +1307,9 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
         return {"repo_scan": {**prior, "baseline": None, "reason": "no_sandbox"}}
 
     provider = get_sandbox_provider()
+    background = pop_background_scan(thread_id)
     existing = await repo_files.read_repo_file(provider, thread_id, BASELINE_PATH)
-    if existing is not None and existing.strip():
+    if existing is not None and existing.strip() and background is None:
         logger.info("repo_scan: baseline already present, not re-measuring")
         summary = prior.get("baseline_summary")
         if summary is None:
@@ -1270,7 +1319,19 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
                 summary = None
         return {"repo_scan": {**prior, "baseline": "existing", "baseline_summary": summary}}
 
-    report = await run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
+    # Overlap: scaffold_finalize kicked the scan as a background task ~2 LLM stages ago (the scan
+    # is data-independent of tech-stack/brownfield). Await it here; fall back to an inline run
+    # when absent (process restart mid-run). Behavior note: overlapped, the baseline usually
+    # EXCLUDES the tech-stack conventions writes (previously it deterministically included them)
+    # -- racily, and accepted; the git-index lock in git_ops covers the commit race.
+    if background is not None:
+        try:
+            report = await background
+        except Exception:  # noqa: BLE001 -- background failure falls back to a fresh inline run
+            logger.warning("background repo scan failed; re-running inline", exc_info=True)
+            report = await run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
+    else:
+        report = await run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
     await repo_files.append_ledger_entry(
         provider, thread_id,
         {"stage": "repo_scan", "node": "baseline", "finding_count": len(report.findings),

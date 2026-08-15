@@ -225,6 +225,31 @@ RUN set -eux; \
     npm install -g pnpm yarn typescript eslint prettier @angular/cli --unsafe-perm true; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 ruff mypy
 
+# ── /opt/aidw/lint: the pipeline-owned ESLint toolchain, resolved AGAINST ITS OWN node_modules ─
+# Linting a target repo must never mutate that repo's dependency graph: installing our lint
+# devDependencies into a pnpm workspace root once re-resolved the whole peer graph, forked
+# drizzle-orm into two incompatible peer-variant instances, and broke the repo's own build.
+# So the toolchain lives here, pinned at image build, and the rebuild gate invokes
+#   /opt/aidw/lint/node_modules/.bin/eslint --config /opt/aidw/lint/eslint.config.mjs .
+# Root-owned and immutable at runtime for the same reason as the global npm tools above.
+COPY lint/ /opt/aidw/lint/
+RUN set -eux; \
+    cd /opt/aidw/lint; \
+    npm install --no-audit --no-fund; \
+    test -x node_modules/.bin/eslint; \
+    node -e "import('/opt/aidw/lint/eslint.config.mjs').then(m => { if (!Array.isArray(m.default)) throw new Error('config not an array'); })"
+
+# ── /opt/aidw/test: pipeline-owned vitest + coverage provider, same isolation rationale ────────
+# vitest resolves @vitest/coverage-v8 from its own node_modules (they're siblings here), so the
+# coverage gate never installs a provider into the target repo. A c8 wrapper does NOT work as an
+# alternative: vitest's pool workers never inherit the wrapper's V8 coverage collection
+# (observed live: a real suite measured a hard 0.0%).
+COPY test/ /opt/aidw/test/
+RUN set -eux; \
+    cd /opt/aidw/test; \
+    npm install --no-audit --no-fund; \
+    test -x node_modules/.bin/vitest
+
 # mise / scc / gitleaks / trivy / osv-scanner / copilot all arrive via the fetch stage's
 # COPY --from at the top of this stage. mise usage note: driven at container start by
 # bootstrap.sh from files the repo itself declares (.tool-versions, mise.toml, .nvmrc,

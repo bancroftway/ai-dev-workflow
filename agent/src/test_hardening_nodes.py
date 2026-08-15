@@ -3,7 +3,7 @@ narrow read-only LLM node for judgment (filing tickets), exactly as scoped in th
 more.
 
 Chain: test_hardening_run_tests (deterministic, retries) -> route(any stable_fail -> test_hardening_regression_gate
-[hard interrupt, out of test-hardening's own scope to resolve] | else -> test_hardening_flake_triage) ->
+[terminal run_failure, out of test-hardening's own scope to resolve] | else -> test_hardening_flake_triage) ->
 test_hardening_flake_triage (read-only) -> test_hardening_mint_tickets (deterministic: allocates real US-#### ids via
 spec_ledger.py, never the LLM) -> test_hardening_exit_check (deterministic) -> route(pass -> next | fail ->
 test_hardening_exit_escalate [should not normally happen, since mint_tickets always links every entry --
@@ -22,7 +22,6 @@ from typing import Any, TypedDict
 import defusedxml.ElementTree as ET
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import interrupt
 
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, spec_ledger
@@ -103,6 +102,9 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
         return {"test_hardening": test_hardening}
 
     provider = get_sandbox_provider()
+    # Clear the sticky no-sandbox flag: it survives END-terminated runs in the checkpoint, and
+    # the router checks it FIRST -- without this a healthy resubmit insta-fails.
+    test_hardening["cannot_verify"] = False
     raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
     tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
 
@@ -153,14 +155,19 @@ def make_test_hardening_route_after_run() -> Any:
 
 
 async def test_hardening_regression_gate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    """A real regression (consistently failing across every attempt) is out of test-hardening's own scope to
-    resolve -- a hard human/upstream interrupt, never auto-handled here."""
+    """A real regression (consistently failing across every attempt) is out of test-hardening's own
+    scope to resolve -- the run ENDs with run_failure set (no human pause; fix out-of-band and
+    resubmit)."""
+    thread_id = config["configurable"]["thread_id"]
     test_hardening = state.get("test_hardening") or default_test_hardening_state()
     if test_hardening.get("cannot_verify"):
-        interrupt({"stage": "test_hardening", "type": "cannot_verify", "reason": "no sandbox -- test suite did not run"})
+        payload = {"stage": "test_hardening", "type": "cannot_verify", "reason": "no sandbox -- test suite did not run"}
     else:
-        interrupt({"stage": "test_hardening", "type": "stable_test_regression", "stable_fail": test_hardening["stable_fail"]})
-    return {}
+        payload = {"stage": "test_hardening", "type": "stable_test_regression", "stable_fail": test_hardening["stable_fail"]}
+    await git_ops.record_run_failure(thread_id, payload)
+    reset = dict(test_hardening)
+    reset["cannot_verify"] = False
+    return {"test_hardening": reset, "run_failure": payload}
 
 
 async def test_hardening_flake_triage_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -250,9 +257,11 @@ def make_test_hardening_route_after_exit() -> Any:
 
 
 async def test_hardening_exit_escalate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    """Should not normally fire -- test_hardening_mint_tickets links every entry deterministically. Present
-    so an unexpected gap (e.g. the triage LLM never returned a decision for some test) surfaces
-    as a real human decision rather than silently passing the gate."""
+    """Should not normally fire -- test_hardening_mint_tickets links every entry deterministically.
+    Present so an unexpected gap (e.g. the triage LLM never returned a decision for some test)
+    ENDs the run with run_failure set rather than silently passing the gate."""
+    thread_id = config["configurable"]["thread_id"]
     test_hardening = state.get("test_hardening") or default_test_hardening_state()
-    interrupt({"stage": "test_hardening", "type": "flake_quarantine_incomplete", "flake_quarantine": test_hardening["flake_quarantine"]})
-    return {}
+    payload = {"stage": "test_hardening", "type": "flake_quarantine_incomplete", "flake_quarantine": test_hardening["flake_quarantine"]}
+    await git_ops.record_run_failure(thread_id, payload)
+    return {"run_failure": payload}

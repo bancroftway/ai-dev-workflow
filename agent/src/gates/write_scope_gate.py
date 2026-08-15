@@ -12,12 +12,17 @@ touched.
 
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass
+import shlex
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .. import repo_files
+from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
@@ -55,7 +60,7 @@ def _is_test_path(path: str) -> bool:
 # verify cycle flagged `.ai-dev-workflow/ac-to-tests.draft.json` etc. as scope violations the
 # model could never fix -- it didn't write them, workflow persistence did -- deadlocking the
 # stage at the verify cap. The scope rule is about the MODEL's writes only.
-_PIPELINE_OWNED_PREFIXES = (".ai-dev-workflow/", "spec/", "APPROVALS.md", "AGENTS.md")
+_PIPELINE_OWNED_PREFIXES = (".ai-dev-workflow/", "APPROVALS.md", "AGENTS.md")
 
 
 def _is_pipeline_owned(path: str) -> bool:
@@ -67,6 +72,7 @@ class WriteScopeOutcome:
     passed: bool
     violating_paths: list[str]
     changed_paths: list[str]
+    reverted_paths: list[str] = field(default_factory=list)
 
 
 async def check_write_scope(provider: SandboxProvider, thread_id: str, baseline_commit: str | None) -> WriteScopeOutcome:
@@ -75,12 +81,39 @@ async def check_write_scope(provider: SandboxProvider, thread_id: str, baseline_
         # to diff against, so nothing to flag. StageSpec.capture_baseline_commit guarantees this
         # is set on every real run; a None here means the stage's own precondition wasn't met,
         # which is a bug in wiring, not a content problem -- fail open rather than false-positive.
-        return WriteScopeOutcome(passed=True, violating_paths=[], changed_paths=[])
+        return WriteScopeOutcome(passed=True, violating_paths=[], changed_paths=[], reverted_paths=[])
 
-    result = await provider.exec_in_sandbox(thread_id, f"git diff --name-only {baseline_commit} -- .")
-    changed_paths = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    # Untracked files MUST be included: the draft's brand-new test files are exactly that until
+    # a later stage commits them, and `git diff <commit>` alone never lists untracked paths --
+    # observed live (headless run 3): changed_paths showed only the ledger while five new test
+    # files sat invisible, which both misreports the stage and would let untracked non-test
+    # writes slip past the scope rule entirely.
+    result = await provider.exec_in_sandbox(
+        thread_id,
+        f"git diff --name-only {baseline_commit} -- . && git ls-files --others --exclude-standard",
+    )
+    changed_paths = sorted({line.strip() for line in (result.stdout or "").splitlines() if line.strip()})
     violating = [p for p in changed_paths if not _is_test_path(p) and not _is_pipeline_owned(p)]
-    return WriteScopeOutcome(passed=len(violating) == 0, violating_paths=violating, changed_paths=changed_paths)
+    if not violating:
+        return WriteScopeOutcome(passed=True, violating_paths=[], changed_paths=changed_paths, reverted_paths=[])
+
+    # Deterministic remediation instead of feedback the model cannot act on: the draft session
+    # has create/edit tools but NO delete and NO bash, so "revert these files" deadlocked the
+    # stage at the verify cap (observed live, headless run 5: two helper .sh scripts at the repo
+    # root). The gate enforces its own contract -- untracked out-of-scope files are removed,
+    # tracked ones restored to their committed state -- and the stage proceeds on what remains.
+    for path in violating:
+        validate_repo_relative_path(path)
+    quoted = " ".join(shlex.quote(p) for p in violating)
+    revert = await provider.exec_in_sandbox(
+        thread_id,
+        f"for p in {quoted}; do if git ls-files --error-unmatch -- \"$p\" >/dev/null 2>&1; "
+        f"then git checkout -- \"$p\"; else rm -rf -- \"$p\"; fi; done",
+    )
+    if not revert.ok:
+        return WriteScopeOutcome(passed=False, violating_paths=violating, changed_paths=changed_paths, reverted_paths=[])
+    logger.info("write-scope gate reverted out-of-scope paths for thread_id=%s: %s", thread_id, violating)
+    return WriteScopeOutcome(passed=True, violating_paths=[], changed_paths=changed_paths, reverted_paths=violating)
 
 
 _WRITE_TOOL_NAMES = {"builtin:create", "builtin:edit", "builtin:apply_patch"}
@@ -154,19 +187,38 @@ async def verify_ac_to_tests(
 
     write_scope = await check_write_scope(provider, thread_id, baseline_commit)
     if not write_scope.passed:
+        # Only reachable when the gate's own auto-revert failed -- in-scope violations are
+        # remediated deterministically (removed/restored), never bounced back to the model,
+        # which has no delete tool and no bash to act on such feedback.
         return VerificationResult(
             passed=False,
             feedback=(
-                "These files are outside the test-only write scope for this stage and must be "
-                f"reverted: {write_scope.violating_paths}. Only test files may be created or "
-                "modified here."
+                "These files are outside the test-only write scope for this stage and could not "
+                f"be auto-reverted: {write_scope.violating_paths}. Only test files may be created "
+                "or modified here."
             ),
             report={"violating_paths": write_scope.violating_paths, "changed_paths": write_scope.changed_paths},
         )
 
+    # A draft that changed nothing but pipeline artifacts DESCRIBED tests instead of creating
+    # them (observed live, run 13: three laps of readiness=true structured replies, zero file
+    # writes). Name that failure exactly -- "no test found covering US-xxxx" reads to the model
+    # like a naming problem, not a you-never-wrote-files problem.
+    real_changes = [p for p in write_scope.changed_paths if not p.startswith((".ai-dev-workflow/", "APPROVALS.md", "AGENTS.md"))]
+    if not real_changes:
+        return VerificationResult(
+            passed=False,
+            feedback=(
+                "You created NO test files -- the working tree has no changes beyond pipeline "
+                "artifacts. Your structured response is metadata ABOUT files; the files "
+                "themselves must be written to disk with your file tools (create/edit) BEFORE "
+                "you respond. Write the actual test files now."
+            ),
+            report={"changed_paths": write_scope.changed_paths},
+        )
+
     coverage = await check_ac_coverage(provider, thread_id, content_dict)
-    return VerificationResult(
-        passed=coverage.passed,
-        feedback=coverage.feedback,
-        report={"changed_paths": write_scope.changed_paths, **coverage.report},
-    )
+    report = {"changed_paths": write_scope.changed_paths, **coverage.report}
+    if write_scope.reverted_paths:
+        report["reverted_out_of_scope_paths"] = write_scope.reverted_paths
+    return VerificationResult(passed=coverage.passed, feedback=coverage.feedback, report=report)

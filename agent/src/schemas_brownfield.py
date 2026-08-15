@@ -53,6 +53,3 @@ class BrownfieldBaselineDraftResponse(BaseModel):
     baseline: BrownfieldBaselineCombined | None = Field(default=None)
 
 
-class BrownfieldBaselineAuditResponse(BaseModel):
-    revised_baseline: BrownfieldBaselineCombined
-    audit_findings: list[str] = Field(default_factory=list)

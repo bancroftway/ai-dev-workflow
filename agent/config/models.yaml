@@ -1,9 +1,9 @@
 # Per-stage, per-role GitHub Copilot model selection (SPECIFICATION.md Section 3.4).
 #
 # `null` lets the Copilot SDK pick its own default model for that call.
-# `audit_model` should differ from `draft_model` -- the adversarial audit pass exists to get a
-# second opinion from a *different* model. If left null, the audit pass still runs, just with
-# the same model as draft_model (a warning is logged).
+# `audit_model` applies ONLY to the three stages with an adversarial audit pass
+# (specification, plan, minimal-code-to-green) and should differ from draft_model -- the audit
+# exists to get a second opinion from a *different* model. Other stages have no audit leg.
 #
 # Valid model ids depend on your GitHub Copilot account/plan -- list what's actually available
 # with `CopilotClient.list_models()` (agent/.venv, `uv run python -c "..."`), not this comment,
@@ -12,54 +12,50 @@
 #   claude-opus-5, gpt-5.6-terra, gpt-5.6-luna, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini,
 #   gpt-5-mini, mai-code-1-flash-picker, gemini-3.1-pro-preview, gemini-3.6-flash,
 #   gemini-3.5-flash, kimi-k2.7-code
+# Headless-test roster (2026-08-15, user directive): cheaper/faster models only, no
+# claude-sonnet-5. Audits stay on a different vendor than their draft for a real second opinion.
 app-discovery:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
 tech-stack:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
-raw-requirements:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
 specification:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
+  audit_model: gemini-3.6-flash
 plan:
-  draft_model: gpt-5.4
-  audit_model: gemini-3.1-pro-preview
+  draft_model: gpt-5.4-mini
+  audit_model: gemini-3.6-flash
 ac-to-tests:
-  draft_model: gpt-5.4
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
 minimal-code-to-green:
+  # gpt-5.4 (not -mini) on purpose: the codegen stage's 70k+-token drafting turn is above the
+  # mini tier's capability floor -- observed live twice, mini replied readiness=false in ~96
+  # tokens rather than implement. Everything else stays on the cheap roster.
   draft_model: gpt-5.4
-  audit_model: claude-sonnet-5
+  audit_model: gemini-3.6-flash
 adversarial-audit:
-  draft_model: claude-sonnet-5
-  audit_model: gpt-5.6-terra
+  draft_model: claude-haiku-4.5
 dedup-simplify:
-  draft_model: gpt-5.4
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
 license-audit:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
 exit:
-  draft_model: claude-sonnet-5
-  audit_model: gpt-5.6-terra
+  draft_model: claude-haiku-4.5
 brownfield-baseline:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
+# Remediation FIX nodes are codegen-tier work -- mini fixed nothing across full cycles
+# (observed live: 44-token replies leaving a complexity finding standing). Triage shares the
+# stage model; acceptable, triage quality also improved.
 quality-remediation:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4
 security-remediation:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4
 finding-cluster-upgrade:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
 test-hardening-flake-triage:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
 metrics-report:
-  draft_model: gpt-5.6-terra
-  audit_model: claude-sonnet-5
+  draft_model: gpt-5.4-mini
+rebuild:
+  # Shared by every R placement's fix node (rebuild.py). gpt-5.4 (not -mini): observed live,
+  # mini left three trivial lint errors standing across all three fix laps.
+  draft_model: gpt-5.4

@@ -76,7 +76,9 @@ class PlanDiagram(BaseModel):
         description="Complete, valid Mermaid diagram source, including its own type declaration "
         "line (e.g. 'erDiagram', 'flowchart TD'). Node/edge labels containing special characters "
         "(/ ( ) : [ ] { } < > & | , ; #) MUST be double-quoted, e.g. Node[\"/tickers route\"] and "
-        "A -->|\"GET /api\"| B -- a bare [/...] is a trapezoid-shape lexical error."
+        "A -->|\"GET /api\"| B -- a bare [/...] is a trapezoid-shape lexical error. Mermaid has "
+        "NO backslash escapes: never write \\\" inside a label; for a literal double quote use "
+        "#quot; instead."
     )
 
 
@@ -201,41 +203,5 @@ class TechStackDraftResponse(BaseModel):
     )
 
 
-class TechStackAuditResponse(BaseModel):
-    """Structured output contract for the tech-stack adversarial-audit node -- re-verifies
-    reported fields against the actual files on disk (catches a wrongly-placed solution root or
-    a hallucinated dotnet_detected)."""
-
-    revised_tech_stack: TechStack
-    audit_findings: list[str] = Field(
-        default_factory=list, description="Gaps found and fixed. Empty if none were found."
-    )
-
-
-class RawRequirementsDocument(BaseModel):
-    """P1 content model: the single evergreen requirements document -- the ONLY human-editable
-    input to the whole pipeline. Deliberately one free-form field, not a structured wishlist --
-    turning prose into User Stories/Acceptance Criteria is P2's job, not P1's."""
-
-    content: str = Field(description="The full requirements document, in Markdown.")
-
-
-class RawRequirementsDraftResponse(BaseModel):
-    """Structured output contract for the raw-requirements drafting node."""
-
-    readiness: bool = Field(
-        description="True if this draft is complete enough to present for human review."
-    )
-    clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
-    raw_requirements: RawRequirementsDocument | None = Field(
-        default=None, description="Present whenever a draft was produced, ready or not."
-    )
-
-
-class RawRequirementsAuditResponse(BaseModel):
-    """Structured output contract for the raw-requirements adversarial-audit node."""
-
-    revised_raw_requirements: RawRequirementsDocument
-    audit_findings: list[str] = Field(
-        default_factory=list, description="Gaps found and fixed. Empty if none were found."
-    )
+# Raw requirements have no schemas: the human's text is recorded verbatim by the deterministic
+# record_raw_requirements_node in graph.py -- no draft, no audit, no structured output.

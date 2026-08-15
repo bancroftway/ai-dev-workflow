@@ -20,6 +20,26 @@ about the Specification (rare -- justify it explicitly in your response if you d
 the bar to pass tests (no disabling assertions, no weakening a test's expectations to match
 whatever you built).
 
+COVERAGE CONTRACT (required): a deterministic gate verifies 95% line+branch coverage after this
+stage. You own the HOW; the gate owns the NUMBER. Write `.ai-dev-workflow/coverage-commands.json`:
+
+    {"entries": [
+      {"root": "", "command": "<command that runs the tests with coverage>",
+       "artifact": "<repo-relative path the command writes>",
+       "format": "cobertura" | "istanbul-json-summary"}
+    ]}
+
+One entry per stack/app root that has tests (a polyglot monorepo gets one entry per stack).
+Each command must be non-interactive, deterministic, and emit its artifact at the stated path in
+one of the two formats -- nothing else is parsed. RUN each command yourself first and confirm the
+artifact appears; a broken entry fails the gate with the replay error. The gate DELETES the
+artifact and re-executes your command itself -- it never reads a number you report, so fabricated
+artifacts cannot pass. For JS/TS without a coverage provider in the repo, the sandbox ships one:
+`/opt/aidw/test/node_modules/.bin/vitest run --coverage --coverage.provider=v8
+--coverage.reporter=json-summary --coverage.reportsDirectory=coverage` (artifact
+`coverage/coverage-summary.json`, format `istanbul-json-summary`) -- never install coverage
+packages into the repo. For .NET, coverlet's cobertura output is the standard route.
+
 Report every file you changed (`changed_files`, one-line summaries -- git is the actual diff, this
 is metadata, not a restatement of the code), how your subagent tasks went, and any `known_gaps` --
 things you know are incomplete or risky, stated plainly rather than hidden.

@@ -2,14 +2,14 @@
 
 Generalizes workflow_persistence.py's private _read_file/_write_file (which only ever operated
 relative to .ai-dev-workflow/) to an arbitrary repo-root-relative path, so pipeline stages beyond
-the original two (AGENTS.md, Directory.Build.props, spec/ledger.json, etc.) have one shared,
+the original two (AGENTS.md, Directory.Build.props, the spec ledger, etc.) have one shared,
 shell-safe read/write primitive instead of each stage reinventing the exec_in_sandbox pattern.
 
 Also owns the workflow action ledger (.ai-dev-workflow/ledger.jsonl) -- a chronological log of
 every node's activity, fresh per session (reset once at the true entry point of a from-scratch
 run, per graph.py's own module docstring on what a "run" is -- never resumed across gate-approval
 continuations, never preserved across a later fresh run on the same thread; an explicit, accepted
-tradeoff, not an oversight). Distinct from spec/ledger.json's stable US-####/AC-####.# ID registry
+tradeoff, not an oversight). Distinct from .ai-dev-workflow/spec/ledger.json's stable US-####/AC-####.# ID registry
 (agent/src/spec_ledger.py), which is cumulative across the repo's whole lifetime -- the naming
 collision between the two is unfortunate but intentional, matching the plan's own terminology.
 """

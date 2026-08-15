@@ -49,11 +49,6 @@ class AcceptanceCriteriaTestsDraftResponse(BaseModel):
     test_suite: AcceptanceCriteriaTestSuite | None = Field(default=None)
 
 
-class AcceptanceCriteriaTestsAuditResponse(BaseModel):
-    revised_test_suite: AcceptanceCriteriaTestSuite
-    audit_findings: list[str] = Field(default_factory=list)
-
-
 class ChangedFile(BaseModel):
     path: str
     change_kind: Literal["created", "modified", "deleted"]

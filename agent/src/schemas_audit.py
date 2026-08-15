@@ -37,14 +37,6 @@ class AdversarialAuditDraftResponse(BaseModel):
     report: AdversarialAuditReport | None = Field(default=None)
 
 
-class AdversarialAuditAuditResponse(BaseModel):
-    """The audit pass here is itself a second, differently-modeled re-probe of the adversarial
-    audit -- it only reuses findings it can independently verify, per the plan's own design."""
-
-    revised_report: AdversarialAuditReport
-    audit_findings: list[str] = Field(default_factory=list)
-
-
 # --- dedup-simplify: de-dup/simplify ---------------------------------------------------------------------
 
 
@@ -68,11 +60,6 @@ class DedupDraftResponse(BaseModel):
     readiness: bool
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
     result: DedupResult | None = Field(default=None)
-
-
-class DedupAuditResponse(BaseModel):
-    revised_result: DedupResult
-    audit_findings: list[str] = Field(default_factory=list)
 
 
 # --- license-audit: license audit -----------------------------------------------------------------------
@@ -106,6 +93,3 @@ class LicenseAuditDraftResponse(BaseModel):
     report: LicenseAuditReport | None = Field(default=None)
 
 
-class LicenseAuditAuditResponse(BaseModel):
-    revised_report: LicenseAuditReport
-    audit_findings: list[str] = Field(default_factory=list)

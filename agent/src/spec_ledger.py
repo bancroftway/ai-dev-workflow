@@ -1,4 +1,4 @@
-"""P2's stable ID registry (US-####/AC-####.#), persisted at spec/ledger.json (repo root) --
+"""P2's stable ID registry (US-####/AC-####.#), persisted at .ai-dev-workflow/spec/ledger.json --
 distinct from .ai-dev-workflow/ledger.jsonl (repo_files.py's workflow ACTION log). This one is
 cumulative across the repo's entire lifetime of using this tool: ids are never reused, even after
 a story is retired, and a story/AC's *meaning* stays associated with its id across every revision
@@ -28,7 +28,10 @@ _REAL_ID_RE = re.compile(r"^US-\d+(\.\d+)?$")
 from . import repo_files
 from .sandbox.provider import SandboxProvider
 
-LEDGER_PATH = "spec/ledger.json"
+# Under .ai-dev-workflow/ on purpose: the pipeline never writes outside its own directory in a
+# target repo (a top-level spec/ folder appearing in someone's repo was reported as a bug). The
+# spec/ subdirectory keeps this ID registry visually apart from ledger.jsonl, the action log.
+LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json"
 SCHEMA_VERSION = 1
 
 EntryStatus = Literal["active", "retired", "revised"]

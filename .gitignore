@@ -32,3 +32,4 @@ agent/.venv/
 # skill-creator transient eval/iteration workspaces (agent/sandbox-image/plugins/ai-dev-workflow)
 agent/sandbox-image/plugins/*/skills/*-workspace/
 agent/sandbox-image/plugins/*/skills/*/evals/
+**/agent-work/

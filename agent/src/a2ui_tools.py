@@ -31,7 +31,6 @@ CATALOG_ID = "urn:ai-dev-workflow:catalog"
 SPECIFICATION_SURFACE_ID = "specification"
 PLAN_SURFACE_ID = "plan"
 TECH_STACK_SURFACE_ID = "tech-stack"
-RAW_REQUIREMENTS_SURFACE_ID = "raw-requirements"
 AC_TO_TESTS_SURFACE_ID = "ac-to-tests"
 MINIMAL_CODE_TO_GREEN_SURFACE_ID = "minimal-code-to-green"
 ADVERSARIAL_AUDIT_SURFACE_ID = "adversarial-audit"
@@ -96,11 +95,6 @@ def build_tech_stack_envelope(tech_stack: dict, audit_findings: list[str] | None
     it, but harmless/inert until a catalog entry exists client-side."""
     return _build_generic_envelope(TECH_STACK_SURFACE_ID, "TechStackSurface", "tech_stack", tech_stack, audit_findings)
 
-
-def build_raw_requirements_envelope(raw_requirements: dict, audit_findings: list[str] | None = None) -> dict:
-    return _build_generic_envelope(
-        RAW_REQUIREMENTS_SURFACE_ID, "RawRequirementsSurface", "raw_requirements", raw_requirements, audit_findings
-    )
 
 
 def build_ac_to_tests_envelope(test_suite: dict, audit_findings: list[str] | None = None) -> dict:
@@ -181,7 +175,6 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.a2
     # Every builder is reachable and produces the same three-operation envelope.
     builders = [
         (build_tech_stack_envelope, "tech-stack", "TechStackSurface", "tech_stack"),
-        (build_raw_requirements_envelope, "raw-requirements", "RawRequirementsSurface", "raw_requirements"),
         (build_ac_to_tests_envelope, "ac-to-tests", "AcToTestsSurface", "test_suite"),
         (build_minimal_code_to_green_envelope, "minimal-code-to-green", "MinimalCodeToGreenSurface", "iteration"),
         (build_adversarial_audit_envelope, "adversarial-audit", "AdversarialAuditSurface", "report"),

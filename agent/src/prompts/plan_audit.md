@@ -23,7 +23,8 @@ diagram if the plan clearly needs one and lacks it (e.g. a schema change with no
 Enforce the quoting rule while you are here: any node or edge label containing `/`, `(`, `)`,
 `:`, brackets/braces, `<`, `>`, `&`, `|`, `,`, `;`, or `#` must be double-quoted --
 `Node["/tickers route"]`, `A -->|"GET /api"| B` -- a bare `[/...]` is a trapezoid-shape lexical
-error the renderer rejects. Fix every unquoted special-character label in your revision.
+error the renderer rejects. Fix every unquoted special-character label in your revision. Mermaid
+has NO backslash escapes: rewrite any `\"` inside a label to `#quot;` or drop the inner quotes.
 
 Also review the Wireframes as part of this audit -- you are responsible for fixing them, not just
 flagging them. Check each against the Specification and the Plan Steps: does every new/changed

@@ -28,7 +28,6 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from ..prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import interrupt
 
 from .. import config as workflow_config
 from .. import git_ops, model_config, repo_files, repo_scan
@@ -101,10 +100,13 @@ async def security_scan_node(state: dict[str, Any], config: RunnableConfig) -> d
     )
     security_remediation["sbom_ok"] = sbom_result.ok
 
-    existing_keys = set(security_remediation["decisions"].keys())
-    security_remediation["findings"] = [f.to_dict() for f in findings if f.finding_key not in existing_keys] + [
-        f for f in security_remediation["findings"] if f["finding_key"] in existing_keys
-    ]
+    # The CURRENT scan is the only truth about what findings exist. The old merge kept every
+    # previously-DECIDED finding in the list forever, so a finding triaged "fix" still counted
+    # as unsuppressed after the fix removed it from the code -- the gate could never converge
+    # (observed live: floors fixed seven packages and the count went UP). Decisions live in
+    # their own dict keyed by stable finding_key: a decision whose finding vanished is inert,
+    # and one whose finding persists still applies.
+    security_remediation["findings"] = [f.to_dict() for f in findings]
 
     await repo_files.append_ledger_entry(
         provider, thread_id, {"stage": "security_remediation", "node": "scan", "finding_count": len(security_remediation["findings"]), "sbom_ok": security_remediation["sbom_ok"]}
@@ -173,6 +175,7 @@ async def security_ledger_write_node(state: dict[str, Any], config: RunnableConf
     findings_by_key = {f["finding_key"]: f for f in security_remediation["findings"]}
     decisions = dict(security_remediation["decisions"])
 
+    wrote_any = False
     for finding_key, decision in decisions.items():
         if decision["decision"] != "suppress" or "ref" in decision:
             continue
@@ -182,10 +185,93 @@ async def security_ledger_write_node(state: dict[str, Any], config: RunnableConf
         finding_obj = Finding(**{k: v for k, v in finding.items() if k != "status"}, status=finding.get("status", "open"))
         ref = await append_suppression(provider, thread_id, "security_remediation", finding_obj, decision["justification"])
         decisions[finding_key] = {**decision, "ref": ref}
+        wrote_any = True
 
     security_remediation["decisions"] = decisions
-    await git_ops.commit_paths(provider, thread_id, [".ai-dev-workflow/suppressions.md"], "ai-dev-workflow: security_remediation suppressions")
+    # Commit only when something was written -- `git add` on a never-created pathspec is a hard
+    # error (observed live in the quality twin of this node).
+    if wrote_any:
+        await git_ops.commit_paths(provider, thread_id, [".ai-dev-workflow/suppressions.md"], "ai-dev-workflow: security_remediation suppressions")
     return {"security_remediation": security_remediation}
+
+
+def _version_key(v: str) -> tuple[int, int, int]:
+    parts = []
+    for token in v.split(".")[:3]:
+        digits = "".join(ch for ch in token if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)  # type: ignore[return-value]
+
+
+def _pick_floor(vulnerable: str, fixed_csv: str) -> str | None:
+    """Smallest fixed version in the vulnerable version's own major, else the smallest higher fix.
+    Pure -- see the __main__ self-check."""
+    fixes = [t.strip() for t in fixed_csv.split(",") if t.strip()]
+    if not fixes:
+        return None
+    vk = _version_key(vulnerable)
+    same_major = [f for f in fixes if _version_key(f)[0] == vk[0] and _version_key(f) >= vk]
+    if same_major:
+        return min(same_major, key=_version_key)
+    higher = [f for f in fixes if _version_key(f) > vk]
+    return min(higher, key=_version_key) if higher else None
+
+
+async def _apply_dependency_floors(provider, thread_id: str, findings: list[dict[str, Any]]) -> list[str]:
+    """Deterministic pre-remediation: every JS-ecosystem vulnerability finding already names its
+    fixed_version, so pinning the floor is mechanical -- exact-version override selectors
+    ("name@vulnerable": fixed) in the manager's overrides block, then reinstall. The LLM fixer
+    was landing these inconsistently (observed live: one thread converged, the next left
+    esbuild@0.18.20 standing through every lap); a known fix version is not judgment work.
+    Best-effort by design -- anything left standing still goes to the LLM fixer."""
+    # BARE package-name keys, deliberately: pnpm override selectors match the REQUESTED range,
+    # not the resolved version, so an exact "sharp@0.34.5" key misses a dependent requesting
+    # "^0.33" and the vulnerable resolution survives (observed live -- both versions ended up in
+    # the lockfile). A bare key forces every resolution of the package; when several vulnerable
+    # majors coexist the highest floor wins. Blast radius is bounded by what follows this node:
+    # a breaking bump fails the rebuild/test gates and the LLM fixer adjusts.
+    floors: dict[str, str] = {}
+    for f in findings:
+        package = f.get("package")
+        if f.get("category") != "vulnerability" or not isinstance(package, dict):
+            continue
+        name, version, fixed = package.get("name"), package.get("version"), package.get("fixed_version")
+        if not (name and version and fixed):
+            continue
+        if str(package.get("ecosystem", "")).lower() not in ("npm", "pnpm", "yarn"):
+            continue
+        choice = _pick_floor(str(version), str(fixed))
+        if choice and (name not in floors or _version_key(choice) > _version_key(floors[name])):
+            floors[str(name)] = choice
+    if not floors:
+        return []
+
+    raw = await repo_files.read_repo_file(provider, thread_id, "package.json")
+    if raw is None:
+        return []
+    try:
+        pkg = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    is_pnpm = await repo_files.read_repo_file(provider, thread_id, "pnpm-lock.yaml") is not None
+    overrides = pkg.setdefault("pnpm", {}).setdefault("overrides", {}) if is_pnpm else pkg.setdefault("overrides", {})
+    changed = False
+    for selector, fixed_version in floors.items():
+        if overrides.get(selector) != fixed_version:
+            overrides[selector] = fixed_version
+            changed = True
+    if not changed:
+        return []
+    await repo_files.write_repo_file(provider, thread_id, "package.json", json.dumps(pkg, indent=2) + "\n")
+    install = "pnpm install --no-frozen-lockfile" if is_pnpm else "npm install --no-audit --no-fund"
+    result = await provider.exec_in_sandbox(thread_id, f"{install} 2>&1")
+    if not result.ok:
+        # Roll back a broken floor set rather than leave the tree uninstallable for the LLM lap.
+        await provider.exec_in_sandbox(thread_id, "git checkout -- package.json && (pnpm install --no-frozen-lockfile 2>&1 || npm install 2>&1) >/dev/null; true")
+        return []
+    return sorted(floors)
 
 
 async def security_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -205,16 +291,24 @@ async def security_fix_node(state: dict[str, Any], config: RunnableConfig) -> di
         if security_remediation["decisions"].get(f["finding_key"], {}).get("decision") == "suppress"
     ]
 
+    floors_applied = await _apply_dependency_floors(get_sandbox_provider(), thread_id, to_fix)
+    if floors_applied:
+        await repo_files.append_ledger_entry(
+            get_sandbox_provider(), thread_id,
+            {"stage": "security_remediation", "node": "dependency_floors", "applied": floors_applied},
+        )
+
     if to_fix or to_suppress:
         # Own session key (security_remediation-fix:draft), not plan:draft -- sharing it returned plan's cached
-        # read-only session so this autopilot fixer silently couldn't write. No dedicated
-        # models.yaml entry, so keep plan's model explicitly.
+        # read-only session so this autopilot fixer silently couldn't write. The fixer uses this
+        # STAGE's model (falling back to plan's) -- same reasoning as quality_nodes: fixing is
+        # codegen-tier work and must not silently ride plan's roster choice.
         model = get_chat_model_for_thread(
             thread_id,
             "security_remediation-fix",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name("plan", "draft"),
+            model_name=model_config.get_model_name("security-remediation", "draft") or model_config.get_model_name("plan", "draft"),
             sandbox=sandbox_registry.get(thread_id),
             agent_mode="autopilot",
         )
@@ -292,8 +386,13 @@ async def security_gate_check_node(state: dict[str, Any], config: RunnableConfig
 
 
 async def security_human_gate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    """Cap-hit terminal failure: unresolved security findings END the run with run_failure set
+    (no human pause -- spec/plan approval are the only human touchpoints). Counter reset rides in
+    the same return so the next resubmission starts fresh."""
+    thread_id = config["configurable"]["thread_id"]
     security_remediation = state.get("security_remediation") or default_security_state()
-    interrupt({"stage": "security_remediation", "type": "security_cycle_cap_exceeded", "report": security_remediation.get("last_gate_report")})
+    payload = {"stage": "security_remediation", "type": "security_cycle_cap_exceeded", "report": security_remediation.get("last_gate_report")}
+    await git_ops.record_run_failure(thread_id, payload)
     reset = dict(security_remediation)
     reset["cycle_count"] = 0
-    return {"security_remediation": reset}
+    return {"security_remediation": reset, "run_failure": payload}

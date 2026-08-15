@@ -19,6 +19,7 @@ the Gates implemented as LangGraph interrupts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -218,27 +219,41 @@ class CopilotChatModel(BaseChatModel):
                 self.sandbox.session_id if self.sandbox else None,
             )
             client = self._build_client()
-            await client.__aenter__()
-            _clients[session_key] = client
+            # Hard cap on connect + session create: a wedged CLI server inside the container
+            # otherwise hangs _connect_via_tcp forever (observed: 8 hours, headless run 2).
+            # Failing loudly lets the node's own error path (telemetry + graph) take over.
+            try:
+                await asyncio.wait_for(client.__aenter__(), timeout=120)
+                _clients[session_key] = client
 
-            # plugin_directories only means anything inside the sandbox's own filesystem -- a
-            # locally-spawned (no-sandbox) Copilot process has no such content to point at.
-            plugin_directories = config.COPILOT_PLUGIN_DIRECTORIES if self.sandbox is not None else None
-            hooks: SessionHooks | None = (
-                {"on_pre_tool_use": self.pre_tool_use_hook} if self.pre_tool_use_hook is not None else None
-            )
+                # plugin_directories only means anything inside the sandbox's own filesystem -- a
+                # locally-spawned (no-sandbox) Copilot process has no such content to point at.
+                plugin_directories = config.COPILOT_PLUGIN_DIRECTORIES if self.sandbox is not None else None
+                hooks: SessionHooks | None = (
+                    {"on_pre_tool_use": self.pre_tool_use_hook} if self.pre_tool_use_hook is not None else None
+                )
 
-            session = await client.create_session(
-                on_permission_request=PermissionHandler.approve_all,
-                on_exit_plan_mode_request=_on_exit_plan_mode_request,
-                model=self.model_name,
-                streaming=True,
-                plugin_directories=plugin_directories,
-                available_tools=self.available_tools,
-                excluded_tools=self.excluded_tools,
-                hooks=hooks,
-                mcp_servers=self.mcp_servers,
-            )
+                session = await asyncio.wait_for(
+                    client.create_session(
+                        on_permission_request=PermissionHandler.approve_all,
+                        on_exit_plan_mode_request=_on_exit_plan_mode_request,
+                        model=self.model_name,
+                        streaming=True,
+                        plugin_directories=plugin_directories,
+                        available_tools=self.available_tools,
+                        excluded_tools=self.excluded_tools,
+                        hooks=hooks,
+                        mcp_servers=self.mcp_servers,
+                    ),
+                    timeout=180,
+                )
+            except asyncio.TimeoutError:
+                _clients.pop(session_key, None)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.__aexit__(None, None, None), timeout=10)
+                raise RuntimeError(
+                    f"Copilot session {session_key!r} timed out connecting to the sandbox CLI server"
+                ) from None
             _sessions[session_key] = session
             return session
 

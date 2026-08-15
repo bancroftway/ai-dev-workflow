@@ -6,6 +6,7 @@ per-session sandbox via SandboxProvider.exec_in_sandbox.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import shlex
@@ -27,6 +28,12 @@ _COMMIT_AUTHOR_EMAIL = "ai-dev-workflow@users.noreply.github.com"
 # every provision call; an agent restart forces reprovision, so absence just skips pushing.
 _PUSH_TOKENS: dict[str, str] = {}
 _LAST_PUSH: dict[str, dict[str, Any]] = {}
+
+# Serializes git index writes: the background repo scan (repo_scan_baseline overlap) commits
+# concurrently with the tech-stack/brownfield chain's commits into the SAME working tree, and two
+# concurrent `git commit`s fail on .git/index.lock. Guards commit_paths/commit_all BODIES only --
+# never wrap commit_ai_dev_workflow (it calls commit_paths; asyncio locks are non-reentrant).
+_GIT_INDEX_LOCK = asyncio.Lock()
 
 
 def set_push_token(thread_id: str, token: str) -> None:
@@ -80,6 +87,37 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
         logger.warning("git push failed for thread_id=%s: %s", thread_id, _LAST_PUSH[thread_id]["error"])
 
 
+async def record_run_failure(thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Durably records a terminal run failure ({stage, type, ...detail}) and returns the payload.
+
+    Escalations no longer pause for a human -- the graph ENDs with `run_failure` set, so this is
+    the last chance to leave a trace: a ledger row plus a commit+push of .ai-dev-workflow/.
+    No-ops (payload-only) when the sandbox is gone -- every `cannot_verify` failure happens
+    exactly then. Best-effort by design: a failed write must never mask the failure itself.
+    """
+    from .sandbox import registry as sandbox_registry  # local: keep git_ops's import surface flat
+
+    if sandbox_registry.get(thread_id) is None:
+        return payload
+    from . import repo_files  # local import mirrors the module-level one-way dependency
+
+    provider = _get_provider()
+    try:
+        await repo_files.append_ledger_entry(
+            provider, thread_id, {"stage": payload.get("stage"), "node": "run_failure", **payload}
+        )
+        await commit_ai_dev_workflow(provider, thread_id, f"ai-dev-workflow: run failed at {payload.get('stage')}")
+    except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
+        logger.warning("failed to durably record run_failure for thread_id=%s", thread_id, exc_info=True)
+    return payload
+
+
+def _get_provider() -> SandboxProvider:
+    from .sandbox import get_sandbox_provider  # local: sandbox/factory imports nothing from here
+
+    return get_sandbox_provider()
+
+
 async def commit_paths(provider: SandboxProvider, thread_id: str, paths: list[str], message: str) -> None:
     """Stage and commit exactly the given repo-relative paths.
 
@@ -89,7 +127,7 @@ async def commit_paths(provider: SandboxProvider, thread_id: str, paths: list[st
 
     Generalizes the original .ai-dev-workflow/-only commit helper (kept below as a thin wrapper,
     `commit_ai_dev_workflow`) so pipeline stages that touch source/config paths outside
-    .ai-dev-workflow/ (AGENTS.md, Directory.Build.props, spec/ledger.json, source files a
+    .ai-dev-workflow/ (AGENTS.md, Directory.Build.props, .ai-dev-workflow/spec/ledger.json, source files a
     codegen stage wrote, CHANGELOG.md, etc.) have one shared commit primitive instead of each
     stage reinventing the git-add-and-commit shell command.
     """
@@ -109,12 +147,17 @@ async def commit_paths(provider: SandboxProvider, thread_id: str, paths: list[st
         f"git -c user.name={shlex.quote(_COMMIT_AUTHOR_NAME)} -c user.email={shlex.quote(_COMMIT_AUTHOR_EMAIL)} "
         f"commit -m {shlex.quote(message)} --quiet"
     )
-    result = await provider.exec_in_sandbox(thread_id, command)
-    if result.ok:
-        await push_head(provider, thread_id)
-        return
+    async with _GIT_INDEX_LOCK:
+        result = await provider.exec_in_sandbox(thread_id, command)
+        if result.ok:
+            await push_head(provider, thread_id)
+            return
     combined_output = f"{result.stdout}\n{result.stderr}".lower()
-    if "nothing to commit" in combined_output:
+    # Two idempotent shapes: a fully clean tree ("nothing to commit"), and -- since the background
+    # repo scan overlaps the tech-stack/brownfield chain -- the requested paths already committed
+    # by a broader .ai-dev-workflow commit while some OTHER file is dirty ("no changes added to
+    # commit", with the dirty file listed as not staged).
+    if "nothing to commit" in combined_output or "no changes added to commit" in combined_output:
         return  # idempotent: caller ran but produced no actual file changes
     raise RuntimeError(f"git commit failed: {result.stderr or result.stdout}")
 
@@ -135,10 +178,11 @@ async def commit_all(provider: SandboxProvider, thread_id: str, message: str) ->
         f"git -c user.name={shlex.quote(_COMMIT_AUTHOR_NAME)} -c user.email={shlex.quote(_COMMIT_AUTHOR_EMAIL)} "
         f"commit -m {shlex.quote(message)} --quiet"
     )
-    result = await provider.exec_in_sandbox(thread_id, command)
-    if result.ok:
-        await push_head(provider, thread_id)
-        return
+    async with _GIT_INDEX_LOCK:
+        result = await provider.exec_in_sandbox(thread_id, command)
+        if result.ok:
+            await push_head(provider, thread_id)
+            return
     combined_output = f"{result.stdout}\n{result.stderr}".lower()
     if "nothing to commit" in combined_output:
         return

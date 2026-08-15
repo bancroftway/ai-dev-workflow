@@ -35,7 +35,6 @@ from typing import Any, Literal, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from ..prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import interrupt
 
 from .. import config as workflow_config
 from .. import git_ops, model_config, repo_files, repo_scan
@@ -163,10 +162,9 @@ async def quality_scan_node(state: dict[str, Any], config: RunnableConfig) -> di
 
     # Only findings not already decided this run carry forward for triage -- bounds token cost
     # across loop iterations, per the plan's own design intent.
-    existing_keys = set(quality_remediation["decisions"].keys())
-    quality_remediation["findings"] = [f.to_dict() for f in findings if f.finding_key not in existing_keys] + [
-        f for f in quality_remediation["findings"] if f["finding_key"] in existing_keys
-    ]
+    # Current scan is the only truth -- see security_nodes.py's twin comment: keeping decided
+    # findings forever meant a fixed finding never left the list and the gate never converged.
+    quality_remediation["findings"] = [f.to_dict() for f in findings]
 
     await repo_files.append_ledger_entry(
         provider,
@@ -232,6 +230,7 @@ async def quality_ledger_write_node(state: dict[str, Any], config: RunnableConfi
     findings_by_key = {f["finding_key"]: f for f in quality_remediation["findings"]}
     decisions = dict(quality_remediation["decisions"])
 
+    wrote_any = False
     for finding_key, decision in decisions.items():
         if decision["decision"] != "suppress" or "ref" in decision:
             continue
@@ -241,9 +240,13 @@ async def quality_ledger_write_node(state: dict[str, Any], config: RunnableConfi
         finding_obj = Finding(**{k: v for k, v in finding.items() if k != "status"}, status=finding.get("status", "open"))
         ref = await append_suppression(provider, thread_id, "quality_remediation", finding_obj, decision["justification"])
         decisions[finding_key] = {**decision, "ref": ref}
+        wrote_any = True
 
     quality_remediation["decisions"] = decisions
-    await git_ops.commit_paths(provider, thread_id, [".ai-dev-workflow/suppressions.md"], "ai-dev-workflow: quality_remediation suppressions")
+    # Commit only when something was written: with zero suppressions the file never exists and
+    # `git add` on the pathspec is a hard error (observed live -- crashed the run).
+    if wrote_any:
+        await git_ops.commit_paths(provider, thread_id, [".ai-dev-workflow/suppressions.md"], "ai-dev-workflow: quality_remediation suppressions")
     return {"quality_remediation": quality_remediation}
 
 
@@ -271,14 +274,16 @@ async def quality_fix_node(state: dict[str, Any], config: RunnableConfig) -> dic
 
     if to_fix or to_suppress:
         # Own session key (quality_remediation-fix:draft), not plan:draft -- sharing it returned plan's cached
-        # read-only session so this autopilot fixer silently couldn't write. No dedicated
-        # models.yaml entry, so keep plan's model explicitly.
+        # read-only session so this autopilot fixer silently couldn't write. The fixer uses this
+        # STAGE's model (falling back to plan's): fixing is codegen-tier work, and hardcoding
+        # plan's model silently downgraded it when plan moved to a mini roster (observed live:
+        # 37-token fix replies that fixed nothing).
         model = get_chat_model_for_thread(
             thread_id,
             "quality_remediation-fix",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name("plan", "draft"),
+            model_name=model_config.get_model_name("quality-remediation", "draft") or model_config.get_model_name("plan", "draft"),
             sandbox=sandbox_registry.get(thread_id),
             agent_mode="autopilot",
         )
@@ -384,10 +389,13 @@ async def quality_gate_check_node(state: dict[str, Any], config: RunnableConfig)
 
 
 async def quality_human_gate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    """Cap-hit escalation -- per the plan, quality-remediation never auto-approves past unresolved quality
-    findings; a real human decision is required once QUALITY_MAX_CYCLES is exhausted."""
+    """Cap-hit terminal failure -- quality-remediation never auto-approves past unresolved quality
+    findings, and never pauses for a human either: the run ENDs with run_failure set. The counter
+    reset rides in the same return so the next resubmission starts fresh."""
+    thread_id = config["configurable"]["thread_id"]
     quality_remediation = state.get("quality_remediation") or default_quality_state()
-    interrupt({"stage": "quality_remediation", "type": "quality_cycle_cap_exceeded", "report": quality_remediation.get("last_gate_report")})
+    payload = {"stage": "quality_remediation", "type": "quality_cycle_cap_exceeded", "report": quality_remediation.get("last_gate_report")}
+    await git_ops.record_run_failure(thread_id, payload)
     reset = dict(quality_remediation)
     reset["cycle_count"] = 0
-    return {"quality_remediation": reset}
+    return {"quality_remediation": reset, "run_failure": payload}

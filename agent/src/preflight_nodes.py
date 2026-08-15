@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.runnables import RunnableConfig
 
-from . import git_ops, repo_files, template_loader
+from . import git_ops, repo_files, repo_scan, template_loader
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -117,6 +117,10 @@ async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str
     return {
         "manifest_exists": manifest_exists,
         "run_baseline_commit": head.stdout.strip() if head.ok else None,
+        # scaffold runs exactly and only on the proceed path (a blank reattach ping ENDs at
+        # intake), so this is where a previous run's terminal failure record gets cleared --
+        # keeping the failure pill visible across reloads but not across a real re-run.
+        "run_failure": None,
     }
 
 
@@ -165,6 +169,12 @@ async def scaffold_finalize_node(state: "GraphState", config: RunnableConfig) ->
         await git_ops.commit_paths(
             provider, thread_id, [*written_paths, ".ai-dev-workflow"], "ai-dev-workflow: scaffold"
         )
+
+    # Kick the ~100s baseline repo scan in the background so it overlaps the tech-stack ->
+    # brownfield LLM chain instead of serializing behind it (repo_scan_baseline_node awaits it).
+    # Guarded on baseline absence -- a returning thread must never be re-measured.
+    if await repo_files.read_repo_file(provider, thread_id, repo_scan.BASELINE_PATH) is None:
+        repo_scan.start_background_scan(thread_id, provider)
     return {}
 
 
@@ -308,47 +318,6 @@ async def hydrate_tech_stack_from_repo_file(
 _TEMPLATE_SENTINEL = "DO NOT MODIFY THIS FILE DURING FEATURE WORK"
 _STAMP_RE = re.compile(r"aidw-template-version:\s*(\d+)")
 
-# Foreign ESLint configs. If a repo already lints its own way, this pipeline defers to it entirely
-# rather than fighting it with a second config file -- eslint.config.mjs is excluded from the list
-# because that is our own destination (handled by the version-stamp path instead).
-_FOREIGN_ESLINT_CONFIGS = (
-    "eslint.config.js",
-    "eslint.config.cjs",
-    "eslint.config.ts",
-    ".eslintrc",
-    ".eslintrc.js",
-    ".eslintrc.cjs",
-    ".eslintrc.json",
-    ".eslintrc.yml",
-    ".eslintrc.yaml",
-)
-
-# Base ESLint dev-dependencies, always installed for a node repo. Versions are otherwise left to
-# npm (unlike NuGet, where Directory.Build.props must name one) so each repo's own lockfile and
-# dependency policy decide -- with one exception.
-#
-# eslint is pinned to ^9 because it is not optional: with a bare "eslint", npm resolves the latest
-# major, and eslint-plugin-react-hooks / eslint-plugin-jsx-a11y still peer-depend on ^8||^9. The
-# whole install then fails ERESOLVE and the repo gets no lint config at all (observed, not
-# theorised). Bump this only after the framework plugins have caught up.
-_NODE_BASE_DEV_DEPS = (
-    "eslint@^9",
-    "@eslint/js",
-    "globals",
-    "typescript-eslint",
-    "eslint-plugin-security",
-    "eslint-plugin-sonarjs",
-)
-
-# Framework overlays. eslint.config.mjs imports each of these optionally, so a repo only ever gets
-# the plugins matching frameworks it actually uses -- one template, four stacks.
-_FRAMEWORK_DEV_DEPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("react", "next", "next.js", "remix", "preact"), ("eslint-plugin-react-hooks", "eslint-plugin-jsx-a11y")),
-    (("angular",), ("angular-eslint",)),
-    (("vue", "nuxt"), ("eslint-plugin-vue",)),
-)
-
-
 @dataclass(frozen=True)
 class _Ecosystem:
     key: str
@@ -356,10 +325,6 @@ class _Ecosystem:
     """(bundled template path, destination filename relative to this ecosystem's root)."""
     guidance: str
     """AGENTS.md paragraph body, appended once and guarded by _guidance_sentinel(key)."""
-    needs_node_install: bool = False
-    """True for ecosystems whose config file cannot run until packages are installed into the
-    target repo -- the config is then written ONLY after a successful install (see _apply_node)."""
-    dev_deps: tuple[str, ...] = field(default=())
 
 
 _DOTNET = _Ecosystem(
@@ -374,17 +339,20 @@ compile.
 """,
 )
 
+# Node writes NOTHING into the target repo. The lint toolchain is baked into the sandbox image
+# at /opt/aidw/lint (config + its own node_modules) and the rebuild gate runs it from there --
+# installing lint devDependencies into a repo once re-resolved a pnpm workspace's peer graph,
+# forked drizzle-orm into two incompatible instances, and broke the repo's own build. A repo
+# with its own ESLint setup keeps its own lint contract (the gate defers, see rebuild.py).
 _NODE = _Ecosystem(
     key="node",
-    files=(("node/eslint.config.mjs", "eslint.config.mjs"),),
-    needs_node_install=True,
-    dev_deps=_NODE_BASE_DEV_DEPS,
+    files=(),
     guidance="""## JavaScript / TypeScript
 
-This repository has a shared `eslint.config.mjs` -- see that file's own header comment for the
-conventions it enforces and the process for changing it. The build runs
-`eslint . --max-warnings=0` plus a strict `tsc --noEmit`, so a lint warning or a type error is a
-build failure, not advice.
+If this repository has no ESLint setup of its own, the pipeline lints it with a pipeline-owned
+config (baked into the CI sandbox, never written into this repo) at `eslint --max-warnings=0`
+strictness, plus a strict `tsc --noEmit` -- a lint warning or a type error is a build failure,
+not advice. A repository that ships its own ESLint config keeps its own lint contract instead.
 """,
 )
 
@@ -427,16 +395,6 @@ def _root_is_safe(root: str) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _node_dev_deps(frameworks: list[str]) -> tuple[str, ...]:
-    """Base ESLint packages plus one overlay per detected framework. Pure -- see the self-check."""
-    deps = list(_NODE_BASE_DEV_DEPS)
-    lowered = " ".join(f.lower() for f in frameworks)
-    for names, extra in _FRAMEWORK_DEV_DEPS:
-        if any(name in lowered for name in names):
-            deps.extend(d for d in extra if d not in deps)
-    return tuple(deps)
 
 
 def _applicable_ecosystems(tech_stack: dict[str, Any]) -> list[tuple[_Ecosystem, str]]:
@@ -490,19 +448,6 @@ async def _detect_package_manager(provider: SandboxProvider, thread_id: str, roo
     return "npm"
 
 
-_LOCKFILE_BY_MANAGER = {"npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "yarn": "yarn.lock"}
-
-# --no-audit/--no-fund are npm-only; pnpm rejects them outright ("Unknown options") and yarn has
-# no equivalent prompt to suppress -- per-manager commands, not per-manager verbs with shared flags.
-# pnpm: a workspace repo refuses a root add without -w (ERR_PNPM_ADDING_TO_ROOT, observed live)
-# while a non-workspace repo refuses -w -- try plain first, fall back to -w.
-_INSTALL_CMD_BY_MANAGER = {
-    "npm": "npm install -D --no-audit --no-fund {deps}",
-    "pnpm": "pnpm add -D {deps} || pnpm add -D -w {deps}",
-    "yarn": "yarn add -D {deps}",
-}
-
-
 async def _write_if_outdated(
     provider: SandboxProvider, thread_id: str, path: str, template_path: str
 ) -> str | None:
@@ -521,45 +466,6 @@ async def _write_if_outdated(
             return None
     await repo_files.write_repo_file(provider, thread_id, path, content)
     return path
-
-
-async def _apply_node(
-    provider: SandboxProvider, thread_id: str, root: str, tech_stack: dict[str, Any]
-) -> tuple[list[str], dict[str, Any]]:
-    """Node/TS conventions. Install first, write second -- never the reverse.
-
-    An eslint.config.mjs whose plugins were never installed fails with "Cannot find package
-    '@eslint/js'", which is a *config* error: no amount of the agent fixing its own code clears
-    it, and quality-remediation's build_ok short-circuit escalates to a human. So a failed install leaves the repo
-    exactly as it arrived, and the failure is recorded instead.
-    """
-    for name in _FOREIGN_ESLINT_CONFIGS:
-        if await repo_files.read_repo_file(provider, thread_id, _join_root(root, name)) is not None:
-            return [], {"skipped": f"repo has its own {name}"}
-
-    manager = await _detect_package_manager(provider, thread_id, root)
-    if manager is None:
-        return [], {"skipped": f"no package.json at root {root!r}"}
-
-    config_path = _join_root(root, "eslint.config.mjs")
-    existing = await repo_files.read_repo_file(provider, thread_id, config_path)
-    if existing is not None and _is_ours(existing):
-        current = _template_version(template_loader.load_template("node/eslint.config.mjs"))
-        if _template_version(existing) >= current:
-            return [], {"skipped": "already current"}
-    elif existing is not None:
-        return [], {"skipped": "repo has its own eslint.config.mjs"}
-
-    deps = _node_dev_deps([str(item) for item in (tech_stack.get("frameworks") or [])])
-    prefix = f"cd {shlex.quote(root)} && " if root else ""
-    install_cmd = _INSTALL_CMD_BY_MANAGER[manager].format(deps=" ".join(deps))
-    install = await provider.exec_in_sandbox(thread_id, f"{prefix}{install_cmd} 2>&1")
-    if not install.ok:
-        return [], {"install_failed": manager, "error": (install.stderr or install.stdout or "")[-500:]}
-
-    written = await _write_if_outdated(provider, thread_id, config_path, "node/eslint.config.mjs")
-    paths = [p for p in (written, _join_root(root, "package.json"), _join_root(root, _LOCKFILE_BY_MANAGER[manager])) if p]
-    return paths, {"installed": manager, "dev_deps": list(deps)}
 
 
 async def apply_stack_conventions(
@@ -583,17 +489,17 @@ async def apply_stack_conventions(
 
     for ecosystem, root in _applicable_ecosystems(tech_stack):
         try:
-            if ecosystem.needs_node_install:
-                paths, outcome = await _apply_node(provider, thread_id, root, tech_stack)
-            else:
-                paths = []
-                for template_path, filename in ecosystem.files:
-                    written = await _write_if_outdated(
-                        provider, thread_id, _join_root(root, filename), template_path
-                    )
-                    if written:
-                        paths.append(written)
-                outcome = {"wrote": paths} if paths else {"skipped": "already current"}
+            # Config-file templates only (dotnet/python; node's files tuple is empty -- its lint
+            # toolchain ships in the sandbox image and never touches the repo). No ecosystem
+            # installs packages into the target repo anymore.
+            paths = []
+            for template_path, filename in ecosystem.files:
+                written = await _write_if_outdated(
+                    provider, thread_id, _join_root(root, filename), template_path
+                )
+                if written:
+                    paths.append(written)
+            outcome = {"wrote": paths} if paths else {"skipped": "already current"}
             written_paths.extend(paths)
             outcomes[ecosystem.key] = outcome
 
@@ -633,9 +539,9 @@ async def apply_stack_conventions(
 
 
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.preflight_nodes`
-    # The one runnable check this module earns: _applicable_ecosystems and _node_dev_deps are the
-    # only non-trivial pure logic here, and every failure mode they have is a real bug (a wrong
-    # path silently misses projects; an unsafe root used to be able to kill the run).
+    # The one runnable check this module earns: _applicable_ecosystems is the only non-trivial
+    # pure logic here, and every failure mode it has is a real bug (a wrong path silently misses
+    # projects; an unsafe root used to be able to kill the run).
     assert _applicable_ecosystems({}) == []
     assert _applicable_ecosystems({"languages": ["Rust"]}) == []
 
@@ -666,14 +572,8 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     )
     assert [(e.key, r) for e, r in polyglot] == [("dotnet", "src"), ("node", "web"), ("python", "api")], polyglot
 
-    assert _node_dev_deps([]) == _NODE_BASE_DEV_DEPS
-    assert "eslint-plugin-jsx-a11y" in _node_dev_deps(["Next.js"])
-    assert "angular-eslint" in _node_dev_deps(["Angular"])
-    assert "eslint-plugin-vue" in _node_dev_deps(["Nuxt"])
-    assert "angular-eslint" not in _node_dev_deps(["React"])
-    # No duplicates when two frameworks map to overlapping overlays.
-    react_next = _node_dev_deps(["React", "Next.js"])
-    assert len(react_next) == len(set(react_next)), react_next
+    # Node writes nothing into the repo: no template files, only the AGENTS.md paragraph.
+    assert _NODE.files == ()
 
     assert _template_version("aidw-template-version: 7") == 7
     assert _template_version("no stamp here") == 0
