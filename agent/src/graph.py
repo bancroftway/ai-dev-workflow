@@ -39,6 +39,7 @@ from . import model_config
 from . import preflight_nodes
 from . import repo_files
 from . import repo_scan
+from . import tech_stack_signals
 from . import finding_cluster_nodes
 from . import test_hardening_nodes
 from . import e2e_nodes
@@ -297,20 +298,10 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
     return messages
 
 
-_UI_FRAMEWORK_MARKERS = ("react", "vue", "angular", "blazor", "svelte", "next", "nuxt", "flutter", "swiftui", "jetpack compose")
-
-
-def _tech_stack_has_ui_framework(state: GraphState) -> bool:
-    """Shared signal for P3's wireframe requirement and P4's Playwright MCP -- both the plan's own
-    wording ("for UI-based applications"/"UI-relevant ACs") gate on whether this repo has a UI
-    framework at all, using brownfield-baseline's own TechStack.frameworks report (already available before either
-    stage's draft runs, unlike a per-diagram/per-AC ui_relevant flag the model hasn't produced
-    yet at session_options time -- a real, deliberate simplification from "only for UI-relevant
-    content specifically" to "only for UI-framework repos at all").
-    """
-    tech_stack = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
-    frameworks = [str(f).lower() for f in (tech_stack.get("frameworks") or [])]
-    return any(marker in fw for fw in frameworks for marker in _UI_FRAMEWORK_MARKERS)
+# Moved to tech_stack_signals.py (a shared leaf module) so e2e_nodes.py can use the exact same
+# signal without a circular import (graph.py imports e2e_nodes to wire it in). Aliased to the old
+# private name so every call site below is unchanged.
+_tech_stack_has_ui_framework = tech_stack_signals.tech_stack_has_ui_framework
 
 
 # Impeccable (vendored design skill, plugins/vendor/pbakaus-impeccable) -- per-stage prompt

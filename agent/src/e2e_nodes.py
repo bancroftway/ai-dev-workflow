@@ -36,17 +36,13 @@ from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
+from .tech_stack_signals import tech_stack_has_ui_framework
 
 E2E_APP_LOG_PATH = "agent-work/e2e-app.log"
 E2E_APP_PID_PATH = "agent-work/e2e-app.pid"
 E2E_REPORT_PATH = "agent-work/e2e-report.json"
 
 E2E_FIX_SYSTEM_PROMPT, E2E_FIX_HUMAN_TEMPLATE = load_prompt_pair("e2e_fix")
-
-# Mirrors graph.py's _UI_FRAMEWORK_MARKERS/_tech_stack_has_ui_framework exactly. Duplicated rather
-# than imported: graph.py imports this module to wire it in, so the reverse import would be
-# circular. Keep this list in sync with graph.py's if that one ever changes.
-_UI_FRAMEWORK_MARKERS = ("react", "vue", "angular", "blazor", "svelte", "next", "nuxt", "flutter", "swiftui", "jetpack compose")
 
 
 class E2EState(TypedDict):
@@ -75,12 +71,6 @@ def default_e2e_state() -> E2EState:
     }
 
 
-def _repo_has_ui_framework(state: dict[str, Any]) -> bool:
-    tech_stack = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
-    frameworks = [str(f).lower() for f in (tech_stack.get("frameworks") or [])]
-    return any(marker in fw for fw in frameworks for marker in _UI_FRAMEWORK_MARKERS)
-
-
 async def _playwright_runner_available(provider: Any, thread_id: str) -> str | None:
     """'local' (the repo's own @playwright/test resolves), 'global' (the image's pinned fallback
     CLI is on PATH), or None (neither -- gate_check treats this as a skip reason; package.json is
@@ -103,12 +93,18 @@ async def e2e_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> 
     thread_id = config["configurable"]["thread_id"]
     e2e = dict(state.get("e2e") or default_e2e_state())
 
-    if not _repo_has_ui_framework(state):
+    if not tech_stack_has_ui_framework(state):
         e2e.update(status="skipped", skipped_reason="tech-stack detection found no UI framework in this repository")
         return {"e2e": e2e}
 
     if sandbox_registry.get(thread_id) is None:
-        e2e.update(status="skipped", skipped_reason="no sandbox available to check for an e2e suite")
+        # Defer to e2e_run_node's own no-sandbox handling (cannot_verify -> escalate) instead of
+        # silently skipping here -- same discipline every other deterministic gate in this
+        # pipeline uses for missing infra (test_hardening, rebuild, security-remediation): it
+        # escalates to a human, it never quietly waves the stage through. Explicitly "running"
+        # (not left as whatever stale status a prior run's checkpoint carries) so the route below
+        # takes the "run" edge regardless of what e2e.status happened to be last time.
+        e2e["status"] = "running"
         return {"e2e": e2e}
 
     provider = get_sandbox_provider()
@@ -273,10 +269,20 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         with contextlib.suppress(asyncio.CancelledError):
             await keepalive
 
-    if "Executable doesn't exist" in (suite_result.stdout or "") + (suite_result.stderr or ""):
+    combined_output = (suite_result.stdout or "") + (suite_result.stderr or "")
+    if "Executable doesn't exist" in combined_output:
         # Infra gap (browser binary missing) -- not fixable by the LLM fixer, so skip with a
         # reason rather than burn a fix cycle on it.
         e2e.update(status="skipped", skipped_reason="playwright browser executable is missing in this environment", failed_tests=[], screenshots=[])
+        return await _finalize_run(provider, thread_id, e2e)
+
+    if suite_result.returncode == 124:
+        # `timeout` itself killed the suite -- a fixable failure (same class as an app that never
+        # got ready), not something to parse a possibly-truncated report for.
+        e2e.update(
+            status="failed", total=0, passed=0, screenshots=[],
+            failed_tests=[{"title": "e2e suite", "error": f"suite timed out after {workflow_config.E2E_SUITE_TIMEOUT_SECONDS}s"}],
+        )
         return await _finalize_run(provider, thread_id, e2e)
 
     # Screenshot harvest. Filenames derive from repo-controlled test titles -- a real shell
@@ -295,7 +301,16 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     e2e["screenshots"] = screenshots
 
     raw_report = await repo_files.read_repo_file(provider, thread_id, E2E_REPORT_PATH)
-    parsed = _parse_playwright_json(raw_report) if raw_report else {"passed": 0, "failed_tests": [], "total": 0}
+    if raw_report:
+        parsed = _parse_playwright_json(raw_report)
+    else:
+        # The reporter never wrote a file at all (suite crashed before it could) -- NEVER read
+        # this as "0 tests, all passed": that would let the very failures this stage exists to
+        # catch skip straight past the fix/escalate loop.
+        parsed = {
+            "passed": 0, "total": 0,
+            "failed_tests": [{"title": "e2e report", "error": f"{E2E_REPORT_PATH} was not written (suite exit code {suite_result.returncode})"}],
+        }
     e2e.update(status="passed" if not parsed["failed_tests"] else "failed", **parsed)
 
     return await _finalize_run(provider, thread_id, e2e)
@@ -383,11 +398,19 @@ def _iter_specs(suite: dict[str, Any]):
 def _parse_playwright_json(raw_json: str) -> dict[str, Any]:
     """Playwright's `--reporter=json` output -> {passed, failed_tests: [{title, error}], total}.
     A test's outcome is judged on its LAST result only -- retries produce multiple results for the
-    same test, and only the final one decides pass/fail."""
+    same test, and only the final one decides pass/fail.
+
+    NEVER returns total==0 with an empty failed_tests: that shape is indistinguishable from "ran
+    zero tests, so vacuously all passed", which would route the run straight past the fix/escalate
+    loop on exactly the failures (a globalSetup throw, a config syntax error, a suite that never
+    actually started) it exists to catch. Malformed JSON and a structurally-empty report each get
+    their own synthetic failed_tests entry instead; playwright's own top-level `errors` (set when
+    something broke before any test could run) are surfaced as real failures when present.
+    """
     try:
         doc = json.loads(raw_json)
     except json.JSONDecodeError:
-        return {"passed": 0, "failed_tests": [], "total": 0}
+        return {"passed": 0, "total": 0, "failed_tests": [{"title": "e2e report", "error": "e2e-report.json was not valid JSON"}]}
 
     passed = 0
     total = 0
@@ -404,6 +427,16 @@ def _parse_playwright_json(raw_json: str) -> dict[str, Any]:
                 else:
                     error = ((outcome.get("error") or {}).get("message")) or outcome.get("status") or "unknown failure"
                     failed_tests.append({"title": title, "error": str(error)})
+
+    if total == 0:
+        top_errors = doc.get("errors") or []
+        if top_errors:
+            for err in top_errors:
+                message = err.get("message") if isinstance(err, dict) else str(err)
+                failed_tests.append({"title": "e2e suite setup", "error": str(message or err)})
+        else:
+            failed_tests.append({"title": "e2e suite", "error": "e2e-report.json contained no tests and no top-level errors"})
+
     return {"passed": passed, "failed_tests": failed_tests, "total": total}
 
 
@@ -437,14 +470,30 @@ def _demo() -> None:
     retried = {"suites": [{"specs": [{"title": "flaky", "tests": [{"results": [{"status": "failed"}, {"status": "passed"}]}]}]}]}
     assert _parse_playwright_json(json.dumps(retried))["failed_tests"] == []
 
-    # Malformed JSON never raises -- an empty, honest report instead.
-    empty = _parse_playwright_json("not json")
-    assert empty == {"passed": 0, "failed_tests": [], "total": 0}, empty
+    # Malformed/missing/structurally-empty reports must NEVER read as "0 tests, all passed" --
+    # that would let the very failures this stage exists to catch skip the fix/escalate loop.
+    malformed = _parse_playwright_json("not json")
+    assert malformed["total"] == 0 and malformed["failed_tests"], malformed
+    empty_string = _parse_playwright_json("")
+    assert empty_string["total"] == 0 and empty_string["failed_tests"], empty_string
 
-    # _repo_has_ui_framework: same UI-framework-marker check graph.py's stage gates use.
-    assert _repo_has_ui_framework({"stages": {"tech-stack": {"approved_content": {"frameworks": ["Next.js"]}}}})
-    assert not _repo_has_ui_framework({"stages": {"tech-stack": {"approved_content": {"frameworks": ["FastAPI"]}}}})
-    assert not _repo_has_ui_framework({})
+    # Empty suites but a top-level setup error (globalSetup threw, config syntax error, ...) --
+    # playwright's own `errors` array is the only place this ever surfaces.
+    setup_failure = {"suites": [], "errors": [{"message": "Error: globalSetup failed"}]}
+    result = _parse_playwright_json(json.dumps(setup_failure))
+    assert result["total"] == 0, result
+    assert result["failed_tests"] == [{"title": "e2e suite setup", "error": "Error: globalSetup failed"}], result
+
+    # Structurally empty (no suites, no errors either) still classifies as a failure, not a pass.
+    structurally_empty = _parse_playwright_json(json.dumps({"suites": []}))
+    assert structurally_empty["total"] == 0 and structurally_empty["failed_tests"], structurally_empty
+
+    # tech_stack_has_ui_framework: same UI-framework-marker check graph.py's stage gates use --
+    # this module's own self-check is a light re-confirmation, the real one lives in
+    # tech_stack_signals.py now.
+    assert tech_stack_has_ui_framework({"stages": {"tech-stack": {"approved_content": {"frameworks": ["Next.js"]}}}})
+    assert not tech_stack_has_ui_framework({"stages": {"tech-stack": {"approved_content": {"frameworks": ["FastAPI"]}}}})
+    assert not tech_stack_has_ui_framework({})
 
     print("e2e_nodes self-check: ok")
 
