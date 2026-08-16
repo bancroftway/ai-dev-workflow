@@ -12,6 +12,7 @@ from .schemas import ClarifyingQuestion
 
 TestKind = Literal["unit", "integration", "e2e_playwright_skeleton"]
 TestFramework = Literal["xunit", "nunit", "vitest", "jest", "playwright"]
+TestCategory = Literal["happy_path", "negative", "edge", "adversarial", "validator"]
 
 
 class AcceptanceCriteriaTestPlanEntry(BaseModel):
@@ -19,6 +20,14 @@ class AcceptanceCriteriaTestPlanEntry(BaseModel):
     us_id: str = Field(description="The parent US-#### id.")
     test_kind: TestKind
     ui_relevant: bool = Field(description="True if this AC concerns user-visible UI behavior (drives Playwright MCP use).")
+    categories: list[TestCategory] = Field(
+        default_factory=list,
+        description=(
+            "Which categories this AC's tests actually cover. Include happy_path plus any of "
+            "negative/edge/adversarial/validator that were meaningful for this AC; explain any "
+            "meaningful-but-skipped category in rationale."
+        ),
+    )
     rationale: str
 
 

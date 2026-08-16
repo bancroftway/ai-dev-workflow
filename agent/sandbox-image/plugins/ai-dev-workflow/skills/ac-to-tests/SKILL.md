@@ -56,6 +56,50 @@ If a single test genuinely proves more than one acceptance criterion, pick the p
 test name and note the others in a comment -- don't invent a combined id that isn't a real
 identifier.
 
+## Write negative, edge, adversarial, and validator tests -- not just the happy path
+
+A suite that only proves a criterion works when everything goes right hasn't proven the criterion
+is safe -- it's proven the demo works. For every criterion that has a wrong-input path, a boundary,
+a trust boundary, or a validator/guard, add the tests below in whichever kind (unit, integration,
+e2e) actually exercises that behavior, alongside the happy-path test, not instead of it:
+
+- **Negative tests** (invalid input, unauthorized/forbidden access, wrong state): assert the
+  SPECIFIC rejection, never just that something failed.
+  - xUnit/.NET: `Assert.Throws<ValidationException>(...)` and assert on `.Message`/`.ErrorCode`, or
+    for an API integration test, assert `response.StatusCode == HttpStatusCode.Forbidden` plus the
+    response body's error code -- not just that the call didn't return 200.
+  - vitest/JS-TS: `expect(() => parse(input)).toThrow(/must be positive/)`, or for an endpoint,
+    `expect(response.status).toBe(401)` together with `expect(body.error).toBe("unauthorized")`.
+  - pytest/python: `with pytest.raises(ValidationError, match="must be positive"): ...`, or
+    `assert response.status_code == 403 and response.json()["error"] == "forbidden"`.
+- **Edge/boundary tests** (empty, null, max/min, off-by-one, unicode/whitespace, duplicates): assert
+  the actual boundary behavior on both sides, e.g. a 101-character input is rejected and a
+  100-character input is accepted -- one side alone doesn't prove where the line is.
+- **Adversarial tests** (wherever the AC touches a trust boundary): feed injection payloads (a
+  `' OR '1'='1` string, a `<script>` tag), oversized/malformed payloads, and path-traversal strings
+  (`../../etc/passwd`), and assert the system neutralizes or rejects them (escaped output, a
+  400/422 response, no traversal outside the intended root) -- not merely that the process didn't
+  crash.
+- **Validator-targeting tests**: for every validator/guard the AC implies, write one case just
+  inside its boundary that must pass and one just outside it that must fail -- a min-length-3 rule
+  needs a 2-character case that fails and a 3-character case that passes, not two cases that both
+  sit comfortably on one side.
+
+**Distinct observable behavior** means each test's assertion would fail for a genuinely different
+reason than any other test's -- a different status code, a different error type or message, a
+different persisted or returned value. If two tests would both go red for the exact same underlying
+bug, one of them isn't earning its place.
+
+Anti-patterns that look like coverage but aren't:
+- Asserting only that "an error happened" -- a bare `toThrow()` or `Assert.ThrowsAny<Exception>()`
+  with no check on which error or why passes for the right bug and every wrong one alike.
+- Restating one boundary check in five disguises -- an empty string, a whitespace-only string,
+  `null`, `undefined`, and a tab character all asserting the identical "field required" error is one
+  behavior proven five times, not five behaviors. Keep the ones that are genuinely distinct code
+  paths (empty vs. whitespace-only sometimes are) and drop the rest.
+- A validator test that only probes deep inside or deep outside the boundary -- it can't distinguish
+  a correct implementation from one that's off by one.
+
 ## Playwright configs must match the sandbox image's own browser build
 
 Any `playwright.config.*` you author must set `use: { screenshot: 'on' }` -- the later e2e stage

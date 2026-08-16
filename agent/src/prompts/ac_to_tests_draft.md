@@ -19,6 +19,24 @@ prefix in the test title string for languages that allow arbitrary test name str
 rename, renumber, or re-prefix an id -- a deterministic gate matches these ids character for
 character against the ledger.
 
+Besides that proving (happy-path) test, for every AC write further tests where meaningful, each
+following the same AC-id-in-test-name rule above unchanged: negative tests covering invalid input,
+unauthorized/forbidden access, and wrong state, asserting the SPECIFIC rejection/error behavior
+(status code, error type, message shape) rather than merely that something "throws"; edge/boundary
+tests covering empty, null, max/min, off-by-one boundaries, unicode/whitespace, and duplicates;
+adversarial tests wherever the AC touches a trust boundary, using injection payloads (SQLi/XSS
+strings), malformed/oversized data, and path traversal, and asserting the input is handled safely
+rather than merely that nothing crashed; and validator-targeting tests that deliberately exercise
+the validation logic itself -- for every validator/guard the AC implies (schema validation, input
+sanitizers, business-rule checks, auth guards), probe each rule from BOTH sides of its boundary (a
+value that barely passes, a value that barely fails) and prove the validator actually rejects what
+it must, since a validator no test can fail is untested regardless of what else passes. Skip any of
+these categories only when it is genuinely not meaningful for that AC, and say why in that AC's
+`coverage_plan` entry's `rationale` rather than silently omitting it; report exactly which
+categories you covered for each AC in that entry's `categories` field. Never pad coverage with
+tautological variants -- every additional test must assert a distinct observable behavior that no
+existing test already proves, not restate the same assertion in a new wrapper.
+
 You have write access, but ONLY to test files -- test projects/files themselves, and their own
 config (e.g. a test project file, `playwright.config.ts`). Never touch production source code,
 even to make a test compile; if a test needs a symbol that doesn't exist yet, that's expected and
