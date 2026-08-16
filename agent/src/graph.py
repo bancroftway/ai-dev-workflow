@@ -1525,8 +1525,8 @@ POST_STAGE_REBUILD: dict[str, rebuild.RebuildSpec] = {
 # R(quality_remediation): sits between quality_fix and quality_gate_check in the plan's own chain (quality_scan -> quality_triage ->
 # quality_ledger_write -> quality_fix -> R(quality_remediation) -> quality_gate_check -> loop|human_gate). Full fix scope --
 # genuine bug-fixing after a real quality-fix pass, same reasoning as REBUILD_AFTER_P6.
-REBUILD_FOR_P8 = rebuild.RebuildSpec(
-    key="r_p8",
+REBUILD_FOR_QUALITY_REMEDIATION = rebuild.RebuildSpec(
+    key="r_quality_remediation",
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
@@ -1534,8 +1534,8 @@ REBUILD_FOR_P8 = rebuild.RebuildSpec(
 )
 
 # R(security_remediation): same placement pattern as R(quality_remediation), between security_fix and security_gate_check.
-REBUILD_FOR_P10 = rebuild.RebuildSpec(
-    key="r_p10",
+REBUILD_FOR_SECURITY_REMEDIATION = rebuild.RebuildSpec(
+    key="r_security_remediation",
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
@@ -1554,7 +1554,7 @@ def _wire_p8(builder: StateGraph) -> None:
     builder.add_node("quality_gate_check", quality_nodes.quality_gate_check_node)
     builder.add_node("quality_human_gate", quality_nodes.quality_human_gate_node)
 
-    r_quality_entry_name = _wire_rebuild(builder, REBUILD_FOR_P8)
+    r_quality_entry_name = _wire_rebuild(builder, REBUILD_FOR_QUALITY_REMEDIATION)
 
     builder.add_edge("quality_scan", "quality_triage")
     builder.add_edge("quality_triage", "quality_ledger_write")
@@ -1934,7 +1934,7 @@ def _wire_p10(builder: StateGraph) -> None:
     builder.add_node("security_gate_check", security_nodes.security_gate_check_node)
     builder.add_node("security_human_gate", security_nodes.security_human_gate_node)
 
-    r_security_entry_name = _wire_rebuild(builder, REBUILD_FOR_P10)
+    r_security_entry_name = _wire_rebuild(builder, REBUILD_FOR_SECURITY_REMEDIATION)
 
     builder.add_edge("security_scan", "security_triage")
     builder.add_edge("security_triage", "security_ledger_write")
