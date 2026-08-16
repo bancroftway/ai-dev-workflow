@@ -7,6 +7,7 @@ import { WorkspaceHeader } from "@/components/WorkspaceHeader";
 import { deriveThreadId } from "@/lib/workflow-thread";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
 import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
+import { parseThresholds } from "@/lib/metric-grades";
 import { WorkflowProviders } from "../../../providers";
 
 export default async function WorkflowPage({
@@ -33,22 +34,15 @@ export default async function WorkflowPage({
   // the sandbox is ready (AppShell), even on a thread that already has state.
   const resume = (await searchParams).resume === "1";
 
-  // Metrics-bar color thresholds, read server-side at request time (NOT NEXT_PUBLIC_*, which
+  // Metrics-bar grade band thresholds, read server-side at request time (NOT NEXT_PUBLIC_*, which
   // would be inlined at build time and unchangeable in a deployed image). Edit .env locally or
   // the container env in deployment, restart, done. Defaults here mirror the .env seeds.
-  const env = (name: string, fallback: number) => {
-    const v = Number(process.env[name]);
-    return Number.isFinite(v) ? v : fallback;
-  };
+  // parseThresholds validates each CSV var and falls back (with a console.warn) on bad input --
+  // this is the only place it's called, so "warn once server-side" holds.
   const metricThresholds = {
-    healthGreen: env("METRIC_HEALTH_GREEN", 80),
-    healthAmber: env("METRIC_HEALTH_AMBER", 60),
-    coverageGreen: env("METRIC_COVERAGE_GREEN", 80),
-    coverageAmber: env("METRIC_COVERAGE_AMBER", 60),
-    dupGreen: env("METRIC_DUP_GREEN", 3),
-    dupAmber: env("METRIC_DUP_AMBER", 5),
-    secGreen: env("METRIC_SEC_GREEN", 0),
-    secAmber: env("METRIC_SEC_AMBER", 2),
+    ccn: parseThresholds(process.env.METRIC_CCN_GRADES, [5, 10, 15, 20], "METRIC_CCN_GRADES", true),
+    coverage: parseThresholds(process.env.METRIC_COVERAGE_GRADES, [80, 70, 50, 30], "METRIC_COVERAGE_GRADES", false),
+    dup: parseThresholds(process.env.METRIC_DUP_GRADES, [3, 5, 10, 20], "METRIC_DUP_GRADES", true),
   };
 
   return (

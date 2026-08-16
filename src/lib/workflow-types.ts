@@ -45,6 +45,22 @@ export interface AppRejection {
   checked_at: string;
 }
 
+/** repo_scan.py's per-metric "measures" block on ScanSummary -- the metrics-bar-ready subset
+ * (security worst-severity + open count, duplication/ccn/coverage numbers). Optional on
+ * ScanSummary because old baseline files predate this block (see repo_scan.py's comment above
+ * its recompute path) -- absence must render "--" placeholders, never crash. */
+export interface ScanMeasures {
+  security: {
+    /** Full SEVERITY_ORDER vocabulary plus "none" for zero open security findings. "info" is a
+     * real, reachable value (Trivy NONE/NEGLIGIBLE) -- graded as a B, same bucket as "low". */
+    worst_open_severity: "none" | "info" | "low" | "medium" | "high" | "critical" | string;
+    by_severity: Record<string, number>;
+  };
+  duplication_percent: number | null;
+  mean_ccn: number | null;
+  coverage_line_rate: number | null;
+}
+
 /** repo_scan.py's ScanReport.summary() shape -- streamed via the repo_scan state channel. */
 export interface ScanSummary {
   health_score: number;
@@ -53,6 +69,7 @@ export interface ScanSummary {
   deduped_count: number;
   gating_count: number;
   severity_floor: string;
+  measures?: ScanMeasures;
 }
 
 /** repo_scan.py's per-metric delta entry (`_metric_deltas`), keyed by metric name (e.g.
