@@ -132,8 +132,16 @@ def _parse_istanbul_counts(raw: str) -> tuple[_Counts | None, str]:
     return _Counts(lc, lt, bc, bt, gaps), ""
 
 
+def _with_timeout(command: str, timeout_seconds: int | None) -> str:
+    """`sh -c` wrap keeps a single `timeout` bound to the WHOLE command even when it chains
+    multiple statements (&&, if/then/else) -- a bare `timeout N cmd1 && cmd2` would only bound
+    cmd1. None (every gate caller today) is a no-op, so behavior is unchanged unless a caller
+    opts in."""
+    return f"timeout {timeout_seconds} sh -c {shlex.quote(command)}" if timeout_seconds else command
+
+
 async def _run_contract_coverage(
-    provider: SandboxProvider, thread_id: str
+    provider: SandboxProvider, thread_id: str, *, timeout_seconds: int | None = None
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]] | None:
     """Replays `.ai-dev-workflow/coverage-commands.json`. Returns None when no contract exists
     (caller falls back to the legacy single-stack path); otherwise (line, branch, gaps,
@@ -175,7 +183,7 @@ async def _run_contract_coverage(
 
         prefix = f"cd {shlex.quote(root)} && " if root else ""
         replay = await provider.exec_in_sandbox(
-            thread_id, f"rm -f {shlex.quote(artifact)} && {prefix}{command} 2>&1"
+            thread_id, f"rm -f {shlex.quote(artifact)} && {_with_timeout(f'{prefix}{command}', timeout_seconds)} 2>&1"
         )
         report["replay_exit_ok"] = replay.ok
         artifact_raw = await repo_files.read_repo_file(provider, thread_id, artifact)
@@ -207,11 +215,14 @@ async def _run_contract_coverage(
     return line_rate, branch_rate, gaps, "", entry_reports
 
 
-async def _run_dotnet_coverage(provider: SandboxProvider, thread_id: str) -> tuple[float | None, float | None, list[CoverageGap], str]:
-    command = (
+async def _run_dotnet_coverage(
+    provider: SandboxProvider, thread_id: str, *, timeout_seconds: int | None = None
+) -> tuple[float | None, float | None, list[CoverageGap], str]:
+    command = _with_timeout(
         "dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura "
-        "/p:CoverletOutput=./TestResults/coverage.cobertura.xml 2>&1"
-    )
+        "/p:CoverletOutput=./TestResults/coverage.cobertura.xml",
+        timeout_seconds,
+    ) + " 2>&1"
     result = await provider.exec_in_sandbox(thread_id, command)
     raw_xml = await repo_files.read_repo_file(provider, thread_id, "TestResults/coverage.cobertura.xml")
     if raw_xml is None:
@@ -235,18 +246,21 @@ async def _run_dotnet_coverage(provider: SandboxProvider, thread_id: str) -> tup
     return line_rate, branch_rate, gaps, ""
 
 
-async def _run_js_coverage(provider: SandboxProvider, thread_id: str) -> tuple[float | None, float | None, list[CoverageGap], str]:
+async def _run_js_coverage(
+    provider: SandboxProvider, thread_id: str, *, timeout_seconds: int | None = None
+) -> tuple[float | None, float | None, list[CoverageGap], str]:
     # The IMAGE-BAKED vitest (+@vitest/coverage-v8 sibling in the same node_modules) measures
     # coverage without installing anything into the target repo. Both wrapper alternatives were
     # tried live and measure a hard 0.0%: `c8 -- vitest run` (pool workers invisible to the
     # wrapper) and NODE_V8_COVERAGE + `c8 report` (vitest workers never write the dumps).
-    command = (
+    command = _with_timeout(
         "rm -rf coverage && "
         "if [ -x /opt/aidw/test/node_modules/.bin/vitest ]; then "
         "/opt/aidw/test/node_modules/.bin/vitest run --coverage --coverage.provider=v8 "
         "--coverage.reporter=json-summary --coverage.reporter=json "
         "--coverage.reportsDirectory=coverage 2>&1; "
-        "else npx --yes vitest run --coverage --coverage.reporter=json-summary 2>&1; fi"
+        "else npx --yes vitest run --coverage --coverage.reporter=json-summary 2>&1; fi",
+        timeout_seconds,
     )
     result = await provider.exec_in_sandbox(thread_id, command)
     raw_summary = await repo_files.read_repo_file(provider, thread_id, "coverage/coverage-summary.json")
@@ -311,40 +325,51 @@ async def _check_exclusion_gaming(provider: SandboxProvider, thread_id: str) -> 
     return violations
 
 
+async def measure_coverage(
+    provider: SandboxProvider, thread_id: str, *, timeout_seconds: int | None = None
+) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
+    """Acquisition half of `verify_coverage`: contract replay (coverage-commands.json) first, then
+    the tech-stack fallback (.NET coverlet / JS vitest) -- no third "direct detection" leg, since
+    by the time anything other than the gate itself calls this (the repo-scan baseline node),
+    `.ai-dev-workflow/tech-stack.approved.json` already exists (tech-stack runs first).
+
+    Every path returns (line_rate, branch_rate, gaps, reason, entry_reports) with line_rate=None
+    on any failure -- NEVER a fabricated 0, the same rule the gate's callers already depend on.
+    `reason` is only meaningful when line_rate is None.
+    """
+    contract = await _run_contract_coverage(provider, thread_id, timeout_seconds=timeout_seconds)
+    if contract is not None:
+        return contract
+
+    raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
+    tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
+    languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
+
+    if tech_stack.get("dotnet_detected"):
+        line_rate, branch_rate, gaps, reason = await _run_dotnet_coverage(provider, thread_id, timeout_seconds=timeout_seconds)
+    elif "typescript" in languages or "javascript" in languages:
+        line_rate, branch_rate, gaps, reason = await _run_js_coverage(provider, thread_id, timeout_seconds=timeout_seconds)
+    else:
+        return None, None, [], (
+            "No coverage tooling mapping for this stack. Record working coverage command(s) in "
+            f"{COVERAGE_COMMANDS_PATH} (see the drafting instructions) so the gate can replay them."
+        ), []
+
+    return line_rate, branch_rate, gaps, reason, []
+
+
 async def verify_coverage(
     thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, provider: SandboxProvider
 ) -> "VerificationResult":
     from ..graph import VerificationResult
 
-    entry_reports: list[dict[str, Any]] = []
-    contract = await _run_contract_coverage(provider, thread_id)
-    if contract is not None:
-        line_rate, branch_rate, gaps, infra_error, entry_reports = contract
-    else:
-        raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
-        tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
-        languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
-
-        if tech_stack.get("dotnet_detected"):
-            line_rate, branch_rate, gaps, infra_error = await _run_dotnet_coverage(provider, thread_id)
-        elif "typescript" in languages or "javascript" in languages:
-            line_rate, branch_rate, gaps, infra_error = await _run_js_coverage(provider, thread_id)
-        else:
-            return VerificationResult(
-                passed=False,
-                feedback=(
-                    "No coverage tooling mapping for this stack. Record working coverage "
-                    f"command(s) in {COVERAGE_COMMANDS_PATH} (see the drafting instructions) so "
-                    "the gate can replay them."
-                ),
-                report={},
-            )
+    line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id)
 
     if line_rate is None:
         return VerificationResult(
             passed=False,
-            feedback=f"Coverage run produced no parseable report -- treat as an infra failure, not a coverage gap: {infra_error}",
-            report={"infra_error": infra_error, "contract_replay": entry_reports},
+            feedback=f"Coverage run produced no parseable report -- treat as an infra failure, not a coverage gap: {reason}",
+            report={"infra_error": reason, "contract_replay": entry_reports},
         )
 
     gaming_violations = await _check_exclusion_gaming(provider, thread_id)
@@ -378,3 +403,45 @@ async def verify_coverage(
         ),
         report=report,
     )
+
+
+def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.gates.test_coverage_gate`
+    """Self-check for the pure parts. `measure_coverage` itself is all sandbox I/O (replay a
+    command, read the artifact back); its two artifact parsers and the timeout-wrap helper are
+    the pure logic worth pinning here."""
+
+    counts, err = _parse_cobertura_counts(
+        '<coverage lines-covered="80" lines-valid="100" branches-covered="18" branches-valid="20">'
+        "<packages><package><classes>"
+        '<class filename="a.py" line-rate="0.5" branch-rate="1.0"/>'
+        "</classes></package></packages></coverage>"
+    )
+    assert counts is not None and err == ""
+    assert counts.lines_covered == 80 and counts.lines_total == 100
+    assert counts.gaps and counts.gaps[0].file == "a.py", "under-threshold class must surface as a gap"
+    assert _parse_cobertura_counts("not xml")[0] is None
+    assert _parse_cobertura_counts('<coverage lines-covered="0" lines-valid="0"/>')[0] is None, (
+        "zero instrumented lines must not report a hollow rate"
+    )
+
+    summary = {
+        "total": {"lines": {"total": 100, "covered": 96, "pct": 96}, "branches": {"total": 10, "covered": 10, "pct": 100}},
+        "src/x.ts": {"lines": {"pct": 50}, "branches": {"pct": 100}},
+    }
+    counts, err = _parse_istanbul_counts(json.dumps(summary))
+    assert counts is not None and counts.lines_covered == 96, err
+    assert counts.gaps and counts.gaps[0].file == "src/x.ts"
+    assert _parse_istanbul_counts(json.dumps({"total": {"lines": {"total": 0}}}))[0] is None
+
+    # timeout wraps the WHOLE command via `sh -c`, so a chained/if-else command is bounded as one
+    # unit -- a bare `timeout N cmd1 && cmd2` would only bound cmd1.
+    assert _with_timeout("echo hi", None) == "echo hi", "no timeout_seconds must be a no-op"
+    wrapped = _with_timeout("echo hi && echo bye", 30)
+    assert wrapped.startswith("timeout 30 sh -c "), wrapped
+    assert "echo hi && echo bye" in wrapped
+
+    print("test_coverage_gate self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

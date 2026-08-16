@@ -55,15 +55,44 @@ export interface ScanSummary {
   severity_floor: string;
 }
 
+/** repo_scan.py's per-metric delta entry (`_metric_deltas`), keyed by metric name (e.g.
+ * "health_score", "coverage_line_rate") on DeltaSummary.metrics. */
+export interface MetricDelta {
+  from: number;
+  to: number;
+  delta: number;
+  direction: "improved" | "regressed" | "neutral";
+}
+
+/** repo_scan.py's `delta_summary()` shape -- a small, frontend-ready rollup of `diff_scans`'
+ * full findings+metrics diff. null when there is no baseline (never a fabricated zero-delta). */
+export interface DeltaSummary {
+  fixed_count: number;
+  introduced_count: number;
+  severity_changed: number;
+  net_change: Record<string, number>;
+  metrics: Record<string, MetricDelta>;
+  baseline_commit: string | null;
+}
+
+/** repo_scan.py's coverage shape -- `reason` is set only when `line_rate` is null (never a
+ * fabricated 0). */
+export interface CoverageState {
+  line_rate: number | null;
+  branch_rate: number | null;
+  reason?: string;
+}
+
 /** Curated scan snapshot streamed on GraphState.repo_scan for the metrics bar -- small keys only,
  * full findings stay in the committed .ai-dev-workflow/repo-scan-*.json files. */
 export interface RepoScanState {
   baseline?: string | null;
   baseline_summary?: ScanSummary | null;
+  baseline_coverage?: CoverageState | null;
   latest_summary?: ScanSummary | null;
   latest_duplication_percent?: number | null;
-  coverage?: { line_rate: number | null; branch_rate: number | null };
-  delta_summary?: unknown;
+  coverage?: CoverageState;
+  delta_summary?: DeltaSummary | null;
   reason?: string;
 }
 

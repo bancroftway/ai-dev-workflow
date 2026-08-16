@@ -78,6 +78,9 @@ LIZARD_MAX_CCN = int(os.environ.get("LIZARD_MAX_CCN", "20"))
 LIZARD_HIGH_CCN = int(os.environ.get("LIZARD_HIGH_CCN", "25"))
 CHURN_WINDOW_DAYS = int(os.environ.get("REPO_SCAN_CHURN_WINDOW_DAYS", "365"))
 SECURITY_SEVERITY_FLOOR = os.environ.get("SECURITY_SEVERITY_FLOOR", "medium")
+# Bounds the coverage measurement the baseline node runs alongside the scan -- a hung test command
+# must not hang the whole baseline forever. None (gate callers) keeps today's unbounded behavior.
+REPO_SCAN_COVERAGE_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIMEOUT_SECONDS", "600"))
 
 # Which categories a security gate is allowed to block on. `duplication`/`maintainability`/
 # `sast-quality` are quality-remediation's business and are gated on the baseline delta instead, never absolutely.
@@ -849,12 +852,21 @@ class ScanReport:
     def summary(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
         by_severity = {level: 0 for level in SEVERITY_ORDER}
         by_category: dict[str, int] = {}
+        # Security-only severity tally -- kept separate from `by_severity` above (which is every
+        # finding, quality included) because a quality-remediation lizard "high" complexity finding
+        # is not a security issue. Reusing that confusion is the live bug measures.security fixes.
+        security_by_severity = {level: 0 for level in SEVERITY_ORDER}
         gating = 0
         for finding in self.findings:
             by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
             by_category[finding.category] = by_category.get(finding.category, 0) + 1
+            if finding.category in SECURITY_CATEGORIES:
+                security_by_severity[finding.severity] = security_by_severity.get(finding.severity, 0) + 1
             if is_gating(finding, severity_floor=severity_floor, introduced_ids=introduced_ids):
                 gating += 1
+        worst_open_severity = next(
+            (level for level in reversed(SEVERITY_ORDER) if security_by_severity.get(level, 0)), "none"
+        )
         return {
             "health_score": health_score(by_severity, self.metrics),
             "by_severity": by_severity,
@@ -862,6 +874,12 @@ class ScanReport:
             "deduped_count": self.deduped_count,
             "gating_count": gating,
             "severity_floor": severity_floor,
+            "measures": {
+                "security": {"worst_open_severity": worst_open_severity, "by_severity": security_by_severity},
+                "duplication_percent": (self.metrics.get("duplication") or {}).get("percent"),
+                "mean_ccn": (self.metrics.get("complexity") or {}).get("mean_ccn"),
+                "coverage_line_rate": (self.metrics.get("coverage") or {}).get("line_rate"),
+            },
         }
 
     def to_dashboard_dict(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
@@ -960,6 +978,7 @@ _METRIC_DIRECTIONS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("mean_ccn", ("metrics", "complexity", "mean_ccn"), "lower_is_better"),
     ("functions_over_threshold", ("metrics", "complexity", "functions_over_threshold"), "lower_is_better"),
     ("total_loc", ("metrics", "size", "total_loc"), "neutral"),
+    ("coverage_line_rate", ("metrics", "coverage", "line_rate"), "higher_is_better"),
 )
 
 
@@ -1016,6 +1035,23 @@ def diff_scans(baseline: dict[str, Any] | None, current: dict[str, Any]) -> dict
             # ponytail: accepted; upgrade path is `git log --follow` rename detection if it proves noisy.
             "renames_not_tracked": True,
         },
+    }
+
+
+def delta_summary(delta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Small, frontend-ready rollup of `diff_scans`' output. metrics_nodes.py used to read a
+    `summary` key diff_scans has never produced -- dead since day one, so the UI never got a
+    delta at all. None in, None out: no baseline still means no delta, never a fabricated one."""
+    if delta is None:
+        return None
+    findings = delta.get("findings") or {}
+    return {
+        "fixed_count": len(findings.get("fixed") or []),
+        "introduced_count": len(findings.get("introduced") or []),
+        "severity_changed": len(findings.get("severity_changed") or []),
+        "net_change": findings.get("net_change"),
+        "metrics": delta.get("metrics"),
+        "baseline_commit": delta.get("baseline_commit"),
     }
 
 
@@ -1270,12 +1306,55 @@ def start_background_scan(thread_id: str, provider: Any) -> None:
     if thread_id in _BACKGROUND_SCANS:
         return
     _BACKGROUND_SCANS[thread_id] = asyncio.create_task(
-        run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
+        _scan_with_coverage(provider, thread_id, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS)
     )
 
 
 def pop_background_scan(thread_id: str) -> "asyncio.Task[Any] | None":
     return _BACKGROUND_SCANS.pop(thread_id, None)
+
+
+async def _scan_with_coverage(
+    provider: Any, thread_id: str, *, timeout_seconds: int | None = None
+) -> tuple["ScanReport", dict[str, Any]]:
+    """The baseline scan and coverage measurement, run one after the other as a single task so
+    both finish before `repo_scan_baseline_node` awaits it -- the report is NOT written to
+    BASELINE_PATH here, deliberately: the node writes it once, after merging coverage in, so the
+    committed file and the streamed summary never disagree about whether coverage is present.
+    """
+    report = await run_repo_scan(provider, thread_id, profile="full")
+    from .gates.test_coverage_gate import measure_coverage  # local: keeps the pure half import-light
+
+    line_rate, branch_rate, _gaps, reason, _entry_reports = await measure_coverage(
+        provider, thread_id, timeout_seconds=timeout_seconds
+    )
+    coverage: dict[str, Any] = {"line_rate": line_rate, "branch_rate": branch_rate}
+    if line_rate is None:
+        coverage["reason"] = reason
+    return report, coverage
+
+
+def _summary_from_stored(stored: dict[str, Any]) -> dict[str, Any]:
+    """Old baseline files predate the `measures` block and only carry whatever summary shape was
+    current when they were written. Reconstructs enough of a ScanReport from the stored dashboard
+    dict's own findings/metrics to rerun the CURRENT `summary()` code, so a pre-change baseline
+    feeds the new UI without a re-scan. `tool`/`raw_severity`/`message` are unused by summary()
+    and is_gating() and are fabricated as empty -- the dashboard dict never carried them anyway
+    (see `_dashboard_finding`)."""
+    findings = tuple(
+        Finding(
+            finding_key=f.get("id", ""), tool="", rule_id=f.get("rule_id") or "",
+            severity=f.get("severity", "info"), raw_severity="",
+            file=(f.get("location") or {}).get("path", "unknown"), line=None, message="",
+            category=f.get("category", "sast"),
+        )
+        for f in stored.get("findings") or []
+        if isinstance(f, dict)
+    )
+    report = ScanReport(
+        findings=findings, metrics=stored.get("metrics") or {}, tools=(), repo=stored.get("repo") or {}, deduped_count=0
+    )
+    return report.summary()
 
 
 async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -1312,26 +1391,43 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
     if existing is not None and existing.strip() and background is None:
         logger.info("repo_scan: baseline already present, not re-measuring")
         summary = prior.get("baseline_summary")
+        baseline_coverage = prior.get("baseline_coverage")
         if summary is None:
             try:
-                summary = json.loads(existing).get("summary")
+                stored = json.loads(existing)
             except json.JSONDecodeError:
-                summary = None
-        return {"repo_scan": {**prior, "baseline": "existing", "baseline_summary": summary}}
+                stored = None
+            if stored is not None:
+                summary = _summary_from_stored(stored)
+                baseline_coverage = (stored.get("metrics") or {}).get("coverage") or {
+                    "line_rate": None, "reason": "not measured in stored baseline",
+                }
+        return {"repo_scan": {**prior, "baseline": "existing", "baseline_summary": summary,
+                              "baseline_coverage": baseline_coverage}}
 
-    # Overlap: scaffold_finalize kicked the scan as a background task ~2 LLM stages ago (the scan
-    # is data-independent of tech-stack/brownfield). Await it here; fall back to an inline run
-    # when absent (process restart mid-run). Behavior note: overlapped, the baseline usually
-    # EXCLUDES the tech-stack conventions writes (previously it deterministically included them)
-    # -- racily, and accepted; the git-index lock in git_ops covers the commit race.
+    # Overlap: scaffold_finalize kicked the scan (and coverage measurement) as a background task
+    # ~2 LLM stages ago (both are data-independent of tech-stack/brownfield). Await it here; fall
+    # back to an inline scan+coverage run when absent (process restart mid-run). Behavior note:
+    # overlapped, the baseline usually EXCLUDES the tech-stack conventions writes (previously it
+    # deterministically included them) -- racily, and accepted; the git-index lock in git_ops
+    # covers the commit race.
     if background is not None:
         try:
-            report = await background
+            report, coverage = await background
         except Exception:  # noqa: BLE001 -- background failure falls back to a fresh inline run
             logger.warning("background repo scan failed; re-running inline", exc_info=True)
-            report = await run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
+            report, coverage = await _scan_with_coverage(
+                provider, thread_id, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
+            )
     else:
-        report = await run_repo_scan(provider, thread_id, profile="full", report_path=BASELINE_PATH)
+        report, coverage = await _scan_with_coverage(
+            provider, thread_id, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
+        )
+    report = replace(report, metrics={**report.metrics, "coverage": coverage})
+    dashboard = report.to_dashboard_dict()
+    await repo_files.write_repo_file(
+        provider, thread_id, BASELINE_PATH, json.dumps(dashboard, indent=2, default=str) + "\n"
+    )
     await repo_files.append_ledger_entry(
         provider, thread_id,
         {"stage": "repo_scan", "node": "baseline", "finding_count": len(report.findings),
@@ -1339,7 +1435,7 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
     )
     await git_ops.commit_paths(provider, thread_id, [BASELINE_PATH], "ai-dev-workflow: repo-scan baseline")
     return {"repo_scan": {**prior, "baseline": "written", "commit": report.repo.get("commit"),
-                          "baseline_summary": report.to_dashboard_dict()["summary"]}}
+                          "baseline_summary": dashboard["summary"], "baseline_coverage": coverage}}
 
 
 async def _repo_facts(provider: Any, thread_id: str) -> dict[str, Any]:
@@ -1442,7 +1538,7 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
 
     lizard_csv = (
         "5,3,20,1,7,fine@1-7@./src/a.py,./src/a.py,fine,fine(),1,7\n"
-        "80,18,400,4,90,messy@1-90@./src/b.py,./src/b.py,messy,messy(),1,90\n"
+        "80,22,400,4,90,messy@1-90@./src/b.py,./src/b.py,messy,messy(),1,90\n"
         "120,40,900,6,150,awful@1-150@./src/b.py,./src/b.py,awful,awful(),1,150\n"
     )
     lizard_findings, lizard_metrics = parse_lizard(lizard_csv)
@@ -1515,6 +1611,23 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert dashboard["summary"]["by_severity"]["critical"] == 1
     assert dashboard["summary"]["health_score"] < 100
 
+    # --- measures: security must not see quality's findings ------------------------------------
+    measures = dashboard["summary"]["measures"]
+    assert measures["security"]["worst_open_severity"] == "critical", measures
+    # The two lizard findings are "high"/"medium" but category=maintainability (quality, not
+    # security) -- counting them here is the live bug this block fixes.
+    assert measures["security"]["by_severity"]["high"] == 1, "quality's high must not count as security"
+    assert measures["security"]["by_severity"]["critical"] == 1
+    assert measures["duplication_percent"] == metrics["duplication"]["percent"]
+    assert measures["mean_ccn"] == metrics["complexity"]["mean_ccn"]
+    assert measures["coverage_line_rate"] is None, "no coverage measured in this fixture"
+
+    # Zero-state: quality-only findings must report "none", not a fabricated severity.
+    quality_only = ScanReport(findings=tuple(lizard_findings), metrics=metrics, tools=(), repo={}, deduped_count=0)
+    qs_measures = quality_only.summary()["measures"]
+    assert qs_measures["security"]["worst_open_severity"] == "none"
+    assert qs_measures["security"]["by_severity"] == {level: 0 for level in SEVERITY_ORDER}
+
     # Sorting is a total order, so the hash is stable regardless of input order.
     shuffled = ScanReport(
         findings=tuple(sort_findings(list(reversed(report.findings)))),
@@ -1540,7 +1653,7 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
             {"id": "gone", "severity": "critical", "category": "secret", "title": "fixed"},
             {"id": "worse", "severity": "low", "category": "sast", "title": "escalated"},
         ],
-        "metrics": {"duplication": {"percent": 8.4}, "size": {"total_loc": 12000}},
+        "metrics": {"duplication": {"percent": 8.4}, "size": {"total_loc": 12000}, "coverage": {"line_rate": 70.0}},
         "tools": [{"name": "trivy", "db_version": "2026-08-01"}],
     }
     current = {
@@ -1551,7 +1664,7 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
             {"id": "worse", "severity": "high", "category": "sast", "title": "escalated"},
             {"id": "new", "severity": "medium", "category": "misconfig", "title": "introduced"},
         ],
-        "metrics": {"duplication": {"percent": 2.1}, "size": {"total_loc": 14100}},
+        "metrics": {"duplication": {"percent": 2.1}, "size": {"total_loc": 14100}, "coverage": {"line_rate": 85.0}},
         "tools": [{"name": "trivy", "db_version": "2026-08-01"}],
     }
     delta = diff_scans(baseline, current)
@@ -1565,6 +1678,7 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert delta["metrics"]["health_score"]["direction"] == "improved"
     assert delta["metrics"]["duplication_percent"]["direction"] == "improved"
     assert delta["metrics"]["total_loc"]["direction"] == "neutral", "more code is not a regression"
+    assert delta["metrics"]["coverage_line_rate"]["direction"] == "improved"
     assert delta["caveats"]["db_drift"] is False
     assert diff_scans({**baseline, "tools": [{"name": "trivy", "db_version": "2026-01-01"}]}, current)["caveats"]["db_drift"]
     assert diff_scans(None, current) is None, "no baseline must mean no delta, never a zero delta"
@@ -1574,6 +1688,24 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     regressed = diff_scans(current, baseline)
     assert regressed["metrics"]["health_score"]["direction"] == "regressed"
     assert regressed["metrics"]["duplication_percent"]["direction"] == "regressed"
+    assert regressed["metrics"]["coverage_line_rate"]["direction"] == "regressed"
+
+    # --- delta_summary: the fix for the dead metrics_nodes.py `.get("summary")` read -------------
+    dsum = delta_summary(delta)
+    assert dsum["fixed_count"] == 1 and dsum["introduced_count"] == 1
+    assert dsum["severity_changed"] == 1, "severity_changed is a COUNT, not the list"
+    assert dsum["net_change"] == delta["findings"]["net_change"]
+    assert dsum["metrics"]["coverage_line_rate"]["direction"] == "improved"
+    assert dsum["baseline_commit"] == "aaa"
+    assert delta_summary(None) is None, "no delta must mean no delta_summary, never a fabricated one"
+
+    # --- old-baseline recompute: pre-`measures` stored files must still produce measures --------
+    recomputed = _summary_from_stored(current)
+    assert "measures" in recomputed
+    # current's three findings (vulnerability/sast/misconfig) are all SECURITY_CATEGORIES.
+    assert recomputed["measures"]["security"]["worst_open_severity"] == "high"
+    assert recomputed["measures"]["duplication_percent"] == current["metrics"]["duplication"]["percent"]
+    assert recomputed["measures"]["coverage_line_rate"] == 85.0
 
     # --- profiles ---------------------------------------------------------------------------------
     assert [t.name for t in select_tools("quality", None, True)] == ["scc", "lizard", "jscpd"]

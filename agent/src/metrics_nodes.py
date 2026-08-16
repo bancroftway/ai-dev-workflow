@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import replace
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -139,12 +140,16 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         return {"metrics_report": {"metrics": {}}}
 
     provider = get_sandbox_provider()
-    scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full", report_path=repo_scan.LATEST_PATH)
+    scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
+    coverage = await _read_coverage_summary(provider, thread_id)
+    # Merged in BEFORE the dashboard dict is built (and BEFORE LATEST_PATH is written) so the
+    # delta engine's coverage_line_rate metric and the `measures` block both see it.
+    scan = replace(scan, metrics={**scan.metrics, "coverage": coverage})
     scan_report = scan.to_dashboard_dict()
+    await repo_files.write_repo_file(provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan_report, indent=2, default=str) + "\n")
     baseline = await _read_baseline(provider, thread_id)
     delta = repo_scan.diff_scans(baseline, scan_report)
 
-    coverage = await _read_coverage_summary(provider, thread_id)
     traceability_rows = await _build_traceability_matrix(provider, thread_id)
     token_usage_summary = await _sum_token_usage(provider, thread_id)
 
@@ -186,7 +191,7 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         latest_summary=scan_report["summary"],
         latest_duplication_percent=(scan.metrics.get("duplication") or {}).get("percent"),
         coverage=coverage,
-        delta_summary=(delta or {}).get("summary") if isinstance(delta, dict) else None,
+        delta_summary=repo_scan.delta_summary(delta),
     )
     return {"metrics_report": {"metrics": metrics}, "repo_scan": prior_repo_scan}
 

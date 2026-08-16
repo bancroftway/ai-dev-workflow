@@ -228,7 +228,17 @@ async def audit_exit_gate_node(state: dict[str, Any], config: RunnableConfig) ->
     if not outcome.passed:
         audit_cluster["attempt_count"] = audit_cluster.get("attempt_count", 0) + 1
     await repo_files.append_ledger_entry(provider, thread_id, {"stage": "audit_cluster", "node": "exit_gate", **audit_cluster["last_outcome"]})
-    return {"audit_cluster": audit_cluster}
+
+    # Same mid-run promotion as graph.py's make_verify_node: re-verifying coverage here (line 132)
+    # produces a fresh numeric line_rate whether the re-check passed or not -- surface it so the
+    # metrics bar's coverage chip stays current through audit-cluster's own re-checks.
+    result: dict[str, Any] = {"audit_cluster": audit_cluster}
+    coverage_report = outcome.report.get("coverage") or {}
+    line_rate = coverage_report.get("line_rate")
+    if isinstance(line_rate, (int, float)):
+        prior_repo_scan = dict(state.get("repo_scan") or {})
+        result["repo_scan"] = {**prior_repo_scan, "coverage": {"line_rate": line_rate, "branch_rate": coverage_report.get("branch_rate")}}
+    return result
 
 
 def make_audit_exit_route():

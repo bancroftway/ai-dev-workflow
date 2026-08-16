@@ -1321,6 +1321,20 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 },
             )
 
+        # minimal-code-to-green's verify_coverage report carries a numeric line_rate whether the
+        # gate passed or not -- promote it onto repo_scan so the metrics bar's coverage chip lights
+        # up mid-run instead of waiting for metrics_report at the very end. Any other
+        # deterministic_verify's report (ledger sync, mermaid render, license scan) has no
+        # line_rate key and this is a no-op.
+        line_rate = result.report.get("line_rate")
+        if isinstance(line_rate, (int, float)):
+            prior_repo_scan = dict(state.get("repo_scan") or {})
+            return {
+                "stages": stages,
+                "messages": extra_messages,
+                "repo_scan": {**prior_repo_scan, "coverage": {"line_rate": line_rate, "branch_rate": result.report.get("branch_rate")}},
+            }
+
         return {"stages": stages, "messages": extra_messages}
 
     return verify_node
