@@ -110,8 +110,21 @@ EOF
         # later PR. Operational assumption: GitHub auto-delete-branch-on-merge is enabled, so
         # origin normally won't even have this ref anymore by the time we get here -- this is the
         # defensive path for when it still does (or auto-delete is off).
-        echo "entrypoint: work branch ${WORK_BRANCH} is already merged into ${REPO_BRANCH} -- recreating from ${REPO_BRANCH}"
-        git -C "$WORKSPACE_DIR" checkout -B "$WORK_BRANCH" "origin/${REPO_BRANCH}"
+        #
+        # Guarded the same way the sibling (not-merged) branch below guards its reset: only safe
+        # to discard the local branch when local has nothing beyond origin's (already-merged)
+        # copy. A prior push can fail (log-and-continue) after this session committed locally but
+        # before the PR merged upstream -- resetting unconditionally here would silently destroy
+        # that unpushed work the next time this container is recreated.
+        if git -C "$WORKSPACE_DIR" show-ref --verify --quiet "refs/heads/${WORK_BRANCH}" && \
+            ! git -C "$WORKSPACE_DIR" merge-base --is-ancestor \
+              "refs/heads/${WORK_BRANCH}" "origin/${WORK_BRANCH}"; then
+          echo "entrypoint: work branch ${WORK_BRANCH} is merged upstream but has unpushed local commits -- keeping local instead of resetting"
+          git -C "$WORKSPACE_DIR" checkout "$WORK_BRANCH"
+        else
+          echo "entrypoint: work branch ${WORK_BRANCH} is already merged into ${REPO_BRANCH} -- recreating from ${REPO_BRANCH}"
+          git -C "$WORKSPACE_DIR" checkout -B "$WORK_BRANCH" "origin/${REPO_BRANCH}"
+        fi
       elif git -C "$WORKSPACE_DIR" show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
         echo "entrypoint: work branch ${WORK_BRANCH} exists locally -- reconciling with origin"
         git -C "$WORKSPACE_DIR" checkout "$WORK_BRANCH"
