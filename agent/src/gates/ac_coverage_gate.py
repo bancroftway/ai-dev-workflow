@@ -20,7 +20,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any
 
-from .. import repo_files
+from .. import repo_files, tech_stack_signals
 from ..sandbox.provider import SandboxProvider
 from ..spec_ledger import LEDGER_PATH
 
@@ -64,7 +64,7 @@ def _extract_failed_files(lines: list[str]) -> list[str]:
 def _resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if tech_stack.get("dotnet_detected"):
-        return "dotnet test --logger 'console;verbosity=normal'"
+        return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet test --logger 'console;verbosity=normal'"
     if "typescript" in languages or "javascript" in languages:
         return "npx --yes vitest run --reporter=verbose || npx --yes jest --verbose"
     if "python" in languages:

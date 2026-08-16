@@ -27,7 +27,7 @@ from langchain_core.runnables import RunnableConfig
 logger = logging.getLogger(__name__)
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files
+from . import git_ops, model_config, repo_files, tech_stack_signals
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -58,7 +58,9 @@ def _resolve_outdated_command(tech_stack: dict[str, Any]) -> str | None:
 
 def _resolve_build_test_command(tech_stack: dict[str, Any]) -> str | None:
     if tech_stack.get("dotnet_detected"):
-        return "dotnet build -warnaserror && dotnet test 2>&1"
+        # One `cd` prefix covers both commands -- it's a single shell invocation, so the cwd it
+        # sets persists across the whole `&&` chain.
+        return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet build -warnaserror && dotnet test 2>&1"
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if "typescript" in languages or "javascript" in languages:
         return "npm install && npm run build --if-present && npx --yes vitest run 2>&1"

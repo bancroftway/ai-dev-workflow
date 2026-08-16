@@ -37,7 +37,7 @@ from ..prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
 from .. import config as workflow_config
-from .. import git_ops, model_config, repo_files, repo_scan
+from .. import git_ops, model_config, repo_files, repo_scan, tech_stack_signals
 from ..copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from ..sandbox import registry as sandbox_registry
 from ..sandbox.factory import get_sandbox_provider
@@ -52,6 +52,14 @@ _SEVERITY_MAP = {"error": "error", "warning": "warning", "note": "info", "none":
 
 SARIF_PATH = "agent-work/analyzers.sarif"
 FORMAT_REPORT_PATH = "agent-work/format-report.json"
+
+# Matches sandbox/local_docker.py & sandbox/azure_aci.py's WORKSPACE_DIR_IN_CONTAINER. Inlined
+# (not imported) since this module has no other reason to depend on a specific sandbox backend.
+# Needed because dotnet build/format below may `cd` into a monorepo's dotnet_solution_root before
+# running -- the --ErrorLog/--report path must stay absolute so the artifact still lands at
+# REPO-ROOT agent-work/ (repo_files.read_repo_file above reads SARIF_PATH/FORMAT_REPORT_PATH
+# repo-relative), regardless of solution-root depth.
+_REPO_ROOT_IN_CONTAINER = "/workspace/repo"
 
 # Categories gated on the baseline delta rather than absolutely. `duplication` is deliberately not
 # here: it is already gated absolutely by QUALITY_MAX_DUPLICATION_PERCENT below, and counting it twice
@@ -119,10 +127,11 @@ async def quality_scan_node(state: dict[str, Any], config: RunnableConfig) -> di
 
     findings: list[Finding] = []
     if tech_stack.get("dotnet_detected"):
+        dotnet_prefix = tech_stack_signals.dotnet_root_prefix(tech_stack)
         build_result = await provider.exec_in_sandbox(
             thread_id,
-            "mkdir -p agent-work && dotnet build --no-incremental "
-            "\"/p:ErrorLog=agent-work/analyzers.sarif%2Cversion=2\" 2>&1",
+            f"mkdir -p agent-work && {dotnet_prefix}dotnet build --no-incremental "
+            f"\"/p:ErrorLog={_REPO_ROOT_IN_CONTAINER}/agent-work/analyzers.sarif%2Cversion=2\" 2>&1",
         )
         quality_remediation["build_ok"] = build_result.ok
         if not build_result.ok:
@@ -139,7 +148,9 @@ async def quality_scan_node(state: dict[str, Any], config: RunnableConfig) -> di
             findings.extend(parse_sarif(raw_sarif, _SEVERITY_MAP))
 
         format_result = await provider.exec_in_sandbox(
-            thread_id, "dotnet format --verify-no-changes --report agent-work/format-report.json 2>&1"
+            thread_id,
+            f"{dotnet_prefix}dotnet format --verify-no-changes "
+            f"--report {_REPO_ROOT_IN_CONTAINER}/agent-work/format-report.json 2>&1",
         )
         quality_remediation["format_clean"] = format_result.ok
     else:
@@ -264,7 +275,10 @@ async def quality_fix_node(state: dict[str, Any], config: RunnableConfig) -> dic
     provider = get_sandbox_provider()
     # Mechanical auto-fixes first, as plain shell -- no LLM budget spent on formatting.
     if quality_remediation["format_clean"] is False:
-        await provider.exec_in_sandbox(thread_id, "dotnet format 2>&1")
+        raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
+        tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
+        dotnet_prefix = tech_stack_signals.dotnet_root_prefix(tech_stack)
+        await provider.exec_in_sandbox(thread_id, f"{dotnet_prefix}dotnet format 2>&1")
 
     to_fix = [
         {**f, **quality_remediation["decisions"].get(f["finding_key"], {})}

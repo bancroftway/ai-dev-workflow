@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, spec_ledger
+from . import git_ops, model_config, repo_files, spec_ledger, tech_stack_signals
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt
 from .sandbox import registry as sandbox_registry
@@ -33,6 +33,10 @@ from .schemas_test_hardening import FlakeTriageResponse
 
 TEST_HARDENING_TOTAL_ATTEMPTS = int(os.environ.get("TEST_HARDENING_TOTAL_ATTEMPTS", "3"))  # 1 initial + 2 retries
 FLAKE_QUARANTINE_PATH = ".ai-dev-workflow/test_hardening/flake-quarantine.json"
+
+# Matches sandbox/local_docker.py & sandbox/azure_aci.py's WORKSPACE_DIR_IN_CONTAINER -- see
+# quality_nodes.py's twin constant for why this is inlined rather than imported.
+_REPO_ROOT_IN_CONTAINER = "/workspace/repo"
 
 FLAKE_TRIAGE_SYSTEM_PROMPT = load_prompt("test_hardening_flake_triage")
 
@@ -55,7 +59,12 @@ def _resolve_test_command(tech_stack: dict[str, Any], attempt: int) -> tuple[str
     """Returns (command, result_file_path) or None if no mapping."""
     if tech_stack.get("dotnet_detected"):
         path = f"agent-work/test_hardening-attempt{attempt}.trx"
-        return f"dotnet test --logger 'trx;LogFileName={os.path.basename(path)}' --results-directory agent-work 2>&1", path
+        command = (
+            f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet test "
+            f"--logger 'trx;LogFileName={os.path.basename(path)}' "
+            f"--results-directory {_REPO_ROOT_IN_CONTAINER}/agent-work 2>&1"
+        )
+        return command, path
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if "typescript" in languages or "javascript" in languages:
         path = f"agent-work/test_hardening-attempt{attempt}.json"
