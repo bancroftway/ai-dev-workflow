@@ -46,7 +46,7 @@ from pydantic import BaseModel, PrivateAttr
 
 from . import config
 from . import telemetry
-from .sandbox import SandboxSession
+from .sandbox import SandboxSession, get_sandbox_provider
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,19 @@ class CopilotChatModel(BaseChatModel):
     def _session_key(self) -> str:
         return f"{self.thread_id}:{self.stage}:{self.role}"
 
+    async def _touch_sandbox(self) -> None:
+        """Reset this session's sandbox idle-timeout clock (no-op without a sandbox).
+
+        A long silent Copilot turn happens entirely over the Copilot TCP session -- no
+        agent-side exec touches the sandbox -- so without this the idle reaper's clock keeps
+        advancing and can reap the container mid-turn. Errors are swallowed: a touch failure
+        (e.g. sandbox already reaped) must never fail the LLM call itself.
+        """
+        if self.sandbox is None:
+            return
+        with contextlib.suppress(Exception):
+            await get_sandbox_provider().touch(self.sandbox.session_id)
+
     def _build_client(self) -> CopilotClient:
         if self.sandbox is not None:
             connection = RuntimeConnection.for_uri(
@@ -292,6 +305,7 @@ class CopilotChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         session = await self._get_session()
+        await self._touch_sandbox()
         prompt, attachments = _messages_to_prompt(messages)
         message_id = f"run-{uuid.uuid4().hex}"
 
@@ -336,6 +350,7 @@ class CopilotChatModel(BaseChatModel):
             await session.send(prompt, agent_mode=self.agent_mode, attachments=attachments or None)
             loop = asyncio.get_running_loop()
             while not done.is_set():
+                await self._touch_sandbox()
                 remaining = _SESSION_IDLE_TIMEOUT_SECONDS - (loop.time() - last_event_at[0])
                 if remaining <= 0:
                     raise TimeoutError(

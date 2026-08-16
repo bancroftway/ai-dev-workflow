@@ -130,7 +130,13 @@ class AzureContainerInstanceProvider(SandboxProvider):
         self._cache_share = os.environ.get("AIDW_CACHE_SHARE")
         self._cache_storage_account = os.environ.get("AIDW_CACHE_STORAGE_ACCOUNT")
         self._cache_storage_key = os.environ.get("AIDW_CACHE_STORAGE_KEY")
-        self._idle_timeout_seconds = idle_timeout_seconds
+        # Parity with LocalDockerProvider: same env var, same override semantics. The idle
+        # reaper's blind spot during a silent Copilot turn is closed by
+        # copilot_chat_model.py's _touch_sandbox() calls; this env var remains an explicit
+        # override for a caller that wants a different idle window (e.g. run_headless.py's
+        # belt-and-suspenders 86400s).
+        env_timeout = os.environ.get("AIDW_SANDBOX_IDLE_TIMEOUT")
+        self._idle_timeout_seconds = float(env_timeout) if env_timeout else idle_timeout_seconds
         self._sandboxes: dict[str, _RunningSandbox] = {}
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None

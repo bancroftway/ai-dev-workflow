@@ -156,9 +156,11 @@ class LocalDockerProvider(SandboxProvider):
         idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         self._image = image
-        # The reaper's idle clock only ticks on agent-side execs; a long silent autopilot turn
-        # (all activity inside the container over the Copilot TCP session) looks idle. Headless
-        # runs set this env high so an hour-long codegen turn doesn't get its sandbox reaped.
+        # The idle reaper's blind spot during a long silent Copilot turn (all activity inside
+        # the container over the Copilot TCP session, no agent-side exec) is now closed by
+        # copilot_chat_model.py's _touch_sandbox() calls. This env var remains an explicit
+        # override for a caller that wants a different idle window (e.g. run_headless.py's
+        # belt-and-suspenders 86400s).
         env_timeout = os.environ.get("AIDW_SANDBOX_IDLE_TIMEOUT")
         self._idle_timeout_seconds = float(env_timeout) if env_timeout else idle_timeout_seconds
         self._sandboxes: dict[str, _RunningSandbox] = {}

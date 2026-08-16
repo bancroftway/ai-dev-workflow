@@ -29,7 +29,7 @@ from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())  # tokens live in the repo-root .env, one level above agent/
 os.environ.setdefault("AIDW_HEADLESS", "1")
-os.environ.setdefault("AIDW_SANDBOX_IDLE_TIMEOUT", "86400")  # don't reap hour-long silent turns
+os.environ.setdefault("AIDW_SANDBOX_IDLE_TIMEOUT", "86400")  # belt-and-suspenders: _touch_sandbox() already keeps a silent turn's sandbox alive; this just widens the margin
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("run_headless")
