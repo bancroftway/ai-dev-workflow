@@ -62,7 +62,8 @@ def _extract_failed_files(lines: list[str]) -> list[str]:
     return sorted(set(failed))
 
 
-def _resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
+def resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
+    """Public: exit's manifest completion records this as the manifest's test_command."""
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if tech_stack.get("dotnet_detected"):
         return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet test --logger 'console;verbosity=normal'"
@@ -101,7 +102,7 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
 
     raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
     tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
-    command = _resolve_test_command(tech_stack)
+    command = resolve_test_command(tech_stack)
     if command is None:
         return AcCoverageOutcome(
             passed=False, feedback="No test-runner command mapping for this stack -- cannot verify AC coverage.", report={}

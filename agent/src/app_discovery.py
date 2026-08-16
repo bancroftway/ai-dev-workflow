@@ -189,6 +189,8 @@ def classify_candidates(files: dict[str, str]) -> list[dict[str, Any]]:
         if name.endswith(".csproj"):
             signals = _csproj_signals(text)
             if signals:
+                if signals["likely_class"] in ("api", "web") and "start_command" not in signals:
+                    signals["start_command"] = f"dotnet run --project {_app_dir(path)}"
                 add(path, signals)
         elif name == "host.json":
             add(path, {"likely_class": "azure_function", "runtime": "unknown", "marker": "host.json present"})
@@ -208,6 +210,9 @@ def classify_candidates(files: dict[str, str]) -> list[dict[str, Any]]:
         elif name == "manage.py":
             add(path, {"likely_class": "web", "runtime": "python", "marker": "Django manage.py", "start_command": "python manage.py runserver"})
         elif name in ("main.py", "app.py", "asgi.py", "wsgi.py"):
+            # ponytail: no deterministic start_command for FastAPI/Flask/Procfile -- the module:app
+            # target is a guess the LLM discovery pass is better placed to make. Extend if greenfield
+            # Python apps show up with empty start commands in practice.
             if re.search(r"FastAPI\(|Flask\(", text):
                 add(path, {"likely_class": "api", "runtime": "python", "marker": f"{name} instantiates FastAPI/Flask"})
         elif name in ("pyproject.toml", "requirements.txt"):
@@ -417,6 +422,34 @@ async def hydrate_from_manifest(
         "rejection_reasons": [],
         "notes": f"Hydrated from manifest.json (assessed in run {recorded.get('run_id')}).",
     }
+
+
+def candidates_to_apps(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pre-LLM scan candidates -> DiscoveredApp-shaped dicts, for exit's manifest re-record where
+    no LLM pass exists to name the apps. Candidates carry likely_class/marker, not name/app_class,
+    and would fail DiscoveredApp validation raw -- this is the explicit mapping. One app per path
+    (first candidate wins; later ones for the same dir are corroborating markers)."""
+    from .schemas_app_discovery import DiscoveredApp
+
+    valid_classes = {"web", "api", "azure_function", "mobile", "library", "cli", "unknown"}
+    apps: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for c in candidates:
+        path = str(c.get("path") or ".")
+        if path in seen:
+            continue
+        seen.add(path)
+        likely = str(c.get("likely_class") or "unknown")
+        apps.append(DiscoveredApp(
+            path=path,
+            name=path.rsplit("/", 1)[-1] if path not in (".", "") else "app",
+            app_class=likely if likely in valid_classes else "unknown",
+            runtime=str(c.get("runtime") or "unknown"),
+            start_command=c.get("start_command"),
+            port=c.get("port"),
+            evidence=[f"{c.get('source', '?')}: {c.get('marker', '?')}"],
+        ).model_dump())
+    return apps
 
 
 def _surviving_apps(report: dict[str, Any], scan: dict[str, Any]) -> list[dict[str, Any]]:

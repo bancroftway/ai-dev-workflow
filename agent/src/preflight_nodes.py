@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, ValidationError
 
 from . import git_ops, repo_files, repo_scan, session_index, template_loader
+from .schemas_app_discovery import DiscoveredApp
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -31,6 +33,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MANIFEST_PATH = ".ai-dev-workflow/manifest.json"
+
+
+class ManifestAppCheck(BaseModel, extra="allow"):
+    """app_discovery.app_check_record_node's block, plus exit's greenfield re-record."""
+
+    checked_at: str | None = None
+    run_id: str | None = None
+    suitable: bool | None = None
+    evidence_fingerprint: str | None = None
+    apps: list[DiscoveredApp] = []
+
+
+class Manifest(BaseModel, extra="allow"):
+    """The one schema every manifest.json writer is validated against, greenfield and brownfield
+    alike. extra='allow' + all-optional keys: this is a shape guard (a wrong-typed app_check or
+    apps list fails loudly in the logs), not a presence gate -- presence of the fields a merge
+    actually needs (apps, test_command, coverage_commands) is enforced by exit's deterministic
+    verify, the only point where the complete picture exists."""
+
+    onboarded: bool | None = None
+    run_id: str | None = None
+    timestamp: str | None = None
+    toolchain: dict[str, Any] | None = None
+    app_check: ManifestAppCheck | None = None
+    test_command: str | None = None
+    coverage_commands: list[dict[str, Any]] | None = None
+    requirements_content_hash: str | None = None
+    approval_hashes: dict[str, Any] | None = None
+    metrics_summary: dict[str, Any] | None = None
+    merge_readiness: dict[str, Any] | None = None
 
 def _guidance_sentinel(key: str) -> str:
     """One idempotency marker per ecosystem's AGENTS.md paragraph.
@@ -89,7 +121,18 @@ async def update_manifest(
         manifest = {}
     if not isinstance(manifest, dict):
         manifest = {}
+    # app_check is itself co-owned (app discovery writes suitable/evidence_fingerprint, exit's
+    # greenfield re-record writes apps) -- deep-merge that one key so a partial update can't
+    # clobber the fingerprint that next-run hydration depends on. Everything else is scalar-owned.
+    if isinstance(updates.get("app_check"), dict) and isinstance(manifest.get("app_check"), dict):
+        updates = {**updates, "app_check": {**manifest["app_check"], **updates["app_check"]}}
     manifest.update(updates)
+    try:
+        Manifest.model_validate(manifest)
+    except ValidationError:
+        # Shape guard only: log loudly, still write -- this runs mid-pipeline and a malformed
+        # value must not take the run down (same tolerance as the JSON-decode path above).
+        logger.warning("manifest.json failed schema validation for thread_id=%s", thread_id, exc_info=True)
     await repo_files.write_repo_file(provider, thread_id, MANIFEST_PATH, json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -604,6 +647,38 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
 
     assert _session_title("  \nAdd login\nsecond line", "abc123") == "Add login"
     assert _session_title("", "abc123") == "(untitled run abc123)"
+
+    # Manifest schema: a full manifest round-trips, unknown extra keys survive (extra="allow"),
+    # a wrong-typed app_check fails validation (the log-and-write-anyway is update_manifest's job).
+    good = {
+        "onboarded": True, "run_id": "r1", "toolchain": {"image": "x"}, "future_key": {"kept": True},
+        "app_check": {"suitable": True, "evidence_fingerprint": "sha256:x", "apps": [
+            {"path": ".", "name": "app", "app_class": "web", "runtime": "node22", "start_command": "npm run dev"}
+        ]},
+        "test_command": "npx vitest run", "coverage_commands": [{"command": "x", "artifact": "y", "format": "istanbul"}],
+    }
+    validated = Manifest.model_validate(good)
+    assert validated.app_check is not None and validated.app_check.apps[0].name == "app"
+    assert validated.model_extra.get("future_key") == {"kept": True}
+    try:
+        Manifest.model_validate({"app_check": {"apps": "not-a-list"}})
+        raise AssertionError("wrong-typed app_check must fail validation")
+    except ValidationError:
+        pass
+
+    # candidates_to_apps: pre-LLM candidates map to valid DiscoveredApp dicts, one per path.
+    from .app_discovery import candidates_to_apps
+    apps = candidates_to_apps([
+        {"path": "src/Api", "source": "src/Api/Api.csproj", "likely_class": "api", "runtime": "dotnet",
+         "marker": "Sdk=Web", "start_command": "dotnet run --project src/Api", "port": 5001},
+        {"path": "src/Api", "source": "src/Api/Program.cs", "likely_class": "api", "runtime": "dotnet", "marker": "web host"},
+        {"path": ".", "likely_class": "not-a-class", "runtime": "node"},
+    ])
+    assert len(apps) == 2 and apps[0]["name"] == "Api" and apps[0]["start_command"] == "dotnet run --project src/Api"
+    assert apps[1]["app_class"] == "unknown" and apps[1]["name"] == "app"
+    assert ManifestAppCheck.model_validate({"apps": apps}).apps[0].port == 5001
+
+    print("preflight_nodes self-check: ok")
     assert _session_title("x" * 100, "abc123") == "x" * 80
 
     assert _template_version("aidw-template-version: 7") == 7
