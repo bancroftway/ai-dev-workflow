@@ -10,6 +10,7 @@ import {
   useInterrupt,
 } from "@copilotkit/react-core/v2";
 import { useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
 import { BuildView } from "@/components/BuildView";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
@@ -28,6 +29,7 @@ import {
   PIPELINE_STAGE_ORDER,
   TAB_STAGE_GROUPS,
   type StageKey,
+  type TechStackSelectionPayload,
   type WorkflowState,
 } from "@/lib/workflow-types";
 
@@ -277,6 +279,13 @@ function InterruptCard({
     resolve(value);
   };
 
+  // Checked BEFORE the generic `payload.type` escalation branch below: this payload also carries
+  // a `type` (tech_stack_selection), but it's a picker for a blank repo, not a failure to
+  // acknowledge.
+  if (payload.type === "tech_stack_selection") {
+    return <TechStackSelectionCard payload={payload as unknown as TechStackSelectionPayload} resolve={done} />;
+  }
+
   if (payload.type) {
     const rest: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
     delete rest.stage;
@@ -319,6 +328,124 @@ function InterruptCard({
       >
         Approve
       </button>
+    </div>
+  );
+}
+
+/** The greenfield tech-stack picker (agent/src/app_discovery.py's greenfield_stack_select_node):
+ * offered instead of a hard rejection when a repository has no application code yet. Lets the
+ * human pick one of the canned catalog stacks and edit its markdown before accepting -- the edited
+ * text is what gets committed verbatim to .ai-dev-workflow/greenfield-stack.md and drives every
+ * later prompt (tech-stack, plan, ac-to-tests) for this run.
+ *
+ * `resolve` here is InterruptCard's `done` wrapper -- both resume shapes below are non-empty
+ * objects on purpose (see InterruptCard's own comment on this): `{ stack_id, markdown }` to
+ * accept, `{ cancelled: true }` to decline. */
+function TechStackSelectionCard({
+  payload,
+  resolve,
+}: {
+  payload: TechStackSelectionPayload;
+  resolve: (value: unknown) => void;
+}) {
+  const stacks = payload.stacks ?? [];
+  const [selectedId, setSelectedId] = useState<string>(stacks[0]?.id ?? "");
+  const [markdown, setMarkdown] = useState<string>(stacks[0]?.markdown ?? "");
+  const [edited, setEdited] = useState(false);
+  const [mode, setMode] = useState<"edit" | "preview">("edit");
+
+  function handleSelect(id: string) {
+    if (edited && !window.confirm("Discard your edits and load the selected stack's description instead?")) {
+      return;
+    }
+    setSelectedId(id);
+    setMarkdown(stacks.find((s) => s.id === id)?.markdown ?? "");
+    setEdited(false);
+  }
+
+  return (
+    <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+      <p className="text-sm font-medium text-amber-900">
+        This repository has no application code yet — pick a tech stack to start from
+      </p>
+      {payload.reasons && payload.reasons.length > 0 && (
+        <ul className="list-disc space-y-0.5 pl-5 text-xs text-amber-800">
+          {payload.reasons.map((reason, index) => (
+            <li key={index}>{reason}</li>
+          ))}
+        </ul>
+      )}
+
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-amber-900">Stack</span>
+        <select
+          className="rounded-md border border-amber-300 bg-white px-3 py-2 text-sm"
+          value={selectedId}
+          onChange={(event) => handleSelect(event.target.value)}
+        >
+          {stacks.map((stack) => (
+            <option key={stack.id} value={stack.id}>
+              {stack.title}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <div className="flex gap-1">
+        <button
+          type="button"
+          className={`rounded-md px-2 py-1 text-xs font-medium ${
+            mode === "edit" ? "bg-neutral-900 text-white" : "border border-neutral-300 bg-white text-neutral-700"
+          }`}
+          onClick={() => setMode("edit")}
+        >
+          Edit
+        </button>
+        <button
+          type="button"
+          className={`rounded-md px-2 py-1 text-xs font-medium ${
+            mode === "preview" ? "bg-neutral-900 text-white" : "border border-neutral-300 bg-white text-neutral-700"
+          }`}
+          onClick={() => setMode("preview")}
+        >
+          Preview
+        </button>
+      </div>
+
+      {mode === "edit" ? (
+        <textarea
+          className="min-h-[240px] w-full rounded-md border border-amber-300 bg-white px-3 py-2 font-mono text-xs"
+          value={markdown}
+          onChange={(event) => {
+            setMarkdown(event.target.value);
+            setEdited(true);
+          }}
+        />
+      ) : (
+        // Default sanitizer, no urlTransform override -- same trust posture as ReportView's own
+        // ReactMarkdown use: this text started as a canned catalog file but may now carry
+        // arbitrary human edits, so raw HTML/script must never render.
+        <div className="prose prose-sm max-h-[240px] max-w-none overflow-auto rounded-md border border-amber-300 bg-white px-3 py-2">
+          <ReactMarkdown>{markdown}</ReactMarkdown>
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <button
+          type="button"
+          className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
+          onClick={() => resolve({ stack_id: selectedId || "custom", markdown })}
+        >
+          Use this stack
+        </button>
+        <button
+          type="button"
+          className="rounded-lg border border-neutral-300 px-4 py-1.5 text-sm font-medium text-neutral-700"
+          onClick={() => resolve({ cancelled: true })}
+        >
+          Decline — reject repository
+        </button>
+      </div>
     </div>
   );
 }

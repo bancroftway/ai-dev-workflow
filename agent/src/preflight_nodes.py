@@ -60,7 +60,8 @@ _TECH_STACK_PARAGRAPH = f"""
 
 Read `.ai-dev-workflow/tech-stack.md` first and follow the technology stack, architecture, and
 coding conventions documented there. It is kept up to date automatically as this repo's stack is
-analyzed.
+analyzed. If `.ai-dev-workflow/greenfield-stack.md` exists, this repository was started greenfield
+-- follow that file's stack description and repository layout when scaffolding the application.
 """
 
 

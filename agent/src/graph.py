@@ -157,6 +157,14 @@ class GraphState(TypedDict):
     # Set only when the repository has no runnable application: the one hard stop in this graph.
     # Read by _route_after_app_discovery and by the frontend's rejection banner.
     app_rejection: dict[str, Any] | None
+    # The greenfield tech-stack picker's own state (agent/src/app_discovery.py's
+    # app_discovery_decide_node -- the sole writer, every run, dict or None -- and
+    # greenfield_stack_select_node). Absent-tolerant everywhere it's read (plain `.get`): a repo
+    # that isn't (or is no longer) greenfield never sets it. Shapes: {"offered": True, "reasons":
+    # [...]} while awaiting a pick, {"stack_id": ..., "markdown": ..., "selected_at": ...} once
+    # picked. A plain dict (not a StageState) -- there is no human-gated stage here, just an
+    # interrupt.
+    greenfield: dict[str, Any] | None
     # Deterministic schema/migration/route grep, grounding brownfield-baseline brownfield's draft prompt.
     brownfield_context: str
     raw_requirements_text: str
@@ -252,6 +260,8 @@ SPEC_SYSTEM_PROMPT = load_prompt("specification_draft")
 
 PLAN_SYSTEM_PROMPT = load_prompt("plan_draft")
 
+PLAN_GREENFIELD_SEGMENT = load_prompt("plan_greenfield_segment")
+
 
 def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
@@ -285,6 +295,8 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
         SystemMessage(content=PLAN_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
     ]
+    if state.get("greenfield"):
+        messages.append(HumanMessage(content=PLAN_GREENFIELD_SEGMENT))
     if _tech_stack_has_ui_framework(state):
         messages.append(HumanMessage(content=IMPECCABLE_PLAN_SEGMENT))
     if plan_stage["draft"] is not None:
@@ -409,11 +421,15 @@ def _build_plan_audit_prompt(state: GraphState) -> list[BaseMessage]:
 
 TECH_STACK_SYSTEM_PROMPT = load_prompt("tech_stack_draft")
 
+TECH_STACK_GREENFIELD_PROMPT = load_prompt("tech_stack_greenfield")
 
 
 def _build_tech_stack_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["tech-stack"]
     messages: list[BaseMessage] = [SystemMessage(content=TECH_STACK_SYSTEM_PROMPT)]
+    greenfield_markdown = (state.get("greenfield") or {}).get("markdown")
+    if greenfield_markdown:
+        messages.append(HumanMessage(content=f"{TECH_STACK_GREENFIELD_PROMPT}\n\n{greenfield_markdown}"))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
     return messages
@@ -507,6 +523,7 @@ async def _verify_specification_ledger(
 
 AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft")
 
+AC_TO_TESTS_GREENFIELD_SEGMENT = load_prompt("ac_to_tests_greenfield_segment")
 
 
 def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
@@ -518,6 +535,8 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
     ]
+    if state.get("greenfield"):
+        messages.append(HumanMessage(content=AC_TO_TESTS_GREENFIELD_SEGMENT))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
     if stage.get("last_verification"):
@@ -1645,14 +1664,36 @@ APP_DISCOVERY_SPEC = StageSpec(
 
 
 def _route_after_app_discovery(state: GraphState) -> str:
+    """Routes "greenfield" only while a stack is being offered and none has been picked yet --
+    once app_discovery_decide_node's own pass-through sets a stack_id (this run or an earlier one),
+    this routes "next" instead, straight past greenfield_stack_select entirely (see that node's own
+    idempotency check for the belt-and-suspenders half of this)."""
+    if state.get("app_rejection"):
+        return "reject"
+    greenfield = state.get("greenfield") or {}
+    if greenfield.get("offered") and not greenfield.get("stack_id"):
+        return "greenfield"
+    return "next"
+
+
+def _route_after_greenfield_select(state: GraphState) -> str:
     return "reject" if state.get("app_rejection") else "next"
 
 
 def _route_after_tech_stack(state: GraphState) -> str:
     """The brownfield branch, moved here from scaffold: app discovery and tech-stack detection both
     run before brownfield-baseline now, so an unsuitable repository is rejected before any human is asked to ratify
-    a baseline -- and before anything is written to the repo."""
-    return "next" if state.get("manifest_exists", True) else "brownfield_baseline_pre"
+    a baseline -- and before anything is written to the repo.
+
+    A greenfield repo (no manifest, a stack already picked) skips brownfield-baseline's LLM stage
+    entirely and goes straight to the deterministic ratification node: there is nothing to baseline
+    in an empty repo, and that stage's brownfield draft would just needs_clarification->END after
+    the human already made their one choice at the tech-stack picker."""
+    if state.get("manifest_exists", True):
+        return "next"
+    if state.get("greenfield"):
+        return "brownfield_write_manifest"
+    return "brownfield_baseline_pre"
 
 
 def _route_after_intake(state: GraphState) -> str:
@@ -1680,9 +1721,11 @@ def _wire_app_discovery(builder: StateGraph) -> None:
     """Wires the suitability gate and the repo-write ordering that depends on it:
 
     scaffold (read-mostly) -> app_discovery_pre (deterministic scan) -> APP_DISCOVERY_SPEC
-    (draft -> audit -> auto-gate) -> app_discovery_decide -> either app_discovery_reject -> END
-    (the one hard stop in this graph) or scaffold_finalize -> tech-stack -> manifest_branch ->
-    (brownfield-baseline brownfield | app_check_record) -> repo_scan_baseline -> raw-requirements.
+    (draft -> audit -> auto-gate) -> app_discovery_decide -> app_discovery_reject -> END (the one
+    hard stop in this graph) | greenfield_stack_select (a blank repo's tech-stack picker, itself
+    routing to app_discovery_reject on decline or scaffold_finalize on accept) | scaffold_finalize
+    -> tech-stack -> manifest_branch -> (brownfield-baseline brownfield | brownfield_write_manifest
+    directly, for a greenfield repo | app_check_record) -> repo_scan_baseline -> raw-requirements.
 
     repo_scan_baseline sits at the convergence point of both branches and immediately before P1,
     so it measures the repository as it arrived: the clone exists, the tech stack is known, and
@@ -1695,6 +1738,7 @@ def _wire_app_discovery(builder: StateGraph) -> None:
     """
     builder.add_node("app_discovery_pre", app_discovery.app_discovery_pre_node)
     builder.add_node("app_discovery_decide", app_discovery.app_discovery_decide_node)
+    builder.add_node("greenfield_stack_select", app_discovery.greenfield_stack_select_node)
     builder.add_node("app_discovery_reject", app_discovery.app_discovery_reject_node)
     builder.add_node("app_check_record", app_discovery.app_check_record_node)
     builder.add_node("repo_scan_baseline", repo_scan.repo_scan_baseline_node)
@@ -1706,6 +1750,11 @@ def _wire_app_discovery(builder: StateGraph) -> None:
     builder.add_conditional_edges(
         "app_discovery_decide",
         _route_after_app_discovery,
+        {"reject": "app_discovery_reject", "greenfield": "greenfield_stack_select", "next": "scaffold_finalize"},
+    )
+    builder.add_conditional_edges(
+        "greenfield_stack_select",
+        _route_after_greenfield_select,
         {"reject": "app_discovery_reject", "next": "scaffold_finalize"},
     )
     builder.add_edge("app_discovery_reject", END)
@@ -1713,7 +1762,11 @@ def _wire_app_discovery(builder: StateGraph) -> None:
     builder.add_conditional_edges(
         "manifest_branch",
         _route_after_tech_stack,
-        {"next": "app_check_record", "brownfield_baseline_pre": "brownfield_baseline_pre"},
+        {
+            "next": "app_check_record",
+            "brownfield_baseline_pre": "brownfield_baseline_pre",
+            "brownfield_write_manifest": "brownfield_write_manifest",
+        },
     )
     builder.add_edge("app_check_record", "repo_scan_baseline")
     builder.add_node("record_raw_requirements", record_raw_requirements_node)

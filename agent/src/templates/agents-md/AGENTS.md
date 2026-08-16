@@ -8,7 +8,8 @@ AI coding agent working in this repository (GitHub Copilot, Claude, and others t
 
 Read `.ai-dev-workflow/tech-stack.md` first and follow the technology stack, architecture, and
 coding conventions documented there. It's kept up to date automatically as this repo's stack is
-analyzed.
+analyzed. If `.ai-dev-workflow/greenfield-stack.md` exists, this repository was started greenfield
+-- follow that file's stack description and repository layout when scaffolding the application.
 
 ## Background context for larger changes
 

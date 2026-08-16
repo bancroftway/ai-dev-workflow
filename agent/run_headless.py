@@ -55,6 +55,16 @@ def _parse_args() -> argparse.Namespace:
         help="resume an earlier run's thread id: reattaches its sandbox/volume and skips every "
         "stage already APPROVED there (sets AIDW_RESUME=1). Stages mid-flight redraft.",
     )
+    parser.add_argument(
+        "--greenfield-stack",
+        default=None,
+        metavar="STACK_ID",
+        help="auto-select this canned stack (agent/src/templates/tech_stacks/*.md filename stem, "
+        "e.g. nextjs-fastapi) when a blank repository is offered the greenfield picker, instead of "
+        "rejecting it -- sets AIDW_GREENFIELD_STACK, which app_discovery.py's decide/select nodes "
+        "read. Headless has no interrupt to answer, so a blank repo without this flag is rejected "
+        "exactly as before.",
+    )
     return parser.parse_args()
 
 
@@ -84,6 +94,9 @@ async def run(args: argparse.Namespace) -> int:
     if args.thread:
         os.environ["AIDW_RESUME"] = "1"
         logger.info("resuming thread %s -- approved stages will be skipped", thread_id)
+    if args.greenfield_stack:
+        os.environ["AIDW_GREENFIELD_STACK"] = args.greenfield_stack
+        logger.info("greenfield auto-select armed: stack_id=%s", args.greenfield_stack)
     cfg = {"configurable": {"thread_id": thread_id}}
     started = time.monotonic()
 

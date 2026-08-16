@@ -45,6 +45,29 @@ export interface AppRejection {
   checked_at: string;
 }
 
+/** A canned monorepo stack the greenfield tech-stack picker offers, loaded from
+ * agent/src/templates/tech_stacks/*.md (agent/src/app_discovery.py's load_stack_catalog).
+ * `markdown` is the full catalog file content -- editable by the user before acceptance in
+ * TechStackSelectionCard, and written verbatim to .ai-dev-workflow/greenfield-stack.md on accept. */
+export interface CannedTechStack {
+  id: string;
+  title: string;
+  markdown: string;
+}
+
+/** Interrupt payload for a greenfield (blank) repository's tech-stack picker
+ * (agent/src/app_discovery.py's greenfield_stack_select_node). Distinct from the plain approval
+ * GatePayload (no `type` at all) and from EscalationPayload (a hard failure): this one asks the
+ * human to pick or edit a stack, not approve a draft or acknowledge a failure -- AppShell's
+ * InterruptCard discriminates on `type === "tech_stack_selection"` before falling through to the
+ * generic escalation branch. */
+export interface TechStackSelectionPayload {
+  stage: "tech-stack";
+  type: "tech_stack_selection";
+  reasons?: string[];
+  stacks: CannedTechStack[];
+}
+
 /** repo_scan.py's per-metric "measures" block on ScanSummary -- the metrics-bar-ready subset
  * (security worst-severity + open count, duplication/ccn/coverage numbers). Optional on
  * ScanSummary because old baseline files predate this block (see repo_scan.py's comment above

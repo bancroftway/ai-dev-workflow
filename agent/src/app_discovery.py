@@ -28,13 +28,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import interrupt
 
 from . import git_ops, repo_files, session_index
 from .preflight_nodes import MANIFEST_PATH, update_manifest
@@ -48,6 +52,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 STAGE_KEY = "app-discovery"
+
+# Written verbatim by greenfield_stack_select_node's accept path, read back by
+# app_discovery_decide_node's idempotency check (and that node's own) and by the greenfield tech
+# stack prompt (graph.py's _build_tech_stack_prompt).
+GREENFIELD_STACK_PATH = ".ai-dev-workflow/greenfield-stack.md"
+
+# The 8 canned monorepo stacks the greenfield picker offers -- DATA (one markdown file per stack),
+# not a prompt: see load_stack_catalog.
+_TECH_STACKS_DIR = Path(__file__).parent / "templates" / "tech_stacks"
+
+# Cap on the accepted markdown's size (verbatim user edits ride in every later tech-stack/plan
+# prompt) -- oversize is rejected outright (routed to the cancel path), never silently truncated.
+_MAX_GREENFIELD_MARKDOWN_BYTES = 64 * 1024
 
 # An app of one of these classes, with a start command and a runtime the container has, is what
 # makes a repository suitable. Everything else (library/cli/unknown) is not, and `mobile` is
@@ -273,6 +290,30 @@ def decide_suitability(apps: list[dict[str, Any]]) -> SuitabilityDecision:
     return SuitabilityDecision(False, reasons)
 
 
+def greenfield_eligible(report: dict[str, Any] | None, surviving: list[dict[str, Any]]) -> bool:
+    """A genuinely blank repository -- offer the greenfield tech-stack picker instead of a hard
+    rejection. Deliberately narrow: `report is None` means discovery itself failed to produce a
+    report (an error, not a finding about the repository, see app_discovery_decide_node), and any
+    non-empty `surviving` means real code was found, just none of it startable (a library/cli
+    repo) -- neither of those is "blank," only an empty apps list on a real report is."""
+    return report is not None and not surviving
+
+
+@lru_cache(maxsize=None)
+def load_stack_catalog() -> list[dict[str, Any]]:
+    """The 8 canned monorepo stacks greenfield_stack_select_node offers, one markdown file per
+    stack under templates/tech_stacks/ -- DATA the user picks from and edits, not a prompt (no
+    prompt_loader involved). id = filename stem, title = the file's first `# ` heading, markdown =
+    the full file text verbatim (what's shown/edited in the UI and, on accept, written verbatim to
+    .ai-dev-workflow/greenfield-stack.md)."""
+    catalog: list[dict[str, Any]] = []
+    for path in sorted(_TECH_STACKS_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), "")
+        catalog.append({"id": path.stem, "title": title, "markdown": text})
+    return catalog
+
+
 # --------------------------------------------------------------------------------------------
 # Sandbox-I/O half and the graph nodes.
 # --------------------------------------------------------------------------------------------
@@ -370,13 +411,19 @@ async def app_discovery_decide_node(state: "GraphState", config: RunnableConfig)
     """The suitability verdict -- deterministic, and the only hard stop in the pipeline.
 
     Fails closed: no report at all is a rejection, with a reason that says so honestly rather than
-    blaming the repository."""
+    blaming the repository.
+
+    A third outcome sits between "suitable" and "rejected": a genuinely blank repository (see
+    greenfield_eligible) is offered the greenfield tech-stack picker instead of being hard-rejected
+    -- unless headless mode has no way to answer the interrupt that offer leads to. This node is
+    the single writer of the `greenfield` state channel and emits it (dict or None) on every run,
+    so a stale offer from an earlier run can never outlive the repository actually gaining code."""
     thread_id = config["configurable"]["thread_id"]
     scan = state.get("app_scan") or {}
 
     if sandbox_registry.get(thread_id) is None:
         # Nothing was scanned, so nothing can be concluded. Never reject on absent evidence.
-        return {"app_rejection": None}
+        return {"app_rejection": None, "greenfield": None}
 
     report = (state.get("stages") or {}).get(STAGE_KEY, {}).get("approved_content")
     if not report:
@@ -395,20 +442,129 @@ async def app_discovery_decide_node(state: "GraphState", config: RunnableConfig)
             decision.suitable, [*decision.reasons, *(report.get("rejection_reasons") or [])]
         )
 
+    provider = get_sandbox_provider()
+    greenfield: dict[str, Any] | None = None
+    eligible = not decision.suitable and greenfield_eligible(report, surviving)
+    headless_blocked = bool(os.environ.get("AIDW_HEADLESS")) and not os.environ.get("AIDW_GREENFIELD_STACK")
+    if eligible and not headless_blocked:
+        prior = state.get("greenfield") or {}
+        already_selected = bool(prior.get("stack_id")) or (
+            await repo_files.read_repo_file(provider, thread_id, GREENFIELD_STACK_PATH) is not None
+        )
+        # Already selected (this run or an earlier one): pass through the existing dict rather
+        # than re-offering -- the routing in graph.py only sends "greenfield" when offered and no
+        # stack_id is set yet, so this is what keeps a stack pick from being asked for twice.
+        greenfield = (
+            {**prior, "stack_id": prior.get("stack_id") or "recorded"}
+            if already_selected
+            else {"offered": True, "reasons": decision.reasons}
+        )
+
     await repo_files.append_ledger_entry(
-        get_sandbox_provider(),
+        provider,
         thread_id,
-        {"stage": STAGE_KEY, "node": "decide", "suitable": decision.suitable, "app_count": len(surviving)},
+        {
+            "stage": STAGE_KEY,
+            "node": "decide",
+            "suitable": decision.suitable,
+            "app_count": len(surviving),
+            **({"greenfield": True} if greenfield is not None else {}),
+        },
     )
 
-    if decision.suitable:
-        return {"app_rejection": None}
+    if decision.suitable or greenfield is not None:
+        return {"app_rejection": None, "greenfield": greenfield}
     return {
         "app_rejection": {
             "reasons": decision.reasons,
             "found": [{"path": a.get("path"), "app_class": a.get("app_class")} for a in surviving],
             "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        "greenfield": None,
+    }
+
+
+def _greenfield_declined_rejection() -> dict[str, Any]:
+    """The app_rejection shape greenfield_stack_select_node's cancel path emits -- routes into the
+    same app_discovery_reject_node every other rejection does, matching its dict shape exactly."""
+    return {
+        "reasons": ["Greenfield setup was declined; no tech stack was selected."],
+        "found": [],
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+async def greenfield_stack_select_node(state: "GraphState", config: RunnableConfig) -> dict[str, Any]:
+    """The greenfield picker: a human (via the frontend's TechStackSelectionCard) or, headless, the
+    AIDW_GREENFIELD_STACK env var chooses which canned monorepo stack this blank repository starts
+    from. Wired between app_discovery_decide and scaffold_finalize -- see graph.py's
+    _wire_app_discovery.
+
+    Everything before interrupt() must be idempotent: LangGraph re-executes this node from the top
+    on resume, and a fresh run that re-enters the graph (e.g. an abandoned-and-reopened interrupt,
+    BR-4's cascade) must never re-ask once a stack is already on disk.
+    """
+    thread_id = config["configurable"]["thread_id"]
+    provider = get_sandbox_provider()
+    existing = state.get("greenfield") or {}
+
+    already_written = await repo_files.read_repo_file(provider, thread_id, GREENFIELD_STACK_PATH) is not None
+    if already_written or existing.get("stack_id"):
+        return {
+            "greenfield": {**existing, "stack_id": existing.get("stack_id") or "recorded"},
+            "app_rejection": None,
         }
+
+    catalog = load_stack_catalog()
+    env_stack_id = os.environ.get("AIDW_GREENFIELD_STACK")
+    if env_stack_id:
+        # Headless auto-select: no human to ask, so the env var stands in for the interrupt.
+        match = next((entry for entry in catalog if entry["id"] == env_stack_id), None)
+        if match is None:
+            valid_ids = ", ".join(entry["id"] for entry in catalog)
+            raise ValueError(f"AIDW_GREENFIELD_STACK={env_stack_id!r} is not a known stack id. Valid ids: {valid_ids}")
+        resume: Any = {"stack_id": match["id"], "markdown": match["markdown"]}
+    else:
+        resume = interrupt(
+            {
+                "stage": "tech-stack",
+                "type": "tech_stack_selection",
+                "reasons": existing.get("reasons") or [],
+                "stacks": catalog,
+            }
+        )
+
+    if not isinstance(resume, dict) or resume.get("cancelled"):
+        return {"greenfield": None, "app_rejection": _greenfield_declined_rejection()}
+
+    stack_id = str(resume.get("stack_id") or "").strip() or "custom"
+    if not any(entry["id"] == stack_id for entry in catalog):
+        stack_id = "custom"
+
+    markdown = resume.get("markdown")
+    if (
+        not isinstance(markdown, str)
+        or not markdown.strip()
+        or len(markdown.encode("utf-8")) > _MAX_GREENFIELD_MARKDOWN_BYTES
+    ):
+        # Oversize or empty is rejected outright, never silently truncated -- a truncated stack
+        # description would commit a broken/incomplete file that every later prompt then trusts.
+        return {"greenfield": None, "app_rejection": _greenfield_declined_rejection()}
+
+    await repo_files.write_repo_file(provider, thread_id, GREENFIELD_STACK_PATH, markdown)
+    await git_ops.commit_paths(
+        provider, thread_id, [GREENFIELD_STACK_PATH], "ai-dev-workflow: greenfield tech stack selected"
+    )
+    await repo_files.append_ledger_entry(
+        provider, thread_id, {"stage": "tech-stack", "node": "greenfield_select", "stack_id": stack_id}
+    )
+    return {
+        "greenfield": {
+            "stack_id": stack_id,
+            "markdown": markdown,
+            "selected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        "app_rejection": None,
     }
 
 
@@ -561,6 +717,34 @@ def _demo() -> None:
     # Fingerprint: order-insensitive over paths, sensitive to content.
     assert fingerprint(nextjs) == fingerprint(dict(reversed(list(nextjs.items()))))
     assert fingerprint(nextjs) != fingerprint({"package.json": '{"dependencies":{"next":"15"},"scripts":{}}'})
+
+    # Greenfield eligibility: a blank repo (a real report, no surviving apps) is eligible; a repo
+    # with a real but non-startable app (library/cli survives path-filtering) is not; a missing
+    # report (discovery itself failed) is not blank, it's an error.
+    assert greenfield_eligible({"apps": []}, []) is True
+    assert (
+        greenfield_eligible(
+            {"apps": [{"path": "src/Foo", "app_class": "library"}]},
+            [{"path": "src/Foo", "app_class": "library"}],
+        )
+        is False
+    )
+    assert greenfield_eligible(None, []) is False
+
+    # Canned tech-stack catalog: exactly the 8 stacks the plan names, unique ids, real titles, and
+    # every one carries the machine-parseable Stack facts section apply_stack_conventions expects.
+    catalog = load_stack_catalog()
+    ids = [entry["id"] for entry in catalog]
+    assert len(catalog) == 8, ids
+    assert len(ids) == len(set(ids)), ids
+    assert set(ids) == {
+        "angular-dotnet", "react-dotnet", "nextjs-dotnet", "nextjs-flask",
+        "nextjs-fastapi", "react-express", "blazor-dotnet", "vue-dotnet",
+    }, ids
+    assert all(entry["title"] for entry in catalog), catalog
+    assert all("## Stack facts" in entry["markdown"] for entry in catalog), [
+        entry["id"] for entry in catalog if "## Stack facts" not in entry["markdown"]
+    ]
 
     print("app_discovery self-check: all assertions passed")
 
