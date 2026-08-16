@@ -214,9 +214,12 @@ export interface E2EState {
   [key: string]: unknown;
 }
 
-/** Outcome of the last push to the ai-dev-workflow/<branch> work branch (git_ops.push_head).
- * ok=false means GitHub persistence is currently failing (e.g. no push permission) -- local
- * commits continue regardless. */
+/** Outcome of the last push to the single, repo-shared `ai-dev-workflow` work branch
+ * (git_ops.push_head) -- every session/user on this repo pushes that same branch, via
+ * --force-with-lease rather than a plain force (WS0's single-branch migration retired the old
+ * per-branch `ai-dev-workflow/<branch>` naming and its "exactly one writer" invariant that made a
+ * plain force safe). ok=false means GitHub persistence is currently failing (e.g. no push
+ * permission) -- local commits continue regardless. */
 export interface PushStatus {
   ok: boolean;
   error?: string | null;

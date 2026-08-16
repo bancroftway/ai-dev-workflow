@@ -2,7 +2,7 @@
 
 import { useAgent } from "@copilotkit/react-core/v2";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import { PIPELINE_STAGE_ORDER, type ScanMeasures, type WorkflowState } from "@/lib/workflow-types";
+import { PIPELINE_STAGE_ORDER, type E2EState, type ScanMeasures, type WorkflowState } from "@/lib/workflow-types";
 import {
   GRADE_TONE,
   computeDelta,
@@ -104,6 +104,28 @@ function securityChip(measures: ScanMeasures | undefined, baseMeasures: ScanMeas
   );
 }
 
+/** e2e is a bespoke node cluster with no StageState of its own (see workflow-types.ts's E2EState
+ * comment), so `activeStage` below never picks it up -- rendered as its own pill instead, styled
+ * like the push-failing/run_failure pills. Silent once it settles into passed/skipped, the same
+ * way a StageState pill goes quiet once approved. */
+function e2ePill(e2e: E2EState | null | undefined): React.ReactNode {
+  if (!e2e || e2e.status == null || e2e.status === "passed" || e2e.status === "skipped") return null;
+  if (e2e.status === "running") {
+    return (
+      <span className={`rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS.gray}`}>
+        e2e: running (attempt {e2e.attempt ?? 1})
+      </span>
+    );
+  }
+  const failed = e2e.failed_tests?.length ?? 0;
+  const tone: Tone = (e2e.passed ?? 0) > 0 ? "amber" : "red";
+  return (
+    <span className={`rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS[tone]}`}>
+      e2e: {failed}/{e2e.total ?? 0} failed
+    </span>
+  );
+}
+
 /** TurboTax-style always-visible metrics strip: five fixed chips (Security, Maintainability,
  * Coverage, Duplication, Gate) once any scan summary exists, "--" gray placeholders for whatever
  * a given summary doesn't carry. The whole bar stays hidden until there's a summary, an active
@@ -128,6 +150,7 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
     const status = state.stages?.[s.key]?.status;
     return status != null && status !== "not_started" && status !== "approved";
   });
+  const e2ePillNode = e2ePill(state.e2e);
 
   let chips: React.ReactNode = null;
   if (summary) {
@@ -206,7 +229,7 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
 
   // The status/push lines matter before any scan has streamed (a needs_clarification stage was
   // previously invisible exactly when no scan had streamed) -- only hide a truly empty strip.
-  if (!summary && !activeStage && state.last_push?.ok !== false && state.run_failure == null) return null;
+  if (!summary && !activeStage && !e2ePillNode && state.last_push?.ok !== false && state.run_failure == null) return null;
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-1.5">
@@ -216,6 +239,7 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
           {activeStage.label} — {STATUS_LABEL[state.stages?.[activeStage.key]?.status ?? ""] ?? state.stages?.[activeStage.key]?.status}
         </span>
       )}
+      {e2ePillNode}
       {state.last_push && state.last_push.ok === false && (
         <span className="rounded-full border border-red-300 bg-red-50 px-2.5 py-0.5 text-xs text-red-800">
           push failing — GitHub persistence off
