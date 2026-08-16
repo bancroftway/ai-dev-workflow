@@ -41,6 +41,7 @@ from . import repo_files
 from . import repo_scan
 from . import finding_cluster_nodes
 from . import test_hardening_nodes
+from . import e2e_nodes
 from . import metrics_nodes
 from . import exit_nodes
 from . import rebuild
@@ -186,6 +187,9 @@ class GraphState(TypedDict):
     finding_cluster: dict[str, Any]
     # test-hardening's own bespoke-cluster state -- see agent/src/test_hardening_nodes.py.
     test_hardening: dict[str, Any]
+    # e2e's own bespoke-cluster state (playwright execution + screenshots + gating) -- see
+    # agent/src/e2e_nodes.py. None until e2e_gate_check_node's first write this run.
+    e2e: dict[str, Any] | None
     # metrics-report's own metrics state -- see agent/src/metrics_nodes.py.
     metrics_report: dict[str, Any]
     # The baseline repo scan taken once at the top of the graph -- see agent/src/repo_scan.py.
@@ -1042,6 +1046,12 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         stage["verify_cycle_count"] = 0
         stage["last_verification"] = None
 
+    # e2e has no StageState (it's a bespoke cluster, see e2e_nodes.py) but its fix-cycle "attempt"
+    # counter needs the exact same unconditional per-run reset as verify_cycle_count above -- a run
+    # that escalated at the cap must not re-enter every later run already AT it.
+    e2e_state = dict(state.get("e2e") or {})
+    e2e_state["attempt"] = 0
+
     if not raw_requirements_text.strip():
         # Textless run (no new submission): hydration may have restored an already-approved
         # raw-requirements doc from the repo into `stages` -- the specification stage's draft
@@ -1063,6 +1073,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # Cleared explicitly: a rejection is a verdict about one run's view of the repository, and
         # a repo that has since gained an application must get a fresh assessment, not a stale no.
         "app_rejection": None,
+        "e2e": e2e_state,
     }
 
 
@@ -1821,9 +1832,10 @@ def _wire_p14(builder: StateGraph) -> None:
 
 
 def _wire_p13(builder: StateGraph) -> None:
-    """Wires test-hardening's node cluster (test_hardening_nodes.py). "next" from test_hardening_exit_check routes to END for now
-    (metrics-report, the real next stage, doesn't exist yet). Verification status: NOT exercised against a
-    real sandbox, same caveat as quality-remediation/security-remediation/audit-cluster."""
+    """Wires test-hardening's node cluster (test_hardening_nodes.py). "next" from
+    test_hardening_exit_check routes into e2e's own gate check (_wire_e2e, e2e_nodes.py) -- e2e
+    sits between test-hardening and metrics-report's compute node. Verification status: NOT
+    exercised against a real sandbox, same caveat as quality-remediation/security-remediation/audit-cluster."""
     builder.add_node("test_hardening_run_tests", test_hardening_nodes.test_hardening_run_tests_node)
     builder.add_node("test_hardening_regression_gate", test_hardening_nodes.test_hardening_regression_gate_node)
     builder.add_node("test_hardening_flake_triage", test_hardening_nodes.test_hardening_flake_triage_node)
@@ -1838,9 +1850,31 @@ def _wire_p13(builder: StateGraph) -> None:
     builder.add_edge("test_hardening_flake_triage", "test_hardening_mint_tickets")
     builder.add_edge("test_hardening_mint_tickets", "test_hardening_exit_check")
     builder.add_conditional_edges(
-        "test_hardening_exit_check", test_hardening_nodes.make_test_hardening_route_after_exit(), {"next": "metrics_compute", "escalate": "test_hardening_exit_escalate"}
+        "test_hardening_exit_check", test_hardening_nodes.make_test_hardening_route_after_exit(), {"next": "e2e_gate_check", "escalate": "test_hardening_exit_escalate"}
     )
     builder.add_edge("test_hardening_exit_escalate", END)
+
+
+def _wire_e2e(builder: StateGraph) -> None:
+    """Wires e2e's node cluster (e2e_nodes.py): e2e_gate_check (deterministic: UI-framework repo?
+    playwright config/tests present? a runner resolvable?) -> route("skip" -> metrics_compute |
+    "run" -> e2e_run) -> e2e_run (boots the app, runs the suite, harvests screenshots) ->
+    route("pass" -> metrics_compute | "fix" [attempt < E2E_MAX_FIX_CYCLES] -> e2e_fix -> e2e_run |
+    "escalate" -> e2e_escalate -> END). Verification status: NOT exercised against a real
+    container -- see e2e_nodes.py's own module docstring for exactly what's unconfirmed."""
+    builder.add_node("e2e_gate_check", e2e_nodes.e2e_gate_check_node)
+    builder.add_node("e2e_run", e2e_nodes.e2e_run_node)
+    builder.add_node("e2e_fix", e2e_nodes.e2e_fix_node)
+    builder.add_node("e2e_escalate", e2e_nodes.e2e_escalate_node)
+
+    builder.add_conditional_edges(
+        "e2e_gate_check", e2e_nodes.make_e2e_route_after_gate_check(), {"skip": "metrics_compute", "run": "e2e_run"}
+    )
+    builder.add_conditional_edges(
+        "e2e_run", e2e_nodes.make_e2e_route_after_run(), {"pass": "metrics_compute", "fix": "e2e_fix", "escalate": "e2e_escalate"}
+    )
+    builder.add_edge("e2e_fix", "e2e_run")
+    builder.add_edge("e2e_escalate", END)
 
 
 def _wire_p10(builder: StateGraph) -> None:
@@ -2000,6 +2034,7 @@ def build_graph() -> StateGraph:
     _wire_p10(builder)
     _wire_audit_cluster(builder)
     _wire_p13(builder)
+    _wire_e2e(builder)
     _wire_p14(builder)
     _wire_p15(builder)
 

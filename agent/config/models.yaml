@@ -59,3 +59,7 @@ rebuild:
   # Shared by every R placement's fix node (rebuild.py). gpt-5.4 (not -mini): observed live,
   # mini left three trivial lint errors standing across all three fix laps.
   draft_model: gpt-5.4
+e2e:
+  # e2e_fix_node (e2e_nodes.py) -- same codegen-tier reasoning as quality/security/rebuild's fix
+  # nodes above: fixing a failing app or test is not mini-tier work.
+  draft_model: gpt-5.4

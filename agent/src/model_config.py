@@ -35,6 +35,7 @@ Stage = Literal[
     "test-hardening-flake-triage",
     "metrics-report",
     "rebuild",
+    "e2e",
 ]
 Role = Literal["draft", "audit"]
 

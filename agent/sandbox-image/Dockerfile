@@ -93,6 +93,9 @@ ARG FUNC_CORE_TOOLS_MAJOR=4
 # `playwright install` downloads is the exact revision the MCP server drives; the MCP team pins
 # playwright alphas on purpose -- this is the same code `@latest` was fetching, now frozen.
 ARG PLAYWRIGHT_MCP_VERSION=0.0.79
+# Also the version the ac-to-tests skill tells the LLM to pin `@playwright/test` to in the
+# TARGET repo's own package.json (agent/sandbox-image/plugins/ai-dev-workflow/skills/ac-to-tests/SKILL.md)
+# -- keep that literal string in sync with this ARG whenever it changes.
 ARG PLAYWRIGHT_VERSION=1.63.0-alpha-2026-08-05
 
 USER root

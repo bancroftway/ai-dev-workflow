@@ -175,10 +175,19 @@ export interface MergeReadinessReport {
   suggested_reviewers_note?: string;
 }
 
-/** Set by a later task's E2E stage -- absent entirely today, so every read of this must be
- * optional-chained and the screenshots section must render nothing when it's undefined. */
+/** agent/src/e2e_nodes.py's E2EState -- the playwright execution stage's bespoke-cluster state.
+ * Absent (undefined) until e2e_gate_check_node's first write of a given run, so every read of
+ * this must be optional-chained and the screenshots section must render nothing when it's
+ * undefined. */
 export interface E2EState {
+  status?: "running" | "passed" | "failed" | "skipped";
+  attempt?: number;
+  passed?: number;
+  failed_tests?: { title: string; error: string }[];
+  total?: number;
+  cannot_verify?: boolean;
   screenshots?: string[];
+  skipped_reason?: string | null;
   [key: string]: unknown;
 }
 
@@ -277,6 +286,7 @@ export interface EscalationPayload {
     | "verification_cap_exceeded"
     | "security_cycle_cap_exceeded"
     | "exit_gate_failed_twice"
+    | "e2e_cap_exceeded"
     | string;
   feedback?: string;
   [key: string]: unknown;

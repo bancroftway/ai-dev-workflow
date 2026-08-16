@@ -56,6 +56,15 @@ If a single test genuinely proves more than one acceptance criterion, pick the p
 test name and note the others in a comment -- don't invent a combined id that isn't a real
 identifier.
 
+## Playwright configs must match the sandbox image's own browser build
+
+Any `playwright.config.*` you author must set `use: { screenshot: 'on' }` -- the later e2e stage
+harvests every test's screenshot (not just failures') into the run's report, and a config that
+only captures on failure silently drops passing-test evidence. Also pin `@playwright/test` to
+exactly `1.63.0-alpha-2026-08-05` (the sandbox image's own `PLAYWRIGHT_VERSION`,
+agent/sandbox-image/Dockerfile) in package.json -- a different version's test runner is not
+guaranteed compatible with the browser build already baked into this image.
+
 ## Reporting your findings
 
 For each acceptance criterion you're given, report: which test kind(s) you chose and why, the

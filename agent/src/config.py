@@ -24,6 +24,13 @@ TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFI
 # reason that names the real cause.
 APP_DISCOVERY_MAX_CLARIFICATION_CYCLES = int(os.environ.get("APP_DISCOVERY_MAX_CLARIFICATION_CYCLES", "1"))
 
+# e2e's own bespoke-cluster caps (agent/src/e2e_nodes.py): fix-cycle cap (same shape as
+# rebuild.py's max_fix_cycles), app-boot readiness timeout, and the whole playwright suite's own
+# timeout (wrapped in `timeout <n>` so a hung suite can't wedge the sandbox forever).
+E2E_MAX_FIX_CYCLES = int(os.environ.get("E2E_MAX_FIX_CYCLES", "2"))
+E2E_APP_READY_TIMEOUT_SECONDS = int(os.environ.get("E2E_APP_READY_TIMEOUT_SECONDS", "120"))
+E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "1200"))
+
 # In-container path the sandbox image bakes the Agent Plugin content to (agent/sandbox-image/
 # Dockerfile's COPY plugins/ -> this path). Overridable for local spikes without a code change.
 COPILOT_PLUGIN_ROOT_IN_CONTAINER = os.environ.get(

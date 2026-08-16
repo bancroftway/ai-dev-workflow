@@ -159,6 +159,7 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         "repo_scan_delta": delta,
         "repo_scan_delta_reason": None if delta else "no baseline recorded for this repository",
         "coverage": coverage,
+        "e2e": state.get("e2e"),
         "traceability_summary": {
             "total": len(traceability_rows),
             "covered": sum(1 for r in traceability_rows if r["status"] == "covered"),
