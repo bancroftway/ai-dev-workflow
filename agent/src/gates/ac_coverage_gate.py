@@ -34,10 +34,11 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _PATH_TOKEN_RE = re.compile(r"[\w@./\\-]+\.[A-Za-z0-9]+")
 
 
-def _id_variants(ac_id: str) -> list[str]:
+def id_variants(ac_id: str) -> list[str]:
     """Spellings a test name may legitimately use for one ledger id. Models re-prefix US-0003.6
     as AC-0003.6 despite instructions (observed live, run 7), and identifier-safe names replace
-    -/. with _ (Test_US_0007_2). Numbering is what identifies the AC; tolerate the spellings."""
+    -/. with _ (Test_US_0007_2). Numbering is what identifies the AC; tolerate the spellings.
+    Public: metrics_nodes' traceability matrix reuses it so both scans accept the same spellings."""
     variants = {ac_id}
     if ac_id.startswith("US-"):
         variants.add("AC-" + ac_id[3:])
@@ -117,7 +118,7 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
     # observed live (headless run 3): the ledger mints US-0001.1-style ids while an AC-\d{4}
     # regex found nothing, so every AC read as uncovered and the stage deadlocked at the cap.
     ac_line_status: dict[str, str] = {}
-    variants_by_id = {ac_id: _id_variants(ac_id) for ac_id in active_ac_ids}
+    variants_by_id = {ac_id: id_variants(ac_id) for ac_id in active_ac_ids}
     for line in lines:
         ac_ids_in_line = {ac_id for ac_id, variants in variants_by_id.items() if any(v in line for v in variants)}
         if not ac_ids_in_line:

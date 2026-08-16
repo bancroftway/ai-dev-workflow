@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import shlex
 from dataclasses import replace
 from typing import Any
 
@@ -24,6 +24,7 @@ from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger
+from .gates.ac_coverage_gate import id_variants
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -31,10 +32,6 @@ from .sandbox.factory import get_sandbox_provider
 METRICS_LATEST_PATH = ".ai-dev-workflow/metrics-latest.json"
 TRACEABILITY_MATRIX_PATH = "traceability-matrix.md"
 
-# The AC-id-embedded test-name convention P4's prompt establishes (graph.py's ac_to_tests_draft.md):
-# an identifier-safe form for C# (Test_AC_0007_2_...) and a literal [AC-0007.2] string elsewhere.
-_AC_ID_IN_TEST_NAME_RE = re.compile(r"Test_AC_(\d{4})_(\d+)_|\[AC-(\d{4})\.(\d+)\]")
-_ID_IN_COMMIT_RE = re.compile(r"\b(US-\d{4}|AC-\d{4}\.\d+)\b")
 
 
 async def _read_baseline(provider: Any, thread_id: str) -> dict[str, Any] | None:
@@ -72,33 +69,57 @@ async def _read_coverage_summary(provider: Any, thread_id: str) -> dict[str, flo
     return {"line_rate": None, "branch_rate": None}
 
 
+def _traceability_rows(
+    ac_entries: list[dict[str, Any]], found_tokens: set[str], commit_log: str
+) -> list[dict[str, Any]]:
+    """Pure half of the matrix build, self-checked in _demo(). Matches each AC's ledger id against
+    the id spellings actually found in test files (ac_coverage_gate.id_variants -- the SAME
+    tolerance the P4 gate applies, so a test the gate accepted is never invisible here).
+    `covered` requires only has_test: every pipeline commit subject is a machine-fixed string that
+    never embeds an AC id, so a has_commit requirement made "covered" structurally unreachable
+    (observed live: 0/11 covered on a 96%-coverage repo). commits_found stays as an informational
+    column."""
+    rows: list[dict[str, Any]] = []
+    for entry in ac_entries:
+        ac_id = entry["id"]
+        variants = id_variants(ac_id)
+        has_test = bool(found_tokens & set(variants))
+        has_commit = any(v in commit_log for v in variants)
+        rows.append({
+            "us_id": entry.get("parent_us_id", ""),
+            "ac_id": ac_id,
+            "description": entry.get("description", ""),
+            "tests_found": has_test,
+            "commits_found": has_commit,
+            "status": "covered" if has_test else "untested",
+        })
+    return rows
+
+
 async def _build_traceability_matrix(provider: Any, thread_id: str) -> list[dict[str, Any]]:
     entries = await spec_ledger.load_ledger(provider, thread_id)
+    ac_entries = [e for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") != "retired"]
+    if not ac_entries:
+        return []
     log_result = await provider.exec_in_sandbox(thread_id, "git log --oneline -n 500 2>&1")
     commit_log = log_result.stdout or ""
-    grep_result = await provider.exec_in_sandbox(thread_id, "grep -rEl 'Test_AC_[0-9]{4}_[0-9]+_|\\[AC-[0-9]{4}\\.[0-9]+\\]' . 2>/dev/null")
-    test_files = [line for line in (grep_result.stdout or "").splitlines() if line.strip()]
 
-    ac_ids_in_tests: set[str] = set()
-    for path in test_files:
-        content = await repo_files.read_repo_file(provider, thread_id, path)
-        if content is None:
-            continue
-        for match in _AC_ID_IN_TEST_NAME_RE.finditer(content):
-            groups = match.groups()
-            us, ac = (groups[0], groups[1]) if groups[0] else (groups[2], groups[3])
-            ac_ids_in_tests.add(f"AC-{us}.{ac}")
-
-    rows: list[dict[str, Any]] = []
-    for entry in entries:
-        if entry.get("kind") != "acceptance_criterion" or entry.get("status") == "retired":
-            continue
-        ac_id = entry["id"]
-        has_test = ac_id in ac_ids_in_tests
-        has_commit = ac_id in commit_log or bool(re.search(rf"\b{re.escape(ac_id)}\b", commit_log))
-        status = "covered" if has_test and has_commit else ("tests_only" if has_test else "untested")
-        rows.append({"us_id": entry.get("parent_us_id", ""), "ac_id": ac_id, "description": entry.get("description", ""), "tests_found": has_test, "commits_found": has_commit, "status": status})
-    return rows
+    # Same two-step scan as ac_coverage_gate's fallback: tracked/untracked-but-not-ignored files
+    # with test/spec in the path (node_modules etc. are gitignored, so never listed), then ONE
+    # grep -F for every id spelling -- no per-file reads, no docker exec per file.
+    listing = await provider.exec_in_sandbox(
+        thread_id, "git ls-files -co --exclude-standard | grep -iE '(test|spec)' || true"
+    )
+    test_files = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
+    found_tokens: set[str] = set()
+    if test_files:
+        id_patterns = " ".join(f"-e {shlex.quote(v)}" for e in ac_entries for v in id_variants(e["id"]))
+        quoted_files = " ".join(shlex.quote(f) for f in test_files)
+        grep = await provider.exec_in_sandbox(
+            thread_id, f"grep -h -o -F {id_patterns} -- {quoted_files} 2>/dev/null | sort -u"
+        )
+        found_tokens = set((grep.stdout or "").split())
+    return _traceability_rows(ac_entries, found_tokens, commit_log)
 
 
 def _render_traceability_matrix(rows: list[dict[str, Any]]) -> str:
@@ -235,3 +256,24 @@ async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConf
     await repo_files.write_repo_file(provider, thread_id, METRICS_LATEST_PATH, json.dumps(metrics, indent=2) + "\n")
     await repo_files.append_ledger_entry(provider, thread_id, {"stage": "metrics_report", "node": "ponytail_gain", "token_usage": model._last_usage})
     return {"metrics_report": metrics_report}
+
+
+def _demo() -> None:
+    """Self-check for the pure traceability matching -- the ledger mints US-####.# ids and tests
+    may spell them four ways; every spelling must count, and covered must not require commit ids."""
+    entry = {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "parent_us_id": "US-0001", "description": "d"}
+    # Every spelling a gate-passing test may use resolves to the same AC.
+    for token in ("US-0001.1", "AC-0001.1", "US_0001_1", "AC_0001_1"):
+        rows = _traceability_rows([entry], {token}, commit_log="")
+        assert rows[0]["status"] == "covered", (token, rows)
+    # covered == has_test alone; machine-fixed commit subjects never carry ids.
+    rows = _traceability_rows([entry], {"AC-0001.1"}, commit_log="abc123 ai-dev-workflow: metrics_report metrics")
+    assert rows[0]["status"] == "covered" and rows[0]["commits_found"] is False
+    # No token found -> untested, never tests_only (kept in the summary shape for the frontend).
+    rows = _traceability_rows([entry], set(), commit_log="")
+    assert rows[0]["status"] == "untested" and rows[0]["tests_found"] is False
+    print("metrics_nodes _demo: ok")
+
+
+if __name__ == "__main__":
+    _demo()
