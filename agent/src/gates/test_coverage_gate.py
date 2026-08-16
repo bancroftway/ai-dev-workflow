@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -39,7 +40,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MIN_COVERAGE_PERCENT_DEFAULT = 95.0
+MIN_COVERAGE_PERCENT = float(os.environ.get("MIN_COVERAGE_PERCENT", "95.0"))
+# Back-compat: agent/src/gates/audit_gates.py imports this old constant name.
+MIN_COVERAGE_PERCENT_DEFAULT = MIN_COVERAGE_PERCENT
 
 # The only strings `measure_coverage` may return as its "reason" -- this value ends up in
 # repo_scan's `metrics.coverage.reason`, which IS hashed into ScanReport.content_hash (see
@@ -110,7 +113,7 @@ def _parse_cobertura_counts(raw_xml: str) -> tuple[_Counts | None, str]:
     for cls in root.iter("class"):
         cls_line_rate = float(cls.get("line-rate", "1")) * 100
         cls_branch_rate = float(cls.get("branch-rate", "1")) * 100
-        if cls_line_rate < MIN_COVERAGE_PERCENT_DEFAULT or cls_branch_rate < MIN_COVERAGE_PERCENT_DEFAULT:
+        if cls_line_rate < MIN_COVERAGE_PERCENT or cls_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=cls.get("filename", cls.get("name", "?")), line_rate=cls_line_rate, branch_rate=cls_branch_rate))
     return _Counts(lc, lt, bc, bt, gaps), ""
 
@@ -145,7 +148,7 @@ def _parse_istanbul_counts(raw: str) -> tuple[_Counts | None, str]:
             continue
         file_line_rate = _pct(entry, "lines", 100)
         file_branch_rate = _pct(entry, "branches", 100)
-        if file_line_rate < MIN_COVERAGE_PERCENT_DEFAULT or file_branch_rate < MIN_COVERAGE_PERCENT_DEFAULT:
+        if file_line_rate < MIN_COVERAGE_PERCENT or file_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=file_path, line_rate=file_line_rate, branch_rate=file_branch_rate))
     return _Counts(lc, lt, bc, bt, gaps), ""
 
@@ -267,7 +270,7 @@ async def _run_dotnet_coverage(
     for cls in root.iter("class"):
         cls_line_rate = float(cls.get("line-rate", "1")) * 100
         cls_branch_rate = float(cls.get("branch-rate", "1")) * 100
-        if cls_line_rate < MIN_COVERAGE_PERCENT_DEFAULT or cls_branch_rate < MIN_COVERAGE_PERCENT_DEFAULT:
+        if cls_line_rate < MIN_COVERAGE_PERCENT or cls_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=cls.get("filename", cls.get("name", "?")), line_rate=cls_line_rate, branch_rate=cls_branch_rate))
 
     return line_rate, branch_rate, gaps, ""
@@ -325,7 +328,7 @@ async def _run_js_coverage(
         # Per-file default 100: an unmeasured metric on one file must not fabricate a gap.
         file_line_rate = _pct(entry, "lines", 100)
         file_branch_rate = _pct(entry, "branches", 100)
-        if file_line_rate < MIN_COVERAGE_PERCENT_DEFAULT or file_branch_rate < MIN_COVERAGE_PERCENT_DEFAULT:
+        if file_line_rate < MIN_COVERAGE_PERCENT or file_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=file_path, line_rate=file_line_rate, branch_rate=file_branch_rate))
 
     return line_rate, branch_rate, gaps, ""
@@ -433,23 +436,23 @@ async def verify_coverage(
             report={"gaming_violations": gaming_violations},
         )
 
-    passed = line_rate >= MIN_COVERAGE_PERCENT_DEFAULT and branch_rate >= MIN_COVERAGE_PERCENT_DEFAULT
+    passed = line_rate >= MIN_COVERAGE_PERCENT and branch_rate >= MIN_COVERAGE_PERCENT
     report = {
         "line_rate": line_rate,
         "branch_rate": branch_rate,
-        "threshold": MIN_COVERAGE_PERCENT_DEFAULT,
+        "threshold": MIN_COVERAGE_PERCENT,
         "gaps": [{"file": g.file, "line_rate": g.line_rate, "branch_rate": g.branch_rate} for g in gaps],
     }
     if entry_reports:
         report["contract_replay"] = entry_reports
     if passed:
-        return VerificationResult(passed=True, feedback=f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) meets the {MIN_COVERAGE_PERCENT_DEFAULT}% threshold.", report=report)
+        return VerificationResult(passed=True, feedback=f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) meets the {MIN_COVERAGE_PERCENT}% threshold.", report=report)
 
     return VerificationResult(
         passed=False,
         feedback=(
             f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) is below the "
-            f"{MIN_COVERAGE_PERCENT_DEFAULT}% threshold. Uncovered: {report['gaps']}"
+            f"{MIN_COVERAGE_PERCENT}% threshold. Uncovered: {report['gaps']}"
         ),
         report=report,
     )
@@ -497,6 +500,13 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     for code in STABLE_REASON_CODES:
         assert " " not in code, f"{code!r} looks like prose, not a stable code"
         assert code in _REASON_FEEDBACK, f"{code!r} has no human-readable gate feedback"
+
+    # MIN_COVERAGE_PERCENT is a module-level env read (MIN_COVERAGE_PERCENT_DEFAULT survives only
+    # as a back-compat alias for audit_gates.py's import) -- pin that it parsed to a float and
+    # still defaults to 95.0 when MIN_COVERAGE_PERCENT is unset, same as the old hardcoded constant.
+    assert isinstance(MIN_COVERAGE_PERCENT, float)
+    assert MIN_COVERAGE_PERCENT == 95.0, "default must stay 95.0 when env var MIN_COVERAGE_PERCENT is unset"
+    assert MIN_COVERAGE_PERCENT_DEFAULT == MIN_COVERAGE_PERCENT, "back-compat alias must track the live value"
 
     print("test_coverage_gate self-check: all assertions passed")
 

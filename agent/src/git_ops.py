@@ -55,16 +55,25 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
     --force-with-lease (not plain --force): WS0's single-branch migration deleted the "exactly one
     writer" invariant that made plain force safe -- every session/user on this repo now pushes the
     SAME branch, so a plain force can silently clobber a concurrent session's already-pushed
-    commits. The clone is --single-branch, so no remote-tracking ref for the work branch exists
-    until something fetches it -- a bare lease with no such ref compares against "branch must not
-    exist" and rejects every push after the first as `stale info`. Fetching the work branch
-    immediately before the push (below) is what gives the lease a real value to compare: the very
-    first push (remote branch absent) leaves the fetch a no-op and the lease's implicit "must not
-    exist" expectation still lets it through, and every push after that compares against a value
-    fetched moments earlier, so a genuine concurrent write is rejected instead of overwritten.
-    Force (of some kind) is still needed at all because two pipeline paths legitimately
+    commits. Force (of some kind) is still needed at all because two pipeline paths legitimately
     `git reset --hard` the work branch (finding-cluster's upgrade revert, app-discovery's reject
     cleanup).
+
+    The lease's expected value is resolved EXPLICITLY (`--force-with-lease=<branch>:<expect>`),
+    never passed bare, because the clone is --single-branch: remote.origin.fetch is config-mapped
+    to only the base branch that was cloned, never to _WORK_BRANCH. Bare `--force-with-lease` (no
+    `=<refname>:<expect>`) resolves its expected value by looking up the remote-tracking ref
+    THROUGH THAT REFSPEC CONFIG -- it never consults whatever ref actually sits on disk, so it
+    can't see refs/remotes/origin/<_WORK_BRANCH> even moments after the explicit-refspec fetch
+    below just wrote it. With no config-mapped tracking ref, the bare lease falls back to its
+    config-less default of "the ref must not exist on the remote" -- correct for the very first
+    push, wrong for every push after (the branch now exists), so it rejected every one of them as
+    `stale info` (confirmed against a live failure log). Fix: read the just-fetched tracking ref
+    ourselves with `git rev-parse` and hand its exact value to `--force-with-lease=<branch>:
+    <expect>`, sidestepping the config lookup entirely -- an absent ref (first push, the fetch was
+    a no-op) keeps the bare "must not exist" lease; a present ref (every push after) compares
+    against the value fetched moments earlier, so a genuine concurrent write is still rejected
+    instead of overwritten.
 
     The token transits the container as a one-shot credential-helper file in /tmp, deleted in the
     same shell invocation.
@@ -79,6 +88,7 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
     helper_path = f"/tmp/aidw-cred-{uuid.uuid4().hex}.sh"
     helper_script = f"#!/bin/sh\necho username=x-access-token\necho password={token}\n"
     helper_b64 = base64.b64encode(helper_script.encode("utf-8")).decode("ascii")
+    tracking_ref = f"refs/remotes/origin/{_WORK_BRANCH}"
     command = (
         f"printf %s {shlex.quote(helper_b64)} | base64 -d > {helper_path} && chmod 700 {helper_path} && "
         # "+" force-updates the local remote-tracking ref even across a non-fast-forward change on
@@ -86,8 +96,17 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
         # would leave the tracking ref stuck at its old value, and every later --force-with-lease
         # push would keep comparing against that stale value and keep failing as "stale info".
         f"(git -c credential.helper={helper_path} fetch --quiet origin "
-        f"+{_WORK_BRANCH}:refs/remotes/origin/{_WORK_BRANCH} || true) && "
+        f"+{_WORK_BRANCH}:{tracking_ref} || true) && "
+        # Resolve the lease's expected value ourselves rather than trusting the bare form to find
+        # it (see docstring): no tracking ref yet (first push) keeps the bare must-not-exist lease;
+        # a resolved ref hands its exact commit to --force-with-lease=<branch>:<expect> so the
+        # comparison never goes through the single-branch-scoped refspec config.
+        f"expect=$(git rev-parse -q --verify {tracking_ref} || true); "
+        f"if [ -n \"$expect\" ]; then "
+        f"git -c credential.helper={helper_path} push --force-with-lease={_WORK_BRANCH}:\"$expect\" --quiet -u origin HEAD; "
+        f"else "
         f"git -c credential.helper={helper_path} push --force-with-lease --quiet -u origin HEAD; "
+        f"fi; "
         f"rc=$?; rm -f {helper_path}; exit $rc"
     )
     result = await provider.exec_in_sandbox(thread_id, command)
