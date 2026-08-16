@@ -191,6 +191,8 @@ async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str
         # intake), so this is where a previous run's terminal failure record gets cleared --
         # keeping the failure pill visible across reloads but not across a real re-run.
         "run_failure": None,
+        # Live cost restarts with the run (the sandbox ledger it sums from is reset just above).
+        "token_usage_running": None,
     }
 
 

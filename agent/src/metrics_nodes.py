@@ -233,6 +233,35 @@ async def metrics_regression_record_node(state: dict[str, Any], config: Runnable
     return {"run_failure": payload}
 
 
+async def collect_live_refresh(state: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
+    """Non-blocking pickup of a finished background refresh scan (kicked by git_ops.commit_all
+    after every code-writing commit): merges the fresher summary into repo_scan.latest_summary and
+    re-sums the token ledger into token_usage_running, so the metrics bar tracks code churn and
+    spend live. Display-only -- the gates' own scans remain the authority, and a refresh landing
+    after a gate's scan may briefly show a summary one commit older (the next writer corrects it)."""
+    report = repo_scan.pop_finished_refresh(thread_id)
+    if report is None or sandbox_registry.get(thread_id) is None:
+        return None
+    provider = get_sandbox_provider()
+    prior_summary = ((state.get("repo_scan") or {}).get("latest_summary")
+                     or (state.get("repo_scan") or {}).get("baseline_summary"))
+    summary = repo_scan.merge_measures(prior_summary, report.to_dashboard_dict()["summary"], "full")
+    prior_repo_scan = dict(state.get("repo_scan") or {})
+    prior_repo_scan.update(
+        latest_summary=summary,
+        latest_duplication_percent=(report.metrics.get("duplication") or {}).get("percent"),
+    )
+    totals = await _sum_token_usage(provider, thread_id)
+    return {
+        "repo_scan": prior_repo_scan,
+        "token_usage_running": {
+            "input_tokens": totals["total_input_tokens"],
+            "output_tokens": totals["total_output_tokens"],
+            "cost": totals["total_cost"],
+        },
+    }
+
+
 async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     run_id = state.get("run_id", "unknown")

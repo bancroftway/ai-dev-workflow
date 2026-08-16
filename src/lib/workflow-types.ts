@@ -237,6 +237,10 @@ export interface WorkflowState {
   audit_cluster?: { last_outcome?: { passed?: boolean; [key: string]: unknown } | null; [key: string]: unknown };
   e2e?: E2EState | null;
   last_push?: PushStatus | null;
+  // Live token spend, re-summed from the sandbox ledger whenever a background refresh scan lands
+  // (agent's metrics_nodes.collect_live_refresh) -- feeds the metrics bar's Cost chip mid-run;
+  // metrics_report.token_usage_summary is the final end-of-run word.
+  token_usage_running?: { input_tokens: number; output_tokens: number; cost: number } | null;
   // Terminal failure: escalations no longer pause for a human -- the graph ENDs with this set.
   run_failure?: EscalationPayload | null;
   stages?: {

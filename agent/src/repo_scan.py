@@ -1357,6 +1357,36 @@ def start_background_scan(thread_id: str, provider: Any) -> None:
     )
 
 
+# Display-only refresh scans keyed by thread_id: kicked after every code-writing commit
+# (git_ops.commit_all), collected non-blocking at the next node boundary so the metrics bar
+# tracks the code as it churns instead of going stale between the four gate scan points.
+_BACKGROUND_REFRESH: dict[str, "asyncio.Task[Any]"] = {}
+
+
+def start_background_refresh(thread_id: str, provider: Any) -> None:
+    task = _BACKGROUND_REFRESH.get(thread_id)
+    if task is not None and not task.done():
+        return  # one in flight is enough -- the next code commit re-kicks
+    # No report_path and no coverage run: this never touches committed artifacts and never runs
+    # the test suite -- it exists purely to stream a fresher summary to the metrics bar.
+    _BACKGROUND_REFRESH[thread_id] = asyncio.create_task(run_repo_scan(provider, thread_id, profile="full"))
+
+
+def pop_finished_refresh(thread_id: str) -> "ScanReport | None":
+    """The finished refresh scan for this thread, or None if none is pending/done. Consumes the
+    task; a crashed scan logs and returns None (display-only, never worth failing a node over)."""
+    task = _BACKGROUND_REFRESH.get(thread_id)
+    if task is None or not task.done():
+        return None
+    del _BACKGROUND_REFRESH[thread_id]
+    if task.cancelled():
+        return None
+    if task.exception() is not None:
+        logger.warning("repo_scan: background refresh scan failed for thread_id=%s", thread_id, exc_info=task.exception())
+        return None
+    return task.result()
+
+
 def pop_background_scan(thread_id: str) -> "asyncio.Task[Any] | None":
     return _BACKGROUND_SCANS.pop(thread_id, None)
 

@@ -223,6 +223,12 @@ async def commit_all(provider: SandboxProvider, thread_id: str, message: str) ->
         result = await provider.exec_in_sandbox(thread_id, command)
         if result.ok:
             await push_head(provider, thread_id)
+            # Every code-writing stage funnels through here -- kick a display-only background
+            # scan so the metrics bar reflects the new code at the next node boundary
+            # (metrics_nodes.collect_live_refresh) instead of going stale until the next gate.
+            from . import repo_scan  # local import mirrors the module-level one-way dependency
+
+            repo_scan.start_background_refresh(thread_id, provider)
             return
     combined_output = f"{result.stdout}\n{result.stderr}".lower()
     if "nothing to commit" in combined_output:

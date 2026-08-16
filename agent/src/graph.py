@@ -16,6 +16,7 @@ resumed and is abandoned by construction (BR-4's cascade).
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -215,6 +216,10 @@ class GraphState(TypedDict):
     # shows it as a red pill, and a resubmission clears it (scaffold_node). Precedent:
     # app_rejection.
     run_failure: dict[str, Any] | None
+    # Live token spend {input_tokens, output_tokens, cost}, re-summed from the ledger whenever a
+    # background refresh scan lands (metrics_nodes.collect_live_refresh) -- feeds the metrics
+    # bar's Cost chip during the run; metrics_report's token_usage_summary is the final word.
+    token_usage_running: dict[str, Any] | None
 
 
 def default_stage_state() -> StageState:
@@ -2064,13 +2069,37 @@ _RENDER_MARKDOWN_BY_STAGE = {stage.key: stage.render_markdown for stage in _ALL_
 _RENDER_MARKDOWN_BY_STAGE["raw-requirements"] = render_raw_requirements_markdown
 
 
+def _with_live_refresh(name: str, action):
+    """Second choke-point wrap (see _TracedStateGraph): after any node returns, fold in a finished
+    background refresh scan + running token totals (metrics_nodes.collect_live_refresh) so the
+    metrics bar updates at the next node boundary after every code-writing commit. Display-only
+    and strictly non-invasive: dict returns only, never a node that wrote repo_scan itself, and
+    any collector error is swallowed -- a display refresh must never fail a real node."""
+
+    async def wrapped(state, config):
+        result = action(state, config)
+        if inspect.isawaitable(result):
+            result = await result
+        if isinstance(result, dict) and "repo_scan" not in result:
+            try:
+                update = await metrics_nodes.collect_live_refresh(state, config["configurable"]["thread_id"])
+            except Exception:  # noqa: BLE001 -- display-only; the node's own result is what matters
+                logger.warning("collect_live_refresh failed after node %s", name, exc_info=True)
+                update = None
+            if update:
+                result = {**result, **update}
+        return result
+
+    return wrapped
+
+
 class _TracedStateGraph(StateGraph):
     """Wraps every node callable in a telemetry span at the single choke point all 51
     add_node call sites flow through -- no per-node edits, no per-cluster wiring."""
 
     def add_node(self, node, action=None, **kwargs):  # type: ignore[override]
         if isinstance(node, str) and callable(action):
-            action = telemetry.traced_node(node, action)
+            action = telemetry.traced_node(node, _with_live_refresh(node, action))
         return super().add_node(node, action, **kwargs)
 
 
