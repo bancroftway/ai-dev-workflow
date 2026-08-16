@@ -143,8 +143,11 @@ async def run(args: argparse.Namespace) -> int:
                 outcome.update(stage_statuses=_stage_statuses(snap.values), error="paused_without_interrupt")
                 break
             payload = interrupts[0].value if isinstance(interrupts[0].value, dict) else {}
-            # The only interrupts left are the spec/plan approval gates; failures END the run
-            # with run_failure instead of pausing.
+            # Spec/plan approval gates are the only interrupts this loop ever actually resumes.
+            # The greenfield stack picker's own interrupt() never fires here: AIDW_GREENFIELD_STACK
+            # set auto-selects a stack without calling interrupt() at all; unset, a blank repo is
+            # rejected outright instead of ever being offered the picker (app_discovery.py's
+            # headless_blocked guard). Failures END the run with run_failure instead of pausing.
             logger.info("auto-approving gate: %s", payload.get("stage"))
             stream_input = Command(resume=True)
     finally:
