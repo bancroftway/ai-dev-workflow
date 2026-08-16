@@ -161,10 +161,20 @@ def _close(
 
 
 def _cap(sessions: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    """Keeps the file from growing forever. Plain index truncation (not a recency re-sort): every
-    row is upserted in place and only ever appended once, at its own start, so append order
-    already tracks recency."""
-    return sessions[-limit:] if limit > 0 and len(sessions) > limit else sessions
+    """Keeps the file from growing forever, WITHOUT ever evicting an in_progress row.
+
+    Plain index truncation (drop the front) breaks that: rows never move once appended, so a
+    stalled in_progress session near the front gets silently truncated away after ~limit more
+    sessions start elsewhere -- end_session then finds no matching entry, logs it, and the
+    outcome is lost for good. Keep every in_progress row regardless of position, plus the most
+    recent `limit` CLOSED rows (completed/failed/rejected/superseded), reassembled in original
+    (chronological) order.
+    """
+    if limit <= 0 or len(sessions) <= limit:
+        return sessions
+    closed = [s for s in sessions if s.get("status") != "in_progress"]
+    kept_closed_ids = {id(s) for s in (closed[-limit:] if len(closed) > limit else closed)}
+    return [s for s in sessions if s.get("status") == "in_progress" or id(s) in kept_closed_ids]
 
 
 # --------------------------------------------------------------------------------------------
@@ -313,6 +323,15 @@ def _demo() -> None:
     ten = [{"i": i} for i in range(10)]
     assert _cap(ten, 5) == ten[-5:]
     assert _cap(ten, 20) == ten
+
+    # Eviction never drops an in_progress row, no matter how far from the tail it sits: a stalled
+    # session near the front must stay reachable for a later end_session to close.
+    stalled = {"run_id": "stalled", "thread_id": "t-stalled", "status": "in_progress"}
+    closed_rows = [{"run_id": f"c{i}", "thread_id": f"t{i}", "status": "completed"} for i in range(5)]
+    mixed = [stalled, *closed_rows]
+    capped = _cap(mixed, 2)
+    assert stalled in capped, capped
+    assert [r["run_id"] for r in capped] == ["stalled", "c3", "c4"], capped
 
     print("session_index self-check: ok")
 

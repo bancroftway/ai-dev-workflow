@@ -77,9 +77,11 @@ export async function POST(request: Request) {
   const session = await auth();
   const accessToken = session?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
   const githubId = session?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
-  // Same source for both the 409 guard's identity comparison below AND the `user_login` forwarded
-  // to the agent for sessions.json -- one GitHub login, captured once at sign-in (src/auth.ts),
-  // rather than a second octokit.rest.users.getAuthenticated() call duplicating it.
+  // Preferred source for both the 409 guard's identity comparison below AND the `user_login`
+  // forwarded to the agent for sessions.json -- the GitHub login captured once at sign-in
+  // (src/auth.ts), avoiding a second octokit.rest.users.getAuthenticated() call on every request.
+  // Falls back to that same live lookup below (currentLogin) when absent -- a session issued
+  // before auth.ts started capturing `login` has none.
   const userLogin = session?.login ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
   if (!accessToken || !githubId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -96,7 +98,12 @@ export async function POST(request: Request) {
   }
 
   const octokit = await getOctokit();
-  const conflict = await findConflictingSession(octokit, owner, repo, userLogin ?? "");
+  // Sessions signed in before this deploy have no `login` on their JWT (src/auth.ts only
+  // captures profile.login on the initial sign-in request) -- without this fallback they'd
+  // compare "" against their own prior session's `user` and get 409'd against themselves. One
+  // extra GitHub call, only for that (increasingly rare) case; everyone else uses the JWT value.
+  const currentLogin = userLogin || (await octokit.rest.users.getAuthenticated()).data.login;
+  const conflict = await findConflictingSession(octokit, owner, repo, currentLogin);
   if (conflict) {
     return NextResponse.json(
       {
@@ -123,10 +130,9 @@ export async function POST(request: Request) {
       repo,
       branch,
       github_token: accessToken,
-      // Advisory only -- see session_index.py's module docstring. Falls back to "" rather than
-      // undefined so a signed-in user whose token predates this change (no `login` in their JWT
-      // yet) doesn't send `undefined` over the wire.
-      user_login: userLogin ?? "",
+      // Advisory only -- see session_index.py's module docstring. Same value the 409 guard above
+      // just compared against, not the raw (possibly empty) JWT one.
+      user_login: currentLogin,
       resume: Boolean(resume),
     }),
   });

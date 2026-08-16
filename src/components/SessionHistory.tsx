@@ -98,6 +98,7 @@ export function SessionHistory({
                 {(s.status === "failed" || s.status === "in_progress") && (
                   <button
                     type="button"
+                    title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
                     className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
                     onClick={() => resume(s)}
                   >

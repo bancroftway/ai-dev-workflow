@@ -936,9 +936,34 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # Popped unconditionally, right here, on EVERY intake -- a resume=1 provision sets this meta
     # flag once, and it must not survive past the first run that consumes it (else a later,
     # unrelated follow-up message on the same thread would also skip the fresh-run stage reset
-    # below). Whether it actually APPLIES depends on stages_empty_pre_hydration, captured next.
+    # below). Whether it actually APPLIES depends on whether THIS run carries fresh requirements
+    # text, computed next (not on whether stages happened to be empty pre-hydration: Resume on a
+    # thread whose checkpoint is still live in this same process -- the common case, since the
+    # failed run never restarted the agent -- has non-empty stages too, and gating on emptiness
+    # made the flag a no-op for exactly that case).
     resume_flag_popped = sandbox_registry.pop_meta_flag(thread_id, "resume")
-    stages_empty_pre_hydration = not stages
+
+    # The Raw Requirements Text (AC-1.3/AC-6.2) is submitted as an ordinary
+    # chat message — the human's "submit" action is agent.addMessage(...) +
+    # runAgent() on the frontend — so every run's current, complete text is
+    # simply the latest HumanMessage, never a delta. That message's content is a plain string
+    # for a text-only submission, or a multimodal InputContent list when screenshots/documents
+    # were attached in the Requirements area -- either way, only the text half becomes
+    # raw_requirements_text; any attachments are carried separately (see GraphState) since they
+    # only matter to this specific run's specification draft, not the persisted text itself.
+    #
+    # Computed here (before hydration/reset below) because whether THIS run carries fresh text is
+    # also what gates `resume` just below: AppShell's Resume button fires a blank runAgent (no new
+    # message), while a genuine new-requirements submission always has text -- so the resume flag
+    # can never skip the fresh-run reset for an actual new submission.
+    raw_requirements_text = state.get("raw_requirements_text", "")
+    requirements_attachments: list[dict[str, Any]] = []
+    for message in reversed(state.get("messages", [])):
+        if isinstance(message, HumanMessage):
+            raw_requirements_text, requirements_attachments = _split_text_and_attachments(
+                message.content
+            )
+            break
 
     # Hydration (architecture plan Section B.2): only when this thread has never had any stage
     # state in this process's memory yet -- i.e. genuinely the first invoke for this thread since
@@ -970,15 +995,15 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # AIDW_RESUME=1 (headless --thread resume) OR a popped `resume` meta flag (the frontend's
     # Resume button, /select's history UI) skip the approved-stage reset so a rerun on the same
     # thread/sandbox picks up at the first UNapproved stage -- hydration above restored every
-    # approved stage from the repo, and make_draft_node's approved short-circuit routes each one
+    # approved stage from the repo (or the in-memory checkpoint already has them, if the agent
+    # process never restarted), and make_draft_node's approved short-circuit routes each one
     # straight to the next. Per-run mechanics (verify counters) still reset below.
     #
-    # The meta flag only counts here when stages_empty_pre_hydration -- the true restart-resume
-    # path (a fresh process, or a genuinely new thread invocation, hydrating from scratch). A
-    # thread already mid-session (stages non-empty before hydration ran) ignores the flag even
-    # though it was just popped above: an ordinary follow-up message must never be treated as a
-    # resume just because some earlier provision call happened to set the flag.
-    resume = os.environ.get("AIDW_RESUME") == "1" or (resume_flag_popped and stages_empty_pre_hydration)
+    # The meta flag only counts here when this run carries NO fresh requirements text -- both the
+    # restart-resume path (a blank reattach ping) and a live-thread Resume click (a blank runAgent,
+    # no new message) are textless. A genuinely new requirements submission always has text, so it
+    # can never be misread as a resume just because some earlier provision call set the flag.
+    resume = os.environ.get("AIDW_RESUME") == "1" or (resume_flag_popped and not raw_requirements_text.strip())
     for stage_spec in STAGES[1:] + _STANDALONE_STAGE_SPECS:
         stage = stages[stage_spec.key]
         if not resume and stage["status"] in ("ready_for_review", "approved"):
@@ -999,23 +1024,6 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # fresh run's very first attempt).
         stage["verify_cycle_count"] = 0
         stage["last_verification"] = None
-
-    # The Raw Requirements Text (AC-1.3/AC-6.2) is submitted as an ordinary
-    # chat message — the human's "submit" action is agent.addMessage(...) +
-    # runAgent() on the frontend — so every run's current, complete text is
-    # simply the latest HumanMessage, never a delta. That message's content is a plain string
-    # for a text-only submission, or a multimodal InputContent list when screenshots/documents
-    # were attached in the Requirements area -- either way, only the text half becomes
-    # raw_requirements_text; any attachments are carried separately (see GraphState) since they
-    # only matter to this specific run's specification draft, not the persisted text itself.
-    raw_requirements_text = state.get("raw_requirements_text", "")
-    requirements_attachments: list[dict[str, Any]] = []
-    for message in reversed(state.get("messages", [])):
-        if isinstance(message, HumanMessage):
-            raw_requirements_text, requirements_attachments = _split_text_and_attachments(
-                message.content
-            )
-            break
 
     if not raw_requirements_text.strip():
         # Resume path: the message scan above found no fresh HumanMessage (a --thread/resume
