@@ -1015,6 +1015,7 @@ _METRIC_DIRECTIONS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("functions_over_threshold", ("metrics", "complexity", "functions_over_threshold"), "lower_is_better"),
     ("total_loc", ("metrics", "size", "total_loc"), "neutral"),
     ("coverage_line_rate", ("metrics", "coverage", "line_rate"), "higher_is_better"),
+    ("coverage_branch_rate", ("metrics", "coverage", "branch_rate"), "higher_is_better"),
 )
 
 

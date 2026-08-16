@@ -265,6 +265,10 @@ async def _run_dotnet_coverage(
 
     line_rate = float(root.get("line-rate", "0")) * 100
     branch_rate = float(root.get("branch-rate", "0")) * 100
+    if float(root.get("branches-valid", "0") or 0) == 0:
+        # No branch points anywhere is vacuously satisfied, not a 0% failure -- same rule as the
+        # contract-replay path's merged counts above.
+        branch_rate = 100.0
 
     gaps: list[CoverageGap] = []
     for cls in root.iter("class"):

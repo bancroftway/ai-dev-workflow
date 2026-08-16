@@ -170,8 +170,11 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     # fallback for a repo/thread that never ran that gate (predates it, or hydrated straight past
     # that stage) -- the delta then compares like-with-like (both contract-merged).
     promoted_coverage = (state.get("repo_scan") or {}).get("coverage") or {}
-    if isinstance(promoted_coverage.get("line_rate"), (int, float)):
-        coverage = {"line_rate": promoted_coverage["line_rate"], "branch_rate": promoted_coverage.get("branch_rate")}
+    if isinstance(promoted_coverage.get("line_rate"), (int, float)) and isinstance(promoted_coverage.get("branch_rate"), (int, float)):
+        # Both rates or nothing: the gate's verify_coverage report always carries a numeric branch
+        # rate (vacuously 100 when branchless), so a line-only value is stale/partial state -- the
+        # 81.8%-branch-in-exit.md incident was a line-only promotion sailing past the branch gate.
+        coverage = {"line_rate": promoted_coverage["line_rate"], "branch_rate": promoted_coverage["branch_rate"]}
     else:
         coverage = await _read_coverage_summary(provider, thread_id)
     # Merged in BEFORE the dashboard dict is built (and BEFORE LATEST_PATH is written) so the
@@ -220,10 +223,12 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     )
     # Curated, small keys for the frontend metrics bar (repo_scan is a LastValue channel -- spread).
     prior_repo_scan = dict(state.get("repo_scan") or {})
+    # Deliberately NOT writing `coverage` back here: repo_scan.coverage is the GATES' promotion
+    # slot (graph.py's make_verify_node, audit_gates' exit gate). Writing this node's own number
+    # into it meant any re-entry "promoted" metrics' prior output as if a gate had verified it.
     prior_repo_scan.update(
         latest_summary=scan_report["summary"],
         latest_duplication_percent=(scan.metrics.get("duplication") or {}).get("percent"),
-        coverage=coverage,
         delta_summary=repo_scan.delta_summary(delta),
     )
     return {"metrics_report": {"metrics": metrics}, "repo_scan": prior_repo_scan}
