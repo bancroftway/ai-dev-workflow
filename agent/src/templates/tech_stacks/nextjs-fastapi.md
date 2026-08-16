@@ -11,6 +11,7 @@ access.
 
 ```
 repo-root/
+├── .gitignore
 ├── apps/
 │   ├── web/                  # Next.js app (App Router)
 │   │   ├── src/app/
@@ -21,8 +22,10 @@ repo-root/
 │       ├── requirements.txt
 │       └── tests/
 ├── ruff.toml, mypy.ini        # written automatically once Python is detected
-└── (no root package.json — each app manages its own dependencies independently)
+└── .ai-dev-workflow/coverage-commands.json   # registers both ecosystems' coverage commands (see Testing)
 ```
+
+(no root package.json — each app manages its own dependencies independently)
 
 ## Scaffolding commands
 
@@ -44,7 +47,17 @@ repo-root/
    def health():
        return {"status": "ok"}
    ```
-7. In `apps/web/next.config.ts`, proxy API calls in development:
+7. Create a root `.gitignore` (FastAPI's manual setup and `create-next-app` each cover only their
+   own app, and nothing generates one for the repo root):
+   ```gitignore
+   node_modules/
+   .next/
+   coverage/
+   .venv/
+   __pycache__/
+   *.pyc
+   ```
+8. In `apps/web/next.config.ts`, proxy API calls in development:
    ```ts
    const nextConfig = {
      async rewrites() {
@@ -75,15 +88,34 @@ repo-root/
 
 - **API (pytest)**: put tests under `apps/api/tests/`, use `fastapi.testclient.TestClient` (or
   `httpx.AsyncClient`) against the `app` object — no running server needed. Run with
-  `cd apps/api && pytest`. Coverage in the Cobertura XML format this pipeline's coverage gate
-  replays: `pytest --cov=. --cov-report=xml:coverage.cobertura.xml`. Record that exact command
-  (with `root: "apps/api"`, `format: "cobertura"`, `artifact: "apps/api/coverage.cobertura.xml"`)
-  in `.ai-dev-workflow/coverage-commands.json` once tests exist, so the coverage gate can replay
-  it.
+  `cd apps/api && pytest`.
 - **Web (Vitest)**: `cd apps/web && npm install -D vitest @testing-library/react
   @testing-library/jest-dom jsdom @vitejs/plugin-react @vitest/coverage-v8`; add a
   `vitest.config.ts` with the React plugin and `test: { environment: "jsdom", globals: true }`.
-  Run with `npx vitest run`, coverage with `npx vitest run --coverage`.
+  Run with `npx vitest run`.
+
+**Coverage contract** (this pipeline's coverage gate replays `.ai-dev-workflow/coverage-commands.json`
+when present, INSTEAD of its own dotnet/js/python legacy fallback -- registering only the Python
+entry would silently exempt the frontend from the 95% threshold forever, so register BOTH entries
+together, never just one):
+```json
+{
+  "entries": [
+    {
+      "command": "npx vitest run --coverage --coverage.reporter=json-summary",
+      "artifact": "apps/web/coverage/coverage-summary.json",
+      "format": "istanbul-json-summary",
+      "root": "apps/web"
+    },
+    {
+      "command": "pytest --cov=. --cov-report=xml:coverage.cobertura.xml",
+      "artifact": "apps/api/coverage.cobertura.xml",
+      "format": "cobertura",
+      "root": "apps/api"
+    }
+  ]
+}
+```
 
 ## Conventions
 

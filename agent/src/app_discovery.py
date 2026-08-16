@@ -299,6 +299,40 @@ def greenfield_eligible(report: dict[str, Any] | None, surviving: list[dict[str,
     return report is not None and not surviving
 
 
+def _greenfield_outcome(already_selected: bool, eligible: bool, headless_blocked: bool) -> str:
+    """Returns "continue" | "offer" | "reject" -- how an UNsuitable repo's greenfield status
+    resolves. Only called when decision.suitable is already False (a suitable repo always clears
+    greenfield to None directly, never through this table).
+
+    `already_selected` wins unconditionally, before eligibility or the headless guard are even
+    consulted: once a stack has been accepted for this repo, a run must never fall through to hard
+    rejection again, however "surviving"/eligible looks *this* time (a repo mid-scaffold may
+    transiently classify as a non-startable library -- not a reason to reject a repo the human
+    already set up) and regardless of headless (nothing left to interrupt-ask once already
+    decided)."""
+    if already_selected:
+        return "continue"
+    if eligible and not headless_blocked:
+        return "offer"
+    return "reject"
+
+
+def _greenfield_passthrough(prior: dict[str, Any], saved_markdown: str | None) -> dict[str, Any]:
+    """The idempotency pass-through dict shared by app_discovery_decide_node's "continue" outcome
+    and greenfield_stack_select_node's own precheck. Must never drop the saved markdown: a
+    passthrough that only checked file-existence and returned a bare `{"stack_id": "recorded"}`
+    left `_build_tech_stack_prompt`'s `.get("markdown")` gate empty, so the LLM drafted as if the
+    repository were still unaddressed rather than reading the committed stack description --
+    `saved_markdown` (freshly read from .ai-dev-workflow/greenfield-stack.md) is preferred since
+    it's the actual source of truth on disk; `prior`'s own markdown is only a fallback for the
+    (in practice unreachable) case a stack_id is set in-memory but the file read comes back empty."""
+    return {
+        **prior,
+        "stack_id": prior.get("stack_id") or "recorded",
+        "markdown": saved_markdown or prior.get("markdown") or "",
+    }
+
+
 @lru_cache(maxsize=None)
 def load_stack_catalog() -> list[dict[str, Any]]:
     """The 8 canned monorepo stacks greenfield_stack_select_node offers, one markdown file per
@@ -444,21 +478,20 @@ async def app_discovery_decide_node(state: "GraphState", config: RunnableConfig)
 
     provider = get_sandbox_provider()
     greenfield: dict[str, Any] | None = None
-    eligible = not decision.suitable and greenfield_eligible(report, surviving)
-    headless_blocked = bool(os.environ.get("AIDW_HEADLESS")) and not os.environ.get("AIDW_GREENFIELD_STACK")
-    if eligible and not headless_blocked:
+    if not decision.suitable:
         prior = state.get("greenfield") or {}
-        already_selected = bool(prior.get("stack_id")) or (
-            await repo_files.read_repo_file(provider, thread_id, GREENFIELD_STACK_PATH) is not None
-        )
-        # Already selected (this run or an earlier one): pass through the existing dict rather
-        # than re-offering -- the routing in graph.py only sends "greenfield" when offered and no
-        # stack_id is set yet, so this is what keeps a stack pick from being asked for twice.
-        greenfield = (
-            {**prior, "stack_id": prior.get("stack_id") or "recorded"}
-            if already_selected
-            else {"offered": True, "reasons": decision.reasons}
-        )
+        saved_markdown = await repo_files.read_repo_file(provider, thread_id, GREENFIELD_STACK_PATH)
+        already_selected = bool(prior.get("stack_id")) or saved_markdown is not None
+        eligible = greenfield_eligible(report, surviving)
+        headless_blocked = bool(os.environ.get("AIDW_HEADLESS")) and not os.environ.get("AIDW_GREENFIELD_STACK")
+        outcome = _greenfield_outcome(already_selected, eligible, headless_blocked)
+        # "continue": pass through the existing dict (never re-offer -- the routing in graph.py
+        # only sends "greenfield" when offered and no stack_id is set yet -- and never reject a
+        # repo the human already set up, see _greenfield_outcome's own docstring).
+        if outcome == "continue":
+            greenfield = _greenfield_passthrough(prior, saved_markdown)
+        elif outcome == "offer":
+            greenfield = {"offered": True, "reasons": decision.reasons}
 
     await repo_files.append_ledger_entry(
         provider,
@@ -508,12 +541,9 @@ async def greenfield_stack_select_node(state: "GraphState", config: RunnableConf
     provider = get_sandbox_provider()
     existing = state.get("greenfield") or {}
 
-    already_written = await repo_files.read_repo_file(provider, thread_id, GREENFIELD_STACK_PATH) is not None
-    if already_written or existing.get("stack_id"):
-        return {
-            "greenfield": {**existing, "stack_id": existing.get("stack_id") or "recorded"},
-            "app_rejection": None,
-        }
+    saved_markdown = await repo_files.read_repo_file(provider, thread_id, GREENFIELD_STACK_PATH)
+    if saved_markdown is not None or existing.get("stack_id"):
+        return {"greenfield": _greenfield_passthrough(existing, saved_markdown), "app_rejection": None}
 
     catalog = load_stack_catalog()
     env_stack_id = os.environ.get("AIDW_GREENFIELD_STACK")
@@ -730,6 +760,25 @@ def _demo() -> None:
         is False
     )
     assert greenfield_eligible(None, []) is False
+
+    # _greenfield_outcome: finding-6 regression -- an already-selected repo must "continue" even
+    # when NOT eligible right now (mid-scaffold, surviving transiently non-empty) and even under
+    # the headless guard (nothing left to interrupt-ask once already decided). Only a genuinely
+    # fresh, never-selected repo can be suppressed by the headless guard or fall to "reject".
+    assert _greenfield_outcome(True, False, False) == "continue"
+    assert _greenfield_outcome(True, True, True) == "continue"
+    assert _greenfield_outcome(False, True, False) == "offer"
+    assert _greenfield_outcome(False, True, True) == "reject"
+    assert _greenfield_outcome(False, False, False) == "reject"
+
+    # _greenfield_passthrough: finding-5 regression -- must never drop the saved markdown. The
+    # freshly-read file content wins when present; the prior in-memory dict's own markdown is only
+    # a fallback; an empty string (never None) when genuinely neither is available.
+    assert _greenfield_passthrough({}, "# Stack\n...")["markdown"] == "# Stack\n..."
+    assert _greenfield_passthrough({"stack_id": "react-express", "markdown": "old"}, None) == {
+        "stack_id": "react-express", "markdown": "old",
+    }
+    assert _greenfield_passthrough({}, None) == {"stack_id": "recorded", "markdown": ""}
 
     # Canned tech-stack catalog: exactly the 8 stacks the plan names, unique ids, real titles, and
     # every one carries the machine-parseable Stack facts section apply_stack_conventions expects.

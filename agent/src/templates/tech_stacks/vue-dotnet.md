@@ -11,27 +11,43 @@ template/reactivity model paired with a strongly-typed .NET backend.
 
 ```
 repo-root/
+├── .gitignore
 ├── apps/
-│   ├── web/                  # Vue app (Vite)
+│   ├── web/                   # Vue app (Vite)
 │   │   ├── src/
-│   │   ├── vite.config.ts    # dev-server proxy: /api -> http://localhost:5080
+│   │   ├── vite.config.ts     # dev-server proxy: /api -> http://localhost:5080
 │   │   └── package.json
-│   └── api/                  # ASP.NET Core Web API
-│       ├── Program.cs
-│       ├── Controllers/
-│       └── Api.csproj
-├── apps/api.Tests/           # xUnit test project for the API
+│   ├── api/                   # ASP.NET Core Web API
+│   │   ├── Program.cs
+│   │   ├── Controllers/
+│   │   └── Api.csproj
+│   ├── api.Tests/              # xUnit test project for the API
+│   └── Directory.Build.props   # written automatically once this stack is detected -- lives at
+│                                # apps/, the common ancestor of Api.csproj AND Api.Tests.csproj,
+│                                # so MSBuild's upward walk finds it from both
 ├── VueDotnetApp.sln
-└── Directory.Build.props     # written automatically once this stack is detected
+└── .ai-dev-workflow/coverage-commands.json   # registers both ecosystems' coverage commands (see Testing)
 ```
 
 ## Scaffolding commands
 
 1. `npm create vite@latest apps/web -- --template vue-ts`
-2. `dotnet new webapi -o apps/api -n Api`
+2. `dotnet new webapi -o apps/api -n Api --use-controllers` (`--use-controllers` opts into the
+   `Controllers/` layout this file documents -- the template defaults to Minimal APIs otherwise)
 3. `dotnet new sln -n VueDotnetApp`
 4. `dotnet sln VueDotnetApp.sln add apps/api/Api.csproj`
-5. In `apps/web/vite.config.ts`, add a dev proxy:
+5. Create a root `.gitignore` (neither `dotnet new` nor Vite's own `.gitignore` covers the *other*
+   stack's artifacts, and nothing generates one for the repo root):
+   ```gitignore
+   node_modules/
+   dist/
+   coverage/
+   bin/
+   obj/
+   TestResults/
+   *.user
+   ```
+6. In `apps/web/vite.config.ts`, add a dev proxy:
    ```ts
    export default defineConfig({
      server: { proxy: { "/api": { target: "http://localhost:5080", changeOrigin: true } } },
@@ -59,13 +75,33 @@ repo-root/
 
 - **API (xUnit + coverlet)**: `dotnet new xunit -o apps/api.Tests -n Api.Tests`, then
   `dotnet add apps/api.Tests reference apps/api/Api.csproj`, `dotnet add apps/api.Tests package
-  coverlet.msbuild`, and `dotnet sln add apps/api.Tests/Api.Tests.csproj`. Run with
-  `dotnet test`. Coverage (matches this pipeline's coverage gate exactly):
-  `dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura
-  /p:CoverletOutput=./TestResults/coverage.cobertura.xml`.
+  coverlet.msbuild`, and `dotnet sln add apps/api.Tests/Api.Tests.csproj`. Run with `dotnet test`.
 - **Web (Vitest)**: `cd apps/web && npm install -D vitest @vue/test-utils jsdom
   @vitest/coverage-v8`; add `test: { environment: "jsdom", globals: true }` to `vite.config.ts`.
-  Run with `npx vitest run`, coverage with `npx vitest run --coverage`.
+  Run with `npx vitest run`.
+
+**Coverage contract** (this pipeline's coverage gate replays `.ai-dev-workflow/coverage-commands.json`
+when present, INSTEAD of its own dotnet/js legacy fallback -- a partial contract silently exempts
+whichever ecosystem it omits from the 95% threshold, so register BOTH entries together, never just
+one):
+```json
+{
+  "entries": [
+    {
+      "command": "dotnet test /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura /p:CoverletOutput=./TestResults/coverage.cobertura.xml",
+      "artifact": "TestResults/coverage.cobertura.xml",
+      "format": "cobertura",
+      "root": ""
+    },
+    {
+      "command": "npx vitest run --coverage --coverage.reporter=json-summary",
+      "artifact": "apps/web/coverage/coverage-summary.json",
+      "format": "istanbul-json-summary",
+      "root": "apps/web"
+    }
+  ]
+}
+```
 
 ## Conventions
 
@@ -80,5 +116,5 @@ repo-root/
 ## Stack facts
 
 dotnet_detected: true
-dotnet_solution_root: "apps/api"
+dotnet_solution_root: "apps"
 convention_roots: node=apps/web

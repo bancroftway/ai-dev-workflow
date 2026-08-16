@@ -11,17 +11,19 @@ default for a small team that wants one language end to end and no framework opi
 
 ```
 repo-root/
-├── package.json              # npm workspaces root: ["apps/web", "apps/api"]
+├── .gitignore
+├── package.json               # npm workspaces root: ["apps/web", "apps/api"]
 ├── package-lock.json
 ├── apps/
-│   ├── web/                  # React app (Vite)
+│   ├── web/                   # React app (Vite)
 │   │   ├── src/
-│   │   ├── vite.config.ts    # dev-server proxy: /api -> http://localhost:4000
+│   │   ├── vite.config.ts     # dev-server proxy: /api -> http://localhost:4000
 │   │   └── package.json
-│   └── api/                  # Express API (TypeScript)
+│   └── api/                   # Express API (TypeScript)
 │       ├── src/index.ts
 │       ├── tsconfig.json
 │       └── package.json
+├── .ai-dev-workflow/coverage-commands.json   # registers both workspaces' coverage commands (see Testing)
 └── (no Directory.Build.props/ruff.toml/mypy.ini — pure Node stack)
 ```
 
@@ -44,13 +46,20 @@ repo-root/
    ```json
    { "name": "react-express-app", "private": true, "workspaces": ["apps/web", "apps/api"] }
    ```
-8. `npm install` (run once, from the repo root, to hoist and link both workspaces).
-9. In `apps/web/vite.config.ts`, add a dev proxy:
-   ```ts
-   export default defineConfig({
-     server: { proxy: { "/api": { target: "http://localhost:4000", changeOrigin: true } } },
-   });
+8. Create a root `.gitignore` (Vite's and `npm init`'s own ignores, if any, are per-workspace, not
+   for the repo root):
+   ```gitignore
+   node_modules/
+   dist/
+   coverage/
    ```
+9. `npm install` (run once, from the repo root, to hoist and link both workspaces).
+10. In `apps/web/vite.config.ts`, add a dev proxy:
+    ```ts
+    export default defineConfig({
+      server: { proxy: { "/api": { target: "http://localhost:4000", changeOrigin: true } } },
+    });
+    ```
 
 ## Package managers
 
@@ -75,12 +84,34 @@ npm workspaces — one lockfile at the repo root covers both `apps/web` and `app
 
 - **API (Vitest)**: `npm install -D vitest supertest @types/supertest --workspace apps/api`. Export
   the Express `app` (don't call `.listen()` at import time) so tests can drive it with
-  `supertest(app)`. Run with `npm run test --workspace apps/api` (`vitest run`), coverage with
-  `vitest run --coverage`.
+  `supertest(app)`. Run with `npm run test --workspace apps/api` (`vitest run`).
 - **Web (Vitest)**: `npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom
   @vitest/coverage-v8 --workspace apps/web`; add `test: { environment: "jsdom", globals: true }` to
-  `vite.config.ts`. Run with `npm run test --workspace apps/web`, coverage with
-  `vitest run --coverage`.
+  `vite.config.ts`. Run with `npm run test --workspace apps/web`.
+
+**Coverage contract**: the two workspaces have different Vitest environments (`jsdom` for the web
+app's components, plain Node for the API), so a single un-scoped `vitest run` at the repo root
+cannot safely cover both. Register a per-workspace entry in `.ai-dev-workflow/coverage-commands.json`
+instead (this pipeline's coverage gate replays this contract INSTEAD of its own js legacy
+fallback when present, so register BOTH entries together, never just one):
+```json
+{
+  "entries": [
+    {
+      "command": "npx vitest run --coverage --coverage.reporter=json-summary",
+      "artifact": "apps/web/coverage/coverage-summary.json",
+      "format": "istanbul-json-summary",
+      "root": "apps/web"
+    },
+    {
+      "command": "npx vitest run --coverage --coverage.reporter=json-summary",
+      "artifact": "apps/api/coverage/coverage-summary.json",
+      "format": "istanbul-json-summary",
+      "root": "apps/api"
+    }
+  ]
+}
+```
 
 ## Conventions
 
