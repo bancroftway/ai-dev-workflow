@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shlex
 from datetime import datetime, timezone
@@ -24,6 +25,8 @@ from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
+
+logger = logging.getLogger(__name__)
 
 CHANGELOG_PATH = "CHANGELOG.md"
 HISTORY_DIR = ".ai-dev-workflow/history"
@@ -75,17 +78,48 @@ def _stale_history_files(filenames: list[str], keep_run_ids: set[str]) -> list[s
     return [name for name in filenames if name.split("-", 1)[0] not in keep_run_ids]
 
 
+def _prune_keep_ids(sessions: list[dict[str, Any]], run_id: str) -> set[str] | None:
+    """Pure decision half of retention: which run_ids survive pruning, or None to skip pruning
+    entirely this run.
+
+    FAIL-CLOSED on an empty `sessions`: session_index._read is fail-OPEN by design (a corrupt file
+    or a transient read glitch returns [] so every existing caller can treat that as "no sessions
+    yet" and move on harmlessly). This is the first caller that uses the result to justify
+    DELETION -- collapsing keep_ids down to just the current run on a bad read would rm -rf every
+    OTHER run's history artifacts (reports, screenshots, snapshots) right before the commit. An
+    empty `sessions` here returns None instead, so the caller skips pruning rather than trusting it.
+    """
+    if not sessions:
+        return None
+    keep_ids = {s.get("run_id") for s in sessions[-_history_retain():] if s.get("run_id")}
+    keep_ids.add(run_id)
+    return keep_ids
+
+
 async def _prune_history(provider: Any, thread_id: str, run_id: str) -> None:
     """Deletes history/ artifacts belonging to runs older than the last N (AIDW_HISTORY_RETAIN,
     default 10), keeping every run_id mentioned in the last N sessions.json entries (chronological,
     see session_index.py) plus always the current run -- run_id may not appear there yet if the
-    exit stage was never approved (end_session only fires when merge_readiness is truthy, above)."""
+    exit stage was never approved (end_session only fires when merge_readiness is truthy, above).
+    Skips pruning entirely (loudly, if history/ is non-empty) when sessions.json read back empty --
+    see _prune_keep_ids for why.
+    """
     sessions = await session_index._read(provider, thread_id)  # noqa: SLF001 -- same package, read-only reuse
-    keep_ids = {s.get("run_id") for s in sessions[-_history_retain():] if s.get("run_id")}
-    keep_ids.add(run_id)
 
     listing = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(HISTORY_DIR)} 2>/dev/null")
     filenames = [n.strip() for n in (listing.stdout or "").splitlines() if n.strip()]
+
+    keep_ids = _prune_keep_ids(sessions, run_id)
+    if keep_ids is None:
+        if filenames:
+            logger.warning(
+                "exit_nodes: history/ has %d file(s) but sessions.json read back empty for "
+                "thread_id=%s -- skipping retention prune this run instead of deleting every "
+                "other run's artifacts on what may be a transient read glitch.",
+                len(filenames), thread_id,
+            )
+        return
+
     stale = _stale_history_files(filenames, keep_ids)
     if not stale:
         return
@@ -352,6 +386,15 @@ def _demo() -> None:
     assert _stale_history_files(files, {"aaaaaaaa"}) == ["bbbbbbbb-report.json", "bbbbbbbb-metrics.json"]
     assert _stale_history_files(files, {"aaaaaaaa", "bbbbbbbb"}) == []
     assert _stale_history_files(files, set()) == files
+
+    # _prune_keep_ids: empty sessions -> None (fail-closed, caller must skip pruning entirely --
+    # NOT "keep only the current run", which would rm -rf every other run's artifacts on a
+    # transient session_index._read glitch). Non-empty sessions -> the last N run_ids + current.
+    assert _prune_keep_ids([], "current") is None
+    sessions = [{"run_id": f"r{i}"} for i in range(5)]
+    os.environ["AIDW_HISTORY_RETAIN"] = "2"
+    assert _prune_keep_ids(sessions, "current") == {"r3", "r4", "current"}
+    os.environ.pop("AIDW_HISTORY_RETAIN", None)
 
     # _render_history_sections: "not recorded"/"no baseline" placeholders when data is absent,
     # real content when present, screenshots section only when there are any.
