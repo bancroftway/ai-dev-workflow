@@ -162,6 +162,14 @@ class GraphState(TypedDict):
     # HumanMessage, if any -- only ever consumed by the specification stage's draft prompt
     # (BR-2: the plan stage's input is the approved Specification, never raw attachments).
     requirements_attachments: list[dict[str, Any]]
+    # id of the last HumanMessage intake_node actually consumed as a fresh submission. Plain
+    # last-write-wins channel (no reducer): intake_node sets it exactly once per genuinely new
+    # submission and otherwise returns it unchanged. This is what lets intake_node tell "the human
+    # submitted something new" apart from "the checkpoint is still replaying the same message from
+    # a run that already consumed it" -- text presence alone can't: a resume click's blank
+    # runAgent() call merges an EMPTY messages list via add_messages, so the checkpointed messages
+    # list still ends in the ORIGINAL HumanMessage from the failed run, non-empty text and all.
+    consumed_message_id: str | None
     stages: dict[str, StageState]
     # Keyed by RebuildSpec.key (rebuild.py) -- each R placement's own RebuildState. Accessed via
     # .get("rebuild") or {} everywhere (rebuild.py's nodes tolerate it being absent on a thread
@@ -936,34 +944,42 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # Popped unconditionally, right here, on EVERY intake -- a resume=1 provision sets this meta
     # flag once, and it must not survive past the first run that consumes it (else a later,
     # unrelated follow-up message on the same thread would also skip the fresh-run stage reset
-    # below). Whether it actually APPLIES depends on whether THIS run carries fresh requirements
-    # text, computed next (not on whether stages happened to be empty pre-hydration: Resume on a
-    # thread whose checkpoint is still live in this same process -- the common case, since the
-    # failed run never restarted the agent -- has non-empty stages too, and gating on emptiness
-    # made the flag a no-op for exactly that case).
+    # below). Whether it actually APPLIES depends on `is_new_submission`, computed next.
     resume_flag_popped = sandbox_registry.pop_meta_flag(thread_id, "resume")
 
     # The Raw Requirements Text (AC-1.3/AC-6.2) is submitted as an ordinary
     # chat message — the human's "submit" action is agent.addMessage(...) +
-    # runAgent() on the frontend — so every run's current, complete text is
-    # simply the latest HumanMessage, never a delta. That message's content is a plain string
-    # for a text-only submission, or a multimodal InputContent list when screenshots/documents
-    # were attached in the Requirements area -- either way, only the text half becomes
-    # raw_requirements_text; any attachments are carried separately (see GraphState) since they
-    # only matter to this specific run's specification draft, not the persisted text itself.
+    # runAgent() on the frontend. That message's content is a plain string for a text-only
+    # submission, or a multimodal InputContent list when screenshots/documents were attached in
+    # the Requirements area -- either way, only the text half becomes raw_requirements_text; any
+    # attachments are carried separately (see GraphState) since they only matter to this specific
+    # run's specification draft, not the persisted text itself.
     #
-    # Computed here (before hydration/reset below) because whether THIS run carries fresh text is
-    # also what gates `resume` just below: AppShell's Resume button fires a blank runAgent (no new
-    # message), while a genuine new-requirements submission always has text -- so the resume flag
-    # can never skip the fresh-run reset for an actual new submission.
-    raw_requirements_text = state.get("raw_requirements_text", "")
+    # "Fresh submission" is decided by MESSAGE ID, not by text presence: AppShell's Resume button
+    # fires a blank runAgent() call (no new message), which merges an EMPTY list into `messages`
+    # via add_messages -- the checkpoint still ends in the ORIGINAL HumanMessage from the failed
+    # run, so a text-presence check would find that old message's non-empty text and wrongly
+    # conclude this run has new requirements. Comparing the latest HumanMessage's id against
+    # consumed_message_id (this state channel, set below whenever a message is genuinely
+    # consumed) tells the two apart: add_messages assigns every message a uuid if it arrives
+    # without one, and LangGraph's checkpointer preserves that id verbatim across every later
+    # invocation on the same thread, so the SAME still-checkpointed message always compares equal
+    # to what was already consumed, while a real new submission (a fresh chat message, including a
+    # clarification answer) always gets a new id.
+    latest_human_message = next(
+        (m for m in reversed(state.get("messages", [])) if isinstance(m, HumanMessage)), None
+    )
+    consumed_message_id = state.get("consumed_message_id")
+    is_new_submission = latest_human_message is not None and latest_human_message.id != consumed_message_id
+
+    raw_requirements_text = state.get("raw_requirements_text", "") if not is_new_submission else ""
     requirements_attachments: list[dict[str, Any]] = []
-    for message in reversed(state.get("messages", [])):
-        if isinstance(message, HumanMessage):
-            raw_requirements_text, requirements_attachments = _split_text_and_attachments(
-                message.content
-            )
-            break
+    if is_new_submission:
+        assert latest_human_message is not None  # narrows for the type checker
+        raw_requirements_text, requirements_attachments = _split_text_and_attachments(
+            latest_human_message.content
+        )
+        consumed_message_id = latest_human_message.id
 
     # Hydration (architecture plan Section B.2): only when this thread has never had any stage
     # state in this process's memory yet -- i.e. genuinely the first invoke for this thread since
@@ -999,11 +1015,12 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # process never restarted), and make_draft_node's approved short-circuit routes each one
     # straight to the next. Per-run mechanics (verify counters) still reset below.
     #
-    # The meta flag only counts here when this run carries NO fresh requirements text -- both the
-    # restart-resume path (a blank reattach ping) and a live-thread Resume click (a blank runAgent,
-    # no new message) are textless. A genuinely new requirements submission always has text, so it
-    # can never be misread as a resume just because some earlier provision call set the flag.
-    resume = os.environ.get("AIDW_RESUME") == "1" or (resume_flag_popped and not raw_requirements_text.strip())
+    # The meta flag only counts here when `not is_new_submission` -- both the restart-resume path
+    # (an empty checkpoint, no HumanMessage at all) and a live-thread Resume click (checkpoint's
+    # message list unchanged, same id as last consumed) satisfy that. A genuinely new requirements
+    # submission (fresh id, including a clarification answer) never does, so it can't be misread
+    # as a resume just because some earlier provision call set the flag.
+    resume = os.environ.get("AIDW_RESUME") == "1" or (resume_flag_popped and not is_new_submission)
     for stage_spec in STAGES[1:] + _STANDALONE_STAGE_SPECS:
         stage = stages[stage_spec.key]
         if not resume and stage["status"] in ("ready_for_review", "approved"):
@@ -1026,8 +1043,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         stage["last_verification"] = None
 
     if not raw_requirements_text.strip():
-        # Resume path: the message scan above found no fresh HumanMessage (a --thread/resume
-        # re-entry replays none), but hydration may have restored an already-approved
+        # Textless run (no new submission): hydration may have restored an already-approved
         # raw-requirements doc from the repo into `stages` -- the specification stage's draft
         # prompt reads raw_requirements_text directly (never stages["raw-requirements"]), so
         # leaving it empty here would draft the spec from nothing even though the approved doc
@@ -1040,6 +1056,10 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         "run_id": uuid.uuid4().hex[:8],
         "raw_requirements_text": raw_requirements_text,
         "requirements_attachments": requirements_attachments,
+        # Unchanged (echoes state.get("consumed_message_id")) on a textless run; set to the newly
+        # consumed message's id on a fresh submission -- either way, the next intake's dedupe
+        # check compares against exactly what this run actually consumed.
+        "consumed_message_id": consumed_message_id,
         # Cleared explicitly: a rejection is a verdict about one run's view of the repository, and
         # a repo that has since gained an application must get a fresh assessment, not a stale no.
         "app_rejection": None,
