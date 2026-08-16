@@ -25,12 +25,20 @@ from langchain_core.runnables import RunnableConfig
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger
 from .gates.ac_coverage_gate import id_variants
+from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 
 METRICS_LATEST_PATH = ".ai-dev-workflow/metrics-latest.json"
 TRACEABILITY_MATRIX_PATH = "traceability-matrix.md"
+
+# Regression gate tolerances: a coverage/health movement smaller than this is scan noise (jscpd is
+# LOC-sensitive, tool DBs drift), not a regression worth blocking a run over. Health tolerance sits
+# below one new medium finding's penalty (3), so a single real new medium still blocks.
+METRIC_REGRESSION_TOLERANCE = float(os.environ.get("METRIC_REGRESSION_TOLERANCE", "1.0"))
+HEALTH_REGRESSION_TOLERANCE = float(os.environ.get("HEALTH_REGRESSION_TOLERANCE", "2.0"))
+_METRICS_GATE_MAX_ATTEMPTS = 2  # one automatic re-scan for tool flake, then fail
 
 
 
@@ -154,11 +162,89 @@ async def _sum_token_usage(provider: Any, thread_id: str) -> dict[str, Any]:
     return totals
 
 
+def regression_reasons(
+    latest_summary: dict[str, Any],
+    delta_summ: dict[str, Any] | None,
+    coverage: dict[str, Any],
+    *,
+    baseline_has_findings: bool,
+    min_coverage: float | None = None,
+    tolerance: float | None = None,
+    health_tolerance: float | None = None,
+) -> list[str]:
+    """Pure decision half of the metrics regression gate (self-checked in _demo). Blocks on:
+    open gating findings (severity-floored, introduced-aware -- greenfield's empty-repo baseline
+    makes every finding gate absolutely, which is the correct rule there), unmeasured or
+    below-threshold coverage, coverage regressing beyond tolerance, and health-score regressing
+    beyond tolerance. The health delta is skipped when the baseline has zero findings: greenfield's
+    baseline is scanned pre-codegen against an empty repo, and comparing real app code against an
+    empty directory is not a regression signal (gating_count covers that case absolutely)."""
+    min_cov = MIN_COVERAGE_PERCENT if min_coverage is None else min_coverage
+    tol = METRIC_REGRESSION_TOLERANCE if tolerance is None else tolerance
+    health_tol = HEALTH_REGRESSION_TOLERANCE if health_tolerance is None else health_tolerance
+    reasons: list[str] = []
+
+    gating = latest_summary.get("gating_count") or 0
+    if gating > 0:
+        reasons.append(f"{gating} gating finding(s) open at/above severity floor {latest_summary.get('severity_floor')!r}")
+
+    line, branch = coverage.get("line_rate"), coverage.get("branch_rate")
+    if not isinstance(line, (int, float)) or not isinstance(branch, (int, float)):
+        reasons.append("coverage unmeasured -- line/branch rate unavailable, which must never pass as '--%'")
+    elif line < min_cov or branch < min_cov:
+        reasons.append(f"coverage below threshold: line {line:.1f}%, branch {branch:.1f}% (minimum {min_cov:.0f}%)")
+
+    metric_deltas = (delta_summ or {}).get("metrics") or {}
+    for name in ("coverage_line_rate", "coverage_branch_rate"):
+        d = metric_deltas.get(name) or {}
+        if d.get("direction") == "regressed" and abs(d.get("delta") or 0) > tol:
+            reasons.append(f"{name} regressed {d.get('from')} -> {d.get('to')} (beyond {tol}pt tolerance)")
+    health = metric_deltas.get("health_score") or {}
+    if baseline_has_findings and health.get("direction") == "regressed" and abs(health.get("delta") or 0) > health_tol:
+        reasons.append(f"health_score regressed {health.get('from')} -> {health.get('to')} (beyond {health_tol}pt tolerance)")
+    return reasons
+
+
+def make_metrics_route_after_compute():
+    """next: gate clean. retry: one automatic re-scan (tool flake). fail: record run_failure and
+    continue INTO exit -- never END, so exit.md/manifest/session close still happen and the exit
+    verify forces merge_ready=False with these reasons."""
+
+    def route(state: dict[str, Any]) -> str:
+        gate = (state.get("repo_scan") or {}).get("metrics_gate") or {}
+        if not (gate.get("reasons") or []):
+            return "next"
+        if int(gate.get("attempt") or 0) < _METRICS_GATE_MAX_ATTEMPTS:
+            return "retry"
+        return "fail"
+
+    return route
+
+
+async def metrics_regression_record_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    thread_id = config["configurable"]["thread_id"]
+    gate = (state.get("repo_scan") or {}).get("metrics_gate") or {}
+    payload = {"stage": "metrics_report", "type": "metrics_regression", "reasons": gate.get("reasons") or []}
+    if sandbox_registry.get(thread_id) is not None:
+        provider = get_sandbox_provider()
+        await repo_files.append_ledger_entry(provider, thread_id, {"node": "regression_gate", **payload})
+    # ponytail: no auto-remediation loop from metrics -- the run proceeds into exit with
+    # run_failure set and merge blocked; add a fix loop only if this fires frequently.
+    return {"run_failure": payload}
+
+
 async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     run_id = state.get("run_id", "unknown")
     if sandbox_registry.get(thread_id) is None:
-        return {"metrics_report": {"metrics": {}}}
+        # attempt is forced past the retry budget: without a sandbox a re-scan can't succeed either,
+        # so the route must go fail (-> exit, which also no-ops sandbox-less) rather than loop.
+        prior_repo_scan = dict(state.get("repo_scan") or {})
+        prior_repo_scan["metrics_gate"] = {
+            "reasons": ["cannot verify -- sandbox lost before the metrics scan ran"],
+            "attempt": _METRICS_GATE_MAX_ATTEMPTS,
+        }
+        return {"metrics_report": {"metrics": {}}, "repo_scan": prior_repo_scan}
 
     provider = get_sandbox_provider()
     scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
@@ -188,6 +274,13 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     traceability_rows = await _build_traceability_matrix(provider, thread_id)
     token_usage_summary = await _sum_token_usage(provider, thread_id)
 
+    delta_summ = repo_scan.delta_summary(delta)
+    attempt = int(((state.get("repo_scan") or {}).get("metrics_gate") or {}).get("attempt") or 0) + 1
+    gate_reasons = regression_reasons(
+        scan_report["summary"], delta_summ, coverage,
+        baseline_has_findings=bool((baseline or {}).get("findings")),
+    )
+
     metrics = {
         "run_id": run_id,
         "repo_scan": scan_report,
@@ -202,6 +295,9 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
             "untested": sum(1 for r in traceability_rows if r["status"] == "untested"),
         },
         "token_usage_summary": token_usage_summary,
+        # Persisted (not just channel state) so exit's deterministic verify can read the gate's
+        # verdict from metrics-latest.json -- deterministic_verify doesn't receive graph state.
+        "regression_gate": {"reasons": gate_reasons, "attempt": attempt},
     }
 
     history_path = f".ai-dev-workflow/history/{run_id}-metrics.json"
@@ -229,7 +325,8 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     prior_repo_scan.update(
         latest_summary=scan_report["summary"],
         latest_duplication_percent=(scan.metrics.get("duplication") or {}).get("percent"),
-        delta_summary=repo_scan.delta_summary(delta),
+        delta_summary=delta_summ,
+        metrics_gate={"reasons": gate_reasons, "attempt": attempt},
     )
     return {"metrics_report": {"metrics": metrics}, "repo_scan": prior_repo_scan}
 
@@ -277,6 +374,34 @@ def _demo() -> None:
     # No token found -> untested, never tests_only (kept in the summary shape for the frontend).
     rows = _traceability_rows([entry], set(), commit_log="")
     assert rows[0]["status"] == "untested" and rows[0]["tests_found"] is False
+
+    # regression_reasons: the metrics gate's pure decision half.
+    clean_summary = {"gating_count": 0, "severity_floor": "medium"}
+    good_cov = {"line_rate": 96.0, "branch_rate": 96.0}
+    kw = dict(min_coverage=95.0, tolerance=1.0, health_tolerance=2.0)
+    # Greenfield: empty-repo baseline, clean scan -> passes (health delta skipped).
+    delta = {"metrics": {"health_score": {"from": 100, "to": 94, "delta": -6, "direction": "regressed"}}}
+    assert regression_reasons(clean_summary, delta, good_cov, baseline_has_findings=False, **kw) == []
+    # Same health regression with a real (non-empty) baseline -> blocks.
+    assert any("health_score" in r for r in regression_reasons(clean_summary, delta, good_cov, baseline_has_findings=True, **kw))
+    # Gating finding -> blocks.
+    assert any("gating" in r for r in regression_reasons({"gating_count": 1, "severity_floor": "medium"}, None, good_cov, baseline_has_findings=False, **kw))
+    # Coverage null -> blocks; below threshold -> blocks; the 81.8%-branch incident is caught.
+    assert any("unmeasured" in r for r in regression_reasons(clean_summary, None, {"line_rate": None, "branch_rate": None}, baseline_has_findings=True, **kw))
+    assert any("below threshold" in r for r in regression_reasons(clean_summary, None, {"line_rate": 96.8, "branch_rate": 81.8}, baseline_has_findings=True, **kw))
+    # 99 -> 96 line drop: above the floor but beyond tolerance -> blocks.
+    drop = {"metrics": {"coverage_line_rate": {"from": 99.0, "to": 96.0, "delta": -3.0, "direction": "regressed"}}}
+    assert any("coverage_line_rate regressed" in r for r in regression_reasons(clean_summary, drop, good_cov, baseline_has_findings=True, **kw))
+    # Sub-tolerance wiggle -> passes (scan noise, not a regression).
+    wiggle = {"metrics": {"coverage_line_rate": {"from": 96.5, "to": 96.0, "delta": -0.5, "direction": "regressed"}}}
+    assert regression_reasons(clean_summary, wiggle, good_cov, baseline_has_findings=True, **kw) == []
+
+    # Route: clean -> next; reasons under the attempt cap -> retry; at cap -> fail.
+    route = make_metrics_route_after_compute()
+    assert route({"repo_scan": {"metrics_gate": {"reasons": [], "attempt": 1}}}) == "next"
+    assert route({"repo_scan": {"metrics_gate": {"reasons": ["x"], "attempt": 1}}}) == "retry"
+    assert route({"repo_scan": {"metrics_gate": {"reasons": ["x"], "attempt": 2}}}) == "fail"
+    assert route({}) == "next"
     print("metrics_nodes _demo: ok")
 
 

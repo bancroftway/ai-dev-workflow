@@ -1869,11 +1869,22 @@ def _wire_audit_cluster(builder: StateGraph) -> None:
 
 def _wire_p14(builder: StateGraph) -> None:
     """Wires metrics-report's metrics + traceability + token-tracking node, plus the one named LLM
-    exception (ponytail-gain). Routes into exit's own draft node. Verification status: NOT
-    exercised against a real sandbox, same caveat as quality-remediation/security-remediation/audit-cluster/test-hardening."""
+    exception (ponytail-gain), plus the regression gate: metrics_compute already runs the final
+    full-profile scan and computes the delta, so gating on it costs nothing extra on the first
+    pass. Clean -> ponytail-gain -> exit. Regressed -> one automatic re-scan (tool flake), then
+    metrics_regression_record sets run_failure and the run continues INTO exit -- never END, so
+    exit.md/manifest/session close still happen and exit's verify blocks the merge.
+    Verification status: NOT exercised against a real sandbox, same caveat as
+    quality-remediation/security-remediation/audit-cluster/test-hardening."""
     builder.add_node("metrics_compute", metrics_nodes.metrics_compute_node)
+    builder.add_node("metrics_regression_record", metrics_nodes.metrics_regression_record_node)
     builder.add_node("metrics_ponytail_gain", metrics_nodes.metrics_ponytail_gain_node)
-    builder.add_edge("metrics_compute", "metrics_ponytail_gain")
+    builder.add_conditional_edges(
+        "metrics_compute",
+        metrics_nodes.make_metrics_route_after_compute(),
+        {"next": "metrics_ponytail_gain", "retry": "metrics_compute", "fail": "metrics_regression_record"},
+    )
+    builder.add_edge("metrics_regression_record", "exit_draft")
     builder.add_edge("metrics_ponytail_gain", "exit_draft")
 
 
