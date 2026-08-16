@@ -21,11 +21,15 @@ const stampPattern = /<!-- graph-source-sha256: [0-9a-f]{64}|<!-- graph-source-s
 // prompts that name which skills each stage calls.
 const files = [
   "agent/src/graph.py",
+  "agent/src/app_discovery.py",
+  "agent/src/tech_stack_signals.py",
   "agent/src/rebuild.py",
   "agent/src/preflight_nodes.py",
+  "agent/src/session_index.py",
   "agent/src/finding_cluster_nodes.py",
   "agent/src/repo_scan.py",
   "agent/src/test_hardening_nodes.py",
+  "agent/src/e2e_nodes.py",
   "agent/src/metrics_nodes.py",
   "agent/src/exit_nodes.py",
   "agent/src/quality_security/quality_nodes.py",

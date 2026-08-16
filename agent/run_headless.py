@@ -1,7 +1,9 @@
 """Headless full-graph runner: executes the entire pipeline for (owner, repo, branch) with no
-frontend. Spec/plan gates are auto-approved (the only interrupts left in the graph); clarifying
-questions are disallowed via the AIDW_HEADLESS draft-prompt injection (graph.py make_draft_node);
-an exhausted deterministic gate ENDs the run with `run_failure` set, which lands in the report.
+frontend. Spec/plan gates are auto-approved; a greenfield repo's tech-stack picker (the graph's
+one other interrupt) auto-selects via --greenfield-stack/AIDW_GREENFIELD_STACK instead of pausing,
+or the repo is rejected if neither is set. Clarifying questions are disallowed via the
+AIDW_HEADLESS draft-prompt injection (graph.py make_draft_node); an exhausted deterministic gate
+ENDs the run with `run_failure` set, which lands in the report.
 
 Runs IN-PROCESS on purpose: the sandbox registry, push-token map, and the graph's InMemorySaver
 checkpointer are all process-local, so provisioning and the graph must share one process.
