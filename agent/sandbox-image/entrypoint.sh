@@ -54,14 +54,13 @@ EOF
 
   : "${REPO_BRANCH:?REPO_BRANCH is required when REPO_CLONE_URL is set}"
 
-  # The pipeline never commits on the user's selected branch: it works on a tool-owned branch
-  # named ai-dev-workflow/<selected-branch>-<session prefix>. The session suffix is what keeps
-  # two users of the same repo+branch on two DIFFERENT remote branches -- stage-end pushes are
-  # `--force`, so a shared branch would let them silently destroy each other's history.
-  WORK_BRANCH="ai-dev-workflow/${REPO_BRANCH}"
-  if [[ -n "${AIDW_SESSION_ID:-}" ]]; then
-    WORK_BRANCH="${WORK_BRANCH}-${AIDW_SESSION_ID:0:8}"
-  fi
+  # The pipeline never commits on the user's selected branch: it works on a single work branch
+  # named ai-dev-workflow, shared by every session on this repo regardless of PR target or user
+  # (WS0 migration -- previously ai-dev-workflow/<selected-branch>-<session prefix>, one branch
+  # per repo+branch+session). Sharing one branch means pushes can race; git_ops.push_head uses
+  # --force-with-lease (never plain --force) so a losing race is rejected instead of silently
+  # overwriting another session's already-pushed commits.
+  WORK_BRANCH="ai-dev-workflow"
 
   # /workspace may be a reused named volume: a prior session's clone (reuse it), a corrupt or
   # partial clone (nuke and re-clone), or empty (fresh clone). Reuse is best-effort end-to-end;
@@ -92,28 +91,57 @@ EOF
   # Work-branch setup. Must run BEFORE the credential material is destroyed below -- the
   # existence probe and fetch both need auth. `git ls-remote --exit-code` guards the fetch: a
   # plain fetch of a missing ref exits non-zero and would kill the container under `set -e`.
-  # A reused volume's local work branch is preferred over origin's copy (single tool-owned
-  # writer; local is newest and may hold commits a broken push never delivered). Any failure in
-  # the reuse-side checkout falls back to a full re-clone rather than crash-looping the volume.
+  #
+  # One constant branch per repo now (WS0 migration) shared by every session/user -- origin is
+  # always the source of truth, never "whichever local copy is newest" (that was only safe under
+  # the old one-writer-per-branch scheme). Any failure in the reuse-side checkout falls back to a
+  # full re-clone rather than crash-looping the volume.
   if ! (
-    if git -C "$WORKSPACE_DIR" show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
-      git -C "$WORKSPACE_DIR" checkout "$WORK_BRANCH"
-    elif git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
+    if git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
         ls-remote --exit-code origin "refs/heads/${WORK_BRANCH}" >/dev/null 2>&1; then
-      echo "entrypoint: work branch ${WORK_BRANCH} exists on origin -- checking it out"
+      echo "entrypoint: fetching origin's copy of work branch ${WORK_BRANCH}"
       git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
         fetch origin "+refs/heads/${WORK_BRANCH}:refs/remotes/origin/${WORK_BRANCH}"
-      git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH" "origin/${WORK_BRANCH}"
+
+      if git -C "$WORKSPACE_DIR" merge-base --is-ancestor \
+          "origin/${WORK_BRANCH}" "origin/${REPO_BRANCH}"; then
+        # Post-merge reset: the work branch's PR was merged (its tip is already contained in the
+        # base branch), so keeping it around would re-surface already-merged commits in every
+        # later PR. Operational assumption: GitHub auto-delete-branch-on-merge is enabled, so
+        # origin normally won't even have this ref anymore by the time we get here -- this is the
+        # defensive path for when it still does (or auto-delete is off).
+        echo "entrypoint: work branch ${WORK_BRANCH} is already merged into ${REPO_BRANCH} -- recreating from ${REPO_BRANCH}"
+        git -C "$WORKSPACE_DIR" checkout -B "$WORK_BRANCH" "origin/${REPO_BRANCH}"
+      elif git -C "$WORKSPACE_DIR" show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
+        echo "entrypoint: work branch ${WORK_BRANCH} exists locally -- reconciling with origin"
+        git -C "$WORKSPACE_DIR" checkout "$WORK_BRANCH"
+        if git -C "$WORKSPACE_DIR" merge-base --is-ancestor HEAD "origin/${WORK_BRANCH}"; then
+          # Origin is at or ahead of local -- a different session (or user) moved it further than
+          # this volume's own copy since we last saw it. Local has nothing origin lacks, so this
+          # is always a fast-forward.
+          git -C "$WORKSPACE_DIR" reset --hard "origin/${WORK_BRANCH}"
+        fi
+        # Else: local is ahead of origin (this session's own unpushed commits) -- keep local, the
+        # next push carries them.
+      else
+        echo "entrypoint: work branch ${WORK_BRANCH} exists on origin -- checking it out"
+        git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH" "origin/${WORK_BRANCH}"
+      fi
+    elif git -C "$WORKSPACE_DIR" show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
+      git -C "$WORKSPACE_DIR" checkout "$WORK_BRANCH"
     else
+      # Base on the freshly fetched REPO_BRANCH, never whatever HEAD a previous session left
+      # checked out (which may be a stale work branch, or REPO_BRANCH from a since-changed
+      # PR target).
       echo "entrypoint: creating work branch ${WORK_BRANCH} off ${REPO_BRANCH}"
-      git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH"
+      git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH" "origin/${REPO_BRANCH}"
     fi
   ); then
     echo "entrypoint: work-branch setup failed on reused clone -- re-cloning from scratch"
     rm -rf "$WORKSPACE_DIR"
     git -c credential.helper="$CRED_HELPER_SCRIPT" \
       clone --branch "$REPO_BRANCH" --single-branch "$REPO_CLONE_URL" "$WORKSPACE_DIR"
-    git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH"
+    git -C "$WORKSPACE_DIR" checkout -b "$WORK_BRANCH" "origin/${REPO_BRANCH}"
   fi
 
   rm -f "$CRED_HELPER_SCRIPT"

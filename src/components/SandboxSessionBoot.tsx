@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 
 /**
@@ -22,6 +22,10 @@ export function SandboxSessionBoot({
   branch: string;
 }) {
   const [status, setStatus] = useSandboxStatus();
+  // Provision can fail with an explanatory message worth showing verbatim (e.g. the 409 hard
+  // provision guard: another user's session is already in progress on this repo) -- falls back
+  // to the generic copy below when the response has no (or an unparseable) error body.
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -30,9 +34,15 @@ export function SandboxSessionBoot({
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ owner, repo, branch }),
     })
-      .then((res) => {
+      .then(async (res) => {
         if (cancelled) return;
-        setStatus(res.ok ? "ready" : "error");
+        if (res.ok) {
+          setStatus("ready");
+          return;
+        }
+        const body = await res.json().catch(() => null);
+        setErrorMessage(typeof body?.error === "string" ? body.error : null);
+        setStatus("error");
       })
       .catch(() => {
         if (!cancelled) setStatus("error");
@@ -53,7 +63,8 @@ export function SandboxSessionBoot({
       }
     >
       {status === "error"
-        ? "Couldn't prepare a dev-tool sandbox for this session — chat still works, but Copilot won't have repo/tool access yet."
+        ? (errorMessage ??
+          "Couldn't prepare a dev-tool sandbox for this session — chat still works, but Copilot won't have repo/tool access yet.")
         : "Preparing dev-tool sandbox…"}
     </div>
   );

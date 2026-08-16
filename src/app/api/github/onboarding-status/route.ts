@@ -19,10 +19,11 @@ export async function GET(request: Request) {
   }
 
   const octokit = await getOctokit();
-  // The pipeline commits on a tool-owned work branch (ai-dev-workflow/<branch>), never on the
+  // The pipeline commits on a single, repo-shared work branch (ai-dev-workflow), never on the
   // user's selected branch -- check the work branch first, fall back to the selected branch for
-  // repos onboarded before work branches existed (or where the work branch was merged in).
-  for (const ref of [`ai-dev-workflow/${branch}`, branch]) {
+  // repos onboarded before this branch existed (or where the work branch was already merged in,
+  // whose manifest state the merged-into branch now inherits).
+  for (const ref of ["ai-dev-workflow", branch]) {
     try {
       await octokit.rest.repos.getContent({ owner, repo, path: ".ai-dev-workflow", ref });
       return NextResponse.json({ onboarded: true });

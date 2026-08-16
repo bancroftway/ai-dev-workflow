@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 _COMMIT_AUTHOR_NAME = "ai-dev-workflow"
 _COMMIT_AUTHOR_EMAIL = "ai-dev-workflow@users.noreply.github.com"
 
+# Must match entrypoint.sh's WORK_BRANCH constant -- every sandbox's HEAD is this branch by the
+# time any pipeline stage runs (WS0 migration: one branch per repo, shared by every session/user).
+_WORK_BRANCH = "ai-dev-workflow"
+
 # Per-thread push credentials + outcome, agent-memory only (never a container env var -- the
 # clone token is deliberately destroyed after clone, see entrypoint.sh). The token re-arrives on
 # every provision call; an agent restart forces reprovision, so absence just skips pushing.
@@ -46,15 +50,21 @@ def get_last_push(thread_id: str) -> dict[str, Any] | None:
 
 
 async def push_head(provider: SandboxProvider, thread_id: str) -> None:
-    """Pushes HEAD (the ai-dev-workflow/<branch>-<user> work branch) to origin, log-and-continue.
+    """Pushes HEAD (the single, repo-shared ai-dev-workflow work branch) to origin, log-and-continue.
 
-    --force (not --force-with-lease): the clone is --single-branch, so no remote-tracking ref for
-    the work branch ever exists or updates -- a bare lease compares against "branch must not
-    exist" and rejected literally every push as `stale info`. Force is needed at all because two
-    pipeline paths legitimately `git reset --hard` the work branch (finding-cluster's upgrade
-    revert, app-discovery's reject cleanup). The branch is tool-owned and user-scoped
-    (entrypoint.sh suffixes it with the session id), so it has exactly one writer -- plain force
-    is safe.
+    --force-with-lease (not plain --force): WS0's single-branch migration deleted the "exactly one
+    writer" invariant that made plain force safe -- every session/user on this repo now pushes the
+    SAME branch, so a plain force can silently clobber a concurrent session's already-pushed
+    commits. The clone is --single-branch, so no remote-tracking ref for the work branch exists
+    until something fetches it -- a bare lease with no such ref compares against "branch must not
+    exist" and rejects every push after the first as `stale info`. Fetching the work branch
+    immediately before the push (below) is what gives the lease a real value to compare: the very
+    first push (remote branch absent) leaves the fetch a no-op and the lease's implicit "must not
+    exist" expectation still lets it through, and every push after that compares against a value
+    fetched moments earlier, so a genuine concurrent write is rejected instead of overwritten.
+    Force (of some kind) is still needed at all because two pipeline paths legitimately
+    `git reset --hard` the work branch (finding-cluster's upgrade revert, app-discovery's reject
+    cleanup).
 
     The token transits the container as a one-shot credential-helper file in /tmp, deleted in the
     same shell invocation.
@@ -71,7 +81,13 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
     helper_b64 = base64.b64encode(helper_script.encode("utf-8")).decode("ascii")
     command = (
         f"printf %s {shlex.quote(helper_b64)} | base64 -d > {helper_path} && chmod 700 {helper_path} && "
-        f"git -c credential.helper={helper_path} push --force --quiet -u origin HEAD; "
+        # "+" force-updates the local remote-tracking ref even across a non-fast-forward change on
+        # origin (a post-merge reset or another session's revert) -- without it, a rejected fetch
+        # would leave the tracking ref stuck at its old value, and every later --force-with-lease
+        # push would keep comparing against that stale value and keep failing as "stale info".
+        f"(git -c credential.helper={helper_path} fetch --quiet origin "
+        f"+{_WORK_BRANCH}:refs/remotes/origin/{_WORK_BRANCH} || true) && "
+        f"git -c credential.helper={helper_path} push --force-with-lease --quiet -u origin HEAD; "
         f"rc=$?; rm -f {helper_path}; exit $rc"
     )
     result = await provider.exec_in_sandbox(thread_id, command)

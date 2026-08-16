@@ -88,6 +88,7 @@ class _RunningSandbox:
     container_name: str
     ip: str
     connection_token: str
+    branch: str
     last_active: float = field(default_factory=time.monotonic)
 
 
@@ -147,8 +148,23 @@ class AzureContainerInstanceProvider(SandboxProvider):
         async with self._lock:
             existing = self._sandboxes.get(session_id)
             if existing is not None:
-                existing.last_active = time.monotonic()
-                return SandboxSession(session_id, existing.ip, _COPILOT_PORT_IN_CONTAINER, existing.connection_token)
+                if existing.branch == branch:
+                    existing.last_active = time.monotonic()
+                    return SandboxSession(session_id, existing.ip, _COPILOT_PORT_IN_CONTAINER, existing.connection_token)
+                # PR-target change mid-session (BLOCKER fix, mirrors LocalDockerProvider): unlike
+                # the local provider, ACI has no cross-restart reattach to keep in sync with
+                # reality, so the in-memory branch this session was provisioned with is already
+                # the single source of truth -- no docker-inspect-style lookup needed.
+                logger.info(
+                    "PR target changed for session_id=%s (%s -> %s) -- deleting old container "
+                    "group and reprovisioning",
+                    session_id, existing.branch, branch,
+                )
+                await _run_az(
+                    "container", "delete", "--resource-group", self._resource_group,
+                    "--name", existing.container_name, "--yes",
+                )
+                del self._sandboxes[session_id]
 
             name = _container_group_name(session_id)
             connection_token = secrets.token_urlsafe(32)
@@ -172,9 +188,6 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 f"REPO_BRANCH={branch}",
                 f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
                 f"AIDW_IMAGE_REF={image or self._sandbox_image}",
-                # Suffixes the tool-owned work branch (entrypoint.sh) so two users on the same
-                # repo+branch never share -- and force-push over -- one remote branch.
-                f"AIDW_SESSION_ID={session_id}",
                 "--secure-environment-variables",
                 f"REPO_CLONE_URL={repo_clone_url}",
                 f"GIT_USER_TOKEN={git_user_token}",
@@ -228,7 +241,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
                 raise
 
-            self._sandboxes[session_id] = _RunningSandbox(name, ip, connection_token)
+            self._sandboxes[session_id] = _RunningSandbox(name, ip, connection_token, branch)
             self._ensure_reaper_running()
             logger.info("Provisioned ACI sandbox session_id=%s container_group=%s ip=%s", session_id, name, ip)
             return SandboxSession(session_id, ip, _COPILOT_PORT_IN_CONTAINER, connection_token)

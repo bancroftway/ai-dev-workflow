@@ -100,6 +100,22 @@ async def _run_docker(*args: str, input_bytes: bytes | None = None) -> tuple[int
     return proc.returncode or 0, stdout.decode().strip(), stderr.decode().strip()
 
 
+async def _container_repo_branch(container_name: str) -> str | None:
+    """REPO_BRANCH the named container was created with, straight from `docker inspect` -- the one
+    source of truth for "what branch is this container actually running", since the agent's own
+    in-memory bookkeeping can't tell a changed provision request from a stale one. None if the
+    container doesn't exist or the env can't be read."""
+    returncode, out, _ = await _run_docker("inspect", container_name)
+    if returncode != 0:
+        return None
+    try:
+        info = json.loads(out)[0]
+        env = dict(e.split("=", 1) for e in info["Config"]["Env"] if "=" in e)
+        return env.get("REPO_BRANCH")
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 async def _inject_git_token(container_id: str, token: str) -> None:
     """docker cp a one-shot token file into the created-but-not-started container.
 
@@ -160,17 +176,31 @@ class LocalDockerProvider(SandboxProvider):
         image: str | None = None,
     ) -> SandboxSession:
         async with self._lock:
+            container_name = f"{_CONTAINER_NAME_PREFIX}{session_id}"
+
             existing = self._sandboxes.get(session_id)
             if existing is not None:
-                existing.last_active = time.monotonic()
-                return SandboxSession(session_id, "localhost", existing.host_port, existing.connection_token)
-
-            container_name = f"{_CONTAINER_NAME_PREFIX}{session_id}"
+                # PR-target change mid-session (BLOCKER fix): the requested branch may have
+                # changed since this session last provisioned (the branch picker is now a PR-target
+                # selector, not part of session identity). Compare against the running
+                # container's OWN env, not agent bookkeeping -- bookkeeping can't distinguish a
+                # genuinely new request from a stale one.
+                current_branch = await _container_repo_branch(container_name)
+                if current_branch == branch:
+                    existing.last_active = time.monotonic()
+                    return SandboxSession(session_id, "localhost", existing.host_port, existing.connection_token)
+                logger.info(
+                    "PR target changed for session_id=%s (%s -> %s) -- stopping old container "
+                    "and reprovisioning (workspace volume preserved)",
+                    session_id, current_branch, branch,
+                )
+                await _run_docker("stop", existing.container_id)
+                del self._sandboxes[session_id]
 
             # A container that survived an agent restart is reattached, not destroyed -- the old
             # path unconditionally `rm -f`'d it, throwing away the clone and every unpushed
             # commit, and raced --rm's autoremove into a name-conflict 502.
-            reattached = await self._try_reattach(session_id, container_name, image or self._image)
+            reattached = await self._try_reattach(session_id, container_name, image or self._image, branch)
             if reattached is not None:
                 self._sandboxes[session_id] = reattached
                 self._ensure_reaper_running()
@@ -184,8 +214,9 @@ class LocalDockerProvider(SandboxProvider):
             connection_token = secrets.token_urlsafe(32)
 
             # Best-effort cleanup of a stale (not-reattachable) container from a previous,
-            # uncleanly-terminated run under the same session_id -- `docker create --name` fails
-            # outright if it's still around.
+            # uncleanly-terminated run under the same session_id, OR a still-running container on
+            # a now-stale branch that _try_reattach declined above -- `docker create --name` fails
+            # outright if it's still around either way.
             await _run_docker("rm", "-f", container_name)
 
             # create -> cp(token) -> start, not `docker run`: the clone credential rides in as a
@@ -212,10 +243,6 @@ class LocalDockerProvider(SandboxProvider):
                 f"REPO_CLONE_URL={repo_clone_url}",
                 "-e",
                 f"REPO_BRANCH={branch}",
-                # Suffixes the tool-owned work branch (entrypoint.sh) so two users on the same
-                # repo+branch never share -- and force-push over -- one remote branch.
-                "-e",
-                f"AIDW_SESSION_ID={session_id}",
                 "-e",
                 f"COPILOT_SDK_AUTH_TOKEN={copilot_auth_token}",
                 "-e",
@@ -250,15 +277,17 @@ class LocalDockerProvider(SandboxProvider):
             return SandboxSession(session_id, "localhost", host_port, connection_token)
 
     async def _try_reattach(
-        self, session_id: str, container_name: str, image_ref: str
+        self, session_id: str, container_name: str, image_ref: str, branch: str
     ) -> _RunningSandbox | None:
         """Rebuild bookkeeping for a container that survived an agent restart.
 
         None means the caller falls through to rm -f + fresh run. Declines when the container
         isn't running, is built from a different image than the current tag points at (a rebuild
         must not leave sessions on stale entrypoints -- AIDW_IMAGE_REF is just the tag string, so
-        the image ID is what's compared), or fails the copilot liveness probe. The recovered
-        connection token MUST be reused -- the running copilot server gates on the one in its env.
+        the image ID is what's compared), is checked out on a different branch than requested (a
+        PR-target change across an agent restart must not silently reattach to the old target),
+        or fails the copilot liveness probe. The recovered connection token MUST be reused -- the
+        running copilot server gates on the one in its env.
         """
         returncode, out, _ = await _run_docker("inspect", container_name)
         if returncode != 0:
@@ -273,6 +302,8 @@ class LocalDockerProvider(SandboxProvider):
             if rc_img != 0 or info["Image"] != current_image_id:
                 return None
             env = dict(e.split("=", 1) for e in info["Config"]["Env"] if "=" in e)
+            if env.get("REPO_BRANCH") != branch:
+                return None
             token = env["COPILOT_CONNECTION_TOKEN"]
             port = int(info["NetworkSettings"]["Ports"][f"{_COPILOT_PORT_IN_CONTAINER}/tcp"][0]["HostPort"])
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):

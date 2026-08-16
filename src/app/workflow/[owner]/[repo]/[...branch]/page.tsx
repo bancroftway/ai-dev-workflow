@@ -24,7 +24,7 @@ export default async function WorkflowPage({
   // Branch names may contain "/" (e.g. "feature/foo") -- the catch-all segment above captures
   // every segment after [repo], which this rejoins into the real branch name.
   const branch = branchSegments.join("/");
-  const threadId = deriveThreadId(owner, repo, branch, githubId);
+  const threadId = deriveThreadId(owner, repo, githubId);
 
   // Metrics-bar color thresholds, read server-side at request time (NOT NEXT_PUBLIC_*, which
   // would be inlined at build time and unchangeable in a deployed image). Edit .env locally or
