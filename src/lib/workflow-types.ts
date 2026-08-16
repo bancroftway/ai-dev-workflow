@@ -156,8 +156,30 @@ export interface MetricsReportState {
   metrics?: {
     coverage?: { line_rate: number | null; branch_rate: number | null };
     traceability_summary?: { total: number; covered: number; tests_only: number; untested: number };
+    token_usage_summary?: { total_input_tokens: number; total_output_tokens: number; total_cost: number; by_stage?: Record<string, unknown> };
+    // repo_scan.py's ScanReport.to_dashboard_dict() -- only `.summary` (the ScanSummary, same
+    // shape MetricsBar reads) is used on the frontend; full findings stay in the committed files.
+    repo_scan?: { summary?: ScanSummary; [key: string]: unknown };
     [key: string]: unknown;
   };
+}
+
+/** agent/src/schemas_exit.py's MergeReadinessReport -- exit's StageState.approved_content shape,
+ * narrowed from `unknown` by whichever view renders it (ReportView). */
+export interface MergeReadinessReport {
+  merge_ready: boolean;
+  blocking_reasons: string[];
+  pr_title: string;
+  pr_description_markdown: string;
+  risk_notes: string[];
+  suggested_reviewers_note?: string;
+}
+
+/** Set by a later task's E2E stage -- absent entirely today, so every read of this must be
+ * optional-chained and the screenshots section must render nothing when it's undefined. */
+export interface E2EState {
+  screenshots?: string[];
+  [key: string]: unknown;
 }
 
 /** Outcome of the last push to the ai-dev-workflow/<branch> work branch (git_ops.push_head).
@@ -178,6 +200,7 @@ export interface WorkflowState {
   test_hardening?: TestHardeningState;
   metrics_report?: MetricsReportState;
   audit_cluster?: { last_outcome?: { passed?: boolean; [key: string]: unknown } | null; [key: string]: unknown };
+  e2e?: E2EState | null;
   last_push?: PushStatus | null;
   // Terminal failure: escalations no longer pause for a human -- the graph ENDs with this set.
   run_failure?: EscalationPayload | null;

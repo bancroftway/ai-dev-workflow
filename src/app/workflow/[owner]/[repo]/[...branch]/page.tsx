@@ -52,7 +52,7 @@ export default async function WorkflowPage({
           <div className="flex min-h-full flex-1 flex-col">
             <WorkspaceHeader />
             <SandboxSessionBoot owner={owner} repo={repo} branch={branch} resume={resume} />
-            <AppShell metricThresholds={metricThresholds} resume={resume} />
+            <AppShell owner={owner} repo={repo} metricThresholds={metricThresholds} resume={resume} />
           </div>
         </SandboxStatusProvider>
       </WorkflowProviders>

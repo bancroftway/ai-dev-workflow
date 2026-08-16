@@ -14,21 +14,24 @@ import { BuildView } from "@/components/BuildView";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
 import { QualityView } from "@/components/QualityView";
+import { ReportView } from "@/components/ReportView";
 import { RequirementsView } from "@/components/RequirementsView";
 import { SessionOverview } from "@/components/SessionOverview";
 import { SpecificationView } from "@/components/SpecificationView";
 import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
+import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   type EscalationPayload,
+  type MergeReadinessReport,
   PIPELINE_STAGE_ORDER,
   TAB_STAGE_GROUPS,
   type StageKey,
   type WorkflowState,
 } from "@/lib/workflow-types";
 
-type ViewId = "requirements" | "specification" | "plan" | "build" | "quality" | "overview";
+type ViewId = "requirements" | "specification" | "plan" | "build" | "quality" | "report" | "overview";
 type DotState = "running" | "done" | "error" | "awaiting";
 
 const DOT_CLASS: Record<DotState, string> = {
@@ -53,9 +56,16 @@ function stageGroupDot(state: WorkflowState, keys: StageKey[], error?: boolean):
 }
 
 export function AppShell({
+  owner,
+  repo,
   metricThresholds,
   resume,
 }: {
+  /** Repo coordinates for the Report tab's raw-content proxy URLs (screenshots) -- not needed by
+   * anything else here, since every other view scopes itself through useWorkflowThread's
+   * threadId instead. */
+  owner: string;
+  repo: string;
   metricThresholds: MetricThresholds;
   /** ?resume=1 from the workflow page -- fires the run once the sandbox is ready even on a
    * thread that already has state, since the ordinary auto-trigger below is deliberately
@@ -143,12 +153,17 @@ export function AppShell({
         ? "running"
         : undefined;
 
+  const exitStage = state.stages?.exit;
+  const reportEnabled = exitStage?.approved_content != null || state.metrics_report?.metrics != null;
+  const reportDot: DotState | undefined = exitStage?.approved_content != null ? "done" : undefined;
+
   const dots: Record<ViewId, DotState | undefined> = {
     requirements: stageGroupDot(state, TAB_STAGE_GROUPS.requirements, state.app_rejection != null),
     specification: stageGroupDot(state, TAB_STAGE_GROUPS.specification),
     plan: stageGroupDot(state, TAB_STAGE_GROUPS.plan),
     build: stageGroupDot(state, TAB_STAGE_GROUPS.build),
     quality: qualityDot,
+    report: reportDot,
     overview: undefined,
   };
 
@@ -198,6 +213,13 @@ export function AppShell({
             onClick={() => setActiveView("quality")}
           />
           <TabButton
+            label="Report"
+            active={activeView === "report"}
+            disabled={!reportEnabled}
+            dot={dots.report}
+            onClick={() => setActiveView("report")}
+          />
+          <TabButton
             label="Overview"
             active={activeView === "overview"}
             onClick={() => setActiveView("overview")}
@@ -210,6 +232,15 @@ export function AppShell({
           {activeView === "plan" && <PlanView />}
           {activeView === "build" && <BuildView />}
           {activeView === "quality" && <QualityView />}
+          {activeView === "report" && (
+            <ReportView
+              report={exitStage?.approved_content as MergeReadinessReport | null | undefined}
+              metrics={state.metrics_report?.metrics}
+              deltaSummary={state.repo_scan?.delta_summary}
+              screenshotUrls={state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path))}
+              thresholds={metricThresholds}
+            />
+          )}
           {activeView === "overview" && <SessionOverview />}
         </main>
       </div>
