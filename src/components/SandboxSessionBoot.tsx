@@ -16,10 +16,14 @@ export function SandboxSessionBoot({
   owner,
   repo,
   branch,
+  resume,
 }: {
   owner: string;
   repo: string;
   branch: string;
+  /** ?resume=1 from the workflow page's searchParams (set by SessionHistory's Resume button) --
+   * forwarded to the provision route so the agent's registry meta carries it into intake_node. */
+  resume?: boolean;
 }) {
   const [status, setStatus] = useSandboxStatus();
   // Provision can fail with an explanatory message worth showing verbatim (e.g. the 409 hard
@@ -32,7 +36,7 @@ export function SandboxSessionBoot({
     fetch("/api/sessions/provision", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ owner, repo, branch }),
+      body: JSON.stringify({ owner, repo, branch, resume: Boolean(resume) }),
     })
       .then(async (res) => {
         if (cancelled) return;
@@ -50,7 +54,7 @@ export function SandboxSessionBoot({
     return () => {
       cancelled = true;
     };
-  }, [owner, repo, branch, setStatus]);
+  }, [owner, repo, branch, resume, setStatus]);
 
   if (status === "ready") return null;
 

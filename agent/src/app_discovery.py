@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
-from . import git_ops, repo_files
+from . import git_ops, repo_files, session_index
 from .preflight_nodes import MANIFEST_PATH, update_manifest
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -424,9 +424,20 @@ async def app_discovery_reject_node(state: "GraphState", config: RunnableConfig)
     lines += ["", "No changes were made to the repository."]
 
     if sandbox_registry.get(thread_id) is not None:
-        cleanup_note = await _clean_up_repo(get_sandbox_provider(), thread_id, state.get("run_baseline_commit"))
+        provider = get_sandbox_provider()
+        cleanup_note = await _clean_up_repo(provider, thread_id, state.get("run_baseline_commit"))
         if cleanup_note:
             lines += ["", cleanup_note]
+
+        # The cleanup reset above resets to run_baseline_commit and never touches sessions.json
+        # (git clean is scoped to .ai-dev-workflow, but sessions.json's own commit already
+        # happened before that baseline was captured -- see scaffold_node -- so it survives the
+        # reset). This is the one writer that closes the session's row AFTER that reset, so it
+        # needs its own commit+push rather than relying on some other node's commit to pick it up.
+        await session_index.end_session(provider, thread_id, run_id=state.get("run_id"), status="rejected")
+        await git_ops.commit_paths(
+            provider, thread_id, [session_index.SESSIONS_PATH], "ai-dev-workflow: session rejected"
+        )
 
     return {"messages": [AIMessage(content="\n".join(lines))]}
 

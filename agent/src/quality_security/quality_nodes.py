@@ -395,7 +395,7 @@ async def quality_human_gate_node(state: dict[str, Any], config: RunnableConfig)
     thread_id = config["configurable"]["thread_id"]
     quality_remediation = state.get("quality_remediation") or default_quality_state()
     payload = {"stage": "quality_remediation", "type": "quality_cycle_cap_exceeded", "report": quality_remediation.get("last_gate_report")}
-    await git_ops.record_run_failure(thread_id, payload)
+    await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
     reset = dict(quality_remediation)
     reset["cycle_count"] = 0
     return {"quality_remediation": reset, "run_failure": payload}

@@ -8,9 +8,14 @@ import { deriveThreadId } from "@/lib/workflow-thread";
 const AGENT_URL = process.env.AGENT_URL ?? "http://localhost:8123/";
 // Must match entrypoint.sh's WORK_BRANCH / agent/src/git_ops.py's _WORK_BRANCH constant.
 const WORK_BRANCH = "ai-dev-workflow";
+// Optional shared secret the agent's sessions_api.py checks on provision/delete when set
+// (AIDW_AGENT_SHARED_SECRET, unset by default -- see that module's docstring for the known gap
+// this only partially closes). Absent here, the header is simply omitted and the agent's own
+// check no-ops identically.
+const AGENT_SHARED_SECRET = process.env.AIDW_AGENT_SHARED_SECRET;
 
-/** One entry in `.ai-dev-workflow/sessions.json` -- schema owned by a later task (session
- * history/resume); only the fields the provision guard below needs are typed here. */
+/** One entry in `.ai-dev-workflow/sessions.json` -- schema owned by agent/src/session_index.py;
+ * only the fields the provision guard below needs are typed here. */
 type SessionIndexEntry = {
   status?: string;
   user?: string;
@@ -72,22 +77,26 @@ export async function POST(request: Request) {
   const session = await auth();
   const accessToken = session?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
   const githubId = session?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
+  // Same source for both the 409 guard's identity comparison below AND the `user_login` forwarded
+  // to the agent for sessions.json -- one GitHub login, captured once at sign-in (src/auth.ts),
+  // rather than a second octokit.rest.users.getAuthenticated() call duplicating it.
+  const userLogin = session?.login ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
   if (!accessToken || !githubId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { owner, repo, branch } = (await request.json()) as {
+  const { owner, repo, branch, resume } = (await request.json()) as {
     owner?: string;
     repo?: string;
     branch?: string;
+    resume?: boolean;
   };
   if (!owner || !repo || !branch) {
     return NextResponse.json({ error: "owner, repo, and branch are required" }, { status: 400 });
   }
 
   const octokit = await getOctokit();
-  const { login: currentLogin } = (await octokit.rest.users.getAuthenticated()).data;
-  const conflict = await findConflictingSession(octokit, owner, repo, currentLogin);
+  const conflict = await findConflictingSession(octokit, owner, repo, userLogin ?? "");
   if (conflict) {
     return NextResponse.json(
       {
@@ -104,13 +113,21 @@ export async function POST(request: Request) {
 
   const response = await fetch(new URL("sessions/provision", agentBaseUrl), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(AGENT_SHARED_SECRET ? { "x-aidw-secret": AGENT_SHARED_SECRET } : {}),
+    },
     body: JSON.stringify({
       thread_id: threadId,
       owner,
       repo,
       branch,
       github_token: accessToken,
+      // Advisory only -- see session_index.py's module docstring. Falls back to "" rather than
+      // undefined so a signed-in user whose token predates this change (no `login` in their JWT
+      // yet) doesn't send `undefined` over the wire.
+      user_login: userLogin ?? "",
+      resume: Boolean(resume),
     }),
   });
 

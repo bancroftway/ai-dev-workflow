@@ -17,7 +17,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from . import approvals, git_ops, preflight_nodes, repo_files, spec_ledger
+from . import approvals, git_ops, preflight_nodes, repo_files, session_index, spec_ledger
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -127,7 +127,23 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
         new_changelog = existing_changelog.rstrip() + "\n\n" + body
 
     await repo_files.write_repo_file(provider, thread_id, CHANGELOG_PATH, new_changelog)
+
+    if merge_readiness:
+        await session_index.end_session(
+            provider,
+            thread_id,
+            run_id=run_id,
+            status="completed",
+            exit_summary={
+                "merge_ready": merge_readiness.get("merge_ready", False),
+                "pr_title": merge_readiness.get("pr_title", ""),
+            },
+        )
+
     await git_ops.commit_paths(
-        provider, thread_id, [MANIFEST_PATH, snapshot_path, CHANGELOG_PATH], "ai-dev-workflow: exit finalize (manifest, changelog)"
+        provider,
+        thread_id,
+        [MANIFEST_PATH, snapshot_path, CHANGELOG_PATH, session_index.SESSIONS_PATH],
+        "ai-dev-workflow: exit finalize (manifest, changelog)",
     )
     return {}

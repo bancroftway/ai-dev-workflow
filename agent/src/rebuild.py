@@ -233,7 +233,7 @@ def make_escalate_node(spec: RebuildSpec):
             "stdout_tail": rb["last_stdout_tail"],
             "stderr_tail": rb["last_stderr_tail"],
         }
-        await git_ops.record_run_failure(thread_id, payload)
+        await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
         rebuild = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
         rebuild.setdefault(spec.key, default_rebuild_state())
         rebuild[spec.key]["fix_cycle_count"] = 0

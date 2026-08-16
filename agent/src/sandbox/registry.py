@@ -9,9 +9,17 @@ this ever moves off "one small persistent agent process" (see the plan's Section
 
 from __future__ import annotations
 
+from typing import Any
+
 from .provider import SandboxSession
 
 _sessions: dict[str, SandboxSession] = {}
+
+# Provision-time facts a node needs but that graph state doesn't carry on its own (registry meta,
+# not GraphState, since it must be visible to scaffold_node/graph.py's intake before the thread
+# has ever hydrated any state) -- who provisioned this thread, which branch a PR should target,
+# and one-shot signals like `resume`. Same process-local caveat as `_sessions` above.
+_meta: dict[str, dict[str, Any]] = {}
 
 
 def get(thread_id: str) -> SandboxSession | None:
@@ -23,4 +31,20 @@ def set(thread_id: str, session: SandboxSession) -> None:
 
 
 def pop(thread_id: str) -> SandboxSession | None:
+    _meta.pop(thread_id, None)
     return _sessions.pop(thread_id, None)
+
+
+def set_meta(thread_id: str, **kwargs: Any) -> None:
+    _meta.setdefault(thread_id, {}).update(kwargs)
+
+
+def get_meta(thread_id: str) -> dict[str, Any]:
+    return _meta.get(thread_id, {})
+
+
+def pop_meta_flag(thread_id: str, key: str) -> bool:
+    """Removes and returns a boolean-ish meta flag, defaulting to False when absent -- for
+    one-shot signals like `resume` that must be consumed by the first intake that sees them and
+    never apply again to a later, unrelated run on the same thread."""
+    return bool(_meta.get(thread_id, {}).pop(key, False))

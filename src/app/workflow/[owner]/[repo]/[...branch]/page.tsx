@@ -11,8 +11,10 @@ import { WorkflowProviders } from "../../../providers";
 
 export default async function WorkflowPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ owner: string; repo: string; branch: string[] }>;
+  searchParams: Promise<{ resume?: string }>;
 }) {
   const session = await auth();
   const githubId = session?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
@@ -25,6 +27,11 @@ export default async function WorkflowPage({
   // every segment after [repo], which this rejoins into the real branch name.
   const branch = branchSegments.join("/");
   const threadId = deriveThreadId(owner, repo, githubId);
+
+  // Set by SessionHistory's Resume button (/select) as ?resume=1 -- forwarded into the
+  // provision POST body (SandboxSessionBoot) and used to unconditionally fire the first run once
+  // the sandbox is ready (AppShell), even on a thread that already has state.
+  const resume = (await searchParams).resume === "1";
 
   // Metrics-bar color thresholds, read server-side at request time (NOT NEXT_PUBLIC_*, which
   // would be inlined at build time and unchangeable in a deployed image). Edit .env locally or
@@ -50,8 +57,8 @@ export default async function WorkflowPage({
         <SandboxStatusProvider>
           <div className="flex min-h-full flex-1 flex-col">
             <WorkspaceHeader />
-            <SandboxSessionBoot owner={owner} repo={repo} branch={branch} />
-            <AppShell metricThresholds={metricThresholds} />
+            <SandboxSessionBoot owner={owner} repo={repo} branch={branch} resume={resume} />
+            <AppShell metricThresholds={metricThresholds} resume={resume} />
           </div>
         </SandboxStatusProvider>
       </WorkflowProviders>

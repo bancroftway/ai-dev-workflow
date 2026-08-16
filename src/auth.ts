@@ -5,6 +5,10 @@ declare module "next-auth" {
   interface Session {
     accessToken?: string;
     githubId?: string;
+    /** GitHub login (handle), captured at sign-in. Advisory only downstream (e.g. session_index
+     * `user` field on the agent side is not re-verified there) -- never used as an identity key,
+     * that's what githubId is for. */
+    login?: string;
   }
 }
 
@@ -21,18 +25,20 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   ],
   session: { strategy: "jwt" },
   callbacks: {
-    async jwt({ token, account }) {
-      // Only set on the initial sign-in request (`account` is only present then) -- exactly
-      // once per login, not re-derived on every token refresh.
+    async jwt({ token, account, profile }) {
+      // Only set on the initial sign-in request (`account`/`profile` are only present then) --
+      // exactly once per login, not re-derived on every token refresh.
       if (account) {
         token.accessToken = account.access_token;
         token.githubId = account.providerAccountId;
+        token.login = (profile as { login?: string } | undefined)?.login;
       }
       return token;
     },
     async session({ session, token }) {
       session.accessToken = token.accessToken as string | undefined;
       session.githubId = token.githubId as string | undefined;
+      session.login = token.login as string | undefined;
       return session;
     },
   },

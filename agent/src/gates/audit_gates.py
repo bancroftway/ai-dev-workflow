@@ -254,7 +254,7 @@ async def audit_exit_human_gate_node(state: dict[str, Any], config: RunnableConf
     thread_id = config["configurable"]["thread_id"]
     audit_cluster = state.get("audit_cluster") or {"attempt_count": 0, "last_outcome": None}
     payload = {"stage": "audit_cluster", "type": "exit_gate_failed_twice", "outcome": audit_cluster.get("last_outcome")}
-    await git_ops.record_run_failure(thread_id, payload)
+    await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
     reset = dict(audit_cluster)
     reset["attempt_count"] = 0
     return {"audit_cluster": reset, "run_failure": payload}

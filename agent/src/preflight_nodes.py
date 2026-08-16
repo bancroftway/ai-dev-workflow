@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.runnables import RunnableConfig
 
-from . import git_ops, repo_files, repo_scan, template_loader
+from . import git_ops, repo_files, repo_scan, session_index, template_loader
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -39,6 +39,17 @@ def _guidance_sentinel(key: str) -> str:
     a repo onboarded before this was generalized doesn't get a second .NET paragraph appended.
     """
     return f"<!-- ai-dev-workflow:{key}-guidance -->"
+
+
+def _session_title(raw_requirements_text: str, run_id: str) -> str:
+    """First non-empty line of the run's requirements text, truncated to 80 chars -- what shows
+    up as the row's title in /select's session history. Falls back to a run-id-stamped
+    placeholder for the (rare) case a run reaches scaffold with no requirements text at all."""
+    for line in raw_requirements_text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:80]
+    return f"(untitled run {run_id})"
 
 
 _TECH_STACK_SENTINEL = _guidance_sentinel("tech-stack")
@@ -105,8 +116,23 @@ async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str
     await repo_files.reset_ledger(provider, thread_id)
     await repo_files.append_ledger_entry(provider, thread_id, {"stage": "scaffold", "node": "scaffold", "action": "ran"})
 
-    # Captured before anything is written, so app_discovery's reject path can put the tree back
-    # exactly as it arrived. Same reference-point technique as StageSpec.capture_baseline_commit.
+    # Session-index UPSERT must land its own commit+push BEFORE the baseline HEAD capture below,
+    # not after: app_discovery's reject path later does `git reset --hard` to that baseline, which
+    # would erase this commit if it were made afterwards. Committing it first means the baseline
+    # itself already includes it, so the reset keeps it.
+    run_id = state.get("run_id", "unknown")
+    meta = sandbox_registry.get_meta(thread_id)
+    await session_index.start_session(
+        provider,
+        thread_id,
+        run_id=run_id,
+        title=_session_title(state.get("raw_requirements_text") or "", run_id),
+        user=meta.get("user_login", ""),
+        target_branch=meta.get("target_branch", ""),
+    )
+
+    # Captured before anything else is written, so app_discovery's reject path can put the tree
+    # back exactly as it arrived. Same reference-point technique as StageSpec.capture_baseline_commit.
     head = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD")
 
     # manifest.json absence is the canonical "never onboarded before" signal -- gates whether
@@ -574,6 +600,10 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
 
     # Node writes nothing into the repo: no template files, only the AGENTS.md paragraph.
     assert _NODE.files == ()
+
+    assert _session_title("  \nAdd login\nsecond line", "abc123") == "Add login"
+    assert _session_title("", "abc123") == "(untitled run abc123)"
+    assert _session_title("x" * 100, "abc123") == "x" * 80
 
     assert _template_version("aidw-template-version: 7") == 7
     assert _template_version("no stamp here") == 0

@@ -933,6 +933,13 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     thread_id = config["configurable"]["thread_id"]
     stages = {key: dict(value) for key, value in state.get("stages", {}).items()}
 
+    # Popped unconditionally, right here, on EVERY intake -- a resume=1 provision sets this meta
+    # flag once, and it must not survive past the first run that consumes it (else a later,
+    # unrelated follow-up message on the same thread would also skip the fresh-run stage reset
+    # below). Whether it actually APPLIES depends on stages_empty_pre_hydration, captured next.
+    resume_flag_popped = sandbox_registry.pop_meta_flag(thread_id, "resume")
+    stages_empty_pre_hydration = not stages
+
     # Hydration (architecture plan Section B.2): only when this thread has never had any stage
     # state in this process's memory yet -- i.e. genuinely the first invoke for this thread since
     # the agent process started, whether because it's a returning session after a restart, or a
@@ -960,11 +967,18 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # idempotency check (not this reset loop) is what decides whether it needs to redraft. Every
     # other stage (specification onward plus every standalone StageSpec) resets on a fresh run.
     #
-    # AIDW_RESUME=1 (headless --thread resume): skip the approved-stage reset so a rerun on the
-    # same thread/sandbox picks up at the first UNapproved stage -- hydration above restored
-    # every approved stage from the repo, and make_draft_node's approved short-circuit routes
-    # each one straight to the next. Per-run mechanics (verify counters) still reset below.
-    resume = os.environ.get("AIDW_RESUME") == "1"
+    # AIDW_RESUME=1 (headless --thread resume) OR a popped `resume` meta flag (the frontend's
+    # Resume button, /select's history UI) skip the approved-stage reset so a rerun on the same
+    # thread/sandbox picks up at the first UNapproved stage -- hydration above restored every
+    # approved stage from the repo, and make_draft_node's approved short-circuit routes each one
+    # straight to the next. Per-run mechanics (verify counters) still reset below.
+    #
+    # The meta flag only counts here when stages_empty_pre_hydration -- the true restart-resume
+    # path (a fresh process, or a genuinely new thread invocation, hydrating from scratch). A
+    # thread already mid-session (stages non-empty before hydration ran) ignores the flag even
+    # though it was just popped above: an ordinary follow-up message must never be treated as a
+    # resume just because some earlier provision call happened to set the flag.
+    resume = os.environ.get("AIDW_RESUME") == "1" or (resume_flag_popped and stages_empty_pre_hydration)
     for stage_spec in STAGES[1:] + _STANDALONE_STAGE_SPECS:
         stage = stages[stage_spec.key]
         if not resume and stage["status"] in ("ready_for_review", "approved"):
@@ -1002,6 +1016,16 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
                 message.content
             )
             break
+
+    if not raw_requirements_text.strip():
+        # Resume path: the message scan above found no fresh HumanMessage (a --thread/resume
+        # re-entry replays none), but hydration may have restored an already-approved
+        # raw-requirements doc from the repo into `stages` -- the specification stage's draft
+        # prompt reads raw_requirements_text directly (never stages["raw-requirements"]), so
+        # leaving it empty here would draft the spec from nothing even though the approved doc
+        # still exists on disk.
+        hydrated_raw_requirements = (stages.get("raw-requirements") or {}).get("approved_content") or {}
+        raw_requirements_text = hydrated_raw_requirements.get("content") or raw_requirements_text
 
     return {
         "stages": stages,
@@ -1307,7 +1331,7 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
             "report": last.get("report"),
             "feedback": last.get("feedback"),
         }
-        await git_ops.record_run_failure(thread_id, payload)
+        await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stages[stage_spec.key]["verify_cycle_count"] = 0

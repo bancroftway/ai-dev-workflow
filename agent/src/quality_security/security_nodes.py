@@ -392,7 +392,7 @@ async def security_human_gate_node(state: dict[str, Any], config: RunnableConfig
     thread_id = config["configurable"]["thread_id"]
     security_remediation = state.get("security_remediation") or default_security_state()
     payload = {"stage": "security_remediation", "type": "security_cycle_cap_exceeded", "report": security_remediation.get("last_gate_report")}
-    await git_ops.record_run_failure(thread_id, payload)
+    await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
     reset = dict(security_remediation)
     reset["cycle_count"] = 0
     return {"security_remediation": reset, "run_failure": payload}

@@ -52,7 +52,17 @@ function stageGroupDot(state: WorkflowState, keys: StageKey[], error?: boolean):
   return undefined;
 }
 
-export function AppShell({ metricThresholds }: { metricThresholds: MetricThresholds }) {
+export function AppShell({
+  metricThresholds,
+  resume,
+}: {
+  metricThresholds: MetricThresholds;
+  /** ?resume=1 from the workflow page -- fires the run once the sandbox is ready even on a
+   * thread that already has state, since the ordinary auto-trigger below is deliberately
+   * suppressed in that case (ordinary reloads must not re-run automatically; a Resume click
+   * should). */
+  resume?: boolean;
+}) {
   const { threadId, runtimeAgentId, localAgentId } = useWorkflowThread();
   const { agent } = useAgent({
     agentId: localAgentId,
@@ -71,15 +81,26 @@ export function AppShell({ metricThresholds }: { metricThresholds: MetricThresho
   // Auto-trigger the run once, as soon as the sandbox is ready, on a thread that's never run
   // before -- scaffold_node hard-fails with no local-working-tree fallback if run before the
   // sandbox exists, so this waits on sandboxStatus rather than firing on mount.
+  //
+  // `resume` bypasses the "never run before" guard entirely: a Resume click (SessionHistory ->
+  // ?resume=1) targets a thread that DOES already have state (that's the whole point -- a failed
+  // or in-progress run being picked back up), which the ordinary auto-trigger below would
+  // otherwise treat as "already running, don't fire" and stay inert. The ref still guards against
+  // firing twice.
   const autoTriggeredRef = useRef(false);
   useEffect(() => {
     if (autoTriggeredRef.current) return;
     if (sandboxStatus !== "ready") return;
+    if (resume) {
+      autoTriggeredRef.current = true;
+      void copilotkit.runAgent({ agent });
+      return;
+    }
     if (Object.keys(state.stages ?? {}).length > 0) return;
     if (agent.messages.length > 0) return;
     autoTriggeredRef.current = true;
     void copilotkit.runAgent({ agent });
-  }, [sandboxStatus, state.stages, agent, copilotkit]);
+  }, [sandboxStatus, state.stages, agent, copilotkit, resume]);
 
   // Section 8: the interrupt UI must be reachable regardless of which view is open. renderInChat
   // defaults to true, publishing into the CopilotSidebar's chat feed, which is mounted around

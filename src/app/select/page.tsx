@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import type { RepoSummary } from "@/app/api/github/repos/route";
 import type { BranchSummary } from "@/app/api/github/branches/route";
+import { SessionHistory } from "@/components/SessionHistory";
 
 type OnboardedStatus = "checking" | "onboarded" | "not-onboarded" | "error";
 
@@ -86,6 +87,7 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
   const [branches, setBranches] = useState<BranchSummary[] | null>(null);
   const [branchesError, setBranchesError] = useState<string | null>(null);
   const [selectedBranch, setSelectedBranch] = useState<string>("");
+  const [hasInProgressSession, setHasInProgressSession] = useState(false);
 
   useEffect(() => {
     fetch(`/api/github/branches?owner=${repo.owner}&repo=${repo.repo}`)
@@ -131,16 +133,29 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
       {selectedBranch && (
         <OnboardingStatusSection key={selectedBranch} owner={repo.owner} repo={repo.repo} branch={selectedBranch}>
           {(status) => (
-            <button
-              type="button"
-              className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-              onClick={handleContinue}
-            >
-              {status === "onboarded" ? "Continue" : "Onboard & Continue"}
-            </button>
+            <>
+              {hasInProgressSession && (
+                <p className="text-xs text-amber-700">
+                  A session is already in progress on this repo — starting a new one may be blocked
+                  until it finishes.
+                </p>
+              )}
+              <button
+                type="button"
+                className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+                onClick={handleContinue}
+              >
+                {status === "onboarded" ? "Continue" : "Onboard & Continue"}
+              </button>
+            </>
           )}
         </OnboardingStatusSection>
       )}
+
+      {/* Keyed by repo (the parent SelectPage already keys RepoBranchSection by repo) -- session
+          history is per-repo, not per-branch, since every session shares the one ai-dev-workflow
+          work branch regardless of which branch a user picks here. */}
+      <SessionHistory owner={repo.owner} repo={repo.repo} onInProgressChange={setHasInProgressSession} />
     </>
   );
 }

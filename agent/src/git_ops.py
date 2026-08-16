@@ -103,11 +103,15 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
         logger.warning("git push failed for thread_id=%s: %s", thread_id, _LAST_PUSH[thread_id]["error"])
 
 
-async def record_run_failure(thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def record_run_failure(
+    thread_id: str, payload: dict[str, Any], run_id: str | None = None
+) -> dict[str, Any]:
     """Durably records a terminal run failure ({stage, type, ...detail}) and returns the payload.
 
     Escalations no longer pause for a human -- the graph ENDs with `run_failure` set, so this is
-    the last chance to leave a trace: a ledger row plus a commit+push of .ai-dev-workflow/.
+    the last chance to leave a trace: a ledger row, the session-index row closed as "failed", and
+    a commit+push of .ai-dev-workflow/ (which covers sessions.json too -- end_session below writes
+    the file only, this commit is what makes it durable).
     No-ops (payload-only) when the sandbox is gone -- every `cannot_verify` failure happens
     exactly then. Best-effort by design: a failed write must never mask the failure itself.
     """
@@ -116,12 +120,14 @@ async def record_run_failure(thread_id: str, payload: dict[str, Any]) -> dict[st
     if sandbox_registry.get(thread_id) is None:
         return payload
     from . import repo_files  # local import mirrors the module-level one-way dependency
+    from . import session_index  # local: same reason -- session_index imports git_ops itself
 
     provider = _get_provider()
     try:
         await repo_files.append_ledger_entry(
             provider, thread_id, {"stage": payload.get("stage"), "node": "run_failure", **payload}
         )
+        await session_index.end_session(provider, thread_id, run_id=run_id, status="failed", failure=payload)
         await commit_ai_dev_workflow(provider, thread_id, f"ai-dev-workflow: run failed at {payload.get('stage')}")
     except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
         logger.warning("failed to durably record run_failure for thread_id=%s", thread_id, exc_info=True)
