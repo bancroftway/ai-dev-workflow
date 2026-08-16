@@ -864,6 +864,11 @@ class ScanReport:
                 security_by_severity[finding.severity] = security_by_severity.get(finding.severity, 0) + 1
             if is_gating(finding, severity_floor=severity_floor, introduced_ids=introduced_ids):
                 gating += 1
+        # Enum is `none|info|low|medium|high|critical` -- the full SEVERITY_ORDER vocabulary plus
+        # "none" for zero open security findings. "info" is a real, reachable value (not clamped
+        # to "low" or hidden as "none"): Trivy reports NONE/NEGLIGIBLE severities that
+        # normalize_tier() maps to "info" on SECURITY_CATEGORIES findings (vulnerability/misconfig/
+        # license), and hiding or inflating that would misreport what was actually found.
         worst_open_severity = next(
             (level for level in reversed(SEVERITY_ORDER) if security_by_severity.get(level, 0)), "none"
         )
@@ -1321,13 +1326,23 @@ async def _scan_with_coverage(
     both finish before `repo_scan_baseline_node` awaits it -- the report is NOT written to
     BASELINE_PATH here, deliberately: the node writes it once, after merging coverage in, so the
     committed file and the streamed summary never disagree about whether coverage is present.
+
+    The coverage half is independently guarded: it runs during the tech-stack/brownfield LLM-overlap
+    window, where a sandbox hiccup (e.g. exec_in_sandbox raising) is more likely than usual. Losing
+    the ALREADY-COMPLETED scan over a coverage crash would force repo_scan_baseline_node's fallback
+    to redo scan+coverage inline -- exactly the critical-path cost this task overlaps away.
     """
     report = await run_repo_scan(provider, thread_id, profile="full")
     from .gates.test_coverage_gate import measure_coverage  # local: keeps the pure half import-light
 
-    line_rate, branch_rate, _gaps, reason, _entry_reports = await measure_coverage(
-        provider, thread_id, timeout_seconds=timeout_seconds
-    )
+    try:
+        line_rate, branch_rate, _gaps, reason, _entry_reports = await measure_coverage(
+            provider, thread_id, timeout_seconds=timeout_seconds
+        )
+    except Exception:  # noqa: BLE001 -- the scan already succeeded; a coverage crash must not lose it
+        logger.warning("repo_scan: coverage measurement crashed; keeping the completed scan", exc_info=True)
+        line_rate, branch_rate, reason = None, None, "runner_error"
+
     coverage: dict[str, Any] = {"line_rate": line_rate, "branch_rate": branch_rate}
     if line_rate is None:
         coverage["reason"] = reason
@@ -1628,12 +1643,30 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert qs_measures["security"]["worst_open_severity"] == "none"
     assert qs_measures["security"]["by_severity"] == {level: 0 for level in SEVERITY_ORDER}
 
+    # Trivy's NONE/NEGLIGIBLE severities normalize to "info" -- on a security category (here,
+    # vulnerability) that must surface as "info", never clamped up to "low" or hidden as "none".
+    info_only = ScanReport(findings=(_vuln("trivy", "CVE-2024-0", "x", "info"),), metrics={}, tools=(), repo={}, deduped_count=0)
+    info_measures = info_only.summary()["measures"]
+    assert info_measures["security"]["worst_open_severity"] == "info", info_measures
+    assert info_measures["security"]["by_severity"]["info"] == 1
+
     # Sorting is a total order, so the hash is stable regardless of input order.
     shuffled = ScanReport(
         findings=tuple(sort_findings(list(reversed(report.findings)))),
         metrics=metrics, tools=report.tools, repo=report.repo, deduped_count=2,
     )
     assert shuffled.to_dashboard_dict()["content_hash"] == dashboard["content_hash"]
+
+    # A coverage-acquisition failure must not break "unchanged repo hashes identically": the
+    # contract is that test_coverage_gate.measure_coverage only ever returns a stable reason CODE
+    # (never raw, volatile subprocess stdout/stderr) into metrics.coverage.reason -- two identical
+    # repos that fail coverage acquisition the same way must hash the same.
+    failed_coverage_metrics = {**metrics, "coverage": {"line_rate": None, "branch_rate": None, "reason": "runner_error"}}
+    run_a = ScanReport(findings=report.findings, metrics=failed_coverage_metrics, tools=report.tools, repo=report.repo, deduped_count=2)
+    run_b = ScanReport(findings=report.findings, metrics=dict(failed_coverage_metrics), tools=report.tools, repo=report.repo, deduped_count=2)
+    assert run_a.to_dashboard_dict()["content_hash"] == run_b.to_dashboard_dict()["content_hash"], (
+        "identical repo + identical stable failure reason must hash identically"
+    )
 
     # --- gating ---------------------------------------------------------------------------------
     low_vuln = _vuln("trivy", "CVE-2024-5", "x", "low")

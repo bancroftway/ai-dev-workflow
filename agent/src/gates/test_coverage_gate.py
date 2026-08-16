@@ -22,6 +22,7 @@ threshold and name the exclusion-gaming problem, not a full per-line coverage re
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shlex
 from dataclasses import dataclass
@@ -36,7 +37,24 @@ from ..sandbox.provider import SandboxProvider
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
+logger = logging.getLogger(__name__)
+
 MIN_COVERAGE_PERCENT_DEFAULT = 95.0
+
+# The only strings `measure_coverage` may return as its "reason" -- this value ends up in
+# repo_scan's `metrics.coverage.reason`, which IS hashed into ScanReport.content_hash (see
+# repo_scan.py's determinism guarantee: "an unchanged repo hashes identically"). Raw subprocess
+# stdout/stderr is NOT stable across runs (timestamps, temp paths, elapsed times) even when the
+# repo itself hasn't changed -- it must never reach this variable. Verbose detail goes to the
+# logger (and, for contract replay, the unhashed per-entry `entry_reports`) instead.
+REASON_TIMEOUT = "timeout"
+REASON_RUNNER_ERROR = "runner_error"
+REASON_PARSE_ERROR = "parse_error"
+REASON_CONTRACT_REPLAY_FAILED = "contract_replay_failed"
+REASON_NO_TOOLING_MAPPING = "no_tooling_mapping"
+STABLE_REASON_CODES = frozenset(
+    {REASON_TIMEOUT, REASON_RUNNER_ERROR, REASON_PARSE_ERROR, REASON_CONTRACT_REPLAY_FAILED, REASON_NO_TOOLING_MAPPING}
+)
 
 COVERAGE_COMMANDS_PATH = ".ai-dev-workflow/coverage-commands.json"
 _CONTRACT_FORMATS = ("cobertura", "istanbul-json-summary")
@@ -157,9 +175,11 @@ async def _run_contract_coverage(
     try:
         entries = json.loads(raw).get("entries", [])
     except json.JSONDecodeError:
-        return None, None, [], f"{COVERAGE_COMMANDS_PATH} is not valid JSON", []
+        logger.warning("repo_scan coverage: %s is not valid JSON", COVERAGE_COMMANDS_PATH)
+        return None, None, [], REASON_CONTRACT_REPLAY_FAILED, []
     if not isinstance(entries, list) or not entries:
-        return None, None, [], f"{COVERAGE_COMMANDS_PATH} has no entries", []
+        logger.warning("repo_scan coverage: %s has no entries", COVERAGE_COMMANDS_PATH)
+        return None, None, [], REASON_CONTRACT_REPLAY_FAILED, []
 
     merged: list[_Counts] = []
     entry_reports: list[dict[str, Any]] = []
@@ -186,6 +206,7 @@ async def _run_contract_coverage(
             thread_id, f"rm -f {shlex.quote(artifact)} && {_with_timeout(f'{prefix}{command}', timeout_seconds)} 2>&1"
         )
         report["replay_exit_ok"] = replay.ok
+        report["replay_returncode"] = replay.returncode
         artifact_raw = await repo_files.read_repo_file(provider, thread_id, artifact)
         if artifact_raw is None:
             report["error"] = f"replay produced no artifact at {artifact}: {(replay.stdout or replay.stderr or '')[-800:]}"
@@ -202,7 +223,9 @@ async def _run_contract_coverage(
 
     if not merged:
         errors = "; ".join(str(r.get("error")) for r in entry_reports if r.get("error"))
-        return None, None, [], f"every coverage-commands entry failed on replay: {errors}", entry_reports
+        logger.warning("repo_scan coverage: every coverage-commands entry failed on replay: %s", errors)
+        timed_out = any(r.get("replay_returncode") == 124 for r in entry_reports)
+        return None, None, [], (REASON_TIMEOUT if timed_out else REASON_CONTRACT_REPLAY_FAILED), entry_reports
 
     lines_total = sum(c.lines_total for c in merged)
     lines_covered = sum(c.lines_covered for c in merged)
@@ -226,12 +249,16 @@ async def _run_dotnet_coverage(
     result = await provider.exec_in_sandbox(thread_id, command)
     raw_xml = await repo_files.read_repo_file(provider, thread_id, "TestResults/coverage.cobertura.xml")
     if raw_xml is None:
-        return None, None, [], (result.stdout or result.stderr or "")[-2000:]
+        logger.warning(
+            "repo_scan coverage: dotnet coverage run produced no artifact: %s",
+            (result.stdout or result.stderr or "")[-2000:],
+        )
+        return None, None, [], REASON_TIMEOUT if result.returncode == 124 else REASON_RUNNER_ERROR
 
     try:
         root = ET.fromstring(raw_xml)
     except ET.ParseError:
-        return None, None, [], "coverage.cobertura.xml failed to parse as XML"
+        return None, None, [], REASON_PARSE_ERROR
 
     line_rate = float(root.get("line-rate", "0")) * 100
     branch_rate = float(root.get("branch-rate", "0")) * 100
@@ -265,12 +292,16 @@ async def _run_js_coverage(
     result = await provider.exec_in_sandbox(thread_id, command)
     raw_summary = await repo_files.read_repo_file(provider, thread_id, "coverage/coverage-summary.json")
     if raw_summary is None:
-        return None, None, [], (result.stdout or result.stderr or "")[-2000:]
+        logger.warning(
+            "repo_scan coverage: js coverage run produced no artifact: %s",
+            (result.stdout or result.stderr or "")[-2000:],
+        )
+        return None, None, [], REASON_TIMEOUT if result.returncode == 124 else REASON_RUNNER_ERROR
 
     try:
         summary = json.loads(raw_summary)
     except json.JSONDecodeError:
-        return None, None, [], "coverage-summary.json failed to parse as JSON"
+        return None, None, [], REASON_PARSE_ERROR
 
     # istanbul writes the literal string "Unknown" for pct when a metric has zero instrumented
     # entities (0 of 0 -- observed live, it crashed float()). Vacuous coverage is treated
@@ -335,7 +366,10 @@ async def measure_coverage(
 
     Every path returns (line_rate, branch_rate, gaps, reason, entry_reports) with line_rate=None
     on any failure -- NEVER a fabricated 0, the same rule the gate's callers already depend on.
-    `reason` is only meaningful when line_rate is None.
+    `reason` is only meaningful when line_rate is None, and is always one of
+    `STABLE_REASON_CODES` -- this value flows into repo_scan's hashed `metrics.coverage.reason`
+    (via the baseline path), so it can never carry volatile subprocess output. Verbose detail is
+    logged at the point of failure instead.
     """
     contract = await _run_contract_coverage(provider, thread_id, timeout_seconds=timeout_seconds)
     if contract is not None:
@@ -350,12 +384,25 @@ async def measure_coverage(
     elif "typescript" in languages or "javascript" in languages:
         line_rate, branch_rate, gaps, reason = await _run_js_coverage(provider, thread_id, timeout_seconds=timeout_seconds)
     else:
-        return None, None, [], (
-            "No coverage tooling mapping for this stack. Record working coverage command(s) in "
-            f"{COVERAGE_COMMANDS_PATH} (see the drafting instructions) so the gate can replay them."
-        ), []
+        logger.info("repo_scan coverage: no tooling mapping for detected languages %s", languages)
+        return None, None, [], REASON_NO_TOOLING_MAPPING, []
 
     return line_rate, branch_rate, gaps, reason, []
+
+
+# Human-readable expansion of each stable reason code, for the GATE's own `feedback` (read by the
+# drafting LLM on retry) -- unlike `reason` itself, this text is never hashed into scan metrics, so
+# it's free to be as actionable as it likes.
+_REASON_FEEDBACK: dict[str, str] = {
+    REASON_TIMEOUT: "the coverage run did not finish within its timeout",
+    REASON_RUNNER_ERROR: "the coverage runner produced no parseable artifact (see server logs for the raw output)",
+    REASON_PARSE_ERROR: "the coverage artifact could not be parsed",
+    REASON_CONTRACT_REPLAY_FAILED: f"every entry in {COVERAGE_COMMANDS_PATH} failed on replay (see server logs for details)",
+    REASON_NO_TOOLING_MAPPING: (
+        "no coverage tooling mapping for this stack. Record working coverage command(s) in "
+        f"{COVERAGE_COMMANDS_PATH} (see the drafting instructions) so the gate can replay them."
+    ),
+}
 
 
 async def verify_coverage(
@@ -368,7 +415,10 @@ async def verify_coverage(
     if line_rate is None:
         return VerificationResult(
             passed=False,
-            feedback=f"Coverage run produced no parseable report -- treat as an infra failure, not a coverage gap: {reason}",
+            feedback=(
+                "Coverage run produced no parseable report -- treat as an infra failure, not a "
+                f"coverage gap: {_REASON_FEEDBACK.get(reason, reason)}"
+            ),
             report={"infra_error": reason, "contract_replay": entry_reports},
         )
 
@@ -439,6 +489,14 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     wrapped = _with_timeout("echo hi && echo bye", 30)
     assert wrapped.startswith("timeout 30 sh -c "), wrapped
     assert "echo hi && echo bye" in wrapped
+
+    # Every reason `measure_coverage` can return is a short stable code (never raw subprocess
+    # output) -- this is what keeps repo_scan's metrics.coverage.reason, and therefore
+    # content_hash, deterministic across two runs of an unchanged repo. `_REASON_FEEDBACK` must
+    # cover every one of them so the gate's own feedback stays actionable despite the terse code.
+    for code in STABLE_REASON_CODES:
+        assert " " not in code, f"{code!r} looks like prose, not a stable code"
+        assert code in _REASON_FEEDBACK, f"{code!r} has no human-readable gate feedback"
 
     print("test_coverage_gate self-check: all assertions passed")
 
