@@ -87,9 +87,11 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
 
     registry.set(body.thread_id, session)
     registry.set_meta(body.thread_id, user_login=body.user_login, target_branch=body.branch, resume=body.resume)
-    # Retained agent-memory-only for stage-end pushes to the ai-dev-workflow/<branch> work branch
-    # (git_ops.push_head). Never passed into the container environment -- the clone credential is
-    # destroyed after clone by design (entrypoint.sh), and pushes re-inject it one-shot per push.
+    # Retained agent-memory-only for stage-end pushes to the single, repo-shared `ai-dev-workflow`
+    # work branch (git_ops.push_head) -- every session/user on this repo pushes that same branch,
+    # via --force-with-lease per WS0's single-branch migration. Never passed into the container
+    # environment -- the clone credential is destroyed after clone by design (entrypoint.sh), and
+    # pushes re-inject it one-shot per push.
     git_ops.set_push_token(body.thread_id, body.github_token)
     return ProvisionResponse(status="ready")
 

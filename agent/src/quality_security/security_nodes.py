@@ -115,7 +115,12 @@ async def security_scan_node(state: dict[str, Any], config: RunnableConfig) -> d
         await git_ops.commit_paths(provider, thread_id, [TRIVY_SBOM_PATH], "ai-dev-workflow: security_remediation SBOM")
     # repo_scan is a LastValue channel -- spread prior state (see repo_scan_baseline_node).
     prior_repo_scan = dict(state.get("repo_scan") or {})
-    prior_repo_scan["latest_summary"] = scan.to_dashboard_dict()["summary"]
+    prior_summary = prior_repo_scan.get("latest_summary") or prior_repo_scan.get("baseline_summary")
+    new_summary = scan.to_dashboard_dict()["summary"]
+    # This scan only ran semgrep/trivy/gitleaks/osv-scanner (the `security` profile,
+    # include_metrics=False) -- merge keeps duplication/ccn/coverage from going gray mid-run
+    # instead of overwriting wholesale (repo_scan.py's merge_measures / PROFILE_MEASURES).
+    prior_repo_scan["latest_summary"] = repo_scan.merge_measures(prior_summary, new_summary, "security")
     return {"security_remediation": security_remediation, "repo_scan": prior_repo_scan}
 
 

@@ -173,7 +173,12 @@ async def quality_scan_node(state: dict[str, Any], config: RunnableConfig) -> di
     )
     # repo_scan is a LastValue channel -- spread prior state (see repo_scan_baseline_node).
     prior_repo_scan = dict(state.get("repo_scan") or {})
-    prior_repo_scan["latest_summary"] = scan.to_dashboard_dict()["summary"]
+    prior_summary = prior_repo_scan.get("latest_summary") or prior_repo_scan.get("baseline_summary")
+    new_summary = scan.to_dashboard_dict()["summary"]
+    # This scan only ran scc/lizard/jscpd (the `quality` profile) -- merge keeps security's
+    # measures from going to all-zeros mid-run instead of overwriting wholesale (repo_scan.py's
+    # merge_measures / PROFILE_MEASURES).
+    prior_repo_scan["latest_summary"] = repo_scan.merge_measures(prior_summary, new_summary, "quality")
     prior_repo_scan["latest_duplication_percent"] = quality_remediation["duplication_percent"]
     return {"quality_remediation": quality_remediation, "repo_scan": prior_repo_scan}
 

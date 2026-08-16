@@ -905,6 +905,37 @@ class ScanReport:
         }
 
 
+# Which `summary()["measures"]` keys a given scan profile's own tools actually measure. A
+# partial-profile scan (quality-remediation's own scan runs only scc/lizard/jscpd;
+# security-remediation's runs only semgrep/trivy/gitleaks/osv-scanner) must not blank the OTHER
+# loop's measures just because this scan's tool set doesn't touch them -- merge_measures keeps the
+# prior value for any key not in this set. A profile absent from this mapping (namely "full", the
+# baseline/metrics-report scan) measures everything summary() can report, so merge_measures is a
+# no-op for it.
+PROFILE_MEASURES: dict[str, frozenset[str]] = {
+    "quality": frozenset({"duplication_percent", "mean_ccn"}),
+    "security": frozenset({"security"}),
+}
+
+
+def merge_measures(prior_summary: dict[str, Any] | None, new_summary: dict[str, Any], profile: str) -> dict[str, Any]:
+    """Merges a partial-profile scan's `measures` onto the prior summary's (the previous latest,
+    or the baseline) -- see PROFILE_MEASURES. Every other field of `new_summary` (health_score,
+    gating_count, by_severity, ...) is this scan's own and is returned untouched; only `measures`
+    keys the profile's own tools didn't compute fall back to the prior value, so quality-remediation's
+    scan can't zero out security's chip mid-run (or security-remediation's blank quality's).
+    """
+    measured = PROFILE_MEASURES.get(profile)
+    if measured is None or prior_summary is None:
+        return new_summary
+    prior_measures = prior_summary.get("measures") or {}
+    new_measures = dict(new_summary.get("measures") or {})
+    for key in new_measures:
+        if key not in measured and key in prior_measures:
+            new_measures[key] = prior_measures[key]
+    return {**new_summary, "measures": new_measures}
+
+
 def _dashboard_finding(finding: Finding, gating: bool) -> dict[str, Any]:
     """No `tool`, no `sources`: the dashboard shows the issue, not who found it."""
     return {
@@ -1642,6 +1673,47 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     qs_measures = quality_only.summary()["measures"]
     assert qs_measures["security"]["worst_open_severity"] == "none"
     assert qs_measures["security"]["by_severity"] == {level: 0 for level in SEVERITY_ORDER}
+
+    # --- merge_measures: a partial-profile scan must not blank the OTHER loop's measures --------
+    prior_for_merge = {
+        "measures": {
+            "security": {"worst_open_severity": "high", "by_severity": {**{lvl: 0 for lvl in SEVERITY_ORDER}, "high": 1}},
+            "duplication_percent": 4.2,
+            "mean_ccn": 6.5,
+            "coverage_line_rate": 71.0,
+        }
+    }
+    quality_only_summary = {
+        "measures": {
+            "security": {"worst_open_severity": "none", "by_severity": {lvl: 0 for lvl in SEVERITY_ORDER}},
+            "duplication_percent": 1.0,
+            "mean_ccn": 3.0,
+            "coverage_line_rate": None,
+        }
+    }
+    merged_quality = merge_measures(prior_for_merge, quality_only_summary, "quality")
+    assert merged_quality["measures"]["security"] == prior_for_merge["measures"]["security"], "quality-remediation's scan must not blank security's measures"
+    assert merged_quality["measures"]["duplication_percent"] == 1.0, "quality-remediation's own duplication must win"
+    assert merged_quality["measures"]["mean_ccn"] == 3.0, "quality-remediation's own ccn must win"
+
+    security_only_summary = {
+        "measures": {
+            "security": {"worst_open_severity": "critical", "by_severity": {**{lvl: 0 for lvl in SEVERITY_ORDER}, "critical": 1}},
+            "duplication_percent": None,
+            "mean_ccn": None,
+            "coverage_line_rate": None,
+        }
+    }
+    merged_security = merge_measures(prior_for_merge, security_only_summary, "security")
+    assert merged_security["measures"]["security"] == security_only_summary["measures"]["security"], "security-remediation's own findings must win"
+    assert merged_security["measures"]["duplication_percent"] == 4.2, "security-remediation's scan must not blank duplication"
+    assert merged_security["measures"]["mean_ccn"] == 6.5, "security-remediation's scan must not blank ccn"
+    assert merged_security["measures"]["coverage_line_rate"] == 71.0, "security-remediation's scan must not blank coverage"
+
+    # No prior summary yet (first scan ever this run) -> nothing to merge, new summary passes through.
+    assert merge_measures(None, quality_only_summary, "quality") == quality_only_summary
+    # "full" (baseline/metrics-report) measures everything itself -- merge_measures is a no-op.
+    assert merge_measures(prior_for_merge, quality_only_summary, "full") == quality_only_summary
 
     # Trivy's NONE/NEGLIGIBLE severities normalize to "info" -- on a security category (here,
     # vulnerability) that must surface as "info", never clamped up to "low" or hidden as "none".

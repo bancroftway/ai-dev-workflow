@@ -203,8 +203,10 @@ class GraphState(TypedDict):
     metrics_report: dict[str, Any]
     # The baseline repo scan taken once at the top of the graph -- see agent/src/repo_scan.py.
     repo_scan: dict[str, Any]
-    # Outcome of the most recent push to the ai-dev-workflow/<branch> work branch
-    # (git_ops.push_head): {ok, error, at}. Streamed so the frontend can warn when GitHub
+    # Outcome of the most recent push to the single, repo-shared `ai-dev-workflow` work branch
+    # (git_ops.push_head): {ok, error, at}. Every session/user on this repo pushes that same
+    # branch via --force-with-lease (WS0's single-branch migration retired the old per-branch
+    # `ai-dev-workflow/<branch>` naming). Streamed so the frontend can warn when GitHub
     # persistence is failing (e.g. the user lacks push permission) instead of silently lying.
     last_push: dict[str, Any] | None
     # Terminal failure record ({stage, type, ...detail} -- the old escalation payload shape).

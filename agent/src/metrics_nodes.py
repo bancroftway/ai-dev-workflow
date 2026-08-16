@@ -141,7 +141,18 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
 
     provider = get_sandbox_provider()
     scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
-    coverage = await _read_coverage_summary(provider, thread_id)
+    # Prefer the contract-merged number graph.py's make_verify_node / audit_gates.py's
+    # audit_exit_gate_node already promoted onto state.repo_scan.coverage: both read the SAME
+    # coverage artifact minimal-code-to-green's own gate produced, whereas _read_coverage_summary
+    # re-parses whichever coverage artifact it finds FIRST on disk -- root cobertura wins that
+    # search on a dual-stack repo, silently reporting only the .NET half. Re-parse stays as the
+    # fallback for a repo/thread that never ran that gate (predates it, or hydrated straight past
+    # that stage) -- the delta then compares like-with-like (both contract-merged).
+    promoted_coverage = (state.get("repo_scan") or {}).get("coverage") or {}
+    if isinstance(promoted_coverage.get("line_rate"), (int, float)):
+        coverage = {"line_rate": promoted_coverage["line_rate"], "branch_rate": promoted_coverage.get("branch_rate")}
+    else:
+        coverage = await _read_coverage_summary(provider, thread_id)
     # Merged in BEFORE the dashboard dict is built (and BEFORE LATEST_PATH is written) so the
     # delta engine's coverage_line_rate metric and the `measures` block both see it.
     scan = replace(scan, metrics={**scan.metrics, "coverage": coverage})
