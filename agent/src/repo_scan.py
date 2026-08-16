@@ -36,6 +36,7 @@ fixtures in `_demo()` so a mismatch shows up as a parse failure rather than sile
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
@@ -1248,8 +1249,19 @@ async def run_repo_scan(
     fragments: list[dict[str, Any]] = []
     tool_runs: list[dict[str, Any]] = []
 
-    for spec in selected:
-        run, tool_findings, fragment = await _run_one(provider, thread_id, spec)
+    # Each tool is an independent sandbox exec writing its own agent-work/ output file, so they
+    # run concurrently -- wall clock drops from sum-of-tools to roughly the longest tool, which is
+    # what makes per-stage background refresh scans affordable. gather() preserves call order, so
+    # findings accumulate in `selected` order exactly as the sequential loop did.
+    # ponytail: fixed concurrency of 3 (semgrep/trivy/osv are CPU+memory heavy in one container);
+    # make it an env knob if a bigger sandbox shows headroom.
+    semaphore = asyncio.Semaphore(3)
+
+    async def _bounded(spec: ToolSpec) -> tuple[dict[str, Any], list[Finding], dict[str, Any]]:
+        async with semaphore:
+            return await _run_one(provider, thread_id, spec)
+
+    for run, tool_findings, fragment in await asyncio.gather(*(_bounded(spec) for spec in selected)):
         tool_runs.append(run)
         findings.extend(tool_findings)
         if fragment:
@@ -1338,8 +1350,6 @@ _BACKGROUND_SCANS: dict[str, "asyncio.Task[Any]"] = {}
 
 
 def start_background_scan(thread_id: str, provider: Any) -> None:
-    import asyncio
-
     if thread_id in _BACKGROUND_SCANS:
         return
     _BACKGROUND_SCANS[thread_id] = asyncio.create_task(
@@ -1354,7 +1364,7 @@ def pop_background_scan(thread_id: str) -> "asyncio.Task[Any] | None":
 async def _scan_with_coverage(
     provider: Any, thread_id: str, *, timeout_seconds: int | None = None
 ) -> tuple["ScanReport", dict[str, Any]]:
-    """The baseline scan and coverage measurement, run one after the other as a single task so
+    """The baseline scan and coverage measurement, run concurrently within a single task so
     both finish before `repo_scan_baseline_node` awaits it -- the report is NOT written to
     BASELINE_PATH here, deliberately: the node writes it once, after merging coverage in, so the
     committed file and the streamed summary never disagree about whether coverage is present.
@@ -1364,16 +1374,19 @@ async def _scan_with_coverage(
     the ALREADY-COMPLETED scan over a coverage crash would force repo_scan_baseline_node's fallback
     to redo scan+coverage inline -- exactly the critical-path cost this task overlaps away.
     """
-    report = await run_repo_scan(provider, thread_id, profile="full")
     from .gates.test_coverage_gate import measure_coverage  # local: keeps the pure half import-light
 
-    try:
-        line_rate, branch_rate, _gaps, reason, _entry_reports = await measure_coverage(
-            provider, thread_id, timeout_seconds=timeout_seconds
-        )
-    except Exception:  # noqa: BLE001 -- the scan already succeeded; a coverage crash must not lose it
-        logger.warning("repo_scan: coverage measurement crashed; keeping the completed scan", exc_info=True)
-        line_rate, branch_rate, reason = None, None, "runner_error"
+    # Scanners and the coverage test run touch disjoint outputs -- run them concurrently.
+    async def _guarded_coverage() -> tuple[Any, Any, Any, str, Any]:
+        try:
+            return await measure_coverage(provider, thread_id, timeout_seconds=timeout_seconds)
+        except Exception:  # noqa: BLE001 -- the scan must not be lost over a coverage crash
+            logger.warning("repo_scan: coverage measurement crashed; keeping the completed scan", exc_info=True)
+            return None, None, [], "runner_error", []
+
+    report, (line_rate, branch_rate, _gaps, reason, _entry_reports) = await asyncio.gather(
+        run_repo_scan(provider, thread_id, profile="full"), _guarded_coverage()
+    )
 
     coverage: dict[str, Any] = {"line_rate": line_rate, "branch_rate": branch_rate}
     if line_rate is None:
