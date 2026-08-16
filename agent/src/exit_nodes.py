@@ -158,6 +158,7 @@ def _render_history_sections(
     delta_summary: dict[str, Any] | None,
     screenshots: list[str],
     run_id: str,
+    e2e: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
     markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
@@ -186,6 +187,14 @@ def _render_history_sections(
         )
     else:
         lines.append("Not recorded for this run.")
+    e2e = e2e or {}
+    e2e_status = e2e.get("status") or "not run"
+    e2e_line = f"- **E2E**: {e2e_status}"
+    if e2e.get("failed_tests"):
+        e2e_line += f" ({len(e2e['failed_tests'])}/{e2e.get('total', 0)} failed)"
+    elif e2e.get("skipped_reason"):
+        e2e_line += f" -- {e2e['skipped_reason']}"
+    lines.append(e2e_line)
     lines.append("")
 
     lines += ["## Delta vs baseline", ""]
@@ -203,12 +212,17 @@ def _render_history_sections(
         lines.append("No baseline recorded for this repository -- nothing to diff.")
     lines.append("")
 
+    # Unconditional section -- the exit report has a fixed skeleton, and "no screenshots" must be
+    # a stated fact with a reason, never a silently missing heading.
+    lines += ["## E2E Screenshots", ""]
     if screenshots:
-        lines += ["## E2E Screenshots", ""]
         for path in screenshots:
             name = path.rsplit("/", 1)[-1]
             lines.append(f"![{name}](./{run_id}-screens/{name})")
-        lines.append("")
+    else:
+        reason = e2e.get("skipped_reason") or ""
+        lines.append(f"(none captured -- e2e {e2e_status}{': ' + reason if reason else ''})")
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -225,6 +239,94 @@ def _diff_ledger(prior: list[dict[str, Any]] | None, current: list[dict[str, Any
     return {"added": added, "revised": revised, "retired": retired}
 
 
+async def verify_exit_readiness(
+    thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any
+) -> Any:
+    """EXIT_SPEC's deterministic_verify: completes the manifest (greenfield re-record + commands --
+    only exit has the complete picture, code exists and coverage-commands.json is final), then
+    forces merge_ready=False on the merge-readiness draft for any deterministic blocker: the
+    metrics regression gate's recorded reasons, a UI app with zero e2e screenshots, or a manifest
+    still missing apps/test_command/coverage_commands. Always returns passed=True with the draft
+    mutated in place -- an LLM redraft can't fix a code regression or a missing screenshot; the
+    downgrade IS the outcome (the no-sandbox cannot_verify path is handled by make_verify_node)."""
+    from . import app_discovery  # local: app_discovery imports nothing from exit_nodes, but keep the surface flat
+    from .gates.ac_coverage_gate import resolve_test_command
+    from .gates.test_coverage_gate import COVERAGE_COMMANDS_PATH
+    from .graph import VerificationResult  # local: graph imports exit_nodes (same pattern as audit_gates)
+    from .tech_stack_signals import frameworks_have_ui
+
+    def _parse(raw: str | None) -> dict[str, Any]:
+        if raw is None:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    manifest = _parse(await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH))
+    tech_stack = _parse(await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json"))
+
+    # --- manifest completion: same shape regardless of entrypoint (greenfield or brownfield) ---
+    updates: dict[str, Any] = {}
+    app_check = manifest.get("app_check") or {}
+    if not (app_check.get("apps") or []):
+        # app_check_record ran pre-scaffold (empty [] on greenfield, by construction) -- re-scan
+        # now that the code exists, exact reuse of e2e_gate_check_node's greenfield re-scan.
+        scan = await app_discovery.collect_evidence(provider, thread_id)
+        apps = app_discovery.candidates_to_apps(scan.get("candidates") or [])
+        if apps:
+            updates["app_check"] = {"apps": apps, "evidence_fingerprint": scan.get("fingerprint")}
+    if not manifest.get("test_command"):
+        command = resolve_test_command(tech_stack)
+        if command:
+            updates["test_command"] = command
+    if not manifest.get("coverage_commands"):
+        entries = _parse(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH)).get("entries")
+        if entries:
+            updates["coverage_commands"] = entries
+    if updates:
+        manifest = await preflight_nodes.update_manifest(provider, thread_id, updates)
+
+    problems: list[str] = []
+
+    # --- presence: what a merge actually needs recorded ---
+    app_check = manifest.get("app_check") or {}
+    if app_check.get("suitable") is not False and not (app_check.get("apps") or []):
+        problems.append("manifest.json records no runnable app (app_check.apps is empty even after re-scan)")
+    if not manifest.get("test_command"):
+        problems.append("manifest.json has no test_command for this stack")
+    if not manifest.get("coverage_commands"):
+        problems.append("manifest.json has no coverage_commands -- coverage is not replayable")
+
+    # --- screenshots: mandatory visual evidence for UI apps, whatever path e2e took (covers all
+    # of its skip paths with one check) ---
+    is_ui = frameworks_have_ui(tech_stack.get("frameworks") or [])
+    screenshots = await _list_screenshots(provider, thread_id, run_id)
+    if is_ui and not screenshots:
+        problems.append("UI application but no e2e screenshots were captured")
+
+    # --- the metrics regression gate's verdict, run-id-stamped so a stale file never gates ---
+    metrics = _parse(await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json"))
+    if metrics.get("run_id") == run_id:
+        problems.extend((metrics.get("regression_gate") or {}).get("reasons") or [])
+    else:
+        problems.append("metrics were not recorded for this run -- the regression gate never passed")
+
+    if problems:
+        content_dict["merge_ready"] = False
+        existing = list(content_dict.get("blocking_reasons") or [])
+        content_dict["blocking_reasons"] = existing + [p for p in problems if p not in existing]
+        feedback = f"merge_ready forced False: {len(problems)} deterministic blocker(s)"
+    else:
+        feedback = "deterministic exit checks passed (manifest complete, screenshots present for UI, metrics gate clean)"
+    return VerificationResult(
+        passed=True,
+        feedback=feedback,
+        report={"blockers": problems, "ui_app": is_ui, "screenshot_count": len(screenshots), "manifest_completed": sorted(updates)},
+    )
+
+
 async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     if sandbox_registry.get(thread_id) is None:
@@ -239,6 +341,11 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
     raw_requirements = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/raw-requirements.approved.json")
     raw_metrics = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json")
     metrics_summary = json.loads(raw_metrics) if raw_metrics else {}
+    if metrics_summary.get("run_id") != run_id:
+        # Stale file from a previous run (metrics_compute short-circuited this run) -- rendering
+        # it as this run's numbers was the "traceability from a stale manifest" bug. Say "not
+        # recorded" instead, and persist nothing stale.
+        metrics_summary = {}
     exit_stage = (state.get("stages") or {}).get("exit", {})
     merge_readiness = exit_stage.get("approved_content")
 
@@ -292,16 +399,19 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
 
     await repo_files.write_repo_file(provider, thread_id, CHANGELOG_PATH, new_changelog)
 
-    if merge_readiness:
+    if merge_readiness or state.get("run_failure"):
+        # A metrics-regression run reaches here too (the gate routes INTO exit, never END) -- close
+        # its session row as failed so it never lingers as "running" in sessions.json.
         await session_index.end_session(
             provider,
             thread_id,
             run_id=run_id,
-            status="completed",
+            status="failed" if state.get("run_failure") else "completed",
+            failure=state.get("run_failure"),
             exit_summary={
-                "merge_ready": merge_readiness.get("merge_ready", False),
-                "pr_title": merge_readiness.get("pr_title", ""),
-            },
+                "merge_ready": (merge_readiness or {}).get("merge_ready", False),
+                "pr_title": (merge_readiness or {}).get("pr_title", ""),
+            } if merge_readiness else None,
         )
 
     # Per-run exit report artifacts (durable even once sessions.json ages the row out): the raw
@@ -338,6 +448,7 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
         delta_summary=delta_summary,
         screenshots=screenshots,
         run_id=run_id,
+        e2e=state.get("e2e"),
     )
     await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
 
@@ -397,13 +508,17 @@ def _demo() -> None:
     os.environ.pop("AIDW_HISTORY_RETAIN", None)
 
     # _render_history_sections: "not recorded"/"no baseline" placeholders when data is absent,
-    # real content when present, screenshots section only when there are any.
+    # real content when present, and a FIXED skeleton -- the screenshots section always renders,
+    # stating why it's empty (e2e status + skip reason) rather than silently missing.
     empty = _render_history_sections(
-        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None, screenshots=[], run_id="r1"
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None, screenshots=[], run_id="r1",
+        e2e={"status": "skipped", "skipped_reason": "no UI framework"},
     )
     assert "not recorded for this run" in empty.lower()
     assert "no baseline recorded" in empty.lower()
-    assert "## E2E Screenshots" not in empty
+    assert "## E2E Screenshots" in empty
+    assert "(none captured -- e2e skipped: no UI framework)" in empty
+    assert "- **E2E**: skipped -- no UI framework" in empty
 
     filled = _render_history_sections(
         files_changed_stat="1 file changed",
@@ -412,11 +527,14 @@ def _demo() -> None:
         delta_summary={"fixed_count": 1, "introduced_count": 0, "severity_changed": 0, "metrics": {"coverage_line_rate": {"from": 70, "to": 80, "delta": 10, "direction": "improved"}}},
         screenshots=[".ai-dev-workflow/history/r1-screens/1.png"],
         run_id="r1",
+        e2e={"status": "passed", "total": 3, "passed": 3, "failed_tests": []},
     )
     assert "1 file changed" in filled
     assert "80.0%" in filled
     assert "coverage_line_rate" in filled
+    assert "- **E2E**: passed" in filled
     assert "## E2E Screenshots" in filled and "./r1-screens/1.png" in filled
+    assert "(none captured" not in filled
 
     print("exit_nodes self-check: ok")
 

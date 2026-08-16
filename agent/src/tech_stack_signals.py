@@ -19,14 +19,20 @@ logger = logging.getLogger(__name__)
 UI_FRAMEWORK_MARKERS = ("react", "vue", "angular", "blazor", "svelte", "next", "nuxt", "flutter", "swiftui", "jetpack compose")
 
 
+def frameworks_have_ui(frameworks: list[Any]) -> bool:
+    """The pure check behind tech_stack_has_ui_framework, for callers that hold a frameworks list
+    but no graph state (exit's deterministic verify reads tech-stack.approved.json off disk)."""
+    lowered = [str(f).lower() for f in frameworks or []]
+    return any(marker in fw for fw in lowered for marker in UI_FRAMEWORK_MARKERS)
+
+
 def tech_stack_has_ui_framework(state: dict[str, Any]) -> bool:
     """Shared signal for P3's wireframe requirement, P4's Playwright MCP, and e2e's gate check --
     all three key off whether this repo has a UI framework at all, using tech-stack's own
     TechStack.frameworks report (a real, deliberate simplification from "only for UI-relevant
     content specifically" to "only for UI-framework repos at all")."""
     tech_stack = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
-    frameworks = [str(f).lower() for f in (tech_stack.get("frameworks") or [])]
-    return any(marker in fw for fw in frameworks for marker in UI_FRAMEWORK_MARKERS)
+    return frameworks_have_ui(tech_stack.get("frameworks") or [])
 
 
 def dotnet_root_prefix(tech_stack: dict[str, Any]) -> str:

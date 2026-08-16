@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import shlex
 from typing import Any, Literal, TypedDict
@@ -34,6 +35,8 @@ from . import git_ops, model_config, repo_files
 from .copilot_chat_model import get_chat_model_for_thread
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
+
+logger = logging.getLogger(__name__)
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .tech_stack_signals import tech_stack_has_ui_framework
@@ -298,6 +301,25 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             dest = f"{screens_dir}/{index:03d}.png"
             await provider.exec_in_sandbox(thread_id, f"cp -- {shlex.quote(path)} {shlex.quote(dest)}")
             screenshots.append(dest)
+    if not screenshots:
+        # Playwright's default screenshot config is only-on-failure, so a green suite harvests
+        # nothing -- and exit.md then has no visual evidence for a UI app. The app is still up
+        # here: take one homepage shot deterministically. Best-effort -- a failure logs and moves
+        # on, NEVER fails the attempt (an infra gap isn't fixable by the e2e fix LLM; exit's
+        # verify is what blocks a UI merge with zero screenshots).
+        # ponytail: homepage-only fallback; per-test shots come from ac-to-tests' screenshot:'on'
+        # config instruction.
+        shot_cmd = "npx playwright screenshot" if runner == "local" else "playwright screenshot"
+        await provider.exec_in_sandbox(thread_id, f"mkdir -p {shlex.quote(screens_dir)}")
+        shot = await provider.exec_in_sandbox(
+            thread_id,
+            f"{run_prefix}{shot_cmd} --full-page http://localhost:{port} {shlex.quote(f'{screens_dir}/001.png')} 2>&1",
+        )
+        landed = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(f'{screens_dir}/001.png')} 2>/dev/null")
+        if (landed.stdout or "").strip():
+            screenshots.append(f"{screens_dir}/001.png")
+        else:
+            logger.warning("e2e fallback screenshot failed for thread_id=%s: %s", thread_id, (shot.stdout or "")[-500:])
     e2e["screenshots"] = screenshots
 
     raw_report = await repo_files.read_repo_file(provider, thread_id, E2E_REPORT_PATH)

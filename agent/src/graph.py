@@ -1628,6 +1628,11 @@ EXIT_SPEC = StageSpec(
     # specification and plan only. The report itself stays reviewable on the work branch.
     requires_human_gate=False,
     sign_approval=True,  # APPROVALS.md covers P2/P3/exit per the plan
+    # Deterministic downgrades, never redrafts: completes the manifest, then forces
+    # merge_ready=False for regression-gate reasons / missing UI screenshots / an incomplete
+    # manifest. Always returns passed=True with the draft mutated -- no retry can fix these.
+    deterministic_verify=exit_nodes.verify_exit_readiness,
+    max_verify_cycles=0,
 )
 
 

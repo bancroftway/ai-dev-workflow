@@ -43,6 +43,10 @@ even to make a test compile; if a test needs a symbol that doesn't exist yet, th
 correct at this stage (a later, separate stage adds minimal scaffolding to make it compile without
 making it pass).
 
+If you write or edit a `playwright.config.*`, its `use` block MUST set `screenshot: 'on'` -- a
+passing e2e suite must still capture visual evidence (the exit report requires screenshots for UI
+apps; Playwright's default only-on-failure setting captures nothing on green runs).
+
 If an Acceptance Criterion is UI-relevant, use the Playwright MCP tools (if available in this
 session) to explore the app's actual current UI before writing a skeleton -- ground locators
 against what's really there; for elements that don't exist yet (the feature hasn't been built),
