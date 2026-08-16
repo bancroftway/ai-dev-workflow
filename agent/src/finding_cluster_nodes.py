@@ -49,7 +49,7 @@ def default_finding_cluster_state() -> FindingClusterState:
 
 def _resolve_outdated_command(tech_stack: dict[str, Any]) -> str | None:
     if tech_stack.get("dotnet_detected"):
-        return "dotnet list package --outdated 2>&1"
+        return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet list package --outdated 2>&1"
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if "typescript" in languages or "javascript" in languages:
         return "npx --yes npm-check-updates 2>&1"
