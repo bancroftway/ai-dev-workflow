@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from .schemas import ClarifyingQuestion
 
 TestKind = Literal["unit", "integration", "e2e_playwright_skeleton"]
-TestFramework = Literal["xunit", "nunit", "vitest", "jest", "playwright"]
+TestFramework = Literal["xunit", "nunit", "vitest", "jest", "playwright", "pytest"]
 TestCategory = Literal["happy_path", "negative", "edge", "adversarial", "validator"]
 
 

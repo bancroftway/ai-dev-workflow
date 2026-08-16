@@ -75,15 +75,24 @@ e2e) actually exercises that behavior, alongside the happy-path test, not instea
 - **Edge/boundary tests** (empty, null, max/min, off-by-one, unicode/whitespace, duplicates): assert
   the actual boundary behavior on both sides, e.g. a 101-character input is rejected and a
   100-character input is accepted -- one side alone doesn't prove where the line is.
+  - xUnit/.NET: `[Theory] [InlineData(100, true)] [InlineData(101, false)]` against one length guard.
+  - vitest/JS-TS: `expect(isValidLength("a".repeat(100))).toBe(true)` and the 101-char call `.toBe(false)`.
+  - pytest/python: `assert is_valid_length("a" * 100) is True` and `assert is_valid_length("a" * 101) is False`.
 - **Adversarial tests** (wherever the AC touches a trust boundary): feed injection payloads (a
   `' OR '1'='1` string, a `<script>` tag), oversized/malformed payloads, and path-traversal strings
   (`../../etc/passwd`), and assert the system neutralizes or rejects them (escaped output, a
   400/422 response, no traversal outside the intended root) -- not merely that the process didn't
   crash.
+  - xUnit/.NET: post `"'; DROP TABLE Users;--"` and assert `response.StatusCode == HttpStatusCode.UnprocessableEntity` plus the row count is unchanged.
+  - vitest/JS-TS: `expect(render({name: "<script>alert(1)</script>"})).not.toContain("<script>")`.
+  - pytest/python: `assert "etc/passwd" not in resolve_path("../../etc/passwd")` (resolves inside the sandbox root).
 - **Validator-targeting tests**: for every validator/guard the AC implies, write one case just
   inside its boundary that must pass and one just outside it that must fail -- a min-length-3 rule
   needs a 2-character case that fails and a 3-character case that passes, not two cases that both
   sit comfortably on one side.
+  - xUnit/.NET: `[InlineData("ab", false)] [InlineData("abc", true)]` against the same `MinLength(3)` guard.
+  - vitest/JS-TS: `expect(validate("ab")).toBe(false)` paired with `expect(validate("abc")).toBe(true)`.
+  - pytest/python: `assert validate("ab") is False` paired with `assert validate("abc") is True`.
 
 **Distinct observable behavior** means each test's assertion would fail for a genuinely different
 reason than any other test's -- a different status code, a different error type or message, a
