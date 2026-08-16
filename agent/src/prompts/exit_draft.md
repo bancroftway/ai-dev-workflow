@@ -13,5 +13,8 @@ request: what changed, why, how it was verified. Note genuine risks in `risk_not
 believe a specific kind of reviewer should look at this (e.g. security-sensitive change), say so
 in `suggested_reviewers_note`.
 
+`pr_description_markdown` must concretely enumerate what was produced -- specific files added or
+changed and the user-visible behavior delta -- not a vague summary a reviewer has to go re-derive from the diff.
+
 Use the `caveman` skill at `full` intensity for `pr_description_markdown` -- reviewers read this
 under time pressure.

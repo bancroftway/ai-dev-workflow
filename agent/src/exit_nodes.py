@@ -12,17 +12,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shlex
 from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from . import approvals, git_ops, preflight_nodes, repo_files, session_index, spec_ledger
+from . import approvals, git_ops, preflight_nodes, repo_files, repo_scan, session_index, spec_ledger
+from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 
 CHANGELOG_PATH = "CHANGELOG.md"
+HISTORY_DIR = ".ai-dev-workflow/history"
+
+# N most recent runs (by sessions.json order) whose history/ artifacts survive exit finalize.
+# Screenshots are committed binaries -- unbounded per-run growth ships to the user's own remote.
+_DEFAULT_HISTORY_RETAIN = 10
 
 
 def _hash_content(raw: str | None) -> str | None:
@@ -47,6 +55,128 @@ async def _find_prior_ledger_snapshot(provider: Any, thread_id: str, current_run
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+def _history_retain() -> int:
+    """AIDW_HISTORY_RETAIN, same tolerant-parse pattern as session_index._file_cap."""
+    try:
+        configured = int(os.environ.get("AIDW_HISTORY_RETAIN") or _DEFAULT_HISTORY_RETAIN)
+    except ValueError:
+        configured = _DEFAULT_HISTORY_RETAIN
+    return max(configured, 1)
+
+
+def _stale_history_files(filenames: list[str], keep_run_ids: set[str]) -> list[str]:
+    """Pure grouping half of retention. run_id is an 8-hex-char token (graph.py intake_node), never
+    containing "-", so splitting each filename on its FIRST "-" reliably recovers the run_id prefix
+    regardless of which artifact kind follows it (-report.json, -exit.md, -metrics.json,
+    -ledger-snapshot.json, -screens). Lexical filename sort would not be chronological (a hex token
+    isn't a timestamp) -- that's why this groups by run_id and checks membership instead."""
+    return [name for name in filenames if name.split("-", 1)[0] not in keep_run_ids]
+
+
+async def _prune_history(provider: Any, thread_id: str, run_id: str) -> None:
+    """Deletes history/ artifacts belonging to runs older than the last N (AIDW_HISTORY_RETAIN,
+    default 10), keeping every run_id mentioned in the last N sessions.json entries (chronological,
+    see session_index.py) plus always the current run -- run_id may not appear there yet if the
+    exit stage was never approved (end_session only fires when merge_readiness is truthy, above)."""
+    sessions = await session_index._read(provider, thread_id)  # noqa: SLF001 -- same package, read-only reuse
+    keep_ids = {s.get("run_id") for s in sessions[-_history_retain():] if s.get("run_id")}
+    keep_ids.add(run_id)
+
+    listing = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(HISTORY_DIR)} 2>/dev/null")
+    filenames = [n.strip() for n in (listing.stdout or "").splitlines() if n.strip()]
+    stale = _stale_history_files(filenames, keep_ids)
+    if not stale:
+        return
+    quoted = " ".join(shlex.quote(f"{HISTORY_DIR}/{name}") for name in stale)
+    await provider.exec_in_sandbox(thread_id, f"rm -rf -- {quoted}")
+
+
+async def _files_changed(provider: Any, thread_id: str, baseline_commit: str | None) -> tuple[str, str]:
+    """git diff --stat and git log --oneline for this run's own commits (baseline..HEAD), as plain
+    text blocks for the report artifacts. Empty strings (never None) when there's no baseline to
+    diff against -- an old thread predating run_baseline_commit, or a run that never scaffolded."""
+    if not baseline_commit:
+        return "", ""
+    range_arg = f"{baseline_commit}..HEAD"
+    diff_result = await provider.exec_in_sandbox(
+        thread_id, f"git diff --stat {shlex.quote(range_arg)} -- . {shlex.quote(':!.ai-dev-workflow')}"
+    )
+    log_result = await provider.exec_in_sandbox(thread_id, f"git log --oneline {shlex.quote(range_arg)}")
+    return (diff_result.stdout or "").strip(), (log_result.stdout or "").strip()
+
+
+async def _list_screenshots(provider: Any, thread_id: str, run_id: str) -> list[str]:
+    """Repo-relative paths of whatever's in history/<run_id>-screens/, empty when the dir doesn't
+    exist (E2E lands the dir in a later task) -- never fabricated."""
+    screens_dir = f"{HISTORY_DIR}/{run_id}-screens"
+    result = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(screens_dir)} 2>/dev/null")
+    names = [n.strip() for n in (result.stdout or "").splitlines() if n.strip()]
+    return [f"{screens_dir}/{name}" for name in names]
+
+
+def _render_history_sections(
+    *,
+    files_changed_stat: str,
+    commits_log: str,
+    metrics_summary: dict[str, Any],
+    delta_summary: dict[str, Any] | None,
+    screenshots: list[str],
+    run_id: str,
+) -> str:
+    """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
+    markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
+    output) -- this is free-form derived text (a git diff --stat block, a metrics rollup) with no
+    schema behind it."""
+    lines: list[str] = ["## What was produced", "", "```", files_changed_stat or "(no baseline recorded for this run -- nothing to diff)", "```", ""]
+    lines += ["**Commits this run:**", "", "```", commits_log or "(none)", "```", ""]
+
+    lines += ["## Metrics", ""]
+    if metrics_summary:
+        coverage = metrics_summary.get("coverage") or {}
+        traceability = metrics_summary.get("traceability_summary") or {}
+        tokens = metrics_summary.get("token_usage_summary") or {}
+        line_rate, branch_rate = coverage.get("line_rate"), coverage.get("branch_rate")
+        lines.append(
+            f"- **Coverage**: line {line_rate if line_rate is not None else '--'}%, "
+            f"branch {branch_rate if branch_rate is not None else '--'}%"
+        )
+        lines.append(
+            f"- **Traceability**: {traceability.get('covered', 0)}/{traceability.get('total', 0)} covered, "
+            f"{traceability.get('tests_only', 0)} tests-only, {traceability.get('untested', 0)} untested"
+        )
+        lines.append(
+            f"- **Tokens**: {tokens.get('total_input_tokens', 0)} in / {tokens.get('total_output_tokens', 0)} out "
+            f"(${tokens.get('total_cost', 0):.4f})"
+        )
+    else:
+        lines.append("Not recorded for this run.")
+    lines.append("")
+
+    lines += ["## Delta vs baseline", ""]
+    if delta_summary:
+        lines += ["| Metric | Before | After | Change |", "|---|---|---|---|"]
+        for name, d in (delta_summary.get("metrics") or {}).items():
+            lines.append(f"| {name} | {d.get('from')} | {d.get('to')} | {d.get('delta')} ({d.get('direction')}) |")
+        lines.append("")
+        lines.append(
+            f"Findings: {delta_summary.get('fixed_count', 0)} fixed, "
+            f"{delta_summary.get('introduced_count', 0)} introduced, "
+            f"{delta_summary.get('severity_changed', 0)} severity-changed."
+        )
+    else:
+        lines.append("No baseline recorded for this repository -- nothing to diff.")
+    lines.append("")
+
+    if screenshots:
+        lines += ["## E2E Screenshots", ""]
+        for path in screenshots:
+            name = path.rsplit("/", 1)[-1]
+            lines.append(f"![{name}](./{run_id}-screens/{name})")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _diff_ledger(prior: list[dict[str, Any]] | None, current: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -99,7 +229,7 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
     )
 
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
-    snapshot_path = f".ai-dev-workflow/history/{run_id}-ledger-snapshot.json"
+    snapshot_path = f"{HISTORY_DIR}/{run_id}-ledger-snapshot.json"
     prior_snapshot = await _find_prior_ledger_snapshot(provider, thread_id, run_id)
     diff = _diff_ledger(prior_snapshot, ledger_entries)
     await repo_files.write_repo_file(provider, thread_id, snapshot_path, json.dumps(ledger_entries, indent=2) + "\n")
@@ -140,10 +270,113 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
             },
         )
 
+    # Per-run exit report artifacts (durable even once sessions.json ages the row out): the raw
+    # diff/log this run actually produced, plus the same metrics/delta numbers the frontend Report
+    # tab shows live, frozen at exit time so a past session's report page can render identically.
+    files_changed_stat, commits_log = await _files_changed(provider, thread_id, state.get("run_baseline_commit"))
+    screenshots = await _list_screenshots(provider, thread_id, run_id)
+    delta_summary = repo_scan.delta_summary(metrics_summary.get("repo_scan_delta"))
+
+    report_path = f"{HISTORY_DIR}/{run_id}-report.json"
+    exit_md_path = f"{HISTORY_DIR}/{run_id}-exit.md"
+
+    report_payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "merge_readiness": merge_readiness,
+        "metrics": metrics_summary,
+        # Not in the plan's literal artifact shape, but required to render "Delta vs baseline" on
+        # a past-session report page without re-deriving it from metrics_summary's raw repo_scan_delta
+        # diff (that transform, repo_scan.delta_summary, is Python-only) -- cheap to persist since
+        # it's already computed for the exit.md section below.
+        "delta_summary": delta_summary,
+        "files_changed": files_changed_stat,
+        "commits": commits_log,
+        "e2e": state.get("e2e"),
+        "screenshots": screenshots,
+    }
+    await repo_files.write_repo_file(provider, thread_id, report_path, json.dumps(report_payload, indent=2, default=str) + "\n")
+
+    exit_markdown = render_exit_markdown(merge_readiness or {}) + "\n" + _render_history_sections(
+        files_changed_stat=files_changed_stat,
+        commits_log=commits_log,
+        metrics_summary=metrics_summary,
+        delta_summary=delta_summary,
+        screenshots=screenshots,
+        run_id=run_id,
+    )
+    await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
+
+    # Retention: prune older runs' history/ artifacts before the commit below picks up whatever's
+    # left (new writes above + any deletions here) in one `git add` on the whole directory.
+    await _prune_history(provider, thread_id, run_id)
+
     await git_ops.commit_paths(
         provider,
         thread_id,
-        [MANIFEST_PATH, snapshot_path, CHANGELOG_PATH, session_index.SESSIONS_PATH],
-        "ai-dev-workflow: exit finalize (manifest, changelog)",
+        [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, session_index.SESSIONS_PATH],
+        "ai-dev-workflow: exit finalize (manifest, changelog, exit report)",
     )
     return {}
+
+
+def _demo() -> None:
+    """Self-check for this module's pure halves: `cd agent && uv run python -m src.exit_nodes`."""
+    # _diff_ledger: added/revised/retired classification against a prior snapshot.
+    prior = [{"id": "US-0001", "status": "active", "last_revised_run_id": "r1"}]
+    current = [
+        {"id": "US-0001", "status": "active", "last_revised_run_id": "r2"},
+        {"id": "US-0002", "status": "retired", "last_revised_run_id": "r2"},
+    ]
+    diff = _diff_ledger(prior, current)
+    assert diff == {"added": ["US-0002"], "revised": ["US-0001"], "retired": ["US-0002"]}, diff
+    assert _diff_ledger(None, current)["added"] == ["US-0001", "US-0002"]
+
+    # _history_retain: env override, tolerant fallback, floor of 1.
+    os.environ.pop("AIDW_HISTORY_RETAIN", None)
+    assert _history_retain() == _DEFAULT_HISTORY_RETAIN
+    os.environ["AIDW_HISTORY_RETAIN"] = "3"
+    assert _history_retain() == 3
+    os.environ["AIDW_HISTORY_RETAIN"] = "not-a-number"
+    assert _history_retain() == _DEFAULT_HISTORY_RETAIN
+    os.environ["AIDW_HISTORY_RETAIN"] = "0"
+    assert _history_retain() == 1
+    os.environ.pop("AIDW_HISTORY_RETAIN", None)
+
+    # _stale_history_files: groups by run_id (first "-") prefix, keeps whole groups, including a
+    # -screens directory entry alongside a run's other artifact files.
+    files = [
+        "aaaaaaaa-report.json", "aaaaaaaa-exit.md", "aaaaaaaa-screens",
+        "bbbbbbbb-report.json", "bbbbbbbb-metrics.json",
+    ]
+    assert _stale_history_files(files, {"aaaaaaaa"}) == ["bbbbbbbb-report.json", "bbbbbbbb-metrics.json"]
+    assert _stale_history_files(files, {"aaaaaaaa", "bbbbbbbb"}) == []
+    assert _stale_history_files(files, set()) == files
+
+    # _render_history_sections: "not recorded"/"no baseline" placeholders when data is absent,
+    # real content when present, screenshots section only when there are any.
+    empty = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None, screenshots=[], run_id="r1"
+    )
+    assert "not recorded for this run" in empty.lower()
+    assert "no baseline recorded" in empty.lower()
+    assert "## E2E Screenshots" not in empty
+
+    filled = _render_history_sections(
+        files_changed_stat="1 file changed",
+        commits_log="abc123 do the thing",
+        metrics_summary={"coverage": {"line_rate": 80.0, "branch_rate": 70.0}, "traceability_summary": {"total": 2, "covered": 1, "tests_only": 1, "untested": 0}, "token_usage_summary": {"total_input_tokens": 100, "total_output_tokens": 50, "total_cost": 0.01}},
+        delta_summary={"fixed_count": 1, "introduced_count": 0, "severity_changed": 0, "metrics": {"coverage_line_rate": {"from": 70, "to": 80, "delta": 10, "direction": "improved"}}},
+        screenshots=[".ai-dev-workflow/history/r1-screens/1.png"],
+        run_id="r1",
+    )
+    assert "1 file changed" in filled
+    assert "80.0%" in filled
+    assert "coverage_line_rate" in filled
+    assert "## E2E Screenshots" in filled and "./r1-screens/1.png" in filled
+
+    print("exit_nodes self-check: ok")
+
+
+if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m src.exit_nodes`
+    _demo()
