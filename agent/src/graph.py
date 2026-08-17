@@ -1642,7 +1642,7 @@ REBUILD_AFTER_P6 = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    next_node="remediation",
+    next_node="remediation_draft",
 )
 
 # Stage 6 (remediation): rebuild after fixes applied
@@ -1651,7 +1651,7 @@ REBUILD_FOR_REMEDIATION = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    next_node="adversarial-compliance",
+    next_node="adversarial-compliance_draft",
 )
 
 # Stage 7 (adversarial-compliance): rebuild after compliance checks
@@ -1660,7 +1660,7 @@ REBUILD_FOR_ADVERSARIAL_COMPLIANCE = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    next_node="metrics-exit",
+    next_node="metrics-exit_draft",
 )
 
 # Maps a STAGES entry's key -> the R placement immediately after it, so build_graph()'s per-stage
