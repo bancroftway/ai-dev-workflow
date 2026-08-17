@@ -165,6 +165,8 @@ async def run_scenario(scenario: Scenario, scenario_num: int, total: int) -> dic
         # Run the headless pipeline
         result = subprocess.run(
             [
+                "uv",
+                "run",
                 "python",
                 "run_headless.py",
                 "bancroftway",

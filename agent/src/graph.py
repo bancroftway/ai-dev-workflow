@@ -1642,7 +1642,25 @@ REBUILD_AFTER_P6 = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    next_node="quality_scan",
+    next_node="remediation",
+)
+
+# Stage 6 (remediation): rebuild after fixes applied
+REBUILD_FOR_REMEDIATION = rebuild.RebuildSpec(
+    key="r_remediation",
+    max_fix_cycles=3,
+    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
+    fix_scope="full",
+    next_node="adversarial-compliance",
+)
+
+# Stage 7 (adversarial-compliance): rebuild after compliance checks
+REBUILD_FOR_ADVERSARIAL_COMPLIANCE = rebuild.RebuildSpec(
+    key="r_adversarial_compliance",
+    max_fix_cycles=3,
+    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
+    fix_scope="full",
+    next_node="metrics-exit",
 )
 
 # Maps a STAGES entry's key -> the R placement immediately after it, so build_graph()'s per-stage
@@ -1650,6 +1668,8 @@ REBUILD_AFTER_P6 = rebuild.RebuildSpec(
 POST_STAGE_REBUILD: dict[str, rebuild.RebuildSpec] = {
     "ac-to-tests": REBUILD_AFTER_AC_TO_TESTS,
     "minimal-code-to-green": REBUILD_AFTER_P6,
+    "remediation": REBUILD_FOR_REMEDIATION,
+    "adversarial-compliance": REBUILD_FOR_ADVERSARIAL_COMPLIANCE,
 }
 
 # R(quality_remediation): sits between quality_fix and quality_gate_check in the plan's own chain (quality_scan -> quality_triage ->
