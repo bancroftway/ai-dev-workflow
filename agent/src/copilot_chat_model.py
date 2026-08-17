@@ -178,6 +178,10 @@ class CopilotChatModel(BaseChatModel):
     pre_tool_use_hook: PreToolUseHandler | None = None
     mcp_servers: dict[str, MCPServerConfig] | None = None
 
+    # Custom agents (replaces scattered session_options lambdas)
+    custom_agents: list[dict] | None = None
+    agent: str | None = None
+
     _closing: bool = PrivateAttr(default=False)
     # Confirmed real by Phase A0's spike (SessionEventType.ASSISTANT_USAGE carries actual measured
     # token/cost data, not an estimate). Captures the LAST ASSISTANT_USAGE event seen during the
@@ -257,6 +261,8 @@ class CopilotChatModel(BaseChatModel):
                         excluded_tools=self.excluded_tools,
                         hooks=hooks,
                         mcp_servers=self.mcp_servers,
+                        custom_agents=self.custom_agents,
+                        agent=self.agent,
                     ),
                     timeout=180,
                 )
@@ -393,6 +399,8 @@ def get_chat_model_for_thread(
     excluded_tools: list[str] | None = None,
     pre_tool_use_hook: PreToolUseHandler | None = None,
     mcp_servers: dict[str, MCPServerConfig] | None = None,
+    custom_agents: list[dict] | None = None,
+    agent: str | None = None,
 ) -> CopilotChatModel:
     """Return the chat model for the given LangGraph thread's (stage, role) Copilot session.
 
@@ -422,6 +430,8 @@ def get_chat_model_for_thread(
         excluded_tools=excluded_tools,
         pre_tool_use_hook=pre_tool_use_hook,
         mcp_servers=mcp_servers,
+        custom_agents=custom_agents,
+        agent=agent,
     )
 
 
