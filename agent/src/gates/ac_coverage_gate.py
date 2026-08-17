@@ -20,7 +20,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any
 
-from .. import repo_files, tech_stack_signals
+from .. import repo_files, stack_discovery, tech_stack_signals
 from ..sandbox.provider import SandboxProvider
 from ..spec_ledger import LEDGER_PATH
 
@@ -100,15 +100,24 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
             report={},
         )
 
-    raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
-    tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
-    command = resolve_test_command(tech_stack)
-    if command is None:
+    # Discover test command via stack_discovery instead of hardcoded heuristics
+    try:
+        recommendation = await stack_discovery.discover_stack_commands(
+            thread_id, owning_stage="ac-to-tests", task="the test command"
+        )
+        test_command = recommendation.test_command
+    except Exception:
+        # Fallback to legacy resolve_test_command if discovery fails
+        raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
+        tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
+        test_command = resolve_test_command(tech_stack)
+
+    if not test_command:
         return AcCoverageOutcome(
             passed=False, feedback="No test-runner command mapping for this stack -- cannot verify AC coverage.", report={}
         )
 
-    result = await provider.exec_in_sandbox(thread_id, command)
+    result = await provider.exec_in_sandbox(thread_id, test_command)
     output = (result.stdout or "") + "\n" + (result.stderr or "")
     # Strip ANSI color codes -- vitest/jest colorize even without a TTY here, and escapes sitting
     # inside a line break naive marker/path matching.
