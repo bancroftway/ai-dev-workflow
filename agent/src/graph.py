@@ -2074,10 +2074,16 @@ def _with_live_refresh(name: str, action):
     background refresh scan + running token totals (metrics_nodes.collect_live_refresh) so the
     metrics bar updates at the next node boundary after every code-writing commit. Display-only
     and strictly non-invasive: dict returns only, never a node that wrote repo_scan itself, and
-    any collector error is swallowed -- a display refresh must never fail a real node."""
+    any collector error is swallowed -- a display refresh must never fail a real node.
+
+    Must mirror telemetry.traced_node's arity dispatch: this wrapper's own (state, config) shape
+    hides the inner node's signature from traced_node, so (state)-only pass-throughs like
+    _manifest_branch_node have to be dispatched here."""
+
+    wants_config = len(inspect.signature(action).parameters) >= 2
 
     async def wrapped(state, config):
-        result = action(state, config)
+        result = action(state, config) if wants_config else action(state)
         if inspect.isawaitable(result):
             result = await result
         if isinstance(result, dict) and "repo_scan" not in result:

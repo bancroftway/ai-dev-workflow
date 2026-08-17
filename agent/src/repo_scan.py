@@ -1159,10 +1159,14 @@ TOOLS: tuple[ToolSpec, ...] = (
         # drizzle migration snapshots, and the pipeline's OWN repo-scan-baseline.json) -- noise
         # that would deadlock the 3% audit-exit gate on every run while measuring zero authored
         # code. Duplication is a signal about code humans/models WROTE.
+        # Tests are excluded too: repeated render/assert scaffolding is idiomatic there, and a
+        # tiny greenfield app whose tree is mostly tests deadlocked the 3% quality gate on test
+        # boilerplate alone (observed live, headless sc1: every clone pair was a *.test.tsx).
         f"jscpd . --threshold {MAX_DUPLICATION_PERCENT} --reporters json --output agent-work/jscpd --silent "
         "--format 'typescript,tsx,javascript,jsx,c-sharp,python' "
         '--ignore "**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/out/**,**/.next/**,'
         '**/coverage/**,**/*.min.js,**/*.d.ts,**/migrations/**,'
+        '**/*.test.*,**/*.spec.*,**/tests/**,**/__tests__/**,**/*Tests.cs,**/*.Tests/**,'
         '**/.ai-dev-workflow/**,**/agent-work/**,**/drizzle/meta/**,**/.wrangler/**,**/*.snap"',
         "agent-work/jscpd/jscpd-report.json", parse_jscpd, "jscpd --version",
     ),

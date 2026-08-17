@@ -21,7 +21,7 @@ from typing import Any, Callable, Literal, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import git_ops, model_config, repo_files
+from . import git_ops, model_config, repo_files, tech_stack_signals
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -94,13 +94,19 @@ def _resolve_build_command(tech_stack: dict[str, Any], fix_scope: FixScope = "fu
     if tech_stack.get("dotnet_detected"):
         return "dotnet clean && dotnet build" if scaffold_only else "dotnet clean && dotnet build -warnaserror"
     if "typescript" in languages or "javascript" in languages:
-        base = (
+        # A monorepo's node app lives under convention_roots["node"] (e.g. apps/web) with NO root
+        # package.json -- a bare tsc at repo root prints help text and fails by construction, so
+        # cd there first (same cure as dotnet_root_prefix). The cd scopes every && fragment after
+        # it, which is what we want: tsc/eslint should check the node app, not the repo root.
+        node_cd = tech_stack_signals.ecosystem_root_prefix(tech_stack, "node")
+        base = node_cd + (
             "if [ -f package.json ] && node -e \"process.exit(require('./package.json').scripts?.build?0:1)\"; "
             "then npm run build; else npx --yes tsc --noEmit; fi"
         )
         return base if scaffold_only else f"{base} && {_TSC_FRAGMENT} && {_ESLINT_FRAGMENT}"
     if "python" in languages:
-        base = "python -m py_compile $(git ls-files '*.py')"
+        python_cd = tech_stack_signals.ecosystem_root_prefix(tech_stack, "python")
+        base = python_cd + "python -m py_compile $(git ls-files '*.py')"
         return base if scaffold_only else f"{base} && {_RUFF_FRAGMENT} && {_MYPY_FRAGMENT}"
     return "echo 'no build-command mapping for this stack -- nothing to check' && true"
 

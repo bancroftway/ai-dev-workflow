@@ -67,8 +67,18 @@ def _resolve_test_command(tech_stack: dict[str, Any], attempt: int) -> tuple[str
         return command, path
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if "typescript" in languages or "javascript" in languages:
+        # cd into the monorepo's node app (issue family: bare tool at repo root) so the app's own
+        # vitest.config applies, prefer the image-baked runner over an npx fetch, and write the
+        # report to a repo-root path since read_repo_file resolves from the repo root.
+        node_cd = tech_stack_signals.ecosystem_root_prefix(tech_stack, "node")
         path = f"agent-work/test_hardening-attempt{attempt}.json"
-        return f"npx --yes vitest run --reporter=json --outputFile={path} 2>&1", path
+        out = f"{_REPO_ROOT_IN_CONTAINER}/{path}"
+        command = (
+            f"{node_cd}if [ -x /opt/aidw/test/node_modules/.bin/vitest ]; then "
+            f"/opt/aidw/test/node_modules/.bin/vitest run --reporter=json --outputFile={out} 2>&1; "
+            f"else npx --yes vitest run --reporter=json --outputFile={out} 2>&1; fi"
+        )
+        return command, path
     return None
 
 

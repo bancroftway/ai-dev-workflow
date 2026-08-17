@@ -30,6 +30,8 @@ stage. You own the HOW; the gate owns the NUMBER. Write `.ai-dev-workflow/covera
     ]}
 
 One entry per stack/app root that has tests (a polyglot monorepo gets one entry per stack).
+The gate runs `command` with the working directory already set to `root` -- do NOT start the
+command with `cd <root> &&`; `artifact` stays repo-root-relative regardless of `root`.
 Each command must be non-interactive, deterministic, and emit its artifact at the stated path in
 one of the two formats -- nothing else is parsed. RUN each command yourself first and confirm the
 artifact appears; a broken entry fails the gate with the replay error. The gate DELETES the

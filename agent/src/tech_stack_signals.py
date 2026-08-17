@@ -48,15 +48,29 @@ def dotnet_root_prefix(tech_stack: dict[str, Any]) -> str:
     is model-reported (TechStack's own field) and must not be trusted to shell out unchecked, same
     as any other repo-relative path from that source.
     """
-    root = tech_stack.get("dotnet_solution_root") or ""
+    return _cd_prefix(tech_stack.get("dotnet_solution_root"), "dotnet_solution_root")
+
+
+def ecosystem_root_prefix(tech_stack: dict[str, Any], ecosystem: str) -> str:
+    """dotnet_root_prefix's twin for the non-.NET ecosystems: `cd`s into
+    TechStack.convention_roots[ecosystem] (e.g. node=apps/web) before a bare npm/tsc/ruff command.
+    Same rationale and same validation -- a greenfield monorepo has no root package.json, so a
+    bare `npx tsc --noEmit` at repo root prints tsc's help text and fails the rebuild gate by
+    construction (observed live, headless sc1). Empty/missing/unsafe root returns ""."""
+    roots = tech_stack.get("convention_roots") or {}
+    return _cd_prefix(roots.get(ecosystem), f"convention_roots[{ecosystem}]")
+
+
+def _cd_prefix(root: Any, field: str) -> str:
+    root = root or ""
     if not root:
         return ""
     try:
         repo_files.validate_repo_relative_path(root)
     except ValueError:
-        logger.warning("ignoring unsafe dotnet_solution_root %r", root)
+        logger.warning("ignoring unsafe %s %r", field, root)
         return ""
-    return f"cd {shlex.quote(root.strip('/'))} && "
+    return f"cd {shlex.quote(str(root).strip('/'))} && "
 
 
 def _demo() -> None:
@@ -68,6 +82,10 @@ def _demo() -> None:
     assert dotnet_root_prefix({"dotnet_solution_root": None}) == ""
     assert dotnet_root_prefix({"dotnet_solution_root": "../evil"}) == ""
     assert dotnet_root_prefix({"dotnet_solution_root": "/abs"}) == ""
+    assert ecosystem_root_prefix({"convention_roots": {"node": "apps/web"}}, "node") == "cd apps/web && "
+    assert ecosystem_root_prefix({"convention_roots": {"node": "apps/web"}}, "python") == ""
+    assert ecosystem_root_prefix({"convention_roots": {"python": "../evil"}}, "python") == ""
+    assert ecosystem_root_prefix({}, "node") == ""
     print("tech_stack_signals self-check: ok")
 
 

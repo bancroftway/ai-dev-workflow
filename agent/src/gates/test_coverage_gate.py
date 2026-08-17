@@ -112,7 +112,11 @@ def _parse_cobertura_counts(raw_xml: str) -> tuple[_Counts | None, str]:
     gaps: list[CoverageGap] = []
     for cls in root.iter("class"):
         cls_line_rate = float(cls.get("line-rate", "1")) * 100
-        cls_branch_rate = float(cls.get("branch-rate", "1")) * 100
+        # A class with no branch points reports branch-rate="0" in coverage.py/coverlet Cobertura
+        # output -- vacuously satisfied, not a 0% gap (observed live: main.py 100% lines, zero
+        # branches, flagged as a 0.0% branch gap).
+        _cls_has_branches = any(line.get("branch") == "true" for line in cls.iter("line"))
+        cls_branch_rate = float(cls.get("branch-rate", "1")) * 100 if _cls_has_branches else 100.0
         if cls_line_rate < MIN_COVERAGE_PERCENT or cls_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=cls.get("filename", cls.get("name", "?")), line_rate=cls_line_rate, branch_rate=cls_branch_rate))
     return _Counts(lc, lt, bc, bt, gaps), ""
@@ -147,7 +151,8 @@ def _parse_istanbul_counts(raw: str) -> tuple[_Counts | None, str]:
         if file_path == "total" or not isinstance(entry, dict):
             continue
         file_line_rate = _pct(entry, "lines", 100)
-        file_branch_rate = _pct(entry, "branches", 100)
+        # 0-of-0 branches is vacuous, same rule as the Cobertura parsers.
+        file_branch_rate = 100.0 if _count(entry, "branches", "total") == 0 else _pct(entry, "branches", 100)
         if file_line_rate < MIN_COVERAGE_PERCENT or file_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=file_path, line_rate=file_line_rate, branch_rate=file_branch_rate))
     return _Counts(lc, lt, bc, bt, gaps), ""
@@ -204,7 +209,11 @@ async def _run_contract_coverage(
             report["error"] = f"invalid path: {exc}"
             continue
 
-        prefix = f"cd {shlex.quote(root)} && " if root else ""
+        # A command that manages its own cwd wins: models write `cd apps/web && vitest ...` AND
+        # `root: apps/web` (observed live, headless sc1) -- prefixing cd again fails with
+        # "can't cd to apps/web" from inside apps/web. The artifact path stays repo-relative
+        # either way, so only the prefix is skipped.
+        prefix = f"cd {shlex.quote(root)} && " if root and not command.lstrip().startswith("cd ") else ""
         replay = await provider.exec_in_sandbox(
             thread_id, f"rm -f {shlex.quote(artifact)} && {_with_timeout(f'{prefix}{command}', timeout_seconds)} 2>&1"
         )
@@ -273,7 +282,11 @@ async def _run_dotnet_coverage(
     gaps: list[CoverageGap] = []
     for cls in root.iter("class"):
         cls_line_rate = float(cls.get("line-rate", "1")) * 100
-        cls_branch_rate = float(cls.get("branch-rate", "1")) * 100
+        # A class with no branch points reports branch-rate="0" in coverage.py/coverlet Cobertura
+        # output -- vacuously satisfied, not a 0% gap (observed live: main.py 100% lines, zero
+        # branches, flagged as a 0.0% branch gap).
+        _cls_has_branches = any(line.get("branch") == "true" for line in cls.iter("line"))
+        cls_branch_rate = float(cls.get("branch-rate", "1")) * 100 if _cls_has_branches else 100.0
         if cls_line_rate < MIN_COVERAGE_PERCENT or cls_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=cls.get("filename", cls.get("name", "?")), line_rate=cls_line_rate, branch_rate=cls_branch_rate))
 
@@ -331,7 +344,12 @@ async def _run_js_coverage(
             continue
         # Per-file default 100: an unmeasured metric on one file must not fabricate a gap.
         file_line_rate = _pct(entry, "lines", 100)
-        file_branch_rate = _pct(entry, "branches", 100)
+        # 0-of-0 branches is vacuous, same rule as the Cobertura parsers.
+        try:
+            branches_total = int((entry.get("branches") or {}).get("total", 0))
+        except (TypeError, ValueError):
+            branches_total = 0
+        file_branch_rate = 100.0 if branches_total == 0 else _pct(entry, "branches", 100)
         if file_line_rate < MIN_COVERAGE_PERCENT or file_branch_rate < MIN_COVERAGE_PERCENT:
             gaps.append(CoverageGap(file=file_path, line_rate=file_line_rate, branch_rate=file_branch_rate))
 

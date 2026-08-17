@@ -8,6 +8,14 @@ repository (source, tests, everything since P6). For every Plan Step and Accepta
 verify -- don't assume -- that the actual code satisfies it. Cite concrete evidence (file/line,
 test name, actual behavior) for every divergence you report; never a bare assertion.
 
+Wireframe conformance is part of this audit whenever `.ai-dev-workflow/plan/wireframes/` exists:
+for EACH wireframe, find the implemented screen (route/page/component) and verify it closely
+follows the wireframe -- every field, action/button, section, and state the wireframe shows must
+exist in the implementation, with the same intent (labels/roles may differ cosmetically; missing
+or extra whole elements, missing states, or a different screen structure are divergences). A
+wireframe with no implemented screen at all is a severity-high divergence. Cite the wireframe
+file and the implementing source file for each screen you check.
+
 You are read-only in this session. Report a `plan_conformance_summary`, every `divergence_finding`
 (with severity, the specific Plan/AC reference, evidence, and a proposed resolution),
 `unresolved_risk_notes` for anything you're not confident about either way, and an

@@ -14,6 +14,8 @@ npm-debug.log*
 
 # Python
 agent/.venv/
+agent/venv/
+**/*.egg-info/
 **/__pycache__/
 *.pyc
 .pytest_cache/
