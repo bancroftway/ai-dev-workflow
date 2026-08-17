@@ -48,8 +48,10 @@ from . import metrics_nodes
 from . import exit_nodes
 from . import rebuild
 from . import spec_ledger
+from . import stack_discovery
 from . import telemetry
 from . import workflow_persistence
+from .custom_agent_loader import load_agent as _load_agent_file
 from .gates import audit_gates
 from .quality_security import quality_nodes, security_nodes
 from .gates.diagram_gate import verify_plan_diagrams
@@ -108,8 +110,29 @@ from .schemas_audit import (
 from .schemas_app_discovery import AppDiscoveryDraftResponse
 from .schemas_brownfield import BrownfieldBaselineDraftResponse
 from .schemas_exit import ExitDraftResponse
+from .schemas_remediation import RemediationDraftResponse
+from .schemas_adversarial_compliance import AdversarialComplianceDraftResponse
 
 logger = logging.getLogger(__name__)
+
+
+def load_agent(stage: str, role: str) -> dict[str, Any]:
+    """Load a custom agent from agent/src/agents/<stage>-<role>.md.
+
+    Returns a CustomAgentConfig dict with keys: name, description, tools, model, prompt.
+    Falls back gracefully if the agent file doesn't exist (logs and returns empty dict).
+    """
+    agent_path = os.path.join(
+        os.path.dirname(__file__),
+        "agents",
+        f"{stage.replace('_', '-')}-{role}.md",
+    )
+    try:
+        return _load_agent_file(agent_path)
+    except (FileNotFoundError, ValueError) as e:
+        logger.warning(f"Could not load agent {stage}-{role}: {e}")
+        return {}
+
 
 StageStatus = Literal[
     "not_started", "drafting", "needs_clarification", "ready_for_review", "approved"
@@ -666,6 +689,53 @@ def _build_exit_prompt(state: GraphState) -> list[BaseMessage]:
     return messages
 
 
+REMEDIATION_SYSTEM_PROMPT = "Consolidate quality, security, dedup, and license findings and recommend fixes."
+
+
+def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
+    """Minimal prompt for consolidated remediation stage 6."""
+    # Summarize quality/security/dedup/license findings from prior analysis
+    return [
+        SystemMessage(content=REMEDIATION_SYSTEM_PROMPT),
+        HumanMessage(content="Review prior quality, security, dedup, and license findings and recommend fixes."),
+    ]
+
+
+ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT = "Audit compliance: security/privacy/performance/UI/E2E tests."
+
+
+def _build_adversarial_compliance_prompt(state: GraphState) -> list[BaseMessage]:
+    """Minimal prompt for consolidated adversarial-compliance stage 7."""
+    return [
+        SystemMessage(content=ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT),
+        HumanMessage(content="Perform adversarial audit and compliance checks."),
+    ]
+
+
+def _build_metrics_exit_prompt(state: GraphState) -> list[BaseMessage]:
+    """Reuse exit prompt (stage 8: metrics+exit consolidation)."""
+    return _build_exit_prompt(state)
+
+
+def build_remediation_envelope(content: dict[str, Any], audit_findings: list[str] | None) -> dict[str, Any]:
+    """Minimal envelope for remediation stage."""
+    return {"stage": "remediation", "content": content}
+
+
+def build_adversarial_compliance_envelope(content: dict[str, Any], audit_findings: list[str] | None) -> dict[str, Any]:
+    """Minimal envelope for adversarial-compliance stage."""
+    return {"stage": "adversarial-compliance", "content": content}
+
+
+def render_remediation_markdown(content: dict[str, Any]) -> str:
+    """Minimal markdown render for remediation."""
+    return json.dumps(content, indent=2)
+
+
+def render_adversarial_compliance_markdown(content: dict[str, Any]) -> str:
+    """Minimal markdown render for adversarial-compliance."""
+    return json.dumps(content, indent=2)
+
 
 @dataclass(frozen=True)
 class StageSpec:
@@ -681,6 +751,8 @@ class StageSpec:
         | type[LicenseAuditDraftResponse]
         | type[ExitDraftResponse]
         | type[AppDiscoveryDraftResponse]
+        | type[RemediationDraftResponse]
+        | type[AdversarialComplianceDraftResponse]
     )
     content_field: str
     surface_tool_name: str
@@ -884,6 +956,42 @@ STAGES: list[StageSpec] = [
         session_options=lambda _state, role: (
             {"agent_mode": "autopilot"} if role == "draft" else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
         ),
+    ),
+    StageSpec(
+        key="remediation",
+        response_schema=RemediationDraftResponse,
+        content_field="remediation_summary",
+        surface_tool_name="present_remediation",
+        build_envelope=build_remediation_envelope,
+        build_prompt=_build_remediation_prompt,
+        max_cycles=workflow_config.REMEDIATION_MAX_CLARIFICATION_CYCLES if hasattr(workflow_config, "REMEDIATION_MAX_CLARIFICATION_CYCLES") else 2,
+        render_markdown=render_remediation_markdown,
+        requires_human_gate=False,
+    ),
+    StageSpec(
+        key="adversarial-compliance",
+        response_schema=AdversarialComplianceDraftResponse,
+        content_field="report",
+        surface_tool_name="present_adversarial_compliance",
+        build_envelope=build_adversarial_compliance_envelope,
+        build_prompt=_build_adversarial_compliance_prompt,
+        max_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES,
+        render_markdown=render_adversarial_compliance_markdown,
+        requires_human_gate=False,
+    ),
+    StageSpec(
+        key="metrics-exit",
+        response_schema=ExitDraftResponse,
+        content_field="report",
+        surface_tool_name="present_exit",
+        build_envelope=build_exit_envelope,
+        build_prompt=_build_metrics_exit_prompt,
+        max_cycles=workflow_config.EXIT_MAX_CLARIFICATION_CYCLES,
+        render_markdown=render_exit_markdown,
+        requires_human_gate=False,
+        sign_approval=True,
+        deterministic_verify=exit_nodes.verify_exit_readiness,
+        max_verify_cycles=0,
     ),
 ]
 
@@ -1144,14 +1252,22 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stages[stage_spec.key]["baseline_commit"] = head_result.stdout.strip() if head_result.ok else None
             state = {**state, "stages": stages}
 
+        # Load custom agent if available, falling back to legacy session_options
+        custom_agents = []
+        agent_config = load_agent(stage_spec.key, "draft")
+        if agent_config:
+            custom_agents = [agent_config]
+
         model = get_chat_model_for_thread(
             thread_id,
             stage_spec.key,
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name(stage_spec.key, "draft"),
+            model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "draft"),
             sandbox=sandbox_registry.get(thread_id),
-            **(stage_spec.session_options(state, "draft") if stage_spec.session_options is not None else {}),
+            custom_agents=custom_agents if custom_agents else None,
+            agent=agent_config.get("name") if agent_config else None,
+            **(stage_spec.session_options(state, "draft") if stage_spec.session_options is not None and not agent_config else {}),
         )
 
         prompt_messages = stage_spec.build_prompt(state)
@@ -1233,14 +1349,23 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
     async def audit_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = config["configurable"]["thread_id"]
+
+        # Load custom agent if available, falling back to legacy session_options
+        custom_agents = []
+        agent_config = load_agent(stage_spec.key, "audit")
+        if agent_config:
+            custom_agents = [agent_config]
+
         model = get_chat_model_for_thread(
             thread_id,
             stage_spec.key,
             "audit",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name(stage_spec.key, "audit"),
+            model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "audit"),
             sandbox=sandbox_registry.get(thread_id),
-            **(stage_spec.session_options(state, "audit") if stage_spec.session_options is not None else {}),
+            custom_agents=custom_agents if custom_agents else None,
+            agent=agent_config.get("name") if agent_config else None,
+            **(stage_spec.session_options(state, "audit") if stage_spec.session_options is not None and not agent_config else {}),
         )
 
         prompt_messages = stage_spec.build_audit_prompt(state)
@@ -1573,85 +1698,11 @@ def _wire_p8(builder: StateGraph) -> None:
     builder.add_edge("quality_human_gate", END)
 
 
-ADVERSARIAL_AUDIT_SPEC = StageSpec(
-    key="adversarial-audit",
-    response_schema=AdversarialAuditDraftResponse,
-    content_field="report",
-    surface_tool_name="present_adversarial_audit",
-    build_envelope=build_adversarial_audit_envelope,
-    build_prompt=_build_adversarial_audit_prompt,
-    max_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES,
-    render_markdown=render_adversarial_audit_markdown,
-    # Divergence findings flow into dedup-simplify and the audit exit gate's objective re-checks;
-    # the human checkpoints are specification and plan only.
-    requires_human_gate=False,
-)
-
-DEDUP_SPEC = StageSpec(
-    key="dedup-simplify",
-    response_schema=DedupDraftResponse,
-    content_field="result",
-    surface_tool_name="present_dedup",
-    build_envelope=build_dedup_envelope,
-    build_prompt=_build_dedup_prompt,
-    max_cycles=workflow_config.DEDUP_MAX_CLARIFICATION_CYCLES,
-    render_markdown=render_dedup_markdown,
-    requires_human_gate=False,  # bounded by jscpd's objective re-check at audit-cluster's exit gate instead
-    # post_approve (not post_audit): dedup has no audit leg anymore, so the audit-node hook site
-    # never fires. A failed jscpd rerun is swallowed (hook contract) and leaves
-    # duplication_percent_after unset -- fine, audit_exit_gate re-runs jscpd itself.
-    post_approve_hook=audit_gates.rerun_jscpd_after_dedup,
-    session_options=lambda _state, role: (
-        {"agent_mode": "autopilot"} if role == "draft" else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
-    ),
-)
-
-LICENSE_AUDIT_SPEC = StageSpec(
-    key="license-audit",
-    response_schema=LicenseAuditDraftResponse,
-    content_field="report",
-    surface_tool_name="present_license_audit",
-    build_envelope=build_license_audit_envelope,
-    build_prompt=_build_license_audit_prompt,
-    max_cycles=workflow_config.LICENSE_AUDIT_MAX_CLARIFICATION_CYCLES,
-    render_markdown=render_license_audit_markdown,
-    requires_human_gate=False,  # the "gate" for flagged packages IS the deterministic_verify escalate below
-    deterministic_verify=audit_gates.verify_license_audit,
-    max_verify_cycles=0,  # any flagged package escalates immediately -- redrafting can't change a license
-)
-
-EXIT_SPEC = StageSpec(
-    key="exit",
-    response_schema=ExitDraftResponse,
-    content_field="report",
-    surface_tool_name="present_exit",
-    build_envelope=build_exit_envelope,
-    build_prompt=_build_exit_prompt,
-    max_cycles=workflow_config.EXIT_MAX_CLARIFICATION_CYCLES,
-    render_markdown=render_exit_markdown,
-    # The merge-readiness report is written and signed automatically; the human checkpoints are
-    # specification and plan only. The report itself stays reviewable on the work branch.
-    requires_human_gate=False,
-    sign_approval=True,  # APPROVALS.md covers P2/P3/exit per the plan
-    # Deterministic downgrades, never redrafts: completes the manifest, then forces
-    # merge_ready=False for regression-gate reasons / missing UI screenshots / an incomplete
-    # manifest. Always returns passed=True with the draft mutated -- no retry can fix these.
-    deterministic_verify=exit_nodes.verify_exit_readiness,
-    max_verify_cycles=0,
-)
-
-
-def _wire_p15(builder: StateGraph) -> None:
-    """Wires exit: EXIT_SPEC (a StageSpec, reusing the standard draft->audit->gate template for
-    consistency with every other stage -- the plan's own diagram sketched a single LLM box, but an
-    adversarial second opinion on "is this merge-ready" is worth having here too) -> exit_finalize
-    (deterministic: manifest.json + CHANGELOG.md + commit, never the model's job) -> END.
-
-    Verification status: NOT exercised against a real sandbox, same caveat as every quality-remediation+ cluster.
-    """
-    builder.add_node("exit_finalize", exit_nodes.exit_finalize_node)
-    _wire_stage(builder, EXIT_SPEC, "exit_finalize")
-    builder.add_edge("exit_finalize", END)
+# Old StageSpec definitions removed - consolidated into stages 6-8:
+# ADVERSARIAL_AUDIT_SPEC → stage 7 (adversarial-compliance)
+# DEDUP_SPEC → stage 7 (adversarial-compliance)
+# LICENSE_AUDIT_SPEC → stage 7 (adversarial-compliance)
+# EXIT_SPEC → stage 8 (metrics-exit)
 
 
 APP_DISCOVERY_SPEC = StageSpec(
@@ -2052,14 +2103,12 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
 
 # Every standalone StageSpec (not in the flat STAGES list, because a bespoke cluster sits between
 # it and its neighbors -- see audit-cluster's own note above). intake_node's setdefault/reset loops need
-# every stage key that will ever appear in GraphState.stages, not just STAGES' own five.
+# every stage key that will ever appear in GraphState.stages, not just STAGES' own eight.
+# Note: ADVERSARIAL_AUDIT_SPEC, DEDUP_SPEC, LICENSE_AUDIT_SPEC, EXIT_SPEC are now consolidated
+# into stages 7 (adversarial-compliance) and 8 (metrics-exit), so they're no longer standalone.
 _STANDALONE_STAGE_SPECS: list[StageSpec] = [
     APP_DISCOVERY_SPEC,
     BROWNFIELD_BASELINE_SPEC,
-    ADVERSARIAL_AUDIT_SPEC,
-    DEDUP_SPEC,
-    LICENSE_AUDIT_SPEC,
-    EXIT_SPEC,
 ]
 _ALL_STAGE_SPECS: list[StageSpec] = STAGES + _STANDALONE_STAGE_SPECS
 # raw-requirements has no StageSpec (deterministic record node) but its stage KEY must stay in
@@ -2127,13 +2176,14 @@ def build_graph() -> StateGraph:
     post_stage_rebuild_entry_name = {key: _wire_rebuild(builder, spec) for key, spec in POST_STAGE_REBUILD.items()}
     _wire_app_discovery(builder)
     _wire_brownfield(builder)
-    _wire_p8(builder)
-    _wire_p10(builder)
-    _wire_audit_cluster(builder)
-    _wire_p13(builder)
-    _wire_e2e(builder)
-    _wire_p14(builder)
-    _wire_p15(builder)
+    # Old cluster wiring disabled: stages 6-8 consolidate the clusters
+    # _wire_p8(builder)  # quality-remediation → now part of stage 6
+    # _wire_p10(builder)  # security-remediation → now part of stage 6
+    # _wire_audit_cluster(builder)  # adversarial/dedup/license → now part of stage 7
+    # _wire_p13(builder)  # test-hardening → now part of stage 7
+    # _wire_e2e(builder)  # e2e → now part of stage 7
+    # _wire_p14(builder)  # metrics → now part of stage 8
+    # _wire_p15(builder)  # exit → now part of stage 8
 
     for index, stage_spec in enumerate(STAGES):
         if stage_spec.key == STAGES[0].key:

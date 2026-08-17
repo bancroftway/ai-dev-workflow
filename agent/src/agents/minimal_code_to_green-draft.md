@@ -7,7 +7,7 @@ tools:
   - builtin:glob
   - builtin:bash
   - builtin:edit
-model: "gpt-5.4-mini"
+model: "gpt-5.4"
 ---
 
 You are the Minimal-Code-to-Green Agent. Read the approved Specification, the approved

@@ -14,15 +14,17 @@ after quality-remediation, after security-remediation, after audit-cluster), eac
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import Any, Callable, Literal, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import git_ops, model_config, repo_files, stack_discovery
 from .copilot_chat_model import get_chat_model_for_thread
+from .custom_agent_loader import load_agent as _load_agent_file
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 
@@ -40,6 +42,27 @@ class RebuildState(TypedDict):
 
 def default_rebuild_state() -> RebuildState:
     return {"status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "", "last_exit_ok": False, "cannot_verify": False}
+
+
+logger = logging.getLogger(__name__)
+
+
+def load_agent(stage: str, role: str) -> dict[str, Any]:
+    """Load a custom agent from agent/src/agents/<stage>-<role>.md.
+
+    Returns a CustomAgentConfig dict with keys: name, description, tools, model, prompt.
+    Falls back gracefully if the agent file doesn't exist (logs and returns empty dict).
+    """
+    agent_path = os.path.join(
+        os.path.dirname(__file__),
+        "agents",
+        f"{stage.replace('_', '-')}-{role}.md",
+    )
+    try:
+        return _load_agent_file(agent_path)
+    except (FileNotFoundError, ValueError) as e:
+        logger.warning(f"Could not load agent {stage}-{role}: {e}")
+        return {}
 
 
 @dataclass(frozen=True)
@@ -138,6 +161,12 @@ def make_fix_node(spec: RebuildSpec):
             stderr_tail=rb["last_stderr_tail"],
         )
 
+        # Load custom agent if available
+        custom_agents = []
+        agent_config = load_agent("rebuild_build", "fix")
+        if agent_config:
+            custom_agents = [agent_config]
+
         # Own session key per placement (rebuild-<key>:draft), not plan:draft -- sharing plan's key
         # returned its cached read-only session so this autopilot fixer silently couldn't write, and
         # bled plan's conversation across every R placement. Dedicated "rebuild" model entry
@@ -148,9 +177,11 @@ def make_fix_node(spec: RebuildSpec):
             f"rebuild-{spec.key}",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name("rebuild", "draft") or model_config.get_model_name("plan", "draft"),
+            model_name=agent_config.get("model") if agent_config else (model_config.get_model_name("rebuild", "draft") or model_config.get_model_name("plan", "draft")),
             sandbox=sandbox_registry.get(thread_id),
-            agent_mode="autopilot",
+            custom_agents=custom_agents if custom_agents else None,
+            agent=agent_config.get("name") if agent_config else None,
+            agent_mode="autopilot" if not agent_config else None,
         )
         await model.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)])
 

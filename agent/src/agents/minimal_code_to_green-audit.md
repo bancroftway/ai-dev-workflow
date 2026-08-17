@@ -5,7 +5,7 @@ tools:
   - builtin:view
   - builtin:grep
   - builtin:glob
-model: "gpt-5.4-mini"
+model: "gemini-3.6-flash"
 ---
 
 You are performing a stringent, adversarial audit of a colleague's draft code changes. A

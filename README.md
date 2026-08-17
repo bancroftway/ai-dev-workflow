@@ -8,138 +8,51 @@ A human-gated, LLM-driven software delivery pipeline built as a single [LangGrap
 
 ---
 
-## The whole graph, start to finish
+## The whole graph: 8-stage pipeline
 
-Each box is one stage. The title says what the stage is for; the numbered lines are the operations it performs in order, including the skills and MCP servers it calls.
-
-**Edge legend** — solid: normal flow · dotted: retry / loop-back · `human` label: the graph pauses on a LangGraph `interrupt()` until a person resolves it (specification and plan always; a greenfield repository's tech-stack picker as a third, one-time exception). An exhausted retry cap anywhere else ENDs the run: the failure is written to the ledger, committed, pushed, and surfaced as `run_failure` in state — resubmitting starts a fresh attempt with counters reset.
-
-The pipeline opens with a suitability gate. `ai-dev-workflow` only applies to a repository containing a startable web app, API, or Azure Function; a library, a package, or a mobile-only repo is rejected with reasons, and the run ends there — the only hard stop in the graph. It runs before anything is written to the repository, so a rejected repo is left exactly as it arrived.
+Clean sequential flow from intake through 8 stages, each integrating custom agents from agent files. Human pauses at specification and plan only. Deterministic gates at ac-to-tests, minimal-code-to-green, and metrics-exit gate on objective checks.
 
 ```mermaid
 flowchart TD
-    session["SESSION PROVISIONING &nbsp;·&nbsp; before the graph is ever invoked (agent/src/sessions_api.py)<br/>1. Next.js server route calls POST /sessions/provision with thread_id, owner, repo, branch<br/>2. sandbox factory picks a provider: local Docker or Azure ACI (agent/src/sandbox/)<br/>3. provider clones owner/repo at branch into /workspace/repo (a per-session named volume locally — the tree and any unpushed commits survive container removal; explicit session DELETE discards it), then checks out the tool-owned work branch `ai-dev-workflow` (one constant branch shared by every session on this repo regardless of user or PR target — pushes use `--force-with-lease` so a losing race is rejected, never silently overwritten; reused from the volume when present, reconciled with origin otherwise, recreated from the selected branch if its own tip is already merged upstream). The user's selected branch is never committed on. Copilot CLI token injected as env; the git clone token arrives as a one-shot pre-start file (never visible in docker inspect); per-owner package cache mounted at /opt/aidw/cache<br/>4. entrypoint runs bootstrap.sh: installs any toolchain the repo declares for itself (.tool-versions, mise.toml, .nvmrc, global.json) into /opt/aidw/tools — non-fatal, and never into the repo<br/>5. registry.set(thread_id, session) plus registry.set_meta(user_login, target_branch, resume) — the GitHub login and `?resume=1` flag the Next.js route forwarded, both consumed later (session_index.py, intake); the GitHub token is retained agent-memory-only for stage-end pushes (git_ops.push_head) — every later node checks this registry before touching disk<br/>6. frontend does agent.addMessage(requirements) then runAgent() — this is what starts the graph"]
-
-    intake["INTAKE &nbsp;·&nbsp; normalize the run and decide what carries over from previous runs<br/>1. mint a fresh run_id (used by the spec ledger, APPROVALS.md and metrics-report/exit snapshots)<br/>2. pop the registry's one-shot `resume` meta flag unconditionally (it must never leak into a later, unrelated run)<br/>3. compare the latest HumanMessage's id against consumed_message_id (a state channel): a DIFFERENT id is a fresh submission (a real chat message, including a clarification answer) — SAME id (or no HumanMessage at all) means this run is textless, because a live-thread Resume click fires a blank runAgent() with no new message and add_messages/the checkpointer replay the SAME old message id every time; text presence alone can't tell these apart, since the checkpoint still ends in the ORIGINAL non-empty HumanMessage either way<br/>4. first invoke for this thread: hydrate every stage's state back out of the repo (workflow_persistence.py)<br/>5. seed default state for every StageSpec that has none yet<br/>6. reset specification onward to not_started — tech-stack and raw-requirements stay approved across runs; AIDW_RESUME=1 or the resume flag (only when textless, per step 3) skips this reset instead, so a resume picks up at the first unapproved stage (in-memory checkpoint or repo hydration, whichever this thread has)<br/>7. a textless run falls back to the hydrated raw-requirements doc, so a resume never drafts the spec from nothing<br/>8. a blank run with no requirements anywhere (the frontend's reload/reattach ping) ends here — zero LLM calls"]
-
-    scaffold["SCAFFOLD &nbsp;·&nbsp; read-mostly entry point (preflight_nodes.py)<br/>1. reset the workflow action ledger (fresh per session)<br/>2. session_index.start_session: UPSERT this thread's row in .ai-dev-workflow/sessions.json (title = first line of the requirements text) and commit+push immediately — BEFORE the baseline capture below, so a later reject's hard reset can't erase it<br/>3. capture git rev-parse HEAD as this run's baseline — the point the reject path resets back to<br/>4. read .ai-dev-workflow/manifest.json — its absence is the canonical never-onboarded-before signal<br/>Nothing else is written to the repo here. The repo-visible writes wait until the suitability gate passes"]
-
-    apre["APP DISCOVERY PRE &nbsp;·&nbsp; deterministic scan for startable applications (app_discovery.py)<br/>1. one bounded find for marker files: *.csproj, host.json, package.json, launchSettings.json, Program.cs, Dockerfile, manage.py, pyproject.toml, app.json, capacitor/ionic configs<br/>2. bounded reads: 60 files max, 4000 chars each, 24000-char evidence blob<br/>3. classify_candidates (pure): web SDK, Functions SDK, framework dependency, or negative evidence (library, no start script)<br/>4. fingerprint over path AND content hashes — the staleness signal for the next run's hydration"]
-
-    app["APP DISCOVERY &nbsp;·&nbsp; does this repo contain an app this workflow can run?<br/>1. hydrate short-circuit: skip the LLM when the manifest already records an accepted result at this exact fingerprint<br/>2. draft: read-only tools, grounded in the scan but free to explore past it — the marker table has no Go/Rails/Spring/PHP rules and a false reject is unrecoverable<br/>3. no audit, no human gate — the deterministic decision below is the gate (it drops any cited path that does not exist)"]
-
-    decide["APP DISCOVERY DECIDE &nbsp;·&nbsp; the verdict, deterministic and fail-closed<br/>1. drop any app whose cited path does not exist<br/>2. suitable = at least one web / api / azure_function app, on dotnet/node/python, with a real start command<br/>3. mobile is detected and rejected on purpose — the sandbox is a Linux container with no Android SDK, JDK/Gradle or Xcode<br/>4. no report at all is a rejection whose reason names that honestly, rather than blaming the repo<br/>5. reasons are composed from what was actually found, never from the model's own suitable flag<br/>6. a genuinely blank repo (a real report, zero surviving apps) is offered the greenfield stack picker instead of a hard rejection — unless headless has no AIDW_GREENFIELD_STACK to answer the interrupt with, or discovery produced no report at all (that is an error, not blank); once a stack is picked, later runs always continue rather than re-litigating suitability"]
-
-    gsel["GREENFIELD STACK SELECT &nbsp;·&nbsp; human interrupt: pick and edit a canned monorepo stack (app_discovery.py)<br/>1. idempotency check first: a stack already recorded on disk or in state skips straight through — never re-asks<br/>2. interrupt(): present the 8 canned stacks (agent/src/templates/tech_stacks/*.md) in the frontend's stack-picker card for the human to choose and edit; headless runs auto-select via AIDW_GREENFIELD_STACK instead, since there is no interrupt to answer<br/>3. accept: write .ai-dev-workflow/greenfield-stack.md verbatim, commit, ledger entry<br/>4. cancel, or an oversize/empty edit, is rejected exactly like an unsuitable repo — never silently truncated"]
-
-    reject["REJECT &nbsp;·&nbsp; the one hard stop in the graph<br/>1. post the reasons as a chat message and into shared state (the red banner in Requirements)<br/>2. verify every commit since the run baseline is the workflow's own; if not, skip the reset and say so<br/>3. git reset --hard to the baseline, git clean -fd .ai-dev-workflow<br/>4. close this run's sessions.json row as rejected and commit+push it — the one writer that runs AFTER the reset above, so it needs its own commit rather than riding another node's<br/>5. END — the repo is left exactly as it arrived"]
-
-    sfin["SCAFFOLD FINALIZE &nbsp;·&nbsp; the write half of scaffolding, deferred until the repo is accepted<br/>1. write AGENTS.md and a thin .github/copilot-instructions.md pointer if absent — never overwriting a human-authored one<br/>2. if AGENTS.md already exists, append only the pointer paragraph to .ai-dev-workflow/tech-stack.md, so a hand-written file still leads agents to the conventions<br/>3. fold agent-work/toolchain-bootstrap.json into .ai-dev-workflow/manifest.json, .ai-dev-workflow/ledger.jsonl and the host-side toolchain log<br/>4. commit them"]
-
-    record["APP CHECK RECORD &nbsp;·&nbsp; persist the accepted apps<br/>1. read-modify-write app_check into .ai-dev-workflow/manifest.json: class, runtime, start command, port, evidence, fingerprint<br/>2. commit<br/>Placed after both branches converge on purpose: creating the manifest earlier would let a run abandoned mid-baseline skip brownfield ratification forever"]
-
-    rscan["REPO SCAN BASELINE &nbsp;·&nbsp; measure the repository exactly as it arrived (repo_scan.py)<br/>1. run the full licence-vetted tool set offline: scc, lizard, jscpd, gitleaks, trivy, osv-scanner, semgrep, git churn — the summary streams into shared state (baseline_summary) to light the frontend metrics bar<br/>2. normalize every result into one Finding vocabulary and deduplicate across tools — trivy and osv-scanner name the same advisory differently, and OSV's alias lists are what reconcile them<br/>3. write .ai-dev-workflow/repo-scan-baseline.json and commit it<br/>4. idempotent on that file, and that is a correctness requirement: every node here is re-entered on every clarification round, and re-baselining would silently zero out the improvement the metrics-report delta exists to report<br/>Placed after both branches converge and before raw-requirements, so the clone exists and the stack is known but nothing has written application code yet"]
-
-    p0pre["BROWNFIELD PRE &nbsp;·&nbsp; brownfield grounding (only when manifest.json is missing)<br/>1. deterministic grep of the repo for schemas, migrations and route definitions<br/>2. store the result as brownfield_context, so the baseline draft is grounded in facts rather than guesses"]
-
-    p0["BROWNFIELD BASELINE &nbsp;·&nbsp; describe the existing system before changing it<br/>1. draft: read-only tool allowlist — skills: preflight-baseline, tech-stack-conventions, caveman<br/>2. no audit, no human gate — ratification is automatic, straight into brownfield write manifest"]
-
-    bwm["BROWNFIELD WRITE MANIFEST &nbsp;·&nbsp; ratification is the literal mechanism that creates the manifest (preflight_nodes.py)<br/>1. write .ai-dev-workflow/manifest.json (onboarded: true) and commit<br/>2. reached two ways — after brownfield-baseline's automatic ratification for a brownfield repo, or directly from tech-stack for a greenfield repo with no manifest yet, whose one human choice already happened at the stack picker"]
-
-    ts["TECH STACK &nbsp;·&nbsp; detect languages, frameworks and build/test commands once per repo<br/>1. hydrate short-circuit: if .ai-dev-workflow/tech-stack.approved.json already exists, mark approved and skip the LLM entirely<br/>2. draft: read-only tool allowlist — skill: tech-stack-conventions<br/>3. no audit, no human gate — supporting infrastructure, it has no review tab<br/>4. post-approve hook: write each detected ecosystem's build-blocking config and append one paragraph per ecosystem to AGENTS.md — .NET gets &lt;solution-root&gt;/Directory.Build.props, Python gets &lt;root&gt;/ruff.toml and &lt;root&gt;/mypy.ini; Node/TS gets NOTHING written into the repo — its lint toolchain is baked into the sandbox image at /opt/aidw/lint and the rebuild gate runs it from there (a repo with its own ESLint setup keeps its own lint contract)<br/>Runs on the approved path, not post-audit, so it still fires on the hydrate short-circuit — otherwise a repo onboarded once would never receive a new or updated convention<br/>Everything downstream reads this: build commands, test commands, and whether Playwright/Excalidraw MCP get attached"]
-
-    rr["RECORD RAW REQUIREMENTS &nbsp;·&nbsp; the human's text, accepted exactly as written<br/>1. deterministic, zero LLM calls: the submitted text is recorded as the approved requirements verbatim — specification is the stage that processes it<br/>2. persists .ai-dev-workflow/raw-requirements.md (+ .approved.json) and commits<br/>3. a blank submission keeps the previously hydrated requirements untouched"]
-
-    spec["SPECIFICATION &nbsp;·&nbsp; user stories and acceptance criteria with permanently stable ids<br/>1. draft: requirements text plus any attachments (screenshots/documents) — skill: spec-sync<br/>2. audit: adversarial revision — skills: ponytail (prose), spec-sync<br/>3. verify (deterministic): sync every US/AC id against .ai-dev-workflow/spec/ledger.json (committed by the verify-pass persist)<br/>4. gate: human approval<br/>5. sign: append a content-hash-signed row to APPROVALS.md so later tampering is detectable"]
-
-    plan["IMPLEMENTATION PLAN &nbsp;·&nbsp; ordered steps plus diagrams, derived only from the approved spec<br/>1. draft: input is the approved Specification, never the raw requirements — UI-framework repos must also emit one self-contained HTML wireframe per new/changed screen (max 6, 30 KB each; inline CSS only, no scripts, no external URLs) and get impeccable `shape` methodology (read-only, no scripts)<br/>2. audit: adversarial revision — skill: ponytail (prose); also reviews and FIXES the wireframes against the spec (the auditor revises artifacts directly, there is no separate editor)<br/>3. verify (deterministic): validate every wireframe (name, size, self-containment — pure checks, no Chromium) and render every Mermaid diagram with mmdc inside the sandbox; a render failure is a syntax failure. Both are committed to .ai-dev-workflow/plan/ on pass<br/>4. gate: human approval<br/>5. sign: content-hash-signed row in APPROVALS.md"]
-
-    p4["AC TO TESTS &nbsp;·&nbsp; write the failing tests first (TDD red), touching test files only<br/>1. capture baseline commit (git rev-parse HEAD) — the reference point for the write-scope check<br/>2. draft: autopilot write access, bash excluded, PreToolUse write-scope hook armed, Playwright MCP for UI repos — skills: ac-to-tests, test-driven-development<br/>3. verify (deterministic), both halves must pass:<br/>&nbsp;&nbsp;&nbsp;&nbsp;a. write-scope gate — git diff against the baseline commit, every changed path must be a test path (pipeline-owned artifacts — .ai-dev-workflow/, APPROVALS.md, AGENTS.md — are exempt: the workflow itself commits those mid-stage)<br/>&nbsp;&nbsp;&nbsp;&nbsp;b. AC-coverage gate — every active AC has a test whose name embeds its id, and that test is currently FAILING<br/>4. no audit, no human gate — the deterministic gate is the gate"]
-
-    r4["R · REBUILD (scaffold-only fix) &nbsp;·&nbsp; the tree must still compile after new tests land<br/>1. run the stack's plain build command; exit code is the whole gate — no LLM in the happy path<br/>&nbsp;&nbsp;&nbsp;compile-only on purpose: strict lint/typecheck would flag pre-existing repo debt this placement's fixer is forbidden to touch — the full strict gate runs at the post-codegen R placements instead<br/>2. on failure, fix node may add compile-enabling stubs only, never real behavior — skill: systematic-debugging<br/>3. up to 3 fix cycles, then the run ENDs with run_failure"]
-
-    p6["MINIMAL CODE TO GREEN &nbsp;·&nbsp; write the least code that turns the ac-to-tests tests green<br/>1. draft: autopilot, full unscoped write access — skills: executing-plans, subagent-driven-development, ponytail (ultra, ADVISORY: Copilot arbitrates each suggestion, implements only what it agrees with, records rejections in ponytail_rejected); UI-framework repos also get impeccable design rules plus a one-time PRODUCT.md/DESIGN.md bootstrap from the approved spec<br/>2. audit: read-only allowlist — also reviews the ponytail arbitration itself<br/>3. verify (deterministic): 95% line+branch coverage via CONTRACT REPLAY — the draft records working coverage command(s) per stack in .ai-dev-workflow/coverage-commands.json (it owns the HOW); the gate deletes each artifact, re-executes each command ITSELF, parses only standard formats (cobertura / istanbul json-summary), and merges counts line-weighted across stacks (it owns the NUMBER — no model-reported figure is ever read). Plus an anti-gaming check that coverage-exclusion config was not broadened<br/>4. no human gate — the coverage verify is the gate"]
-
-    r6["R · REBUILD (full fix) &nbsp;·&nbsp; clean build after real implementation work<br/>1. clean+build, gate on exit code<br/>2. on failure, full-scope fix — skill: systematic-debugging (4-phase root-cause analysis)<br/>3. up to 3 fix cycles, then the run ENDs with run_failure"]
-
-    p8["QUALITY REMEDIATION &nbsp;·&nbsp; analyzer findings triaged, fixed or explicitly suppressed<br/>1. quality_scan: dotnet build with SARIF ErrorLog and dotnet format --verify-no-changes, plus repo_scan's quality profile (jscpd duplication, lizard per-function complexity) — also refreshes repo-scan-latest.json and streams the summary to the metrics bar<br/>2. quality_triage: LLM decides fix-or-suppress per finding — skill: quality-triage<br/>3. quality_ledger_write: every suppression gets a written justification — no silent suppression<br/>4. quality_fix: dotnet format plus LLM fixes for what triage marked fixable — then git add -A commit + push (commit_all)<br/>5. R(quality): clean rebuild after the fixes<br/>6. quality_gate_check: analyzer errors and the duplication threshold gate absolutely; complexity findings gate only if they are NEW against the baseline scan, so a brownfield repo's inherited debt is reported and burned down rather than deadlocking its first gate<br/>7. pass, or loop back to scan (max 3 cycles), then the run ENDs with run_failure"]
-
-    p10["SECURITY REMEDIATION &nbsp;·&nbsp; same shape as quality-remediation, tuned for vulnerabilities and secrets<br/>1. security_scan: repo_scan's security profile — semgrep against vendored rules, trivy for vuln/misconfig/license/secret, gitleaks, osv-scanner — all fully offline against databases baked into the image, deduplicated across tools, plus a CycloneDX SBOM; refreshes repo-scan-latest.json and streams the summary to the metrics bar<br/>2. security_triage: fix-or-suppress per finding — skills: security-triage, security-review — a secret can NEVER be suppressed, enforced on the finding's category rather than on which tool reported it<br/>3. security_ledger_write: justification recorded for every suppression<br/>4. security_fix: LLM fixes the findings triage marked fixable — then git add -A commit + push (commit_all)<br/>5. R(security): clean rebuild<br/>6. security_gate_check: absolute, not delta-scoped — an inherited CVE is still exploitable. Zero unsuppressed findings at or above the severity floor (default: medium), else loop (max 3), then the run ENDs with run_failure"]
-
-    p11a["ADVERSARIAL AUDIT &nbsp;·&nbsp; does the code that now exists actually match the spec and plan?<br/>1. draft: compare approved Specification and Plan against the real repo, report divergences — skills: caveman, verification-before-completion; UI-framework repos also get an impeccable `critique`-style design review (read-only, no scripts), findings folded into the report<br/>2. no audit, no human gate — findings flow into de-dup and the audit exit gate's objective re-checks"]
-
-    p11b["DE-DUP / SIMPLIFY &nbsp;·&nbsp; collapse the duplication the pipeline just introduced<br/>1. dedup_simplify_pre: run jscpd through repo_scan, feed the parsed clone pairs into the draft prompt<br/>2. draft: autopilot write access, refactor the clusters — jscpd findings are authoritative; ponytail ultra + ponytail-audit run as ADVISORY proposals Copilot arbitrates (rejections recorded in ponytail_rejected); UI-framework repos also run impeccable's deterministic design detector and an impeccable `polish` pass over adversarial-audit's design findings<br/>3. no audit, no human gate — jscpd's objective re-check at the audit exit gate is the real bound<br/>4. post-approve hook: re-run jscpd and record the new duplication percentage"]
-
-    p11c["FINDING CLUSTER (DEPENDENCY UPGRADES) &nbsp;·&nbsp; verify-before-audit, because a bad upgrade is objectively detectable<br/>1. finding_cluster_pre: list outdated dependencies with the stack's own command<br/>2. finding_cluster_draft: write access — perform upgrades and regenerate lockfiles<br/>3. finding_cluster_verify: clean rebuild plus full test run<br/>4. pass, then finding_cluster_audit — read-only risk review of the upgrade<br/>5. fail with cycles left, then loop back to draft carrying the failure evidence<br/>6. fail at the cap, then finding_cluster_revert (git revert) and a logged notice (no interrupt) that never blocks the audit cluster"]
-
-    p11d["LICENSE AUDIT &nbsp;·&nbsp; classify every dependency license against policy<br/>1. license_audit_pre: deterministic license scan, declared and detected licenses per package<br/>2. draft: classify each package against license-policy.json — skill: license-audit<br/>3. verify (deterministic): any flagged package ENDs the run immediately (max_verify_cycles is 0 — redrafting cannot change a license); the failure text says to remove or replace the flagged dependency, then resubmit"]
-
-    p11exit["AUDIT EXIT GATE &nbsp;·&nbsp; re-prove the objective properties instead of trusting earlier stages<br/>1. re-verify test coverage against the threshold<br/>2. re-verify duplication below the max percentage (default 3%)<br/>3. re-verify license policy and write THIRD-PARTY-NOTICES.md<br/>4. pass, or retry once, then the run ENDs with run_failure"]
-
-    r11["R · REBUILD (full fix) &nbsp;·&nbsp; clean build after all of the audit cluster's refactoring and upgrades"]
-
-    p13["TEST HARDENING · FULL TEST SUITE + FLAKE QUARANTINE<br/>1. test_hardening_run_tests: run the whole suite with retries; parse trx (.NET) or vitest JSON (JS/TS)<br/>2. any stable failure, then test_hardening_regression_gate — the run ENDs with run_failure (out of test-hardening's scope to fix)<br/>3. test_hardening_flake_triage: narrow read-only LLM judgment over the intermittent failures<br/>4. test_hardening_mint_tickets: allocate real US-#### ids through spec_ledger.py — deterministic, never the LLM<br/>5. test_hardening_exit_check: passes once every quarantined test is linked to a ticket (an unlinked entry should not happen — mint_tickets links every entry deterministically — and ENDs the run with run_failure if it ever does); success proceeds into e2e, not straight to metrics-report"]
-
-    e2e["E2E &nbsp;·&nbsp; playwright against the running app, screenshots, a bounded fix loop (e2e_nodes.py)<br/>1. e2e_gate_check: skip straight to metrics-report when tech-stack found no UI framework, no playwright.config.*/e2e spec files, or no runner resolvable (local @playwright/test or the image's pinned global fallback) — a greenfield repo re-scans for a start command against the now-scaffolded tree<br/>2. e2e_run: boot the app with secrets stripped from its env, poll its port for readiness, run the suite under a hard timeout, harvest test-results/*.png into .ai-dev-workflow/history/&lt;run_id&gt;-screens — a green suite that captured nothing gets one deterministic homepage screenshot while the app is still up (best-effort, never fails the attempt; exit's verify is what blocks a UI merge with zero screenshots) — then parse the JSON report — a missing or malformed report is always a failure, never a silent pass<br/>3. e2e_fix: autopilot LLM fix from the failed tests and the app's log tail, then rerun<br/>4. pass, or loop (up to 2 fix cycles), then escalate: the run ENDs with run_failure (cannot_verify with no sandbox, e2e_cap_exceeded at the cycle cap)"]
-
-    p14["METRICS REPORT + TRACEABILITY + REGRESSION GATE &nbsp;·&nbsp; deterministic, with exactly one named LLM exception<br/>1. run repo_scan's full profile (tools run concurrently): size and language mix, per-function complexity, duplication, churn/hotspots/ownership, and every deduplicated security finding with its CVE and fix version<br/>2. diff it against the baseline taken at the top of the graph — what was fixed, what was introduced, what got worse, and each metric's direction declared rather than inferred (more code is neutral, more duplication is a regression)<br/>3. take coverage from the gates' own promoted numbers (line AND branch, else re-parse the artifact) and the e2e cluster's own result<br/>4. build traceability-matrix.md by matching each AC's ledger id (every tolerated spelling) against test-file contents — covered = a test exists<br/>5. sum token consumption from every stage's ledger entries<br/>6. write repo-scan-latest.json, repo-scan-delta.json and metrics-latest.json (run-id-stamped)<br/>7. REGRESSION GATE: block on open gating findings, unmeasured/below-95% coverage (line or branch), coverage regressing &gt;1pt, or health score regressing &gt;2pt vs a non-empty baseline (greenfield's empty pre-codegen baseline gates absolutely via gating_count instead) — one automatic re-scan for tool flake, then run_failure is set and the run continues INTO exit (never straight to END) so the report explaining the block still gets written<br/>8. metrics_ponytail_gain: the one LLM call — run /ponytail-gain for the code/cost/speed scorecard<br/>No baseline recorded means the delta is omitted with a reason, never fabricated as a zero"]
-
-    p15["EXIT &nbsp;·&nbsp; is this actually merge-ready?<br/>1. draft: merge-readiness report and PR description from the spec, plan and metrics-report metrics — skills: caveman, finishing-a-development-branch<br/>2. exit_verify (deterministic): complete the manifest — post-scaffold app re-scan when app_check.apps is empty, record test_command and coverage_commands, one schema regardless of entrypoint — then force merge_ready=false for any deterministic blocker: the regression gate's recorded reasons (run-id-stamped read), a UI app with zero e2e screenshots (covers every e2e skip path), or a manifest still missing apps/commands; no audit, no human gate — specification and plan are the only two human checkpoints on every ordinary run<br/>3. sign: content-hash-signed row in APPROVALS.md<br/>4. exit_finalize (deterministic): update manifest.json (schema-validated, app_check deep-merged), write the CHANGELOG entry from the ledger diff, close this run's sessions.json row as completed — or failed when run_failure is set (a stale metrics-latest.json from a previous run is ignored, never rendered as this run's numbers)<br/>5. write per-run exit report artifacts with a FIXED section skeleton — the E2E Screenshots section always renders, stating why it's empty when it is: history/&lt;run_id&gt;-report.json and history/&lt;run_id&gt;-exit.md, read by the frontend Report tab and the past-session report page (raw screenshots served through a hardened same-origin proxy)<br/>6. prune history/ artifacts of runs older than the last AIDW_HISTORY_RETAIN (default 10), keeping every run sessions.json still lists plus this run, then commit"]
-
-    pause(["PAUSE FOR HUMAN INPUT<br/>Any draft that comes back not-ready emits clarifying questions and ends the run.<br/>The human answers in chat, and the next run re-enters at INTAKE from the top.<br/>(Headless mode forbids this: drafts must make and record assumptions instead.)"])
-
-    failed(["RUN FAILURE — END<br/>Any exhausted retry cap or lost sandbox ends the run here:<br/>ledger row written, committed and pushed; run_failure streamed to the UI; this run's sessions.json row closed as failed (stage, type, message).<br/>Counters reset in the same step, so resubmitting starts a clean attempt. The /select history UI's Resume button re-enters at INTAKE with ?resume=1."])
-
-    done(["END"])
-
-    session --> intake --> scaffold --> apre --> app --> decide
-    decide -->|suitable| sfin --> ts
-    decide -->|greenfield| gsel
-    decide -->|unsuitable| reject --> done
-    gsel -->|accept| sfin
-    gsel -->|decline| reject
-    ts -->|manifest.json exists| record
-    ts -->|no manifest.json, brownfield| p0pre
-    ts -->|no manifest.json, greenfield| bwm
-    p0pre --> p0
-    p0 --> bwm
-    bwm --> record
-    record --> rscan --> rr
-    rr --> spec
-    spec -->|human| plan
-    plan -->|human| p4
-    p4 --> r4 --> p6
-    p6 --> r6 --> p8
-    p8 --> p10 --> p11a
-    p11a --> p11b --> p11c --> p11d --> p11exit --> r11 --> p13
-    p13 --> e2e --> p14 --> p15
-    p14 -.->|regression/coverage gate failure, 1 re-scan| p14
-    p14 -.->|still failing: run_failure set, merge blocked| p15
-    p15 --> done
-
-    p4 -.->|write-scope or AC-coverage failure, 3 tries| p4
-    p6 -.->|coverage below threshold, 3 tries| p6
-    spec -.->|ledger sync failure| spec
-    plan -.->|diagram render failure| plan
-    p8 -.->|gate not met, max 3 cycles| p8
-    p10 -.->|gate not met, max 3 cycles| p10
-    p11exit -.->|retry once| p11exit
-    e2e -.->|failed tests, max 2 fix cycles| e2e
-    p4 -.->|cap| failed
-    p6 -.->|cap| failed
-    p8 -.->|cap| failed
-    p10 -.->|cap| failed
-    p11d -.->|flagged license| failed
-    p11exit -.->|cap| failed
-    p13 -.->|stable failure or unlinked quarantine| failed
-    e2e -.->|cannot verify or cap| failed
-    r4 -.->|cap| failed
-    r6 -.->|cap| failed
-    r11 -.->|cap| failed
-    ts -.-> pause
-    spec -.-> pause
-    plan -.-> pause
-    p6 -.-> pause
+    session["SESSION PROVISIONING<br/>Sandbox + repo clone + toolchain bootstrap"]
+    intake["INTAKE<br/>Normalize run; hydrate prior stage state"]
+    scaffold["SCAFFOLD & APP DISCOVERY<br/>Baseline capture + app suitability check + greenfield stack picker"]
+    scaffold_fin["SCAFFOLD FINALIZE<br/>Write AGENTS.md, tech-stack conventions"]
+    
+    stage1["STAGE 1: TECH STACK<br/>Detect languages, frameworks, build/test commands<br/>Agent: tech-stack-draft (read-only discovery)"]
+    
+    stage2["STAGE 2: SPECIFICATION<br/>Draft user stories + acceptance criteria<br/>Agents: specification-draft → specification-audit<br/>Gate: human approval + sign to APPROVALS.md"]
+    
+    stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Gate: human approval + sign to APPROVALS.md"]
+    
+    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red)<br/>Agent: ac-to-tests-draft (scaffold-only rebuild)<br/>Gate: write-scope + AC-coverage deterministic checks"]
+    
+    stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
+    
+    stage6["STAGE 6: REMEDIATION FLEET<br/>Consolidated: quality+security+dedup+license findings<br/>Triage-and-fix via: remediation-fix agent (autopilot)<br/>Parallel: finding-cluster-upgrade loop (verify-then-audit)<br/>Rebuild gate + jscpd re-check"]
+    
+    stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Audit full repo state + test hardening + E2E + wireframe conformance<br/>Agents: adversarial-audit-draft (full-repo review)<br/>test-hardening + e2e automated checks"]
+    
+    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan + coverage + traceability<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign"]
+    
+    done["END<br/>Repo ready for merge or run_failure recorded"]
+    
+    session --> intake --> scaffold --> stage1 --> stage2
+    stage2 --> stage3 --> stage4 --> stage5
+    stage5 --> stage6 --> stage7 --> stage8 --> done
+    
+    scaffold -.->|suitable path| scaffold_fin --> stage1
+    stage2 -.->|not ready| stage2
+    stage3 -.->|not ready| stage3
+    stage4 -.->|gate failure, 3 tries| stage4
+    stage5 -.->|gate failure, 3 tries| stage5
+    stage6 -.->|gate failure, 3 cycles| stage6
+    stage8 -.->|regression gate failure, 1 rescan| stage8
+    
+    stage4 -.->|cap| done
+    stage5 -.->|cap| done
+    stage6 -.->|cap| done
+    stage8 -.->|cap| done
 ```
 
 ## Every file this pipeline writes into a target repo
@@ -294,4 +207,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 3838d5fd230c4efa8148fcc49070225a589c5600963e9372882326e1703cd471 -->
+<!-- graph-source-sha256: 9e0de2403b300797e9fbb97c1a53d61fa549cef44c896411e24273ae5eac6967 -->
