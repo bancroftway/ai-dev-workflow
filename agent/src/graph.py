@@ -52,7 +52,7 @@ from . import spec_ledger
 from . import stack_discovery
 from . import telemetry
 from . import workflow_persistence
-from .custom_agent_loader import load_agent as _load_agent_file
+from .custom_agent_loader import load_agent_for_stage
 from .gates import audit_gates
 from .quality_security import quality_nodes, security_nodes
 from .gates.diagram_gate import verify_plan_diagrams
@@ -115,24 +115,6 @@ from .schemas_remediation import RemediationDraftResponse
 from .schemas_adversarial_compliance import AdversarialComplianceDraftResponse
 
 logger = logging.getLogger(__name__)
-
-
-def load_agent(stage: str, role: str) -> dict[str, Any]:
-    """Load a custom agent from agent/src/agents/<stage>-<role>.md.
-
-    Returns a CustomAgentConfig dict with keys: name, description, tools, model, prompt.
-    Falls back gracefully if the agent file doesn't exist (logs and returns empty dict).
-    """
-    agent_path = os.path.join(
-        os.path.dirname(__file__),
-        "agents",
-        f"{stage.replace('_', '-')}-{role}.md",
-    )
-    try:
-        return _load_agent_file(agent_path)
-    except (FileNotFoundError, ValueError) as e:
-        logger.warning(f"Could not load agent {stage}-{role}: {e}")
-        return {}
 
 
 StageStatus = Literal[
@@ -966,7 +948,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_remediation",
         build_envelope=build_remediation_envelope,
         build_prompt=_build_remediation_prompt,
-        max_cycles=workflow_config.REMEDIATION_MAX_CLARIFICATION_CYCLES if hasattr(workflow_config, "REMEDIATION_MAX_CLARIFICATION_CYCLES") else 2,
+        max_cycles=2,
         render_markdown=render_remediation_markdown,
         requires_human_gate=False,
     ),
@@ -1267,7 +1249,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         # Load custom agent if available, falling back to legacy session_options
         custom_agents = []
-        agent_config = load_agent(stage_spec.key, "draft")
+        agent_config = load_agent_for_stage(stage_spec.key, "draft")
         if agent_config:
             custom_agents = [agent_config]
 
@@ -1365,7 +1347,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         # Load custom agent if available, falling back to legacy session_options
         custom_agents = []
-        agent_config = load_agent(stage_spec.key, "audit")
+        agent_config = load_agent_for_stage(stage_spec.key, "audit")
         if agent_config:
             custom_agents = [agent_config]
 

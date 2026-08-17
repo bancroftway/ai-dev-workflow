@@ -1,7 +1,6 @@
 "use client";
 
 import { createContext, useContext, type ReactNode } from "react";
-import { deriveLocalAgentId } from "@/lib/workflow-thread";
 
 export const RUNTIME_AGENT_ID = "workflow";
 
@@ -28,7 +27,9 @@ export function WorkflowThreadProvider({
   const value: WorkflowThreadValue = {
     threadId,
     runtimeAgentId: RUNTIME_AGENT_ID,
-    localAgentId: deriveLocalAgentId(threadId),
+    // useAgent's threadId requires a distinct runtimeAgentId + local agentId pairing, never the
+    // shared "workflow" registry id directly -- one call site, inlined rather than its own file.
+    localAgentId: `workflow-thread-${threadId}`,
   };
   return <WorkflowThreadContext.Provider value={value}>{children}</WorkflowThreadContext.Provider>;
 }

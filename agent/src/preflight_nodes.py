@@ -530,28 +530,6 @@ def _applicable_ecosystems(tech_stack: dict[str, Any]) -> list[tuple[_Ecosystem,
     return [(eco, root) for eco, root in applicable if _root_is_safe(root)]
 
 
-async def _detect_package_manager(provider: SandboxProvider, thread_id: str, root: str) -> str | None:
-    """npm / pnpm / yarn for this root, or None when there is no package.json to install into.
-
-    Dispatching matters: running `npm install` in a pnpm repo drops a package-lock.json next to
-    pnpm-lock.yaml and commits it, which quietly corrupts that repo's dependency management.
-    """
-    package_json = await repo_files.read_repo_file(provider, thread_id, _join_root(root, "package.json"))
-    if package_json is None:
-        return None
-    try:
-        declared = str(json.loads(package_json).get("packageManager") or "")
-    except json.JSONDecodeError:
-        declared = ""
-    for name in ("pnpm", "yarn", "npm"):
-        if declared.startswith(name):
-            return name
-    for lockfile, name in (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("package-lock.json", "npm")):
-        if await repo_files.read_repo_file(provider, thread_id, _join_root(root, lockfile)) is not None:
-            return name
-    return "npm"
-
-
 async def _write_if_outdated(
     provider: SandboxProvider, thread_id: str, path: str, template_path: str
 ) -> str | None:

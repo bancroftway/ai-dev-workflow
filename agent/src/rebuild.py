@@ -24,7 +24,7 @@ from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import git_ops, model_config, repo_files, stack_discovery
 from .copilot_chat_model import get_chat_model_for_thread
-from .custom_agent_loader import load_agent as _load_agent_file
+from .custom_agent_loader import load_agent_for_stage
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 
@@ -45,24 +45,6 @@ def default_rebuild_state() -> RebuildState:
 
 
 logger = logging.getLogger(__name__)
-
-
-def load_agent(stage: str, role: str) -> dict[str, Any]:
-    """Load a custom agent from agent/src/agents/<stage>-<role>.md.
-
-    Returns a CustomAgentConfig dict with keys: name, description, tools, model, prompt.
-    Falls back gracefully if the agent file doesn't exist (logs and returns empty dict).
-    """
-    agent_path = os.path.join(
-        os.path.dirname(__file__),
-        "agents",
-        f"{stage.replace('_', '-')}-{role}.md",
-    )
-    try:
-        return _load_agent_file(agent_path)
-    except (FileNotFoundError, ValueError) as e:
-        logger.warning(f"Could not load agent {stage}-{role}: {e}")
-        return {}
 
 
 @dataclass(frozen=True)
@@ -163,7 +145,7 @@ def make_fix_node(spec: RebuildSpec):
 
         # Load custom agent if available
         custom_agents = []
-        agent_config = load_agent("rebuild_build", "fix")
+        agent_config = load_agent_for_stage("rebuild_build", "fix")
         if agent_config:
             custom_agents = [agent_config]
 

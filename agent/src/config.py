@@ -11,8 +11,6 @@ MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES = int(
     os.environ.get("MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES", "3")
 )
 ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES", "2"))
-DEDUP_MAX_CLARIFICATION_CYCLES = int(os.environ.get("DEDUP_MAX_CLARIFICATION_CYCLES", "2"))
-LICENSE_AUDIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("LICENSE_AUDIT_MAX_CLARIFICATION_CYCLES", "2"))
 EXIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("EXIT_MAX_CLARIFICATION_CYCLES", "2"))
 # Small default: tech-stack detection is autonomous codebase study, not human-clarification-driven,
 # so this safety cap should rarely if ever trigger.

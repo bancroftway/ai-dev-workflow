@@ -29,14 +29,18 @@ ARG TRIVY_VERSION=0.73.0
 # repo_scan.py's command uses the v2 `scan source --offline-vulnerabilities` subcommand form;
 # v1's flags differ and would silently produce no output.
 ARG OSV_SCANNER_VERSION=2.0.2
+# Anchore's dedicated SBOM cataloger -- repo_scan.py's own docstring explains why this replaced the
+# earlier "redundant with Trivy" call. Same goreleaser asset-naming convention as scc/gitleaks/trivy
+# above (no "v" prefix in the filename, unlike the release tag).
+ARG SYFT_VERSION=1.51.0
 # mise (multi-language version manager) is what lets this immutable image serve a repo needing a
 # toolchain it doesn't ship -- Node 18, a second JDK, a Go version. See the /opt/aidw layout below
 # and bootstrap.sh for how it's driven. Pinned like every other tool here.
 ARG MISE_VERSION=2025.1.0
 
-# ── fetch stage: the six curl|tar binary installs, COPY'd into the final stage in one layer ────
+# ── fetch stage: the seven curl|tar binary installs, COPY'd into the final stage in one layer ───
 # Size win is ~0 (each RUN already deleted its tarball in-layer); the gains are parallel fetching
-# under BuildKit and six layers collapsing to one. All fetches stay arch-aware via
+# under BuildKit and seven layers collapsing to one. All fetches stay arch-aware via
 # `dpkg --print-architecture`, hence ${BASE_IMAGE} (cached anyway) rather than a smaller fetcher.
 FROM ${BASE_IMAGE} AS fetch
 ARG COPILOT_CLI_VERSION
@@ -45,6 +49,7 @@ ARG GITLEAKS_VERSION
 ARG TRIVY_VERSION
 ARG OSV_SCANNER_VERSION
 ARG MISE_VERSION
+ARG SYFT_VERSION
 RUN set -eux; \
     mkdir -p /out/bin; \
     arch="$(dpkg --print-architecture)"; \
@@ -54,13 +59,15 @@ RUN set -eux; \
                scc_asset="scc_Linux_x86_64.tar.gz"; \
                gitleaks_asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"; \
                trivy_asset="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"; \
-               osv_asset="osv-scanner_linux_amd64" ;; \
+               osv_asset="osv-scanner_linux_amd64"; \
+               syft_asset="syft_${SYFT_VERSION}_linux_amd64.tar.gz" ;; \
         arm64) copilot_asset="copilot-linux-arm64.tar.gz"; \
                mise_asset="mise-v${MISE_VERSION}-linux-arm64.tar.gz"; \
                scc_asset="scc_Linux_arm64.tar.gz"; \
                gitleaks_asset="gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz"; \
                trivy_asset="trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz"; \
-               osv_asset="osv-scanner_linux_arm64" ;; \
+               osv_asset="osv-scanner_linux_arm64"; \
+               syft_asset="syft_${SYFT_VERSION}_linux_arm64.tar.gz" ;; \
         *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/github/copilot-cli/releases/download/v${COPILOT_CLI_VERSION}/${copilot_asset}" -o /tmp/copilot.tar.gz; \
@@ -75,8 +82,10 @@ RUN set -eux; \
     curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${trivy_asset}" -o /tmp/trivy.tar.gz; \
     tar -xzf /tmp/trivy.tar.gz -C /out/bin trivy; \
     curl -fsSL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/${osv_asset}" -o /out/bin/osv-scanner; \
-    chmod +x /out/bin/copilot /out/bin/scc /out/bin/gitleaks /out/bin/trivy /out/bin/osv-scanner; \
-    rm -rf /tmp/copilot.tar.gz /tmp/mise /tmp/mise.tar.gz /tmp/scc.tar.gz /tmp/gitleaks.tar.gz /tmp/trivy.tar.gz
+    curl -fsSL "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${syft_asset}" -o /tmp/syft.tar.gz; \
+    tar -xzf /tmp/syft.tar.gz -C /out/bin syft; \
+    chmod +x /out/bin/copilot /out/bin/scc /out/bin/gitleaks /out/bin/trivy /out/bin/osv-scanner /out/bin/syft; \
+    rm -rf /tmp/copilot.tar.gz /tmp/mise /tmp/mise.tar.gz /tmp/scc.tar.gz /tmp/gitleaks.tar.gz /tmp/trivy.tar.gz /tmp/syft.tar.gz
 
 # ── final stage ────────────────────────────────────────────────────────────────────────────────
 FROM ${BASE_IMAGE}
@@ -198,6 +207,8 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # P8's quality scan: jscpd (duplication) via npm, lizard (per-function complexity) via pip.
+# checkov (IaC misconfig) and interrogate (Python docstring coverage) ride the same pip line as
+# lizard/semgrep -- all five are pure-Python static analyzers with no other runtime dependency.
 # ponytail: no version pin here -- neither gate reads a specific tool version, just parses
 # whatever JSON/CSV shape the latest release emits, so pinning buys nothing over always-latest.
 # azure-functions-core-tools rides along in the same layer: npm rather than the
@@ -207,7 +218,7 @@ RUN set -eux; \
 # Node-based Functions projects downstream, in R's build and P13's test runs.
 RUN set -eux; \
     npm install -g jscpd "azure-functions-core-tools@${FUNC_CORE_TOOLS_MAJOR}" --unsafe-perm true; \
-    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep
+    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep checkov interrogate
 
 # Front-end and Python quality toolchain. These are the deterministic signal for non-.NET repos:
 # preflight_nodes.apply_stack_conventions writes eslint.config.mjs / ruff.toml / mypy.ini into a

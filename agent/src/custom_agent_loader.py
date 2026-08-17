@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+import logging
+import os
+from typing import Any, TypedDict
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class CustomAgentConfig(TypedDict):
@@ -57,3 +61,23 @@ def load_agent(path: str) -> CustomAgentConfig:
     # Build config dict
     config = {**frontmatter, "prompt": prompt}
     return config
+
+
+def load_agent_for_stage(stage: str, role: str) -> dict[str, Any]:
+    """Load a custom agent from agent/src/agents/<stage>-<role>.md.
+
+    Returns a CustomAgentConfig dict with keys: name, description, tools, model, prompt.
+    Falls back gracefully if the agent file doesn't exist (logs and returns empty dict) -- used
+    by both graph.py's stage nodes and rebuild.py's fix nodes, which used to each carry their own
+    verbatim copy of this wrapper.
+    """
+    agent_path = os.path.join(
+        os.path.dirname(__file__),
+        "agents",
+        f"{stage.replace('_', '-')}-{role}.md",
+    )
+    try:
+        return load_agent(agent_path)
+    except (FileNotFoundError, ValueError) as e:
+        logger.warning(f"Could not load agent {stage}-{role}: {e}")
+        return {}

@@ -6,16 +6,28 @@ assembles a single structured report suitable for a repo metrics/health dashboar
 
 Callers select a subset with `profile=` (or an explicit `tools=`):
 
-    quality  -> scc, lizard, jscpd                       (quality-remediation)
-    security -> semgrep, trivy, gitleaks, osv-scanner    (security-remediation)
-    full     -> those plus git churn/ownership           (baseline node, metrics-report)
+    quality  -> scc, lizard, jscpd, interrogate, dotnet-docs   (quality-remediation)
+    security -> semgrep, trivy, gitleaks, osv-scanner, checkov (security-remediation)
+    full     -> those plus git churn/ownership and syft (SBOM) (baseline node, metrics-report)
 
 Licence bar is permissive (MIT / Apache-2.0), with exactly one documented exception: semgrep is
 LGPL-2.1. Invoking it as a subprocess creates no derivative work, but it does not meet the bar, so
 it is recorded in the report's `tools[]` block as `permissive: false` and driven from a vendored
-rule pack rather than the network registry. SonarQube (LGPL-3.0 + server), TruffleHog (AGPL-3.0)
-and code-maat (GPL-3.0) were evaluated and rejected on licence; hercules, Dependency-Check,
-Grype/Syft, detect-secrets, ZAP and Nuclei were rejected as redundant or out of scope.
+rule pack rather than the network registry. SonarQube (LGPL-3.0 + server), TruffleHog (AGPL-3.0),
+Hadolint (GPL-3.0), cloc (GPL-2.0) and code-maat (GPL-3.0) were evaluated and rejected on licence;
+hercules, Dependency-Check, Grype, detect-secrets, ZAP and Nuclei were rejected as redundant or out
+of scope. Syft was originally rejected here too ("redundant with Trivy's own SBOM mode") but is now
+included as a dedicated tool: Syft is Anchore's purpose-built SBOM cataloger with materially deeper
+per-ecosystem coverage than Trivy's SBOM-as-a-byproduct mode, and its output is large enough
+(cyclonedx-json, one entry per dependency) that it is persisted as its own artifact
+(`SBOM_PATH`) rather than folded into `metrics`, which flows into an 8000-char-truncated LLM
+prompt elsewhere in the pipeline. Checkov's `misconfig` findings and interrogate's/dotnet-docs'
+`maintainability`/documentation signal reuse `SECURITY_CATEGORIES`/`QUALITY_CATEGORIES` below --
+no separate gate code needed for either. OpenSSF Scorecard was evaluated and NOT added: it needs a
+live GitHub/GitLab token at scan time, after the untrusted target repo is already checked out --
+this sandbox deliberately deletes its one-shot git token before any repo-supplied code executes
+(see agent/sandbox-image/local_docker.py), and Scorecard would reintroduce exactly the credential
+exposure that design prevents. Revisit only with an explicit scoped-token plan.
 
 Determinism: every command is prefixed `LC_ALL=C`, vulnerability databases are baked into the
 image and never updated at scan time, findings are sorted before serialization, and `content_hash`
@@ -62,6 +74,10 @@ SCHEMA_VERSION = 1
 BASELINE_PATH = ".ai-dev-workflow/repo-scan-baseline.json"
 LATEST_PATH = ".ai-dev-workflow/repo-scan-latest.json"
 DELTA_PATH = ".ai-dev-workflow/repo-scan-delta.json"
+# Syft's full cyclonedx-json output (one entry per dependency) is too large for the metrics dict --
+# see the module docstring's SBOM paragraph -- so it is persisted here instead, exactly like the
+# three paths above.
+SBOM_PATH = ".ai-dev-workflow/sbom.json"
 
 # Vendored LGPL-2.1 semgrep rules and the baked offline OSV database, both placed by the sandbox
 # image. Overridable so a differently-built image can move them without a code change.
@@ -78,6 +94,10 @@ MAX_DUPLICATION_PERCENT = float(os.environ.get("QUALITY_MAX_DUPLICATION_PERCENT"
 LIZARD_MAX_CCN = int(os.environ.get("LIZARD_MAX_CCN", "20"))
 LIZARD_HIGH_CCN = int(os.environ.get("LIZARD_HIGH_CCN", "25"))
 CHURN_WINDOW_DAYS = int(os.environ.get("REPO_SCAN_CHURN_WINDOW_DAYS", "365"))
+# Lenient first-cut floor, not a calibrated target: interrogate's own README default is 80%, but
+# that's tuned for a project treating docstrings as a merge gate from day one. Starting at 50% means
+# this only fires on repos with substantially undocumented public APIs, not on ordinary gaps.
+DOC_COVERAGE_MIN_PERCENT = float(os.environ.get("DOC_COVERAGE_MIN_PERCENT", "50.0"))
 SECURITY_SEVERITY_FLOOR = os.environ.get("SECURITY_SEVERITY_FLOOR", "medium")
 # Bounds the coverage measurement the baseline node runs alongside the scan -- a hung test command
 # must not hang the whole baseline forever. None (gate callers) keeps today's unbounded behavior.
@@ -666,6 +686,156 @@ def _numstat_int(value: str) -> int:
     return 0 if value.strip() in ("-", "") else int(value)
 
 
+def parse_checkov(raw: str) -> ParseResult:
+    """Checkov's `-o json` prints either one framework-result dict, or a list of them when it
+    auto-detects more than one IaC framework in the repo (Terraform + Dockerfile + Kubernetes,
+    say) -- both shapes are handled here. Findings are tagged `misconfig`, the same category Trivy's
+    own IaC scanning already uses, so they gate through the existing `SECURITY_CATEGORIES` check in
+    `is_gating` with no new gate code."""
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], {}
+    entries = doc if isinstance(doc, list) else [doc] if isinstance(doc, dict) else []
+
+    findings: list[Finding] = []
+    total_failed = 0
+    total_passed = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        results = entry.get("results") or {}
+        failed = results.get("failed_checks") or []
+        total_failed += len(failed)
+        total_passed += len(results.get("passed_checks") or [])
+        for check in failed:
+            if not isinstance(check, dict):
+                continue
+            rule_id = check.get("check_id", "unknown")
+            path = _norm_path(check.get("file_path", ""))
+            line_range = check.get("file_line_range") or [None, None]
+            tier = normalize_tier(check.get("severity"))
+            findings.append(
+                Finding(
+                    finding_key=stable_id("misconfig", rule_id, path),
+                    tool="checkov",
+                    rule_id=rule_id,
+                    # OSS Checkov leaves `severity` null on most checks (it's a paid-platform field);
+                    # defaulting to medium matches Trivy's own misconfig parser above rather than
+                    # inventing a different convention for the same category.
+                    severity=tier or "medium",
+                    raw_severity=str(check.get("severity") or ""),
+                    file=path,
+                    line=line_range[0] if len(line_range) > 0 else None,
+                    end_line=line_range[1] if len(line_range) > 1 else None,
+                    message=check.get("check_name") or rule_id,
+                    category="misconfig",
+                    title=check.get("check_name") or rule_id,
+                    severity_source="native" if tier else "defaulted",
+                    sources=("checkov",),
+                )
+            )
+    if not entries:
+        return [], {}
+    return findings, {"iac": {"failed_checks": total_failed, "passed_checks": total_passed}}
+
+
+_INTERROGATE_RESULT_RE = re.compile(r"actual:\s*([\d.]+)\s*%")
+
+
+def parse_interrogate(raw: str) -> ParseResult:
+    """Parses interrogate's documented final summary line (`RESULT: PASSED/FAILED (minimum: X%,
+    actual: Y%)`), falling back to the last bare percentage in the output if that line is ever
+    missing -- interrogate has no JSON output mode, so this is text parsing against a documented
+    but not schema-guaranteed format, same caveat this module's own docstring already carries for
+    lizard's CSV column order."""
+    match = _INTERROGATE_RESULT_RE.search(raw)
+    if match:
+        percent = float(match.group(1))
+    else:
+        candidates = re.findall(r"([\d.]+)\s*%", raw)
+        if not candidates:
+            return [], {}
+        percent = float(candidates[-1])
+
+    findings: list[Finding] = []
+    if percent < DOC_COVERAGE_MIN_PERCENT:
+        # One aggregate finding for the whole repo, not one per undocumented symbol -- same
+        # reasoning as jscpd's aggregate duplication finding above: a per-symbol flood would drown
+        # the dashboard, and the per-file breakdown already lives in interrogate's own -v output.
+        findings.append(
+            Finding(
+                finding_key=stable_id("maintainability", "docstring-coverage", "."),
+                tool="interrogate",
+                rule_id="docstring-coverage-under-threshold",
+                severity="low",
+                raw_severity=f"{percent:.1f}%",
+                file=".",
+                line=None,
+                message=(
+                    f"Python docstring coverage is {percent:.1f}% "
+                    f"(threshold {DOC_COVERAGE_MIN_PERCENT}%)."
+                ),
+                category="maintainability",
+                title="Docstring coverage under threshold",
+                severity_source="derived",
+                sources=("interrogate",),
+            )
+        )
+    return findings, {
+        "documentation": {"python_docstring_coverage_percent": round(percent, 1), "python_threshold": DOC_COVERAGE_MIN_PERCENT}
+    }
+
+
+# MSB1003 (no project/solution found) / MSB1011 (multiple found, ambiguous) mean this repo has no
+# single buildable .NET target -- reporting 0 CS1591 warnings in that case would misread as "fully
+# documented" rather than "not a .NET repo", so this is treated as no measurement at all.
+_DOTNET_NO_PROJECT_RE = re.compile(r"MSB1003|MSB1011")
+_CS1591_RE = re.compile(r"\bCS1591\b")
+
+
+def parse_dotnet_docs(raw: str) -> ParseResult:
+    """Counts Roslyn's CS1591 ("missing XML comment for publicly visible member") from a dedicated
+    build invocation that overrides `TreatWarningsAsErrors`/`GenerateDocumentationFile` on the
+    command line only (`/p:...`, MSBuild's highest-precedence property source) -- it deliberately
+    never touches `templates/dotnet/Directory.Build.props`, which sets `TreatWarningsAsErrors=true`
+    repo-wide and is explicitly marked "DO NOT MODIFY DURING FEATURE WORK". Reports a raw count, not
+    a percentage: unlike interrogate, nothing here also counts total public members, and a bare
+    count isn't comparable across repos of different sizes -- visibility only, no aggregate finding."""
+    if _DOTNET_NO_PROJECT_RE.search(raw):
+        return [], {}
+    return [], {"documentation": {"dotnet_undocumented_public_members": len(_CS1591_RE.findall(raw))}}
+
+
+def parse_syft(raw: str) -> ParseResult:
+    """Summarizes Syft's cyclonedx-json SBOM into a handful of numbers for the metrics dict; the
+    full document is persisted separately (`SBOM_PATH`, written by `run_repo_scan` below) rather
+    than expanded here -- see the module docstring's SBOM paragraph for why."""
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], {}
+    components = doc.get("components")
+    if not isinstance(components, list):
+        return [], {}
+
+    ecosystems: dict[str, int] = {}
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        match = re.match(r"pkg:([^/]+)/", component.get("purl") or "")
+        ecosystem = match.group(1) if match else "unknown"
+        ecosystems[ecosystem] = ecosystems.get(ecosystem, 0) + 1
+
+    return [], {
+        "sbom": {
+            "component_count": len(components),
+            "ecosystems": dict(sorted(ecosystems.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "format": "cyclonedx-json",
+        }
+    }
+
+
 # --- dedup ------------------------------------------------------------------------------------
 
 
@@ -1201,19 +1371,45 @@ TOOLS: tuple[ToolSpec, ...] = (
         f"--since={CHURN_WINDOW_DAYS}.days.ago > agent-work/git-churn.txt",
         "agent-work/git-churn.txt", parse_git_churn, "git --version",
     ),
+    ToolSpec(
+        "checkov", "Apache-2.0", True,
+        "checkov --directory . --compact --quiet --output json > agent-work/checkov.json",
+        "agent-work/checkov.json", parse_checkov, "checkov --version",
+    ),
+    ToolSpec(
+        "interrogate", "MIT", True,
+        # --fail-under 0: this pipeline owns the gating decision (DOC_COVERAGE_MIN_PERCENT above),
+        # never interrogate's own exit code.
+        "interrogate --fail-under 0 -v . > agent-work/interrogate.txt",
+        "agent-work/interrogate.txt", parse_interrogate, "interrogate --version",
+    ),
+    ToolSpec(
+        # "n/a" license, like git-churn above: this invokes the .NET SDK's own Roslyn compiler, not
+        # a separate vetted dependency.
+        "dotnet-docs", "n/a", True,
+        "mkdir -p agent-work && dotnet build --no-incremental "
+        "/p:GenerateDocumentationFile=true /p:TreatWarningsAsErrors=false /p:WarningLevel=9999 "
+        "> agent-work/dotnet-docs.txt",
+        "agent-work/dotnet-docs.txt", parse_dotnet_docs, "dotnet --version",
+    ),
+    ToolSpec(
+        "syft", "Apache-2.0", True,
+        "syft dir:. -o cyclonedx-json=agent-work/sbom.json",
+        "agent-work/sbom.json", parse_syft, "syft version",
+    ),
 )
 
 TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 
 PROFILES: dict[str, tuple[str, ...]] = {
-    "quality": ("scc", "lizard", "jscpd"),
-    "security": ("semgrep", "trivy", "gitleaks", "osv-scanner"),
+    "quality": ("scc", "lizard", "jscpd", "interrogate", "dotnet-docs"),
+    "security": ("semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"),
     "full": tuple(tool.name for tool in TOOLS),
 }
 
 # Tools whose only output is measurement, skipped entirely when a gate caller passes
 # include_metrics=False.
-METRIC_ONLY_TOOLS = frozenset({"scc", "git-churn"})
+METRIC_ONLY_TOOLS = frozenset({"scc", "git-churn", "dotnet-docs", "syft"})
 
 
 def select_tools(profile: str, tools: Sequence[str] | None, include_metrics: bool) -> list[ToolSpec]:
@@ -1279,6 +1475,16 @@ async def run_repo_scan(
         repo=await _repo_facts(provider, thread_id),
         deduped_count=collapsed,
     )
+
+    if any(run["name"] == "syft" and run["status"] == "ok" for run in tool_runs):
+        # Full SBOM, not the small summary parse_syft hands to `metrics` -- persisted as its own
+        # artifact for the same reason the dashboard report is: too large to round-trip through the
+        # sandbox's ephemeral agent-work/ on every caller that wants it.
+        from . import repo_files
+
+        sbom_raw = await repo_files.read_repo_file(provider, thread_id, "agent-work/sbom.json")
+        if sbom_raw:
+            await repo_files.write_repo_file(provider, thread_id, SBOM_PATH, sbom_raw)
 
     if report_path is not None:
         from . import repo_files  # local import: keeps the pure half importable without langchain
@@ -1679,8 +1885,61 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert "Ada" not in json.dumps(_public_metrics(churn)), "author names must not reach the artifact"
 
     # Every parser tolerates garbage rather than taking the scan down with it.
-    for parse in (parse_scc, parse_lizard, parse_jscpd, parse_gitleaks, parse_trivy, parse_osv, parse_semgrep, parse_git_churn):
+    for parse in (
+        parse_scc, parse_lizard, parse_jscpd, parse_gitleaks, parse_trivy, parse_osv, parse_semgrep,
+        parse_git_churn, parse_checkov, parse_interrogate, parse_dotnet_docs, parse_syft,
+    ):
         assert parse("}{ not json") == ([], {}) or parse("}{ not json")[0] == []
+
+    # --- checkov: list-of-frameworks shape, misconfig category reuses SECURITY_CATEGORIES ---------
+    checkov_findings, checkov_metrics = parse_checkov(json.dumps([
+        {"check_type": "terraform", "results": {
+            "failed_checks": [{"check_id": "CKV_AWS_1", "check_name": "S3 bucket is not public",
+                                "file_path": "/main.tf", "file_line_range": [10, 14], "severity": "HIGH"}],
+            "passed_checks": [{"check_id": "CKV_AWS_2"}],
+        }},
+        {"check_type": "dockerfile", "results": {"failed_checks": [], "passed_checks": []}},
+    ]))
+    assert checkov_metrics["iac"] == {"failed_checks": 1, "passed_checks": 1}
+    assert checkov_findings[0].category == "misconfig" and checkov_findings[0].severity == "high"
+    assert checkov_findings[0].line == 10 and checkov_findings[0].end_line == 14
+    assert is_gating(checkov_findings[0], severity_floor="medium", introduced_ids=None), (
+        "checkov must gate through the existing misconfig category with no new gate code"
+    )
+    assert parse_checkov(json.dumps({"results": {"failed_checks": [], "passed_checks": []}})) == ([], {"iac": {"failed_checks": 0, "passed_checks": 0}})
+
+    # --- interrogate: documented RESULT line, and the fallback when it's missing -------------------
+    under, under_metrics = parse_interrogate("some table\nRESULT: FAILED (minimum: 0.0%, actual: 12.5%)\n")
+    assert under_metrics["documentation"]["python_docstring_coverage_percent"] == 12.5
+    assert len(under) == 1 and under[0].category == "maintainability"
+    over, over_metrics = parse_interrogate("RESULT: PASSED (minimum: 0.0%, actual: 92.3%)\n")
+    assert over_metrics["documentation"]["python_docstring_coverage_percent"] == 92.3
+    assert over == [], "above threshold must not gate"
+    fallback, fallback_metrics = parse_interrogate("| TOTAL | 10 | 2 | 8 | 80.0% |\n")
+    assert fallback_metrics["documentation"]["python_docstring_coverage_percent"] == 80.0, (
+        "must fall back to the last bare percentage when the RESULT line is absent"
+    )
+
+    # --- dotnet-docs: CS1591 count, and "no project" must not read as "fully documented" -----------
+    _, dotnet_metrics = parse_dotnet_docs(
+        "Foo.cs(10,5): warning CS1591: Missing XML comment for publicly visible type\n"
+        "Bar.cs(20,5): warning CS1591: Missing XML comment for publicly visible type\n"
+    )
+    assert dotnet_metrics["documentation"]["dotnet_undocumented_public_members"] == 2
+    assert parse_dotnet_docs("MSBUILD : error MSB1003: Specify a project or solution file.") == ([], {})
+
+    # --- syft: SBOM summarized to a handful of numbers, never expanded into `metrics` --------------
+    _, syft_metrics = parse_syft(json.dumps({"components": [
+        {"purl": "pkg:npm/lodash@4.17.21"}, {"purl": "pkg:npm/left-pad@1.0.0"}, {"purl": "pkg:pypi/requests@2.0.0"},
+    ]}))
+    assert syft_metrics["sbom"]["component_count"] == 3
+    assert syft_metrics["sbom"]["ecosystems"] == {"npm": 2, "pypi": 1}
+    assert parse_syft("}{ not json") == ([], {})
+
+    # --- doc metrics from two languages merge into one `documentation` section, no key collision --
+    merged_docs = _assemble_metrics([under_metrics, dotnet_metrics])
+    assert merged_docs["documentation"]["python_docstring_coverage_percent"] == 12.5
+    assert merged_docs["documentation"]["dotnet_undocumented_public_members"] == 2
 
     # --- hotspot join: needs churn AND complexity ---------------------------------------------
     metrics = _assemble_metrics([lizard_metrics, churn, jscpd_metrics, scc_metrics])
@@ -1861,12 +2120,15 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert recomputed["measures"]["coverage_line_rate"] == 85.0
 
     # --- profiles ---------------------------------------------------------------------------------
-    assert [t.name for t in select_tools("quality", None, True)] == ["scc", "lizard", "jscpd"]
+    assert [t.name for t in select_tools("quality", None, True)] == ["scc", "lizard", "jscpd", "interrogate", "dotnet-docs"]
     assert "trivy" not in [t.name for t in select_tools("quality", None, True)]
-    assert [t.name for t in select_tools("security", None, True)] == ["semgrep", "trivy", "gitleaks", "osv-scanner"]
+    assert [t.name for t in select_tools("security", None, True)] == ["semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"]
     assert [t.name for t in select_tools("full", ["jscpd"], True)] == ["jscpd"], "explicit tools= must win"
     assert "scc" not in [t.name for t in select_tools("full", None, False)]
     assert "git-churn" not in [t.name for t in select_tools("full", None, False)]
+    assert "dotnet-docs" not in [t.name for t in select_tools("full", None, False)]
+    assert "syft" not in [t.name for t in select_tools("full", None, False)]
+    assert "syft" in [t.name for t in select_tools("full", None, True)], "syft is full-profile-only, like git-churn"
     try:
         select_tools("full", ["nope"], True)
         raise AssertionError("unknown tool must raise")

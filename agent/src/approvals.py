@@ -3,12 +3,6 @@ for a stage that opts in (StageSpec.sign_approval) appends a signed row recordin
 content was approved. A later read of "the approved spec/plan" can re-hash the current on-disk
 content and compare against the latest recorded row for that stage -- a post-approval edit
 (accidental or adversarial) to the approved file no longer gets silently trusted as authoritative.
-
-verify_approval is provided for that future consumer side; nothing in this codebase calls it yet
-(no stage currently re-reads another stage's already-approved artifact from disk mid-run --
-approved_content already lives in in-memory GraphState for the run that approved it), but exit's
-manifest finalization and any future stage that resumes a thread purely by rehydrating from disk
-(intake_node's hydrate_state path) are the intended callers once built.
 """
 
 from __future__ import annotations
@@ -93,11 +87,3 @@ async def latest_approval(provider: SandboxProvider, thread_id: str, stage_key: 
     return matching[-1] if matching else None
 
 
-async def verify_approval(provider: SandboxProvider, thread_id: str, stage_key: str, content: dict) -> bool:
-    """True if `content`'s hash matches the latest recorded approval row for this stage -- False
-    if there's no recorded approval at all, or the current content's hash doesn't match (the
-    signal a post-approval edit invalidated the approval)."""
-    record = await latest_approval(provider, thread_id, stage_key)
-    if record is None:
-        return False
-    return record.content_sha256 == _hash_content(content)

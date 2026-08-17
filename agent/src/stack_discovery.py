@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Literal
 
 from pydantic import BaseModel
 
 from .custom_agent_loader import load_agent
-from .copilot_chat_model import get_chat_model_for_thread
+from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import render_prompt
 from langchain_core.messages import HumanMessage
 
@@ -65,21 +64,8 @@ async def discover_stack_commands(
     # Render the data-only template
     data_template = render_prompt("stack_discovery_data", task=task)
 
-    # Send the message; the agent's system prompt is already in the CustomAgentConfig
-    response = await model.ainvoke([HumanMessage(content=data_template)])
-
-    # Extract JSON from response
-    response_text = response.content if isinstance(response.content, str) else str(response.content)
-    try:
-        # Try to extract JSON if it's wrapped
-        if "```json" in response_text:
-            json_start = response_text.index("```json") + 7
-            json_end = response_text.index("```", json_start)
-            json_text = response_text[json_start:json_end].strip()
-        else:
-            json_text = response_text.strip()
-        result_dict = json.loads(json_text)
-    except (json.JSONDecodeError, ValueError) as e:
-        raise ValueError(f"Failed to parse model response as JSON: {response_text}") from e
-
-    return StackCommandRecommendation(**result_dict)
+    # Send the message; the agent's system prompt is already in the CustomAgentConfig.
+    # ainvoke_structured (copilot_chat_model.py) is the same schema-prompting +
+    # validate-and-retry mechanism every other structured LLM call in this codebase already uses
+    # -- replaces a hand-rolled ```json fence-strip + json.loads with no retry-on-malformed-output.
+    return await ainvoke_structured(model, [HumanMessage(content=data_template)], StackCommandRecommendation)
