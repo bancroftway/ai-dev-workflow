@@ -21,7 +21,7 @@ from typing import Any, Literal, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import git_ops, repo_files, stack_discovery
+from . import git_ops, model_config, repo_files, stack_discovery
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
