@@ -1,0 +1,104 @@
+2026-08-17 08:59:10,177 INFO Running 5 E2E scenarios against bancroftway/empty_sample_repo
+2026-08-17 08:59:10,177 INFO Tokens found: git=True, copilot=True
+2026-08-17 08:59:10,177 INFO 
+============================================================
+2026-08-17 08:59:10,177 INFO Scenario 1/5: Simple React app (difficulty=1)
+2026-08-17 08:59:10,177 INFO Tech stack: nextjs-plain
+2026-08-17 08:59:10,177 INFO ============================================================
+
+2026-08-17 08:59:10,179 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s1-4a034480
+2026-08-17 08:59:10,179 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmp_chbx88o.md
+2026-08-17 08:59:10,179 INFO   --greenfield-stack nextjs-plain
+2026-08-17 08:59:10,179 INFO   --thread e2e-s1-4a034480
+2026-08-17 08:59:10,323 ERROR \u2717 FAILED with exit code 1
+2026-08-17 08:59:10,323 ERROR Last 500 chars of output:
+
+Traceback (most recent call last):
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\run_headless.py", line 30, in <module>
+    from dotenv import find_dotenv, load_dotenv
+ModuleNotFoundError: No module named 'dotenv'
+
+2026-08-17 08:59:10,325 INFO 
+============================================================
+2026-08-17 08:59:10,325 INFO Scenario 2/5: Next.js + FastAPI + Tests (difficulty=2)
+2026-08-17 08:59:10,325 INFO Tech stack: nextjs-fastapi
+2026-08-17 08:59:10,325 INFO ============================================================
+
+2026-08-17 08:59:10,325 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s2-2fbc2893
+2026-08-17 08:59:10,325 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmprho3oaom.md
+2026-08-17 08:59:10,325 INFO   --greenfield-stack nextjs-fastapi
+2026-08-17 08:59:10,325 INFO   --thread e2e-s2-2fbc2893
+2026-08-17 08:59:10,474 ERROR \u2717 FAILED with exit code 1
+2026-08-17 08:59:10,474 ERROR Last 500 chars of output:
+
+Traceback (most recent call last):
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\run_headless.py", line 30, in <module>
+    from dotenv import find_dotenv, load_dotenv
+ModuleNotFoundError: No module named 'dotenv'
+
+2026-08-17 08:59:10,475 INFO 
+============================================================
+2026-08-17 08:59:10,475 INFO Scenario 3/5: .NET Console App with Coverage (difficulty=2)
+2026-08-17 08:59:10,475 INFO Tech stack: dotnet-console
+2026-08-17 08:59:10,475 INFO ============================================================
+
+2026-08-17 08:59:10,475 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s3-7017bab7
+2026-08-17 08:59:10,475 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmp9zmhdtd3.md
+2026-08-17 08:59:10,476 INFO   --greenfield-stack dotnet-console
+2026-08-17 08:59:10,476 INFO   --thread e2e-s3-7017bab7
+2026-08-17 08:59:10,621 ERROR \u2717 FAILED with exit code 1
+2026-08-17 08:59:10,621 ERROR Last 500 chars of output:
+
+Traceback (most recent call last):
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\run_headless.py", line 30, in <module>
+    from dotenv import find_dotenv, load_dotenv
+ModuleNotFoundError: No module named 'dotenv'
+
+2026-08-17 08:59:10,621 INFO 
+============================================================
+2026-08-17 08:59:10,621 INFO Scenario 4/5: Multi-app Monorepo (Node + Python) (difficulty=4)
+2026-08-17 08:59:10,621 INFO Tech stack: nextjs-python-monorepo
+2026-08-17 08:59:10,621 INFO ============================================================
+
+2026-08-17 08:59:10,622 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s4-2b2c96d0
+2026-08-17 08:59:10,622 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmprjioq6hx.md
+2026-08-17 08:59:10,622 INFO   --greenfield-stack nextjs-python-monorepo
+2026-08-17 08:59:10,622 INFO   --thread e2e-s4-2b2c96d0
+2026-08-17 08:59:10,759 ERROR \u2717 FAILED with exit code 1
+2026-08-17 08:59:10,759 ERROR Last 500 chars of output:
+
+Traceback (most recent call last):
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\run_headless.py", line 30, in <module>
+    from dotenv import find_dotenv, load_dotenv
+ModuleNotFoundError: No module named 'dotenv'
+
+2026-08-17 08:59:10,760 INFO 
+============================================================
+2026-08-17 08:59:10,760 INFO Scenario 5/5: Complex SPA + Backend + CLI (difficulty=5)
+2026-08-17 08:59:10,760 INFO Tech stack: react-django-cli
+2026-08-17 08:59:10,760 INFO ============================================================
+
+2026-08-17 08:59:10,760 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s5-9fe8def2
+2026-08-17 08:59:10,760 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmptixm2guz.md
+2026-08-17 08:59:10,760 INFO   --greenfield-stack react-django-cli
+2026-08-17 08:59:10,760 INFO   --thread e2e-s5-9fe8def2
+2026-08-17 08:59:10,937 ERROR \u2717 FAILED with exit code 1
+2026-08-17 08:59:10,937 ERROR Last 500 chars of output:
+
+Traceback (most recent call last):
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\run_headless.py", line 30, in <module>
+    from dotenv import find_dotenv, load_dotenv
+ModuleNotFoundError: No module named 'dotenv'
+
+2026-08-17 08:59:10,937 INFO 
+============================================================
+2026-08-17 08:59:10,937 INFO SUMMARY: 0/5 scenarios passed
+2026-08-17 08:59:10,937 INFO ============================================================
+
+2026-08-17 08:59:10,937 INFO \u2717 FAIL | S1 | Simple React app | nextjs-plain
+2026-08-17 08:59:10,937 INFO \u2717 FAIL | S2 | Next.js + FastAPI + Tests | nextjs-fastapi
+2026-08-17 08:59:10,937 INFO \u2717 FAIL | S3 | .NET Console App with Coverage | dotnet-console
+2026-08-17 08:59:10,937 INFO \u2717 FAIL | S4 | Multi-app Monorepo (Node + Python) | nextjs-python-monorepo
+2026-08-17 08:59:10,937 INFO \u2717 FAIL | S5 | Complex SPA + Backend + CLI | react-django-cli
+2026-08-17 08:59:10,938 INFO 
+Detailed results written to: D:\Projects\bancroftway\ai-dev-workflow\agent\e2e_results.json

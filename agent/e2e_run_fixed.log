@@ -1,0 +1,114 @@
+2026-08-17 09:00:14,219 INFO Running 5 E2E scenarios against bancroftway/empty_sample_repo
+2026-08-17 09:00:14,219 INFO Tokens found: git=True, copilot=True
+2026-08-17 09:00:14,219 INFO 
+============================================================
+2026-08-17 09:00:14,219 INFO Scenario 1/5: Simple React app (difficulty=1)
+2026-08-17 09:00:14,219 INFO Tech stack: nextjs-plain
+2026-08-17 09:00:14,219 INFO ============================================================
+
+2026-08-17 09:00:14,222 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s1-705d5dde
+2026-08-17 09:00:14,222 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmp1sinbwqx.md
+2026-08-17 09:00:14,222 INFO   --greenfield-stack nextjs-plain
+2026-08-17 09:00:14,222 INFO   --thread e2e-s1-705d5dde
+2026-08-17 09:00:17,056 ERROR \u2717 FAILED with exit code 1
+2026-08-17 09:00:17,056 ERROR Last 500 chars of output:
+ter=checkpointer, store=store)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1248, in compile
+    self.validate(
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1141, in validate
+    raise ValueError(
+ValueError: At 'r_minimal_code_to_green_rebuild' node, 'route' branch found unknown target 'quality_scan'
+
+2026-08-17 09:00:17,057 INFO 
+============================================================
+2026-08-17 09:00:17,057 INFO Scenario 2/5: Next.js + FastAPI + Tests (difficulty=2)
+2026-08-17 09:00:17,057 INFO Tech stack: nextjs-fastapi
+2026-08-17 09:00:17,057 INFO ============================================================
+
+2026-08-17 09:00:17,057 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s2-685fd9cb
+2026-08-17 09:00:17,057 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmp3j_fha41.md
+2026-08-17 09:00:17,057 INFO   --greenfield-stack nextjs-fastapi
+2026-08-17 09:00:17,057 INFO   --thread e2e-s2-685fd9cb
+2026-08-17 09:00:18,982 ERROR \u2717 FAILED with exit code 1
+2026-08-17 09:00:18,982 ERROR Last 500 chars of output:
+ter=checkpointer, store=store)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1248, in compile
+    self.validate(
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1141, in validate
+    raise ValueError(
+ValueError: At 'r_minimal_code_to_green_rebuild' node, 'route' branch found unknown target 'quality_scan'
+
+2026-08-17 09:00:18,984 INFO 
+============================================================
+2026-08-17 09:00:18,984 INFO Scenario 3/5: .NET Console App with Coverage (difficulty=2)
+2026-08-17 09:00:18,984 INFO Tech stack: dotnet-console
+2026-08-17 09:00:18,984 INFO ============================================================
+
+2026-08-17 09:00:18,984 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s3-ff9ea9fe
+2026-08-17 09:00:18,984 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmp2t751icp.md
+2026-08-17 09:00:18,984 INFO   --greenfield-stack dotnet-console
+2026-08-17 09:00:18,984 INFO   --thread e2e-s3-ff9ea9fe
+2026-08-17 09:00:20,888 ERROR \u2717 FAILED with exit code 1
+2026-08-17 09:00:20,888 ERROR Last 500 chars of output:
+ter=checkpointer, store=store)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1248, in compile
+    self.validate(
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1141, in validate
+    raise ValueError(
+ValueError: At 'r_minimal_code_to_green_rebuild' node, 'route' branch found unknown target 'quality_scan'
+
+2026-08-17 09:00:20,889 INFO 
+============================================================
+2026-08-17 09:00:20,889 INFO Scenario 4/5: Multi-app Monorepo (Node + Python) (difficulty=4)
+2026-08-17 09:00:20,889 INFO Tech stack: nextjs-python-monorepo
+2026-08-17 09:00:20,889 INFO ============================================================
+
+2026-08-17 09:00:20,890 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s4-1e5a7db8
+2026-08-17 09:00:20,890 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmpxytgec2j.md
+2026-08-17 09:00:20,890 INFO   --greenfield-stack nextjs-python-monorepo
+2026-08-17 09:00:20,890 INFO   --thread e2e-s4-1e5a7db8
+2026-08-17 09:00:22,718 ERROR \u2717 FAILED with exit code 1
+2026-08-17 09:00:22,718 ERROR Last 500 chars of output:
+ter=checkpointer, store=store)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1248, in compile
+    self.validate(
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1141, in validate
+    raise ValueError(
+ValueError: At 'r_minimal_code_to_green_rebuild' node, 'route' branch found unknown target 'quality_scan'
+
+2026-08-17 09:00:22,718 INFO 
+============================================================
+2026-08-17 09:00:22,718 INFO Scenario 5/5: Complex SPA + Backend + CLI (difficulty=5)
+2026-08-17 09:00:22,720 INFO Tech stack: react-django-cli
+2026-08-17 09:00:22,720 INFO ============================================================
+
+2026-08-17 09:00:22,720 INFO Running: python run_headless.py bancroftway empty_sample_repo ai-dev-workflow-e2e-s5-eacfd572
+2026-08-17 09:00:22,720 INFO   --requirements-file C:\Users\jblis\AppData\Local\Temp\tmp3an3qt40.md
+2026-08-17 09:00:22,720 INFO   --greenfield-stack react-django-cli
+2026-08-17 09:00:22,720 INFO   --thread e2e-s5-eacfd572
+2026-08-17 09:00:24,639 ERROR \u2717 FAILED with exit code 1
+2026-08-17 09:00:24,639 ERROR Last 500 chars of output:
+ter=checkpointer, store=store)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1248, in compile
+    self.validate(
+  File "D:\Projects\bancroftway\ai-dev-workflow\agent\.venv\Lib\site-packages\langgraph\graph\state.py", line 1141, in validate
+    raise ValueError(
+ValueError: At 'r_minimal_code_to_green_rebuild' node, 'route' branch found unknown target 'quality_scan'
+
+2026-08-17 09:00:24,641 INFO 
+============================================================
+2026-08-17 09:00:24,641 INFO SUMMARY: 0/5 scenarios passed
+2026-08-17 09:00:24,641 INFO ============================================================
+
+2026-08-17 09:00:24,641 INFO \u2717 FAIL | S1 | Simple React app | nextjs-plain
+2026-08-17 09:00:24,641 INFO \u2717 FAIL | S2 | Next.js + FastAPI + Tests | nextjs-fastapi
+2026-08-17 09:00:24,641 INFO \u2717 FAIL | S3 | .NET Console App with Coverage | dotnet-console
+2026-08-17 09:00:24,641 INFO \u2717 FAIL | S4 | Multi-app Monorepo (Node + Python) | nextjs-python-monorepo
+2026-08-17 09:00:24,641 INFO \u2717 FAIL | S5 | Complex SPA + Backend + CLI | react-django-cli
+2026-08-17 09:00:24,642 INFO 
+Detailed results written to: D:\Projects\bancroftway\ai-dev-workflow\agent\e2e_results.json

@@ -2193,7 +2193,6 @@ def build_graph() -> StateGraph:
     # the repository (see preflight_nodes.scaffold_finalize_node).
     builder.add_edge("scaffold", "app_discovery_pre")
 
-    post_stage_rebuild_entry_name = {key: _wire_rebuild(builder, spec) for key, spec in POST_STAGE_REBUILD.items()}
     _wire_app_discovery(builder)
     _wire_brownfield(builder)
     # Old cluster wiring disabled: stages 6-8 consolidate the clusters
@@ -2205,22 +2204,29 @@ def build_graph() -> StateGraph:
     # _wire_p14(builder)  # metrics → now part of stage 8
     # _wire_p15(builder)  # exit → now part of stage 8
 
+    # Wire all stage nodes first (rebuilds reference next stages, so stages must exist first)
     for index, stage_spec in enumerate(STAGES):
         if stage_spec.key == STAGES[0].key:
             # tech-stack exits into the brownfield branch, not straight into raw-requirements --
             # _wire_app_discovery owns that edge (and everything before it).
             next_draft_name = "manifest_branch"
-        elif stage_spec.key in post_stage_rebuild_entry_name:
-            # This stage has an R placement immediately after it -- route into R's rebuild node,
-            # never straight to the next stage's draft (checked before the plain "next stage in
-            # STAGES" case below, since R's own next_node is what eventually reaches that draft).
-            next_draft_name = post_stage_rebuild_entry_name[stage_spec.key]
         elif index + 1 < len(STAGES):
             next_draft_name = f"{STAGES[index + 1].key}_draft"
         else:
             next_draft_name = END
 
         _wire_stage(builder, stage_spec, next_draft_name)
+
+    # Now wire rebuild nodes (which reference next-stage nodes that were just added)
+    post_stage_rebuild_entry_name = {key: _wire_rebuild(builder, spec) for key, spec in POST_STAGE_REBUILD.items()}
+
+    # Route stages with rebuilds: gate -> rebuild instead of gate -> next_draft
+    for stage_key, rebuild_node_name in post_stage_rebuild_entry_name.items():
+        gate_name = f"{stage_key}_gate"
+        auto_approve_name = f"{stage_key}_auto_approve"
+        # Remove the old edge to next_draft and add edge to rebuild instead
+        builder.add_edge(gate_name, rebuild_node_name)
+        builder.add_edge(auto_approve_name, rebuild_node_name)
 
     return builder
 
