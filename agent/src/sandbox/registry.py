@@ -15,10 +15,11 @@ from .provider import SandboxSession
 
 _sessions: dict[str, SandboxSession] = {}
 
-# Provision-time facts a node needs but that graph state doesn't carry on its own (registry meta,
-# not GraphState, since it must be visible to scaffold_node/graph.py's intake before the thread
-# has ever hydrated any state) -- who provisioned this thread, which branch a PR should target,
-# and one-shot signals like `resume`. Same process-local caveat as `_sessions` above.
+# One-shot signals a node needs but that graph state doesn't carry on its own (registry meta, not
+# GraphState, since it must be visible to graph.py's intake before the thread has ever hydrated
+# any state) -- just `resume` today. Durable provision-time facts (user_login, source_branch,
+# work_branch) live in session_store.py (SQL) instead, not here -- they used to live in this dict
+# and were lost on every agent restart, which is exactly the caveat below warns about.
 _meta: dict[str, dict[str, Any]] = {}
 
 

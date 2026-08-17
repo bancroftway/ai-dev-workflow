@@ -4,17 +4,17 @@ import { E2E_GITHUB_ID, E2E_MODE } from "@/lib/e2e";
 import { AppShell } from "@/components/AppShell";
 import { SandboxSessionBoot } from "@/components/SandboxSessionBoot";
 import { WorkspaceHeader } from "@/components/WorkspaceHeader";
-import { deriveThreadId } from "@/lib/workflow-thread";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
 import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
 import { parseThresholds } from "@/lib/metric-grades";
-import { WorkflowProviders } from "../../../providers";
+import { lookupSessionWithAuthorization } from "@/lib/session-access";
+import { WorkflowProviders } from "../../../../providers";
 
 export default async function WorkflowPage({
   params,
   searchParams,
 }: {
-  params: Promise<{ owner: string; repo: string; branch: string[] }>;
+  params: Promise<{ owner: string; repo: string; sessionId: string; branch: string[] }>;
   searchParams: Promise<{ resume?: string }>;
 }) {
   const session = await auth();
@@ -23,11 +23,26 @@ export default async function WorkflowPage({
     redirect("/");
   }
 
-  const { owner, repo, branch: branchSegments } = await params;
+  const { owner, repo, sessionId, branch: branchSegments } = await params;
   // Branch names may contain "/" (e.g. "feature/foo") -- the catch-all segment above captures
-  // every segment after [repo], which this rejoins into the real branch name.
+  // every segment after [sessionId], which this rejoins into the real branch name.
   const branch = branchSegments.join("/");
-  const threadId = deriveThreadId(owner, repo, githubId);
+
+  // Ownership check: sessionId is a random UUID now (no longer deterministically derived from
+  // (owner, repo, githubId)), so landing on someone else's session id here is no longer
+  // structurally impossible the way it used to be. "not_found" is the only outcome that proceeds
+  // (a brand-new session SandboxSessionBoot is about to provision, client-side, after this page
+  // renders) -- "denied" must hard-redirect rather than fall through the same way, since this
+  // page renders AppShell against sessionId as a LangGraph thread_id next, and that checkpointer
+  // has no owner/repo check of its own.
+  const lookup = await lookupSessionWithAuthorization(sessionId);
+  if (lookup.kind === "denied") {
+    redirect("/select");
+  }
+  const sessionRow = lookup.kind === "authorized" ? lookup.session : null;
+  if (sessionRow && (sessionRow.owner !== owner || sessionRow.repo !== repo)) {
+    redirect("/select");
+  }
 
   // Set by SessionHistory's Resume button (/select) as ?resume=1 -- forwarded into the
   // provision POST body (SandboxSessionBoot) and used to unconditionally fire the first run once
@@ -46,13 +61,21 @@ export default async function WorkflowPage({
   };
 
   return (
-    <WorkflowThreadProvider threadId={threadId}>
+    <WorkflowThreadProvider threadId={sessionId}>
       <WorkflowProviders>
         <SandboxStatusProvider>
           <div className="flex min-h-full flex-1 flex-col">
             <WorkspaceHeader />
-            <SandboxSessionBoot owner={owner} repo={repo} branch={branch} resume={resume} />
-            <AppShell owner={owner} repo={repo} metricThresholds={metricThresholds} resume={resume} />
+            <SandboxSessionBoot sessionId={sessionId} owner={owner} repo={repo} branch={branch} resume={resume} />
+            <AppShell
+              owner={owner}
+              repo={repo}
+              // Not yet provisioned (sessionRow is null): no artifacts exist to read yet either,
+              // so an empty string is never actually dereferenced against GitHub.
+              workBranch={sessionRow?.work_branch ?? ""}
+              metricThresholds={metricThresholds}
+              resume={resume}
+            />
           </div>
         </SandboxStatusProvider>
       </WorkflowProviders>

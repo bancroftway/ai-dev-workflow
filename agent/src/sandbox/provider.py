@@ -56,6 +56,7 @@ class SandboxProvider(abc.ABC):
         session_id: str,
         repo_clone_url: str,
         branch: str,
+        work_branch: str,
         git_user_token: str,
         copilot_auth_token: str,
         image: str | None = None,
@@ -64,10 +65,13 @@ class SandboxProvider(abc.ABC):
 
         repo_clone_url/branch/git_user_token are used once, inside the sandbox, for the single
         git clone -- never written to a long-lived env var visible to arbitrary child processes
-        (plan Section C.4's ordering guarantee). copilot_auth_token is the shared Copilot PAT
-        (agent/src/graph.py's GITHUB_TOKEN) the sandbox's own `copilot --server` process
-        authenticates with; it is a no-op if passed to the agent's own CopilotClient once that
-        client connects via for_uri (see this package's docstring).
+        (plan Section C.4's ordering guarantee). work_branch is this session's own unique git
+        branch (agent/src/branch_naming.py, computed once at session creation and never
+        recomputed here) -- passed straight through as the sandbox's WORK_BRANCH env var.
+        copilot_auth_token is the shared Copilot PAT (agent/src/graph.py's GITHUB_TOKEN) the
+        sandbox's own `copilot --server` process authenticates with; it is a no-op if passed to
+        the agent's own CopilotClient once that client connects via for_uri (see this package's
+        docstring).
         """
 
     @abc.abstractmethod

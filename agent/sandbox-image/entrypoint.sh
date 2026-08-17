@@ -54,13 +54,11 @@ EOF
 
   : "${REPO_BRANCH:?REPO_BRANCH is required when REPO_CLONE_URL is set}"
 
-  # The pipeline never commits on the user's selected branch: it works on a single work branch
-  # named ai-dev-workflow, shared by every session on this repo regardless of PR target or user
-  # (WS0 migration -- previously ai-dev-workflow/<selected-branch>-<session prefix>, one branch
-  # per repo+branch+session). Sharing one branch means pushes can race; git_ops.push_head uses
-  # --force-with-lease (never plain --force) so a losing race is rejected instead of silently
-  # overwriting another session's already-pushed commits.
-  WORK_BRANCH="ai-dev-workflow"
+  # The pipeline never commits on the user's selected branch: it works on this session's own
+  # unique work branch (ai-dev-workflow/<session_id>, agent/src/branch_naming.py), computed once by
+  # the agent and passed in via this env var -- never derived here. One branch per session means
+  # this session is the branch's only writer, so git_ops.push_head is a plain --force.
+  : "${WORK_BRANCH:?WORK_BRANCH is required when REPO_CLONE_URL is set}"
 
   # /workspace may be a reused named volume: a prior session's clone (reuse it), a corrupt or
   # partial clone (nuke and re-clone), or empty (fresh clone). Reuse is best-effort end-to-end;
@@ -92,9 +90,10 @@ EOF
   # existence probe and fetch both need auth. `git ls-remote --exit-code` guards the fetch: a
   # plain fetch of a missing ref exits non-zero and would kill the container under `set -e`.
   #
-  # One constant branch per repo now (WS0 migration) shared by every session/user -- origin is
-  # always the source of truth, never "whichever local copy is newest" (that was only safe under
-  # the old one-writer-per-branch scheme). Any failure in the reuse-side checkout falls back to a
+  # This session's own unique work branch -- origin is still treated as the source of truth (not
+  # "whichever local copy is newest") because a human can merge-and-delete this branch out from
+  # under a still-resumable session between runs, or this container can be recreated against a
+  # reused workspace volume that's behind. Any failure in the reuse-side checkout falls back to a
   # full re-clone rather than crash-looping the volume.
   if ! (
     if git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" \
@@ -129,9 +128,10 @@ EOF
         echo "entrypoint: work branch ${WORK_BRANCH} exists locally -- reconciling with origin"
         git -C "$WORKSPACE_DIR" checkout "$WORK_BRANCH"
         if git -C "$WORKSPACE_DIR" merge-base --is-ancestor HEAD "origin/${WORK_BRANCH}"; then
-          # Origin is at or ahead of local -- a different session (or user) moved it further than
-          # this volume's own copy since we last saw it. Local has nothing origin lacks, so this
-          # is always a fast-forward.
+          # Origin is at or ahead of local -- this session's own branch, but a human (or a stale
+          # push from before this container was recreated) moved origin further than this volume's
+          # own copy since we last saw it. Local has nothing origin lacks, so this is always a
+          # fast-forward.
           git -C "$WORKSPACE_DIR" reset --hard "origin/${WORK_BRANCH}"
         fi
         # Else: local is ahead of origin (this session's own unpushed commits) -- keep local, the

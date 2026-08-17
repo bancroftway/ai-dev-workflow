@@ -247,21 +247,15 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         e2e.update(status="skipped", skipped_reason="@playwright/test is no longer resolvable and no global playwright runner is installed", failed_tests=[], screenshots=[])
         return await _finalize_run(provider, thread_id, e2e)
 
-    if runner == "local":
-        # Image-default writable browsers cache (PLAYWRIGHT_BROWSERS_PATH is already set in the
-        # container's own env) -- install chromium once, only when a marker check shows it's
-        # missing, so the per-owner cache volume absorbs the cost across sessions.
-        marker = await provider.exec_in_sandbox(thread_id, 'ls "$PLAYWRIGHT_BROWSERS_PATH" 2>/dev/null | grep -qi chromium && echo PRESENT')
-        if "PRESENT" not in (marker.stdout or ""):
-            await provider.exec_in_sandbox(thread_id, "npx --yes playwright install chromium")
-        run_prefix, run_cmd = "", "npx playwright test"
-    else:
-        # Global pinned fallback runner: force it onto the image's baked (chromium-headless-shell
-        # only) browser path rather than the writable cache, which this runner never populated.
-        run_prefix, run_cmd = "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers ", "playwright test"
-
+    # No runtime `playwright install` -- PLAYWRIGHT_BROWSERS_PATH is baked into the image at
+    # /opt/playwright-browsers (chromium-headless-shell, Dockerfile), never a per-owner cache
+    # volume: concurrent sessions of the same owner previously raced to extract browser binaries
+    # into that shared, non-content-addressed path, and on-the-fly installs are explicitly not
+    # wanted regardless. Only the invocation binary differs between "local" (repo's own
+    # @playwright/test via npx) and "global" (the image's pinned fallback CLI) runners.
+    run_cmd = "npx playwright test" if runner == "local" else "playwright test"
     command = (
-        f"{run_prefix}PLAYWRIGHT_JSON_OUTPUT_NAME={E2E_REPORT_PATH} BASE_URL=http://localhost:{port} "
+        f"PLAYWRIGHT_JSON_OUTPUT_NAME={E2E_REPORT_PATH} BASE_URL=http://localhost:{port} "
         f"timeout {workflow_config.E2E_SUITE_TIMEOUT_SECONDS} {run_cmd} --reporter=json 2>&1"
     )
     keepalive = asyncio.create_task(_keepalive_touch(provider, thread_id))

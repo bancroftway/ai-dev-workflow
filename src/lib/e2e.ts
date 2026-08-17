@@ -12,7 +12,8 @@ export const E2E_MODE = process.env.AIDW_E2E_MODE === "1" && process.env.NODE_EN
 
 export const E2E_GITHUB_TOKEN = process.env.E2E_GITHUB_TOKEN;
 
-/** Stable synthetic identity -- it keys deriveThreadId, so it must not vary between requests. */
+/** Stable synthetic identity used wherever a githubId is needed (auth checks, hasRepoAccess) --
+ * must not vary between requests within one E2E run. */
 export const E2E_GITHUB_ID = "e2e-user";
 
 if (E2E_MODE) {

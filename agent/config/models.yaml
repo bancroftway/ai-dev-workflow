@@ -63,3 +63,6 @@ e2e:
   # e2e_fix_node (e2e_nodes.py) -- same codegen-tier reasoning as quality/security/rebuild's fix
   # nodes above: fixing a failing app or test is not mini-tier work.
   draft_model: gpt-5.4
+session-title:
+  # One short sentence in, one short phrase out -- the cheapest tier is plenty.
+  draft_model: gpt-5.4-mini

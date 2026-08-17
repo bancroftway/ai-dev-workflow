@@ -18,11 +18,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
-from . import git_ops, repo_files, repo_scan, session_index, template_loader
+from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader
+from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
+from .prompt_loader import load_prompt_pair, render_prompt
 from .schemas_app_discovery import DiscoveredApp
+from .schemas_session import SessionTitleResponse
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -82,6 +86,37 @@ def _session_title(raw_requirements_text: str, run_id: str) -> str:
         if stripped:
             return stripped[:80]
     return f"(untitled run {run_id})"
+
+
+async def _generate_session_title(thread_id: str, raw_requirements_text: str, run_id: str) -> str:
+    """LLM-generated session title, shown in the session-list UI -- same get_chat_model_for_thread
+    / ainvoke_structured mechanism every draft node already uses (GitHub Copilot-backed), no
+    separate LLM integration. Falls back to _session_title's first-line heuristic on empty input
+    or any failure -- title generation must never block scaffold."""
+    text = (raw_requirements_text or "").strip()
+    if not text:
+        return _session_title(raw_requirements_text, run_id)
+    try:
+        system, human_template = load_prompt_pair("session_title")
+        human = render_prompt(human_template, requirements_text=text[:4000])
+        model = get_chat_model_for_thread(
+            thread_id,
+            "session-title",
+            "draft",
+            github_token=os.environ.get("GITHUB_TOKEN"),
+            model_name=model_config.get_model_name("session-title", "draft"),
+            sandbox=sandbox_registry.get(thread_id),
+        )
+        response = await ainvoke_structured(
+            model, [SystemMessage(content=system), HumanMessage(content=human)], SessionTitleResponse
+        )
+        title = response.title.strip()
+        return title[:80] if title else _session_title(raw_requirements_text, run_id)
+    except Exception:
+        logger.warning(
+            "session title generation failed for thread_id=%s; using heuristic fallback", thread_id, exc_info=True
+        )
+        return _session_title(raw_requirements_text, run_id)
 
 
 _TECH_STACK_SENTINEL = _guidance_sentinel("tech-stack")
@@ -160,19 +195,16 @@ async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str
     await repo_files.reset_ledger(provider, thread_id)
     await repo_files.append_ledger_entry(provider, thread_id, {"stage": "scaffold", "node": "scaffold", "action": "ran"})
 
-    # Session-index UPSERT must land its own commit+push BEFORE the baseline HEAD capture below,
-    # not after: app_discovery's reject path later does `git reset --hard` to that baseline, which
-    # would erase this commit if it were made afterwards. Committing it first means the baseline
-    # itself already includes it, so the reset keeps it.
+    # Session row lives in SQL now (session_store.py) -- owner/repo/user_login/source_branch/
+    # work_branch were already written once at provision time (sessions_api.provision_session);
+    # this just refreshes the live run_id/title/status, independent of the git baseline capture
+    # below (no more commit-ordering constraint against app_discovery's reject-path reset).
     run_id = state.get("run_id", "unknown")
-    meta = sandbox_registry.get_meta(thread_id)
-    await session_index.start_session(
-        provider,
+    raw_requirements_text = state.get("raw_requirements_text") or ""
+    await session_store.touch_run(
         thread_id,
         run_id=run_id,
-        title=_session_title(state.get("raw_requirements_text") or "", run_id),
-        user=meta.get("user_login", ""),
-        target_branch=meta.get("target_branch", ""),
+        title=await _generate_session_title(thread_id, raw_requirements_text, run_id),
     )
 
     # Captured before anything else is written, so app_discovery's reject path can put the tree

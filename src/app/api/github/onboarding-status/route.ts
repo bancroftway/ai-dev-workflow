@@ -19,19 +19,17 @@ export async function GET(request: Request) {
   }
 
   const octokit = await getOctokit();
-  // The pipeline commits on a single, repo-shared work branch (ai-dev-workflow), never on the
-  // user's selected branch -- check the work branch first, fall back to the selected branch for
-  // repos onboarded before this branch existed (or where the work branch was already merged in,
-  // whose manifest state the merged-into branch now inherits).
-  for (const ref of ["ai-dev-workflow", branch]) {
-    try {
-      await octokit.rest.repos.getContent({ owner, repo, path: ".ai-dev-workflow", ref });
-      return NextResponse.json({ onboarded: true });
-    } catch (error) {
-      const status = (error as { status?: number }).status;
-      if (status !== 404) {
-        throw error;
-      }
+  // Each session now works on its own branch (ai-dev-workflow/<session_id>), which never exists
+  // until a session is provisioned -- there's no single well-known work branch to check first
+  // anymore, so this checks the chosen source branch directly. A merged session's onboarding
+  // files land there via its PR, which is exactly what this is meant to detect.
+  try {
+    await octokit.rest.repos.getContent({ owner, repo, path: ".ai-dev-workflow", ref: branch });
+    return NextResponse.json({ onboarded: true });
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    if (status !== 404) {
+      throw error;
     }
   }
   return NextResponse.json({ onboarded: false });

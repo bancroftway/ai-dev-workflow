@@ -114,7 +114,10 @@ COPY --from=fetch /out/bin/ /usr/local/bin/
 #                      between two sessions running different customers' untrusted repos.
 #   /opt/aidw/cache -- package caches: npm, NuGet, pip, uv, mise downloads. Content-addressed
 #                      data, safe to share, and mounted as a per-owner named volume by
-#                      agent/src/sandbox/local_docker.py.
+#                      agent/src/sandbox/local_docker.py. Playwright browsers are NOT here --
+#                      see /opt/playwright-browsers below (baked at build time, never a runtime
+#                      install, so there is nothing version-drifted or partially-extracted for
+#                      concurrent sessions of the same owner to race on).
 #
 # Both are created AND declared here rather than only at mount time, so the container behaves
 # identically with or without a volume attached -- the mount is purely an accelerator, never a
@@ -127,7 +130,7 @@ ENV AIDW_TOOLS_DIR=/opt/aidw/tools \
     NUGET_PACKAGES=/opt/aidw/cache/nuget \
     PIP_CACHE_DIR=/opt/aidw/cache/pip \
     UV_CACHE_DIR=/opt/aidw/cache/uv \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/aidw/cache/playwright \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
     DOTNET_CLI_TELEMETRY_OPTOUT=1
 # mise's shims live under MISE_DATA_DIR, not under a bare tools/shims -- getting this wrong means
 # every mise-installed toolchain is invisible at runtime.
@@ -154,22 +157,22 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends gh; \
     rm -rf /var/lib/apt/lists/*
 
-# Playwright MCP + its exact-matching browser build, baked at BUILD time. The browser lands in
-# /opt/playwright-browsers (root-owned, world-readable), deliberately NOT the runtime
-# PLAYWRIGHT_BROWSERS_PATH=/opt/aidw/cache/playwright set above: (a) that path is a per-owner
-# volume, and mounting a volume over a build-populated directory hides its contents; (b) target
-# repos' own `playwright install` runs (P4/P13) must keep writing to the writable cache volume,
-# which a root-owned baked dir would break with EACCES. graph.py's PLAYWRIGHT_MCP_CONFIG points
-# the MCP server -- and only it -- at this baked path via the MCP server's own env.
-# chromium-headless-shell, not full chromium: the MCP runs --headless only, and the headless
-# shell is roughly half the size.
+# Playwright MCP + its exact-matching browser build, baked at BUILD time into
+# /opt/playwright-browsers (root-owned, world-readable) -- this is now the ONE browser path for
+# everything that runs Playwright in this image: the MCP server (graph.py's PLAYWRIGHT_MCP_CONFIG
+# points at it explicitly) AND target repos' own e2e test runs (e2e_nodes.py, via the global
+# PLAYWRIGHT_BROWSERS_PATH env set above). No runtime `playwright install` happens anywhere in
+# this image -- deterministic version, no runtime npm/browser fetch in a container running
+# untrusted repos, and no concurrent-extraction race between sessions of the same owner (the
+# problem a writable, per-owner cache volume had).
+# chromium-headless-shell, not full chromium: --headless only is what both the MCP and e2e_nodes'
+# `playwright test` runs need, and the headless shell is roughly half the size.
 # The stable /usr/local/bin/aidw-headless-shell symlink exists for mermaid-cli's Puppeteer (next
 # layer), which reuses THIS browser read-only via PUPPETEER_EXECUTABLE_PATH instead of downloading
-# a second full Chromium (~450 MB saved). Read-only reuse of the baked path violates neither of
-# the two constraints above.
+# a second full Chromium (~450 MB saved).
 RUN set -eux; \
     npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "playwright@${PLAYWRIGHT_VERSION}"; \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers playwright install chromium-headless-shell; \
+    playwright install chromium-headless-shell; \
     chmod -R a+rX /opt/playwright-browsers; \
     ln -s "$(ls /opt/playwright-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell)" \
         /usr/local/bin/aidw-headless-shell

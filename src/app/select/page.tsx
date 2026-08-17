@@ -87,7 +87,6 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
   const [branches, setBranches] = useState<BranchSummary[] | null>(null);
   const [branchesError, setBranchesError] = useState<string | null>(null);
   const [selectedBranch, setSelectedBranch] = useState<string>("");
-  const [hasInProgressSession, setHasInProgressSession] = useState(false);
 
   useEffect(() => {
     fetch(`/api/github/branches?owner=${repo.owner}&repo=${repo.repo}`)
@@ -102,9 +101,10 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
       .catch((err: Error) => setBranchesError(err.message));
   }, [repo]);
 
-  function handleContinue() {
+  function startNewSession() {
     if (!selectedBranch) return;
-    router.push(`/workflow/${repo.owner}/${repo.repo}/${selectedBranch}`);
+    const sessionId = crypto.randomUUID();
+    router.push(`/workflow/${repo.owner}/${repo.repo}/${sessionId}/${selectedBranch}`);
   }
 
   return (
@@ -129,33 +129,27 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
         </select>
       </label>
 
-      {/* Keyed by branch so switching branches re-checks onboarding status from scratch. */}
+      {/* Keyed by branch so switching branches re-checks onboarding status and re-fetches the
+          session list from scratch. */}
       {selectedBranch && (
         <OnboardingStatusSection key={selectedBranch} owner={repo.owner} repo={repo.repo} branch={selectedBranch}>
           {(status) => (
-            <>
-              {hasInProgressSession && (
-                <p className="text-xs text-amber-700">
-                  A session is already in progress on this repo — starting a new one may be blocked
-                  until it finishes.
-                </p>
-              )}
-              <button
-                type="button"
-                className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-                onClick={handleContinue}
-              >
-                {status === "onboarded" ? "Continue" : "Onboard & Continue"}
-              </button>
-            </>
+            <button
+              type="button"
+              className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+              onClick={startNewSession}
+            >
+              {status === "onboarded" ? "Start new session" : "Onboard & start new session"}
+            </button>
           )}
         </OnboardingStatusSection>
       )}
 
-      {/* Keyed by repo (the parent SelectPage already keys RepoBranchSection by repo) -- session
-          history is per-repo, not per-branch, since every session shares the one ai-dev-workflow
-          work branch regardless of which branch a user picks here. */}
-      <SessionHistory owner={repo.owner} repo={repo.repo} onInProgressChange={setHasInProgressSession} />
+      {/* Sessions are branch-scoped now (each gets its own ai-dev-workflow/<session_id> branch),
+          so the list is too -- shown once both repo and branch are chosen, keyed the same way. */}
+      {selectedBranch && (
+        <SessionHistory key={selectedBranch} owner={repo.owner} repo={repo.repo} sourceBranch={selectedBranch} />
+      )}
     </>
   );
 }

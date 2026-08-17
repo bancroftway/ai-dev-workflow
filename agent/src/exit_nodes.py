@@ -13,27 +13,24 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import shlex
 from datetime import datetime, timezone
 from typing import Any
 
-from langchain_core.runnables import RunnableConfig
-
-from . import approvals, git_ops, preflight_nodes, repo_files, repo_scan, session_index, spec_ledger
+from . import approvals, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
-from .sandbox import registry as sandbox_registry
-from .sandbox.factory import get_sandbox_provider
+from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
 
 CHANGELOG_PATH = "CHANGELOG.md"
 HISTORY_DIR = ".ai-dev-workflow/history"
 
-# N most recent runs (by sessions.json order) whose history/ artifacts survive exit finalize.
-# Screenshots are committed binaries -- unbounded per-run growth ships to the user's own remote.
-_DEFAULT_HISTORY_RETAIN = 10
+# No retention/pruning of history/ here anymore: that subsystem existed to bound growth across
+# MANY sessions dumping artifacts into one shared branch (WS0's single ai-dev-workflow branch).
+# Branch-per-session means a branch's history/ dir only ever holds ITS OWN session's attempts
+# (one per resume), which is small by construction -- nothing left to prune.
 
 
 def _hash_content(raw: str | None) -> str | None:
@@ -58,73 +55,6 @@ async def _find_prior_ledger_snapshot(provider: Any, thread_id: str, current_run
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
-
-
-def _history_retain() -> int:
-    """AIDW_HISTORY_RETAIN, same tolerant-parse pattern as session_index._file_cap."""
-    try:
-        configured = int(os.environ.get("AIDW_HISTORY_RETAIN") or _DEFAULT_HISTORY_RETAIN)
-    except ValueError:
-        configured = _DEFAULT_HISTORY_RETAIN
-    return max(configured, 1)
-
-
-def _stale_history_files(filenames: list[str], keep_run_ids: set[str]) -> list[str]:
-    """Pure grouping half of retention. run_id is an 8-hex-char token (graph.py intake_node), never
-    containing "-", so splitting each filename on its FIRST "-" reliably recovers the run_id prefix
-    regardless of which artifact kind follows it (-report.json, -exit.md, -metrics.json,
-    -ledger-snapshot.json, -screens). Lexical filename sort would not be chronological (a hex token
-    isn't a timestamp) -- that's why this groups by run_id and checks membership instead."""
-    return [name for name in filenames if name.split("-", 1)[0] not in keep_run_ids]
-
-
-def _prune_keep_ids(sessions: list[dict[str, Any]], run_id: str) -> set[str] | None:
-    """Pure decision half of retention: which run_ids survive pruning, or None to skip pruning
-    entirely this run.
-
-    FAIL-CLOSED on an empty `sessions`: session_index._read is fail-OPEN by design (a corrupt file
-    or a transient read glitch returns [] so every existing caller can treat that as "no sessions
-    yet" and move on harmlessly). This is the first caller that uses the result to justify
-    DELETION -- collapsing keep_ids down to just the current run on a bad read would rm -rf every
-    OTHER run's history artifacts (reports, screenshots, snapshots) right before the commit. An
-    empty `sessions` here returns None instead, so the caller skips pruning rather than trusting it.
-    """
-    if not sessions:
-        return None
-    keep_ids = {s.get("run_id") for s in sessions[-_history_retain():] if s.get("run_id")}
-    keep_ids.add(run_id)
-    return keep_ids
-
-
-async def _prune_history(provider: Any, thread_id: str, run_id: str) -> None:
-    """Deletes history/ artifacts belonging to runs older than the last N (AIDW_HISTORY_RETAIN,
-    default 10), keeping every run_id mentioned in the last N sessions.json entries (chronological,
-    see session_index.py) plus always the current run -- run_id may not appear there yet if the
-    exit stage was never approved (end_session only fires when merge_readiness is truthy, above).
-    Skips pruning entirely (loudly, if history/ is non-empty) when sessions.json read back empty --
-    see _prune_keep_ids for why.
-    """
-    sessions = await session_index._read(provider, thread_id)  # noqa: SLF001 -- same package, read-only reuse
-
-    listing = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(HISTORY_DIR)} 2>/dev/null")
-    filenames = [n.strip() for n in (listing.stdout or "").splitlines() if n.strip()]
-
-    keep_ids = _prune_keep_ids(sessions, run_id)
-    if keep_ids is None:
-        if filenames:
-            logger.warning(
-                "exit_nodes: history/ has %d file(s) but sessions.json read back empty for "
-                "thread_id=%s -- skipping retention prune this run instead of deleting every "
-                "other run's artifacts on what may be a transient read glitch.",
-                len(filenames), thread_id,
-            )
-        return
-
-    stale = _stale_history_files(filenames, keep_ids)
-    if not stale:
-        return
-    quoted = " ".join(shlex.quote(f"{HISTORY_DIR}/{name}") for name in stale)
-    await provider.exec_in_sandbox(thread_id, f"rm -rf -- {quoted}")
 
 
 async def _files_changed(provider: Any, thread_id: str, baseline_commit: str | None) -> tuple[str, str]:
@@ -327,14 +257,21 @@ async def verify_exit_readiness(
     )
 
 
-async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
-    thread_id = config["configurable"]["thread_id"]
-    if sandbox_registry.get(thread_id) is None:
-        return {}
+async def exit_finalize_node(
+    thread_id: str, content: dict[str, Any], state: dict[str, Any], provider: SandboxProvider
+) -> None:
+    """StageSpec.post_approve_hook for metrics-exit -- the ONLY place this ever runs (never
+    add_node'd as a standalone graph node; every run reaches it since requires_human_gate=False
+    and verify_exit_readiness always returns passed=True). `content` is the exit stage's own
+    approved_content (a MergeReadinessReport dict) -- the caller (_run_post_approve_hook) already
+    checked the sandbox is live and content is non-empty before calling.
 
-    provider = get_sandbox_provider()
+    A metrics-regression failure is deliberately routed INTO this stage rather than straight to
+    git_ops.record_run_failure, specifically so the exit report/changelog/session-close below still
+    happen for it -- see the status logic at the bottom, which checks state["run_failure"] first."""
     run_id = state.get("run_id", "unknown")
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    merge_readiness = content
 
     spec_approval = await approvals.latest_approval(provider, thread_id, "specification")
     plan_approval = await approvals.latest_approval(provider, thread_id, "plan")
@@ -346,8 +283,6 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
         # it as this run's numbers was the "traceability from a stale manifest" bug. Say "not
         # recorded" instead, and persist nothing stale.
         metrics_summary = {}
-    exit_stage = (state.get("stages") or {}).get("exit", {})
-    merge_readiness = exit_stage.get("approved_content")
 
     # Read-modify-write, never a wholesale overwrite: manifest.json is co-owned. brownfield-baseline owns
     # `onboarded`, app discovery owns `app_check`, and this node owns the keys below. Overwriting
@@ -399,22 +334,61 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
 
     await repo_files.write_repo_file(provider, thread_id, CHANGELOG_PATH, new_changelog)
 
-    if merge_readiness or state.get("run_failure"):
-        # A metrics-regression run reaches here too (the gate routes INTO exit, never END) -- close
-        # its session row as failed so it never lingers as "running" in sessions.json.
-        await session_index.end_session(
-            provider,
-            thread_id,
-            run_id=run_id,
-            status="failed" if state.get("run_failure") else "completed",
-            failure=state.get("run_failure"),
-            exit_summary={
-                "merge_ready": (merge_readiness or {}).get("merge_ready", False),
-                "pr_title": (merge_readiness or {}).get("pr_title", ""),
-            } if merge_readiness else None,
-        )
+    # Status logic: merge_ready-aware, not just run_failure-aware -- a run that reaches exit but
+    # fails a DETERMINISTIC gate (verify_exit_readiness forcing merge_ready=False: missing
+    # screenshots, no test command, a metrics regression) must be recorded "failed" and stay
+    # resumable, exactly like a hard crash. Getting this wrong would make an actually-unsuccessful
+    # session permanently unresumable once resume is server-enforced against status=="completed".
+    run_failure = state.get("run_failure")
+    merge_ready = bool(merge_readiness.get("merge_ready")) if merge_readiness else False
+    if run_failure:
+        status = "failed"
+        failure_payload = run_failure
+    elif merge_ready:
+        status = "completed"
+        failure_payload = None
+    else:
+        status = "failed"
+        failure_payload = {
+            "stage": "exit",
+            "type": "gates_not_passed",
+            "feedback": "; ".join((merge_readiness or {}).get("blocking_reasons") or []) or "exit gates did not pass",
+        }
 
-    # Per-run exit report artifacts (durable even once sessions.json ages the row out): the raw
+    pr_url = None
+    if status == "completed":
+        session_row = await session_store.get_session(thread_id)
+        if session_row and session_row.get("pr_url"):
+            # Idempotency: the hydrate-short-circuit path can re-fire this hook for an already-
+            # approved exit stage (e.g. a resumed thread) -- never open a second PR for one session.
+            pr_url = session_row["pr_url"]
+        elif session_row:
+            token = git_ops.get_push_token(thread_id)
+            if token:
+                pr_url = await git_ops.open_pull_request(
+                    owner=session_row["owner"],
+                    repo=session_row["repo"],
+                    source_branch=session_row["source_branch"],
+                    work_branch=session_row["work_branch"],
+                    title=merge_readiness.get("pr_title") or f"ai-dev-workflow: {run_id}",
+                    body=merge_readiness.get("pr_description_markdown") or "",
+                    token=token,
+                )
+            else:
+                logger.warning("no push token retained for thread_id=%s -- skipping PR creation", thread_id)
+
+    await session_store.close_session(
+        thread_id,
+        run_id=run_id,
+        status=status,
+        failure=failure_payload,
+        merge_ready=merge_ready if merge_readiness else None,
+        pr_title=(merge_readiness or {}).get("pr_title"),
+        pr_url=pr_url,
+    )
+
+    # Per-run exit report artifacts (durable even once the session ages out of the UI's recent
+    # list): the raw
     # diff/log this run actually produced, plus the same metrics/delta numbers the frontend Report
     # tab shows live, frozen at exit time so a past session's report page can render identically.
     files_changed_stat, commits_log = await _files_changed(provider, thread_id, state.get("run_baseline_commit"))
@@ -452,17 +426,12 @@ async def exit_finalize_node(state: dict[str, Any], config: RunnableConfig) -> d
     )
     await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
 
-    # Retention: prune older runs' history/ artifacts before the commit below picks up whatever's
-    # left (new writes above + any deletions here) in one `git add` on the whole directory.
-    await _prune_history(provider, thread_id, run_id)
-
     await git_ops.commit_paths(
         provider,
         thread_id,
-        [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, session_index.SESSIONS_PATH],
+        [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH],
         "ai-dev-workflow: exit finalize (manifest, changelog, exit report)",
     )
-    return {}
 
 
 def _demo() -> None:
@@ -476,36 +445,6 @@ def _demo() -> None:
     diff = _diff_ledger(prior, current)
     assert diff == {"added": ["US-0002"], "revised": ["US-0001"], "retired": ["US-0002"]}, diff
     assert _diff_ledger(None, current)["added"] == ["US-0001", "US-0002"]
-
-    # _history_retain: env override, tolerant fallback, floor of 1.
-    os.environ.pop("AIDW_HISTORY_RETAIN", None)
-    assert _history_retain() == _DEFAULT_HISTORY_RETAIN
-    os.environ["AIDW_HISTORY_RETAIN"] = "3"
-    assert _history_retain() == 3
-    os.environ["AIDW_HISTORY_RETAIN"] = "not-a-number"
-    assert _history_retain() == _DEFAULT_HISTORY_RETAIN
-    os.environ["AIDW_HISTORY_RETAIN"] = "0"
-    assert _history_retain() == 1
-    os.environ.pop("AIDW_HISTORY_RETAIN", None)
-
-    # _stale_history_files: groups by run_id (first "-") prefix, keeps whole groups, including a
-    # -screens directory entry alongside a run's other artifact files.
-    files = [
-        "aaaaaaaa-report.json", "aaaaaaaa-exit.md", "aaaaaaaa-screens",
-        "bbbbbbbb-report.json", "bbbbbbbb-metrics.json",
-    ]
-    assert _stale_history_files(files, {"aaaaaaaa"}) == ["bbbbbbbb-report.json", "bbbbbbbb-metrics.json"]
-    assert _stale_history_files(files, {"aaaaaaaa", "bbbbbbbb"}) == []
-    assert _stale_history_files(files, set()) == files
-
-    # _prune_keep_ids: empty sessions -> None (fail-closed, caller must skip pruning entirely --
-    # NOT "keep only the current run", which would rm -rf every other run's artifacts on a
-    # transient session_index._read glitch). Non-empty sessions -> the last N run_ids + current.
-    assert _prune_keep_ids([], "current") is None
-    sessions = [{"run_id": f"r{i}"} for i in range(5)]
-    os.environ["AIDW_HISTORY_RETAIN"] = "2"
-    assert _prune_keep_ids(sessions, "current") == {"r3", "r4", "current"}
-    os.environ.pop("AIDW_HISTORY_RETAIN", None)
 
     # _render_history_sections: "not recorded"/"no baseline" placeholders when data is absent,
     # real content when present, and a FIXED skeleton -- the screenshots section always renders,

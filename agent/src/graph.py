@@ -47,6 +47,7 @@ from . import e2e_nodes
 from . import metrics_nodes
 from . import exit_nodes
 from . import rebuild
+from . import session_store
 from . import spec_ledger
 from . import stack_discovery
 from . import telemetry
@@ -403,9 +404,10 @@ IMPECCABLE_DEDUP_SEGMENT = (
 # but has NOT been spike-tested (it needs its own MCP server process, which doesn't exist here).
 # Baked into the sandbox image (Dockerfile's PLAYWRIGHT_MCP_VERSION npm -g install), not fetched
 # via `npx -y @playwright/mcp@latest` at session time -- deterministic version, no runtime npm
-# fetch in a container running untrusted repos. The env points ONLY this server at the
-# build-baked browser (see the Dockerfile's /opt/playwright-browsers comment); target repos' own
-# playwright runs keep the global PLAYWRIGHT_BROWSERS_PATH cache-volume path.
+# fetch in a container running untrusted repos. The env points this server at the build-baked
+# browser (see the Dockerfile's /opt/playwright-browsers comment) -- the SAME path the global
+# PLAYWRIGHT_BROWSERS_PATH now points at for target repos' own e2e runs too (e2e_nodes.py), so
+# there is exactly one baked browser, never a runtime `playwright install`.
 PLAYWRIGHT_MCP_CONFIG: dict[str, Any] = {
     "playwright": {
         "type": "stdio",
@@ -992,6 +994,10 @@ STAGES: list[StageSpec] = [
         sign_approval=True,
         deterministic_verify=exit_nodes.verify_exit_readiness,
         max_verify_cycles=0,
+        # Every run reaches this stage's approval (requires_human_gate=False, deterministic_verify
+        # always returns passed=True) -- this is the only place exit_finalize_node ever runs; it
+        # was never add_node'd/wired before this hook existed.
+        post_approve_hook=exit_nodes.exit_finalize_node,
     ),
 ]
 
@@ -1029,15 +1035,22 @@ async def _run_post_approve_hook(
     stage_spec: "StageSpec", thread_id: str, content: dict[str, Any] | None, state: GraphState
 ) -> None:
     """Fires StageSpec.post_approve_hook from all three places a stage becomes "approved"
-    (gate_node, auto_approve_node, and make_draft_node's hydrate short-circuit).
+    (gate_node, auto_approve_node, and make_draft_node's hydrate short-circuit) -- and, since this
+    is the one choke point all three already share, also updates the session row's current_stage
+    (drives the session-list UI's progress indicator) unconditionally, whether or not the stage
+    has its own post_approve_hook.
 
     Failures are logged and swallowed for the same reason _persist_if_sandboxed swallows its own:
     a convention file that couldn't be written must not take down a run whose approval already
     happened. The hook itself is expected to record its own partial failures where they matter.
     """
-    if stage_spec.post_approve_hook is None or not content:
-        return
     if sandbox_registry.get(thread_id) is None:
+        return
+    try:
+        await session_store.update_current_stage(thread_id, stage_spec.key)
+    except Exception:
+        logger.warning("update_current_stage failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True)
+    if stage_spec.post_approve_hook is None or not content:
         return
     try:
         await stage_spec.post_approve_hook(thread_id, content, state, get_sandbox_provider())

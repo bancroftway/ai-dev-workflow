@@ -13,11 +13,15 @@ import { useSandboxStatus } from "@/lib/sandbox-status-context";
  * gate on the same readiness signal without prop-drilling.
  */
 export function SandboxSessionBoot({
+  sessionId,
   owner,
   repo,
   branch,
   resume,
 }: {
+  /** This session's own id -- a UUID minted client-side for a new session, or the historical
+   * session being resumed. Forwarded as-is to the provision route/agent; never derived here. */
+  sessionId: string;
   owner: string;
   repo: string;
   branch: string;
@@ -26,9 +30,9 @@ export function SandboxSessionBoot({
   resume?: boolean;
 }) {
   const [status, setStatus] = useSandboxStatus();
-  // Provision can fail with an explanatory message worth showing verbatim (e.g. the 409 hard
-  // provision guard: another user's session is already in progress on this repo) -- falls back
-  // to the generic copy below when the response has no (or an unparseable) error body.
+  // Provision can fail with an explanatory message worth showing verbatim (e.g. the agent's
+  // 404/409 resume guards) -- falls back to the generic copy below when the response has no (or
+  // an unparseable) error body.
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
@@ -36,7 +40,7 @@ export function SandboxSessionBoot({
     fetch("/api/sessions/provision", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ owner, repo, branch, resume: Boolean(resume) }),
+      body: JSON.stringify({ sessionId, owner, repo, branch, resume: Boolean(resume) }),
     })
       .then(async (res) => {
         if (cancelled) return;
@@ -54,7 +58,7 @@ export function SandboxSessionBoot({
     return () => {
       cancelled = true;
     };
-  }, [owner, repo, branch, resume, setStatus]);
+  }, [sessionId, owner, repo, branch, resume, setStatus]);
 
   if (status === "ready") return null;
 

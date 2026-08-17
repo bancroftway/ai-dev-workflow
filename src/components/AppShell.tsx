@@ -60,6 +60,7 @@ function stageGroupDot(state: WorkflowState, keys: StageKey[], error?: boolean):
 export function AppShell({
   owner,
   repo,
+  workBranch,
   metricThresholds,
   resume,
 }: {
@@ -68,6 +69,10 @@ export function AppShell({
    * threadId instead. */
   owner: string;
   repo: string;
+  /** This session's own work_branch (agent/src/branch_naming.py) -- the git ref screenshots
+   * actually live on, resolved once server-side (the workflow page) since it's the same value
+   * useWorkflowThread's threadId already identifies this session by. */
+  workBranch: string;
   metricThresholds: MetricThresholds;
   /** ?resume=1 from the workflow page -- fires the run once the sandbox is ready even on a
    * thread that already has state, since the ordinary auto-trigger below is deliberately
@@ -239,7 +244,7 @@ export function AppShell({
               report={exitStage?.approved_content as MergeReadinessReport | null | undefined}
               metrics={state.metrics_report?.metrics}
               deltaSummary={state.repo_scan?.delta_summary}
-              screenshotUrls={state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path))}
+              screenshotUrls={state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path, workBranch))}
               thresholds={metricThresholds}
             />
           )}

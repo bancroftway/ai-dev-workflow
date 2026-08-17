@@ -36,6 +36,7 @@ Stage = Literal[
     "metrics-report",
     "rebuild",
     "e2e",
+    "session-title",
 ]
 Role = Literal["draft", "audit"]
 

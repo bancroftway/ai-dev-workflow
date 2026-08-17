@@ -6,25 +6,22 @@ import { E2E_GITHUB_ID, E2E_MODE } from "@/lib/e2e";
 import { getOctokit } from "@/lib/github";
 import { parseThresholds } from "@/lib/metric-grades";
 import { rawProxyUrl } from "@/lib/raw-proxy";
+import { getAuthorizedSession } from "@/lib/session-access";
 import type { DeltaSummary, MergeReadinessReport, MetricsReportState } from "@/lib/workflow-types";
-
-// Must match entrypoint.sh's WORK_BRANCH / agent/src/git_ops.py's _WORK_BRANCH constant -- every
-// history/ artifact lives on this single repo-shared branch, never the user's own branch.
-const WORK_BRANCH = "ai-dev-workflow";
 
 // run_id is intake_node's uuid4().hex[:8] (agent/src/graph.py) -- 8 lowercase hex chars. The
 // range is a little generous (6-12) to tolerate a length tweak on the agent side without this
 // route needing a matching edit.
 const RUN_ID_RE = /^[a-z0-9]{6,12}$/;
 
-async function readRepoFile(octokit: Octokit, owner: string, repo: string, path: string): Promise<string | null> {
+async function readRepoFile(octokit: Octokit, owner: string, repo: string, path: string, ref: string): Promise<string | null> {
   try {
-    const res = await octokit.rest.repos.getContent({ owner, repo, path, ref: WORK_BRANCH });
+    const res = await octokit.rest.repos.getContent({ owner, repo, path, ref });
     if (Array.isArray(res.data) || res.data.type !== "file" || !res.data.content) return null;
     return Buffer.from(res.data.content, "base64").toString("utf-8");
   } catch (error) {
-    // Covers both "this file was never written" and "the ai-dev-workflow branch doesn't exist yet"
-    // -- neither is an error worth a 500, both just mean there's nothing to show here.
+    // Covers both "this file was never written" and "this session's work branch doesn't exist
+    // (anymore)" -- neither is an error worth a 500, both just mean there's nothing to show here.
     if ((error as { status?: number }).status === 404) return null;
     throw error;
   }
@@ -33,7 +30,7 @@ async function readRepoFile(octokit: Octokit, owner: string, repo: string, path:
 export default async function RunReportPage({
   params,
 }: {
-  params: Promise<{ owner: string; repo: string; runId: string }>;
+  params: Promise<{ owner: string; repo: string; sessionId: string; runId: string }>;
 }) {
   const session = await auth();
   const githubId = session?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
@@ -41,15 +38,27 @@ export default async function RunReportPage({
     redirect("/");
   }
 
-  const { owner, repo, runId } = await params;
+  const { owner, repo, sessionId, runId } = await params;
   if (!RUN_ID_RE.test(runId)) {
     return <NotFoundPanel owner={owner} repo={repo} />;
   }
 
+  // The exit report and its screenshots live on THIS session's own work_branch, resolved via the
+  // agent (session_store.py) -- there's no more single repo-shared branch to default to.
+  // getAuthorizedSession also gates on the caller's own GitHub access to the session's repo (an
+  // IDOR check every session-by-id lookup needs now that ids are random UUIDs, not a hash only
+  // their own owner could compute) -- both "no such session" and "exists but you can't see it"
+  // collapse to the same not-found panel here, which is the right response either way.
+  const sessionRow = await getAuthorizedSession(sessionId);
+  if (!sessionRow || sessionRow.owner !== owner || sessionRow.repo !== repo) {
+    return <NotFoundPanel owner={owner} repo={repo} />;
+  }
+  const ref = sessionRow.work_branch;
+
   const octokit = await getOctokit();
   const historyPath = (suffix: string) => `.ai-dev-workflow/history/${runId}-${suffix}`;
 
-  const reportRaw = await readRepoFile(octokit, owner, repo, historyPath("report.json"));
+  const reportRaw = await readRepoFile(octokit, owner, repo, historyPath("report.json"), ref);
 
   let report: MergeReadinessReport | null = null;
   let metrics: MetricsReportState["metrics"] | undefined;
@@ -74,8 +83,8 @@ export default async function RunReportPage({
   } else {
     // Fallback: report.json is absent -- either this run predates it, or the run never reached
     // exit finalize. Reconstruct per-file, noting gaps rather than fabricating them.
-    const metricsRaw = await readRepoFile(octokit, owner, repo, historyPath("metrics.json"));
-    const exitMdRaw = await readRepoFile(octokit, owner, repo, historyPath("exit.md"));
+    const metricsRaw = await readRepoFile(octokit, owner, repo, historyPath("metrics.json"), ref);
+    const exitMdRaw = await readRepoFile(octokit, owner, repo, historyPath("exit.md"), ref);
 
     if (!metricsRaw && !exitMdRaw) {
       return <NotFoundPanel owner={owner} repo={repo} />;
@@ -120,7 +129,7 @@ export default async function RunReportPage({
       metrics={metrics}
       deltaSummary={deltaSummary}
       filesChanged={filesChanged}
-      screenshotUrls={screenshots.map((path) => rawProxyUrl(owner, repo, path))}
+      screenshotUrls={screenshots.map((path) => rawProxyUrl(owner, repo, path, ref))}
       thresholds={metricThresholds}
     />
   );
@@ -131,7 +140,7 @@ function NotFoundPanel({ owner, repo }: { owner: string; repo: string }) {
     <div className="mx-auto flex max-w-2xl flex-col gap-2 p-10 text-center">
       <h1 className="text-lg font-semibold">No report found for this run</h1>
       <p className="text-sm text-neutral-500">
-        Nothing was recorded for this run on {owner}/{repo}, or the ai-dev-workflow branch doesn&apos;t exist yet.
+        Nothing was recorded for this run on {owner}/{repo}, or this session&apos;s branch doesn&apos;t exist yet.
       </p>
     </div>
   );

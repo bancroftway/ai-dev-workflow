@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
 from .sandbox.provider import SandboxProvider
 
 from .repo_files import validate_repo_relative_path
@@ -22,10 +24,6 @@ logger = logging.getLogger(__name__)
 
 _COMMIT_AUTHOR_NAME = "ai-dev-workflow"
 _COMMIT_AUTHOR_EMAIL = "ai-dev-workflow@users.noreply.github.com"
-
-# Must match entrypoint.sh's WORK_BRANCH constant -- every sandbox's HEAD is this branch by the
-# time any pipeline stage runs (WS0 migration: one branch per repo, shared by every session/user).
-_WORK_BRANCH = "ai-dev-workflow"
 
 # Per-thread push credentials + outcome, agent-memory only (never a container env var -- the
 # clone token is deliberately destroyed after clone, see entrypoint.sh). The token re-arrives on
@@ -49,31 +47,70 @@ def get_last_push(thread_id: str) -> dict[str, Any] | None:
     return _LAST_PUSH.get(thread_id)
 
 
+def get_push_token(thread_id: str) -> str | None:
+    """The same clone/push credential push_head uses -- open_pull_request reuses it rather than
+    threading a second copy of the user's GitHub token through exit_finalize_node."""
+    return _PUSH_TOKENS.get(thread_id)
+
+
+async def open_pull_request(
+    *, owner: str, repo: str, source_branch: str, work_branch: str, title: str, body: str, token: str
+) -> str | None:
+    """Opens a GitHub PR (work_branch -> source_branch) via a plain REST call -- no SDK dependency
+    needed for one POST. Idempotent against GitHub's 422 "already exists" response: fetches and
+    returns the existing PR's URL instead of treating it as an error (exit_finalize_node's hook can
+    legitimately fire more than once for the same session, e.g. a resumed thread whose exit stage
+    was already approved). Any other failure: log-and-continue, return None -- a hiccup here must
+    never flip an otherwise gate-passing session to failed."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                headers=headers,
+                json={"title": title, "body": body, "head": work_branch, "base": source_branch},
+            )
+        except httpx.HTTPError:
+            logger.warning("open_pull_request request failed for %s/%s", owner, repo, exc_info=True)
+            return None
+
+        if resp.status_code == 201:
+            return resp.json().get("html_url")
+
+        if resp.status_code == 422:
+            try:
+                existing = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                    headers=headers,
+                    params={"head": f"{owner}:{work_branch}", "base": source_branch, "state": "all"},
+                )
+                if existing.status_code == 200 and existing.json():
+                    return existing.json()[0].get("html_url")
+            except httpx.HTTPError:
+                logger.warning("open_pull_request existing-PR lookup failed for %s/%s", owner, repo, exc_info=True)
+                return None
+
+        logger.warning(
+            "open_pull_request failed for %s/%s %s->%s: %s %s",
+            owner, repo, work_branch, source_branch, resp.status_code, resp.text[:300],
+        )
+        return None
+
+
 async def push_head(provider: SandboxProvider, thread_id: str) -> None:
-    """Pushes HEAD (the single, repo-shared ai-dev-workflow work branch) to origin, log-and-continue.
+    """Pushes HEAD (this session's own unique work branch) to origin, log-and-continue.
 
-    --force-with-lease (not plain --force): WS0's single-branch migration deleted the "exactly one
-    writer" invariant that made plain force safe -- every session/user on this repo now pushes the
-    SAME branch, so a plain force can silently clobber a concurrent session's already-pushed
-    commits. Force (of some kind) is still needed at all because two pipeline paths legitimately
-    `git reset --hard` the work branch (finding-cluster's upgrade revert, app-discovery's reject
-    cleanup).
-
-    The lease's expected value is resolved EXPLICITLY (`--force-with-lease=<branch>:<expect>`),
-    never passed bare, because the clone is --single-branch: remote.origin.fetch is config-mapped
-    to only the base branch that was cloned, never to _WORK_BRANCH. Bare `--force-with-lease` (no
-    `=<refname>:<expect>`) resolves its expected value by looking up the remote-tracking ref
-    THROUGH THAT REFSPEC CONFIG -- it never consults whatever ref actually sits on disk, so it
-    can't see refs/remotes/origin/<_WORK_BRANCH> even moments after the explicit-refspec fetch
-    below just wrote it. With no config-mapped tracking ref, the bare lease falls back to its
-    config-less default of "the ref must not exist on the remote" -- correct for the very first
-    push, wrong for every push after (the branch now exists), so it rejected every one of them as
-    `stale info` (confirmed against a live failure log). Fix: read the just-fetched tracking ref
-    ourselves with `git rev-parse` and hand its exact value to `--force-with-lease=<branch>:
-    <expect>`, sidestepping the config lookup entirely -- an absent ref (first push, the fetch was
-    a no-op) keeps the bare "must not exist" lease; a present ref (every push after) compares
-    against the value fetched moments earlier, so a genuine concurrent write is still rejected
-    instead of overwritten.
+    Plain --force, not --force-with-lease: branch-per-session restores "exactly one writer per
+    branch" (WS0's single shared `ai-dev-workflow` branch gave that up, which is what forced the
+    lease workaround this replaced -- see git history if that reasoning is ever needed again).
+    Force (of some kind) is still needed because two pipeline paths legitimately `git reset --hard`
+    this session's own work branch (finding-cluster's upgrade revert, app-discovery's reject
+    cleanup) -- but with no other writer to protect against, there's nothing left for a lease to
+    compare against.
 
     The token transits the container as a one-shot credential-helper file in /tmp, deleted in the
     same shell invocation.
@@ -88,25 +125,9 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
     helper_path = f"/tmp/aidw-cred-{uuid.uuid4().hex}.sh"
     helper_script = f"#!/bin/sh\necho username=x-access-token\necho password={token}\n"
     helper_b64 = base64.b64encode(helper_script.encode("utf-8")).decode("ascii")
-    tracking_ref = f"refs/remotes/origin/{_WORK_BRANCH}"
     command = (
         f"printf %s {shlex.quote(helper_b64)} | base64 -d > {helper_path} && chmod 700 {helper_path} && "
-        # "+" force-updates the local remote-tracking ref even across a non-fast-forward change on
-        # origin (a post-merge reset or another session's revert) -- without it, a rejected fetch
-        # would leave the tracking ref stuck at its old value, and every later --force-with-lease
-        # push would keep comparing against that stale value and keep failing as "stale info".
-        f"(git -c credential.helper={helper_path} fetch --quiet origin "
-        f"+{_WORK_BRANCH}:{tracking_ref} || true) && "
-        # Resolve the lease's expected value ourselves rather than trusting the bare form to find
-        # it (see docstring): no tracking ref yet (first push) keeps the bare must-not-exist lease;
-        # a resolved ref hands its exact commit to --force-with-lease=<branch>:<expect> so the
-        # comparison never goes through the single-branch-scoped refspec config.
-        f"expect=$(git rev-parse -q --verify {tracking_ref} || true); "
-        f"if [ -n \"$expect\" ]; then "
-        f"git -c credential.helper={helper_path} push --force-with-lease={_WORK_BRANCH}:\"$expect\" --quiet -u origin HEAD; "
-        f"else "
-        f"git -c credential.helper={helper_path} push --force-with-lease --quiet -u origin HEAD; "
-        f"fi; "
+        f"git -c credential.helper={helper_path} push --force --quiet -u origin HEAD; "
         f"rc=$?; rm -f {helper_path}; exit $rc"
     )
     result = await provider.exec_in_sandbox(thread_id, command)
@@ -128,9 +149,9 @@ async def record_run_failure(
     """Durably records a terminal run failure ({stage, type, ...detail}) and returns the payload.
 
     Escalations no longer pause for a human -- the graph ENDs with `run_failure` set, so this is
-    the last chance to leave a trace: a ledger row, the session-index row closed as "failed", and
-    a commit+push of .ai-dev-workflow/ (which covers sessions.json too -- end_session below writes
-    the file only, this commit is what makes it durable).
+    the last chance to leave a trace: a ledger row and the session row closed as "failed" (SQL,
+    session_store.py -- unlike the ledger write below, this isn't a git commit, so it survives
+    even when the commit that follows fails).
     No-ops (payload-only) when the sandbox is gone -- every `cannot_verify` failure happens
     exactly then. Best-effort by design: a failed write must never mask the failure itself.
     """
@@ -139,14 +160,14 @@ async def record_run_failure(
     if sandbox_registry.get(thread_id) is None:
         return payload
     from . import repo_files  # local import mirrors the module-level one-way dependency
-    from . import session_index  # local: same reason -- session_index imports git_ops itself
+    from . import session_store  # local: keeps git_ops's import surface flat, same as sandbox_registry above
 
     provider = _get_provider()
     try:
         await repo_files.append_ledger_entry(
             provider, thread_id, {"stage": payload.get("stage"), "node": "run_failure", **payload}
         )
-        await session_index.end_session(provider, thread_id, run_id=run_id, status="failed", failure=payload)
+        await session_store.close_session(thread_id, run_id=run_id, status="failed", failure=payload)
         await commit_ai_dev_workflow(provider, thread_id, f"ai-dev-workflow: run failed at {payload.get('stage')}")
     except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
         logger.warning("failed to durably record run_failure for thread_id=%s", thread_id, exc_info=True)

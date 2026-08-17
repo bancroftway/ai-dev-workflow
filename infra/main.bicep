@@ -49,6 +49,16 @@ param vnetAddressPrefix string = '10.10.0.0/16'
 @description('Subnet address space, delegated to Microsoft.ContainerInstance/containerGroups.')
 param aciSubnetAddressPrefix string = '10.10.1.0/24'
 
+@description('Azure AD object id of the session database\'s AAD admin -- a person or group who can run the one-time CREATE USER grant for the agent\'s managed identity (see infra/README.md). Azure AD-only auth, no SQL password of any kind.')
+param sqlAadAdminObjectId string
+
+@description('Display name of the SQL AAD admin (shown in the Azure portal only).')
+param sqlAadAdminLogin string
+
+@description('Principal type of sqlAadAdminObjectId.')
+@allowed(['User', 'Group'])
+param sqlAadAdminPrincipalType string = 'User'
+
 var acrName = replace('${namePrefix}acr', '-', '')
 // ACI's own image reference always resolves through the ACR created below, regardless of the
 // tag CI last pushed -- kept as its own var so provision() (agent/src/sandbox/azure_aci.py) and
@@ -121,6 +131,52 @@ resource sandboxAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+// Single source of truth for session metadata (session_store.py) -- replaces the old
+// `.ai-dev-workflow/sessions.json` git-committed file. Azure AD-only auth (azureADOnlyAuthentication:
+// true below): no SQL login/password of any kind to manage or rotate. Only the agent connects
+// (it's the sole reader AND writer -- the frontend calls the agent's HTTP API, never SQL
+// directly, so there's exactly one schema-aware client). Basic tier: one logical writer
+// (agentApp is pinned minReplicas=maxReplicas=1), one small table, low volume.
+resource sqlServer 'Microsoft.Sql/servers@2023-08-01-preview' = {
+  name: '${namePrefix}-sql'
+  location: location
+  properties: {
+    administrators: {
+      administratorType: 'ActiveDirectory'
+      principalType: sqlAadAdminPrincipalType
+      login: sqlAadAdminLogin
+      sid: sqlAadAdminObjectId
+      azureADOnlyAuthentication: true
+    }
+  }
+}
+
+resource sqlDatabase 'Microsoft.Sql/servers/databases@2023-08-01-preview' = {
+  parent: sqlServer
+  name: 'Ai-Dev-Workflow'
+  location: location
+  sku: {
+    name: 'Basic'
+    tier: 'Basic'
+  }
+  properties: {
+    maxSizeBytes: 2147483648 // 2 GB -- Basic's own cap, far more than one small metadata table needs
+  }
+}
+
+// No VNet integration on the Container Apps environment today (real scope increase to add --
+// flagged in Known gaps below, not bundled into this change), so Container Apps egress uses
+// unpredictable public IPs. AAD-only auth is what's actually locked down here; this firewall rule
+// just lets Azure-hosted callers reach the server at all.
+resource sqlAllowAzureServices 'Microsoft.Sql/servers/firewallRules@2023-08-01-preview' = {
+  parent: sqlServer
+  name: 'AllowAllWindowsAzureIps'
+  properties: {
+    startIpAddress: '0.0.0.0'
+    endIpAddress: '0.0.0.0'
+  }
+}
+
 resource containerAppsEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: '${namePrefix}-env'
   location: location
@@ -172,6 +228,10 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_ACI_VNET_NAME', value: sandboxVnet.name }
             { name: 'AZURE_ACI_SUBNET_NAME', value: 'aci-subnet' }
             { name: 'AZURE_ACI_IDENTITY', value: sandboxIdentity.id }
+            // session_store.py's db.py picks the Azure AD token connection path whenever this is
+            // set (vs. the local Trusted_Connection path for dev) -- see agent/src/db.py.
+            { name: 'AZURE_SQL_SERVER', value: '${sqlServer.name}.database.windows.net' }
+            { name: 'AZURE_SQL_DATABASE', value: sqlDatabase.name }
           ]
           resources: {
             cpu: json('0.5')

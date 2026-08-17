@@ -2,49 +2,67 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { SessionEntry } from "@/app/api/sessions/list/route";
+import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 
-const STATUS_BADGE: Record<SessionEntry["status"], string> = {
+const STATUS_BADGE: Record<Session["status"], string> = {
   completed: "bg-green-100 text-green-800",
   failed: "bg-red-100 text-red-800",
   rejected: "bg-amber-100 text-amber-800",
   in_progress: "bg-blue-100 text-blue-800",
-  superseded: "bg-neutral-100 text-neutral-600",
 };
 
+function ProgressIndicator({ currentStage }: { currentStage: string | null }) {
+  if (!currentStage) return <span className="text-xs text-neutral-500">Starting…</span>;
+  const index = STAGE_KEYS_IN_ORDER.indexOf(currentStage as (typeof STAGE_KEYS_IN_ORDER)[number]);
+  const label = index === -1 ? currentStage : `Stage ${index + 1} of ${STAGE_KEYS_IN_ORDER.length}: ${currentStage}`;
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-xs text-neutral-600">{label}</span>
+      {index !== -1 && (
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-100">
+          <div
+            className="h-full rounded-full bg-blue-500 transition-all"
+            style={{ width: `${((index + 1) / STAGE_KEYS_IN_ORDER.length) * 100}%` }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
- * Per-repo session history for /select, rendered inside RepoBranchSection (keyed by repo there,
- * so switching repos always re-fetches from scratch). Reports whether any session on this repo
- * is in_progress via `onInProgressChange` so the parent can show its own amber note near the
- * Continue button -- the provision route's 409 guard (Task 1) is the real enforcement; this is
- * just advance notice.
+ * Session list for /select, rendered once a repo AND branch are both chosen (SelectPage keys this
+ * by (repo, branch) so switching either always re-fetches from scratch). Reports whether any
+ * session on this repo/branch is in_progress via `onInProgressChange` for cosmetic use only --
+ * concurrency is fully open now (branch-per-session), there is no provision-time lock to warn
+ * about, unlike the old per-repo 409 guard this replaced.
  */
 export function SessionHistory({
   owner,
   repo,
+  sourceBranch,
   onInProgressChange,
 }: {
   owner: string;
   repo: string;
+  sourceBranch: string;
   onInProgressChange?: (inProgress: boolean) => void;
 }) {
   const router = useRouter();
-  const [sessions, setSessions] = useState<SessionEntry[] | null>(null);
-  const [warning, setWarning] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<Session[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    const params = new URLSearchParams({ owner, repo });
+    const params = new URLSearchParams({ owner, repo, source_branch: sourceBranch });
     fetch(`/api/sessions/list?${params}`)
       .then((res) => {
         if (!res.ok) throw new Error(`Failed to load session history (${res.status})`);
         return res.json();
       })
-      .then((data: { sessions: SessionEntry[]; warning?: string }) => {
+      .then((data: { sessions: Session[] }) => {
         if (cancelled) return;
         setSessions(data.sessions);
-        setWarning(data.warning ?? null);
         onInProgressChange?.(data.sessions.some((s) => s.status === "in_progress"));
       })
       .catch((err: Error) => {
@@ -56,26 +74,25 @@ export function SessionHistory({
     // onInProgressChange intentionally excluded -- a parent-supplied setState function's identity
     // must not re-trigger this fetch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [owner, repo]);
+  }, [owner, repo, sourceBranch]);
 
-  function resume(session: SessionEntry) {
-    router.push(`/workflow/${owner}/${repo}/${session.target_branch}?resume=1`);
+  function resume(session: Session) {
+    router.push(`/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}?resume=1`);
   }
 
   return (
     <div className="flex flex-col gap-2">
-      <h2 className="text-sm font-medium text-neutral-700">Session history</h2>
+      <h2 className="text-sm font-medium text-neutral-700">Sessions on this branch</h2>
       {error && <p className="text-sm text-red-600">{error}</p>}
-      {warning && <p className="text-xs text-amber-700">{warning}</p>}
-      {!error && sessions === null && <p className="text-sm text-neutral-500">Loading session history…</p>}
+      {!error && sessions === null && <p className="text-sm text-neutral-500">Loading sessions…</p>}
       {sessions?.length === 0 && (
-        <p className="text-sm text-neutral-500">No past sessions for this repository.</p>
+        <p className="text-sm text-neutral-500">No sessions yet for this repository/branch.</p>
       )}
       {sessions && sessions.length > 0 && (
         <ul className="flex flex-col gap-2">
           {sessions.map((s) => (
             <li
-              key={s.run_id}
+              key={s.session_id}
               className="flex flex-col gap-1 rounded-md border border-neutral-200 px-3 py-2 text-sm"
             >
               <div className="flex items-center justify-between gap-2">
@@ -87,11 +104,12 @@ export function SessionHistory({
                 </span>
               </div>
               <div className="text-xs text-neutral-500">
-                {s.user || "unknown"} · started {s.started_at} · ended {s.ended_at ?? "—"}
+                {s.user_login || "unknown"} · started {s.started_at} · ended {s.ended_at ?? "—"}
               </div>
-              {s.status === "failed" && s.failure && (
+              {s.status === "in_progress" && <ProgressIndicator currentStage={s.current_stage} />}
+              {s.status === "failed" && s.failure_message && (
                 <p className="text-xs text-red-700">
-                  {s.failure.stage}: {s.failure.type} — {s.failure.message}
+                  {s.failure_stage}: {s.failure_type} — {s.failure_message}
                 </p>
               )}
               <div className="flex gap-2">
@@ -106,13 +124,25 @@ export function SessionHistory({
                   </button>
                 )}
                 {s.status === "completed" && (
-                  <button
-                    type="button"
-                    className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
-                    onClick={() => router.push(`/sessions/${owner}/${repo}/${s.run_id}/report`)}
-                  >
-                    View report
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
+                      onClick={() => router.push(`/sessions/${owner}/${repo}/${s.session_id}/${s.run_id}/report`)}
+                    >
+                      View report
+                    </button>
+                    {s.pr_url && (
+                      <a
+                        href={s.pr_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
+                      >
+                        View PR
+                      </a>
+                    )}
+                  </>
                 )}
               </div>
             </li>

@@ -19,6 +19,7 @@ agent/venv/
 **/__pycache__/
 *.pyc
 .pytest_cache/
+**/uv.lock
 
 # Editors / OS
 .DS_Store
@@ -35,3 +36,5 @@ agent/venv/
 agent/sandbox-image/plugins/*/skills/*-workspace/
 agent/sandbox-image/plugins/*/skills/*/evals/
 **/agent-work/
+**/*.log
+

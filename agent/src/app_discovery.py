@@ -40,7 +40,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
-from . import git_ops, repo_files, session_index
+from . import git_ops, repo_files, session_store
 from .preflight_nodes import MANIFEST_PATH, update_manifest
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -648,15 +648,9 @@ async def app_discovery_reject_node(state: "GraphState", config: RunnableConfig)
         if cleanup_note:
             lines += ["", cleanup_note]
 
-        # The cleanup reset above resets to run_baseline_commit and never touches sessions.json
-        # (git clean is scoped to .ai-dev-workflow, but sessions.json's own commit already
-        # happened before that baseline was captured -- see scaffold_node -- so it survives the
-        # reset). This is the one writer that closes the session's row AFTER that reset, so it
-        # needs its own commit+push rather than relying on some other node's commit to pick it up.
-        await session_index.end_session(provider, thread_id, run_id=state.get("run_id"), status="rejected")
-        await git_ops.commit_paths(
-            provider, thread_id, [session_index.SESSIONS_PATH], "ai-dev-workflow: session rejected"
-        )
+        # Session row lives in SQL now (session_store.py), not a git-committed file -- closing it
+        # is independent of the repo-tree reset above, no follow-up commit needed.
+        await session_store.close_session(thread_id, run_id=state.get("run_id"), status="rejected")
 
     return {"messages": [AIMessage(content="\n".join(lines))]}
 

@@ -3,10 +3,6 @@ import { auth } from "@/auth";
 import { E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
 import { getOctokit } from "@/lib/github";
 
-// Must match entrypoint.sh's WORK_BRANCH / agent/src/git_ops.py's _WORK_BRANCH constant -- exit
-// report artifacts (and their screenshots) live on this single repo-shared branch.
-const WORK_BRANCH = "ai-dev-workflow";
-
 const CONTENT_TYPE_BY_EXT: Record<string, string> = {
   png: "image/png",
   jpg: "image/jpeg",
@@ -36,6 +32,9 @@ function notFound() {
  * (never SVG/HTML/XML/JSON, which the browser would happily execute/parse as same-origin content
  * -- stored XSS against the NextAuth session otherwise), with nosniff + a locked-down CSP +
  * sandboxed Content-Disposition on every response.
+ *
+ * `ref` (required) is the git ref to read from -- the caller's own session's work_branch, since
+ * screenshots/reports now live on a per-session branch rather than one repo-shared default.
  */
 export async function GET(request: Request) {
   const session = await auth();
@@ -48,8 +47,9 @@ export async function GET(request: Request) {
   const owner = searchParams.get("owner");
   const repo = searchParams.get("repo");
   const path = searchParams.get("path");
+  const ref = searchParams.get("ref");
 
-  if (!owner || !repo || !path) {
+  if (!owner || !repo || !path || !ref) {
     return notFound();
   }
   if (path.startsWith("/") || path.includes("..") || path.includes("\\") || !path.startsWith(".ai-dev-workflow/")) {
@@ -65,7 +65,7 @@ export async function GET(request: Request) {
   const octokit = await getOctokit();
   let bytes: Buffer;
   try {
-    const content = await octokit.rest.repos.getContent({ owner, repo, path, ref: WORK_BRANCH });
+    const content = await octokit.rest.repos.getContent({ owner, repo, path, ref });
     if (Array.isArray(content.data) || content.data.type !== "file") {
       // Symlink/dir/submodule -- never proxied.
       return notFound();
@@ -77,7 +77,7 @@ export async function GET(request: Request) {
       // `download_url` -- that's an unauthenticated, time-limited redirect that would leak the
       // blob to anyone who captured the URL; `mediaType: "raw"` stays on the authenticated call.
       const raw = await octokit.rest.repos.getContent({
-        owner, repo, path, ref: WORK_BRANCH,
+        owner, repo, path, ref,
         mediaType: { format: "raw" },
       });
       bytes = Buffer.from(raw.data as unknown as ArrayBuffer);
