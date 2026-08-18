@@ -37,6 +37,20 @@ param authSecret string
 @secure()
 param copilotGithubToken string
 
+@description('Entra tenant id (single-tenant deployment).')
+param entraTenantId string
+
+@description('The single Entra app registration\'s client id -- covers user sign-in, the exposed api://<id>/access_as_user scope, and the agent\'s on-behalf-of Key Vault exchange (see infra/README.md).')
+param entraAppId string
+
+@description('That app registration\'s client secret (used by both the frontend sign-in and the agent\'s OBO exchange).')
+@secure()
+param entraClientSecret string
+
+@description('Shared secret between the frontend and the agent\'s session endpoints (x-aidw-secret) -- required now that those endpoints carry user Entra assertions.')
+@secure()
+param agentSharedSecret string
+
 @description('Container image for the frontend, e.g. myacr.azurecr.io/ai-dev-workflow-frontend:sha. Left as a placeholder tag on first deploy; CI (deploy-frontend.yml) updates it on every push.')
 param frontendImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
@@ -206,6 +220,8 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
       }
       secrets: [
         { name: 'copilot-github-token', value: copilotGithubToken }
+        { name: 'entra-client-secret', value: entraClientSecret }
+        { name: 'agent-shared-secret', value: agentSharedSecret }
       ]
       registries: [
         { server: '${acr.name}.azurecr.io', identity: 'system' }
@@ -219,6 +235,14 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
           env: [
             { name: 'GITHUB_TOKEN', secretRef: 'copilot-github-token' }
             { name: 'SANDBOX_PROVIDER', value: 'azure' }
+            // On-behalf-of Key Vault exchange (agent/src/keyvault.py): the shared Entra app
+            // registration's confidential-client credentials. The agent's MANAGED identity is
+            // deliberately not involved -- it has no vault access; every vault read happens as
+            // the signed-in user via their forwarded assertion.
+            { name: 'AZURE_TENANT_ID', value: entraTenantId }
+            { name: 'AIDW_AGENT_APP_ID', value: entraAppId }
+            { name: 'AIDW_AGENT_CLIENT_SECRET', secretRef: 'entra-client-secret' }
+            { name: 'AIDW_AGENT_SHARED_SECRET', secretRef: 'agent-shared-secret' }
             // docker-entrypoint.sh runs `az login --identity` before starting uvicorn when this
             // is set -- the agent's own system-assigned identity (below), not the sandbox
             // identity, which only ever needs AcrPull, never ACI-management permissions.
@@ -267,6 +291,8 @@ resource frontendApp 'Microsoft.App/containerApps@2024-03-01' = {
         { name: 'auth-github-id', value: authGithubId }
         { name: 'auth-github-secret', value: authGithubSecret }
         { name: 'auth-secret', value: authSecret }
+        { name: 'entra-client-secret', value: entraClientSecret }
+        { name: 'agent-shared-secret', value: agentSharedSecret }
       ]
       registries: [
         { server: '${acr.name}.azurecr.io', identity: 'system' }
@@ -281,6 +307,13 @@ resource frontendApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AUTH_GITHUB_ID', secretRef: 'auth-github-id' }
             { name: 'AUTH_GITHUB_SECRET', secretRef: 'auth-github-secret' }
             { name: 'AUTH_SECRET', secretRef: 'auth-secret' }
+            // Entra ID primary sign-in (src/auth.ts): the ONE shared app registration -- same
+            // three values the agent gets. GitHub above is the LINKED account (repos/push), not
+            // the sign-in.
+            { name: 'AZURE_TENANT_ID', value: entraTenantId }
+            { name: 'AIDW_AGENT_APP_ID', value: entraAppId }
+            { name: 'AIDW_AGENT_CLIENT_SECRET', secretRef: 'entra-client-secret' }
+            { name: 'AIDW_AGENT_SHARED_SECRET', secretRef: 'agent-shared-secret' }
             // Required behind Container Apps' ingress -- confirmed locally (Dockerfile smoke
             // test) that NextAuth otherwise rejects every request with UntrustedHost.
             { name: 'AUTH_TRUST_HOST', value: 'true' }

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
+import { getServerAuthToken } from "@/auth";
 import { E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
 import { getOctokit } from "@/lib/github";
 
@@ -37,8 +37,8 @@ function notFound() {
  * screenshots/reports now live on a per-session branch rather than one repo-shared default.
  */
 export async function GET(request: Request) {
-  const session = await auth();
-  const accessToken = session?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
+  const token = await getServerAuthToken();
+  const accessToken = token?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
   if (!accessToken) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401, headers: HARDENED_HEADERS });
   }

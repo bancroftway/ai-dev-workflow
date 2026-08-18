@@ -3,7 +3,6 @@ import { auth } from "@/auth";
 import { E2E_GITHUB_ID, E2E_MODE } from "@/lib/e2e";
 import { AppShell } from "@/components/AppShell";
 import { SandboxSessionBoot } from "@/components/SandboxSessionBoot";
-import { WorkspaceHeader } from "@/components/WorkspaceHeader";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
 import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
 import { parseThresholds } from "@/lib/metric-grades";
@@ -64,18 +63,26 @@ export default async function WorkflowPage({
     <WorkflowThreadProvider threadId={sessionId}>
       <WorkflowProviders>
         <SandboxStatusProvider>
-          <div className="flex min-h-full flex-1 flex-col">
-            <WorkspaceHeader />
-            <SandboxSessionBoot sessionId={sessionId} owner={owner} repo={repo} branch={branch} resume={resume} />
-            <AppShell
-              owner={owner}
-              repo={repo}
-              // Not yet provisioned (sessionRow is null): no artifacts exist to read yet either,
-              // so an empty string is never actually dereferenced against GitHub.
-              workBranch={sessionRow?.work_branch ?? ""}
-              metricThresholds={metricThresholds}
-              resume={resume}
-            />
+          {/* The page shell (header, frozen/scroll split) lives once in root layout now -- this
+              is just this route's own content, filling whatever height that shell hands it. */}
+          <div className="flex h-full w-full flex-col">
+            <div className="shrink-0">
+              <SandboxSessionBoot sessionId={sessionId} owner={owner} repo={repo} branch={branch} resume={resume} />
+            </div>
+            {/* min-h-0 is required here, not decorative: without it a flex child's default
+                min-height:auto lets it grow past this row's share of the column instead of
+                bounding to it, which is what AppShell's own internal scroll region depends on. */}
+            <div className="min-h-0 flex-1">
+              <AppShell
+                owner={owner}
+                repo={repo}
+                // Not yet provisioned (sessionRow is null): no artifacts exist to read yet either,
+                // so an empty string is never actually dereferenced against GitHub.
+                workBranch={sessionRow?.work_branch ?? ""}
+                metricThresholds={metricThresholds}
+                resume={resume}
+              />
+            </div>
           </div>
         </SandboxStatusProvider>
       </WorkflowProviders>

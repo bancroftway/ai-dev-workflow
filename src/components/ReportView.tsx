@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import { Chip, type MetricThresholds } from "@/components/MetricsBar";
+import { ViewContainer } from "@/components/ViewContainer";
 import {
   GRADE_TONE,
   gradeHigherIsBetter,
@@ -39,7 +40,7 @@ export function ReportView({ report, metrics, deltaSummary, filesChanged, screen
   const gatingCount = metrics?.repo_scan?.summary?.gating_count;
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-6 p-6">
+    <ViewContainer>
       <div>
         <h1 className="text-lg font-semibold">Report</h1>
         <p className="text-sm text-neutral-500">Merge readiness, metrics, and what this run produced.</p>
@@ -128,7 +129,7 @@ export function ReportView({ report, metrics, deltaSummary, filesChanged, screen
           </div>
         </div>
       )}
-    </div>
+    </ViewContainer>
   );
 }
 

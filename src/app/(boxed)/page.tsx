@@ -65,7 +65,7 @@ export default function Home() {
         <form
           action={async () => {
             "use server";
-            await signIn("github", { redirectTo: "/select" });
+            await signIn("microsoft-entra-id", { redirectTo: "/select" });
           }}
           className="mt-10"
         >
@@ -73,8 +73,7 @@ export default function Home() {
             type="submit"
             className="inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-neutral-800"
           >
-            <GitHubMark className="h-4 w-4" />
-            Sign in with GitHub
+            Sign in with Microsoft
           </button>
         </form>
       </section>
@@ -125,12 +124,12 @@ export default function Home() {
       <section className="border-t border-neutral-200 py-20">
         <div className="mx-auto max-w-2xl px-6 text-center">
           <h2 className="text-2xl font-semibold text-neutral-900">
-            Sign in with GitHub to start your first workflow.
+            Sign in with Microsoft to start your first workflow.
           </h2>
           <form
             action={async () => {
               "use server";
-              await signIn("github", { redirectTo: "/select" });
+              await signIn("microsoft-entra-id", { redirectTo: "/select" });
             }}
             className="mt-8"
           >
@@ -138,20 +137,11 @@ export default function Home() {
               type="submit"
               className="inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-neutral-800"
             >
-              <GitHubMark className="h-4 w-4" />
-              Sign in with GitHub
+              Sign in with Microsoft
             </button>
           </form>
         </div>
       </section>
     </main>
-  );
-}
-
-function GitHubMark({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden="true">
-      <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.09 3.29 9.4 7.86 10.93.57.1.79-.25.79-.55 0-.27-.01-1.16-.02-2.11-3.2.7-3.87-1.36-3.87-1.36-.53-1.33-1.29-1.69-1.29-1.69-1.05-.72.08-.7.08-.7 1.17.08 1.78 1.2 1.78 1.2 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.56-.29-5.25-1.28-5.25-5.7 0-1.26.45-2.29 1.18-3.09-.12-.29-.51-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.05 11.05 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.24 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.43-2.7 5.41-5.27 5.69.41.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .3.21.66.8.55A10.52 10.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z" />
-    </svg>
   );
 }

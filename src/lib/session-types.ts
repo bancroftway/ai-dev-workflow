@@ -23,6 +23,10 @@ export type Session = {
   failure_stage: string | null;
   failure_type: string | null;
   failure_message: string | null;
+  /** Live, not persisted -- whether this session's sandbox is currently registered in the
+   * agent's memory right now. False after an agent restart until the session is reprovisioned,
+   * regardless of `status`. */
+  container_alive: boolean;
 };
 
 /** agent/src/graph.py's STAGES list, key order -- used only to render "stage N of M" in the

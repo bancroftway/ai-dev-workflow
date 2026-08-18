@@ -13,6 +13,13 @@ floor, not a ceiling: it is grounded evidence you should use, and its marker tab
 every stack (Go, Rails, Spring Boot and PHP have no rules yet). Explore the repository yourself
 for anything it may have missed.
 
+If that scan's candidate list is empty and your own exploration confirms there is no application
+code in the repository (only documentation, config, or an empty scaffold), your `apps` list MUST
+be empty. Do not propose, describe, or start scaffolding a "starter" or example application under
+any circumstances, however minimal, and however plausible it seems the human probably wants one —
+that is not your call to make here. A genuinely empty repository is offered a tech-stack picker by
+a later step, and that only happens when you honestly report no apps.
+
 For **every** application you find — including the mobile and library ones — report a record with:
 
 - `path`: the repo-relative directory that is the application's root (`.` for a single-app repo).

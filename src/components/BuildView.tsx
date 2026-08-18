@@ -1,6 +1,7 @@
 "use client";
 
 import { useAgent } from "@copilotkit/react-core/v2";
+import { ViewContainer } from "@/components/ViewContainer";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { StageState, WorkflowState } from "@/lib/workflow-types";
 
@@ -50,7 +51,7 @@ export function BuildView() {
   const state = (agent.state ?? {}) as WorkflowState;
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 p-6">
+    <ViewContainer>
       <div>
         <h1 className="text-lg font-semibold">Build</h1>
         <p className="text-sm text-neutral-500">Tests-first implementation progress after the approved plan.</p>
@@ -58,6 +59,6 @@ export function BuildView() {
       {BUILD_STAGES.map(({ key, label, blurb }) => (
         <StageCard key={key} label={label} blurb={blurb} stage={state.stages?.[key]} />
       ))}
-    </div>
+    </ViewContainer>
   );
 }

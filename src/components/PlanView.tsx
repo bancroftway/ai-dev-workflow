@@ -4,6 +4,7 @@ import { useAgent } from "@copilotkit/react-core/v2";
 import { parseImplementationPlan, PlanSurfaceRenderer } from "@/a2ui/catalog";
 import { A2UISurfaceView } from "@/components/A2UISurfaceView";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
+import { ViewContainer } from "@/components/ViewContainer";
 import { PLAN_SURFACE_ID } from "@/lib/a2ui-surface-ids";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
@@ -31,7 +32,7 @@ export function PlanView() {
     (interrupt.stage === "plan" ? parseImplementationPlan(interrupt.draft) : null);
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 p-6">
+    <ViewContainer>
       <ClarifyingQuestions
         stageKey="plan"
         questions={plan?.clarifying_questions ?? []}
@@ -53,6 +54,6 @@ export function PlanView() {
           )
         }
       />
-    </div>
+    </ViewContainer>
   );
 }

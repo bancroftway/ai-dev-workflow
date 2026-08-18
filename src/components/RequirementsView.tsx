@@ -5,6 +5,7 @@ import type { InputContent } from "@ag-ui/core";
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
+import { ViewContainer } from "@/components/ViewContainer";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
@@ -140,7 +141,7 @@ export function RequirementsView() {
   }
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 p-6">
+    <ViewContainer>
       <div>
         <h1 className="text-lg font-semibold">Requirements</h1>
         <p className="text-sm text-neutral-500">
@@ -185,7 +186,7 @@ export function RequirementsView() {
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        className="rounded-lg border border-neutral-300 focus-within:ring-1 focus-within:ring-neutral-400"
+        className="flex min-h-0 flex-1 flex-col rounded-lg border border-neutral-300 focus-within:ring-1 focus-within:ring-neutral-400"
       >
         <div className="flex items-center gap-1 border-b border-neutral-200 px-2 py-1">
           <ModeButton label="Edit" active={mode === "edit"} onClick={() => setMode("edit")} />
@@ -195,7 +196,7 @@ export function RequirementsView() {
         {mode === "edit" ? (
           <textarea
             ref={textareaRef}
-            className="min-h-[240px] w-full p-3 text-sm outline-none"
+            className="min-h-[240px] w-full flex-1 resize-none p-3 text-sm outline-none"
             placeholder="Describe your software idea... (markdown supported; paste or drag screenshots in)"
             value={text}
             onChange={(event) => setText(event.target.value)}
@@ -203,7 +204,7 @@ export function RequirementsView() {
             disabled={agent.isRunning || submitting}
           />
         ) : (
-          <div className="prose prose-sm min-h-[240px] max-w-none p-3 [&_img]:max-h-80 [&_img]:rounded-md [&_img]:border">
+          <div className="prose prose-sm min-h-[240px] max-w-none flex-1 overflow-y-auto p-3 [&_img]:max-h-80 [&_img]:rounded-md [&_img]:border">
             {text.trim() ? (
               <ReactMarkdown urlTransform={resolveUrl}>{text}</ReactMarkdown>
             ) : (
@@ -268,7 +269,7 @@ export function RequirementsView() {
           {agent.isRunning || submitting ? "Submitting…" : "Submit"}
         </button>
       </div>
-    </div>
+    </ViewContainer>
   );
 }
 

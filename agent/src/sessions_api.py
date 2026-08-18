@@ -22,17 +22,20 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from . import branch_naming, git_ops, session_store
+from . import branch_naming, git_ops, keyvault, session_store
 from .sandbox import get_sandbox_provider, registry
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+config_router = APIRouter(prefix="/vault-config", tags=["vault-config"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -64,6 +67,11 @@ class ProvisionRequest(BaseModel):
     # (a fresh UUID the frontend mints), since branch-per-session means there is no deterministic
     # (owner, repo, user) -> thread_id formula to recompute from anymore.
     resume: bool = False
+    # The user's Entra access token for the agent API, forwarded by the Next.js provision route.
+    # Exchanged once, immediately, on-behalf-of the user for this session's Key Vault secrets
+    # (keyvault.py), then discarded -- never stored, never passed into the sandbox. None in
+    # E2E-bypass and headless runs, which simply skip the vault fetch.
+    entra_assertion: str | None = None
 
 
 class ProvisionResponse(BaseModel):
@@ -82,6 +90,27 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             # Server-enforced, not just a hidden Resume button: a completed session can never be
             # resumed, regardless of what the frontend sends.
             raise HTTPException(status_code=409, detail="a completed session cannot be resumed")
+
+    # Vault fetch happens BEFORE the sandbox boots: a misconfigured/revoked vault fails the
+    # provision in seconds with the provider's own AADSTS/403 detail, instead of surfacing hours
+    # later as a confusing e2e boot failure. A configured vault with no assertion (E2E bypass,
+    # headless) is only a warning -- those runs proceed secretless, exactly as before.
+    vault_uri = await keyvault.get_vault_uri(body.owner, body.repo, body.user_login)
+    if vault_uri and body.entra_assertion:
+        try:
+            app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion)
+        except keyvault.VaultAccessError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail=f"key vault {vault_uri} is configured for this repo but not readable as you: {exc}",
+            ) from None
+        keyvault.set_app_secrets(body.thread_id, app_secrets)
+        logger.info("fetched %d app secret(s) for thread_id=%s", len(app_secrets), body.thread_id)
+    elif vault_uri:
+        logger.warning(
+            "key vault configured for %s/%s but provision carried no entra_assertion (thread_id=%s) -- app secrets unavailable",
+            body.owner, body.repo, body.thread_id,
+        )
 
     work_branch = branch_naming.work_branch_for(body.thread_id)
     provider = get_sandbox_provider()
@@ -151,6 +180,15 @@ class SessionResponse(BaseModel):
     failure_stage: str | None = None
     failure_type: str | None = None
     failure_message: str | None = None
+    # Live, not persisted: whether this session's sandbox is CURRENTLY registered in this agent
+    # process's memory right now (registry.py) -- independent of `status`, which only tracks the
+    # workflow's own DB lifecycle. An agent restart drops this to false for every session until
+    # each is reprovisioned, same as every other in-memory cache in this module.
+    container_alive: bool = False
+
+
+def _row_to_response(row: dict[str, Any]) -> "SessionResponse":
+    return SessionResponse(**row, container_alive=registry.get(row["session_id"]) is not None)
 
 
 class SessionListResponse(BaseModel):
@@ -166,7 +204,7 @@ async def list_sessions(
     that file no longer exists."""
     _check_shared_secret(request)
     rows = await session_store.list_sessions(owner, repo, source_branch)
-    return SessionListResponse(sessions=[SessionResponse(**row) for row in rows])
+    return SessionListResponse(sessions=[_row_to_response(row) for row in rows])
 
 
 @router.get("/{session_id}", response_model=SessionResponse)
@@ -177,15 +215,148 @@ async def get_session_row(session_id: str, request: Request) -> SessionResponse:
     row = await session_store.get_session(session_id)
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
-    return SessionResponse(**row)
+    return _row_to_response(row)
 
 
 @router.delete("/{thread_id}")
 async def terminate_session(thread_id: str, request: Request) -> ProvisionResponse:
+    """Container-only teardown (WorkspaceHeader's "Stop container" button): the sandbox and its
+    workspace volume are discarded, but the session's history row and its GitHub work branch are
+    untouched -- resuming later just provisions a fresh sandbox onto the same branch. For "delete
+    this session entirely," see delete_session_full below."""
     _check_shared_secret(request)
     provider = get_sandbox_provider()
     await provider.terminate(thread_id)
     # Explicit close discards the persistent workspace too (idle reaps deliberately keep it).
     await provider.discard_workspace(thread_id)
     registry.pop(thread_id)
+    keyvault.pop_app_secrets(thread_id)
     return ProvisionResponse(status="terminated")
+
+
+class DeleteSessionRequest(BaseModel):
+    # The CURRENT caller's live GitHub token, forwarded fresh per request -- git_ops._PUSH_TOKENS
+    # is agent-restart-fragile by design and would silently no-op on exactly the old sessions a
+    # user is most likely to be purging. Optional: an empty/absent token just skips the remote
+    # branch delete (the session row is still removed -- this app's own bookkeeping shouldn't be
+    # held hostage by a GitHub-side failure).
+    github_token: str = ""
+
+
+class DeleteSessionResponse(BaseModel):
+    status: str
+    branch_deleted: bool
+
+
+@router.post("/{thread_id}/delete", response_model=DeleteSessionResponse)
+async def delete_session_full(thread_id: str, body: DeleteSessionRequest, request: Request) -> DeleteSessionResponse:
+    """Full purge (SessionHistory's "Delete" button): stop the container if one is running,
+    discard its workspace, delete the session's own GitHub work branch, and remove the history
+    row so it no longer shows up in the list at all. Session-scoped teardown only -- never called
+    for a session still in progress from the UI, but idempotent either way (every step here
+    already tolerates an already-gone container/branch/row)."""
+    _check_shared_secret(request)
+    row = await session_store.get_session(thread_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    provider = get_sandbox_provider()
+    await provider.terminate(thread_id)
+    await provider.discard_workspace(thread_id)
+    registry.pop(thread_id)
+    keyvault.pop_app_secrets(thread_id)
+
+    branch_deleted = False
+    if body.github_token:
+        branch_deleted = await git_ops.delete_remote_branch(
+            owner=row["owner"], repo=row["repo"], branch=row["work_branch"], token=body.github_token
+        )
+
+    await session_store.delete_session(thread_id)
+    return DeleteSessionResponse(status="deleted", branch_deleted=branch_deleted)
+
+
+class SessionActionRequest(BaseModel):
+    """Named actions only -- the frontend never sends shell. Adding an action = a new Literal
+    member plus a handler branch below; anything else is rejected by validation before it runs."""
+
+    action: Literal["refresh-secrets"]
+    entra_assertion: str = ""
+
+
+class SessionActionResponse(BaseModel):
+    ok: bool = True
+    secret_count: int
+
+
+@router.post("/{thread_id}/actions", response_model=SessionActionResponse)
+async def run_session_action(thread_id: str, body: SessionActionRequest, request: Request) -> SessionActionResponse:
+    """On-demand, frontend-initiated work against a live session. v1: "refresh-secrets" -- the
+    user added/rotated a vault secret mid-session and wants it picked up without starting over.
+    Re-fetches on-behalf-of the user with the fresh assertion the frontend just minted, updates
+    the in-process cache (also the recovery path when an agent restart dropped it), and re-writes
+    the env file inside the sandbox if one is running."""
+    _check_shared_secret(request)
+    row = await session_store.get_session(thread_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    # Only "refresh-secrets" exists; a second action turns this into a match on body.action.
+    vault_uri = await keyvault.get_vault_uri(row["owner"], row["repo"], row["user_login"])
+    if not vault_uri:
+        raise HTTPException(status_code=404, detail="no key vault is configured for this repo")
+    if not body.entra_assertion:
+        raise HTTPException(status_code=401, detail="no Entra assertion -- sign in again")
+    try:
+        app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion)
+    except keyvault.VaultAccessError as exc:
+        raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
+
+    keyvault.set_app_secrets(thread_id, app_secrets)
+    if registry.get(thread_id) is not None:
+        await keyvault.write_env_file(get_sandbox_provider(), thread_id, app_secrets)
+    logger.info("refreshed %d app secret(s) for thread_id=%s", len(app_secrets), thread_id)
+    return SessionActionResponse(secret_count=len(app_secrets))
+
+
+# --- per user-repo vault configuration (settings page) ----------------------------------------
+
+_VAULT_URI_RE = re.compile(r"^https://[a-z0-9][a-z0-9-]{1,22}[a-z0-9]\.vault\.azure\.net/?$")
+
+
+class VaultConfigResponse(BaseModel):
+    vault_uri: str
+
+
+@config_router.get("", response_model=VaultConfigResponse)
+async def get_vault_config(request: Request, owner: str, repo: str, user_login: str) -> VaultConfigResponse:
+    _check_shared_secret(request)
+    vault_uri = await keyvault.get_vault_uri(owner, repo, user_login)
+    if not vault_uri:
+        raise HTTPException(status_code=404, detail="no key vault configured")
+    return VaultConfigResponse(vault_uri=vault_uri)
+
+
+class VaultConfigPutRequest(BaseModel):
+    owner: str
+    repo: str
+    user_login: str
+    vault_uri: str
+    entra_assertion: str
+
+
+@config_router.put("", response_model=SessionActionResponse)
+async def put_vault_config(body: VaultConfigPutRequest, request: Request) -> SessionActionResponse:
+    """Save the mapping -- but only after proving it works: a test-read on-behalf-of the caller.
+    The 403 detail (AADSTS code and all) goes back verbatim so the settings page can show the
+    user exactly which grant is missing. Nothing is saved on a failed test."""
+    _check_shared_secret(request)
+    vault_uri = body.vault_uri.strip()
+    if not _VAULT_URI_RE.match(vault_uri):
+        raise HTTPException(status_code=422, detail="vault_uri must look like https://<name>.vault.azure.net/")
+    try:
+        app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion)
+    except keyvault.VaultAccessError as exc:
+        raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
+    await keyvault.set_vault_uri(body.owner, body.repo, body.user_login, vault_uri)
+    return SessionActionResponse(secret_count=len(app_secrets))

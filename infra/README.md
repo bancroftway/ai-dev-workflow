@@ -28,7 +28,9 @@ az deployment group validate \
   --resource-group <rg> \
   --template-file main.bicep \
   --parameters namePrefix=<prefix> authGithubId=<id> authGithubSecret=<secret> authSecret=<secret> \
-               copilotGithubToken=<token> sqlAadAdminObjectId=<your-aad-object-id> sqlAadAdminLogin=<your-upn-or-group-name>
+               copilotGithubToken=<token> sqlAadAdminObjectId=<your-aad-object-id> sqlAadAdminLogin=<your-upn-or-group-name> \
+               entraTenantId=<tenant-id> entraAppId=<app-client-id> entraClientSecret=<secret> \
+               agentSharedSecret=<random>
 az deployment group what-if \
   --resource-group <rg> \
   --template-file main.bicep \
@@ -51,6 +53,46 @@ session can provision a sandbox. After the first `az deployment group create`, p
 `CONTAINER_APP_NAME_*` repo variables and the OIDC login secrets are configured — see the
 comments at the top of `.github/workflows/deploy-*.yml`), then subsequent pushes to `main` keep
 everything current automatically.
+
+## One-time Entra app registration (sign-in + on-behalf-of Key Vault)
+
+ONE app registration, created once per tenant, covers all three roles: user sign-in, the exposed
+API scope, and the OBO confidential client (same-app OBO is a documented, supported pattern; the
+split-registration variant was deliberately collapsed — fewest moving parts for a single-tenant
+internal tool). The design: users sign in with Entra ID; the access token (audience = this same
+app) is forwarded at provision time as an OBO assertion; the agent (`agent/src/keyvault.py`)
+exchanges it on-behalf-of the user for a Key Vault token. **The service has no standing vault
+access** — Azure evaluates the *user's* RBAC on every vault read.
+
+Portal (portal.azure.com → Microsoft Entra ID → App registrations → New registration):
+
+1. Name e.g. `<prefix>-app` · **Accounts in this organizational directory only** · Redirect URI:
+   platform **Web**, `http://localhost:3000/api/auth/callback/microsoft-entra-id` (add
+   `https://<frontend-fqdn>/api/auth/callback/microsoft-entra-id` for prod) → Register.
+   Overview page: client id → `entraAppId` / `AIDW_AGENT_APP_ID`; tenant id → `entraTenantId` /
+   `AZURE_TENANT_ID`.
+2. **Expose an API** → set the Application ID URI (default `api://<client-id>`) → **Add a
+   scope** named `access_as_user`, consent "Admins and users", enabled.
+3. **API permissions** → Add a permission → **My APIs** → this same app → Delegated →
+   `access_as_user` → Add → **Grant admin consent** (the app requests its own scope at sign-in;
+   without consent every login prompts or fails with AADSTS65001).
+4. **Certificates & secrets** → New client secret → copy the Value →
+   `entraClientSecret` / `AIDW_AGENT_CLIENT_SECRET`.
+
+Per-user vault access (each vault's owner, once per user): grant `Key Vault Secrets User` —
+
+```bash
+az role assignment create --role "Key Vault Secrets User" \
+  --assignee <user-upn> --scope <vault-resource-id>
+```
+
+Users point a repo at their vault via the app's per-repo settings page (gear icon on the repo
+list); the save test-reads the vault as them, so a bad grant fails loudly at configure time.
+Notes: apps that read Key Vault *themselves* at startup work by storing their own service
+principal's `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` as vault secrets (the env
+injection makes `DefaultAzureCredential`'s environment path work inside the sandbox). Tenant
+Conditional Access policies can block the OBO exchange (AADSTS530xx) — the error detail is
+surfaced verbatim in the settings page and provision failures.
 
 ## One-time SQL grant (run once per environment, after the first deploy)
 
@@ -77,8 +119,9 @@ whichever shell invokes it too).
 
 ## Known gaps
 
-- No Key Vault — secrets are Container Apps' own built-in secrets, per Decision 4 (small internal
-  tool, this is sufficient at this scale; see the plan's D.3 note on what changes later).
+- No Key Vault *for the service's own secrets* — those are Container Apps' built-in secrets, per
+  Decision 4 (small internal tool, sufficient at this scale). User-app secrets are different:
+  they come from per user-repo Key Vaults read on-behalf-of the user (section above).
 - No custom domain/TLS config beyond the platform-managed `*.azurecontainerapps.io` certificate.
 - The agent's own identity is granted resource-group-scoped **Contributor** to manage ACI
   container groups — broader than strictly needed (no built-in role is narrower for

@@ -4,6 +4,7 @@ import { useAgent } from "@copilotkit/react-core/v2";
 import { parseSpecification, SpecificationSurfaceRenderer } from "@/a2ui/catalog";
 import { A2UISurfaceView } from "@/components/A2UISurfaceView";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
+import { ViewContainer } from "@/components/ViewContainer";
 import { SPECIFICATION_SURFACE_ID } from "@/lib/a2ui-surface-ids";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
@@ -28,7 +29,7 @@ export function SpecificationView() {
     (interrupt.stage === "specification" ? parseSpecification(interrupt.draft) : null);
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 p-6">
+    <ViewContainer>
       <ClarifyingQuestions
         stageKey="specification"
         questions={stage?.clarifying_questions ?? []}
@@ -44,6 +45,6 @@ export function SpecificationView() {
           )
         }
       />
-    </div>
+    </ViewContainer>
   );
 }

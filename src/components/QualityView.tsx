@@ -1,6 +1,7 @@
 "use client";
 
 import { useAgent } from "@copilotkit/react-core/v2";
+import { ViewContainer } from "@/components/ViewContainer";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { RemediationFinding, WorkflowState } from "@/lib/workflow-types";
 
@@ -78,7 +79,7 @@ export function QualityView() {
   const latestHealth = scan?.latest_summary?.health_score;
 
   return (
-    <div className="mx-auto flex max-w-4xl flex-col gap-4 p-6">
+    <ViewContainer>
       <div>
         <h1 className="text-lg font-semibold">Quality</h1>
         <p className="text-sm text-neutral-500">
@@ -158,6 +159,6 @@ export function QualityView() {
       {!quality && !security && !tests && !metrics && (
         <p className="text-sm text-neutral-500">Quality stages haven’t run yet — they start after the build stages complete.</p>
       )}
-    </div>
+    </ViewContainer>
   );
 }

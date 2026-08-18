@@ -101,6 +101,38 @@ async def open_pull_request(
         return None
 
 
+async def delete_remote_branch(*, owner: str, repo: str, branch: str, token: str) -> bool:
+    """Deletes a branch ref via a plain REST call -- no sandbox/clone needed, so this works even
+    for a long-idle session whose container was already reaped. Uses the CURRENT caller's live
+    GitHub token (forwarded fresh per delete request), never the in-memory _PUSH_TOKENS cache:
+    that cache is agent-restart-fragile by design (see its own module comment) and would silently
+    no-op on exactly the old sessions a user is most likely to be cleaning up.
+
+    404 (branch already gone, e.g. deleted via a merged PR) counts as success -- the caller's goal
+    ("this branch should not exist") is already satisfied. Any other failure is log-and-continue,
+    returned as False: a session's DB row should still be deletable even if GitHub is unreachable
+    or the token lacks permission, since the row is this app's own bookkeeping, not GitHub's."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.delete(
+                f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}", headers=headers
+            )
+        except httpx.HTTPError:
+            logger.warning("delete_remote_branch request failed for %s/%s@%s", owner, repo, branch, exc_info=True)
+            return False
+    if resp.status_code in (204, 404):
+        return True
+    logger.warning(
+        "delete_remote_branch failed for %s/%s@%s: %s %s", owner, repo, branch, resp.status_code, resp.text[:300]
+    )
+    return False
+
+
 async def push_head(provider: SandboxProvider, thread_id: str) -> None:
     """Pushes HEAD (this session's own unique work branch) to origin, log-and-continue.
 

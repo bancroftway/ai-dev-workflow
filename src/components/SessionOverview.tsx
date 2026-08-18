@@ -1,6 +1,7 @@
 "use client";
 
 import { useAgent } from "@copilotkit/react-core/v2";
+import { ViewContainer } from "@/components/ViewContainer";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -23,7 +24,7 @@ export function SessionOverview() {
   const stages = Object.entries(state.stages ?? {});
 
   return (
-    <div className="mx-auto flex max-w-2xl flex-col gap-3 p-6">
+    <ViewContainer>
       <h1 className="text-lg font-semibold">Session Overview</h1>
       {stages.length === 0 && <p className="text-sm text-neutral-500">No stages have run yet.</p>}
       <ol className="flex flex-col gap-2">
@@ -34,6 +35,6 @@ export function SessionOverview() {
           </li>
         ))}
       </ol>
-    </div>
+    </ViewContainer>
   );
 }

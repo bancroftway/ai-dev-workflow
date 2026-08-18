@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
+import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
 import { E2E_GITHUB_ID, E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
 
@@ -20,10 +20,10 @@ import { E2E_GITHUB_ID, E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
  * PAT must have `repo` read on that repo.
  */
 export async function POST(request: Request) {
-  const session = await auth();
-  const accessToken = session?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
-  const githubId = session?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
-  const userLogin = session?.login ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
+  const token = await getServerAuthToken();
+  const accessToken = token?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
+  const githubId = token?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
+  const userLogin = token?.login ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
   if (!accessToken || !githubId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -54,6 +54,10 @@ export async function POST(request: Request) {
       // Advisory only -- see session_store.py's module docstring.
       user_login: userLogin ?? "",
       resume: Boolean(resume),
+      // Fresh Entra access token (the jwt callback refreshes it before this route reads it) --
+      // the agent exchanges it on-behalf-of for the session's Key Vault secrets at provision
+      // time, then discards it. Absent in E2E-bypass mode; the agent skips the vault fetch then.
+      entra_assertion: token?.entraAccessToken ?? null,
     }),
   });
 

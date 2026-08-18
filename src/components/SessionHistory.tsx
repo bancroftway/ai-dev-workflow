@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { ContainerStatusButton } from "@/components/ContainerStatus";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 
 const STATUS_BADGE: Record<Session["status"], string> = {
@@ -51,6 +52,9 @@ export function SessionHistory({
   const router = useRouter();
   const [sessions, setSessions] = useState<Session[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -80,10 +84,62 @@ export function SessionHistory({
     router.push(`/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}?resume=1`);
   }
 
+  async function stopContainer(session: Session) {
+    const confirmed = window.confirm(
+      "Stop this session's dev-tool container? Its in-progress sandbox workspace is discarded " +
+        "-- work already pushed to GitHub is unaffected, but resuming this session later " +
+        "provisions a fresh container.",
+    );
+    if (!confirmed) return;
+    setStoppingId(session.session_id);
+    try {
+      const res = await fetch("/api/sessions/terminate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: session.session_id }),
+      });
+      if (res.ok) {
+        setSessions((prev) =>
+          prev?.map((s) => (s.session_id === session.session_id ? { ...s, container_alive: false } : s)) ?? prev,
+        );
+      }
+    } finally {
+      setStoppingId(null);
+    }
+  }
+
+  async function deleteSession(session: Session) {
+    const confirmed = window.confirm(
+      `Delete "${session.title}"? This stops its container if one is running, deletes its ` +
+        `GitHub branch (${session.work_branch}), and removes it from this list. This cannot be undone.`,
+    );
+    if (!confirmed) return;
+    setDeleteError(null);
+    setDeletingId(session.session_id);
+    try {
+      const res = await fetch("/api/sessions/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: session.session_id }),
+      });
+      const body = (await res.json()) as { detail?: string };
+      if (res.ok) {
+        setSessions((prev) => prev?.filter((s) => s.session_id !== session.session_id) ?? prev);
+      } else {
+        setDeleteError(body.detail ?? `Delete failed (${res.status})`);
+      }
+    } catch {
+      setDeleteError("Delete failed: network error");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-2">
       <h2 className="text-sm font-medium text-neutral-700">Sessions on this branch</h2>
       {error && <p className="text-sm text-red-600">{error}</p>}
+      {deleteError && <p className="text-sm text-red-600">{deleteError}</p>}
       {!error && sessions === null && <p className="text-sm text-neutral-500">Loading sessions…</p>}
       {sessions?.length === 0 && (
         <p className="text-sm text-neutral-500">No sessions yet for this repository/branch.</p>
@@ -97,11 +153,18 @@ export function SessionHistory({
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="truncate font-medium text-neutral-900">{s.title}</span>
-                <span
-                  className={`shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[s.status]}`}
-                >
-                  {s.status.replace("_", " ")}
-                </span>
+                <div className="flex shrink-0 items-center gap-2">
+                  <ContainerStatusButton
+                    status={s.container_alive ? "ready" : "terminated"}
+                    onStop={() => stopContainer(s)}
+                    stopping={stoppingId === s.session_id}
+                  />
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[s.status]}`}
+                  >
+                    {s.status.replace("_", " ")}
+                  </span>
+                </div>
               </div>
               <div className="text-xs text-neutral-500">
                 {s.user_login || "unknown"} · started {s.started_at} · ended {s.ended_at ?? "—"}
@@ -144,6 +207,15 @@ export function SessionHistory({
                     )}
                   </>
                 )}
+                <button
+                  type="button"
+                  title="Stops its container if running, deletes its GitHub branch, and removes it from this list."
+                  className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-500 hover:border-red-300 hover:bg-red-50 hover:text-red-700 disabled:opacity-40"
+                  disabled={deletingId === s.session_id}
+                  onClick={() => deleteSession(s)}
+                >
+                  {deletingId === s.session_id ? "Deleting…" : "Delete"}
+                </button>
               </div>
             </li>
           ))}

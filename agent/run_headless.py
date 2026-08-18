@@ -39,7 +39,7 @@ logger = logging.getLogger("run_headless")
 from langchain_core.messages import HumanMessage  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
-from src import copilot_chat_model, git_ops  # noqa: E402
+from src import branch_naming, copilot_chat_model, git_ops  # noqa: E402
 from src.graph import graph  # noqa: E402
 from src.sandbox import get_sandbox_provider, registry  # noqa: E402
 
@@ -108,6 +108,7 @@ async def run(args: argparse.Namespace) -> int:
         session_id=thread_id,
         repo_clone_url=f"https://github.com/{args.owner}/{args.repo}.git",
         branch=args.branch,
+        work_branch=branch_naming.work_branch_for(thread_id),
         git_user_token=git_token,
         copilot_auth_token=copilot_token,
     )

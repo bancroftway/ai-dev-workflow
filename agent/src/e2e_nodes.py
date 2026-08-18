@@ -31,7 +31,7 @@ from langchain_core.runnables import RunnableConfig
 
 from . import app_discovery
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files
+from . import git_ops, keyvault, model_config, repo_files, session_store
 from .copilot_chat_model import get_chat_model_for_thread
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
@@ -212,13 +212,40 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     port = int(app.get("port") or 3000)
     start_command = str(app["start_command"])
 
-    # Secrets stripped from the started app's environment: docker exec inherits this container's
-    # own env (including the Copilot session's fleet PAT), and an app that leaked its env on an
-    # error page would otherwise get screenshotted and committed straight into git history.
+    # App secrets (keyvault.py): fetched on-behalf-of the user at provision time, injected here
+    # as an env file sourced only into the app's own shell. Cache empty but a vault IS configured
+    # means the agent restarted since provision -- an infra/user-action gap the e2e fix LLM can't
+    # patch, so escalate (cannot_verify) instead of burning fix cycles booting a secretless app.
+    app_secrets = keyvault.get_app_secrets(thread_id)
+    if app_secrets is None:
+        sess_row = await session_store.get_session(thread_id)
+        if sess_row is not None and await keyvault.get_vault_uri(
+            sess_row["owner"], sess_row["repo"], sess_row["user_login"]
+        ):
+            e2e["status"] = "failed"
+            e2e["cannot_verify"] = True
+            e2e["failed_tests"] = [{
+                "title": "app secrets",
+                "error": "a key vault is configured for this repo but no secrets are cached "
+                         "(agent restarted since provision?) -- click 'Refresh Key Vault secrets' "
+                         "in the workspace header, then retry",
+            }]
+            return {"e2e": e2e}
+    if app_secrets:
+        await keyvault.write_env_file(provider, thread_id, app_secrets)
+        launch_command = f"set -a; . {keyvault.APP_ENV_PATH} 2>/dev/null; set +a; {start_command}"
+    else:
+        launch_command = start_command
+
+    # Fleet secrets stripped from the started app's environment: docker exec inherits this
+    # container's own env (including the Copilot session's fleet PAT), and an app that leaked its
+    # env on an error page would otherwise get screenshotted and committed straight into git
+    # history. The vault env file above is the OPPOSITE case -- secrets the user intends the app
+    # to have.
     await provider.exec_in_sandbox(
         thread_id,
         f"env -u COPILOT_SDK_AUTH_TOKEN -u COPILOT_CONNECTION_TOKEN -u GITHUB_TOKEN "
-        f"nohup sh -c {shlex.quote(start_command)} > {E2E_APP_LOG_PATH} 2>&1 & echo $! > {E2E_APP_PID_PATH}",
+        f"nohup sh -c {shlex.quote(launch_command)} > {E2E_APP_LOG_PATH} 2>&1 & echo $! > {E2E_APP_PID_PATH}",
     )
 
     ready = False
@@ -307,7 +334,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         await provider.exec_in_sandbox(thread_id, f"mkdir -p {shlex.quote(screens_dir)}")
         shot = await provider.exec_in_sandbox(
             thread_id,
-            f"{run_prefix}{shot_cmd} --full-page http://localhost:{port} {shlex.quote(f'{screens_dir}/001.png')} 2>&1",
+            f"{shot_cmd} --full-page http://localhost:{port} {shlex.quote(f'{screens_dir}/001.png')} 2>&1",
         )
         landed = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(f'{screens_dir}/001.png')} 2>/dev/null")
         if (landed.stdout or "").strip():

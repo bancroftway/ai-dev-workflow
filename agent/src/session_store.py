@@ -175,6 +175,15 @@ async def close_session(
         )
 
 
+async def delete_session(session_id: str) -> None:
+    """Removes the row entirely -- distinct from close_session (which ends an attempt but keeps
+    its history). Used only by the explicit "delete session" purge (sessions_api.delete_session_full),
+    never by the ordinary run lifecycle."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute("DELETE FROM dbo.sessions WHERE session_id = ?", session_id)
+
+
 _COLUMNS = [
     "session_id", "owner", "repo", "user_login", "title", "source_branch", "work_branch",
     "run_id", "current_stage", "status", "started_at", "ended_at", "merge_ready",
@@ -271,11 +280,14 @@ async def _demo() -> None:
         sessions = await list_sessions(owner, repo)
         assert any(s["session_id"] == session_id for s in sessions), sessions
 
+        await delete_session(session_id)
+        assert await get_session(session_id) is None
+
         print("session_store self-check: ok")
     finally:
-        pool = await _get_pool()
-        async with pool.acquire() as conn, conn.cursor() as cur:
-            await cur.execute("DELETE FROM dbo.sessions WHERE session_id = ?", session_id)
+        # Idempotent: the assertions above already deleted the row on the success path, so this
+        # is only reached (and only matters) if an earlier assertion raised first.
+        await delete_session(session_id)
 
 
 async def _demo_and_close() -> None:

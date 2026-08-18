@@ -455,8 +455,15 @@ def candidates_to_apps(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
 def _surviving_apps(report: dict[str, Any], scan: dict[str, Any]) -> list[dict[str, Any]]:
     """Drop any app whose path the model invented. A scan candidate is proof enough; so is a path
     that really exists (the model gets read-only tools and may legitimately find a stack the
-    marker table never looked for)."""
-    candidate_paths = {c["path"] for c in (scan.get("candidates") or [])}
+    marker table never looked for) -- EXCEPT when the scan found nothing at all. An empty
+    candidate list means there is no grounding whatsoever, so the model's own path="." claim
+    can't be trusted on its bare say-so: a README-only repo was previously classified "suitable"
+    this way, with a fabricated app the model invented despite being told never to, which skipped
+    the greenfield picker entirely and free-drafted an ungrounded tech stack instead."""
+    candidates = scan.get("candidates") or []
+    if not candidates:
+        return []
+    candidate_paths = {c["path"] for c in candidates}
     surviving: list[dict[str, Any]] = []
     for app in report.get("apps") or []:
         path = str(app.get("path") or "").strip()
@@ -770,6 +777,13 @@ def _demo() -> None:
         ]
     }
     assert [a["path"] for a in _surviving_apps(report, scan)] == ["src/Api", "services/go-gateway"]
+
+    # Finding (2026-08): a README-only repo scanned zero candidates, yet the model still claimed
+    # a runnable app at path="." -- the deterministic backstop must refuse ANY app when the scan
+    # itself found nothing, regardless of what the model reports.
+    hallucinated = {"apps": [{"path": ".", "app_class": "web", "runtime": "node22", "start_command": "npm start"}]}
+    assert _surviving_apps(hallucinated, {"candidates": []}) == []
+    assert _surviving_apps(hallucinated, {}) == []
 
     # Fingerprint: order-insensitive over paths, sensitive to content.
     assert fingerprint(nextjs) == fingerprint(dict(reversed(list(nextjs.items()))))
