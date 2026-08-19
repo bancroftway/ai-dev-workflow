@@ -96,6 +96,25 @@ def _parse_vitest_json(raw_json: str) -> dict[str, str]:
     return results
 
 
+def _repo_relative(path: str) -> str | None:
+    """A model-reported path normalised to repo-relative, or None when it escapes the repo.
+
+    Models report absolute container paths despite being asked for repo-relative ones (observed:
+    '/workspace/repo/test-results-0/test-results-0.trx'), and repo_files rejects those with a
+    ValueError that used to propagate straight out of the node and kill the run.
+    """
+    cleaned = (path or "").strip()
+    if not cleaned:
+        return None
+    for prefix in ("/workspace/repo/", "workspace/repo/", "./"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
+    if cleaned.startswith("/") or ".." in cleaned.split("/"):
+        return None
+    return cleaned or None
+
+
 async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     test_hardening = dict(state.get("test_hardening") or default_test_hardening_state())
@@ -134,7 +153,18 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
     outcomes: dict[str, list[str]] = {}
     for attempt in range(TEST_HARDENING_TOTAL_ATTEMPTS):
         command = discovery.command.replace(_ATTEMPT_TOKEN, str(attempt))
-        result_path = discovery.result_path.replace(_ATTEMPT_TOKEN, str(attempt))
+        result_path = _repo_relative(discovery.result_path.replace(_ATTEMPT_TOKEN, str(attempt)))
+        if result_path is None:
+            # A path outside the repo is a bad report, not a reason to kill the run. Previously the
+            # reported '/workspace/repo/test-results-0/test-results-0.trx' reached read_repo_file
+            # verbatim and its ValueError propagated out of the node, ending an otherwise healthy
+            # run with a stack trace instead of a stage result.
+            logger.warning(
+                "test-hardening: reported result_path %r is not inside the repo -- skipping flake check",
+                discovery.result_path,
+            )
+            test_hardening["last_exit_ok"] = True
+            return {"test_hardening": test_hardening}
         await provider.exec_in_sandbox(thread_id, command)
         raw_result = await repo_files.read_repo_file(provider, thread_id, result_path)
         if raw_result is None:

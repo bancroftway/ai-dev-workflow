@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 from dataclasses import replace
 from typing import Any
@@ -59,25 +60,85 @@ async def _read_baseline(provider: Any, thread_id: str) -> dict[str, Any] | None
 
 
 async def _read_coverage_summary(provider: Any, thread_id: str) -> dict[str, float | None]:
-    """Re-parses whichever coverage artifact P6/audit-cluster's own gates already produced -- never
-    re-runs coverage a third time, per the plan's explicit instruction."""
-    raw_cobertura = await repo_files.read_repo_file(provider, thread_id, "TestResults/coverage.cobertura.xml")
-    if raw_cobertura is not None:
-        import defusedxml.ElementTree as ET
+    """Re-parses whichever coverage artifact the earlier gates already produced -- never re-runs
+    coverage a third time, per the plan's explicit instruction.
 
+    Artifacts are SEARCHED FOR, not assumed at two fixed root paths. The old version looked only at
+    `TestResults/coverage.cobertura.xml` and `coverage/coverage-summary.json`, which exist only when
+    the project sits at the repo root; every generated monorepo writes
+    `apps/api.Tests/TestResults/<guid>/coverage.cobertura.xml` instead, so this returned None and the
+    regression gate failed the run with "coverage unmeasured" despite a fully measured 100% suite.
+    Parsing is delegated to test_coverage_gate's own parsers so both places agree on what a number
+    means (including its branch-attribute case handling and per-line condition parsing).
+    """
+    from .gates.test_coverage_gate import (
+        COVERAGE_COMMANDS_PATH,
+        _Counts,
+        _parse_cobertura_counts,
+        _parse_istanbul_counts,
+    )
+
+    # The contract written by the coverage gate is the AUTHORITATIVE list: one artifact per test
+    # root, naming exactly the file that root's command produces. Globbing the tree instead is
+    # actively wrong -- `dotnet test` writes a fresh TestResults/<guid>/ directory on every run, so a
+    # repo that has been through a few verify cycles holds a dozen historical snapshots, and summing
+    # them counts the same assembly over and over. That produced a confident, entirely fictional
+    # "88.9% line / 61.9% branch" for a suite the gate had just measured above 95%.
+    contract_paths: list[str] = []
+    raw_contract = await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH)
+    if raw_contract:
         try:
-            root = ET.fromstring(raw_cobertura)
-            return {"line_rate": float(root.get("line-rate", "0")) * 100, "branch_rate": float(root.get("branch-rate", "0")) * 100}
-        except Exception:  # noqa: BLE001 -- best-effort metrics, never fail the whole node over a parse error
-            pass
-    raw_summary = await repo_files.read_repo_file(provider, thread_id, "coverage/coverage-summary.json")
-    if raw_summary is not None:
-        try:
-            total = json.loads(raw_summary).get("total", {})
-            return {"line_rate": total.get("lines", {}).get("pct"), "branch_rate": total.get("branches", {}).get("pct")}
-        except json.JSONDecodeError:
-            pass
-    return {"line_rate": None, "branch_rate": None}
+            contract_paths = [
+                str(entry["artifact"])
+                for entry in (json.loads(raw_contract).get("entries") or [])
+                if entry.get("artifact")
+            ]
+        except (json.JSONDecodeError, TypeError):
+            contract_paths = []
+
+    if contract_paths:
+        paths = contract_paths
+    else:
+        # No contract (an older branch, or a stage that never ran): fall back to the NEWEST artifact
+        # per test root, so at least nothing is double-counted.
+        listing = await provider.exec_in_sandbox(
+            thread_id,
+            "find . \\( -name 'coverage.cobertura.xml' -o -name 'coverage-summary.json' \\) "
+            "-not -path '*/node_modules/*' -not -path './.git/*' -printf '%T@ %p\\n' 2>/dev/null "
+            "| sort -rn | head -40",
+        )
+        newest_per_root: dict[str, str] = {}
+        for line in (listing.stdout or "").splitlines():
+            _, _, path = line.strip().partition(" ")
+            if not path:
+                continue
+            root = re.split(r"/(?:TestResults|coverage)", path, maxsplit=1)[0]
+            newest_per_root.setdefault(root, path)  # sorted newest-first, so the first wins
+        paths = list(newest_per_root.values())
+    merged: list[_Counts] = []
+    for path in paths:
+        raw = await repo_files.read_repo_file(provider, thread_id, path.removeprefix("./"))
+        if raw is None:
+            continue
+        counts, _ = (
+            _parse_cobertura_counts(raw) if path.endswith(".xml") else _parse_istanbul_counts(raw)
+        )
+        if counts is not None:
+            merged.append(counts)
+    if not merged:
+        return {"line_rate": None, "branch_rate": None}
+
+    # Counts, not rates, are what merge correctly across stacks: averaging a 10-line worker's rate
+    # with a 10k-line app's would weigh them equally.
+    lines_covered = sum(c.lines_covered for c in merged)
+    lines_total = sum(c.lines_total for c in merged)
+    branches_covered = sum(c.branches_covered for c in merged)
+    branches_total = sum(c.branches_total for c in merged)
+    return {
+        "line_rate": (100.0 * lines_covered / lines_total) if lines_total else None,
+        # No branch points anywhere is vacuously full coverage, not 0% -- same convention the gate uses.
+        "branch_rate": (100.0 * branches_covered / branches_total) if branches_total else 100.0,
+    }
 
 
 def _traceability_rows(
@@ -118,18 +179,22 @@ async def _build_traceability_matrix(provider: Any, thread_id: str) -> list[dict
     # Same two-step scan as ac_coverage_gate's fallback: tracked/untracked-but-not-ignored files
     # with test/spec in the path (node_modules etc. are gitignored, so never listed), then ONE
     # grep -F for every id spelling -- no per-file reads, no docker exec per file.
-    listing = await provider.exec_in_sandbox(
-        thread_id, "git ls-files -co --exclude-standard | grep -iE '(test|spec)' || true"
+    # The file list is piped into xargs rather than interpolated into the command, and vendored
+    # directories are filtered out. Both matter: `git ls-files -co` includes UNTRACKED files, and a
+    # run that had npm download a browser into apps/web/.playwright-browsers/ contributed thousands
+    # of paths matching /test|spec/, which built a single command line past Windows' 32 KB limit and
+    # killed the node outright with "[WinError 206] The filename or extension is too long". xargs
+    # chunks the arguments itself, so no file count can reproduce that.
+    id_patterns = " ".join(f"-e {shlex.quote(v)}" for e in ac_entries for v in id_variants(e["id"]))
+    excluded = "/(node_modules|\\.playwright-browsers|bin|obj|dist|build|\\.next|\\.venv|vendor|TestResults|coverage)/"
+    grep = await provider.exec_in_sandbox(
+        thread_id,
+        "git ls-files -co --exclude-standard "
+        "| grep -iE '(test|spec)' "
+        f"| grep -vE {shlex.quote(excluded)} "
+        f"| xargs -r -d '\\n' grep -h -o -F {id_patterns} -- 2>/dev/null | sort -u || true",
     )
-    test_files = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
-    found_tokens: set[str] = set()
-    if test_files:
-        id_patterns = " ".join(f"-e {shlex.quote(v)}" for e in ac_entries for v in id_variants(e["id"]))
-        quoted_files = " ".join(shlex.quote(f) for f in test_files)
-        grep = await provider.exec_in_sandbox(
-            thread_id, f"grep -h -o -F {id_patterns} -- {quoted_files} 2>/dev/null | sort -u"
-        )
-        found_tokens = set((grep.stdout or "").split())
+    found_tokens = set((grep.stdout or "").split())
     return _traceability_rows(ac_entries, found_tokens, commit_log)
 
 

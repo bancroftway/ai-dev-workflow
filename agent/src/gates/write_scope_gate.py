@@ -12,6 +12,7 @@ touched.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shlex
@@ -72,6 +73,41 @@ def _is_pipeline_owned(path: str) -> bool:
 # stage's own prompt mandates, and the coverage gate relies on the same split to exclude browser
 # specs from a unit run.
 _E2E_PATH_RE = re.compile(r"(^|/)e2e(/|$)|(^|/)playwright\.config\.[jt]sx?$|\.e2e\.[jt]sx?$", re.IGNORECASE)
+
+
+def _has_e2e_test(changed_paths: list[str]) -> bool:
+    """True when a real browser-level spec was written (a playwright config alone doesn't count --
+    a config with no spec runs zero tests and still yields no screenshots)."""
+    return any(
+        _is_test_path(p)
+        and _E2E_PATH_RE.search(p)
+        and not _is_pipeline_owned(p)
+        and not p.endswith(("playwright.config.ts", "playwright.config.js"))
+        for p in changed_paths
+    )
+
+
+async def _stack_has_ui(provider: SandboxProvider, thread_id: str) -> bool:
+    """UI-framework signal read from the repo's own approved tech-stack record.
+
+    Read from disk rather than from this stage's content_dict, which holds the ac-to-tests draft and
+    has no tech_stack key. Uses the same `frameworks_have_ui` helper as e2e's gate and P3's wireframe
+    requirement, so all three agree on what "has a UI" means. Fails OPEN (False) when the record is
+    unreadable -- an unreadable artifact must not be reported as a missing browser test.
+    """
+    from ..tech_stack_signals import frameworks_have_ui
+
+    for path in (".ai-dev-workflow/tech-stack.approved.json", ".ai-dev-workflow/tech-stack.draft.json"):
+        raw = await repo_files.read_repo_file(provider, thread_id, path)
+        if raw is None:
+            continue
+        try:
+            frameworks = json.loads(raw).get("frameworks") or []
+        except json.JSONDecodeError:
+            continue
+        if frameworks:
+            return frameworks_have_ui([str(f) for f in frameworks])
+    return False
 
 
 def _has_non_e2e_test(changed_paths: list[str]) -> bool:
@@ -255,6 +291,33 @@ async def verify_ac_to_tests(
             report={"changed_paths": write_scope.changed_paths, "e2e_only": True},
         )
 
+    # The mirror of the check above: a UI stack that wrote NO browser test at all. Both directions
+    # are enforced because each alone is satisfiable while dodging the other -- e2e-only stops at the
+    # outermost layer, and no-e2e leaves the running app unproven and (just as concretely) leaves the
+    # e2e stage with nothing to run, which is how every delivered branch ended up with zero
+    # screenshots and a blocked merge.
+    if await _stack_has_ui(provider, thread_id) and not _has_e2e_test(real_changes):
+        return VerificationResult(
+            passed=False,
+            feedback=(
+                "You did NOT write a Playwright spec. Check the working tree before you answer "
+                "again: previous attempts reported \"Added required Playwright e2e skeleton files "
+                "beside the web app (config + spec)\" four times in a row while making no write "
+                "call for either file, so the claim was false each time and this gate caught it "
+                "each time. Your response is metadata about files that must already exist.\n\n"
+                "This stack has a UI framework but you wrote no Playwright end-to-end spec. The "
+                "running app is never exercised through a browser, and the e2e stage has nothing to "
+                "run -- so the merge is blocked for missing visual evidence no matter how good the "
+                "unit tests are. Add a playwright.config.ts beside the web app plus at least one "
+                "spec under its tests/e2e/ covering the primary user journeys. Import from "
+                "'@playwright/test' in BOTH the config and the specs (mixing that with "
+                "'playwright/test' loads two runner copies and playwright refuses to run), set "
+                "screenshot: 'on', take baseURL from process.env.BASE_URL, and locate elements with "
+                "getByTestId. Keep the tests below the UI that you already wrote."
+            ),
+            report={"changed_paths": write_scope.changed_paths, "missing_e2e": True},
+        )
+
     coverage = await check_ac_coverage(provider, thread_id, content_dict)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
     if write_scope.reverted_paths:
@@ -265,6 +328,16 @@ async def verify_ac_to_tests(
 def _demo() -> None:
     """Self-check for the pure path classifiers. The gate's own I/O half needs a sandbox."""
     # e2e-only suites are what this stage produced live, and must be rejected
+    # A UI stack must ALSO write a browser spec -- the mirror of the e2e-only rejection. A config
+    # with no spec does not count: it runs zero tests and yields no screenshots.
+    assert _has_e2e_test(["apps/web/tests/e2e/a.spec.ts"])
+    assert not _has_e2e_test(["apps/web/playwright.config.ts"])
+    assert not _has_e2e_test(["apps/api.Tests/TaskTests.cs", "apps/web/src/app/calc.test.ts"])
+    assert not _has_e2e_test([".ai-dev-workflow/ledger.jsonl"])
+    # Both directions together: a full, healthy suite satisfies each check.
+    _full = ["apps/web/tests/e2e/a.spec.ts", "apps/api.Tests/TaskTests.cs"]
+    assert _has_e2e_test(_full) and _has_non_e2e_test(_full)
+
     assert not _has_non_e2e_test(["apps/web/tests/e2e/task-tracker.ac.spec.ts"])
     assert not _has_non_e2e_test(["apps/web/tests/e2e/a.spec.ts", "apps/web/playwright.config.ts"])
     # a real pyramid passes

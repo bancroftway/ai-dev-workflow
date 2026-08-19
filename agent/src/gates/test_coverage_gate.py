@@ -155,6 +155,61 @@ _FRONTEND_NPM_PACKAGES: tuple[tuple[str, str], ...] = (
 )
 
 
+# A declared backend framework and the evidence that it is a RUNNING SERVICE rather than a library.
+# Observed live (nextjs-dotnet): the run declared "ASP.NET Core Web API", shipped apps/api as a plain
+# `Microsoft.NET.Sdk` class library with no Program.cs and no endpoints, and passed every gate --
+# 98.9% coverage on C# that the running app never called, next to a Next.js frontend keeping its
+# state in localStorage. Two disconnected halves, neither of them the approved app.
+_BACKEND_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("asp.net", ("Microsoft.NET.Sdk.Web", "Microsoft.AspNetCore.App", "WebApplication", "WebHost")),
+    ("aspnet", ("Microsoft.NET.Sdk.Web", "Microsoft.AspNetCore.App", "WebApplication", "WebHost")),
+    ("fastapi", ("FastAPI(",)),
+    ("flask", ("Flask(",)),
+    ("django", ("WSGI_APPLICATION", "ASGI_APPLICATION", "urlpatterns")),
+    ("express", ("express(",)),
+    ("nest", ("NestFactory",)),
+)
+
+# HTTP calls a frontend makes to reach its backend. localStorage-only persistence is the specific
+# false-pass this exists to catch, so browser-storage APIs are deliberately NOT in this list.
+_HTTP_CALL_MARKERS = ("fetch(", "axios", "httpclient", "$fetch", "xmlhttprequest", "useswr", "usequery(")
+
+
+def missing_hosted_backend(frameworks: list[str], project_texts: dict[str, str]) -> str | None:
+    """A declared backend framework with no evidence of an actual HTTP host, or None.
+
+    `project_texts` maps a repo-relative path to its contents (project files and entry points).
+    Fails OPEN when no backend framework is declared or nothing could be read: only positive
+    evidence that the declared service is not hosted counts against the stage.
+    """
+    if not project_texts:
+        return None
+    blob = "\n".join(project_texts.values())
+    for framework in frameworks:
+        name = str(framework).lower()
+        for marker, needles in _BACKEND_MARKERS:
+            if marker not in name:
+                continue
+            if not any(needle.lower() in blob.lower() for needle in needles):
+                return str(framework)
+            break
+    return None
+
+
+def frontend_only_uses_local_storage(frontend_texts: dict[str, str]) -> bool:
+    """True when the frontend persists state but never calls a backend over HTTP.
+
+    Only meaningful when a backend was declared -- the caller checks that. A single-tier app that
+    legitimately has no backend must never reach this.
+    """
+    if not frontend_texts:
+        return False
+    blob = "\n".join(frontend_texts.values()).lower()
+    if any(marker in blob for marker in _HTTP_CALL_MARKERS):
+        return False
+    return "localstorage" in blob or "sessionstorage" in blob or "indexeddb" in blob
+
+
 def missing_frontend_dependency(frameworks: list[str], package_json: str | None) -> str | None:
     """A declared JS/TS framework absent from package.json's dependencies, or None.
 
@@ -179,6 +234,80 @@ def missing_frontend_dependency(frameworks: list[str], package_json: str | None)
             if package not in declared:
                 return str(framework)
             break
+    return None
+
+
+async def _declared_frameworks(provider: SandboxProvider, thread_id: str) -> list[str]:
+    """Frameworks from the repo's own tech-stack record; empty when unreadable (fail open)."""
+    for path in (".ai-dev-workflow/tech-stack.approved.json", ".ai-dev-workflow/tech-stack.draft.json"):
+        raw = await repo_files.read_repo_file(provider, thread_id, path)
+        if raw is None:
+            continue
+        try:
+            frameworks = json.loads(raw).get("frameworks") or []
+        except json.JSONDecodeError:
+            continue
+        if frameworks:
+            return [str(f) for f in frameworks]
+    return []
+
+
+async def _check_integration_fidelity(
+    provider: SandboxProvider, thread_id: str, source_files: list[str]
+) -> str | None:
+    """Feedback describing a declared-but-unbuilt backend or a frontend that never calls it, else None.
+
+    This is the "is it actually one app" check. Coverage says nothing about it: a class library with
+    no host can be tested to 99% while the running product never invokes a line of it.
+    """
+    frameworks = await _declared_frameworks(provider, thread_id)
+    if not frameworks:
+        return None
+
+    # Project/entry files that would carry the evidence of a real HTTP host.
+    backend_paths = [
+        path for path in source_files
+        if path.endswith((".csproj", "Program.cs", "Startup.cs", "main.py", "app.py", "server.js", "server.ts", "index.js", "index.ts", "main.ts"))
+    ]
+    project_files = await provider.exec_in_sandbox(
+        thread_id, "git ls-files '*.csproj' && git ls-files --others --exclude-standard '*.csproj'"
+    )
+    backend_paths += [line.strip() for line in (project_files.stdout or "").splitlines() if line.strip()]
+    texts: dict[str, str] = {}
+    for path in sorted(set(backend_paths))[:25]:
+        content = await repo_files.read_repo_file(provider, thread_id, path)
+        if content is not None:
+            texts[path] = content
+
+    unhosted = missing_hosted_backend(frameworks, texts)
+    if unhosted:
+        return (
+            f"The approved Tech Stack declares {unhosted} as this app's backend, but nothing in the "
+            f"repository actually hosts it: no web-SDK project file and no entry point that builds a "
+            f"running HTTP service with mapped endpoints. What exists is a library -- code nothing "
+            f"invokes. Its tests can reach any coverage number and still prove nothing about the "
+            f"running product.\n\nBuild the real service: for ASP.NET Core that means "
+            f"Sdk=\"Microsoft.NET.Sdk.Web\" and a Program.cs that builds a WebApplication and maps "
+            f"the endpoints the Specification's ACs describe, then have the frontend call it."
+        )
+
+    # Only ask the "does the frontend call it" question when a backend was actually declared --
+    # a legitimately single-tier app has nothing to call.
+    if not any(marker in str(f).lower() for f in frameworks for marker, _ in _BACKEND_MARKERS):
+        return None
+    frontend_texts: dict[str, str] = {}
+    for path in [p for p in source_files if p.lower().endswith((".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"))][:30]:
+        content = await repo_files.read_repo_file(provider, thread_id, path)
+        if content is not None:
+            frontend_texts[path] = content
+    if frontend_only_uses_local_storage(frontend_texts):
+        return (
+            "The frontend persists its state in browser storage and never calls the backend over "
+            "HTTP -- there is no fetch/axios/HttpClient call anywhere in it. The declared API is "
+            "therefore dead code, and the two halves of this app are not connected, so what would "
+            "ship is not the app that was approved.\n\nWire the frontend to the API: replace the "
+            "browser-storage persistence with calls to the endpoints the backend exposes."
+        )
     return None
 
 
@@ -613,6 +742,14 @@ async def verify_coverage(
             report={"infra_error": "declared_frontend_missing", "framework": missing_ui},
         )
 
+    integration_problem = await _check_integration_fidelity(provider, thread_id, source_files)
+    if integration_problem:
+        return VerificationResult(
+            passed=False,
+            feedback=integration_problem,
+            report={"infra_error": "integration_fidelity"},
+        )
+
     line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id)
 
     if line_rate is None:
@@ -811,6 +948,34 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert missing_frontend_dependency(["Next.js"], "{not json") is None
     # Non-npm frontends are not judged by package.json at all.
     assert missing_frontend_dependency(["Blazor"], _placeholder) is None
+
+    # Integration fidelity. The live nextjs-dotnet failure: "ASP.NET Core Web API" declared, but
+    # apps/api was a plain class library with no Program.cs, beside a localStorage-only frontend.
+    _lib_only = {"apps/api/Api.csproj": '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup/></Project>'}
+    assert missing_hosted_backend(["ASP.NET Core Web API"], _lib_only) == "ASP.NET Core Web API"
+    _hosted = {
+        "apps/api/Api.csproj": '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>',
+        "apps/api/Program.cs": "var builder = WebApplication.CreateBuilder(args);",
+    }
+    assert missing_hosted_backend(["ASP.NET Core Web API"], _hosted) is None
+    # A FrameworkReference-style host counts too -- plain Sdk is not by itself proof of a library.
+    assert missing_hosted_backend(
+        ["ASP.NET Core"], {"a/Program.cs": "WebApplication.CreateBuilder(args)"}
+    ) is None
+    assert missing_hosted_backend(["FastAPI"], {"api/main.py": "app = FastAPI()"}) is None
+    assert missing_hosted_backend(["FastAPI"], {"api/main.py": "def add(a, b): return a + b"}) == "FastAPI"
+    # Fails OPEN: nothing declared, or nothing readable.
+    assert missing_hosted_backend(["Next.js", "xUnit"], _lib_only) is None
+    assert missing_hosted_backend(["ASP.NET Core"], {}) is None
+
+    # Frontend that never calls the API is the other half of the same defect.
+    assert frontend_only_uses_local_storage({"web/storage.ts": "localStorage.setItem('x', v)"})
+    assert not frontend_only_uses_local_storage({"web/api.ts": "await fetch(`${base}/expenses`)"})
+    # A cache in front of real HTTP calls is fine -- only storage with NO http call is the failure.
+    assert not frontend_only_uses_local_storage(
+        {"web/api.ts": "await fetch(u)", "web/cache.ts": "localStorage.setItem('c', v)"}
+    )
+    assert not frontend_only_uses_local_storage({})
 
     print("test_coverage_gate self-check: all assertions passed")
 

@@ -16,6 +16,20 @@ If a test command is the ONLY thing a stack offers, prefer a type-check or a no-
 running it, and if you genuinely cannot separate the two, say so in `summary` and judge solely on
 compilation/type errors, ignoring assertion failures.
 
+PREFER THE PROJECT'S OWN BUILD SCRIPT over a raw compiler invocation whenever package.json defines
+one (`npm run build`, `npm run typecheck`). Modern frameworks generate type declarations as part of
+their build, and their tsconfig then *includes* those generated files -- so a bare `tsc --noEmit` on
+a clean checkout fails on files that do not exist yet and never could. Observed live, a Next.js app:
+
+    error TS6053: File '.next/types/app/layout.ts' not found.
+      Matched by include pattern '.next/types/**/*.ts' in 'apps/web/tsconfig.json'
+
+Nothing was wrong with that code. `.next/` is generated and gitignored, so the errors say only that
+the build had not been run -- and the fix agent that ran next could not repair it either, because
+there was nothing to repair. `npm run build` in that directory generates the types and then
+type-checks, which is the answer this stage actually wants. Reserve a raw `tsc --noEmit` for
+projects that define no build script of their own.
+
 Work out how to build this repository yourself, then do it. Do not assume the project lives at
 the repository root: a generated monorepo commonly keeps its projects under `apps/` or similar,
 and running a build tool from the wrong directory fails instantly with a misleading error (e.g.

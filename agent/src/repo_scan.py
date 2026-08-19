@@ -1000,14 +1000,82 @@ def health_score(by_severity: dict[str, int], metrics: dict[str, Any]) -> int:
     return max(0, min(100, round(100 - penalty)))
 
 
+# Paths whose findings are REPORTED but never block a merge: they are not the application. Three
+# kinds, all observed gating a real run -- 53 of its 68 gating findings came from here:
+#   * the pipeline's own scratch output. `agent-work/gitleaks.json` IS a secret-scanner report, so
+#     scanning it finds 48 "Base64 High Entropy String" secrets -- the pipeline flagging its own
+#     evidence of scanning, and by far the loudest signal in the run.
+#   * build outputs and restored artifacts (bin/, obj/, .next/, dist/), which are regenerated.
+#   * vendored third-party payloads -- node_modules and, memorably, a downloaded Chromium's bundled
+#     accessibility scripts under .playwright-browsers/.
+# Nothing here is code a human wrote or can meaningfully fix, and a gate that blocks on it teaches
+# people to ignore the gate.
+_NON_APPLICATION_PATH_RE = re.compile(
+    r"(^|/)("
+    r"agent-work|\.ai-dev-workflow|node_modules|\.playwright-browsers|"
+    r"bin|obj|dist|build|out|\.next|\.nuxt|\.venv|vendor|TestResults|coverage"
+    r")/",
+)
+
+
+def is_non_application_path(path: str | None) -> bool:
+    """True for pipeline scratch, build output, and vendored payloads. Pure; self-checked below."""
+    if not path:
+        return False
+    return bool(_NON_APPLICATION_PATH_RE.search(path if path.startswith("/") else f"/{path}"))
+
+
+# Rule namespaces that describe PORTABILITY/STYLE rather than a defect. semgrep ships an i18n pack
+# whose `jsx-not-internationalized` fires on every literal string in a component -- 7 gating findings
+# on a counter app, for text no requirement asked to be translatable. Reported, never blocking:
+# these say "you have not internationalised this", which is a product decision, not a security or
+# correctness problem, and a gate that blocks on it blocks every UI app forever.
+_NON_GATING_RULE_RE = re.compile(
+    r"\.portability\.|i18next|jsx-not-internationalized"
+    # Fires once per dependency block in package.json -- a generic "you have dependencies" lint
+    # rather than a finding about this code. Six identical copies gated one run.
+    r"|package-dependencies-check"
+)
+
+# Lock files list TRANSITIVE dependencies -- packages this application never chose. A licence
+# obligation on one of them is a decision for a human (and often has no action available at all:
+# @img/sharp-* arrives with Next.js itself and cannot be removed from it), so it is reported and
+# never blocking. A licence finding on the MANIFEST, which the app author does control, still gates.
+_LOCK_FILE_RE = re.compile(r"(^|/)(package-lock\.json|packages\.lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Cargo\.lock|go\.sum)$")
+
+
+def is_transitive_dependency_file(path: str | None) -> bool:
+    """True for lock files, whose contents are resolved transitively rather than authored. Pure."""
+    return bool(path) and bool(_LOCK_FILE_RE.search(path))
+
+
+def is_advisory_rule(rule_id: str | None) -> bool:
+    """True for rules that report a stylistic/portability preference, not a defect. Pure."""
+    return bool(rule_id) and bool(_NON_GATING_RULE_RE.search(rule_id))
+
+
 def is_gating(finding: Finding, *, severity_floor: str, introduced_ids: frozenset[str] | None) -> bool:
     """Security gates absolutely, at or above the floor -- an inherited CVE is still exploitable.
     Quality gates only on what this pipeline introduced, so a brownfield repo's pre-existing debt
     cannot deadlock its first gate. With no baseline (greenfield) `introduced_ids` is None and
     every quality finding gates, which is the same rule."""
+    # Checked before category: a finding outside the application never gates, however severe it
+    # looks, because there is nothing in the product to fix.
+    if is_non_application_path(finding.file):
+        return False
+    if is_advisory_rule(finding.rule_id):
+        return False
+    # A licence obligation inherited through a lock file is not actionable in this repository.
+    if finding.category == "license" and is_transitive_dependency_file(finding.file):
+        return False
     if finding.category in SECURITY_CATEGORIES:
         return meets_or_exceeds(finding.severity, severity_floor)
     if finding.category in QUALITY_CATEGORIES:
+        # The floor applies here TOO. Without it a `low` finding gates while a `low` security
+        # finding does not -- observed: "Docstring coverage under threshold" (low) blocking a run
+        # whose floor was `medium`, which is not a defensible reason to refuse a merge.
+        if not meets_or_exceeds(finding.severity, severity_floor):
+            return False
         return introduced_ids is None or finding.finding_key in introduced_ids
     return False
 
@@ -2141,6 +2209,64 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert all("--config auto" not in t.command for t in TOOLS), "no network rule fetch"
     assert "--skip-db-update" in TOOLS_BY_NAME["trivy"].command
     assert "--offline-vulnerabilities" in TOOLS_BY_NAME["osv-scanner"].command
+
+    # Non-application paths never gate. Each of these actually gated a real run.
+    assert is_non_application_path("agent-work/gitleaks.json")          # 48 of that run's 68
+    assert is_non_application_path("apps/web/.playwright-browsers/chromium-1234/x/main.js")
+    assert is_non_application_path("apps/api.Tests/bin/Debug/net10.0/Api.Tests.deps.json")
+    assert is_non_application_path("apps/api.Tests/obj/project.assets.json")
+    assert is_non_application_path("apps/web/node_modules/left-pad/index.js")
+    assert is_non_application_path(".ai-dev-workflow/history/x-report.json")
+    # Real application code still gates -- this must not become a blanket amnesty.
+    assert not is_non_application_path("apps/web/src/app/page.tsx")
+    assert not is_non_application_path("apps/api/Program.cs")
+    assert not is_non_application_path("apps/web/package.json")
+    assert not is_non_application_path("src/binary_search.py")   # 'bin' must not match inside a word
+    assert not is_non_application_path("apps/api/Services/Outbox.cs")  # nor 'out'
+    assert not is_non_application_path(None)
+
+    _noisy = Finding(
+        finding_key="k1", tool="checkov", rule_id="CKV_SECRET_6", severity="high",
+        raw_severity="HIGH", file="agent-work/gitleaks.json", line=29,
+        message="Base64 High Entropy String", category="misconfig",
+        title="Base64 High Entropy String", severity_source="native", sources=("checkov",),
+    )
+    assert not is_gating(_noisy, severity_floor="medium", introduced_ids=None)
+    _real = replace(_noisy, finding_key="k2", file="apps/web/src/app/page.tsx")
+    assert is_gating(_real, severity_floor="medium", introduced_ids=None)
+
+    # Advisory (portability/i18n) rules report but never block -- 7 of one run's gating findings
+    # were a single semgrep i18n rule firing on untranslated JSX text in a counter demo.
+    assert is_advisory_rule(
+        "opt.aidw.semgrep-rules.typescript.react.portability.i18next.jsx-not-internationalized"
+    )
+    assert not is_advisory_rule("python.lang.security.audit.dangerous-subprocess-use")
+    assert not is_advisory_rule(None)
+    _i18n = replace(_real, finding_key="k3", category="sast",
+                    rule_id="opt.aidw.semgrep-rules.typescript.react.portability.i18next.jsx-not-internationalized")
+    assert not is_gating(_i18n, severity_floor="medium", introduced_ids=None)
+    # A REAL security rule in the same file still gates -- this is not a blanket sast exemption.
+    _sec = replace(_real, finding_key="k4", category="sast", rule_id="typescript.react.security.audit.react-dangerouslysetinnerhtml")
+    assert is_gating(_sec, severity_floor="medium", introduced_ids=None)
+
+    # Transitive licence obligations are advisory; a licence on the manifest still gates.
+    assert is_transitive_dependency_file("apps/web/package-lock.json")
+    assert is_transitive_dependency_file("poetry.lock") and is_transitive_dependency_file("go.sum")
+    assert not is_transitive_dependency_file("apps/web/package.json")
+    _lic = replace(_noisy, finding_key="k5", category="license", rule_id="LGPL-3.0-or-later",
+                   file="apps/web/package-lock.json", severity="high")
+    assert not is_gating(_lic, severity_floor="medium", introduced_ids=None)
+    assert is_gating(replace(_lic, finding_key="k6", file="apps/web/package.json"),
+                     severity_floor="medium", introduced_ids=None)
+    # The generic npm dependency lint is advisory (6 identical copies gated one run).
+    assert is_advisory_rule("opt.aidw.semgrep-rules.json.npm.security.package-dependencies-check")
+    # Quality findings respect the severity floor, exactly as security ones do.
+    _low_quality = replace(_noisy, finding_key="k7", category="maintainability",
+                           rule_id="docstring-coverage-under-threshold", severity="low",
+                           file="apps/api/Program.cs")
+    assert not is_gating(_low_quality, severity_floor="medium", introduced_ids=None)
+    assert is_gating(replace(_low_quality, finding_key="k8", severity="high"),
+                     severity_floor="medium", introduced_ids=None)
 
     print("repo_scan self-check: all assertions passed")
 

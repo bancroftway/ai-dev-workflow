@@ -26,7 +26,10 @@ Steps:
 
 Then report via `report_stage_output`:
 - `command`: the command with `<<attempt_token>>` still in it (not the substituted form).
-- `result_path`: the result file path, also still containing `<<attempt_token>>`.
+- `result_path`: the result file path, REPO-RELATIVE (e.g. `agent-work/test-results-<<attempt_token>>.trx`),
+  also still containing `<<attempt_token>>`. Never an absolute path like
+  `/workspace/repo/...` -- the orchestrator reads it relative to the repository root and an
+  absolute path is rejected outright, costing this stage its whole run.
 - `format`: `trx` or `vitest-json`.
 - `success`: true only if your proving run actually produced a readable result file.
 - `error`: if you could not produce one, the real reason.

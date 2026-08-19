@@ -72,6 +72,46 @@ Both levels are runnable here without touching dependency manifests (which you m
 `apps/api.Tests/Api.Tests.csproj` plus `*Tests.cs` files), and JS/TS unit tests run under the
 sandbox's own baked vitest with just a `vitest.config.ts` -- no `package.json` change required.
 
+## Playwright: REQUIRED when this stack has a UI, and it must be written this exact way
+
+A UI stack with no Playwright suite is rejected by the gate. Write, beside the web app (e.g.
+`apps/web/`), both of these:
+
+1. `playwright.config.ts`:
+
+```ts
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './tests/e2e',
+  use: {
+    baseURL: process.env.BASE_URL ?? 'http://localhost:3000',
+    screenshot: 'on',
+  },
+});
+```
+
+2. At least one spec under `<web-app>/tests/e2e/*.spec.ts` covering the primary user journeys.
+
+Three details are not stylistic -- get them wrong and the suite cannot run at all:
+
+- **Import from `'@playwright/test'`** -- the idiomatic path, in both the config and every spec.
+  Use the SAME import specifier in both; mixing `'@playwright/test'` in one and `'playwright/test'`
+  in the other loads two copies of the runner and playwright rejects it outright with "did not
+  expect test.beforeEach() to be called here ... two different versions of @playwright/test".
+  The orchestrator guarantees this import resolves; you add no dependency (you cannot edit
+  `package.json`).
+- **`screenshot: 'on'`**, not the default `'only-on-failure'`. These images become the visual record
+  attached to the run's exit report, so they are needed when tests PASS.
+- **`baseURL` from `process.env.BASE_URL`.** The orchestrator boots the app on a port it chooses and
+  passes it in; a hardcoded URL points at nothing.
+
+Locate elements with **`data-testid`** via `page.getByTestId('expense-row')`, never by CSS class,
+DOM position, or visible text. Class names and copy change for cosmetic reasons and take the suite
+down with them; a test id is a contract. The stage that writes the UI is instructed to put a
+`data-testid` on every element a test needs, so name the ids you expect in that AC's
+`coverage_plan` entry -- that is the handshake between the two stages.
+
 Besides that proving (happy-path) test, for every AC write further tests where meaningful, each
 following the same AC-id-in-test-name rule above unchanged: negative tests covering invalid input,
 unauthorized/forbidden access, and wrong state, asserting the SPECIFIC rejection/error behavior

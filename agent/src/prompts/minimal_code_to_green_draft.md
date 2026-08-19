@@ -54,6 +54,40 @@ end-to-end specs under `tests/e2e/` (so a unit runner can exclude them -- they c
 by vitest/jest), and never install coverage packages into the repo. Coverage is measured from real
 report files, so the way to pass this gate is genuinely-tested code, not configuration.
 
+## Install CURRENT dependency versions, never a version you remember
+
+When you add a dependency, let the package manager resolve the current release -- `npm install next`
+(or `@latest`), `dotnet add package X` without a `--version` -- and never type a specific version
+number from memory. A remembered version is months or years old, and old releases carry published
+CVEs that the security scan then blocks the run on, correctly.
+
+Observed live: a hand-written `"next": "15.4.6"` produced 33 gating vulnerability findings, including
+a CRITICAL pre-authentication remote-code-execution advisory, on an app whose own code was fine. The
+fix was a one-line version bump that the package manager would have chosen unprompted. The same
+mistake in reverse also happens with runtimes: pin the toolchain version this sandbox actually has
+installed, not the one you are most familiar with.
+
+## The app must be WIRED TOGETHER, and its UI must be testable
+
+Two requirements that are checked deterministically, not judged by taste:
+
+**A full-stack app is one app, not two.** If the approved Tech Stack declares both a backend API and
+a frontend, then the backend must be a real HTTP service that actually starts (for ASP.NET Core:
+`Sdk="Microsoft.NET.Sdk.Web"` and a `Program.cs` that builds a `WebApplication` and maps endpoints)
+and the frontend must actually CALL it over HTTP. A frontend that keeps its state in `localStorage`
+beside a backend nothing invokes is not the approved app -- it is two disconnected halves, and the
+backend's tests then prove nothing about the running product no matter how high their coverage.
+Observed live: a run shipped a C# class library with no host at all next to a Next.js app persisting
+to `localStorage`, passed every gate, and delivered an "API" that was dead code.
+
+**Every element a test touches needs a `data-testid`.** Put one on each input, button, list row,
+total, error message, and empty-state element -- anything an end-to-end test asserts on or interacts
+with. Use stable semantic names tied to meaning, not layout (`data-testid="expense-row"`,
+`data-testid="add-member-button"`, `data-testid="net-balance-total"`). The tests written in the
+previous stage locate elements with `page.getByTestId(...)`; check that stage's specs for the ids
+they expect and honour those exact names. Selecting by CSS class or visible text breaks the suite on
+any cosmetic change, which is why the id is the contract.
+
 Report every file you changed (`changed_files`, one-line summaries -- git is the actual diff, this
 is metadata, not a restatement of the code), how your subagent tasks went, and any `known_gaps` --
 things you know are incomplete or risky, stated plainly rather than hidden.

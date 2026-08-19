@@ -198,21 +198,25 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
     # without trusting reporter formatting at all. Tautological (green) ids can't hide here:
     # a green test printed its ✓ line and was classified "pass" above.
     if missing and not result_ok:
-        listing = await provider.exec_in_sandbox(
-            thread_id, "git ls-files -co --exclude-standard | grep -iE '(test|spec)' || true"
+        # Piped into xargs, not interpolated: `git ls-files -co` lists UNTRACKED files too, so a
+        # vendored directory (a browser npm downloaded into apps/web, say) can contribute thousands
+        # of /test|spec/ matches and push a single command line past the OS argv limit -- which
+        # killed metrics_compute's identical scan with "[WinError 206] The filename or extension is
+        # too long". Fixed here as well because the bug is the pattern, not the one call site.
+        id_patterns = " ".join(f"-e {shlex.quote(v)}" for ac in missing for v in variants_by_id[ac])
+        excluded = "/(node_modules|\\.playwright-browsers|bin|obj|dist|build|\\.next|\\.venv|vendor|TestResults|coverage)/"
+        grep = await provider.exec_in_sandbox(
+            thread_id,
+            "git ls-files -co --exclude-standard "
+            "| grep -iE '(test|spec)' "
+            f"| grep -vE {shlex.quote(excluded)} "
+            f"| xargs -r -d '\\n' grep -h -o -F {id_patterns} -- 2>/dev/null | sort -u || true",
         )
-        all_test_files = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
-        if all_test_files:
-            id_patterns = " ".join(f"-e {shlex.quote(v)}" for ac in missing for v in variants_by_id[ac])
-            quoted_files = " ".join(shlex.quote(f) for f in all_test_files)
-            grep = await provider.exec_in_sandbox(
-                thread_id, f"grep -h -o -F {id_patterns} -- {quoted_files} 2>/dev/null | sort -u"
-            )
-            found_tokens = set((grep.stdout or "").split())
-            for ac in missing:
-                if found_tokens & set(variants_by_id[ac]):
-                    ac_line_status[ac] = "fail"
-            missing = [ac for ac in active_ac_ids if ac not in ac_line_status]
+        found_tokens = set((grep.stdout or "").split())
+        for ac in missing:
+            if found_tokens & set(variants_by_id[ac]):
+                ac_line_status[ac] = "fail"
+        missing = [ac for ac in active_ac_ids if ac not in ac_line_status]
 
     tautological = [ac for ac in active_ac_ids if ac_line_status.get(ac) == "pass"]
 

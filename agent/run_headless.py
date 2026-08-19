@@ -148,6 +148,25 @@ async def run(args: argparse.Namespace) -> int:
                     # can be approved while the run recorded a terminal problem elsewhere.
                     ok=statuses.get("metrics-exit") == "approved" and values.get("run_failure") is None,
                 )
+                # A stage status can be APPROVED purely from hydration -- restored from a previous
+                # run's metrics-exit.approved.json in the repo. When that happens the stage
+                # short-circuits, exit_finalize never runs, and the exit report left on the branch
+                # belongs to an earlier run: observed live, a run that had just re-run e2e and
+                # metrics reported ok=true while the committed report still read "no e2e
+                # screenshots were captured" from 40 minutes earlier. Proof of THIS run finishing is
+                # its own exit report, which only exit_finalize writes.
+                run_id = values.get("run_id")
+                if outcome["ok"] and run_id:
+                    probe = await provider.exec_in_sandbox(
+                        thread_id, f"ls .ai-dev-workflow/history/{run_id}-exit.md 2>/dev/null"
+                    )
+                    if not (probe.stdout or "").strip():
+                        outcome["ok"] = False
+                        outcome["error"] = (
+                            f"exit_finalize did not run this run (no history/{run_id}-exit.md): the "
+                            "final stage was approved from hydrated state, so the exit report, "
+                            "manifest and screenshots on the branch are a previous run's."
+                        )
                 break
 
             interrupts = snap.interrupts or tuple(i for task in snap.tasks for i in task.interrupts)

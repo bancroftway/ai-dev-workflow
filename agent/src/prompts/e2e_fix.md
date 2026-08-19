@@ -9,6 +9,18 @@ reason. NEVER delete a test, skip it (`.skip`/`test.fixme`), or weaken its asser
 pass -- a test that no longer proves the behavior it was written for is a regression dressed up as
 a fix.
 
+Two failures here are environmental rather than bugs in the app, and are fixed in the suite's own
+files:
+
+- **"did not expect test.beforeEach() to be called here" / "two different versions of
+  @playwright/test"** -- the config and the specs are importing the runner under DIFFERENT
+  specifiers, which loads two copies of it. Make every file (`playwright.config.ts` and every spec)
+  import from `'@playwright/test'`, consistently. Do not add a dependency; the import resolves.
+- **"No tests found"** -- the config's `testDir` does not point at where the specs actually live.
+  Fix the path rather than moving the specs.
+
+Everything else here is a real defect: fix the app.
+
 Failing tests:
 <<failed_tests_json>>
 

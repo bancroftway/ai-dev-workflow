@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 CHANGELOG_PATH = "CHANGELOG.md"
 HISTORY_DIR = ".ai-dev-workflow/history"
+# Stable, run-id-free location for the LATEST run's exit report, so a human landing on the delivered
+# branch can find it without knowing a run id. The per-run copy under HISTORY_DIR remains the archive.
+EXIT_REPORT_PATH = ".ai-dev-workflow/EXIT-REPORT.md"
 
 # No retention/pruning of history/ here anymore: that subsystem existed to bound growth across
 # MANY sessions dumping artifacts into one shared branch (WS0's single ai-dev-workflow branch).
@@ -80,6 +83,23 @@ async def _list_screenshots(provider: Any, thread_id: str, run_id: str) -> list[
     return [f"{screens_dir}/{name}" for name in names]
 
 
+def _screen_label(filename: str) -> tuple[str, str]:
+    """('001-expenses-new.png') -> ('Expenses New', '/expenses/new').
+
+    The route is recovered from the filename because e2e_nodes names each shot after the route it
+    captured (_route_slug) -- so the report can say WHICH screen an image shows without a second
+    channel of state to keep in sync. Suite-harvested images have no route; they are labelled as
+    such rather than given a fabricated one.
+    """
+    stem = filename.rsplit(".", 1)[0]
+    slug = stem.split("-", 1)[1] if "-" in stem else stem
+    if slug == "suite":
+        return "Test run", "(from playwright suite)"
+    if slug == "home":
+        return "Home", "/"
+    return slug.replace("-", " ").title(), "/" + slug.replace("-", "/")
+
+
 def _render_history_sections(
     *,
     files_changed_stat: str,
@@ -89,6 +109,7 @@ def _render_history_sections(
     screenshots: list[str],
     run_id: str,
     e2e: dict[str, Any] | None = None,
+    screenshot_prefix: str = "./",
 ) -> str:
     """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
     markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
@@ -144,11 +165,15 @@ def _render_history_sections(
 
     # Unconditional section -- the exit report has a fixed skeleton, and "no screenshots" must be
     # a stated fact with a reason, never a silently missing heading.
-    lines += ["## E2E Screenshots", ""]
+    lines += ["## Screens", ""]
     if screenshots:
+        lines += ["| Screen | Route | Screenshot |", "|---|---|---|"]
         for path in screenshots:
             name = path.rsplit("/", 1)[-1]
-            lines.append(f"![{name}](./{run_id}-screens/{name})")
+            screen, route = _screen_label(name)
+            lines.append(f"| {screen} | `{route}` | ![{screen}]({screenshot_prefix}{run_id}-screens/{name}) |")
+        lines.append("")
+        lines.append(f"{len(screenshots)} screenshot(s) captured from the running application.")
     else:
         reason = e2e.get("skipped_reason") or ""
         lines.append(f"(none captured -- e2e {e2e_status}{': ' + reason if reason else ''})")
@@ -426,10 +451,26 @@ async def exit_finalize_node(
     )
     await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
 
+    # A second copy at a FIXED, obvious path. The per-run file above is the archive, but its name
+    # carries a run id and sits a directory deep, so on a delivered branch nobody finds it -- the
+    # report was reviewed as "missing" for five consecutive runs while being committed every time.
+    # Screenshot links are re-based to history/... because this copy lives one level up from them.
+    latest_markdown = render_exit_markdown(merge_readiness or {}) + "\n" + _render_history_sections(
+        files_changed_stat=files_changed_stat,
+        commits_log=commits_log,
+        metrics_summary=metrics_summary,
+        delta_summary=delta_summary,
+        screenshots=screenshots,
+        run_id=run_id,
+        e2e=state.get("e2e"),
+        screenshot_prefix="history/",
+    )
+    await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, latest_markdown)
+
     await git_ops.commit_paths(
         provider,
         thread_id,
-        [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH],
+        [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH],
         "ai-dev-workflow: exit finalize (manifest, changelog, exit report)",
     )
 
@@ -455,7 +496,7 @@ def _demo() -> None:
     )
     assert "not recorded for this run" in empty.lower()
     assert "no baseline recorded" in empty.lower()
-    assert "## E2E Screenshots" in empty
+    assert "## Screens" in empty
     assert "(none captured -- e2e skipped: no UI framework)" in empty
     assert "- **E2E**: skipped -- no UI framework" in empty
 
@@ -464,7 +505,11 @@ def _demo() -> None:
         commits_log="abc123 do the thing",
         metrics_summary={"coverage": {"line_rate": 80.0, "branch_rate": 70.0}, "traceability_summary": {"total": 2, "covered": 1, "tests_only": 1, "untested": 0}, "token_usage_summary": {"total_input_tokens": 100, "total_output_tokens": 50, "total_cost": 0.01}},
         delta_summary={"fixed_count": 1, "introduced_count": 0, "severity_changed": 0, "metrics": {"coverage_line_rate": {"from": 70, "to": 80, "delta": 10, "direction": "improved"}}},
-        screenshots=[".ai-dev-workflow/history/r1-screens/1.png"],
+        screenshots=[
+            ".ai-dev-workflow/history/r1-screens/001-home.png",
+            ".ai-dev-workflow/history/r1-screens/002-expenses-new.png",
+            ".ai-dev-workflow/history/r1-screens/003-suite.png",
+        ],
         run_id="r1",
         e2e={"status": "passed", "total": 3, "passed": 3, "failed_tests": []},
     )
@@ -472,8 +517,28 @@ def _demo() -> None:
     assert "80.0%" in filled
     assert "coverage_line_rate" in filled
     assert "- **E2E**: passed" in filled
-    assert "## E2E Screenshots" in filled and "./r1-screens/1.png" in filled
+    assert "## Screens" in filled and "./r1-screens/001-home.png" in filled
     assert "(none captured" not in filled
+    # Each screenshot is LABELLED with the screen and route it shows -- "list of screens created"
+    # is the point of the section, not an unlabelled pile of images.
+    assert "| Home | `/` |" in filled, filled
+    assert "| Expenses New | `/expenses/new` |" in filled, filled
+    assert "| Test run | `(from playwright suite)` |" in filled, filled
+
+    # The stable-pointer copy lives one directory above the images, so its links must be re-based;
+    # a "./" prefix there would 404 for every screenshot.
+    rebased = _render_history_sections(
+        files_changed_stat="x", commits_log="y", metrics_summary={}, delta_summary=None,
+        screenshots=[".ai-dev-workflow/history/r1-screens/001-home.png"], run_id="r1",
+        e2e={"status": "passed"}, screenshot_prefix="history/",
+    )
+    assert "(history/r1-screens/001-home.png)" in rebased, rebased
+
+    # _screen_label: filename -> (screen, route). Route is recovered from the name e2e wrote.
+    assert _screen_label("001-home.png") == ("Home", "/")
+    assert _screen_label("002-expenses.png") == ("Expenses", "/expenses")
+    assert _screen_label("003-expenses-new.png") == ("Expenses New", "/expenses/new")
+    assert _screen_label("004-suite.png")[1] == "(from playwright suite)"
 
     print("exit_nodes self-check: ok")
 

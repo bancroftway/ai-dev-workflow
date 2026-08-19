@@ -86,7 +86,7 @@ from .markdown_render import (
     render_specification_markdown,
     render_tech_stack_markdown,
 )
-from .prompt_loader import load_prompt
+from .prompt_loader import load_prompt, load_prompt_pair
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -668,15 +668,23 @@ def _build_exit_prompt(state: GraphState, stage_key: str = "metrics-exit") -> li
     return messages
 
 
-REMEDIATION_SYSTEM_PROMPT = "Consolidate quality, security, dedup, and license findings and recommend fixes."
+# A real prompt file, like every other stage's -- the inline one-liner this replaces told the model
+# to "recommend fixes" and handed it no findings whatsoever, so the stage produced prose while the
+# scanner's gating findings went untouched all the way to the metrics gate.
+REMEDIATION_SYSTEM_PROMPT, REMEDIATION_HUMAN_TEMPLATE = load_prompt_pair("remediation_draft")
 
 
 def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
-    """Minimal prompt for consolidated remediation stage 6."""
-    # Summarize quality/security/dedup/license findings from prior analysis
+    """Consolidated remediation stage 6.
+
+    The findings themselves are NOT marshalled into the prompt: the agent has file tools and reads
+    `.ai-dev-workflow/repo-scan-latest.json` directly, which is both the authoritative copy and the
+    same offload principle the rest of this pipeline uses -- Python checks the facts afterwards
+    (the metrics regression gate re-scans), the agent decides how to fix them.
+    """
     return [
         SystemMessage(content=REMEDIATION_SYSTEM_PROMPT),
-        HumanMessage(content="Review prior quality, security, dedup, and license findings and recommend fixes."),
+        HumanMessage(content=REMEDIATION_HUMAN_TEMPLATE),
     ]
 
 
@@ -1041,6 +1049,16 @@ STAGES: list[StageSpec] = [
         max_cycles=2,
         render_markdown=render_remediation_markdown,
         requires_human_gate=False,
+        # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
+        # edits source to fix scanner findings. Without them it could only ever describe the work --
+        # which is exactly what it did, for every run, until now.
+        session_options=lambda _state, _role: {
+            "agent_mode": "autopilot",
+            "available_tools": [
+                "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",
+                "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+            ],
+        },
     ),
     StageSpec(
         key="adversarial-compliance",
@@ -1321,6 +1339,12 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         stage_now = state["stages"][stage_spec.key]
         if stage_now["status"] == "approved" and stage_now.get("approved_content"):
             logger.info("draft skipped for already-approved stage %s (resume)", stage_spec.key)
+            # Skipping the LLM is right; skipping the hook is not. exit_finalize is what writes this
+            # run's exit report, refreshes the manifest and closes the session, and it is idempotent
+            # by design (its PR creation already guards against re-opening one). Without this, a
+            # resumed run that re-ran e2e and metrics left the PREVIOUS run's report on the branch
+            # -- still reading "no e2e screenshots were captured" beside 14 fresh screenshots.
+            await _run_post_approve_hook(stage_spec, thread_id, stage_now["approved_content"], state)
             return {}
 
         if stage_spec.prefill_from_repo_file is not None and sandbox_registry.get(thread_id) is not None:
@@ -1621,6 +1645,13 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             wrote_nothing_real = changed_paths is not None and not [
                 path for path in changed_paths if not path.startswith(_PIPELINE_ARTIFACT_PREFIXES)
             ]
+            # Partial fabrication: real files WERE written, but a specific required artifact the
+            # model claimed to have created is absent. Same self-reinforcing shape as a total
+            # fabrication -- observed live, a session reported "Added required Playwright e2e
+            # skeleton files (config + spec)" verbatim on four consecutive turns while making no
+            # write call for either, because its own history already asserted the work was done.
+            # Only a fresh session stops it re-reading that claim as fact.
+            fabricated_artifact = bool(verify_report.get("missing_e2e"))
             # A missing required skill belongs in the same bucket, for the same reason. The skill
             # is meant to shape HOW the turn is done, so it has to be invoked before the work, not
             # bolted on after. Once the session has already produced an answer, a redraft just
@@ -1629,7 +1660,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             # invoked it correctly on a fresh session in the previous run. Restarting is what gives
             # the model a turn where invoking the skill can still change the work.
             skipped_required_skill = bool(verify_report.get("missing_skills"))
-            if wrote_nothing_real or skipped_required_skill:
+            if wrote_nothing_real or skipped_required_skill or fabricated_artifact:
                 await copilot_chat_model.close_session(thread_id, stage_spec.key, "draft")
         stages[stage_spec.key] = stage
 
@@ -1852,7 +1883,11 @@ REBUILD_FOR_ADVERSARIAL_COMPLIANCE = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    next_node="metrics-exit_draft",
+    # Into test-hardening, which chains on to e2e and then the metrics pass before metrics-exit.
+    # This single value is the whole insertion point for the back half of the pipeline: the
+    # per-stage loop in build_graph() consumes it as stage 7's successor, so there is no extra
+    # add_edge and therefore none of the fan-out hazard that comment warns about.
+    next_node="test_hardening_run_tests",
 )
 
 # Maps a STAGES entry's key -> the R placement immediately after it, so build_graph()'s per-stage
@@ -2106,8 +2141,11 @@ def _wire_p14(builder: StateGraph) -> None:
         metrics_nodes.make_metrics_route_after_compute(),
         {"next": "metrics_ponytail_gain", "retry": "metrics_compute", "fail": "metrics_regression_record"},
     )
-    builder.add_edge("metrics_regression_record", "exit_draft")
-    builder.add_edge("metrics_ponytail_gain", "exit_draft")
+    # "exit_draft" until the stage-8 consolidation renamed that stage to metrics-exit; these two
+    # edges were left pointing at a node that no longer exists, so reviving this function without
+    # fixing them would fail graph compilation.
+    builder.add_edge("metrics_regression_record", "metrics-exit_draft")
+    builder.add_edge("metrics_ponytail_gain", "metrics-exit_draft")
 
 
 def _wire_p13(builder: StateGraph) -> None:
@@ -2125,13 +2163,19 @@ def _wire_p13(builder: StateGraph) -> None:
     builder.add_conditional_edges(
         "test_hardening_run_tests", test_hardening_nodes.make_test_hardening_route_after_run(), {"regression": "test_hardening_regression_gate", "triage": "test_hardening_flake_triage"}
     )
-    builder.add_edge("test_hardening_regression_gate", END)  # terminal: fix out-of-band, resubmit
+    # Routes INTO metrics-exit rather than END, for exactly the reason _wire_p14's docstring gives
+    # for metrics regressions: "never END, so exit.md/manifest/session close still happen and exit's
+    # verify blocks the merge". Ending here instead meant a test regression produced no exit report,
+    # no manifest completion and no session close -- the run just stopped, and the human got a
+    # failure with none of the artifacts that explain it. The regression still blocks the merge;
+    # test_hardening_regression_gate_node sets run_failure, which exit_finalize_node reads first.
+    builder.add_edge("test_hardening_regression_gate", "metrics-exit_draft")
     builder.add_edge("test_hardening_flake_triage", "test_hardening_mint_tickets")
     builder.add_edge("test_hardening_mint_tickets", "test_hardening_exit_check")
     builder.add_conditional_edges(
         "test_hardening_exit_check", test_hardening_nodes.make_test_hardening_route_after_exit(), {"next": "e2e_gate_check", "escalate": "test_hardening_exit_escalate"}
     )
-    builder.add_edge("test_hardening_exit_escalate", END)
+    builder.add_edge("test_hardening_exit_escalate", "metrics-exit_draft")  # see e2e_escalate
 
 
 def _wire_e2e(builder: StateGraph) -> None:
@@ -2153,7 +2197,11 @@ def _wire_e2e(builder: StateGraph) -> None:
         "e2e_run", e2e_nodes.make_e2e_route_after_run(), {"pass": "metrics_compute", "fix": "e2e_fix", "escalate": "e2e_escalate"}
     )
     builder.add_edge("e2e_fix", "e2e_run")
-    builder.add_edge("e2e_escalate", END)
+    # Into metrics-exit, not END -- same reasoning as test_hardening_regression_gate above. The node
+    # has already recorded run_failure, so the merge stays blocked; routing onward just means the
+    # human also gets exit.md, the manifest and a closed session explaining WHY e2e failed, instead
+    # of a run that stops with no artifact naming the failure.
+    builder.add_edge("e2e_escalate", "metrics-exit_draft")
 
 
 def _wire_p10(builder: StateGraph) -> None:
@@ -2344,14 +2392,24 @@ def build_graph() -> StateGraph:
 
     _wire_tech_stack_intake(builder)
     _wire_brownfield(builder)
-    # Old cluster wiring disabled: stages 6-8 consolidate the clusters
-    # _wire_p8(builder)  # quality-remediation → now part of stage 6
-    # _wire_p10(builder)  # security-remediation → now part of stage 6
-    # _wire_audit_cluster(builder)  # adversarial/dedup/license → now part of stage 7
-    # _wire_p13(builder)  # test-hardening → now part of stage 7
-    # _wire_e2e(builder)  # e2e → now part of stage 7
-    # _wire_p14(builder)  # metrics → now part of stage 8
-    # _wire_p15(builder)  # exit → now part of stage 8
+    # CONSOLIDATED into stages 6-8 -- these clusters' work genuinely moved into a StageSpec, so
+    # their wiring is dead on purpose:
+    # _wire_p8(builder)  # quality-remediation → stage 6 (remediation)
+    # _wire_p10(builder)  # security-remediation → stage 6 (remediation)
+    # _wire_audit_cluster(builder)  # adversarial/dedup/license → stage 7 (adversarial-compliance)
+    # _wire_p15(builder)  # exit → stage 8 (metrics-exit + exit_finalize post_approve_hook)
+    #
+    # NOT consolidated -- these three were only ever switched OFF, and nothing took over their
+    # work. Their nodes are add_node'd exclusively inside these functions, so leaving them
+    # commented removed test-hardening, e2e and the metrics/regression pass from the compiled graph
+    # entirely: no app was ever booted, no screenshot taken, and metrics-latest.json was never
+    # written for any run. Every completed run therefore ended with exit.md carrying
+    # "no e2e screenshots were captured" + "metrics were not recorded for this run", which forced
+    # merge_ready=False and status="failed" -- the pipeline could not report a successful run at all.
+    # `assert_pipeline_nodes_registered()` below now fails loudly if any of them goes missing again.
+    _wire_p13(builder)  # test-hardening: runs the suite N x, triages flakes
+    _wire_e2e(builder)  # e2e: boots the app, drives playwright, harvests screenshots
+    _wire_p14(builder)  # metrics: final full scan, baseline delta, regression gate
 
     # R placements are registered BEFORE the stages that route into them, so each stage can be
     # wired with its true successor in one shot. The previous order (wire stage -> next_draft,
@@ -2380,8 +2438,38 @@ def build_graph() -> StateGraph:
     return builder
 
 
+# Nodes that do work no other node took over, listed so their ABSENCE is a loud failure rather than
+# a silently shorter pipeline. Three of these sat unregistered for the whole consolidation (their
+# _wire_* calls were commented out as "now part of stage 7/8" when nothing had in fact taken them
+# over), and every run completed "successfully" without ever booting the app, taking a screenshot,
+# or recording a metric -- visible only as two stale-looking blocker lines in exit.md.
+REQUIRED_PIPELINE_NODES = (
+    "test_hardening_run_tests",  # runs the suite N x to find flakes
+    "e2e_gate_check",
+    "e2e_run",  # boots the app, drives playwright, harvests screenshots
+    "metrics_compute",  # final scan + baseline delta -> metrics-latest.json
+    "metrics_regression_record",
+)
+
+
+def assert_pipeline_nodes_registered(builder: StateGraph) -> None:
+    """Fails loudly when a pipeline node is not in the compiled graph.
+
+    A missing node does not raise on its own: the graph simply routes around the work, every stage
+    still reports "approved", and the loss shows up only as an empty section in a report nobody
+    reads closely. That is precisely how test-hardening, e2e and metrics stayed dead across 5+
+    end-to-end runs, so this is an assertion rather than a comment.
+    """
+    missing = [name for name in REQUIRED_PIPELINE_NODES if name not in builder.nodes]
+    assert not missing, (
+        f"pipeline nodes missing from the graph: {missing} -- a _wire_* call is commented out or "
+        "renamed. The run would silently skip that work and still report success."
+    )
+
+
 def compile_graph():
     builder = build_graph()
+    assert_pipeline_nodes_registered(builder)
     checkpointer = InMemorySaver()
     store = InMemoryStore()
     # Async checkpoint durability (Section 3.5): "async" is the documented

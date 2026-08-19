@@ -92,6 +92,15 @@ def _app_dir(path: str) -> str:
 def _csproj_signals(text: str) -> dict[str, Any] | None:
     if re.search(r'Sdk\s*=\s*"Microsoft\.NET\.Sdk\.Web"', text):
         return {"likely_class": "api", "runtime": "dotnet", "marker": 'Sdk="Microsoft.NET.Sdk.Web"'}
+    # An ASP.NET FrameworkReference makes a plain-Sdk project a web host just as surely as Sdk.Web
+    # does. Keying only on Sdk.Web classified such a project "library" with start_command=null, so
+    # e2e had no API to boot and screenshotted a UI whose every request failed.
+    if re.search(r'FrameworkReference\s+Include\s*=\s*"Microsoft\.AspNetCore\.App"', text):
+        return {
+            "likely_class": "api",
+            "runtime": "dotnet",
+            "marker": 'FrameworkReference Include="Microsoft.AspNetCore.App"',
+        }
     if re.search(r"<AzureFunctionsVersion>|Microsoft\.NET\.Sdk\.Functions|Microsoft\.Azure\.Functions\.Worker", text):
         return {"likely_class": "azure_function", "runtime": "dotnet", "marker": "Azure Functions SDK reference"}
     if re.search(r"<OutputType>\s*Exe\s*</OutputType>", text):
@@ -345,6 +354,18 @@ def _demo() -> None:
     apps = classify_candidates(webapi)
     api = next(a for a in apps if a["source"].endswith(".csproj"))
     assert api["likely_class"] == "api" and api["path"] == "src/Api", apps
+
+    # A plain-Sdk project with an ASP.NET FrameworkReference is a web host too. Classifying it
+    # "library" left it with no start_command, so e2e booted only the frontend and screenshotted a
+    # UI whose API calls all failed -- visual "evidence" of an app that did not work.
+    _framework_ref = _csproj_signals(
+        '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>'
+        '<FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup></Project>'
+    )
+    assert _framework_ref is not None and _framework_ref["likely_class"] == "api", _framework_ref
+    # A genuine library is still a library -- this must not classify everything as an API.
+    _plain = _csproj_signals('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup/></Project>')
+    assert _plain is not None and _plain["likely_class"] == "library", _plain
     assert api["port"] == 5217, apps
 
     functions = {
