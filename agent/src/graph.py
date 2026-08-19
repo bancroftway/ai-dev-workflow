@@ -53,7 +53,7 @@ from . import spec_ledger
 from . import telemetry
 from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
-from .gates import audit_gates
+from .gates import audit_gates, skill_gate
 from .quality_security import quality_nodes, security_nodes
 from .gates.diagram_gate import verify_plan_diagrams
 from .gates.test_coverage_gate import verify_coverage
@@ -1515,6 +1515,26 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 "feedback": "no sandbox -- deterministic verification did not run",
                 "report": {},
             }
+            stages[stage_spec.key] = stage
+            return {"stages": stages}
+
+        # Methodology enforcement, checked before the stage's own content check: a stage built
+        # around a skill (RED-before-GREEN, writing-plans, receiving-code-review) that silently
+        # skipped it produced work that only LOOKS finished, and no content check can see that.
+        # Verified from the session's own skill.invoked events, never the model's self-report;
+        # fails open when the log is unreadable (see gates/skill_gate.py).
+        skill_check = await skill_gate.check_required_skills(provider, thread_id, stage_spec.key)
+        if not skill_check.passed:
+            stage["last_verification"] = {
+                "passed": False,
+                "feedback": skill_gate.feedback_for(skill_check),
+                "report": {
+                    "missing_skills": skill_check.missing,
+                    "invoked_skills": skill_check.invoked,
+                    "required_skills": skill_check.required,
+                },
+            }
+            stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
             stages[stage_spec.key] = stage
             return {"stages": stages}
 
