@@ -27,7 +27,8 @@ from langchain_core.runnables import RunnableConfig
 logger = logging.getLogger(__name__)
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, tech_stack_signals
+from . import git_ops, model_config, repo_files, stack_runner
+from .schemas import StageReport
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -47,24 +48,12 @@ def default_finding_cluster_state() -> FindingClusterState:
     return {"cycle_count": 0, "pre_upgrade_commit": None, "last_verify_ok": False, "last_output_tail": "", "audit_notes": ""}
 
 
-def _resolve_outdated_command(tech_stack: dict[str, Any]) -> str | None:
-    if tech_stack.get("dotnet_detected"):
-        return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet list package --outdated 2>&1"
-    languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
-    if "typescript" in languages or "javascript" in languages:
-        return "npx --yes npm-check-updates 2>&1"
-    return None
+class UpgradeVerifyReport(StageReport):
+    """Build+test verification after a dependency upgrade (prompts/rebuild_verify.md)."""
 
-
-def _resolve_build_test_command(tech_stack: dict[str, Any]) -> str | None:
-    if tech_stack.get("dotnet_detected"):
-        # One `cd` prefix covers both commands -- it's a single shell invocation, so the cwd it
-        # sets persists across the whole `&&` chain.
-        return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet build -warnaserror && dotnet test 2>&1"
-    languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
-    if "typescript" in languages or "javascript" in languages:
-        return "npm install && npm run build --if-present && npx --yes vitest run 2>&1"
-    return None
+    ok: bool = False
+    stdout_tail: str = ""
+    stderr_tail: str = ""
 
 
 async def finding_cluster_pre_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -85,12 +74,12 @@ async def finding_cluster_draft_node(state: dict[str, Any], config: RunnableConf
     if sandbox_registry.get(thread_id) is None:
         return {"finding_cluster": finding_cluster}
 
-    tech_stack = ((state.get("stages") or {}).get("tech-stack") or {}).get("approved_content") or {}
-    outdated_command = _resolve_outdated_command(tech_stack)
-    outdated_report = ""
-    if outdated_command:
-        result = await get_sandbox_provider().exec_in_sandbox(thread_id, outdated_command)
-        outdated_report = (result.stdout or result.stderr or "")[-4000:]
+    # No pre-gathered "outdated" report: this agent runs autopilot with bash and knows its own
+    # ecosystem's tooling, so it discovers outdated dependencies itself. The canned commands that
+    # used to be piped in here (`dotnet list package --outdated` at a guessed root, `npx
+    # npm-check-updates` at the repo root) produced empty or misleading input on a generated
+    # monorepo -- the same wrong-directory failure family as the other deleted guessers.
+    outdated_report = "(discover outdated dependencies yourself using this repo's own tooling)"
 
     # Own session key (finding-cluster-upgrade:draft), not plan:draft. Sharing plan's key returned plan's
     # cached read-only session (tools lock at session creation) so this autopilot upgrade agent
@@ -121,19 +110,26 @@ async def finding_cluster_verify_node(state: dict[str, Any], config: RunnableCon
         return {"finding_cluster": finding_cluster}
 
     provider = get_sandbox_provider()
-    tech_stack = ((state.get("stages") or {}).get("tech-stack") or {}).get("approved_content") or {}
-    command = _resolve_build_test_command(tech_stack)
-    if command is None:
-        finding_cluster["last_verify_ok"] = True
-        return {"finding_cluster": finding_cluster}
-
-    result = await provider.exec_in_sandbox(thread_id, command)
-    finding_cluster["last_verify_ok"] = result.ok
-    finding_cluster["last_output_tail"] = (result.stdout or result.stderr or "")[-4000:]
-    if not result.ok:
+    # GHCP builds AND tests the upgraded tree itself and reports structurally -- replaces a canned
+    # per-stack `build && test` string whose repo-root assumption broke on generated monorepos.
+    report = await stack_runner.run_and_report(
+        thread_id,
+        stage_key="rebuild",
+        prompt_name="rebuild_verify",
+        schema=UpgradeVerifyReport,
+        addendum=(
+            "Dependencies in this repository were just upgraded. After building, ALSO run the "
+            "full test suite: the point is to prove the upgrade did not break anything. Report "
+            "ok=false if either the build or the tests fail."
+        ),
+    )
+    verify_ok = report.success and report.ok
+    finding_cluster["last_verify_ok"] = verify_ok
+    finding_cluster["last_output_tail"] = (report.stdout_tail or report.stderr_tail or report.error or "")[-4000:]
+    if not verify_ok:
         finding_cluster["cycle_count"] = finding_cluster["cycle_count"] + 1
-    await repo_files.append_ledger_entry(provider, thread_id, {"stage": "finding_cluster", "node": "verify", "ok": result.ok, "cycle": finding_cluster["cycle_count"]})
-    if result.ok:
+    await repo_files.append_ledger_entry(provider, thread_id, {"stage": "finding_cluster", "node": "verify", "ok": verify_ok, "cycle": finding_cluster["cycle_count"]})
+    if verify_ok:
         # Verified dependency upgrade: commit manifests/lockfiles (and anything else the upgrade
         # touched) so the revert path has a clean pre/post boundary and the work branch gets it.
         await git_ops.commit_all(provider, thread_id, "ai-dev-workflow: finding-cluster dependency upgrades")

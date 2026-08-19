@@ -38,7 +38,6 @@ DEDUP_SURFACE_ID = "dedup-simplify"
 LICENSE_AUDIT_SURFACE_ID = "license-audit"
 EXIT_SURFACE_ID = "exit"
 BROWNFIELD_BASELINE_SURFACE_ID = "brownfield-baseline"
-APP_DISCOVERY_SURFACE_ID = "app-discovery"
 
 
 def _build_generic_envelope(surface_id: str, component_name: str, data_field: str, data: dict, audit_findings: list[str] | None = None) -> dict:
@@ -75,11 +74,6 @@ def build_brownfield_baseline_envelope(baseline: dict, audit_findings: list[str]
     return _build_generic_envelope(BROWNFIELD_BASELINE_SURFACE_ID, "BrownfieldBaselineSurface", "baseline", baseline, audit_findings)
 
 
-def build_app_discovery_envelope(report: dict, audit_findings: list[str] | None = None) -> dict:
-    return _build_generic_envelope(APP_DISCOVERY_SURFACE_ID, "AppDiscoverySurface", "report", report, audit_findings)
-
-
-
 def build_specification_envelope(specification: dict, audit_findings: list[str] | None = None) -> dict:
     return _build_generic_envelope(SPECIFICATION_SURFACE_ID, "SpecificationSurface", "specification", specification, audit_findings)
 
@@ -89,10 +83,10 @@ def build_plan_envelope(plan: dict, audit_findings: list[str] | None = None) -> 
 
 
 def build_tech_stack_envelope(tech_stack: dict, audit_findings: list[str] | None = None) -> dict:
-    """No frontend renderer is registered for this surface yet (tech-stack has no visible tab,
-    per the pipeline's own design -- requires_human_gate=False on its StageSpec) -- emitted for
-    parity with every other stage's audit node and so a future session-overview panel can read
-    it, but harmless/inert until a catalog entry exists client-side."""
+    """No frontend catalog entry consumes this A2UI surface -- the Tech Stack tab renders directly
+    off the stage's interrupt payload/approved_content instead (its own markdown editor, not a
+    fixed-schema A2UI component). Emitted only for parity with every other stage's audit node;
+    harmless/inert until a catalog entry exists client-side."""
     return _build_generic_envelope(TECH_STACK_SURFACE_ID, "TechStackSurface", "tech_stack", tech_stack, audit_findings)
 
 
@@ -182,7 +176,6 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.a2
         (build_license_audit_envelope, "license-audit", "LicenseAuditSurface", "report"),
         (build_exit_envelope, "exit", "ExitSurface", "report"),
         (build_brownfield_baseline_envelope, "brownfield-baseline", "BrownfieldBaselineSurface", "baseline"),
-        (build_app_discovery_envelope, "app-discovery", "AppDiscoverySurface", "report"),
     ]
     payload = {"k": "v"}
     for build, surface_id, component, field in builders:

@@ -16,7 +16,7 @@ ARG BASE_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0
 # Pinned to match agent/.venv's installed github-copilot-sdk build (agent/.venv/Lib/site-packages/
 # copilot/_cli_version.py's CLI_VERSION) so the SDK's minimum protocol version check
 # (client.py's _MIN_PROTOCOL_VERSION) never rejects this server on a stale binary.
-ARG COPILOT_CLI_VERSION=1.0.78
+ARG COPILOT_CLI_VERSION=1.0.79
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end
 # against a rebuilt image -- see each gate module's own docstring.

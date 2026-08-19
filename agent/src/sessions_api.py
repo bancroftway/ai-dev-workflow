@@ -29,13 +29,14 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from . import branch_naming, git_ops, keyvault, session_store
+from . import app_discovery, branch_naming, git_ops, keyvault, session_store
 from .sandbox import get_sandbox_provider, registry
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 config_router = APIRouter(prefix="/vault-config", tags=["vault-config"])
+catalog_router = APIRouter(tags=["tech-stack"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -360,3 +361,16 @@ async def put_vault_config(body: VaultConfigPutRequest, request: Request) -> Ses
         raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
     await keyvault.set_vault_uri(body.owner, body.repo, body.user_login, vault_uri)
     return SessionActionResponse(secret_count=len(app_secrets))
+
+
+class TechStackCatalogResponse(BaseModel):
+    stacks: list[dict[str, Any]]
+
+
+@catalog_router.get("/tech-stack-catalog", response_model=TechStackCatalogResponse)
+async def get_tech_stack_catalog(request: Request) -> TechStackCatalogResponse:
+    """The 8 canned monorepo stacks the Tech Stack tab's dropdown offers -- static, session-
+    independent data (app_discovery.load_stack_catalog is @lru_cache'd), so this is its own tiny
+    router rather than living under /sessions or /vault-config."""
+    _check_shared_secret(request)
+    return TechStackCatalogResponse(stacks=app_discovery.load_stack_catalog())

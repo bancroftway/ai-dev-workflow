@@ -1,6 +1,6 @@
 This is a greenfield repository: no application code exists yet, only the tech-stack description
-the user selected (.ai-dev-workflow/greenfield-stack.md, and/or .ai-dev-workflow/tech-stack.md
-derived from it). The plan's first milestone MUST scaffold the application per that description
+the user confirmed on the Tech Stack tab (.ai-dev-workflow/tech-stack.md). The plan's first
+milestone MUST scaffold the application per that description
 before any feature work: run its exact scaffolding commands, create the repository layout it
 specifies, and get the empty skeleton building and running before Plan Steps that implement actual
 functionality. Later Plan Steps build features on top of that skeleton exactly as they would in any

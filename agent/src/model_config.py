@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 _CONFIG_PATH = Path(__file__).parent.parent / "config" / "models.yaml"
 
 Stage = Literal[
-    "app-discovery",
     "tech-stack",
     "specification",
     "plan",
@@ -38,7 +37,7 @@ Stage = Literal[
     "e2e",
     "session-title",
 ]
-Role = Literal["draft", "audit"]
+Role = Literal["draft", "audit", "extract"]
 
 
 @lru_cache(maxsize=None)
@@ -50,7 +49,10 @@ def _load_config() -> dict[str, dict[str, str | None]]:
 def get_model_name(stage: Stage, role: Role) -> str | None:
     stage_config = _load_config().get(stage, {})
     draft_model = stage_config.get("draft_model")
-    if role == "draft":
+    if role in ("draft", "extract"):
+        # "extract" deliberately shares draft_model rather than needing its own models.yaml entry
+        # -- a one-shot structured-extraction pass is not a config-worthy decision distinct from
+        # drafting, unlike audit (a genuinely separate model choice, hence its own warning below).
         return draft_model
 
     audit_model = stage_config.get("audit_model")

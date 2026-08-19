@@ -64,16 +64,11 @@ export function RequirementsView() {
     }
   }, [rawRequirementsContent]);
 
-  // A rejection is a hard stop, not a gate: resubmitting the same repository cannot change the
-  // verdict, so the submit button goes down with it. The only way forward is to point the session
-  // at a repository containing a runnable app -- or add one and start a new session.
-  const rejection = state.app_rejection ?? null;
   // A run submitted while an interrupt is pending is silently dropped server-side (the endpoint
   // re-emits the stored interrupt and never starts the graph), so Submit must go down while a
   // review is open -- an enabled button there is a lie.
   const { interrupt: openInterrupt } = useOpenInterrupt();
-  const disabled =
-    text.trim().length === 0 || agent.isRunning || submitting || rejection !== null || openInterrupt.open;
+  const disabled = text.trim().length === 0 || agent.isRunning || submitting || openInterrupt.open;
 
   /** Pasted images upload through the normal attachment queue AND insert a markdown ref at the
    * cursor. Each pasted file is renamed to a unique name first -- clipboard images all arrive as
@@ -149,31 +144,6 @@ export function RequirementsView() {
           clarifying questions below. Paste screenshots directly into the text.
         </p>
       </div>
-
-      {rejection && (
-        <div className="space-y-3 rounded-lg border border-red-300 bg-red-50 p-4">
-          <h2 className="text-sm font-medium text-red-900">
-            ai-dev-workflow cannot run on this repository
-          </h2>
-          <ul className="list-disc space-y-2 pl-5">
-            {rejection.reasons.map((reason, index) => (
-              <li key={index} className="text-sm text-red-900">
-                {reason}
-              </li>
-            ))}
-          </ul>
-          {rejection.found.length > 0 && (
-            <div className="text-xs text-red-700">
-              Found:{" "}
-              {rejection.found.map((app) => `${app.path} (${app.app_class})`).join(", ")}
-            </div>
-          )}
-          <p className="text-xs text-red-700">
-            This workflow only applies to repositories containing a startable web app, API, or
-            Azure Function. No changes were made to the repository.
-          </p>
-        </div>
-      )}
 
       <ClarifyingQuestions
         stageKey="raw-requirements"
@@ -258,7 +228,9 @@ export function RequirementsView() {
       <div className="flex items-center justify-end gap-3">
         {openInterrupt.open && (
           <span className="text-xs text-neutral-500">
-            A review is waiting in the chat sidebar — approve or acknowledge it first, then edit and resubmit.
+            {openInterrupt.stage === "tech-stack"
+              ? "Finish the Tech Stack tab first, then resubmit."
+              : "A review is waiting in the chat sidebar — approve or acknowledge it first, then edit and resubmit."}
           </span>
         )}
         <button

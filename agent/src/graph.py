@@ -28,6 +28,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from pydantic import ValidationError
 from langgraph.graph.message import add_messages
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt
@@ -49,7 +50,6 @@ from . import exit_nodes
 from . import rebuild
 from . import session_store
 from . import spec_ledger
-from . import stack_discovery
 from . import telemetry
 from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
@@ -61,7 +61,6 @@ from .gates.write_scope_gate import pre_tool_use_write_scope_hook, verify_ac_to_
 from .a2ui_tools import (
     build_ac_to_tests_envelope,
     build_adversarial_audit_envelope,
-    build_app_discovery_envelope,
     build_dedup_envelope,
     build_exit_envelope,
     build_license_audit_envelope,
@@ -76,7 +75,6 @@ from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import (
     render_ac_to_tests_markdown,
     render_adversarial_audit_markdown,
-    render_app_discovery_markdown,
     render_dedup_markdown,
     render_exit_markdown,
     render_license_audit_markdown,
@@ -108,7 +106,6 @@ from .schemas_audit import (
     DedupDraftResponse,
     LicenseAuditDraftResponse,
 )
-from .schemas_app_discovery import AppDiscoveryDraftResponse
 from .schemas_brownfield import BrownfieldBaselineDraftResponse
 from .schemas_exit import ExitDraftResponse
 from .schemas_remediation import RemediationDraftResponse
@@ -151,27 +148,16 @@ class GraphState(TypedDict):
     run_id: str
     # Set by scaffold_node (preflight_nodes.py) -- manifest.json absence is the canonical
     # "never onboarded before" signal, routing into brownfield-baseline's brownfield sub-flow. Read once at
-    # scaffold time and routed on from state, never re-read: app discovery writes to manifest.json
-    # mid-run, so a fresh read at the branch point would always report "onboarded".
+    # scaffold time and routed on from state, never re-read: app_check_record_node writes to
+    # manifest.json mid-run, so a fresh read at the branch point would always report "onboarded".
     manifest_exists: bool
-    # `git rev-parse HEAD` captured by scaffold_node before this run writes anything -- the
-    # reference point app_discovery's reject path resets back to, so a rejected repository is left
-    # exactly as it arrived.
+    # `git rev-parse HEAD` captured by scaffold_node before this run writes anything.
     run_baseline_commit: str | None
-    # app_discovery.py's deterministic scan output (candidates/evidence/fingerprint), grounding the
-    # discovery stage's prompt and bounding which paths its report may cite.
+    # app_discovery.py's deterministic scan output (candidates/evidence/fingerprint) -- grounds
+    # the Tech Stack tab's fresh-detection draft, app_check_record_node's manifest write, and
+    # e2e's app-boot rescan. "Greenfield" is now derived from this (tech_stack_signals.
+    # is_greenfield_repo: no candidates found), not a separate state channel.
     app_scan: dict[str, Any]
-    # Set only when the repository has no runnable application: the one hard stop in this graph.
-    # Read by _route_after_app_discovery and by the frontend's rejection banner.
-    app_rejection: dict[str, Any] | None
-    # The greenfield tech-stack picker's own state (agent/src/app_discovery.py's
-    # app_discovery_decide_node -- the sole writer, every run, dict or None -- and
-    # greenfield_stack_select_node). Absent-tolerant everywhere it's read (plain `.get`): a repo
-    # that isn't (or is no longer) greenfield never sets it. Shapes: {"offered": True, "reasons":
-    # [...]} while awaiting a pick, {"stack_id": ..., "markdown": ..., "selected_at": ...} once
-    # picked. A plain dict (not a StageState) -- there is no human-gated stage here, just an
-    # interrupt.
-    greenfield: dict[str, Any] | None
     # Deterministic schema/migration/route grep, grounding brownfield-baseline brownfield's draft prompt.
     brownfield_context: str
     raw_requirements_text: str
@@ -219,8 +205,7 @@ class GraphState(TypedDict):
     # Terminal failure record ({stage, type, ...detail} -- the old escalation payload shape).
     # Escalations no longer pause for a human (spec/plan approval are the only two human
     # touchpoints); an exhausted deterministic gate ENDs the run with this set, the frontend
-    # shows it as a red pill, and a resubmission clears it (scaffold_node). Precedent:
-    # app_rejection.
+    # shows it as a red pill, and a resubmission clears it (scaffold_node).
     run_failure: dict[str, Any] | None
     # Live token spend {input_tokens, output_tokens, cost}, re-summed from the ledger whenever a
     # background refresh scan lands (metrics_nodes.collect_live_refresh) -- feeds the metrics
@@ -308,7 +293,7 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
         SystemMessage(content=PLAN_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
     ]
-    if state.get("greenfield"):
+    if tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=PLAN_GREENFIELD_SEGMENT))
     if _tech_stack_has_ui_framework(state):
         messages.append(HumanMessage(content=IMPECCABLE_PLAN_SEGMENT))
@@ -393,7 +378,12 @@ IMPECCABLE_DEDUP_SEGMENT = (
 PLAYWRIGHT_MCP_CONFIG: dict[str, Any] = {
     "playwright": {
         "type": "stdio",
-        "command": "mcp-server-playwright",
+        # @playwright/mcp's actual installed binary name (npm bin field) -- confirmed live in the
+        # sandbox image (`find / -iname 'mcp-server*'` finds nothing, `playwright-mcp` exists).
+        # The wrong name here silently failed the MCP server's stdio startup, which cascaded into
+        # the whole session losing every OTHER tool too (ac-to-tests-draft was left with only a
+        # git/curl/gh/sql/skill baseline, no edit -- 8+ runs escalating with zero test files).
+        "command": "playwright-mcp",
         "args": ["--headless", "--isolated"],
         "env": {"PLAYWRIGHT_BROWSERS_PATH": "/opt/playwright-browsers"},
         "tools": ["*"],
@@ -435,39 +425,34 @@ def _build_plan_audit_prompt(state: GraphState) -> list[BaseMessage]:
 
 TECH_STACK_SYSTEM_PROMPT = load_prompt("tech_stack_draft")
 
-TECH_STACK_GREENFIELD_PROMPT = load_prompt("tech_stack_greenfield")
-
 
 def _build_tech_stack_prompt(state: GraphState) -> list[BaseMessage]:
+    """Unconditional explore-and-draft -- no greenfield branch. The greenfield case (no code to
+    explore) is now handled BEFORE this LLM ever runs, via prefill_tech_stack_from_repo_file
+    (tech-stack.md already has the user's picked/edited canned-stack content) or, for a genuinely
+    fresh empty repo with no tech-stack.md either, this same prompt just explores an empty
+    repository and honestly reports finding nothing -- the Tech Stack tab's dropdown lets the
+    human pick a canned stack afterward, no prompt-level special-casing needed."""
     stage = state["stages"]["tech-stack"]
     messages: list[BaseMessage] = [SystemMessage(content=TECH_STACK_SYSTEM_PROMPT)]
-    greenfield_markdown = (state.get("greenfield") or {}).get("markdown")
-    if greenfield_markdown:
-        messages.append(HumanMessage(content=f"{TECH_STACK_GREENFIELD_PROMPT}\n\n{greenfield_markdown}"))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
     return messages
 
 
-
-APP_DISCOVERY_SYSTEM_PROMPT = load_prompt("app_discovery_draft")
-
-
-
-def _build_app_discovery_prompt(state: GraphState) -> list[BaseMessage]:
-    stage = state["stages"][app_discovery.STAGE_KEY]
-    scan = state.get("app_scan") or {}
-    messages: list[BaseMessage] = [
-        SystemMessage(content=APP_DISCOVERY_SYSTEM_PROMPT),
-        HumanMessage(
-            content=f"Deterministic scan -- candidate applications:\n\n{json.dumps(scan.get('candidates') or [], indent=2)}"
-        ),
-        HumanMessage(content=f"Deterministic scan -- marker file contents:\n\n{scan.get('evidence') or '(nothing found)'}"),
-    ]
-    if stage["draft"] is not None:
-        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
-    return messages
-
+def _build_tech_stack_interrupt_extra(state: GraphState) -> dict[str, Any]:
+    """Tells the Tech Stack tab (a) whether to show the canned-stack dropdown -- only when this
+    draft came from the unconditional LLM explore-and-draft path (no tech-stack.md existed),
+    never when prefill_tech_stack_from_repo_file already loaded the file's own content -- and
+    (b) plain markdown text to populate the editor with, computed HERE (not client-side) since
+    the frontend has no renderer for a raw TechStack-shaped draft, only for the {"markdown": ...}
+    shape prefill produces. Both distinctions key off the same shape test preflight_nodes.
+    _select_tech_stack_markdown already relies on: prefill's draft has a top-level "markdown" key,
+    the LLM draft path's raw TechStack dict does not."""
+    draft = state["stages"]["tech-stack"].get("draft") or {}
+    if isinstance(draft, dict) and "markdown" in draft:
+        return {"file_existed": True, "markdown": draft.get("markdown") or ""}
+    return {"file_existed": False, "markdown": render_tech_stack_markdown(draft)}
 
 
 BROWNFIELD_BASELINE_SYSTEM_PROMPT = load_prompt("brownfield_baseline_draft")
@@ -549,7 +534,7 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
     ]
-    if state.get("greenfield"):
+    if tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=AC_TO_TESTS_GREENFIELD_SEGMENT))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
@@ -734,7 +719,6 @@ class StageSpec:
         | type[DedupDraftResponse]
         | type[LicenseAuditDraftResponse]
         | type[ExitDraftResponse]
-        | type[AppDiscoveryDraftResponse]
         | type[RemediationDraftResponse]
         | type[AdversarialComplianceDraftResponse]
     )
@@ -821,6 +805,35 @@ class StageSpec:
     finding: an allowlist, not a blocklist, is what actually enforces read-only) or, later, real
     write access."""
 
+    use_custom_agent: bool = True
+    """False routes make_draft_node around the custom_agents/agent mechanism, using
+    session_options' own available_tools/model config instead. ac-to-tests sets this: empirically
+    confirmed (not just theorized) by directly comparing "custom_agents + builtin:create in its
+    tools:" (still failed -- zero test files, same as before create was ever added) against
+    "no custom_agents + available_tools including builtin:create" (worked, ac-to-tests approved)
+    in back-to-back full pipeline runs on the same repo/stack. Whatever's silently dropping/
+    ignoring part of a custom agent's own tools: list, available_tools is not affected by it."""
+
+    prefill_from_repo_file: Callable[[str, "GraphState", SandboxProvider], Awaitable[dict[str, Any] | None]] | None = None
+    """Like hydrate_from_repo_file, but the result becomes an UNAPPROVED draft
+    (status="ready_for_review") rather than auto-approved -- it still passes through the human
+    gate normally. For "this stage's own artifact file already exists on disk but has never been
+    reviewed through this tool" (the Tech Stack tab's "tech-stack.md exists" case): skip the LLM
+    call, show the file's own content, let the human confirm or edit it via the normal gate."""
+
+    build_interrupt_extra: Callable[["GraphState"], dict[str, Any]] | None = None
+    """Extra keys merged into this stage's interrupt() payload alongside {"stage", "draft"} --
+    computed synchronously from state right before pausing, no I/O (whatever a stage needs was
+    already gathered at draft time). None adds nothing, today's exact payload shape."""
+
+    resolve_from_interrupt: Callable[[str, Any, "GraphState", SandboxProvider], Awaitable[dict[str, Any] | None]] | None = None
+    """(thread_id, raw interrupt() resume value, state, provider) -> override content dict, or
+    None to keep today's behavior (approve stage["draft"] verbatim -- the resume value is
+    otherwise discarded entirely). Only called when a sandbox is registered for this thread, same
+    guard as every other hook here that does real I/O. Lets a stage's gate actually receive
+    edited content back from the frontend instead of just re-approving whatever was drafted --
+    the Tech Stack tab's Submit needs this to save the human's edits, not the LLM's draft."""
+
     capture_baseline_commit: bool = False
     """When True, make_draft_node captures `git rev-parse HEAD` into this stage's StageState the
     first time draft_node runs this run (guarded by "not already set," see make_draft_node) --
@@ -846,9 +859,12 @@ STAGES: list[StageSpec] = [
         build_prompt=_build_tech_stack_prompt,
         max_cycles=workflow_config.TECH_STACK_MAX_CLARIFICATION_CYCLES,
         render_markdown=render_tech_stack_markdown,
-        requires_human_gate=False,
+        requires_human_gate=True,
         post_approve_hook=preflight_nodes.apply_stack_conventions,
         hydrate_from_repo_file=preflight_nodes.hydrate_tech_stack_from_repo_file,
+        prefill_from_repo_file=preflight_nodes.prefill_tech_stack_from_repo_file,
+        build_interrupt_extra=_build_tech_stack_interrupt_extra,
+        resolve_from_interrupt=preflight_nodes.resolve_tech_stack_submission,
         session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
     ),
     # raw-requirements is deliberately NOT a StageSpec anymore: the human's text is accepted
@@ -870,6 +886,12 @@ STAGES: list[StageSpec] = [
         render_markdown=render_specification_markdown,
         deterministic_verify=_verify_specification_ledger,
         sign_approval=True,
+        # The one stage that may use `brainstorming` -- exploring intent and requirements before
+        # anything is built is precisely its purpose. It stays disabled for every other stage
+        # (config.COPILOT_DISABLED_SKILLS), where it fires as a blanket mandate on mechanical work.
+        session_options=lambda _state, _role: {
+            "disabled_skills": workflow_config.COPILOT_DISABLED_SKILLS_SPECIFICATION
+        },
     ),
     StageSpec(
         key="plan",
@@ -907,10 +929,23 @@ STAGES: list[StageSpec] = [
         requires_human_gate=False,
         capture_baseline_commit=True,
         deterministic_verify=verify_ac_to_tests,
+        # Root cause of the long escalation streak: `builtin:edit` only edits EXISTING files -- a
+        # greenfield repo with no test files yet needs `builtin:create`. That alone wasn't the
+        # full story: also needs the session `working_directory` now set unconditionally in
+        # copilot_chat_model.py's _get_session (without it, file tools are never even attempted).
+        # use_custom_agent=False is EMPIRICALLY required, not stylistic -- back-to-back full runs
+        # showed custom_agents + builtin:create in its own tools: list still failing (zero test
+        # files, identical symptom to before create existed), while available_tools with the same
+        # tool list worked. Something in custom_agents' tool resolution silently drops/ignores part
+        # of its own declared list; available_tools isn't affected by it.
+        use_custom_agent=False,
         session_options=lambda state, role: (
             {
                 "agent_mode": "autopilot",
-                "excluded_tools": ["builtin:bash"],
+                "available_tools": [
+                    "builtin:view", "builtin:grep", "builtin:glob",
+                    "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+                ],
                 "pre_tool_use_hook": pre_tool_use_write_scope_hook,
                 **({"mcp_servers": PLAYWRIGHT_MCP_CONFIG} if _tech_stack_has_ui_framework(state) else {}),
             }
@@ -937,8 +972,22 @@ STAGES: list[StageSpec] = [
         # Draft gets full, unscoped write access -- "minimal code to green" is definitionally a
         # code-writing task (Part A Decisions point 6, tier (iii)). Audit stays read-only, same
         # asymmetry as P4's session_options.
+        # Same empirically-confirmed fix ac-to-tests needed: with custom_agents in play the
+        # session silently loses part of the agent's own declared `tools:` list, so the model
+        # cannot write files and answers in JSON prose instead. Observed live here too --
+        # minimal-code-to-green "completed" a full Angular+.NET scaffold in 18 seconds having
+        # written nothing at all. available_tools is honored where the custom agent's list is not.
+        use_custom_agent=False,
         session_options=lambda _state, role: (
-            {"agent_mode": "autopilot"} if role == "draft" else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
+            {
+                "agent_mode": "autopilot",
+                "available_tools": [
+                    "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",
+                    "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+                ],
+            }
+            if role == "draft"
+            else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
         ),
     ),
     StageSpec(
@@ -1190,9 +1239,6 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # consumed message's id on a fresh submission -- either way, the next intake's dedupe
         # check compares against exactly what this run actually consumed.
         "consumed_message_id": consumed_message_id,
-        # Cleared explicitly: a rejection is a verdict about one run's view of the repository, and
-        # a repo that has since gained an application must get a fresh assessment, not a stale no.
-        "app_rejection": None,
         "e2e": e2e_state,
     }
 
@@ -1231,6 +1277,20 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             logger.info("draft skipped for already-approved stage %s (resume)", stage_spec.key)
             return {}
 
+        if stage_spec.prefill_from_repo_file is not None and sandbox_registry.get(thread_id) is not None:
+            prefilled = await stage_spec.prefill_from_repo_file(thread_id, state, get_sandbox_provider())
+            if prefilled is not None:
+                stages = {key: dict(value) for key, value in state["stages"].items()}
+                stage = stages[stage_spec.key]
+                stage["draft"] = prefilled
+                stage["readiness"] = True
+                stage["ever_ready_for_review"] = True
+                stage["status"] = "ready_for_review"
+                stage["clarifying_questions"] = []
+                stages[stage_spec.key] = stage
+                logger.info("draft prefilled from repo file for stage %s, skipping LLM", stage_spec.key)
+                return {"stages": stages}
+
         if (
             stage_spec.capture_baseline_commit
             and state["stages"][stage_spec.key].get("baseline_commit") is None
@@ -1249,7 +1309,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         # Load custom agent if available, falling back to legacy session_options
         custom_agents = []
-        agent_config = load_agent_for_stage(stage_spec.key, "draft")
+        agent_config = load_agent_for_stage(stage_spec.key, "draft") if stage_spec.use_custom_agent else {}
         if agent_config:
             custom_agents = [agent_config]
 
@@ -1262,7 +1322,15 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
             agent=agent_config.get("name") if agent_config else None,
-            **(stage_spec.session_options(state, "draft") if stage_spec.session_options is not None and not agent_config else {}),
+            # session_options (agent_mode/hooks/mcp_servers/tool scoping) is orthogonal to
+            # agent_config (model/prompt/tools list) -- both apply together, always. The old
+            # `and not agent_config` guard here silently skipped session_options for every stage
+            # with a custom agent file, which is every draft stage. Confirmed live: ac-to-tests
+            # never got its "autopilot" agent_mode override and ran the whole time on
+            # get_chat_model_for_thread's "plan" (read-only) default -- 10+ headless runs
+            # escalating with zero test files written, because the session could plan but never
+            # actually call edit.
+            **(stage_spec.session_options(state, "draft") if stage_spec.session_options is not None else {}),
         )
 
         prompt_messages = stage_spec.build_prompt(state)
@@ -1360,24 +1428,36 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
             agent=agent_config.get("name") if agent_config else None,
-            **(stage_spec.session_options(state, "audit") if stage_spec.session_options is not None and not agent_config else {}),
+            # See the draft-role call's own comment above -- session_options must apply
+            # regardless of agent_config; they're orthogonal concerns.
+            **(stage_spec.session_options(state, "audit") if stage_spec.session_options is not None else {}),
         )
 
         prompt_messages = stage_spec.build_audit_prompt(state)
-        response = await ainvoke_structured(model, prompt_messages, stage_spec.audit_response_schema)
-
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
-
-        revised_content = getattr(response, stage_spec.audit_content_field)
-        content_dict = revised_content.model_dump(mode="json")
+        try:
+            response = await ainvoke_structured(model, prompt_messages, stage_spec.audit_response_schema)
+            content_dict = getattr(response, stage_spec.audit_content_field).model_dump(mode="json")
+            audit_findings = list(response.audit_findings)
+        except (ValidationError, ValueError) as exc:
+            # An adversarial second opinion that never actually parses (observed live: 3
+            # consecutive attempts all truncated mid-JSON, same root output-length issue every
+            # retry, not a formatting fluke ainvoke_structured's own retry loop could fix) must
+            # not crash the whole run over a draft that already passed its OWN readiness check --
+            # "an audit nobody reads was pure latency" is this codebase's own stated bar for when
+            # skipping the audit is fine (ac-to-tests has none at all). Keep the pre-audit draft
+            # unchanged rather than lose the whole run to a nice-to-have adversarial pass.
+            logger.warning("audit response failed to parse for stage %s -- keeping pre-audit draft unchanged", stage_spec.key, exc_info=exc)
+            content_dict = stage["draft"]
+            audit_findings = []
 
         used_ids: set[str] = set(stage["used_ids"])
         _extract_ids(content_dict, used_ids)
 
         stage["draft"] = content_dict
         stage["used_ids"] = sorted(used_ids)
-        stage["audit_findings"] = list(response.audit_findings)
+        stage["audit_findings"] = audit_findings
         stages[stage_spec.key] = stage
 
         # A stage with a deterministic_verify gate (e.g. specification's ledger sync) can still
@@ -1560,23 +1640,33 @@ def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]
 
 def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     async def gate_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        thread_id = config["configurable"]["thread_id"]
         stage = state["stages"][stage_spec.key]
         # Pauses here (BR-4/Section 6 Gate) until the frontend's useInterrupt
         # resolve(payload) resumes this exact node with that payload -- unless this stage is
         # supporting infrastructure with no tab to review it in (requires_human_gate=False), in
         # which case it proceeds straight through to the same approved-marking body every other
-        # stage already runs post-interrupt-resolve.
+        # stage already runs post-interrupt-resolve. The resume value is captured (previously
+        # discarded outright) so resolve_from_interrupt below can actually see what the frontend
+        # resolved with -- every OTHER stage's gate still just re-approves stage["draft"]
+        # verbatim, since resolve_from_interrupt is None for all of them.
+        resume_value: Any = None
         if stage_spec.requires_human_gate:
-            interrupt({"stage": stage_spec.key, "draft": stage["draft"]})
+            extra = stage_spec.build_interrupt_extra(state) if stage_spec.build_interrupt_extra else {}
+            resume_value = interrupt({"stage": stage_spec.key, "draft": stage["draft"], **extra})
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         approved = stages[stage_spec.key]
+        content = approved["draft"]
+        if stage_spec.resolve_from_interrupt is not None and sandbox_registry.get(thread_id) is not None:
+            resolved = await stage_spec.resolve_from_interrupt(thread_id, resume_value, state, get_sandbox_provider())
+            if resolved is not None:
+                content = resolved
         approved["status"] = "approved"
-        approved["approved_content"] = approved["draft"]
+        approved["approved_content"] = content
         approved["cycle_count"] = 0
         stages[stage_spec.key] = approved
 
-        thread_id = config["configurable"]["thread_id"]
         await _persist_if_sandboxed(thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} approved")
 
         if stage_spec.sign_approval and sandbox_registry.get(thread_id) is not None:
@@ -1720,56 +1810,18 @@ def _wire_p8(builder: StateGraph) -> None:
 # EXIT_SPEC → stage 8 (metrics-exit)
 
 
-APP_DISCOVERY_SPEC = StageSpec(
-    key=app_discovery.STAGE_KEY,
-    response_schema=AppDiscoveryDraftResponse,
-    content_field="app_detection",
-    surface_tool_name="present_app_discovery",
-    build_envelope=build_app_discovery_envelope,
-    build_prompt=_build_app_discovery_prompt,
-    max_cycles=workflow_config.APP_DISCOVERY_MAX_CLARIFICATION_CYCLES,
-    render_markdown=render_app_discovery_markdown,
-    # No human gate: the verdict is app_discovery_decide_node's deterministic policy, and there is
-    # nothing here for a human to approve -- either the repository has a runnable app or it does
-    # not.
-    requires_human_gate=False,
-    hydrate_from_repo_file=app_discovery.hydrate_from_manifest,
-    # Read-only, but with real sandbox tools on purpose: the deterministic scan's marker table has
-    # no rules for Go/Rails/Spring/PHP, and a false rejection is unrecoverable within a run. The
-    # model exploring past the evidence blob is the safety margin.
-    session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
-)
-
-
-def _route_after_app_discovery(state: GraphState) -> str:
-    """Routes "greenfield" only while a stack is being offered and none has been picked yet --
-    once app_discovery_decide_node's own pass-through sets a stack_id (this run or an earlier one),
-    this routes "next" instead, straight past greenfield_stack_select entirely (see that node's own
-    idempotency check for the belt-and-suspenders half of this)."""
-    if state.get("app_rejection"):
-        return "reject"
-    greenfield = state.get("greenfield") or {}
-    if greenfield.get("offered") and not greenfield.get("stack_id"):
-        return "greenfield"
-    return "next"
-
-
-def _route_after_greenfield_select(state: GraphState) -> str:
-    return "reject" if state.get("app_rejection") else "next"
-
-
 def _route_after_tech_stack(state: GraphState) -> str:
-    """The brownfield branch, moved here from scaffold: app discovery and tech-stack detection both
-    run before brownfield-baseline now, so an unsuitable repository is rejected before any human is asked to ratify
-    a baseline -- and before anything is written to the repo.
+    """The brownfield branch: tech-stack detection runs before brownfield-baseline, so its
+    approved content (dotnet_detected etc.) is available to brownfield-baseline's own draft.
 
-    A greenfield repo (no manifest, a stack already picked) skips brownfield-baseline's LLM stage
-    entirely and goes straight to the deterministic ratification node: there is nothing to baseline
-    in an empty repo, and that stage's brownfield draft would just needs_clarification->END after
-    the human already made their one choice at the tech-stack picker."""
+    A greenfield repo (no manifest, the deterministic scan found nothing) skips brownfield-
+    baseline's LLM stage entirely and goes straight to the deterministic ratification node: there
+    is nothing to baseline in an empty repo, and that stage's brownfield draft would just
+    needs_clarification->END after the human already confirmed a tech stack on the Tech Stack
+    tab."""
     if state.get("manifest_exists", True):
         return "next"
-    if state.get("greenfield"):
+    if tech_stack_signals.is_greenfield_repo(state):
         return "brownfield_write_manifest"
     return "brownfield_baseline_pre"
 
@@ -1795,15 +1847,17 @@ async def _manifest_branch_node(_state: GraphState) -> dict[str, Any]:
     return {}
 
 
-def _wire_app_discovery(builder: StateGraph) -> None:
-    """Wires the suitability gate and the repo-write ordering that depends on it:
-
-    scaffold (read-mostly) -> app_discovery_pre (deterministic scan) -> APP_DISCOVERY_SPEC
-    (draft -> audit -> auto-gate) -> app_discovery_decide -> app_discovery_reject -> END (the one
-    hard stop in this graph) | greenfield_stack_select (a blank repo's tech-stack picker, itself
-    routing to app_discovery_reject on decline or scaffold_finalize on accept) | scaffold_finalize
-    -> tech-stack -> manifest_branch -> (brownfield-baseline brownfield | brownfield_write_manifest
+def _wire_tech_stack_intake(builder: StateGraph) -> None:
+    """Wires the repo-write ordering: scaffold (read-mostly) -> app_discovery_pre (deterministic
+    scan, no LLM, no verdict) -> scaffold_finalize -> tech-stack (draft -> human-gated tab,
+    STAGES[0]) -> manifest_branch -> (brownfield-baseline brownfield | brownfield_write_manifest
     directly, for a greenfield repo | app_check_record) -> repo_scan_baseline -> raw-requirements.
+
+    No hard-rejection anymore, and no separate greenfield interrupt: the Tech Stack tab (backed
+    by the tech-stack StageSpec's human gate) is what every repository goes through now, empty or
+    not -- see graph.py's/preflight_nodes.py's Tech Stack tab redesign. The deterministic scan's
+    only remaining jobs are grounding the tech-stack draft's exploration and feeding
+    app_check_record_node/e2e_nodes.py's fresh rescans.
 
     repo_scan_baseline sits at the convergence point of both branches and immediately before P1,
     so it measures the repository as it arrived: the clone exists, the tech stack is known, and
@@ -1811,31 +1865,16 @@ def _wire_app_discovery(builder: StateGraph) -> None:
     because this node -- like every node on the main path -- is re-entered on every clarification
     round; see repo_scan.repo_scan_baseline_node's docstring for why that matters.
 
-    Verification status: the deterministic scan and the reject path have NOT been exercised
-    against a real sandbox; app_discovery.py's own self-check covers the pure half only.
+    Verification status: the deterministic scan has NOT been exercised against a real sandbox;
+    app_discovery.py's own self-check covers the pure half only.
     """
     builder.add_node("app_discovery_pre", app_discovery.app_discovery_pre_node)
-    builder.add_node("app_discovery_decide", app_discovery.app_discovery_decide_node)
-    builder.add_node("greenfield_stack_select", app_discovery.greenfield_stack_select_node)
-    builder.add_node("app_discovery_reject", app_discovery.app_discovery_reject_node)
     builder.add_node("app_check_record", app_discovery.app_check_record_node)
     builder.add_node("repo_scan_baseline", repo_scan.repo_scan_baseline_node)
     builder.add_node("scaffold_finalize", preflight_nodes.scaffold_finalize_node)
     builder.add_node("manifest_branch", _manifest_branch_node)
 
-    builder.add_edge("app_discovery_pre", f"{APP_DISCOVERY_SPEC.key}_draft")
-    _wire_stage(builder, APP_DISCOVERY_SPEC, "app_discovery_decide")
-    builder.add_conditional_edges(
-        "app_discovery_decide",
-        _route_after_app_discovery,
-        {"reject": "app_discovery_reject", "greenfield": "greenfield_stack_select", "next": "scaffold_finalize"},
-    )
-    builder.add_conditional_edges(
-        "greenfield_stack_select",
-        _route_after_greenfield_select,
-        {"reject": "app_discovery_reject", "next": "scaffold_finalize"},
-    )
-    builder.add_edge("app_discovery_reject", END)
+    builder.add_edge("app_discovery_pre", "scaffold_finalize")
     builder.add_edge("scaffold_finalize", f"{STAGES[0].key}_draft")
     builder.add_conditional_edges(
         "manifest_branch",
@@ -2122,7 +2161,6 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
 # Note: ADVERSARIAL_AUDIT_SPEC, DEDUP_SPEC, LICENSE_AUDIT_SPEC, EXIT_SPEC are now consolidated
 # into stages 7 (adversarial-compliance) and 8 (metrics-exit), so they're no longer standalone.
 _STANDALONE_STAGE_SPECS: list[StageSpec] = [
-    APP_DISCOVERY_SPEC,
     BROWNFIELD_BASELINE_SPEC,
 ]
 _ALL_STAGE_SPECS: list[StageSpec] = STAGES + _STANDALONE_STAGE_SPECS
@@ -2131,6 +2169,15 @@ _ALL_STAGE_SPECS: list[StageSpec] = STAGES + _STANDALONE_STAGE_SPECS
 _STAGE_KEYS = [stage.key for stage in _ALL_STAGE_SPECS] + ["raw-requirements"]
 _RENDER_MARKDOWN_BY_STAGE = {stage.key: stage.render_markdown for stage in _ALL_STAGE_SPECS}
 _RENDER_MARKDOWN_BY_STAGE["raw-requirements"] = render_raw_requirements_markdown
+# tech-stack.md has exactly one writer now: preflight_nodes.resolve_tech_stack_submission (the
+# human's own edited text, written at gate-approval time). The generic per-stage render below
+# would otherwise re-render approved_content (the machine-extracted TechStack JSON) over that
+# same path on every persist call, silently discarding whatever the human actually typed --
+# confirmed by tracing persist_state's "content_to_render = approved_content ... write .md" step,
+# which runs on every gate approval regardless of which stage. Popped, not left mapped to None:
+# persist_state's `.get(stage_key)` treats an absent key and an explicit None identically, but an
+# absent key is what documents "deliberately no writer" rather than "renderer not set up yet".
+del _RENDER_MARKDOWN_BY_STAGE["tech-stack"]
 
 
 def _with_live_refresh(name: str, action):
@@ -2188,7 +2235,7 @@ def build_graph() -> StateGraph:
     # the repository (see preflight_nodes.scaffold_finalize_node).
     builder.add_edge("scaffold", "app_discovery_pre")
 
-    _wire_app_discovery(builder)
+    _wire_tech_stack_intake(builder)
     _wire_brownfield(builder)
     # Old cluster wiring disabled: stages 6-8 consolidate the clusters
     # _wire_p8(builder)  # quality-remediation → now part of stage 6
@@ -2199,29 +2246,29 @@ def build_graph() -> StateGraph:
     # _wire_p14(builder)  # metrics → now part of stage 8
     # _wire_p15(builder)  # exit → now part of stage 8
 
-    # Wire all stage nodes first (rebuilds reference next stages, so stages must exist first)
+    # R placements are registered BEFORE the stages that route into them, so each stage can be
+    # wired with its true successor in one shot. The previous order (wire stage -> next_draft,
+    # then "replace" that edge with one to the rebuild node) could not work: builder.add_edge only
+    # ADDS, so both edges stayed live and the gate fanned out into two concurrent branches. Both
+    # branches write `stages`, which LangGraph rejects within one super-step -- observed live:
+    # "InvalidUpdateError: At key 'stages': Can receive only one value per step", ~15 minutes into
+    # a run, once the pipeline finally got far enough for the second branch to do real work.
+    post_stage_rebuild_entry_name = {key: _wire_rebuild(builder, spec) for key, spec in POST_STAGE_REBUILD.items()}
+
     for index, stage_spec in enumerate(STAGES):
         if stage_spec.key == STAGES[0].key:
             # tech-stack exits into the brownfield branch, not straight into raw-requirements --
-            # _wire_app_discovery owns that edge (and everything before it).
+            # _wire_tech_stack_intake owns that edge (and everything before it).
             next_draft_name = "manifest_branch"
         elif index + 1 < len(STAGES):
             next_draft_name = f"{STAGES[index + 1].key}_draft"
         else:
             next_draft_name = END
 
-        _wire_stage(builder, stage_spec, next_draft_name)
-
-    # Now wire rebuild nodes (which reference next-stage nodes that were just added)
-    post_stage_rebuild_entry_name = {key: _wire_rebuild(builder, spec) for key, spec in POST_STAGE_REBUILD.items()}
-
-    # Route stages with rebuilds: gate -> rebuild instead of gate -> next_draft
-    for stage_key, rebuild_node_name in post_stage_rebuild_entry_name.items():
-        gate_name = f"{stage_key}_gate"
-        auto_approve_name = f"{stage_key}_auto_approve"
-        # Remove the old edge to next_draft and add edge to rebuild instead
-        builder.add_edge(gate_name, rebuild_node_name)
-        builder.add_edge(auto_approve_name, rebuild_node_name)
+        # A stage with an R placement hands off to the rebuild node, which owns the edge onward to
+        # the next stage (RebuildSpec.next_node) once the build is green.
+        rebuild_entry = post_stage_rebuild_entry_name.get(stage_spec.key)
+        _wire_stage(builder, stage_spec, rebuild_entry or next_draft_name)
 
     return builder
 

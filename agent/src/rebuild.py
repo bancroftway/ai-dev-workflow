@@ -22,13 +22,21 @@ from typing import Any, Callable, Literal, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import git_ops, model_config, repo_files, stack_discovery
+from . import git_ops, model_config, repo_files, stack_runner
 from .copilot_chat_model import get_chat_model_for_thread
-from .custom_agent_loader import load_agent_for_stage
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
+from .schemas import StageReport
 
 FixScope = Literal["scaffold_only", "full"]
+
+
+class BuildVerifyReport(StageReport):
+    """What the build-verification agent must report (prompts/rebuild_verify.md)."""
+
+    ok: bool = False
+    stdout_tail: str = ""
+    stderr_tail: str = ""
 
 
 class RebuildState(TypedDict):
@@ -76,25 +84,30 @@ def make_rebuild_node(spec: RebuildSpec):
         # and the router checks it FIRST -- without this a healthy resubmit insta-fails.
         rb["cannot_verify"] = False
 
-        # Discover the build command via audit-model exploration
-        discovery = await stack_discovery.discover_stack_commands(
-            thread_id, owning_stage=spec.key, task="the build command"
+        # GHCP finds every buildable project and builds it from the right directory, then reports
+        # through a schema-validated terminal tool. Replaces "an audit model guesses a build
+        # command + root, Python runs `cd {root} && {command}` blindly" -- that guess was wrong on
+        # every headless run (a greenfield monorepo has nothing buildable at the repo root, so
+        # `dotnet build` died with MSB1003 in ~2s and this node silently escalated every time).
+        report = await stack_runner.run_and_report(
+            thread_id,
+            stage_key="rebuild",
+            prompt_name="rebuild_verify",
+            schema=BuildVerifyReport,
+            addendum=spec.fix_prompt_addendum or "",
         )
+        build_ok = report.success and report.ok
 
-        # cd into root, then run the command
-        full_command = f"cd {discovery.root} && {discovery.build_command}"
-        result = await provider.exec_in_sandbox(thread_id, full_command)
-
-        rb["status"] = "clean" if result.ok else "failed"
-        rb["last_exit_ok"] = result.ok
-        rb["last_stdout_tail"] = (result.stdout or "")[-4000:]
-        rb["last_stderr_tail"] = (result.stderr or "")[-4000:]
+        rb["status"] = "clean" if build_ok else "failed"
+        rb["last_exit_ok"] = build_ok
+        rb["last_stdout_tail"] = (report.stdout_tail or "")[-4000:]
+        rb["last_stderr_tail"] = (report.stderr_tail or report.error or "")[-4000:]
         rebuild[spec.key] = rb
 
         await repo_files.append_ledger_entry(
-            provider, thread_id, {"stage": spec.key, "node": "rebuild", "ok": result.ok, "cycle": rb["fix_cycle_count"]}
+            provider, thread_id, {"stage": spec.key, "node": "rebuild", "ok": build_ok, "cycle": rb["fix_cycle_count"]}
         )
-        if result.ok:
+        if build_ok:
             # A green build is the checkpoint where the code-writing sessions' source changes
             # (codegen, fixes) become worth keeping -- the artifact-only commit sites never stage
             # source, so without this the pushed work branch would carry no code at all.
@@ -143,27 +156,29 @@ def make_fix_node(spec: RebuildSpec):
             stderr_tail=rb["last_stderr_tail"],
         )
 
-        # Load custom agent if available
-        custom_agents = []
-        agent_config = load_agent_for_stage("rebuild_build", "fix")
-        if agent_config:
-            custom_agents = [agent_config]
-
         # Own session key per placement (rebuild-<key>:draft), not plan:draft -- sharing plan's key
         # returned its cached read-only session so this autopilot fixer silently couldn't write, and
         # bled plan's conversation across every R placement. Dedicated "rebuild" model entry
         # (falling back to plan's) -- the fixer needs codegen-tier capability regardless of how
         # cheap the drafting roster is.
+        #
+        # No custom_agents: confirmed live (twice -- ac-to-tests, then minimal-code-to-green) that
+        # a session created with custom_agents silently loses part of the agent's own declared
+        # `tools:` list, leaving a "fixer" that cannot edit anything and answers in prose instead.
+        # available_tools IS honored, so the tool set is declared here.
         model = get_chat_model_for_thread(
             thread_id,
             f"rebuild-{spec.key}",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=agent_config.get("model") if agent_config else (model_config.get_model_name("rebuild", "draft") or model_config.get_model_name("plan", "draft")),
+            model_name=model_config.get_model_name("rebuild", "draft") or model_config.get_model_name("plan", "draft"),
             sandbox=sandbox_registry.get(thread_id),
-            custom_agents=custom_agents if custom_agents else None,
-            agent=agent_config.get("name") if agent_config else None,
-            agent_mode="autopilot" if not agent_config else None,
+            available_tools=[
+                "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",
+                "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+            ],
+            # Always autopilot -- a fix node's whole purpose requires write access.
+            agent_mode="autopilot",
         )
         await model.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)])
 

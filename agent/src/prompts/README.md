@@ -13,10 +13,9 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 
 | File | Stage | Role |
 |---|---|---|
-| `app_discovery_draft.md` | app-discovery | classify repo, find startable apps |
 | `brownfield_baseline_draft.md` | brownfield-baseline | pre-existing system baseline |
-| `tech_stack_draft.md` | tech-stack | detect languages/frameworks |
-| `tech_stack_greenfield.md` | tech-stack | greenfield: derive the stack report from the user-selected canned stack |
+| `tech_stack_draft.md` | tech-stack | detect languages/frameworks (Tech Stack tab's fresh-detection path) |
+| `tech_stack_extract.md` | tech-stack | one-shot JSON extraction from the tab's saved/approved markdown |
 | `specification_draft.md` / `specification_audit.md` | specification | user stories + acceptance criteria |
 | `plan_draft.md` / `plan_audit.md` | plan | implementation plan, diagrams, wireframes |
 | `plan_greenfield_segment.md` | plan | greenfield: scaffold-first milestone segment |

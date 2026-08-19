@@ -37,6 +37,8 @@ from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
 
 logger = logging.getLogger(__name__)
+from . import stack_runner
+from .schemas import StageReport
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .tech_stack_signals import tech_stack_has_ui_framework
@@ -57,7 +59,14 @@ class E2EState(TypedDict):
     cannot_verify: bool  # sandbox missing at run time -- the suite never ran, escalate not pass
     screenshots: list[str]  # repo-relative paths
     skipped_reason: str | None
-    greenfield_candidates: list[dict[str, Any]]  # gate_check's own re-scan, greenfield runs only
+    app_candidates: list[dict[str, Any]]  # gate_check's own fresh re-scan (see its own comment)
+
+
+class AppLaunchReport(StageReport):
+    """What the app-launch discovery agent must report (prompts/e2e_run.md)."""
+
+    start_command: str = ""
+    port: int = 0
 
 
 def default_e2e_state() -> E2EState:
@@ -70,7 +79,7 @@ def default_e2e_state() -> E2EState:
         "cannot_verify": False,
         "screenshots": [],
         "skipped_reason": None,
-        "greenfield_candidates": [],
+        "app_candidates": [],
     }
 
 
@@ -125,11 +134,13 @@ async def e2e_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> 
         return {"e2e": e2e}
 
     e2e["status"] = "running"
-    if state.get("greenfield"):
-        # app-discovery ran pre-scaffold, so its own apps list is empty -- re-derive
-        # start_command/port against the now-scaffolded repo for e2e_run to use.
-        scan = await app_discovery.collect_evidence(provider, thread_id)
-        e2e["greenfield_candidates"] = scan["candidates"]
+    # app_check_record ran pre-scaffold, so its recorded apps list reflects a possibly-empty (or
+    # since-changed) repo -- always re-derive start_command/port fresh against the now-scaffolded
+    # repo for e2e_run to use (exit_nodes.py's own verify_exit_readiness established this same
+    # "re-scan now that the code exists" precedent). No longer greenfield-only: a brownfield repo
+    # that had zero startable apps before scaffolding has the exact same staleness problem.
+    scan = await app_discovery.collect_evidence(provider, thread_id)
+    e2e["app_candidates"] = scan["candidates"]
 
     return {"e2e": e2e}
 
@@ -187,11 +198,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     provider = get_sandbox_provider()
     e2e["cannot_verify"] = False
 
-    if state.get("greenfield"):
-        candidates = e2e.get("greenfield_candidates") or []
-    else:
-        app_discovery_stage = (state.get("stages") or {}).get("app-discovery") or {}
-        candidates = (app_discovery_stage.get("approved_content") or {}).get("apps") or []
+    candidates = e2e.get("app_candidates") or []
     app = next((a for a in candidates if str(a.get("start_command") or "").strip()), None)
 
     await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work")
@@ -209,8 +216,26 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         )
         return await _finalize_run(provider, thread_id, e2e)
 
-    port = int(app.get("port") or 3000)
-    start_command = str(app["start_command"])
+    # GHCP discovers AND proves the launch values (it actually starts the app, curls it, then
+    # stops it) instead of Python trusting app_discovery's static guess -- the same wrong-root /
+    # wrong-command failure family that broke every other stack-specific invocation. Python still
+    # owns the launch itself: this app must outlive the GHCP turn, and a detached process started
+    # inside a finished tool call has no defined lifetime.
+    launch = await stack_runner.run_and_report(
+        thread_id,
+        stage_key="e2e-run",
+        prompt_name="e2e_run",
+        schema=AppLaunchReport,
+    )
+    if launch.success and launch.start_command:
+        port = int(launch.port or app.get("port") or 3000)
+        start_command = launch.start_command
+    else:
+        # Fall back to the scan's own candidate rather than failing outright: a proven command is
+        # better, but an unproven one is still better than not trying to boot at all.
+        logger.warning("e2e: launch discovery failed (%s) -- falling back to scanned candidate", launch.error)
+        port = int(app.get("port") or 3000)
+        start_command = str(app["start_command"])
 
     # App secrets (keyvault.py): fetched on-behalf-of the user at provision time, injected here
     # as an env file sourced only into the app's own shell. Cache empty but a vault IS configured

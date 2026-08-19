@@ -16,6 +16,7 @@ and vitest-json (JS/TS) parsing are both written from documented schema shape, n
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, TypedDict
 
@@ -24,19 +25,31 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, spec_ledger, tech_stack_signals
+from . import git_ops, model_config, repo_files, spec_ledger, stack_runner
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
+from .schemas import StageReport
 from .schemas_test_hardening import FlakeTriageResponse
+
+logger = logging.getLogger(__name__)
 
 TEST_HARDENING_TOTAL_ATTEMPTS = int(os.environ.get("TEST_HARDENING_TOTAL_ATTEMPTS", "3"))  # 1 initial + 2 retries
 FLAKE_QUARANTINE_PATH = ".ai-dev-workflow/test_hardening/flake-quarantine.json"
 
-# Matches sandbox/local_docker.py & sandbox/azure_aci.py's WORKSPACE_DIR_IN_CONTAINER -- see
-# quality_nodes.py's twin constant for why this is inlined rather than imported.
-_REPO_ROOT_IN_CONTAINER = "/workspace/repo"
+# Placeholder the discovery agent leaves in its command/result path; Python substitutes the
+# attempt number so repeated runs don't overwrite each other's result files.
+_ATTEMPT_TOKEN = "__ATTEMPT__"
+
+
+class TestCommandReport(StageReport):
+    """What the test-command discovery agent must report (prompts/test_hardening_run.md)."""
+
+    command: str = ""
+    result_path: str = ""
+    format: str = ""
+
 
 FLAKE_TRIAGE_SYSTEM_PROMPT = load_prompt("test_hardening_flake_triage")
 
@@ -53,33 +66,6 @@ class TestHardeningState(TypedDict):
 
 def default_test_hardening_state() -> TestHardeningState:
     return {"attempt": 0, "test_outcomes": {}, "stable_fail": [], "flaky": [], "flake_quarantine": {}, "last_exit_ok": False, "cannot_verify": False}
-
-
-def _resolve_test_command(tech_stack: dict[str, Any], attempt: int) -> tuple[str, str] | None:
-    """Returns (command, result_file_path) or None if no mapping."""
-    if tech_stack.get("dotnet_detected"):
-        path = f"agent-work/test_hardening-attempt{attempt}.trx"
-        command = (
-            f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet test "
-            f"--logger 'trx;LogFileName={os.path.basename(path)}' "
-            f"--results-directory {_REPO_ROOT_IN_CONTAINER}/agent-work 2>&1"
-        )
-        return command, path
-    languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
-    if "typescript" in languages or "javascript" in languages:
-        # cd into the monorepo's node app (issue family: bare tool at repo root) so the app's own
-        # vitest.config applies, prefer the image-baked runner over an npx fetch, and write the
-        # report to a repo-root path since read_repo_file resolves from the repo root.
-        node_cd = tech_stack_signals.ecosystem_root_prefix(tech_stack, "node")
-        path = f"agent-work/test_hardening-attempt{attempt}.json"
-        out = f"{_REPO_ROOT_IN_CONTAINER}/{path}"
-        command = (
-            f"{node_cd}if [ -x /opt/aidw/test/node_modules/.bin/vitest ]; then "
-            f"/opt/aidw/test/node_modules/.bin/vitest run --reporter=json --outputFile={out} 2>&1; "
-            f"else npx --yes vitest run --reporter=json --outputFile={out} 2>&1; fi"
-        )
-        return command, path
-    return None
 
 
 def _parse_trx(raw_xml: str) -> dict[str, str]:
@@ -124,22 +110,39 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
     # Clear the sticky no-sandbox flag: it survives END-terminated runs in the checkpoint, and
     # the router checks it FIRST -- without this a healthy resubmit insta-fails.
     test_hardening["cannot_verify"] = False
-    raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
-    tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
 
     await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work")
+
+    # GHCP discovers and PROVES the test command once (canned per-stack commands guessed the wrong
+    # root on generated monorepos); Python then repeats that exact command N times. The repetition
+    # deliberately stays here: flake detection compares runs of an IDENTICAL command, and a model
+    # re-deciding the invocation each round would make the comparison meaningless.
+    discovery = await stack_runner.run_and_report(
+        thread_id,
+        stage_key="test-hardening-run",
+        prompt_name="test_hardening_run",
+        schema=TestCommandReport,
+        attempt_token=_ATTEMPT_TOKEN,
+    )
+    if not discovery.success or not discovery.command or _ATTEMPT_TOKEN not in discovery.result_path:
+        # No usable command: treat as "nothing to harden" exactly as an unmapped stack did before,
+        # rather than blocking the pipeline on a flake check that cannot run.
+        logger.warning("test-hardening: no usable test command discovered (%s)", discovery.error)
+        test_hardening["last_exit_ok"] = True
+        return {"test_hardening": test_hardening}
+
     outcomes: dict[str, list[str]] = {}
     for attempt in range(TEST_HARDENING_TOTAL_ATTEMPTS):
-        resolved = _resolve_test_command(tech_stack, attempt)
-        if resolved is None:
-            test_hardening["last_exit_ok"] = True
-            return {"test_hardening": test_hardening}
-        command, result_path = resolved
+        command = discovery.command.replace(_ATTEMPT_TOKEN, str(attempt))
+        result_path = discovery.result_path.replace(_ATTEMPT_TOKEN, str(attempt))
         await provider.exec_in_sandbox(thread_id, command)
         raw_result = await repo_files.read_repo_file(provider, thread_id, result_path)
         if raw_result is None:
             continue
-        per_test = _parse_trx(raw_result) if result_path.endswith(".trx") else _parse_vitest_json(raw_result)
+        per_test = (
+            _parse_trx(raw_result) if discovery.format == "trx" or result_path.endswith(".trx")
+            else _parse_vitest_json(raw_result)
+        )
         for test_name, outcome in per_test.items():
             outcomes.setdefault(test_name, []).append(outcome)
 

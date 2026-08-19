@@ -35,6 +35,13 @@ def tech_stack_has_ui_framework(state: dict[str, Any]) -> bool:
     return frameworks_have_ui(tech_stack.get("frameworks") or [])
 
 
+def is_greenfield_repo(state: dict[str, Any]) -> bool:
+    """No candidate the deterministic scan found -- a genuinely blank (or non-startable-only)
+    repository. Replaces the removed interrupt-driven state["greenfield"] dict; pure function of
+    the scan already taken at app_discovery_pre_node, no separate state channel needed."""
+    return not (state.get("app_scan") or {}).get("candidates")
+
+
 def dotnet_root_prefix(tech_stack: dict[str, Any]) -> str:
     """Shell prefix that `cd`s into TechStack.dotnet_solution_root before a bare `dotnet` command,
     for every quality/test/finding-cluster/gate node that shells out to dotnet build/format/test.
@@ -75,6 +82,11 @@ def _cd_prefix(root: Any, field: str) -> str:
 
 def _demo() -> None:
     """Self-check: `cd agent && uv run python -m src.tech_stack_signals`."""
+    assert is_greenfield_repo({}) is True
+    assert is_greenfield_repo({"app_scan": {}}) is True
+    assert is_greenfield_repo({"app_scan": {"candidates": []}}) is True
+    assert is_greenfield_repo({"app_scan": {"candidates": [{"path": "."}]}}) is False
+
     assert dotnet_root_prefix({"dotnet_solution_root": "apps"}) == "cd apps && "
     assert dotnet_root_prefix({"dotnet_solution_root": "apps/backend"}) == "cd apps/backend && "
     assert dotnet_root_prefix({"dotnet_solution_root": ""}) == ""

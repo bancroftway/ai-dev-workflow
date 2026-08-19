@@ -36,35 +36,17 @@ export interface StageState {
   baseline_commit: string | null;
 }
 
-/** Set by agent/src/app_discovery.py's decide node when the repository contains no startable
- * application. The one hard stop in the pipeline -- the run ends rather than pausing, so this is
- * the only signal the human gets, alongside the chat message the reject node posts. */
-export interface AppRejection {
-  reasons: string[];
-  found: { path: string; app_class: string }[];
-  checked_at: string;
-}
-
-/** A canned monorepo stack the greenfield tech-stack picker offers, loaded from
- * agent/src/templates/tech_stacks/*.md (agent/src/app_discovery.py's load_stack_catalog).
- * `markdown` is the full catalog file content -- editable by the user before acceptance in
- * TechStackSelectionCard, and written verbatim to .ai-dev-workflow/greenfield-stack.md on accept. */
+/** A canned monorepo stack the Tech Stack tab's dropdown offers, loaded from
+ * agent/src/templates/tech_stacks/*.md via GET /api/tech-stack-catalog (agent/src/app_discovery.py's
+ * load_stack_catalog). `markdown` is the full catalog file content -- picking one overwrites the
+ * tab's editor with it, still hand-editable before Submit. */
 export interface CannedTechStack {
   id: string;
   title: string;
   markdown: string;
 }
 
-/** Interrupt payload for a greenfield (blank) repository's tech-stack picker
- * (agent/src/app_discovery.py's greenfield_stack_select_node). Distinct from the plain approval
- * GatePayload (no `type` at all) and from EscalationPayload (a hard failure): this one asks the
- * human to pick or edit a stack, not approve a draft or acknowledge a failure -- AppShell's
- * InterruptCard discriminates on `type === "tech_stack_selection"` before falling through to the
- * generic escalation branch. */
-export interface TechStackSelectionPayload {
-  stage: "tech-stack";
-  type: "tech_stack_selection";
-  reasons?: string[];
+export interface TechStackCatalogResponse {
   stacks: CannedTechStack[];
 }
 
@@ -228,7 +210,6 @@ export interface PushStatus {
 
 export interface WorkflowState {
   raw_requirements_text?: string;
-  app_rejection?: AppRejection | null;
   repo_scan?: RepoScanState;
   quality_remediation?: QualityRemediationState;
   security_remediation?: SecurityRemediationState;
@@ -244,7 +225,6 @@ export interface WorkflowState {
   // Terminal failure: escalations no longer pause for a human -- the graph ENDs with this set.
   run_failure?: EscalationPayload | null;
   stages?: {
-    "app-discovery"?: StageState;
     "brownfield-baseline"?: StageState;
     "tech-stack"?: StageState;
     "raw-requirements"?: StageState;
@@ -268,7 +248,6 @@ export type StageKey = keyof NonNullable<WorkflowState["stages"]>;
 // intentionally absent here -- the Session Overview panel reads state.stages dynamically, so their
 // absence from this static list doesn't hide them from that panel, only from this ordered lookup.
 export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
-  { key: "app-discovery", label: "Runnable App Check" },
   { key: "brownfield-baseline", label: "Preflight Baseline" },
   { key: "tech-stack", label: "Tech Stack" },
   { key: "specification", label: "Specification" },
@@ -284,6 +263,7 @@ export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
 // Which StageState keys each tab's status dot derives from. The quality tab has no StageState
 // stages -- it reads the bespoke quality/security/test/metrics state keys directly (AppShell).
 export const TAB_STAGE_GROUPS: Record<string, StageKey[]> = {
+  "tech-stack": ["tech-stack"],
   requirements: ["raw-requirements"], // recorded as-is (always "approved"); no gate ever surfaces
   specification: ["specification"],
   plan: ["plan"],

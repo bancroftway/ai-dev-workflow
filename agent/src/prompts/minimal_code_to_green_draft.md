@@ -4,7 +4,13 @@ currently-failing test pass with the minimum implementation that genuinely satis
 Acceptance Criterion -- not the least code that happens to make the assertion pass. Use the
 `subagent-driven-development` skill (fresh subagent per task, two-stage review) and the
 `executing-plans` skill (work through the approved Implementation Plan's steps under review
-checkpoints). Run the `ponytail` skill (ultra) as an ADVISORY pass, not as orders: before writing
+checkpoints). Where the Plan's steps are genuinely independent of one another, use the
+`dispatching-parallel-agents` skill to run them concurrently rather than serially. Before you
+declare the work done, use the `requesting-code-review` skill on what you built and act on what
+it surfaces -- a later adversarial stage will review this code anyway, and finding your own
+defects here is cheaper than a rejected stage. Use `verification-before-completion` to confirm
+your claims are backed by evidence (a command you actually ran, output you actually saw) rather
+than assumption -- never report work as complete on the strength of having written it. Run the `ponytail` skill (ultra) as an ADVISORY pass, not as orders: before writing
 anything, generate its suggestions (does this need to exist, is it already in the codebase, is it
 a standard-library/native-platform feature, can it be one line), then evaluate each suggestion on
 its own merits -- correctness, genuine satisfaction of the Acceptance Criterion, behavior
@@ -20,27 +26,13 @@ about the Specification (rare -- justify it explicitly in your response if you d
 the bar to pass tests (no disabling assertions, no weakening a test's expectations to match
 whatever you built).
 
-COVERAGE CONTRACT (required): a deterministic gate verifies 95% line+branch coverage after this
-stage. You own the HOW; the gate owns the NUMBER. Write `.ai-dev-workflow/coverage-commands.json`:
-
-    {"entries": [
-      {"root": "", "command": "<command that runs the tests with coverage>",
-       "artifact": "<repo-relative path the command writes>",
-       "format": "cobertura" | "istanbul-json-summary"}
-    ]}
-
-One entry per stack/app root that has tests (a polyglot monorepo gets one entry per stack).
-The gate runs `command` with the working directory already set to `root` -- do NOT start the
-command with `cd <root> &&`; `artifact` stays repo-root-relative regardless of `root`.
-Each command must be non-interactive, deterministic, and emit its artifact at the stated path in
-one of the two formats -- nothing else is parsed. RUN each command yourself first and confirm the
-artifact appears; a broken entry fails the gate with the replay error. The gate DELETES the
-artifact and re-executes your command itself -- it never reads a number you report, so fabricated
-artifacts cannot pass. For JS/TS without a coverage provider in the repo, the sandbox ships one:
-`/opt/aidw/test/node_modules/.bin/vitest run --coverage --coverage.provider=v8
---coverage.reporter=json-summary --coverage.reportsDirectory=coverage` (artifact
-`coverage/coverage-summary.json`, format `istanbul-json-summary`) -- never install coverage
-packages into the repo. For .NET, coverlet's cobertura output is the standard route.
+COVERAGE: a deterministic gate verifies 95% line+branch coverage after this stage. A separate
+coverage agent works out how to run your tests with coverage and does it -- you do NOT need to
+record commands or write any coverage config file. What you owe that agent is a suite it can
+actually run: keep each stack's tests runnable from that stack's own project root, keep Playwright
+end-to-end specs under `tests/e2e/` (so a unit runner can exclude them -- they cannot be executed
+by vitest/jest), and never install coverage packages into the repo. Coverage is measured from real
+report files, so the way to pass this gate is genuinely-tested code, not configuration.
 
 Report every file you changed (`changed_files`, one-line summaries -- git is the actual diff, this
 is metadata, not a restatement of the code), how your subagent tasks went, and any `known_gaps` --

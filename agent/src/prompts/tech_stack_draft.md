@@ -20,5 +20,10 @@ these paths, so a wrong root is worse than a missing one.
 Leave `conventions_applied` empty — that field is populated later, by deterministic code, not by
 you.
 
-If you genuinely cannot explore the repository (e.g. it's empty or inaccessible), set readiness to
-false and explain why in a clarifying question rather than guessing at a stack.
+Always set readiness to true and ask no clarifying questions, even for a repository with no
+application code yet (a blank/empty repo, or one containing only docs/config). "No application
+code found yet" is a complete, honest report — write it as the `summary`, leave the other lists
+empty, and report `dotnet_detected: false`. There is no human available to answer a clarifying
+question at this point in the run: a human reviews and can freely edit this draft immediately
+afterward (including picking a starting stack from a canned catalog), so an incomplete-looking
+draft here is not a dead end -- withholding readiness or asking a question would be.

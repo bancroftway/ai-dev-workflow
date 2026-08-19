@@ -20,9 +20,21 @@ import shlex
 from dataclasses import dataclass
 from typing import Any
 
-from .. import repo_files, stack_discovery, tech_stack_signals
+from .. import repo_files, stack_runner, tech_stack_signals
 from ..sandbox.provider import SandboxProvider
+from ..schemas import StageReport
 from ..spec_ledger import LEDGER_PATH
+
+# Where the test-run agent tees the suite's complete console output for this gate to read.
+AC_TEST_OUTPUT_PATH = "agent-work/ac-test-output.txt"
+
+
+class AcTestRunReport(StageReport):
+    """What the test-run agent must report (prompts/ac_test_run.md)."""
+
+    output_artifact: str = ""
+    exit_ok: bool = False
+
 
 # One line of a test runner's console output naming a test and its outcome -- covers dotnet test's
 # default console logger, vitest's default reporter, and jest/playwright's default reporters
@@ -100,25 +112,32 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
             report={},
         )
 
-    # Discover test command via stack_discovery instead of hardcoded heuristics
-    try:
-        recommendation = await stack_discovery.discover_stack_commands(
-            thread_id, owning_stage="ac-to-tests", task="the test command"
-        )
-        test_command = recommendation.test_command
-    except Exception:
-        # Fallback to legacy resolve_test_command if discovery fails
-        raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
-        tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
-        test_command = resolve_test_command(tech_stack)
-
-    if not test_command:
+    # A GHCP session finds every test root and runs it, teeing the complete console output to a
+    # file this gate then reads. Replaces "an audit model guesses a test command, Python execs it"
+    # -- that guess kept running the wrong tool from the wrong directory on generated monorepos,
+    # producing an MSB1003-style error instead of any test output, which read here as "no AC is
+    # covered" and deadlocked the stage at its verify cap.
+    await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(AC_TEST_OUTPUT_PATH)}")
+    run_report = await stack_runner.run_and_report(
+        thread_id,
+        stage_key="ac-test-run",
+        prompt_name="ac_test_run",
+        schema=AcTestRunReport,
+        output_path=AC_TEST_OUTPUT_PATH,
+    )
+    output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)
+    if output is None:
         return AcCoverageOutcome(
-            passed=False, feedback="No test-runner command mapping for this stack -- cannot verify AC coverage.", report={}
+            passed=False,
+            feedback=(
+                "The test suite could not be run, so AC coverage cannot be verified -- this is an "
+                f"infra failure, not a coverage gap: {run_report.error or 'no test output was captured'}"
+            ),
+            report={"infra_error": "test_run_failed", "run_summary": run_report.summary},
         )
-
-    result = await provider.exec_in_sandbox(thread_id, test_command)
-    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    # The suite is expected RED at this stage; exit_ok is the runner's own exit status, which the
+    # tree-grep fallback below keys off exactly as the old exec's returncode did.
+    result_ok = run_report.exit_ok
     # Strip ANSI color codes -- vitest/jest colorize even without a TTY here, and escapes sitting
     # inside a line break naive marker/path matching.
     lines = [_ANSI_RE.sub("", line) for line in output.splitlines()]
@@ -154,7 +173,7 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
     # matters, "the test exists and nothing is green", is checkable from the tree + exit code
     # without trusting reporter formatting at all. Tautological (green) ids can't hide here:
     # a green test printed its ✓ line and was classified "pass" above.
-    if missing and not result.ok:
+    if missing and not result_ok:
         listing = await provider.exec_in_sandbox(
             thread_id, "git ls-files -co --exclude-standard | grep -iE '(test|spec)' || true"
         )
@@ -190,7 +209,7 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
                 "tautological": tautological,
                 "active_ac_ids": active_ac_ids,
                 # Diagnostics: enough to reconstruct WHY the scan missed an id without rerunning.
-                "runner_exit_ok": result.ok,
+                "runner_exit_ok": result_ok,
                 "failed_files_seen": _extract_failed_files(lines),
                 "output_tail": "\n".join(lines[-40:]),
             },

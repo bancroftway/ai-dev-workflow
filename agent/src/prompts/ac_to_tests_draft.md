@@ -11,13 +11,49 @@ For every active Acceptance Criterion, write one or more real, runnable test(s) 
 right now (no implementation exists yet) and will only pass once the AC is genuinely satisfied --
 never a tautological test (no bare `assert true`, no test that only checks a mock was called with
 whatever the mock was told to return). Follow this repository's own existing test project
-conventions (naming, framework, folder structure) rather than inventing new ones. Embed each AC's
+conventions (naming, framework, folder structure) rather than inventing new ones. If no test
+project exists yet for a language/framework an AC needs (a genuinely greenfield repo -- nothing
+has been scaffolded before this stage runs), read `.ai-dev-workflow/tech-stack.md`'s own Testing
+section for the intended framework, then hand-author the minimal test project files yourself with
+your edit tool (a test project/csproj file, a package.json's test-related fields, a
+vitest/playwright config) -- you have no shell/bash tool in this stage, so write these files
+directly rather than running a scaffolding CLI command. Do not skip writing tests, and do not
+merely describe the setup in your response, just because nothing exists yet. Embed each AC's
 id in its covering test's name, copied VERBATIM from the ledger -- if the ledger says
 `US-0007.2`, the test name contains `US-0007.2` (or the identifier-safe `US_0007_2` where `-`/`.`
 aren't legal in identifiers, e.g. `Test_US_0007_2_UserCanResetPassword`; a literal `[US-0007.2]`
 prefix in the test title string for languages that allow arbitrary test name strings). Never
 rename, renumber, or re-prefix an id -- a deterministic gate matches these ids character for
 character against the ledger.
+
+TEST LEVELS (a pyramid, not a pile of browser tests). The categories below (negative, edge,
+adversarial, validator) describe what a test ASSERTS; this section is about WHERE it runs, and the
+two are independent -- you can satisfy every category entirely in end-to-end specs, and that is a
+failed round. Write, in this order of preference:
+
+- **Unit tests** -- the default, and the bulk of your suite. Any rule you can state as "given this
+  input, this output/state" belongs here: validation rules, state transitions, ordering/filtering,
+  formatting, id generation, business logic. Fast, no browser, no server.
+- **Integration tests** -- for behavior that only exists when components meet: an API endpoint's
+  real request/response cycle including status codes and error bodies, persistence round-trips
+  (write then read it back), a service against its real collaborators.
+- **Subcutaneous tests** -- exercise a user-visible workflow through the layer JUST BELOW the UI
+  (the API/service/store), end to end in behavior but without a browser. This is where most
+  "user can do X" criteria are best proven: the same journey, far faster and far less brittle.
+- **End-to-end (Playwright)** -- reserved for what genuinely requires a real browser: rendering,
+  navigation, and user interaction. Cover the primary journeys; do not re-prove at this level a
+  rule you already proved beneath it.
+
+An AC being user-facing does NOT make it e2e-only. Nearly every user-facing criterion decomposes
+into a rule testable at unit level, a boundary testable at integration/subcutaneous level, and a
+thin browser-level check that the user can actually reach it -- write all the layers that apply.
+A round whose test files are ONLY `*.spec.ts` Playwright specs will be rejected: it means you
+stopped at the outermost layer. Report the level of each test in that AC's `coverage_plan` entry.
+
+Both levels are runnable here without touching dependency manifests (which you may not edit):
+.NET unit/integration tests live in a test project you may create yourself (e.g.
+`apps/api.Tests/Api.Tests.csproj` plus `*Tests.cs` files), and JS/TS unit tests run under the
+sandbox's own baked vitest with just a `vitest.config.ts` -- no `package.json` change required.
 
 Besides that proving (happy-path) test, for every AC write further tests where meaningful, each
 following the same AC-id-in-test-name rule above unchanged: negative tests covering invalid input,
@@ -38,7 +74,12 @@ tautological variants -- every additional test must assert a distinct observable
 existing test already proves, not restate the same assertion in a new wrapper.
 
 You have write access, but ONLY to test files -- test projects/files themselves, and their own
-config (e.g. a test project file, `playwright.config.ts`). Never touch production source code,
+config. Concretely, these paths are permitted, and they are enough to build the full pyramid
+above: anything under a `tests/`, `test/`, `__tests__/`, or `e2e/` directory; any `*.test.ts(x)`
+or `*.spec.ts(x)`; `vitest.config.ts` and `playwright.config.ts`; any `*.Tests/` directory,
+`*Tests.csproj`, or `*Tests.cs`; and Python `test_*.py`, `*_test.py`, `conftest.py`. Editing
+`package.json` (or any other dependency manifest) is NOT permitted and will be reverted -- use
+the sandbox's baked test runners instead of adding dependencies. Never touch production source code,
 even to make a test compile; if a test needs a symbol that doesn't exist yet, that's expected and
 correct at this stage (a later, separate stage adds minimal scaffolding to make it compile without
 making it pass).

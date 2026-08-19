@@ -22,9 +22,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
+from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
-from .prompt_loader import load_prompt_pair, render_prompt
+from .markdown_render import render_tech_stack_markdown
+from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
+from .schemas import TechStack
 from .schemas_app_discovery import DiscoveredApp
 from .schemas_session import SessionTitleResponse
 from .sandbox import registry as sandbox_registry
@@ -126,10 +129,12 @@ _TECH_STACK_PARAGRAPH = f"""
 ## Before generating, modifying, or reviewing any code
 
 Read `.ai-dev-workflow/tech-stack.md` first and follow the technology stack, architecture, and
-coding conventions documented there. It is kept up to date automatically as this repo's stack is
-analyzed. If `.ai-dev-workflow/greenfield-stack.md` exists, this repository was started greenfield
--- follow that file's stack description and repository layout when scaffolding the application.
+repository layout documented there -- including for a from-scratch (greenfield) repository, where
+this file describes the stack and layout to scaffold the application into.
 """
+
+TECH_STACK_MD_PATH = ".ai-dev-workflow/tech-stack.md"
+TECH_STACK_APPROVED_JSON_PATH = ".ai-dev-workflow/tech-stack.approved.json"
 
 
 async def update_manifest(
@@ -394,7 +399,7 @@ async def hydrate_tech_stack_from_repo_file(
     (e.g. from a version of this tool predating the sidecar, or manual repo setup) is treated as
     "needs a fresh run," not "already done."
     """
-    raw = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
+    raw = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_APPROVED_JSON_PATH)
     if raw is None:
         return None
     try:
@@ -407,6 +412,99 @@ async def hydrate_tech_stack_from_repo_file(
             thread_id,
         )
         return None
+
+
+async def prefill_tech_stack_from_repo_file(
+    thread_id: str, _state: "GraphState", provider: SandboxProvider
+) -> dict[str, Any] | None:
+    """StageSpec.prefill_from_repo_file for the tech-stack stage: tech-stack.md exists but
+    approved.json doesn't (else hydrate_tech_stack_from_repo_file already short-circuited to
+    approved above) -- show the file's own content in the Tech Stack tab, zero LLM calls, zero
+    repo exploration. Unlike hydrate, the result becomes an UNAPPROVED draft that still passes
+    through the human gate (make_draft_node), since the file's content was never reviewed through
+    this tool before."""
+    raw = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_MD_PATH)
+    return {"markdown": raw} if raw is not None else None
+
+
+_TECH_STACK_EXTRACT_PROMPT = load_prompt("tech_stack_extract")
+
+
+async def _extract_tech_stack(thread_id: str, markdown: str, provider: SandboxProvider) -> dict[str, Any]:
+    """One-shot structured extraction of the TechStack schema from already-human-approved
+    markdown -- no repo exploration, no clarification loop, distinct "extract" role so this never
+    shares (and clobbers) the draft session's own cached conversation (get_chat_model_for_thread's
+    session cache is keyed by (thread_id, stage, role))."""
+    model = get_chat_model_for_thread(
+        thread_id,
+        "tech-stack",
+        "extract",
+        github_token=os.environ.get("GITHUB_TOKEN"),
+        model_name=model_config.get_model_name("tech-stack", "extract"),
+        sandbox=sandbox_registry.get(thread_id),
+        available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
+    )
+    response = await ainvoke_structured(
+        model, [SystemMessage(content=_TECH_STACK_EXTRACT_PROMPT), HumanMessage(content=markdown)], TechStack
+    )
+    return response.model_dump(mode="json")
+
+
+def _select_tech_stack_markdown(resume_value: Any, draft: dict[str, Any] | None) -> str:
+    """Pure decision behind resolve_tech_stack_submission: what text actually gets saved.
+
+    The tab's Submit resolves with `{"markdown": edited_text}` in the normal case; a bare
+    `resume_value` (e.g. headless auto-approve, `Command(resume=True)`) falls back to whatever
+    the stage already had as its draft -- which itself is one of two shapes depending on how the
+    draft was produced: `{"markdown": ...}` from prefill_tech_stack_from_repo_file (file already
+    existed), or a raw TechStack-shaped dict from the LLM draft path (needs rendering to text)."""
+    draft = draft or {}
+    if isinstance(draft, dict) and "markdown" in draft:
+        fallback = draft.get("markdown")
+    else:
+        fallback = render_tech_stack_markdown(draft)
+    markdown = (resume_value.get("markdown") if isinstance(resume_value, dict) else "") or fallback or ""
+    return markdown
+
+
+async def resolve_tech_stack_submission(
+    thread_id: str, resume_value: Any, state: "GraphState", provider: SandboxProvider
+) -> dict[str, Any] | None:
+    """StageSpec.resolve_from_interrupt for the tech-stack stage: the Tech Stack tab's Submit
+    button resolves with `{"markdown": <edited text>}` -- this is what actually gets that edited
+    text saved and turned into the structured TechStack every downstream gate reads, since
+    make_gate_node's default behavior (approve stage["draft"] verbatim) has no way to see it.
+    """
+    stage = state["stages"]["tech-stack"]
+    markdown = _select_tech_stack_markdown(resume_value, stage.get("draft"))
+
+    # Written FIRST, unconditionally: the human's approved text must never be lost even if the
+    # extraction pass below fails outright -- ainvoke_structured raises after exhausting its own 3
+    # retries, and an uncaught exception here would otherwise crash the whole graph run through
+    # make_gate_node, losing this write along with it.
+    await repo_files.write_repo_file(provider, thread_id, TECH_STACK_MD_PATH, markdown)
+    await git_ops.commit_paths(provider, thread_id, [TECH_STACK_MD_PATH], "ai-dev-workflow: tech stack saved")
+
+    try:
+        tech_stack = await _extract_tech_stack(thread_id, markdown, provider)
+    except Exception:
+        logger.exception(
+            "tech-stack extraction failed for thread_id=%s; approving with a bare summary instead "
+            "of failing the run -- a human already reviewed and approved the markdown, which is "
+            "what matters; a failed best-effort JSON extraction is a quality loss, not a reason to "
+            "crash. Every downstream consumer tolerates a sparse TechStack (only `summary` is "
+            "required).",
+            thread_id,
+        )
+        tech_stack = TechStack(summary=markdown.strip()[:500] or "(not extracted)").model_dump(mode="json")
+
+    await repo_files.write_repo_file(
+        provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(tech_stack, indent=2) + "\n"
+    )
+    await git_ops.commit_paths(
+        provider, thread_id, [TECH_STACK_APPROVED_JSON_PATH], "ai-dev-workflow: tech stack extracted"
+    )
+    return tech_stack
 
 
 # ── Ecosystem convention table ────────────────────────────────────────────────────────────────
@@ -692,6 +790,14 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
 
     print("preflight_nodes self-check: ok")
     assert _session_title("x" * 100, "abc123") == "x" * 80
+
+    # _select_tech_stack_markdown: the tab's edited text wins; a bare (non-dict) resume value
+    # falls back to whatever the stage already had, rendering a raw TechStack draft to markdown
+    # but using a prefilled {"markdown": ...} draft's text verbatim.
+    assert _select_tech_stack_markdown({"markdown": "edited"}, {"markdown": "prefilled"}) == "edited"
+    assert _select_tech_stack_markdown(True, {"markdown": "prefilled"}) == "prefilled"
+    assert _select_tech_stack_markdown(True, {"summary": "S"}) == render_tech_stack_markdown({"summary": "S"})
+    assert _select_tech_stack_markdown(True, None) == render_tech_stack_markdown({})
 
     assert _template_version("aidw-template-version: 7") == 7
     assert _template_version("no stamp here") == 0

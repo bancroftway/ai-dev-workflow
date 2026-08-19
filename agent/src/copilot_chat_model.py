@@ -182,6 +182,20 @@ class CopilotChatModel(BaseChatModel):
     custom_agents: list[dict] | None = None
     agent: str | None = None
 
+    # Handler-backed custom tools passed straight to create_session. The structured-output
+    # mechanism (src/stack_runner.py) registers one `is_terminal=True` reporting tool here whose
+    # `parameters` IS the stage's JSON schema: a schema-valid call ends the agent's turn, an
+    # invalid one is rejected by our own client-side handler with field-level Pydantic errors and
+    # the model retries in-session. Tools are captured at session-creation time (same as
+    # available_tools), which is why each stage keeps its own session key.
+    tools: list[Any] | None = None
+
+    # Per-stage override of config.COPILOT_DISABLED_SKILLS. Exists because the vendored packs'
+    # two mandate-style skills belong in exactly one stage each rather than nowhere: brainstorming
+    # ("explore intent/requirements before implementation") is correct for specification and
+    # actively harmful in a mechanical stage like ac-to-tests, where it burned whole turns.
+    disabled_skills: list[str] | None = None
+
     _closing: bool = PrivateAttr(default=False)
     # Confirmed real by Phase A0's spike (SessionEventType.ASSISTANT_USAGE carries actual measured
     # token/cost data, not an estimate). Captures the LAST ASSISTANT_USAGE event seen during the
@@ -243,12 +257,52 @@ class CopilotChatModel(BaseChatModel):
                 await asyncio.wait_for(client.__aenter__(), timeout=120)
                 _clients[session_key] = client
 
+                # A stdio MCP server whose `command` doesn't resolve fails to spawn -- and that
+                # failure is otherwise completely silent: it doesn't appear in our logs, our OTEL
+                # spans, or even the CLI's own session event stream (confirmed live, PLAYWRIGHT_MCP_
+                # CONFIG's wrong "mcp-server-playwright" vs the real "playwright-mcp" binary name).
+                # The session just quietly loses every tool -- not only the MCP server's own --
+                # and 8+ headless runs burned 5-10 minutes each escalating with zero test files
+                # before this got traced back to a missing binary. Fail loud, at session-creation
+                # time, instead of after 3 costly draft/verify cycles.
+                if self.mcp_servers and self.sandbox is not None:
+                    provider = get_sandbox_provider()
+                    for server_name, server_cfg in self.mcp_servers.items():
+                        cmd = server_cfg.get("command") if isinstance(server_cfg, dict) else None
+                        if not cmd:
+                            continue
+                        probe = await provider.exec_in_sandbox(self.sandbox.session_id, f"command -v {cmd}")
+                        if not probe.ok:
+                            raise RuntimeError(
+                                f"MCP server {server_name!r} command {cmd!r} not found on PATH in "
+                                f"sandbox {self.sandbox.session_id} (stage={self.stage} role={self.role}) "
+                                "-- it would otherwise fail to spawn silently and take the session's "
+                                "other tools down with it"
+                            )
+
                 # plugin_directories only means anything inside the sandbox's own filesystem -- a
                 # locally-spawned (no-sandbox) Copilot process has no such content to point at.
                 plugin_directories = config.COPILOT_PLUGIN_DIRECTORIES if self.sandbox is not None else None
+                # Loaded-but-forbidden skills (config.COPILOT_DISABLED_SKILLS): the vendored packs
+                # carry a couple of standing "invoke a skill before ANY response" mandates that
+                # hijack a stage's turn. Disabling those two by name keeps every other skill this
+                # repo's prompts actually reference reachable.
+                disabled_skills = (
+                    (self.disabled_skills if self.disabled_skills is not None else config.COPILOT_DISABLED_SKILLS)
+                    if plugin_directories
+                    else None
+                )
                 hooks: SessionHooks | None = (
                     {"on_pre_tool_use": self.pre_tool_use_hook} if self.pre_tool_use_hook is not None else None
                 )
+                # Without an explicit working_directory, file tools (view/edit/create) are never
+                # even attempted -- confirmed via a standalone spike against a bare sandbox: the
+                # exact same session config with working_directory unset produced zero tool calls
+                # and a model claiming no file tool existed; with it set, the model actually
+                # attempted (and, once available_tools also included builtin:create, succeeded at)
+                # the write. Must match entrypoint.sh's WORKSPACE_DIR /
+                # sandbox.local_docker.WORKSPACE_DIR_IN_CONTAINER.
+                working_directory = "/workspace/repo" if self.sandbox is not None else None
 
                 session = await asyncio.wait_for(
                     client.create_session(
@@ -257,12 +311,15 @@ class CopilotChatModel(BaseChatModel):
                         model=self.model_name,
                         streaming=True,
                         plugin_directories=plugin_directories,
+                        disabled_skills=disabled_skills,
                         available_tools=self.available_tools,
                         excluded_tools=self.excluded_tools,
                         hooks=hooks,
                         mcp_servers=self.mcp_servers,
                         custom_agents=self.custom_agents,
                         agent=self.agent,
+                        tools=self.tools,
+                        working_directory=working_directory,
                     ),
                     timeout=180,
                 )
@@ -273,6 +330,11 @@ class CopilotChatModel(BaseChatModel):
                 raise RuntimeError(
                     f"Copilot session {session_key!r} timed out connecting to the sandbox CLI server"
                 ) from None
+            except Exception:
+                _clients.pop(session_key, None)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.__aexit__(None, None, None), timeout=10)
+                raise
             _sessions[session_key] = session
             return session
 
@@ -401,6 +463,8 @@ def get_chat_model_for_thread(
     mcp_servers: dict[str, MCPServerConfig] | None = None,
     custom_agents: list[dict] | None = None,
     agent: str | None = None,
+    tools: list[Any] | None = None,
+    disabled_skills: list[str] | None = None,
 ) -> CopilotChatModel:
     """Return the chat model for the given LangGraph thread's (stage, role) Copilot session.
 
@@ -432,6 +496,8 @@ def get_chat_model_for_thread(
         mcp_servers=mcp_servers,
         custom_agents=custom_agents,
         agent=agent,
+        tools=tools,
+        disabled_skills=disabled_skills,
     )
 
 
@@ -449,7 +515,9 @@ async def close_thread_session(thread_id: str) -> None:
 
 
 _STRUCTURED_OUTPUT_INSTRUCTION = (
-    "Respond with ONLY a single JSON object matching this JSON Schema. "
+    "If completing this task requires using your tools (e.g. writing files), do that FIRST, "
+    "using as many turns as you need -- only once that work is actually done, respond with ONLY "
+    "a single JSON object matching this JSON Schema as your final message. "
     "No markdown code fences, no commentary before or after the JSON.\n\n"
     "JSON Schema:\n{schema}"
 )
@@ -503,3 +571,13 @@ async def ainvoke_structured(
             )
     assert last_error is not None
     raise last_error
+
+
+def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
+    """The Copilot session id backing one (thread, stage, role), or None if none was created.
+
+    Exists so a gate can verify what a stage's session ACTUALLY did -- gates/skill_gate.py reads
+    that session's own `skill.invoked` events rather than trusting the model's self-report.
+    """
+    session = _sessions.get(f"{thread_id}:{stage}:{role}")
+    return getattr(session, "session_id", None) if session is not None else None

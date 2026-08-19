@@ -10,7 +10,6 @@ import {
   useInterrupt,
 } from "@copilotkit/react-core/v2";
 import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
 import { BuildView } from "@/components/BuildView";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
@@ -19,6 +18,7 @@ import { ReportView } from "@/components/ReportView";
 import { RequirementsView } from "@/components/RequirementsView";
 import { SessionOverview } from "@/components/SessionOverview";
 import { SpecificationView } from "@/components/SpecificationView";
+import { TechStackView } from "@/components/TechStackView";
 import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
@@ -29,11 +29,10 @@ import {
   PIPELINE_STAGE_ORDER,
   TAB_STAGE_GROUPS,
   type StageKey,
-  type TechStackSelectionPayload,
   type WorkflowState,
 } from "@/lib/workflow-types";
 
-type ViewId = "requirements" | "specification" | "plan" | "build" | "quality" | "report" | "overview";
+type ViewId = "tech-stack" | "requirements" | "specification" | "plan" | "build" | "quality" | "report" | "overview";
 type DotState = "running" | "done" | "error" | "awaiting";
 
 const DOT_CLASS: Record<DotState, string> = {
@@ -46,8 +45,7 @@ const DOT_CLASS: Record<DotState, string> = {
 /** Dot for a tab whose status derives from ordinary StageStates (TAB_STAGE_GROUPS). Green dots
  * intentionally clear on resubmission: intake resets later stages to not_started on each fresh
  * run, and the dots simply reflect that. */
-function stageGroupDot(state: WorkflowState, keys: StageKey[], error?: boolean): DotState | undefined {
-  if (error) return "error";
+function stageGroupDot(state: WorkflowState, keys: StageKey[]): DotState | undefined {
   const stages = keys.map((k) => state.stages?.[k]).filter((s) => s != null);
   if (stages.length === 0) return undefined;
   if (stages.some((s) => s.status === "drafting")) return "running";
@@ -87,7 +85,7 @@ export function AppShell({
     threadId,
     updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged],
   });
-  const [activeView, setActiveView] = useState<ViewId>("requirements");
+  const [activeView, setActiveView] = useState<ViewId>("tech-stack");
   const { copilotkit } = useCopilotKit();
   const [sandboxStatus] = useSandboxStatus();
 
@@ -165,7 +163,8 @@ export function AppShell({
   const reportDot: DotState | undefined = exitStage?.approved_content != null ? "done" : undefined;
 
   const dots: Record<ViewId, DotState | undefined> = {
-    requirements: stageGroupDot(state, TAB_STAGE_GROUPS.requirements, state.app_rejection != null),
+    "tech-stack": stageGroupDot(state, TAB_STAGE_GROUPS["tech-stack"]),
+    requirements: stageGroupDot(state, TAB_STAGE_GROUPS.requirements),
     specification: stageGroupDot(state, TAB_STAGE_GROUPS.specification),
     plan: stageGroupDot(state, TAB_STAGE_GROUPS.plan),
     build: stageGroupDot(state, TAB_STAGE_GROUPS.build),
@@ -185,6 +184,12 @@ export function AppShell({
         )}
         <MetricsBar thresholds={metricThresholds} />
         <nav className="flex items-center gap-1 border-b border-neutral-200 px-4 py-2">
+          <TabButton
+            label="Tech Stack"
+            active={activeView === "tech-stack"}
+            dot={dots["tech-stack"]}
+            onClick={() => setActiveView("tech-stack")}
+          />
           <TabButton
             label="Requirements"
             active={activeView === "requirements"}
@@ -234,6 +239,7 @@ export function AppShell({
         </nav>
 
         <main className="flex-1 overflow-y-auto">
+          {activeView === "tech-stack" && <TechStackView />}
           {activeView === "requirements" && <RequirementsView />}
           {activeView === "specification" && <SpecificationView />}
           {activeView === "plan" && <PlanView />}
@@ -272,24 +278,30 @@ function InterruptCard({
   const stageKey = typeof payload.stage === "string" ? payload.stage : undefined;
   const stageLabel = PIPELINE_STAGE_ORDER.find((s) => s.key === stageKey)?.label ?? stageKey ?? "this stage";
   const draft = (payload as Record<string, unknown>).draft;
-
-  useEffect(() => {
-    setInterrupt({ open: true, stage: stageKey, draft });
-    return () => setInterrupt({ open: false });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- payload identity churns per render; stage is the real key
-  }, [stageKey]);
+  const draftMarkdown = (payload as Record<string, unknown>).markdown;
+  const fileExisted = (payload as Record<string, unknown>).file_existed;
 
   const done = (value: unknown) => {
     setInterrupt({ open: false });
     resolve(value);
   };
 
-  // Checked BEFORE the generic `payload.type` escalation branch below: this payload also carries
-  // a `type` (tech_stack_selection), but it's a picker for a blank repo, not a failure to
-  // acknowledge.
-  if (payload.type === "tech_stack_selection") {
-    return <TechStackSelectionCard payload={payload as unknown as TechStackSelectionPayload} resolve={done} />;
-  }
+  useEffect(() => {
+    setInterrupt({
+      open: true,
+      stage: stageKey,
+      draft,
+      draftMarkdown: typeof draftMarkdown === "string" ? draftMarkdown : undefined,
+      fileExisted: typeof fileExisted === "boolean" ? fileExisted : undefined,
+      resolve: done,
+    });
+    return () => setInterrupt({ open: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- payload identity churns per render; stage is the real key
+  }, [stageKey]);
+
+  // The Tech Stack tab handles its own review entirely -- it reads {draftMarkdown, fileExisted,
+  // resolve} from InterruptContext directly (set above) rather than rendering a sidebar card.
+  if (stageKey === "tech-stack") return null;
 
   if (payload.type) {
     const rest: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
@@ -337,148 +349,24 @@ function InterruptCard({
   );
 }
 
-/** The greenfield tech-stack picker (agent/src/app_discovery.py's greenfield_stack_select_node):
- * offered instead of a hard rejection when a repository has no application code yet. Lets the
- * human pick one of the canned catalog stacks and edit its markdown before accepting -- the edited
- * text is what gets committed verbatim to .ai-dev-workflow/greenfield-stack.md and drives every
- * later prompt (tech-stack, plan, ac-to-tests) for this run.
- *
- * `resolve` here is InterruptCard's `done` wrapper -- both resume shapes below are non-empty
- * objects on purpose (see InterruptCard's own comment on this): `{ stack_id, markdown }` to
- * accept, `{ cancelled: true }` to decline. */
-function TechStackSelectionCard({
-  payload,
-  resolve,
-}: {
-  payload: TechStackSelectionPayload;
-  resolve: (value: unknown) => void;
-}) {
-  const stacks = payload.stacks ?? [];
-  const [selectedId, setSelectedId] = useState<string>(stacks[0]?.id ?? "");
-  const [markdown, setMarkdown] = useState<string>(stacks[0]?.markdown ?? "");
-  const [edited, setEdited] = useState(false);
-  const [mode, setMode] = useState<"edit" | "preview">("edit");
-
-  function handleSelect(id: string) {
-    if (edited && !window.confirm("Discard your edits and load the selected stack's description instead?")) {
-      return;
-    }
-    setSelectedId(id);
-    setMarkdown(stacks.find((s) => s.id === id)?.markdown ?? "");
-    setEdited(false);
-  }
-
-  return (
-    <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
-      <p className="text-sm font-medium text-amber-900">
-        This repository has no application code yet — pick a tech stack to start from
-      </p>
-      {payload.reasons && payload.reasons.length > 0 && (
-        <ul className="list-disc space-y-0.5 pl-5 text-xs text-amber-800">
-          {payload.reasons.map((reason, index) => (
-            <li key={index}>{reason}</li>
-          ))}
-        </ul>
-      )}
-
-      <label className="flex flex-col gap-1">
-        <span className="text-xs font-medium text-amber-900">Stack</span>
-        <select
-          className="rounded-md border border-amber-300 bg-white px-3 py-2 text-sm"
-          value={selectedId}
-          onChange={(event) => handleSelect(event.target.value)}
-        >
-          {stacks.map((stack) => (
-            <option key={stack.id} value={stack.id}>
-              {stack.title}
-            </option>
-          ))}
-        </select>
-      </label>
-
-      <div className="flex gap-1">
-        <button
-          type="button"
-          className={`rounded-md px-2 py-1 text-xs font-medium ${
-            mode === "edit" ? "bg-neutral-900 text-white" : "border border-neutral-300 bg-white text-neutral-700"
-          }`}
-          onClick={() => setMode("edit")}
-        >
-          Edit
-        </button>
-        <button
-          type="button"
-          className={`rounded-md px-2 py-1 text-xs font-medium ${
-            mode === "preview" ? "bg-neutral-900 text-white" : "border border-neutral-300 bg-white text-neutral-700"
-          }`}
-          onClick={() => setMode("preview")}
-        >
-          Preview
-        </button>
-      </div>
-
-      {mode === "edit" ? (
-        <textarea
-          className="min-h-[240px] w-full rounded-md border border-amber-300 bg-white px-3 py-2 font-mono text-xs"
-          value={markdown}
-          onChange={(event) => {
-            setMarkdown(event.target.value);
-            setEdited(true);
-          }}
-        />
-      ) : (
-        // Default sanitizer, no urlTransform override -- same trust posture as ReportView's own
-        // ReactMarkdown use: this text started as a canned catalog file but may now carry
-        // arbitrary human edits, so raw HTML/script must never render.
-        <div className="prose prose-sm max-h-[240px] max-w-none overflow-auto rounded-md border border-amber-300 bg-white px-3 py-2">
-          <ReactMarkdown>{markdown}</ReactMarkdown>
-        </div>
-      )}
-
-      <div className="flex gap-2">
-        <button
-          type="button"
-          className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
-          onClick={() => resolve({ stack_id: selectedId || "custom", markdown })}
-        >
-          Use this stack
-        </button>
-        <button
-          type="button"
-          className="rounded-lg border border-neutral-300 px-4 py-1.5 text-sm font-medium text-neutral-700"
-          onClick={() => resolve({ cancelled: true })}
-        >
-          Decline — reject repository
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// Chat input gating (WS9): a running agent should not be interrupted by free-text chat, and a
-// rejected repo has nothing to chat about. While running, the slot shows a pulsing progress line
-// naming the stage currently drafting -- driven by the same AG-UI streamed state AppShell
-// subscribes to (this child re-renders with it). Module-level with CopilotChatInput's statics
-// copied on (Object.assign) so it satisfies the `typeof CopilotChatInput` slot type and keeps a
-// stable identity across renders -- an inline component would remount the input every render and
-// drop in-progress text.
+// Chat input gating (WS9): a running agent should not be interrupted by free-text chat. While
+// running, the slot shows a pulsing progress line naming the stage currently drafting -- driven
+// by the same AG-UI streamed state AppShell subscribes to (this child re-renders with it).
+// Module-level with CopilotChatInput's statics copied on (Object.assign) so it satisfies the
+// `typeof CopilotChatInput` slot type and keeps a stable identity across renders -- an inline
+// component would remount the input every render and drop in-progress text.
 const GatedChatInput = Object.assign(
   function GatedChatInputImpl(props: CopilotChatInputProps) {
     const { localAgentId } = useWorkflowThread();
     const { agent } = useAgent({ agentId: localAgentId });
     const state = (agent.state ?? {}) as WorkflowState;
-    const rejected = state.app_rejection != null;
-    if (agent.isRunning || rejected) {
+    if (agent.isRunning) {
       const draftingStage = PIPELINE_STAGE_ORDER.find((s) => state.stages?.[s.key]?.status === "drafting");
       return (
         <div className="border-t border-neutral-200 px-4 py-3 text-sm text-neutral-400">
-          {rejected ? (
-            "This repository was rejected — chat is closed."
-          ) : (
-            <span className="animate-pulse">
-              ⋯ {draftingStage ? `Drafting ${draftingStage.label}` : "Working"} — chat opens when the agent needs you
-            </span>
-          )}
+          <span className="animate-pulse">
+            ⋯ {draftingStage ? `Drafting ${draftingStage.label}` : "Working"} — chat opens when the agent needs you
+          </span>
         </div>
       );
     }

@@ -15,12 +15,6 @@ EXIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("EXIT_MAX_CLARIFICATION_CYCLE
 # Small default: tech-stack detection is autonomous codebase study, not human-clarification-driven,
 # so this safety cap should rarely if ever trigger.
 TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFICATION_CYCLES", "2"))
-# Deliberately 1, and load-bearing: with a not-ready draft, make_route_after_draft sends
-# cycle_count >= max_cycles to auto_approve rather than to needs_clarification -> END. App
-# discovery gates the entire pipeline, so a model that withholds readiness must not be able to
-# halt the run silently -- an empty report reaches the decide node, which fails closed with a
-# reason that names the real cause.
-APP_DISCOVERY_MAX_CLARIFICATION_CYCLES = int(os.environ.get("APP_DISCOVERY_MAX_CLARIFICATION_CYCLES", "1"))
 
 # e2e's own bespoke-cluster caps (agent/src/e2e_nodes.py): fix-cycle cap (same shape as
 # rebuild.py's max_fix_cycles), app-boot readiness timeout, and the whole playwright suite's own
@@ -42,6 +36,47 @@ COPILOT_PLUGIN_DIRECTORIES = [
     f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/github-awesome-copilot/security-review",
     f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/pbakaus-impeccable/impeccable",
 ]
+
+# Skills that are loaded but must never be offered to a pipeline session. Both are written as
+# standing MANDATES rather than opt-in capabilities -- using-superpowers' own description is
+# "Use when starting any conversation ... requiring skill invocation before ANY response", and
+# brainstorming's is "You MUST use this before any creative work". Confirmed live: with these
+# reachable, ac-to-tests-draft spent its turn calling skills 10x and its own edit tools 0x, and
+# escalated with zero test files written.
+#
+# The rest of the superpowers pack is the opposite -- narrow, opt-in, and already named by this
+# repo's own prompts (test-driven-development in ac_to_tests_draft.md, systematic-debugging in
+# rebuild_build_fix.md/e2e_fix.md, subagent-driven-development + executing-plans in
+# minimal_code_to_green_draft.md, verification-before-completion + receiving-code-review in the
+# audit prompts). Excluding the whole plugin turned every one of those into a dangling reference
+# to a skill the session could not load; disabling just the two mandates keeps the referenced
+# skills working.
+COPILOT_DISABLED_SKILLS = ["using-superpowers", "brainstorming"]
+
+# specification is the ONE stage where brainstorming belongs -- its whole job is exploring intent
+# and requirements before anything is built, which is exactly what that skill is for. Everywhere
+# else it fires as a blanket "you MUST brainstorm before any creative work" mandate on stages that
+# are mechanical (write these tests, run this build) and burns the turn. using-superpowers stays
+# disabled everywhere: it is a meta-router that mandates invoking A skill before ANY response,
+# including before clarifying questions, and no stage wants that.
+COPILOT_DISABLED_SKILLS_SPECIFICATION = ["using-superpowers"]
+
+# Skills each stage is REQUIRED to invoke, enforced deterministically rather than trusted: the
+# stage's prompt names them, and gates/skill_gate.py verifies against the Copilot session's own
+# `skill.invoked` events (the model's self-report in StageReport.skills_invoked is telemetry, not
+# evidence -- a model that skipped a skill will happily claim it used one).
+REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
+    "specification": ["brainstorming"],
+    "plan": ["writing-plans"],
+    "ac-to-tests": ["test-driven-development"],
+    "minimal-code-to-green": ["executing-plans", "requesting-code-review", "verification-before-completion"],
+    "adversarial-audit": ["receiving-code-review", "verification-before-completion"],
+    "adversarial-compliance": ["receiving-code-review", "verification-before-completion"],
+    "exit": ["finishing-a-development-branch"],
+    # dispatching-parallel-agents is deliberately NOT required: it applies only when the plan has
+    # genuinely independent steps, so mandating it would force a nonsense invocation on a linear
+    # plan. systematic-debugging likewise -- the fix nodes it belongs to only run on failure.
+}
 
 # Read-only tool allowlist (Phase A0 spike finding: excluded_tools blocklisting write-capable
 # tools is incomplete -- the model can reach create/bash/edit/apply_patch interchangeably, so

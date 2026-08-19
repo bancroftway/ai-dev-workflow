@@ -9,6 +9,46 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class StageReport(BaseModel):
+    """Universal contract: EVERY stage reports through this before it can exit -- gate or no gate.
+
+    LLM-backed stages report it by calling the `report_stage_output` tool that src/stack_runner.py
+    registers (a schema-valid call ends the turn; an invalid one is rejected client-side with
+    field-level Pydantic errors and the model retries in-session). Deterministic stages construct
+    it in Python from what they measured. Either way stack_runner ledgers it before the stage
+    returns, so a stage can FAIL but can never go silent -- the failure mode that made 25+ headless
+    runs unreadable.
+
+    Stage-specific schemas subclass this and add their own fields (build check: stdout_tail;
+    coverage: entries; e2e: port/results_artifact; ...). Fields carry defaults so the legacy
+    stage schemas (specification/plan/ac-to-tests, which already have their own proven response
+    shapes) can be rebased onto this base without invalidating outputs their models produce today.
+    """
+
+    success: bool = Field(default=True, description="Did the work complete as instructed?")
+    ready_for_next_stage: bool = Field(
+        default=True,
+        description="Your own claim that the pipeline can proceed. Telemetry only -- the "
+        "deterministic gates, never this field, decide what actually happens next.",
+    )
+    error: str | None = Field(
+        default=None, description="What went wrong. REQUIRED whenever success is false."
+    )
+    summary: str = Field(default="", description="Short plain account of what you actually did.")
+    artifacts: list[str] = Field(
+        default_factory=list, description="Repo-relative paths this stage produced or changed."
+    )
+    skills_invoked: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every skill you invoked this turn, by name (e.g. 'test-driven-development'). Report "
+            "what you ACTUALLY invoked, not what you were asked to -- this is cross-checked "
+            "against the session's own skill-invocation log, and a mismatch is treated as a "
+            "false report."
+        ),
+    )
+
+
 class ClarifyingQuestion(BaseModel):
     id: str = Field(description="Short identifier, stable within the turn that produced it.")
     question: str

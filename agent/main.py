@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 logging.basicConfig(level=logging.INFO)
 
 from src.graph import graph
+from src.sessions_api import catalog_router as tech_stack_catalog_router
 from src.sessions_api import config_router as vault_config_router
 from src.sessions_api import router as sessions_router
 from src.telemetry import setup as telemetry_setup
@@ -34,6 +35,7 @@ app.add_middleware(
 
 app.include_router(sessions_router)
 app.include_router(vault_config_router)
+app.include_router(tech_stack_catalog_router)
 
 add_langgraph_fastapi_endpoint(
     app=app,

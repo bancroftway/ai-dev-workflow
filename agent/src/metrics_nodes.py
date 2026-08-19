@@ -13,6 +13,7 @@ scanner's own pure half is self-checked (`uv run python -m src.repo_scan`).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 from dataclasses import replace
@@ -29,6 +30,8 @@ from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
+
+logger = logging.getLogger(__name__)
 
 METRICS_LATEST_PATH = ".ai-dev-workflow/metrics-latest.json"
 TRACEABILITY_MATRIX_PATH = "traceability-matrix.md"
@@ -252,6 +255,14 @@ async def collect_live_refresh(state: dict[str, Any], thread_id: str) -> dict[st
         latest_duplication_percent=(report.metrics.get("duplication") or {}).get("percent"),
     )
     totals = await _sum_token_usage(provider, thread_id)
+    measures = summary.get("measures", {})
+    logger.info(
+        "repo_scan: background refresh landed thread_id=%s health_score=%s duplication_percent=%s "
+        "mean_ccn=%s coverage_line_rate=%s gating_count=%s cost=$%.2f",
+        thread_id, summary.get("health_score"), measures.get("duplication_percent"),
+        measures.get("mean_ccn"), measures.get("coverage_line_rate"), summary.get("gating_count"),
+        totals["total_cost"],
+    )
     return {
         "repo_scan": prior_repo_scan,
         "token_usage_running": {

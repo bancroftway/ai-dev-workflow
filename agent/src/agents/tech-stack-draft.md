@@ -5,8 +5,6 @@ tools:
   - builtin:view
   - builtin:grep
   - builtin:glob
-  - builtin:bash
-  - builtin:edit
 model: "gpt-5.4-mini"
 ---
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 
@@ -37,13 +38,23 @@ from ..prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
 from .. import config as workflow_config
-from .. import git_ops, model_config, repo_files, repo_scan, tech_stack_signals
+from .. import git_ops, model_config, repo_files, repo_scan, stack_runner, tech_stack_signals
 from ..copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from ..sandbox import registry as sandbox_registry
 from ..sandbox.factory import get_sandbox_provider
+from ..schemas import StageReport
 from .sarif import Finding, parse_sarif
 from .schemas import TriageResponse
 from .suppressions import append_suppression, check_no_silent_suppression
+
+
+class QualityScanRunReport(StageReport):
+    """What the quality-scan agent must report (prompts/quality_scan_run.md)."""
+
+    build_ok: bool = False
+    format_clean: bool = False
+    sarif_written: bool = False
+    format_report_written: bool = False
 
 QUALITY_MAX_CYCLES = int(os.environ.get("QUALITY_MAX_CYCLES", "3"))
 QUALITY_MAX_DUPLICATION_PERCENT = float(os.environ.get("QUALITY_MAX_DUPLICATION_PERCENT", "3.0"))
@@ -127,14 +138,25 @@ async def quality_scan_node(state: dict[str, Any], config: RunnableConfig) -> di
 
     findings: list[Finding] = []
     if tech_stack.get("dotnet_detected"):
-        dotnet_prefix = tech_stack_signals.dotnet_root_prefix(tech_stack)
-        build_result = await provider.exec_in_sandbox(
+        # GHCP locates the project(s), builds with analyzers, and format-checks -- reporting
+        # through a schema-validated terminal tool. Replaces `{dotnet_root_prefix}dotnet build`,
+        # whose repo-root guess is exactly the MSB1003 failure mode that killed the coverage gate
+        # on every generated monorepo. The SARIF/format artifacts are deleted first, so their
+        # existence afterward is proof this run produced them; parsing stays here in Python.
+        await provider.exec_in_sandbox(
             thread_id,
-            f"mkdir -p agent-work && {dotnet_prefix}dotnet build --no-incremental "
-            f"\"/p:ErrorLog={_REPO_ROOT_IN_CONTAINER}/agent-work/analyzers.sarif%2Cversion=2\" 2>&1",
+            f"mkdir -p agent-work && rm -f {shlex.quote(SARIF_PATH)} {shlex.quote(FORMAT_REPORT_PATH)}",
         )
-        quality_remediation["build_ok"] = build_result.ok
-        if not build_result.ok:
+        scan_report = await stack_runner.run_and_report(
+            thread_id,
+            stage_key="quality-scan-run",
+            prompt_name="quality_scan_run",
+            schema=QualityScanRunReport,
+            sarif_path=SARIF_PATH,
+            format_report_path=FORMAT_REPORT_PATH,
+        )
+        quality_remediation["build_ok"] = scan_report.build_ok
+        if not scan_report.build_ok:
             # A non-compiling tree can't be trusted for analyzer coverage -- short-circuits to
             # human escalation via quality_gate_check's own routing (never loops scan->triage->fix on
             # a tree that doesn't even build).
@@ -147,12 +169,7 @@ async def quality_scan_node(state: dict[str, Any], config: RunnableConfig) -> di
         if raw_sarif is not None:
             findings.extend(parse_sarif(raw_sarif, _SEVERITY_MAP))
 
-        format_result = await provider.exec_in_sandbox(
-            thread_id,
-            f"{dotnet_prefix}dotnet format --verify-no-changes "
-            f"--report {_REPO_ROOT_IN_CONTAINER}/agent-work/format-report.json 2>&1",
-        )
-        quality_remediation["format_clean"] = format_result.ok
+        quality_remediation["format_clean"] = scan_report.format_clean
     else:
         quality_remediation["build_ok"] = True
         quality_remediation["format_clean"] = True

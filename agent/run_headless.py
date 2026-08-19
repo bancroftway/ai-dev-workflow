@@ -1,9 +1,11 @@
 """Headless full-graph runner: executes the entire pipeline for (owner, repo, branch) with no
-frontend. Spec/plan gates are auto-approved; a greenfield repo's tech-stack picker (the graph's
-one other interrupt) auto-selects via --greenfield-stack/AIDW_GREENFIELD_STACK instead of pausing,
-or the repo is rejected if neither is set. Clarifying questions are disallowed via the
-AIDW_HEADLESS draft-prompt injection (graph.py make_draft_node); an exhausted deterministic gate
-ENDs the run with `run_failure` set, which lands in the report.
+frontend. Every gate auto-approves, including the Tech Stack tab: --greenfield-stack picks one of
+the canned catalog stacks for it (its interrupt is otherwise resumed with the detect-pass's own
+draft, same as every other gate). There is no more hard-rejection path -- an empty repo without
+--greenfield-stack simply proceeds with whatever the detect pass honestly found (a sparse draft).
+Clarifying questions are disallowed via the AIDW_HEADLESS draft-prompt injection (graph.py
+make_draft_node); an exhausted deterministic gate ENDs the run with `run_failure` set, which lands
+in the report.
 
 Runs IN-PROCESS on purpose: the sandbox registry, push-token map, and the graph's InMemorySaver
 checkpointer are all process-local, so provisioning and the graph must share one process.
@@ -33,13 +35,13 @@ load_dotenv(find_dotenv())  # tokens live in the repo-root .env, one level above
 os.environ.setdefault("AIDW_HEADLESS", "1")
 os.environ.setdefault("AIDW_SANDBOX_IDLE_TIMEOUT", "86400")  # belt-and-suspenders: _touch_sandbox() already keeps a silent turn's sandbox alive; this just widens the margin
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.basicConfig(level=os.environ.get("AIDW_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("run_headless")
 
 from langchain_core.messages import HumanMessage  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
-from src import branch_naming, copilot_chat_model, git_ops  # noqa: E402
+from src import app_discovery, branch_naming, copilot_chat_model, git_ops  # noqa: E402
 from src.graph import graph  # noqa: E402
 from src.sandbox import get_sandbox_provider, registry  # noqa: E402
 
@@ -61,11 +63,11 @@ def _parse_args() -> argparse.Namespace:
         "--greenfield-stack",
         default=None,
         metavar="STACK_ID",
-        help="auto-select this canned stack (agent/src/templates/tech_stacks/*.md filename stem, "
-        "e.g. nextjs-fastapi) when a blank repository is offered the greenfield picker, instead of "
-        "rejecting it -- sets AIDW_GREENFIELD_STACK, which app_discovery.py's decide/select nodes "
-        "read. Headless has no interrupt to answer, so a blank repo without this flag is rejected "
-        "exactly as before.",
+        help="when the run reaches the Tech Stack tab's gate, resume it with this canned stack's "
+        "markdown (agent/src/templates/tech_stacks/*.md filename stem, e.g. nextjs-fastapi) "
+        "instead of whatever the detect pass drafted -- for repeatable canned-scenario testing "
+        "against a blank repository. Without this flag, the gate just auto-approves the detect "
+        "pass's own draft, same as every other gate.",
     )
     return parser.parse_args()
 
@@ -89,15 +91,22 @@ async def run(args: argparse.Namespace) -> int:
         # Fine-grained PATs are often read-only; a pushless run silently loses all output.
         logger.warning("E2E_GITHUB_TOKEN looks fine-grained -- confirm it has PUSH (contents: write). A read-only token voids every stage-end push.")
 
-    # uuid chars FIRST: entrypoint.sh suffixes the remote work branch with the first 8 chars of
-    # the session id -- a constant prefix would collapse every headless run onto one shared,
-    # force-pushed branch that also rehydrates the previous run's state.
-    thread_id = args.thread or uuid.uuid4().hex[:12]
+    # full canonical uuid4 string, not a truncated .hex -- session_store's `sessions.session_id`
+    # column is SQL Server `uniqueidentifier`; a short hex-only string fails that conversion
+    # (matches the format session_store.create_session mints for API-driven sessions).
+    thread_id = args.thread or str(uuid.uuid4())
     if args.thread:
         os.environ["AIDW_RESUME"] = "1"
         logger.info("resuming thread %s -- approved stages will be skipped", thread_id)
+    greenfield_stack_markdown: str | None = None
     if args.greenfield_stack:
-        os.environ["AIDW_GREENFIELD_STACK"] = args.greenfield_stack
+        catalog = app_discovery.load_stack_catalog()
+        match = next((entry for entry in catalog if entry["id"] == args.greenfield_stack), None)
+        if match is None:
+            valid = ", ".join(entry["id"] for entry in catalog)
+            logger.error("--greenfield-stack %r is not a known stack id. Valid: %s", args.greenfield_stack, valid)
+            return 2
+        greenfield_stack_markdown = match["markdown"]
         logger.info("greenfield auto-select armed: stack_id=%s", args.greenfield_stack)
     cfg = {"configurable": {"thread_id": thread_id}}
     started = time.monotonic()
@@ -131,7 +140,6 @@ async def run(args: argparse.Namespace) -> int:
                 stuck = [k for k, s in statuses.items() if s == "needs_clarification"]
                 outcome.update(
                     stage_statuses=statuses,
-                    app_rejection=values.get("app_rejection"),
                     run_failure=values.get("run_failure"),
                     needs_clarification=stuck,
                     ok=statuses.get("exit") == "approved",
@@ -144,13 +152,17 @@ async def run(args: argparse.Namespace) -> int:
                 outcome.update(stage_statuses=_stage_statuses(snap.values), error="paused_without_interrupt")
                 break
             payload = interrupts[0].value if isinstance(interrupts[0].value, dict) else {}
-            # Spec/plan approval gates are the only interrupts this loop ever actually resumes.
-            # The greenfield stack picker's own interrupt() never fires here: AIDW_GREENFIELD_STACK
-            # set auto-selects a stack without calling interrupt() at all; unset, a blank repo is
-            # rejected outright instead of ever being offered the picker (app_discovery.py's
-            # headless_blocked guard). Failures END the run with run_failure instead of pausing.
-            logger.info("auto-approving gate: %s", payload.get("stage"))
-            stream_input = Command(resume=True)
+            # Every gate auto-approves. The Tech Stack tab's gate is the one exception: with
+            # --greenfield-stack set, resume it with that canned stack's markdown (matching
+            # preflight_nodes.resolve_tech_stack_submission's expected {"markdown": ...} shape) --
+            # without it, a bare resume=True falls through to the detect pass's own draft, same as
+            # every other gate. There is no more hard-rejection path to guard against here.
+            if payload.get("stage") == "tech-stack" and greenfield_stack_markdown is not None:
+                logger.info("resuming tech-stack gate with canned stack %s", args.greenfield_stack)
+                stream_input = Command(resume={"markdown": greenfield_stack_markdown})
+            else:
+                logger.info("auto-approving gate: %s", payload.get("stage"))
+                stream_input = Command(resume=True)
     finally:
         try:
             await copilot_chat_model.close_thread_session(thread_id)

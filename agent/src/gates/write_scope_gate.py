@@ -67,6 +67,22 @@ def _is_pipeline_owned(path: str) -> bool:
     return path.startswith(_PIPELINE_OWNED_PREFIXES)
 
 
+# A Playwright end-to-end spec: either it sits in an e2e directory, or it's the playwright config
+# itself. Matched by LOCATION rather than by reading imports -- `tests/e2e/` is the convention this
+# stage's own prompt mandates, and the coverage gate relies on the same split to exclude browser
+# specs from a unit run.
+_E2E_PATH_RE = re.compile(r"(^|/)e2e(/|$)|(^|/)playwright\.config\.[jt]sx?$|\.e2e\.[jt]sx?$", re.IGNORECASE)
+
+
+def _has_non_e2e_test(changed_paths: list[str]) -> bool:
+    """True when at least one written test lives below the browser layer (unit/integration/
+    subcutaneous). Pipeline artifacts never count as tests."""
+    return any(
+        _is_test_path(p) and not _E2E_PATH_RE.search(p) and not _is_pipeline_owned(p)
+        for p in changed_paths
+    )
+
+
 @dataclass(frozen=True)
 class WriteScopeOutcome:
     passed: bool
@@ -217,8 +233,50 @@ async def verify_ac_to_tests(
             report={"changed_paths": write_scope.changed_paths},
         )
 
+    # Test-pyramid check: a suite made only of Playwright e2e specs means the stage stopped at the
+    # outermost layer. Observed live -- one `apps/web/tests/e2e/*.spec.ts` and nothing else, for
+    # every AC, because a user-facing criterion always "needs a browser" under the skill's own
+    # heuristic. That suite is slow, brittle, and proves no rule below the UI; it also leaves the
+    # coverage gate with nothing instrumentable, since a unit runner cannot execute Playwright
+    # specs. Enforced here rather than left to the prompt, which the model can silently ignore.
+    if not _has_non_e2e_test(real_changes):
+        return VerificationResult(
+            passed=False,
+            feedback=(
+                "Every test you wrote is a Playwright end-to-end spec. A browser test cannot prove "
+                "the rules beneath the UI, and a unit runner cannot execute it, so this suite is "
+                "not acceptable on its own. Add tests BELOW the UI for the same criteria and keep "
+                "e2e for genuine user journeys: unit tests for logic/validation/state rules, and "
+                "integration or subcutaneous tests (API/service layer, no browser) for workflows. "
+                "You may create these without touching any dependency manifest -- a .NET test "
+                "project (e.g. apps/api.Tests/Api.Tests.csproj plus *Tests.cs) and/or JS/TS "
+                "*.test.ts files with a vitest.config.ts run on the sandbox's baked runners."
+            ),
+            report={"changed_paths": write_scope.changed_paths, "e2e_only": True},
+        )
+
     coverage = await check_ac_coverage(provider, thread_id, content_dict)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
     if write_scope.reverted_paths:
         report["reverted_out_of_scope_paths"] = write_scope.reverted_paths
     return VerificationResult(passed=coverage.passed, feedback=coverage.feedback, report=report)
+
+
+def _demo() -> None:
+    """Self-check for the pure path classifiers. The gate's own I/O half needs a sandbox."""
+    # e2e-only suites are what this stage produced live, and must be rejected
+    assert not _has_non_e2e_test(["apps/web/tests/e2e/task-tracker.ac.spec.ts"])
+    assert not _has_non_e2e_test(["apps/web/tests/e2e/a.spec.ts", "apps/web/playwright.config.ts"])
+    # a real pyramid passes
+    assert _has_non_e2e_test(["apps/web/tests/e2e/a.spec.ts", "apps/api.Tests/TaskTests.cs"])
+    assert _has_non_e2e_test(["apps/web/src/app/calc.test.ts"])
+    assert _has_non_e2e_test(["apps/api.Tests/Api.Tests.csproj", "apps/api.Tests/TaskTests.cs"])
+    assert _has_non_e2e_test(["tests/test_tasks.py"])
+    # non-test and pipeline-owned files never count as tests
+    assert not _has_non_e2e_test(["apps/web/src/app/page.tsx"])
+    assert not _has_non_e2e_test([".ai-dev-workflow/ledger.jsonl"])
+    print("write_scope_gate self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

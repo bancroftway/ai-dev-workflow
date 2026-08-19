@@ -173,6 +173,18 @@ async def verify_plan_diagrams(
 ) -> "VerificationResult":
     from ..graph import VerificationResult  # local import: graph.py imports this module
 
+    if not content_dict:
+        # Reachable via the clarification-cycle safety cap: auto_approve_node promotes whatever
+        # the last draft attempt produced straight to "approved" content, and a draft that never
+        # got past a (headless-disallowed) clarifying-question response can leave that empty/None.
+        # A crash here would kill the whole run; report it through the normal retry/escalate path
+        # instead, same as any other failed verification.
+        return VerificationResult(
+            passed=False,
+            feedback="Plan content is empty -- the draft never produced a real plan (safety-cap auto-approve after repeated clarification attempts). Draft a complete plan with no clarifying questions.",
+            report={"plan_content": "empty"},
+        )
+
     diagrams = content_dict.get("diagrams") or []
     wireframes = content_dict.get("wireframes") or []
 
