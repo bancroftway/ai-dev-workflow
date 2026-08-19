@@ -564,8 +564,18 @@ async def ainvoke_structured(
             request_messages.append(
                 HumanMessage(
                     content=(
-                        f"That was not valid JSON matching the schema (error: {exc}). "
-                        "Reply again with ONLY the corrected JSON object, no other text."
+                        f"That response was rejected (error: {exc}).\n"
+                        # Not every rejection is a syntax problem. A schema may also enforce a
+                        # WORK rule -- e.g. ac-to-tests refuses readiness=true with no test files
+                        # -- and the old wording ("reply again with ONLY the corrected JSON, no
+                        # other text") told the model to re-answer without touching its tools,
+                        # which is exactly the wrong move when the rejection means the work is
+                        # missing. Read the error and act on what it actually says.
+                        "If the error is about the JSON itself (syntax, a wrong or missing "
+                        "field), reply again with ONLY the corrected JSON object.\n"
+                        "If the error says required WORK is missing, do that work first with "
+                        "your tools -- write the files, run the command -- and only then reply "
+                        "with the JSON describing what you actually did."
                     )
                 )
             )
@@ -581,3 +591,26 @@ def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
     """
     session = _sessions.get(f"{thread_id}:{stage}:{role}")
     return getattr(session, "session_id", None) if session is not None else None
+
+
+async def close_session(thread_id: str, stage: str, role: str) -> None:
+    """Drop one (thread, stage, role) Copilot session so the next call starts a fresh one.
+
+    Sessions are conversational and cached per stage, which is normally what we want -- a retry
+    keeps its context and the gate's feedback. But when a stage fails because the model reported
+    work it never did, that fabricated claim is now in its own history and it repeats it: observed
+    live, ac-to-tests asserted "created failing RED-phase tests for all active ACs" on six
+    consecutive laps while making zero write calls. Retrying in the same session re-reads the lie;
+    a fresh session re-reads only the prompt and the failure feedback.
+    """
+    session_key = f"{thread_id}:{stage}:{role}"
+    session = _sessions.pop(session_key, None)
+    client = _clients.pop(session_key, None)
+    _session_locks.pop(session_key, None)
+    if session is not None:
+        with contextlib.suppress(Exception):
+            await session.disconnect()
+    if client is not None:
+        with contextlib.suppress(Exception):
+            await client.__aexit__(None, None, None)
+    logger.info("closed session %r so the next attempt starts fresh", session_key)

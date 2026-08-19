@@ -81,6 +81,160 @@ class CoverageRunReport(StageReport):
     entries: list[CoverageEntry] = Field(default_factory=list)
 
 
+# Config/manifest files are not an application. Observed live: a run reported every stage approved
+# having produced only package.json, tsconfig.json and a Directory.Build.props -- the actual task
+# logic had been written INSIDE the test helper (tests/setup-task-store-stub.ts), so the suite
+# passed by testing its own stub and no app existed at all. That is precisely the tautological
+# outcome this pipeline exists to prevent, and a bare "did any non-test file change" check waved
+# it through.
+_SOURCE_EXTENSIONS = (
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+    ".cs", ".fs", ".vb", ".py", ".go", ".rb", ".java", ".kt", ".rs", ".php",
+    ".html", ".css", ".scss",
+)
+# Filenames that are configuration/manifests even though they carry a source-ish extension.
+_CONFIG_FILE_RE = re.compile(
+    r"(^|/)("
+    r"package(-lock)?\.json|tsconfig[^/]*\.json|angular\.json|nx\.json|jsconfig\.json|"
+    r"[^/]*\.config\.([cm]?[jt]s|[jt]sx)|[^/]*\.conf\.([cm]?[jt]s)|"
+    r"eslint[^/]*|prettier[^/]*|babel[^/]*"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+# A declared UI framework's unmistakable source signature. Observed live (nextjs-dotnet): the run
+# finished with ok=true and every stage approved, having built ONLY the .NET API -- apps/ held just
+# api and api.Tests, and not one .ts/.tsx file was tracked. Coverage was 98.9% because the C# it
+# did write was well tested, so no existing gate had any reason to object. Stack fidelity has to be
+# checked on its own; a coverage number says nothing about whether the declared app was built.
+_FRONTEND_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Checked longest-marker-first so "next"/"nuxt" win before a bare "react" also matches.
+    ("blazor", (".razor",)),
+    ("angular", (".component.ts",)),
+    ("svelte", (".svelte",)),
+    ("nuxt", (".vue",)),
+    ("vue", (".vue",)),
+    ("next", (".tsx", ".jsx")),
+    ("react", (".tsx", ".jsx")),
+    ("flutter", (".dart",)),
+    ("swiftui", (".swift",)),
+)
+
+
+def missing_declared_frontend(frameworks: list[str], source_files: list[str]) -> str | None:
+    """The declared UI framework whose source signature is absent from the tree, or None.
+
+    Pure function of (declared frameworks, delivered files) so it is directly testable -- see this
+    module's self-check.
+    """
+    lowered_paths = [path.lower() for path in source_files]
+    for framework in frameworks:
+        name = str(framework).lower()
+        for marker, suffixes in _FRONTEND_SIGNATURES:
+            if marker not in name:
+                continue
+            if not any(path.endswith(suffixes) for path in lowered_paths):
+                return str(framework)
+            break  # this framework is satisfied; don't let a later marker re-judge it
+    return None
+
+
+# The npm package a declared JS/TS framework must actually depend on. A source-file signature
+# alone proved gameable: told to build a Next.js frontend, a run created apps/web/src/app/page.tsx
+# plus a package.json whose every script was `node -e "console.log('web build placeholder')"` and
+# no dependencies at all. That satisfies "a .tsx file exists" while installing no framework and
+# building nothing, so the declared frontend still did not exist in any real sense.
+_FRONTEND_NPM_PACKAGES: tuple[tuple[str, str], ...] = (
+    ("angular", "@angular/core"),
+    ("svelte", "svelte"),
+    ("nuxt", "nuxt"),
+    ("vue", "vue"),
+    ("next", "next"),
+    ("react", "react"),
+)
+
+
+def missing_frontend_dependency(frameworks: list[str], package_json: str | None) -> str | None:
+    """A declared JS/TS framework absent from package.json's dependencies, or None.
+
+    Fails OPEN (returns None) when there is no package.json to read: only positive evidence that
+    the manifest omits the framework counts against the stage.
+    """
+    if package_json is None:
+        return None
+    try:
+        manifest = json.loads(package_json)
+    except json.JSONDecodeError:
+        return None
+    declared = {
+        *(manifest.get("dependencies") or {}),
+        *(manifest.get("devDependencies") or {}),
+    }
+    for framework in frameworks:
+        name = str(framework).lower()
+        for marker, package in _FRONTEND_NPM_PACKAGES:
+            if marker not in name:
+                continue
+            if package not in declared:
+                return str(framework)
+            break
+    return None
+
+
+async def _missing_declared_frontend(
+    provider: SandboxProvider, thread_id: str, source_files: list[str]
+) -> str | None:
+    """Same check against the repo's own approved tech-stack record. Returns None (fails OPEN) when
+    that record can't be read -- an unreadable artifact is not evidence the frontend is missing."""
+    for path in (".ai-dev-workflow/tech-stack.approved.json", ".ai-dev-workflow/tech-stack.draft.json"):
+        raw = await repo_files.read_repo_file(provider, thread_id, path)
+        if raw is None:
+            continue
+        try:
+            frameworks = json.loads(raw).get("frameworks") or []
+        except json.JSONDecodeError:
+            continue
+        if not frameworks:
+            continue
+        names = [str(f) for f in frameworks]
+        if (missing := missing_declared_frontend(names, source_files)) is not None:
+            return missing
+        # A signature file exists; now check the framework is genuinely installed. Search the
+        # manifests the tree actually has rather than assuming a location -- a monorepo keeps the
+        # web app's package.json under apps/web/, not at the repo root.
+        listing = await provider.exec_in_sandbox(
+            thread_id,
+            "git ls-files && git ls-files --others --exclude-standard",
+        )
+        manifests = [
+            stripped
+            for line in (listing.stdout or "").splitlines()
+            if (stripped := line.strip()).endswith("package.json")
+            and "node_modules/" not in stripped
+        ]
+        if not manifests:
+            return None  # nothing to check against; fail open
+        # Satisfied if ANY manifest declares it -- which package.json owns the frontend is the
+        # repo's own layout decision, not this gate's to dictate.
+        unsatisfied: str | None = None
+        for manifest_path in manifests[:10]:
+            raw_manifest = await repo_files.read_repo_file(provider, thread_id, manifest_path)
+            result = missing_frontend_dependency(names, raw_manifest)
+            if result is None:
+                return None
+            unsatisfied = result
+        return unsatisfied
+    return None
+
+
+def _is_application_source(path: str) -> bool:
+    """A real implementation file, not a manifest, config, or project scaffold file."""
+    if _CONFIG_FILE_RE.search(path):
+        return False
+    return path.lower().endswith(_SOURCE_EXTENSIONS)
+
+
 # thread_id -> (tree-state key, last successful measurement). Process-local, same lifetime as the
 # graph's own in-memory checkpointer; a fresh process just re-measures.
 _COVERAGE_MEMO: dict[str, tuple[str, tuple[float | None, float | None, list["CoverageGap"], str, list[dict[str, Any]]]]] = {}
@@ -135,13 +289,43 @@ def _parse_cobertura_counts(raw_xml: str) -> tuple[_Counts | None, str]:
     gaps: list[CoverageGap] = []
     for cls in root.iter("class"):
         cls_line_rate = float(cls.get("line-rate", "1")) * 100
-        # A class with no branch points reports branch-rate="0" in coverage.py/coverlet Cobertura
-        # output -- vacuously satisfied, not a 0% gap (observed live: main.py 100% lines, zero
-        # branches, flagged as a 0.0% branch gap).
-        _cls_has_branches = any(line.get("branch") == "true" for line in cls.iter("line"))
-        cls_branch_rate = float(cls.get("branch-rate", "1")) * 100 if _cls_has_branches else 100.0
+        # Branch numbers are recomputed from the class's own lines rather than trusting its
+        # branch-rate attribute. Two reasons, both seen live: a class with no branch points reports
+        # branch-rate="0" (vacuous, not a real 0% gap), and a class WITH partially-covered branches
+        # can still report a healthy branch-rate, so the aggregate came out at 86% while every
+        # per-file gap looked fine and the model was handed an empty "here's where to look" list.
+        # .lower(): coverlet emits branch="True" (capital T), coverage.py emits "true". Comparing
+        # case-sensitively made branch_lines ALWAYS empty on .NET, so every class scored a vacuous
+        # 100% and gaps came back empty while the aggregate sat at 88% -- the model was told it
+        # failed and handed nowhere to look, for six verify cycles.
+        branch_lines = [line for line in cls.iter("line") if (line.get("branch") or "").lower() == "true"]
+        covered_branches = total_branches = 0
+        uncovered_lines: list[str] = []
+        # Coverlet emits each <line> TWICE -- once under its <method> and once in the class-level
+        # <lines> block -- so counts and the reported line list are de-duplicated by line number.
+        seen_lines: set[str] = set()
+        for line in branch_lines:
+            if (num := line.get("number")) is not None:
+                if num in seen_lines:
+                    continue
+                seen_lines.add(num)
+            # condition-coverage looks like: "50% (1/2)"
+            match = re.search(r"\((\d+)/(\d+)\)", line.get("condition-coverage", ""))
+            if not match:
+                continue
+            hit, total = int(match.group(1)), int(match.group(2))
+            covered_branches += hit
+            total_branches += total
+            if hit < total and (number := line.get("number")) and number not in uncovered_lines:
+                uncovered_lines.append(number)
+        cls_branch_rate = (100.0 * covered_branches / total_branches) if total_branches else 100.0
         if cls_line_rate < MIN_COVERAGE_PERCENT or cls_branch_rate < MIN_COVERAGE_PERCENT:
-            gaps.append(CoverageGap(file=cls.get("filename", cls.get("name", "?")), line_rate=cls_line_rate, branch_rate=cls_branch_rate))
+            name = cls.get("filename", cls.get("name", "?"))
+            # Name the exact lines whose branches are only half-taken -- that is the actionable
+            # part; a bare percentage tells the model nothing about which case it forgot to test.
+            if uncovered_lines:
+                name = f"{name} (partially-covered branch lines: {', '.join(uncovered_lines[:20])})"
+            gaps.append(CoverageGap(file=name, line_rate=cls_line_rate, branch_rate=cls_branch_rate))
     return _Counts(lc, lt, bc, bt, gaps), ""
 
 
@@ -381,10 +565,20 @@ async def verify_coverage(
     # no code. Observed live: minimal-code-to-green "completed" in 18s having only answered in
     # JSON prose -- the same failure ac-to-tests already guards against with its own no-test-files
     # check, which is what makes that stage self-correct instead of looping blind.
-    tracked = await provider.exec_in_sandbox(thread_id, "git ls-files")
+    # Untracked files MUST be included, for the same reason write_scope_gate spells out: code this
+    # stage just wrote is untracked until a later node commits it. A bare `git ls-files` sees none
+    # of it -- observed live on nextjs-fastapi, where apps/api/main.py, apps/api/routers/ and
+    # apps/web/ all existed on disk and this gate still reported "you wrote NO application code"
+    # and killed the run.
+    tracked = await provider.exec_in_sandbox(
+        thread_id, "git ls-files && git ls-files --others --exclude-standard"
+    )
     source_files = [
         stripped for line in (tracked.stdout or "").splitlines()
-        if (stripped := line.strip()) and not _is_pipeline_owned(stripped) and not _is_test_path(stripped)
+        if (stripped := line.strip())
+        and not _is_pipeline_owned(stripped)
+        and not _is_test_path(stripped)
+        and _is_application_source(stripped)
     ]
     if not source_files:
         return VerificationResult(
@@ -399,16 +593,53 @@ async def verify_coverage(
             report={"infra_error": "no_application_code", "source_files": 0},
         )
 
+    missing_ui = await _missing_declared_frontend(provider, thread_id, source_files)
+    if missing_ui:
+        return VerificationResult(
+            passed=False,
+            feedback=(
+                f"The approved Tech Stack declares {missing_ui} as this app's frontend, but the "
+                "repository does not actually contain that frontend -- either it has no source "
+                f"file for {missing_ui}, or its package.json never declares {missing_ui} as a "
+                "dependency. Only the backend was really built, so the delivered app cannot be "
+                "the app that was approved.\n\n"
+                "Build the frontend described in the approved Plan: a package.json that really "
+                "depends on the framework, real components/pages, and real build/test scripts, "
+                "wired to the API you already wrote. A file that merely has the right extension, "
+                "or a script that echoes a placeholder string, does not count -- that leaves the "
+                "app non-functional while looking complete, which is the exact outcome every gate "
+                "here exists to prevent."
+            ),
+            report={"infra_error": "declared_frontend_missing", "framework": missing_ui},
+        )
+
     line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id)
 
     if line_rate is None:
         # Infra failure, not a coverage gap: the coverage run itself never produced a readable
         # artifact. The per-entry detail carries what the run agent actually reported/attempted.
+        # The per-entry errors are the ONLY place the concrete blocker is named, and the model
+        # reads `feedback`, not `report` -- leaving them out of the feedback meant handing over a
+        # generic "see server logs" while the actual, fixable diagnosis sat one field away.
+        # Observed live (nextjs-dotnet): the run agent reported exactly "apps/api.Tests targets
+        # net8.0 ... the sandbox has Microsoft.NETCore.App 10.0.10 but not 8.0.0, so testhost.dll
+        # could not start", and the model was told none of it and burned the stage's whole budget.
+        entry_errors = [str(detail["error"]) for detail in entry_reports if detail.get("error")]
+        detail_text = ""
+        if entry_errors:
+            detail_text = "\n\nWhat the coverage run actually reported:\n" + "\n".join(
+                f"- {err}" for err in entry_errors
+            ) + (
+                "\n\nFix the cause it names. If it is a toolchain mismatch (a project targeting a "
+                "runtime this sandbox does not have installed), retarget the project to the "
+                "version that IS installed -- check `dotnet --list-runtimes` / the equivalent for "
+                "this stack rather than assuming a version."
+            )
         return VerificationResult(
             passed=False,
             feedback=(
                 "The coverage run produced no parseable report -- treat this as an infra failure, "
-                f"not a coverage gap: {_REASON_FEEDBACK.get(reason, reason)}"
+                f"not a coverage gap: {_REASON_FEEDBACK.get(reason, reason)}{detail_text}"
             ),
             report={"infra_error": reason, "contract_replay": entry_reports},
         )
@@ -440,7 +671,36 @@ async def verify_coverage(
         passed=False,
         feedback=(
             f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) is below the "
-            f"{MIN_COVERAGE_PERCENT}% threshold. Uncovered: {report['gaps']}"
+            f"{MIN_COVERAGE_PERCENT}% threshold. Files below threshold: {report['gaps']}\n\n"
+            "These per-file rates say WHERE the gap is, not WHICH paths are missed -- do not guess "
+            "at it. Run the coverage command yourself and read the detailed report (an lcov/HTML "
+            "report, or the per-line hit counts in the cobertura XML / istanbul json), find the "
+            "exact lines and branches with zero hits in the files above, and write tests that "
+            "drive those specific paths. Branch coverage is usually the binding constraint: for "
+            "each uncovered branch, ask which input makes the condition take its other side -- "
+            "typically an error/rejection path, an empty or single-element collection, an exact "
+            "boundary value, or a rounding remainder case. Never weaken a test or broaden an "
+            "exclusion to close the gap.\n\n"
+            # Observed live (vue-dotnet, 6 straight verify cycles): every remaining branch was
+            # either a guard clause unreachable through the public API or Program.cs wiring. The
+            # model kept inventing reflection/private-constructor tests to colour those lines in,
+            # the audit rejected them as gaming, and it reverted -- churning without ever gaining
+            # a branch. Naming the two legitimate exits is what breaks that loop.
+            "If a branch cannot be reached through the code's real public surface, do NOT reach "
+            "for reflection, internal-visibility hacks, or a test that invokes a private "
+            "constructor purely to colour in a line -- that is gaming the gate and the audit will "
+            "reject it. Exactly two resolutions are legitimate:\n"
+            "1. DELETE the unreachable code. A defensive check no caller can trigger is dead code; "
+            "removing it closes the gap AND shrinks the codebase. This is usually right for guard "
+            "clauses duplicating validation already enforced upstream.\n"
+            "2. TEST IT AT THE RIGHT LEVEL. An app's composition root and endpoint wiring (e.g. "
+            "Program.cs) is not unit-testable by construction; it is covered by in-process "
+            "integration tests that boot the real app and drive it over HTTP -- ASP.NET Core's "
+            "WebApplicationFactory<T>/TestServer, or this stack's equivalent. If the gap is in "
+            "wiring, add those tests rather than deleting it.\n"
+            "Pick per branch, say which you chose and why, then actually make the edit. Reporting "
+            "that coverage is stuck without changing any source or test file is not a valid "
+            "outcome for this stage."
         ),
         report=report,
     )
@@ -495,6 +755,62 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert isinstance(MIN_COVERAGE_PERCENT, float)
     assert MIN_COVERAGE_PERCENT == 95.0, "default must stay 95.0 when env var MIN_COVERAGE_PERCENT is unset"
     assert MIN_COVERAGE_PERCENT_DEFAULT == MIN_COVERAGE_PERCENT, "back-compat alias must track the live value"
+
+    # The exact false-green tree observed live: manifests + a task store hidden in the test
+    # helper, and no application at all -- must NOT count as application source.
+    assert not _is_application_source("package.json")
+    assert not _is_application_source("tsconfig.json")
+    assert not _is_application_source("apps/Directory.Build.props")
+    assert not _is_application_source("apps/web/vitest.config.ts")
+    assert not _is_application_source("apps/web/karma.conf.cjs")
+    # Real implementation files do count.
+    assert _is_application_source("apps/web/src/app/task.service.ts")
+    assert _is_application_source("apps/api/Program.cs")
+    assert _is_application_source("apps/web/src/app/app.component.html")
+    # Regression: coverlet's capital-T branch="True" must be recognised, and the gap must name
+    # the specific half-covered line rather than an empty list.
+    _dotnet = """<coverage lines-covered="257" lines-valid="261" branches-covered="74" branches-valid="84">
+      <packages><package><classes>
+      <class name="Api.Program" filename="Program.cs" line-rate="0.9555" branch-rate="0.8888"><lines>
+      <line number="16" hits="30" branch="True" condition-coverage="50% (1/2)"/>
+      <line number="25" hits="22" branch="True" condition-coverage="100% (2/2)"/>
+      </lines></class></classes></package></packages></coverage>"""
+    _counts, _err = _parse_cobertura_counts(_dotnet)
+    assert _err == "" and _counts is not None, _err
+    assert _counts.gaps, 'capital-T branch="True" was not recognised -- gaps came back empty'
+    assert "16" in _counts.gaps[0].file and "25" not in _counts.gaps[0].file, _counts.gaps[0].file
+    assert 74.0 < _counts.gaps[0].branch_rate < 76.0, _counts.gaps[0].branch_rate
+
+    # Stack fidelity. The live nextjs-dotnet miss: Next.js declared, only C# delivered.
+    assert missing_declared_frontend(
+        ["Next.js", "ASP.NET Core"], ["apps/api/Program.cs", "apps/api/AppState.cs"]
+    ) == "Next.js"
+    # Satisfied once real frontend sources exist.
+    assert missing_declared_frontend(
+        ["Next.js", "ASP.NET Core"], ["apps/api/Program.cs", "apps/web/app/page.tsx"]
+    ) is None
+    # Each framework family recognised by its own signature -- a Vue app is not satisfied by .tsx.
+    assert missing_declared_frontend(["Vue"], ["apps/web/src/App.vue"]) is None
+    assert missing_declared_frontend(["Vue"], ["apps/web/src/App.tsx"]) == "Vue"
+    assert missing_declared_frontend(["Blazor"], ["apps/web/Pages/Index.razor"]) is None
+    assert missing_declared_frontend(["Blazor"], ["apps/api/Program.cs"]) == "Blazor"
+    assert missing_declared_frontend(["Angular"], ["apps/web/src/app/app.component.ts"]) is None
+    # Backend-only stacks must never be flagged -- no UI framework is declared at all.
+    assert missing_declared_frontend(["FastAPI", "ASP.NET Core"], ["apps/api/main.py"]) is None
+
+    # Dependency half. The live placeholder manifest: scripts that echo, no dependencies at all.
+    _placeholder = json.dumps({"name": "web", "scripts": {"build": "node -e \"console.log('x')\""}})
+    assert missing_frontend_dependency(["Next.js"], _placeholder) == "Next.js"
+    assert missing_frontend_dependency(["Next.js"], json.dumps({"dependencies": {"next": "15.0.0"}})) is None
+    # devDependencies count -- test-only frameworks legitimately live there.
+    assert missing_frontend_dependency(["Vue"], json.dumps({"devDependencies": {"vue": "3.4.0"}})) is None
+    assert missing_frontend_dependency(["Angular"], json.dumps({"dependencies": {"@angular/core": "18.0.0"}})) is None
+    assert missing_frontend_dependency(["Angular"], json.dumps({"dependencies": {"angular-cli": "1.0.0"}})) == "Angular"
+    # Fails OPEN on no/unreadable manifest -- absence of evidence is not evidence of absence.
+    assert missing_frontend_dependency(["Next.js"], None) is None
+    assert missing_frontend_dependency(["Next.js"], "{not json") is None
+    # Non-npm frontends are not judged by package.json at all.
+    assert missing_frontend_dependency(["Blazor"], _placeholder) is None
 
     print("test_coverage_gate self-check: all assertions passed")
 

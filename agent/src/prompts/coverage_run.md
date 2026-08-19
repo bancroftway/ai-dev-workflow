@@ -20,9 +20,26 @@ Steps:
    under `tests/e2e/`, import `@playwright/test`, and a unit runner such as vitest cannot resolve
    that import: the whole run dies before instrumenting anything. Exclude that directory
    explicitly (e.g. vitest's `--exclude 'tests/e2e/**'`).
-4. Confirm with your own eyes that each report file actually exists after the run, and that it
+4. Do NOT pass a "skip the build" flag (e.g. .NET's `--no-build`). Nothing rebuilds between the
+   last edit and this run, so such a flag measures the PREVIOUS build's assemblies: the report
+   file is freshly written and looks valid while describing code that no longer exists.
+5. Confirm with your own eyes that each report file actually exists after the run, and that it
    reports a non-zero number of instrumented lines. A run that "succeeds" while instrumenting
    nothing is a failure -- usually it means the runner matched no real source files.
+
+Only report roots that ACTUALLY CONTAIN TESTS. A project directory with no test files is not a
+test root: running a unit runner there produces an empty report with zero instrumented lines, and
+reporting it fails the whole gate for no reason (observed live -- all tests lived in a .NET test
+project while an empty `apps/web` was reported alongside it). Check for test files first; if a
+candidate root has none, leave it out of `entries` entirely and say so in `summary`.
+
+You MAY install or configure a coverage emitter -- you are not write-restricted, and a missing
+emitter is not a reason to fail. For .NET specifically, `dotnet-coverage` is NOT available in this
+sandbox; the supported route is coverlet, which the SDK wires up via
+`dotnet test --collect:"XPlat Code Coverage"` (it writes `coverage.cobertura.xml` under
+`TestResults/<guid>/`). If the test project lacks the `coverlet.collector` package reference, add
+it (`dotnet add <TestProject> package coverlet.collector`) and re-run. Report the artifact path
+that actually exists afterwards, not the one you expected.
 
 For JS/TS repos with no coverage provider of their own, this sandbox ships one:
 `/opt/aidw/test/node_modules/.bin/vitest run --coverage --coverage.provider=v8`

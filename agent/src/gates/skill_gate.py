@@ -117,6 +117,30 @@ def _demo() -> None:
     for stage, skills in workflow_config.REQUIRED_SKILLS_BY_STAGE.items():
         for skill in skills:
             assert skill in known, f"{stage} requires unknown skill {skill!r}"
+    # A stage key that does not exist silently disables enforcement for it -- worse than a crash,
+    # because everything still looks configured. Two stale keys ("exit", "adversarial-audit") got
+    # in this way before this check existed.
+    from ..graph import _STAGE_KEYS
+
+    unknown_stages = [s for s in workflow_config.REQUIRED_SKILLS_BY_STAGE if s not in _STAGE_KEYS]
+    assert not unknown_stages, f"REQUIRED_SKILLS_BY_STAGE names non-existent stages: {unknown_stages}"
+
+    # This gate runs BEFORE deterministic_verify, so a stage with a required skill and no verify
+    # laps turns one missed skill into an instant, unrecoverable run failure. metrics-exit was
+    # exactly that: max_verify_cycles=0 (set when its deterministic_verify could only pass) plus a
+    # required skill ended an otherwise-complete run on its last stage.
+    from ..graph import _ALL_STAGE_SPECS
+
+    caps = {spec.key: spec.max_verify_cycles for spec in _ALL_STAGE_SPECS}
+    no_retry = [
+        stage
+        for stage in workflow_config.REQUIRED_SKILLS_BY_STAGE
+        if caps.get(stage, 0) < 1
+    ]
+    assert not no_retry, (
+        f"stages require a skill but have no verify laps to correct a miss: {no_retry} "
+        "-- give them max_verify_cycles >= 1 or drop the requirement"
+    )
     print("skill_gate self-check: all assertions passed")
 
 

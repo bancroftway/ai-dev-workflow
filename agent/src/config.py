@@ -70,9 +70,8 @@ REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
     "plan": ["writing-plans"],
     "ac-to-tests": ["test-driven-development"],
     "minimal-code-to-green": ["executing-plans", "requesting-code-review", "verification-before-completion"],
-    "adversarial-audit": ["receiving-code-review", "verification-before-completion"],
     "adversarial-compliance": ["receiving-code-review", "verification-before-completion"],
-    "exit": ["finishing-a-development-branch"],
+    "metrics-exit": ["finishing-a-development-branch"],
     # dispatching-parallel-agents is deliberately NOT required: it applies only when the plan has
     # genuinely independent steps, so mandating it would force a nonsense invocation on a linear
     # plan. systematic-debugging likewise -- the fix nodes it belongs to only run on failure.

@@ -28,7 +28,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from langgraph.graph.message import add_messages
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt
@@ -71,6 +71,7 @@ from .a2ui_tools import (
     build_tech_stack_envelope,
     present_surface_messages,
 )
+from . import copilot_chat_model
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import (
     render_ac_to_tests_markdown,
@@ -240,6 +241,12 @@ class VerificationResult:
     passed: bool
     feedback: str
     report: dict[str, Any]
+
+
+# Paths the pipeline itself writes; a "change set" containing only these means the stage produced
+# nothing of its own (see make_verify_node's fabrication check). Mirrors write_scope_gate's own
+# _PIPELINE_OWNED_PREFIXES.
+_PIPELINE_ARTIFACT_PREFIXES = (".ai-dev-workflow/", "APPROVALS.md", "AGENTS.md")
 
 
 def _extract_ids(value: Any, out: set[str]) -> None:
@@ -644,8 +651,11 @@ def _build_license_audit_prompt(state: GraphState) -> list[BaseMessage]:
 EXIT_SYSTEM_PROMPT = load_prompt("exit_draft")
 
 
-def _build_exit_prompt(state: GraphState) -> list[BaseMessage]:
-    stage = state["stages"]["exit"]
+def _build_exit_prompt(state: GraphState, stage_key: str = "metrics-exit") -> list[BaseMessage]:
+    # The consolidated pipeline has no bare "exit" stage -- exit work lives in `metrics-exit`
+    # (see STAGES). Hardcoding "exit" here raised KeyError the first time a run ever reached this
+    # far, which is why it stayed latent until now.
+    stage = state["stages"][stage_key]
     metrics_compute = (state.get("metrics_report") or {}).get("metrics", {})
     messages: list[BaseMessage] = [
         SystemMessage(content=EXIT_SYSTEM_PROMPT),
@@ -805,8 +815,16 @@ class StageSpec:
     finding: an allowlist, not a blocklist, is what actually enforces read-only) or, later, real
     write access."""
 
-    use_custom_agent: bool = True
-    """False routes make_draft_node around the custom_agents/agent mechanism, using
+    use_custom_agent: bool = False
+    """Default False: the custom_agents mechanism is BROKEN in the GHCP SDK -- a session created
+    with custom_agents silently drops the agent's own declared `tools:`, leaving the model with no
+    tools and no error (isolated repro in agent-work/ghcp-bug-report-custom-agents-tools.md). It
+    bit four stages before being defaulted off: ac-to-tests and minimal-code-to-green wrote no
+    files, the rebuild fix node could not edit, and plan reported "I can't inspect the repository"
+    on any stack where session_options did not happen to pass available_tools as well. Tools now
+    come from session_options/available_tools, which IS honored; models come from models.yaml.
+
+    True routes make_draft_node through the custom_agents/agent mechanism, using
     session_options' own available_tools/model config instead. ac-to-tests sets this: empirically
     confirmed (not just theorized) by directly comparing "custom_agents + builtin:create in its
     tools:" (still failed -- zero test files, same as before create was ever added) against
@@ -911,11 +929,19 @@ STAGES: list[StageSpec] = [
         # MCP servers needed (Excalidraw MCP deleted: never spike-tested, fetched unpinned
         # `npx -y mcp-excalidraw` at runtime, and had no export path). The UI-repo branch keeps
         # the same read-only allowlist it had when the MCP was attached.
-        session_options=lambda state, _role: (
-            {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
-            if _tech_stack_has_ui_framework(state)
-            else {}
-        ),
+        # Unconditional read-only tools: the plan agent must inspect the repo and
+        # .ai-dev-workflow/tech-stack.md to plan concretely, and it never writes. The previous
+        # UI-framework conditional left non-UI stacks (e.g. blazor-dotnet) with no tools at all
+        # once custom_agents stopped supplying them -- the agent answered "I can't inspect the
+        # repository contents from this interface" and the stage died with an empty plan.
+        session_options=lambda _state, _role: {
+            "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
+        },
+        # Above the default 3 because this stage's one recurring failure -- not invoking
+        # writing-plans -- is now answered by restarting the draft session (see make_verify_node),
+        # and a restart only helps if there are laps left to spend on it. At 3, the first attempt
+        # plus one reset exhausted the budget before a fresh session got a fair chance.
+        max_verify_cycles=5,
     ),
     StageSpec(
         key="ac-to-tests",
@@ -929,6 +955,12 @@ STAGES: list[StageSpec] = [
         requires_human_gate=False,
         capture_baseline_commit=True,
         deterministic_verify=verify_ac_to_tests,
+        # Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block --
+        # the model returns a fully-detailed coverage_plan claiming it "created failing RED-phase
+        # tests" while making zero write calls (confirmed from its own session log: glob/view/skill
+        # only). The gate catches the fabrication every time and the redraft usually succeeds, so
+        # the cheapest reliability win is simply not running out of retries mid-flake.
+        max_verify_cycles=6,
         # Root cause of the long escalation streak: `builtin:edit` only edits EXISTING files -- a
         # greenfield repo with no test files yet needs `builtin:create`. That alone wasn't the
         # full story: also needs the session `working_directory` now set unconditionally in
@@ -969,6 +1001,15 @@ STAGES: list[StageSpec] = [
         # Coverage verification (the deterministic gate) is the real check; the human checkpoints
         # are specification and plan only.
         requires_human_gate=False,
+        # Higher than the default 3: closing a real coverage gap is iterative, and each lap makes
+        # measurable progress (observed live: a genuine app landed at 100% lines / 83.3% branches
+        # and simply ran out of laps before reaching the 95% branch threshold). A stage that is
+        # genuinely stuck still fails -- just after it has actually had a chance to converge.
+        # Raised 6 -> 12 after a vue-dotnet run climbed 88.1% -> 91.9% branches (74/84 -> 79/86)
+        # over six laps and was cut off mid-convergence: the remaining gap was a handful of guard
+        # clauses, and each lap was closing roughly one. Six laps is enough to prove a stage is
+        # moving, not enough to let it finish; a truly stuck stage still burns out, just later.
+        max_verify_cycles=12,
         # Draft gets full, unscoped write access -- "minimal code to green" is definitionally a
         # code-writing task (Part A Decisions point 6, tier (iii)). Audit stays read-only, same
         # asymmetry as P4's session_options.
@@ -1024,7 +1065,12 @@ STAGES: list[StageSpec] = [
         requires_human_gate=False,
         sign_approval=True,
         deterministic_verify=exit_nodes.verify_exit_readiness,
-        max_verify_cycles=0,
+        # Was 0, on the (then-true) reasoning that verify_exit_readiness always returns passed=True
+        # so no retry could ever be needed. The skill gate now runs BEFORE deterministic_verify and
+        # CAN fail, which turned any missed skill here into an instant, unrecoverable run failure --
+        # observed live: one `invoked: []` at metrics-exit ended a run that had cleared every other
+        # stage. Any stage with a required skill needs laps to correct it (asserted below).
+        max_verify_cycles=3,
         # Every run reaches this stage's approval (requires_human_gate=False, deterministic_verify
         # always returns passed=True) -- this is the only place exit_finalize_node ever runs; it
         # was never add_node'd/wired before this hook existed.
@@ -1362,7 +1408,16 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         stage = stages[stage_spec.key]
 
         content = getattr(response, stage_spec.content_field)
-        content_dict = content.model_dump(mode="json") if content is not None else stage["draft"]
+        # Most stages' content_field is a nested Pydantic model, but not all: remediation's
+        # `remediation_summary` is a plain str. Only models can be dumped -- a str (or any other
+        # scalar) is already its own serialized form. Reached for the first time only once a run
+        # got past minimal-code-to-green, which is why this sat latent until now.
+        if content is None:
+            content_dict = stage["draft"]
+        elif isinstance(content, BaseModel):
+            content_dict = content.model_dump(mode="json")
+        else:
+            content_dict = content
 
         used_ids: set[str] = set(stage["used_ids"])
         if content_dict is not None:
@@ -1536,6 +1591,13 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             }
             stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
             stages[stage_spec.key] = stage
+            # Restart the draft session, for the reason spelled out in the deterministic_verify
+            # branch below: a skill shapes HOW a turn is done, so it must be invoked before the
+            # work, and a session that has already answered will only revise its own text. This
+            # branch returns early, so it needs its own reset -- putting it only below meant three
+            # identical `invoked: []` turns with no restart between them (observed live at
+            # metrics-exit, which then exhausted its budget and failed an otherwise-complete run).
+            await copilot_chat_model.close_session(thread_id, stage_spec.key, "draft")
             return {"stages": stages}
 
         result = await stage_spec.deterministic_verify(
@@ -1544,6 +1606,31 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
         if not result.passed:
             stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
+            # Reset the session ONLY when the stage fabricated -- i.e. claimed work while writing
+            # nothing but pipeline artifacts. That specific failure is self-reinforcing: the false
+            # claim sits in the session's own history and the model re-reads and repeats it (six
+            # identical fabrications, observed live). A fresh session sees only the prompt and this
+            # feedback.
+            #
+            # For every OTHER failure (a tautological test, a coverage gap, a bad plan) the history
+            # is exactly what the retry needs -- it knows what it already wrote and why that was
+            # rejected. Resetting there makes the model rewrite the same flawed artifact from
+            # scratch each lap, which is how a single bad test consumed a whole cycle budget.
+            verify_report = result.report or {}
+            changed_paths = verify_report.get("changed_paths")
+            wrote_nothing_real = changed_paths is not None and not [
+                path for path in changed_paths if not path.startswith(_PIPELINE_ARTIFACT_PREFIXES)
+            ]
+            # A missing required skill belongs in the same bucket, for the same reason. The skill
+            # is meant to shape HOW the turn is done, so it has to be invoked before the work, not
+            # bolted on after. Once the session has already produced an answer, a redraft just
+            # revises that text -- observed live (nextjs-dotnet, plan): three consecutive turns
+            # with `invoked: []` and no attempt to call the skill tool, while the very same stage
+            # invoked it correctly on a fresh session in the previous run. Restarting is what gives
+            # the model a turn where invoking the skill can still change the work.
+            skipped_required_skill = bool(verify_report.get("missing_skills"))
+            if wrote_nothing_real or skipped_required_skill:
+                await copilot_chat_model.close_session(thread_id, stage_spec.key, "draft")
         stages[stage_spec.key] = stage
 
         extra_messages: list[BaseMessage] = []

@@ -39,8 +39,32 @@ class AcTestRunReport(StageReport):
 # One line of a test runner's console output naming a test and its outcome -- covers dotnet test's
 # default console logger, vitest's default reporter, and jest/playwright's default reporters
 # closely enough for this purpose (all print a pass/fail glyph or word beside the test name).
-_FAIL_MARKERS = ("fail", "✗", "×", "FAILED")
-_PASS_MARKERS = ("pass", "✓", "√", "PASSED", "ok ")
+# Outcome markers are matched as WORDS/GLYPHS, never as bare substrings of the whole line. The
+# line contains the test's own NAME, and names legitimately contain these words -- observed live:
+# `Test_US_0003_1_AssignStaff_WhenCapacityOverlapDuplicateAndWeeklyMaxRulesPass_Succeeds` was a
+# stub that threw NotImplementedException (correctly RED), but "RulesPass" made a substring match
+# classify it as PASSING, so the gate rejected it as tautological and no redraft could ever fix it.
+_FAIL_MARKERS = ("fail", "failed", "✗", "×")
+_PASS_MARKERS = ("pass", "passed", "ok", "✓", "√")
+
+# A word boundary that treats identifier characters (including _) as part of a word, so "RulesPass"
+# does not match "pass" while "Passed:" and "[PASS]" do.
+def _has_marker(line: str, markers: tuple[str, ...]) -> bool:
+    lowered = line.lower()
+    for marker in markers:
+        if marker in ("✗", "×", "✓", "√"):
+            if marker in line:
+                return True
+            continue
+        for match in re.finditer(re.escape(marker), lowered):
+            before = lowered[match.start() - 1] if match.start() else " "
+            after_index = match.end()
+            after = lowered[after_index] if after_index < len(lowered) else " "
+            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                return True
+    return False
+
+
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _PATH_TOKEN_RE = re.compile(r"[\w@./\\-]+\.[A-Za-z0-9]+")
@@ -153,8 +177,8 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
         if not ac_ids_in_line:
             continue
         lowered = line.lower()
-        is_fail = any(marker.lower() in lowered for marker in _FAIL_MARKERS)
-        is_pass = any(marker.lower() in lowered for marker in _PASS_MARKERS)
+        is_fail = _has_marker(line, _FAIL_MARKERS)
+        is_pass = _has_marker(line, _PASS_MARKERS)
         for ac_id in ac_ids_in_line:
             if is_fail:
                 ac_line_status[ac_id] = "fail"

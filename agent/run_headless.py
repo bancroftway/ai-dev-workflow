@@ -142,7 +142,11 @@ async def run(args: argparse.Namespace) -> int:
                     stage_statuses=statuses,
                     run_failure=values.get("run_failure"),
                     needs_clarification=stuck,
-                    ok=statuses.get("exit") == "approved",
+                    # "metrics-exit", not "exit": the pipeline consolidated its final stage and
+                    # this success check kept reading the old key, so a fully-approved run with
+                    # no run_failure still reported ok=false. Guard on run_failure too -- a stage
+                    # can be approved while the run recorded a terminal problem elsewhere.
+                    ok=statuses.get("metrics-exit") == "approved" and values.get("run_failure") is None,
                 )
                 break
 

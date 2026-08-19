@@ -80,6 +80,14 @@ coverage-run:
 ac-test-run:
   # gates/ac_coverage_gate.py -- runs the (expected-RED) suite and tees output for the AC-id scan.
   draft_model: gpt-5.4
+remediation:
+  # Previously carried by agents/remediation-draft.md's own `model:`; custom_agents is now off by
+  # default (graph.py StageSpec.use_custom_agent), so every stage's roster lives here instead.
+  draft_model: gpt-5.4
+adversarial-compliance:
+  draft_model: gpt-5.4
+metrics-exit:
+  draft_model: gpt-5.4-mini
 session-title:
   # One short sentence in, one short phrase out -- the cheapest tier is plenty.
   draft_model: gpt-5.4-mini

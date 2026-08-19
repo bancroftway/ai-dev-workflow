@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .schemas import ClarifyingQuestion
 
@@ -56,6 +56,34 @@ class AcceptanceCriteriaTestsDraftResponse(BaseModel):
     readiness: bool
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
     test_suite: AcceptanceCriteriaTestSuite | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def _ready_means_files_were_written(self) -> "AcceptanceCriteriaTestsDraftResponse":
+        """readiness=True with no test files is the stage's dominant failure, and it is not a
+        content problem the audit can fix -- it means no work happened at all.
+
+        Observed live across three consecutive fresh sessions (nextjs-dotnet): the model called
+        the `skill` tool exactly once, then emitted `{"readiness": true, "test_suite": null}` in
+        under 5 seconds, self-reporting "no test files were written to disk yet" as the REASON
+        for the empty report. The write-scope gate caught it every time, but only after the whole
+        graph cycle had been spent, and six cycles of that exhausted the stage.
+
+        Raising it here instead moves the correction inside the turn: ainvoke_structured feeds
+        this message straight back to the same session, which still has its file tools and can
+        write the tests and answer again -- three attempts before a graph cycle is spent at all.
+        """
+        if not self.readiness:
+            return self  # not claiming done; clarifying_questions is the honest path
+        if self.test_suite is None or not self.test_suite.test_files:
+            raise ValueError(
+                "readiness=true but test_files is empty. This response is metadata ABOUT test "
+                "files -- it is not the files themselves. Nothing has been written to the repo "
+                "yet. Use your file tools (create/apply_patch) to write the actual test files to "
+                "disk NOW, then reply with this JSON listing the files you really created. If "
+                "something genuinely blocks you from writing them, set readiness=false and put "
+                "the blocker in clarifying_questions instead of reporting an empty suite as done."
+            )
+        return self
 
 
 class ChangedFile(BaseModel):
