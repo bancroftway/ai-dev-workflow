@@ -47,6 +47,28 @@ _METRICS_GATE_MAX_ATTEMPTS = 2  # one automatic re-scan for tool flake, then fai
 
 
 
+async def _supply_chain_delta(provider: Any, thread_id: str) -> dict[str, Any] | None:
+    """Which packages this run added, removed or upgraded -- or None when it cannot be determined.
+
+    Reads the two SBOM snapshots rather than the scan reports: component identity is what syft
+    reports reliably, whereas its `dependencies` graph is too sparse on this stack to attribute
+    ancestry (see repo_scan.sbom_ancestry). None, never an empty diff, when either side is missing:
+    "no baseline SBOM" and "nothing changed" are different facts.
+    """
+    async def _load(path: str) -> dict[str, Any] | None:
+        raw = await repo_files.read_repo_file(provider, thread_id, path)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    return repo_scan.supply_chain_diff(
+        await _load(repo_scan.SBOM_BASELINE_PATH), await _load(repo_scan.SBOM_PATH)
+    )
+
+
 async def _read_baseline(provider: Any, thread_id: str) -> dict[str, Any] | None:
     """The baseline written once at the top of the graph by repo_scan_baseline_node. Absent on a
     repo that ran the pipeline before repo_scan existed -- in which case the delta is omitted with
@@ -364,7 +386,11 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         return {"metrics_report": {"metrics": {}}, "repo_scan": prior_repo_scan}
 
     provider = get_sandbox_provider()
-    scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
+    # The ONE caller that opts into the Eval layer: this is the run's final measurement, so paying
+    # for EVAL_ATTEMPTS suite runs buys the per-AC verified/executed/flake numbers the exit report
+    # is judged on. Every other caller (the four gate scan points, and the per-commit background
+    # refresh) leaves include_eval at its False default and never runs a suite.
+    scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full", include_eval=True)
     # Prefer the contract-merged number graph.py's make_verify_node / audit_gates.py's
     # audit_exit_gate_node already promoted onto state.repo_scan.coverage: both read the SAME
     # coverage artifact minimal-code-to-green's own gate produced, whereas _read_coverage_summary
@@ -412,6 +438,12 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
             "untested": sum(1 for r in traceability_rows if r["status"] == "untested"),
         },
         "token_usage_summary": token_usage_summary,
+        # The Eval layer's two halves, lifted out of the scan report so the exit report and the
+        # dashboard do not have to know where inside it they live. `solidly_verified` (linked AND
+        # green AND not flaky) is the number this pipeline should be judged on.
+        "ac_verification": scan_report.get("ac_verification"),
+        "ac_execution": scan_report.get("ac_execution"),
+        "supply_chain": await _supply_chain_delta(provider, thread_id),
         # Persisted (not just channel state) so exit's deterministic verify can read the gate's
         # verdict from metrics-latest.json -- deterministic_verify doesn't receive graph state.
         "regression_gate": {"reasons": gate_reasons, "attempt": attempt},

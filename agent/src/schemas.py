@@ -161,6 +161,12 @@ class SpecificationDraftResponse(BaseModel):
     specification: Specification | None = Field(
         default=None, description="Present whenever a draft was produced, ready or not."
     )
+    skills_invoked: list[str] = Field(
+        default_factory=list,
+        description="Exact names of skills you invoked with your `skill` tool this turn, and only "
+        "those. Cross-checked against the session's own recorded invocations -- a name you did not "
+        "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
+    )
 
 
 class PlanDraftResponse(BaseModel):
@@ -172,6 +178,12 @@ class PlanDraftResponse(BaseModel):
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
     plan: ImplementationPlan | None = Field(
         default=None, description="Present whenever a draft was produced, ready or not."
+    )
+    skills_invoked: list[str] = Field(
+        default_factory=list,
+        description="Exact names of skills you invoked with your `skill` tool this turn, and only "
+        "those. Cross-checked against the session's own recorded invocations -- a name you did not "
+        "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
     )
 
 

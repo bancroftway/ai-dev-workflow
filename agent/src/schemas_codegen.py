@@ -84,6 +84,12 @@ class AcceptanceCriteriaTestsDraftResponse(BaseModel):
                 "the blocker in clarifying_questions instead of reporting an empty suite as done."
             )
         return self
+    skills_invoked: list[str] = Field(
+        default_factory=list,
+        description="Exact names of skills you invoked with your `skill` tool this turn, and only "
+        "those. Cross-checked against the session's own recorded invocations -- a name you did not "
+        "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
+    )
 
 
 class ChangedFile(BaseModel):
@@ -115,6 +121,12 @@ class MinimalCodeToGreenDraftResponse(BaseModel):
     readiness: bool
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
     iteration: CodegenIterationResult | None = Field(default=None)
+    skills_invoked: list[str] = Field(
+        default_factory=list,
+        description="Exact names of skills you invoked with your `skill` tool this turn, and only "
+        "those. Cross-checked against the session's own recorded invocations -- a name you did not "
+        "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
+    )
 
 
 class MinimalCodeToGreenAuditResponse(BaseModel):

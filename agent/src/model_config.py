@@ -38,7 +38,9 @@ Stage = Literal[
     "metrics-report",
     "session-title",
 ]
-Role = Literal["draft", "audit", "extract"]
+# "fix" is a WRITE-capable pass that closes what a stage's deterministic verify reported (see
+# graph.make_verify_fix_node). Declared so a stage can give it a different model from its draft.
+Role = Literal["draft", "audit", "extract", "fix"]
 
 
 @lru_cache(maxsize=None)
@@ -55,6 +57,14 @@ def get_model_name(stage: Stage, role: Role) -> str | None:
         # -- a one-shot structured-extraction pass is not a config-worthy decision distinct from
         # drafting, unlike audit (a genuinely separate model choice, hence its own warning below).
         return draft_model
+
+    if role == "fix":
+        # Explicit branch, because without it "fix" fell through to the audit lookup below: the
+        # `fix_model` key was silently ignored (dead config) and every fix pass logged "No
+        # audit_model configured", which is a misleading thing to print about a write pass.
+        # Falls back to draft_model rather than audit_model -- fixing is a code-writing job, and
+        # the audit tier is chosen to critique, sometimes on a cheaper model.
+        return stage_config.get("fix_model") or draft_model
 
     audit_model = stage_config.get("audit_model")
     if audit_model is None:

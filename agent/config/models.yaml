@@ -71,6 +71,8 @@ remediation:
   # default (graph.py StageSpec.use_custom_agent), so every stage's roster lives here instead.
   draft_model: gpt-5.4
 adversarial-compliance:
+  # The write-capable pass that closes audit divergences -- real code edits, so not a mini tier.
+  fix_model: gpt-5.4
   draft_model: gpt-5.4
 metrics-exit:
   draft_model: gpt-5.4-mini

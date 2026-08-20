@@ -17,7 +17,7 @@ import shlex
 from datetime import datetime, timezone
 from typing import Any
 
-from . import approvals, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger
+from . import approvals, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
@@ -91,13 +91,114 @@ def _screen_label(filename: str) -> tuple[str, str]:
     channel of state to keep in sync. Suite-harvested images have no route; they are labelled as
     such rather than given a fabricated one.
     """
+    import re
+
     stem = filename.rsplit(".", 1)[0]
     slug = stem.split("-", 1)[1] if "-" in stem else stem
+    # Suite captures now carry the AC id playwright put in its result directory name
+    # (`001-US-0005-1-suite.png`), so the report can point an image at the criterion it proves
+    # instead of listing anonymous "Test run" rows.
+    ac = re.match(r"^(US-\d{4}(?:-\d+)?)-suite$", slug)
+    if ac:
+        return f"AC {ac.group(1)}", "(from playwright suite)"
     if slug == "suite":
         return "Test run", "(from playwright suite)"
     if slug == "home":
         return "Home", "/"
     return slug.replace("-", " ").title(), "/" + slug.replace("-", "/")
+
+
+def _render_skills_section(stages: dict[str, Any] | None) -> list[str]:
+    """Per-stage skill evidence, from each stage's own session events -- never its self-report.
+
+    Exists because the enforcement was invisible: the gate recorded nothing on the pass path, so a
+    green run showed no sign that any methodology skill had been applied. `unverified` marks a stage
+    whose session log could not be read, which is deliberately distinct from "no skills required".
+    """
+    if not stages:
+        return []
+    rows: list[str] = []
+    for stage_key, stage in stages.items():
+        skills = (stage or {}).get("skills")
+        if not skills:
+            continue
+        invoked = ", ".join(skills.get("invoked") or []) or "(none)"
+        notes: list[str] = []
+        if skills.get("missing"):
+            notes.append(f"MISSING {', '.join(skills['missing'])}")
+        if skills.get("unsubstantiated"):
+            notes.append(f"CLAIMED BUT NOT INVOKED {', '.join(skills['unsubstantiated'])}")
+        if not skills.get("verified"):
+            notes.append("unverified (session log unreadable)")
+        rows.append(f"| {stage_key} | {invoked} | {'; '.join(notes) or 'ok'} |")
+    if not rows:
+        return []
+    return ["## Skills invoked per stage", "", "| Stage | Skills invoked | Notes |", "|---|---|---|", *rows, ""]
+
+
+def _render_eval_section(metrics_summary: dict[str, Any] | None) -> list[str]:
+    """Acceptance-criteria verification and execution -- the Eval layer (ac_eval.py).
+
+    Unconditional heading, like the Screens and Skills sections: "we could not measure this" is a
+    fact a reviewer needs, and a silently absent section reads as though the question was never
+    asked.
+    """
+    lines = ["## Acceptance criteria: verified and executed", ""]
+    verification = (metrics_summary or {}).get("ac_verification") or {}
+    execution = (metrics_summary or {}).get("ac_execution") or {}
+    if not verification and not execution:
+        return lines + ["Not evaluated for this run.", ""]
+
+    if verification.get("status") == "not_evaluated":
+        lines.append(f"- **Linked to tests**: not evaluated ({verification.get('reason')})")
+    elif verification:
+        levels = verification.get("levels") or {}
+        unverified = verification.get("unverified") or []
+        lines.append(
+            f"- **Linked to tests**: {verification.get('linked', 0)}/{verification.get('total', 0)} "
+            f"(unit {levels.get('unit', 0)}, integration {levels.get('integration', 0)}, e2e {levels.get('e2e', 0)})"
+        )
+        if unverified:
+            lines.append(f"- **No test names these criteria**: {', '.join(unverified)}")
+        if verification.get("e2e_only"):
+            lines.append(
+                f"- **Proven only at the browser layer**: {', '.join(verification['e2e_only'])} "
+                "(no unit or integration test names them)"
+            )
+
+    if execution.get("status") == "not_evaluated":
+        lines.append(f"- **Execution**: not evaluated ({execution.get('reason')})")
+    elif execution:
+        lines.append(
+            f"- **Solidly verified** (linked AND green AND not flaky): "
+            f"**{execution.get('solidly_verified', 0)}** of {verification.get('total', 0)}"
+        )
+        lines.append(
+            f"- **Execution over {execution.get('attempts', 0)} run(s)**: {execution.get('passing', 0)} passing, "
+            f"{execution.get('failing', 0)} failing, {execution.get('not_run', 0)} never exercised"
+        )
+        if execution.get("flaky"):
+            lines.append(f"- **Flaky** (passed some runs, failed others): {', '.join(execution['flaky'])}")
+    return lines + [""]
+
+
+def _render_supply_chain_section(metrics_summary: dict[str, Any] | None) -> list[str]:
+    """What this run did to the dependency tree."""
+    lines = ["## Supply chain", ""]
+    chain = (metrics_summary or {}).get("supply_chain")
+    if not chain:
+        return lines + ["No baseline SBOM recorded for this repository -- nothing to diff.", ""]
+    lines.append(
+        f"- **Net change**: {chain.get('net_change', 0):+d} components "
+        f"({chain.get('added_count', 0)} added, {chain.get('removed_count', 0)} removed)"
+    )
+    for label, key in (("Added", "added"), ("Removed", "removed"), ("Version changed", "version_changed")):
+        items = chain.get(key) or []
+        if items:
+            shown = ", ".join(f"`{i}`" for i in items[:15])
+            more = f" ... and {len(items) - 15} more" if len(items) > 15 else ""
+            lines.append(f"- **{label}** ({len(items)}): {shown}{more}")
+    return lines + [""]
 
 
 def _render_history_sections(
@@ -110,6 +211,7 @@ def _render_history_sections(
     run_id: str,
     e2e: dict[str, Any] | None = None,
     screenshot_prefix: str = "./",
+    stages: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
     markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
@@ -163,8 +265,12 @@ def _render_history_sections(
         lines.append("No baseline recorded for this repository -- nothing to diff.")
     lines.append("")
 
-    # Unconditional section -- the exit report has a fixed skeleton, and "no screenshots" must be
-    # a stated fact with a reason, never a silently missing heading.
+    # Unconditional sections -- the exit report has a fixed skeleton, and "no screenshots" / "not
+    # evaluated" must be stated facts with reasons, never silently missing headings.
+    lines += _render_eval_section(metrics_summary)
+    lines += _render_supply_chain_section(metrics_summary)
+    lines += _render_skills_section(stages)
+
     lines += ["## Screens", ""]
     if screenshots:
         lines += ["| Screen | Route | Screenshot |", "|---|---|---|"]
@@ -174,6 +280,32 @@ def _render_history_sections(
             lines.append(f"| {screen} | `{route}` | ![{screen}]({screenshot_prefix}{run_id}-screens/{name}) |")
         lines.append("")
         lines.append(f"{len(screenshots)} screenshot(s) captured from the running application.")
+        # Which commit the images depict. Stages after e2e (the conformance audit's fix pass) can
+        # change UI source, and screenshots then show a tree that no longer exists -- stated here
+        # rather than left for a reviewer to discover by comparing pixels to code.
+        shot_commit = e2e.get("screenshot_commit")
+        if shot_commit:
+            lines.append("")
+            lines.append(
+                f"Captured at commit `{shot_commit}`. If later stages changed UI source, these "
+                f"images show that commit and not the tip of the branch."
+            )
+        blanks = e2e.get("degenerate_screenshots") or []
+        if blanks:
+            lines.append("")
+            lines.append(
+                f"**{len(blanks)} capture(s) are too small to contain a rendered page** and are not "
+                f"evidence of a working UI: {', '.join(p.rsplit('/', 1)[-1] for p in blanks)}"
+            )
+        identical = e2e.get("same_size_screenshots") or []
+        if identical:
+            lines.append("")
+            lines.append(
+                f"{len(identical)} capture(s) share an exact byte size "
+                f"({', '.join(p.rsplit('/', 1)[-1] for p in identical)}) -- usually coincidental PNG "
+                f"compression of a similar layout, occasionally a page that never changed. Worth a "
+                f"glance, not a blocker."
+            )
     else:
         reason = e2e.get("skipped_reason") or ""
         lines.append(f"(none captured -- e2e {e2e_status}{': ' + reason if reason else ''})")
@@ -220,7 +352,7 @@ async def verify_exit_readiness(
             return {}
 
     manifest = _parse(await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH))
-    tech_stack = _parse(await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json"))
+    tech_stack = _parse(await repo_files.read_repo_file(provider, thread_id, workflow_persistence.TECH_STACK_APPROVED_PATH))
 
     # --- manifest completion: same shape regardless of entrypoint (greenfield or brownfield) ---
     updates: dict[str, Any] = {}
@@ -448,6 +580,7 @@ async def exit_finalize_node(
         screenshots=screenshots,
         run_id=run_id,
         e2e=state.get("e2e"),
+        stages=state.get("stages"),
     )
     await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
 
@@ -464,6 +597,7 @@ async def exit_finalize_node(
         run_id=run_id,
         e2e=state.get("e2e"),
         screenshot_prefix="history/",
+        stages=state.get("stages"),
     )
     await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, latest_markdown)
 
@@ -539,6 +673,25 @@ def _demo() -> None:
     assert _screen_label("002-expenses.png") == ("Expenses", "/expenses")
     assert _screen_label("003-expenses-new.png") == ("Expenses New", "/expenses/new")
     assert _screen_label("004-suite.png")[1] == "(from playwright suite)"
+    # AC-tagged suite captures are labelled with the criterion they prove.
+    assert _screen_label("001-US-0005-1-suite.png") == ("AC US-0005-1", "(from playwright suite)")
+    assert _screen_label("002-US-0002-suite.png") == ("AC US-0002", "(from playwright suite)")
+
+    # Skills section: evidence per stage, with a claimed-but-never-invoked skill called out. Empty
+    # when no stage recorded any, so the section never appears as an empty heading.
+    assert _render_skills_section(None) == []
+    assert _render_skills_section({"plan": {}}) == []
+    _rows = _render_skills_section({
+        "plan": {"skills": {"invoked": ["writing-plans"], "missing": [], "unsubstantiated": [], "verified": True}},
+        "ac-to-tests": {"skills": {"invoked": ["ac-to-tests"], "missing": ["test-driven-development"],
+                                    "unsubstantiated": ["test-driven-development"], "verified": True}},
+        "plan-b": {"skills": {"invoked": [], "missing": [], "unsubstantiated": [], "verified": False}},
+    })
+    _text = "\n".join(_rows)
+    assert "| plan | writing-plans | ok |" in _text
+    assert "MISSING test-driven-development" in _text
+    assert "CLAIMED BUT NOT INVOKED" in _text, _text
+    assert "unverified (session log unreadable)" in _text
 
     print("exit_nodes self-check: ok")
 

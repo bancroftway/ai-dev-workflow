@@ -52,7 +52,7 @@ from . import spec_ledger
 from . import telemetry
 from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
-from .gates import adversarial_gate, skill_gate
+from .gates import adversarial_gate, remediation_gate, skill_gate
 from .gates.diagram_gate import verify_plan_diagrams
 from .gates.test_coverage_gate import verify_coverage
 from .gates.write_scope_gate import pre_tool_use_write_scope_hook, verify_ac_to_tests
@@ -82,7 +82,7 @@ from .markdown_render import (
     render_specification_markdown,
     render_tech_stack_markdown,
 )
-from .prompt_loader import load_prompt, load_prompt_pair
+from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -130,6 +130,7 @@ class StageState(TypedDict):
     # Set once per run by make_draft_node when StageSpec.capture_baseline_commit is True (P4's
     # write-scope gate); None for every other stage.
     baseline_commit: str | None
+    skills: dict[str, Any] | None
 
 
 class GraphState(TypedDict):
@@ -217,6 +218,8 @@ def default_stage_state() -> StageState:
         "verify_cycle_count": 0,
         "last_verification": None,
         "baseline_commit": None,
+        # Skill evidence recorded by make_draft_node from the session's own skill.invoked events.
+        "skills": None,
     }
 
 
@@ -664,6 +667,22 @@ def _build_metrics_exit_prompt(state: GraphState) -> list[BaseMessage]:
     return _build_exit_prompt(state)
 
 
+_WHOLE_RESPONSE_EXCLUDED = frozenset({"readiness", "clarifying_questions"})
+
+
+def _stage_content(response: BaseModel, content_field: str | None) -> Any:
+    """The stage's artifact, per StageSpec.content_field.
+
+    `content_field=None` means the response's own fields ARE the artifact; readiness and the
+    clarifying questions are dropped because they are stored under their own stage keys and would
+    otherwise appear twice in the persisted draft.
+    """
+    if content_field is not None:
+        return getattr(response, content_field)
+    dumped = response.model_dump(mode="json")
+    return {key: value for key, value in dumped.items() if key not in _WHOLE_RESPONSE_EXCLUDED}
+
+
 def build_remediation_envelope(content: dict[str, Any], audit_findings: list[str] | None) -> dict[str, Any]:
     """Surface envelope for the remediation stage."""
     return {"stage": "remediation", "content": content}
@@ -701,7 +720,13 @@ class StageSpec:
         | type[ExitDraftResponse]
         | type[RemediationDraftResponse]
     )
-    content_field: str
+    content_field: str | None
+    """Which response field becomes the stage's draft, or None for "the whole response".
+
+    Most stages nest their artifact in one field (`specification`, `plan`, ...). Remediation does
+    not: its report IS the response's own fields (what was fixed, what moved, what was left), so
+    naming any single one of them silently discards the rest.
+    """
     surface_tool_name: str
     build_envelope: Callable[[dict[str, Any], list[str] | None], dict[str, Any]]
     build_prompt: Callable[[GraphState], list[BaseMessage]]
@@ -736,6 +761,12 @@ class StageSpec:
     compare future runs against)."""
 
     post_approve_hook: Callable[[str, dict[str, Any], "GraphState", SandboxProvider], Awaitable[None]] | None = None
+    # Prompt name for a WRITE-capable pass inserted between a failed deterministic_verify and the
+    # redraft. Needed when the stage itself cannot act on its own findings: adversarial-compliance is
+    # read-only by design (an auditor that edits the code it audits is not an audit), so blocking on
+    # its divergences with no fix step made the stage structurally unable to pass -- it re-audited,
+    # found the same real gaps, and exhausted its cycles.
+    verify_fix_prompt: str | None = None
     """Same signature as post_audit_hook, but fired from every place a stage reaches "approved" --
     gate_node, auto_approve_node, AND make_draft_node's hydrate_from_repo_file short-circuit.
 
@@ -1011,13 +1042,20 @@ STAGES: list[StageSpec] = [
     StageSpec(
         key="remediation",
         response_schema=RemediationDraftResponse,
-        content_field="remediation_summary",
+        content_field=None,  # the whole response is the report -- see _stage_content
         surface_tool_name="present_remediation",
         build_envelope=build_remediation_envelope,
         build_prompt=_build_remediation_prompt,
         max_cycles=2,
         render_markdown=render_remediation_markdown,
         requires_human_gate=False,
+        # Nothing read this stage's output until now: it could report "fixed the pre-auth RCE" and
+        # be believed. The gate re-scans and blocks on any finding still gating that the report does
+        # not explain. capture_baseline_commit is what lets it diff the stage's own changes and
+        # catch a scanner being silenced instead of a defect being fixed.
+        capture_baseline_commit=True,
+        deterministic_verify=remediation_gate.verify_remediation,
+        max_verify_cycles=3,
         # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
         # edits source to fix scanner findings. Without them it could only ever describe the work --
         # which is exactly what it did, for every run, until now.
@@ -1048,6 +1086,7 @@ STAGES: list[StageSpec] = [
         },
         deterministic_verify=adversarial_gate.verify_adversarial_compliance,
         max_verify_cycles=3,
+        verify_fix_prompt="adversarial_compliance_fix",
     ),
     StageSpec(
         key="metrics-exit",
@@ -1322,7 +1361,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         # hook (tech-stack) keep firing their post_approve_hook on every run. On normal runs
         # intake resets every spec-onward stage to not_started, so this never triggers there.
         stage_now = state["stages"][stage_spec.key]
-        if stage_now["status"] == "approved" and stage_now.get("approved_content"):
+        if should_skip_draft(stage_now):
             logger.info("draft skipped for already-approved stage %s (resume)", stage_spec.key)
             # Skipping the LLM is right; skipping the hook is not. exit_finalize is what writes this
             # run's exit report, refreshes the manifest and closes the session, and it is idempotent
@@ -1416,11 +1455,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
 
-        content = getattr(response, stage_spec.content_field)
-        # Most stages' content_field is a nested Pydantic model, but not all: remediation's
-        # `remediation_summary` is a plain str. Only models can be dumped -- a str (or any other
-        # scalar) is already its own serialized form. Reached for the first time only once a run
-        # got past minimal-code-to-green, which is why this sat latent until now.
+        content = _stage_content(response, stage_spec.content_field)
         if content is None:
             content_dict = stage["draft"]
         elif isinstance(content, BaseModel):
@@ -1446,6 +1481,19 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         else:
             stage["status"] = "needs_clarification"
             stage["cycle_count"] = stage["cycle_count"] + 1
+
+        # Skill evidence for EVERY stage, on every path -- not just when a required skill is missing.
+        # Recorded here rather than in the verify branch because make_draft_node is the one node every
+        # StageSpec has: doing it in verify skipped stages with no deterministic_verify entirely, and
+        # skipped the pass path even where verify existed, which is why a green run left no trace that
+        # any skill had been used. Persisted into state.json's per-stage record.
+        if sandbox_registry.get(thread_id) is not None:
+            stage["skills"] = await skill_gate.skills_record(
+                get_sandbox_provider(),
+                thread_id,
+                stage_spec.key,
+                self_reported=getattr(response, "skills_invoked", None),
+            )
 
         stages[stage_spec.key] = stage
 
@@ -1706,6 +1754,60 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
     return route
 
 
+def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
+    """Write-capable pass that closes what the stage's deterministic_verify reported.
+
+    Modelled on e2e_fix: the findings already carry a plan reference and cited evidence, so the fix
+    agent is handed those verbatim rather than a summary of them.
+    """
+    system_prompt, human_template = load_prompt_pair(stage_spec.verify_fix_prompt or "")
+
+    async def verify_fix_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        thread_id = config["configurable"]["thread_id"]
+        stage = state["stages"][stage_spec.key]
+        report = (stage.get("last_verification") or {}).get("report") or {}
+        reasons = report.get("blocking_reasons") or []
+        if not reasons:
+            return {}
+
+        model = get_chat_model_for_thread(
+            thread_id,
+            stage_spec.key,
+            "fix",
+            github_token=os.environ.get("GITHUB_TOKEN"),
+            # The `fix` role is declared in model_config precisely so this write-capable pass can be
+            # tiered separately from the read-only audit it serves; falls back to the stage's draft
+            # model, matching how e2e_fix resolves its own.
+            model_name=(
+                model_config.get_model_name(stage_spec.key, "fix")
+                or model_config.get_model_name(stage_spec.key, "draft")
+            ),
+            # WITHOUT this the session runs Copilot locally, outside the sandbox, with no access to
+            # the worktree -- so a pass declared write-capable silently could not write. Observed
+            # live: `Creating Copilot session '...:adversarial-compliance:fix' ... sandbox=None`,
+            # returning in 10 seconds with the same four divergences still open.
+            sandbox=sandbox_registry.get(thread_id),
+            # Flat kwargs, not a session_options dict -- this helper takes them directly.
+            agent_mode="autopilot",
+            available_tools=[
+                "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",
+                "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+            ],
+        )
+        rendered = render_prompt(human_template, blocking_reasons="\n".join(f"- {r}" for r in reasons))
+        await model.ainvoke(
+            [SystemMessage(content=system_prompt), HumanMessage(content=rendered)],
+            config={"metadata": {"emit-messages": False}},
+        )
+        if sandbox_registry.get(thread_id) is not None:
+            await git_ops.commit_all(
+                get_sandbox_provider(), thread_id, f"ai-dev-workflow: {stage_spec.key} conformance fixes"
+            )
+        return {}
+
+    return verify_fix_node
+
+
 def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     """Deterministic-verify cap exhaustion, e.g. a gate that keeps failing a real check (coverage,
     write-scope, ledger-sync). Never auto-approved past a failed deterministic gate -- and never
@@ -1728,6 +1830,19 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stages[stage_spec.key]["verify_cycle_count"] = 0
+        # The approval is REVOKED, and persisted revoked. A stage that exhausted its deterministic
+        # gate did not pass, so leaving status=approved on the branch is simply false -- and it has
+        # a concrete consequence: `intake` clears `last_verification` on every run, so the next
+        # resume would hydrate this stage as cleanly approved, skip its draft entirely, and continue
+        # on the exact content the gate rejected. Observed live: ac-to-tests escalated on a real
+        # depth shortfall, and the following run logged "draft skipped for already-approved stage
+        # ac-to-tests (resume)" and went on to write production code against it.
+        stages[stage_spec.key]["status"] = "needs_clarification"
+        stages[stage_spec.key]["approved_content"] = None
+        await _persist_if_sandboxed(
+            thread_id, state, stages,
+            f"ai-dev-workflow: {stage_spec.key} escalated -- approval revoked ({payload['type']})",
+        )
         return {"stages": stages, "run_failure": payload}
 
     return escalate_node
@@ -1807,6 +1922,29 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
     return gate_node
 
 
+def should_skip_draft(stage: dict[str, Any]) -> bool:
+    """Whether a stage's LLM draft can be skipped because it is already approved. Pure.
+
+    A FAILED verification cancels the skip, and that clause is the whole reason this is a named
+    function rather than an inline condition. Without it the verify-retry loop is a NO-OP for every
+    auto-approved stage: `auto_approve` sets status=approved BEFORE verify runs, so when verify
+    fails and routes back to the draft node, the stage looks "already approved" and the redraft is
+    skipped -- the run then continues on exactly the content verification had rejected.
+
+    Observed live on a fresh nextjs-dotnet run: ac-to-tests auto-approved a test suite of
+    `{coverage_plan: [], test_files: [], summary: "No test files were written in this turn."}`; its
+    verify correctly closed the Copilot session so the next attempt would start fresh; the retry
+    then logged "draft skipped for already-approved stage ac-to-tests (resume)" and the pipeline
+    proceeded to write production code against no tests at all.
+    """
+    if stage.get("status") != "approved" or not stage.get("approved_content"):
+        return False
+    last_verification = stage.get("last_verification") or {}
+    if last_verification and not last_verification.get("passed"):
+        return False
+    return True
+
+
 def make_auto_approve_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     async def auto_approve_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         # US-10/AC-10.3: safety cap hit while still not-ready. Proceed to
@@ -1850,7 +1988,9 @@ REBUILD_AFTER_P6 = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    next_node="remediation_draft",
+    # Into the pre-scan, not straight into the draft: remediation cannot act on findings nobody has
+    # measured yet, and the scan of the code minimal-code-to-green just wrote is that measurement.
+    next_node="remediation_scan",
 )
 
 # Stage 6 (remediation): rebuild after fixes applied
@@ -1859,7 +1999,9 @@ REBUILD_FOR_REMEDIATION = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    next_node="adversarial-compliance_draft",
+    # Into test-hardening, NOT adversarial-compliance: the audit was moved to the end of the back
+    # half so it can judge the finished state. See REBUILD_FOR_ADVERSARIAL_COMPLIANCE below.
+    next_node="test_hardening_run_tests",
 )
 
 # Stage 7 (adversarial-compliance): rebuild after compliance checks
@@ -1868,11 +2010,14 @@ REBUILD_FOR_ADVERSARIAL_COMPLIANCE = rebuild.RebuildSpec(
     max_fix_cycles=3,
     fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
     fix_scope="full",
-    # Into test-hardening, which chains on to e2e and then the metrics pass before metrics-exit.
-    # This single value is the whole insertion point for the back half of the pipeline: the
-    # per-stage loop in build_graph() consumes it as stage 7's successor, so there is no extra
-    # add_edge and therefore none of the fan-out hazard that comment warns about.
-    next_node="test_hardening_run_tests",
+    # Into the metrics pass: adversarial-compliance is now the LAST judgement before metrics-exit,
+    # because it audits conformance against the approved Plan and its evidence includes this run's
+    # test-hardening and e2e outcomes. Running it earlier made it block on evidence that had not
+    # been produced yet -- observed live: it failed the run with "[major] PS-9: Fresh successful
+    # verification evidence still not present", citing an e2e outcome of all-nulls, which was simply
+    # e2e not having run. An audit that demands evidence the pipeline emits after it is a deadlock,
+    # not a gate.
+    next_node="metrics_compute",
 )
 
 # Maps a STAGES entry's key -> the R placement immediately after it, so build_graph()'s per-stage
@@ -2078,11 +2223,17 @@ def _wire_e2e(builder: StateGraph) -> None:
     builder.add_node("e2e_fix", e2e_nodes.e2e_fix_node)
     builder.add_node("e2e_escalate", e2e_nodes.e2e_escalate_node)
 
+    # Both non-failure exits land on adversarial-compliance, the audit that now closes the back
+    # half. "skip" included: a repo with no UI still gets audited for Plan conformance.
     builder.add_conditional_edges(
-        "e2e_gate_check", e2e_nodes.make_e2e_route_after_gate_check(), {"skip": "metrics_compute", "run": "e2e_run"}
+        "e2e_gate_check",
+        e2e_nodes.make_e2e_route_after_gate_check(),
+        {"skip": "adversarial-compliance_draft", "run": "e2e_run"},
     )
     builder.add_conditional_edges(
-        "e2e_run", e2e_nodes.make_e2e_route_after_run(), {"pass": "metrics_compute", "fix": "e2e_fix", "escalate": "e2e_escalate"}
+        "e2e_run",
+        e2e_nodes.make_e2e_route_after_run(),
+        {"pass": "adversarial-compliance_draft", "fix": "e2e_fix", "escalate": "e2e_escalate"},
     )
     builder.add_edge("e2e_fix", "e2e_run")
     # Into metrics-exit, not END -- same reasoning as test_hardening_regression_gate above. The node
@@ -2158,10 +2309,16 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
         escalate_name = f"{stage_spec.key}_escalate"
         builder.add_node(verify_name, make_verify_node(stage_spec))
         builder.add_node(escalate_name, make_escalate_node(stage_spec))
+        retry_target = draft_name
+        if stage_spec.verify_fix_prompt:
+            fix_name = f"{stage_spec.key}_verify_fix"
+            builder.add_node(fix_name, make_verify_fix_node(stage_spec))
+            builder.add_edge(fix_name, draft_name)
+            retry_target = fix_name
         builder.add_conditional_edges(
             verify_name,
             make_route_after_verify(stage_spec),
-            {"gate": gate_name, "retry": draft_name, "escalate": escalate_name},
+            {"gate": gate_name, "retry": retry_target, "escalate": escalate_name},
         )
         builder.add_edge(escalate_name, END)
 
@@ -2270,6 +2427,12 @@ def build_graph() -> StateGraph:
     _wire_p13(builder)  # test-hardening: runs the suite N x, triages flakes
     _wire_e2e(builder)  # e2e: boots the app, drives playwright, harvests screenshots
     _wire_p14(builder)  # metrics: final full scan, baseline delta, regression gate
+
+    # Deterministic pre-draft scan for remediation: REBUILD_AFTER_P6 routes here instead of
+    # straight into remediation_draft, so the stage reads the findings of the code that was just
+    # written rather than a scan file that did not exist yet. No LLM, no gate -- one scan, published.
+    builder.add_node("remediation_scan", remediation_gate.remediation_scan_node)
+    builder.add_edge("remediation_scan", "remediation_draft")
 
     # R placements are registered BEFORE the stages that route into them, so each stage can be
     # wired with its true successor in one shot. The previous order (wire stage -> next_draft,
@@ -2440,3 +2603,50 @@ def compile_graph():
 
 
 graph = compile_graph()
+
+
+def _demo() -> None:
+    """`cd agent && uv run python -m src.graph`.
+
+    build_graph() already asserts the structural invariants (every required node registered, no dead
+    cluster, no stub stage). What this adds is the routing PREDICATE that no structural check can
+    see: whether a stage that failed verification actually gets redrafted.
+    """
+    # Genuine resume: approved, content present, verification clean (or never run) -> skip.
+    assert should_skip_draft({"status": "approved", "approved_content": {"x": 1}, "last_verification": None})
+    assert should_skip_draft({"status": "approved", "approved_content": {"x": 1}})
+    assert should_skip_draft(
+        {"status": "approved", "approved_content": {"x": 1}, "last_verification": {"passed": True}}
+    )
+
+    # The live bug this function exists for: auto-approved, then verify FAILED. The redraft MUST run,
+    # or the verify-retry loop silently does nothing and the rejected content ships.
+    assert not should_skip_draft(
+        {
+            "status": "approved",
+            "approved_content": {"coverage_plan": [], "test_files": []},
+            "last_verification": {"passed": False, "feedback": "no e2e specs for any UI criterion"},
+        }
+    )
+    # cannot_verify (no sandbox) is a failure too -- never skip on it.
+    assert not should_skip_draft(
+        {"status": "approved", "approved_content": {"x": 1}, "last_verification": {"passed": False, "cannot_verify": True}}
+    )
+    # Nothing approved, or approved with no content -> the draft has to run.
+    assert not should_skip_draft({"status": "in_progress", "approved_content": {"x": 1}})
+    assert not should_skip_draft({"status": "approved", "approved_content": None})
+
+    # The cross-process half of the same bug: `intake` clears last_verification on every run, so a
+    # stage that escalated would hydrate as cleanly approved and skip its redraft forever. escalate_node
+    # therefore REVOKES the approval, and this is the shape it leaves behind.
+    assert not should_skip_draft(
+        {"status": "needs_clarification", "approved_content": None, "last_verification": None}
+    ), "an escalated stage must be redrafted on the next run, not skipped as approved"
+
+    build_graph()  # runs assert_pipeline_nodes_registered + assert_no_dead_clusters
+    assert_no_stub_stages()
+    print("graph self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

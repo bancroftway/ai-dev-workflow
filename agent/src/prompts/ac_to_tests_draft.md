@@ -67,6 +67,25 @@ thin browser-level check that the user can actually reach it -- write all the la
 A round whose test files are ONLY `*.spec.ts` Playwright specs will be rejected: it means you
 stopped at the outermost layer. Report the level of each test in that AC's `coverage_plan` entry.
 
+**The hard numbers Python enforces, per acceptance criterion:**
+
+- **At least 1 test naming the criterion**, at any level, and it must currently FAIL (TDD red,
+  checked mechanically -- a brand-new test that already passes is almost certainly tautological).
+- **At least 1 end-to-end test** for each AC you mark `ui_relevant: true` in `coverage_plan`.
+- **2 tests below the browser layer** (unit and/or integration) per criterion are enforced at the
+  IMPLEMENTATION stage, once the code exists -- not here. Write them now wherever the rule is
+  already expressible without the implementation (pure validation, clamping, formatting,
+  ordering): every one you write now is one that stage does not have to, and a criterion proven
+  only in a browser is a criterion whose rule nothing checks beneath the UI.
+
+A round that writes `Api.Tests.csproj` and a Playwright spec but no `.cs` test file at all is the
+common failure shape here. The project file is not a test.
+
+Both are counted by finding the AC id inside test names, so every test must carry its criterion id
+in its own name (`Test_US_0001_2_...`, `TestUS00012...`, or `[US-0001.2] ...` in a Playwright
+title). A test that covers a criterion without naming it does not count toward that criterion,
+because nothing can attribute it.
+
 Both levels are runnable here without touching dependency manifests (which you may not edit):
 .NET unit/integration tests live in a test project you may create yourself (e.g.
 `apps/api.Tests/Api.Tests.csproj` plus `*Tests.cs` files), and JS/TS unit tests run under the
@@ -135,6 +154,18 @@ these categories only when it is genuinely not meaningful for that AC, and say w
 categories you covered for each AC in that entry's `categories` field. Never pad coverage with
 tautological variants -- every additional test must assert a distinct observable behavior that no
 existing test already proves, not restate the same assertion in a new wrapper.
+
+These three anti-padding rules are checked by Python and will BLOCK the stage, so they are worth
+reading as requirements rather than advice:
+
+1. **Distinct assertion targets.** Each AC needs at least two tests asserting genuinely different
+   expressions. Numeric literals are normalised before comparison, so `Assert.Equal(1, c.Value)`
+   and `Assert.Equal(2, c.Value)` count as ONE assertion target, not two. Assert a different
+   property, a different method's return, or a different observable effect.
+2. **No near-duplicate bodies.** Two tests for the same AC whose bodies are >= 92% similar count as
+   one test. Renaming a test and changing a literal does not produce a second test.
+3. **Category spread.** An AC whose `categories` contains only `happy_path` is blocked. At least one
+   negative, edge, or adversarial case per criterion.
 
 You have write access, but ONLY to test files -- test projects/files themselves, and their own
 config. Concretely, these paths are permitted, and they are enough to build the full pyramid

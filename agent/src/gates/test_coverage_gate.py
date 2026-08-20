@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 import defusedxml.ElementTree as ET
 from pydantic import BaseModel, Field
 
-from .. import repo_files, stack_runner
+from .. import repo_files, stack_runner, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
@@ -208,6 +208,50 @@ def frontend_only_uses_local_storage(frontend_texts: dict[str, str]) -> bool:
     return "localstorage" in blob or "sessionstorage" in blob or "indexeddb" in blob
 
 
+# An outbound call LEAVING this process: an absolute URL, or a base URL read from config/env. A
+# same-origin relative path ("/api/counter") is deliberately NOT here -- that is the thing being
+# detected, not evidence against it.
+_OUTBOUND_CALL_MARKERS = (
+    "http://",
+    "https://",
+    "process.env",
+    "api_base",
+    "apibase",
+    "baseurl",
+    "base_url",
+    "backend",
+    "upstream",
+)
+
+
+def frontend_reimplements_backend(route_handler_texts: dict[str, str]) -> list[str]:
+    """Frontend-owned API routes that implement state themselves instead of calling the backend.
+
+    Returns the offending paths (empty when fine). Only meaningful when a separate hosted backend
+    was declared -- the caller checks that.
+
+    This exists because `frontend_only_uses_local_storage` was evaded by a real run in a way that
+    looks compliant from every angle it measured: the app declared a .NET API, actually built it
+    (`apps/api/Program.cs`, `CounterStore.cs`), and the frontend really did make an HTTP call --
+    `fetch('/api/counter')`. But that path is a Next.js route handler in the SAME project, backed by
+    an in-process module store, so the .NET service was never contacted by anything. Every existing
+    check passed: a backend framework was declared and hosted, the frontend had a real dependency,
+    and an HTTP-call marker was present, so the localStorage rule short-circuited to "fine".
+
+    The distinguishing signal is deliberately narrow, to keep a legitimate BFF/proxy layer passing:
+    a route handler that forwards to the backend contains an OUTBOUND call (an absolute URL, or a
+    base URL from `process.env`). One that contains no outbound call at all is not a proxy -- it is
+    a second implementation of the same state.
+    """
+    offenders: list[str] = []
+    for path, contents in (route_handler_texts or {}).items():
+        lowered = contents.lower()
+        if any(marker in lowered for marker in _OUTBOUND_CALL_MARKERS):
+            continue  # forwards somewhere -- a proxy/BFF, which is a legitimate design
+        offenders.append(path)
+    return sorted(offenders)
+
+
 def missing_frontend_dependency(frameworks: list[str], package_json: str | None) -> str | None:
     """A declared JS/TS framework absent from package.json's dependencies, or None.
 
@@ -237,7 +281,7 @@ def missing_frontend_dependency(frameworks: list[str], package_json: str | None)
 
 async def _declared_frameworks(provider: SandboxProvider, thread_id: str) -> list[str]:
     """Frameworks from the repo's own tech-stack record; empty when unreadable (fail open)."""
-    for path in (".ai-dev-workflow/tech-stack.approved.json", ".ai-dev-workflow/tech-stack.draft.json"):
+    for path in (workflow_persistence.TECH_STACK_APPROVED_PATH, workflow_persistence.TECH_STACK_DRAFT_PATH):
         raw = await repo_files.read_repo_file(provider, thread_id, path)
         if raw is None:
             continue
@@ -263,9 +307,12 @@ async def _check_integration_fidelity(
         return None
 
     # Project/entry files that would carry the evidence of a real HTTP host.
+    from ..repo_scan import is_non_application_path as _non_app
+
     backend_paths = [
         path for path in source_files
         if path.endswith((".csproj", "Program.cs", "Startup.cs", "main.py", "app.py", "server.js", "server.ts", "index.js", "index.ts", "main.ts"))
+        and not _non_app(path)
     ]
     project_files = await provider.exec_in_sandbox(
         thread_id, "git ls-files '*.csproj' && git ls-files --others --exclude-standard '*.csproj'"
@@ -293,8 +340,18 @@ async def _check_integration_fidelity(
     # a legitimately single-tier app has nothing to call.
     if not any(marker in str(f).lower() for f in frameworks for marker, _ in _BACKEND_MARKERS):
         return None
+    # Build output is excluded explicitly: `.next/` chunks are .js and would otherwise be read as
+    # "frontend source", both wasting reads and (before the path validator was fixed) crashing the
+    # stage on a generated filename like `[externals]__05yr04l._.js`.
+    from ..repo_scan import is_non_application_path
+
+    frontend_candidates = [
+        p for p in source_files
+        if p.lower().endswith((".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"))
+        and not is_non_application_path(p)
+    ]
     frontend_texts: dict[str, str] = {}
-    for path in [p for p in source_files if p.lower().endswith((".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"))][:30]:
+    for path in frontend_candidates[:30]:
         content = await repo_files.read_repo_file(provider, thread_id, path)
         if content is not None:
             frontend_texts[path] = content
@@ -306,6 +363,32 @@ async def _check_integration_fidelity(
             "ship is not the app that was approved.\n\nWire the frontend to the API: replace the "
             "browser-storage persistence with calls to the endpoints the backend exposes."
         )
+
+    # The same rule, evaded differently: the frontend DOES make an HTTP call, but to its own
+    # framework route handler backed by an in-process store, so the declared service is still never
+    # contacted. See frontend_reimplements_backend for the observed case.
+    route_handlers = {
+        path: text for path, text in frontend_texts.items()
+        if re.search(r"(^|/)(app|src/app|pages)/api/.*/route\.[jt]sx?$", path)
+        or re.search(r"(^|/)pages/api/", path)
+    }
+    self_implemented = frontend_reimplements_backend(route_handlers)
+    if self_implemented and len(self_implemented) == len(route_handlers):
+        return (
+            "The frontend calls its OWN framework route handlers, not the declared backend. These "
+            f"handlers implement the state themselves and make no outbound call to any other "
+            f"service: {', '.join(self_implemented)}.\n\n"
+            "So there are now two implementations of the same behaviour -- one in the frontend's "
+            "route handlers, one in the backend the Tech Stack declares -- and the running product "
+            "uses only the first. The backend is dead code, and its tests prove nothing about what "
+            "would ship. A same-origin `fetch('/api/...')` does NOT make the two halves connected "
+            "when the thing serving that path is the frontend itself.\n\n"
+            "Fix it one of two ways: either delete the frontend's duplicate handlers and call the "
+            "backend's endpoints directly (with its base URL from configuration), or keep the "
+            "handlers as a thin proxy that forwards every request to the backend and returns its "
+            "response -- forwarding, never re-implementing. Do not satisfy this by deleting the "
+            "backend: the Tech Stack that declares it is approved."
+        )
     return None
 
 
@@ -314,7 +397,7 @@ async def _missing_declared_frontend(
 ) -> str | None:
     """Same check against the repo's own approved tech-stack record. Returns None (fails OPEN) when
     that record can't be read -- an unreadable artifact is not evidence the frontend is missing."""
-    for path in (".ai-dev-workflow/tech-stack.approved.json", ".ai-dev-workflow/tech-stack.draft.json"):
+    for path in (workflow_persistence.TECH_STACK_APPROVED_PATH, workflow_persistence.TECH_STACK_DRAFT_PATH):
         raw = await repo_files.read_repo_file(provider, thread_id, path)
         if raw is None:
             continue
@@ -639,7 +722,7 @@ async def measure_coverage(
     # Cheap guard, kept from the old tech-stack dispatch: on a repo with no detected languages
     # (the blank-repo baseline scan, which runs before anything is scaffolded) there is nothing to
     # measure, so don't spend a GHCP session discovering that.
-    raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/tech-stack.approved.json")
+    raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.TECH_STACK_APPROVED_PATH)
     tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
     languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
     if not languages and not tech_stack.get("dotnet_detected"):
@@ -677,6 +760,62 @@ _REASON_FEEDBACK: dict[str, str] = {
         f"{COVERAGE_COMMANDS_PATH} (see the drafting instructions) so the gate can replay them."
     ),
 }
+
+
+async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str, dict[str, Any]] | None:
+    """GREEN-phase per-AC depth: `(feedback, report)` when a criterion is under-tested, else None.
+
+    Reuses ac_coverage_gate's counters so RED and GREEN measure identically -- only the threshold
+    differs. `ui_relevant` is NOT consulted here: that flag lives in ac-to-tests' own coverage_plan,
+    which this stage does not produce, so only the level-agnostic "tests below the browser layer"
+    requirement is enforced at this phase.
+    """
+    from .ac_coverage_gate import (
+        MIN_NON_E2E_TESTS_PER_AC,
+        count_tests_per_ac,
+        depth_shortfalls,
+    )
+    from ..spec_ledger import load_ledger
+
+    entries = await load_ledger(provider, thread_id)
+    ac_ids = sorted({str(e.get("id")) for e in entries if "." in str(e.get("id") or "")})
+    if not ac_ids:
+        return None  # no ledger, nothing to attribute -- never a fabricated failure
+
+    listing = await provider.exec_in_sandbox(
+        thread_id,
+        "git ls-files -co --exclude-standard | grep -iE '(test|spec)' "
+        r"| grep -vE '(^|/)(node_modules|\.playwright-browsers|bin|obj|dist|build|\.next|\.venv|vendor|TestResults|coverage|\.ai-dev-workflow|agent-work)/' "
+        "| head -60 || true",
+    )
+    test_files: dict[str, str] = {}
+    for line in (listing.stdout or "").splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        contents = await repo_files.read_repo_file(provider, thread_id, path)
+        if contents is not None:
+            test_files[path] = contents
+    if not test_files:
+        return None  # the coverage gate above already blocks a repo with no tests
+
+    counts = count_tests_per_ac(ac_ids, test_files)
+    shortfalls = depth_shortfalls(
+        counts, ui_relevant=set(), min_non_e2e=MIN_NON_E2E_TESTS_PER_AC, test_files=test_files
+    )
+    if not shortfalls:
+        return None
+    detail = "; ".join(f"{ac}: {' and '.join(problems)}" for ac, problems in sorted(shortfalls.items()))
+    return (
+        "Coverage meets the threshold, but these acceptance criteria are not tested deeply enough "
+        f"-- each needs at least {MIN_NON_E2E_TESTS_PER_AC} test(s) BELOW the browser layer (unit "
+        f"and/or integration), named with the criterion id so they can be attributed: {detail}\n\n"
+        "A high coverage percentage does not mean each criterion is proven: one integration test "
+        "through a small app can colour in every line while most criteria are only ever exercised "
+        "through Playwright. Add the missing unit/integration tests -- do not weaken existing "
+        "tests, and do not add browser tests to satisfy this.",
+        {"ac_depth_shortfalls": {ac: problems for ac, problems in sorted(shortfalls.items())}},
+    )
 
 
 async def verify_coverage(
@@ -800,6 +939,15 @@ async def verify_coverage(
     if entry_reports:
         report["contract_replay"] = entry_reports
     if passed:
+        # Per-AC depth, enforced HERE rather than at ac-to-tests. This is the GREEN phase: the
+        # implementation exists, so "2 tests below the browser layer per criterion" is a thing that
+        # can actually be written. At the RED phase there is no module to unit-test yet and the same
+        # requirement escalated three consecutive runs (see MIN_NON_E2E_TESTS_PER_AC_RED). High
+        # coverage does NOT imply per-criterion depth: one integration test through a small app can
+        # colour in every line while leaving most criteria proven only in the browser.
+        depth = await check_ac_depth(provider, thread_id)
+        if depth is not None:
+            return VerificationResult(passed=False, feedback=depth[0], report={**report, **depth[1]})
         return VerificationResult(passed=True, feedback=f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) meets the {MIN_COVERAGE_PERCENT}% threshold.", report=report)
 
     return VerificationResult(
@@ -973,6 +1121,38 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
         {"web/api.ts": "await fetch(u)", "web/cache.ts": "localStorage.setItem('c', v)"}
     )
     assert not frontend_only_uses_local_storage({})
+
+    # The evasion that passed every check above, taken verbatim from a live run: a declared .NET API
+    # that was really built, a frontend that really calls fetch -- at its OWN Next.js route handler,
+    # backed by an in-process module store. The .NET service was never contacted by anything.
+    self_implemented = {
+        "apps/web/src/app/api/counter/route.ts": (
+            "import { NextResponse } from 'next/server';\n"
+            "import { getCounterStore } from '../../../lib/counter-store';\n"
+            "export function GET() {\n"
+            "  const store = getCounterStore();\n"
+            "  return NextResponse.json({ value: store.get() });\n"
+            "}\n"
+        )
+    }
+    assert frontend_reimplements_backend(self_implemented) == [
+        "apps/web/src/app/api/counter/route.ts"
+    ], frontend_reimplements_backend(self_implemented)
+
+    # A thin proxy must keep PASSING -- forwarding to the backend is a legitimate BFF design, and
+    # this check must not push anyone away from it.
+    proxy = {
+        "apps/web/src/app/api/counter/route.ts": (
+            "export async function GET() {\n"
+            "  const res = await fetch(`${process.env.API_BASE_URL}/counter`);\n"
+            "  return Response.json(await res.json());\n"
+            "}\n"
+        )
+    }
+    assert frontend_reimplements_backend(proxy) == [], frontend_reimplements_backend(proxy)
+    absolute = {"r.ts": "await fetch('http://127.0.0.1:5080/counter')"}
+    assert frontend_reimplements_backend(absolute) == []
+    assert frontend_reimplements_backend({}) == []
 
     print("test_coverage_gate self-check: all assertions passed")
 

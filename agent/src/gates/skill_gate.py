@@ -24,6 +24,7 @@ import json
 import logging
 import shlex
 from dataclasses import dataclass
+from typing import Any
 
 from .. import config as workflow_config
 from ..copilot_chat_model import get_session_id
@@ -72,22 +73,86 @@ async def invoked_skills(provider: SandboxProvider, thread_id: str, stage: str, 
     return names
 
 
+# Roles whose sessions count towards a stage's required skills. A stage runs a DRAFT session and,
+# where it has an audit pass, a separate AUDIT session -- and several required skills belong to the
+# audit by nature: `requesting-code-review` and `verification-before-completion` are what a review
+# pass invokes, not what a first draft does. Checking only the draft therefore reported a skill
+# missing that had genuinely been used in the other session. Observed live: minimal-code-to-green's
+# draft invoked seven skills while `verification-before-completion` was reported missing, and real
+# runs do create `plan:audit` and `minimal-code-to-green:audit` sessions.
+_ROLES_CHECKED = ("draft", "audit")
+
+
 async def check_required_skills(
-    provider: SandboxProvider, thread_id: str, stage: str, role: str = "draft"
+    provider: SandboxProvider, thread_id: str, stage: str, roles: tuple[str, ...] = _ROLES_CHECKED
 ) -> SkillCheckOutcome:
+    """Union of every checked role's `skill.invoked` events for this stage.
+
+    `verified` stays False only when NO role produced a readable log: one absent session (a stage
+    with no audit pass) alongside one readable session is a complete answer, not an unverifiable one.
+    """
     required = list(workflow_config.REQUIRED_SKILLS_BY_STAGE.get(stage, []))
     if not required:
         return SkillCheckOutcome(passed=True, required=[], invoked=[], missing=[], verified=True)
 
-    invoked = await invoked_skills(provider, thread_id, stage, role)
-    if invoked is None:
+    invoked: list[str] = []
+    any_readable = False
+    for role in roles:
+        role_skills = await invoked_skills(provider, thread_id, stage, role)
+        if role_skills is None:
+            continue
+        any_readable = True
+        for skill in role_skills:
+            if skill not in invoked:
+                invoked.append(skill)
+
+    if not any_readable:
         logger.info("skill gate: cannot verify invocations for stage=%s (no readable session log)", stage)
         return SkillCheckOutcome(passed=True, required=required, invoked=[], missing=[], verified=False)
 
     missing = [skill for skill in required if skill not in invoked]
     if missing:
-        logger.info("skill gate: stage=%s missing required skills %s (invoked: %s)", stage, missing, invoked)
+        logger.info("skill gate: stage=%s missing required skills %s (invoked across %s: %s)",
+                    stage, missing, list(roles), invoked)
     return SkillCheckOutcome(passed=not missing, required=required, invoked=invoked, missing=missing, verified=True)
+
+
+async def skills_record(
+    provider: SandboxProvider, thread_id: str, stage: str, self_reported: list[str] | None = None
+) -> dict[str, Any]:
+    """The stage's skill evidence, for persistence into state.json -- on the PASS path too.
+
+    Previously only failures stored anything (the pass path returned early), so a healthy run left no
+    trace that any skill had been used and `grep skill_gate` on a green log returned nothing. That is
+    the whole reason "we force GHCP to report skills" looked unimplemented.
+
+    `unsubstantiated` is the interesting field: a skill the model CLAIMED but never invoked. The event
+    log cannot be forged, so a non-empty list here is a fabrication signal of exactly the kind that
+    has been this pipeline's most expensive failure mode. Recorded, not gated -- we should learn how
+    often it fires before blocking on it.
+    """
+    required = list(workflow_config.REQUIRED_SKILLS_BY_STAGE.get(stage, []))
+    invoked: list[str] = []
+    any_readable = False
+    for role in _ROLES_CHECKED:
+        role_skills = await invoked_skills(provider, thread_id, stage, role)
+        if role_skills is None:
+            continue
+        any_readable = True
+        for skill in role_skills:
+            if skill not in invoked:
+                invoked.append(skill)
+    claimed = [str(s) for s in (self_reported or [])]
+    return {
+        "required": required,
+        "invoked": invoked,
+        "self_reported": claimed,
+        "unsubstantiated": [s for s in claimed if s not in invoked],
+        "missing": [s for s in required if s not in invoked],
+        # False means NO role produced a readable log. Kept distinct from `missing: []` on purpose:
+        # "no evidence" must never read as "enforced".
+        "verified": any_readable,
+    }
 
 
 def feedback_for(outcome: SkillCheckOutcome) -> str:

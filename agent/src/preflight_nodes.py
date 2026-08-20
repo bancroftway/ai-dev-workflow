@@ -23,7 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader
+from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader, workflow_persistence
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
@@ -134,7 +134,8 @@ this file describes the stack and layout to scaffold the application into.
 """
 
 TECH_STACK_MD_PATH = ".ai-dev-workflow/tech-stack.md"
-TECH_STACK_APPROVED_JSON_PATH = ".ai-dev-workflow/tech-stack.approved.json"
+# One truth, derived from the stage-file numbering -- see workflow_persistence.
+TECH_STACK_APPROVED_JSON_PATH = workflow_persistence.TECH_STACK_APPROVED_PATH
 
 
 async def update_manifest(

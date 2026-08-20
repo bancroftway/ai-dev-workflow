@@ -18,13 +18,14 @@ CONFIRMED. `playwright screenshot --full-page` works against the image's baked
 chromium-headless-shell (no full chromium needed, no runtime `playwright install`), and
 `screenshot: 'on'` yields images for PASSING tests, not only failures.
 
-CONFIRMED, and it needed a fix: `@playwright/test` is NOT installed in the image (only the
-`playwright` package is), so a spec importing it dies with MODULE_NOT_FOUND, and NODE_PATH does not
-help. Fix: _link_global_playwright symlinks the global package and drops a tiny @playwright/test
-shim, so specs keep the IDIOMATIC import. Importing `playwright/test` instead also runs, but breaks
-the moment a repo ships its own @playwright/test -- the runner then loads one copy and the spec
-another, and playwright rejects it ("did not expect test.beforeEach() ... two different versions").
-Both the shim and the mixed-import failure were reproduced live.
+RESOLVED IN THE IMAGE. `@playwright/test` is now installed globally at the same pinned version as
+`playwright`, so specs use the IDIOMATIC import. Node does not search global node_modules, so the
+suite is invoked with NODE_PATH scoped to that prefix -- verified in the rebuilt image with no shim
+and no local node_modules. This replaced a compatibility shim that wrote a fake @playwright/test into
+the target repo, which had already once overwritten a real install. Importing `playwright/test`
+directly also runs but breaks the moment a repo ships its own @playwright/test: the runner loads one
+copy and the spec another, and playwright rejects it ("did not expect test.beforeEach() ... two
+different versions"). Both failures were reproduced live.
 
 CONFIRMED. `--reporter=json` writes the shape `_parse_playwright_json` expects: a live run parsed
 `agent-work/e2e-report.json` into 12 expected / 1 unexpected with per-spec titles, and the failing
@@ -54,7 +55,7 @@ from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
 
 logger = logging.getLogger(__name__)
-from . import stack_runner
+from . import stack_runner, test_results
 from .schemas import StageReport
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -80,6 +81,10 @@ class E2EState(TypedDict):
     suite: bool  # a playwright suite exists to run; False -> boot and screenshot only
     config_dir: str  # repo-relative directory holding playwright.config.* ("" = repo root)
     routes: list[str]  # routes actually screenshotted, parallel to `screenshots`
+    degenerate_screenshots: list[str]  # captures too small to hold a rendered page
+    same_size_screenshots: list[str]  # exact-byte-size matches: reported, never gated on
+    screenshot_commit: str | None  # short sha the captures depict, for staleness detection
+    page_state: str  # what the browser saw on failure: status, title, console errors, rendered text
 
 
 class AppLaunchReport(StageReport):
@@ -108,17 +113,21 @@ def default_e2e_state() -> E2EState:
         "suite": False,
         "config_dir": "",
         "routes": [],
+        "degenerate_screenshots": [],
+        "same_size_screenshots": [],
+        "screenshot_commit": None,
+        "page_state": "",
     }
 
 
-# The globally-installed playwright package, which provides BOTH the `playwright` CLI (with its
-# `test` subcommand) and the importable test runner under its own `./test` export. Verified live in
-# the sandbox image: `@playwright/test` is NOT installed there (/usr/lib/node_modules/@playwright
-# holds only `mcp`), so a spec written the idiomatic way dies with MODULE_NOT_FOUND, and NODE_PATH
-# does not fix it (playwright resolves config imports itself). _link_global_playwright bridges that
-# gap without changing how specs are written -- see its docstring for why the shim beats telling
-# specs to import 'playwright/test'.
+# The globally-installed `playwright` package, which provides the CLI (including its `test`
+# subcommand). Its presence is how `_playwright_runner_available` decides a repo without its own
+# install can still run a suite. The image now installs `@playwright/test` beside it at the SAME
+# pinned version, which is what lets specs use the idiomatic import.
 GLOBAL_PLAYWRIGHT_PATH = "/usr/lib/node_modules/playwright"
+# Global npm prefix. Used ONLY as a scoped NODE_PATH for playwright invocations, never exported
+# image-wide -- see the comment at its use site for why that distinction matters.
+GLOBAL_NODE_MODULES = "/usr/lib/node_modules"
 
 
 async def _playwright_runner_available(provider: Any, thread_id: str, config_dir: str = "") -> str | None:
@@ -175,45 +184,6 @@ async def _alias_browsers_for_local_runner(provider: Any, thread_id: str) -> Non
         f"  [ -n \"$rev\" ] || continue; "
         f"  ln -sfnT \"$baked\" {shlex.quote(BROWSER_ALIAS_DIR)}/chromium_headless_shell-$rev 2>/dev/null; "
         f"done; true",
-    )
-
-
-async def _link_global_playwright(provider: Any, thread_id: str, config_dir: str) -> None:
-    """Make the IDIOMATIC `@playwright/test` import resolve, using the globally installed package.
-
-    Called only when the repo has no @playwright/test of its own. Two pieces, both required:
-      * node_modules/playwright        -> symlink to the global package
-      * node_modules/@playwright/test  -> a 3-line shim re-exporting `playwright/test`
-
-    Why a shim rather than telling specs to import 'playwright/test' directly (which also works):
-    when the repo DOES ship @playwright/test, the runner loads that copy while a 'playwright/test'
-    import resolves to a different one, and playwright rejects the mix with "did not expect
-    test.beforeEach() to be called here ... two different versions of @playwright/test". Observed
-    live. Keeping the import idiomatic in every case, and fixing resolution here, removes the
-    dependency on which packages a given repo happens to have installed.
-
-    Idempotent, no network, no package.json edit -- package.json is outside ac-to-tests' write scope,
-    so the stage that writes specs could never add the dependency itself.
-    """
-    target = f"{config_dir}/node_modules" if config_dir else "node_modules"
-    shim = f"{target}/@playwright/test"
-    link = f"{target}/playwright"
-    # Both writes are strictly ADDITIVE, guarded on the target not already existing. Without these
-    # guards this function overwrote a REAL @playwright/test install (replacing its package.json and
-    # index.js with the shim's), and `ln -sfn` against an existing directory silently created
-    # node_modules/playwright/playwright rather than replacing it. `-T` treats the destination as a
-    # name, never as a directory to descend into. Both were observed live, on the same run.
-    await provider.exec_in_sandbox(
-        thread_id,
-        f"mkdir -p {shlex.quote(target)}; "
-        f"[ -e {shlex.quote(link)} ] || ln -sfnT {shlex.quote(GLOBAL_PLAYWRIGHT_PATH)} {shlex.quote(link)}; "
-        f"if [ ! -e {shlex.quote(f'{shim}/package.json')} ]; then "
-        f"mkdir -p {shlex.quote(shim)} && "
-        f"printf '%s\\n' '{{\"name\":\"@playwright/test\",\"version\":\"1.0.0\",\"main\":\"index.js\"}}' "
-        f"> {shlex.quote(f'{shim}/package.json')} && "
-        f"printf '%s\\n' 'module.exports = require(\"playwright/test\");' "
-        f"> {shlex.quote(f'{shim}/index.js')}; "
-        f"fi; true",
     )
 
 
@@ -345,6 +315,22 @@ async def _finalize_run(provider: Any, thread_id: str, e2e: E2EState) -> dict[st
     return {"e2e": e2e}
 
 
+def suite_screenshot_name(index: int, source_path: str) -> str:
+    """`001-US-0005-1-suite.png` from playwright's own result directory name.
+
+    Playwright names each result dir after the test title, and this pipeline requires the AC id IN
+    that title -- so the id is sitting right there in the path
+    (`test-results/e2e-click-counter--US-0005-1-63f6d--.../test-finished-1.png`). The harvest used to
+    flatten everything to `001-suite.png`, throwing away the one thing that links visual evidence to
+    an acceptance criterion. Falls back to plain `-suite` when no id is present.
+    """
+    match = re.search(r"(US[-_]\d{4}(?:[._-]\d+)?)", source_path, re.IGNORECASE)
+    if not match:
+        return f"{index:03d}-suite.png"
+    ac_id = match.group(1).upper().replace("_", "-").replace(".", "-")
+    return f"{index:03d}-{ac_id}-suite.png"
+
+
 def _route_slug(route: str) -> str:
     """'/expenses/new' -> 'expenses-new', '/' -> 'home'. Filename-safe by construction: routes come
     from a model's report, so anything outside [a-z0-9-] is dropped rather than escaped."""
@@ -463,6 +449,106 @@ def _with_port_env(command: str, port: int, runtime: str) -> str:
     if runtime == "dotnet":
         return f"ASPNETCORE_URLS=http://127.0.0.1:{port} {command}"
     return f"PORT={port} {command}"
+
+
+# What the BROWSER saw, as text a model can read. A screenshot proved a real defect once -- a
+# Next.js overlay reading "Missing <html> and <body> tags in the root layout" -- while the feedback
+# reaching e2e_fix said only "element(s) not found", so the fix node worked blind for two cycles. The
+# diagnosis was sitting in a PNG. This captures the same information as JSON.
+#
+# Deliberately a node script against the global playwright rather than the `screenshot` CLI: the CLI
+# writes an image and reports nothing about console errors, page title, or rendered text.
+_PAGE_PROBE_JS = r"""
+const { chromium } = require("%(pw)s");
+(async () => {
+  const out = { status: null, title: "", errors: [], text: "" };
+  let browser;
+  try {
+    browser = await chromium.launch();
+    const page = await browser.newPage();
+    page.on("console", m => { if (m.type() === "error") out.errors.push(m.text()); });
+    page.on("pageerror", e => out.errors.push("pageerror: " + e.message));
+    const resp = await page.goto(process.argv[2], { waitUntil: "load", timeout: 15000 })
+      .catch(e => { out.errors.push("navigation failed: " + e.message); return null; });
+    if (resp) out.status = resp.status();
+    out.title = await page.title().catch(() => "");
+    out.text = (await page.innerText("body").catch(() => "")).slice(0, 2000);
+  } catch (e) {
+    out.errors.push("probe failed: " + e.message);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    console.log(JSON.stringify(out));
+  }
+})();
+""" % {"pw": GLOBAL_PLAYWRIGHT_PATH}
+
+_PAGE_PROBE_PATH = "agent-work/e2e-page-probe.js"
+
+
+async def _capture_page_state(provider: Any, thread_id: str, port: int, route: str) -> dict[str, Any]:
+    """HTTP status, title, console/page errors and rendered text for one route. Never raises: this
+    is diagnostic colour on a failure path, and a broken probe must not mask the failure it explains.
+    """
+    await repo_files.write_repo_file(provider, thread_id, _PAGE_PROBE_PATH, _PAGE_PROBE_JS)
+    result = await provider.exec_in_sandbox(
+        thread_id,
+        f"PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
+        f"node {shlex.quote(_PAGE_PROBE_PATH)} {shlex.quote(f'http://localhost:{port}{route}')} 2>&1 | tail -1",
+    )
+    raw = (result.stdout or "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": None, "title": "", "errors": [f"page probe produced no JSON: {raw[:300]}"], "text": ""}
+
+
+def summarise_page_state(route: str, state: dict[str, Any]) -> str:
+    """One human/model-readable line-set for a probed route. Pure, so it is self-checkable."""
+    parts = [f"route {route} -> HTTP {state.get('status')}"]
+    if state.get("title"):
+        parts.append(f"title: {state['title']!r}")
+    errors = state.get("errors") or []
+    if errors:
+        parts.append("browser errors: " + " | ".join(str(e) for e in errors[:5]))
+    text = (state.get("text") or "").strip()
+    if text:
+        # The rendered text IS the diagnosis when a framework paints its error overlay into the page.
+        parts.append(f"rendered text: {text[:600]!r}")
+    else:
+        parts.append("rendered text: (empty -- the page painted nothing)")
+    return "; ".join(parts)
+
+
+# A screenshot of a page that rendered nothing is honest but carries no information, and five of them
+# look like evidence. Observed live: a failed run produced five PNGs of IDENTICAL 4254 bytes. Flagged
+# rather than deleted -- and never fatal, since two genuinely identical pages are possible.
+_DEGENERATE_PNG_MAX_BYTES = 8192
+
+
+def degenerate_screenshots(sizes: dict[str, int]) -> list[str]:
+    """Screenshot paths that almost certainly show an EMPTY page: tiny files only.
+
+    Size-identity is deliberately NOT part of this any more. It reads as a clever proxy for "the page
+    never changed", and it is wrong: two ~96 KB captures of a counter reading 0 and the same counter
+    reading 1 came out byte-identical in size, because PNG compression of a near-identical layout
+    lands on the same length. Both were correct, fully-rendered pages -- and flagging them sent a
+    5/5-passing e2e suite into the fix loop twice.
+
+    `same_size_screenshots` below still reports that coincidence, because a genuinely stuck page does
+    produce it. It is a note, never a gate: the file being 4 KB is evidence of nothing rendering; the
+    file being the same length as its neighbour is evidence of nothing at all.
+    """
+    if not sizes:
+        return []
+    return sorted(path for path, size in sizes.items() if size <= _DEGENERATE_PNG_MAX_BYTES)
+
+
+def same_size_screenshots(sizes: dict[str, int]) -> list[str]:
+    """Captures sharing an exact byte size -- reported for a human to glance at, never gated on."""
+    by_size: dict[int, list[str]] = {}
+    for path, size in sizes.items():
+        by_size.setdefault(size, []).append(path)
+    return sorted(path for paths in by_size.values() if len(paths) > 1 for path in paths)
 
 
 async def _kill_stale_app_processes(provider: Any, thread_id: str) -> None:
@@ -787,14 +873,19 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # wanted regardless. Only the invocation binary differs between "local" (repo's own
     # @playwright/test via npx) and "global" (the image's pinned fallback CLI) runners.
     config_dir = str(e2e.get("config_dir") or "")
-    # Always populated: the standalone `playwright screenshot` calls below use it too.
+    # Always populated: the standalone `playwright screenshot` calls below use it too, and a repo
+    # with its own playwright may want a browser revision the image does not bake under that name.
     await _alias_browsers_for_local_runner(provider, thread_id)
-    if runner == "global":
-        # Makes the idiomatic `@playwright/test` import resolve against the image's global package.
-        await _link_global_playwright(provider, thread_id, config_dir)
-    else:
-        # The repo brought its own playwright, which pins a browser revision the image does not bake.
-        await _alias_browsers_for_local_runner(provider, thread_id)
+
+    # The image installs @playwright/test globally at the pinned version, but node does not search
+    # global node_modules -- so the idiomatic `import { test } from '@playwright/test'` needs
+    # NODE_PATH pointing there. Scoped to the playwright invocation ONLY, never set image-wide: a
+    # global NODE_PATH would let a generated app resolve packages it never declared in its
+    # package.json, hiding a missing dependency that would fail the moment the app ran anywhere else.
+    # Verified in the rebuilt image -- config + spec importing '@playwright/test', no shim and no
+    # local node_modules, suite green. This replaced a shim that wrote a fake @playwright/test into
+    # the target repo, which had already once overwritten a real install.
+    node_path_env = f"NODE_PATH={shlex.quote(GLOBAL_NODE_MODULES)} " if runner == "global" else ""
 
     # Paths that the suite's own working directory owns. Playwright must run from the directory
     # holding its config (previously it always ran from the repo root, which simply found no config
@@ -802,11 +893,19 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     cd_prefix = f"cd {shlex.quote(config_dir)} && " if config_dir else ""
     results_root = f"{config_dir}/test-results" if config_dir else "test-results"
 
+    # Stale results from a PREVIOUS attempt are deleted before the suite runs. Playwright does not
+    # clear its own output directory, so a failed attempt's `test-failed-1.png` files survive a later
+    # green run -- and they are read as current evidence: the conformance audit failed a run citing
+    # "blank white screenshots indicate captured Playwright failures, not passing evidence", pointing
+    # at PNGs from an attempt two cycles earlier. Evidence on disk must belong to the run being
+    # judged.
+    await provider.exec_in_sandbox(thread_id, f"rm -rf {shlex.quote(results_root)}")
+
     suite_result = None
     if e2e.get("suite"):
         run_cmd = "npx playwright test" if runner == "local" else "playwright test"
         command = (
-            f"{cd_prefix}PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
+            f"{cd_prefix}{node_path_env}PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
             f"PLAYWRIGHT_JSON_OUTPUT_NAME={shlex.quote(_report_path_for(config_dir))} "
             f"BASE_URL=http://localhost:{port} "
             f"timeout {workflow_config.E2E_SUITE_TIMEOUT_SECONDS} {run_cmd} --reporter=json 2>&1"
@@ -850,7 +949,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     screenshots: list[str] = []
     await provider.exec_in_sandbox(thread_id, f"mkdir -p {shlex.quote(screens_dir)}")
     for index, path in enumerate(found_paths, start=1):
-        dest = f"{screens_dir}/{index:03d}-suite.png"
+        dest = f"{screens_dir}/{suite_screenshot_name(index, path)}"
         await provider.exec_in_sandbox(thread_id, f"cp -- {shlex.quote(path)} {shlex.quote(dest)}")
         screenshots.append(dest)
 
@@ -884,9 +983,47 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     e2e["screenshots"] = screenshots
     e2e["routes"] = routes
 
+    # Which commit these images actually depict. Stages that run AFTER e2e can still change UI source
+    # -- the conformance audit's fix pass does exactly that -- and the screenshots are then evidence
+    # of a tree that no longer exists. The audit caught this itself and filed it as a divergence
+    # ("provided screenshot artifact still shows pre-fix UI"), so the exit report now says which
+    # commit the visual evidence belongs to instead of implying it is current.
+    head = await provider.exec_in_sandbox(thread_id, "git rev-parse --short HEAD 2>/dev/null || true")
+    e2e["screenshot_commit"] = (head.stdout or "").strip() or None
+
+    # Size every capture, then flag the ones that show nothing. Kept (they are honest evidence of a
+    # blank page) but labelled, so five identical blanks stop reading as five pieces of proof.
+    sizes: dict[str, int] = {}
+    for path in screenshots:
+        stat = await provider.exec_in_sandbox(thread_id, f"stat -c %s {shlex.quote(path)} 2>/dev/null")
+        try:
+            sizes[path] = int((stat.stdout or "0").strip())
+        except ValueError:
+            continue
+    blank = degenerate_screenshots(sizes)
+    e2e["degenerate_screenshots"] = blank
+    if blank:
+        logger.warning(
+            "e2e: %d/%d screenshots are too small to contain a rendered page for thread_id=%s",
+            len(blank), len(screenshots), thread_id,
+        )
+    identical = same_size_screenshots(sizes)
+    e2e["same_size_screenshots"] = identical
+    if identical:
+        # Informational only -- see degenerate_screenshots for why this must not gate.
+        logger.info(
+            "e2e: %d screenshots share an exact byte size for thread_id=%s (often coincidental "
+            "PNG compression of a similar layout, not a stuck page)",
+            len(identical), thread_id,
+        )
+
     raw_report = await repo_files.read_repo_file(provider, thread_id, E2E_REPORT_PATH)
     if raw_report:
         parsed = _parse_playwright_json(raw_report)
+    elif not e2e.get("suite"):
+        # No suite existed to run; the boot+screenshot pass IS the whole stage here. Zero tests is
+        # the truth, not a crash, and must not be reported as a failure.
+        parsed = {"passed": 0, "total": 0, "failed_tests": []}
     else:
         # The reporter never wrote a file at all (suite crashed before it could) -- NEVER read
         # this as "0 tests, all passed": that would let the very failures this stage exists to
@@ -896,6 +1033,25 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             "failed_tests": [{"title": "e2e report", "error": f"{E2E_REPORT_PATH} was not written (suite exit code {suite_result.returncode})"}],
         }
     e2e.update(status="passed" if not parsed["failed_tests"] else "failed", **parsed)
+
+    # On failure, probe the app and attach what the BROWSER saw. Without this the fix node reads
+    # "element(s) not found" and starts guessing, while the page itself is displaying the cause --
+    # the live example being a Next.js overlay saying "Missing <html> and <body> tags in the root
+    # layout", visible in a screenshot and in no text anywhere. Also probed when the suite passed but
+    # every capture looks blank, which is the same blindness wearing a green hat.
+    if e2e["status"] == "failed" or e2e.get("degenerate_screenshots"):
+        state_line = summarise_page_state(routes[0], await _capture_page_state(provider, thread_id, port, routes[0]))
+        logger.info("e2e page state: %s", state_line)
+        e2e["page_state"] = state_line
+        failures = list(e2e.get("failed_tests") or [])
+        failures.append({"title": "page state at failure", "error": state_line})
+        e2e["failed_tests"] = failures
+        if e2e.get("degenerate_screenshots") and e2e["status"] != "failed":
+            # A green suite whose screenshots are all blank is not evidence of a working UI.
+            e2e["skipped_reason"] = (
+                f"{len(e2e['degenerate_screenshots'])} screenshot(s) are too small to contain a "
+                f"rendered page -- {state_line}"
+            )
 
     return await _finalize_run(provider, thread_id, e2e)
 
@@ -972,56 +1128,10 @@ async def e2e_escalate_node(state: dict[str, Any], config: RunnableConfig) -> di
 # --------------------------------------------------------------------------------------------
 
 
-def _iter_specs(suite: dict[str, Any]):
-    for spec in suite.get("specs") or []:
-        yield spec
-    for nested in suite.get("suites") or []:
-        yield from _iter_specs(nested)
-
-
-def _parse_playwright_json(raw_json: str) -> dict[str, Any]:
-    """Playwright's `--reporter=json` output -> {passed, failed_tests: [{title, error}], total}.
-    A test's outcome is judged on its LAST result only -- retries produce multiple results for the
-    same test, and only the final one decides pass/fail.
-
-    NEVER returns total==0 with an empty failed_tests: that shape is indistinguishable from "ran
-    zero tests, so vacuously all passed", which would route the run straight past the fix/escalate
-    loop on exactly the failures (a globalSetup throw, a config syntax error, a suite that never
-    actually started) it exists to catch. Malformed JSON and a structurally-empty report each get
-    their own synthetic failed_tests entry instead; playwright's own top-level `errors` (set when
-    something broke before any test could run) are surfaced as real failures when present.
-    """
-    try:
-        doc = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return {"passed": 0, "total": 0, "failed_tests": [{"title": "e2e report", "error": "e2e-report.json was not valid JSON"}]}
-
-    passed = 0
-    total = 0
-    failed_tests: list[dict[str, str]] = []
-    for suite in doc.get("suites") or []:
-        for spec in _iter_specs(suite):
-            title = spec.get("title", "unknown")
-            for test in spec.get("tests") or []:
-                total += 1
-                results = test.get("results") or []
-                outcome = results[-1] if results else {}
-                if outcome.get("status") == "passed":
-                    passed += 1
-                else:
-                    error = ((outcome.get("error") or {}).get("message")) or outcome.get("status") or "unknown failure"
-                    failed_tests.append({"title": title, "error": str(error)})
-
-    if total == 0:
-        top_errors = doc.get("errors") or []
-        if top_errors:
-            for err in top_errors:
-                message = err.get("message") if isinstance(err, dict) else str(err)
-                failed_tests.append({"title": "e2e suite setup", "error": str(message or err)})
-        else:
-            failed_tests.append({"title": "e2e suite", "error": "e2e-report.json contained no tests and no top-level errors"})
-
-    return {"passed": passed, "failed_tests": failed_tests, "total": total}
+# Moved to test_results.py -- repo_scan's eval layer parses the same report. Aliased so the
+# module docstring's CONFIRMED note above and every call site below stay accurate.
+_iter_specs = test_results._iter_specs
+_parse_playwright_json = test_results.parse_playwright_json
 
 
 def _demo() -> None:
@@ -1085,6 +1195,35 @@ def _demo() -> None:
     assert _route_slug("/expenses") == "expenses"
     assert _route_slug("/expenses/new") == "expenses-new"
     assert _route_slug("/a b;rm -rf/") == "a-b-rm-rf"  # no shell metacharacters survive
+
+    # Screenshot triage. A tiny PNG means nothing rendered; equal byte sizes mean nothing at all.
+    # These are the REAL sizes from a live 5/5-passing run whose captures were fully rendered pages
+    # (a counter reading 0 and the same counter reading 1) -- the old size-identity rule flagged them
+    # and drove the suite into the fix loop twice.
+    real_sizes = {
+        "001-US-0003-1-suite.png": 101935,
+        "003-US-0002-1-suite.png": 96281,
+        "005-US-0003-2-suite.png": 96281,
+        "004-US-0001-1-suite.png": 94786,
+    }
+    assert degenerate_screenshots(real_sizes) == [], "fully-rendered pages must never be called blank"
+    assert same_size_screenshots(real_sizes) == ["003-US-0002-1-suite.png", "005-US-0003-2-suite.png"], (
+        "the coincidence is still reported -- just not gated on"
+    )
+    # A genuinely empty capture IS caught, which is the case the check exists for.
+    assert degenerate_screenshots({"blank.png": 4254, "real.png": 96281}) == ["blank.png"]
+    assert degenerate_screenshots({}) == []
+
+    # Suite screenshots keep the AC id playwright already put in its result directory name -- the
+    # harvest used to flatten it away, severing visual evidence from the criterion it proves.
+    assert suite_screenshot_name(
+        1, "apps/web/test-results/e2e-click-counter--US-0005-1-63f6d--reload/test-finished-1.png"
+    ) == "001-US-0005-1-suite.png"
+    assert suite_screenshot_name(
+        2, "test-results/spec-US_0002_3-abc/test-failed-1.png"
+    ) == "002-US-0002-3-suite.png"
+    # No id in the path -> plain name, never a fabricated id.
+    assert suite_screenshot_name(3, "test-results/smoke/test-finished-1.png") == "003-suite.png"
 
     # The playwright JSON report path has to be rewritten relative to the directory the suite runs
     # in. Passing the repo-relative path unchanged wrote the report to apps/web/agent-work/... and

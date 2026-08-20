@@ -78,6 +78,9 @@ DELTA_PATH = ".ai-dev-workflow/repo-scan-delta.json"
 # see the module docstring's SBOM paragraph -- so it is persisted here instead, exactly like the
 # three paths above.
 SBOM_PATH = ".ai-dev-workflow/sbom.json"
+# The SBOM as it stood at the baseline scan, so supply_chain_diff has a "before" to compare
+# against -- SBOM_PATH itself is overwritten by every subsequent scan.
+SBOM_BASELINE_PATH = ".ai-dev-workflow/sbom-baseline.json"
 
 # Vendored LGPL-2.1 semgrep rules and the baked offline OSV database, both placed by the sandbox
 # image. Overridable so a differently-built image can move them without a code change.
@@ -807,6 +810,142 @@ def parse_dotnet_docs(raw: str) -> ParseResult:
     return [], {"documentation": {"dotnet_undocumented_public_members": len(_CS1591_RE.findall(raw))}}
 
 
+# Fraction of SBOM components the dependency graph must actually mention before ancestry is
+# reported at all. Syft emits a near-empty graph for some ecosystems (816 components / 20 edges on
+# this pipeline's own branch), and a split derived from that describes the tool, not the project.
+MIN_GRAPH_COVERAGE = 0.5
+
+
+def sbom_ancestry(doc: dict[str, Any]) -> dict[str, Any]:
+    """Direct vs transitive dependencies, and licences, from a CycloneDX document. Pure.
+
+    The `dependencies` graph makes ancestry a FACT -- "you chose this" vs "Next.js chose this" --
+    where the alternative is `is_transitive_dependency_file`, which infers it from whether the
+    finding's path looks like a lock file. That heuristic is right often and wrong silently: a
+    direct dependency pinned in a lock file reads as inherited, and an inherited one surfaced
+    against `package.json` reads as chosen.
+
+    Returns `{}` when the document carries no USABLE dependency graph, so callers can tell
+    "measured, and everything is direct" apart from "no graph to measure" -- the licence gate must
+    not treat an absent graph as proof that nothing is inherited.
+
+    "Usable" is a real threshold, not a formality. Measured on this pipeline's own branch, syft's
+    CycloneDX output held **816 components and 20 dependency entries** -- 97% of components appear
+    nowhere in the graph. Attributing ancestry from that yields "773 direct, 43 transitive", which is
+    not a finding about the project; it is a restatement of which components syft happened to link.
+    Below MIN_GRAPH_COVERAGE the honest answer is that ancestry was not measured.
+    """
+    dependencies = doc.get("dependencies")
+    components = doc.get("components") or []
+    if not isinstance(dependencies, list) or not dependencies:
+        return {}
+
+    all_refs = {c.get("bom-ref") for c in components if isinstance(c, dict) and c.get("bom-ref")}
+    parents: dict[str, set[str]] = {}
+    for entry in dependencies:
+        if not isinstance(entry, dict):
+            continue
+        ref = entry.get("ref")
+        if not isinstance(ref, str):
+            continue
+        for child in entry.get("dependsOn") or []:
+            if isinstance(child, str):
+                parents.setdefault(child, set()).add(ref)
+
+    # Direct = no COMPONENT depends on it. Its only parent (if any) is the document's subject, which
+    # CycloneDX carries in `metadata.component` and not in `components` -- so "chosen by the project"
+    # falls out of the graph without needing to identify the root at all. Keying off
+    # `metadata.component.bom-ref` instead looked equivalent and was not: a document whose subject
+    # ref is absent or spelled differently then yields ZERO direct dependencies and reports every
+    # top-level package as inherited.
+    # Sparsity guard: how many components the graph actually says anything about.
+    mentioned = {ref for ref in parents if ref in all_refs}
+    for entry in dependencies:
+        if isinstance(entry, dict) and isinstance(entry.get("ref"), str) and entry["ref"] in all_refs:
+            mentioned.add(entry["ref"])
+    coverage = len(mentioned) / len(all_refs) if all_refs else 0.0
+    if coverage < MIN_GRAPH_COVERAGE:
+        return {}
+
+    direct = {ref for ref in all_refs if not (parents.get(ref, set()) & all_refs)}
+    transitive = {ref for ref in all_refs if ref not in direct}
+
+    licences: dict[str, list[str]] = {}
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        names: list[str] = []
+        for entry in component.get("licenses") or []:
+            if not isinstance(entry, dict):
+                continue
+            licence = entry.get("license") or {}
+            name = licence.get("id") or licence.get("name") or entry.get("expression")
+            if name:
+                names.append(str(name))
+        if names:
+            licences[str(component.get("bom-ref"))] = sorted(set(names))
+
+    return {
+        "direct": sorted(direct),
+        "transitive_count": len(transitive),
+        "direct_count": len(direct),
+        "licences_by_ref": licences,
+        "with_licence": len(licences),
+    }
+
+
+def sbom_component_purls(doc: dict[str, Any] | None) -> dict[str, str]:
+    """`{ecosystem/name -> version}` for every component with a real package identity (a purl).
+
+    Keyed on the purl's name rather than bom-ref because refs are per-document hashes -- comparing
+    two scans by ref reports every component as both removed and added. The version is kept so an
+    upgrade reads as an upgrade rather than as a remove/add pair.
+
+    Components WITHOUT a purl are skipped, and that is the whole subtlety. Syft catalogues build
+    output as components too: measured on one branch, 404 of 803 entries had no purl and their
+    `name` was an absolute file path (`/workspace/repo/apps/api.Tests/bin/Debug/net10.0/Api.dll`).
+    A name-based fallback therefore turned a dependency diff into a list of DLLs -- it reported
+    "+796 components added" for a run that added roughly 399 packages, which is worse than useless
+    because it looks precise. No purl means no package identity, so there is nothing to diff.
+    """
+    purls: dict[str, str] = {}
+    for component in (doc or {}).get("components") or []:
+        if not isinstance(component, dict):
+            continue
+        match = re.match(r"^pkg:([^/]+)/(.+?)@([^?#]+)", component.get("purl") or "")
+        if match:
+            ecosystem, name, version = match.groups()
+            purls[f"{ecosystem}/{name}"] = version
+    return purls
+
+
+def supply_chain_diff(baseline_sbom: dict[str, Any] | None, current_sbom: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Which packages this run added, removed or moved. None when either side is unavailable.
+
+    Independent of the `dependencies` graph on purpose -- component identity is what syft reports
+    reliably, and `sbom_ancestry` has to decline on a sparse graph. This is the part of "put the SBOM
+    to work" that survives contact with syft's actual output.
+    """
+    if baseline_sbom is None or current_sbom is None:
+        return None
+    before, after = sbom_component_purls(baseline_sbom), sbom_component_purls(current_sbom)
+    added = sorted(name for name in after.keys() - before.keys())
+    removed = sorted(name for name in before.keys() - after.keys())
+    changed = sorted(
+        f"{name}: {before[name]} -> {after[name]}"
+        for name in before.keys() & after.keys()
+        if before[name] != after[name]
+    )
+    return {
+        "added": added,
+        "removed": removed,
+        "version_changed": changed,
+        "added_count": len(added),
+        "removed_count": len(removed),
+        "net_change": len(after) - len(before),
+    }
+
+
 def parse_syft(raw: str) -> ParseResult:
     """Summarizes Syft's cyclonedx-json SBOM into a handful of numbers for the metrics dict; the
     full document is persisted separately (`SBOM_PATH`, written by `run_repo_scan` below) rather
@@ -827,13 +966,22 @@ def parse_syft(raw: str) -> ParseResult:
         ecosystem = match.group(1) if match else "unknown"
         ecosystems[ecosystem] = ecosystems.get(ecosystem, 0) + 1
 
-    return [], {
-        "sbom": {
-            "component_count": len(components),
-            "ecosystems": dict(sorted(ecosystems.items(), key=lambda kv: (-kv[1], kv[0]))),
-            "format": "cyclonedx-json",
-        }
+    ancestry = sbom_ancestry(doc)
+    sbom: dict[str, Any] = {
+        "component_count": len(components),
+        "ecosystems": dict(sorted(ecosystems.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "format": "cyclonedx-json",
     }
+    if ancestry:
+        # Counts only, plus the direct set: `licences_by_ref` and the full ref lists are large and
+        # this fragment lands in the hashed metrics body.
+        sbom["direct_count"] = ancestry["direct_count"]
+        sbom["transitive_count"] = ancestry["transitive_count"]
+        sbom["components_with_licence"] = ancestry["with_licence"]
+    else:
+        # Distinguishable from "all direct" on purpose -- see sbom_ancestry.
+        sbom["ancestry"] = "no_dependency_graph"
+    return [], {"sbom": sbom}
 
 
 # --- dedup ------------------------------------------------------------------------------------
@@ -1087,6 +1235,11 @@ class ScanReport:
     tools: tuple[dict[str, Any], ...]
     repo: dict[str, Any]
     deduped_count: int
+    # The Eval layer (ac_eval.py), absent unless a caller asked for it. Split in two because only
+    # one half can live inside content_hash: `ac_verification` is static analysis of the worktree,
+    # while `ac_execution` runs the suites and is therefore legitimately non-deterministic.
+    ac_verification: dict[str, Any] | None = None
+    ac_execution: dict[str, Any] | None = None
 
     def summary(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
         by_severity = {level: 0 for level in SEVERITY_ORDER}
@@ -1132,8 +1285,12 @@ class ScanReport:
             for f in self.findings
         ]
         metrics = _public_metrics(self.metrics)
-        body = {"findings": findings, "metrics": metrics}
-        return {
+        body: dict[str, Any] = {"findings": findings, "metrics": metrics}
+        # INSIDE the hash: static AC verification is pure worktree analysis, so an unchanged repo
+        # must hash identically with it present.
+        if self.ac_verification is not None:
+            body["ac_verification"] = self.ac_verification
+        report = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "content_hash": content_hash(body),
@@ -1142,6 +1299,12 @@ class ScanReport:
             **body,
             "tools": list(self.tools),
         }
+        # OUTSIDE the hash, and added after it is computed: running a suite twice can legitimately
+        # give different answers (that is what the flake metric measures), so including execution
+        # would break the module's documented determinism contract on the first flaky test.
+        if self.ac_execution is not None:
+            report["ac_execution"] = self.ac_execution
+        return report
 
 
 # Which `summary()["measures"]` keys a given scan profile's own tools actually measure. A
@@ -1255,6 +1418,10 @@ _METRIC_DIRECTIONS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("total_loc", ("metrics", "size", "total_loc"), "neutral"),
     ("coverage_line_rate", ("metrics", "coverage", "line_rate"), "higher_is_better"),
     ("coverage_branch_rate", ("metrics", "coverage", "branch_rate"), "higher_is_better"),
+    # Dependency bloat. "neutral" on purpose: adding packages is how features get built, so a
+    # framework install is not a regression -- but "this run added 47 components" is exactly the
+    # kind of change that should be visible in a review rather than discovered later.
+    ("sbom_component_count", ("metrics", "sbom", "component_count"), "neutral"),
 )
 
 
@@ -1473,6 +1640,11 @@ PROFILES: dict[str, tuple[str, ...]] = {
     "quality": ("scc", "lizard", "jscpd", "interrogate", "dotnet-docs"),
     "security": ("semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"),
     "full": tuple(tool.name for tool in TOOLS),
+    # The Eval layer runs no scanner tools at all -- it reads the ledger, the test files and the
+    # suites' own output. Deliberately its own profile and NOT part of "full": see run_repo_scan's
+    # `include_eval` docstring for why adding it to an existing profile would run the test suite on
+    # every commit.
+    "eval": (),
 }
 
 # Tools whose only output is measurement, skipped entirely when a gate caller passes
@@ -1503,12 +1675,19 @@ async def run_repo_scan(
     tools: Sequence[str] | None = None,
     include_metrics: bool = True,
     report_path: str | None = None,
+    include_eval: bool = False,
 ) -> ScanReport:
     """Runs the selected tools in the sandbox and returns one deduplicated report.
 
     A tool that is missing, crashes, or emits unparseable output degrades the report -- it never
     raises. The dashboard needs to be able to say "this signal was unavailable" rather than
     silently showing zero findings, which reads identically to a clean repo.
+
+    `include_eval` defaults to **False**, and that default is load-bearing rather than cautious:
+    `start_background_refresh` runs `profile="full"` after every `commit_all`, and its contract says
+    it "never runs the test suite". Making eval part of any existing profile would fire N suite runs
+    per commit, in the background, concurrently with the pipeline's own test runs and app boots.
+    Only a caller that explicitly wants the Eval layer opts in.
     """
     selected = select_tools(profile, tools, include_metrics)
     await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work agent-work/jscpd")
@@ -1535,8 +1714,23 @@ async def run_repo_scan(
         if fragment:
             fragments.append(fragment)
 
+    eval_result: dict[str, Any] = {}
+    if include_eval:
+        from . import ac_eval
+
+        try:
+            eval_result = await ac_eval.evaluate(provider, thread_id)
+        except Exception:  # noqa: BLE001 -- same rule as the tools: degrade, never raise
+            logger.exception("repo_scan: eval layer failed for thread %s", thread_id)
+            eval_result = {
+                "ac_verification": ac_eval.not_evaluated("eval_raised"),
+                "ac_execution": ac_eval.not_evaluated("eval_raised"),
+            }
+
     deduped, collapsed = dedupe(findings)
     report = ScanReport(
+        ac_verification=eval_result.get("ac_verification"),
+        ac_execution=eval_result.get("ac_execution"),
         findings=tuple(deduped),
         metrics=_assemble_metrics(fragments),
         tools=tuple(sorted(tool_runs, key=lambda t: t["name"])),
@@ -1796,12 +1990,21 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
     await repo_files.write_repo_file(
         provider, thread_id, BASELINE_PATH, json.dumps(dashboard, indent=2, default=str) + "\n"
     )
+    # Snapshot the SBOM alongside the baseline scan. SBOM_PATH is overwritten by every later scan,
+    # so without this there is no "before" to compare against and `supply_chain_diff` has nothing to
+    # do -- the run could report 816 components without being able to say which of them it added.
+    baseline_sbom = await repo_files.read_repo_file(provider, thread_id, SBOM_PATH)
+    committed = [BASELINE_PATH]
+    if baseline_sbom:
+        await repo_files.write_repo_file(provider, thread_id, SBOM_BASELINE_PATH, baseline_sbom)
+        committed.append(SBOM_BASELINE_PATH)
+
     await repo_files.append_ledger_entry(
         provider, thread_id,
         {"stage": "repo_scan", "node": "baseline", "finding_count": len(report.findings),
          "commit": report.repo.get("commit")},
     )
-    await git_ops.commit_paths(provider, thread_id, [BASELINE_PATH], "ai-dev-workflow: repo-scan baseline")
+    await git_ops.commit_paths(provider, thread_id, committed, "ai-dev-workflow: repo-scan baseline")
     return {"repo_scan": {**prior, "baseline": "written", "commit": report.repo.get("commit"),
                           "baseline_summary": dashboard["summary"], "baseline_coverage": coverage}}
 
@@ -2003,6 +2206,91 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert syft_metrics["sbom"]["component_count"] == 3
     assert syft_metrics["sbom"]["ecosystems"] == {"npm": 2, "pypi": 1}
     assert parse_syft("}{ not json") == ([], {})
+    # No dependency graph must be distinguishable from "everything is direct".
+    assert syft_metrics["sbom"]["ancestry"] == "no_dependency_graph", syft_metrics["sbom"]
+
+    # --- SBOM ancestry: "you chose this" vs "your framework chose this", as a fact -----------------
+    sbom_doc = {
+        "metadata": {"component": {"bom-ref": "root"}},
+        "components": [
+            {"bom-ref": "next", "purl": "pkg:npm/next@15.4.9", "licenses": [{"license": {"id": "MIT"}}]},
+            {"bom-ref": "styled-jsx", "purl": "pkg:npm/styled-jsx@5.1.6", "licenses": [{"license": {"name": "Apache-2.0"}}]},
+            {"bom-ref": "deep", "purl": "pkg:npm/deep@1.0.0"},
+        ],
+        "dependencies": [
+            {"ref": "root", "dependsOn": ["next"]},
+            {"ref": "next", "dependsOn": ["styled-jsx"]},
+            {"ref": "styled-jsx", "dependsOn": ["deep"]},
+        ],
+    }
+    ancestry = sbom_ancestry(sbom_doc)
+    # `next` is in the root's own dependsOn -- chosen. The other two arrived through it.
+    assert ancestry["direct"] == ["next"], ancestry
+    assert ancestry["direct_count"] == 1 and ancestry["transitive_count"] == 2, ancestry
+    # Licences come from the components themselves -- both `license.id` and `license.name` forms.
+    assert ancestry["licences_by_ref"]["styled-jsx"] == ["Apache-2.0"], ancestry["licences_by_ref"]
+    assert ancestry["with_licence"] == 2, ancestry
+
+    # With no identifiable root, "depended on by nothing" is the fallback definition of direct.
+    rootless = sbom_ancestry({**sbom_doc, "metadata": {}})
+    assert rootless["direct"] == ["next"], rootless
+
+    # An absent graph returns {} -- NOT a report that every component is direct.
+    assert sbom_ancestry({"components": sbom_doc["components"]}) == {}
+    assert sbom_ancestry({"components": [], "dependencies": []}) == {}
+
+    # A graph too sparse to attribute is also {}. This is the REAL shape syft produced on this
+    # pipeline's branch (816 components, 20 dependency entries): without the guard it reported
+    # "773 direct, 43 transitive", which describes syft's linking, not the project's choices.
+    sparse = {
+        "components": [{"bom-ref": f"c{i}"} for i in range(100)],
+        "dependencies": [{"ref": "c0", "dependsOn": ["c1"]}, {"ref": "c1", "dependsOn": ["c2"]}],
+    }
+    assert sbom_ancestry(sparse) == {}, "a graph covering 3% of components must not yield an ancestry split"
+    _, sparse_metrics = parse_syft(json.dumps(sparse))
+    assert sparse_metrics["sbom"]["ancestry"] == "no_dependency_graph", sparse_metrics["sbom"]
+
+    # --- supply-chain diff: works WITHOUT the dependency graph, which is why it is the half of
+    # --- "put the SBOM to work" that actually ships on this stack.
+    base_sbom = {"components": [
+        {"purl": "pkg:npm/next@15.4.6"}, {"purl": "pkg:npm/react@19.0.0"}, {"purl": "pkg:npm/gone@1.0.0"},
+    ]}
+    curr_sbom = {"components": [
+        {"purl": "pkg:npm/next@15.4.9"}, {"purl": "pkg:npm/react@19.0.0"}, {"purl": "pkg:npm/added@2.0.0"},
+    ]}
+    chain = supply_chain_diff(base_sbom, curr_sbom)
+    assert chain["added"] == ["npm/added"], chain
+    assert chain["removed"] == ["npm/gone"], chain
+    # An upgrade is an upgrade, not a remove+add pair -- that is why identity excludes the version.
+    assert chain["version_changed"] == ["npm/next: 15.4.6 -> 15.4.9"], chain
+    assert chain["net_change"] == 0, chain
+    # No baseline means no diff, never a fabricated one (same rule as delta_summary).
+    assert supply_chain_diff(None, curr_sbom) is None
+    # A component with NO purl is skipped -- it has no package identity. This is what stops syft's
+    # catalogued build output (404 of 803 entries on a real branch, each named by an absolute file
+    # path) from being reported as added dependencies.
+    assert sbom_component_purls({"components": [{"name": "custom", "version": "1.2"}]}) == {}
+    dll_noise = {"components": [
+        {"name": "/workspace/repo/apps/api.Tests/bin/Debug/net10.0/Api.dll", "version": "1.0"},
+        {"purl": "pkg:npm/next@15.4.9"},
+    ]}
+    assert sbom_component_purls(dll_noise) == {"npm/next": "15.4.9"}, sbom_component_purls(dll_noise)
+
+    # Just past the threshold, attribution resumes: 6 of 10 components appear in the graph.
+    dense = {
+        "components": [{"bom-ref": f"d{i}"} for i in range(10)],
+        "dependencies": [{"ref": f"d{i}", "dependsOn": [f"d{i + 1}"]} for i in range(5)],
+    }
+    dense_ancestry = sbom_ancestry(dense)
+    assert dense_ancestry, "6/10 coverage is above MIN_GRAPH_COVERAGE and must be attributed"
+    assert dense_ancestry["transitive_count"] == 5, dense_ancestry
+
+    _, graphed = parse_syft(json.dumps(sbom_doc))
+    assert graphed["sbom"]["direct_count"] == 1, graphed["sbom"]
+    assert graphed["sbom"]["transitive_count"] == 2, graphed["sbom"]
+    assert "ancestry" not in graphed["sbom"], "a measured graph must not also report no_dependency_graph"
+    # The big per-ref maps stay OUT of the hashed metrics fragment.
+    assert "licences_by_ref" not in graphed["sbom"] and "direct" not in graphed["sbom"], graphed["sbom"]
 
     # --- doc metrics from two languages merge into one `documentation` section, no key collision --
     merged_docs = _assemble_metrics([under_metrics, dotnet_metrics])
@@ -2114,6 +2402,36 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert run_a.to_dashboard_dict()["content_hash"] == run_b.to_dashboard_dict()["content_hash"], (
         "identical repo + identical stable failure reason must hash identically"
     )
+
+    # --- the Eval layer's two halves sit on opposite sides of the hash ---------------------------
+    # This is the whole reason ac_verification and ac_execution are separate fields. A flaky test
+    # makes execution differ between two runs over an IDENTICAL worktree; if that moved the hash,
+    # the module's documented "unchanged worktree hashes identically" contract would be false the
+    # first time a test flaked.
+    base_kwargs = dict(findings=report.findings, metrics=metrics, tools=report.tools, repo=report.repo, deduped_count=2)
+    verification = {"total": 4, "linked": 3, "unverified": ["US-0003.2"], "levels": {"unit": 2, "integration": 1, "e2e": 1}}
+    exec_run_1 = {"status": "evaluated", "passing": 3, "failing": 0, "flaky": []}
+    exec_run_2 = {"status": "evaluated", "passing": 2, "failing": 1, "flaky": ["US-0002.1"]}
+    eval_a = ScanReport(**base_kwargs, ac_verification=verification, ac_execution=exec_run_1)
+    eval_b = ScanReport(**base_kwargs, ac_verification=verification, ac_execution=exec_run_2)
+    dash_a, dash_b = eval_a.to_dashboard_dict(), eval_b.to_dashboard_dict()
+    assert dash_a["content_hash"] == dash_b["content_hash"], (
+        "ac_execution must be EXCLUDED from content_hash -- a flaky suite would otherwise make an "
+        "unchanged worktree hash differently on every run"
+    )
+    assert dash_a["ac_execution"] != dash_b["ac_execution"], "both reports must still carry their own execution result"
+
+    # ...while the static half IS hashed: a repo that gained a test is a changed repo.
+    more_verified = {**verification, "linked": 4, "unverified": []}
+    eval_c = ScanReport(**base_kwargs, ac_verification=more_verified, ac_execution=exec_run_1)
+    assert eval_c.to_dashboard_dict()["content_hash"] != dash_a["content_hash"], (
+        "ac_verification must be INSIDE content_hash -- linking a new test changes the repo's content"
+    )
+
+    # Absent eval (the default) must not change the hash of a report that never had it, or every
+    # existing baseline on disk would appear to have moved.
+    assert ScanReport(**base_kwargs).to_dashboard_dict()["content_hash"] == dashboard["content_hash"]
+    assert "ac_execution" not in ScanReport(**base_kwargs).to_dashboard_dict()
 
     # --- gating ---------------------------------------------------------------------------------
     low_vuln = _vuln("trivy", "CVE-2024-5", "x", "low")

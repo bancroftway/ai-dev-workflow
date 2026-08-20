@@ -27,15 +27,9 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 2
 WORKFLOW_DIR = ".ai-dev-workflow"
 
-_README_CONTENT = """# .ai-dev-workflow
-
-This folder is managed by ai-dev-workflow. It persists the Requirements, Specification, and
-Implementation Plan drafted and approved through the tool, so the workflow can resume across
-sessions and its history is visible in this repo's own git log and pull requests.
-
-Files here are generated -- hand-editing is unsupported and may be overwritten.
-"""
-
+# No README is written into WORKFLOW_DIR. It explained that the folder is tool-managed and
+# hand-edits get overwritten, but it is one more generated file in every delivered branch for a
+# reader who can see that from the numbered artifacts themselves.
 
 class HydrationError(Exception):
     """`.ai-dev-workflow/` exists but can't be safely hydrated.
@@ -79,6 +73,21 @@ def _stage_file(stage_key: str, kind: str) -> str:
     except ValueError:
         return f"{stage_key}.{kind}"
     return f"{index:02d}-{stage_key}.{kind}"
+
+
+# Canonical paths for the tech-stack artifacts, DERIVED from _stage_file so they can never drift
+# from the numbering. They exist as constants because five other modules read them off disk -- four
+# gates and exit's verify -- and each had the unnumbered literal hardcoded. When numbering landed,
+# those readers kept looking for `tech-stack.approved.json` while persistence wrote
+# `02-tech-stack.approved.json`, and preflight's own writer kept the old name alive, so every branch
+# carried BOTH files.
+#
+# `tech-stack.md` is deliberately NOT here: it holds the human's own edited markdown (written by
+# preflight at gate-approval time, which is why no `02-tech-stack.md` render exists), and its name is
+# a contract with the target repo -- templates/agents-md/AGENTS.md tells that repo's own agents to
+# read `.ai-dev-workflow/tech-stack.md`. Renaming it would break a promise made outside this codebase.
+TECH_STACK_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'approved.json')}"
+TECH_STACK_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'draft.json')}"
 
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
@@ -149,8 +158,28 @@ async def hydrate_state(
             except json.JSONDecodeError as exc:
                 raise HydrationError(f"{approved_path} is not valid JSON: {exc}") from exc
 
+        # A stage artifact that is not a JSON object is from a superseded schema and cannot be fed
+        # to this build's renderers or gates (which index it by key). Observed: remediation was
+        # persisted as a bare summary STRING, because its content_field named one str field of the
+        # response. Dropping it re-runs the stage under the current schema, which is the only
+        # outcome that yields a usable artifact -- keeping it crashes persistence on every write.
+        superseded = [
+            name
+            for name, value in (("draft", draft), ("approved", approved_content))
+            if value is not None and not isinstance(value, dict)
+        ]
+        if superseded:
+            logger.warning(
+                "stage %s: discarding non-object %s artifact(s) from a superseded schema -- the "
+                "stage will re-run",
+                stage_key,
+                "/".join(superseded),
+            )
+            draft = draft if isinstance(draft, dict) else None
+            approved_content = approved_content if isinstance(approved_content, dict) else None
+
         stages[stage_key] = {
-            "status": stored.get("status", "not_started"),
+            "status": "not_started" if superseded else stored.get("status", "not_started"),
             "draft": draft,
             "clarifying_questions": stored.get("clarifying_questions", []),
             "readiness": stored.get("readiness", False),
@@ -159,6 +188,7 @@ async def hydrate_state(
             "ever_ready_for_review": stored.get("ever_ready_for_review", False),
             "used_ids": stored.get("used_ids", []),
             "audit_findings": stored.get("audit_findings", []),
+            "skills": stored.get("skills"),
             # Added after this module's initial version -- .get() with graph.py's
             # default_stage_state() defaults so an older state.json (predating these fields)
             # hydrates cleanly instead of producing a stage dict missing keys later code expects.
@@ -221,6 +251,11 @@ async def persist_state(
             "ever_ready_for_review": stage.get("ever_ready_for_review", False),
             "used_ids": stage.get("used_ids", []),
             "audit_findings": stage.get("audit_findings", []),
+            # Which skills this stage's sessions actually invoked, from their own skill.invoked
+            # events -- see gates/skill_gate.skills_record. Lives in state.json rather than inside
+            # the draft/approved JSON because those hold MODEL output, and pipeline metadata mixed
+            # into content that gets re-validated on hydration is asking for trouble.
+            "skills": stage.get("skills"),
             "verify_cycle_count": stage.get("verify_cycle_count", 0),
             "last_verification": stage.get("last_verification"),
             "baseline_commit": stage.get("baseline_commit"),
@@ -228,9 +263,6 @@ async def persist_state(
 
     state_doc = {"schema_version": SCHEMA_VERSION, "stages": stored_stages}
     await _write_file(provider, thread_id, "state.json", json.dumps(state_doc, indent=2))
-
-    if await _read_file(provider, thread_id, "README.md") is None:
-        await _write_file(provider, thread_id, "README.md", _README_CONTENT)
 
 
 def _demo() -> None:
@@ -241,6 +273,12 @@ def _demo() -> None:
     assert _stage_file("metrics-exit", "approved.json") == "09-metrics-exit.approved.json"
     # A key this module does not know still persists, unnumbered, rather than crashing or guessing.
     assert _stage_file("some-future-stage", "draft.json") == "some-future-stage.draft.json"
+
+    # The tech-stack constants must track the numbering, not a stale literal -- five modules read
+    # them off disk, and when numbering landed those readers were still looking for the unnumbered
+    # name while persistence wrote the numbered one, so branches carried BOTH files.
+    assert TECH_STACK_APPROVED_PATH == f"{WORKFLOW_DIR}/02-tech-stack.approved.json"
+    assert TECH_STACK_DRAFT_PATH == f"{WORKFLOW_DIR}/02-tech-stack.draft.json"
 
     # Padding must keep lexical order == execution order; a bare str(n) breaks at 10 stages.
     names = [_stage_file(k, "md") for k in _STAGE_ORDER]

@@ -18,5 +18,11 @@ class ExitDraftResponse(BaseModel):
     readiness: bool
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
     report: MergeReadinessReport | None = Field(default=None)
+    skills_invoked: list[str] = Field(
+        default_factory=list,
+        description="Exact names of skills you invoked with your `skill` tool this turn, and only "
+        "those. Cross-checked against the session's own recorded invocations -- a name you did not "
+        "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
+    )
 
 

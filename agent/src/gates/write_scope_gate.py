@@ -19,7 +19,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .. import repo_files
+from .. import repo_files, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
 
@@ -97,7 +97,7 @@ async def _stack_has_ui(provider: SandboxProvider, thread_id: str) -> bool:
     """
     from ..tech_stack_signals import frameworks_have_ui
 
-    for path in (".ai-dev-workflow/tech-stack.approved.json", ".ai-dev-workflow/tech-stack.draft.json"):
+    for path in (workflow_persistence.TECH_STACK_APPROVED_PATH, workflow_persistence.TECH_STACK_DRAFT_PATH):
         raw = await repo_files.read_repo_file(provider, thread_id, path)
         if raw is None:
             continue

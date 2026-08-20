@@ -40,6 +40,20 @@ logger = logging.getLogger(__name__)
 
 ReportT = TypeVar("ReportT", bound=StageReport)
 
+# Appended to prompts the same way WELL_FORMED_JSON_RULES is. Its value is NOT the list -- the
+# session's own skill.invoked events already give us that, and they cannot be forged. Its value is
+# the DISAGREEMENT: a skill claimed here but absent from the log lands in the stage record's
+# `unsubstantiated`, which is the fabrication signature that has cost this pipeline the most (one
+# session reported "Added required Playwright e2e skeleton files (config + spec)" on four
+# consecutive turns having made zero write calls).
+SKILLS_REPORT_RULES = """
+Also report `skills_invoked`: the exact names of the skills you invoked with your `skill` tool during
+this turn, and only those. Do not list a skill you merely read about, intended to use, or believe
+would have been appropriate. This is cross-checked against the session's own recorded skill
+invocations, so a name you did not actually invoke is visible as an unsubstantiated claim -- an empty
+list is a perfectly good answer, an inaccurate one is not.
+"""
+
 REPORT_TOOL_NAME = "report_stage_output"
 
 # Appended to every prompt this module sends. Belt-and-braces next to the tool's own schema
@@ -147,7 +161,10 @@ async def run_and_report(
         )
         system, template = load_prompt_pair(prompt_name)
         prompt = render_prompt(template, **render_values)
-        messages = [SystemMessage(content=system), HumanMessage(content=f"{prompt}\n\n{WELL_FORMED_JSON_RULES}")]
+        messages = [
+            SystemMessage(content=system),
+            HumanMessage(content=f"{prompt}\n\n{WELL_FORMED_JSON_RULES}\n{SKILLS_REPORT_RULES}"),
+        ]
 
         # A turn can end with prose instead of the required tool call (observed live: the coverage
         # session answered in text and never reported). The tool is the ONLY accepted exit, so a

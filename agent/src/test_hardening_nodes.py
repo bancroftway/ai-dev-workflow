@@ -20,12 +20,11 @@ import logging
 import os
 from typing import Any, TypedDict
 
-import defusedxml.ElementTree as ET
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, spec_ledger, stack_runner
+from . import git_ops, model_config, repo_files, spec_ledger, stack_runner, test_results
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt
 from .sandbox import registry as sandbox_registry
@@ -68,51 +67,12 @@ def default_test_hardening_state() -> TestHardeningState:
     return {"attempt": 0, "test_outcomes": {}, "stable_fail": [], "flaky": [], "flake_quarantine": {}, "last_exit_ok": False, "cannot_verify": False}
 
 
-def _parse_trx(raw_xml: str) -> dict[str, str]:
-    """testName -> 'pass'|'fail', from a Visual Studio Test Results (.trx) file."""
-    try:
-        root = ET.fromstring(raw_xml)
-    except ET.ParseError:
-        return {}
-    ns = {"t": "http://microsoft.com/schemas/VisualStudio/TeamTest/2010"}
-    results: dict[str, str] = {}
-    for result in root.findall(".//t:UnitTestResult", ns) or root.findall(".//UnitTestResult"):
-        name = result.get("testName", "unknown")
-        outcome = result.get("outcome", "")
-        results[name] = "pass" if outcome.lower() == "passed" else "fail"
-    return results
-
-
-def _parse_vitest_json(raw_json: str) -> dict[str, str]:
-    try:
-        doc = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return {}
-    results: dict[str, str] = {}
-    for test_result in doc.get("testResults", []):
-        for assertion in test_result.get("assertionResults", []):
-            name = assertion.get("fullName") or assertion.get("title", "unknown")
-            results[name] = "pass" if assertion.get("status") == "passed" else "fail"
-    return results
-
-
-def _repo_relative(path: str) -> str | None:
-    """A model-reported path normalised to repo-relative, or None when it escapes the repo.
-
-    Models report absolute container paths despite being asked for repo-relative ones (observed:
-    '/workspace/repo/test-results-0/test-results-0.trx'), and repo_files rejects those with a
-    ValueError that used to propagate straight out of the node and kill the run.
-    """
-    cleaned = (path or "").strip()
-    if not cleaned:
-        return None
-    for prefix in ("/workspace/repo/", "workspace/repo/", "./"):
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
-            break
-    if cleaned.startswith("/") or ".." in cleaned.split("/"):
-        return None
-    return cleaned or None
+# Moved to test_results.py: repo_scan's eval layer needs the same parsers, and three copies of
+# "what did the suite actually do" is how the three drift apart. Aliased rather than
+# call-site-renamed so the diff stays reviewable.
+_parse_trx = test_results.parse_trx
+_parse_vitest_json = test_results.parse_vitest_json
+_repo_relative = test_results.repo_relative
 
 
 async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:

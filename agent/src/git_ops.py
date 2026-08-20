@@ -212,6 +212,25 @@ def _get_provider() -> SandboxProvider:
     return get_sandbox_provider()
 
 
+# Every way git says "you asked me to commit, and there was nothing to commit". All of them are
+# no-ops, not failures. The third one -- "nothing added to commit but untracked files present" --
+# cost real work before it was handled: git emits it when the requested paths are clean but some
+# unrelated file is untracked, and treating it as an error aborted the whole persist step, leaving
+# state.json un-updated while the stage's artifact sat on the branch with nothing referencing it.
+# The next resume then silently re-ran that stage.
+_EMPTY_COMMIT_PHRASES = (
+    "nothing to commit",
+    "no changes added to commit",
+    "nothing added to commit",
+)
+
+
+def is_empty_commit_output(combined_output: str) -> bool:
+    """True when git's output means "nothing to commit". Case-insensitive; pure."""
+    lowered = combined_output.lower()
+    return any(phrase in lowered for phrase in _EMPTY_COMMIT_PHRASES)
+
+
 async def commit_paths(provider: SandboxProvider, thread_id: str, paths: list[str], message: str) -> None:
     """Stage and commit exactly the given repo-relative paths.
 
@@ -251,7 +270,7 @@ async def commit_paths(provider: SandboxProvider, thread_id: str, paths: list[st
     # repo scan overlaps the tech-stack/brownfield chain -- the requested paths already committed
     # by a broader .ai-dev-workflow commit while some OTHER file is dirty ("no changes added to
     # commit", with the dirty file listed as not staged).
-    if "nothing to commit" in combined_output or "no changes added to commit" in combined_output:
+    if is_empty_commit_output(combined_output):
         return  # idempotent: caller ran but produced no actual file changes
     raise RuntimeError(f"git commit failed: {result.stderr or result.stdout}")
 
@@ -262,11 +281,83 @@ async def commit_ai_dev_workflow(provider: SandboxProvider, thread_id: str, mess
     await commit_paths(provider, thread_id, [".ai-dev-workflow"], message)
 
 
+# Build output, dependency trees and test scratch, none of which belong in a reviewable branch.
+# `.ai-dev-workflow/` is deliberately absent: that folder IS the deliverable.
+_GITIGNORE_ENTRIES = (
+    "node_modules/",
+    ".next/",
+    "out/",
+    "dist/",
+    "build/",
+    "bin/",
+    "obj/",
+    "coverage/",
+    ".nyc_output/",
+    "TestResults/",
+    "test-results/",
+    "playwright-report/",
+    "blob-report/",
+    "playwright/.cache/",
+    "agent-work/",
+    ".env.local",
+    ".DS_Store",
+    "*.user",
+)
+_GITIGNORE_HEADER = "# Managed by ai-dev-workflow: build output and scratch must not reach the review branch."
+_GITIGNORE_ENSURED: set[str] = set()
+
+
+async def ensure_gitignore(provider: SandboxProvider, thread_id: str) -> list[str]:
+    """Guarantee a .gitignore covering build output, and untrack anything it already caught.
+
+    Runs from `commit_all`, which is the `git add -A` that caused the problem: with no .gitignore in
+    a generated repo, one run put **893 of 997 tracked paths** on the review branch as `.next/`,
+    `bin/` and `obj/` artifacts. A pull request that is 90% build output is not reviewable, so this
+    is a merge-readiness fix, not tidiness.
+
+    Returns the paths it untracked (empty when there was nothing to do). Once per thread per
+    process: the git plumbing is cheap but not free, and nothing re-dirties it mid-run.
+    """
+    if thread_id in _GITIGNORE_ENSURED:
+        return []
+    _GITIGNORE_ENSURED.add(thread_id)
+
+    existing = await provider.exec_in_sandbox(thread_id, "cat .gitignore 2>/dev/null || true")
+    current_lines = {line.strip() for line in str(existing.stdout or "").splitlines()}
+    missing = [entry for entry in _GITIGNORE_ENTRIES if entry not in current_lines]
+    if missing:
+        block = "\n".join([_GITIGNORE_HEADER, *missing])
+        # Appended, never overwritten: a repo (or a stage) may have its own entries that matter.
+        await provider.exec_in_sandbox(
+            thread_id, f"printf '%s\\n' {shlex.quote(block)} >> .gitignore"
+        )
+
+    # `git ls-files -i -c --exclude-standard` = tracked files that the ignore rules now match.
+    # Listed BEFORE removing them -- listing afterwards returns the empty set by construction, which
+    # would make the log claim nothing was ever wrong.
+    listed = await provider.exec_in_sandbox(thread_id, "git ls-files -i -c --exclude-standard")
+    untracked = [line.strip() for line in str(listed.stdout or "").splitlines() if line.strip()]
+    if untracked:
+        # xargs, not one argv: this list was 893 entries on the branch that motivated the fix.
+        await provider.exec_in_sandbox(
+            thread_id,
+            "git ls-files -z -i -c --exclude-standard | xargs -0 -r git rm -r --cached --quiet --",
+        )
+    if missing or untracked:
+        logger.info(
+            "gitignore: added %d entr(ies), untracked %d already-committed path(s)",
+            len(missing),
+            len(untracked),
+        )
+    return untracked
+
+
 async def commit_all(provider: SandboxProvider, thread_id: str, message: str) -> None:
     """Stage and commit EVERYTHING the pipeline's code-writing sessions changed (`git add -A`,
     .gitignore respected) and push. The artifact-only commit sites above deliberately never touch
     source files -- without this, the work branch the human reviews on GitHub would carry specs
     and scan reports but none of the generated code."""
+    await ensure_gitignore(provider, thread_id)
     command = (
         "git add -A && "
         f"git -c user.name={shlex.quote(_COMMIT_AUTHOR_NAME)} -c user.email={shlex.quote(_COMMIT_AUTHOR_EMAIL)} "
@@ -283,7 +374,41 @@ async def commit_all(provider: SandboxProvider, thread_id: str, message: str) ->
 
             repo_scan.start_background_refresh(thread_id, provider)
             return
-    combined_output = f"{result.stdout}\n{result.stderr}".lower()
-    if "nothing to commit" in combined_output:
+    combined_output = f"{result.stdout}\n{result.stderr}"
+    # Same shared phrase set as commit_paths: this site used to check only "nothing to commit", so
+    # the two disagreed about what counts as an empty commit.
+    if is_empty_commit_output(combined_output):
         return
     raise RuntimeError(f"git commit -A failed: {result.stderr or result.stdout}")
+
+
+def _demo() -> None:
+    """`cd agent && uv run python -m src.git_ops`."""
+    # The exact wording git produced on a live run, which the old narrower check missed.
+    real_output = (
+        "On branch ai-dev-workflow/50d64d0b\n"
+        "Untracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n"
+        "\tapps/web/.next/lock\n\n"
+        "nothing added to commit but untracked files present (use \"git add\" to track)\n"
+    )
+    assert is_empty_commit_output(real_output), "the live 'nothing added to commit' wording must be a no-op"
+    assert is_empty_commit_output("nothing to commit, working tree clean")
+    assert is_empty_commit_output("no changes added to commit (use \"git add\")")
+    assert is_empty_commit_output("NOTHING TO COMMIT"), "must be case-insensitive"
+    # A real failure must still raise -- this is the half that must not become permissive.
+    assert not is_empty_commit_output("error: pathspec 'x' did not match any file(s) known to git")
+    assert not is_empty_commit_output("fatal: could not read Username for 'https://github.com'")
+
+    # .gitignore entries must cover the build output that actually polluted a branch (893 of 997
+    # tracked paths), and must NOT cover the deliverable.
+    for expected in (".next/", "bin/", "obj/", "node_modules/", "test-results/"):
+        assert expected in _GITIGNORE_ENTRIES, expected
+    assert not any(".ai-dev-workflow" in entry for entry in _GITIGNORE_ENTRIES), (
+        ".ai-dev-workflow/ is the deliverable and must never be ignored"
+    )
+
+    print("git_ops self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

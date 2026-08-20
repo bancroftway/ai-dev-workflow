@@ -34,7 +34,14 @@ _EXEC_CMD_BUDGET = 16000
 # allowlist -- closes a real command-injection gap (found by automated security review) where a
 # model-reported string (e.g. TechStack.dotnet_solution_root, a PlanDiagram's own `name`) could
 # otherwise flow unquoted into a shell command built by f-string interpolation below.
-_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+# Square brackets are LEGITIMATE in these repos: Next.js names dynamic route segments
+# `app/expenses/[id]/page.tsx`, and its build output uses them too
+# (`.next/dev/server/chunks/ssr/[externals]__...js`). Rejecting them raised
+# "unsafe or invalid repo-relative path" on a real generated app and killed the stage. Every use of a
+# path still goes through shlex.quote before reaching a shell, so the traversal defences below (no
+# leading /, no `..` segment) remain the actual safety property -- the character class is about
+# catching nonsense, not about quoting.
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.\-/\[\]()@+ ]+$")
 
 
 def validate_repo_relative_path(path: str) -> str:
@@ -113,7 +120,49 @@ async def append_ledger_entry(provider: SandboxProvider, thread_id: str, entry: 
     line = json.dumps(payload, default=str) + "\n"
     encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
     parent_dir = LEDGER_PATH.rsplit("/", 1)[0]
-    command = f"mkdir -p {shlex.quote(parent_dir)} && echo {encoded} | base64 -d >> {shlex.quote(LEDGER_PATH)}"
-    result = await provider.exec_in_sandbox(thread_id, command)
-    if not result.ok:
-        raise RuntimeError(f"failed to append to {LEDGER_PATH}: {result.stderr}")
+    quoted = shlex.quote(LEDGER_PATH)
+    if len(encoded) <= _EXEC_CMD_BUDGET:
+        commands = [f"mkdir -p {shlex.quote(parent_dir)} && echo {encoded} | base64 -d >> {quoted}"]
+    else:
+        # Chunked for the same reason write_repo_file is, and found the same way -- WinError 206,
+        # "The filename or extension is too long". The entry that overflowed argv was the
+        # `run_failure` row: its feedback names every failing acceptance criterion, so the single
+        # most important ledger line in a failed run was the one that could not be written. It was
+        # swallowed as a best-effort warning, which is exactly how a run loses the record of why it
+        # failed.
+        tmp = shlex.quote(LEDGER_PATH + ".b64part")
+        commands = [f"mkdir -p {shlex.quote(parent_dir)} && : > {tmp}"]
+        commands += [
+            f"printf %s {encoded[i:i + _EXEC_CMD_BUDGET]} >> {tmp}"
+            for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
+        ]
+        commands.append(f"base64 -d < {tmp} >> {quoted} && rm -f {tmp}")
+    for command in commands:
+        result = await provider.exec_in_sandbox(thread_id, command)
+        if not result.ok:
+            raise RuntimeError(f"failed to append to {LEDGER_PATH}: {result.stderr}")
+
+
+def _demo() -> None:
+    """`cd agent && uv run python -m src.repo_files`."""
+    # Legitimate in these repos: Next.js dynamic route segments and its build output both use
+    # brackets. Rejecting them killed a stage on a real generated app.
+    for ok in (
+        "apps/web/src/app/expenses/[id]/page.tsx",
+        "apps/web/.next/dev/server/chunks/ssr/[externals]__05yr04l._.js",
+        "apps/api/Program.cs",
+        "a/b@1.2.3/c.ts",
+    ):
+        assert validate_repo_relative_path(ok) == ok, ok
+    # The actual safety property: no absolute paths, no traversal, no shell metacharacters.
+    for bad in ("/etc/passwd", "../secrets", "a/../../b", "", "a/b;rm -rf c", "a/$(whoami)/b", "a/`id`/b", "a/b|c"):
+        try:
+            validate_repo_relative_path(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted unsafe path: {bad!r}")
+    print("repo_files self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()
