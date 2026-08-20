@@ -109,6 +109,18 @@ def traced_node(
                 span.record_exception(exc)
                 span.set_status(StatusCode.ERROR, str(exc))
                 logger.exception("node %s failed (thread_id=%s)", name, thread_id)
+                # Third run-terminal, and the only one with no node of its own: an unhandled
+                # node exception aborts the whole graph invocation, so exit_finalize_node and
+                # escalate_node never get to release this thread's ~20 Copilot sessions.
+                # GraphBubbleUp is excluded above on purpose -- that is a gate interrupt, where
+                # the stage's conversation continuity is exactly what we want to keep.
+                # The SYNC forget, not close_thread_session: we are inside an except about to
+                # re-raise, and the exception may itself be a dead/reaped sandbox -- awaiting
+                # disconnect() there would block until timeout and turn a fast failure slow.
+                if thread_id:
+                    from .copilot_chat_model import forget_thread_sessions
+
+                    forget_thread_sessions(thread_id)
                 raise
 
     wrapper.__name__ = getattr(fn, "__name__", name)

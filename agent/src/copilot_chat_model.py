@@ -502,16 +502,52 @@ def get_chat_model_for_thread(
 
 
 async def close_thread_session(thread_id: str) -> None:
-    """Close and forget every Copilot session for a thread (call on graph run completion/error)."""
+    """Close and forget every Copilot session for a thread (call on graph run completion/error).
+
+    Per-session failures are logged and stepped over rather than raised: this runs at the END of a
+    run (exit_nodes, escalate_node, run_headless), so letting one unreachable session abort the
+    loop would both leak the remaining sessions and turn a completed run into a failed one. Popping
+    the dicts is what actually matters and cannot fail; the awaits are best-effort resource release.
+    """
     prefix = f"{thread_id}:"
     for session_key in [key for key in _sessions if key.startswith(prefix)]:
         session = _sessions.pop(session_key, None)
         client = _clients.pop(session_key, None)
         _session_locks.pop(session_key, None)
         if session is not None:
-            await session.disconnect()
+            try:
+                await session.disconnect()
+            except Exception:
+                logger.warning("disconnect failed for session %r during thread close", session_key, exc_info=True)
         if client is not None:
-            await client.__aexit__(None, None, None)
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception:
+                logger.warning("client close failed for session %r during thread close", session_key, exc_info=True)
+
+
+def forget_thread_sessions(thread_id: str) -> None:
+    """Drop cached Copilot handles for a thread whose sandbox is already gone.
+
+    Sync and network-free ON PURPOSE, which is why this is not close_thread_session: once the
+    container is destroyed, session.disconnect() and client.__aexit__() are calls to a dead
+    endpoint that only block until their timeout. There is nothing to close gracefully.
+
+    Called from sandbox.registry.pop() -- the one choke point every container-destruction path
+    routes through (both providers' terminate(), the idle reaper via terminate(), and the
+    DELETE /{thread_id} endpoint). Without it, _sessions kept handing out up to ~26 handles per
+    thread pointing into a container that no longer exists: the same phantom-state bug the
+    `registry.pop` comment in local_docker.terminate describes, one layer up.
+    """
+    prefix = f"{thread_id}:"
+    stale = [key for key in _sessions if key.startswith(prefix)]
+    stale += [key for key in _clients if key.startswith(prefix) and key not in stale]
+    for session_key in stale:
+        _sessions.pop(session_key, None)
+        _clients.pop(session_key, None)
+        _session_locks.pop(session_key, None)
+    if stale:
+        logger.info("forgot %d Copilot session(s) for thread_id=%s (sandbox gone)", len(stale), thread_id)
 
 
 _STRUCTURED_OUTPUT_INSTRUCTION = (
@@ -602,15 +638,107 @@ async def close_session(thread_id: str, stage: str, role: str) -> None:
     live, ac-to-tests asserted "created failing RED-phase tests for all active ACs" on six
     consecutive laps while making zero write calls. Retrying in the same session re-reads the lie;
     a fresh session re-reads only the prompt and the failure feedback.
+
+    The freshness guarantee comes from popping _sessions, which cannot fail -- the awaits below are
+    best-effort resource release, so a failure there does NOT mean the next attempt reuses the
+    poisoned history. They are logged rather than silently suppressed because a runtime that can no
+    longer close a session is worth seeing in the log, not because correctness depends on them.
     """
     session_key = f"{thread_id}:{stage}:{role}"
     session = _sessions.pop(session_key, None)
     client = _clients.pop(session_key, None)
     _session_locks.pop(session_key, None)
     if session is not None:
-        with contextlib.suppress(Exception):
+        try:
             await session.disconnect()
+        except Exception:
+            logger.warning("disconnect failed for session %r (already dropped anyway)", session_key, exc_info=True)
     if client is not None:
-        with contextlib.suppress(Exception):
+        try:
             await client.__aexit__(None, None, None)
+        except Exception:
+            logger.warning("client close failed for session %r (already dropped anyway)", session_key, exc_info=True)
     logger.info("closed session %r so the next attempt starts fresh", session_key)
+
+
+def _demo() -> None:
+    """Self-check for the session-cache eviction path (the live session paths need a sandbox)."""
+    doomed, survivor = "thread-doomed", "thread-survivor"
+    for thread in (doomed, survivor):
+        for key in (f"{thread}:specification:draft", f"{thread}:plan:audit"):
+            _sessions[key] = object()  # type: ignore[assignment]
+            _clients[key] = object()  # type: ignore[assignment]
+            _session_locks[key] = asyncio.Lock()
+
+    forget_thread_sessions(doomed)
+
+    # The whole point: one thread's dead sandbox must not evict another thread's live sessions.
+    assert not [k for k in _sessions if k.startswith(f"{doomed}:")], "doomed sessions survived"
+    assert not [k for k in _clients if k.startswith(f"{doomed}:")], "doomed clients survived"
+    assert not [k for k in _session_locks if k.startswith(f"{doomed}:")], "doomed locks survived"
+    assert len([k for k in _sessions if k.startswith(f"{survivor}:")]) == 2, "evicted the wrong thread"
+
+    # A client with no session entry (create_session failed after __aenter__) must still be evicted,
+    # otherwise a half-built session leaks a TCP connection into a destroyed container forever.
+    _clients[f"{doomed}:orphan:draft"] = object()  # type: ignore[assignment]
+    forget_thread_sessions(doomed)
+    assert f"{doomed}:orphan:draft" not in _clients, "orphaned client survived"
+
+    forget_thread_sessions("never-existed")  # must not raise
+
+    # The wiring itself: registry.pop is the choke point every container teardown routes through,
+    # and it reaches this module via a function-local import. A broken import would otherwise only
+    # surface as a silent leak in production.
+    from .sandbox import registry
+
+    registry.pop(survivor)
+    assert not [k for k in _sessions if k.startswith(f"{survivor}:")], "registry.pop did not evict"
+    assert not [k for k in _clients if k.startswith(f"{survivor}:")], "registry.pop left clients"
+    # The third eviction trigger: an unhandled node exception is run-ending, but a
+    # GraphBubbleUp (gate interrupt) is NOT -- it must leave the stage's conversation intact.
+    # Getting this backwards would either leak every failed run's sessions or silently destroy
+    # a stage's context every time it pauses for human approval.
+    from langgraph.errors import GraphBubbleUp
+
+    from .telemetry import traced_node
+
+    async def _blows_up(_state, _config):
+        raise RuntimeError("node blew up")
+
+    async def _pauses_at_gate(_state, _config):
+        raise GraphBubbleUp("gate interrupt")
+
+    async def _check_node_error_paths() -> None:
+        config = {"configurable": {"thread_id": "thread-node-error"}}
+        key = "thread-node-error:plan:draft"
+        for failing, should_survive in ((_blows_up, False), (_pauses_at_gate, True)):
+            _sessions[key] = object()  # type: ignore[assignment]
+            _clients[key] = object()  # type: ignore[assignment]
+            with contextlib.suppress(RuntimeError, GraphBubbleUp):
+                await traced_node("selfcheck", failing)({}, config)
+            assert (key in _sessions) is should_survive, (
+                f"{failing.__name__}: expected survive={should_survive}"
+            )
+            _sessions.pop(key, None)
+            _clients.pop(key, None)
+
+    # traced_node logger.exception()s the deliberate failure above. Left visible, a passing
+    # self-check prints a full traceback, which teaches everyone to ignore this output.
+    logging.getLogger("src.telemetry").setLevel(logging.CRITICAL)
+    try:
+        asyncio.run(_check_node_error_paths())
+    finally:
+        logging.getLogger("src.telemetry").setLevel(logging.NOTSET)
+
+    print("copilot_chat_model self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    # Re-dispatch through the PACKAGE name on purpose. `python -m src.copilot_chat_model` loads this
+    # file as "__main__", so registry.pop's `from ..copilot_chat_model import ...` would import a
+    # SECOND copy of this module with its own _sessions/_clients dicts -- and the wiring assertion
+    # below would fail against caches nothing ever wrote to. Production imports it exactly once
+    # (main.py -> src.graph -> src.copilot_chat_model), which is what this reproduces.
+    from src.copilot_chat_model import _demo as _packaged_demo
+
+    _packaged_demo()

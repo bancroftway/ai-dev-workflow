@@ -17,7 +17,7 @@ import shlex
 from datetime import datetime, timezone
 from typing import Any
 
-from . import approvals, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
+from . import approvals, copilot_chat_model, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
@@ -607,6 +607,16 @@ async def exit_finalize_node(
         [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH],
         "ai-dev-workflow: exit finalize (manifest, changelog, exit report)",
     )
+
+    # Graceful end-of-run release of this thread's ~20 Copilot sessions. metrics-exit is genuinely
+    # the last stage -- every other terminal path (metrics regression, test-hardening, e2e escalate)
+    # routes INTO metrics-exit_draft rather than END, and all four POST_STAGE_REBUILD placements sit
+    # before it -- so nothing downstream needs a session. run_headless.py already did this at
+    # process exit; the server path never did, which left every completed run's sessions riding
+    # until the sandbox idle-reaper eventually took the container down.
+    # Deliberately NOT done on the needs_clarification -> END path: there the user is about to
+    # answer the model's own question, and that stage's conversation continuity is wanted.
+    await copilot_chat_model.close_thread_session(thread_id)
 
 
 def _demo() -> None:

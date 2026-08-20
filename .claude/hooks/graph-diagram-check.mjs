@@ -25,15 +25,12 @@ const files = [
   "agent/src/tech_stack_signals.py",
   "agent/src/rebuild.py",
   "agent/src/preflight_nodes.py",
-  "agent/src/session_index.py",
-  "agent/src/finding_cluster_nodes.py",
+  "agent/src/session_store.py",
   "agent/src/repo_scan.py",
   "agent/src/test_hardening_nodes.py",
   "agent/src/e2e_nodes.py",
   "agent/src/metrics_nodes.py",
   "agent/src/exit_nodes.py",
-  "agent/src/quality_security/quality_nodes.py",
-  "agent/src/quality_security/security_nodes.py",
   "agent/src/sessions_api.py",
 ];
 const dirs = [

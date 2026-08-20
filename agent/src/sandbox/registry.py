@@ -32,6 +32,15 @@ def set(thread_id: str, session: SandboxSession) -> None:
 
 
 def pop(thread_id: str) -> SandboxSession | None:
+    # Every container-destruction path routes through here (both providers' terminate(), the idle
+    # reaper via terminate(), and DELETE /{thread_id}), so this is also the one place that can
+    # reliably evict the Copilot sessions pointing INTO that container. Without it they survive as
+    # live-looking handles to a destroyed sandbox -- the same phantom-state bug the `registry.pop`
+    # comments in terminate() describe, one layer up. Imported here, not at module scope:
+    # copilot_chat_model imports .sandbox, so a top-level import cycles.
+    from ..copilot_chat_model import forget_thread_sessions
+
+    forget_thread_sessions(thread_id)
     _meta.pop(thread_id, None)
     return _sessions.pop(thread_id, None)
 

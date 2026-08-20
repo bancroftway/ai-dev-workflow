@@ -1845,6 +1845,11 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
             thread_id, state, stages,
             f"ai-dev-workflow: {stage_spec.key} escalated -- approval revoked ({payload['type']})",
         )
+        # The other genuine run terminal (exit_nodes.exit_finalize_node is the success one): an
+        # escalated deterministic gate ENDs the run, and recovery is fix-out-of-band + resubmit,
+        # which re-enters at intake and rebuilds whatever sessions it needs. Nothing downstream
+        # reads these, so release them rather than leaving ~20 to ride until the idle reaper.
+        await copilot_chat_model.close_thread_session(thread_id)
         return {"stages": stages, "run_failure": payload}
 
     return escalate_node

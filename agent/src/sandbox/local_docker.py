@@ -199,6 +199,15 @@ class LocalDockerProvider(SandboxProvider):
                 )
                 await _run_docker("stop", existing.container_id)
                 del self._sandboxes[session_id]
+                # A destruction path that does NOT route through registry.pop (the registry
+                # entry is about to be overwritten by the reprovision below, so it was never
+                # popped). AzureContainerInstanceProvider.provision has the same branch and needs
+                # the same call. The reprovisioned container gets a NEW host port, so every cached
+                # Copilot session for this thread now points at the old one -- forget them here or
+                # the next stage dials a dead port.
+                from ..copilot_chat_model import forget_thread_sessions
+
+                forget_thread_sessions(session_id)
 
             # A container that survived an agent restart is reattached, not destroyed -- the old
             # path unconditionally `rm -f`'d it, throwing away the clone and every unpushed

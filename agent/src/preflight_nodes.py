@@ -588,9 +588,10 @@ def _join_root(root: str, name: str) -> str:
 
 
 def _root_is_safe(root: str) -> bool:
-    """A root is model-reported, and repo_files' path allowlist is deliberately narrow (no spaces,
-    no traversal). An unusable root is skipped with a recorded reason rather than raised on -- a
-    ValueError here would otherwise propagate out of the hook and take the whole run down."""
+    """A root is model-reported, and repo_files' path allowlist rejects traversal, absolute paths and
+    shell metacharacters (spaces ARE allowed -- see repo_files._SAFE_PATH_RE for why). An unusable
+    root is skipped with a recorded reason rather than raised on -- a ValueError here would otherwise
+    propagate out of the hook and take the whole run down."""
     if root == "":
         return True
     try:
@@ -739,9 +740,21 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     # Low confidence (None) is not the same as the repo root ("").
     assert _applicable_ecosystems({"dotnet_detected": True, "dotnet_solution_root": None}) == []
 
-    # A root the path allowlist rejects is dropped, not raised on.
-    assert _applicable_ecosystems({"languages": ["Python"], "convention_roots": {"python": "My App"}}) == []
-    assert _applicable_ecosystems({"languages": ["Python"], "convention_roots": {"python": "../etc"}}) == []
+    # A root the path allowlist rejects is dropped, not raised on. Traversal, absolute paths and
+    # shell metacharacters are all rejected -- the cases that actually matter, since these roots are
+    # model-reported and end up inside container shell commands.
+    def _py_roots(root: str) -> list[tuple[str, str]]:
+        applicable = _applicable_ecosystems({"languages": ["Python"], "convention_roots": {"python": root}})
+        return [(eco.key, resolved) for eco, resolved in applicable]
+
+    assert _py_roots("../etc") == []
+    assert _py_roots("/etc") == []
+    assert _py_roots("src; rm -rf /") == []
+    assert _py_roots("a$(whoami)") == []
+    # Spaces are NOT rejected, deliberately -- repo_files._SAFE_PATH_RE was widened for a real
+    # generated Next.js chunk path, and shlex.quote (not the character class) is what makes these
+    # shell-safe. This assertion exists so nobody "fixes" the class back and breaks that stage.
+    assert _py_roots("My App") == [("python", "My App")]
 
     polyglot = _applicable_ecosystems(
         {
@@ -789,7 +802,6 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     assert apps[1]["app_class"] == "unknown" and apps[1]["name"] == "app"
     assert ManifestAppCheck.model_validate({"apps": apps}).apps[0].port == 5001
 
-    print("preflight_nodes self-check: ok")
     assert _session_title("x" * 100, "abc123") == "x" * 80
 
     # _select_tech_stack_markdown: the tab's edited text wins; a bare (non-dict) resume value

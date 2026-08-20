@@ -172,6 +172,13 @@ class AzureContainerInstanceProvider(SandboxProvider):
                     "--name", existing.container_name, "--yes",
                 )
                 del self._sandboxes[session_id]
+                # Mirrors LocalDockerProvider: a destruction path that bypasses registry.pop
+                # because the reprovision below overwrites the registry entry anyway. On ACI the
+                # replacement group also gets a new IP, so stale Copilot sessions would dial a
+                # dead address rather than merely a dead port.
+                from ..copilot_chat_model import forget_thread_sessions
+
+                forget_thread_sessions(session_id)
 
             name = _container_group_name(session_id)
             connection_token = secrets.token_urlsafe(32)
