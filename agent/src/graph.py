@@ -17,11 +17,13 @@ resumed and is abandoned by construction (BR-4's cascade).
 from __future__ import annotations
 
 import inspect
+import importlib
 import json
 import logging
 import os
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -1922,6 +1924,38 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
     return gate_node
 
 
+def assert_gates_have_self_checks() -> None:
+    """Every gate module must expose a runnable `_demo`. Fails the build when one does not.
+
+    A broken gate does not crash -- it runs, returns a number, and the number is wrong. Measured this
+    session: the per-AC depth counter read a real `.cs` file holding 14 tests and reported ZERO tests
+    for every criterion (the generated names strip punctuation, `TestUS00012...`, and both the id
+    variants and the test-declaration regex missed them). Nothing errored; the pipeline carried on
+    and wrote production code against what it believed were no tests. The only thing that catches
+    that class of defect is handing the pure function a real artifact and asserting the answer.
+
+    So the convention is enforced rather than hoped for. Note what this does NOT guarantee: a
+    self-check whose fixtures were invented from the same wrong assumption as the code will pass
+    while both are wrong -- which is exactly what happened. Fixtures should come from artifacts
+    captured out of a real run; the checks in ac_coverage_gate, e2e_nodes and repo_scan now do.
+    """
+    gates_dir = Path(__file__).parent / "gates"
+    missing: list[str] = []
+    for path in sorted(gates_dir.glob("*.py")):
+        if path.stem == "__init__":
+            continue
+        module = importlib.import_module(f"{__package__}.gates.{path.stem}")
+        if not callable(getattr(module, "_demo", None)):
+            missing.append(path.stem)
+    if missing:
+        raise AssertionError(
+            "these gate module(s) have no runnable `_demo` self-check: "
+            + ", ".join(missing)
+            + ". Add one that exercises the module's pure functions against a REAL captured "
+            "artifact -- a gate with no check is a gate nobody can prove works."
+        )
+
+
 def should_skip_draft(stage: dict[str, Any]) -> bool:
     """Whether a stage's LLM draft can be skipped because it is already approved. Pure.
 
@@ -2645,6 +2679,7 @@ def _demo() -> None:
 
     build_graph()  # runs assert_pipeline_nodes_registered + assert_no_dead_clusters
     assert_no_stub_stages()
+    assert_gates_have_self_checks()
     print("graph self-check: all assertions passed")
 
 

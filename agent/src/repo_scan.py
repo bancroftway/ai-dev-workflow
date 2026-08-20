@@ -537,6 +537,45 @@ def _trivy_secrets(result: dict[str, Any], target: str) -> list[Finding]:
     return findings
 
 
+def uninstallable_lock_packages(lock_text: str, target_os: str, target_arch: str) -> set[str]:
+    """Package names an npm lockfile marks OPTIONAL for a platform that is not the scan target.
+
+    Authoritative, from the lockfile's own `os`/`cpu` constraints -- not a guess from the package
+    name. npm records every platform variant of an optional native dependency and installs only the
+    one matching the host, so a lockfile on a linux/x64 target legitimately contains entries for
+    win32, darwin, freebsd and half a dozen CPU architectures that can never be present.
+
+    This exists because a licence scan read those entries as if they were installed: a Click Counter
+    app with no image handling at all was reported as carrying three high-severity LGPL obligations
+    from `@img/sharp-win32-arm64` and friends. Measured on that repo, 16 of 27 `@img/*` lock entries
+    were for platforms that cannot install there, and `ls node_modules/@img` confirmed only the
+    linux/x64 and wasm32 variants existed. A licence that cannot apply to the artifact being built
+    is not a finding about it.
+    """
+    try:
+        doc = json.loads(lock_text)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    excluded: set[str] = set()
+    for path, entry in (doc.get("packages") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("optional"):
+            continue
+        oses = [str(o).lower() for o in (entry.get("os") or [])]
+        cpus = [str(c).lower() for c in (entry.get("cpu") or [])]
+        # A constraint list that excludes the target, honouring npm's "!platform" negation form.
+        os_blocked = bool(oses) and not (
+            target_os in oses or (any(o.startswith("!") for o in oses) and f"!{target_os}" not in oses)
+        )
+        cpu_blocked = bool(cpus) and not (
+            target_arch in cpus or (any(c.startswith("!") for c in cpus) and f"!{target_arch}" not in cpus)
+        )
+        if os_blocked or cpu_blocked:
+            name = path.split("node_modules/", 1)[-1] if "node_modules/" in path else path
+            if name:
+                excluded.add(name)
+    return excluded
+
+
 def _trivy_licenses(result: dict[str, Any], target: str) -> list[Finding]:
     findings = []
     for lic in result.get("Licenses") or []:
@@ -559,6 +598,9 @@ def _trivy_licenses(result: dict[str, Any], target: str) -> list[Finding]:
                 title=f"Licence: {name}",
                 severity_source="native" if tier else "defaulted",
                 sources=("trivy",),
+                # Structured, so a licence finding can be matched against the lockfile's own
+                # platform constraints rather than by parsing it back out of `message`.
+                package={"name": str(lic.get("PkgName") or "")} if lic.get("PkgName") else None,
             )
         )
     return findings
@@ -1667,6 +1709,55 @@ def select_tools(profile: str, tools: Sequence[str] | None, include_metrics: boo
 # ------------------------------------------------------------------------------------------------
 
 
+async def _drop_uninstallable_licences(
+    provider: Any, thread_id: str, findings: list[Finding]
+) -> list[Finding] | None:
+    """Remove licence findings for packages the lockfile marks unusable on this platform.
+
+    Returns None when nothing changed (no licence findings, no lockfile, nothing excluded), so the
+    caller can leave the list untouched. Reads the target platform from the sandbox rather than
+    assuming linux/x64 -- the scan runs wherever the container runs.
+    """
+    licence_pkgs = {
+        (f.package or {}).get("name")
+        for f in findings
+        if f.category == "license" and (f.package or {}).get("name")
+    }
+    if not licence_pkgs:
+        return None
+
+    from . import repo_files
+
+    probe = await provider.exec_in_sandbox(thread_id, "uname -s; uname -m")
+    lines = [line.strip().lower() for line in (probe.stdout or "").splitlines() if line.strip()]
+    target_os = {"linux": "linux", "darwin": "darwin"}.get(lines[0] if lines else "", "linux")
+    target_arch = {"x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(
+        lines[1] if len(lines) > 1 else "", "x64"
+    )
+
+    excluded: set[str] = set()
+    listing = await provider.exec_in_sandbox(
+        thread_id,
+        "git ls-files '*package-lock.json' && git ls-files --others --exclude-standard '*package-lock.json'",
+    )
+    for path in {line.strip() for line in (listing.stdout or "").splitlines() if line.strip()}:
+        lock_text = await repo_files.read_repo_file(provider, thread_id, path)
+        if lock_text:
+            excluded |= uninstallable_lock_packages(lock_text, target_os, target_arch)
+
+    if not (excluded & licence_pkgs):
+        return None
+    kept = [
+        f for f in findings
+        if not (f.category == "license" and (f.package or {}).get("name") in excluded)
+    ]
+    logger.info(
+        "repo_scan: dropped %d licence finding(s) for packages not installable on %s/%s",
+        len(findings) - len(kept), target_os, target_arch,
+    )
+    return kept
+
+
 async def run_repo_scan(
     provider: Any,
     thread_id: str,
@@ -1713,6 +1804,13 @@ async def run_repo_scan(
         findings.extend(tool_findings)
         if fragment:
             fragments.append(fragment)
+
+    # Drop licence findings for optional native packages the lockfile itself says cannot install on
+    # this target. See uninstallable_lock_packages: without this, a counter app with no image code
+    # reported LGPL obligations from `@img/sharp-win32-arm64` on a linux/x64 container.
+    dropped_platform_licences = await _drop_uninstallable_licences(provider, thread_id, findings)
+    if dropped_platform_licences:
+        findings = dropped_platform_licences
 
     eval_result: dict[str, Any] = {}
     if include_eval:
@@ -2249,6 +2347,31 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert sbom_ancestry(sparse) == {}, "a graph covering 3% of components must not yield an ancestry split"
     _, sparse_metrics = parse_syft(json.dumps(sparse))
     assert sparse_metrics["sbom"]["ancestry"] == "no_dependency_graph", sparse_metrics["sbom"]
+
+    # --- platform-excluded licences: npm records every variant, installs one ------------------
+    lock = json.dumps({"packages": {
+        "": {"name": "web"},
+        "node_modules/next": {"version": "16.3.1"},
+        "node_modules/@img/sharp-win32-arm64": {"optional": True, "os": ["win32"], "cpu": ["arm64"], "license": "Apache-2.0"},
+        "node_modules/@img/sharp-libvips-darwin-x64": {"optional": True, "os": ["darwin"], "cpu": ["x64"], "license": "LGPL-3.0-or-later"},
+        "node_modules/@img/sharp-libvips-linux-x64": {"optional": True, "os": ["linux"], "cpu": ["x64"], "license": "LGPL-3.0-or-later"},
+        "node_modules/@img/sharp-wasm32": {"optional": True, "cpu": ["wasm32"], "license": "Apache-2.0"},
+    }})
+    excluded = uninstallable_lock_packages(lock, "linux", "x64")
+    # Cannot install here -> its licence is not a fact about this artifact.
+    assert "@img/sharp-win32-arm64" in excluded, excluded
+    assert "@img/sharp-libvips-darwin-x64" in excluded, excluded
+    assert "@img/sharp-wasm32" in excluded, excluded
+    # The variant that DOES install must be kept -- this check must not hide a real obligation.
+    assert "@img/sharp-libvips-linux-x64" not in excluded, excluded
+    # Non-optional packages are never excluded, whatever their name.
+    assert "next" not in excluded and "" not in excluded, excluded
+    # On a darwin/arm64 target the exclusions invert, which is the point of reading the constraints.
+    mac = uninstallable_lock_packages(lock, "darwin", "x64")
+    assert "@img/sharp-libvips-darwin-x64" not in mac and "@img/sharp-libvips-linux-x64" in mac, mac
+    # Malformed or absent lockfile: no exclusions, never a crash.
+    assert uninstallable_lock_packages("}{ not json", "linux", "x64") == set()
+    assert uninstallable_lock_packages("{}", "linux", "x64") == set()
 
     # --- supply-chain diff: works WITHOUT the dependency graph, which is why it is the half of
     # --- "put the SBOM to work" that actually ships on this stack.

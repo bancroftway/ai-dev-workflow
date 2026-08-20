@@ -137,8 +137,12 @@ async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[s
     )
 
 
-def _check_wireframe_self_test() -> None:
-    """Runnable check for the pure wireframe validator: `uv run python -m src.gates.diagram_gate`."""
+def _demo() -> None:
+    """Runnable check for the pure wireframe validator: `uv run python -m src.gates.diagram_gate`.
+
+    Named `_demo` to match every other gate: graph.assert_gates_have_self_checks() enforces the one
+    convention, so a new gate cannot ship without a check that can actually be run.
+    """
     ok_html = "<html><body><style>body{font-family:sans-serif}</style><div>Login</div></body></html>"
     assert check_wireframe("login", ok_html) is None
     assert check_wireframe("bad name!", ok_html) is not None
@@ -165,7 +169,7 @@ def _check_wireframe_self_test() -> None:
 
 
 if __name__ == "__main__":
-    _check_wireframe_self_test()
+    _demo()
 
 
 async def verify_plan_diagrams(

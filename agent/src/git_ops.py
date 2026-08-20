@@ -294,10 +294,18 @@ _GITIGNORE_ENTRIES = (
     "coverage/",
     ".nyc_output/",
     "TestResults/",
-    "test-results/",
+    # Both the directory and the loose files: Playwright writes `test-results/`, while the pipeline's
+    # own test-run agents write `test-results-0.json` beside it. A directory-only pattern let
+    # `apps/web/test-results-0.json` be committed as if it were source.
+    "test-results*",
+    "*.trx",
     "playwright-report/",
     "blob-report/",
     "playwright/.cache/",
+    # ASP.NET's conventional runtime-data directory. The generated app persists its counter to
+    # `App_Data/counter.json` and its store creates the file on demand, so tracking it puts live
+    # application state into every diff.
+    "App_Data/",
     "agent-work/",
     ".env.local",
     ".DS_Store",
@@ -305,6 +313,90 @@ _GITIGNORE_ENTRIES = (
 )
 _GITIGNORE_HEADER = "# Managed by ai-dev-workflow: build output and scratch must not reach the review branch."
 _GITIGNORE_ENSURED: set[str] = set()
+
+
+def generated_ignore_entries(untracked: list[str], tracked: list[str]) -> list[str]:
+    """.gitignore entries covering files that appeared from building/booting, given the tracked set.
+
+    `_GITIGNORE_ENTRIES` is an enumerated list, and an enumerated list is always one stack behind:
+    it needed widening twice in a single session (`test-results/` missed the loose
+    `test-results-0.json`; `App_Data/` was missing entirely), and a Python or Rust target would bring
+    `__pycache__/`, `.pytest_cache/`, `target/` next. This derives the answer instead.
+
+    The rule needs no per-stack knowledge: by the time the app has been built and booted, every
+    source file a stage authored is already committed, so anything still untracked was produced by
+    the toolchain.
+
+    The entry is the generated directory sitting immediately INSIDE the deepest ancestor that does
+    contain tracked files -- so `apps/web/.next/cache/turbopack/x.meta` collapses to `apps/web/.next/`
+    while `apps/web/` itself is never ignored. When no ancestor contains tracked files at all, only
+    the exact file is ignored, never a directory: a subtree with nothing committed in it might be
+    source that simply has not been committed yet, and ignoring it would hide real work. That is
+    deliberately conservative -- a first draft of this walked to the highest untracked ancestor and
+    would have ignored an entire `services/` tree.
+
+    `.ai-dev-workflow/` is excluded unconditionally: it is the deliverable, and parts of it are
+    legitimately untracked mid-run.
+    """
+    tracked_dirs: set[str] = set()
+    for path in tracked:
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            tracked_dirs.add("/".join(parts[:i]))
+
+    entries: set[str] = set()
+    for path in untracked:
+        clean = path.strip().strip("/")
+        if not clean or clean.startswith(".ai-dev-workflow"):
+            continue
+        parts = clean.split("/")
+        # Deepest ancestor that holds tracked files; the entry is the one segment below it.
+        deepest = -1
+        for i in range(1, len(parts)):
+            if "/".join(parts[:i]) in tracked_dirs:
+                deepest = i
+        if deepest == -1:
+            entries.add(clean)  # nothing committed anywhere above it -- ignore the file only
+            continue
+        below = "/".join(parts[: deepest + 1])
+        entries.add(clean if below == clean else f"{below}/")
+    return sorted(entries)
+
+
+async def ignore_generated_files(provider: SandboxProvider, thread_id: str) -> list[str]:
+    """Append ignore entries for anything the toolchain produced but nothing tracks. Returns them.
+
+    Runs on every `commit_all` -- deliberately without the once-per-thread guard `ensure_gitignore`
+    uses, because generated files appear progressively (a build here, a test run there, a booted app
+    later), not all at once at the first commit.
+    """
+    listing = await provider.exec_in_sandbox(
+        thread_id, "git ls-files --others --exclude-standard && echo --- && git ls-files"
+    )
+    raw = str(listing.stdout or "")
+    if "---" not in raw:
+        return []
+    untracked_block, tracked_block = raw.split("---", 1)
+    untracked = [line.strip() for line in untracked_block.splitlines() if line.strip()]
+    tracked = [line.strip() for line in tracked_block.splitlines() if line.strip()]
+    if not untracked:
+        return []
+
+    candidates = generated_ignore_entries(untracked, tracked)
+    existing = await provider.exec_in_sandbox(thread_id, "cat .gitignore 2>/dev/null || true")
+    current = {line.strip() for line in str(existing.stdout or "").splitlines()}
+    missing = [entry for entry in candidates if entry not in current]
+    if not missing:
+        return []
+
+    block = "\n".join(["# Detected as generated: untracked after build/boot, nothing authored it.", *missing])
+    await provider.exec_in_sandbox(thread_id, f"printf '%s\\n' {shlex.quote(block)} >> .gitignore")
+    logger.info(
+        "gitignore: %d generated path(s) detected and ignored: %s",
+        len(missing),
+        ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else ""),
+    )
+    return missing
 
 
 async def ensure_gitignore(provider: SandboxProvider, thread_id: str) -> list[str]:
@@ -358,6 +450,9 @@ async def commit_all(provider: SandboxProvider, thread_id: str, message: str) ->
     source files -- without this, the work branch the human reviews on GitHub would carry specs
     and scan reports but none of the generated code."""
     await ensure_gitignore(provider, thread_id)
+    # After the static list, the derived sweep: generated files appear progressively across a run
+    # (build, then test output, then a booted app's runtime state), so this runs on every commit.
+    await ignore_generated_files(provider, thread_id)
     command = (
         "git add -A && "
         f"git -c user.name={shlex.quote(_COMMIT_AUTHOR_NAME)} -c user.email={shlex.quote(_COMMIT_AUTHOR_EMAIL)} "
@@ -401,11 +496,67 @@ def _demo() -> None:
 
     # .gitignore entries must cover the build output that actually polluted a branch (893 of 997
     # tracked paths), and must NOT cover the deliverable.
-    for expected in (".next/", "bin/", "obj/", "node_modules/", "test-results/"):
+    for expected in (".next/", "bin/", "obj/", "node_modules/", "test-results*", "App_Data/"):
         assert expected in _GITIGNORE_ENTRIES, expected
+    # The loose-file case that slipped through a directory-only pattern, and the runtime state file.
+    import fnmatch
+
+    for artifact in ("apps/web/test-results-0.json", "apps/api.Tests/x.trx"):
+        name = artifact.rsplit("/", 1)[-1]
+        assert any(fnmatch.fnmatch(name, pat) for pat in _GITIGNORE_ENTRIES if not pat.endswith("/")), artifact
     assert not any(".ai-dev-workflow" in entry for entry in _GITIGNORE_ENTRIES), (
         ".ai-dev-workflow/ is the deliverable and must never be ignored"
     )
+
+    # --- derived generated-file detection ---------------------------------------------------------
+    # A whole generated directory collapses to one entry, however many files it holds.
+    tracked = [
+        "apps/web/package.json",
+        "apps/web/src/app/page.tsx",
+        "apps/api/Program.cs",
+        ".gitignore",
+    ]
+    next_build = [
+        "apps/web/.next/BUILD_ID",
+        "apps/web/.next/cache/turbopack/00000058.meta",
+        "apps/web/.next/server/app/page.js",
+    ]
+    assert generated_ignore_entries(next_build, tracked) == ["apps/web/.next/"], generated_ignore_entries(
+        next_build, tracked
+    )
+
+    # A loose file in a directory that DOES hold source is ignored by exact path -- ignoring
+    # `apps/web/` because a test-result landed there would bury the whole app.
+    loose = ["apps/web/test-results-0.json", "apps/web/test-results-1.json"]
+    assert generated_ignore_entries(loose, tracked) == [
+        "apps/web/test-results-0.json",
+        "apps/web/test-results-1.json",
+    ], generated_ignore_entries(loose, tracked)
+
+    # The two real cases this session had to patch by hand, now derived rather than enumerated.
+    assert generated_ignore_entries(["apps/api/App_Data/counter.json"], tracked) == ["apps/api/App_Data/"]
+
+    # Stacks the static list has never seen. Each needs a tracked sibling, because the collapse is
+    # anchored on "a directory that already holds committed source".
+    polyglot = [*tracked, "services/api/main.py", "crates/engine/Cargo.toml", "apps/api.Tests/Api.Tests.csproj"]
+    for path, expected in (
+        ("services/api/__pycache__/app.cpython-312.pyc", "services/api/__pycache__/"),
+        ("crates/engine/target/debug/engine", "crates/engine/target/"),
+        ("apps/api.Tests/obj/Debug/net10.0/Api.Tests.dll", "apps/api.Tests/obj/"),
+    ):
+        got = generated_ignore_entries([path], polyglot)
+        assert got == [expected], (path, got)
+
+    # With NOTHING committed above it, only the file is ignored -- never a directory that might turn
+    # out to be uncommitted source.
+    orphan = generated_ignore_entries(["services/api/__pycache__/app.pyc"], tracked)
+    assert orphan == ["services/api/__pycache__/app.pyc"], orphan
+
+    # The deliverable is never ignored, however untracked it looks mid-run.
+    assert generated_ignore_entries([".ai-dev-workflow/history/r1-screens/001-home.png"], tracked) == []
+    assert generated_ignore_entries([], tracked) == []
+    # A stray file at the repo root has no ancestor directory -- exact path, never "/".
+    assert generated_ignore_entries(["stray.log"], tracked) == ["stray.log"]
 
     print("git_ops self-check: all assertions passed")
 
