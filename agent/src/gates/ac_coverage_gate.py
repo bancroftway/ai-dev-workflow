@@ -4,17 +4,27 @@ currently be FAILING (a passing "new" test before any implementation exists is a
 tautological -- this is TDD's RED step, checked mechanically rather than trusted to the model's
 own self-report).
 
-Regex-based test-name/result extraction, not a framework-specific structured-report parser
-(trx/junit-xml/playwright-json each have real schemas this could parse properly) -- a pragmatic
-simplification given time constraints, noted here rather than silently passed off as more rigorous
-than it is. Good enough to catch the two failure modes that matter (zero coverage, tautological
-pass) as long as the stack's test runner prints AC ids and pass/fail status in its console output,
-which every stack's default reporter does.
+Pass/fail now comes from the runners' own STRUCTURED reports (`.trx`, vitest/jest JSON, Playwright
+JSON) via `status_from_structured_reports`. Console-text scraping remains only as a fallback for a
+suite whose runner offers no machine-readable reporter, and whatever the structured reports decide is
+final -- the text pass cannot overwrite it.
+
+That ordering is the fix for a specific, real defect this module's docstring used to disclaim: a stub
+named `Test_US_0003_1_..._WhenCapacityOverlapDuplicateAndWeeklyMaxRulesPass_Succeeds` threw
+NotImplementedException, so it was correctly RED, but "RulesPass" made the text-marker match read it
+as PASSING -- the gate then rejected it as tautological and no redraft could ever fix it. A `.trx`
+carries `outcome="Failed"` and cannot be misread that way. Console output has a layout; a report has
+a schema.
+
+Attribution (which test covers which criterion) prefers the canonical `[US-0001.2]` id in the test's
+DISPLAY name, which every runner reports verbatim; see `test_results.attributed_ac_ids` for why that
+beats both a mangled method name and an xUnit `[Trait]` (whose value never reaches the trx at all).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -28,6 +38,8 @@ from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
 from ..spec_ledger import LEDGER_PATH
 
+logger = logging.getLogger(__name__)
+
 # Where the test-run agent tees the suite's complete console output for this gate to read.
 AC_TEST_OUTPUT_PATH = "agent-work/ac-test-output.txt"
 
@@ -37,6 +49,14 @@ class AcTestRunReport(StageReport):
 
     output_artifact: str = ""
     exit_ok: bool = False
+    result_artifacts: list[str] = []
+    """Machine-readable runner reports (.trx / vitest-json / playwright-json).
+
+    These are preferred over `output_artifact` for deciding which tests passed. Console text has a
+    LAYOUT, not a schema: deciding pass/fail from it means matching words like "pass" in lines that
+    also contain test names, and a test called `...RulesPass_Succeeds` was once read as passing when
+    it was a stub throwing NotImplementedException. A `.trx` says `outcome="Failed"`.
+    """
 
 
 # One line of a test runner's console output naming a test and its outcome -- covers dotnet test's
@@ -356,6 +376,48 @@ def category_spread(content_dict: dict[str, Any], ac_id: str) -> set[str]:
     return {c for c in categories if c}
 
 
+def status_from_structured_reports(
+    ac_ids: list[str], reports: dict[str, str]
+) -> tuple[dict[str, str], dict[str, int]]:
+    """`({ac_id -> 'pass'|'fail'}, attribution tally)` from runner reports keyed by path. Pure.
+
+    The authoritative path. `reports` maps a file path to its contents; the format is chosen by
+    extension, so an unrecognised file is skipped rather than guessed at. An AC fails if ANY test
+    attributed to it failed -- the same rule the eval layer applies, for the same reason.
+
+    Replaces deciding pass/fail from console text, which the module docstring has long flagged as a
+    known shortcut. That shortcut had a real failure: a stub named
+    `Test_US_0003_1_..._WhenCapacityOverlapDuplicateAndWeeklyMaxRulesPass_Succeeds` threw
+    NotImplementedException -- correctly RED -- but "RulesPass" made a marker match classify it as
+    PASSING, so the gate rejected it as tautological and no redraft could fix it. A `.trx` carries
+    `outcome="Failed"` and cannot be misread that way.
+    """
+    known = set(ac_ids)
+    per_ac: dict[str, str] = {}
+    tally = {"canonical": 0, "fallback": 0, "unattributed": 0}
+    for path, contents in (reports or {}).items():
+        lowered = path.lower()
+        if lowered.endswith(".trx"):
+            outcomes = test_results.parse_trx(contents)
+        elif lowered.endswith(".json"):
+            # vitest/jest and playwright both emit JSON with different shapes; try both and take
+            # whichever actually parsed, rather than inferring intent from the filename.
+            outcomes = test_results.parse_vitest_json(contents) or test_results.playwright_outcomes(contents)
+        else:
+            continue
+        for name, result in outcomes.items():
+            ids, mechanism = test_results.attributed_ac_ids(name)
+            tally["unattributed" if mechanism == "none" else mechanism] += 1
+            for ac_id in ids:
+                if ac_id not in known:
+                    continue
+                if per_ac.get(ac_id) == "fail" or result == "fail":
+                    per_ac[ac_id] = "fail"
+                else:
+                    per_ac[ac_id] = "pass"
+    return per_ac, tally
+
+
 def unattributed_tests(ac_ids: list[str], test_files: dict[str, str]) -> dict[str, int]:
     """Per file, how many test declarations carry NO recognisable AC id. Pure.
 
@@ -530,7 +592,29 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
     # Matched by substring against the ledger's OWN ids, never a hardcoded id-format regex --
     # observed live (headless run 3): the ledger mints US-0001.1-style ids while an AC-\d{4}
     # regex found nothing, so every AC read as uncovered and the stage deadlocked at the cap.
+    # PREFERRED: the runners' own structured reports. Console scraping below is the fallback for a
+    # suite whose runner offered no machine-readable reporter.
+    structured_reports: dict[str, str] = {}
+    for artifact in run_report.result_artifacts or []:
+        rel = test_results.repo_relative(artifact)
+        if not rel:
+            continue
+        contents = await repo_files.read_repo_file(provider, thread_id, rel)
+        if contents:
+            structured_reports[rel] = contents
+
     ac_line_status: dict[str, str] = {}
+    attribution_tally: dict[str, int] = {}
+    if structured_reports:
+        ac_line_status, attribution_tally = status_from_structured_reports(active_ac_ids, structured_reports)
+        logger.info(
+            "ac coverage: %d AC status(es) from %d structured report(s) (attribution %s)",
+            len(ac_line_status), len(structured_reports), attribution_tally,
+        )
+
+    # Whatever the structured reports decided is FINAL -- the console pass below must not overwrite
+    # it. A schema'd `outcome="Failed"` beats a line of text that happens to contain the word "pass".
+    decided_by_schema = set(ac_line_status)
     variants_by_id = {ac_id: id_variants(ac_id) for ac_id in active_ac_ids}
     for line in lines:
         ac_ids_in_line = {ac_id for ac_id, variants in variants_by_id.items() if any(v in line for v in variants)}
@@ -539,7 +623,7 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
         lowered = line.lower()
         is_fail = _has_marker(line, _FAIL_MARKERS)
         is_pass = _has_marker(line, _PASS_MARKERS)
-        for ac_id in ac_ids_in_line:
+        for ac_id in ac_ids_in_line - decided_by_schema:
             if is_fail:
                 ac_line_status[ac_id] = "fail"
             elif is_pass and ac_line_status.get(ac_id) != "fail":
@@ -727,6 +811,40 @@ def _demo() -> None:
     assert id_variants("US-0001.2") == ["AC-0001.2", "AC00012", "AC_0001_2", "US-0001.2", "US00012", "US_0001_2"], (
         id_variants("US-0001.2")
     )
+
+    # --- structured reports decide pass/fail; console text is only the fallback -------------------
+    # Shape and attribute names taken verbatim from a real `dotnet test --logger trx` run, including
+    # the DisplayName-derived testName that carries the canonical id.
+    real_trx = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results>'
+        '<UnitTestResult testName="[US-0001.2] counter loads persisted value" outcome="Passed" />'
+        '<UnitTestResult testName="[US-0003.4] decrement is rejected at zero" outcome="Failed" />'
+        '<UnitTestResult testName="Api.Tests.T.TestUS00021IncrementPersists" outcome="Passed" />'
+        '<UnitTestResult testName="ProgramConstructorIsReachable" outcome="Passed" />'
+        "</Results></TestRun>"
+    )
+    status, tally = status_from_structured_reports(
+        ["US-0001.2", "US-0003.4", "US-0002.1"], {"TR/ac-run.trx": real_trx}
+    )
+    assert status == {"US-0001.2": "pass", "US-0003.4": "fail", "US-0002.1": "pass"}, status
+    # Two canonical display names, one punctuation-stripped method name, one test naming no criterion.
+    assert tally == {"canonical": 2, "fallback": 1, "unattributed": 1}, tally
+
+    # The failure the console scraper actually made: a stub whose NAME contains "RulesPass" while its
+    # outcome is Failed. A schema cannot be misread that way.
+    trap = (
+        '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results>'
+        '<UnitTestResult testName="[US-0003.1] AssignStaff_WhenWeeklyMaxRulesPass_Succeeds" outcome="Failed" />'
+        "</Results></TestRun>"
+    )
+    trap_status, _ = status_from_structured_reports(["US-0003.1"], {"a.trx": trap})
+    assert trap_status == {"US-0003.1": "fail"}, trap_status
+    assert _has_marker("AssignStaff_WhenWeeklyMaxRulesPass_Succeeds", _PASS_MARKERS) is False
+
+    # An unrecognised artifact is skipped, never guessed at; no reports means no opinion.
+    assert status_from_structured_reports(["US-0001.1"], {"notes.txt": "whatever"}) == ({}, {"canonical": 0, "fallback": 0, "unattributed": 0})
+    assert status_from_structured_reports(["US-0001.1"], {})[0] == {}
 
     # --- attribution health: "could not read it" must never look like "nothing is there" --------
     # A file whose tests all name their criterion: nothing unattributed.

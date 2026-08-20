@@ -96,6 +96,28 @@ previous stage locate elements with `page.getByTestId(...)`; check that stage's 
 they expect and honour those exact names. Selecting by CSS class or visible text breaks the suite on
 any cosmetic change, which is why the id is the contract.
 
+## Tests you add here
+
+A deterministic gate requires **2 tests below the browser layer** (unit and/or integration) for every
+acceptance criterion, checked once your implementation exists. The previous stage wrote what it could
+before there was any code to test; filling the gap is part of this stage's job.
+
+Name every test you add so its criterion can be attributed -- the id in canonical `US-####.#`
+spelling, bracketed, at the start of the name the RUNNER reports:
+
+```csharp
+[Fact(DisplayName = "[US-0002.1] increment persists exactly one")]
+public void IncrementPersistsOne() { ... }
+```
+
+```ts
+it('[US-0002.1] increment persists exactly one', () => { ... });
+```
+
+Use `DisplayName` for xUnit rather than encoding the id in the method name: a C# method name cannot
+contain `-` or `.`, and an id mangled into `TestUS00021...` is attributed only by a fallback matcher.
+`[Trait("AC", ...)]` does not work at all -- the value never reaches the `.trx`.
+
 Report every file you changed (`changed_files`, one-line summaries -- git is the actual diff, this
 is metadata, not a restatement of the code), how your subagent tasks went, and any `known_gaps` --
 things you know are incomplete or risky, stated plainly rather than hidden.

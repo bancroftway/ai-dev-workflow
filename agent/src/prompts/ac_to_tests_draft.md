@@ -81,10 +81,34 @@ stopped at the outermost layer. Report the level of each test in that AC's `cove
 A round that writes `Api.Tests.csproj` and a Playwright spec but no `.cs` test file at all is the
 common failure shape here. The project file is not a test.
 
-Both are counted by finding the AC id inside test names, so every test must carry its criterion id
-in its own name (`Test_US_0001_2_...`, `TestUS00012...`, or `[US-0001.2] ...` in a Playwright
-title). A test that covers a criterion without naming it does not count toward that criterion,
-because nothing can attribute it.
+### Naming a test so its criterion can be attributed
+
+Every test MUST carry its criterion id in the name the test runner reports, in this exact form —
+the id in canonical `US-####.#` spelling, in square brackets, at the start:
+
+```csharp
+[Fact(DisplayName = "[US-0001.2] counter loads the persisted backend value")]
+public void CounterLoadsPersistedValue() { ... }
+
+[Theory(DisplayName = "[US-0003.4] decrement is rejected at zero")]
+[InlineData(0)]
+public void DecrementRejectedAtZero(int start) { ... }
+```
+
+```ts
+test('[US-0001.2] counter loads the persisted backend value', async ({ page }) => { ... });
+it('[US-0002.1] increment adds exactly one', () => { ... });
+```
+
+`DisplayName` is not decoration — it is what makes this work. A C# **method** name cannot contain
+`-` or `.`, so an id squeezed into one becomes `TestUS00012...`, and attribution then depends on
+guessing how the punctuation was mangled. `DisplayName` is reported verbatim by the runner, so the
+id survives exactly as the ledger spells it. (`[Trait("AC", "...")]` does NOT work: the value never
+reaches the `.trx` at all — verified against a real `dotnet test` run.)
+
+A test that covers a criterion without naming it cannot be credited to it. A name that mangles the
+id still usually works via a fallback matcher, but the fallback is counted and reported — use the
+bracketed form.
 
 Both levels are runnable here without touching dependency manifests (which you may not edit):
 .NET unit/integration tests live in a test project you may create yourself (e.g.

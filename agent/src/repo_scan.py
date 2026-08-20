@@ -537,6 +537,35 @@ def _trivy_secrets(result: dict[str, Any], target: str) -> list[Finding]:
     return findings
 
 
+def direct_dependency_names(lock_text: str) -> set[str]:
+    """Packages the PROJECT chose, from an npm lockfile's own root entry. Authoritative.
+
+    `packages[""]` records `dependencies` and `devDependencies` exactly as `package.json` declares
+    them, so "did we choose this or did a framework drag it in" is a lookup, not an inference.
+
+    This replaces a path heuristic. `is_transitive_dependency_file` answers the question by asking
+    whether the finding's FILE looks like a lock file, which conflates two different things: a
+    licence obligation on `next` (chosen here, actionable, should gate) and one on
+    `@img/sharp-libvips-linux-x64` (dragged in by `next`, nothing this repo can do) both surface
+    against `package-lock.json` and were both treated as advisory.
+
+    It is also the plan's SBOM ancestry goal, reached from a source that actually carries the data:
+    syft's CycloneDX `dependencies` graph was too sparse to use (816 components, 20 edges), while the
+    lockfile states it outright.
+    """
+    try:
+        doc = json.loads(lock_text)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    root = (doc.get("packages") or {}).get("") or {}
+    names: set[str] = set()
+    for key in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        section = root.get(key)
+        if isinstance(section, dict):
+            names.update(str(name) for name in section)
+    return names
+
+
 def uninstallable_lock_packages(lock_text: str, target_os: str, target_arch: str) -> set[str]:
     """Package names an npm lockfile marks OPTIONAL for a platform that is not the scan target.
 
@@ -1244,7 +1273,13 @@ def is_advisory_rule(rule_id: str | None) -> bool:
     return bool(rule_id) and bool(_NON_GATING_RULE_RE.search(rule_id))
 
 
-def is_gating(finding: Finding, *, severity_floor: str, introduced_ids: frozenset[str] | None) -> bool:
+def is_gating(
+    finding: Finding,
+    *,
+    severity_floor: str,
+    introduced_ids: frozenset[str] | None,
+    direct_dependencies: frozenset[str] | None = None,
+) -> bool:
     """Security gates absolutely, at or above the floor -- an inherited CVE is still exploitable.
     Quality gates only on what this pipeline introduced, so a brownfield repo's pre-existing debt
     cannot deadlock its first gate. With no baseline (greenfield) `introduced_ids` is None and
@@ -1255,9 +1290,15 @@ def is_gating(finding: Finding, *, severity_floor: str, introduced_ids: frozense
         return False
     if is_advisory_rule(finding.rule_id):
         return False
-    # A licence obligation inherited through a lock file is not actionable in this repository.
+    # A licence obligation inherited through a lock file is not actionable in this repository -- but
+    # only when it really is inherited. With the lockfile's own direct-dependency set available, a
+    # licence on a package THIS project chose still gates: it is a decision someone here made and
+    # can unmake. Without that set (`None`), every lock-file licence stays advisory, which is the
+    # older, blunter behaviour.
     if finding.category == "license" and is_transitive_dependency_file(finding.file):
-        return False
+        package_name = (finding.package or {}).get("name") if finding.package else None
+        if direct_dependencies is None or not package_name or package_name not in direct_dependencies:
+            return False
     if finding.category in SECURITY_CATEGORIES:
         return meets_or_exceeds(finding.severity, severity_floor)
     if finding.category in QUALITY_CATEGORIES:
@@ -1282,6 +1323,9 @@ class ScanReport:
     # while `ac_execution` runs the suites and is therefore legitimately non-deterministic.
     ac_verification: dict[str, Any] | None = None
     ac_execution: dict[str, Any] | None = None
+    # Packages the project itself declared, read from the lockfile's root entry. Lets is_gating tell
+    # "we chose this LGPL package" from "our framework did" -- see direct_dependency_names.
+    direct_dependencies: frozenset[str] | None = None
 
     def summary(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
         by_severity = {level: 0 for level in SEVERITY_ORDER}
@@ -1296,7 +1340,12 @@ class ScanReport:
             by_category[finding.category] = by_category.get(finding.category, 0) + 1
             if finding.category in SECURITY_CATEGORIES:
                 security_by_severity[finding.severity] = security_by_severity.get(finding.severity, 0) + 1
-            if is_gating(finding, severity_floor=severity_floor, introduced_ids=introduced_ids):
+            if is_gating(
+                finding,
+                severity_floor=severity_floor,
+                introduced_ids=introduced_ids,
+                direct_dependencies=self.direct_dependencies,
+            ):
                 gating += 1
         # Enum is `none|info|low|medium|high|critical` -- the full SEVERITY_ORDER vocabulary plus
         # "none" for zero open security findings. "info" is a real, reachable value (not clamped
@@ -1323,7 +1372,15 @@ class ScanReport:
 
     def to_dashboard_dict(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
         findings = [
-            _dashboard_finding(f, is_gating(f, severity_floor=severity_floor, introduced_ids=introduced_ids))
+            _dashboard_finding(
+                f,
+                is_gating(
+                    f,
+                    severity_floor=severity_floor,
+                    introduced_ids=introduced_ids,
+                    direct_dependencies=self.direct_dependencies,
+                ),
+            )
             for f in self.findings
         ]
         metrics = _public_metrics(self.metrics)
@@ -1711,20 +1768,21 @@ def select_tools(profile: str, tools: Sequence[str] | None, include_metrics: boo
 
 async def _drop_uninstallable_licences(
     provider: Any, thread_id: str, findings: list[Finding]
-) -> list[Finding] | None:
+) -> tuple[list[Finding] | None, frozenset[str]]:
     """Remove licence findings for packages the lockfile marks unusable on this platform.
 
     Returns None when nothing changed (no licence findings, no lockfile, nothing excluded), so the
     caller can leave the list untouched. Reads the target platform from the sandbox rather than
     assuming linux/x64 -- the scan runs wherever the container runs.
     """
+    direct: set[str] = set()
     licence_pkgs = {
         (f.package or {}).get("name")
         for f in findings
         if f.category == "license" and (f.package or {}).get("name")
     }
     if not licence_pkgs:
-        return None
+        return None, frozenset()
 
     from . import repo_files
 
@@ -1744,9 +1802,10 @@ async def _drop_uninstallable_licences(
         lock_text = await repo_files.read_repo_file(provider, thread_id, path)
         if lock_text:
             excluded |= uninstallable_lock_packages(lock_text, target_os, target_arch)
+            direct.update(direct_dependency_names(lock_text))
 
     if not (excluded & licence_pkgs):
-        return None
+        return None, frozenset(direct)
     kept = [
         f for f in findings
         if not (f.category == "license" and (f.package or {}).get("name") in excluded)
@@ -1755,7 +1814,7 @@ async def _drop_uninstallable_licences(
         "repo_scan: dropped %d licence finding(s) for packages not installable on %s/%s",
         len(findings) - len(kept), target_os, target_arch,
     )
-    return kept
+    return kept, frozenset(direct)
 
 
 async def run_repo_scan(
@@ -1808,7 +1867,9 @@ async def run_repo_scan(
     # Drop licence findings for optional native packages the lockfile itself says cannot install on
     # this target. See uninstallable_lock_packages: without this, a counter app with no image code
     # reported LGPL obligations from `@img/sharp-win32-arm64` on a linux/x64 container.
-    dropped_platform_licences = await _drop_uninstallable_licences(provider, thread_id, findings)
+    dropped_platform_licences, direct_dependencies = await _drop_uninstallable_licences(
+        provider, thread_id, findings
+    )
     if dropped_platform_licences:
         findings = dropped_platform_licences
 
@@ -1827,6 +1888,7 @@ async def run_repo_scan(
 
     deduped, collapsed = dedupe(findings)
     report = ScanReport(
+        direct_dependencies=direct_dependencies or None,
         ac_verification=eval_result.get("ac_verification"),
         ac_execution=eval_result.get("ac_execution"),
         findings=tuple(deduped),
@@ -2347,6 +2409,37 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert sbom_ancestry(sparse) == {}, "a graph covering 3% of components must not yield an ancestry split"
     _, sparse_metrics = parse_syft(json.dumps(sparse))
     assert sparse_metrics["sbom"]["ancestry"] == "no_dependency_graph", sparse_metrics["sbom"]
+
+    # --- direct vs transitive, from the lockfile's own root entry ---------------------------------
+    # Shape and contents taken from a real generated app's package-lock.json.
+    root_lock = json.dumps({"packages": {
+        "": {"name": "web",
+             "dependencies": {"next": "16.3.1", "react": "19.2.8"},
+             "devDependencies": {"vitest": "4.1.11"}},
+        "node_modules/next": {"version": "16.3.1"},
+        "node_modules/@img/sharp-libvips-linux-x64": {"optional": True, "license": "LGPL-3.0-or-later"},
+    }})
+    direct = direct_dependency_names(root_lock)
+    assert direct == {"next", "react", "vitest"}, direct
+    assert direct_dependency_names("}{ not json") == set()
+    assert direct_dependency_names("{}") == set()
+
+    # A licence on a package the framework dragged in is advisory -- nothing here can change it.
+    inherited = Finding(
+        finding_key="lic-t", tool="trivy", rule_id="LGPL-3.0-or-later", severity="high",
+        raw_severity="HIGH", file="apps/web/package-lock.json", line=None,
+        message="licence LGPL-3.0-or-later on package @img/sharp-libvips-linux-x64",
+        category="license", package={"name": "@img/sharp-libvips-linux-x64"},
+    )
+    assert not is_gating(inherited, severity_floor="medium", introduced_ids=None,
+                         direct_dependencies=frozenset(direct))
+    # A licence on a package THIS project chose gates: it is a decision someone here can unmake.
+    # The old path heuristic could not tell these two apart -- both live in package-lock.json.
+    chosen = replace(inherited, finding_key="lic-d", package={"name": "next"})
+    assert is_gating(chosen, severity_floor="medium", introduced_ids=None,
+                     direct_dependencies=frozenset(direct))
+    # With no lockfile facts available, everything in a lock file stays advisory (older behaviour).
+    assert not is_gating(chosen, severity_floor="medium", introduced_ids=None, direct_dependencies=None)
 
     # --- platform-excluded licences: npm records every variant, installs one ------------------
     lock = json.dumps({"packages": {

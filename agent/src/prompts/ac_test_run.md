@@ -20,10 +20,22 @@ Steps:
    criteria ids against those test names).
 3. Append ALL of that output -- every suite, complete, uncoloured if you can -- to the single file
    `<<output_path>>`. Create it fresh; do not append to a previous run's file.
-4. Confirm the file exists and actually contains the runner output before you finish.
+4. **Also emit each runner's own MACHINE-READABLE report**, in addition to the console output, and
+   list the file paths in `result_artifacts`. Console text is a fallback; these files are the
+   authoritative record of which test passed, because they have a schema instead of a layout:
+
+   - .NET: `dotnet test --logger "trx;LogFileName=ac-run.trx" --results-directory TR`
+   - vitest: `npx vitest run --reporter=json --outputFile=ac-run-vitest.json`
+   - jest: `npx jest --json --outputFile=ac-run-jest.json`
+   - Playwright: `npx playwright test --reporter=json > ac-run-playwright.json`
+
+   Use whichever apply. If a runner offers no structured reporter, say so in `summary` and rely on
+   the console output for that suite.
+5. Confirm the files exist and actually contain results before you finish.
 
 Then report via `report_stage_output`:
 - `output_artifact`: `<<output_path>>`
+- `result_artifacts`: every machine-readable report path you produced, repo-relative.
 - `exit_ok`: whether the suite exited zero (usually false here -- that is fine and expected).
 - `success`: true if you ran the suite(s) and captured their output, even when tests failed.
 - `error`: only if you could not run the tests at all, with the real reason.
