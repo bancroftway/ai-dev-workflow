@@ -53,6 +53,55 @@ import defusedxml.ElementTree as ET
 _AC_IN_NAME_RE = re.compile(r"(?:US|AC)[^A-Za-z0-9]{0,2}(\d{4})[^A-Za-z0-9]{0,2}(\d+)(?!\d)", re.IGNORECASE)
 
 
+# The canonical form: the ledger id, punctuation intact, bracketed at the front of the test's
+# DISPLAY name -- `[US-0001.2] counter loads persisted value`.
+#
+# This is the primary attribution mechanism, and it is deliberately a display name rather than a
+# framework trait. Both alternatives were probed against a real runner before choosing:
+#
+#   xUnit `[Trait("AC","US-0001.2")]`  -- the value NEVER reaches the .trx. No <Properties>, no
+#                                         <TestCategory>; the string "US-0001.2" appears nowhere in
+#                                         the file. A parser for it would read a field that does not
+#                                         exist.
+#   xUnit `[Fact(DisplayName = "...")]` -- becomes the trx's own `testName` attribute, verbatim,
+#                                         punctuation and all. Confirmed on a live `dotnet test`.
+#
+# So the display name IS the structured field here, and it works identically for vitest and
+# Playwright, where `test('[US-0001.2] ...')` is already the natural way to write it. Crucially it
+# removes the reason the old scheme was brittle: a C# METHOD name cannot contain `-` or `.`, which
+# forced `TestUS00012...` and the punctuation-stripped matching that silently failed. A display name
+# has no such restriction.
+_CANONICAL_AC_RE = re.compile(r"\[(US-\d{4}\.\d+)\]")
+
+
+def attributed_ac_ids(test_name: str) -> tuple[list[str], str]:
+    """`(ids, mechanism)` where mechanism is 'canonical' | 'fallback' | 'none'.
+
+    Canonical bracketed ids win outright. The tolerant name matcher below is kept as a FALLBACK for
+    suites written before the convention (and for pytest, whose method names cannot carry
+    punctuation either), but the mechanism is returned so callers can report how often the reliable
+    path was actually used -- a fallback nobody measures is a fallback that quietly becomes the norm.
+    """
+    canonical = _CANONICAL_AC_RE.findall(test_name or "")
+    if canonical:
+        deduped: list[str] = []
+        for ac_id in canonical:
+            if ac_id.upper() not in {d.upper() for d in deduped}:
+                deduped.append(ac_id.upper())
+        return deduped, "canonical"
+    tolerant = ac_ids_in_name(test_name)
+    return tolerant, "fallback" if tolerant else "none"
+
+
+def attribution_health(test_names: list[str]) -> dict[str, int]:
+    """How each test in a suite was attributed. Surfaced so the convention's adoption is visible."""
+    tally = {"canonical": 0, "fallback": 0, "unattributed": 0}
+    for name in test_names:
+        _, mechanism = attributed_ac_ids(name)
+        tally["unattributed" if mechanism == "none" else mechanism] += 1
+    return tally
+
+
 def ac_ids_in_name(test_name: str) -> list[str]:
     """Every AC id mentioned in a test name, normalised to `US-0001.2`.
 
@@ -261,6 +310,25 @@ def _demo() -> None:
     # produce a path that does not exist.
     assert repo_relative("./.ai-dev-workflow/history/x.json") == ".ai-dev-workflow/history/x.json"
     assert repo_relative("./agent-work/e2e-report.json") == "agent-work/e2e-report.json"
+
+    # --- canonical attribution (primary) vs tolerant name matching (measured fallback) -----------
+    # The exact string a live `dotnet test` put in the trx for [Fact(DisplayName = "[US-0001.2] ...")].
+    real_display_name = "[US-0001.2] counter loads persisted value"
+    assert attributed_ac_ids(real_display_name) == (["US-0001.2"], "canonical")
+    # Playwright's natural form is already canonical.
+    assert attributed_ac_ids("[US-0003.2] decrement at zero shows message") == (["US-0003.2"], "canonical")
+    # A method name with punctuation stripped still attributes -- via the fallback, and it says so.
+    assert attributed_ac_ids("Api.Tests.T.TestUS00012Resolve") == (["US-0001.2"], "fallback")
+    # A test naming no criterion is 'none', never silently credited to one.
+    assert attributed_ac_ids("ProgramConstructorIsReachable") == ([], "none")
+    # Canonical wins outright when both forms are present, so one test is not counted twice over.
+    both = attributed_ac_ids("[US-0005.1] covers TestUS00099Thing")
+    assert both == (["US-0005.1"], "canonical"), both
+    # Several criteria in one display name are all credited.
+    assert attributed_ac_ids("[US-0001.1] and [US-0001.2] both")[0] == ["US-0001.1", "US-0001.2"]
+
+    health = attribution_health([real_display_name, "TestUS00012Resolve", "HelperMethod"])
+    assert health == {"canonical": 1, "fallback": 1, "unattributed": 1}, health
 
     print("test_results self-check: all assertions passed")
 

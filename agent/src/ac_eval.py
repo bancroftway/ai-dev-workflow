@@ -32,7 +32,7 @@ import shlex
 from typing import Any
 
 from . import repo_files, spec_ledger, test_results
-from .test_results import ac_ids_in_name
+from .test_results import attributed_ac_ids, attribution_health
 from .gates.ac_coverage_gate import classify_test_level, count_tests_per_ac, id_variants
 from .gates.test_coverage_gate import _with_timeout
 from .sandbox.provider import SandboxProvider
@@ -101,10 +101,11 @@ def attribute_outcomes(ac_ids: list[str], outcomes: dict[str, str]) -> dict[str,
     known = set(ac_ids)
     per_ac: dict[str, str] = {}
     for test_name, result in outcomes.items():
-        # test_results.ac_ids_in_name, not substring matching against id_variants: the real .NET
-        # names strip all punctuation (`TestUS00012...`), which no variant of `US-0001.2` contains.
-        # Substring matching returned zero attributions for a fully passing suite.
-        for ac_id in ac_ids_in_name(test_name):
+        # Canonical `[US-0001.2]` first, tolerant name matching only as a fallback -- see
+        # test_results.attributed_ac_ids for why the display name is the reliable channel and the
+        # punctuation-stripped method name is not.
+        ids, _mechanism = attributed_ac_ids(test_name)
+        for ac_id in ids:
             if ac_id not in known:
                 continue
             if per_ac.get(ac_id) == "fail" or result == "fail":
@@ -361,6 +362,11 @@ async def evaluate(
         execution = execution_summary(ac_ids, per_attempt)
         if notes:
             execution["notes"] = notes[:20]
+        # How the suite's tests were attributed to criteria. Reported because the canonical
+        # `[US-0001.2]` display-name form is the reliable channel and the tolerant name matcher is a
+        # fallback -- if `fallback` dominates, the convention is not being followed and attribution
+        # is one naming change away from silently reporting zeros again.
+        execution["attribution"] = attribution_health(sorted({n for a in per_attempt for n in a}))
     return {"ac_verification": verification, "ac_execution": execution}
 
 
