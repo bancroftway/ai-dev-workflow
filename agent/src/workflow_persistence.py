@@ -47,8 +47,38 @@ class HydrationError(Exception):
     """
 
 
+# Pipeline order, used ONLY to prefix artifact filenames so a directory listing reads in execution
+# order (`01-tech-stack.draft.json`, `02-specification.draft.json`, ...). Stage KEYS are untouched --
+# nothing keys off these numbers.
+#
+# Duplicated here rather than imported from graph.py because graph imports THIS module; the
+# self-check at the bottom asserts the two lists agree, so adding a stage to graph without adding it
+# here fails loudly instead of silently dropping a stage's number.
+#
+# raw-requirements sorts first: it is the human's input, recorded before tech-stack drafts anything.
+# brownfield-baseline sits at the end because it only runs on the brownfield entrypoint.
+_STAGE_ORDER: tuple[str, ...] = (
+    "raw-requirements",
+    "tech-stack",
+    "specification",
+    "plan",
+    "ac-to-tests",
+    "minimal-code-to-green",
+    "remediation",
+    "adversarial-compliance",
+    "metrics-exit",
+    "brownfield-baseline",
+)
+
+
 def _stage_file(stage_key: str, kind: str) -> str:
-    return f"{stage_key}.{kind}"
+    """`01-tech-stack.draft.json`. Unknown keys fall back to the unnumbered name rather than
+    guessing a position -- a stage this module has never heard of should still persist."""
+    try:
+        index = _STAGE_ORDER.index(stage_key) + 1
+    except ValueError:
+        return f"{stage_key}.{kind}"
+    return f"{index:02d}-{stage_key}.{kind}"
 
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
@@ -201,3 +231,32 @@ async def persist_state(
 
     if await _read_file(provider, thread_id, "README.md") is None:
         await _write_file(provider, thread_id, "README.md", _README_CONTENT)
+
+
+def _demo() -> None:
+    """Self-check for the pure half: `cd agent && uv run python -m src.workflow_persistence`."""
+    # Numbered, zero-padded, execution-ordered.
+    assert _stage_file("tech-stack", "draft.json") == "02-tech-stack.draft.json"
+    assert _stage_file("raw-requirements", "md") == "01-raw-requirements.md"
+    assert _stage_file("metrics-exit", "approved.json") == "09-metrics-exit.approved.json"
+    # A key this module does not know still persists, unnumbered, rather than crashing or guessing.
+    assert _stage_file("some-future-stage", "draft.json") == "some-future-stage.draft.json"
+
+    # Padding must keep lexical order == execution order; a bare str(n) breaks at 10 stages.
+    names = [_stage_file(k, "md") for k in _STAGE_ORDER]
+    assert names == sorted(names), names
+
+    # Drift guard: graph owns the stage list, this module owns their numbering. Imported lazily --
+    # graph imports this module, so a top-level import here would be circular.
+    from .graph import _STAGE_KEYS
+
+    assert set(_STAGE_ORDER) == set(_STAGE_KEYS), (
+        f"stage list drift: only in _STAGE_ORDER={set(_STAGE_ORDER) - set(_STAGE_KEYS)}, "
+        f"only in graph._STAGE_KEYS={set(_STAGE_KEYS) - set(_STAGE_ORDER)}"
+    )
+
+    print("workflow_persistence self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

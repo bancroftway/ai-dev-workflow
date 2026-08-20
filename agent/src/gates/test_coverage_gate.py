@@ -44,8 +44,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MIN_COVERAGE_PERCENT = float(os.environ.get("MIN_COVERAGE_PERCENT", "95.0"))
-# Back-compat: agent/src/gates/audit_gates.py imports this old constant name.
-MIN_COVERAGE_PERCENT_DEFAULT = MIN_COVERAGE_PERCENT
 
 # The only strings `measure_coverage` may return as its "reason" -- this value ends up in
 # repo_scan's `metrics.coverage.reason`, which IS hashed into ScanReport.content_hash (see
@@ -886,12 +884,11 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
         assert " " not in code, f"{code!r} looks like prose, not a stable code"
         assert code in _REASON_FEEDBACK, f"{code!r} has no human-readable gate feedback"
 
-    # MIN_COVERAGE_PERCENT is a module-level env read (MIN_COVERAGE_PERCENT_DEFAULT survives only
-    # as a back-compat alias for audit_gates.py's import) -- pin that it parsed to a float and
-    # still defaults to 95.0 when MIN_COVERAGE_PERCENT is unset, same as the old hardcoded constant.
+    # MIN_COVERAGE_PERCENT is a module-level env read -- pin that it parsed to a float and still
+    # defaults to 95.0 when unset. Its MIN_COVERAGE_PERCENT_DEFAULT alias went with
+    # gates/audit_gates.py, which was its only importer.
     assert isinstance(MIN_COVERAGE_PERCENT, float)
     assert MIN_COVERAGE_PERCENT == 95.0, "default must stay 95.0 when env var MIN_COVERAGE_PERCENT is unset"
-    assert MIN_COVERAGE_PERCENT_DEFAULT == MIN_COVERAGE_PERCENT, "back-compat alias must track the live value"
 
     # The exact false-green tree observed live: manifests + a task store hidden in the test
     # helper, and no application at all -- must NOT count as application source.

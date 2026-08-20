@@ -1,6 +1,8 @@
-"""audit-cluster's four sub-stage schemas -- kept as one module since all four are tightly scoped to audit-cluster
-and none is large enough to warrant its own file (unlike schemas_codegen.py's P4/P6 split, which
-covers two genuinely separate stages each with several substantial types).
+"""Adversarial-audit schemas, used by the adversarial-compliance stage.
+
+The dedup-simplify and license-audit schemas that shared this module went with their node cluster:
+duplication is now measured by repo_scan and gated in metrics_nodes.regression_reasons, and licence
+obligations surface as repo_scan `license` findings rather than a stage of their own.
 """
 
 from __future__ import annotations
@@ -10,7 +12,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .schemas import ClarifyingQuestion
-from .schemas_codegen import ChangedFile
 
 # --- adversarial-audit: adversarial audit -------------------------------------------------------------------
 
@@ -35,61 +36,3 @@ class AdversarialAuditDraftResponse(BaseModel):
     readiness: bool
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
     report: AdversarialAuditReport | None = Field(default=None)
-
-
-# --- dedup-simplify: de-dup/simplify ---------------------------------------------------------------------
-
-
-class DedupResult(BaseModel):
-    approach_summary: str
-    changed_files: list[ChangedFile] = Field(default_factory=list)
-    regression_risk: Literal["none", "low", "medium", "high"] = Field(
-        description="Populated by the audit pass's own read-only risk assessment; the draft pass leaves this at its default."
-    )
-    duplication_percent_before: float | None = Field(default=None)
-    duplication_percent_after: float | None = Field(
-        default=None, description="Populated by the post_audit_hook's own deterministic jscpd re-run, never by the model."
-    )
-    ponytail_rejected: list[str] = Field(
-        default_factory=list,
-        description="Ponytail proposals evaluated and rejected, each with a one-line reason.",
-    )
-
-
-class DedupDraftResponse(BaseModel):
-    readiness: bool
-    clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
-    result: DedupResult | None = Field(default=None)
-
-
-# --- license-audit: license audit -----------------------------------------------------------------------
-
-LicenseBucket = Literal["allow", "review_required", "deny", "unknown"]
-LicenseConfidence = Literal["high", "medium", "low"]
-
-
-class LicenseClassification(BaseModel):
-    package_name: str
-    ecosystem: str = Field(description="e.g. 'nuget', 'npm'.")
-    declared_license: str
-    detected_license: str
-    bucket: LicenseBucket
-    confidence: LicenseConfidence
-    dual_or_exception_flag: bool = Field(
-        description="True for dual-licensed or exception-carrying packages -- the single most common automated misclassification; always route to human review, never auto-accept."
-    )
-    rationale: str
-    recommended_action: str
-
-
-class LicenseAuditReport(BaseModel):
-    classifications: list[LicenseClassification] = Field(default_factory=list)
-    summary: str
-
-
-class LicenseAuditDraftResponse(BaseModel):
-    readiness: bool
-    clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
-    report: LicenseAuditReport | None = Field(default=None)
-
-

@@ -42,7 +42,6 @@ from . import preflight_nodes
 from . import repo_files
 from . import repo_scan
 from . import tech_stack_signals
-from . import finding_cluster_nodes
 from . import test_hardening_nodes
 from . import e2e_nodes
 from . import metrics_nodes
@@ -53,17 +52,14 @@ from . import spec_ledger
 from . import telemetry
 from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
-from .gates import audit_gates, skill_gate
-from .quality_security import quality_nodes, security_nodes
+from .gates import adversarial_gate, skill_gate
 from .gates.diagram_gate import verify_plan_diagrams
 from .gates.test_coverage_gate import verify_coverage
 from .gates.write_scope_gate import pre_tool_use_write_scope_hook, verify_ac_to_tests
 from .a2ui_tools import (
     build_ac_to_tests_envelope,
     build_adversarial_audit_envelope,
-    build_dedup_envelope,
     build_exit_envelope,
-    build_license_audit_envelope,
     build_minimal_code_to_green_envelope,
     build_brownfield_baseline_envelope,
     build_plan_envelope,
@@ -104,13 +100,10 @@ from .schemas_codegen import (
 )
 from .schemas_audit import (
     AdversarialAuditDraftResponse,
-    DedupDraftResponse,
-    LicenseAuditDraftResponse,
 )
 from .schemas_brownfield import BrownfieldBaselineDraftResponse
 from .schemas_exit import ExitDraftResponse
 from .schemas_remediation import RemediationDraftResponse
-from .schemas_adversarial_compliance import AdversarialComplianceDraftResponse
 
 logger = logging.getLogger(__name__)
 
@@ -179,15 +172,11 @@ class GraphState(TypedDict):
     # .get("rebuild") or {} everywhere (rebuild.py's nodes tolerate it being absent on a thread
     # that predates R), so this key is genuinely optional at the TypedDict level in practice.
     rebuild: dict[str, Any]
-    # quality-remediation/security-remediation's own bespoke-cluster state (quality_security/quality_nodes.py, security_nodes.py) -- not a
-    # StageState, since neither is a StageSpec. Same absent-is-tolerated pattern as `rebuild` above.
-    quality_remediation: dict[str, Any]
-    security_remediation: dict[str, Any]
-    # audit-cluster's own cross-substage scratch state (jscpd/license-scan reports for prompt grounding,
-    # exit-gate attempt tracking) -- see agent/src/gates/audit_gates.py.
-    audit_cluster: dict[str, Any]
-    # finding-cluster's dependency-upgrade bespoke cluster state -- see agent/src/finding_cluster_nodes.py.
-    finding_cluster: dict[str, Any]
+    # The quality/security/audit-cluster/finding-cluster scratch channels that sat here went with
+    # their node modules. Nothing live read any of them, and each cluster's surviving behaviour has a
+    # home now: never-suppress and dependency upgrades in the remediation prompt, licence findings and
+    # duplication in repo_scan (the duplication THRESHOLD moved to metrics_nodes.regression_reasons --
+    # jscpd measured it but nothing had gated on it since the audit cluster was switched off).
     # test-hardening's own bespoke-cluster state -- see agent/src/test_hardening_nodes.py.
     test_hardening: dict[str, Any]
     # e2e's own bespoke-cluster state (playwright execution + screenshots + gating) -- see
@@ -374,28 +363,23 @@ IMPECCABLE_DEDUP_SEGMENT = (
 # "playwright-browser_navigate"; "mcp:*" in available_tools is required to let them through an
 # allowlist-tier stage, otherwise the allowlist silently filters every MCP tool out -- caught by
 # testing, not guessed). Playwright MCP itself (spawns its own browser via npx, no external
-# service needed) was the one actually exercised; Excalidraw below uses the identical config shape
-# but has NOT been spike-tested (it needs its own MCP server process, which doesn't exist here).
-# Baked into the sandbox image (Dockerfile's PLAYWRIGHT_MCP_VERSION npm -g install), not fetched
-# via `npx -y @playwright/mcp@latest` at session time -- deterministic version, no runtime npm
-# fetch in a container running untrusted repos. The env points this server at the build-baked
-# browser (see the Dockerfile's /opt/playwright-browsers comment) -- the SAME path the global
-# PLAYWRIGHT_BROWSERS_PATH now points at for target repos' own e2e runs too (e2e_nodes.py), so
-# there is exactly one baked browser, never a runtime `playwright install`.
-PLAYWRIGHT_MCP_CONFIG: dict[str, Any] = {
-    "playwright": {
-        "type": "stdio",
-        # @playwright/mcp's actual installed binary name (npm bin field) -- confirmed live in the
-        # sandbox image (`find / -iname 'mcp-server*'` finds nothing, `playwright-mcp` exists).
-        # The wrong name here silently failed the MCP server's stdio startup, which cascaded into
-        # the whole session losing every OTHER tool too (ac-to-tests-draft was left with only a
-        # git/curl/gh/sql/skill baseline, no edit -- 8+ runs escalating with zero test files).
-        "command": "playwright-mcp",
-        "args": ["--headless", "--isolated"],
-        "env": {"PLAYWRIGHT_BROWSERS_PATH": "/opt/playwright-browsers"},
-        "tools": ["*"],
-    }
-}
+# service needed) was the one actually exercised. NO MCP server is attached to any stage today, and
+# none is installed in the image -- the notes below record what each was and why it went, so the
+# next person weighing one starts from evidence instead of re-running these experiments.
+# ac-to-tests used to attach a Playwright MCP server here. Deleted rather than left dormant, in
+# keeping with the two notes below: the stage runs in the TDD RED phase, so on a greenfield run
+# there is no application to browse, and selectors are now AUTHORED rather than discovered (the
+# codegen stage must put a `data-testid` on every element a test touches; specs locate by
+# `getByTestId`). Two facts worth keeping if it is ever reinstated, both learned expensively:
+# the installed binary is `playwright-mcp` (NOT `mcp-server-*` -- `find / -iname 'mcp-server*'`
+# finds nothing), and getting that name wrong did not fail loudly: the stdio startup failed
+# silently and the session lost every OTHER tool with it, leaving ac-to-tests-draft without an edit
+# tool and 8+ runs escalating with zero test files. Its env must point at
+# /opt/playwright-browsers, the one baked browser path. The server is no longer installed either --
+# keeping an unattached MCP in the image was what forced PLAYWRIGHT_VERSION to track
+# @playwright/mcp's own alpha `playwright` dependency, so removing it also frees that pin.
+# Reinstating it means one npm line in the Dockerfile plus this config, for a stage that audits a
+# RUNNING app -- never one that writes tests before the app exists.
 # The plan stage used to attach an Excalidraw MCP server here for wireframes. Deleted rather
 # than left dormant: it was never spike-tested, fetched unpinned `npx -y mcp-excalidraw` over
 # the network at session time, and had no scene-to-SVG export path. Wireframes are now
@@ -591,61 +575,10 @@ def _build_minimal_code_to_green_audit_prompt(state: GraphState) -> list[BaseMes
 ADVERSARIAL_AUDIT_SYSTEM_PROMPT = load_prompt("adversarial_audit_draft")
 
 
-def _build_adversarial_audit_prompt(state: GraphState) -> list[BaseMessage]:
-    spec_stage = state["stages"]["specification"]
-    plan_stage = state["stages"]["plan"]
-    stage = state["stages"]["adversarial-audit"]
-    messages: list[BaseMessage] = [
-        SystemMessage(content=ADVERSARIAL_AUDIT_SYSTEM_PROMPT),
-        HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
-        HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
-    ]
-    if _tech_stack_has_ui_framework(state):
-        messages.append(HumanMessage(content=IMPECCABLE_CRITIQUE_SEGMENT))
-    if stage["draft"] is not None:
-        messages.append(HumanMessage(content=f"Your immediately-prior report (JSON):\n{stage['draft']}"))
-    return messages
-
-
-
 DEDUP_SYSTEM_PROMPT = load_prompt("dedup_draft")
 
 
-def _build_dedup_prompt(state: GraphState) -> list[BaseMessage]:
-    stage = state["stages"]["dedup-simplify"]
-    jscpd_report = (state.get("audit_cluster") or {}).get("jscpd_report_for_dedup", "(no jscpd report available)")
-    messages: list[BaseMessage] = [
-        SystemMessage(content=DEDUP_SYSTEM_PROMPT),
-        HumanMessage(content=f"jscpd duplication-cluster report:\n\n{jscpd_report}"),
-    ]
-    if _tech_stack_has_ui_framework(state):
-        messages.append(HumanMessage(content=IMPECCABLE_DEDUP_SEGMENT))
-        # adversarial-audit's approved divergence report is where impeccable critique findings land -- inject
-        # it here rather than relying on impeccable's own cross-session critique storage, which a
-        # different Copilot session (adversarial-audit's) may or may not have been able to write.
-        adversarial_report = (state["stages"].get("adversarial-audit") or {}).get("approved_content")
-        if adversarial_report:
-            messages.append(HumanMessage(content=f"adversarial-audit report (JSON), including any design findings:\n\n{adversarial_report}"))
-    if stage["draft"] is not None:
-        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
-    return messages
-
-
-
 LICENSE_AUDIT_SYSTEM_PROMPT = load_prompt("license_audit_draft")
-
-
-def _build_license_audit_prompt(state: GraphState) -> list[BaseMessage]:
-    stage = state["stages"]["license-audit"]
-    scan_report = (state.get("audit_cluster") or {}).get("license_scan_report", "(no deterministic scan report available)")
-    messages: list[BaseMessage] = [
-        SystemMessage(content=LICENSE_AUDIT_SYSTEM_PROMPT),
-        HumanMessage(content=f"Deterministic license scan (declared/detected licenses per package):\n\n{scan_report}"),
-    ]
-    if stage["draft"] is not None:
-        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
-    return messages
-
 
 
 EXIT_SYSTEM_PROMPT = load_prompt("exit_draft")
@@ -688,15 +621,42 @@ def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
     ]
 
 
-ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT = "Audit compliance: security/privacy/performance/UI/E2E tests."
+ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT = load_prompt("adversarial_audit_draft")
 
 
 def _build_adversarial_compliance_prompt(state: GraphState) -> list[BaseMessage]:
-    """Minimal prompt for consolidated adversarial-compliance stage 7."""
-    return [
+    """Stage 7: adversarial conformance audit of the implementation against the approved Plan.
+
+    The approved Specification and Plan are passed EXPLICITLY rather than left for the agent to find:
+    they are the thing it audits against, and its whole value is comparing them to the code. The e2e
+    outcome goes in too, because this stage absorbed e2e's compliance role in the consolidation --
+    a suite that failed, or screenshots that were never captured, is conformance evidence the audit
+    should weigh rather than rediscover.
+    """
+    e2e = state.get("e2e") or {}
+    e2e_summary = {
+        "status": e2e.get("status"),
+        "passed": e2e.get("passed"),
+        "total": e2e.get("total"),
+        "failed_tests": (e2e.get("failed_tests") or [])[:10],
+        "screenshots": e2e.get("screenshots") or [],
+        "skipped_reason": e2e.get("skipped_reason"),
+    }
+    messages: list[BaseMessage] = [
         SystemMessage(content=ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT),
-        HumanMessage(content="Perform adversarial audit and compliance checks."),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{state['stages']['specification']['approved_content']}"),
+        HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{state['stages']['plan']['approved_content']}"),
+        HumanMessage(content=f"End-to-end run outcome (JSON):\n\n{json.dumps(e2e_summary, default=str)[:4000]}"),
     ]
+    stage = state["stages"]["adversarial-compliance"]
+    if stage.get("draft") is not None and stage.get("last_verification"):
+        messages.append(
+            HumanMessage(
+                content="Your previous audit was rejected by the deterministic gate:\n\n"
+                f"{stage['last_verification'].get('feedback')}"
+            )
+        )
+    return messages
 
 
 def _build_metrics_exit_prompt(state: GraphState) -> list[BaseMessage]:
@@ -705,23 +665,27 @@ def _build_metrics_exit_prompt(state: GraphState) -> list[BaseMessage]:
 
 
 def build_remediation_envelope(content: dict[str, Any], audit_findings: list[str] | None) -> dict[str, Any]:
-    """Minimal envelope for remediation stage."""
+    """Surface envelope for the remediation stage."""
     return {"stage": "remediation", "content": content}
 
 
-def build_adversarial_compliance_envelope(content: dict[str, Any], audit_findings: list[str] | None) -> dict[str, Any]:
-    """Minimal envelope for adversarial-compliance stage."""
-    return {"stage": "adversarial-compliance", "content": content}
-
-
 def render_remediation_markdown(content: dict[str, Any]) -> str:
-    """Minimal markdown render for remediation."""
-    return json.dumps(content, indent=2)
+    """Human-readable remediation summary.
 
-
-def render_adversarial_compliance_markdown(content: dict[str, Any]) -> str:
-    """Minimal markdown render for adversarial-compliance."""
-    return json.dumps(content, indent=2)
+    Was `json.dumps(content)`, which made 06-remediation.md a wall of JSON -- the stage now reports
+    which findings it fixed, which dependencies it moved and what it deliberately left, and those are
+    the three things a reviewer actually reads.
+    """
+    lines = ["# Remediation", "", content.get("remediation_summary") or "(no summary reported)", ""]
+    for heading, key in (
+        ("Dependencies upgraded", "dependencies_upgraded"),
+        ("Findings addressed", "findings_addressed"),
+        ("Known gaps (deliberately not fixed)", "known_gaps"),
+    ):
+        items = content.get(key) or []
+        if items:
+            lines += [f"## {heading}", ""] + [f"- {item}" for item in items] + [""]
+    return "\n".join(lines).strip() + "\n"
 
 
 @dataclass(frozen=True)
@@ -734,11 +698,8 @@ class StageSpec:
         | type[AcceptanceCriteriaTestsDraftResponse]
         | type[MinimalCodeToGreenDraftResponse]
         | type[AdversarialAuditDraftResponse]
-        | type[DedupDraftResponse]
-        | type[LicenseAuditDraftResponse]
         | type[ExitDraftResponse]
         | type[RemediationDraftResponse]
-        | type[AdversarialComplianceDraftResponse]
     )
     content_field: str
     surface_tool_name: str
@@ -987,7 +948,15 @@ STAGES: list[StageSpec] = [
                     "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
                 ],
                 "pre_tool_use_hook": pre_tool_use_write_scope_hook,
-                **({"mcp_servers": PLAYWRIGHT_MCP_CONFIG} if _tech_stack_has_ui_framework(state) else {}),
+                # No Playwright MCP here. It was attached for UI repos so the drafting model could
+                # drive a live browser while writing specs -- but this stage runs in the TDD RED
+                # phase, before any implementation exists, so on a greenfield run there is nothing
+                # to browse. Selectors are now authored, not discovered: the codegen stage is
+                # required to put a `data-testid` on every element a test touches, and these specs
+                # locate by `getByTestId`. Against that, the MCP is pure risk -- a wrong server name
+                # once "cascaded into the whole session losing every OTHER tool too", leaving this
+                # stage with no edit tool and 8+ runs escalating with zero test files. The server
+                # stays in the image for a future stage that audits a RUNNING app.
             }
             if role == "draft"
             else {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS}
@@ -1062,14 +1031,23 @@ STAGES: list[StageSpec] = [
     ),
     StageSpec(
         key="adversarial-compliance",
-        response_schema=AdversarialComplianceDraftResponse,
+        response_schema=AdversarialAuditDraftResponse,
         content_field="report",
         surface_tool_name="present_adversarial_compliance",
-        build_envelope=build_adversarial_compliance_envelope,
+        build_envelope=build_adversarial_audit_envelope,
         build_prompt=_build_adversarial_compliance_prompt,
         max_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES,
-        render_markdown=render_adversarial_compliance_markdown,
+        render_markdown=render_adversarial_audit_markdown,
         requires_human_gate=False,
+        # Read-only, but it MUST have tools: the prompt says "you are read-only in this session" and
+        # asks it to verify every Plan step and AC against the actual code and wireframes. It
+        # previously had none at all, so it could only speculate -- which is how a stage meant to be
+        # the last substantive gate approved every run it ever saw.
+        session_options=lambda _state, _role: {
+            "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
+        },
+        deterministic_verify=adversarial_gate.verify_adversarial_compliance,
+        max_verify_cycles=3,
     ),
     StageSpec(
         key="metrics-exit",
@@ -1082,6 +1060,13 @@ STAGES: list[StageSpec] = [
         render_markdown=render_exit_markdown,
         requires_human_gate=False,
         sign_approval=True,
+        # Read-only tools, added because this stage SIGNS THE MERGE VERDICT. Its prompt is real and
+        # it receives spec/plan/metrics JSON, so it was never a stub -- but with no tools it could
+        # only restate what it was handed, unable to check a single claim against the branch it is
+        # declaring merge-ready.
+        session_options=lambda _state, _role: {
+            "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
+        },
         deterministic_verify=exit_nodes.verify_exit_readiness,
         # Was 0, on the (then-true) reasoning that verify_exit_readiness always returns passed=True
         # so no retry could ever be needed. The skill gate now runs BEFORE deterministic_verify and
@@ -1899,9 +1884,6 @@ POST_STAGE_REBUILD: dict[str, rebuild.RebuildSpec] = {
     "adversarial-compliance": REBUILD_FOR_ADVERSARIAL_COMPLIANCE,
 }
 
-# R(quality_remediation): sits between quality_fix and quality_gate_check in the plan's own chain (quality_scan -> quality_triage ->
-# quality_ledger_write -> quality_fix -> R(quality_remediation) -> quality_gate_check -> loop|human_gate). Full fix scope --
-# genuine bug-fixing after a real quality-fix pass, same reasoning as REBUILD_AFTER_P6.
 REBUILD_FOR_QUALITY_REMEDIATION = rebuild.RebuildSpec(
     key="r_quality_remediation",
     max_fix_cycles=3,
@@ -1910,7 +1892,6 @@ REBUILD_FOR_QUALITY_REMEDIATION = rebuild.RebuildSpec(
     next_node="quality_gate_check",
 )
 
-# R(security_remediation): same placement pattern as R(quality_remediation), between security_fix and security_gate_check.
 REBUILD_FOR_SECURITY_REMEDIATION = rebuild.RebuildSpec(
     key="r_security_remediation",
     max_fix_cycles=3,
@@ -1918,38 +1899,6 @@ REBUILD_FOR_SECURITY_REMEDIATION = rebuild.RebuildSpec(
     fix_scope="full",
     next_node="security_gate_check",
 )
-
-
-def _wire_p8(builder: StateGraph) -> None:
-    """Wires quality-remediation's bespoke node cluster (quality_security/quality_nodes.py) -- NOT exercised against a
-    real sandbox yet, see quality_nodes.py's own module docstring for exactly what's unverified.
-    quality_gate_check's "next" routes into security-remediation's own scan node."""
-    builder.add_node("quality_scan", quality_nodes.quality_scan_node)
-    builder.add_node("quality_triage", quality_nodes.quality_triage_node)
-    builder.add_node("quality_ledger_write", quality_nodes.quality_ledger_write_node)
-    builder.add_node("quality_fix", quality_nodes.quality_fix_node)
-    builder.add_node("quality_gate_check", quality_nodes.quality_gate_check_node)
-    builder.add_node("quality_human_gate", quality_nodes.quality_human_gate_node)
-
-    r_quality_entry_name = _wire_rebuild(builder, REBUILD_FOR_QUALITY_REMEDIATION)
-
-    builder.add_edge("quality_scan", "quality_triage")
-    builder.add_edge("quality_triage", "quality_ledger_write")
-    builder.add_edge("quality_ledger_write", "quality_fix")
-    builder.add_edge("quality_fix", r_quality_entry_name)
-    builder.add_conditional_edges(
-        "quality_gate_check",
-        quality_nodes.make_quality_route_after_gate(),
-        {"next": "security_scan", "retry": "quality_scan", "escalate": "quality_human_gate"},
-    )
-    builder.add_edge("quality_human_gate", END)
-
-
-# Old StageSpec definitions removed - consolidated into stages 6-8:
-# ADVERSARIAL_AUDIT_SPEC → stage 7 (adversarial-compliance)
-# DEDUP_SPEC → stage 7 (adversarial-compliance)
-# LICENSE_AUDIT_SPEC → stage 7 (adversarial-compliance)
-# EXIT_SPEC → stage 8 (metrics-exit)
 
 
 def _route_after_tech_stack(state: GraphState) -> str:
@@ -2063,67 +2012,6 @@ def _wire_brownfield(builder: StateGraph) -> None:
     builder.add_edge("brownfield_write_manifest", "app_check_record")
 
 
-REBUILD_FOR_AUDIT_CLUSTER = rebuild.RebuildSpec(
-    key="r_audit_cluster",
-    max_fix_cycles=3,
-    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
-    fix_scope="full",
-    next_node="test_hardening_run_tests",
-)
-
-
-def _wire_audit_cluster(builder: StateGraph) -> None:
-    """Wires all of audit-cluster: adversarial-audit (StageSpec) -> dedup_simplify_pre (deterministic)
-    -> dedup-simplify (StageSpec) -> finding_cluster (bespoke verify-loop cluster,
-    finding_cluster_nodes.py) -> license_audit_pre (deterministic) -> license-audit (StageSpec)
-    -> audit_exit_gate (deterministic, retry-once-then-escalate) -> R(audit_cluster) -> END.
-
-    adversarial-audit/dedup-simplify/license-audit are standalone StageSpec instances, not appended to the flat STAGES list --
-    finding-cluster's bespoke cluster interrupts what would otherwise be linear STAGES-style chaining, so
-    _wire_stage (extracted from build_graph()'s STAGES loop) is called directly here with each
-    stage's own explicit next_draft_name instead.
-
-    Verification status: NOT exercised against a real sandbox -- same caveat as quality-remediation/security-remediation.
-    """
-    builder.add_node("dedup_simplify_pre", audit_gates.dedup_simplify_pre_node)
-    builder.add_node("finding_cluster_pre", finding_cluster_nodes.finding_cluster_pre_node)
-    builder.add_node("finding_cluster_draft", finding_cluster_nodes.finding_cluster_draft_node)
-    builder.add_node("finding_cluster_verify", finding_cluster_nodes.finding_cluster_verify_node)
-    builder.add_node("finding_cluster_audit", finding_cluster_nodes.finding_cluster_audit_node)
-    builder.add_node("finding_cluster_revert", finding_cluster_nodes.finding_cluster_revert_node)
-    builder.add_node("finding_cluster_notice_gate", finding_cluster_nodes.finding_cluster_notice_gate_node)
-    builder.add_node("license_audit_pre", audit_gates.license_audit_pre_node)
-    builder.add_node("audit_exit_gate", audit_gates.audit_exit_gate_node)
-    builder.add_node("audit_exit_human_gate", audit_gates.audit_exit_human_gate_node)
-
-    r_audit_entry_name = _wire_rebuild(builder, REBUILD_FOR_AUDIT_CLUSTER)
-
-    _wire_stage(builder, ADVERSARIAL_AUDIT_SPEC, "dedup_simplify_pre")
-    builder.add_edge("dedup_simplify_pre", "dedup-simplify_draft")
-    _wire_stage(builder, DEDUP_SPEC, "finding_cluster_pre")
-
-    builder.add_edge("finding_cluster_pre", "finding_cluster_draft")
-    builder.add_edge("finding_cluster_draft", "finding_cluster_verify")
-    builder.add_conditional_edges(
-        "finding_cluster_verify",
-        finding_cluster_nodes.make_finding_cluster_route_after_verify(),
-        {"audit": "finding_cluster_audit", "retry": "finding_cluster_draft", "revert": "finding_cluster_revert"},
-    )
-    builder.add_edge("finding_cluster_audit", "license_audit_pre")
-    builder.add_edge("finding_cluster_revert", "finding_cluster_notice_gate")
-    builder.add_edge("finding_cluster_notice_gate", "license_audit_pre")  # informational gate -- never blocks audit-cluster
-
-    builder.add_edge("license_audit_pre", "license-audit_draft")
-    _wire_stage(builder, LICENSE_AUDIT_SPEC, "audit_exit_gate")
-
-    builder.add_conditional_edges(
-        "audit_exit_gate",
-        audit_gates.make_audit_exit_route(),
-        {"next": r_audit_entry_name, "retry": "audit_exit_gate", "escalate": "audit_exit_human_gate"},
-    )
-    builder.add_edge("audit_exit_human_gate", END)
-
-
 def _wire_p14(builder: StateGraph) -> None:
     """Wires metrics-report's metrics + traceability + token-tracking node, plus the one named LLM
     exception (ponytail-gain), plus the regression gate: metrics_compute already runs the final
@@ -2202,31 +2090,6 @@ def _wire_e2e(builder: StateGraph) -> None:
     # human also gets exit.md, the manifest and a closed session explaining WHY e2e failed, instead
     # of a run that stops with no artifact naming the failure.
     builder.add_edge("e2e_escalate", "metrics-exit_draft")
-
-
-def _wire_p10(builder: StateGraph) -> None:
-    """Wires security-remediation's bespoke node cluster (quality_security/security_nodes.py) -- NOT exercised against a
-    real sandbox yet, see security_nodes.py's own module docstring for exactly what's unverified.
-    security_gate_check's "next" routes into adversarial-audit's own draft node."""
-    builder.add_node("security_scan", security_nodes.security_scan_node)
-    builder.add_node("security_triage", security_nodes.security_triage_node)
-    builder.add_node("security_ledger_write", security_nodes.security_ledger_write_node)
-    builder.add_node("security_fix", security_nodes.security_fix_node)
-    builder.add_node("security_gate_check", security_nodes.security_gate_check_node)
-    builder.add_node("security_human_gate", security_nodes.security_human_gate_node)
-
-    r_security_entry_name = _wire_rebuild(builder, REBUILD_FOR_SECURITY_REMEDIATION)
-
-    builder.add_edge("security_scan", "security_triage")
-    builder.add_edge("security_triage", "security_ledger_write")
-    builder.add_edge("security_ledger_write", "security_fix")
-    builder.add_edge("security_fix", r_security_entry_name)
-    builder.add_conditional_edges(
-        "security_gate_check",
-        security_nodes.make_security_route_after_gate(),
-        {"next": "adversarial-audit_draft", "retry": "security_scan", "escalate": "security_human_gate"},
-    )
-    builder.add_edge("security_human_gate", END)
 
 
 def _wire_rebuild(builder: StateGraph, spec: rebuild.RebuildSpec) -> str:
@@ -2394,9 +2257,6 @@ def build_graph() -> StateGraph:
     _wire_brownfield(builder)
     # CONSOLIDATED into stages 6-8 -- these clusters' work genuinely moved into a StageSpec, so
     # their wiring is dead on purpose:
-    # _wire_p8(builder)  # quality-remediation → stage 6 (remediation)
-    # _wire_p10(builder)  # security-remediation → stage 6 (remediation)
-    # _wire_audit_cluster(builder)  # adversarial/dedup/license → stage 7 (adversarial-compliance)
     # _wire_p15(builder)  # exit → stage 8 (metrics-exit + exit_finalize post_approve_hook)
     #
     # NOT consolidated -- these three were only ever switched OFF, and nothing took over their
@@ -2467,9 +2327,110 @@ def assert_pipeline_nodes_registered(builder: StateGraph) -> None:
     )
 
 
+# Node-defining modules that must still contribute at least one node to the compiled graph. A module
+# whose EVERY *_node function is unreachable is a cluster that was switched off without being
+# deleted -- which is exactly what happened to quality/security/audit/finding-cluster: three
+# `_wire_*` calls commented out as "now part of stage 6/7", both replacement stages turned out to be
+# stubs, and 22 node functions sat dead while every run reported success.
+_NODE_MODULES = (
+    "test_hardening_nodes",
+    "e2e_nodes",
+    "metrics_nodes",
+    "app_discovery",
+    "preflight_nodes",
+)
+# Functions named *_node that are NOT graph nodes: post_approve hooks and prompt helpers. Without
+# this the detector reports them as dead (it did, on its first run).
+_NON_GRAPH_NODE_FUNCTIONS = frozenset({
+    "exit_finalize_node",              # StageSpec.post_approve_hook, never add_node'd
+    "brownfield_baseline_context_node",  # prompt-context helper
+})
+
+
+def assert_no_dead_clusters(builder: StateGraph) -> None:
+    """Fail when a node module has been orphaned rather than deleted.
+
+    Retiring a cluster is fine; retiring it by commenting out one line and leaving the module behind
+    is what cost this pipeline its e2e, test-hardening and metrics stages for an entire session. This
+    makes that state a build failure instead of a comment nobody reads.
+    """
+    import importlib
+    import inspect
+
+    live = set(builder.nodes)
+    orphaned: list[str] = []
+    for module_name in _NODE_MODULES:
+        module = importlib.import_module(f".{module_name}", __package__)
+        node_fns = [
+            name
+            for name, fn in inspect.getmembers(module, inspect.isfunction)
+            if name.endswith("_node")
+            and name not in _NON_GRAPH_NODE_FUNCTIONS
+            and (inspect.getmodule(fn).__name__ if inspect.getmodule(fn) else "").endswith(module_name)
+        ]
+        if node_fns and not any(name.removesuffix("_node") in live or name in live for name in node_fns):
+            orphaned.append(f"{module_name} ({len(node_fns)} node functions, none registered)")
+    assert not orphaned, (
+        f"dead node cluster(s): {orphaned} -- a _wire_* call is commented out or renamed. Delete the "
+        "module, or register it; do not leave it dormant."
+    )
+
+
+def assert_no_stub_stages() -> None:
+    """Fail when a StageSpec is a stub: a literal prompt, an uncheckable schema, or no tools.
+
+    Every marker here comes from a stage that shipped this way. remediation's prompt was the single
+    sentence "Review prior quality, security, dedup, and license findings and recommend fixes", with
+    no findings passed in and no write tools -- so it fixed nothing while approving every run.
+    adversarial-compliance was the same shape with `report: dict | None`.
+
+    Prompt provenance is checked BY VALUE, not by inspecting build_prompt for a `load_prompt` call:
+    stages load their prompt into a module constant and merely reference it, so a source-inspection
+    check passes only the stages that happen to load inline -- it would have flagged all eight
+    healthy stages and missed nothing.
+    """
+    from pathlib import Path
+
+    # Both whole files AND their system halves: load_prompt_pair splits a prompt file on its first
+    # `---` line, so a paired prompt's system constant is only the top of the file and would never
+    # equal the whole text. (The detector caught this about itself on first run.)
+    prompt_texts: set[str] = set()
+    for path in (Path(__file__).parent / "prompts").glob("*.md"):
+        text = path.read_text(encoding="utf-8").strip()
+        prompt_texts.add(text)
+        system_half, separator, _ = text.partition("\n---\n")
+        if separator:
+            prompt_texts.add(system_half.strip())
+    problems: list[str] = []
+    for spec in _ALL_STAGE_SPECS:
+        fields = set(getattr(spec.response_schema, "model_fields", {}) or {})
+        if not (fields - {"readiness", "clarifying_questions"}):
+            problems.append(f"{spec.key}: response schema has no typed payload field")
+        if not spec.session_options:
+            problems.append(f"{spec.key}: declares no session_options, so it has no tools at all")
+
+    # The prompt check needs a rendered message, which needs state; assert instead that every stage's
+    # system prompt constant is one of the prompt files. Constants are module-level, so compare the
+    # set of them rather than calling build_prompt with a fake state.
+    literal_prompts = [
+        name
+        for name, value in globals().items()
+        if name.endswith("SYSTEM_PROMPT")
+        and isinstance(value, str)
+        and value.strip() not in prompt_texts
+    ]
+    if literal_prompts:
+        problems.append(
+            f"system prompt(s) not backed by a prompts/*.md file: {sorted(literal_prompts)}"
+        )
+    assert not problems, "stub stage(s) detected: " + "; ".join(problems)
+
+
 def compile_graph():
     builder = build_graph()
     assert_pipeline_nodes_registered(builder)
+    assert_no_dead_clusters(builder)
+    assert_no_stub_stages()
     checkpointer = InMemorySaver()
     store = InMemoryStore()
     # Async checkpoint durability (Section 3.5): "async" is the documented

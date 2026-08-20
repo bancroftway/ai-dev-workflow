@@ -395,11 +395,19 @@ async def _listening_ports(provider: Any, thread_id: str) -> set[int]:
     return ports
 
 
-async def _pick_free_port(provider: Any, thread_id: str, preferred: int = 0) -> int:
-    """A port nothing is listening on: `preferred` when it is genuinely free and not 3000, else the
-    first free port in _APP_PORT_RANGE. Falls back to the range's start when everything looks busy
-    (better to try and get a real error than to silently reuse a known-occupied port)."""
-    busy = await _listening_ports(provider, thread_id)
+async def _pick_free_port(
+    provider: Any, thread_id: str, preferred: int = 0, reserved: set[int] | None = None
+) -> int:
+    """A port nothing is listening on AND nothing in this run has already claimed.
+
+    `reserved` is what makes this safe to call more than once per run. Listening state alone is not
+    enough: the primary app's port is chosen before the supporting services boot, and the primary
+    does not bind until after them, so a service picking later still saw that port free and took it.
+    Both processes then got 3101 and the web app died with `EADDRINUSE` while playwright drove the
+    API instead -- every page 404'd and the specs failed on an app that was fine. Callers keep one
+    `reserved` set per e2e_run invocation and add every port handed out.
+    """
+    busy = await _listening_ports(provider, thread_id) | (reserved or set())
     if preferred and preferred != 3000 and preferred not in busy:
         return preferred
     for candidate in _APP_PORT_RANGE:
@@ -646,7 +654,13 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # The port is chosen HERE, before the agent runs, and handed to it -- rather than letting each
     # side guess. 3000 is taken by the sandbox's own Copilot server (see _APP_PORT_RANGE), and a dev
     # server that finds its port busy silently moves to another one, which reads as a dead app.
-    requested_port = await _pick_free_port(provider, thread_id, int(app.get("port") or 0))
+    # One set for the whole invocation: every port handed out below is added to it, so no two
+    # processes can be given the same one regardless of which binds first (see _pick_free_port).
+    reserved_ports: set[int] = set()
+    requested_port = await _pick_free_port(
+        provider, thread_id, int(app.get("port") or 0), reserved_ports
+    )
+    reserved_ports.add(requested_port)
     launch = await stack_runner.run_and_report(
         thread_id,
         stage_key="e2e-run",
@@ -709,7 +723,10 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         # framework default (5000/5080) which may already be held, and drifts exactly as the web app
         # did. Probed unconditionally now: a supporting service we booted has an HTTP surface by
         # definition, since app_discovery only gives a start_command to something it can serve.
-        other_port = await _pick_free_port(provider, thread_id, int(other.get("port") or 0))
+        other_port = await _pick_free_port(
+            provider, thread_id, int(other.get("port") or 0), reserved_ports
+        )
+        reserved_ports.add(other_port)
         service_urls.append(f"http://127.0.0.1:{other_port}")
         await _boot_process(
             provider, thread_id,
@@ -1107,6 +1124,39 @@ def _demo() -> None:
     )
     # 3000 must never be handed out: it belongs to the sandbox's own Copilot server.
     assert 3000 not in _APP_PORT_RANGE
+
+    # Port reservation: two picks in the same run must never collide, even though NOTHING is
+    # listening yet at either call. This is the EADDRINUSE that made e2e pass or fail on timing.
+    import asyncio as _asyncio
+
+    class _NoListeners:
+        async def exec_in_sandbox(self, _thread_id, _command):
+            class R:
+                ok, stdout, stderr, returncode = True, "", "", 0
+            return R()
+
+    async def _two_picks():
+        reserved: set[int] = set()
+        first = await _pick_free_port(_NoListeners(), "t", 0, reserved)
+        reserved.add(first)
+        second = await _pick_free_port(_NoListeners(), "t", 0, reserved)
+        return first, second
+
+    _first, _second = _asyncio.run(_two_picks())
+    assert _first != _second, (_first, _second)
+    assert _first in _APP_PORT_RANGE and _second in _APP_PORT_RANGE
+
+    async def _same_preferred_twice():
+        # The exact live shape: both apps ask for the same preferred port (app_discovery gave one
+        # of them a port, or neither), nothing is bound, and they must still diverge.
+        reserved: set[int] = set()
+        a = await _pick_free_port(_NoListeners(), "t", 3105, reserved)
+        reserved.add(a)
+        b = await _pick_free_port(_NoListeners(), "t", 3105, reserved)
+        return a, b
+
+    _a, _b = _asyncio.run(_same_preferred_twice())
+    assert _a == 3105 and _b != 3105, (_a, _b)
 
     # Primary selection over realistic raw candidates: the UI app is chosen, APIs boot first.
     _raw = [

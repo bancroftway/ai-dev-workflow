@@ -40,6 +40,7 @@ TRACEABILITY_MATRIX_PATH = "traceability-matrix.md"
 # Regression gate tolerances: a coverage/health movement smaller than this is scan noise (jscpd is
 # LOC-sensitive, tool DBs drift), not a regression worth blocking a run over. Health tolerance sits
 # below one new medium finding's penalty (3), so a single real new medium still blocks.
+MAX_DUPLICATION_PERCENT = float(os.environ.get("MAX_DUPLICATION_PERCENT", "3.0"))
 METRIC_REGRESSION_TOLERANCE = float(os.environ.get("METRIC_REGRESSION_TOLERANCE", "1.0"))
 HEALTH_REGRESSION_TOLERANCE = float(os.environ.get("HEALTH_REGRESSION_TOLERANCE", "2.0"))
 _METRICS_GATE_MAX_ATTEMPTS = 2  # one automatic re-scan for tool flake, then fail
@@ -261,6 +262,17 @@ def regression_reasons(
         reasons.append("coverage unmeasured -- line/branch rate unavailable, which must never pass as '--%'")
     elif line < min_cov or branch < min_cov:
         reasons.append(f"coverage below threshold: line {line:.1f}%, branch {branch:.1f}% (minimum {min_cov:.0f}%)")
+
+    # Duplication threshold, salvaged from gates/audit_gates.py's verify_audit_exit when that
+    # (unreachable) module was deleted. jscpd measures duplication on every full scan and repo_scan
+    # reports it, but nothing gated on it once the audit cluster was switched off -- so a run could
+    # ship arbitrarily duplicated code with no objection. Absolute threshold, not a delta: a
+    # greenfield repo has no baseline to regress against.
+    duplication = (latest_summary.get("measures") or {}).get("duplication_percent")
+    if isinstance(duplication, (int, float)) and duplication > MAX_DUPLICATION_PERCENT:
+        reasons.append(
+            f"duplication {duplication:.1f}% exceeds the {MAX_DUPLICATION_PERCENT:.0f}% threshold"
+        )
 
     metric_deltas = (delta_summ or {}).get("metrics") or {}
     for name in ("coverage_line_rate", "coverage_branch_rate"):

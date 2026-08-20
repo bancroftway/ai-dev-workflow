@@ -95,16 +95,15 @@ ARG NODE_MAJOR=22
 # app discovery (agent/src/app_discovery.py) classifies Azure Functions repos as in scope. Pinned
 # to a major only -- nothing parses its output, same reasoning as jscpd/lizard below.
 ARG FUNC_CORE_TOOLS_MAJOR=4
-# P4's Playwright MCP server (graph.py's PLAYWRIGHT_MCP_CONFIG), baked instead of `npx -y
-# @playwright/mcp@latest` at session time -- deterministic version, no runtime npm/browser fetch
-# inside a container running untrusted repos. PLAYWRIGHT_VERSION must equal @playwright/mcp's own
-# `playwright` dependency (npm view @playwright/mcp@$VER dependencies) so the browser build
-# `playwright install` downloads is the exact revision the MCP server drives; the MCP team pins
-# playwright alphas on purpose -- this is the same code `@latest` was fetching, now frozen.
-ARG PLAYWRIGHT_MCP_VERSION=0.0.79
-# Also the version the ac-to-tests skill tells the LLM to pin `@playwright/test` to in the
-# TARGET repo's own package.json (agent/sandbox-image/plugins/ai-dev-workflow/skills/ac-to-tests/SKILL.md)
-# -- keep that literal string in sync with this ARG whenever it changes.
+# The @playwright/mcp server was REMOVED, not left dormant: nothing attached it once ac-to-tests
+# stopped (graph.py's "Deleted rather than left dormant" note explains why -- that stage runs before
+# any app exists, and selectors are authored via data-testid rather than discovered). Keeping an
+# unused MCP server also FORCED this version pin: PLAYWRIGHT_VERSION had to equal @playwright/mcp's
+# own `playwright` dependency, and the MCP team pins alphas deliberately, which is the only reason
+# this image runs a 1.63.0-alpha instead of a stable release. That constraint is now gone. Moving to
+# a stable Playwright is a free choice but must be made deliberately: this literal is duplicated in
+# the ac-to-tests SKILL.md and in two prompts that pin `@playwright/test` to it, so all four change
+# together or the browser revision stops matching the baked build.
 ARG PLAYWRIGHT_VERSION=1.63.0-alpha-2026-08-05
 
 USER root
@@ -168,8 +167,8 @@ RUN set -eux; \
 
 # Playwright MCP + its exact-matching browser build, baked at BUILD time into
 # /opt/playwright-browsers (root-owned, world-readable) -- this is now the ONE browser path for
-# everything that runs Playwright in this image: the MCP server (graph.py's PLAYWRIGHT_MCP_CONFIG
-# points at it explicitly) AND target repos' own e2e test runs (e2e_nodes.py, via the global
+# everything that runs Playwright in this image: target repos' own e2e test runs (e2e_nodes.py,
+# via the global
 # PLAYWRIGHT_BROWSERS_PATH env set above). No runtime `playwright install` happens anywhere in
 # this image -- deterministic version, no runtime npm/browser fetch in a container running
 # untrusted repos, and no concurrent-extraction race between sessions of the same owner (the
@@ -179,8 +178,16 @@ RUN set -eux; \
 # The stable /usr/local/bin/aidw-headless-shell symlink exists for mermaid-cli's Puppeteer (next
 # layer), which reuses THIS browser read-only via PUPPETEER_EXECUTABLE_PATH instead of downloading
 # a second full Chromium (~450 MB saved).
+# `@playwright/test` is installed globally ALONGSIDE `playwright`, at the same pinned version. It is
+# the package a generated repo's specs and config actually import, and it was previously absent:
+# /usr/lib/node_modules/@playwright held only `mcp`, so an idiomatic
+# `import { test } from '@playwright/test'` died with MODULE_NOT_FOUND and e2e_nodes had to write a
+# compatibility shim into the target repo at run time. Installing it here makes that shim a fallback
+# rather than the mechanism, and keeps repo and image on one Playwright version -- which is also what
+# keeps the baked browser revision correct.
 RUN set -eux; \
-    npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "playwright@${PLAYWRIGHT_VERSION}"; \
+    npm install -g "playwright@${PLAYWRIGHT_VERSION}" \
+        "@playwright/test@${PLAYWRIGHT_VERSION}"; \
     playwright install chromium-headless-shell; \
     chmod -R a+rX /opt/playwright-browsers; \
     ln -s "$(ls /opt/playwright-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell)" \

@@ -105,6 +105,12 @@ Three details are not stylistic -- get them wrong and the suite cannot run at al
   attached to the run's exit report, so they are needed when tests PASS.
 - **`baseURL` from `process.env.BASE_URL`.** The orchestrator boots the app on a port it chooses and
   passes it in; a hardcoded URL points at nothing.
+- **If you add `@playwright/test` to a package.json, pin it to exactly `1.63.0-alpha-2026-08-05`** --
+  the sandbox image's own Playwright version. Playwright fetches a browser build matched to its own
+  version and the image bakes exactly one; a mismatch fails at run time with "Executable doesn't
+  exist at .../chromium_headless_shell-<rev>". Observed live: `^1.55.0` resolved to 1.62.1, wanting
+  revision 1234 against an image holding 1237. This is the one dependency you should NOT let the
+  package manager resolve to "latest".
 
 Locate elements with **`data-testid`** via `page.getByTestId('expense-row')`, never by CSS class,
 DOM position, or visible text. Class names and copy change for cosmetic reasons and take the suite

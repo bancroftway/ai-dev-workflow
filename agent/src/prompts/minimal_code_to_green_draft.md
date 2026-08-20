@@ -67,6 +67,14 @@ fix was a one-line version bump that the package manager would have chosen unpro
 mistake in reverse also happens with runtimes: pin the toolchain version this sandbox actually has
 installed, not the one you are most familiar with.
 
+**One exception, and only one: `@playwright/test`.** Pin it to exactly the version the sandbox image
+installs (`1.63.0-alpha-2026-08-05`). This is not a style preference and it is not stale advice --
+Playwright downloads a browser build matched to its own version, the image bakes exactly one such
+build, and a mismatch fails at RUN time with "Executable doesn't exist at
+.../chromium_headless_shell-<rev>". Observed live: `^1.55.0` resolved to 1.62.1, which wanted
+revision 1234 while the image has 1237, and the whole e2e stage failed on a working app. Do not
+"correct" this pin to a newer version.
+
 ## The app must be WIRED TOGETHER, and its UI must be testable
 
 Two requirements that are checked deterministically, not judged by taste:

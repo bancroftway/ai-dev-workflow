@@ -34,8 +34,6 @@ TECH_STACK_SURFACE_ID = "tech-stack"
 AC_TO_TESTS_SURFACE_ID = "ac-to-tests"
 MINIMAL_CODE_TO_GREEN_SURFACE_ID = "minimal-code-to-green"
 ADVERSARIAL_AUDIT_SURFACE_ID = "adversarial-audit"
-DEDUP_SURFACE_ID = "dedup-simplify"
-LICENSE_AUDIT_SURFACE_ID = "license-audit"
 EXIT_SURFACE_ID = "exit"
 BROWNFIELD_BASELINE_SURFACE_ID = "brownfield-baseline"
 
@@ -56,14 +54,6 @@ def _build_generic_envelope(surface_id: str, component_name: str, data_field: st
 
 def build_adversarial_audit_envelope(report: dict, audit_findings: list[str] | None = None) -> dict:
     return _build_generic_envelope(ADVERSARIAL_AUDIT_SURFACE_ID, "AdversarialAuditSurface", "report", report, audit_findings)
-
-
-def build_dedup_envelope(result: dict, audit_findings: list[str] | None = None) -> dict:
-    return _build_generic_envelope(DEDUP_SURFACE_ID, "DedupSurface", "result", result, audit_findings)
-
-
-def build_license_audit_envelope(report: dict, audit_findings: list[str] | None = None) -> dict:
-    return _build_generic_envelope(LICENSE_AUDIT_SURFACE_ID, "LicenseAuditSurface", "report", report, audit_findings)
 
 
 def build_exit_envelope(report: dict, audit_findings: list[str] | None = None) -> dict:
@@ -172,8 +162,6 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.a2
         (build_ac_to_tests_envelope, "ac-to-tests", "AcToTestsSurface", "test_suite"),
         (build_minimal_code_to_green_envelope, "minimal-code-to-green", "MinimalCodeToGreenSurface", "iteration"),
         (build_adversarial_audit_envelope, "adversarial-audit", "AdversarialAuditSurface", "report"),
-        (build_dedup_envelope, "dedup-simplify", "DedupSurface", "result"),
-        (build_license_audit_envelope, "license-audit", "LicenseAuditSurface", "report"),
         (build_exit_envelope, "exit", "ExitSurface", "report"),
         (build_brownfield_baseline_envelope, "brownfield-baseline", "BrownfieldBaselineSurface", "baseline"),
     ]

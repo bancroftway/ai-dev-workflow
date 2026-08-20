@@ -36,25 +36,11 @@ minimal-code-to-green:
   # tokens rather than implement. Everything else stays on the cheap roster.
   draft_model: gpt-5.4
   audit_model: gemini-3.6-flash
-adversarial-audit:
-  draft_model: claude-haiku-4.5
-dedup-simplify:
-  draft_model: gpt-5.4-mini
-license-audit:
-  draft_model: gpt-5.4-mini
-exit:
-  draft_model: claude-haiku-4.5
 brownfield-baseline:
   draft_model: gpt-5.4-mini
 # Remediation FIX nodes are codegen-tier work -- mini fixed nothing across full cycles
 # (observed live: 44-token replies leaving a complexity finding standing). Triage shares the
 # stage model; acceptable, triage quality also improved.
-quality-remediation:
-  draft_model: gpt-5.4
-security-remediation:
-  draft_model: gpt-5.4
-finding-cluster-upgrade:
-  draft_model: gpt-5.4-mini
 test-hardening-flake-triage:
   draft_model: gpt-5.4-mini
 metrics-report:
