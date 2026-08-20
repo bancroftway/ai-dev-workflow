@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 
-from .. import repo_files, stack_runner, tech_stack_signals
+from .. import repo_files, stack_runner, tech_stack_signals, test_results
 from .write_scope_gate import _E2E_PATH_RE
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
@@ -183,8 +183,14 @@ def count_tests_per_ac(ac_ids: list[str], test_files: dict[str, str]) -> dict[st
             # Shared with the anti-padding checks below, so "what is a test" is defined once.
             if not _TEST_DECL_RE.search(line):
                 continue
+            # One general matcher, not the enumerated `id_variants` list. The list held six
+            # spellings, each added reactively after a run had already reported "0 tests" for a
+            # criterion that was tested -- a naming convention nobody controls cannot be covered by
+            # enumeration. `id_variants` survives only for the sandbox grep, which needs literal
+            # strings to pass to `grep -F`.
+            named = set(test_results.ac_ids_in_name(line))
             for ac in ac_ids:
-                if any(variant in line for variant in id_variants(ac)):
+                if ac in named:
                     counts[ac][level] += 1
     return counts
 
@@ -230,6 +236,20 @@ _TEST_DECL_RE = re.compile(
     r"|\b(?:public|internal|private)\s+(?:async\s+)?[\w<>\[\],\s]+?\s+\w+\s*\(",
     re.IGNORECASE,
 )
+
+# The subset that actually carries a test NAME: a `test(...)`/`it(...)`/`describe(...)` call, or a
+# method signature. A bare `[Fact]` / `[Theory]` attribute line matches _TEST_DECL_RE but names
+# nothing -- it is the line ABOVE the name in every generated .NET suite.
+_NAMED_TEST_DECL_RE = re.compile(
+    r"\b(?:test|it|describe)\s*\("
+    r"|\b(?:public|internal|private)\s+(?:async\s+)?[\w<>\[\],\s]+?\s+\w+\s*\(",
+    re.IGNORECASE,
+)
+
+# How each xUnit-family framework MARKS a method as a test. Used to tell a test from a helper:
+# without it, a constructor or a Dispose reads as an unnamed test.
+_TEST_ATTRIBUTE_RE = re.compile(r"^\s*\[\s*(Fact|Theory|Test|TestMethod|TestCase)\b", re.IGNORECASE)
+_JS_TEST_CALL_RE = re.compile(r"\b(?:test|it)\s*(?:\.\w+)?\s*\(\s*['\"`]", re.IGNORECASE)
 
 
 def _normalise_assertion(target: str) -> str:
@@ -334,6 +354,50 @@ def category_spread(content_dict: dict[str, Any], ac_id: str) -> set[str]:
             elif isinstance(value, list):
                 categories.update(str(v) for v in value)
     return {c for c in categories if c}
+
+
+def unattributed_tests(ac_ids: list[str], test_files: dict[str, str]) -> dict[str, int]:
+    """Per file, how many test declarations carry NO recognisable AC id. Pure.
+
+    The generic safety net for this whole class of defect. Attribution works by finding an AC id
+    inside a model-authored test name, and no pattern can cover a convention nobody controls -- four
+    spellings had to be added reactively, each discovered only after a run had already reported "0
+    tests" for criteria that were tested. The failure mode is what makes it dangerous: an unmatched
+    name is indistinguishable from an untested criterion, so the gate reports a confident zero.
+
+    A file full of test declarations where NOTHING matched is therefore reported as an attribution
+    problem, not as an absence of tests. That distinction is the whole point: "I could not read this"
+    and "there is nothing here" must never look the same.
+    """
+    out: dict[str, int] = {}
+    known = set(ac_ids)
+    for path, contents in (test_files or {}).items():
+        unmatched = 0
+        attributed_above = False
+        for line in contents.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _TEST_ATTRIBUTE_RE.search(stripped):
+                attributed_above = True
+                continue
+            # _NAMED_TEST_DECL_RE, not _TEST_DECL_RE: a bare `[Fact]` attribute line matches the
+            # latter but carries no name -- it is the line ABOVE the name in every generated .NET
+            # suite, and counting it reported a phantom orphan per correctly-named test.
+            is_js_test = bool(_JS_TEST_CALL_RE.search(stripped))
+            is_attributed_method = attributed_above and bool(_NAMED_TEST_DECL_RE.search(stripped))
+            attributed_above = False
+            # A method signature with no test attribute above it is a HELPER -- a constructor, a
+            # Dispose, a CreateClient factory. Measured on a real suite: counting those reported 4
+            # orphans in a file where every actual test was correctly named, which would have sent a
+            # redraft chasing an attribution problem that did not exist.
+            if not (is_js_test or is_attributed_method):
+                continue
+            if not (set(test_results.ac_ids_in_name(stripped)) & known):
+                unmatched += 1
+        if unmatched:
+            out[path] = unmatched
+    return out
 
 
 def depth_shortfalls(
@@ -547,9 +611,26 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
             content_dict=content_dict,
         )
         depth_report = {"counts_per_ac": counts, "ui_relevant": sorted(ui_relevant)}
+        # Attribution health, recorded whether or not the gate blocks. A criterion reported as
+        # untested while its file is full of tests nothing could attribute is a PARSE failure, and
+        # the feedback has to say so -- telling a model to "add tests for US-0001.1" when it already
+        # wrote five is how a stage burns its whole budget.
+        orphans = unattributed_tests(active_ac_ids, test_files)
+        if orphans:
+            depth_report["unattributed_tests"] = orphans
 
     if missing or tautological or depth_shortfall:
         reasons = []
+        if depth_report.get("unattributed_tests") and missing:
+            total_orphans = sum(depth_report["unattributed_tests"].values())
+            reasons.append(
+                f"ATTRIBUTION WARNING: {total_orphans} test declaration(s) carry no recognisable "
+                f"AC id ({', '.join(depth_report['unattributed_tests'])}). Criteria listed below as "
+                f"untested may in fact be tested by those. Every test must name its criterion in its "
+                f"own name (e.g. `Test_US_0001_2_...`, `TestUS00012...`, or `[US-0001.2] ...` in a "
+                f"Playwright title) -- a test that covers a criterion without naming it cannot be "
+                f"credited to it"
+            )
         if depth_shortfall:
             reasons.append(
                 "these ACs are not tested deeply enough: "
@@ -646,6 +727,41 @@ def _demo() -> None:
     assert id_variants("US-0001.2") == ["AC-0001.2", "AC00012", "AC_0001_2", "US-0001.2", "US00012", "US_0001_2"], (
         id_variants("US-0001.2")
     )
+
+    # --- attribution health: "could not read it" must never look like "nothing is there" --------
+    # A file whose tests all name their criterion: nothing unattributed.
+    named_ok = {"t/T.cs": "[Fact]\npublic void TestUS00011Works(){ Assert.True(x); }\n"}
+    assert unattributed_tests(["US-0001.1"], named_ok) == {}, unattributed_tests(["US-0001.1"], named_ok)
+
+    # The dangerous shape: three real tests, none naming a criterion. Without this the gate reports a
+    # confident "no test found covering US-0001.1" and the redraft is told to write tests that exist.
+    anonymous = {
+        "t/CounterTests.cs": (
+            "[Fact]\npublic void IncrementAddsOne(){ Assert.Equal(1, c.Value); }\n"
+            "[Fact]\npublic void DecrementSubtractsOne(){ Assert.Equal(0, c.Value); }\n"
+            "[Fact]\npublic void ResetReturnsToZero(){ Assert.Equal(0, c.Value); }\n"
+        )
+    }
+    orphans = unattributed_tests(["US-0001.1"], anonymous)
+    assert orphans == {"t/CounterTests.cs": 3}, orphans
+    # A criterion mentioned in ANOTHER criterion's test does not silence the warning for this one.
+    assert unattributed_tests(["US-0009.9"], named_ok) == {"t/T.cs": 1}
+    assert unattributed_tests([], {}) == {}
+
+    # Helpers are not tests. A constructor, a Dispose and a factory method all match the method
+    # signature pattern; counting them reported 4 orphans in a real suite where every test WAS
+    # correctly named, which would have sent a redraft chasing a problem that did not exist.
+    helpers_only = {
+        "t/T.cs": (
+            "public CounterTests(){ }\n"
+            "public void Dispose(){ }\n"
+            "private HttpClient CreateClient(){ return null; }\n"
+        )
+    }
+    assert unattributed_tests(["US-0001.1"], helpers_only) == {}, unattributed_tests(["US-0001.1"], helpers_only)
+    # A JS test call is name-bearing on its own, with no attribute line above it.
+    js_anon = {"t/x.spec.ts": "test('increments the counter', async () => {});\n"}
+    assert unattributed_tests(["US-0001.1"], js_anon) == {"t/x.spec.ts": 1}
 
     # --- anti-padding ---------------------------------------------------------------------------
     # Three tests, one assertion target: the same expression with a different literal each time.

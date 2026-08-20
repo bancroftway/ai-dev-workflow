@@ -45,7 +45,12 @@ import defusedxml.ElementTree as ET
 # requiring one would miss exactly the case this was written for. The cost is that a name like
 # `BUS00012` would match; crediting a criterion that is not there is a worse-than-ideal trade, but
 # strictly better than crediting nothing, and no real test name looks like that.
-_AC_IN_NAME_RE = re.compile(r"(?:US|AC)[-_]?(\d{4})[.\-_]?(\d+)(?!\d)", re.IGNORECASE)
+#
+# Separators are ANY run of non-alphanumerics (or none) on both sides of the story number, rather
+# than an enumerated set. Listing them is how this stayed broken: `[-_]?` handled
+# `TestUS00012Resolve` and `us-0001_2` but silently missed `US 0001.2` and `Test.US.0001.2.Works`,
+# and each miss reads as "this criterion has no tests" rather than as a parse failure.
+_AC_IN_NAME_RE = re.compile(r"(?:US|AC)[^A-Za-z0-9]{0,2}(\d{4})[^A-Za-z0-9]{0,2}(\d+)(?!\d)", re.IGNORECASE)
 
 
 def ac_ids_in_name(test_name: str) -> list[str]:
