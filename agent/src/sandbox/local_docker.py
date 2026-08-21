@@ -241,6 +241,11 @@ class LocalDockerProvider(SandboxProvider):
                 container_name,
                 "--label",
                 f"aidw.session={session_id}",
+                # Docker's default /dev/shm is 64MB; headless Chromium (playwright e2e) crashes
+                # pages under it -- observed live (s04 run 21): `page.goto: Page crashed` on an
+                # otherwise-healthy app, intermittently, exactly the documented shm-starvation
+                # signature. 1g matches Playwright's own docker guidance.
+                "--shm-size=1g",
                 "-p",
                 f"{host_port}:{_COPILOT_PORT_IN_CONTAINER}",
                 # Created on demand by Docker; nothing pre-provisions it. The container works

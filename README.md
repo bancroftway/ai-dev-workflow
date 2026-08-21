@@ -31,7 +31,7 @@ flowchart TD
     
     stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes quality+security+dedup+license findings (autopilot, write+bash)<br/>Gate: deterministic re-scan blocks any unexplained finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
     
-    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Boot the app, run playwright, harvest screenshots<br/>E2E fix loop; a failure records run_failure and routes INTO stage 8"]
+    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
     
     stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Closes the back half: audits finished repo vs approved Plan + wireframes<br/>Agent: adversarial-compliance-draft (read-only, full-repo review)<br/>Gate: deterministic claim-verification + fix prompt. Rebuild gate after."]
     
@@ -255,4 +255,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 2892faab063e6b6dc1b6f2b0a83fa9f68d126579152e482b14730b42f6389a7a -->
+<!-- graph-source-sha256: 6ee63c73fe94491568f70197f027efd43e9583882209fc48ff8e7fe2ad5261f3 -->

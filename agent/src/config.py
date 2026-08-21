@@ -19,11 +19,14 @@ TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFI
 # e2e's own bespoke-cluster caps (agent/src/e2e_nodes.py): fix-cycle cap (same shape as
 # rebuild.py's max_fix_cycles), app-boot readiness timeout, and the whole playwright suite's own
 # timeout (wrapped in `timeout <n>` so a hung suite can't wedge the sandbox forever).
-# 4, not 2: each e2e fix lap is one focused code change against named failing tests, and a real
-# app needs a few. Observed live (s04 run 13): 0/6 -> 4/6 in two laps -- steady convergence cut
-# off at the cap, the same failure shape that raised minimal-code-to-green's and
-# adversarial-compliance's budgets. A genuinely-stuck loop still burns out, two laps later.
-E2E_MAX_FIX_CYCLES = int(os.environ.get("E2E_MAX_FIX_CYCLES", "4"))
+# 8: the e2e loop's job is to FIX the app, not to exit early (user directive 2026-08-21) -- a
+# failing acceptance journey is a code bug, and escalating hands a human a broken app. Observed
+# live: 0/6 -> 4/6 in two laps (run 13), so real convergence spans many laps. The cap exists only
+# as a runaway backstop, not as an expected exit.
+E2E_MAX_FIX_CYCLES = int(os.environ.get("E2E_MAX_FIX_CYCLES", "8"))
+# Same philosophy for stable unit/integration-test regressions: repair in-pipeline, cap only as a
+# runaway backstop (see test_hardening_nodes.test_hardening_fix_node).
+TEST_HARDENING_MAX_FIX_CYCLES = int(os.environ.get("TEST_HARDENING_MAX_FIX_CYCLES", "4"))
 E2E_APP_READY_TIMEOUT_SECONDS = int(os.environ.get("E2E_APP_READY_TIMEOUT_SECONDS", "120"))
 E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "1200"))
 

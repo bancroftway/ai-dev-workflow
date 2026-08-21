@@ -26,7 +26,7 @@ from langchain_core.runnables import RunnableConfig
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, spec_ledger, stack_runner, test_results
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
-from .prompt_loader import load_prompt
+from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .schemas import StageReport
@@ -61,10 +61,11 @@ class TestHardeningState(TypedDict):
     flake_quarantine: dict[str, dict[str, Any]]  # test_name -> {ticket_id, title, narrative}
     last_exit_ok: bool
     cannot_verify: bool  # sandbox missing at run time -- the suite never ran, escalate not pass
+    fix_attempt: int  # stable-regression fix laps used (test_hardening_fix_node)
 
 
 def default_test_hardening_state() -> TestHardeningState:
-    return {"attempt": 0, "test_outcomes": {}, "stable_fail": [], "flaky": [], "flake_quarantine": {}, "last_exit_ok": False, "cannot_verify": False}
+    return {"attempt": 0, "fix_attempt": 0, "test_outcomes": {}, "stable_fail": [], "flaky": [], "flake_quarantine": {}, "last_exit_ok": False, "cannot_verify": False}
 
 
 # Moved to test_results.py: repo_scan's eval layer needs the same parsers, and three copies of
@@ -160,10 +161,54 @@ def make_test_hardening_route_after_run() -> Any:
         if test_hardening.get("last_exit_ok") and not test_hardening.get("test_outcomes"):
             return "triage"  # no test-command mapping for this stack -- nothing to gate on
         if test_hardening["stable_fail"]:
+            # The loop's job is to FIX the regression, not to end the run (user directive
+            # 2026-08-21) -- observed live: an e2e fix lap left a frontend api migration
+            # half-finished, 5 unit tests went stably red, and the run ended with nothing in the
+            # pipeline empowered to repair it. The cap keeps a truly-stuck loop bounded.
+            if test_hardening.get("fix_attempt", 0) < workflow_config.TEST_HARDENING_MAX_FIX_CYCLES:
+                return "fix"
             return "regression"
         return "triage"
 
     return route
+
+
+async def test_hardening_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    """One bounded repair lap for a STABLE test regression, mirroring e2e_fix_node: fresh Copilot
+    session per lap (a reused session's history eventually answers "already addressed" and edits
+    nothing -- measured on e2e's loop), autopilot write access, then back to run_tests for the
+    deterministic re-check."""
+    thread_id = config["configurable"]["thread_id"]
+    test_hardening = dict(state.get("test_hardening") or default_test_hardening_state())
+    if sandbox_registry.get(thread_id) is None:
+        return {"test_hardening": test_hardening}
+
+    provider = get_sandbox_provider()
+    system, template = load_prompt_pair("test_hardening_fix")
+    prompt = render_prompt(template, stable_fail_json=json.dumps(test_hardening.get("stable_fail") or [], indent=2))
+    model = get_chat_model_for_thread(
+        thread_id,
+        "test-hardening",
+        f"fix-{state.get('run_id', 'run')}-{test_hardening.get('fix_attempt', 0) + 1}",
+        github_token=os.environ.get("GITHUB_TOKEN"),
+        model_name=model_config.get_model_name("e2e", "draft") or model_config.get_model_name("minimal-code-to-green", "draft"),
+        sandbox=sandbox_registry.get(thread_id),
+        agent_mode="autopilot",
+    )
+    timed_out = ""
+    try:
+        await model.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+    except (TimeoutError, RuntimeError) as exc:  # a failed session is a failed lap, not a dead run -- e2e_fix's rule
+        timed_out = str(exc)
+        logger.warning("test-hardening fix lap lost to a Copilot session failure, counting the lap: %s", exc)
+
+    test_hardening["fix_attempt"] = test_hardening.get("fix_attempt", 0) + 1
+    entry: dict[str, Any] = {"stage": "test_hardening", "node": "fix", "attempt": test_hardening["fix_attempt"]}
+    if timed_out:
+        entry["timeout"] = timed_out
+    await repo_files.append_ledger_entry(provider, thread_id, entry)
+    await git_ops.commit_all(provider, thread_id, "ai-dev-workflow: test regression fix cycle")
+    return {"test_hardening": test_hardening}
 
 
 async def test_hardening_regression_gate_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:

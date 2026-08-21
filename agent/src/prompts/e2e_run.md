@@ -23,9 +23,14 @@ flag or environment variable the framework honours (`--port`, `PORT=`, `ASPNETCO
 confirm with your own eyes that the app answered on **<<requested_port>>** and no other port.
 
 Steps:
-1. Explore the tree and find the web application and how it is meant to be served. Prefer a
-   production-ish serve of an already-built app over a dev server with file watching, when the
-   repo supports both; build first if that is what the app requires.
+1. Explore the tree and find the web application and how it is meant to be served. Prefer the
+   app's DEVELOPMENT server (`npm run dev`, `ng serve`, `vite`, `next dev`, `dotnet run`) over a
+   production build+serve whenever the repo supports both. This suite exists to find and FIX
+   failures, and a production bundle minifies its errors into opaque codes ("Minified React error
+   #441") while the dev server names the failing component and line -- observed live: three fix
+   cycles were burned diagnosing a 500 the dev server would have explained in its first log line.
+   Production hardening is not what this stage tests. Use a production serve only when no dev
+   mode exists.
 2. PROVE it: start the app yourself in the background and poll until it answers, with
    `curl -s -o /dev/null -w '%{http_code}' http://localhost:<<requested_port>>`. ANY status code
    means the app is up -- including 404. Do NOT use `curl -sf`: `-f` makes curl exit non-zero on

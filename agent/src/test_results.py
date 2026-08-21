@@ -187,6 +187,14 @@ def parse_playwright_json(raw_json: str) -> dict[str, Any]:
                     passed += 1
                 else:
                     error = ((outcome.get("error") or {}).get("message")) or outcome.get("status") or "unknown failure"
+                    # A hung test's top-level message is just "Test timeout of 30000ms exceeded" --
+                    # the actionable part (WHICH awaited call hung, with a code frame pointing at
+                    # the spec line) lives in results[].errors[].message. Observed live: 8 fix laps
+                    # burned on two hanging journeys whose feedback never named the hanging call.
+                    for extra in outcome.get("errors") or []:
+                        frame = str((extra or {}).get("message") or "")
+                        if frame and frame not in error:
+                            error = f"{error}\n{frame}"
                     failed_tests.append({"title": title, "error": str(error)})
 
     if total == 0:

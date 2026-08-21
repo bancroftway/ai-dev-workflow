@@ -155,6 +155,15 @@ Three details are not stylistic -- get them wrong and the suite cannot run at al
   revision 1234 against an image holding 1237. This is the one dependency you should NOT let the
   package manager resolve to "latest".
 
+E2E specs may assert ONLY on contracted surfaces: `data-testid` locators and user-visible text/
+state. Never `page.waitForResponse`/`waitForRequest`/`page.route` with a URL or predicate -- the
+app's network shape (endpoint paths, query strings) is an implementation detail no stage has
+promised you, and a spec that guesses it hangs for its full timeout when the guess is wrong
+(observed live: a checkout journey died on a waitForResponse predicate across multiple fix
+cycles). To know an action completed, wait on its USER-VISIBLE effect with a web-first assertion
+(`await expect(page.getByTestId('book-row')).toContainText('On loan')`) -- these auto-retry, so
+no network synchronization is needed.
+
 Locate elements with **`data-testid`** via `page.getByTestId('expense-row')`, never by CSS class,
 DOM position, or visible text. Class names and copy change for cosmetic reasons and take the suite
 down with them; a test id is a contract. The stage that writes the UI is instructed to put a

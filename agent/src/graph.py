@@ -2249,9 +2249,15 @@ def _wire_p13(builder: StateGraph) -> None:
     builder.add_node("test_hardening_exit_check", test_hardening_nodes.test_hardening_exit_check_node)
     builder.add_node("test_hardening_exit_escalate", test_hardening_nodes.test_hardening_exit_escalate_node)
 
+    builder.add_node("test_hardening_fix", test_hardening_nodes.test_hardening_fix_node)
     builder.add_conditional_edges(
-        "test_hardening_run_tests", test_hardening_nodes.make_test_hardening_route_after_run(), {"regression": "test_hardening_regression_gate", "triage": "test_hardening_flake_triage"}
+        "test_hardening_run_tests",
+        test_hardening_nodes.make_test_hardening_route_after_run(),
+        {"regression": "test_hardening_regression_gate", "triage": "test_hardening_flake_triage", "fix": "test_hardening_fix"},
     )
+    # The fix lap loops back into the SAME deterministic re-run -- green is proven by the full
+    # suite (three identical attempts), never by the fix agent's word.
+    builder.add_edge("test_hardening_fix", "test_hardening_run_tests")
     # Routes INTO metrics-exit rather than END, for exactly the reason _wire_p14's docstring gives
     # for metrics regressions: "never END, so exit.md/manifest/session close still happen and exit's
     # verify blocks the merge". Ending here instead meant a test regression produced no exit report,

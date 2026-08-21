@@ -67,6 +67,20 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
         lines.extend(f"- {note}" for note in risk_notes)
         lines.append("")
 
+    # Link, don't inline: the wireframes are self-contained HTML files written by plan verify to
+    # plan/wireframes/<screen>.html (relative to this file's own .ai-dev-workflow/ home). Without
+    # this section they were invisible from the plan document -- present on the branch, referenced
+    # by the adversarial audit, and unfindable by a human reading 04-plan.md.
+    wireframes = content.get("wireframes") or []
+    if wireframes:
+        lines.append("## Wireframes")
+        lines.append("")
+        for wf in wireframes:
+            screen = str(wf.get("screen", "")).strip()
+            if screen:
+                lines.append(f"- [{screen}](plan/wireframes/{screen}.html)")
+        lines.append("")
+
     diagrams = content.get("diagrams") or []
     if diagrams:
         lines.append("## Diagrams")

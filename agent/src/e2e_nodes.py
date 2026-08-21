@@ -455,9 +455,15 @@ def _with_port_env(command: str, port: int, runtime: str) -> str:
     ASPNETCORE_URLS by any ASP.NET Core host -- whereas the flag spelling differs per framework and
     guessing it wrong is the brittleness this pipeline keeps removing.
     """
+    # `export VAR=..; cmd`, never a `VAR=.. cmd` prefix: proven/scanned commands routinely chain
+    # (`cd apps/web && next dev`), and a prefix assignment scopes to the FIRST word only -- the
+    # variable is gone after `&&`. Observed live (s04 run 18): API_BASE_URL was injected exactly
+    # this way, evaporated at the `&&`, and the app fell back to a dead default port -- every SSR
+    # render 500'd with {"code":"upstream-unavailable","message":"fetch failed"} while the API sat
+    # healthy on the port nobody told the app about.
     if runtime == "dotnet":
-        return f"ASPNETCORE_URLS=http://127.0.0.1:{port} {command}"
-    return f"PORT={port} {command}"
+        return f"export ASPNETCORE_URLS=http://127.0.0.1:{port}; {command}"
+    return f"export PORT={port}; {command}"
 
 
 # What the BROWSER saw, as text a model can read. A screenshot proved a real defect once -- a
@@ -476,7 +482,7 @@ const { chromium } = require("%(pw)s");
     browser = await chromium.launch();
     const page = await browser.newPage();
     page.on("console", m => { if (m.type() === "error") out.errors.push(m.text()); });
-    page.on("pageerror", e => out.errors.push("pageerror: " + e.message));
+    page.on("pageerror", e => out.errors.push("pageerror: " + (e.stack || e.message || String(e))));
     const resp = await page.goto(process.argv[2], { waitUntil: "load", timeout: 15000 })
       .catch(e => { out.errors.push("navigation failed: " + e.message); return null; });
     if (resp) out.status = resp.status();
@@ -634,6 +640,19 @@ def _report_path_for(config_dir: str) -> str:
     return "/".join([".."] * len(config_dir.split("/"))) + f"/{E2E_REPORT_PATH}"
 
 
+# Every e2e boot runs in DEBUG shape so failures are legible to the fix loop (user directive
+# 2026-08-21: the loop's job is to fix the app, and it cannot fix what it cannot read). Env-only on
+# purpose -- rewriting build commands per framework is brittle; each variable is that framework's
+# own documented switch and is inert where meaningless. ASP.NET's Development environment turns a
+# bare 500 into a developer exception page with the real stack. NODE_ENV is deliberately absent:
+# dev servers set their own, and forcing it corrupts a `next build`. The frontend half of
+# legibility (unminified React errors) comes from the launch prompt preferring dev servers.
+_DEBUG_BOOT_ENV = (
+    "ASPNETCORE_ENVIRONMENT=Development DOTNET_ENVIRONMENT=Development "
+    "ASPNETCORE_DETAILEDERRORS=true NEXT_TELEMETRY_DISABLED=1 FLASK_DEBUG=1 PYTHONUNBUFFERED=1"
+)
+
+
 async def _boot_process(
     provider: Any, thread_id: str, launch_command: str, log_path: str, pid_path: str, *, env_file: bool
 ) -> None:
@@ -658,6 +677,7 @@ async def _boot_process(
         # group. Killing the recorded pid alone left the real server (a child of the sh wrapper)
         # running -- which is how a previous attempt's dev server survived to hold port 3000.
         f"env -u COPILOT_SDK_AUTH_TOKEN -u COPILOT_CONNECTION_TOKEN -u GITHUB_TOKEN "
+        f"{_DEBUG_BOOT_ENV} "
         f"setsid nohup sh -c {shlex.quote(command)} > {shlex.quote(log_path)} 2>&1 & "
         f"echo $! > {shlex.quote(pid_path)}",
     )
@@ -848,10 +868,12 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # (a port nothing is listening on, since Python chose the API's port), every request fails, and
     # the suite reports a healthy app as broken.
     if service_urls:
-        api_env = " ".join(f"{name}={shlex.quote(service_urls[0])}" for name in await _api_env_names(provider, thread_id))
+        # export, not a prefix assignment -- see _with_port_env's comment: a `VAR=x cd .. && cmd`
+        # prefix dies at the `&&` and the app never hears about the API's real port.
+        api_env = "; ".join(f"export {name}={shlex.quote(service_urls[0])}" for name in await _api_env_names(provider, thread_id))
         if api_env:
             logger.info("e2e: pointing app env at booted service: %s", api_env)
-            start_command = f"{api_env} {start_command}"
+            start_command = f"{api_env}; {start_command}"
     await _boot_process(
         provider, thread_id, start_command, E2E_APP_LOG_PATH, E2E_APP_PID_PATH, env_file=use_env_file
     )
@@ -1096,10 +1118,16 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # Own session key (e2e:fix), not minimal-code-to-green's -- sharing that key would return its
     # cached session and bleed this loop's conversation across stages. Same codegen-tier model
     # fallback reasoning as rebuild.py/security_nodes.py's own fix nodes.
+    # FRESH session per lap (run_id + attempt in the key), never the cached thread:e2e:fix one.
+    # Observed live (s04 runs 13-17 on one thread): the reused session's conversation grew across
+    # every lap and resume until fix laps completed in ~30 seconds flat -- the model answering
+    # "already addressed" into a history that said so, editing nothing, eight laps in a row. A fix
+    # lap's context is its prompt: failing tests + app log; carrying prior laps' chatter provides
+    # nothing and eventually poisons the loop.
     model = get_chat_model_for_thread(
         thread_id,
         "e2e",
-        "fix",
+        f"fix-{state.get('run_id', 'run')}-{e2e.get('attempt', 0) + 1}",
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("e2e", "draft") or model_config.get_model_name("minimal-code-to-green", "draft"),
         sandbox=sandbox_registry.get(thread_id),
@@ -1113,9 +1141,13 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     timed_out = ""
     try:
         await model.ainvoke([SystemMessage(content=E2E_FIX_SYSTEM_PROMPT), HumanMessage(content=prompt)])
-    except TimeoutError as exc:
+    except (TimeoutError, RuntimeError) as exc:
+        # RuntimeError too: a Copilot session error (stream hiccup, quota) must cost one lap, not
+        # the whole run -- observed live (s04 run 22): an unhandled quota RuntimeError killed the
+        # process before the outcome JSON was even written. A permanent error still walks to the
+        # cap and escalates with a proper run_failure record.
         timed_out = str(exc)
-        logger.warning("e2e fix lap lost to a hung Copilot session, counting the lap: %s", exc)
+        logger.warning("e2e fix lap lost to a Copilot session failure, counting the lap: %s", exc)
 
     e2e["attempt"] = e2e.get("attempt", 0) + 1
     ledger_entry: dict[str, Any] = {"stage": "e2e", "node": "fix", "attempt": e2e["attempt"], "token_usage": model._last_usage}
