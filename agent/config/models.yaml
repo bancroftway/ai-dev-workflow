@@ -22,7 +22,12 @@ specification:
   draft_model: gpt-5.4-mini
   audit_model: gemini-3.6-flash
 plan:
-  draft_model: gpt-5.4-mini
+  # gpt-5.4 (not -mini): the plan draft is one large structured reply (steps + inline mermaid +
+  # wireframe HTML). Observed live (s04 lending-library, 2026-08-20): mini's output cap truncated
+  # the JSON at the same column on every attempt -- column 18354, ~4k tokens -- so all 3
+  # ainvoke_structured retries failed identically and the run died. Small scenarios fit under the
+  # cap; any moderate UI scenario does not.
+  draft_model: gpt-5.4
   audit_model: gemini-3.6-flash
 ac-to-tests:
   # gpt-5.3-codex: mini and plain gpt-5.4 both drafted structured metadata describing test files

@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import git_ops, model_config, repo_files, stack_runner
+from . import git_ops, model_config, repo_files, stack_runner, test_results
 from .copilot_chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -64,6 +65,69 @@ class RebuildSpec:
     next_node: str
 
 
+# Where the TDD-red gate's suite run tees its console output (same convention as the AC gate's
+# AC_TEST_OUTPUT_PATH; separate file so the two runs never clobber each other's evidence).
+_RED_GATE_OUTPUT_PATH = "agent-work/red-gate-output.txt"
+
+
+def red_gate_verdict(outcomes: dict[str, str]) -> tuple[bool, list[str], int]:
+    """(all_red, passing test names, failed count) over runner-reported outcomes. Pure.
+
+    Vacuous red is a FAIL: zero parsed outcomes means the suite never demonstrably ran, and "all
+    zero tests are failing" must not open the gate."""
+    passed = sorted(name for name, outcome in outcomes.items() if outcome == "pass")
+    failed = sum(1 for outcome in outcomes.values() if outcome == "fail")
+    return (not passed and failed > 0), passed, failed
+
+
+async def _verify_all_red(thread_id: str) -> tuple[bool, str]:
+    """Deterministic TDD-red gate: run the suite, parse the runners' own structured reports, and
+    require zero passing tests (and at least one failing). The scaffold fix node is INSTRUCTED to
+    keep tests failing at runtime; this is the check that stops an over-implemented scaffold --
+    an accidental green here means a test that will never have its "watch it fail" moment."""
+    from .gates.ac_coverage_gate import AcTestRunReport  # local: avoids import at module load
+
+    provider = get_sandbox_provider()
+    await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(_RED_GATE_OUTPUT_PATH)}")
+    report = await stack_runner.run_and_report(
+        thread_id,
+        stage_key="red-gate",
+        prompt_name="ac_test_run",
+        schema=AcTestRunReport,
+        output_path=_RED_GATE_OUTPUT_PATH,
+    )
+    outcomes: dict[str, str] = {}
+    for artifact in report.result_artifacts or []:
+        rel = test_results.repo_relative(artifact)
+        contents = await repo_files.read_repo_file(provider, thread_id, rel) if rel else None
+        if not contents:
+            continue
+        parsed = (
+            test_results.parse_trx(contents)
+            or test_results.parse_vitest_json(contents)
+            or test_results.playwright_outcomes(contents)
+        )
+        outcomes = test_results.merge_outcomes(outcomes, parsed)
+
+    all_red, passed, failed = red_gate_verdict(outcomes)
+    if not outcomes:
+        return False, (
+            "TDD-red gate: could not verify a single test outcome -- the suite run produced no "
+            f"parseable runner report ({report.error or 'no result_artifacts reported'}). Re-run "
+            "the suite with a machine-readable reporter (.trx / vitest-json / playwright-json); "
+            "the pipeline does not proceed until every test demonstrably FAILS."
+        )
+    if not all_red:
+        names = ", ".join(passed[:10]) + (f", and {len(passed) - 10} more" if len(passed) > 10 else "")
+        return False, (
+            f"TDD-red gate: {len(passed)} test(s) PASSED after scaffolding ({failed} failed): "
+            f"{names}. Scaffolding must not implement behavior -- strip those code paths back to "
+            "NotImplementedException-style stubs so every test fails at runtime; a test that "
+            "passes before the implementation stage proves nothing."
+        )
+    return True, f"TDD-red verified: 0 passed / {failed} failed."
+
+
 def make_rebuild_node(spec: RebuildSpec):
     async def rebuild_node(state: dict[str, Any], config) -> dict[str, Any]:
         thread_id = config["configurable"]["thread_id"]
@@ -98,15 +162,36 @@ def make_rebuild_node(spec: RebuildSpec):
         )
         build_ok = report.success and report.ok
 
+        # TDD-red gate, scaffold placement only: a green build is necessary but NOT sufficient --
+        # the suite must also RUN with zero passing tests before the implementation stage may
+        # start. A red-gate violation re-enters the same bounded fix loop (the fix prompt gets the
+        # passing test names via last_stderr_tail); at the cap the run ENDs with run_failure.
+        red_detail = ""
+        red_failed = False
+        # Only while the implementation stage has NOT yet run: on a resumed thread with
+        # minimal-code-to-green already approved, the suite is legitimately GREEN here -- observed
+        # live (s04 run 7): the red gate on a resume stripped the finished implementation back to
+        # stubs to satisfy all-red, mctg was hydrated-skipped, and test-hardening flagged the
+        # wreckage as a stable regression.
+        mctg_status = ((state.get("stages") or {}).get("minimal-code-to-green") or {}).get("status")
+        if build_ok and spec.fix_scope == "scaffold_only" and mctg_status != "approved":
+            red_ok, red_detail = await _verify_all_red(thread_id)
+            if not red_ok:
+                build_ok = False
+                red_failed = True
+
         rb["status"] = "clean" if build_ok else "failed"
         rb["last_exit_ok"] = build_ok
         rb["last_stdout_tail"] = (report.stdout_tail or "")[-4000:]
-        rb["last_stderr_tail"] = (report.stderr_tail or report.error or "")[-4000:]
+        # A red-gate violation replaces the (green) build's stderr as the fix node's feedback --
+        # the passing test names are the actionable part, not a clean compiler log.
+        rb["last_stderr_tail"] = (red_detail if red_failed else (report.stderr_tail or report.error or ""))[-4000:]
         rebuild[spec.key] = rb
 
-        await repo_files.append_ledger_entry(
-            provider, thread_id, {"stage": spec.key, "node": "rebuild", "ok": build_ok, "cycle": rb["fix_cycle_count"]}
-        )
+        ledger_entry: dict[str, Any] = {"stage": spec.key, "node": "rebuild", "ok": build_ok, "cycle": rb["fix_cycle_count"]}
+        if red_detail:
+            ledger_entry["red_gate"] = red_detail[:300]
+        await repo_files.append_ledger_entry(provider, thread_id, ledger_entry)
         if build_ok:
             # A green build is the checkpoint where the code-writing sessions' source changes
             # (codegen, fixes) become worth keeping -- the artifact-only commit sites never stage
@@ -211,3 +296,19 @@ def make_escalate_node(spec: RebuildSpec):
         return {"rebuild": rebuild, "run_failure": payload}
 
     return escalate_node
+
+
+def _demo() -> None:
+    """`cd agent && uv run python -m src.rebuild`."""
+    # Vacuous red is a FAIL: no parsed outcomes must not open the gate.
+    ok, passed, failed = red_gate_verdict({})
+    assert not ok and passed == [] and failed == 0
+    ok, _, failed = red_gate_verdict({"a": "fail", "b": "fail"})
+    assert ok and failed == 2
+    ok, passed, _ = red_gate_verdict({"a": "fail", "b": "pass"})
+    assert not ok and passed == ["b"]
+    print("rebuild red-gate self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

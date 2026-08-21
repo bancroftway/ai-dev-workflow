@@ -24,6 +24,13 @@ Rules that matter more than speed:
 - If a test the audit asks for genuinely cannot be written in this environment (it needs a service
   this sandbox does not have, say), write the nearest test that DOES prove the behaviour and explain
   the substitution.
+- **The e2e suite already PASSED against this tree -- do not un-pass it.** Every `data-testid` the
+  Playwright specs under `tests/e2e/` locate by is a contract: when you restructure UI toward the
+  wireframes, carry every existing `data-testid` onto the new structure (grep the specs for
+  `getByTestId` and check each one still resolves). Observed live: a conformance lap rewrote the
+  catalog screen, dropped `book-row`, and every one of 6 previously-green e2e tests failed -- the
+  wireframe got closer and the product broke. A conformance fix that breaks a passing test is a
+  REGRESSION; the suite you leave behind must be at least as green as the one you found.
 
 You have full write access to source and tests. After your changes, run the build and the affected
 tests yourself and confirm they pass for the right reason -- the audit runs again immediately after

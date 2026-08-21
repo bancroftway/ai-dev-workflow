@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -465,6 +466,18 @@ _SAFE_EXCLUSION_PATTERNS = {
 }
 
 
+# Files no model authored and no test can meaningfully cover: compiler/source-generator output
+# (observed live: System.Text.RegularExpressions.Generator's RegexGenerator.g.cs held the branch
+# aggregate at 88.9% while every authored file stood higher -- 12 verify laps burned on a
+# denominator the model could not touch). Same rule the scanners already apply to generated paths.
+_GENERATED_FILE_RE = re.compile(
+    r"(^|[/\\])(obj|bin|node_modules|\.next|dist|build)([/\\])"
+    r"|\.(g|g\.i|generated|designer)\.(cs|ts|js)$"
+    r"|\.d\.ts$",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class CoverageGap:
     file: str
@@ -508,17 +521,25 @@ def _parse_cobertura_counts(raw_xml: str) -> tuple[_Counts | None, str]:
         # case-sensitively made branch_lines ALWAYS empty on .NET, so every class scored a vacuous
         # 100% and gaps came back empty while the aggregate sat at 88% -- the model was told it
         # failed and handed nowhere to look, for six verify cycles.
-        branch_lines = [line for line in cls.iter("line") if (line.get("branch") or "").lower() == "true"]
         covered_branches = total_branches = 0
+        cls_lines_covered = cls_lines_total = 0
         uncovered_lines: list[str] = []
         # Coverlet emits each <line> TWICE -- once under its <method> and once in the class-level
         # <lines> block -- so counts and the reported line list are de-duplicated by line number.
         seen_lines: set[str] = set()
-        for line in branch_lines:
+        for line in cls.iter("line"):
             if (num := line.get("number")) is not None:
                 if num in seen_lines:
                     continue
                 seen_lines.add(num)
+            cls_lines_total += 1
+            try:
+                if int(line.get("hits", "0") or "0") > 0:
+                    cls_lines_covered += 1
+            except ValueError:
+                pass
+            if (line.get("branch") or "").lower() != "true":
+                continue
             # condition-coverage looks like: "50% (1/2)"
             match = re.search(r"\((\d+)/(\d+)\)", line.get("condition-coverage", ""))
             if not match:
@@ -528,15 +549,25 @@ def _parse_cobertura_counts(raw_xml: str) -> tuple[_Counts | None, str]:
             total_branches += total
             if hit < total and (number := line.get("number")) and number not in uncovered_lines:
                 uncovered_lines.append(number)
+        name = cls.get("filename", cls.get("name", "?"))
+        if _GENERATED_FILE_RE.search(name):
+            # Generated code is nobody's to cover: pull its contribution back OUT of the root
+            # aggregate (its per-line counts, deduped above) and never report it as a gap.
+            lc -= cls_lines_covered
+            lt -= cls_lines_total
+            bc -= covered_branches
+            bt -= total_branches
+            continue
         cls_branch_rate = (100.0 * covered_branches / total_branches) if total_branches else 100.0
         if cls_line_rate < MIN_COVERAGE_PERCENT or cls_branch_rate < MIN_COVERAGE_PERCENT:
-            name = cls.get("filename", cls.get("name", "?"))
             # Name the exact lines whose branches are only half-taken -- that is the actionable
             # part; a bare percentage tells the model nothing about which case it forgot to test.
             if uncovered_lines:
                 name = f"{name} (partially-covered branch lines: {', '.join(uncovered_lines[:20])})"
             gaps.append(CoverageGap(file=name, line_rate=cls_line_rate, branch_rate=cls_branch_rate))
-    return _Counts(lc, lt, bc, bt, gaps), ""
+    if lt <= 0:
+        return None, "every instrumented line is in generated code -- nothing authored was measured"
+    return _Counts(lc, lt, max(bc, 0), max(bt, 0), gaps), ""
 
 
 def _parse_istanbul_counts(raw: str) -> tuple[_Counts | None, str]:
@@ -950,11 +981,63 @@ async def verify_coverage(
             return VerificationResult(passed=False, feedback=depth[0], report={**report, **depth[1]})
         return VerificationResult(passed=True, feedback=f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) meets the {MIN_COVERAGE_PERCENT}% threshold.", report=report)
 
+    # Absolute deficit, not just rates: "88.0% vs 95%" reads as far away, "+7 branch sides" reads
+    # as one lap of work. Summed from the replay entries' own covered/total counts.
+    def _deficit(key: str) -> int | None:
+        covered = total = 0
+        for detail in entry_reports or []:
+            match = re.fullmatch(r"(\d+)/(\d+)", str(detail.get(key, "")))
+            if not match:
+                return None
+            covered += int(match.group(1))
+            total += int(match.group(2))
+        return max(0, math.ceil(MIN_COVERAGE_PERCENT / 100 * total) - covered) if total else None
+
+    line_deficit, branch_deficit = _deficit("lines"), _deficit("branches")
+
+    # Quote the SOURCE of every half-covered branch line. A bare line number sent the model
+    # re-reading coverage reports for laps; the line's own text shows immediately whether the miss
+    # is a testable other-side (write the test) or a defensive half no input can reach (delete it
+    # -- observed live: every branch stuck across 8 flat laps was a `??`/ternary fallback the
+    # code could never produce).
+    gap_snippets: list[str] = []
+    for gap in gaps[:6]:
+        anno = re.match(r"(.+?) \(partially-covered branch lines: ([0-9, ]+)\)$", gap.file)
+        if not anno:
+            continue
+        rel_name, nums = anno.group(1), [n.strip() for n in anno.group(2).split(",") if n.strip()][:6]
+        awk = (
+            f"awk -v ns={shlex.quote(','.join(nums))} "
+            "'BEGIN{split(ns,a,\",\"); for(i in a) want[a[i]]=1} (NR in want){printf \"    line %d: %s\\n\", NR, $0}'"
+        )
+        found = await provider.exec_in_sandbox(
+            thread_id,
+            "cd /workspace/repo && f=$(git ls-files -co --exclude-standard | grep -F "
+            + shlex.quote(rel_name)
+            + " | head -1) && [ -n \"$f\" ] && " + awk + " \"$f\"",
+        )
+        if (found.stdout or "").strip():
+            gap_snippets.append(f"  {rel_name}:\n{found.stdout.rstrip()}")
+    snippet_text = (
+        "\n\nThe exact half-covered branch lines:\n" + "\n".join(gap_snippets) + "\n\n"
+        "For each line above: write the test that makes the condition take its OTHER side -- or, "
+        "if no input can (a `??`/ternary fallback for a state your own code never produces), the "
+        "condition is dead: delete it."
+        if gap_snippets
+        else ""
+    )
+    deficit_text = (
+        f" To reach {MIN_COVERAGE_PERCENT}%: {line_deficit} more covered line(s) and "
+        f"{branch_deficit} more covered branch side(s)."
+        if line_deficit is not None and branch_deficit is not None
+        else ""
+    )
     return VerificationResult(
         passed=False,
         feedback=(
             f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) is below the "
-            f"{MIN_COVERAGE_PERCENT}% threshold. Files below threshold: {report['gaps']}\n\n"
+            f"{MIN_COVERAGE_PERCENT}% threshold.{deficit_text} "
+            f"Files below threshold: {report['gaps']}{snippet_text}\n\n"
             "These per-file rates say WHERE the gap is, not WHICH paths are missed -- do not guess "
             "at it. Run the coverage command yourself and read the detailed report (an lcov/HTML "
             "report, or the per-line hit counts in the cobertura XML / istanbul json), find the "
@@ -980,7 +1063,10 @@ async def verify_coverage(
             "Program.cs) is not unit-testable by construction; it is covered by in-process "
             "integration tests that boot the real app and drive it over HTTP -- ASP.NET Core's "
             "WebApplicationFactory<T>/TestServer, or this stack's equivalent. If the gap is in "
-            "wiring, add those tests rather than deleting it.\n"
+            "wiring, add those tests rather than deleting it. The factory hook is "
+            "`public partial class Program { }` with an EMPTY body -- a private constructor added "
+            "to Program is itself permanently-uncoverable lines (observed live: a 3-line private "
+            "ctor was the whole remaining Program.cs gap); if one exists, delete it.\n"
             "Pick per branch, say which you chose and why, then actually make the edit. Reporting "
             "that coverage is stuck without changing any source or test file is not a valid "
             "outcome for this stage."
@@ -1062,6 +1148,26 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert _counts.gaps, 'capital-T branch="True" was not recognised -- gaps came back empty'
     assert "16" in _counts.gaps[0].file and "25" not in _counts.gaps[0].file, _counts.gaps[0].file
     assert 74.0 < _counts.gaps[0].branch_rate < 76.0, _counts.gaps[0].branch_rate
+
+    # Generated code is excluded from the aggregate AND the gap list: a source-generator's .g.cs
+    # under obj/ (observed live holding branches at 88.9% while authored code stood higher) has its
+    # per-line contribution subtracted from the root counters.
+    _gen = """<coverage lines-covered="90" lines-valid="110" branches-covered="8" branches-valid="12">
+      <packages><package><classes>
+      <class name="Api.Isbn" filename="Services/IsbnValidator.cs" line-rate="1.0"><lines>
+      <line number="5" hits="1" branch="True" condition-coverage="100% (2/2)"/>
+      </lines></class>
+      <class name="Regex_g" filename="obj/Debug/net10.0/System.Text.RegularExpressions.Generator/RegexGenerator.g.cs" line-rate="0.5"><lines>
+      <line number="73" hits="1" branch="True" condition-coverage="50% (2/4)"/>
+      <line number="74" hits="0"/>
+      <line number="75" hits="1"/>
+      </lines></class>
+      </classes></package></packages></coverage>"""
+    _gc, _gerr = _parse_cobertura_counts(_gen)
+    assert _gerr == "" and _gc is not None, _gerr
+    assert (_gc.lines_covered, _gc.lines_total) == (88, 107), (_gc.lines_covered, _gc.lines_total)
+    assert (_gc.branches_covered, _gc.branches_total) == (6, 8), (_gc.branches_covered, _gc.branches_total)
+    assert all("RegexGenerator" not in g.file for g in _gc.gaps), _gc.gaps
 
     # Stack fidelity. The live nextjs-dotnet miss: Next.js declared, only C# delivered.
     assert missing_declared_frontend(

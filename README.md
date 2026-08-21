@@ -1,6 +1,6 @@
 # ai-dev-workflow
 
-A human-gated, LLM-driven software delivery pipeline built as a single [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Every stage drafts an artifact and runs a *deterministic* check (a real script or parse — never LLM self-attestation). Exactly three stages get an adversarial second-model audit (specification, plan, minimal-code-to-green); exactly two pause for a human by default (specification, plan), plus one narrow exception — a greenfield (no existing app) repository pauses once more at a tech-stack picker. Every other failure ENDs the run with a `run_failure` record instead of waiting on a person. All work happens inside a per-session sandbox container holding a clone of the target repo/branch.
+A human-gated, LLM-driven software delivery pipeline built as a single [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Every stage drafts an artifact and runs a *deterministic* check (a real script or parse — never LLM self-attestation). Exactly three stages get an adversarial second-model audit (specification, plan, minimal-code-to-green); exactly three pause for a human by default (tech-stack, specification, plan) — the tech-stack pause is skipped once a repo carries an approved sidecar, and a greenfield (no existing app) repository gets a stack picker at that same pause. Every other failure ENDs the run with a `run_failure` record instead of waiting on a person. All work happens inside a per-session sandbox container holding a clone of the target repo/branch.
 
 - Graph definition: [agent/src/graph.py](agent/src/graph.py)
 - Frontend (AG-UI / CopilotKit): [src/](src/)
@@ -10,7 +10,7 @@ A human-gated, LLM-driven software delivery pipeline built as a single [LangGrap
 
 ## The whole graph: 8-stage pipeline
 
-Clean sequential flow from intake through 8 stages, each integrating custom agents from agent files. Human pauses at specification and plan only. Deterministic gates at ac-to-tests, minimal-code-to-green, and metrics-exit gate on objective checks.
+Clean sequential flow from intake through 8 stages, each integrating custom agents from agent files. Human pauses at tech-stack, specification and plan. Every stage from specification onward carries a deterministic verify (spec ledger, plan diagrams, AC coverage, coverage-contract replay, remediation re-scan, adversarial claim-check, exit readiness) — never LLM self-attestation.
 
 ```mermaid
 flowchart TD
@@ -25,13 +25,15 @@ flowchart TD
     
     stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Gate: human approval + sign to APPROVALS.md"]
     
-    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red)<br/>Agent: ac-to-tests-draft (scaffold-only rebuild)<br/>Gate: write-scope + AC-coverage deterministic checks"]
+    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red)<br/>Agent: ac-to-tests-draft (scaffold-only rebuild)<br/>Gate: write-scope + AC-coverage deterministic checks<br/>Post-scaffold TDD-red gate: suite must RUN with zero passing tests"]
     
     stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
     
-    stage6["STAGE 6: REMEDIATION FLEET<br/>Consolidated: quality+security+dedup+license findings<br/>Triage-and-fix via: remediation-fix agent (autopilot)<br/>Parallel: finding-cluster-upgrade loop (verify-then-audit)<br/>Rebuild gate + jscpd re-check"]
+    stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes quality+security+dedup+license findings (autopilot, write+bash)<br/>Gate: deterministic re-scan blocks any unexplained finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
     
-    stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Audit full repo state + test hardening + E2E + wireframe conformance<br/>Agents: adversarial-audit-draft (full-repo review)<br/>test-hardening + e2e automated checks"]
+    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Boot the app, run playwright, harvest screenshots<br/>E2E fix loop; a failure records run_failure and routes INTO stage 8"]
+    
+    stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Closes the back half: audits finished repo vs approved Plan + wireframes<br/>Agent: adversarial-compliance-draft (read-only, full-repo review)<br/>Gate: deterministic claim-verification + fix prompt. Rebuild gate after."]
     
     stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan + coverage + traceability<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign"]
     
@@ -39,7 +41,7 @@ flowchart TD
     
     session --> intake --> scaffold --> stage1 --> stage2
     stage2 --> stage3 --> stage4 --> stage5
-    stage5 --> stage6 --> stage7 --> stage8 --> done
+    stage5 --> stage6 --> harden --> stage7 --> stage8 --> done
     
     scaffold -.->|suitable path| scaffold_fin --> stage1
     stage2 -.->|not ready| stage2
@@ -47,12 +49,16 @@ flowchart TD
     stage4 -.->|gate failure, 3 tries| stage4
     stage5 -.->|gate failure, 3 tries| stage5
     stage6 -.->|gate failure, 3 cycles| stage6
+    harden -.->|e2e fix loop| harden
+    stage7 -.->|gate failure, 6 tries| stage7
     stage8 -.->|regression gate failure, 1 rescan| stage8
     
     stage4 -.->|cap| done
     stage5 -.->|cap| done
     stage6 -.->|cap| done
+    stage7 -.->|cap| done
     stage8 -.->|cap| done
+    harden -.->|failure: run_failure recorded| stage8
 ```
 
 ## Every file this pipeline writes into a target repo
@@ -116,7 +122,7 @@ flowchart LR
     a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan and minimal-code-to-green<br/>configure one; every other stage goes<br/>straight from draft to verify/gate."]
     v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage."]
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves.<br/>Only specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
-    aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>proceed as if approved, skipping the audit."]
+    aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>skips the audit and the human gate —<br/>never the deterministic verify. Approval is<br/>persisted only after verify passes."]
     e["ESCALATE<br/>Verify cap exhausted. The run ENDs with<br/>run_failure recorded (ledger + commit + push).<br/>Never auto-approved past a failed<br/>deterministic gate. Counters reset for resubmit."]
     q(["Not ready: emit clarifying questions, end the run"])
 
@@ -129,7 +135,8 @@ flowchart LR
     v -->|failed at cap| e
     e --> theend(["END"])
     g --> next["next stage"]
-    aa --> next
+    aa -->|stage has a verify| v
+    aa -->|no verify| next
 ```
 
 Cross-cutting behavior that is not drawn above, because it happens in nearly every node: state is persisted to the sandbox repo and committed after each audit, verify and gate — and every successful commit is pushed to the single, repo-shared `ai-dev-workflow` work branch on origin (`--force-with-lease`, not plain `--force` — WS0's single-branch migration means every session/user on a repo shares this one branch, so a losing race is rejected instead of silently overwriting another session's already-pushed commits; a failed push is logged, surfaced in the UI via streamed `last_push` state, and never blocks the run). Generated source code is committed separately (`git add -A`) at every green rebuild and after each quality/security/dependency fix round, so the pushed branch always carries the code, not just the artifacts. Every LLM node appends a ledger entry with its token usage; a fresh run always re-enters at `intake`, abandoning any interrupt a previous run left open. Each of those code commits also kicks a display-only background full-profile scan, collected non-blocking at the next node boundary, so the metrics bar (including its running $ Cost chip, re-summed from the ledger) tracks the code as it churns instead of going stale between the gate scans — the gates' own scans stay authoritative.
@@ -248,4 +255,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 1914a95f93f135d80058738f5b830bdab76f49cea6cdb32773c7fa0dcda3ef65 -->
+<!-- graph-source-sha256: 2892faab063e6b6dc1b6f2b0a83fa9f68d126579152e482b14730b42f6389a7a -->

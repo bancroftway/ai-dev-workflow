@@ -303,16 +303,20 @@ def distinct_assertion_targets(ac_id: str, test_files: dict[str, str]) -> set[st
     return targets
 
 
-def _test_bodies(ac_id: str, test_files: dict[str, str]) -> list[str]:
-    """Each test body (as normalised text) belonging to tests that name this AC."""
-    bodies: list[str] = []
+def _tests_for_ac(ac_id: str, test_files: dict[str, str]) -> list[tuple[str, str]]:
+    """(label, normalised body) per test naming this AC. The label ("path :: decl line") exists so
+    a failed check can NAME the test to rewrite -- observed live: feedback that only counted
+    near-duplicates sent the model rewriting the Playwright spec for 6 laps while the duplicate
+    pair sat in the .NET unit file."""
+    tests: list[tuple[str, str]] = []
     variants = id_variants(ac_id)
-    for contents in test_files.values():
+    for path, contents in test_files.items():
         current: list[str] | None = None
+        decl = ""
         for line in contents.splitlines():
             if _TEST_DECL_RE.search(line):
                 if current:
-                    bodies.append("\n".join(current))
+                    tests.append((decl, "\n".join(current)))
                 if any(variant in line for variant in variants):
                     # Seed with whatever follows the opening brace, so a one-line test
                     # (`public void X(){ Assert.Equal(1, c.Value); }`) has a body at all -- without
@@ -321,13 +325,23 @@ def _test_bodies(ac_id: str, test_files: dict[str, str]) -> list[str]:
                     # two identical clones with different names stop looking like duplicates.
                     inline = line.split("{", 1)[1] if "{" in line else ""
                     current = [inline.strip()] if inline.strip() else []
+                    decl = f"{path} :: {line.strip()[:100]}"
                 else:
                     current = None
             elif current is not None:
                 current.append(line.strip())
         if current:
-            bodies.append("\n".join(current))
-    return [re.sub(r"\s+", " ", body).strip() for body in bodies if body.strip()]
+            tests.append((decl, "\n".join(current)))
+    return [
+        (decl, re.sub(r"\s+", " ", body).strip())
+        for decl, body in tests
+        if body.strip()
+    ]
+
+
+def _test_bodies(ac_id: str, test_files: dict[str, str]) -> list[str]:
+    """Each test body (as normalised text) belonging to tests that name this AC."""
+    return [body for _, body in _tests_for_ac(ac_id, test_files)]
 
 
 def asserting_test_count(ac_id: str, test_files: dict[str, str]) -> int:
@@ -349,15 +363,62 @@ def duplicate_test_bodies(ac_id: str, test_files: dict[str, str]) -> int:
     difflib rather than jscpd: jscpd runs in the sandbox over the whole repo and reports a repo-wide
     percentage, which cannot answer "are THIS criterion's three tests actually three tests".
     """
-    bodies = _test_bodies(ac_id, test_files)
-    duplicates = 0
-    kept: list[str] = []
-    for body in bodies:
-        if any(SequenceMatcher(None, body, seen).ratio() >= MAX_TEST_BODY_SIMILARITY for seen in kept):
-            duplicates += 1
+    return len(duplicate_test_pairs(ac_id, test_files))
+
+
+def duplicate_test_pairs(ac_id: str, test_files: dict[str, str]) -> list[tuple[str, str]]:
+    """(duplicate test label, original test label) per near-duplicate, so feedback names both."""
+    pairs: list[tuple[str, str]] = []
+    kept: list[tuple[str, str]] = []
+    for decl, body in _tests_for_ac(ac_id, test_files):
+        original = next(
+            (k_decl for k_decl, k_body in kept
+             if SequenceMatcher(None, body, k_body).ratio() >= MAX_TEST_BODY_SIMILARITY),
+            None,
+        )
+        if original is not None:
+            pairs.append((decl, original))
         else:
-            kept.append(body)
-    return duplicates
+            kept.append((decl, body))
+    return pairs
+
+
+# A fiat-failure call: an assertion that fails unconditionally. Full-call patterns, case-sensitive
+# on each language's own keyword casing, so a REAL assertion whose message merely mentions "false"
+# is not caught.
+_FIAT_FAIL_RE = re.compile(
+    r"Assert\s*\.\s*(?:Is)?True\(\s*false\b[^)]*\)"      # xunit/nunit/mstest Assert.True(false, ...)
+    r"|Assert\s*\.\s*Fail\s*\("                          # Assert.Fail("not implemented")
+    r"|expect\(\s*true\s*\)\s*\.\s*toBe\(\s*false\s*\)"  # jest/vitest fiat
+    r"|\b(?:expect|assert)\s*\.\s*fail\s*\("             # chai/node/vitest expect.fail()
+    r"|pytest\s*\.\s*fail\s*\("                          # pytest.fail("...")
+    r"|(?<![\w.])assert\s+False\b"                       # bare python assert False
+)
+
+
+def fiat_stub_tests(ac_id: str, test_files: dict[str, str]) -> int:
+    """How many of this AC's tests fail by fiat -- their only assertion is an unconditional failure.
+
+    Distinct from the assertion-FREE stub asserting_test_count already tolerates: an empty skeleton
+    is the documented RED-phase form, while `Assert.True(false, "RED: ...")` is red paint -- it makes
+    the suite fail without encoding any behavior, pads the depth counts, and (being a one-liner)
+    trips the near-duplicate check with feedback the drafting model has proven unable to act on
+    (observed live: 96 fiat stubs, 6 laps burned re-wording two stub messages). A body with at
+    least one real assertion alongside a fiat one is NOT counted -- e.g. Assert.Fail inside a catch
+    block guarding a genuine act-assert path.
+    """
+    return len(fiat_stub_labels(ac_id, test_files))
+
+
+def fiat_stub_labels(ac_id: str, test_files: dict[str, str]) -> list[str]:
+    """The fiat-failing tests' labels ("path :: decl line"), so feedback names what to rewrite."""
+    labels: list[str] = []
+    for decl, body in _tests_for_ac(ac_id, test_files):
+        if not _FIAT_FAIL_RE.search(body):
+            continue
+        if not _ASSERTION_RE.search(_FIAT_FAIL_RE.sub("", body)):
+            labels.append(decl)
+    return labels
 
 
 def category_spread(content_dict: dict[str, Any], ac_id: str) -> set[str]:
@@ -487,6 +548,22 @@ def depth_shortfalls(
         if ac in ui_relevant and per_level["e2e"] < 1:
             problems.append("no end-to-end test, and this criterion is user-facing")
 
+        # Fiat-failure stubs are named FIRST and directly: they are what the model actually writes
+        # when it wants red without work, and letting them fall through to the near-duplicate check
+        # produces feedback about similarity the model answers by re-wording messages forever.
+        if test_files:
+            stub_labels = fiat_stub_labels(ac, test_files)
+            if stub_labels:
+                named = "; ".join(stub_labels[:3]) + (
+                    f"; and {len(stub_labels) - 3} more" if len(stub_labels) > 3 else ""
+                )
+                problems.append(
+                    f"{len(stub_labels)} of its test(s) fail by fiat (Assert.True(false) / "
+                    f"Assert.Fail / expect(true).toBe(false) placeholder bodies): {named} -- "
+                    "write the real arrange-act-assert against the not-yet-existing API instead; "
+                    "a compile or module-resolution failure is the expected RED signal at this stage"
+                )
+
         # Anti-padding, only where there are tests to inspect: an AC with no tests already failed
         # above, and reporting "0 distinct assertions" alongside that is noise.
         # Counted over tests that ACTUALLY ASSERT, not all tests: RED-phase stubs assert nothing by
@@ -500,11 +577,15 @@ def depth_shortfalls(
                     f"target(s) (need {MIN_DISTINCT_ASSERTIONS_PER_AC}) -- tests asserting the same "
                     f"expression with a different literal are one test, not several"
                 )
-            duplicates = duplicate_test_bodies(ac, test_files)
-            if duplicates:
+            pairs = duplicate_test_pairs(ac, test_files)
+            if pairs:
+                named = "; ".join(f"'{dup}' duplicates '{orig}'" for dup, orig in pairs[:3]) + (
+                    f"; and {len(pairs) - 3} more" if len(pairs) > 3 else ""
+                )
                 problems.append(
-                    f"{duplicates} of its test(s) are near-duplicate bodies of another test for the "
-                    f"same criterion (>= {int(MAX_TEST_BODY_SIMILARITY * 100)}% similar)"
+                    f"{len(pairs)} of its test(s) are near-duplicate bodies of another test for the "
+                    f"same criterion (>= {int(MAX_TEST_BODY_SIMILARITY * 100)}% similar): {named} -- "
+                    "rewrite the named duplicate to assert a different observable behavior"
                 )
 
         if content_dict is not None and total_tests > 0:
@@ -784,6 +865,38 @@ def _demo() -> None:
         {"ac_id": "US-0002.1", "ui_relevant": False},
     ]}}
     assert _ui_relevant_ac_ids(plan, ["US-0001.1", "US-0002.1"]) == {"US-0001.1"}
+
+    # Fiat-failure stubs are named directly (the real 2026-08-20 shape: DisplayName attribute line,
+    # method on the next, body only Assert.True(false, ...)). A real test alongside is untouched,
+    # and a fiat call guarding a genuine assertion does not make a test a stub.
+    fiat_files = {
+        "apps/api.Tests/tests/T.cs": (
+            '[Fact(DisplayName = "[US-0006.1] borrower summary lists books")]\n'
+            "public void US_0006_1_Lists() {\n"
+            '    Assert.True(false, "RED: not implemented yet.");\n'
+            "}\n"
+            '[Fact(DisplayName = "[US-0006.1] returned books excluded")]\n'
+            "public void US_0006_1_Excluded() {\n"
+            "    var summary = service.Summarize(borrower);\n"
+            "    Assert.Empty(summary.ActiveLoans);\n"
+            '    if (wrong) Assert.Fail("unreachable");\n'
+            "}\n"
+        )
+    }
+    labels = fiat_stub_labels("US-0006.1", fiat_files)
+    assert len(labels) == 1 and "US_0006_1_Lists" in labels[0], labels
+
+    # Near-duplicate pairs carry both names, so the feedback points at the exact tests to rewrite --
+    # count-only feedback sent a live run rewriting the Playwright spec for 6 laps while the
+    # duplicate pair sat in the .NET unit file.
+    dup_files = {
+        "apps/api.Tests/tests/D.cs": (
+            "[Fact] public void US_0007_1_A(){ var r = svc.Add(book); Assert.Equal(1, r.Count); }\n"
+            "[Fact] public void US_0007_1_B(){ var r = svc.Add(book); Assert.Equal(1, r.Count); }\n"
+        )
+    }
+    pairs = duplicate_test_pairs("US-0007.1", dup_files)
+    assert len(pairs) == 1 and "US_0007_1_B" in pairs[0][0] and "US_0007_1_A" in pairs[0][1], pairs
 
     # The .NET shape this pipeline actually generates: `[Fact]` on one line, the criterion id inside
     # a PascalCase method name on the next, with all punctuation stripped. Every part of this was

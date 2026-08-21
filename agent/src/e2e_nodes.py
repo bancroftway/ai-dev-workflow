@@ -354,7 +354,16 @@ def _candidate_class(candidate: dict[str, Any]) -> str:
 # stop what it starts and does not always comply) can leave holding a port. Killed before booting:
 # observed live, a leftover `next dev` from an earlier attempt made Next.js pick port 3002 instead of
 # 3000 while the readiness probe watched 3000, so a perfectly healthy app read as "never answered".
-_STALE_APP_PATTERNS = ("next dev", "next start", "npm run dev", "vite", "ng serve", "dotnet run", "uvicorn", "flask run")
+# "next-server" and "dotnet exec"/"bin/Debug": the LISTENERS, not just the wrappers. `next start`
+# rewrites its child's title to `next-server (v15...)` and `dotnet run` spawns `dotnet exec
+# .../bin/Debug/.../Api.dll` -- sweeping only the wrapper text killed npm/sh and left the actual
+# port-holder alive, so every later boot died EADDRINUSE against a server running the PREVIOUS
+# lap's broken build (observed live, s04 run 12: three e2e fix laps all "failed" against a stale
+# 500 the fixes had already cured on disk).
+_STALE_APP_PATTERNS = (
+    "next dev", "next start", "next-server", "npm run dev", "vite", "ng serve",
+    "dotnet run", "dotnet exec", "bin/Debug", "uvicorn", "flask run",
+)
 
 
 # Port 3000 is NOT available in this sandbox: the Copilot headless server itself listens there
@@ -1096,12 +1105,23 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         sandbox=sandbox_registry.get(thread_id),
         agent_mode="autopilot",
     )
-    await model.ainvoke([SystemMessage(content=E2E_FIX_SYSTEM_PROMPT), HumanMessage(content=prompt)])
+    # A hung Copilot session is a FAILED FIX LAP, not a dead run: unhandled, this timeout killed a
+    # 50-minute otherwise-healthy run at its second-to-last stage (observed live, s04 run 11 --
+    # "Copilot session silent for 300s (stage=e2e role=fix)"). The lap is still counted, so a
+    # permanently-hung model walks to the cap and escalates with run_failure like any other
+    # unfixable e2e failure; the next e2e_run simply re-tests whatever (possibly nothing) changed.
+    timed_out = ""
+    try:
+        await model.ainvoke([SystemMessage(content=E2E_FIX_SYSTEM_PROMPT), HumanMessage(content=prompt)])
+    except TimeoutError as exc:
+        timed_out = str(exc)
+        logger.warning("e2e fix lap lost to a hung Copilot session, counting the lap: %s", exc)
 
     e2e["attempt"] = e2e.get("attempt", 0) + 1
-    await repo_files.append_ledger_entry(
-        provider, thread_id, {"stage": "e2e", "node": "fix", "attempt": e2e["attempt"], "token_usage": model._last_usage}
-    )
+    ledger_entry: dict[str, Any] = {"stage": "e2e", "node": "fix", "attempt": e2e["attempt"], "token_usage": model._last_usage}
+    if timed_out:
+        ledger_entry["timeout"] = timed_out
+    await repo_files.append_ledger_entry(provider, thread_id, ledger_entry)
     await git_ops.commit_all(provider, thread_id, "ai-dev-workflow: e2e fix cycle")
     return {"e2e": e2e}
 

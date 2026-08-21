@@ -200,7 +200,11 @@ or `*.spec.ts(x)`; `vitest.config.ts` and `playwright.config.ts`; any `*.Tests/`
 the sandbox's baked test runners instead of adding dependencies. Never touch production source code,
 even to make a test compile; if a test needs a symbol that doesn't exist yet, that's expected and
 correct at this stage (a later, separate stage adds minimal scaffolding to make it compile without
-making it pass).
+making it pass). For the same reason, NEVER write a body that fails by fiat -- `Assert.True(false,
+...)`, `Assert.Fail(...)`, `expect(true).toBe(false)`, `pytest.fail(...)` placeholders are blocked
+by a Python check: they prove nothing about the criterion, and a file of them collapses into
+near-duplicate bodies. Write the real arrange-act-assert calling the API the plan promises; the
+compile or module-resolution failure it causes IS the RED signal this stage exists to produce.
 
 If you write or edit a `playwright.config.*`, its `use` block MUST set `screenshot: 'on'` -- a
 passing e2e suite must still capture visual evidence (the exit report requires screenshots for UI

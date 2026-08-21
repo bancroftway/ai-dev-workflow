@@ -54,6 +54,28 @@ end-to-end specs under `tests/e2e/` (so a unit runner can exclude them -- they c
 by vitest/jest), and never install coverage packages into the repo. Coverage is measured from real
 report files, so the way to pass this gate is genuinely-tested code, not configuration.
 
+**Write-side branch discipline -- this is what "minimal" means:** every branch you write must be
+demanded by a failing test. Do not write defensive fallbacks for states your own code cannot
+produce: `result.Error ?? "request-failed"` when the service always sets Error alongside a null
+result, a config-path ternary no test configures, a `Deserialize(...) ?? CreateInitial()` for a
+file only your code writes. Each such half is a branch NO test can cover, and the coverage gate
+counts it against you (observed live: a run plateaued at 93.6% branches for 8 laps -- every stuck
+branch was a `??` or ternary half the code could never reach). You control both sides here: the
+minimal implementation has no unreachable halves.
+
+When you are on a coverage-gap retry lap, two rules (both observed burning a live run that
+plateaued 1 branch short of the threshold for 4 straight laps):
+
+- **Coverage work is ADDITIVE.** Never rewrite or delete an existing passing test while closing a
+  gap -- add the missing case beside it. A live run oscillated 89 -> 85 -> 87 -> 85 covered
+  branches because each lap rewrote the suite and lost branches the previous lap had won.
+- **A condition no input can make take its other side is DEAD CODE -- delete the condition, do not
+  keep writing tests at it.** The live example: `checkDigit is >= 0 and <= 10` where checkDigit is
+  0..10 by construction three lines earlier; no test can ever falsify it, and the only correct
+  move is removing the redundant guard (the earlier validation already enforces it). Trace where
+  the value comes from; if every producer already guarantees the range, the guard is unreachable
+  and its uncovered half will never close. Deleting dead conditions IS minimal code to green.
+
 ## Install CURRENT dependency versions, never a version you remember
 
 When you add a dependency, let the package manager resolve the current release -- `npm install next`

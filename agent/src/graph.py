@@ -1087,7 +1087,13 @@ STAGES: list[StageSpec] = [
             "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
         },
         deterministic_verify=adversarial_gate.verify_adversarial_compliance,
-        max_verify_cycles=3,
+        # 6, not 3: this stage's fix laps carry the whole back-half workload (wireframe
+        # conformance, negative-path e2e specs, frontend unit tests) and each lap is ~8 minutes of
+        # real multi-file work. Observed live (s04 run 6): 3 laps all made measurable progress --
+        # the audit's own findings went from absent panels to "closer now, still not full match" --
+        # and the run was cut off mid-convergence, same failure shape that moved
+        # minimal-code-to-green from 6 to 12.
+        max_verify_cycles=6,
         verify_fix_prompt="adversarial_compliance_fix",
     ),
     StageSpec(
