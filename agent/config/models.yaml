@@ -75,7 +75,11 @@ adversarial-compliance:
   fix_model: gpt-5.4
   draft_model: gpt-5.4
 metrics-exit:
-  draft_model: gpt-5.4-mini
+  # Not mini: this turn reads the run's metrics, ledger and diff and writes the whole merge-readiness
+  # report + PR description, and it has a required skill to invoke first. Observed live (thread
+  # 70bbfc95, otherwise-complete run, every earlier stage approved): the mini session went silent and
+  # the run died with `TimeoutError: Copilot session silent for 300s (stage=metrics-exit role=draft)`.
+  draft_model: gpt-5.4
 session-title:
   # One short sentence in, one short phrase out -- the cheapest tier is plenty.
   draft_model: gpt-5.4-mini

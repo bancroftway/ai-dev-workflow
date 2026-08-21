@@ -1996,11 +1996,22 @@ def make_auto_approve_node(stage_spec: StageSpec) -> Callable[[GraphState, Runna
         stages[stage_spec.key] = stage
 
         thread_id = config["configurable"]["thread_id"]
-        await _persist_if_sandboxed(
-            thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} auto-approved (safety cap)"
-        )
-
-        await _run_post_approve_hook(stage_spec, thread_id, stage["approved_content"], state)
+        # A verify-bearing stage's approval is NOT persisted here, because it hasn't passed
+        # anything yet: this node runs BEFORE the deterministic verify (build_graph wires
+        # auto_approve -> verify), and gate_node persists the same approval on the pass edge. The
+        # in-memory status is only what routing needs. Persisting it early wrote an unverified
+        # approval to the branch, and that file is what the NEXT run hydrates -- intake clears
+        # last_verification, so should_skip_draft's failed-verification guard cannot see the
+        # rejection and the stage is skipped as "already approved" forever. Observed live
+        # (bookmarks/nextjs-dotnet, thread 70bbfc95): ac-to-tests hit its clarification cap with
+        # `{coverage_plan: [], test_files: [], summary: "No test files were written in this turn."}`,
+        # committed it as "auto-approved (safety cap)", failed its verify -- and every later resume
+        # hydrated that empty suite and wrote production code against zero tests.
+        if stage_spec.deterministic_verify is None:
+            await _persist_if_sandboxed(
+                thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} auto-approved (safety cap)"
+            )
+            await _run_post_approve_hook(stage_spec, thread_id, stage["approved_content"], state)
         return {"stages": stages, "last_push": git_ops.get_last_push(thread_id)}
 
     return auto_approve_node
@@ -2681,6 +2692,39 @@ def _demo() -> None:
     assert not should_skip_draft(
         {"status": "needs_clarification", "approved_content": None, "last_verification": None}
     ), "an escalated stage must be redrafted on the next run, not skipped as approved"
+
+    # The other half of that bug: auto_approve (clarification cap) used to COMMIT its approval to
+    # the branch before verify had run, and that committed file is what the next run hydrates. A
+    # verify-bearing stage must leave nothing on disk until it passes; a stage with no verify still
+    # has to persist, since nothing downstream would.
+    import asyncio
+
+    persisted: list[str] = []
+
+    async def _record_persist(thread_id, state, stages, message):  # noqa: ANN001, ANN202
+        persisted.append(message)
+
+    async def _skip_hook(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        return None
+
+    real_persist, real_hook = _persist_if_sandboxed, _run_post_approve_hook
+    globals()["_persist_if_sandboxed"] = _record_persist
+    globals()["_run_post_approve_hook"] = _skip_hook
+    try:
+        by_key = {spec.key: spec for spec in STAGES}
+        for spec, expect_persist in ((by_key["ac-to-tests"], False), (by_key["tech-stack"], True)):
+            persisted.clear()
+            demo_state = {"stages": {spec.key: {**default_stage_state(), "draft": {"x": 1}}}}
+            asyncio.run(
+                make_auto_approve_node(spec)(demo_state, {"configurable": {"thread_id": "demo-thread"}})  # type: ignore[arg-type]
+            )
+            assert bool(persisted) is expect_persist, (
+                f"{spec.key}: auto_approve persisted={bool(persisted)}, expected {expect_persist} "
+                "(a verify-bearing stage's unverified approval must never reach the branch)"
+            )
+    finally:
+        globals()["_persist_if_sandboxed"] = real_persist
+        globals()["_run_post_approve_hook"] = real_hook
 
     build_graph()  # runs assert_pipeline_nodes_registered + assert_no_dead_clusters
     assert_no_stub_stages()

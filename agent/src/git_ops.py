@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import logging
 import shlex
 import uuid
@@ -312,6 +313,51 @@ _GITIGNORE_ENTRIES = (
     "*.user",
 )
 _GITIGNORE_HEADER = "# Managed by ai-dev-workflow: build output and scratch must not reach the review branch."
+# Suffixes a stage plausibly AUTHORED: source, and the manifests/configs that declare a project.
+# Deliberately generous -- a false "authored" costs one over-specific ignore entry, a false
+# "generated" silently deletes a whole app tree from the branch.
+_AUTHORED_SUFFIXES = (
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro",
+    ".py", ".cs", ".fs", ".vb", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".swift",
+    ".razor", ".cshtml", ".html", ".css", ".scss", ".sass", ".sql", ".sh", ".md",
+    ".yml", ".yaml", ".toml", ".ini", ".cfg",
+    ".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".props", ".targets",
+)
+# `.json` is NOT a suffix above on purpose: half the JSON in a built tree is toolchain output
+# (`test-results-0.json`, `coverage-summary.json`, `*.nuget.g.props` siblings). These names are the
+# authored ones -- a project manifest, a lockfile that belongs in review, a settings file.
+_AUTHORED_NAMES = (
+    "package.json", "package-lock.json", "tsconfig*.json", "jsconfig*.json", "appsettings*.json",
+    "angular.json", "nx.json", "turbo.json", "global.json", "nuget.config", "composer.json",
+    "deno.json", "requirements*.txt", "*.lock", "Dockerfile*", "Makefile",
+    # Dot-files and per-stack odds and ends a stage legitimately writes. Observed live on the run
+    # right after the collapse fix: `apps/web/.gitignore`, `apps/api/api.http` and
+    # `apps/api/Properties/` (launchSettings.json) were still "detected as generated" and kept out
+    # of the branch -- the app the reviewer sees must contain everything the stage actually wrote.
+    ".gitignore", ".gitattributes", ".dockerignore", ".editorconfig", ".npmrc", ".nvmrc",
+    "*.env.example", "*.http", "launchSettings.json", "*.csx", "*.ps1", "*.bat",
+)
+_GENERATED_DIR_NAMES = frozenset(entry.strip("/") for entry in _GITIGNORE_ENTRIES if entry.endswith("/"))
+_GENERATED_FILE_PATTERNS = tuple(entry for entry in _GITIGNORE_ENTRIES if not entry.endswith("/"))
+
+
+def _looks_authored(path: str) -> bool:
+    """Whether this path is source/manifest a stage could have written (never toolchain output).
+
+    Extension alone is not enough in either direction: a build directory is full of `.js` and
+    `.json` (`.next/server/app/page.js`, `obj/project.assets.json`). So anything living UNDER a
+    known output directory is generated whatever it is named -- the static ignore list already
+    enumerates those directories, so this reuses it rather than growing a second list.
+    """
+    segments = path.split("/")
+    if any(segment in _GENERATED_DIR_NAMES for segment in segments[:-1]):
+        return False
+    name = segments[-1]
+    if any(fnmatch.fnmatch(name, pattern) for pattern in _GENERATED_FILE_PATTERNS):
+        return False
+    if path.lower().endswith(_AUTHORED_SUFFIXES):
+        return True
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _AUTHORED_NAMES)
 _GITIGNORE_ENSURED: set[str] = set()
 
 
@@ -344,10 +390,34 @@ def generated_ignore_entries(untracked: list[str], tracked: list[str]) -> list[s
         for i in range(1, len(parts)):
             tracked_dirs.add("/".join(parts[:i]))
 
+    # Directories that still hold an AUTHORED untracked file. The docstring's premise -- "by the
+    # time the app has been built, every authored file is already committed" -- is false for the one
+    # stage that matters: minimal-code-to-green writes a whole app tree and nothing commits it until
+    # the rebuild node runs, so the collapse below would ignore that tree wholesale. Observed live
+    # (nextjs-dotnet, thread 70bbfc95): `apps/` held one tracked file (Directory.Build.props from
+    # scaffold), so the brand-new `apps/web/` and `apps/api.Tests/` collapsed to exactly those two
+    # ignore entries -- the frontend was never committed, the coverage gate reported
+    # "declared_frontend_missing", and the stage burned all 12 laps rebuilding a tree the gate could
+    # not see. So authored files are never ignored, and the collapse walks DOWN past any directory
+    # that holds one (`apps/web/` -> `apps/web/.next/`).
+    authored_dirs: set[str] = set()
+    for path in untracked:
+        clean = path.strip().strip("/")
+        if not _looks_authored(clean):
+            continue
+        parts = clean.split("/")
+        for i in range(1, len(parts)):
+            authored_dirs.add("/".join(parts[:i]))
+
     entries: set[str] = set()
     for path in untracked:
         clean = path.strip().strip("/")
-        if not clean or clean.startswith(".ai-dev-workflow"):
+        # `.gitignore` is this function's own output file. It is untracked on the first pass, sits at
+        # the repo root next to tracked files, and so used to be "detected as generated" and added to
+        # itself -- observed live, line 23 of the branch's own .gitignore was `.gitignore`.
+        if not clean or clean.startswith(".ai-dev-workflow") or clean == ".gitignore":
+            continue
+        if _looks_authored(clean):
             continue
         parts = clean.split("/")
         # Deepest ancestor that holds tracked files; the entry is the one segment below it.
@@ -358,8 +428,13 @@ def generated_ignore_entries(untracked: list[str], tracked: list[str]) -> list[s
         if deepest == -1:
             entries.add(clean)  # nothing committed anywhere above it -- ignore the file only
             continue
-        below = "/".join(parts[: deepest + 1])
-        entries.add(clean if below == clean else f"{below}/")
+        for i in range(deepest + 1, len(parts)):
+            candidate = "/".join(parts[:i])
+            if candidate not in authored_dirs:
+                entries.add(candidate if candidate == clean else f"{candidate}/")
+                break
+        else:
+            entries.add(clean)  # every directory above it holds authored work -- ignore this file only
     return sorted(entries)
 
 
@@ -557,6 +632,26 @@ def _demo() -> None:
     assert generated_ignore_entries([], tracked) == []
     # A stray file at the repo root has no ancestor directory -- exact path, never "/".
     assert generated_ignore_entries(["stray.log"], tracked) == ["stray.log"]
+
+    # The live kill (thread 70bbfc95): minimal-code-to-green had just written the whole app and
+    # NOTHING under apps/ was committed except scaffold's Directory.Build.props. The collapse used to
+    # produce ["apps/api.Tests/", "apps/web/"] -- the frontend never reached the branch, the coverage
+    # gate reported declared_frontend_missing, and the stage burned all 12 laps. Authored files must
+    # survive; only the toolchain output below them may be ignored.
+    scaffold_only = ["apps/Directory.Build.props", ".gitignore"]
+    fresh_app = [
+        "apps/web/package.json",
+        "apps/web/src/app/page.tsx",
+        "apps/web/.next/BUILD_ID",
+        "apps/web/node_modules/next/index.js",
+        "apps/api.Tests/Api.Tests.csproj",
+        "apps/api.Tests/CounterApiTests.cs",
+        "apps/api.Tests/obj/project.assets.json",
+        ".gitignore",
+    ]
+    got = generated_ignore_entries(fresh_app, scaffold_only)
+    assert got == ["apps/api.Tests/obj/", "apps/web/.next/", "apps/web/node_modules/"], got
+    assert ".gitignore" not in got, "this function's own output file must never ignore itself"
 
     print("git_ops self-check: all assertions passed")
 
