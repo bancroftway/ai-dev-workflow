@@ -27,13 +27,12 @@ from dataclasses import dataclass, field
 from . import registry
 from .. import config as workflow_config
 from ..telemetry import traced_exec
-from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_copilot_ready
+from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_cli_ready, wait_for_copilot_ready
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_IMAGE = "ai-dev-workflow-sandbox:latest"
 DEFAULT_IDLE_TIMEOUT_SECONDS = 1800.0
-_COPILOT_PORT_IN_CONTAINER = 3000
 _REAP_POLL_SECONDS = 60.0
 _CONTAINER_NAME_PREFIX = "ai-dev-workflow-sandbox-"
 # Matches entrypoint.sh's WORKSPACE_DIR -- the clone's own root, so persistence code can address
@@ -176,9 +175,14 @@ class LocalDockerProvider(SandboxProvider):
         branch: str,
         work_branch: str,
         git_user_token: str,
-        copilot_auth_token: str,
+        runtime_auth_token: str,
         image: str | None = None,
     ) -> SandboxSession:
+        # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
+        # a module-scope import here would cycle. Needed for both the env-var choice below and
+        # the readiness-check branch further down.
+        from ..chat_model import PROVIDER
+
         async with self._lock:
             container_name = f"{_CONTAINER_NAME_PREFIX}{session_id}"
 
@@ -233,6 +237,10 @@ class LocalDockerProvider(SandboxProvider):
             attempts = max(1, workflow_config.SANDBOX_PROVISION_RETRY_ATTEMPTS)
             last_exc: Exception | None = None
             for attempt in range(attempts):
+                # No longer published into the container (see the removed -p below) -- kept only
+                # because the copilot-provider branch's wait_for_copilot_ready still needs a real
+                # host/port/token triple to attempt its TCP handshake, and SandboxSession's shape
+                # still has these fields (see provider.py; nothing external reads them anymore).
                 host_port = _free_port()
                 connection_token = secrets.token_urlsafe(32)
 
@@ -258,8 +266,6 @@ class LocalDockerProvider(SandboxProvider):
                     # otherwise-healthy app, intermittently, exactly the documented shm-starvation
                     # signature. 1g matches Playwright's own docker guidance.
                     "--shm-size=1g",
-                    "-p",
-                    f"{host_port}:{_COPILOT_PORT_IN_CONTAINER}",
                     # Created on demand by Docker; nothing pre-provisions it. The container works
                     # identically without this mount (every cache path is an ENV in the image), so
                     # this is purely a warm-start accelerator.
@@ -274,12 +280,15 @@ class LocalDockerProvider(SandboxProvider):
                     f"REPO_BRANCH={branch}",
                     "-e",
                     f"WORK_BRANCH={work_branch}",
+                    # Both set unconditionally, one real one empty, so this call never needs to
+                    # branch on provider itself -- the sandbox-image entrypoint is what picks
+                    # which one it actually needs. Harmless unused env either way.
                     "-e",
-                    f"COPILOT_SDK_AUTH_TOKEN={copilot_auth_token}",
+                    f"COPILOT_SDK_AUTH_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
                     "-e",
-                    f"COPILOT_CONNECTION_TOKEN={connection_token}",
+                    f"ANTHROPIC_API_KEY={runtime_auth_token if PROVIDER == 'claude' else ''}",
                     "-e",
-                    f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
+                    f"AGENT_PROVIDER={PROVIDER}",
                     # Stamped into bootstrap.sh's toolchain report, so a "this repo needed a toolchain
                     # the image lacks" finding is attributable to a specific image rather than to the
                     # fleet in general.
@@ -295,7 +304,15 @@ class LocalDockerProvider(SandboxProvider):
                     returncode, _, stderr = await _run_docker("start", container_id)
                     if returncode != 0:
                         raise RuntimeError(f"docker start failed for session {session_id!r}: {stderr}")
-                    await wait_for_copilot_ready("localhost", host_port, connection_token)
+                    if PROVIDER == "copilot":
+                        await wait_for_copilot_ready("localhost", host_port, connection_token)
+                    else:
+                        async def _exec(cmd: str) -> tuple[int, str, str]:
+                            return await _run_docker(
+                                "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd
+                            )
+
+                        await wait_for_cli_ready(_exec)
                     last_exc = None
                     break
                 except Exception as exc:
@@ -326,8 +343,13 @@ class LocalDockerProvider(SandboxProvider):
         must not leave sessions on stale entrypoints -- AIDW_IMAGE_REF is just the tag string, so
         the image ID is what's compared), is checked out on a different branch than requested (a
         PR-target change across an agent restart must not silently reattach to the old target),
-        or fails the copilot liveness probe. The recovered connection token MUST be reused -- the
-        running copilot server gates on the one in its env.
+        or fails the liveness probe (copilot's TCP handshake, or a CLI version-check exec for
+        Claude -- same PROVIDER branch as fresh provisioning). host_port/connection_token can no
+        longer be recovered from the container's own state -- neither the port nor
+        COPILOT_CONNECTION_TOKEN are wired into it anymore (see provision()'s docker create) -- so
+        they're re-minted here exactly like a fresh provision() would, purely to satisfy
+        _RunningSandbox's shape and the copilot branch's probe call; nothing downstream reads them
+        back off the returned SandboxSession.
         """
         returncode, out, _ = await _run_docker("inspect", container_name)
         if returncode != 0:
@@ -344,15 +366,28 @@ class LocalDockerProvider(SandboxProvider):
             env = dict(e.split("=", 1) for e in info["Config"]["Env"] if "=" in e)
             if env.get("REPO_BRANCH") != branch:
                 return None
-            token = env["COPILOT_CONNECTION_TOKEN"]
-            port = int(info["NetworkSettings"]["Ports"][f"{_COPILOT_PORT_IN_CONTAINER}/tcp"][0]["HostPort"])
+            container_id = info["Id"]
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+        # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
+        # a module-scope import here would cycle.
+        from ..chat_model import PROVIDER
+
+        port = _free_port()
+        token = secrets.token_urlsafe(32)
         try:
-            await wait_for_copilot_ready("localhost", port, token)
+            if PROVIDER == "copilot":
+                await wait_for_copilot_ready("localhost", port, token)
+            else:
+
+                async def _exec(cmd: str) -> tuple[int, str, str]:
+                    return await _run_docker("exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd)
+
+                await wait_for_cli_ready(_exec)
         except Exception:  # noqa: BLE001 -- liveness probe; any failure means "don't reattach"
             return None
-        return _RunningSandbox(info["Id"], port, token)
+        return _RunningSandbox(container_id, port, token)
 
     async def touch(self, session_id: str) -> None:
         async with self._lock:

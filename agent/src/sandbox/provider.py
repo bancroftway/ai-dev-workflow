@@ -59,7 +59,7 @@ class SandboxProvider(abc.ABC):
         branch: str,
         work_branch: str,
         git_user_token: str,
-        copilot_auth_token: str,
+        runtime_auth_token: str,
         image: str | None = None,
     ) -> SandboxSession:
         """Start (or reuse) the sandbox for session_id and return how to reach it.
@@ -69,10 +69,10 @@ class SandboxProvider(abc.ABC):
         (plan Section C.4's ordering guarantee). work_branch is this session's own unique git
         branch (agent/src/branch_naming.py, computed once at session creation and never
         recomputed here) -- passed straight through as the sandbox's WORK_BRANCH env var.
-        copilot_auth_token is the shared Copilot PAT (agent/src/graph.py's GITHUB_TOKEN) the
-        sandbox's own `copilot --server` process authenticates with; it is a no-op if passed to
-        the agent's own CopilotClient once that client connects via for_uri (see this package's
-        docstring).
+        runtime_auth_token is the active provider's own secret -- the shared Copilot PAT
+        (agent/src/graph.py's GITHUB_TOKEN) or an Anthropic API key, whichever chat_model.PROVIDER
+        currently selects -- written into the sandbox as COPILOT_SDK_AUTH_TOKEN or
+        ANTHROPIC_API_KEY (never both real) for its own coding-agent CLI to authenticate with.
         """
 
     @abc.abstractmethod

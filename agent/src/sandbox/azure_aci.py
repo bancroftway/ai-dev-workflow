@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from . import registry
 from .. import config as workflow_config
 from ..telemetry import traced_exec
-from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_copilot_ready
+from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_cli_ready, wait_for_copilot_ready
 
 logger = logging.getLogger(__name__)
 
@@ -150,9 +150,14 @@ class AzureContainerInstanceProvider(SandboxProvider):
         branch: str,
         work_branch: str,
         git_user_token: str,
-        copilot_auth_token: str,
+        runtime_auth_token: str,
         image: str | None = None,
     ) -> SandboxSession:
+        # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
+        # a module-scope import here would cycle. Needed for both the env-var choice below and
+        # the readiness-check branch further down.
+        from ..chat_model import PROVIDER
+
         async with self._lock:
             existing = self._sandboxes.get(session_id)
             if existing is not None:
@@ -202,13 +207,16 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 "--environment-variables",
                 f"REPO_BRANCH={branch}",
                 f"WORK_BRANCH={work_branch}",
-                f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
+                f"AGENT_PROVIDER={PROVIDER}",
                 f"AIDW_IMAGE_REF={image or self._sandbox_image}",
                 "--secure-environment-variables",
                 f"REPO_CLONE_URL={repo_clone_url}",
                 f"GIT_USER_TOKEN={git_user_token}",
-                f"COPILOT_SDK_AUTH_TOKEN={copilot_auth_token}",
-                f"COPILOT_CONNECTION_TOKEN={connection_token}",
+                # Both set unconditionally, one real one empty, so this call never needs to branch
+                # on provider itself -- the sandbox-image entrypoint is what picks which one it
+                # actually needs. Harmless unused env either way.
+                f"COPILOT_SDK_AUTH_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
+                f"ANTHROPIC_API_KEY={runtime_auth_token if PROVIDER == 'claude' else ''}",
             ]
             if self._location:
                 args += ["--location", self._location]
@@ -260,16 +268,28 @@ class AzureContainerInstanceProvider(SandboxProvider):
                     # This loop's own previous attempt's group, named identically -- `az container
                     # create --name` fails outright if it's still around.
                     await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
+                    # No longer wired into args (nothing in the container reads it anymore -- see
+                    # the removed COPILOT_CONNECTION_TOKEN env above), so there's nothing to splice
+                    # here; re-minted only because the copilot branch below and SandboxSession's
+                    # shape still consume it.
                     connection_token = secrets.token_urlsafe(32)
-                    args[args.index(next(a for a in args if a.startswith("COPILOT_CONNECTION_TOKEN=")))] = (
-                        f"COPILOT_CONNECTION_TOKEN={connection_token}"
-                    )
                 returncode, stdout, stderr = await _run_az(*args)
                 if returncode != 0:
                     raise RuntimeError(f"az container create failed for session {session_id!r}: {stderr}")
                 try:
                     ip = await self._resolve_ip(name, create_output=stdout)
-                    await wait_for_copilot_ready(ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
+                    if PROVIDER == "copilot":
+                        await wait_for_copilot_ready(ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
+                    else:
+                        async def _exec(cmd: str) -> tuple[int, str, str]:
+                            return await _run_az(
+                                "container", "exec",
+                                "--resource-group", self._resource_group,
+                                "--name", name,
+                                "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {cmd}\"",
+                            )
+
+                        await wait_for_cli_ready(_exec)
                     last_exc = None
                     break
                 except Exception as exc:
