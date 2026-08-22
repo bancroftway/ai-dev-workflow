@@ -76,6 +76,7 @@ flowchart TD
 | `.ai-dev-workflow/plan/wireframes/*.html` | plan verify | Self-contained HTML wireframes (UI plans only) — open directly in a browser. |
 | `.ai-dev-workflow/coverage-commands.json` | minimal-code-to-green | The coverage contract: per-stack command + artifact + format. Written by the draft, REPLAYED by the coverage gate — the gate deletes artifacts and re-runs each command itself, so the number is always machine-derived. |
 | `.ai-dev-workflow/ledger.jsonl` | every node | Per-session action log, including token usage and toolchain installs. Reset each session. |
+| `.ai-dev-workflow/quarantine/<run_id>/...` | ac-to-tests write-scope gate | A copy of any file the gate classified as an out-of-scope write, kept before it reverts the original — preserves evidence for a language this gate's test-path regex doesn't recognize, instead of silently deleting the model's work. Part of the same committed audit trail as everything else under `.ai-dev-workflow/`. |
 | `.ai-dev-workflow/repo-scan-baseline.json` | repo scan baseline | The repository as it arrived, measured once and never re-measured. Delete it to force a re-baseline. |
 | `.ai-dev-workflow/repo-scan-latest.json` | metrics-report | The same shape at the end of the run: deduplicated findings with severity, location, CVE and fix version, plus size/complexity/duplication/churn metrics and a health score. Findings carry no tool attribution — which tool found what lives in the report's `tools[]` run-health block. |
 | `.ai-dev-workflow/repo-scan-delta.json` | metrics-report | Baseline versus latest: fixed, introduced, persisted, severity changes, and per-metric direction. Omitted, not faked, when no baseline exists. |
@@ -124,16 +125,19 @@ flowchart LR
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves.<br/>Only specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
     aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>skips the audit and the human gate —<br/>never the deterministic verify. Approval is<br/>persisted only after verify passes."]
     e["ESCALATE<br/>Verify cap exhausted. The run ENDs with<br/>run_failure recorded (ledger + commit + push).<br/>Never auto-approved past a failed<br/>deterministic gate. Counters reset for resubmit."]
+    ie["DRAFT-ESCALATE<br/>Copilot session failure survived infra_retry's<br/>own backoff attempts (quota/timeout/429) — never<br/>charged against cycle_count. run_failure tagged<br/>failure_type=infra_transient/quota_exhausted,<br/>not gate_exhausted. Wired for every stage,<br/>including tech-stack, the one with no verify."]
     q(["Not ready: emit clarifying questions, end the run"])
 
     d -->|readiness| a
     d -->|cap reached| aa
     d -->|not ready| q
+    d -.->|infra exhausted| ie
     a --> v
     v -->|passed| g
     v -.->|failed, retries left| d
     v -->|failed at cap| e
     e --> theend(["END"])
+    ie --> theend
     g --> next["next stage"]
     aa -->|stage has a verify| v
     aa -->|no verify| next
@@ -214,7 +218,8 @@ distinct paths do, and each covers a case the others structurally cannot:
 
 | When | Mechanism | Why not one of the others |
 |---|---|---|
-| Run reaches a genuine terminal | `close_thread_session` from `exit_nodes.exit_finalize_node` (success) and `graph.make_escalate_node` (failed deterministic gate) | Graceful: awaits `disconnect()`, which preserves on-disk session state |
+| Run reaches a genuine terminal | `close_thread_session` from `exit_nodes.exit_finalize_node` (success), `graph.make_escalate_node` (failed deterministic gate), and `graph.make_draft_escalate_node` (draft-level infra exhaustion) | Graceful: awaits `disconnect()`, which preserves on-disk session state |
+| Verify lap stalls (near-identical feedback / zero new changes, `VERIFY_STALL_LAPS` consecutive laps) | `close_session` (`graph.py`'s `make_verify_node`) | Same self-reinforcing shape as a fabrication reset, just not one of the three named patterns — see `infra_retry.py`'s module docstring |
 | Container destroyed | `forget_thread_sessions` from `sandbox.registry.pop` | The idle reaper fires ~30 min later with no stage on the stack, so nothing unwinds and no `finally` can run |
 | Unhandled node exception | `forget_thread_sessions` from `telemetry.traced_node` | An exception aborts the whole graph invocation, so neither terminal node above ever runs |
 | A stage's history is poisoned | `close_session` (fabricated-work retries, `graph.py`) | Targets one `(stage, role)`, not the whole thread |
@@ -255,4 +260,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 6ee63c73fe94491568f70197f027efd43e9583882209fc48ff8e7fe2ad5261f3 -->
+<!-- graph-source-sha256: 05c214409eea6d52618c42b4eeeea53a43c037e307862235652f6ae3ffa9fb67 -->

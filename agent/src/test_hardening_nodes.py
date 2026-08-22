@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, spec_ledger, stack_runner, test_results
+from . import git_ops, model_config, repo_files, run_failure, spec_ledger, stack_runner, test_results
 from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
@@ -219,9 +219,13 @@ async def test_hardening_regression_gate_node(state: dict[str, Any], config: Run
     test_hardening = state.get("test_hardening") or default_test_hardening_state()
     if test_hardening.get("cannot_verify"):
         payload = {"stage": "test_hardening", "type": "cannot_verify", "reason": "no sandbox -- test suite did not run"}
+        detail = payload["reason"]
     else:
         payload = {"stage": "test_hardening", "type": "stable_test_regression", "stable_fail": test_hardening["stable_fail"]}
-    await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
+        detail = json.dumps(payload["stable_fail"])
+    payload = await run_failure.record_run_failure_and_reset(
+        thread_id, state.get("run_id"), payload=payload, detail_for_classification=detail,
+    )
     reset = dict(test_hardening)
     reset["cannot_verify"] = False
     return {"test_hardening": reset, "run_failure": payload}
@@ -320,5 +324,9 @@ async def test_hardening_exit_escalate_node(state: dict[str, Any], config: Runna
     thread_id = config["configurable"]["thread_id"]
     test_hardening = state.get("test_hardening") or default_test_hardening_state()
     payload = {"stage": "test_hardening", "type": "flake_quarantine_incomplete", "flake_quarantine": test_hardening["flake_quarantine"]}
-    await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
+    payload = await run_failure.record_run_failure_and_reset(
+        thread_id, state.get("run_id"),
+        payload=payload,
+        detail_for_classification=json.dumps(test_hardening["flake_quarantine"]),
+    )
     return {"run_failure": payload}

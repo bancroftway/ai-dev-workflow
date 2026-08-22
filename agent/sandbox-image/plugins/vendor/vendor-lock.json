@@ -1,4 +1,5 @@
 {
+  "_readme": "Provenance record for the 5 third-party skill packs fetch-vendor-plugins.sh builds at Docker build time (and locally, on demand). This file is tracked in git; the fetched plugin content it describes is NOT (see .gitignore) -- fetch-vendor-plugins.sh is the single source of truth for reproducing it, this file is the human-readable record of what was decided and why. destDir/wrapper/stripped_paths/extra_files/patches describe exactly what the script does for each entry; they are not machine-parsed by the script (five fixed plugins do not earn a generic JSON-driven config reader in the Dockerfile's minimal `fetch` build stage) -- keep them in sync with the script by hand when either changes.",
   "vendored": [
     {
       "name": "superpowers",
@@ -8,7 +9,15 @@
       "sha": "b36e0829c6d0140e93cfef2ca599b1b07d4a7797",
       "vendoredAt": "2026-08-12",
       "vendoredBy": "jbliss1234@gmail.com",
-      "notes": "All 14 skills copied verbatim with the repo's own .claude-plugin/plugin.json. hooks/, assets/, docs/, scripts/, tests/, and other-platform (.codex-plugin/, .cursor-plugin/, etc.) directories stripped."
+      "destDir": "obra-superpowers/superpowers/skills",
+      "wrapper": null,
+      "extra_files": [
+        {"from": ".claude-plugin/plugin.json", "to": ".claude-plugin/plugin.json"},
+        {"from": ".claude-plugin/marketplace.json", "to": ".claude-plugin/marketplace.json"}
+      ],
+      "stripped_paths": [],
+      "patches": [],
+      "notes": "All 14 skills copied verbatim with the repo's own .claude-plugin/{plugin,marketplace}.json. hooks/, assets/, docs/, scripts/, tests/, and other-platform (.codex-plugin/, .cursor-plugin/, etc.) directories are top-level repo dirs, siblings of skills/ -- excluded automatically by sourcePath scoping alone, no stripping needed within skills/ itself (verified against a real clone at the pinned sha: byte-identical)."
     },
     {
       "name": "ponytail",
@@ -18,7 +27,12 @@
       "sha": "2ed6c52c9d7e5e56942508591085fd45dea277d3",
       "vendoredAt": "2026-08-12",
       "vendoredBy": "jbliss1234@gmail.com",
-      "notes": "Source repo has no .claude-plugin/plugin.json (uses a root-level plugin.json + plugin.yaml for a different, multi-platform packaging convention) -- a minimal .claude-plugin/plugin.json wrapper was authored fresh for this vendored copy (not a patch to skill content). commands/ (TOML format, not Claude Code's .md convention) and hooks/ were not vendored -- unvalidated mechanisms; the plugin_directories -> skill-loading path is what Phase A0 actually confirmed works. ponytail-mcp/ (a bundled MCP server) was also not vendored -- flagged as a future enhancement, not validated here."
+      "destDir": "dietrichgebert-ponytail/ponytail/skills",
+      "wrapper": "wrappers/dietrichgebert-ponytail/plugin.json",
+      "extra_files": [],
+      "stripped_paths": [],
+      "patches": [],
+      "notes": "Source repo has no .claude-plugin/plugin.json (uses a root-level plugin.json + plugin.yaml for a different, multi-platform packaging convention) -- the wrapper here is authored fresh (small enough to check into git directly, not vendored/fetched). commands/ (TOML format, not Claude Code's .md convention) and hooks/ were not vendored -- unvalidated mechanisms; the plugin_directories -> skill-loading path is what Phase A0 actually confirmed works. ponytail-mcp/ (a bundled MCP server) was also not vendored -- flagged as a future enhancement, not validated here. Verified against a real clone at the pinned sha: skills/ content is byte-identical."
     },
     {
       "name": "caveman",
@@ -28,7 +42,12 @@
       "sha": "099327780ef69ad88c4cfc15c54314579ac367a4",
       "vendoredAt": "2026-08-12",
       "vendoredBy": "jbliss1234@gmail.com",
-      "notes": "Only the caveman skill itself was vendored, per explicit direction -- the source repo is a large monorepo (browser extension, proxy server, compression engine, MCP server, multiple other caveman-* skills). LICENSING.md confirms skills/ is MIT while the engine/proxy/browse/mcp components are BSL-1.1 -- vendoring only the skill keeps this cleanly within the MIT-licensed surface. No .claude-plugin/plugin.json in source; wrapper authored fresh, same reasoning as ponytail."
+      "destDir": "juliusbrussee-caveman/caveman/skills/caveman",
+      "wrapper": "wrappers/juliusbrussee-caveman/plugin.json",
+      "extra_files": [],
+      "stripped_paths": [],
+      "patches": [],
+      "notes": "Only the caveman skill itself was vendored, per explicit direction -- the source repo is a large monorepo (browser extension, proxy server, compression engine, MCP server, multiple other caveman-* skills). LICENSING.md confirms skills/ is MIT while the engine/proxy/browse/mcp components are BSL-1.1 -- vendoring only the skill keeps this cleanly within the MIT-licensed surface. No .claude-plugin/plugin.json in source; wrapper authored fresh, same reasoning as ponytail. Verified against a real clone at the pinned sha: byte-identical."
     },
     {
       "name": "security-review",
@@ -38,7 +57,12 @@
       "sha": "0a6e37e4e242c944380228fa29dbd14e64ac1b63",
       "vendoredAt": "2026-08-12",
       "vendoredBy": "jbliss1234@gmail.com",
-      "notes": "Skill + its references/ subfolder (bundled reference docs, a legitimate skill component) copied verbatim. No .claude-plugin/plugin.json in source (it's one skill among many in a shared collection repo); wrapper authored fresh."
+      "destDir": "github-awesome-copilot/security-review/skills/security-review",
+      "wrapper": "wrappers/github-awesome-copilot/plugin.json",
+      "extra_files": [],
+      "stripped_paths": [],
+      "patches": [],
+      "notes": "Skill + its references/ subfolder (bundled reference docs, a legitimate skill component) copied verbatim. No .claude-plugin/plugin.json in source (it's one skill among many in a shared collection repo); wrapper authored fresh. Verified against a real clone at the pinned sha: byte-identical."
     },
     {
       "name": "impeccable",
@@ -48,7 +72,70 @@
       "sha": "5a149f3fdb1b5793f10567233b1dcab98fc305fd",
       "vendoredAt": "2026-08-14",
       "vendoredBy": "jbliss1234@gmail.com",
-      "notes": "Apache-2.0 (LICENSE + NOTICE.md copied to the plugin root per Apache attribution requirement). Source repo ships an official Claude plugin at plugin/ (v4.1.1); its .claude-plugin/plugin.json and skills/impeccable payload copied. Stripped as interactive/unvalidated in a headless pipeline: scripts/live* + scripts/live/ + live-browser*.js, reference/live.md, reference/live-setup.md, scripts/hook*.mjs, reference/hooks.md; the SKILL.md rows/paragraphs referencing them (live command row, Hooks paragraph, 'live' in argument-hint) were deleted so no instruction points at a stripped file. Patched: every '.claude/skills/impeccable' script-path fallback in SKILL.md and reference/*.md rewritten to the absolute in-container path /opt/ai-dev-workflow-plugins/vendor/pbakaus-impeccable/impeccable/skills/impeccable (Copilot CLI does not reliably report a skill base dir the way Claude Code does). scripts/ left byte-identical (they resolve their own paths relative to the module; the update check fails silently offline). Used by graph.py's UI-repo-gated prompt segments: shape (P3, methodology only), design rules + document (P6), critique (P11a), audit detectors + polish (P11b)."
+      "destDir": "pbakaus-impeccable/impeccable",
+      "wrapper": null,
+      "extra_files": [
+        {"from": "LICENSE", "to": "LICENSE"},
+        {"from": "NOTICE.md", "to": "NOTICE.md"}
+      ],
+      "stripped_paths": [
+        ".grok-plugin",
+        "agents",
+        "hooks",
+        "skills/impeccable/reference/hooks.md",
+        "skills/impeccable/reference/live.md",
+        "skills/impeccable/reference/live-setup.md",
+        "skills/impeccable/scripts/hook.mjs",
+        "skills/impeccable/scripts/hook-admin.mjs",
+        "skills/impeccable/scripts/hook-before-edit.mjs",
+        "skills/impeccable/scripts/hook-lib.mjs",
+        "skills/impeccable/scripts/live.mjs",
+        "skills/impeccable/scripts/live-accept.mjs",
+        "skills/impeccable/scripts/live-browser.js",
+        "skills/impeccable/scripts/live-browser-dom.js",
+        "skills/impeccable/scripts/live-browser-session.js",
+        "skills/impeccable/scripts/live-commit-manual-edits.mjs",
+        "skills/impeccable/scripts/live-complete.mjs",
+        "skills/impeccable/scripts/live-copy-edit-agent.mjs",
+        "skills/impeccable/scripts/live-discard-manual-edits.mjs",
+        "skills/impeccable/scripts/live-inject.mjs",
+        "skills/impeccable/scripts/live-insert.mjs",
+        "skills/impeccable/scripts/live-manual-edit-evidence.mjs",
+        "skills/impeccable/scripts/live-poll.mjs",
+        "skills/impeccable/scripts/live-resume.mjs",
+        "skills/impeccable/scripts/live-server.mjs",
+        "skills/impeccable/scripts/live-status.mjs",
+        "skills/impeccable/scripts/live-target.mjs",
+        "skills/impeccable/scripts/live-wrap.mjs",
+        "skills/impeccable/scripts/live"
+      ],
+      "patches": [
+        {
+          "files": "skills/impeccable/**/*.md",
+          "find": ".claude/skills/impeccable",
+          "replace": "/opt/ai-dev-workflow-plugins/vendor/pbakaus-impeccable/impeccable/skills/impeccable",
+          "reason": "Every reference/*.md and SKILL.md names its own scripts via a hardcoded fallback path -- Copilot CLI does not reliably report a skill's base directory the way Claude Code does, so the fallback must resolve to where this image actually places the skill."
+        },
+        {
+          "files": "skills/impeccable/SKILL.md",
+          "find": "extract|live]",
+          "replace": "extract]",
+          "reason": "Removes the just-stripped `live` command from the argument-hint token list."
+        },
+        {
+          "files": "skills/impeccable/SKILL.md",
+          "find": "| `live` | Iterate | Visual variant mode: pick elements in the browser, generate alternatives | [reference/live.md](reference/live.md) |\n",
+          "replace": "",
+          "reason": "Removes the Commands table row pointing at the stripped reference/live.md."
+        },
+        {
+          "files": "skills/impeccable/SKILL.md",
+          "find": "\n**Hooks:** `/impeccable hooks <on|off|status|ignore-rule|ignore-file|ignore-value|reset>` manages the design detector hook for this project (auto-runs the detector after UI file edits and surfaces findings). Load [reference/hooks.md](reference/hooks.md) when the user invokes it with any argument.",
+          "replace": "",
+          "reason": "Removes the paragraph describing the stripped hooks system."
+        }
+      ],
+      "notes": "Apache-2.0 (LICENSE + NOTICE.md copied to the plugin root per Apache attribution requirement -- see extra_files above). Source repo ships an official Claude plugin at plugin/ (v4.1.1); its .claude-plugin/plugin.json and skills/impeccable payload copied. Stripped as interactive/unvalidated in a headless pipeline: the .grok-plugin (other-platform) directory, the four impeccable-* subagents, the hooks system, and the whole 'live' visual-iteration feature (server, browser injection, per-framework adapters) -- see stripped_paths above. The SKILL.md rows/paragraphs referencing the stripped features are removed so no instruction points at a missing file -- see patches above. Every '.claude/skills/impeccable' script-path fallback in SKILL.md and reference/*.md is rewritten to the absolute in-container path. scripts/ (everything not stripped) is left byte-identical -- they resolve their own paths relative to the module. Used by graph.py's UI-repo-gated prompt segments: shape (P3, methodology only), design rules + document (P6), critique (P11a), audit detectors + polish (P11b). All of the above verified against a real clone at the pinned sha via fetch-vendor-plugins.sh, diffed byte-for-byte against what was previously committed."
     }
   ]
 }

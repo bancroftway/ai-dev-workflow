@@ -49,7 +49,7 @@ from pydantic import Field
 
 from . import app_discovery
 from . import config as workflow_config
-from . import git_ops, keyvault, model_config, repo_files, session_store
+from . import git_ops, keyvault, model_config, repo_files, run_failure, session_store
 from .copilot_chat_model import get_chat_model_for_thread
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
@@ -1168,7 +1168,11 @@ async def e2e_escalate_node(state: dict[str, Any], config: RunnableConfig) -> di
         "feedback": "; ".join(f"{t.get('title')}: {t.get('error')}" for t in (e2e.get("failed_tests") or [])) or None,
         "run_id": state.get("run_id"),
     }
-    await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
+    payload = await run_failure.record_run_failure_and_reset(
+        thread_id, state.get("run_id"),
+        payload=payload,
+        detail_for_classification=payload["feedback"] or "",
+    )
     e2e["attempt"] = 0
     e2e["cannot_verify"] = False
     e2e["status"] = "failed"

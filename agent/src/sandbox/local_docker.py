@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import registry
+from .. import config as workflow_config
 from ..telemetry import traced_exec
 from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_copilot_ready
 
@@ -222,73 +223,93 @@ class LocalDockerProvider(SandboxProvider):
                 )
                 return SandboxSession(session_id, "localhost", reattached.host_port, reattached.connection_token)
 
-            host_port = _free_port()
-            connection_token = secrets.token_urlsafe(32)
+            # Retried as a whole (fresh port, fresh token, fresh container) up to
+            # SANDBOX_PROVISION_RETRY_ATTEMPTS times: wait_for_copilot_ready already polls the
+            # connect handshake continuously for its own 60s deadline, so re-polling the SAME dead
+            # socket after it raises would just wait out an identical timeout again. A real retry
+            # has to start a new container -- distinguishes "this container is just slow" (already
+            # handled inside wait_for_copilot_ready's own loop) from "this container never came up
+            # at all" (needs a fresh attempt, not a longer wait on the same one).
+            attempts = max(1, workflow_config.SANDBOX_PROVISION_RETRY_ATTEMPTS)
+            last_exc: Exception | None = None
+            for attempt in range(attempts):
+                host_port = _free_port()
+                connection_token = secrets.token_urlsafe(32)
 
-            # Best-effort cleanup of a stale (not-reattachable) container from a previous,
-            # uncleanly-terminated run under the same session_id, OR a still-running container on
-            # a now-stale branch that _try_reattach declined above -- `docker create --name` fails
-            # outright if it's still around either way.
-            await _run_docker("rm", "-f", container_name)
-
-            # create -> cp(token) -> start, not `docker run`: the clone credential rides in as a
-            # one-shot file (see _inject_git_token) instead of an env var that would stay readable
-            # forever via `docker inspect`.
-            returncode, container_id, stderr = await _run_docker(
-                "create",
-                "--rm",
-                "--name",
-                container_name,
-                "--label",
-                f"aidw.session={session_id}",
-                # Docker's default /dev/shm is 64MB; headless Chromium (playwright e2e) crashes
-                # pages under it -- observed live (s04 run 21): `page.goto: Page crashed` on an
-                # otherwise-healthy app, intermittently, exactly the documented shm-starvation
-                # signature. 1g matches Playwright's own docker guidance.
-                "--shm-size=1g",
-                "-p",
-                f"{host_port}:{_COPILOT_PORT_IN_CONTAINER}",
-                # Created on demand by Docker; nothing pre-provisions it. The container works
-                # identically without this mount (every cache path is an ENV in the image), so
-                # this is purely a warm-start accelerator.
-                "-v",
-                f"{_cache_volume_name(repo_clone_url)}:{_CACHE_DIR_IN_CONTAINER}",
-                # Workspace durability -- see _WS_VOLUME_PREFIX comment above.
-                "-v",
-                f"{_WS_VOLUME_PREFIX}{session_id}:/workspace",
-                "-e",
-                f"REPO_CLONE_URL={repo_clone_url}",
-                "-e",
-                f"REPO_BRANCH={branch}",
-                "-e",
-                f"WORK_BRANCH={work_branch}",
-                "-e",
-                f"COPILOT_SDK_AUTH_TOKEN={copilot_auth_token}",
-                "-e",
-                f"COPILOT_CONNECTION_TOKEN={connection_token}",
-                "-e",
-                f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
-                # Stamped into bootstrap.sh's toolchain report, so a "this repo needed a toolchain
-                # the image lacks" finding is attributable to a specific image rather than to the
-                # fleet in general.
-                "-e",
-                f"AIDW_IMAGE_REF={image or self._image}",
-                image or self._image,
-            )
-            if returncode != 0:
-                raise RuntimeError(f"docker create failed for session {session_id!r}: {stderr}")
-
-            try:
-                await _inject_git_token(container_id, git_user_token)
-                returncode, _, stderr = await _run_docker("start", container_id)
-                if returncode != 0:
-                    raise RuntimeError(f"docker start failed for session {session_id!r}: {stderr}")
-                await wait_for_copilot_ready("localhost", host_port, connection_token)
-            except Exception:
-                # --rm never armed for a never-started container; rm -f covers both cases. The
-                # workspace volume survives (named volumes are never auto-removed).
+                # Best-effort cleanup of a stale (not-reattachable) container from a previous,
+                # uncleanly-terminated run under the same session_id, OR a still-running container on
+                # a now-stale branch that _try_reattach declined above -- `docker create --name` fails
+                # outright if it's still around either way. Also cleans up THIS loop's own previous
+                # failed attempt on a retry, since the container name is fixed per session_id.
                 await _run_docker("rm", "-f", container_name)
-                raise
+
+                # create -> cp(token) -> start, not `docker run`: the clone credential rides in as a
+                # one-shot file (see _inject_git_token) instead of an env var that would stay readable
+                # forever via `docker inspect`.
+                returncode, container_id, stderr = await _run_docker(
+                    "create",
+                    "--rm",
+                    "--name",
+                    container_name,
+                    "--label",
+                    f"aidw.session={session_id}",
+                    # Docker's default /dev/shm is 64MB; headless Chromium (playwright e2e) crashes
+                    # pages under it -- observed live (s04 run 21): `page.goto: Page crashed` on an
+                    # otherwise-healthy app, intermittently, exactly the documented shm-starvation
+                    # signature. 1g matches Playwright's own docker guidance.
+                    "--shm-size=1g",
+                    "-p",
+                    f"{host_port}:{_COPILOT_PORT_IN_CONTAINER}",
+                    # Created on demand by Docker; nothing pre-provisions it. The container works
+                    # identically without this mount (every cache path is an ENV in the image), so
+                    # this is purely a warm-start accelerator.
+                    "-v",
+                    f"{_cache_volume_name(repo_clone_url)}:{_CACHE_DIR_IN_CONTAINER}",
+                    # Workspace durability -- see _WS_VOLUME_PREFIX comment above.
+                    "-v",
+                    f"{_WS_VOLUME_PREFIX}{session_id}:/workspace",
+                    "-e",
+                    f"REPO_CLONE_URL={repo_clone_url}",
+                    "-e",
+                    f"REPO_BRANCH={branch}",
+                    "-e",
+                    f"WORK_BRANCH={work_branch}",
+                    "-e",
+                    f"COPILOT_SDK_AUTH_TOKEN={copilot_auth_token}",
+                    "-e",
+                    f"COPILOT_CONNECTION_TOKEN={connection_token}",
+                    "-e",
+                    f"COPILOT_SERVER_PORT={_COPILOT_PORT_IN_CONTAINER}",
+                    # Stamped into bootstrap.sh's toolchain report, so a "this repo needed a toolchain
+                    # the image lacks" finding is attributable to a specific image rather than to the
+                    # fleet in general.
+                    "-e",
+                    f"AIDW_IMAGE_REF={image or self._image}",
+                    image or self._image,
+                )
+                if returncode != 0:
+                    raise RuntimeError(f"docker create failed for session {session_id!r}: {stderr}")
+
+                try:
+                    await _inject_git_token(container_id, git_user_token)
+                    returncode, _, stderr = await _run_docker("start", container_id)
+                    if returncode != 0:
+                        raise RuntimeError(f"docker start failed for session {session_id!r}: {stderr}")
+                    await wait_for_copilot_ready("localhost", host_port, connection_token)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    # --rm never armed for a never-started container; rm -f covers both cases. The
+                    # workspace volume survives (named volumes are never auto-removed).
+                    await _run_docker("rm", "-f", container_name)
+                    last_exc = exc
+                    if attempt < attempts - 1:
+                        logger.warning(
+                            "sandbox provision attempt %d/%d failed for session_id=%s, retrying with a fresh container: %s",
+                            attempt + 1, attempts, session_id, exc,
+                        )
+            if last_exc is not None:
+                raise last_exc
 
             self._sandboxes[session_id] = _RunningSandbox(container_id, host_port, connection_token)
             self._ensure_reaper_running()

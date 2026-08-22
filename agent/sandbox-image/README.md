@@ -1,17 +1,39 @@
 # Sandbox image: Agent Plugin content
 
 This directory builds the per-session sandbox container that runs GitHub Copilot CLI headless.
-`plugins/` is baked into the image (`Dockerfile`'s `COPY plugins/ /opt/ai-dev-workflow-plugins/`)
-and is also a local Claude Code marketplace, so what you dogfood in Claude Code is byte-identical
-to what ships into the sandbox.
+`plugins/ai-dev-workflow/` (this project's own first-party skill pack) and `plugins/vendor/`'s
+five third-party skill packs both end up at `/opt/ai-dev-workflow-plugins/` in the image, but they
+get there differently:
 
 ```
 plugins/
-  .claude-plugin/marketplace.json   # local marketplace root
-  ai-dev-workflow/                  # first-party skill pack (this repo's own)
-  vendor/<source-slug>/<name>/      # vendored 3rd-party skill packs
-  vendor/vendor-lock.json           # pin manifest for vendored packs
+  .claude-plugin/marketplace.json      # local marketplace root
+  ai-dev-workflow/                     # first-party skill pack (this repo's own) -- committed
+  vendor/vendor-lock.json              # provenance record for the vendored packs -- committed
+  vendor/fetch-vendor-plugins.sh       # fetches + curates them at Docker build time -- committed
+  vendor/wrappers/<source-slug>/       # authored .claude-plugin/plugin.json for packs whose
+                                        # source ships none -- committed (tiny, not vendored)
+  vendor/<source-slug>/<name>/         # the fetched packs themselves -- NOT committed, see
+                                        # .gitignore; Dockerfile's `fetch` stage runs
+                                        # fetch-vendor-plugins.sh to (re)populate this at build time
 ```
+
+`ai-dev-workflow/` is copied into the image directly (`Dockerfile`'s
+`COPY plugins/ai-dev-workflow/ ...`). `vendor/`'s five packs are fetched from their pinned commits
+and curated (stripped files, patched paths, extra license files -- see `vendor-lock.json`) by
+`fetch-vendor-plugins.sh`, run as a Docker `RUN` step, never at session runtime -- a live sandbox
+session runs untrusted repos and must stay network-independent, the same reason this image already
+bakes Playwright's browser and the semgrep/OSV/Trivy databases at build time instead of per-session.
+
+`plugins/` also doubles as a local Claude Code marketplace for dogfooding (see below); that only
+needs the vendored content present on disk locally, so run the fetch script once yourself first:
+
+```
+sh agent/sandbox-image/plugins/vendor/fetch-vendor-plugins.sh
+```
+
+(No argument: writes plugin content as siblings of `vendor-lock.json`, same layout it has inside
+the image, so `/plugin marketplace add` below sees byte-identical content either way.)
 
 The in-container path (`/opt/ai-dev-workflow-plugins`) must stay in sync with
 `agent/src/config.py`'s `COPILOT_PLUGIN_ROOT_IN_CONTAINER`/`COPILOT_PLUGIN_DIRECTORIES` —
@@ -39,17 +61,35 @@ The in-container path (`/opt/ai-dev-workflow-plugins`) must stay in sync with
 
 ## Vendoring a 3rd-party skill pack
 
-1. Target: `plugins/vendor/<source-slug>/<plugin-name>/`.
-2. Copy only `.claude-plugin/plugin.json`, `commands/`, `skills/`, `.mcp.json` -- strip/reject
-   `agents/`, `hooks/`, `hooks.json`, LSP config. **Never patch the vendored files** -- if a
-   vendored skill's own instructions try to write files to a hardcoded path, that's neutralized
-   at the calling stage's harness level (an `available_tools` allowlist + a prompt-level override
-   instruction), not by editing the skill's prose.
-3. Record in `plugins/vendor/vendor-lock.json` (name, source repo URL, ref/tag, commit sha, date
-   vendored, vendored by).
-4. Register as a `marketplace.json` entry and append its in-container path to
+1. Add an entry to `plugins/vendor/vendor-lock.json`: `name`, `sourceUrl`, `sourcePath`, `ref`,
+   `sha` (pin to a real commit, not a floating branch), `vendoredAt`, `vendoredBy`, `destDir` (where
+   it lands under `plugins/vendor/`), and `notes` explaining any judgment calls (license scoping,
+   what got stripped and why).
+2. Copy only `.claude-plugin/plugin.json`, `commands/`, `skills/`, `.mcp.json` from the source --
+   strip/reject `agents/`, `hooks/`, `hooks.json`, LSP config, and anything interactive/unvalidated
+   in a headless pipeline. List every stripped path explicitly in the entry's `stripped_paths`
+   array (relative to `sourcePath`) rather than leaving it as prose a script can't act on.
+3. If the source's own file needs a path rewrite to work from this image's in-container location
+   (Copilot CLI does not reliably report a skill's own base directory the way Claude Code does),
+   add it to the entry's `patches` array (`files`/`find`/`replace`/`reason`) -- this IS allowed,
+   unlike the old rule here: a hardcoded path rewrite is a mechanical necessity, not an edit to the
+   skill's own guidance. Never patch anything beyond what's needed to resolve at the right path or
+   remove a reference to something `stripped_paths` just deleted.
+4. If the source ships license/attribution files OUTSIDE `sourcePath` that need to travel with the
+   vendored copy (e.g. a root-level `LICENSE`), list them in `extra_files` (`from`/`to`).
+5. If the source has no `.claude-plugin/plugin.json` of its own, author one fresh under
+   `plugins/vendor/wrappers/<source-slug>/plugin.json` (this file IS committed -- it's this
+   project's own small authored content, not vendored) and set the entry's `wrapper` field to its
+   path.
+6. Add the new entry's clone/curate/patch steps to `fetch-vendor-plugins.sh` itself (the script is
+   not JSON-driven -- five-then-six fixed plugins don't earn a generic config reader; write the
+   steps as a new block matching the existing ones), then add its `destDir` to `.gitignore`
+   alongside the other four.
+7. Register a `marketplace.json` entry and append its in-container path to
    `agent/src/config.py`'s `COPILOT_PLUGIN_DIRECTORIES`.
-5. Re-verify via the spike technique below before merging.
+8. **Verify by actually running the script**: `sh fetch-vendor-plugins.sh /tmp/vendor-verify` and
+   inspect the output, or run it in place and confirm `git status` shows no unexpected changes to
+   the other four plugins. Then re-verify via the spike technique below before merging.
 
 ## Confirming a plugin change actually reaches the sandbox (the "spike" smoke test)
 

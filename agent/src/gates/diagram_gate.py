@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .. import git_ops, repo_files
+from ..failure_classification import classify_failure
 from ..sandbox.provider import SandboxProvider
 
 if TYPE_CHECKING:
@@ -64,14 +65,6 @@ def check_wireframe(screen: str, html_source: str) -> str | None:
             return f"wireframe {screen!r} {reason} -- wireframes must be fully self-contained (inline CSS only)"
     return None
 
-_INFRA_FAILURE_MARKERS = (
-    "command not found",
-    "cannot find module",
-    "failed to launch the browser process",
-    "error while loading shared libraries",
-)
-
-
 @dataclass(frozen=True)
 class DiagramRenderOutcome:
     name: str
@@ -81,8 +74,10 @@ class DiagramRenderOutcome:
 
 
 def _looks_like_infra_failure(stderr: str) -> bool:
-    lowered = stderr.lower()
-    return any(marker in lowered for marker in _INFRA_FAILURE_MARKERS)
+    # Delegates to the repo-wide classifier (failure_classification.py) instead of a
+    # gate-local marker list, so this gate, the sandbox connect-handshake retry, and every
+    # escalate node's failure_type tagging agree on what "infra, not content" means.
+    return classify_failure(stderr) == "infra_transient"
 
 
 def _mermaid_error_summary(output: str) -> str:

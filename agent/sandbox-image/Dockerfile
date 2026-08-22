@@ -351,7 +351,25 @@ COPY bootstrap.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh
 # Agent Plugin content (skills/commands/MCP servers for GitHub Copilot CLI) -- see
 # agent/sandbox-image/README.md and agent/src/config.py's COPILOT_PLUGIN_DIRECTORIES for
 # the matching in-container path this must stay in sync with.
-COPY plugins/ /opt/ai-dev-workflow-plugins/
+#
+# ai-dev-workflow/ is this project's own first-party skill pack -- committed to git, copied
+# directly like everything else in this stage.
+COPY plugins/ai-dev-workflow/ /opt/ai-dev-workflow-plugins/ai-dev-workflow/
+COPY plugins/.claude-plugin/ /opt/ai-dev-workflow-plugins/.claude-plugin/
+# vendor/ is five third-party skill packs -- NOT committed to git (see vendor-lock.json's own
+# "_readme" and this repo's .gitignore): fetched here, at build time, from their pinned commits,
+# with the exact curation (stripped files, patched paths, extra license files)
+# fetch-vendor-plugins.sh and vendor-lock.json document. Build-time, never session-runtime, for
+# the same reason Playwright's browser and the semgrep/OSV/Trivy databases are baked above instead
+# of fetched per-session: a live sandbox session runs untrusted repos and must stay
+# network-independent. Only vendor-lock.json/fetch-vendor-plugins.sh/wrappers/ are ever committed
+# -- copied first, before the RUN below, so this layer's build cache only invalidates when one of
+# those three actually changes, not on an unrelated Dockerfile edit.
+COPY plugins/vendor/vendor-lock.json plugins/vendor/fetch-vendor-plugins.sh /opt/ai-dev-workflow-plugins/vendor/
+COPY plugins/vendor/wrappers/ /opt/ai-dev-workflow-plugins/vendor/wrappers/
+RUN set -eux; \
+    chmod +x /opt/ai-dev-workflow-plugins/vendor/fetch-vendor-plugins.sh; \
+    sh /opt/ai-dev-workflow-plugins/vendor/fetch-vendor-plugins.sh /opt/ai-dev-workflow-plugins/vendor
 RUN chmod +x /usr/local/bin/ai-dev-workflow-entrypoint.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh && \
     mkdir -p /workspace && chown -R vscode:vscode /workspace /opt/ai-dev-workflow-plugins /opt/aidw && \
     # /opt/aidw/tools/bin is first on PATH (see the ENV PATH above) but nothing installs into it --

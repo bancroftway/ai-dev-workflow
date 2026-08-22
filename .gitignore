@@ -32,9 +32,27 @@ agent/venv/
 .gstack/browse-audit.jsonl
 .gstack/
 
+# Azurite local Azure Storage emulator state (never source, regenerated per run)
+__azurite_db_*.json
+__blobstorage__/
+__queuestorage__/
+__tablestorage__/
+
 # skill-creator transient eval/iteration workspaces (agent/sandbox-image/plugins/ai-dev-workflow)
 agent/sandbox-image/plugins/*/skills/*-workspace/
 agent/sandbox-image/plugins/*/skills/*/evals/
 **/agent-work/
 **/*.log
+
+# Vendored 3rd-party skill packs are fetched at Docker build time (and on demand locally) by
+# fetch-vendor-plugins.sh, not committed -- vendor-lock.json is the provenance record, the script
+# is the reproduction mechanism, wrappers/ is small authored content with no upstream source.
+# Listed explicitly (not a single vendor/*/ glob) so adding a genuinely first-party directory
+# under plugins/vendor/ later doesn't silently vanish from git -- add a line here alongside any
+# new vendor-lock.json entry.
+agent/sandbox-image/plugins/vendor/dietrichgebert-ponytail/
+agent/sandbox-image/plugins/vendor/juliusbrussee-caveman/
+agent/sandbox-image/plugins/vendor/github-awesome-copilot/
+agent/sandbox-image/plugins/vendor/obra-superpowers/
+agent/sandbox-image/plugins/vendor/pbakaus-impeccable/
 

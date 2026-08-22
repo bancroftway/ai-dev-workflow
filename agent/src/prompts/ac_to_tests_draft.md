@@ -120,18 +120,11 @@ sandbox's own baked vitest with just a `vitest.config.ts` -- no `package.json` c
 A UI stack with no Playwright suite is rejected by the gate. Write, beside the web app (e.g.
 `apps/web/`), both of these:
 
-1. `playwright.config.ts`:
+1. `playwright.config.ts` -- write EXACTLY this (byte-for-byte; it is the single source of truth
+   for this file, shared with the sandbox image's own pinned Playwright build):
 
 ```ts
-import { defineConfig } from '@playwright/test';
-
-export default defineConfig({
-  testDir: './tests/e2e',
-  use: {
-    baseURL: process.env.BASE_URL ?? 'http://localhost:3000',
-    screenshot: 'on',
-  },
-});
+<<playwright_config_template>>
 ```
 
 2. At least one spec under `<web-app>/tests/e2e/*.spec.ts` covering the primary user journeys.
@@ -169,6 +162,14 @@ DOM position, or visible text. Class names and copy change for cosmetic reasons 
 down with them; a test id is a contract. The stage that writes the UI is instructed to put a
 `data-testid` on every element a test needs, so name the ids you expect in that AC's
 `coverage_plan` entry -- that is the handshake between the two stages.
+
+**If the screen an AC touches has a wireframe, assert against what it shows, not just that the page
+loads.** Wireframes approved with the Plan live at `.ai-dev-workflow/plan/wireframes/<screen>.html`;
+when one exists, your e2e spec for that screen should exercise the fields, actions, and states it
+depicts (a form's fields, a button's action, an empty/error state it shows) -- "the page renders" is
+not a proving test for a screen the Plan already specified in detail. This also lets adversarial-
+compliance (which checks implementation against these same wireframes later) find fewer real
+divergences, since your suite is what will have caught a missing element first.
 
 Besides that proving (happy-path) test, for every AC write further tests where meaningful, each
 following the same AC-id-in-test-name rule above unchanged: negative tests covering invalid input,

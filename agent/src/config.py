@@ -30,6 +30,19 @@ TEST_HARDENING_MAX_FIX_CYCLES = int(os.environ.get("TEST_HARDENING_MAX_FIX_CYCLE
 E2E_APP_READY_TIMEOUT_SECONDS = int(os.environ.get("E2E_APP_READY_TIMEOUT_SECONDS", "120"))
 E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "1200"))
 
+# make_verify_node's stall-detector (graph.py's _detect_verify_stall): resets the draft session
+# after this many consecutive verify laps report near-identical feedback, an unchanged
+# changed_paths set, or non-improving coverage (whichever signals apply to the stage), on top of
+# the existing fabrication/skipped-skill triggers. Operational kill-switch if the heuristic
+# misfires -- see infra_retry.py's own env vars for the matching draft/audit-side knob.
+VERIFY_STALL_LAPS = int(os.environ.get("AIDW_VERIFY_STALL_LAPS", "2"))
+
+# Bounded retry when a sandbox container starts but its copilot --server never completes the
+# connect handshake (sandbox/provider.py's wait_for_copilot_ready) -- distinguishes "the container
+# is slow" (worth retrying) from "the container never came up" (retrying the same dead process is
+# just spent time). See sandbox/local_docker.py's provision().
+SANDBOX_PROVISION_RETRY_ATTEMPTS = int(os.environ.get("AIDW_SANDBOX_PROVISION_RETRY_ATTEMPTS", "2"))
+
 # In-container path the sandbox image bakes the Agent Plugin content to (agent/sandbox-image/
 # Dockerfile's COPY plugins/ -> this path). Overridable for local spikes without a code change.
 COPILOT_PLUGIN_ROOT_IN_CONTAINER = os.environ.get(

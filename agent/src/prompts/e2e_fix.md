@@ -21,6 +21,13 @@ files:
 
 Everything else here is a real defect: fix the app.
 
+The backend is instrumented with OpenTelemetry, and its console exporter writes spans to the same
+stdout/stderr stream captured below -- if a failing test corresponds to a request that reached the
+backend, look for its trace/span output first: it names the actual handler and any downstream call
+that failed, which narrows the fix far faster than reasoning from the frontend symptom alone. A
+frontend-only failure (nothing in the log correlates) means the root cause never reached the
+backend at all -- start there instead.
+
 Failing tests:
 <<failed_tests_json>>
 

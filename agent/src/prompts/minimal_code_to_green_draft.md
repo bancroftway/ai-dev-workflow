@@ -110,6 +110,19 @@ backend's tests then prove nothing about the running product no matter how high 
 Observed live: a run shipped a C# class library with no host at all next to a Next.js app persisting
 to `localStorage`, passed every gate, and delivered an "API" that was dead code.
 
+**The backend must be instrumented with OpenTelemetry, regardless of stack.** A deterministic gate
+checks for an OpenTelemetry SDK signal in the backend's project and entry files. Add it at startup,
+before mapping routes/handlers: for ASP.NET Core, the `OpenTelemetry.Extensions.Hosting` +
+`OpenTelemetry.Instrumentation.AspNetCore` NuGet packages and a
+`builder.Services.AddOpenTelemetry()...AddAspNetCoreInstrumentation()` call in `Program.cs`; for
+Express/Nest, `@opentelemetry/api` + `@opentelemetry/sdk-node` initialized before the app's other
+imports -- OTel's own convention is a dedicated `tracing.js`/`instrumentation.js` file required
+first, which the deterministic check also looks for; for FastAPI/Flask/Django, `opentelemetry-api`
++ the matching `opentelemetry-instrumentation-*` package, initialized at app startup. Use a console exporter (or
+respect `OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_TRACES_EXPORTER=none` if either is set in the
+environment) -- this is not decoration: it is what lets a later e2e failure be traced to the actual
+handler or downstream call that broke, instead of only a frontend symptom.
+
 **Every element a test touches needs a `data-testid`.** Put one on each input, button, list row,
 total, error message, and empty-state element -- anything an end-to-end test asserts on or interacts
 with. Use stable semantic names tied to meaning, not layout (`data-testid="expense-row"`,
@@ -117,6 +130,16 @@ with. Use stable semantic names tied to meaning, not layout (`data-testid="expen
 previous stage locate elements with `page.getByTestId(...)`; check that stage's specs for the ids
 they expect and honour those exact names. Selecting by CSS class or visible text breaks the suite on
 any cosmetic change, which is why the id is the contract.
+
+**If a screen has a wireframe, read it before you build the screen.** Wireframes approved with the
+Plan live at `.ai-dev-workflow/plan/wireframes/<screen>.html`; when one exists for a screen you are
+implementing, match its fields, actions, sections, and states before considering that screen done --
+same intent, cosmetic labels/roles may differ, but no whole element, state, or section it shows may
+be missing. This is not a new requirement invented here: the adversarial-compliance stage already
+checks every implemented screen against its wireframe and blocks the run on a mismatch. Checking it
+now, while the code is still yours to write, is the cheap version of that fix -- catching it after
+the fact is the expensive one (that stage's own fix-lap cap is 6, specifically because wireframe
+rework is heavy). No wireframe for a screen means nothing to check here.
 
 ## Tests you add here
 

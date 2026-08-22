@@ -173,6 +173,51 @@ _BACKEND_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # false-pass this exists to catch, so browser-storage APIs are deliberately NOT in this list.
 _HTTP_CALL_MARKERS = ("fetch(", "axios", "httpclient", "$fetch", "xmlhttprequest", "useswr", "usequery(")
 
+# Minimal OpenTelemetry-presence signal per backend ecosystem, checked against the SAME backend
+# project+entrypoint texts missing_hosted_backend already reads -- no new I/O. Deliberately broad
+# (a bare substring, not an exact package/import match): OpenTelemetry ships many co-installed
+# packages per ecosystem (OpenTelemetry.Extensions.Hosting, OpenTelemetry.Instrumentation.AspNetCore
+# for .NET; @opentelemetry/api, @opentelemetry/sdk-node, @opentelemetry/auto-instrumentations-node
+# for Node; opentelemetry-api, opentelemetry-instrumentation-fastapi for Python) and this only needs
+# to know SOME OTel signal is present, not which package. Same "verify, don't trust the model's own
+# claim" discipline as the checks above -- generated code must be instrumented regardless of the
+# declared stack, so an e2e failure traces to the handler/downstream call that actually broke
+# instead of only a frontend symptom (agent/src/telemetry.py sets up the identical thing for the
+# orchestrator itself; this is the same pattern applied to what the pipeline generates).
+_OTEL_MARKERS: tuple[tuple[str, str], ...] = (
+    ("asp.net", "opentelemetry"),
+    ("aspnet", "opentelemetry"),
+    ("fastapi", "opentelemetry"),
+    ("flask", "opentelemetry"),
+    ("django", "opentelemetry"),
+    ("express", "opentelemetry"),
+    ("nest", "opentelemetry"),
+)
+
+
+def missing_otel_instrumentation(frameworks: list[str], project_texts: dict[str, str]) -> str | None:
+    """A declared, actually-hosted backend framework with no OpenTelemetry signal anywhere in its
+    project/entry files, or None.
+
+    Fails OPEN (returns None) when there is nothing to read -- only positive evidence of absence
+    counts, same discipline as missing_hosted_backend. Deliberately permissive (one substring match
+    anywhere in the sampled files passes): this checks that instrumentation was attempted at all,
+    not that it is complete or correct -- a semantic/AST-level instrumentation-quality check is a
+    different, heavier gate this is not trying to be.
+    """
+    if not project_texts:
+        return None
+    blob = "\n".join(project_texts.values()).lower()
+    for framework in frameworks:
+        name = str(framework).lower()
+        for marker, needle in _OTEL_MARKERS:
+            if marker not in name:
+                continue
+            if needle not in blob:
+                return str(framework)
+            break
+    return None
+
 
 def missing_hosted_backend(frameworks: list[str], project_texts: dict[str, str]) -> str | None:
     """A declared backend framework with no evidence of an actual HTTP host, or None.
@@ -325,6 +370,25 @@ async def _check_integration_fidelity(
         if content is not None:
             texts[path] = content
 
+    # OTel's own Node.js docs recommend a SEPARATE bootstrap file (tracing.js/instrumentation.js)
+    # required before anything else in the entrypoint -- a correctly-instrumented app following
+    # that idiomatic pattern would false-positive-fail missing_otel_instrumentation if it only ever
+    # saw `texts` above, since the entrypoint itself would contain nothing but a bare `require(...)`
+    # and the OTel setup call lives in a file this function never otherwise reads. package.json is
+    # also checked directly: the most reliable "was the dependency even added" signal regardless of
+    # which file the setup code lives in. Kept as a SEPARATE dict (not merged into `texts`) so this
+    # widening only affects the OTel check, not missing_hosted_backend's already-established input.
+    otel_extra_paths = [
+        path for path in source_files
+        if path.endswith(("tracing.js", "tracing.ts", "instrumentation.js", "instrumentation.ts", "otel.js", "otel.ts", "package.json"))
+        and not _non_app(path)
+    ]
+    otel_extra_texts: dict[str, str] = {}
+    for path in sorted(set(otel_extra_paths))[:10]:
+        content = await repo_files.read_repo_file(provider, thread_id, path)
+        if content is not None:
+            otel_extra_texts[path] = content
+
     unhosted = missing_hosted_backend(frameworks, texts)
     if unhosted:
         return (
@@ -335,6 +399,26 @@ async def _check_integration_fidelity(
             f"running product.\n\nBuild the real service: for ASP.NET Core that means "
             f"Sdk=\"Microsoft.NET.Sdk.Web\" and a Program.cs that builds a WebApplication and maps "
             f"the endpoints the Specification's ACs describe, then have the frontend call it."
+        )
+
+    # Checked only once the backend is confirmed hosted -- an unhosted backend is missing_hosted_
+    # backend's finding to report above, not a second one here for the same root cause.
+    missing_otel = missing_otel_instrumentation(frameworks, {**texts, **otel_extra_texts})
+    if missing_otel:
+        return (
+            f"The approved Tech Stack declares {missing_otel} as this app's backend, and it is "
+            f"hosted, but no OpenTelemetry SDK signal is present anywhere in its project or entry "
+            f"files. Every generated backend must be instrumented regardless of the declared stack, "
+            f"so an e2e failure traces to the handler or downstream call that actually broke instead "
+            f"of only a frontend symptom. Add the OpenTelemetry SDK for this ecosystem -- for ASP.NET "
+            f"Core: the OpenTelemetry.Extensions.Hosting + OpenTelemetry.Instrumentation.AspNetCore "
+            f"NuGet packages and a builder.Services.AddOpenTelemetry()...AddAspNetCoreInstrumentation() "
+            f"call in Program.cs; for Express/Nest: @opentelemetry/api + @opentelemetry/sdk-node "
+            f"initialized before the app's other imports; for FastAPI/Flask/Django: "
+            f"opentelemetry-api + the matching opentelemetry-instrumentation-* package, initialized "
+            f"at app startup -- with a console or OTLP exporter (respect OTEL_EXPORTER_OTLP_ENDPOINT "
+            f"/ OTEL_TRACES_EXPORTER=none if set, the same convention this pipeline's own "
+            f"telemetry.py already uses for itself)."
         )
 
     # Only ask the "does the frontend call it" question when a backend was actually declared --
@@ -1218,6 +1302,20 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     # Fails OPEN: nothing declared, or nothing readable.
     assert missing_hosted_backend(["Next.js", "xUnit"], _lib_only) is None
     assert missing_hosted_backend(["ASP.NET Core"], {}) is None
+
+    # OTel presence: any signal anywhere in the sampled backend files passes (deliberately
+    # permissive -- see missing_otel_instrumentation's docstring); its total absence for a declared,
+    # hosted backend does not.
+    assert missing_otel_instrumentation(["ASP.NET Core Web API"], _hosted) == "ASP.NET Core Web API"
+    _hosted_with_otel = {**_hosted, "apps/api/Api.csproj": _hosted["apps/api/Api.csproj"] + "<!-- OpenTelemetry.Extensions.Hosting -->"}
+    assert missing_otel_instrumentation(["ASP.NET Core Web API"], _hosted_with_otel) is None
+    assert missing_otel_instrumentation(["FastAPI"], {"api/main.py": "app = FastAPI()"}) == "FastAPI"
+    assert missing_otel_instrumentation(
+        ["FastAPI"], {"api/main.py": "from opentelemetry import trace\napp = FastAPI()"}
+    ) is None
+    # Fails OPEN: nothing declared, or nothing readable -- same discipline as missing_hosted_backend.
+    assert missing_otel_instrumentation(["Next.js", "xUnit"], _lib_only) is None
+    assert missing_otel_instrumentation(["ASP.NET Core"], {}) is None
 
     # Frontend that never calls the API is the other half of the same defect.
     assert frontend_only_uses_local_storage({"web/storage.ts": "localStorage.setItem('x', v)"})

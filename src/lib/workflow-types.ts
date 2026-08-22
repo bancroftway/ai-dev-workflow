@@ -297,7 +297,11 @@ export interface EscalationPayload {
     | "security_cycle_cap_exceeded"
     | "exit_gate_failed_twice"
     | "e2e_cap_exceeded"
+    | "draft_infra_exhausted"
     | string;
+  // WHY the run died (a real gate-verified defect vs. a quota/timeout/infra failure) --
+  // orthogonal to `type` above (WHICH ceiling was hit). See agent/src/failure_classification.py.
+  failure_type?: "gate_exhausted" | "infra_transient" | "quota_exhausted" | string;
   feedback?: string;
   [key: string]: unknown;
 }

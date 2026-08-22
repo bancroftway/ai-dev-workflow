@@ -23,6 +23,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, TypedDict
 
@@ -49,15 +50,18 @@ from . import e2e_nodes
 from . import metrics_nodes
 from . import exit_nodes
 from . import rebuild
+from . import run_failure
 from . import session_store
 from . import spec_ledger
 from . import telemetry
 from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
 from .gates import adversarial_gate, remediation_gate, skill_gate
+from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
 from .gates.diagram_gate import verify_plan_diagrams
 from .gates.test_coverage_gate import verify_coverage
 from .gates.write_scope_gate import pre_tool_use_write_scope_hook, verify_ac_to_tests
+from .infra_retry import call_with_infra_retry
 from .a2ui_tools import (
     build_ac_to_tests_envelope,
     build_adversarial_audit_envelope,
@@ -85,6 +89,7 @@ from .markdown_render import (
     render_tech_stack_markdown,
 )
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
+from . import template_loader
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -133,6 +138,22 @@ class StageState(TypedDict):
     # write-scope gate); None for every other stage.
     baseline_commit: str | None
     skills: dict[str, Any] | None
+    # Draft-level infra exhaustion (make_draft_node's infra_retry attempts all lost to a Copilot
+    # quota/timeout failure) -- routed by make_route_after_draft straight to make_draft_escalate_node,
+    # bypassing cycle_count entirely. See infra_retry.py's module docstring.
+    infra_exhausted: bool
+    last_infra_error: str | None
+    # make_verify_node's stall-detector: near-identical feedback / zero changed files / no
+    # improvement in reported coverage across config.VERIFY_STALL_LAPS consecutive verify laps
+    # resets the draft session, on top of the existing fabrication/skipped-skill triggers.
+    last_verify_feedback: str | None
+    last_verify_changed_paths: list[str] | None
+    verify_stall_count: int
+    # minimal-code-to-green never sets capture_baseline_commit, so last_verify_changed_paths is
+    # always None there -- best_verify_coverage_rate is the heuristic that actually fires for that
+    # stage's documented failure shape (oscillating branch coverage across laps, not "zero files
+    # changed" -- files WERE changed each lap in the observed incident, just not converging).
+    best_verify_coverage_rate: float | None
 
 
 class GraphState(TypedDict):
@@ -222,6 +243,12 @@ def default_stage_state() -> StageState:
         "baseline_commit": None,
         # Skill evidence recorded by make_draft_node from the session's own skill.invoked events.
         "skills": None,
+        "infra_exhausted": False,
+        "last_infra_error": None,
+        "last_verify_feedback": None,
+        "last_verify_changed_paths": None,
+        "verify_stall_count": 0,
+        "best_verify_coverage_rate": None,
     }
 
 
@@ -516,7 +543,14 @@ async def _verify_specification_ledger(
     )
 
 
-AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft")
+# playwright.config.ts's exact content is a template file (agent/src/templates/playwright/), not
+# hand-duplicated prose here -- it must byte-for-byte match the sandbox image's pinned Playwright
+# version (Dockerfile's PLAYWRIGHT_VERSION comment: "this literal is duplicated in the ac-to-tests
+# SKILL.md and in two prompts... so all four change together"). Substituted once at module load,
+# same caching lifetime as load_prompt's own lru_cache.
+AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft").replace(
+    "<<playwright_config_template>>", template_loader.load_template("playwright/playwright.config.ts").strip()
+)
 
 AC_TO_TESTS_GREENFIELD_SEGMENT = load_prompt("ac_to_tests_greenfield_segment")
 
@@ -1310,6 +1344,20 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # fresh run's very first attempt).
         stage["verify_cycle_count"] = 0
         stage["last_verification"] = None
+        # Same reasoning for draft-level infra exhaustion (make_draft_node/make_draft_escalate_node):
+        # a prior run's Copilot outage must not make this run's very first draft attempt
+        # instant-escalate before it even tries. make_draft_escalate_node also clears this on its
+        # own handling path; reset here too as the same defense-in-depth every other per-run
+        # counter in this loop already gets.
+        stage["infra_exhausted"] = False
+        stage["last_infra_error"] = None
+        # Stall-detector state (make_verify_node): a resume should get a fresh 2-lap window to
+        # re-detect an in-progress stall rather than immediately treating this run's first verify
+        # lap as "identical to whatever the previous run's last lap reported."
+        stage["last_verify_feedback"] = None
+        stage["last_verify_changed_paths"] = None
+        stage["verify_stall_count"] = 0
+        stage["best_verify_coverage_rate"] = None
 
     # e2e has no StageState (it's a bespoke cluster, see e2e_nodes.py) but its fix-cycle "attempt"
     # counter needs the exact same unconditional per-run reset as verify_cycle_count above -- a run
@@ -1458,7 +1506,25 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                     "assumption in the document, and deliver the COMPLETE draft with readiness true."
                 )
             prompt_messages = [*prompt_messages, HumanMessage(content=headless_note)]
-        response = await ainvoke_structured(model, prompt_messages, stage_spec.response_schema)
+        try:
+            response = await call_with_infra_retry(
+                lambda: ainvoke_structured(model, prompt_messages, stage_spec.response_schema),
+                label=f"{stage_spec.key}:draft",
+            )
+        except (TimeoutError, RuntimeError) as exc:
+            # A Copilot session failure (quota, 429, stream hiccup) that survived infra_retry's own
+            # backoff attempts. This must NOT consume cycle_count -- that budget bounds genuine
+            # "not good enough yet" clarification attempts, and charging an infra outage against it
+            # would just move the same "run dies for an infra reason" failure a few laps later while
+            # shrinking the budget available for real fixes. There is also no new draft content to
+            # hand an audit/verify step, so this cannot fall through to the stage's normal routing
+            # the way a not-ready draft does -- it takes its own dedicated escalate edge instead
+            # (see make_route_after_draft / _wire_stage's draft_escalate wiring).
+            logger.warning("draft infra-exhausted for stage %s -- escalating without consuming cycle_count", stage_spec.key, exc_info=exc)
+            stages = {key: dict(value) for key, value in state["stages"].items()}
+            stages[stage_spec.key]["infra_exhausted"] = True
+            stages[stage_spec.key]["last_infra_error"] = str(exc)[-2000:]
+            return {"stages": stages}
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
@@ -1556,8 +1622,12 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         prompt_messages = stage_spec.build_audit_prompt(state)
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
+        audit_skipped_infra = False
         try:
-            response = await ainvoke_structured(model, prompt_messages, stage_spec.audit_response_schema)
+            response = await call_with_infra_retry(
+                lambda: ainvoke_structured(model, prompt_messages, stage_spec.audit_response_schema),
+                label=f"{stage_spec.key}:audit",
+            )
             content_dict = getattr(response, stage_spec.audit_content_field).model_dump(mode="json")
             audit_findings = list(response.audit_findings)
         except (ValidationError, ValueError) as exc:
@@ -1571,6 +1641,18 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             logger.warning("audit response failed to parse for stage %s -- keeping pre-audit draft unchanged", stage_spec.key, exc_info=exc)
             content_dict = stage["draft"]
             audit_findings = []
+        except (TimeoutError, RuntimeError) as exc:
+            # Same "an audit nobody reads was pure latency" bar applies to a Copilot session
+            # failure that survived infra_retry's own backoff attempts -- unlike make_draft_node,
+            # there is a perfectly good pre-audit draft to fall back to here, so this degrades to
+            # "the audit genuinely did not run" rather than escalating the whole stage. Distinct
+            # from the ValidationError/ValueError branch's silent skip: audit_skipped_infra is
+            # recorded so a human/dashboard can tell "no findings because it's clean" apart from
+            # "no findings because the audit never ran."
+            logger.warning("audit infra-exhausted for stage %s -- keeping pre-audit draft unchanged", stage_spec.key, exc_info=exc)
+            content_dict = stage["draft"]
+            audit_findings = []
+            audit_skipped_infra = True
 
         used_ids: set[str] = set(stage["used_ids"])
         _extract_ids(content_dict, used_ids)
@@ -1600,7 +1682,16 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             await repo_files.append_ledger_entry(
                 get_sandbox_provider(),
                 thread_id,
-                {"stage": stage_spec.key, "node": "audit", "audit_findings_count": len(stage["audit_findings"]), "token_usage": model._last_usage},
+                {
+                    "stage": stage_spec.key,
+                    "node": "audit",
+                    "audit_findings_count": len(stage["audit_findings"]),
+                    "token_usage": model._last_usage,
+                    # Distinguishes "clean, zero findings" from "the audit itself never ran" (a
+                    # Copilot infra failure that survived infra_retry) -- both look identical as
+                    # audit_findings_count=0 otherwise.
+                    "audit_skipped_infra": audit_skipped_infra,
+                },
             )
 
         if stage_spec.post_audit_hook is not None and sandbox_registry.get(thread_id) is not None:
@@ -1609,6 +1700,65 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         return {"stages": stages, "messages": extra_messages, "last_push": git_ops.get_last_push(thread_id)}
 
     return audit_node
+
+
+@dataclass(frozen=True)
+class _StallSignals:
+    feedback_similar: bool
+    paths_unchanged: bool
+    coverage_not_improving: bool
+    # The stage's own best-branch-rate-seen, updated (never lowered) -- the caller writes this
+    # straight back into stage["best_verify_coverage_rate"] regardless of whether a stall triggered.
+    new_best_coverage_rate: float | None
+
+    @property
+    def any_triggered(self) -> bool:
+        return self.feedback_similar or self.paths_unchanged or self.coverage_not_improving
+
+
+def _detect_verify_stall(
+    feedback: str,
+    last_feedback: str | None,
+    changed_paths: list[str] | None,
+    last_changed_paths: list[str] | None,
+    branch_rate: float | None,
+    best_branch_rate: float | None,
+) -> _StallSignals:
+    """Pure stall-detection logic for make_verify_node's 4th session-reset trigger. Separated from
+    the stateful node so it is directly testable (see this module's _demo()) -- the same "pure
+    function, stateful caller" split every gates/*.py check already uses.
+
+    Three independent heuristics, ORed together:
+    - feedback_similar: the model answering the same way twice in a row (SequenceMatcher, same
+      0.92 threshold ac_coverage_gate.py's MAX_TEST_BODY_SIMILARITY already uses for near-duplicate
+      test bodies -- one fewer bespoke cutoff in the codebase).
+    - paths_unchanged: the exact changed_paths list write_scope_gate already computes is identical
+      to the prior lap's -- nothing new was written. Only ever non-None for stages that set
+      capture_baseline_commit (today: ac-to-tests); permanently inert (both sides None) elsewhere.
+    - coverage_not_improving: for stages with no changed_paths signal at all but a numeric progress
+      metric each lap (minimal-code-to-green's branch_rate, the documented binding constraint in
+      the live incidents that motivated that stage's own max_verify_cycles=12 -- 93.6% branches
+      stuck 8 laps; 88.1% -> 91.9% cut off mid-convergence at 6). Tracks the BEST rate seen, not
+      just the immediately-prior lap: a naive consecutive-pair comparison misses a genuine
+      OSCILLATING stall (89 -> 85 -> 87 -> 85 -- no two adjacent laps are equal, but none beat 89
+      either), which is exactly the shape observed live.
+    """
+    feedback_similar = bool(
+        last_feedback and SequenceMatcher(None, feedback, last_feedback).ratio() >= MAX_TEST_BODY_SIMILARITY
+    )
+    paths_unchanged = (
+        last_changed_paths is not None
+        and changed_paths is not None
+        and sorted(changed_paths) == sorted(last_changed_paths)
+    )
+    coverage_not_improving = (
+        isinstance(branch_rate, (int, float)) and best_branch_rate is not None and branch_rate <= best_branch_rate + 0.01
+    )
+    if isinstance(branch_rate, (int, float)) and (best_branch_rate is None or branch_rate > best_branch_rate):
+        new_best = float(branch_rate)
+    else:
+        new_best = best_branch_rate
+    return _StallSignals(feedback_similar, paths_unchanged, coverage_not_improving, new_best)
 
 
 def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
@@ -1701,8 +1851,35 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             # invoked it correctly on a fresh session in the previous run. Restarting is what gives
             # the model a turn where invoking the skill can still change the work.
             skipped_required_skill = bool(verify_report.get("missing_skills"))
-            if wrote_nothing_real or skipped_required_skill or fabricated_artifact:
+            # Stall detector (4th session-reset trigger): the same self-reinforcing shape as the
+            # three fabrication triggers above, just not one of the specific patterns those already
+            # name. See _detect_verify_stall's own docstring for what each heuristic catches.
+            signals = _detect_verify_stall(
+                result.feedback, stage.get("last_verify_feedback"),
+                changed_paths, stage.get("last_verify_changed_paths"),
+                verify_report.get("branch_rate"), stage.get("best_verify_coverage_rate"),
+            )
+            stage["best_verify_coverage_rate"] = signals.new_best_coverage_rate
+            if signals.any_triggered:
+                stage["verify_stall_count"] = stage.get("verify_stall_count", 0) + 1
+            else:
+                stage["verify_stall_count"] = 0
+            stalled = stage["verify_stall_count"] >= workflow_config.VERIFY_STALL_LAPS
+            stage["last_verify_feedback"] = result.feedback
+            stage["last_verify_changed_paths"] = changed_paths
+            if wrote_nothing_real or skipped_required_skill or fabricated_artifact or stalled:
+                if stalled and not (wrote_nothing_real or skipped_required_skill or fabricated_artifact):
+                    logger.warning(
+                        "verify stall detected for stage %s after %d laps (feedback_similar=%s, paths_unchanged=%s, coverage_not_improving=%s) -- resetting session",
+                        stage_spec.key, stage["verify_stall_count"],
+                        signals.feedback_similar, signals.paths_unchanged, signals.coverage_not_improving,
+                    )
                 await copilot_chat_model.close_session(thread_id, stage_spec.key, "draft")
+                stage["verify_stall_count"] = 0
+                # A reset session starts fresh either way; the coverage high-water mark is about
+                # detecting non-improvement, not about the session's memory, so it is NOT cleared
+                # here -- resetting it would let a stalled stage "re-earn" laps against a lowered
+                # bar instead of the real best it has already achieved this run.
         stages[stage_spec.key] = stage
 
         extra_messages: list[BaseMessage] = []
@@ -1816,6 +1993,42 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
     return verify_fix_node
 
 
+def make_draft_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
+    """Draft-level infra exhaustion only (make_draft_node's own infra_retry attempts all lost to a
+    Copilot quota/timeout failure) -- a distinct node from make_escalate_node's deterministic-verify
+    cap exhaustion, wired unconditionally for every stage (unlike the verify-cap escalate, which
+    only exists for stages with a deterministic_verify) so this path never depends on whether a
+    given stage happens to have one. Never routes to auto_approve: silently force-approving a draft
+    that never successfully generated any content would push stale/empty content to a human
+    approval gate or downstream stage, which is worse than clearly failing the run."""
+
+    async def draft_escalate_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        thread_id = config["configurable"]["thread_id"]
+        stage = state["stages"][stage_spec.key]
+        detail = stage.get("last_infra_error") or ""
+        payload = {"stage": stage_spec.key, "type": "draft_infra_exhausted", "detail": detail[-2000:]}
+        # This node is only ever reached via make_route_after_draft's infra_exhausted check --
+        # never a genuine content/gate failure -- so the default (when the exception message
+        # itself doesn't happen to contain a recognizable quota marker) is infra_transient, not
+        # classify_failure's generic gate_exhausted fallback. See record_run_failure_and_reset's
+        # own docstring for why this matters.
+        payload = await run_failure.record_run_failure_and_reset(
+            thread_id, state.get("run_id"),
+            payload=payload, detail_for_classification=detail, default_failure_type="infra_transient",
+        )
+
+        stages = {key: dict(value) for key, value in state["stages"].items()}
+        stages[stage_spec.key]["infra_exhausted"] = False
+        stages[stage_spec.key]["status"] = "needs_clarification"
+        await _persist_if_sandboxed(
+            thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} escalated -- draft infra exhausted",
+        )
+        await copilot_chat_model.close_thread_session(thread_id)
+        return {"stages": stages, "run_failure": payload}
+
+    return draft_escalate_node
+
+
 def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     """Deterministic-verify cap exhaustion, e.g. a gate that keeps failing a real check (coverage,
     write-scope, ledger-sync). Never auto-approved past a failed deterministic gate -- and never
@@ -1834,7 +2047,11 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
             "report": last.get("report"),
             "feedback": last.get("feedback"),
         }
-        await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
+        payload = await run_failure.record_run_failure_and_reset(
+            thread_id, state.get("run_id"),
+            payload=payload,
+            detail_for_classification=f"{last.get('feedback') or ''} {last.get('report') or ''}",
+        )
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stages[stage_spec.key]["verify_cycle_count"] = 0
@@ -1864,6 +2081,12 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
 def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     def route(state: GraphState) -> str:
         stage = state["stages"][stage_spec.key]
+        # Checked before readiness/cycle_count: an infra-exhausted draft (make_draft_node, after
+        # its own infra_retry backoff attempts were all lost to a Copilot quota/timeout failure)
+        # has no draft content at all, so it must not be treated as "not ready yet" -- that would
+        # increment cycle_count for a reason that has nothing to do with clarification quality.
+        if stage.get("infra_exhausted"):
+            return "escalate"
         # A hydrate_from_repo_file short-circuit (see make_draft_node) marks the stage "approved"
         # directly, in draft_node itself -- this content was already audited and approved in a
         # prior run, so it must bypass BOTH audit_node and gate_node entirely. Routing on
@@ -2084,22 +2307,6 @@ POST_STAGE_REBUILD: dict[str, rebuild.RebuildSpec] = {
     "remediation": REBUILD_FOR_REMEDIATION,
     "adversarial-compliance": REBUILD_FOR_ADVERSARIAL_COMPLIANCE,
 }
-
-REBUILD_FOR_QUALITY_REMEDIATION = rebuild.RebuildSpec(
-    key="r_quality_remediation",
-    max_fix_cycles=3,
-    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
-    fix_scope="full",
-    next_node="quality_gate_check",
-)
-
-REBUILD_FOR_SECURITY_REMEDIATION = rebuild.RebuildSpec(
-    key="r_security_remediation",
-    max_fix_cycles=3,
-    fix_prompt_addendum="Fix the build using the systematic-debugging skill's 4-phase root-cause analysis.",
-    fix_scope="full",
-    next_node="security_gate_check",
-)
 
 
 def _route_after_tech_stack(state: GraphState) -> str:
@@ -2336,11 +2543,17 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
     draft_name = f"{stage_spec.key}_draft"
     gate_name = f"{stage_spec.key}_gate"
     auto_approve_name = f"{stage_spec.key}_auto_approve"
+    draft_escalate_name = f"{stage_spec.key}_draft_escalate"
     verify_name = f"{stage_spec.key}_verify" if stage_spec.deterministic_verify is not None else None
 
     builder.add_node(draft_name, make_draft_node(stage_spec))
     builder.add_node(gate_name, make_gate_node(stage_spec))
     builder.add_node(auto_approve_name, make_auto_approve_node(stage_spec))
+    # Wired for every stage regardless of whether it has a deterministic_verify (unlike the
+    # verify-cap escalate below, which only exists then) -- draft-level infra exhaustion can
+    # happen on any stage, including tech-stack, the one STAGES entry with no verify_name.
+    builder.add_node(draft_escalate_name, make_draft_escalate_node(stage_spec))
+    builder.add_edge(draft_escalate_name, END)
 
     # The adversarial audit leg is opt-in (specification/plan/minimal-code-to-green only): a
     # stage without audit config routes its ready draft straight to verify (when present) or the
@@ -2361,6 +2574,7 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
             "needs_clarification": END,
             "headless_redraft": draft_name,  # headless only: self-answer and redraft, no human exit
             "already_approved": next_draft_name,
+            "escalate": draft_escalate_name,
         },
     )
 
@@ -2626,6 +2840,16 @@ def assert_no_stub_stages() -> None:
         system_half, separator, _ = text.partition("\n---\n")
         if separator:
             prompt_texts.add(system_half.strip())
+    # ac_to_tests_draft.md's playwright.config.ts snippet is a <<placeholder>> resolved from a
+    # template file at module load (AC_TO_TESTS_SYSTEM_PROMPT, above) -- one canonical copy shared
+    # with the sandbox image's pinned Playwright version, instead of hand-duplicated prose that can
+    # drift. Add the POST-substitution text too, so this by-value check still recognizes it as
+    # prompt-file-backed rather than flagging every deliberate template substitution as a stub.
+    prompt_texts.add(
+        load_prompt("ac_to_tests_draft")
+        .replace("<<playwright_config_template>>", template_loader.load_template("playwright/playwright.config.ts").strip())
+        .strip()
+    )
     problems: list[str] = []
     for spec in _ALL_STAGE_SPECS:
         fields = set(getattr(spec.response_schema, "model_fields", {}) or {})
@@ -2741,6 +2965,39 @@ def _demo() -> None:
     build_graph()  # runs assert_pipeline_nodes_registered + assert_no_dead_clusters
     assert_no_stub_stages()
     assert_gates_have_self_checks()
+
+    # _detect_verify_stall: the three heuristics, independently.
+    s = _detect_verify_stall("same feedback", "same feedback", None, None, None, None)
+    assert s.feedback_similar and s.any_triggered
+    s = _detect_verify_stall("totally different this time", "wildly unrelated text entirely", None, None, None, None)
+    assert not s.feedback_similar and not s.any_triggered
+    s = _detect_verify_stall("f", "f2", ["a.py"], ["a.py"], None, None)
+    assert s.paths_unchanged and s.any_triggered
+    s = _detect_verify_stall("f", "f2", ["a.py"], ["b.py"], None, None)
+    assert not s.paths_unchanged
+    # No baseline_commit captured (minimal-code-to-green) -- both changed_paths sides are None, so
+    # paths_unchanged must stay permanently inert (never a false trigger from "None == None").
+    s = _detect_verify_stall("f", "f2", None, None, None, None)
+    assert not s.paths_unchanged and not s.any_triggered
+
+    # The exact documented live oscillation: 89 -> 85 -> 87 -> 85 covered branches. Consecutive-pair
+    # comparison would miss every one of these (no two adjacent values are equal); tracking the
+    # best-seen-so-far must not.
+    best = None
+    laps = []
+    for rate in (89.0, 85.0, 87.0, 85.0):
+        sig = _detect_verify_stall("f", "f2", None, None, rate, best)
+        best = sig.new_best_coverage_rate
+        laps.append(sig.coverage_not_improving)
+    assert laps == [False, True, True, True], f"expected only the first lap (a new best) to NOT flag: {laps}"
+    assert best == 89.0, "the high-water mark must survive laps that don't beat it, not reset to the latest value"
+    # A genuinely improving run (each lap beats the last) must never be flagged as stalled.
+    best = None
+    for rate in (70.0, 80.0, 95.0):
+        sig = _detect_verify_stall("f", "f2", None, None, rate, best)
+        best = sig.new_best_coverage_rate
+        assert not sig.coverage_not_improving, f"a strictly-improving rate ({rate}) must never count as a stall"
+
     print("graph self-check: all assertions passed")
 
 

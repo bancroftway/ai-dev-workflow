@@ -36,6 +36,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import registry
+from .. import config as workflow_config
 from ..telemetry import traced_exec
 from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_copilot_ready
 
@@ -245,16 +246,42 @@ class AzureContainerInstanceProvider(SandboxProvider):
                     "--registry-password", self._registry_password or "",
                 ]
 
-            returncode, stdout, stderr = await _run_az(*args)
-            if returncode != 0:
-                raise RuntimeError(f"az container create failed for session {session_id!r}: {stderr}")
-
-            try:
-                ip = await self._resolve_ip(name, create_output=stdout)
-                await wait_for_copilot_ready(ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
-            except Exception:
-                await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
-                raise
+            # Retried as a whole (fresh container group, fresh token) up to
+            # SANDBOX_PROVISION_RETRY_ATTEMPTS times -- mirrors LocalDockerProvider.provision's own
+            # retry. wait_for_copilot_ready already polls the connect handshake continuously for
+            # its own 60s deadline, so re-polling the SAME unresponsive group after it raises would
+            # just wait out an identical timeout again; only a fresh `az container create` can
+            # distinguish "this group is just slow" from "this group never came up at all."
+            attempts = max(1, workflow_config.SANDBOX_PROVISION_RETRY_ATTEMPTS)
+            last_exc: Exception | None = None
+            ip = ""
+            for attempt in range(attempts):
+                if attempt > 0:
+                    # This loop's own previous attempt's group, named identically -- `az container
+                    # create --name` fails outright if it's still around.
+                    await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
+                    connection_token = secrets.token_urlsafe(32)
+                    args[args.index(next(a for a in args if a.startswith("COPILOT_CONNECTION_TOKEN=")))] = (
+                        f"COPILOT_CONNECTION_TOKEN={connection_token}"
+                    )
+                returncode, stdout, stderr = await _run_az(*args)
+                if returncode != 0:
+                    raise RuntimeError(f"az container create failed for session {session_id!r}: {stderr}")
+                try:
+                    ip = await self._resolve_ip(name, create_output=stdout)
+                    await wait_for_copilot_ready(ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
+                    last_exc = exc
+                    if attempt < attempts - 1:
+                        logger.warning(
+                            "ACI sandbox provision attempt %d/%d failed for session_id=%s, retrying with a fresh container group: %s",
+                            attempt + 1, attempts, session_id, exc,
+                        )
+            if last_exc is not None:
+                raise last_exc
 
             self._sandboxes[session_id] = _RunningSandbox(name, ip, connection_token, branch)
             self._ensure_reaper_running()

@@ -266,12 +266,26 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
           push failing — GitHub persistence off
         </span>
       )}
-      {state.run_failure && (
-        <span className="rounded-full border border-red-300 bg-red-50 px-2.5 py-0.5 text-xs text-red-800">
-          {state.run_failure.stage}: {state.run_failure.type} — run ended
-          {state.run_failure.type === "cannot_verify" ? " (sandbox lost — resubmit to restart)" : ""}
-        </span>
-      )}
+      {state.run_failure && (() => {
+        // failure_type distinguishes a real gate-verified defect (red -- your code needs a fix)
+        // from a quota/timeout/infra failure (amber -- resubmitting may just work, nothing about
+        // the generated code was actually wrong). Older payloads predate this field and fall back
+        // to the pre-existing red/"run ended" treatment.
+        const isInfra = state.run_failure.failure_type === "infra_transient" || state.run_failure.failure_type === "quota_exhausted";
+        const toneClass = isInfra ? CHIP_CLASS.amber : CHIP_CLASS.red;
+        const reason = isInfra
+          ? state.run_failure.failure_type === "quota_exhausted"
+            ? "quota/rate limit — resubmit once it resets"
+            : "infrastructure failure — resubmit to retry"
+          : null;
+        return (
+          <span className={`rounded-full border px-2.5 py-0.5 text-xs ${toneClass}`}>
+            {state.run_failure.stage}: {state.run_failure.type} — run ended
+            {reason ? ` (${reason})` : ""}
+            {state.run_failure.type === "cannot_verify" ? " (sandbox lost — resubmit to restart)" : ""}
+          </span>
+        );
+      })()}
     </div>
   );
 }

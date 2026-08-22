@@ -23,8 +23,9 @@ from typing import Any, Callable, Literal, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import git_ops, model_config, repo_files, stack_runner, test_results
+from . import git_ops, model_config, repo_files, run_failure, stack_runner, test_results
 from .copilot_chat_model import get_chat_model_for_thread
+from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .schemas import StageReport
@@ -265,7 +266,21 @@ def make_fix_node(spec: RebuildSpec):
             # Always autopilot -- a fix node's whole purpose requires write access.
             agent_mode="autopilot",
         )
-        await model.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+        try:
+            await call_with_infra_retry(
+                lambda: model.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)]),
+                label=f"rebuild-{spec.key}:fix",
+            )
+        except (TimeoutError, RuntimeError) as exc:
+            # A Copilot session failure that survived infra_retry's own backoff attempts. No new
+            # separate counter here (unlike make_draft_node/make_verify_node): fix_node has no
+            # routing decision of its own -- rebuild_node's NEXT build-check run is what decides
+            # pass/fail, driven only by fix_cycle_count vs max_fix_cycles. Tagging last_stderr_tail
+            # lets make_escalate_node's failure_type classification (run_failure.py) correctly
+            # report infra_transient/quota_exhausted if this stage does eventually escalate,
+            # instead of looking like a genuine build defect.
+            logger.warning("rebuild fix infra-exhausted for %s -- counting the lap: %s", spec.key, exc)
+            rb["last_stderr_tail"] = f"[infra failure, fix lap not attempted] {exc}"[-4000:]
 
         rb["fix_cycle_count"] = rb["fix_cycle_count"] + 1
         rb["status"] = "fixing"
@@ -288,7 +303,11 @@ def make_escalate_node(spec: RebuildSpec):
             "stdout_tail": rb["last_stdout_tail"],
             "stderr_tail": rb["last_stderr_tail"],
         }
-        await git_ops.record_run_failure(thread_id, payload, state.get("run_id"))
+        payload = await run_failure.record_run_failure_and_reset(
+            thread_id, state.get("run_id"),
+            payload=payload,
+            detail_for_classification=f"{rb['last_stdout_tail']} {rb['last_stderr_tail']}",
+        )
         rebuild = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
         rebuild.setdefault(spec.key, default_rebuild_state())
         rebuild[spec.key]["fix_cycle_count"] = 0

@@ -125,9 +125,16 @@ class WriteScopeOutcome:
     violating_paths: list[str]
     changed_paths: list[str]
     reverted_paths: list[str] = field(default_factory=list)
+    # Non-empty exactly when reverted_paths is: where a COPY of each reverted/deleted path's
+    # content survives, for a human (or the model, next lap) to confirm a true scope violation
+    # versus this gate's 3-language-family test-path regex missing a legitimate test in an
+    # unrecognized language (Go, Rust, Java, Ruby, ...). See check_write_scope's docstring.
+    quarantine_dir: str = ""
 
 
-async def check_write_scope(provider: SandboxProvider, thread_id: str, baseline_commit: str | None) -> WriteScopeOutcome:
+async def check_write_scope(
+    provider: SandboxProvider, thread_id: str, baseline_commit: str | None, run_id: str = "unknown"
+) -> WriteScopeOutcome:
     if baseline_commit is None:
         # No baseline captured (e.g. this draft never actually ran against a sandbox) -- nothing
         # to diff against, so nothing to flag. StageSpec.capture_baseline_commit guarantees this
@@ -154,18 +161,37 @@ async def check_write_scope(provider: SandboxProvider, thread_id: str, baseline_
     # stage at the verify cap (observed live, headless run 5: two helper .sh scripts at the repo
     # root). The gate enforces its own contract -- untracked out-of-scope files are removed,
     # tracked ones restored to their committed state -- and the stage proceeds on what remains.
+    #
+    # A COPY is quarantined under .ai-dev-workflow/quarantine/ (already pipeline-owned, so it
+    # never re-triggers this same check next lap) before the revert runs. This is a copy-then-
+    # revert, never a plain move: a *tracked* file that was only moved (not reverted) would still
+    # show up as a deletion against baseline_commit in every future git diff -- the model has no
+    # way to "fix" a deletion of a file it correctly should not have touched, so that would
+    # deadlock exactly like the original no-revert-at-all design did, just via a different path.
+    # Reverting to baseline is still what makes the violation disappear; quarantining only stops
+    # that revert from being silent, unrecoverable data loss when the "violation" is actually a
+    # legitimate test file in a language this gate's regex doesn't recognize.
     for path in violating:
         validate_repo_relative_path(path)
     quoted = " ".join(shlex.quote(p) for p in violating)
+    quarantine_dir = f".ai-dev-workflow/quarantine/{run_id}"
     revert = await provider.exec_in_sandbox(
         thread_id,
-        f"for p in {quoted}; do if git ls-files --error-unmatch -- \"$p\" >/dev/null 2>&1; "
+        f"mkdir -p {shlex.quote(quarantine_dir)} && "
+        f"for p in {quoted}; do "
+        f"mkdir -p \"{quarantine_dir}/$(dirname -- \"$p\")\" && cp -f -- \"$p\" \"{quarantine_dir}/$p\" 2>/dev/null; "
+        f"if git ls-files --error-unmatch -- \"$p\" >/dev/null 2>&1; "
         f"then git checkout -- \"$p\"; else rm -rf -- \"$p\"; fi; done",
     )
     if not revert.ok:
         return WriteScopeOutcome(passed=False, violating_paths=violating, changed_paths=changed_paths, reverted_paths=[])
-    logger.info("write-scope gate reverted out-of-scope paths for thread_id=%s: %s", thread_id, violating)
-    return WriteScopeOutcome(passed=True, violating_paths=[], changed_paths=changed_paths, reverted_paths=violating)
+    logger.info(
+        "write-scope gate quarantined+reverted out-of-scope paths for thread_id=%s: %s -> %s",
+        thread_id, violating, quarantine_dir,
+    )
+    return WriteScopeOutcome(
+        passed=True, violating_paths=[], changed_paths=changed_paths, reverted_paths=violating, quarantine_dir=quarantine_dir
+    )
 
 
 _WRITE_TOOL_NAMES = {"builtin:create", "builtin:edit", "builtin:apply_patch"}
@@ -237,7 +263,7 @@ async def verify_ac_to_tests(
     from ..graph import VerificationResult
     from .ac_coverage_gate import check_ac_coverage
 
-    write_scope = await check_write_scope(provider, thread_id, baseline_commit)
+    write_scope = await check_write_scope(provider, thread_id, baseline_commit, run_id)
     if not write_scope.passed:
         # Only reachable when the gate's own auto-revert failed -- in-scope violations are
         # remediated deterministically (removed/restored), never bounced back to the model,
@@ -322,6 +348,7 @@ async def verify_ac_to_tests(
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
     if write_scope.reverted_paths:
         report["reverted_out_of_scope_paths"] = write_scope.reverted_paths
+        report["quarantine_dir"] = write_scope.quarantine_dir
     return VerificationResult(passed=coverage.passed, feedback=coverage.feedback, report=report)
 
 
