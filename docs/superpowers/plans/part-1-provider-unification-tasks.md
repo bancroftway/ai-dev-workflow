@@ -287,8 +287,12 @@ just assert `PROVIDER in ("copilot","claude")` and that every re-exported name i
 Tasks 1-4, but review it after Task 6 since Task 6 is the actual caller).
 
 Add `async def wait_for_cli_ready(exec_fn: Callable[[str], Awaitable[tuple[int,str,str]]]) -> None`
-alongside the existing `wait_for_copilot_ready` (do not remove `wait_for_copilot_ready` — it's
-still used on the Copilot path per Task 6). No server/socket to handshake with anymore for either
+alongside the existing `wait_for_copilot_ready` (do not remove `wait_for_copilot_ready` in *this*
+task — Task 5 lands before Task 6's callers exist, so deleting it here would break nothing yet but
+is still premature; **Task 6, corrected 2026-08-22, deletes it once both providers switch to
+`wait_for_cli_ready` and no caller remains** — see that task's text, since Copilot's own TCP
+handshake turned out not to survive contact with this same task's port removal). No server/socket
+to handshake with anymore for either
 provider's CLI-exec path — poll `exec_fn("claude --version")` (or `"copilot --version"`, caller's
 choice — this function takes whichever version-check command the caller wants) every 0.5s up to
 the existing `_READY_TIMEOUT_SECONDS` (60.0), raise `RuntimeError` on timeout with the last error.
@@ -323,23 +327,40 @@ In both files' `provision()`:
   `AGENT_PROVIDER={PROVIDER}` as its own env var (entrypoint.sh needs it — Task 7). This keeps
   `local_docker.py`'s `docker create` call and `azure_aci.py`'s `az container create` call from
   ever needing to branch on provider themselves — harmless unused env either way.
-- **Remove** the `-p {host_port}:3000` port publish in `local_docker.py` and the
-  `COPILOT_SERVER_PORT`/`COPILOT_CONNECTION_TOKEN` env vars in both files — nothing listens on a
-  port anymore for either provider. (Keep `_COPILOT_PORT_IN_CONTAINER`/`_free_port()`-adjacent
-  code only if something else in the file still needs a port number for its `SandboxSession`
-  return value shape — check whether `SandboxSession.port`/`.connection_token` fields are read
-  anywhere else before deciding whether to keep them as always-empty/zero placeholders or thread
-  the dataclass shape change further. Default to keeping the dataclass shape unchanged and just
-  passing dummy/empty values, since changing `SandboxSession`'s fields ripples into
-  `copilot_chat_model.py`/`claude_chat_model.py`'s `sandbox: SandboxSession | None` field — out of
-  scope for this task, note it as a follow-up if it looks genuinely dead.)
-- Replace the direct `wait_for_copilot_ready(...)` call with a branch:
-  `if PROVIDER == "copilot": await wait_for_copilot_ready(...)` (unchanged) `else:` build a local
-  `_exec` closure wrapping this provider's own low-level command runner (`_run_docker("exec", "-w",
-  WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd)` for local; the `az container exec`
-  equivalent for ACI) and `await wait_for_cli_ready(_exec)`. Apply this to **every** call site of
-  `wait_for_copilot_ready` in `local_docker.py`, including the one inside `_try_reattach` — a
-  reattach to a Claude-mode container needs the same branch, not just fresh provisioning.
+- **Corrected 2026-08-22, see Ruling in progress.md.** **Remove** the `-p {host_port}:3000` port
+  publish in `local_docker.py`, **and** the `--ports`/`_COPILOT_PORT_IN_CONTAINER` publish in
+  `azure_aci.py`, and the `COPILOT_SERVER_PORT`/`COPILOT_CONNECTION_TOKEN` env vars in both files —
+  nothing listens on a port anymore for either provider, on either sandbox backend. The original
+  version of this bullet kept ACI's port publish "since something might still need it" — it
+  doesn't: Copilot's own JSON-RPC/TCP session mechanism (`RuntimeConnection.for_uri`) was already
+  fully retired by Task 3's CLI-exec rewrite, so nothing on either backend ever connects to this
+  port for any reason anymore, readiness included (see next bullet). Remove
+  `_COPILOT_PORT_IN_CONTAINER`/`_free_port()`-adjacent code from both files once nothing references
+  it. `SandboxSession.port`/`.connection_token` stay in the dataclass unchanged, passed as
+  dummy/empty values (confirmed dead everywhere outside these two files' own construction call
+  sites, per Task 6's original review — still correctly out of scope to remove the fields
+  themselves; note as a follow-up if it looks genuinely dead).
+- **Corrected 2026-08-22.** Replace the direct `wait_for_copilot_ready(...)` call with an
+  unconditional `await wait_for_cli_ready(_exec)` — **no provider branch at all**, for either
+  provider, on either backend. The original version of this bullet special-cased
+  `if PROVIDER == "copilot": await wait_for_copilot_ready(...) (unchanged)`, reasoning that
+  Copilot's TCP handshake was still valid there — that reasoning silently depended on a port still
+  being published, which the bullet above's own instruction removes in the same task. As
+  originally written, this made the default configuration (`AGENT_PROVIDER=copilot` +
+  `SANDBOX_PROVIDER=local`, i.e. no env overrides at all) permanently unable to provision a
+  sandbox: `wait_for_copilot_ready`'s real loopback `socket.create_connection` (provider.py) can
+  never succeed against a port nothing publishes anymore. The Spec's own words for what Part 1
+  does to Copilot's readiness mechanism are unambiguous: "the `wait_for_copilot_ready` JSON-RPC
+  handshake... goes away." Build the local `_exec` closure wrapping this provider's own low-level
+  command runner (`_run_docker("exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c",
+  cmd)` for local; the `az container exec` equivalent for ACI) polling `{binary} --version` where
+  `binary` is `"claude"` or `"copilot"` per the active `PROVIDER` — apply this to **every** call
+  site in `local_docker.py`, including the one inside `_try_reattach`. Delete
+  `wait_for_copilot_ready` from `agent/src/sandbox/provider.py` once nothing calls it anymore
+  (confirmed by Task 6's original review: exactly 3 paired call sites exist, all in these two
+  files — no other caller anywhere in the repo). Also correct `provider.py`'s module-level
+  docstring, which still describes the retired `RuntimeConnection.for_uri`/TCP-server architecture
+  as current — rewrite to describe the one CLI-exec-readiness shape both providers now share.
 
 Self-check: none new — this is provisioning logic against a real Docker daemon, covered by
 Task 12's real-container verification, not a unit test.
