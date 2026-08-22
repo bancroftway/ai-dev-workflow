@@ -1,37 +1,40 @@
-"""The one way this pipeline asks GHCP to run something in the repo and report back.
+"""How this pipeline asks a coding agent to run something in the repo and report back.
 
 Why this module exists: for 25+ headless runs, Python guessed the stack-specific shell command
 for a generated app (`dotnet test` at the repo root, a canned vitest invocation, an LLM-guessed
 build command run blindly) and the guess kept being wrong -- MSB1003, zero instrumented lines,
 Playwright specs pulled into a unit run. The repo layout is knowable only by looking at it, so
-the looking is delegated to a GHCP session with real tools, and Python keeps the part that must
-stay deterministic: parsing artifacts, checking freshness, applying thresholds.
+the looking is delegated to a coding-agent session with real tools, and Python keeps the part
+that must stay deterministic: parsing artifacts, checking freshness, applying thresholds.
 
-The reporting contract (proven by spike before this module existed):
+The reporting contract: the session does its real work with its tools, then responds with a
+final assistant message that is a single JSON object matching the stage's `schema`.
+structured_output.ainvoke_structured (Task 4) is what actually enforces this -- it prompts for
+that JSON, validates the response against the Pydantic schema, and on a mismatch feeds the model
+back the exact validation error and asks again, up to its own retry budget, before raising. This
+module's job stops at catching that raise and synthesizing the same success=False report shape it
+already produces on every other failure path, so one bad stage session degrades the run instead
+of crashing it.
 
-    Tool(name="report_stage_output", parameters=<the stage's JSON schema>, is_terminal=True)
-
-A schema-VALID call ends the agent's turn -- it is the stage's only exit door. An INVALID call is
-rejected by _make_report_tool's handler, which runs in THIS process, and returns the exact
-Pydantic errors as the tool result; per the SDK's own contract a failed terminal call leaves the
-agent loop running, so the model reads the field-level feedback and calls again. No re-prompting,
-no parsing prose. Note that a terminal tool call means there may be NO final assistant text at
-all, which is why nothing here uses copilot_chat_model.ainvoke_structured.
+This used to be a client-side terminal-tool call (`Tool(name="report_stage_output",
+is_terminal=True)`, validated by a handler running in THIS process) that only worked because
+Copilot ran as a persistent SDK session able to call back into that in-memory handler. Once
+Copilot moved to per-turn CLI-exec there was no live process left for a `copilot -p` subprocess to
+call back into, so that mechanism silently stopped working -- every call synthesized a
+success=False report regardless of what the session actually did. ainvoke_structured's
+prompt-and-validate approach needs nothing but `model.ainvoke()`, which both providers implement,
+so it is now the one path for both.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import ValidationError
-
-from copilot import Tool
-from copilot.tools import ToolResult
 
 from . import model_config, repo_files
-from .copilot_chat_model import get_chat_model_for_thread
+from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
 from .schemas import StageReport
@@ -54,66 +57,22 @@ invocations, so a name you did not actually invoke is visible as an unsubstantia
 list is a perfectly good answer, an inaccurate one is not.
 """
 
-REPORT_TOOL_NAME = "report_stage_output"
-
-# Appended to every prompt this module sends. Belt-and-braces next to the tool's own schema
-# enforcement: the tool boundary is what actually guarantees shape, but nudging the model away
-# from fenced/decorated payloads costs nothing and cuts the reject-retry round trips.
+# Appended to every prompt this module sends. Belt-and-braces next to ainvoke_structured's own
+# schema validation: that validate-and-retry loop is what actually guarantees shape, but nudging
+# the model away from fenced/decorated payloads up front costs nothing and cuts the reject-retry
+# round trips.
 WELL_FORMED_JSON_RULES = """
 Reporting rules (strict):
-- Report ONLY by calling the `report_stage_output` tool. Your work is not complete until that
-  call succeeds -- do not finish with a prose answer instead.
+- Report ONLY by responding with the JSON object described in your instructions, as your final
+  message. Your work is not complete until you send that JSON -- do not finish with a prose
+  answer instead.
 - Pass real JSON values: double-quoted keys and strings, no trailing commas, no code fences, no
-  commentary inside the arguments, booleans as true/false (never "true"), numbers unquoted.
+  commentary before or after the JSON, booleans as true/false (never "true"), numbers unquoted.
 - Every required field must be present. If something failed, set success=false and put the real
   reason in `error` -- never report success for work you did not actually complete.
 - Report only what you actually observed. Do not report a file path you did not create, or a
   command result you did not see.
 """.strip()
-
-
-# (thread_id, stage_key) -> the last validated report from that session's reporting tool.
-#
-# Deliberately module-level rather than a per-call local: copilot_chat_model caches one Copilot
-# session per (thread, stage, role), and `tools` are only registered on the CREATE call, so the
-# handler closure from the FIRST invocation is the one that stays live for every later invocation
-# on that session. A per-call dict therefore looked empty on every reuse -- observed live on the
-# rebuild node, which runs once per fix lap against one cached session. Keying the shared store by
-# session identity makes the reused handler and the current caller agree on where the report goes.
-_STASHES: dict[tuple[str, str], Any] = {}
-
-
-def _make_report_tool(schema: type[ReportT], stash_key: tuple[str, str]) -> Tool:
-    """The validating exit door. Handler runs client-side (SDK round-trips the call to us over
-    HandlePendingToolCall), so this Pydantic validation is genuinely OUR check, not the model's
-    self-assessment."""
-
-    def handler(invocation: Any) -> ToolResult:
-        try:
-            _STASHES[stash_key] = schema.model_validate(invocation.arguments)
-        except ValidationError as exc:
-            logger.info("report_stage_output rejected: %s validation error(s)", exc.error_count())
-            return ToolResult(
-                text_result_for_llm=(
-                    "Your report did NOT match the required schema and was rejected. Fix exactly "
-                    f"these problems and call `{REPORT_TOOL_NAME}` again:\n{exc}"
-                ),
-                result_type="failure",
-                error="schema validation failed",
-            )
-        return ToolResult(text_result_for_llm="Report accepted.", result_type="success")
-
-    return Tool(
-        name=REPORT_TOOL_NAME,
-        description=(
-            "Report your final results for this stage. Your work is not complete until this call "
-            "succeeds. If the arguments do not match the schema you will get the validation "
-            "errors back and must call again with them fixed."
-        ),
-        parameters=schema.model_json_schema(),
-        handler=handler,
-        is_terminal=True,
-    )
 
 
 async def run_and_report(
@@ -126,10 +85,10 @@ async def run_and_report(
     model_name: str | None = None,
     **render_values: str,
 ) -> ReportT:
-    """Run one GHCP session that does real work in the sandbox and reports through `schema`.
+    """Run one coding-agent session that does real work in the sandbox and reports through `schema`.
 
     Always returns a report -- never raises for model misbehavior. If the session ends without a
-    valid call (or there is no sandbox at all), a success=False report is synthesized so the
+    valid report (or there is no sandbox at all), a success=False report is synthesized so the
     caller routes into its own existing failure path instead of the run dying. Every outcome,
     including the synthesized failure, is appended to the ledger before returning.
     """
@@ -142,12 +101,6 @@ async def run_and_report(
             sandboxed=False,
         )
 
-    stash_key = (thread_id, stage_key)
-    _STASHES.pop(stash_key, None)  # never read a previous lap's report
-    # The report tool must be reachable when an allowlist is in play, or the model has no exit
-    # door at all. Source-qualified ("custom:") per copilot._mode.ToolSet's own convention.
-    tools_allowlist = [*available_tools, f"custom:{REPORT_TOOL_NAME}"] if available_tools else None
-
     try:
         model = get_chat_model_for_thread(
             thread_id,
@@ -156,8 +109,7 @@ async def run_and_report(
             model_name=model_name or model_config.get_model_name(stage_key, "draft") or model_config.get_model_name("stack-run", "draft"),
             sandbox=sandbox,
             agent_mode="autopilot",
-            available_tools=tools_allowlist,
-            tools=[_make_report_tool(schema, stash_key)],
+            available_tools=available_tools,
         )
         system, template = load_prompt_pair(prompt_name)
         prompt = render_prompt(template, **render_values)
@@ -165,46 +117,19 @@ async def run_and_report(
             SystemMessage(content=system),
             HumanMessage(content=f"{prompt}\n\n{WELL_FORMED_JSON_RULES}\n{SKILLS_REPORT_RULES}"),
         ]
-
-        # A turn can end with prose instead of the required tool call (observed live: the coverage
-        # session answered in text and never reported). The tool is the ONLY accepted exit, so a
-        # silent turn gets one explicit nudge before we give up -- cheaper than failing a whole
-        # gate cycle, and the model still has its full session context to report from.
-        for attempt in range(2):
-            await model.ainvoke(messages)
-            if stash_key in _STASHES:
-                break
-            if attempt == 0:
-                logger.info("stack_runner: %s ended without a report -- nudging once", stage_key)
-                messages = [
-                    HumanMessage(
-                        content=(
-                            f"You ended your turn without calling `{REPORT_TOOL_NAME}`, so none of "
-                            "your work has been recorded. Call it NOW with the results of what you "
-                            "just did. Report only what you actually observed; if the work could "
-                            "not be completed, call it with success=false and the real reason in "
-                            "`error`."
-                        )
-                    )
-                ]
+        # ainvoke_structured owns the "no report -> nudge -> give up" loop internally (its own
+        # validate-and-retry, up to its own attempt budget) -- a turn ending in prose instead of
+        # the required JSON (observed live: the coverage session answered in text and never
+        # reported) is exactly the mismatch it retries on, so nothing here needs to duplicate that
+        # loop. It either returns a valid `schema` instance or raises once its retries are spent,
+        # which the except below turns into the same synthesized failure as any other session error.
+        report = await ainvoke_structured(model, messages, schema)
     except Exception as exc:  # noqa: BLE001 -- a failed stage must not kill the run
         logger.warning("stack_runner session failed for stage_key=%s", stage_key, exc_info=True)
         return await _ledger(
             thread_id,
             stage_key,
             schema(success=False, ready_for_next_stage=False, error=f"session error: {exc}"),
-        )
-
-    report = _STASHES.pop(stash_key, None)
-    if report is None:
-        return await _ledger(
-            thread_id,
-            stage_key,
-            schema(
-                success=False,
-                ready_for_next_stage=False,
-                error=f"session ended without a valid {REPORT_TOOL_NAME} call, even after a nudge",
-            ),
         )
     return await _ledger(thread_id, stage_key, report)
 
