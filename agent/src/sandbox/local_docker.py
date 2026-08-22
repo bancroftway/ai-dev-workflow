@@ -302,7 +302,7 @@ class LocalDockerProvider(SandboxProvider):
                             "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd
                         )
 
-                    await wait_for_cli_ready(_exec)
+                    await wait_for_cli_ready(_exec, version_command=f"{PROVIDER} --version")
                     last_exc = None
                     break
                 except Exception as exc:
@@ -361,8 +361,12 @@ class LocalDockerProvider(SandboxProvider):
         async def _exec(cmd: str) -> tuple[int, str, str]:
             return await _run_docker("exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd)
 
+        # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
+        # a module-scope import here would cycle.
+        from ..chat_model import PROVIDER
+
         try:
-            await wait_for_cli_ready(_exec)
+            await wait_for_cli_ready(_exec, version_command=f"{PROVIDER} --version")
         except Exception:  # noqa: BLE001 -- liveness probe; any failure means "don't reattach"
             return None
         return _RunningSandbox(container_id, 0, "")

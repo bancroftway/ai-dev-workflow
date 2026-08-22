@@ -112,21 +112,26 @@ class SandboxProvider(abc.ABC):
         """
 
 
-async def wait_for_cli_ready(exec_fn: Callable[[str], Awaitable[tuple[int, str, str]]]) -> None:
+async def wait_for_cli_ready(
+    exec_fn: Callable[[str], Awaitable[tuple[int, str, str]]], version_command: str
+) -> None:
     """Block until the CLI tool in the sandbox is ready to accept commands.
 
     exec_fn is a thin provider-specific wrapper (docker exec / az container exec) that executes
-    a command in the sandbox and returns (returncode, stdout, stderr). This function polls the
-    CLI with a version-check command every 0.5s up to _READY_TIMEOUT_SECONDS. Once the command
-    succeeds (returncode == 0), returns; otherwise raises RuntimeError on timeout with the
-    last error observed.
+    a command in the sandbox and returns (returncode, stdout, stderr). version_command is the
+    caller-supplied version-check command for whichever CLI is actually active (e.g. "claude
+    --version" or "copilot --version") -- no default here, deliberately: a fallback would silently
+    check the wrong binary for any caller that forgot to pass one, exactly the bug this parameter
+    replaces. This function polls exec_fn(version_command) every 0.5s up to _READY_TIMEOUT_SECONDS.
+    Once the command succeeds (returncode == 0), returns; otherwise raises RuntimeError on timeout
+    with the last error observed.
     """
     deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
     last_error: str | None = None
 
     while time.monotonic() < deadline:
         try:
-            returncode, stdout, stderr = await exec_fn("claude --version")
+            returncode, stdout, stderr = await exec_fn(version_command)
             if returncode == 0:
                 return
             last_error = f"returncode {returncode}: {stderr}"

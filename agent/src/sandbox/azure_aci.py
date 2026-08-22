@@ -284,7 +284,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                             "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {cmd}\"",
                         )
 
-                    await wait_for_cli_ready(_exec)
+                    await wait_for_cli_ready(_exec, version_command=f"{PROVIDER} --version")
                     last_exc = None
                     break
                 except Exception as exc:
