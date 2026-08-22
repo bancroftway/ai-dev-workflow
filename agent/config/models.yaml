@@ -1,90 +1,162 @@
-# Per-stage, per-role GitHub Copilot model selection (SPECIFICATION.md Section 3.4).
+# Per-stage, per-role model selection for both agent providers (SPECIFICATION.md Section 3.4).
 #
-# `null` lets the Copilot SDK pick its own default model for that call.
+# Every stage nests a full model config per AGENT_PROVIDER value -- {stage}: {copilot: {draft_model,
+# audit_model}, claude: {draft_model, audit_model}}. model_config.get_model_name looks up
+# stage -> provider -> role, so only the active provider's block is ever read at runtime; editing
+# (or leaving stale) the other provider's block cannot affect a live run on the active one.
+#
+# `null` (or an absent key) lets the active CLI pick its own default model for that call.
 # `audit_model` applies ONLY to the three stages with an adversarial audit pass
 # (specification, plan, minimal-code-to-green) and should differ from draft_model -- the audit
 # exists to get a second opinion from a *different* model. Other stages have no audit leg.
 #
-# Valid model ids depend on your GitHub Copilot account/plan -- list what's actually available
-# with `CopilotClient.list_models()` (agent/.venv, `uv run python -c "..."`), not this comment,
-# since the roster changes over time. As of this writing, this account has access to:
+# COPILOT roster: valid model ids depend on your GitHub Copilot account/plan -- list what's
+# actually available with `CopilotClient.list_models()` (agent/.venv, `uv run python -c "..."`),
+# not this comment, since the roster changes over time. As of this writing, this account has
+# access to:
 #   auto, claude-sonnet-5, claude-sonnet-4.6, claude-sonnet-4.5, claude-haiku-4.5,
 #   claude-opus-5, gpt-5.6-terra, gpt-5.6-luna, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini,
 #   gpt-5-mini, mai-code-1-flash-picker, gemini-3.1-pro-preview, gemini-3.6-flash,
 #   gemini-3.5-flash, kimi-k2.7-code
 # Headless-test roster (2026-08-15, user directive): cheaper/faster models only, no
 # claude-sonnet-5. Audits stay on a different vendor than their draft for a real second opinion.
+#
+# CLAUDE roster: every claude: block below is a PLACEHOLDER an operator should tune, not a
+# measured choice -- added by Task 10 (part-1-provider-unification) purely to give
+# AGENT_PROVIDER=claude a config shape to read. Defaults mirror each stage's existing Copilot
+# tier (mini -> haiku, full -> sonnet) with any audit bumped one tier up (haiku -> sonnet,
+# sonnet -> opus) so the "audit differs from draft" property above still holds. `sonnet`/`opus`/
+# `haiku` are Claude Code CLI's own published model aliases -- claude_chat_model.py passes
+# get_model_name's return straight through as `--model <value>`, no separate id-mapping table --
+# but verify them against Anthropic's currently published model list (`claude --help` or
+# Anthropic's docs) before relying on this section for a real Claude-backed run, same
+# "verify before you trust this comment" caveat as the Copilot roster above.
 tech-stack:
   # Also used for the "extract" role (Tech Stack tab's Submit-time JSON extraction) -- shares
   # draft_model, see model_config.get_model_name's own comment on why that's not a config gap.
-  draft_model: gpt-5.4-mini
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
 specification:
-  draft_model: gpt-5.4-mini
-  audit_model: gemini-3.6-flash
+  copilot:
+    draft_model: gpt-5.4-mini
+    audit_model: gemini-3.6-flash
+  claude:
+    draft_model: haiku
+    audit_model: sonnet
 plan:
-  # gpt-5.4 (not -mini): the plan draft is one large structured reply (steps + inline mermaid +
-  # wireframe HTML). Observed live (s04 lending-library, 2026-08-20): mini's output cap truncated
-  # the JSON at the same column on every attempt -- column 18354, ~4k tokens -- so all 3
-  # ainvoke_structured retries failed identically and the run died. Small scenarios fit under the
-  # cap; any moderate UI scenario does not.
-  draft_model: gpt-5.4
-  audit_model: gemini-3.6-flash
+  copilot:
+    # gpt-5.4 (not -mini): the plan draft is one large structured reply (steps + inline mermaid +
+    # wireframe HTML). Observed live (s04 lending-library, 2026-08-20): mini's output cap truncated
+    # the JSON at the same column on every attempt -- column 18354, ~4k tokens -- so all 3
+    # ainvoke_structured retries failed identically and the run died. Small scenarios fit under the
+    # cap; any moderate UI scenario does not.
+    draft_model: gpt-5.4
+    audit_model: gemini-3.6-flash
+  claude:
+    draft_model: sonnet
+    audit_model: opus
 ac-to-tests:
-  # gpt-5.3-codex: mini and plain gpt-5.4 both drafted structured metadata describing test files
-  # without ever calling a file-write tool. Used via plain session_options (graph.py's StageSpec.
-  # use_custom_agent=False for this stage) -- custom_agents was empirically confirmed to silently
-  # drop part of its own declared tools:, so there is no agents/ac-to-tests-draft.md.
-  draft_model: gpt-5.3-codex
+  copilot:
+    # gpt-5.3-codex: mini and plain gpt-5.4 both drafted structured metadata describing test files
+    # without ever calling a file-write tool. Used via plain session_options (graph.py's StageSpec.
+    # use_custom_agent=False for this stage) -- custom_agents was empirically confirmed to silently
+    # drop part of its own declared tools:, so there is no agents/ac-to-tests-draft.md.
+    draft_model: gpt-5.3-codex
+  claude:
+    draft_model: sonnet
 minimal-code-to-green:
-  # gpt-5.4 (not -mini) on purpose: the codegen stage's 70k+-token drafting turn is above the
-  # mini tier's capability floor -- observed live twice, mini replied readiness=false in ~96
-  # tokens rather than implement. Everything else stays on the cheap roster.
-  draft_model: gpt-5.4
-  audit_model: gemini-3.6-flash
+  copilot:
+    # gpt-5.4 (not -mini) on purpose: the codegen stage's 70k+-token drafting turn is above the
+    # mini tier's capability floor -- observed live twice, mini replied readiness=false in ~96
+    # tokens rather than implement. Everything else stays on the cheap roster.
+    draft_model: gpt-5.4
+    audit_model: gemini-3.6-flash
+  claude:
+    draft_model: sonnet
+    audit_model: opus
 brownfield-baseline:
-  draft_model: gpt-5.4-mini
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
 # Remediation FIX nodes are codegen-tier work -- mini fixed nothing across full cycles
 # (observed live: 44-token replies leaving a complexity finding standing). Triage shares the
 # stage model; acceptable, triage quality also improved.
 test-hardening-flake-triage:
-  draft_model: gpt-5.4-mini
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
 metrics-report:
-  draft_model: gpt-5.4-mini
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
 rebuild:
-  # Shared by every R placement (rebuild.py): both the GHCP build-VERIFICATION session and the
-  # fix node. gpt-5.4 (not -mini): observed live, mini left trivial lint errors standing.
-  draft_model: gpt-5.4
+  copilot:
+    # Shared by every R placement (rebuild.py): both the GHCP build-VERIFICATION session and the
+    # fix node. gpt-5.4 (not -mini): observed live, mini left trivial lint errors standing.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 e2e:
-  # e2e_fix_node (e2e_nodes.py) -- same codegen-tier reasoning as quality/security/rebuild's fix
-  # nodes above: fixing a failing app or test is not mini-tier work.
-  draft_model: gpt-5.4
+  copilot:
+    # e2e_fix_node (e2e_nodes.py) -- same codegen-tier reasoning as quality/security/rebuild's fix
+    # nodes above: fixing a failing app or test is not mini-tier work.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 # src/stack_runner.py sessions: a GHCP agent explores the repo, works out how to run a real
 # toolchain command there, runs it, and reports through a schema-validated terminal tool. Exploring
 # a generated monorepo and getting a build/test/coverage invocation right is the same class of work
 # as the fix nodes above, not draft-tier -- mini-tier models guessed roots wrong.
 stack-run:
-  # Fallback for any stack_runner stage_key without its own entry below.
-  draft_model: gpt-5.4
+  copilot:
+    # Fallback for any stack_runner stage_key without its own entry below.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 coverage-run:
-  # gates/test_coverage_gate.py -- runs the tests with coverage, reports artifact paths.
-  draft_model: gpt-5.4
+  copilot:
+    # gates/test_coverage_gate.py -- runs the tests with coverage, reports artifact paths.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 ac-test-run:
-  # gates/ac_coverage_gate.py -- runs the (expected-RED) suite and tees output for the AC-id scan.
-  draft_model: gpt-5.4
+  copilot:
+    # gates/ac_coverage_gate.py -- runs the (expected-RED) suite and tees output for the AC-id scan.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 remediation:
-  # Previously carried by agents/remediation-draft.md's own `model:`; custom_agents is now off by
-  # default (graph.py StageSpec.use_custom_agent), so every stage's roster lives here instead.
-  draft_model: gpt-5.4
+  copilot:
+    # Previously carried by agents/remediation-draft.md's own `model:`; custom_agents is now off by
+    # default (graph.py StageSpec.use_custom_agent), so every stage's roster lives here instead.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 adversarial-compliance:
-  # The write-capable pass that closes audit divergences -- real code edits, so not a mini tier.
-  fix_model: gpt-5.4
-  draft_model: gpt-5.4
+  copilot:
+    # The write-capable pass that closes audit divergences -- real code edits, so not a mini tier.
+    fix_model: gpt-5.4
+    draft_model: gpt-5.4
+  claude:
+    fix_model: sonnet
+    draft_model: sonnet
 metrics-exit:
-  # Not mini: this turn reads the run's metrics, ledger and diff and writes the whole merge-readiness
-  # report + PR description, and it has a required skill to invoke first. Observed live (thread
-  # 70bbfc95, otherwise-complete run, every earlier stage approved): the mini session went silent and
-  # the run died with `TimeoutError: Copilot session silent for 300s (stage=metrics-exit role=draft)`.
-  draft_model: gpt-5.4
+  copilot:
+    # Not mini: this turn reads the run's metrics, ledger and diff and writes the whole merge-readiness
+    # report + PR description, and it has a required skill to invoke first. Observed live (thread
+    # 70bbfc95, otherwise-complete run, every earlier stage approved): the mini session went silent and
+    # the run died with `TimeoutError: Copilot session silent for 300s (stage=metrics-exit role=draft)`.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 session-title:
-  # One short sentence in, one short phrase out -- the cheapest tier is plenty.
-  draft_model: gpt-5.4-mini
+  copilot:
+    # One short sentence in, one short phrase out -- the cheapest tier is plenty.
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku

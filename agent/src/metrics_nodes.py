@@ -24,6 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
+from . import chat_model
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger
 from .gates.ac_coverage_gate import id_variants
@@ -492,7 +493,7 @@ async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConf
         "metrics-report",
         "draft",
         github_token=os.environ.get("GITHUB_TOKEN"),
-        model_name=model_config.get_model_name("metrics-report", "draft"),
+        model_name=model_config.get_model_name("metrics-report", "draft", chat_model.PROVIDER),
         sandbox=sandbox_registry.get(thread_id),
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )

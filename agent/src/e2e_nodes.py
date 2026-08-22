@@ -48,6 +48,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import Field
 
 from . import app_discovery
+from . import chat_model
 from . import config as workflow_config
 from . import git_ops, keyvault, model_config, repo_files, run_failure, session_store
 from .copilot_chat_model import get_chat_model_for_thread
@@ -1129,7 +1130,7 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         "e2e",
         f"fix-{state.get('run_id', 'run')}-{e2e.get('attempt', 0) + 1}",
         github_token=os.environ.get("GITHUB_TOKEN"),
-        model_name=model_config.get_model_name("e2e", "draft") or model_config.get_model_name("minimal-code-to-green", "draft"),
+        model_name=model_config.get_model_name("e2e", "draft", chat_model.PROVIDER) or model_config.get_model_name("minimal-code-to-green", "draft", chat_model.PROVIDER),
         sandbox=sandbox_registry.get(thread_id),
         agent_mode="autopilot",
     )

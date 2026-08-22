@@ -1468,7 +1468,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stage_spec.key,
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "draft"),
+            model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "draft", chat_model.PROVIDER),
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
             agent=agent_config.get("name") if agent_config else None,
@@ -1610,7 +1610,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stage_spec.key,
             "audit",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "audit"),
+            model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "audit", chat_model.PROVIDER),
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
             agent=agent_config.get("name") if agent_config else None,
@@ -1964,8 +1964,8 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             # tiered separately from the read-only audit it serves; falls back to the stage's draft
             # model, matching how e2e_fix resolves its own.
             model_name=(
-                model_config.get_model_name(stage_spec.key, "fix")
-                or model_config.get_model_name(stage_spec.key, "draft")
+                model_config.get_model_name(stage_spec.key, "fix", chat_model.PROVIDER)
+                or model_config.get_model_name(stage_spec.key, "draft", chat_model.PROVIDER)
             ),
             # WITHOUT this the session runs Copilot locally, outside the sandbox, with no access to
             # the worktree -- so a pass declared write-capable silently could not write. Observed

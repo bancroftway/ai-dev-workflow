@@ -22,6 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
+from . import chat_model
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader, workflow_persistence
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
@@ -107,7 +108,7 @@ async def _generate_session_title(thread_id: str, raw_requirements_text: str, ru
             "session-title",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name("session-title", "draft"),
+            model_name=model_config.get_model_name("session-title", "draft", chat_model.PROVIDER),
             sandbox=sandbox_registry.get(thread_id),
         )
         response = await ainvoke_structured(
@@ -441,7 +442,7 @@ async def _extract_tech_stack(thread_id: str, markdown: str, provider: SandboxPr
         "tech-stack",
         "extract",
         github_token=os.environ.get("GITHUB_TOKEN"),
-        model_name=model_config.get_model_name("tech-stack", "extract"),
+        model_name=model_config.get_model_name("tech-stack", "extract", chat_model.PROVIDER),
         sandbox=sandbox_registry.get(thread_id),
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )

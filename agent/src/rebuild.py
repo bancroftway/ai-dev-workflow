@@ -23,6 +23,7 @@ from typing import Any, Callable, Literal, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
+from . import chat_model
 from . import git_ops, model_config, repo_files, run_failure, stack_runner, test_results
 from .copilot_chat_model import get_chat_model_for_thread
 from .infra_retry import call_with_infra_retry
@@ -257,7 +258,7 @@ def make_fix_node(spec: RebuildSpec):
             f"rebuild-{spec.key}",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name("rebuild", "draft") or model_config.get_model_name("plan", "draft"),
+            model_name=model_config.get_model_name("rebuild", "draft", chat_model.PROVIDER) or model_config.get_model_name("plan", "draft", chat_model.PROVIDER),
             sandbox=sandbox_registry.get(thread_id),
             available_tools=[
                 "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",

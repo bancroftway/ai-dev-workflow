@@ -33,6 +33,7 @@ from typing import TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from . import chat_model
 from . import model_config, repo_files
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt_pair, render_prompt
@@ -106,7 +107,7 @@ async def run_and_report(
             thread_id,
             stage_key,
             "draft",
-            model_name=model_name or model_config.get_model_name(stage_key, "draft") or model_config.get_model_name("stack-run", "draft"),
+            model_name=model_name or model_config.get_model_name(stage_key, "draft", chat_model.PROVIDER) or model_config.get_model_name("stack-run", "draft", chat_model.PROVIDER),
             sandbox=sandbox,
             agent_mode="autopilot",
             available_tools=available_tools,

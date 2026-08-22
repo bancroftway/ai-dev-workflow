@@ -1,7 +1,10 @@
-"""Per-stage, per-role GitHub Copilot model configuration (SPECIFICATION.md Section 3.4).
+"""Per-stage, per-role, per-provider model configuration (SPECIFICATION.md Section 3.4).
 
 Loaded once from agent/config/models.yaml -- editable without touching code, same principle as
-agent/src/prompts/*.md. Replaces the old single global COPILOT_MODEL_NAME env var.
+agent/src/prompts/*.md. Replaces the old single global COPILOT_MODEL_NAME env var. Every stage now
+nests one full config per AGENT_PROVIDER value (see models.yaml's own header comment); callers
+pass which one they want rather than this module assuming Copilot, the only provider that existed
+when this file was first written.
 """
 
 from __future__ import annotations
@@ -44,13 +47,18 @@ Role = Literal["draft", "audit", "extract", "fix"]
 
 
 @lru_cache(maxsize=None)
-def _load_config() -> dict[str, dict[str, str | None]]:
+def _load_config() -> dict[str, dict[str, dict[str, str | None]]]:
     with _CONFIG_PATH.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
-def get_model_name(stage: Stage, role: Role) -> str | None:
-    stage_config = _load_config().get(stage, {})
+def get_model_name(stage: Stage, role: Role, provider: str) -> str | None:
+    # provider is an explicit, required parameter rather than this module reading
+    # chat_model.PROVIDER itself: Part 4 (runtime-configurable provider) doesn't exist yet, and
+    # importing chat_model from here for one string would add an import-time dependency on a
+    # module that dispatches on the same env var, for no benefit -- every real call site just
+    # passes chat_model.PROVIDER along.
+    stage_config = _load_config().get(stage, {}).get(provider, {})
     draft_model = stage_config.get("draft_model")
     if role in ("draft", "extract"):
         # "extract" deliberately shares draft_model rather than needing its own models.yaml entry
@@ -69,11 +77,48 @@ def get_model_name(stage: Stage, role: Role) -> str | None:
     audit_model = stage_config.get("audit_model")
     if audit_model is None:
         logger.warning(
-            "No audit_model configured for stage %r in models.yaml; falling back to "
-            "draft_model %r. The audit pass will run, but against the same model as the "
+            "No audit_model configured for stage %r provider %r in models.yaml; falling back "
+            "to draft_model %r. The audit pass will run, but against the same model as the "
             "draft it's meant to critique.",
             stage,
+            provider,
             draft_model,
         )
         return draft_model
     return audit_model
+
+
+def _demo() -> None:
+    """Self-check for the provider-keyed lookup added by Task 10 (part-1-provider-unification):
+    real models.yaml content, not a hand-built fixture, so a nesting mistake in the YAML itself
+    (wrong indentation collapsing copilot/claude together, a stage missing a provider block) fails
+    this assert exactly like it would fail a live run.
+    """
+    # "specification" has an explicit audit_model on both providers -- values must resolve
+    # correctly AND differ per provider, or a stage would silently run the wrong vendor's model.
+    assert get_model_name("specification", "draft", "copilot") == "gpt-5.4-mini"
+    assert get_model_name("specification", "draft", "claude") == "haiku"
+    assert get_model_name("specification", "audit", "copilot") == "gemini-3.6-flash"
+    assert get_model_name("specification", "audit", "claude") == "sonnet"
+
+    # "tech-stack" has no audit_model on either provider -- audit must fall back to that SAME
+    # provider's own draft_model, never leaking across to the other provider's value.
+    assert get_model_name("tech-stack", "draft", "copilot") == "gpt-5.4-mini"
+    assert get_model_name("tech-stack", "draft", "claude") == "haiku"
+    assert get_model_name("tech-stack", "audit", "copilot") == get_model_name("tech-stack", "draft", "copilot")
+    assert get_model_name("tech-stack", "audit", "claude") == get_model_name("tech-stack", "draft", "claude")
+    assert get_model_name("tech-stack", "audit", "copilot") != get_model_name("tech-stack", "audit", "claude")
+
+    print("model_config self-check: provider-keyed draft/audit lookups all resolved correctly")
+
+
+if __name__ == "__main__":
+    # Re-dispatch through the PACKAGE name on purpose. `python -m src.model_config` loads this file
+    # as "__main__", so a direct `_demo()` call would import this module a second time as a
+    # non-package import, splitting `_load_config`'s lru_cache across two sys.modules entries.
+    # Re-dispatching through `from src.model_config import` ensures there is only one copy of this
+    # module in sys.modules. This convention is unconditional across this codebase (see
+    # cli_agent_exec.py, claude_chat_model.py, chat_model.py).
+    from src.model_config import _demo as _packaged_demo
+
+    _packaged_demo()
