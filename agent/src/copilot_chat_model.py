@@ -41,11 +41,11 @@ import logging
 import re
 import shlex
 import uuid
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import BaseModel, PrivateAttr
 
@@ -583,82 +583,6 @@ def secret_env_names() -> set[str]:
     one of them.
     """
     return {"COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "GITHUB_TOKEN"}
-
-
-_STRUCTURED_OUTPUT_INSTRUCTION = (
-    "If completing this task requires using your tools (e.g. writing files), do that FIRST, "
-    "using as many turns as you need -- only once that work is actually done, respond with ONLY "
-    "a single JSON object matching this JSON Schema as your final message. "
-    "No markdown code fences, no commentary before or after the JSON.\n\n"
-    "JSON Schema:\n{schema}"
-)
-
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
-
-SchemaT = TypeVar("SchemaT", bound=BaseModel)
-
-
-async def ainvoke_structured(
-    model: CopilotChatModel,
-    messages: list[BaseMessage],
-    schema: type[SchemaT],
-    *,
-    max_attempts: int = 3,
-) -> SchemaT:
-    """Invoke the model and parse its response as the given Pydantic schema.
-
-    Preserved unchanged by this rewrite (not named in task-3-brief.md's function list, but
-    actively imported by graph.py/stack_runner.py/preflight_nodes.py/test_hardening_nodes.py --
-    removing it would break every one of those call sites). Its logic never touched SDK internals
-    to begin with, only `model.ainvoke(...)`, the standard BaseChatModel entry point both the old
-    session-based implementation and the new CLI-exec one satisfy identically -- so it keeps
-    working unchanged now that _agenerate/_agenerate_inner's insides are a CLI exec instead of a
-    live session.
-
-    The Copilot CLI has no native structured-output/tool-calling contract to bind to (unlike
-    ClaudeChatModel.response_schema's confirmed --json-schema flag), so this drives structured
-    output via explicit JSON-schema prompting plus a validate-and-retry loop instead.
-    """
-    schema_json = json.dumps(schema.model_json_schema())
-    request_messages = [
-        *messages,
-        HumanMessage(content=_STRUCTURED_OUTPUT_INSTRUCTION.format(schema=schema_json)),
-    ]
-
-    last_error: Exception | None = None
-    for attempt in range(max_attempts):
-        # emit-messages=False (ag_ui_langgraph's convention, agent.py:993) keeps this raw
-        # JSON-schema-constrained output out of the AG-UI text-message stream -- with the
-        # CopilotSidebar now showing a real chat transcript (unlike the old top-banner-only
-        # UI), an unsuppressed stream would render this structured output as if it were
-        # assistant chat prose, which it was never meant to be.
-        response = await model.ainvoke(request_messages, config={"metadata": {"emit-messages": False}})
-        raw = _CODE_FENCE_RE.sub("", str(response.content)).strip()
-        try:
-            return schema.model_validate_json(raw)
-        except Exception as exc:  # noqa: BLE001 - retry loop deliberately broad
-            last_error = exc
-            request_messages.append(response)
-            request_messages.append(
-                HumanMessage(
-                    content=(
-                        f"That response was rejected (error: {exc}).\n"
-                        # Not every rejection is a syntax problem. A schema may also enforce a
-                        # WORK rule -- e.g. ac-to-tests refuses readiness=true with no test files
-                        # -- and the old wording ("reply again with ONLY the corrected JSON, no
-                        # other text") told the model to re-answer without touching its tools,
-                        # which is exactly the wrong move when the rejection means the work is
-                        # missing. Read the error and act on what it actually says.
-                        "If the error is about the JSON itself (syntax, a wrong or missing "
-                        "field), reply again with ONLY the corrected JSON object.\n"
-                        "If the error says required WORK is missing, do that work first with "
-                        "your tools -- write the files, run the command -- and only then reply "
-                        "with the JSON describing what you actually did."
-                    )
-                )
-            )
-    assert last_error is not None
-    raise last_error
 
 
 def _demo() -> None:

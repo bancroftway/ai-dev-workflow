@@ -25,7 +25,7 @@ from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, run_failure, spec_ledger, stack_runner, test_results
-from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
+from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider

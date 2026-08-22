@@ -73,8 +73,8 @@ from .a2ui_tools import (
     build_tech_stack_envelope,
     present_surface_messages,
 )
-from . import copilot_chat_model
-from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
+from . import chat_model
+from .chat_model import ainvoke_structured, close_session, close_thread_session, get_chat_model_for_thread
 from .markdown_render import (
     render_ac_to_tests_markdown,
     render_adversarial_audit_markdown,
@@ -1812,7 +1812,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             # branch returns early, so it needs its own reset -- putting it only below meant three
             # identical `invoked: []` turns with no restart between them (observed live at
             # metrics-exit, which then exhausted its budget and failed an otherwise-complete run).
-            await copilot_chat_model.close_session(thread_id, stage_spec.key, "draft")
+            await close_session(thread_id, stage_spec.key, "draft")
             return {"stages": stages}
 
         result = await stage_spec.deterministic_verify(
@@ -1874,7 +1874,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                         stage_spec.key, stage["verify_stall_count"],
                         signals.feedback_similar, signals.paths_unchanged, signals.coverage_not_improving,
                     )
-                await copilot_chat_model.close_session(thread_id, stage_spec.key, "draft")
+                await close_session(thread_id, stage_spec.key, "draft")
                 stage["verify_stall_count"] = 0
                 # A reset session starts fresh either way; the coverage high-water mark is about
                 # detecting non-improvement, not about the session's memory, so it is NOT cleared
@@ -2023,7 +2023,7 @@ def make_draft_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, Run
         await _persist_if_sandboxed(
             thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} escalated -- draft infra exhausted",
         )
-        await copilot_chat_model.close_thread_session(thread_id)
+        await close_thread_session(thread_id)
         return {"stages": stages, "run_failure": payload}
 
     return draft_escalate_node
@@ -2072,7 +2072,7 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
         # escalated deterministic gate ENDs the run, and recovery is fix-out-of-band + resubmit,
         # which re-enters at intake and rebuilds whatever sessions it needs. Nothing downstream
         # reads these, so release them rather than leaving ~20 to ride until the idle reaper.
-        await copilot_chat_model.close_thread_session(thread_id)
+        await close_thread_session(thread_id)
         return {"stages": stages, "run_failure": payload}
 
     return escalate_node

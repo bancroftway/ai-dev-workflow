@@ -24,7 +24,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader, workflow_persistence
-from .copilot_chat_model import ainvoke_structured, get_chat_model_for_thread
+from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .schemas import TechStack
