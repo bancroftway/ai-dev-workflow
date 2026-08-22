@@ -17,7 +17,7 @@ import shlex
 from datetime import datetime, timezone
 from typing import Any
 
-from . import approvals, copilot_chat_model, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
+from . import approvals, chat_model, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
@@ -616,7 +616,7 @@ async def exit_finalize_node(
     # until the sandbox idle-reaper eventually took the container down.
     # Deliberately NOT done on the needs_clarification -> END path: there the user is about to
     # answer the model's own question, and that stage's conversation continuity is wanted.
-    await copilot_chat_model.close_thread_session(thread_id)
+    await chat_model.close_thread_session(thread_id)
 
 
 def _demo() -> None:
