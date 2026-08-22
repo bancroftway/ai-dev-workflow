@@ -81,6 +81,12 @@ COPILOT_DISABLED_SKILLS = ["using-superpowers", "brainstorming"]
 # including before clarifying questions, and no stage wants that.
 COPILOT_DISABLED_SKILLS_SPECIFICATION = ["using-superpowers"]
 
+# Timeout for CLI-based provider turns (both Claude Code and GitHub Copilot, per-turn subprocess
+# exec inside the sandbox). Generous default since the agent's turn may involve multiple tool
+# calls, waiting for user input/approval, or complex reasoning -- the timeout is a runaway
+# backstop, not an expected exit.
+CLI_AGENT_TURN_TIMEOUT_SECONDS = int(os.environ.get("CLI_AGENT_TURN_TIMEOUT_SECONDS", "2400"))
+
 # Skills each stage is REQUIRED to invoke, enforced deterministically rather than trusted: the
 # stage's prompt names them, and gates/skill_gate.py verifies against the Copilot session's own
 # `skill.invoked` events (the model's self-report in StageReport.skills_invoked is telemetry, not
