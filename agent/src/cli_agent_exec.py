@@ -13,7 +13,6 @@ import base64
 import shlex
 import time
 from dataclasses import dataclass
-from typing import Any
 
 from .sandbox.provider import SandboxProvider
 
@@ -44,15 +43,17 @@ async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: st
     absolute paths (no validate_repo_relative_path call), since the file is NOT repo-relative.
     """
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    parent_dir = path.rsplit("/", 1)[0]
+    parent_dir = path.rsplit("/", 1)[0] if "/" in path else ""
     quoted = shlex.quote(path)
 
     if len(encoded) <= _EXEC_CMD_BUDGET:
-        commands = [f"mkdir -p {shlex.quote(parent_dir)} && echo {encoded} | base64 -d > {quoted}"]
+        parent_mkdir = f"mkdir -p {shlex.quote(parent_dir)} && " if parent_dir else ""
+        commands = [f"{parent_mkdir}echo {encoded} | base64 -d > {quoted}"]
     else:
         # Chunked for the same reason write_repo_file is: WinError 206 on large payloads.
         tmp = shlex.quote(path + ".b64part")
-        commands = [f"mkdir -p {shlex.quote(parent_dir)} && : > {tmp}"]
+        parent_mkdir = f"mkdir -p {shlex.quote(parent_dir)} && " if parent_dir else ""
+        commands = [f"{parent_mkdir}: > {tmp}"]
         commands += [
             f"printf %s {encoded[i : i + _EXEC_CMD_BUDGET]} >> {tmp}"
             for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
@@ -63,6 +64,27 @@ async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: st
         result = await provider.exec_in_sandbox(thread_id, command)
         if not result.ok:
             raise RuntimeError(f"failed to write {path}: {result.stderr}")
+
+
+def _build_startup_command(
+    command: str,
+    prompt_path: str,
+    out_path: str,
+    err_path: str,
+    exit_path: str,
+    pid_path: str,
+) -> str:
+    """Build the backgrounded setsid/nohup startup command string.
+
+    Pure string building, no I/O. Factors out the command-construction logic so both
+    run_turn and _demo can call the same code path, ensuring the self-check tests
+    the actual production command syntax.
+    """
+    sh_script = (
+        f"{command} < {shlex.quote(prompt_path)} > {shlex.quote(out_path)} 2> {shlex.quote(err_path)}; "
+        f"echo $? > {shlex.quote(exit_path)}"
+    )
+    return f"setsid nohup sh -c {shlex.quote(sh_script)} >/dev/null 2>&1 & echo $! > {shlex.quote(pid_path)}"
 
 
 async def run_turn(
@@ -105,13 +127,8 @@ async def run_turn(
 
     # Launch backgrounded. Use `;` before the backgrounded setsid, NEVER `&&`: with `&&`,
     # `cmd1 && cmd2 &` backgrounds the whole compound as one job, so `$!` would report the
-    # wrong PID and a timeout-kill would target the wrong process group. The redirections must
-    # be INSIDE the sh -c quotes, not outside.
-    sh_script = (
-        f"{command} < {shlex.quote(prompt_path)} > {shlex.quote(out_path)} 2> {shlex.quote(err_path)}; "
-        f"echo $? > {shlex.quote(exit_path)}"
-    )
-    startup_command = f"setsid nohup sh -c {shlex.quote(sh_script)} >/dev/null 2>&1 & echo $! > {shlex.quote(pid_path)}"
+    # wrong PID and a timeout-kill would target the wrong process group.
+    startup_command = _build_startup_command(command, prompt_path, out_path, err_path, exit_path, pid_path)
     result = await provider.exec_in_sandbox(thread_id, startup_command)
     if not result.ok:
         raise RuntimeError(f"failed to launch turn: {result.stderr}")
@@ -167,7 +184,6 @@ def _demo() -> None:
     see copilot_chat_model.py's own demo for the same scoping pattern ("the pure half").
     """
     # Test chunking boundary math: edge cases at chunk boundaries.
-    base_str = "x" * _EXEC_CMD_BUDGET
     short_encoded = base64.b64encode(b"hello").decode("ascii")
     assert len(short_encoded) < _EXEC_CMD_BUDGET, "short payload overflowed budget"
 
@@ -177,9 +193,10 @@ def _demo() -> None:
     chunk_count = (len(long_encoded) + _EXEC_CMD_BUDGET - 1) // _EXEC_CMD_BUDGET
     assert chunk_count == 3, f"expected 3 chunks, got {chunk_count}"
 
-    # Test command-string shape: semicolon placement is critical.
-    # `;` before backgrounded setsid ensures only the setsid/sh command is backgrounded,
-    # not the echo $! which captures its PID.
+    # Test command-string construction: call the actual production code path, not a hand-copied
+    # duplicate. This ensures a future regression (e.g., someone "fixing" `;` back to `&&`)
+    # would fail the self-check, catching the mistake at runtime rather than silently
+    # in production.
     scratch_prefix = "/tmp/test-prefix"
     prompt_path = scratch_prefix
     out_path = f"{scratch_prefix}.out"
@@ -188,16 +205,10 @@ def _demo() -> None:
     pid_path = f"{scratch_prefix}.pid"
 
     test_command = "echo hello"
-    test_prompt = "prompt content"
 
-    sh_script = (
-        f"{test_command} < {shlex.quote(prompt_path)} > {shlex.quote(out_path)} 2> {shlex.quote(err_path)}; "
-        f"echo $? > {shlex.quote(exit_path)}"
-    )
-    startup_cmd = f"setsid nohup sh -c {shlex.quote(sh_script)} >/dev/null 2>&1 & echo $! > {shlex.quote(pid_path)}"
+    startup_cmd = _build_startup_command(test_command, prompt_path, out_path, err_path, exit_path, pid_path)
 
-    # Verify the command structure: `;` appears inside the sh -c quotes (inside sh_script), the
-    # redirections are inside sh -c, and the pidfile write follows the backgrounded `&`.
+    # Verify the command structure via the actual production path.
     assert " & echo $! > " in startup_cmd, "pidfile capture should follow backgrounding"
     assert "setsid nohup sh -c" in startup_cmd, "should use setsid nohup sh -c structure"
     assert ">/dev/null 2>&1 &" in startup_cmd, "should redirect setsid/nohup output before backgrounding"
@@ -206,4 +217,11 @@ def _demo() -> None:
 
 
 if __name__ == "__main__":
-    _demo()
+    # Re-dispatch through the PACKAGE name on purpose. `python -m src.cli_agent_exec` loads this
+    # file as "__main__", so a direct `_demo()` call would import this module a second time as a
+    # non-package import. Re-dispatching through `from src.cli_agent_exec import` ensures there is
+    # only one copy of this module in sys.modules, matching how production imports it (graph.py ->
+    # provider tasks -> this module). This convention is unconditional across this codebase.
+    from src.cli_agent_exec import _demo as _packaged_demo
+
+    _packaged_demo()
