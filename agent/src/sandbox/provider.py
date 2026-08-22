@@ -16,6 +16,7 @@ import json
 import socket
 import time
 from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 _READY_TIMEOUT_SECONDS = 60.0
 
@@ -158,4 +159,32 @@ async def wait_for_copilot_ready(host: str, port: int, connection_token: str) ->
     raise RuntimeError(
         f"sandbox at {host}:{port} did not complete a connect handshake within "
         f"{_READY_TIMEOUT_SECONDS}s (last error: {last_error})"
+    )
+
+
+async def wait_for_cli_ready(exec_fn: Callable[[str], Awaitable[tuple[int, str, str]]]) -> None:
+    """Block until the CLI tool in the sandbox is ready to accept commands.
+
+    exec_fn is a thin provider-specific wrapper (docker exec / az container exec) that executes
+    a command in the sandbox and returns (returncode, stdout, stderr). This function polls the
+    CLI with a version-check command every 0.5s up to _READY_TIMEOUT_SECONDS. Once the command
+    succeeds (returncode == 0), returns; otherwise raises RuntimeError on timeout with the
+    last error observed.
+    """
+    deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
+    last_error: str | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            returncode, stdout, stderr = await exec_fn("claude --version")
+            if returncode == 0:
+                return
+            last_error = f"returncode {returncode}: {stderr}"
+        except Exception as exc:
+            last_error = str(exc)
+        await asyncio.sleep(0.5)
+
+    raise RuntimeError(
+        f"CLI tool in sandbox did not become ready within {_READY_TIMEOUT_SECONDS}s "
+        f"(last error: {last_error})"
     )
