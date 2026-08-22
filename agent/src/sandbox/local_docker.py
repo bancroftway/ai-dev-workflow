@@ -203,7 +203,7 @@ class LocalDockerProvider(SandboxProvider):
                 # the same call. The reprovisioned container gets a NEW host port, so every cached
                 # Copilot session for this thread now points at the old one -- forget them here or
                 # the next stage dials a dead port.
-                from ..copilot_chat_model import forget_thread_sessions
+                from ..chat_model import forget_thread_sessions
 
                 forget_thread_sessions(session_id)
 

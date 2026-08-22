@@ -29,7 +29,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from . import app_discovery, branch_naming, git_ops, keyvault, session_store
+from . import app_discovery, branch_naming, chat_model, git_ops, keyvault, session_store
 from .sandbox import get_sandbox_provider, registry
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,14 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     work_branch = branch_naming.work_branch_for(body.thread_id)
     provider = get_sandbox_provider()
     repo_clone_url = f"https://github.com/{body.owner}/{body.repo}.git"
+    # The active provider's own secret -- an Anthropic API key or the shared Copilot PAT,
+    # whichever chat_model.PROVIDER currently selects (see sandbox/provider.py's provision()
+    # docstring for how the sandbox uses this).
+    runtime_auth_token = (
+        os.environ.get("ANTHROPIC_API_KEY", "")
+        if chat_model.PROVIDER == "claude"
+        else os.environ.get("GITHUB_TOKEN", "")
+    )
     try:
         session = await provider.provision(
             session_id=body.thread_id,
@@ -123,7 +131,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             branch=body.branch,
             work_branch=work_branch,
             git_user_token=body.github_token,
-            copilot_auth_token=os.environ.get("GITHUB_TOKEN", ""),
+            runtime_auth_token=runtime_auth_token,
         )
     except Exception as exc:  # noqa: BLE001 -- surfaced to the caller as a plain 502, not swallowed
         logger.exception("sandbox provisioning failed for thread_id=%s", body.thread_id)

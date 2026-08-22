@@ -25,7 +25,7 @@ from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import chat_model
 from . import git_ops, model_config, repo_files, run_failure, stack_runner, test_results
-from .copilot_chat_model import get_chat_model_for_thread
+from .chat_model import get_chat_model_for_thread
 from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider

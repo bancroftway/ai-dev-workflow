@@ -37,6 +37,14 @@ param authSecret string
 @secure()
 param copilotGithubToken string
 
+@description('Which coding-agent provider the agent container dispatches to at startup (agent/src/chat_model.py\'s AGENT_PROVIDER switch).')
+@allowed(['copilot', 'claude'])
+param agentProvider string = 'copilot'
+
+@description('Anthropic API key for the Claude provider (agent/src/claude_chat_model.py). Left blank when agentProvider is \'copilot\' -- unused in that mode.')
+@secure()
+param anthropicApiKey string = ''
+
 @description('Entra tenant id (single-tenant deployment).')
 param entraTenantId string
 
@@ -220,6 +228,7 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
       }
       secrets: [
         { name: 'copilot-github-token', value: copilotGithubToken }
+        { name: 'anthropic-api-key', value: anthropicApiKey }
         { name: 'entra-client-secret', value: entraClientSecret }
         { name: 'agent-shared-secret', value: agentSharedSecret }
       ]
@@ -234,6 +243,8 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
           image: agentImage
           env: [
             { name: 'GITHUB_TOKEN', secretRef: 'copilot-github-token' }
+            { name: 'ANTHROPIC_API_KEY', secretRef: 'anthropic-api-key' }
+            { name: 'AGENT_PROVIDER', value: agentProvider }
             { name: 'SANDBOX_PROVIDER', value: 'azure' }
             // On-behalf-of Key Vault exchange (agent/src/keyvault.py): the shared Entra app
             // registration's confidential-client credentials. The agent's MANAGED identity is

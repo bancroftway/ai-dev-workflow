@@ -51,7 +51,7 @@ from . import app_discovery
 from . import chat_model
 from . import config as workflow_config
 from . import git_ops, keyvault, model_config, repo_files, run_failure, session_store
-from .copilot_chat_model import get_chat_model_for_thread
+from .chat_model import get_chat_model_for_thread
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
 

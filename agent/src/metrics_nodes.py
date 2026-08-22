@@ -29,7 +29,7 @@ from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger
 from .gates.ac_coverage_gate import id_variants
 from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
-from .copilot_chat_model import get_chat_model_for_thread
+from .chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 

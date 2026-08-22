@@ -41,7 +41,7 @@ logger = logging.getLogger("run_headless")
 from langchain_core.messages import HumanMessage  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
-from src import app_discovery, branch_naming, copilot_chat_model, git_ops  # noqa: E402
+from src import app_discovery, branch_naming, chat_model, git_ops  # noqa: E402
 from src.graph import graph  # noqa: E402
 from src.sandbox import get_sandbox_provider, registry  # noqa: E402
 
@@ -83,9 +83,17 @@ async def run(args: argparse.Namespace) -> int:
         return 2
 
     git_token = os.environ.get("E2E_GITHUB_TOKEN", "")
-    copilot_token = os.environ.get("GITHUB_TOKEN", "")
-    if not git_token or not copilot_token:
-        logger.error("E2E_GITHUB_TOKEN and GITHUB_TOKEN must both be set (root .env)")
+    # The active provider's own secret -- an Anthropic API key or the shared Copilot PAT,
+    # whichever chat_model.PROVIDER currently selects (see sandbox/provider.py's provision()
+    # docstring for how the sandbox uses this).
+    runtime_auth_token = (
+        os.environ.get("ANTHROPIC_API_KEY", "")
+        if chat_model.PROVIDER == "claude"
+        else os.environ.get("GITHUB_TOKEN", "")
+    )
+    if not git_token or not runtime_auth_token:
+        token_env_var = "ANTHROPIC_API_KEY" if chat_model.PROVIDER == "claude" else "GITHUB_TOKEN"
+        logger.error("E2E_GITHUB_TOKEN and %s must both be set (root .env)", token_env_var)
         return 2
     if git_token.startswith("github_pat_"):
         # Fine-grained PATs are often read-only; a pushless run silently loses all output.
@@ -119,7 +127,7 @@ async def run(args: argparse.Namespace) -> int:
         branch=args.branch,
         work_branch=branch_naming.work_branch_for(thread_id),
         git_user_token=git_token,
-        copilot_auth_token=copilot_token,
+        runtime_auth_token=runtime_auth_token,
     )
     registry.set(thread_id, session)
     git_ops.set_push_token(thread_id, git_token)
@@ -188,7 +196,7 @@ async def run(args: argparse.Namespace) -> int:
                 stream_input = Command(resume=True)
     finally:
         try:
-            await copilot_chat_model.close_thread_session(thread_id)
+            await chat_model.close_thread_session(thread_id)
         except Exception:  # noqa: BLE001 -- teardown must not mask the run outcome
             logger.warning("close_thread_session failed", exc_info=True)
         if args.discard_sandbox:

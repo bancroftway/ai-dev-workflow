@@ -118,7 +118,7 @@ def traced_node(
                 # re-raise, and the exception may itself be a dead/reaped sandbox -- awaiting
                 # disconnect() there would block until timeout and turn a fast failure slow.
                 if thread_id:
-                    from .copilot_chat_model import forget_thread_sessions
+                    from .chat_model import forget_thread_sessions
 
                     forget_thread_sessions(thread_id)
                 raise

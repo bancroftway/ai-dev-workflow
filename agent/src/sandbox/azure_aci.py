@@ -181,7 +181,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 # because the reprovision below overwrites the registry entry anyway. On ACI the
                 # replacement group also gets a new IP, so stale Copilot sessions would dial a
                 # dead address rather than merely a dead port.
-                from ..copilot_chat_model import forget_thread_sessions
+                from ..chat_model import forget_thread_sessions
 
                 forget_thread_sessions(session_id)
 
