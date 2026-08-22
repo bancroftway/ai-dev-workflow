@@ -20,19 +20,15 @@ a required skill is absent from a log it could actually read.
 
 from __future__ import annotations
 
-import json
 import logging
-import shlex
 from dataclasses import dataclass
 from typing import Any
 
 from .. import config as workflow_config
-from ..copilot_chat_model import get_session_id
+from ..chat_model import get_session_id, read_skill_invocations
 from ..sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
-
-_SESSION_STATE_DIR = "/home/vscode/.copilot/session-state"
 
 
 @dataclass(frozen=True)
@@ -45,32 +41,11 @@ class SkillCheckOutcome:
 
 
 async def invoked_skills(provider: SandboxProvider, thread_id: str, stage: str, role: str = "draft") -> list[str] | None:
-    """Skill names this stage's own Copilot session invoked, or None if unverifiable."""
+    """Skill names this stage's own session invoked, or None if unverifiable."""
     session_id = get_session_id(thread_id, stage, role)
     if not session_id:
         return None
-    # The session log lives OUTSIDE the repo, so read it directly rather than via repo_files
-    # (which resolves repo-relative paths).
-    path = f"{_SESSION_STATE_DIR}/{shlex.quote(session_id)}/events.jsonl"
-    result = await provider.exec_in_sandbox(thread_id, f"cat {path} 2>/dev/null")
-    if not result.ok or not (result.stdout or "").strip():
-        return None
-
-    names: list[str] = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line or '"skill.invoked"' not in line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") != "skill.invoked":
-            continue
-        name = (event.get("data") or {}).get("name")
-        if isinstance(name, str) and name not in names:
-            names.append(name)
-    return names
+    return await read_skill_invocations(provider, thread_id, session_id)
 
 
 # Roles whose sessions count towards a stage's required skills. A stage runs a DRAFT session and,
