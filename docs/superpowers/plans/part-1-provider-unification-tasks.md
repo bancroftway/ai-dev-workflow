@@ -517,8 +517,44 @@ an explicit `audit_model` and one that falls back to `draft_model`.
 
 ## Task 11: Call-site wiring
 
-**Files:** `agent/src/sessions_api.py`, `agent/run_headless.py`, `infra/main.bicep`. Depends on
-Task 6 (the `runtime_auth_token` rename) and Task 4.
+**Files:** `agent/src/sessions_api.py`, `agent/run_headless.py`, `infra/main.bicep`, plus 7 more
+files added 2026-08-22 (see "Expanded scope" below): `agent/src/e2e_nodes.py`, `agent/src/rebuild.py`,
+`agent/src/metrics_nodes.py`, `agent/src/sandbox/registry.py`, `agent/src/sandbox/local_docker.py`,
+`agent/src/sandbox/azure_aci.py`, `agent/src/telemetry.py`. Depends on Task 6 (the
+`runtime_auth_token` rename) and Task 4.
+
+**Expanded scope, found during Task 10**: Task 10's implementer and a controller follow-up sweep
+found 7 more files with the exact same bug shape this task already fixes for
+`run_headless.py`'s `close_thread_session` call below — a hardcoded
+`from .copilot_chat_model import <name>` (or `from ..copilot_chat_model import <name>` under
+`sandbox/`) that should instead read `from .chat_model import <name>` (function names are
+unchanged in every case, only the module they're imported from). Two different functions are
+affected:
+
+- **`get_chat_model_for_thread`**, hardcoded in `agent/src/e2e_nodes.py:54`,
+  `agent/src/rebuild.py:28`, `agent/src/metrics_nodes.py:32`. This is the more severe half: each
+  of these files already correctly calls `model_config.get_model_name(..., chat_model.PROVIDER)`
+  (Task 10) to resolve the right model name for whichever provider is active, then hands that
+  correctly-resolved name to a **Copilot-only** session builder regardless — under
+  `AGENT_PROVIDER=claude`, a Claude model alias (e.g. `"sonnet"`) gets passed into
+  `CopilotChatModel`, which is wrong for whatever stage each of these three files serves. Fix:
+  change each to `from .chat_model import get_chat_model_for_thread`.
+- **`forget_thread_sessions`**, hardcoded in `agent/src/sandbox/registry.py:41`,
+  `agent/src/sandbox/local_docker.py:206`, `agent/src/sandbox/azure_aci.py:184`,
+  `agent/src/telemetry.py:121` — every one of these sits on a container-teardown or
+  thread-cleanup path (registry eviction, container reprovisioning, an unhandled-node-exception
+  handler). Under `AGENT_PROVIDER=claude`, each of these calls clears Copilot's own (empty, for a
+  Claude-mode thread) session-id dict instead of Claude's real one — the actual in-memory
+  `_session_ids` entries for that thread in `claude_chat_model.py` are never evicted. Fix: change
+  each to `from .chat_model import forget_thread_sessions` (or `from ..chat_model import
+  forget_thread_sessions` under `sandbox/`, matching each file's existing relative-import depth).
+  All four of these imports are already lazy/function-local for the same import-cycle reason Task
+  6 documented — keep them lazy, only change which module they import from.
+
+Every one of these 7 changes is a one-line import-source swap with no other logic change — read
+each file's real current import line before editing (the line numbers above are where they were
+found; confirm they still match before you edit, the way every other task in this plan asks you
+to verify brief line-number citations against real content).
 
 **sessions_api.py**: in `provision_session`, compute
 `runtime_auth_token = os.environ.get("ANTHROPIC_API_KEY", "") if chat_model.PROVIDER == "claude" else os.environ.get("GITHUB_TOKEN", "")`
