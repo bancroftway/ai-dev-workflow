@@ -30,7 +30,6 @@ import hashlib
 import json
 import logging
 import os
-import secrets
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -38,11 +37,10 @@ from dataclasses import dataclass, field
 from . import registry
 from .. import config as workflow_config
 from ..telemetry import traced_exec
-from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_cli_ready, wait_for_copilot_ready
+from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_cli_ready
 
 logger = logging.getLogger(__name__)
 
-_COPILOT_PORT_IN_CONTAINER = 3000
 _CONTAINER_NAME_PREFIX = "aidevworkflow-sandbox-"
 _IP_WAIT_TIMEOUT_SECONDS = 60.0
 _REAP_POLL_SECONDS = 60.0
@@ -154,8 +152,9 @@ class AzureContainerInstanceProvider(SandboxProvider):
         image: str | None = None,
     ) -> SandboxSession:
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
-        # a module-scope import here would cycle. Needed for both the env-var choice below and
-        # the readiness-check branch further down.
+        # a module-scope import here would cycle. Needed only to pick which of
+        # COPILOT_SDK_AUTH_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
+        # (wait_for_cli_ready) no longer branches on this.
         from ..chat_model import PROVIDER
 
         async with self._lock:
@@ -163,7 +162,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
             if existing is not None:
                 if existing.branch == branch:
                     existing.last_active = time.monotonic()
-                    return SandboxSession(session_id, existing.ip, _COPILOT_PORT_IN_CONTAINER, existing.connection_token)
+                    return SandboxSession(session_id, existing.ip, 0, existing.connection_token)
                 # PR-target change mid-session (BLOCKER fix, mirrors LocalDockerProvider): unlike
                 # the local provider, ACI has no cross-restart reattach to keep in sync with
                 # reality, so the in-memory branch this session was provisioned with is already
@@ -187,7 +186,11 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 forget_thread_sessions(session_id)
 
             name = _container_group_name(session_id)
-            connection_token = secrets.token_urlsafe(32)
+            # Inert now -- nothing listens on a port for either provider (Copilot's TCP/JSON-RPC
+            # session mechanism was retired by Task 3's CLI-exec rewrite), so there's no real
+            # value to generate. Kept only because SandboxSession/_RunningSandbox's shape still
+            # has this field; see provider.py.
+            connection_token = ""
 
             # Best-effort cleanup of a stale container group from a previous, uncleanly-terminated
             # run under the same session_id -- `az container create --name` fails outright if a
@@ -203,7 +206,6 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 "--cpu", "1",
                 "--memory", "2",
                 "--restart-policy", "Never",
-                "--ports", str(_COPILOT_PORT_IN_CONTAINER),
                 "--environment-variables",
                 f"REPO_BRANCH={branch}",
                 f"WORK_BRANCH={work_branch}",
@@ -254,12 +256,12 @@ class AzureContainerInstanceProvider(SandboxProvider):
                     "--registry-password", self._registry_password or "",
                 ]
 
-            # Retried as a whole (fresh container group, fresh token) up to
-            # SANDBOX_PROVISION_RETRY_ATTEMPTS times -- mirrors LocalDockerProvider.provision's own
-            # retry. wait_for_copilot_ready already polls the connect handshake continuously for
-            # its own 60s deadline, so re-polling the SAME unresponsive group after it raises would
-            # just wait out an identical timeout again; only a fresh `az container create` can
-            # distinguish "this group is just slow" from "this group never came up at all."
+            # Retried as a whole (fresh container group) up to SANDBOX_PROVISION_RETRY_ATTEMPTS
+            # times -- mirrors LocalDockerProvider.provision's own retry. wait_for_cli_ready
+            # already polls its own exec continuously for its own 60s deadline, so re-polling the
+            # SAME unresponsive group after it raises would just wait out an identical timeout
+            # again; only a fresh `az container create` can distinguish "this group is just slow"
+            # from "this group never came up at all."
             attempts = max(1, workflow_config.SANDBOX_PROVISION_RETRY_ATTEMPTS)
             last_exc: Exception | None = None
             ip = ""
@@ -268,28 +270,21 @@ class AzureContainerInstanceProvider(SandboxProvider):
                     # This loop's own previous attempt's group, named identically -- `az container
                     # create --name` fails outright if it's still around.
                     await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
-                    # No longer wired into args (nothing in the container reads it anymore -- see
-                    # the removed COPILOT_CONNECTION_TOKEN env above), so there's nothing to splice
-                    # here; re-minted only because the copilot branch below and SandboxSession's
-                    # shape still consume it.
-                    connection_token = secrets.token_urlsafe(32)
                 returncode, stdout, stderr = await _run_az(*args)
                 if returncode != 0:
                     raise RuntimeError(f"az container create failed for session {session_id!r}: {stderr}")
                 try:
                     ip = await self._resolve_ip(name, create_output=stdout)
-                    if PROVIDER == "copilot":
-                        await wait_for_copilot_ready(ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
-                    else:
-                        async def _exec(cmd: str) -> tuple[int, str, str]:
-                            return await _run_az(
-                                "container", "exec",
-                                "--resource-group", self._resource_group,
-                                "--name", name,
-                                "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {cmd}\"",
-                            )
 
-                        await wait_for_cli_ready(_exec)
+                    async def _exec(cmd: str) -> tuple[int, str, str]:
+                        return await _run_az(
+                            "container", "exec",
+                            "--resource-group", self._resource_group,
+                            "--name", name,
+                            "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {cmd}\"",
+                        )
+
+                    await wait_for_cli_ready(_exec)
                     last_exc = None
                     break
                 except Exception as exc:
@@ -306,7 +301,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
             self._sandboxes[session_id] = _RunningSandbox(name, ip, connection_token, branch)
             self._ensure_reaper_running()
             logger.info("Provisioned ACI sandbox session_id=%s container_group=%s ip=%s", session_id, name, ip)
-            return SandboxSession(session_id, ip, _COPILOT_PORT_IN_CONTAINER, connection_token)
+            return SandboxSession(session_id, ip, 0, connection_token)
 
     async def _resolve_ip(self, container_group_name: str, *, create_output: str) -> str:
         """`az container create`'s own JSON output usually already has the IP; fall back to

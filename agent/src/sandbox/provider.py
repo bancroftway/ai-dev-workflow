@@ -1,19 +1,21 @@
 """SandboxProvider interface: the seam between the agent and per-session sandboxes.
 
-copilot_chat_model.py constructs a CopilotClient against RuntimeConnection.for_uri(host:port,
-connection_token=...) once it has a SandboxSession -- see the architecture plan's Section C.1,
-which is grounded in the SDK's own client.py: connecting via for_uri skips _start_cli_server
-entirely, so the *sandbox itself* must already be running `copilot --headless --auth-token-env
-COPILOT_SDK_AUTH_TOKEN --port <N>` with COPILOT_SDK_AUTH_TOKEN/COPILOT_CONNECTION_TOKEN set in its
-own environment before the agent ever connects.
+Both copilot_chat_model.py and claude_chat_model.py drive their sandbox purely through one-shot
+`exec` calls (docker exec / az container exec -- see cli_agent_exec.py) -- there is no persistent
+server and no long-lived connection between the agent process and the sandbox for either provider.
+Copilot's own JSON-RPC/TCP session mechanism (RuntimeConnection.for_uri, a real `copilot --server`
+process, and the connect handshake this module used to perform) was fully retired by Task 3's
+CLI-exec rewrite; nothing on either sandbox backend publishes or listens on a port anymore.
+wait_for_cli_ready() below is the one readiness check every SandboxProvider.provision() now polls
+before returning: exec a version-check command until the sandbox's CLI tooling actually responds,
+rather than trusting the container's "running" state (which flips true well before
+bootstrap.sh/toolchain setup has finished).
 """
 
 from __future__ import annotations
 
 import abc
 import asyncio
-import json
-import socket
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -23,7 +25,14 @@ _READY_TIMEOUT_SECONDS = 60.0
 
 @dataclass(frozen=True)
 class SandboxSession:
-    """Everything copilot_chat_model.py needs to build a RuntimeConnection.for_uri(...) call."""
+    """Bookkeeping a SandboxProvider hands back after provision().
+
+    session_id/host are real and load-bearing (exec_in_sandbox's dispatch key, and diagnostic
+    logging). port/connection_token are inert leftovers of the retired TCP/for_uri connection
+    scheme described in this module's own docstring -- always a dummy/empty value now, kept only
+    because removing them ripples into copilot_chat_model.py/claude_chat_model.py's own
+    `sandbox: SandboxSession | None` field.
+    """
 
     session_id: str
     host: str
@@ -101,65 +110,6 @@ class SandboxProvider(abc.ABC):
         process. `command` is run via `sh -c`, so the caller is responsible for shell-safe
         quoting (workflow_persistence.py base64-encodes file content for exactly this reason).
         """
-
-
-async def wait_for_copilot_ready(host: str, port: int, connection_token: str) -> None:
-    """Block until the sandbox's copilot --server has actually completed its own startup, not
-    just bound its listening socket.
-
-    Shared by every SandboxProvider implementation (LocalDockerProvider, AzureContainerInstanceProvider,
-    ...) -- a bare TCP connect is NOT sufficient here, confirmed empirically
-    (scratchpad/repro_warmup_window.py from the investigation this fixes): the CLI prints
-    "listening on port" and accepts TCP connections within milliseconds, but its JSON-RPC layer
-    takes several seconds longer to finish initializing. Any `connect` request that arrives before
-    that finishes gets the connection dropped with zero response -- which is exactly what caused
-    ~2/3 of CopilotChatModel session creations to fail with ProcessExitedError when this check only
-    verified bare socket connectivity. Performing the real `connect` handshake as the readiness
-    check (with the actual connection_token, not a placeholder) means provision() only returns
-    once a caller connecting the same way the agent will is actually guaranteed to succeed.
-    """
-    deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
-    last_error: str | None = None
-    message = {
-        "jsonrpc": "2.0",
-        "id": "readiness-check",
-        "method": "connect",
-        "params": {"token": connection_token},
-    }
-    body = json.dumps(message, separators=(",", ":")).encode()
-    payload = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
-
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=2.0) as sock:
-                sock.sendall(payload)
-                response = sock.recv(4096)
-        except OSError as exc:
-            last_error = str(exc)
-            await asyncio.sleep(0.3)
-            continue
-        if not response:
-            last_error = "connection closed with no response (server not ready yet)"
-            await asyncio.sleep(0.3)
-            continue
-        # Any well-formed JSON-RPC response -- success or an error frame like
-        # AUTHENTICATION_FAILED -- proves the RPC layer itself is live, which is all this check
-        # needs to confirm. A malformed/partial frame means it's still warming up.
-        try:
-            _, _, raw_body = response.partition(b"\r\n\r\n")
-            parsed = json.loads(raw_body)
-        except (json.JSONDecodeError, ValueError):
-            last_error = f"unparseable response during warmup: {response[:200]!r}"
-            await asyncio.sleep(0.3)
-            continue
-        if "result" in parsed or "error" in parsed:
-            return
-        last_error = f"unexpected response shape: {parsed!r}"
-        await asyncio.sleep(0.3)
-    raise RuntimeError(
-        f"sandbox at {host}:{port} did not complete a connect handshake within "
-        f"{_READY_TIMEOUT_SECONDS}s (last error: {last_error})"
-    )
 
 
 async def wait_for_cli_ready(exec_fn: Callable[[str], Awaitable[tuple[int, str, str]]]) -> None:
