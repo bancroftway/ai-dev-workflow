@@ -363,14 +363,32 @@ GitHub-releases-hosted prebuilt binaries, npm is simpler and matches how `eslint
 regardless of which `AGENT_PROVIDER` a given deployment runs — decided at container start, not
 build time. Remove `EXPOSE 3000` — nothing listens on a port anymore for either provider.
 
-**entrypoint.sh**: after the existing clone/bootstrap logic and before the current
-`copilot --server` exec, add: `AGENT_PROVIDER="${AGENT_PROVIDER:-copilot}"`; if `"claude"`, warn
-if `ANTHROPIC_API_KEY` is empty (same style as the existing `COPILOT_SDK_AUTH_TOKEN` empty-warning
-a few lines below) and `exec sleep infinity` (still makes this process pid 1's replacement, same
-signal-delivery reasoning as the `copilot` exec path — this process still IS the container's main
-process, it just has nothing to serve). Otherwise, fall through to the existing unchanged
-`exec copilot --headless ...` path. Also update the copy in this file's own header comment
-describing entrypoint responsibility #2 to mention both providers, not just Copilot.
+**entrypoint.sh — corrected 2026-08-22, see Ruling in progress.md**: this file's real tail at HEAD
+(verified against the file, not reconstructed from memory) is an unconditional
+`COPILOT_SDK_AUTH_TOKEN`-empty warning followed by an unconditional
+`exec copilot --headless --no-auto-update --log-level error --auth-token-env
+COPILOT_SDK_AUTH_TOKEN --no-auto-login --host 0.0.0.0 --port "$COPILOT_SERVER_PORT"` (lines
+178-202) — a persistent TCP server. **This is not a fallback to preserve.** Task 6 already removed
+the only way anything could ever reach that port (the `-p host:3000` Docker publish and the
+`COPILOT_SERVER_PORT`/`COPILOT_CONNECTION_TOKEN` env vars), so keeping this exec as the
+`AGENT_PROVIDER=copilot` (default) path would make the default sandbox permanently unreachable —
+a real regression, not a deliberate, temporary cross-task gap like Task 6/11's parameter rename.
+Match the Spec's own Part 1 module-layout text exactly: "entrypoint.sh collapses to one path for
+every provider: clone, bootstrap, exec sleep infinity. The AGENT_PROVIDER branch that used to pick
+copilot --server vs sleep infinity goes away — there's only one shape now."
+
+Replace lines 178-202 entirely with: `AGENT_PROVIDER="${AGENT_PROVIDER:-copilot}"`; if `"claude"`,
+warn if `ANTHROPIC_API_KEY` is empty (new warning, same message style as the one it replaces);
+else (covers `"copilot"` and any other/unrecognized value — an unrecognized provider name should
+not crash the container, `chat_model.py`'s own dispatch already raises `ValueError` at the point a
+session actually starts, which is the right layer to fail loudly at) keep the existing
+`COPILOT_SDK_AUTH_TOKEN`-empty warning verbatim. Either branch ends the same way: one unconditional
+`exec sleep infinity` — no provider branch on the exec target itself, only on which credential
+gets warned about. Delete the `--host 0.0.0.0 is required...` comment block (lines 183-193) and
+the `COPILOT_SERVER_PORT` variable (line 28) entirely — both existed only to justify/configure the
+now-deleted server exec. Also rewrite this file's own header comment (lines 1-24, especially
+responsibility #2's description of "exec the Copilot CLI runtime in headless TCP server mode...")
+to describe the one shape both providers now share, not the old Copilot-only server behavior.
 
 Self-check: N/A — shell scripts and a Dockerfile, verified by an actual `docker build` +
 container run in Task 12, not a unit test.
