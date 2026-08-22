@@ -17,6 +17,13 @@ ARG BASE_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0
 # copilot/_cli_version.py's CLI_VERSION) so the SDK's minimum protocol version check
 # (client.py's _MIN_PROTOCOL_VERSION) never rejects this server on a stale binary.
 ARG COPILOT_CLI_VERSION=1.0.79
+# Claude Code CLI -- npm-installed (final stage's Node/npm layer), not curl+tar like Copilot
+# above, so this pin has no sibling SDK protocol check to lean on: claude_chat_model.py drives
+# this CLI by per-turn exec, not an SDK, so the pin here IS the compatibility contract for the
+# flags (--resume, --permission-mode, --json-schema, --plugin-dir, --mcp-config) and
+# --output-format json fields (session_id/usage/total_cost_usd/is_error) that module depends on --
+# an unpinned `@latest` install could silently reshape either one out from under it.
+ARG CLAUDE_CODE_CLI_VERSION=2.1.126
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end
 # against a rebuilt image -- see each gate module's own docstring.
@@ -91,6 +98,10 @@ RUN set -eux; \
 FROM ${BASE_IMAGE}
 
 ARG NODE_MAJOR=22
+# Redeclared here (default lives with COPILOT_CLI_VERSION above) so the npm install in the
+# Node/npm/gh layer below can see it -- same cross-stage pattern as COPILOT_CLI_VERSION's own
+# redeclaration in the fetch stage.
+ARG CLAUDE_CODE_CLI_VERSION
 # Azure Functions Core Tools: `func` is what actually builds and runs a Functions project, and
 # app discovery (agent/src/app_discovery.py) classifies Azure Functions repos as in scope. Pinned
 # to a major only -- nothing parses its output, same reasoning as jscpd/lizard below.
@@ -148,14 +159,22 @@ RUN set -eux; \
     mkdir -p /opt/aidw/tools/bin /opt/aidw/cache; \
     chmod -R a+rwX /opt/aidw
 
-# Node.js/npm (NodeSource) + Python + the GitHub CLI. dotnet, git, and curl already come from
-# the base dotnet/sdk image (verified: Ubuntu 24.04, git/curl preinstalled, `dotnet --version`
-# reports 10.0.x).
+# Node.js/npm (NodeSource) + Python + the GitHub CLI + the Claude Code CLI. dotnet, git, and curl
+# already come from the base dotnet/sdk image (verified: Ubuntu 24.04, git/curl preinstalled,
+# `dotnet --version` reports 10.0.x).
+#
+# Claude Code CLI is npm-installed here, not fetched via the curl+tar pattern used for the Copilot
+# binary above -- that pattern is for GitHub-releases-hosted prebuilt binaries, and
+# @anthropic-ai/claude-code is a plain npm package, the same install path as eslint/typescript/
+# playwright elsewhere in this file. Both CLIs are baked into every image regardless of which
+# AGENT_PROVIDER a given deployment runs -- entrypoint.sh picks between them at container start,
+# not build time.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates gnupg python3 python3-pip; \
     curl -fsSL --retry 5 --retry-all-errors "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
     apt-get install -y --no-install-recommends nodejs; \
+    npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}"; \
     curl -fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
     chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg; \
@@ -383,7 +402,5 @@ RUN chmod +x /usr/local/bin/ai-dev-workflow-entrypoint.sh /usr/local/bin/ai-dev-
 
 USER vscode
 WORKDIR /workspace
-
-EXPOSE 3000
 
 ENTRYPOINT ["/usr/local/bin/ai-dev-workflow-entrypoint.sh"]

@@ -10,22 +10,24 @@
 #      are present). Either way it is only ever passed per-invocation via
 #      `git -c credential.helper=...`, never written to a persistent .gitconfig, and both copies
 #      are destroyed before anything repo-supplied can run. Skipped entirely when REPO_CLONE_URL
-#      is unset, so this image is also usable as a bare Copilot-runtime sandbox for testing the
-#      transport/connect mechanics on their own.
-#   2. exec the Copilot CLI runtime in headless TCP server mode, authenticated with the shared
-#      COPILOT_SDK_AUTH_TOKEN (agent/src/graph.py's GITHUB_TOKEN) and gated by
-#      COPILOT_CONNECTION_TOKEN. `exec` (not a backgrounded process) so this process IS pid 1's
-#      replacement -- container lifecycle and signal delivery (docker stop -> SIGTERM) match the
-#      copilot process directly, and `docker logs` shows its output.
+#      is unset, so this image is also usable as a bare sandbox for exercising either CLI
+#      directly, without a target repo.
+#   2. exec `sleep infinity` so this process (still pid 1) simply holds the container open. Nothing
+#      long-lived runs in here for either provider: both Claude and Copilot are driven by a
+#      per-turn CLI exec from outside the container (agent/src/sandbox/provider.py's
+#      wait_for_cli_ready, plus claude_chat_model.py/copilot_chat_model.py), never by a persistent
+#      in-container server. `exec` (not a backgrounded `sleep`) still matters -- it keeps this
+#      script as pid 1's replacement so `docker stop`/ACI's equivalent deliver SIGTERM directly to
+#      it instead of to a wrapper shell that would have to relay the signal.
 #
 # Ordering note (plan Section C.4): once devcontainer.json onCreateCommand/postCreateCommand
 # support lands, it must run strictly after step 1's credential material is already gone and
-# strictly before COPILOT_SDK_AUTH_TOKEN is relied upon by anything -- an untrusted repo's own
-# postCreateCommand runs with the same privileges as this script.
+# strictly before the active provider's own credential (COPILOT_SDK_AUTH_TOKEN or
+# ANTHROPIC_API_KEY, whichever AGENT_PROVIDER selects) is relied upon by anything -- an untrusted
+# repo's own postCreateCommand runs with the same privileges as this script.
 set -euo pipefail
 
 WORKSPACE_DIR="/workspace/repo"
-COPILOT_SERVER_PORT="${COPILOT_SERVER_PORT:-3000}"
 
 # Local Docker provider delivers the clone credential as a pre-start file (never in Config.Env,
 # so `docker inspect` shows nothing); Azure ACI delivers it as a secure env var. Env wins when
@@ -175,28 +177,24 @@ else
   cd "$WORKSPACE_DIR"
 fi
 
-if [[ -z "${COPILOT_SDK_AUTH_TOKEN:-}" ]]; then
-  echo "entrypoint: WARNING -- COPILOT_SDK_AUTH_TOKEN is empty; the copilot runtime will start" \
-       "but any session creation will fail auth" >&2
+# One shape for every provider: clone, bootstrap, exec sleep infinity. Neither CLI is started
+# here -- both are driven by a per-turn `docker exec`/`az container exec` from outside (see this
+# file's own header comment, responsibility #2) -- so the only provider-specific thing left is
+# which credential gets warned about when empty. An unrecognized AGENT_PROVIDER value falls
+# through to the copilot-shaped warning below rather than crashing the container here;
+# chat_model.py's own dispatch already raises ValueError the moment a session actually tries to
+# use it, which is the right layer to fail loudly at, not this script.
+AGENT_PROVIDER="${AGENT_PROVIDER:-copilot}"
+if [[ "$AGENT_PROVIDER" == "claude" ]]; then
+  if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "entrypoint: WARNING -- ANTHROPIC_API_KEY is empty; the claude runtime will start" \
+         "but any session creation will fail auth" >&2
+  fi
+else
+  if [[ -z "${COPILOT_SDK_AUTH_TOKEN:-}" ]]; then
+    echo "entrypoint: WARNING -- COPILOT_SDK_AUTH_TOKEN is empty; the copilot runtime will start" \
+         "but any session creation will fail auth" >&2
+  fi
 fi
 
-# --host 0.0.0.0 is required, not cosmetic: copilot's TCP server rejects any connection whose
-# peer isn't true loopback by default (confirmed empirically -- a Docker-published connection to
-# the default bind arrives as the bridge gateway's address, not 127.0.0.1, and gets destroyed
-# before even reaching the JSON-RPC layer, with zero response). --host 0.0.0.0 is GitHub's own
-# documented mechanism for exactly this case ("from another machine on your network" / "from a
-# separate process or container") -- COPILOT_CONNECTION_TOKEN is still what gates access once
-# bound this way (verified: a wrong token gets a clean AUTHENTICATION_FAILED JSON-RPC error over
-# the published port, not a silent drop). Because the wire protocol is plaintext TCP with no TLS,
-# this still relies on the surrounding network being trusted (loopback-only publish for local
-# dev, internal-only Container Apps ingress in Azure -- see architecture plan Section D) rather
-# than on the token alone.
-echo "entrypoint: starting copilot --server on 0.0.0.0:${COPILOT_SERVER_PORT}"
-exec copilot \
-  --headless \
-  --no-auto-update \
-  --log-level error \
-  --auth-token-env COPILOT_SDK_AUTH_TOKEN \
-  --no-auto-login \
-  --host 0.0.0.0 \
-  --port "$COPILOT_SERVER_PORT"
+exec sleep infinity
