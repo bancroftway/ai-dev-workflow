@@ -24,7 +24,7 @@ Steps:
    and contains per-test entries. Tests themselves may pass or fail -- either is fine; what
    matters is that the result file is produced.
 
-Then report via `report_stage_output`:
+Then report:
 - `command`: the command with `<<attempt_token>>` still in it (not the substituted form).
 - `result_path`: the result file path, REPO-RELATIVE (e.g. `agent-work/test-results-<<attempt_token>>.trx`),
   also still containing `<<attempt_token>>`. Never an absolute path like

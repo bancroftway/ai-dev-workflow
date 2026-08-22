@@ -33,7 +33,7 @@ Steps:
    the console output for that suite.
 5. Confirm the files exist and actually contain results before you finish.
 
-Then report via `report_stage_output`:
+Then report:
 - `output_artifact`: `<<output_path>>`
 - `result_artifacts`: every machine-readable report path you produced, repo-relative.
 - `exit_ok`: whether the suite exited zero (usually false here -- that is fine and expected).

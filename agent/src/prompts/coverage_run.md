@@ -44,7 +44,7 @@ that actually exists afterwards, not the one you expected.
 For JS/TS repos with no coverage provider of their own, this sandbox ships one:
 `/opt/aidw/test/node_modules/.bin/vitest run --coverage --coverage.provider=v8`
 
-Then report via `report_stage_output`:
+Then report:
 - `entries`: one per test root you ran, each with `root` (repo-relative directory you ran in, ""
   for the repo root), `command` (exactly what you ran), `artifact` (repo-relative path to the
   report file that now exists), and `format` (one of the two names above).

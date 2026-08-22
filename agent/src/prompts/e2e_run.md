@@ -48,7 +48,7 @@ Steps:
 4. If the app cannot be started at all, that is a real finding: report it rather than guessing a
    command you never saw work.
 
-Then report via `report_stage_output`:
+Then report:
 - `start_command`: the exact foreground command (with any needed `cd`).
 - `port`: the port it actually answered on -- which must be <<requested_port>>.
 - `routes`: every route path from step 3, each beginning with `/`. These are screenshotted one by

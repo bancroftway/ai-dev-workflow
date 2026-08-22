@@ -46,7 +46,7 @@ Steps:
 3. If a build fails, capture the real compiler/tool output. That output is the whole point -- the
    fix agent that runs next can only work from what you report.
 
-Then report via `report_stage_output`:
+Then report:
 - `success`: true only if EVERY buildable project built cleanly.
 - `ok`: same as success -- the build gate reads this field.
 - `stdout_tail` / `stderr_tail`: the last few thousand characters of real output. On failure these

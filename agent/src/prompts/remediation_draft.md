@@ -47,7 +47,7 @@ when its licence genuinely conflicts with the project's; otherwise record it in 
 Do not touch the acceptance-criteria tests to make anything pass. When your changes are done the
 suite must still be green for the same reasons it was green before.
 
-Then report via `report_stage_output`:
+Then report:
 - `remediation_summary`: what you actually changed, grouped by kind (dependencies upgraded with
   their old -> new versions, code findings fixed, findings deliberately left).
 - `findings_addressed`: the `id` of each finding you fixed, copied from the scan report.
