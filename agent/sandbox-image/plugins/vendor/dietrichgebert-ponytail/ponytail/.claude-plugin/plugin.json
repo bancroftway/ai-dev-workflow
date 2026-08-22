@@ -1,7 +1,0 @@
-{
-  "name": "ponytail",
-  "description": "Code/doc minimization skill pack: forces the simplest, shortest, most minimal solution (YAGNI-first) and provides audit/debt/gain/review commands for existing code.",
-  "homepage": "https://github.com/dietrichgebert/ponytail",
-  "repository": "https://github.com/dietrichgebert/ponytail",
-  "license": "MIT"
-}

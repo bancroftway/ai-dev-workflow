@@ -1,7 +1,0 @@
-{
-  "name": "caveman",
-  "description": "Output-token reduction skill: terse response formatting that preserves code/commands/critical information while cutting explanatory prose. Vendored scope is the caveman skill only -- the source repo's browser extension and proxy server components are explicitly excluded, and licensed differently (BSL-1.1) from the MIT-licensed skills/ directory this was copied from.",
-  "homepage": "https://github.com/JuliusBrussee/caveman",
-  "repository": "https://github.com/JuliusBrussee/caveman",
-  "license": "MIT"
-}
