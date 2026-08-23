@@ -172,7 +172,7 @@ class LocalDockerProvider(SandboxProvider):
     ) -> SandboxSession:
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
         # a module-scope import here would cycle. Needed only to pick which of
-        # COPILOT_SDK_AUTH_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
+        # GITHUB_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
         # (wait_for_cli_ready) no longer branches on this.
         from ..chat_model import PROVIDER
 
@@ -275,8 +275,18 @@ class LocalDockerProvider(SandboxProvider):
                     # Both set unconditionally, one real one empty, so this call never needs to
                     # branch on provider itself -- the sandbox-image entrypoint is what picks
                     # which one it actually needs. Harmless unused env either way.
+                    #
+                    # GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B /
+                    # task-12b): the real Copilot CLI's own `copilot help environment` documents
+                    # GITHUB_TOKEN (or GH_TOKEN/COPILOT_GITHUB_TOKEN) as what it actually reads for
+                    # auth -- confirmed empirically too (setting GITHUB_TOKEN to any nonempty value
+                    # moves the CLI's own error past "no auth found" into real token-format
+                    # validation; COPILOT_SDK_AUTH_TOKEN never does anything). COPILOT_SDK_AUTH_TOKEN
+                    # was the correct name only for the old SDK-based `copilot --server` process
+                    # (see copilot_chat_model.py's module docstring) -- Task 3 fully retired that
+                    # process, and this line is the one place that never got updated to match.
                     "-e",
-                    f"COPILOT_SDK_AUTH_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
+                    f"GITHUB_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
                     "-e",
                     f"ANTHROPIC_API_KEY={runtime_auth_token if PROVIDER == 'claude' else ''}",
                     "-e",

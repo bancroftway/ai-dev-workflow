@@ -22,9 +22,9 @@
 #
 # Ordering note (plan Section C.4): once devcontainer.json onCreateCommand/postCreateCommand
 # support lands, it must run strictly after step 1's credential material is already gone and
-# strictly before the active provider's own credential (COPILOT_SDK_AUTH_TOKEN or
-# ANTHROPIC_API_KEY, whichever AGENT_PROVIDER selects) is relied upon by anything -- an untrusted
-# repo's own postCreateCommand runs with the same privileges as this script.
+# strictly before the active provider's own credential (GITHUB_TOKEN or ANTHROPIC_API_KEY,
+# whichever AGENT_PROVIDER selects) is relied upon by anything -- an untrusted repo's own
+# postCreateCommand runs with the same privileges as this script.
 set -euo pipefail
 
 WORKSPACE_DIR="/workspace/repo"
@@ -191,8 +191,14 @@ if [[ "$AGENT_PROVIDER" == "claude" ]]; then
          "but any session creation will fail auth" >&2
   fi
 else
-  if [[ -z "${COPILOT_SDK_AUTH_TOKEN:-}" ]]; then
-    echo "entrypoint: WARNING -- COPILOT_SDK_AUTH_TOKEN is empty; the copilot runtime will start" \
+  # GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B / task-12b): this warning
+  # used to check the old SDK-server process's env var, which the real `copilot` CLI (v1.0.79)
+  # never reads at all -- it reads GITHUB_TOKEN (see local_docker.py/azure_aci.py's own fix for
+  # the same root cause). Left checking the old name, this warning would stay silent on a
+  # genuinely-empty GITHUB_TOKEN and could fire falsely if COPILOT_SDK_AUTH_TOKEN alone were ever
+  # set -- same symptom as the bug itself, not a separate one.
+  if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+    echo "entrypoint: WARNING -- GITHUB_TOKEN is empty; the copilot runtime will start" \
          "but any session creation will fail auth" >&2
   fi
 fi

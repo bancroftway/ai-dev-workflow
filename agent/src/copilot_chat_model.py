@@ -143,6 +143,33 @@ def _parse_copilot_jsonl(stdout: str) -> tuple[list[dict[str, Any]], str | None]
     return events, session_id
 
 
+def _build_copilot_wrapper_script(argv: list[str], prompt_path: str, timeout_seconds: float) -> str:
+    """Build the text of the tiny wrapper script that feeds `-p` its value via shell expansion.
+
+    Pure string construction, no I/O -- so _demo can assert its exact shape without a live sandbox
+    (same "pure half only" scoping as _parse_copilot_jsonl above). The caller writes this text to a
+    scratch file via write_scratch_file and runs it as `sh <path>`; see that call site in
+    _agenerate_inner for the full "why" this exists at all (real CLI has no stdin-fed prompt mode)
+    and why it is a wrapper FILE rather than a directly-embedded command-substitution fragment
+    (avoids a double-quote-nesting hazard in azure_aci.py's own re-embedding of the command
+    string). This function only owns the string's shape, not that reasoning.
+
+    argv[0] must be "copilot" (the caller's own hardcoded first element, never touched again after
+    construction) -- everything in argv[1:] is flags only; `-p`'s value is never one of them.
+    """
+    assert argv and argv[0] == "copilot", f"expected argv[0] == 'copilot', got argv={argv!r}"
+    # Double-quoted command substitution: the shell fixes where this quoted argument starts and
+    # ends from THIS literal text, before it ever runs `cat` -- the prompt file's bytes only
+    # appear afterward, already-parsed, dropped into that one argument slot. A double-quoted
+    # substitution's result is never re-split, glob-expanded, or re-parsed for further
+    # substitution, so nothing the prompt could contain (quotes, backticks, `$(...)`, semicolons,
+    # newlines) can widen its own quoting or inject a second command. shlex.quote(prompt_path)
+    # guards the path itself the same way, though in practice every scratch path this codebase
+    # builds (_SCRATCH_DIR + stage/role/uuid4().hex) is already shlex-safe with no quoting needed.
+    prompt_expr = f'"$(cat {shlex.quote(prompt_path)})"'
+    return f"COPILOT_TASK_WAIT_TIMEOUT_SECONDS={timeout_seconds} copilot -p {prompt_expr} {shlex.join(argv[1:])}\n"
+
+
 class CopilotChatModel(BaseChatModel):
     """A LangChain chat model driving the GitHub Copilot CLI as a per-turn subprocess exec inside
     the sandbox (cli_agent_exec.run_turn), matching ClaudeChatModel's public shape -- see this
@@ -263,12 +290,20 @@ class CopilotChatModel(BaseChatModel):
         prompt = _messages_to_prompt(messages)
         session_id = _session_ids.get(self._session_key)
 
-        # Bare `-p` (no inline value), relying on the prompt arriving over stdin -- identical
-        # mechanism to claude_chat_model's `["claude", "-p", ...]`, and cli_agent_exec.run_turn
-        # always redirects scratch_prefix's contents onto this command's stdin regardless of which
-        # provider it is. The flags table's own "-p PROMPT / --prompt=PROMPT (or piped stdin)"
-        # explicitly lists piped stdin as a valid form.
-        argv = ["copilot", "-p", "--output-format", "json"]
+        # `-p`'s own value is deliberately NOT put in argv here (unlike Claude's stdin-fed
+        # `["claude", "-p", ...]` -- see claude_chat_model.py, confirmed working). Verified against
+        # the real CLI, v1.0.79 (task-12-report.md "BUG A"): `-p`/`--prompt` has no stdin-fed mode
+        # at all -- it always requires the prompt as `-p`'s own next argv token, no matter what's
+        # piped in. 4 independent real-CLI probes confirmed this: bare `-p` followed by more flags
+        # -> "Invalid command format ... prompt was not quoted"; `-p` with no following token ->
+        # "argument missing"; `-p` with an explicit quoted value -> proceeds past parsing straight
+        # to the auth check; `-p -` -> "-" taken as a literal 1-char prompt, not a stdin marker.
+        # cli_agent_exec.run_turn's stdin redirection (`< scratch_prefix`) is correct for and
+        # required by Claude, but is simply not a mechanism this CLI ever reads its prompt from.
+        # `-p`'s real value is supplied via the shell-wrapper construction right before `command`
+        # is built below, near the end of this function -- see the comment there for the full
+        # "why" (both why shell expansion instead of argv/stdin, and why a wrapper script file).
+        argv = ["copilot", "--output-format", "json"]
         # --session-id, not the flags-table-documented --resume: --resume alone opens an
         # interactive picker that needs a TTY a headless sandbox exec never has, whereas
         # --session-id resumes the exact id with no prompt (task-3-brief.md's explicit preference).
@@ -394,7 +429,51 @@ class CopilotChatModel(BaseChatModel):
         # cmd`), not a new run_turn parameter -- cli_agent_exec.py is Task 1's reviewed-clean
         # shared file, out of this task's scope to touch, and every exec here already runs through
         # `sh -c` (_build_startup_command), where a leading env assignment is ordinary syntax.
-        command = f"COPILOT_TASK_WAIT_TIMEOUT_SECONDS={config.CLI_AGENT_TURN_TIMEOUT_SECONDS} {shlex.join(argv)}"
+        #
+        # Bug A fix (task-12-report.md / task-12b-report.md): `-p` gets its value from shell
+        # expansion, not argv or stdin -- see the comment on `argv = ["copilot", ...]` above for
+        # why stdin (this shared runner's normal mechanism, and Claude's own, confirmed-working
+        # one) cannot work for this CLI at all. `scratch_prefix` IS the prompt file's real path:
+        # run_turn (cli_agent_exec.py) writes the prompt there as its own first step, before it
+        # ever launches `command` -- its internal `prompt_path = scratch_prefix` is the exact same
+        # string passed as `scratch_prefix` a few lines below, so by the time anything here
+        # actually reads that path, the prompt is already on disk (write-then-launch is
+        # run_turn's own ordering, not re-derived here).
+        #
+        # _build_copilot_wrapper_script's own docstring covers the double-quoted-$(cat...) safety
+        # argument (why arbitrary prompt content -- quotes, backticks, $(), semicolons, newlines --
+        # cannot escape this construction). The remaining choice made here, at the call site, is
+        # WHERE that expansion lives: in a small wrapper SCRIPT FILE (written via
+        # write_scratch_file, the same base64-safe primitive already used for the prompt itself and
+        # the MCP config above) rather than spliced directly into `command`.
+        #
+        # That choice is deliberate, not decorative: `command` does not end its short life as one
+        # opaque token. cli_agent_exec._build_startup_command embeds it into a larger sh_script and
+        # shlex.quote()'s THAT once -- fine, single-quoting survives arbitrary content -- but
+        # azure_aci.py's exec_in_sandbox (this provider's OTHER SandboxProvider) re-embeds the
+        # resulting string a SECOND time via plain Python f-string interpolation into its own
+        # double-quoted `/bin/sh -c "cd ... && {command}"` (see that module's own docstring,
+        # already flagged there as unverified to preserve shell operators). A `-p "$(cat ...)"`
+        # fragment spliced straight into `command` would put two guaranteed literal `"` characters
+        # inside that outer double-quoted string on EVERY Copilot turn, not just some rare edge
+        # case -- closing it early and breaking the exec. Routing the expansion through a wrapper
+        # file sidesteps this entirely: the file's bytes travel via base64 like every other scratch
+        # file here, so `command` itself ends up as just `sh <plain-path>` -- no shell
+        # metacharacters left for any provider's own re-embedding to mishandle. Verified against the
+        # real LocalDockerProvider container below (task-12b-report.md); AzureContainerInstance
+        # itself was not re-verified live (no ACI target in this environment, matching Task 12's
+        # own stated limitation) -- but this shape does not depend on that provider's quoting
+        # fidelity to be correct the way the plain-embed alternative would have.
+        # ponytail: `$(cat ...)` becomes a single argv word at exec time, capped by the container
+        # kernel's MAX_ARG_STRLEN (128 KiB per argv element on Linux) -- comfortably enough for
+        # normal stage prompts, unlike the old stdin path this replaces, which had no such ceiling.
+        # If a stage ever grows a prompt anywhere near that, this wrapper script is the place to
+        # change (e.g. write the prompt into a shell variable via a `read` builtin instead of a
+        # single command-substitution word), not a reason to raise the limit blindly.
+        wrapper_path = f"{scratch_prefix}.cmd.sh"
+        wrapper_script = _build_copilot_wrapper_script(argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS)
+        await write_scratch_file(provider, self.thread_id, wrapper_path, wrapper_script)
+        command = f"sh {shlex.quote(wrapper_path)}"
         result = await run_turn(
             provider,
             self.thread_id,
@@ -587,10 +666,34 @@ def secret_env_names() -> set[str]:
 
 def _demo() -> None:
     """Self-check for the JSONL parser's defensive scanning (session_id found on ANY line, not
-    just the assumed-final one) and the session-cache eviction path -- the live CLI-exec path
-    needs a sandbox, see cli_agent_exec.py's and claude_chat_model.py's own demos for the same
-    "pure half only" scoping.
+    just the assumed-final one), the Bug A wrapper-script shape (task-12b), and the session-cache
+    eviction path -- the live CLI-exec path needs a sandbox, see cli_agent_exec.py's and
+    claude_chat_model.py's own demos for the same "pure half only" scoping.
     """
+    # Bug A fix (task-12b): the wrapper script must feed `-p` an explicit, double-quoted
+    # command-substitution value -- never bare/stdin-fed (the real CLI has no such mode -- see
+    # _agenerate_inner's own comment on `argv = ["copilot", ...]`) and never the raw prompt text
+    # inlined (would re-blow cli_agent_exec._EXEC_CMD_BUDGET for a large prompt). Exact-match, not
+    # a substring check, so any accidental reordering/re-quoting/missing-newline regression fails
+    # loud here rather than only against a live container.
+    wrapper = _build_copilot_wrapper_script(
+        ["copilot", "--output-format", "json", "--mode", "plan"], "/tmp/aidw-agent/fake-prompt", 1800
+    )
+    assert wrapper == (
+        'COPILOT_TASK_WAIT_TIMEOUT_SECONDS=1800 copilot -p "$(cat /tmp/aidw-agent/fake-prompt)" '
+        "--output-format json --mode plan\n"
+    ), f"unexpected wrapper script shape: {wrapper!r}"
+
+    # A prompt path containing shell-special characters must come out shlex-quoted, not raw --
+    # this is what actually makes the $(cat ...) construction safe (see the function's own
+    # docstring); built from the same stdlib call under test so this assertion tracks shlex's own
+    # behavior rather than hand-duplicating its quoting rules.
+    dangerous_path = "/tmp/aidw-agent/a b'c\"d"
+    wrapper_special = _build_copilot_wrapper_script(["copilot"], dangerous_path, 60)
+    assert f"$(cat {shlex.quote(dangerous_path)})" in wrapper_special, (
+        f"prompt path with shell-special characters must be shlex-quoted: {wrapper_special!r}"
+    )
+
     # Defensive scan: session_id shows up on an EARLY line, not the (more likely, per this
     # module's own guess) final line -- must still be found. This is exactly the defensive
     # behavior task-3-brief.md calls for, since the real per-line shape is unverified.
