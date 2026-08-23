@@ -465,5 +465,18 @@ Tasks 1-8.
    `AGENT_PROVIDER`/`agentProvider`'s deploy-time default correctly.
 5. Confirm a pre-Part-4 checkpointed run (if one can be constructed/simulated) resumes correctly
    under Task 4's bridge-fallback logic, not just a freshly-started one.
-6. Write a final report naming what was verified for real, what remains unverified and why, and
+6. **Added after Task 4's review found it untracked**: confirm (or explicitly accept as a known,
+   documented gap) the process-restart scenario Ruling 2's literal text doesn't actually cover —
+   `GraphState.provider` is pinned via `InMemorySaver`, which is process-local; if the agent
+   process restarts while a run is paused mid-gate, and the org setting changed since that run
+   started, the next reattach re-resolves the LIVE provider, not the one the run started on
+   (confirmed real by Task 4's review via `workflow_persistence.hydrate_state`'s real, stages-only
+   restore scope — no mechanism restores a bare top-level `GraphState` field like `provider` across
+   a restart). This is a real gap in the Spec's literal "never affects an in-flight run" promise,
+   correctly out of Task 4's own scope (every other un-hydrated `GraphState` field has the same
+   property) — but it needs an explicit decision here: accept it as documented, known, low-probability
+   residual risk, or scope a follow-up task to extend `workflow_persistence`'s durable-state schema
+   (or swap `InMemorySaver` for a real durable checkpointer) to close it. Do not let this be the
+   first time anyone notices it is untested.
+7. Write a final report naming what was verified for real, what remains unverified and why, and
    any place reality diverged from what Tasks 1-8 assumed — same shape as Part 1's Task 12 report.
