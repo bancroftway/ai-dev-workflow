@@ -192,6 +192,9 @@ async def test_hardening_fix_node(state: dict[str, Any], config: RunnableConfig)
         "test-hardening",
         f"fix-{state.get('run_id', 'run')}-{test_hardening.get('fix_attempt', 0) + 1}",
         provider=state["provider"],
+        # Task 3b (Part 2 Ruling 10) fix-round-3 -- see e2e_fix_node's own comment (same shape,
+        # same mechanism, same fix).
+        run_id=state.get("run_id", "unknown"),
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("e2e", "draft", state["provider"]) or model_config.get_model_name("minimal-code-to-green", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
@@ -245,6 +248,9 @@ async def test_hardening_flake_triage_node(state: dict[str, Any], config: Runnab
         "test-hardening-flake-triage",
         "draft",
         provider=state["provider"],
+        # Task 3b (Part 2 Ruling 10) fix-round-3 -- same mechanism/fix as every other graph-node
+        # call site in this task.
+        run_id=state.get("run_id", "unknown"),
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("test-hardening-flake-triage", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),

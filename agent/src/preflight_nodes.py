@@ -111,6 +111,9 @@ async def _generate_session_title(thread_id: str, raw_requirements_text: str, ru
             "session-title",
             "draft",
             provider=provider,
+            # Task 3b (Part 2 Ruling 10) fix-round-3: `run_id` is already this function's own
+            # parameter (used above for the fallback title) -- just wasn't forwarded here.
+            run_id=run_id,
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("session-title", "draft", provider),
             sandbox=sandbox_registry.get(thread_id),
@@ -436,7 +439,9 @@ async def prefill_tech_stack_from_repo_file(
 _TECH_STACK_EXTRACT_PROMPT = load_prompt("tech_stack_extract")
 
 
-async def _extract_tech_stack(thread_id: str, markdown: str, provider: SandboxProvider, chat_provider: str) -> dict[str, Any]:
+async def _extract_tech_stack(
+    thread_id: str, markdown: str, provider: SandboxProvider, chat_provider: str, run_id: str
+) -> dict[str, Any]:
     """One-shot structured extraction of the TechStack schema from already-human-approved
     markdown -- no repo exploration, no clarification loop, distinct "extract" role so this never
     shares (and clobbers) the draft session's own cached conversation (get_chat_model_for_thread's
@@ -445,12 +450,16 @@ async def _extract_tech_stack(thread_id: str, markdown: str, provider: SandboxPr
     `chat_provider` (this thread's pinned org provider, "claude"/"copilot") is threaded in from
     resolve_tech_stack_submission's own `state["provider"]` -- named distinctly from `provider`
     (the pre-existing SandboxProvider connection object this function already took) to avoid
-    colliding with it, same disambiguation chat_model.read_skill_invocations uses."""
+    colliding with it, same disambiguation chat_model.read_skill_invocations uses. `run_id`
+    (Task 3b, Part 2 Ruling 10 fix-round-3) is threaded in the same way, from the same caller's
+    `state["run_id"]` -- this function has no `state` of its own, same reason `chat_provider`
+    isn't just read here directly."""
     model = get_chat_model_for_thread(
         thread_id,
         "tech-stack",
         "extract",
         provider=chat_provider,
+        run_id=run_id,
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("tech-stack", "extract", chat_provider),
         sandbox=sandbox_registry.get(thread_id),
@@ -498,7 +507,9 @@ async def resolve_tech_stack_submission(
     await git_ops.commit_paths(provider, thread_id, [TECH_STACK_MD_PATH], "ai-dev-workflow: tech stack saved")
 
     try:
-        tech_stack = await _extract_tech_stack(thread_id, markdown, provider, state["provider"])
+        tech_stack = await _extract_tech_stack(
+            thread_id, markdown, provider, state["provider"], state.get("run_id", "unknown")
+        )
     except Exception:
         logger.exception(
             "tech-stack extraction failed for thread_id=%s; approving with a bare summary instead "
