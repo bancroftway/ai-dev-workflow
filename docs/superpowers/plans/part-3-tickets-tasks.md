@@ -347,6 +347,68 @@ not policy calls, and explicitly did not touch). The user decided:
   run's own final `scan_report`, overwriting whatever was there before. Confirm the exact real
   transition point before wiring anything; don't assume the function name/line without checking.
 
+## Ruling 9 — added 2026-08-23, after the user's own decision: restore attachment forwarding,
+## scoped by what research actually found (not what the original ask assumed)
+
+The user decided to restore multimodal requirements-attachment support, with three explicit
+asks: (1) the ticket-intake description field needs inline-attachment support, (2) a real
+upload system for documents/screenshots, (3) Specification and Plan instructed to actually use
+whatever's attached. Dedicated research
+(`docs/superpowers/plans/part-3-attachments-research-notes.md`) found the real gap is much
+narrower than "build this from scratch" — and in one place, architecturally different from what
+the ask assumed:
+
+- **Intake/capture already works, end to end, today — just not on the New Ticket page.**
+  `src/components/RequirementsView.tsx` (the main workflow page's own requirements surface)
+  already has a markdown textarea + Preview toggle, paste-to-attach, drag-and-drop, and a file
+  picker, built on CopilotKit's `useAttachments` hook — and `intake_node`'s
+  `_split_text_and_attachments` (`graph.py:1435-1451`) already correctly splits real submissions
+  into `GraphState.requirements_attachments`. A user can already attach a file today, on the
+  screen immediately after New Ticket's own handoff, before ever clicking Submit for real. Ask
+  (1) is a UX-unification request (put this capability on the New Ticket page itself, not a
+  second screen), not a blocked capability.
+- **No durable file storage exists anywhere in this codebase.** Every attachment today is
+  client-side base64-inline (CopilotKit's default strategy, no `onUpload` configured) — held in
+  browser memory and the in-process checkpoint, never written anywhere durable.
+  `workflow_persistence.py` already names this a deliberate, still-open gap. The only durable-
+  artifact pattern anywhere in the repo (git-commit inside a running sandbox, used for e2e
+  screenshots) doesn't apply at ticket-creation time, since no sandbox exists yet.
+- **The real, confirmed bottleneck is exactly what the Part 1 finding said**: both
+  `claude_chat_model.py` and `copilot_chat_model.py` explicitly drop non-text content before it
+  ever reaches either CLI. Claude's real CLI (checked against the exact pinned sandbox-image
+  version, 2.1.126) has an undocumented `--file <file_id>:<path>` flag whose semantics
+  (arbitrary local path/id, vs. requiring a prior Anthropic Files-API upload) are UNVERIFIED —
+  this needs empirical resolution, not a guess, before any real forwarding code is written.
+  Copilot's own verified CLI flag table (Part 1's own research) has no attachment/file flag of
+  any kind — there may be no real mechanism to restore for that provider at all.
+- **Plan is barred from raw attachments by an explicit, deliberate, pre-existing rule** (`BR-2`,
+  `graph.py:225`: "the plan stage's input is the approved Specification, never raw attachments"),
+  not an oversight parallel to the CLI-drop bug. The user's ask (3) needs a real design choice
+  here, not just "wire it through": either revise BR-2 to let Plan see raw attachments directly
+  (touches Plan's own message-building architecture, which has zero multimodal shape today), or
+  have Specification's OWN approved output carry a textual distillation of what each attachment
+  showed, which Plan then reads through the exact channel it already trusts (the approved
+  Specification JSON) with zero change to BR-2 or to Plan's own architecture.
+
+  **Controller's Ruling**: the second option. Specification's draft schema gains a field for its
+  own description of what each attachment contributed (exact shape — one string per attachment,
+  or folded into existing free-text fields — is Task 14's own call, confirmed against the real
+  schema, not decided here). This is strictly less invasive, reuses an existing trusted channel,
+  and needs no new multimodal capability on Plan's side at all. If this turns out insufficient in
+  practice (Plan genuinely needs to see a screenshot's actual pixels, not a text description of
+  it), that is grounds to revisit BR-2 later — not assumed necessary now.
+
+- **Copilot forwarding**: accepted as a disclosed, real capability asymmetry between providers
+  for this pass, not a gap to force closed. Copilot's own `_messages_to_prompt` keeps dropping
+  non-text content with its existing logged warning, unchanged — matching how this whole
+  redesign already accepts other real capability differences between the two providers (Part 1's
+  own `response_schema` fast-path, structured-output handling). Revisit only if a real Copilot
+  CLI flag for this is ever confirmed to exist (none is today, per Part 1's own verified table).
+
+**Split into 3 tasks, dispatched sequentially (never two implementers at once, per this skill's
+own standing rule, even though these touch disjoint files) — Task 12 and 13 are independent of
+each other's output, ordering between them doesn't matter for correctness:**
+
 ## Global Constraints (apply to every task)
 
 - **Every ticket runs the identical 8-stage `StageSpec` set, always** (`tech-stack`,
@@ -690,6 +752,96 @@ outcomes distinctly before wiring the write into the right branch only.
 Do not build any regression-checking mechanism for a ticket's own changes against a PRIOR ticket's
 shipped work (explicitly out of scope per Ruling 7's own text — a different question, this task
 does not touch it).
+
+## Task 12: New Ticket page gets inline-attachment support (Ruling 9)
+
+Extract or share `RequirementsView.tsx`'s existing markdown+attachment editing capability
+(CopilotKit's `useAttachments` hook, the paste/drag/file-picker wiring, the Edit/Preview toggle)
+so the New Ticket page's Description field (`src/app/(boxed)/tickets/new/page.tsx:289-298`,
+currently a plain `<textarea>`) gains the same capability directly, rather than requiring a
+second screen. Your own call whether to extract a shared component both pages import, or some
+other structure — read `RequirementsView.tsx` in full first (it is NOT a rich WYSIWYG editor: a
+textarea + a separate Preview pane, no inline-rendered images while typing — match that same
+shape, don't build something fancier unasked).
+
+**The real technical constraint to solve, not sidestep:** New Ticket currently hands off
+`{title, description}` to the workflow page via `sessionStorage`
+(`tickets/new/page.tsx:172-175`, consumed by `RequirementsView.tsx`'s `parseNewTicketHandoff`).
+Attachments today are base64-inline (`RequirementsView`'s own configured `maxSize: 20 *
+1024 * 1024` — 20MB before base64 inflation, ~27MB after) — `sessionStorage` has real per-origin
+size limits (typically 5-10MB) that a single attachment at that configured max would blow well
+past on its own. Investigate before choosing a mechanism: does `router.push` between these two
+routes trigger a full page reload, or is it a client-side App Router transition that keeps the
+JS runtime alive (in which case a plain in-memory handoff — a module-level variable, a small
+Context, anything that isn't serialized through `sessionStorage`'s own storage quota — could
+carry attachment data across the transition with no size ceiling from browser storage at all)?
+Confirm which is really true in this codebase before deciding: reducing the max attachment size
+specifically for this handoff, and keeping `sessionStorage`, is also an acceptable answer if
+in-memory doesn't pan out — your call, backed by what you actually found, not assumed.
+
+Offline verification: `npm run build`/`npm run lint`. If a live click-through isn't reachable in
+this environment, say so plainly (the standard every other frontend task in this Part has held
+itself to) rather than assuming this works because it compiles.
+
+## Task 13: Restore attachment forwarding for Claude (Ruling 9); Copilot stays as-is
+
+**Step 1, empirical, before writing any forwarding code**: this environment has a real `claude`
+binary (`/c/Users/jblis/.local/bin/claude`, confirmed v2.1.126 — the exact pinned sandbox-image
+version). Resolve the real, unverified question the research flagged: does `claude`'s `--file
+file_id:relative_path` flag accept an arbitrary local id/path pair directly, or does `file_id`
+require a prior upload to Anthropic's own Files API? Test it directly — write a real scratch file,
+try invoking `claude -p ... --file <something>:<path-to-that-file>` (non-destructively, a trivial
+prompt), and see what actually happens. Also check `claude --help`'s `--input-format
+stream-json` flag (a second, unused-in-this-codebase mechanism for richer structured stdin) as an
+alternative if `--file` turns out to need a Files-API upload step this pipeline has no reason to
+add. Report exactly what you found, with the real command/output, before proceeding to step 2 —
+if neither mechanism turns out usable without new infrastructure this task wasn't scoped for
+(e.g., a real Files-API upload step, a new credential), STOP and report that finding rather than
+building something that only looks like it works.
+
+**Step 2**: once a real, confirmed mechanism exists, wire it into
+`agent/src/claude_chat_model.py`'s `_messages_to_prompt`/turn-running code (currently drops
+non-text content with a logged warning — see its own docstring, which already names the intended
+upgrade path: "mirror `write_scratch_file` for binary payloads and pass the result via a --file
+flag per part instead of dropping it"). Each non-text attachment part (base64 `source.type ==
+"data"`, per the AG-UI `InputContent` shape `_split_text_and_attachments` already produces) needs
+decoding and writing to a scratch file inside the sandbox, then referencing it via whatever the
+step-1 investigation confirmed actually works.
+
+**Copilot: do not touch `copilot_chat_model.py`.** Ruling 9 accepts this as a disclosed capability
+asymmetry — no real CLI mechanism exists to restore it for that provider today. Leave its own
+`_messages_to_prompt`'s drop-with-warning behavior exactly as it is.
+
+Verify empirically: a real turn, through the real sandbox, with a real (small) test image/
+document attached, actually reaching the model — not just that the code compiles. Extend
+`claude_chat_model.py`'s own offline self-check proportionately, but the sandbox-level integration
+claim needs a real run, not just a mocked assertion, given how much this exact class of claim (
+"should work" vs. "actually works against the real CLI") has mattered elsewhere in this session.
+
+## Task 14: Specification and Plan prompts learn to use attachments (Ruling 9)
+
+**Specification** (`agent/src/prompts/specification_draft.md`): add explicit instructions to look
+at and use whatever attachments/screenshots are provided, not just silently receive them (today,
+zero mention of attachments/screenshots/images anywhere in this prompt, confirmed by the
+research). Read the real current file in full before drafting new instructions — match its
+existing voice/structure, don't rewrite wholesale.
+
+**Plan**: per Ruling 9's own decision, Plan does NOT gain raw attachment access — BR-2
+(`graph.py:225`) stays exactly as it is. Instead: extend the Specification draft schema
+(`schemas.py` or wherever `SpecificationDraftResponse`/`Specification` actually lives — confirm,
+don't guess) with a field for Specification's own distillation of what each attachment
+contributed (your call on exact shape, confirmed against the real schema — e.g. one string per
+attachment, or folded into an existing free-text field if one already fits) — and teach
+`specification_draft.md` to populate it. Since Plan already reads the full approved Specification
+JSON (`_build_plan_prompt`, `graph.py:405-430`, confirmed by research to already receive
+`spec_stage["approved_content"]` in full), it needs NO new plumbing to see this field — only a
+`plan_draft.md` instruction telling the model this field exists and what it means, if the field
+name isn't already self-explanatory.
+
+Verify with a real assertion (proportionate to this codebase's own `_demo()` convention): a
+Specification draft that includes an attachment's distillation actually appears, unmodified, in
+what `_build_plan_prompt` hands to the model — the same "wired, not just correct in isolation"
+proof this Part's own prior prompt-plumbing tasks have already used repeatedly.
 
 ## Non-goals (this pass)
 
