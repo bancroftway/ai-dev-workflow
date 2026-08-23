@@ -137,6 +137,17 @@ class StageState(TypedDict):
     # through a StageSpec.deterministic_verify gate, when one is set (unused by specification/plan).
     verify_cycle_count: int
     last_verification: dict[str, Any] | None
+    # Set by make_gate_node on a human REJECTION (Part 2 Task 10, Ruling 3) -- deliberately its
+    # own field, not a reuse of last_verification/last_verify_feedback above: those two belong to
+    # the deterministic_verify retry/stall machinery (make_verify_node/make_route_after_verify/
+    # should_skip_draft all read them for that purpose, for specification/plan too, which already
+    # have a deterministic_verify of their own), and AppShell's stageGroupDot paints a tab's dot
+    # red when last_verification says failed -- a human politely asking for a revision is not the
+    # same signal as a script-detected failure, and must not light that same error dot. Folded
+    # into the next draft prompt (_build_tech_stack_prompt/_build_specification_prompt/
+    # _build_plan_prompt) as reviewer guidance; cleared back to None the moment the stage is
+    # actually approved. Only ever set for the 3 requires_human_gate=True stages.
+    reviewer_feedback: str | None
     # Set once per run by make_draft_node when StageSpec.capture_baseline_commit is True (P4's
     # write-scope gate); None for every other stage.
     baseline_commit: str | None
@@ -284,6 +295,7 @@ def default_stage_state() -> StageState:
         "audit_findings": [],
         "verify_cycle_count": 0,
         "last_verification": None,
+        "reviewer_feedback": None,
         "baseline_commit": None,
         # Skill evidence recorded by make_draft_node from the session's own skill.invoked events.
         "skills": None,
@@ -368,6 +380,20 @@ async def hydrate_plan_ticket_mode_context(
     return {"ticket_mode_baseline": True} if raw is not None else None
 
 
+def _reviewer_feedback_message(stage: StageState) -> HumanMessage | None:
+    """Shared by every requires_human_gate=True stage's build_prompt (tech-stack/specification/
+    plan) -- Part 2 Task 10 (Ruling 3): folds a human's gate REJECTION feedback into the next
+    draft call as reviewer guidance. Phrased distinctly from the ac-to-tests/minimal-code-to-green/
+    adversarial-compliance "last verification attempt failed" wording those stages' own
+    build_prompt functions use for a deterministic_verify failure -- a person's opinion is not a
+    script's finding, and StageState.reviewer_feedback is deliberately its own field for exactly
+    that reason (see its own comment). None on the overwhelmingly common path (never rejected)."""
+    feedback = stage.get("reviewer_feedback")
+    if not feedback:
+        return None
+    return HumanMessage(content=f"A human reviewer rejected your previous draft and left this feedback: {feedback}")
+
+
 def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
     requirements_text = f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"
@@ -407,6 +433,9 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
         messages.append(
             HumanMessage(content=f"Identifiers already used at some point, never reuse: {stage['used_ids']}")
         )
+    feedback_message = _reviewer_feedback_message(stage)
+    if feedback_message is not None:
+        messages.append(feedback_message)
     return messages
 
 
@@ -435,6 +464,9 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
         messages.append(
             HumanMessage(content=f"Identifiers already used at some point, never reuse: {plan_stage['used_ids']}")
         )
+    feedback_message = _reviewer_feedback_message(plan_stage)
+    if feedback_message is not None:
+        messages.append(feedback_message)
     return messages
 
 
@@ -562,6 +594,9 @@ def _build_tech_stack_prompt(state: GraphState) -> list[BaseMessage]:
     messages: list[BaseMessage] = [SystemMessage(content=TECH_STACK_SYSTEM_PROMPT)]
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    feedback_message = _reviewer_feedback_message(stage)
+    if feedback_message is not None:
+        messages.append(feedback_message)
     return messages
 
 
@@ -1579,6 +1614,11 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # fresh run's very first attempt).
         stage["verify_cycle_count"] = 0
         stage["last_verification"] = None
+        # A rejection's own feedback (Part 2 Task 10) is per-run the same way -- a fresh
+        # submission must not hand a brand-new draft attempt guidance about a completely
+        # different requirements round. Approval already clears it (make_gate_node); this is the
+        # defense-in-depth counterpart for a thread that was left rejected and never resolved.
+        stage["reviewer_feedback"] = None
         # Same reasoning for draft-level infra exhaustion (make_draft_node/make_draft_escalate_node):
         # a prior run's Copilot outage must not make this run's very first draft attempt
         # instant-escalate before it even tries. make_draft_escalate_node also clears this on its
@@ -2576,6 +2616,45 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     )
             resume_value = interrupt({"stage": stage_spec.key, "draft": stage["draft"], **extra})
 
+        # Part 2 Task 10 (Ruling 3): the one resume shape that means a human REJECTION --
+        # discriminated from every other resume_value this function has ever accepted (tech-
+        # stack's own {"markdown": ...} submit shape, the generic InterruptCard's
+        # {"decision": "approved"}, headless's bare `True`, and every non-gated stage's
+        # resume_value of None) -- all of those fall through to the unchanged approval body below
+        # exactly as before. Loops back to THIS stage's own draft node (make_route_after_gate,
+        # wired in _wire_stage) instead of ending the run -- the same "loop back and try again"
+        # shape this pipeline's own deterministic_verify retry already uses for a failed check
+        # (make_route_after_verify), just triggered by a human's opinion instead of a script's.
+        # Never reached for a non-gated stage: resume_value stays None there, so the isinstance
+        # check is False and this whole branch is skipped, unchanged from before this task.
+        if isinstance(resume_value, dict) and resume_value.get("decision") == "rejected":
+            stages = {key: dict(value) for key, value in state["stages"].items()}
+            rejected = stages[stage_spec.key]
+            feedback = str(resume_value.get("feedback") or "").strip()
+            rejected["status"] = "needs_clarification"
+            rejected["reviewer_feedback"] = feedback or "(rejected with no feedback provided)"
+            stages[stage_spec.key] = rejected
+            # Mirrors the True-setting call above: this session is no longer sitting at a gate --
+            # it is about to redraft. Never routes through _run_post_approve_hook/
+            # update_current_stage (that would fire post_approve_hook, which is only correct for
+            # genuine approvals -- tech-stack's apply_stack_conventions must never run over
+            # content a human just rejected).
+            if sandbox_registry.get(thread_id) is not None:
+                try:
+                    await session_store.set_awaiting_gate(thread_id, False)
+                except Exception:
+                    logger.warning(
+                        "set_awaiting_gate failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True
+                    )
+            await _persist_if_sandboxed(
+                thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} rejected by reviewer"
+            )
+            # No approvals.record_approval call here, deliberately: that ledger's whole purpose
+            # (approvals.py's own docstring) is a tamper-evident record of content a human
+            # APPROVED -- a rejection has no approved content to hash, and logging it there would
+            # conflate "a human said no" with the one thing that file is meant to prove happened.
+            return {"stages": stages}
+
         stages = {key: dict(value) for key, value in state["stages"].items()}
         approved = stages[stage_spec.key]
         content = approved["draft"]
@@ -2586,6 +2665,10 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         approved["status"] = "approved"
         approved["approved_content"] = content
         approved["cycle_count"] = 0
+        # Cleared on approval (belt-and-suspenders with intake_node's own per-run reset): a stage
+        # approved right after being rejected once must not carry that stale feedback into some
+        # unrelated future redraft (e.g. a later escalate-and-revoke on a DIFFERENT gate).
+        approved["reviewer_feedback"] = None
         stages[stage_spec.key] = approved
 
         await _persist_if_sandboxed(thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} approved")
@@ -2603,6 +2686,25 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         return {"stages": stages, "last_push": git_ops.get_last_push(thread_id)}
 
     return gate_node
+
+
+def make_route_after_gate(stage_spec: StageSpec) -> Callable[[GraphState], str]:
+    """Routes make_gate_node's outgoing edge (Part 2 Task 10). "approved" -- the only outcome that
+    existed before this task, and still the only one for the 5 non-gated stages, which always
+    reach "approved" -- proceeds to the next stage's draft, unchanged from the unconditional edge
+    this replaced. "rejected" (Ruling 3) loops back to THIS stage's own draft node instead.
+
+    Reads state AFTER gate_node has already run: LangGraph evaluates a conditional edge's routing
+    function against the state its source node just returned (the same reliance
+    make_route_after_draft/make_route_after_verify already have on make_draft_node/
+    make_verify_node's own writes), so `stage["status"]` here already reflects whichever branch
+    gate_node took."""
+
+    def route(state: GraphState) -> str:
+        stage = state["stages"][stage_spec.key]
+        return "approved" if stage["status"] == "approved" else "rejected"
+
+    return route
 
 
 def assert_gates_have_self_checks() -> None:
@@ -3045,7 +3147,16 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
         )
         builder.add_edge(escalate_name, END)
 
-    builder.add_edge(gate_name, next_draft_name)
+    # Part 2 Task 10 (Ruling 3): was an unconditional add_edge(gate_name, next_draft_name) --
+    # gate_node could only ever mark a stage approved before this task. "rejected" only ever
+    # fires for the 3 requires_human_gate=True stages (make_route_after_gate); every non-gated
+    # stage's gate_node always reaches "approved", so this is a no-op change for those 5 stages,
+    # not a behavior change -- see make_route_after_gate's own docstring.
+    builder.add_conditional_edges(
+        gate_name,
+        make_route_after_gate(stage_spec),
+        {"approved": next_draft_name, "rejected": draft_name},
+    )
     # auto_approve (clarification cap) skips the AUDIT and the HUMAN gate -- never the
     # deterministic verify. Observed live (run 14): a stage auto-approved with NO draft content
     # sailed past the coverage gate entirely and the pipeline "progressed" with zero feature
@@ -3412,6 +3523,33 @@ def _demo() -> None:
     build_graph()  # runs assert_pipeline_nodes_registered + assert_no_dead_clusters
     assert_no_stub_stages()
     assert_gates_have_self_checks()
+
+    # make_route_after_gate (Part 2 Task 10): pure predicate, same convention as
+    # should_skip_draft/_detect_verify_stall in this same function -- the real interrupt()/resume
+    # round-trip (gate_node's own rejection branch) cannot run outside a real LangGraph execution
+    # context, so it's exercised for real against the compiled graph separately (task-10-report.md),
+    # not here.
+    route_after_gate = make_route_after_gate(by_key["specification"])
+    assert route_after_gate({"stages": {"specification": {**default_stage_state(), "status": "approved"}}}) == "approved"
+    assert (
+        route_after_gate(
+            {
+                "stages": {
+                    "specification": {
+                        **default_stage_state(),
+                        "status": "needs_clarification",
+                        "reviewer_feedback": "add multi-tenant support to US-3",
+                    }
+                }
+            }
+        )
+        == "rejected"
+    )
+    # Never true before this task; confirms the "always approved" no-op claim for the 5 non-gated
+    # stages' own StageSpec.requires_human_gate default is irrelevant here -- make_route_after_gate
+    # only ever reads status, which gate_node always sets to "approved" for those stages.
+    route_after_gate_nongated = make_route_after_gate(by_key["ac-to-tests"])
+    assert route_after_gate_nongated({"stages": {"ac-to-tests": {**default_stage_state(), "status": "approved"}}}) == "approved"
 
     # _detect_verify_stall: the three heuristics, independently.
     s = _detect_verify_stall("same feedback", "same feedback", None, None, None, None)

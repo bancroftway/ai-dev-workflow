@@ -114,17 +114,18 @@ export function AppShell({
     void copilotkit.runAgent({ agent });
   }, [sandboxStatus, state.stages, agent, copilotkit, resume]);
 
-  // Section 8: the interrupt UI must be reachable regardless of which view is open. renderInChat
-  // defaults to true, but the CopilotSidebar it used to publish into is gone (Task 7) and no
-  // replacement render target exists yet -- render() below still runs, it just has nowhere to
-  // mount, so the interrupt card is effectively invisible until Task 10 gives it a real home.
+  // Section 8: the interrupt UI must be reachable regardless of which view is open. Task 7 dropped
+  // the CopilotSidebar that renderInChat's default (true) used to publish into; renderInChat:
+  // false below gets the rendered element back directly instead, so this component can mount it
+  // itself (Task 10) -- see the banner rendered between the tab nav and <main> further down.
   //
   // The backend delivers the interrupt payload as a JSON *string* (ag_ui_langgraph's
   // dump_json_safe) -- parsing it is what makes the gate/escalation distinction work at all.
   // Discrimination is presence of `type`: the plain approval gate payload (graph.py
   // make_gate_node) has none; every escalation carries one.
-  useInterrupt<EscalationPayload>({
+  const interruptElement = useInterrupt<EscalationPayload, false>({
     agentId: localAgentId,
+    renderInChat: false,
     render: ({ resolve, event }) => {
       const raw: unknown = event?.value;
       let payload: EscalationPayload = {};
@@ -235,6 +236,12 @@ export function AppShell({
           />
         </nav>
 
+        {/* The Gate UI's new home (Task 10) -- rendered here so it's visible above whichever tab
+            is open, matching the comment on useInterrupt above. null for tech-stack's own gate
+            (InterruptCard returns null there; TechStackView renders its own controls instead) and
+            for the ordinary "nothing is paused right now" case, so this adds no dead space then. */}
+        {interruptElement != null && <div className="px-4 pt-3">{interruptElement}</div>}
+
         <main className="flex-1 overflow-y-auto">
           {activeView === "tech-stack" && <TechStackView />}
           {activeView === "requirements" && <RequirementsView />}
@@ -274,6 +281,12 @@ function InterruptCard({
   const draft = (payload as Record<string, unknown>).draft;
   const draftMarkdown = (payload as Record<string, unknown>).markdown;
   const fileExisted = (payload as Record<string, unknown>).file_existed;
+  // Why a Reject would send the draft back for revision (Ruling 3, graph.py make_gate_node) --
+  // required so the redraft has something to act on. No explicit reset needed between gate
+  // occurrences: useInterrupt's own `element` is null while a rejected stage is redrafting (real
+  // async work in between), so this whole component unmounts and a fresh instance -- fresh
+  // useState("") included -- mounts for the next occurrence, same stage or not.
+  const [feedback, setFeedback] = useState("");
 
   const done = (value: unknown) => {
     setInterrupt({ open: false });
@@ -329,16 +342,37 @@ function InterruptCard({
   }
 
   return (
-    <div className="flex items-center justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
-      <span className="text-sm text-amber-900">
-        The <strong>{stageLabel}</strong> is ready for your review.
-      </span>
-      <button
-        className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
-        onClick={() => done({ decision: "approved" })}
-      >
-        Approve
-      </button>
+    <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-sm text-amber-900">
+          The <strong>{stageLabel}</strong> is ready for your review.
+        </span>
+        <div className="flex shrink-0 gap-2">
+          <button
+            className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
+            onClick={() => done({ decision: "approved" })}
+          >
+            Approve
+          </button>
+          <button
+            className="rounded-lg border border-red-300 bg-white px-4 py-1.5 text-sm font-medium text-red-700 disabled:cursor-not-allowed disabled:opacity-40"
+            disabled={!feedback.trim()}
+            title={feedback.trim() ? undefined : "Add feedback below to explain what should change"}
+            onClick={() => done({ decision: "rejected", feedback: feedback.trim() })}
+          >
+            Reject
+          </button>
+        </div>
+      </div>
+      {/* Required to reject (Ruling 3) -- the redraft this feeds (graph.py's make_gate_node ->
+          the stage's own draft node) has nothing to act on otherwise. */}
+      <textarea
+        className="w-full rounded-md border border-amber-300 bg-white px-2 py-1 text-sm text-neutral-900 outline-none placeholder:text-neutral-400"
+        rows={2}
+        placeholder="What should change before this is approved? (required to reject)"
+        value={feedback}
+        onChange={(event) => setFeedback(event.target.value)}
+      />
     </div>
   );
 }

@@ -1,6 +1,6 @@
 # ai-dev-workflow
 
-A human-gated, LLM-driven software delivery pipeline built as a single [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Every stage drafts an artifact and runs a *deterministic* check (a real script or parse — never LLM self-attestation). Exactly three stages get an adversarial second-model audit (specification, plan, minimal-code-to-green); exactly three pause for a human by default (tech-stack, specification, plan) — the tech-stack pause is skipped once a repo carries an approved sidecar, and a greenfield (no existing app) repository gets a stack picker at that same pause. Every other failure ENDs the run with a `run_failure` record instead of waiting on a person. All work happens inside a per-session sandbox container holding a clone of the target repo/branch.
+A human-gated, LLM-driven software delivery pipeline built as a single [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Every stage drafts an artifact and runs a *deterministic* check (a real script or parse — never LLM self-attestation). Exactly three stages get an adversarial second-model audit (specification, plan, minimal-code-to-green); exactly three pause for a human by default (tech-stack, specification, plan) — the tech-stack pause is skipped once a repo carries an approved sidecar, and a greenfield (no existing app) repository gets a stack picker at that same pause. A human may approve or reject at any of those three gates; a rejection loops back to that stage's own draft with the reviewer's feedback folded into the next attempt, rather than ending the run. Every other failure ENDs the run with a `run_failure` record instead of waiting on a person. All work happens inside a per-session sandbox container holding a clone of the target repo/branch.
 
 - Graph definition: [agent/src/graph.py](agent/src/graph.py)
 - Frontend (AG-UI / CopilotKit): [src/](src/)
@@ -44,8 +44,9 @@ flowchart TD
     stage5 --> stage6 --> harden --> stage7 --> stage8 --> done
     
     scaffold -.->|suitable path| scaffold_fin --> stage1
-    stage2 -.->|not ready| stage2
-    stage3 -.->|not ready| stage3
+    stage1 -.->|not ready, or rejected| stage1
+    stage2 -.->|not ready, or rejected| stage2
+    stage3 -.->|not ready, or rejected| stage3
     stage4 -.->|gate failure, 3 tries| stage4
     stage5 -.->|gate failure, 3 tries| stage5
     stage6 -.->|gate failure, 3 cycles| stage6
@@ -119,10 +120,10 @@ Every LLM prompt in the pipeline is an editable markdown file under [agent/src/p
 
 ```mermaid
 flowchart LR
-    d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit.<br/>Optional reframing: adjust the draft prompt from a<br/>repo file check without skipping the draft itself<br/>(e.g. specification's ticket-mode baseline check)."]
+    d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit.<br/>Optional reframing: adjust the draft prompt from a<br/>repo file check without skipping the draft itself<br/>(e.g. specification's ticket-mode baseline check).<br/>A prior human gate rejection's feedback (below)<br/>is folded in the same way."]
     a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan and minimal-code-to-green<br/>configure one; every other stage goes<br/>straight from draft to verify/gate."]
     v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage."]
-    g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves.<br/>Only specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
+    g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves<br/>or rejects with feedback.<br/>tech-stack, specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
     aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>skips the audit and the human gate —<br/>never the deterministic verify. Approval is<br/>persisted only after verify passes."]
     e["ESCALATE<br/>Verify cap exhausted. The run ENDs with<br/>run_failure recorded (ledger + commit + push).<br/>Never auto-approved past a failed<br/>deterministic gate. Counters reset for resubmit."]
     ie["DRAFT-ESCALATE<br/>Copilot session failure survived infra_retry's<br/>own backoff attempts (quota/timeout/429) — never<br/>charged against cycle_count. run_failure tagged<br/>failure_type=infra_transient/quota_exhausted,<br/>not gate_exhausted. Wired for every stage,<br/>including tech-stack, the one with no verify."]
@@ -138,7 +139,8 @@ flowchart LR
     v -->|failed at cap| e
     e --> theend(["END"])
     ie --> theend
-    g --> next["next stage"]
+    g -->|approved| next["next stage"]
+    g -.->|rejected, with feedback| d
     aa -->|stage has a verify| v
     aa -->|no verify| next
 ```
@@ -260,4 +262,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: ff8b39d1a438560ab510cd5a53d7584b0d3ab16e699007a93370a89f0c880fd1 -->
+<!-- graph-source-sha256: ef611be06f9830cca966e517a8954799f1b7493a49d750adc82a20b358c0e5dd -->

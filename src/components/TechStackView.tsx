@@ -35,6 +35,7 @@ export function TechStackView() {
   const [catalog, setCatalog] = useState<CannedTechStack[]>([]);
   const [selectedStackId, setSelectedStackId] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [feedback, setFeedback] = useState("");
   const syncedRef = useRef(false);
 
   useEffect(() => {
@@ -45,7 +46,17 @@ export function TechStackView() {
       .catch(() => setCatalog([]));
   }, [showDropdown]);
 
-  // Prefill exactly once from whatever the gate is showing -- never clobber an active edit.
+  // A rejected submission (Part 2 Task 10) reopens this SAME gate a second time once the redraft
+  // is ready -- before Task 10, Submit's only outcome (implicit approval) always advanced the
+  // pipeline past tech-stack, so this gate could never reopen within one mount and the one-shot
+  // guard below never needed resetting. Without this, a reject would leave the just-rejected text
+  // sitting in the editor forever instead of showing the fresh redraft.
+  useEffect(() => {
+    if (isOpen) syncedRef.current = false;
+  }, [isOpen]);
+
+  // Prefill exactly once per gate occurrence from whatever the gate is showing -- never clobber
+  // an active edit.
   useEffect(() => {
     if (syncedRef.current || !isOpen || typeof interrupt.draftMarkdown !== "string") return;
     setText(interrupt.draftMarkdown);
@@ -67,7 +78,19 @@ export function TechStackView() {
     }
   }
 
+  // Same {decision, feedback} contract as the generic InterruptCard's Reject button
+  // (graph.py make_gate_node) -- consistency across every gated stage's UI, per the plan's text.
+  async function handleReject() {
+    setSubmitting(true);
+    try {
+      interrupt.resolve?.({ decision: "rejected", feedback: feedback.trim() });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   const disabled = !isOpen || text.trim().length === 0 || submitting || sandboxStatus !== "ready";
+  const rejectDisabled = !isOpen || feedback.trim().length === 0 || submitting || sandboxStatus !== "ready";
 
   const state = (agent.state ?? {}) as WorkflowState;
   const stage = state.stages?.["tech-stack"];
@@ -136,10 +159,29 @@ export function TechStackView() {
             )}
           </div>
 
+          <label className="flex flex-col gap-1">
+            <span className="text-sm font-medium text-neutral-700">Feedback (required to reject)</span>
+            <textarea
+              className="min-h-[60px] w-full resize-none rounded-md border border-neutral-300 p-2 text-sm outline-none"
+              rows={2}
+              placeholder="What should change before this is approved?"
+              value={feedback}
+              onChange={(event) => setFeedback(event.target.value)}
+              disabled={submitting}
+            />
+          </label>
+
           <div className="flex items-center justify-end gap-3">
             {sandboxStatus !== "ready" && (
               <span className="text-xs text-neutral-500">Waiting for the dev-tool sandbox to finish starting…</span>
             )}
+            <button
+              className="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-700 disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={rejectDisabled}
+              onClick={handleReject}
+            >
+              Reject
+            </button>
             <button
               className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
               disabled={disabled}
