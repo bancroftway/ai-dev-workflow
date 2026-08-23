@@ -31,6 +31,20 @@ guess in this whole module. A completely unparseable stream fails loud (RuntimeE
 unexpected-but-parseable shape degrades to falsy defaults plus a logged warning rather than
 crashing. Fixing this parser against a real container's real output is Task 12's (final
 verification) named job, not a defect being hidden here.
+
+Update (task-3-report.md, Part 2 Task 3): in a later dev environment, `which copilot` still finds
+nothing (no persistent PATH install here either), but `npx --yes @github/copilot` fetches and runs
+a real, authenticatable CLI on demand -- combined with a `gh auth token` credential, this produced
+the first real output from this CLI seen anywhere in this project's history (task-3-report.md has
+the full transcript and circumstances). It confirms the non-final-line envelope shape (a
+dot-namespaced `type` string, a `data` dict, `id`/`timestamp`/`parentId`, optional `ephemeral`) but
+hit a real quota_exceeded error before the model ever invoked a tool, so a real tool-call-shaped
+line is still unconfirmed -- see _translate_intermediate_events' own docstring below. It also
+surfaced a concrete, real gap in the session_id scan just below: the real terminal line's own
+session identifier is camelCase `sessionId`, not the snake_case `session_id` this module scans
+for, so real multi-turn `--session-id` continuity is very likely broken today. That is final-line
+parsing, out of THIS task's scope (task-3-brief.md: "the existing final-result parsing... is
+untouched") -- flagged here rather than silently carried forward uncorrected.
 """
 
 from __future__ import annotations
@@ -50,8 +64,11 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import BaseModel, PrivateAttr
 
 from . import config
+from . import run_event_store
+from . import run_event_stream
 from . import telemetry
 from .cli_agent_exec import _SCRATCH_DIR, run_turn, write_scratch_file
+from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
 
 logger = logging.getLogger(__name__)
@@ -141,6 +158,70 @@ def _parse_copilot_jsonl(stdout: str) -> tuple[list[dict[str, Any]], str | None]
         if isinstance(candidate, str) and candidate:
             session_id = candidate
     return events, session_id
+
+
+def _translate_intermediate_events(
+    intermediate_events: list[dict[str, Any]],
+    *,
+    run_id: str,
+    session_id: str,
+    stage: str,
+    node: str,
+) -> list[RunEvent]:
+    """Translate Copilot's intermediate (non-final) parsed JSONL lines into Task-1-shaped
+    RunEvents, tool-call granularity where a line represents one (task-3-brief.md). `_agenerate_inner`
+    passes `events[:-1]` here -- every parsed line EXCEPT the last, which stays the result-shaped
+    summary line handled separately and left untouched by this task.
+
+    Not every intermediate line becomes a RunEvent: only ones this function can positively identify
+    as tool-call-shaped do (task-3's explicit instruction -- "not every line necessarily is one").
+    Everything else (session/status bookkeeping, plain assistant text, ...) is silently skipped,
+    the same defensive-skip spirit _parse_copilot_jsonl already applies to a malformed line.
+
+    CONFIRMED REAL (task-3-report.md: a real, authenticated `copilot -p --output-format json`
+    invocation, captured 2026-08-23 via `npx --yes @github/copilot` + a `gh auth token` credential
+    -- the first real output from this CLI seen anywhere in this project's history): every
+    intermediate line carries a dot-namespaced `type` string ("session.mcp_server_status_changed",
+    "user.message", "assistant.turn_start", "model.call_start", "assistant.turn_end",
+    "assistant.idle", ...), an event-specific `data` dict (sometimes empty), an `id`, a `timestamp`,
+    and a `parentId`; some additionally carry `ephemeral: true` for transient UI-status noise. That
+    real capture hit a real quota_exceeded error before the model ever invoked a tool, so it
+    contains ZERO real tool-call-shaped lines -- there is no confirmed-real example of one anywhere
+    yet (module docstring). The `namespace == "tool"` check below is therefore a defensible
+    INFERENCE from the one confirmed-real naming convention above (a tool call plausibly lives
+    under its own single-word "tool" domain, exactly the way session/user/assistant/model each get
+    their own) -- NOT a confirmed-real shape. Task 14's whole-Part sweep against a real Copilot run
+    is what actually proves or disproves this guess; flagged here rather than papered over, the
+    same standard this module already holds `_parse_copilot_jsonl` to.
+    """
+    translated: list[RunEvent] = []
+    for raw_event in intermediate_events:
+        event_type = raw_event.get("type")
+        if not isinstance(event_type, str):
+            continue
+        namespace, _, verb = event_type.partition(".")
+        if namespace != "tool":
+            continue
+        data = raw_event.get("data")
+        payload = data if isinstance(data, dict) else {}
+        # Defensive key-name scan (same spirit as _parse_copilot_jsonl's own session_id scan just
+        # above): which key actually carries the tool's name is exactly as unconfirmed as the
+        # "tool.*" namespace guess itself, so try the plausible spellings rather than committing to
+        # one -- `verb` (e.g. "call_start" in "tool.call_start") is the last-resort fallback so a
+        # tool call with no recognizable name field still yields a non-empty summary.
+        tool_name = payload.get("name") or payload.get("toolName") or payload.get("tool_name") or verb or "unknown"
+        translated.append(
+            RunEvent(
+                run_id=run_id,
+                session_id=session_id,
+                type=RunEventType.TOOL_CALL,
+                stage=stage,
+                node=node,
+                summary=f"tool call: {tool_name}",
+                payload=payload,
+            )
+        )
+    return translated
 
 
 def _build_copilot_wrapper_script(argv: list[str], prompt_path: str, timeout_seconds: int) -> str:
@@ -516,6 +597,33 @@ class CopilotChatModel(BaseChatModel):
         if new_session_id:
             _session_ids[self._session_key] = new_session_id
 
+        # Task 3 (Part 2 run-visibility): every intermediate JSONL line this turn produced (all of
+        # `events` except the final result-shaped line, handled below/untouched) is translated and
+        # persisted+emitted via the same two-call pattern graph.py's draft/audit/verify sites use
+        # for their own NODE_FINISHED event -- run_event_store.append_event then
+        # run_event_stream.emit_live, rebinding to append_event's returned copy (seq/ts filled in)
+        # before the live call. See _translate_intermediate_events' own docstring for exactly what
+        # is/isn't confirmed real about which lines qualify. Both calls fail soft internally (their
+        # own docstrings) -- no extra try/except needed here.
+        #
+        # ponytail: run_id="unknown" -- this layer has no access to the graph's real per-run
+        # run_id, only graph.py's own nodes do (via `state["run_id"]`); threading a real value down
+        # here would mean extending chat_model.py's Ruling-4-governed dispatcher contract and/or
+        # structured_output.py's ainvoke_structured, both outside this task's scope
+        # (task-3-brief.md). Matches graph.py's OWN sentinel for the identical "not available" case
+        # (`state.get("run_id", "unknown")`) rather than inventing a new one. Concrete, real cost:
+        # until something threads a real run_id through, these events are not retrievable via
+        # run_event_store.list_events(run_id) for a specific run -- see task-3-report.md.
+        for tool_call_event in _translate_intermediate_events(
+            events[:-1],
+            run_id="unknown",
+            session_id=self.thread_id,
+            stage=self.stage,
+            node=self.role,
+        ):
+            tool_call_event = await run_event_store.append_event(tool_call_event)
+            await run_event_stream.emit_live(tool_call_event)
+
         # Best-effort guess, NOT confirmed against real output (module docstring): the LAST line is
         # the result-shaped summary event, by analogy with Claude's single terminal JSON object
         # carrying result/is_error/usage/total_cost_usd together. Every element of `events` is
@@ -705,9 +813,11 @@ def secret_env_names() -> set[str]:
 
 def _demo() -> None:
     """Self-check for the JSONL parser's defensive scanning (session_id found on ANY line, not
-    just the assumed-final one), the Bug A wrapper-script shape (task-12b), and the session-cache
-    eviction path -- the live CLI-exec path needs a sandbox, see cli_agent_exec.py's and
-    claude_chat_model.py's own demos for the same "pure half only" scoping.
+    just the assumed-final one), the Bug A wrapper-script shape (task-12b), _translate_intermediate_
+    events (Task 3, Part 2 -- both against a real captured shape and a clearly-labeled synthetic
+    one, see that function's own docstring), and the session-cache eviction path -- the live
+    CLI-exec path needs a sandbox, see cli_agent_exec.py's and claude_chat_model.py's own demos for
+    the same "pure half only" scoping.
     """
     # Bug A fix (task-12b): the wrapper script must feed `-p` an explicit, double-quoted
     # command-substitution value -- never bare/stdin-fed (the real CLI has no such mode -- see
@@ -756,6 +866,100 @@ def _demo() -> None:
     # never raises -- _agenerate_inner is what turns that into a RuntimeError.
     events, session_id = _parse_copilot_jsonl("not json\n\n   \n")
     assert events == [] and session_id is None
+
+    # --- Task 3 (Part 2 run-visibility): _translate_intermediate_events self-check ---
+    #
+    # Part A -- REAL captured shape (task-3-report.md has the full transcript and circumstances):
+    # a real, authenticated `copilot -p --output-format json` invocation, run via `npx --yes
+    # @github/copilot` + a `gh auth token` credential on 2026-08-23 -- the first real output from
+    # this CLI seen anywhere in this project's history (the module docstring's original "no
+    # copilot binary is installed or authenticated" was accurate for the environment part-1's
+    # task-3/task-12 reports were written in, not this one). It hit a real, genuine 402
+    # quota_exceeded error before the model ever invoked a tool, so it proves the real non-tool-call
+    # envelope shape (dot-namespaced `type`, a `data` dict, `id`/`timestamp`/`parentId`, optional
+    # `ephemeral`) but contains ZERO real tool-call-shaped lines. `id`/`timestamp`/`parentId`/
+    # `sessionId` values below are copied verbatim (random UUIDs/timestamps, nothing sensitive);
+    # `data` payloads are trimmed of this-machine-local specifics (personal MCP server names,
+    # absolute file paths, an unrelated project's content) that carried no test signal for what is
+    # being checked here -- the KEYS and STRUCTURE are exactly as captured.
+    real_shape_jsonl = (
+        '{"type": "session.tools_updated", "data": {"model": "claude-sonnet-5"}, "ephemeral": true, '
+        '"id": "31813b9e-70ef-410f-ba5b-eb4134ab24ec", "timestamp": "2026-08-23T18:50:42.305Z", '
+        '"parentId": "ee6716ea-9e8c-4cbc-8faf-5d34a6c27f97"}\n'
+        '{"type": "user.message", "data": {"content": "reply with exactly: hello"}, '
+        '"id": "c91b0d13-6432-4b27-b545-bdda158e214f", "timestamp": "2026-08-23T18:50:42.315Z", '
+        '"parentId": "ee6716ea-9e8c-4cbc-8faf-5d34a6c27f97"}\n'
+        '{"type": "assistant.turn_end", "data": {"turnId": "0"}, '
+        '"id": "8304d712-7080-44ec-be6a-d997488b70f4", "timestamp": "2026-08-23T18:50:42.725Z", '
+        '"parentId": "c61e3b31-b4da-4369-bf57-4dc925acfe18"}\n'
+        '{"type": "assistant.idle", "data": {}, "ephemeral": true, '
+        '"id": "d5289a42-7a0f-43b5-98c0-5594626f1911", "timestamp": "2026-08-23T18:50:42.735Z", '
+        '"parentId": "a55990ad-7426-4d4e-90ad-8bd2dd519077"}\n'
+        '{"type": "result", "timestamp": "2026-08-23T18:50:42.775Z", '
+        '"sessionId": "8d6fbad9-d488-4558-90bd-a8e8bffac2ab", "exitCode": 1, '
+        '"usage": {"premiumRequests": 0, "totalApiDurationMs": 0, "sessionDurationMs": 5559, '
+        '"codeChanges": {"linesAdded": 0, "linesRemoved": 0, "filesModified": []}}}\n'
+    )
+    real_events, real_session_id = _parse_copilot_jsonl(real_shape_jsonl)
+    assert len(real_events) == 5, f"expected 5 parsed real-shape events, got {len(real_events)}"
+    # Real, concrete, out-of-scope-for-this-task finding (module docstring / task-3-report.md): the
+    # real terminal line's session identifier is camelCase "sessionId", not the snake_case
+    # "session_id" _parse_copilot_jsonl scans for -- against genuinely real output, new_session_id
+    # comes back None every turn. Asserted here, not silently glossed over, so this trips if
+    # someone fixes the scan without updating this comment; NOT touched by this task (final-line
+    # parsing is explicitly out of scope -- task-3-brief.md).
+    assert real_session_id is None, (
+        "if this now finds a session id, _parse_copilot_jsonl's snake_case-only scan was fixed for "
+        "the real camelCase 'sessionId' shape -- update this comment, it documents that real gap"
+    )
+    # The actual point of Part A: fed through the translation function, real captured non-tool-call
+    # lines must yield ZERO RunEvents -- proves "not every line is a tool call" against genuinely
+    # real data, not just a synthetic fixture built to already agree with the code under test.
+    real_translated = _translate_intermediate_events(
+        real_events[:-1], run_id="run-real", session_id="thread-real", stage="specification", node="draft",
+    )
+    assert real_translated == [], f"real non-tool-call lines must translate to nothing, got {real_translated}"
+
+    # Part B -- SYNTHETIC, explicitly NOT confirmed real (module docstring / task-3-report.md): no
+    # real tool-call-shaped line has ever been captured (Part A's real turn failed on quota before
+    # the model could invoke one). This fixture is this session's own best-effort, clearly-labeled
+    # GUESS at what one might look like, built only by extending the one real, confirmed naming
+    # convention from Part A (a dot-namespaced "<domain>.<verb>" `type`, sharing session/user/
+    # assistant/model's own single-word-domain shape) to a plausible "tool" domain -- never treat
+    # this as ground truth.
+    synthetic_jsonl = (
+        '{"type": "tool.call_start", "data": {"name": "str_replace_editor", "input": {"path": "a.py"}}, '
+        '"id": "syn-1", "timestamp": "2026-01-01T00:00:00.000Z", "parentId": "syn-0"}\n'
+        '{"type": "assistant.message_delta", "data": {"text": "..."}, "ephemeral": true, '
+        '"id": "syn-2", "timestamp": "2026-01-01T00:00:00.100Z", "parentId": "syn-0"}\n'
+        '{"type": "tool.call_end", "data": {"toolName": "bash", "exitCode": 0}, '
+        '"id": "syn-3", "timestamp": "2026-01-01T00:00:00.200Z", "parentId": "syn-0"}\n'
+        '{"result": "done", "is_error": false, "usage": {"input_tokens": 5, "output_tokens": 3}}\n'
+    )
+    synthetic_events, _ = _parse_copilot_jsonl(synthetic_jsonl)
+    assert len(synthetic_events) == 4
+    synthetic_translated = _translate_intermediate_events(
+        synthetic_events[:-1],  # drop the final result-shaped line, exactly like _agenerate_inner does
+        run_id="run-1", session_id="thread-1", stage="specification", node="draft",
+    )
+    # Exactly 2 of the 3 intermediate lines are tool-call-shaped ("tool.*") -- the
+    # assistant.message_delta line must be skipped, proving "not every line is a tool call" on the
+    # positive-fixture side too.
+    assert len(synthetic_translated) == 2, f"expected 2 tool-call RunEvents, got {len(synthetic_translated)}"
+    assert all(e.type is RunEventType.TOOL_CALL for e in synthetic_translated)
+    assert all(e.run_id == "run-1" and e.session_id == "thread-1" for e in synthetic_translated)
+    assert all(e.stage == "specification" and e.node == "draft" for e in synthetic_translated)
+    assert synthetic_translated[0].payload == {"name": "str_replace_editor", "input": {"path": "a.py"}}
+    assert synthetic_translated[0].summary == "tool call: str_replace_editor"
+    assert synthetic_translated[1].payload == {"toolName": "bash", "exitCode": 0}
+    assert synthetic_translated[1].summary == "tool call: bash"
+    # seq/ts are never pre-set by the translator -- append_event (run_event_store.py) fills those
+    # in on actual persistence, the same contract as every other RunEvent built in this codebase.
+    assert all(e.seq is None and e.ts is None for e in synthetic_translated)
+
+    # No intermediate lines at all (a turn whose only JSONL line is the final result) must yield
+    # an empty list, not an error -- _agenerate_inner's events[:-1] is [] in that case.
+    assert _translate_intermediate_events([], run_id="r", session_id="s", stage="st", node="n") == []
 
     # Session-cache eviction: one thread's dead sandbox must not evict another thread's live
     # sessions (mirrors claude_chat_model._demo's doomed/survivor shape).
