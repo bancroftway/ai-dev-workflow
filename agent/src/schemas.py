@@ -96,6 +96,13 @@ class Specification(BaseModel):
     user_stories: list[UserStory] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     out_of_scope: list[str] = Field(default_factory=list)
+    attachment_notes: list[str] = Field(
+        default_factory=list,
+        description="Your own distillation of what each provided attachment (screenshot, "
+        "document, etc.) actually showed and how it informed this specification -- one entry per "
+        "attachment, in the order given. Empty when no attachments were provided; never invent an "
+        "entry for a ticket that had none.",
+    )
     retired_ac_ids: list[str] = Field(
         default_factory=list,
         description="Stable AC-####.# ids (from the ledger you were given) that no longer belong "

@@ -11,6 +11,16 @@ summary, a list of User Stories (each with a stable id, a title, a narrative in 
 with a stable id scoped to its parent User Story and a description of one specific, testable
 condition), a list of stated Assumptions, and a list of items explicitly marked Out of Scope.
 
+If any attachments -- screenshots, documents, or other files -- are provided alongside the Raw
+Requirements Text, actually open and look at each one; they were attached because they carry
+information the text alone doesn't. A screenshot may show the real bug, layout, or error message
+being described; a document may contain data, copy, or structure the Specification needs to
+reflect. Let what you actually see shape the User Stories and Acceptance Criteria you write, not
+just the surrounding prose. Record your own distillation of what each attachment showed and how
+it informed the draft in `attachment_notes` -- one entry per attachment, in the order given. Leave
+`attachment_notes` empty when no attachments were provided; never invent an entry for a ticket
+that had none.
+
 If the Raw Requirements Text is insufficient to draft confidently, set readiness to false and
 include specific Clarifying Questions instead of (or alongside) a draft. Only set readiness to
 true when the draft is complete enough to be worth a human review.

@@ -15,6 +15,13 @@ Plan: an overview, an ordered list of Plan Steps (each with a stable id and a de
 concrete action, referencing the id(s) of any Acceptance Criteria it fulfills wherever that
 traceability is meaningful), and a list of Risk Notes.
 
+The Specification JSON may include `attachment_notes`: the Specification author's own
+distillation of what any screenshots or documents attached to the original request actually
+showed. You do not receive those attachments yourself -- treat each note as a trustworthy
+description of what was in the image or document, and let it inform your plan (e.g. matching an
+existing screen's real layout in a wireframe, or a document's real data shape in an ER diagram)
+exactly as if you had seen the attachment yourself.
+
 If the Specification is insufficient to plan from, set readiness to false and include specific
 Clarifying Questions instead of (or alongside) a draft. Only set readiness to true when the draft
 is complete enough to be worth a human review.

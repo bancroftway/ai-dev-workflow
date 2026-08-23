@@ -3311,6 +3311,28 @@ def _demo() -> None:
         PLAN_TICKET_MODE_SEGMENT in str(m.content) for m in _build_plan_prompt(plan_demo_state)  # type: ignore[arg-type]
     )
 
+    # Task 14: BR-2 stays exactly as it is (Plan gets zero raw attachment access) -- but
+    # Specification's own attachment_notes field, once inside the approved Specification JSON,
+    # must reach _build_plan_prompt unmodified through the very same "Approved Specification
+    # (JSON)" message it already reads for user_stories/assumptions/etc -- no separate plumbing
+    # exists for it, or should. Wired, not just correct in isolation, same proof as
+    # PLAN_TICKET_MODE_SEGMENT above.
+    plan_demo_state["stages"]["specification"]["approved_content"] = {
+        "attachment_notes": [
+            "task-14-demo-marker: screenshot showed a red error banner reading 'Session expired'"
+        ]
+    }
+    assert any(
+        "task-14-demo-marker: screenshot showed a red error banner reading 'Session expired'"
+        in str(m.content)
+        for m in _build_plan_prompt(plan_demo_state)  # type: ignore[arg-type]
+    ), "attachment_notes content must reach _build_plan_prompt unmodified via approved_content"
+
+    # Both prompts actually teach the behavior, not just the schema silently accepting the field.
+    assert "attachment_notes" in SPEC_SYSTEM_PROMPT, "specification_draft.md must name the field it's asked to populate"
+    assert "attachment" in SPEC_SYSTEM_PROMPT.lower(), "specification_draft.md must instruct the model to use attachments"
+    assert "attachment_notes" in PLAN_SYSTEM_PROMPT, "plan_draft.md must explain the attachment_notes field it receives"
+
     # spec_ledger.hydrate_ac_to_tests_ticket_mode_context: a coarser "the ledger has entries" check
     # would ALWAYS fire here, even on a project's first-ever ticket (its own spec just populated
     # the ledger moments before) -- must fire only when the ledger holds an AC beyond this ticket's
