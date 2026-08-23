@@ -637,6 +637,16 @@ async def check_ac_coverage(
         except json.JSONDecodeError:
             pass
 
+    # Snapshot the WHOLE ledger's active AC ids before scoping below, for unattributed_tests alone
+    # (review finding on this same Ruling 7 fix): that check answers "does this test declaration
+    # name ANY real ledger AC" -- distinguishing "I could not read this test" from "there is
+    # nothing here" -- not "does this test belong to my ticket". Every other consumer below
+    # legitimately wants the ticket-scoped list; this one call site does not, and must keep reading
+    # the project-wide set or an earlier ticket's own correctly-named, already-shipped test files
+    # (still picked up by the repo-wide git ls-files scan below, which isn't diff-scoped) would be
+    # misreported as unattributed on every multi-ticket project.
+    all_active_ac_ids = list(active_ac_ids)
+
     # Ruling 7: scope down to THIS TICKET's own ACs, right at the source, before ANY downstream
     # check (missing/tautological/depth/attribution -- all below -- read active_ac_ids uniformly).
     # Unscoped, this list is the WHOLE PROJECT's ledger -- every ticket ever filed. On a project's
@@ -808,7 +818,7 @@ async def check_ac_coverage(
         # untested while its file is full of tests nothing could attribute is a PARSE failure, and
         # the feedback has to say so -- telling a model to "add tests for US-0001.1" when it already
         # wrote five is how a stage burns its whole budget.
-        orphans = unattributed_tests(active_ac_ids, test_files)
+        orphans = unattributed_tests(all_active_ac_ids, test_files)
         if orphans:
             depth_report["unattributed_tests"] = orphans
 
@@ -1176,15 +1186,22 @@ async def _demo_ticket_scoping() -> None:
 
     class _FakeCoverageProvider:
         """Serves `cat <path>` for the paths this scenario cares about (the project ledger, ticket
-        #2's own approved Specification, the console tee, and one .trx). Every other
-        exec_in_sandbox call (the `rm -f` reset, the depth-scan's git ls-files listing) is inert --
-        ok with empty output -- since this scenario's pass/fail decision comes entirely from the
-        structured report, exactly as status_from_structured_reports' own docstring says it should."""
+        #2's own approved Specification, the console tee, and one .trx). The depth-scan's own
+        `git ls-files ... | head -60` listing (distinguished by that unique substring -- it is the
+        only exec call this module makes containing it) returns `test_listing` when given one, so
+        the attribution-scoping scenario below can seed real test file paths for
+        unattributed_tests to read. Every OTHER exec_in_sandbox call (the `rm -f` reset, the
+        missing-AC grep fallback) is inert -- ok with empty output -- since this scenario's
+        pass/fail decision comes entirely from the structured report, exactly as
+        status_from_structured_reports' own docstring says it should."""
 
-        def __init__(self, files: dict[str, str]) -> None:
+        def __init__(self, files: dict[str, str], test_listing: list[str] | None = None) -> None:
             self._files = files
+            self._test_listing = test_listing or []
 
         async def exec_in_sandbox(self, _thread_id: str, command: str):  # noqa: ANN201
+            if "head -60" in command:
+                return _FakeExecResult(True, "\n".join(self._test_listing))
             for path, content in self._files.items():
                 if path in command:
                     return _FakeExecResult(True, content)
@@ -1267,6 +1284,44 @@ async def _demo_ticket_scoping() -> None:
         )
         assert outcome3.report.get("active_ac_ids") == ["US-0001.1", "US-0002.1"], outcome3.report
         assert outcome3.report.get("tautological") == ["US-0001.1"], outcome3.report
+
+        # (c) Review finding on this same fix: unattributed_tests must keep reading the WHOLE
+        # ledger's active ids, not the now-scoped active_ac_ids -- it answers "is this ANY real AC"
+        # (attribution health), not "is this MY ticket's AC". Seed the depth-scan's repo-wide
+        # listing (which is never diff/ticket-scoped) with ticket #1's own correctly-named,
+        # already-shipped test file alongside a genuinely unattributed one. Ticket #2's own AC is
+        # left uncovered here (no trx entry for it) purely to reach the failure branch that
+        # actually attaches depth_report to the outcome -- see check_ac_coverage's success return,
+        # which omits "depth" entirely when nothing failed.
+        attribution_files = {
+            LEDGER_PATH: ledger,
+            workflow_persistence.SPECIFICATION_APPROVED_PATH: ticket2_spec,
+            AC_TEST_OUTPUT_PATH: "test run finished\n",
+            "TestResults/ac-run.trx": (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results>'
+                '<UnitTestResult testName="[US-0001.1] ticket 1 feature, already shipped" outcome="Passed" />'
+                "</Results></TestRun>"
+            ),
+            "apps/api.Tests/Ticket1Tests.cs": "[Fact]\npublic void TestUS00011AlreadyShipped(){ Assert.True(true); }\n",
+            "apps/api.Tests/OrphanTests.cs": "[Fact]\npublic void SomeGenuinelyUnrelatedHelperTest(){ Assert.True(true); }\n",
+        }
+        outcome4 = await check_ac_coverage(
+            _FakeCoverageProvider(
+                attribution_files,
+                test_listing=["apps/api.Tests/Ticket1Tests.cs", "apps/api.Tests/OrphanTests.cs"],
+            ),
+            "t", {}, chat_provider="claude",
+        )
+        orphans = outcome4.report.get("depth", {}).get("unattributed_tests", {})
+        assert "apps/api.Tests/Ticket1Tests.cs" not in orphans, (
+            "ticket #1's own correctly-named, already-shipped test must not be misreported as "
+            f"unattributed just because it falls outside ticket #2's own scope: {orphans}"
+        )
+        assert orphans == {"apps/api.Tests/OrphanTests.cs": 1}, (
+            f"a genuinely unattributed test (names no real AC id at all) must still be caught -- "
+            f"the distinction must be restored, not silenced entirely: {orphans}"
+        )
     finally:
         stack_runner.run_and_report = original_run_and_report
 
