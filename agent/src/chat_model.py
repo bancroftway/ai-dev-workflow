@@ -251,6 +251,7 @@ def get_chat_model_for_thread(
     role: str,
     *,
     provider: str,
+    run_id: str | None = None,
     github_token: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
@@ -285,8 +286,18 @@ def get_chat_model_for_thread(
     keeps that unconditional pattern working under either provider, rather than raising
     TypeError("unexpected keyword argument") the moment AGENT_PROVIDER=claude actually runs, which
     is what calling the OLD import-time-bound alias directly would have done.
+
+    run_id (Task 3b, Part 2 Ruling 10): the graph's real per-run id, forwarded unchanged to both
+    provider modules so their chat-model instances can carry a genuine `self.run_id` instead of
+    Copilot's previous hardcoded "unknown" placeholder in its own RunEvent-building call site
+    (copilot_chat_model.py's _agenerate_inner). Optional, defaulting to None -- graph.py's
+    draft/audit/fix call sites (the ones with a real `state["run_id"]` on hand) pass it; older call
+    sites elsewhere (e2e_nodes.py, metrics_nodes.py, preflight_nodes.py, rebuild.py,
+    test_hardening_nodes.py) are unchanged by this task and simply keep not passing it, same as
+    before -- a caller that omits it is not a regression, just not yet wired up.
     """
     common: dict[str, Any] = dict(
+        run_id=run_id,
         model_name=model_name,
         sandbox=sandbox,
         agent_mode=agent_mode,
@@ -522,6 +533,19 @@ def _demo() -> None:
         assert get_chat_model_for_thread(thread_id, stage, role, provider="claude")._llm_type == "claude-code"
         assert get_chat_model_for_thread(thread_id, stage, role, provider="copilot")._llm_type == "github-copilot"
         assert get_chat_model_for_thread(thread_id, stage, role, provider="claude")._llm_type == "claude-code", "flip back to claude failed"
+
+        # run_id (Task 3b, Part 2 Ruling 10): the dispatcher must thread a real run_id through to
+        # the constructed instance for BOTH providers, not just build one that silently drops it --
+        # the exact gap that left copilot_chat_model.py's RunEvents stuck on a hardcoded "unknown".
+        # A caller that omits it (every call site this task doesn't touch) must still get None, not
+        # a surprise default injected here that would mask a caller's own missing value.
+        claude_model = get_chat_model_for_thread(thread_id, stage, role, provider="claude", run_id="run-real-456")
+        assert claude_model.run_id == "run-real-456", f"claude instance did not carry the real run_id, got {claude_model.run_id!r}"
+        copilot_model = get_chat_model_for_thread(thread_id, stage, role, provider="copilot", run_id="run-real-456")
+        assert copilot_model.run_id == "run-real-456", f"copilot instance did not carry the real run_id, got {copilot_model.run_id!r}"
+        assert get_chat_model_for_thread(thread_id, stage, role, provider="copilot").run_id is None, (
+            "omitting run_id must leave the instance's run_id as None, not a silently-injected placeholder"
+        )
 
         # get_session_id / forget_thread_sessions (sync): seed each provider's OWN _session_ids
         # dict with a distinguishing marker under the same key; confirm the right one comes back.

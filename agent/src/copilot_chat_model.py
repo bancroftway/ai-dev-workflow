@@ -265,6 +265,15 @@ class CopilotChatModel(BaseChatModel):
     thread_id: str
     stage: str
     role: str
+    # Task 3b (Part 2 Ruling 10): the graph's real per-run id, threaded in by the dispatcher
+    # (chat_model.get_chat_model_for_thread) at construction time from whichever caller has one on
+    # hand -- graph.py's draft/audit/fix call sites pass state["run_id"]; a caller this task
+    # doesn't touch (e2e_nodes.py, metrics_nodes.py, ...) simply doesn't pass one, leaving this
+    # None, same as before. _agenerate_inner's own RunEvent-building call site below falls back to
+    # the "unknown" sentinel only in that case, matching graph.py's own
+    # `state.get("run_id", "unknown")` convention for "not available" rather than inventing a
+    # second one.
+    run_id: str | None = None
     model_name: str | None = None
     # Vestigial: every real call site (graph.py, e2e_nodes.py, metrics_nodes.py,
     # preflight_nodes.py, test_hardening_nodes.py, rebuild.py) unconditionally passes
@@ -606,17 +615,18 @@ class CopilotChatModel(BaseChatModel):
         # is/isn't confirmed real about which lines qualify. Both calls fail soft internally (their
         # own docstrings) -- no extra try/except needed here.
         #
-        # ponytail: run_id="unknown" -- this layer has no access to the graph's real per-run
-        # run_id, only graph.py's own nodes do (via `state["run_id"]`); threading a real value down
-        # here would mean extending chat_model.py's Ruling-4-governed dispatcher contract and/or
-        # structured_output.py's ainvoke_structured, both outside this task's scope
-        # (task-3-brief.md). Matches graph.py's OWN sentinel for the identical "not available" case
-        # (`state.get("run_id", "unknown")`) rather than inventing a new one. Concrete, real cost:
-        # until something threads a real run_id through, these events are not retrievable via
-        # run_event_store.list_events(run_id) for a specific run -- see task-3-report.md.
+        # Task 3b (Part 2 Ruling 10) fix: self.run_id is now the graph's real per-run id, set by
+        # chat_model.get_chat_model_for_thread at construction time from whatever the caller has on
+        # hand (graph.py's draft/audit/fix sites pass state["run_id"]). Falls back to the "unknown"
+        # sentinel only for a caller this task doesn't touch (e2e_nodes.py, metrics_nodes.py, ...)
+        # that hasn't been wired up to pass one yet -- matches graph.py's OWN sentinel for the
+        # identical "not available" case (`state.get("run_id", "unknown")`) rather than inventing a
+        # second one. Previously always "unknown" unconditionally (task-3-report.md); see that
+        # report for the concrete cost this left: events not retrievable via
+        # run_event_store.list_events(run_id) for a specific run.
         for tool_call_event in _translate_intermediate_events(
             events[:-1],
-            run_id="unknown",
+            run_id=self.run_id or "unknown",
             session_id=self.thread_id,
             stage=self.stage,
             node=self.role,
@@ -669,6 +679,7 @@ def get_chat_model_for_thread(
     stage: str,
     role: str,
     *,
+    run_id: str | None = None,
     github_token: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
@@ -690,11 +701,15 @@ def get_chat_model_for_thread(
     _agenerate_inner's insides changed. github_token is now vestigial -- kept only so those call
     sites' unconditional `github_token=os.environ.get("GITHUB_TOKEN")` keeps working unchanged, see
     CopilotChatModel.github_token's own comment for why it is never read anymore.
+
+    run_id (Task 3b, Part 2 Ruling 10): optional, defaults to None -- see CopilotChatModel.run_id's
+    own comment for who passes a real value and why a caller that doesn't is not a regression.
     """
     return CopilotChatModel(
         thread_id=thread_id,
         stage=stage,
         role=role,
+        run_id=run_id,
         github_token=github_token,
         model_name=model_name,
         sandbox=sandbox,
@@ -960,6 +975,22 @@ def _demo() -> None:
     # No intermediate lines at all (a turn whose only JSONL line is the final result) must yield
     # an empty list, not an error -- _agenerate_inner's events[:-1] is [] in that case.
     assert _translate_intermediate_events([], run_id="r", session_id="s", stage="st", node="n") == []
+
+    # --- Task 3b (Part 2 Ruling 10): run_id threads through the constructor into self.run_id, and
+    # _agenerate_inner's own fallback expression (`self.run_id or "unknown"`) no longer collapses a
+    # real value down to the placeholder. _agenerate_inner itself needs a live sandbox+CLI exec
+    # (module docstring's "pure half only" scoping), so this exercises the exact expression at its
+    # call site directly rather than the whole turn.
+    real_run_id_model = get_chat_model_for_thread("t", "s", "r", run_id="run-real-123")
+    assert real_run_id_model.run_id == "run-real-123", "run_id did not thread through the constructor"
+    assert (real_run_id_model.run_id or "unknown") == "run-real-123", (
+        "a real run_id must not fall back to the 'unknown' sentinel"
+    )
+    no_run_id_model = get_chat_model_for_thread("t", "s", "r")
+    assert no_run_id_model.run_id is None, "omitting run_id must leave it None, not a silently-injected default"
+    assert (no_run_id_model.run_id or "unknown") == "unknown", (
+        "omitting run_id must still fall back to the pre-existing 'unknown' sentinel"
+    )
 
     # Session-cache eviction: one thread's dead sandbox must not evict another thread's live
     # sessions (mirrors claude_chat_model._demo's doomed/survivor shape).

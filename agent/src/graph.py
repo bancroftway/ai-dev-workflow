@@ -1721,6 +1721,11 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stage_spec.key,
             "draft",
             provider=state["provider"],
+            # Task 3b (Part 2 Ruling 10): thread the real run_id through so a Copilot turn's own
+            # tool-call RunEvents (copilot_chat_model.py's _agenerate_inner) carry it instead of
+            # the "unknown" placeholder -- same sentinel-fallback convention this file already
+            # uses at the RunEvent(...) construction just below.
+            run_id=state.get("run_id", "unknown"),
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "draft", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
@@ -1887,6 +1892,8 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stage_spec.key,
             "audit",
             provider=state["provider"],
+            # Task 3b (Part 2 Ruling 10) -- see the draft-role call's own comment above.
+            run_id=state.get("run_id", "unknown"),
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "audit", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
@@ -2279,6 +2286,11 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             stage_spec.key,
             "fix",
             provider=state["provider"],
+            # Task 3b (Part 2 Ruling 10) -- see make_draft_node's draft-role call site's own
+            # comment above. This node builds no RunEvent of its own, but a Copilot turn here
+            # still runs through _agenerate_inner's own tool-call RunEvent building, which would
+            # otherwise keep seeing "unknown" the same as every other un-threaded call site.
+            run_id=state.get("run_id", "unknown"),
             github_token=os.environ.get("GITHUB_TOKEN"),
             # The `fix` role is declared in model_config precisely so this write-capable pass can be
             # tiered separately from the read-only audit it serves; falls back to the stage's draft

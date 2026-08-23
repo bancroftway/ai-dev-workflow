@@ -254,6 +254,12 @@ class ClaudeChatModel(BaseChatModel):
     thread_id: str
     stage: str
     role: str
+    # Task 3b (Part 2 Ruling 10): same field, same dispatcher-set-at-construction-time shape as
+    # CopilotChatModel.run_id (see that class's own comment) -- kept in sync purely so both
+    # provider constructors stay on one shape. Not read anywhere in this module yet: Claude's
+    # _agenerate_inner builds no RunEvents of its own (that's Task 4, still pending); this just
+    # makes the real value reachable here already, for whenever that task needs it.
+    run_id: str | None = None
     model_name: str | None = None
     # Structural parity with CopilotChatModel.sandbox -- but unlike Copilot (whose SDK can start a
     # local child process when this is None), every Claude turn always execs through
@@ -496,6 +502,7 @@ def get_chat_model_for_thread(
     stage: str,
     role: str,
     *,
+    run_id: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
     agent_mode: Literal["interactive", "plan", "autopilot", "shell"] = "plan",
@@ -518,11 +525,15 @@ def get_chat_model_for_thread(
     No github_token-equivalent parameter here: the Claude CLI authenticates from the sandbox
     container's own environment (see secret_env_names below), not from anything this process
     passes in.
+
+    run_id (Task 3b, Part 2 Ruling 10): optional, defaults to None -- see ClaudeChatModel.run_id's
+    own comment for why this module accepts it but doesn't read it yet.
     """
     return ClaudeChatModel(
         thread_id=thread_id,
         stage=stage,
         role=role,
+        run_id=run_id,
         model_name=model_name,
         sandbox=sandbox,
         agent_mode=agent_mode,
@@ -663,6 +674,13 @@ def _demo() -> None:
     )
     assert all_known == ["Grep", "Glob", "Bash", "Skill", "Write"], f"unexpected mapping: {all_known}"
     assert _map_tool_names(["builtin:ask_user"]) == [], "fully-unknown list should map to empty, not raise"
+
+    # Task 3b (Part 2 Ruling 10): run_id threads through the constructor same as CopilotChatModel's
+    # (shape parity, even though nothing here reads it yet -- see ClaudeChatModel.run_id's comment).
+    assert get_chat_model_for_thread("t", "s", "r", run_id="run-real-123").run_id == "run-real-123", (
+        "run_id did not thread through the constructor"
+    )
+    assert get_chat_model_for_thread("t", "s", "r").run_id is None, "omitting run_id must leave it None"
 
     # _prepare_attachment (task-13): the pure decode/shape half of attachment forwarding -- the
     # actual write_scratch_file call needs a live sandbox, same "pure half only" scoping as
