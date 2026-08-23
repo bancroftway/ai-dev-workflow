@@ -102,6 +102,12 @@ PLAN_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('plan', 'approved.json')}"
 # identical "this ticket's own AC ids" question.
 SPECIFICATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('specification', 'approved.json')}"
 
+# Same reasoning again -- graph.py's hydrate_remediation_ticket_mode_context (Task 7b) reads this
+# to detect an earlier ticket's own approved remediation report for this same project, so a later
+# ticket's draft can carry that ticket's accepted `known_gaps` reasoning forward instead of
+# re-investigating an unrelated, still-open finding from scratch on every single ticket.
+REMEDIATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('remediation', 'approved.json')}"
+
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
     return await repo_files.read_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}")
@@ -294,6 +300,7 @@ def _demo() -> None:
     assert TECH_STACK_DRAFT_PATH == f"{WORKFLOW_DIR}/02-tech-stack.draft.json"
     assert PLAN_APPROVED_PATH == f"{WORKFLOW_DIR}/04-plan.approved.json"
     assert SPECIFICATION_APPROVED_PATH == f"{WORKFLOW_DIR}/03-specification.approved.json"
+    assert REMEDIATION_APPROVED_PATH == f"{WORKFLOW_DIR}/07-remediation.approved.json"
 
     # Padding must keep lexical order == execution order; a bare str(n) breaks at 10 stages.
     names = [_stage_file(k, "md") for k in _STAGE_ORDER]

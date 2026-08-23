@@ -770,6 +770,36 @@ def _build_exit_prompt(state: GraphState, stage_key: str = "metrics-exit") -> li
 # scanner's gating findings went untouched all the way to the metrics gate.
 REMEDIATION_SYSTEM_PROMPT, REMEDIATION_HUMAN_TEMPLATE = load_prompt_pair("remediation_draft")
 
+# Appended only when hydrate_remediation_ticket_mode_context (StageSpec.
+# draft_prompt_context_from_repo_file) finds an earlier ticket's own approved remediation report
+# already on disk for this same project -- remediation's own analogue of
+# hydrate_plan_ticket_mode_context, same "reframe, never skip" contract (see that hook's own
+# docstring on StageSpec), different artifact.
+REMEDIATION_TICKET_MODE_SEGMENT = load_prompt("remediation_ticket_mode_segment")
+
+
+async def hydrate_remediation_ticket_mode_context(
+    thread_id: str, _state: "GraphState", provider: SandboxProvider
+) -> dict[str, Any] | None:
+    """StageSpec.draft_prompt_context_from_repo_file for the remediation stage.
+
+    Signals ticket-mode framing when workflow_persistence.REMEDIATION_APPROVED_PATH already exists
+    on disk -- an earlier ticket already ran this stage against this same project and left its own
+    `known_gaps` reasoning behind. Unlike plan/spec/ac-to-tests, _build_remediation_prompt below has
+    no "immediately-prior draft" block at all (every attempt re-reads the live scan from scratch by
+    design -- see its own docstring), so a prior TICKET's report is otherwise completely invisible
+    to this ticket's draft; reading the file is the only way to recover it.
+
+    Without this, a still-open, already-investigated finding (e.g. "no fixed version published
+    yet") forces every later ticket to rediscover and re-justify the exact same gap from scratch --
+    the "re-auditing the whole project every time" cost the Spec calls out for this stage
+    specifically. Never short-circuits drafting -- see draft_prompt_context_from_repo_file's own
+    docstring on StageSpec; this ticket's own draft still scans and fixes whatever it can either
+    way, this only tells it where not to start from zero.
+    """
+    raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.REMEDIATION_APPROVED_PATH)
+    return {"ticket_mode_baseline": True} if raw is not None else None
+
 
 def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
     """Consolidated remediation stage 6.
@@ -777,12 +807,18 @@ def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
     The findings themselves are NOT marshalled into the prompt: the agent has file tools and reads
     `.ai-dev-workflow/repo-scan-latest.json` directly, which is both the authoritative copy and the
     same offload principle the rest of this pipeline uses -- Python checks the facts afterwards
-    (the metrics regression gate re-scans), the agent decides how to fix them.
+    (the metrics regression gate re-scans), the agent decides how to fix them. No "immediately-prior
+    draft" block either, unlike plan/spec/ac-to-tests: max_cycles=2 and every attempt re-reads the
+    live scan fresh, so there is no same-run draft worth echoing back -- only a PRIOR TICKET's own
+    approved report (see hydrate_remediation_ticket_mode_context) is otherwise invisible here.
     """
-    return [
+    messages: list[BaseMessage] = [
         SystemMessage(content=REMEDIATION_SYSTEM_PROMPT),
         HumanMessage(content=REMEDIATION_HUMAN_TEMPLATE),
     ]
+    if state["stages"]["remediation"].get("ticket_mode_baseline"):
+        messages.append(HumanMessage(content=REMEDIATION_TICKET_MODE_SEGMENT))
+    return messages
 
 
 ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT = load_prompt("adversarial_audit_draft")
@@ -1251,6 +1287,7 @@ STAGES: list[StageSpec] = [
         # catch a scanner being silenced instead of a defect being fixed.
         capture_baseline_commit=True,
         deterministic_verify=remediation_gate.verify_remediation,
+        draft_prompt_context_from_repo_file=hydrate_remediation_ticket_mode_context,
         max_verify_cycles=3,
         # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
         # edits source to fix scanner findings. Without them it could only ever describe the work --
@@ -3302,6 +3339,54 @@ def _demo() -> None:
         AC_TO_TESTS_TICKET_MODE_SEGMENT in str(m.content)
         for m in _build_ac_to_tests_prompt(ac_demo_state)  # type: ignore[arg-type]
     )
+
+    # Task 7b: remediation's own ticket-mode reframe hook -- an earlier ticket's own accepted
+    # known_gaps reasoning is otherwise completely invisible to a later ticket's draft (remediation
+    # has no "immediately-prior draft" block the way plan/spec/ac-to-tests do; every attempt
+    # re-reads the live scan from scratch by design). Cache miss vs. cache hit must actually change
+    # the hook's answer, not just compile.
+    assert asyncio.run(
+        hydrate_remediation_ticket_mode_context("t", {}, _FakeRepoFileProvider({}))  # type: ignore[arg-type]
+    ) is None, "a project's first-ever ticket has no prior remediation report to carry forward"
+    assert asyncio.run(
+        hydrate_remediation_ticket_mode_context(  # type: ignore[arg-type]
+            "t", {}, _FakeRepoFileProvider({workflow_persistence.REMEDIATION_APPROVED_PATH: "{}"})
+        )
+    ) == {"ticket_mode_baseline": True}, "an earlier ticket's approved remediation report must trigger the reframe"
+
+    # Wired, not just correct in isolation: _build_remediation_prompt actually appends
+    # REMEDIATION_TICKET_MODE_SEGMENT when (and only when) the prompt-only stage copy carries the
+    # signal -- same wiring proof as plan/ac-to-tests above.
+    remediation_demo_state = {"stages": {"remediation": {**default_stage_state()}}}
+    assert not any(
+        REMEDIATION_TICKET_MODE_SEGMENT in str(m.content)
+        for m in _build_remediation_prompt(remediation_demo_state)  # type: ignore[arg-type]
+    )
+    remediation_demo_state["stages"]["remediation"]["ticket_mode_baseline"] = True
+    assert any(
+        REMEDIATION_TICKET_MODE_SEGMENT in str(m.content)
+        for m in _build_remediation_prompt(remediation_demo_state)  # type: ignore[arg-type]
+    )
+
+    # Task 7b: adversarial-compliance's wireframe-conformance instruction must scope to the
+    # wireframes THIS ticket's own approved Plan lists, not every wireframe ever produced for this
+    # project. The prior wording ("for EACH wireframe" under the whole, ticket-accumulating
+    # .ai-dev-workflow/plan/wireframes/ directory) audited every earlier ticket's already-shipped,
+    # already-approved screens too -- and verify_adversarial_compliance blocks on ANY critical/major
+    # divergence_finding with no per-ticket filter (agent/src/gates/adversarial_gate.py), so a false
+    # positive against an unrelated, already-approved screen could fail a run over work this ticket
+    # never touched. Checked in both the live prompt and its dormant agents/ duplicate, which must
+    # teach the same thing (consistency sweep). Whitespace-normalized before comparing -- this
+    # prompt is hand-wrapped at a fixed column, so a multi-word phrase can legitimately straddle a
+    # line break in the raw file.
+    def _flat(text: str) -> str:
+        return " ".join(text.split())
+
+    assert "for EACH wireframe, find the implemented screen" not in _flat(ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT)
+    assert "Only audit the screens the Plan above actually lists" in _flat(ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT)
+    _dormant_adversarial_prompt = _flat(load_agent_for_stage("adversarial-compliance", "draft")["prompt"])
+    assert "for EACH wireframe, find the implemented screen" not in _dormant_adversarial_prompt
+    assert "Only audit the screens the Plan above actually lists" in _dormant_adversarial_prompt
 
     # minimal-code-to-green's brownfield segment deliberately reuses tech_stack_signals.
     # is_greenfield_repo directly rather than a new StageSpec hook (see

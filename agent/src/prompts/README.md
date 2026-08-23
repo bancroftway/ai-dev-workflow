@@ -26,6 +26,7 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 | `ac_to_tests_ticket_mode_segment.md` | ac-to-tests | ticket-mode: scope test-writing to this ticket's own ACs, not the ledger's whole-project active list |
 | `minimal_code_to_green_draft.md` / `minimal_code_to_green_audit.md` | minimal-code-to-green | minimal code to pass tests |
 | `minimal_code_to_green_brownfield_segment.md` | minimal-code-to-green | brownfield: extend this repo's existing code conventions instead of assuming a blank repo |
+| `remediation_ticket_mode_segment.md` | remediation | ticket-mode: carry an earlier ticket's own accepted `known_gaps` reasoning forward instead of re-investigating it from scratch |
 | `quality_remediation_triage.md` | quality-remediation | fix/suppress decision per quality finding |
 | `quality_remediation_fix.md` | quality-remediation | apply fixes + suppression markers |
 | `security_remediation_triage.md` | security-remediation | fix/suppress decision per security finding |
