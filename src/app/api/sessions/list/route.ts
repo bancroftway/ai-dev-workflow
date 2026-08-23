@@ -8,9 +8,10 @@ import { hasRepoAccess } from "@/lib/session-access";
 const NO_STORE = { "Cache-Control": "no-store" };
 
 /**
- * Session list for /select's session-list panel (GET ?owner=&repo=&source_branch=). Proxies the
- * agent's `GET /sessions` -- SQL Server (session_store.py) is the single source of truth now, not
- * a `.ai-dev-workflow/sessions.json` file read off GitHub.
+ * Session list for /select's session-list panel (GET ?owner=&repo=&source_branch=) and (Task 9)
+ * the project-scoped Board (GET ?owner=&repo=&project_id=). Proxies the agent's `GET /sessions` --
+ * SQL Server (session_store.py) is the single source of truth now, not a
+ * `.ai-dev-workflow/sessions.json` file read off GitHub.
  *
  * `auth()` alone only proves SOME user is signed in, not that THIS user can see THIS owner/repo --
  * without the hasRepoAccess check below, any authenticated user could page through arbitrary
@@ -28,6 +29,7 @@ export async function GET(request: Request) {
   const owner = searchParams.get("owner");
   const repo = searchParams.get("repo");
   const sourceBranch = searchParams.get("source_branch");
+  const projectId = searchParams.get("project_id");
   if (!owner || !repo) {
     return NextResponse.json({ error: "owner and repo query params are required" }, { status: 400 });
   }
@@ -38,6 +40,7 @@ export async function GET(request: Request) {
 
   const agentParams = new URLSearchParams({ owner, repo });
   if (sourceBranch) agentParams.set("source_branch", sourceBranch);
+  if (projectId) agentParams.set("project_id", projectId);
 
   const response = await agentFetch(`sessions?${agentParams}`);
   if (!response.ok) {

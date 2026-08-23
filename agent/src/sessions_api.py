@@ -288,6 +288,14 @@ class SessionResponse(BaseModel):
     # workflow's own DB lifecycle. An agent restart drops this to false for every session until
     # each is reprovisioned, same as every other in-memory cache in this module.
     container_alive: bool = False
+    # Part 3 Task 1 added this BIT column and the two write-side call sites that keep it current
+    # (session_store.set_awaiting_gate / update_current_stage), but never declared it here -- so
+    # every response silently dropped it via Pydantic v2's default `extra="ignore"` on
+    # `SessionResponse(**row, ...)` below (confirmed in task-1-report.md's own "not a breaking
+    # concern" note). The Board's (Task 9) pause marker reads this field directly, so it has to
+    # actually leave this process now: True while `current_stage` is paused at its own human gate
+    # awaiting approval, False/None otherwise.
+    awaiting_gate: bool | None = None
 
 
 def _row_to_response(row: dict[str, Any]) -> "SessionResponse":
@@ -839,6 +847,28 @@ def _demo() -> None:
     assertions through set_project_repo/get_project/find_project_by_repo) -- no second fake DB
     pool is wired up here."""
     import asyncio
+
+    # Task 9 (Board pause marker): a plain dict-in, model-out check that awaiting_gate survives
+    # SessionResponse(**row, ...) -- pinned here because it silently did NOT before this task
+    # (Pydantic v2's default extra="ignore" dropped it, per task-1-report.md's own "not a breaking
+    # concern... yet" note). project_id is deliberately included and left unread below: the field
+    # genuinely isn't declared on SessionResponse (nothing downstream needs it in the per-session
+    # payload -- filtering already happens server-side via the query param), so this only proves
+    # THAT key is still, correctly, dropped -- a future accidental declaration of it is someone
+    # else's deliberate choice to review, not a regression this assertion should catch.
+    fake_row = {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "owner": "octocat", "repo": "demo", "user_login": "octocat", "title": "t",
+        "source_branch": "main", "work_branch": "wb", "run_id": None,
+        "current_stage": "plan", "status": "in_progress",
+        "started_at": datetime(2026, 1, 1), "ended_at": None,
+        "merge_ready": None, "pr_title": None, "pr_url": None,
+        "failure_stage": None, "failure_type": None, "failure_message": None,
+        "project_id": "22222222-2222-2222-2222-222222222222", "awaiting_gate": True,
+    }
+    resp = _row_to_response(fake_row)
+    assert resp.awaiting_gate is True, resp
+    assert not hasattr(resp, "project_id"), "project_id should not be declared on SessionResponse"
 
     global _fetch_default_branch  # reassigned further down; must precede every use in this function
 

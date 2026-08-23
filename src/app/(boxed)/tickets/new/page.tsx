@@ -212,6 +212,15 @@ export default function NewTicketPage() {
               </option>
             ))}
           </select>
+          {/* Task 9's only entry point into the Board -- nothing else in the app links to it yet. */}
+          {!isNewProject && (
+            <Link
+              href={`/projects/${selectedProjectId}/board`}
+              className="self-start text-xs text-neutral-500 underline hover:text-neutral-800"
+            >
+              View board →
+            </Link>
+          )}
         </label>
 
         {isNewProject && (

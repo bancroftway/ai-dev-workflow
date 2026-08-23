@@ -15,6 +15,10 @@ export type Session = {
   run_id: string | null;
   current_stage: string | null;
   status: "in_progress" | "completed" | "failed" | "rejected";
+  /** True while `current_stage` is paused at its own human gate awaiting approval (Part 3 Task 1
+   * `dbo.sessions.awaiting_gate`, threaded through `SessionResponse` for Task 9's board). Null/false
+   * the rest of the time, including for every terminal (completed/failed/rejected) row. */
+  awaiting_gate: boolean | null;
   started_at: string;
   ended_at: string | null;
   merge_ready: boolean | null;
