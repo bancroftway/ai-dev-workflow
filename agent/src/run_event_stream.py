@@ -91,6 +91,7 @@ async def _demo() -> None:
     run_event_store._demo()'s own broken-dependency check. `python -m src.run_event_stream`.
     """
     import uuid
+    from datetime import datetime, timezone
 
     from ag_ui.core import EventType, RunAgentInput
     from copilotkit import LangGraphAGUIAgent
@@ -112,9 +113,19 @@ async def _demo() -> None:
         summary="draft ready for review",
         payload={"readiness": True},
     )
+    assert probe_event.seq is None and probe_event.ts is None  # pre-append shape
+
+    # Simulates the real graph.py call-site contract: run_event_store.append_event returns a copy
+    # with DB-assigned seq/ts filled in, and every call site must rebind to that copy
+    # (`run_event = await run_event_store.append_event(run_event)`) before calling emit_live --
+    # fix round 1's own finding was exactly a call site that emitted the pre-rebind event instead,
+    # silently shipping seq=None/ts=None live while the DB copy had real values. No DB here (this
+    # module stays DB-independent) -- dataclasses.replace stands in for append_event's own `return
+    # replace(event, seq=seq, ts=ts)` (run_event_store.py) without a real connection.
+    appended_event = dataclasses.replace(probe_event, seq=42, ts=datetime.now(timezone.utc))
 
     async def _node(state: _State, config: RunnableConfig) -> dict:
-        await emit_live(probe_event, config)
+        await emit_live(appended_event, config)
         return {"foo": state["foo"] + 1}
 
     graph = (
@@ -134,17 +145,21 @@ async def _demo() -> None:
     assert len(custom_events) == 1, custom_events
     ev = custom_events[0]
     assert ev.name == CUSTOM_EVENT_NAME, ev.name
+    # seq/ts MUST be the real, non-None values from the (simulated) post-append copy -- this is
+    # the exact assertion that would have caught fix round 1's bug (a call site emitting the
+    # pre-rebind event, which would land here as seq=None/ts=None instead).
     assert ev.value == {
         "run_id": "demo-run", "session_id": probe_event.session_id, "type": "node_finished",
         "stage": "specification", "node": "draft", "summary": "draft ready for review",
-        "payload": {"readiness": True}, "token_usage": None, "seq": None, "ts": None,
+        "payload": {"readiness": True}, "token_usage": None,
+        "seq": 42, "ts": appended_event.ts.isoformat(),
     }, ev.value
 
     # Fail-soft contract, mirroring run_event_store._demo()'s own broken-dependency check: called
     # with no active run/config at all (bare module-level call, no graph/node context) there is no
     # parent run id, which is the real, confirmed RuntimeError case (see this module's docstring)
     # -- must not raise.
-    await emit_live(probe_event, config=None)
+    await emit_live(appended_event, config=None)
 
     print("run_event_stream self-check: ok")
 

@@ -1850,7 +1850,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 payload={"readiness": response.readiness},
                 token_usage=model._last_usage,
             )
-            await run_event_store.append_event(run_event)
+            run_event = await run_event_store.append_event(run_event)
             # Live counterpart (Part 2 Task 2) -- same event, third destination: a LangGraph custom
             # event that ag_ui_langgraph's already-mounted bridge relays to the browser as an AG-UI
             # CUSTOM event while this run is still in progress. See run_event_stream.py's module
@@ -1990,7 +1990,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 },
                 token_usage=model._last_usage,
             )
-            await run_event_store.append_event(run_event)
+            run_event = await run_event_store.append_event(run_event)
             # Live counterpart (Part 2 Task 2) -- same event, third destination; see
             # run_event_stream.py's module docstring. Also fails soft, same reasoning as above.
             await run_event_stream.emit_live(run_event, config)
@@ -2219,7 +2219,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 summary=f"verify {'passed' if result.passed else 'failed'} (cycle {stage['verify_cycle_count']})",
                 payload={"passed": result.passed, "cycle": stage["verify_cycle_count"]},
             )
-            await run_event_store.append_event(run_event)
+            run_event = await run_event_store.append_event(run_event)
             # Live counterpart (Part 2 Task 2) -- same event, third destination; see
             # run_event_stream.py's module docstring. Also fails soft, same reasoning as above.
             await run_event_stream.emit_live(run_event, config)
