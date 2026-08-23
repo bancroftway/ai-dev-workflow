@@ -33,6 +33,7 @@ export function AttachmentEditor({
   placeholder,
   minHeightClassName = "min-h-[240px]",
   uploadError,
+  textareaId,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -41,6 +42,10 @@ export function AttachmentEditor({
   placeholder?: string;
   minHeightClassName?: string;
   uploadError?: string | null;
+  /** Wired to the edit-mode textarea's `id` so a caller's own `<label htmlFor>` (Task 10 sweep
+   * item #16) has a real control to associate with. Optional -- RequirementsView.tsx's own call
+   * site renders no visible text label at all, so it has nothing to pass here and none is needed. */
+  textareaId?: string;
 }) {
   const [mode, setMode] = useState<"edit" | "preview">("edit");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -111,6 +116,7 @@ export function AttachmentEditor({
       {mode === "edit" ? (
         <textarea
           ref={textareaRef}
+          id={textareaId}
           className={`${minHeightClassName} w-full flex-1 resize-none p-3 text-sm outline-none`}
           placeholder={placeholder}
           value={value}

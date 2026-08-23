@@ -1420,6 +1420,13 @@ async def _run_post_approve_hook(
     Failures are logged and swallowed for the same reason _persist_if_sandboxed swallows its own:
     a convention file that couldn't be written must not take down a run whose approval already
     happened. The hook itself is expected to record its own partial failures where they matter.
+
+    Known limitation (Task 10 sweep item #2, mirrors a pre-existing current_stage gap): a session
+    whose sandbox is evicted while paused at a gate, then approved anyway, skips this whole
+    function -- including the update_current_stage call below that clears awaiting_gate -- and can
+    leave that column stuck True until the next touch_run. Only affects the Board's cosmetic ⏸
+    marker; not fixed here since the real fix (decoupling awaiting_gate's clear from this sandbox
+    guard) would touch this hot, already-reviewed choke point for a cosmetic-only edge case.
     """
     if sandbox_registry.get(thread_id) is None:
         return

@@ -47,7 +47,14 @@ type ProjectState =
  * bucket. */
 function columnFor(session: Session): string {
   if (session.status === "completed") return DONE_COLUMN;
-  return session.current_stage ?? STAGE_KEYS_IN_ORDER[0];
+  const stage = session.current_stage;
+  // Same fallback already used for the null case, now also covering a non-null value that isn't
+  // one of the 8 real keys (Task 10 sweep item #14) -- defense in depth only, since current_stage
+  // is documented elsewhere as never actually holding a non-STAGES value. Without this, such a
+  // session would land in a `grouped` bucket the render loop below never iterates (it only maps
+  // over the fixed `columns` list), silently vanishing from the board instead of degrading
+  // gracefully the way SessionHistory.tsx's own ProgressIndicator already does for this same case.
+  return stage && (STAGE_KEYS_IN_ORDER as readonly string[]).includes(stage) ? stage : STAGE_KEYS_IN_ORDER[0];
 }
 
 /** Re-reads the project list and finds this one -- no `GET /api/projects/:id` exists (same
@@ -74,6 +81,22 @@ export default function ProjectBoardPage() {
   const [projectState, setProjectState] = useState<ProjectState>({ kind: "loading" });
   const [sessions, setSessions] = useState<Session[] | null>(null);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
+
+  // Reset both to a loading/empty state the moment projectId itself changes (Task 10 sweep item
+  // #13): without this, direct board-to-board navigation (browser back/forward, a typed URL) kept
+  // rendering the PREVIOUS project's already-`ready` state and session cards until the effects
+  // below re-fetched. Deliberately done HERE, during render, not with a synchronous setState
+  // inside the effects below -- that shape is exactly what react-hooks/set-state-in-effect (an
+  // enforced lint error in this repo) flags as a cascading-render risk. This is the sanctioned
+  // "adjusting state when a prop changes" pattern instead: React re-renders once, synchronously,
+  // before committing, rather than committing stale state and scheduling a second render via an
+  // effect.
+  const [resetForProjectId, setResetForProjectId] = useState<string | null>(null);
+  if (projectId !== resetForProjectId) {
+    setResetForProjectId(projectId);
+    setProjectState({ kind: "loading" });
+    setSessions(null);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -107,6 +130,8 @@ export default function ProjectBoardPage() {
     const ownerId = owner;
     const repoId = repo;
     let cancelled = false;
+    // sessions is already reset to null for the new projectId by the render-phase block above
+    // (Task 10 sweep item #13) before this effect ever runs -- nothing to clear here.
     function load() {
       const query = new URLSearchParams({ owner: ownerId, repo: repoId, project_id: projectId });
       fetch(`/api/sessions/list?${query}`)

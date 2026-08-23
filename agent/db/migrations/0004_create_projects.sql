@@ -56,8 +56,10 @@ CREATE INDEX IX_sessions_project ON dbo.sessions(project_id, started_at DESC);
 -- interrupt() call actually pauses (session_store.set_awaiting_gate), cleared back to 0
 -- unconditionally by update_current_stage's same UPDATE (and by touch_run on a resume, so a
 -- process restart while paused can't leave a stale 1 behind once that session is next touched).
--- NULL (via this ALTER's default-free ADD) only ever describes a pre-migration row that predates
--- the column; every session created after this ships gets a real 0/1 from create_session onward
--- (implicitly 0/NULL at INSERT time -- see session_store.create_session, unset until the first
--- gate pause).
+-- NULL describes both a pre-migration row that predates the column AND, just as much, a normal
+-- fresh row created after this ships: create_session's own INSERT does not list this column at
+-- all (Task 10 sweep item #1 -- corrected from an earlier version of this comment that overstated
+-- "a real 0/1 from create_session onward"), so every new session starts out NULL and stays that
+-- way until its first gate pause/approve/resume actually sets or clears it. No functional impact
+-- either way: NULL and 0 both read falsy everywhere this column is checked.
 ALTER TABLE dbo.sessions ADD awaiting_gate BIT NULL;

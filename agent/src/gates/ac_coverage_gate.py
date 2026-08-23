@@ -628,24 +628,27 @@ async def check_ac_coverage(
     which now requires it itself; not resolved in here."""
     raw_ledger = await repo_files.read_repo_file(provider, thread_id, LEDGER_PATH)
     active_ac_ids: list[str] = []
+    all_ledger_ac_ids: list[str] = []
     if raw_ledger is not None:
         try:
             entries = json.loads(raw_ledger).get("entries", [])
             active_ac_ids = [
                 e["id"] for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") in ("active", "revised")
             ]
+            # Every status, retired included -- see unattributed_tests's own call site below (Task
+            # 10 sweep item #10): that check's question ("did a real human ever write this AC id
+            # anywhere in the ledger") doesn't care whether the AC is still active, unlike every
+            # other consumer of active_ac_ids in this function.
+            all_ledger_ac_ids = [e["id"] for e in entries if e.get("kind") == "acceptance_criterion"]
         except json.JSONDecodeError:
             pass
 
-    # Snapshot the WHOLE ledger's active AC ids before scoping below, for unattributed_tests alone
-    # (review finding on this same Ruling 7 fix): that check answers "does this test declaration
-    # name ANY real ledger AC" -- distinguishing "I could not read this test" from "there is
-    # nothing here" -- not "does this test belong to my ticket". Every other consumer below
-    # legitimately wants the ticket-scoped list; this one call site does not, and must keep reading
-    # the project-wide set or an earlier ticket's own correctly-named, already-shipped test files
-    # (still picked up by the repo-wide git ls-files scan below, which isn't diff-scoped) would be
-    # misreported as unattributed on every multi-ticket project.
-    all_active_ac_ids = list(active_ac_ids)
+    # unattributed_tests (below) reads all_ledger_ac_ids, not active_ac_ids -- see that list's own
+    # comment above (review finding on the original Ruling 7 fix, sharpened by Task 10 sweep item
+    # #10): that check answers "does this test declaration name ANY real ledger AC, ever" --
+    # distinguishing "I could not read this test" from "there is nothing here" -- not "does this
+    # test belong to my ticket" or even "is this AC still active". Every other consumer below
+    # legitimately wants the ticket-scoped, active-only list; that one call site does not.
 
     # Ruling 7: scope down to THIS TICKET's own ACs, right at the source, before ANY downstream
     # check (missing/tautological/depth/attribution -- all below -- read active_ac_ids uniformly).
@@ -818,7 +821,7 @@ async def check_ac_coverage(
         # untested while its file is full of tests nothing could attribute is a PARSE failure, and
         # the feedback has to say so -- telling a model to "add tests for US-0001.1" when it already
         # wrote five is how a stage burns its whole budget.
-        orphans = unattributed_tests(all_active_ac_ids, test_files)
+        orphans = unattributed_tests(all_ledger_ac_ids, test_files)
         if orphans:
             depth_report["unattributed_tests"] = orphans
 
@@ -1210,11 +1213,17 @@ async def _demo_ticket_scoping() -> None:
     # The WHOLE PROJECT's ledger: ticket #1's US-0001.1 (shipped, still "active" -- retirement is
     # not what makes an old AC stop needing coverage, see spec_ledger.sync_ledger) plus ticket #2's
     # own, brand-new US-0002.1.
+    # US-0003/.1 are RETIRED -- present only for the attribution scenario (c) below, which needs a
+    # retired AC with a correctly-named test to prove Task 10 sweep item #10's fix. Retired status
+    # already correctly excludes them from active_ac_ids (and therefore from outcome/outcome2/
+    # outcome3's own assertions above, which never mention US-0003), so adding them here is safe.
     ledger = json.dumps({"entries": [
         {"id": "US-0001", "kind": "user_story", "status": "active"},
         {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
         {"id": "US-0002", "kind": "user_story", "status": "active"},
         {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0003", "kind": "user_story", "status": "retired"},
+        {"id": "US-0003.1", "kind": "acceptance_criterion", "status": "retired"},
     ]})
     # Ticket #2's OWN approved Specification cites only its own story -- exactly what
     # own_ac_ids_from_specification (spec_ledger.py) reads.
@@ -1305,11 +1314,16 @@ async def _demo_ticket_scoping() -> None:
             ),
             "apps/api.Tests/Ticket1Tests.cs": "[Fact]\npublic void TestUS00011AlreadyShipped(){ Assert.True(true); }\n",
             "apps/api.Tests/OrphanTests.cs": "[Fact]\npublic void SomeGenuinelyUnrelatedHelperTest(){ Assert.True(true); }\n",
+            # Task 10 sweep item #10: a test correctly naming a now-RETIRED AC (US-0003.1) must not
+            # be misreported as unattributed either -- unattributed_tests answers "did a real human
+            # ever write this AC id anywhere in the ledger", which doesn't stop being true just
+            # because the AC was later retired.
+            "apps/api.Tests/RetiredTests.cs": "[Fact]\npublic void TestUS00031NowRetired(){ Assert.True(true); }\n",
         }
         outcome4 = await check_ac_coverage(
             _FakeCoverageProvider(
                 attribution_files,
-                test_listing=["apps/api.Tests/Ticket1Tests.cs", "apps/api.Tests/OrphanTests.cs"],
+                test_listing=["apps/api.Tests/Ticket1Tests.cs", "apps/api.Tests/OrphanTests.cs", "apps/api.Tests/RetiredTests.cs"],
             ),
             "t", {}, chat_provider="claude",
         )
@@ -1317,6 +1331,10 @@ async def _demo_ticket_scoping() -> None:
         assert "apps/api.Tests/Ticket1Tests.cs" not in orphans, (
             "ticket #1's own correctly-named, already-shipped test must not be misreported as "
             f"unattributed just because it falls outside ticket #2's own scope: {orphans}"
+        )
+        assert "apps/api.Tests/RetiredTests.cs" not in orphans, (
+            "a test correctly naming a now-RETIRED AC must not be misreported as unattributed "
+            f"(Task 10 sweep item #10): {orphans}"
         )
         assert orphans == {"apps/api.Tests/OrphanTests.cs": 1}, (
             f"a genuinely unattributed test (names no real AC id at all) must still be caught -- "

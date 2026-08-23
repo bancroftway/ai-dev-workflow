@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 _COMMIT_AUTHOR_NAME = "ai-dev-workflow"
 _COMMIT_AUTHOR_EMAIL = "ai-dev-workflow@users.noreply.github.com"
+# Duplicated as literals in agent/sandbox-image/entrypoint.sh's own COMMIT_AUTHOR_NAME/EMAIL (its
+# scaffold-mode initial commit) -- two different runtimes (Python here, bash there), not worth new
+# env-var plumbing for a value that never changes (Task 3, Task 10 sweep item #4). If this value
+# ever needs to change, change it in both places.
 
 # Per-thread push credentials + outcome, agent-memory only (never a container env var -- the
 # clone token is deliberately destroyed after clone, see entrypoint.sh). The token re-arrives on

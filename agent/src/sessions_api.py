@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 import httpx
+import pyodbc
 from pydantic import BaseModel
 
 from . import (
@@ -832,7 +833,23 @@ async def connect_project_route(body: ConnectProjectRequest, request: Request) -
             body.repo, tech_stack_id=None, tech_stack_text=None, created_by=body.created_by
         )
     )
-    await project_store.set_project_repo(project_id, body.owner, body.repo, default_branch)
+    try:
+        await project_store.set_project_repo(project_id, body.owner, body.repo, default_branch)
+    except pyodbc.IntegrityError:
+        # Task 10 sweep item #12 -- a pre-existing, narrow TOCTOU race (confirmed to actually
+        # occur, not just theoretical: task-10-report.md reproduces it against the real DB). Two
+        # concurrent FIRST-TIME connects to the exact same never-before-seen (owner, repo) can both
+        # pass the `existing is None` check above and both reach this UPDATE -- the loser collides
+        # on UX_projects_owner_repo's own unique index. The DB-level safety property this index
+        # exists for always held (never two rows survive), but without this catch the loser's own
+        # request surfaced as a raw, unhandled 500 instead of resolving to the same project the
+        # winner got. A fresh find_project_by_repo lookup now finds the winner's just-committed
+        # row; if it somehow still can't (a different integrity error entirely), re-raise rather
+        # than fabricate a false idempotency win.
+        winner = await project_store.find_project_by_repo(body.owner, body.repo)
+        if winner is None:
+            raise
+        return ProjectResponse(**winner)
     row = await project_store.get_project(project_id)
     return ProjectResponse(**row)
 
@@ -950,6 +967,58 @@ def _demo() -> None:
     assert calls == ["fetch_default_branch"], (
         f"create_project must never run before a successful fetch -- orphan-row bug reintroduced, calls={calls}"
     )
+
+    # Task 10 sweep item #12: the TOCTOU race between the `existing is None` check and this same
+    # route's own set_project_repo UPDATE, reproduced empirically against the real DB in
+    # task-10-report.md (two concurrent first-time connects to the same never-seen (owner, repo)
+    # both passed `existing is None`, and the loser's set_project_repo hit
+    # UX_projects_owner_repo's real unique-index violation as a raw, unhandled pyodbc.
+    # IntegrityError). This pins the fix offline: set_project_repo raises that same exception type
+    # once (simulating "the other concurrent caller already won"), and a second
+    # find_project_by_repo call (the retry lookup) now finds the winner's row -- the route must
+    # return THAT project gracefully, not propagate the exception.
+    winner_row = {"project_id": "33333333-3333-3333-3333-333333333333", "name": "racey-repo",
+                  "owner": "octocat", "repo": "racey-repo", "tech_stack_id": None, "tech_stack_text": None,
+                  "created_by": "someone-else", "created_at": datetime(2026, 1, 1), "updated_at": datetime(2026, 1, 1),
+                  "default_branch": "main"}
+    find_calls = 0
+
+    async def fake_find_first_none_then_winner(owner: str, repo: str) -> dict[str, Any] | None:
+        nonlocal find_calls
+        find_calls += 1
+        return None if find_calls == 1 else winner_row
+
+    async def fake_create_project_ok(*args: Any, **kwargs: Any) -> str:
+        return "loser-project-id-never-returned"
+
+    async def fake_fetch_ok(*args: Any, **kwargs: Any) -> str | None:
+        return "main"
+
+    async def fake_set_project_repo_loses_race(*args: Any, **kwargs: Any) -> None:
+        raise pyodbc.IntegrityError(
+            "23000", "Cannot insert duplicate key row ... 'UX_projects_owner_repo' ... (2601)"
+        )
+
+    original_find2 = project_store.find_project_by_repo
+    original_create2 = project_store.create_project
+    original_set_repo = project_store.set_project_repo
+    original_fetch2 = _fetch_default_branch
+    project_store.find_project_by_repo = fake_find_first_none_then_winner  # type: ignore[assignment]
+    project_store.create_project = fake_create_project_ok  # type: ignore[assignment]
+    project_store.set_project_repo = fake_set_project_repo_loses_race  # type: ignore[assignment]
+    _fetch_default_branch = fake_fetch_ok
+    try:
+        body = ConnectProjectRequest(owner="octocat", repo="racey-repo", created_by="octocat", github_token="tok123")
+        result = asyncio.run(connect_project_route(body, _FakeRequest()))  # type: ignore[arg-type]
+        assert result.project_id == winner_row["project_id"], (
+            f"a lost race must resolve to the WINNER's project_id, got {result.project_id!r}"
+        )
+    finally:
+        project_store.find_project_by_repo = original_find2  # type: ignore[assignment]
+        project_store.create_project = original_create2  # type: ignore[assignment]
+        project_store.set_project_repo = original_set_repo  # type: ignore[assignment]
+        _fetch_default_branch = original_fetch2
+    assert find_calls == 2, f"expected exactly one retry lookup after losing the race, find_calls={find_calls}"
 
     print("sessions_api self-check: all assertions passed")
 

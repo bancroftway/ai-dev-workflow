@@ -336,6 +336,18 @@ def sync_ledger(
             # Cascade: see this function's own docstring -- ac_coverage_gate only looks at an
             # AC's own status, never its parent's, so an orphaned "active" AC under a retired
             # story would still be treated as required coverage.
+            #
+            # Safe by construction, not just in practice (Task 10 sweep item #5 -- recording the
+            # proof here so a future reader doesn't have to re-derive it): this loop only runs for
+            # a us_id that is NOT in touched_ids (the `if us_id in touched_ids: ... continue` guard
+            # above already ruled out "revised AND retired in the same draft" for the story
+            # itself). Revising one of THIS story's own ACs via existing_ac_id requires nesting
+            # that AC inside a draft story block whose own existing_us_id resolves to this same
+            # us_id -- which would add us_id to touched_ids and hit that same guard. So a story
+            # reaching this cascade can never have one of its children simultaneously revised by
+            # this same draft; any child already sitting in "revised" got there from an earlier
+            # run, and flipping it to "retired" now is exactly the cascade this function's
+            # docstring documents, not a live contradiction.
             for child in updated:
                 if (
                     child.get("kind") == "acceptance_criterion"

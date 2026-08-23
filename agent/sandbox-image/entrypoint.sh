@@ -38,7 +38,10 @@ set -euo pipefail
 WORKSPACE_DIR="/workspace/repo"
 
 # Matches git_ops.py's _COMMIT_AUTHOR_NAME/_COMMIT_AUTHOR_EMAIL -- the scaffold path's initial
-# commit (below) shows the same author as every other commit this pipeline ever makes.
+# commit (below) shows the same author as every other commit this pipeline ever makes. Duplicated
+# as literals on purpose (Task 3, Task 10 sweep item #4): two different runtimes, not worth new
+# env-var plumbing for a value that never changes. If this value ever needs to change, change it
+# in both places -- agent/src/git_ops.py is the other one.
 COMMIT_AUTHOR_NAME="ai-dev-workflow"
 COMMIT_AUTHOR_EMAIL="ai-dev-workflow@users.noreply.github.com"
 

@@ -33,6 +33,7 @@ type SubmitState =
  * provision_session just scaffolded, since neither is echoed back by the calls that trigger them. */
 async function fetchProject(projectId: string): Promise<ProjectSummary | null> {
   const res = await fetch("/api/projects");
+  if (!res.ok) throw new Error(`Failed to load projects (${res.status})`);
   const data = (await res.json()) as ProjectListResponse;
   return data.projects.find((p) => p.project_id === projectId) ?? null;
 }
@@ -310,7 +311,14 @@ export default function NewTicketPage() {
         </label>
 
         <div className="flex flex-col gap-1">
-          <span className="text-sm font-medium text-neutral-700">Description</span>
+          {/* A plain <div>, not a <label> wrapping the whole multi-control editor (Task 10 sweep
+              item #16): AttachmentEditor nests its own buttons (mode toggle, attach, remove), and
+              a <label> wrapping several unrelated interactive elements risks the browser's default
+              click-forwards-to-labeled-control behavior firing on the wrong one. The explicit
+              htmlFor/id pair below restores the programmatic association without that risk. */}
+          <label htmlFor="new-ticket-description" className="text-sm font-medium text-neutral-700">
+            Description
+          </label>
           <AttachmentEditor
             value={description}
             onChange={setDescription}
@@ -319,6 +327,7 @@ export default function NewTicketPage() {
             placeholder="Describe what you want built. You can refine this further once the session opens. Paste or drag screenshots in."
             minHeightClassName="min-h-[160px]"
             uploadError={uploadError}
+            textareaId="new-ticket-description"
           />
         </div>
 

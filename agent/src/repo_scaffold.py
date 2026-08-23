@@ -51,11 +51,19 @@ async def create_repo(
         "X-GitHub-Api-Version": "2022-11-28",
     }
     payload = {"name": slug, "private": True}
-    if client is None:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+    try:
+        if client is None:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post("https://api.github.com/user/repos", headers=headers, json=payload)
+        else:
             resp = await client.post("https://api.github.com/user/repos", headers=headers, json=payload)
-    else:
-        resp = await client.post("https://api.github.com/user/repos", headers=headers, json=payload)
+    except httpx.HTTPError as exc:
+        # Task 10 sweep item #3: match git_ops.py's open_pull_request/delete_remote_branch, which
+        # both catch this same exception around their own httpx call -- a network-level failure
+        # (DNS, timeout, connection reset) now raises this module's own RuntimeError convention
+        # too, not a raw httpx.* type the one real caller (sessions_api.provision_session) happens
+        # to catch broadly today but shouldn't have to rely on.
+        raise RuntimeError(f"create_repo failed for {slug!r}: request error: {exc}") from exc
 
     if resp.status_code != 201:
         raise RuntimeError(f"create_repo failed for {slug!r}: {resp.status_code} {resp.text[:300]}")
@@ -128,6 +136,22 @@ def _demo() -> None:
         assert "422" in str(exc) and "name already exists" in str(exc), str(exc)
     finally:
         asyncio.run(mock_client_422.aclose())
+
+    # --- a transport-level failure raises this module's own RuntimeError, not a raw httpx.* type
+    # (Task 10 sweep item #3) ------------------------------------------------------------------
+    def handle_network_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated DNS/connection failure", request=request)
+
+    mock_client_neterr = httpx.AsyncClient(transport=httpx.MockTransport(handle_network_error))
+    try:
+        asyncio.run(create_repo("whatever", "tok123", client=mock_client_neterr))
+        raise AssertionError("create_repo must raise on a transport-level failure too")
+    except RuntimeError as exc:
+        assert "request error" in str(exc), str(exc)
+    except httpx.HTTPError:
+        raise AssertionError("create_repo leaked a raw httpx.HTTPError instead of its own RuntimeError")
+    finally:
+        asyncio.run(mock_client_neterr.aclose())
 
     print("repo_scaffold self-check: all assertions passed")
 
