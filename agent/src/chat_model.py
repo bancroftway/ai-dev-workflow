@@ -139,12 +139,20 @@ def _get_provider_sync() -> str:
 
     Reads the same shared cache get_provider() populates -- a sync caller benefits from whatever an
     async caller already fetched, within the same TTL window -- but on a cold/expired cache it
-    never itself hits the DB; it falls back straight to the env var, the same default
-    get_provider() itself falls back to. Net effect: a sync-only call path can go up to
-    _PROVIDER_CACHE_TTL_SECONDS longer than an async one before it first observes an admin's
-    DB-saved provider change in a fresh process. That is an explicit, bounded trade-off, not an
-    oversight -- the alternative is blocking a sync function on network I/O it cannot safely
-    perform, or risking the RuntimeError above.
+    never itself hits the DB, and never writes _provider_cache either; it only ever falls back
+    straight to the env var, the same default get_provider() itself falls back to. Net effect: the
+    staleness bound here is NOT a fixed _PROVIDER_CACHE_TTL_SECONDS -- it is self-correcting rather
+    than time-bounded. A sync-only call path can lag an admin's DB-saved provider change for as
+    long as it takes until the NEXT time any async-dispatched function in this module
+    (get_provider(), close_session(), close_thread_session(), read_skill_invocations(), or
+    get_runtime_auth_token()) actually runs and warms the shared cache -- if none of those ever
+    run in a given process, this function never once consults the DB, no matter how much time
+    passes. In practice that window is normally short (a real graph run's own lifecycle calls
+    close_session/close_thread_session, and Task 5 is expected to wire get_runtime_auth_token()
+    early in session provisioning), but that is a fact about this codebase's call patterns, not a
+    guarantee this function itself enforces. This is an explicit trade-off, not an oversight -- the
+    alternative is blocking a sync function on network I/O it cannot safely perform, or risking the
+    RuntimeError above.
     """
     cached = _cached_provider_if_fresh()
     if cached is not None:
