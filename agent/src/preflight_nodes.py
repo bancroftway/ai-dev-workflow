@@ -110,6 +110,7 @@ async def _generate_session_title(thread_id: str, raw_requirements_text: str, ru
             thread_id,
             "session-title",
             "draft",
+            provider=provider,
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("session-title", "draft", provider),
             sandbox=sandbox_registry.get(thread_id),
@@ -288,7 +289,7 @@ async def scaffold_finalize_node(state: "GraphState", config: RunnableConfig) ->
     # brownfield LLM chain instead of serializing behind it (repo_scan_baseline_node awaits it).
     # Guarded on baseline absence -- a returning thread must never be re-measured.
     if await repo_files.read_repo_file(provider, thread_id, repo_scan.BASELINE_PATH) is None:
-        repo_scan.start_background_scan(thread_id, provider)
+        repo_scan.start_background_scan(thread_id, provider, chat_provider=state["provider"])
     return {}
 
 
@@ -449,6 +450,7 @@ async def _extract_tech_stack(thread_id: str, markdown: str, provider: SandboxPr
         thread_id,
         "tech-stack",
         "extract",
+        provider=chat_provider,
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("tech-stack", "extract", chat_provider),
         sandbox=sandbox_registry.get(thread_id),

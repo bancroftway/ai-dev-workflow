@@ -699,10 +699,14 @@ def _with_timeout(command: str, timeout_seconds: int | None) -> str:
 
 
 async def _run_coverage_via_ghcp(
-    provider: SandboxProvider, thread_id: str
+    provider: SandboxProvider, thread_id: str, *, chat_provider: str
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
     """Acquisition half: one GHCP session finds every test root, runs it with coverage, and
     reports where the report files landed; THIS function parses those files and does the math.
+
+    `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
+    keyword-only, no default -- threaded straight through to stack_runner.run_and_report below,
+    which now requires it itself; not resolved in here.
 
     Replaces three deleted code paths that all guessed commands in Python (a canned `dotnet test`
     at the repo root -> MSB1003 on every greenfield monorepo; a canned image-baked vitest
@@ -723,6 +727,7 @@ async def _run_coverage_via_ghcp(
         stage_key="coverage-run",
         prompt_name="coverage_run",
         schema=CoverageRunReport,
+        provider=chat_provider,
         failure_detail=(
             "No prior automatic attempt: determine how to run this repository's tests with "
             "coverage from scratch."
@@ -823,10 +828,14 @@ async def _check_exclusion_gaming(provider: SandboxProvider, thread_id: str) -> 
 
 
 async def measure_coverage(
-    provider: SandboxProvider, thread_id: str, *, timeout_seconds: int | None = None
+    provider: SandboxProvider, thread_id: str, *, chat_provider: str, timeout_seconds: int | None = None
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
     """Acquisition half of `verify_coverage`: a GHCP session runs the tests with coverage and
     reports its artifacts, which THIS module parses (see `_run_coverage_via_ghcp`).
+
+    `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
+    keyword-only, no default -- threaded straight through to `_run_coverage_via_ghcp`; not
+    resolved in here.
 
     Returns (line_rate, branch_rate, gaps, reason, entry_reports) with line_rate=None on any
     failure -- NEVER a fabricated 0, the same rule the gate's callers already depend on. `reason`
@@ -856,7 +865,7 @@ async def measure_coverage(
         logger.info("repo_scan coverage: reusing measurement for unchanged tree")
         return cached[1]
 
-    result = await _run_coverage_via_ghcp(provider, thread_id)
+    result = await _run_coverage_via_ghcp(provider, thread_id, chat_provider=chat_provider)
     if result[0] is not None:
         _COVERAGE_MEMO[thread_id] = (memo_key, result)
     return result
@@ -934,8 +943,13 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
 
 
 async def verify_coverage(
-    thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, provider: SandboxProvider
+    thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
+    chat_provider: str,
 ) -> "VerificationResult":
+    """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
+    through to measure_coverage below, which needs it for its own stack_runner.run_and_report
+    call -- named distinctly from `provider` (the pre-existing SandboxProvider connection object)
+    to avoid colliding with it."""
     from ..graph import VerificationResult
     from .write_scope_gate import _is_pipeline_owned, _is_test_path
 
@@ -1002,7 +1016,7 @@ async def verify_coverage(
             report={"infra_error": "integration_fidelity"},
         )
 
-    line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id)
+    line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id, chat_provider=chat_provider)
 
     if line_rate is None:
         # Infra failure, not a coverage gap: the coverage run itself never produced a readable

@@ -198,7 +198,7 @@ async def run(args: argparse.Namespace) -> int:
                 stream_input = Command(resume=True)
     finally:
         try:
-            await chat_model.close_thread_session(thread_id)
+            await chat_model.close_thread_session(thread_id, provider=active_provider)
         except Exception:  # noqa: BLE001 -- teardown must not mask the run outcome
             logger.warning("close_thread_session failed", exc_info=True)
         if args.discard_sandbox:

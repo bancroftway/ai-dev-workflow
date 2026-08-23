@@ -33,7 +33,6 @@ from typing import TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from . import chat_model
 from . import model_config, repo_files
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .prompt_loader import load_prompt_pair, render_prompt
@@ -82,11 +81,21 @@ async def run_and_report(
     stage_key: str,
     prompt_name: str,
     schema: type[ReportT],
+    provider: str,
     available_tools: list[str] | None = None,
     model_name: str | None = None,
     **render_values: str,
 ) -> ReportT:
     """Run one coding-agent session that does real work in the sandbox and reports through `schema`.
+
+    `provider` is required, keyword-only, no default (Ruling 4,
+    docs/superpowers/plans/part-4-org-settings-tasks.md): this run's own pinned `state["provider"]`,
+    threaded in by every caller. This function has no `state` of its own -- it is a helper every one
+    of its callers is itself a graph node (or a hook that received `state` directly) that calls
+    into -- so it cannot resolve the provider itself; get_chat_model_for_thread's own required
+    `provider` argument (Ruling 4) means it has to come from somewhere, and reading get_provider()
+    fresh in here instead would silently let a run drift onto a live setting change mid-run, exactly
+    the bug Ruling 4 exists to close everywhere else in this module.
 
     Always returns a report -- never raises for model misbehavior. If the session ends without a
     valid report (or there is no sandbox at all), a success=False report is synthesized so the
@@ -103,17 +112,11 @@ async def run_and_report(
         )
 
     try:
-        # run_and_report is a shared helper called from many different graph nodes across several
-        # modules -- it never receives `state` itself (threading state["provider"] through would
-        # mean changing StageSpec hook signatures used throughout graph.py, well beyond this
-        # call's own fix), so this is the one site in this task that reads the live setting via
-        # get_provider() rather than a pinned state["provider"] -- bounded by the same TTL cache
-        # get_chat_model_for_thread's own internal dispatch already relies on below.
-        provider = await chat_model.get_provider()
         model = get_chat_model_for_thread(
             thread_id,
             stage_key,
             "draft",
+            provider=provider,
             model_name=model_name or model_config.get_model_name(stage_key, "draft", provider) or model_config.get_model_name("stack-run", "draft", provider),
             sandbox=sandbox,
             agent_mode="autopilot",

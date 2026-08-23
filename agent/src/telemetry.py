@@ -119,10 +119,24 @@ def traced_node(
                 # a pure dict pop for both providers now, nothing here awaits a disconnect() (no
                 # such thing exists) -- but staying sync keeps this handler simple and correct
                 # even if the exception itself is a dead/reaped sandbox.
+                #
+                # forget_thread_sessions now requires an explicit `provider` (Ruling 4). This
+                # wrapper wraps EVERY node, intake included (build_graph's _TracedStateGraph), so
+                # `state` here is not always guaranteed to already carry a pinned "provider" --
+                # specifically, an exception raised inside intake_node itself, on a thread's very
+                # first-ever intake, fires this handler against a `state` that never got the
+                # chance to have "provider" written into it. `state.get("provider") or await
+                # get_provider()` is intake_node's own bridge idiom for exactly this situation
+                # (GraphState.provider's own docstring), reused here rather than a bare
+                # `state["provider"]` that would KeyError in that one narrow case and mask the
+                # real exception this handler exists to report.
                 if thread_id:
-                    from .chat_model import forget_thread_sessions
+                    from .chat_model import forget_thread_sessions, get_provider
 
-                    forget_thread_sessions(thread_id)
+                    provider = state.get("provider") if isinstance(state, dict) else None
+                    if provider is None:
+                        provider = await get_provider()
+                    forget_thread_sessions(thread_id, provider=provider)
                 raise
 
     wrapper.__name__ = getattr(fn, "__name__", name)

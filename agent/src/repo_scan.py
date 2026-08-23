@@ -1981,11 +1981,14 @@ def _extract_db_version(version_output: str) -> str | None:
 _BACKGROUND_SCANS: dict[str, "asyncio.Task[Any]"] = {}
 
 
-def start_background_scan(thread_id: str, provider: Any) -> None:
+def start_background_scan(thread_id: str, provider: Any, *, chat_provider: str) -> None:
+    """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required, no
+    default -- threaded straight through to the background task's own _scan_with_coverage call;
+    not resolved in here."""
     if thread_id in _BACKGROUND_SCANS:
         return
     _BACKGROUND_SCANS[thread_id] = asyncio.create_task(
-        _scan_with_coverage(provider, thread_id, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS)
+        _scan_with_coverage(provider, thread_id, chat_provider=chat_provider, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS)
     )
 
 
@@ -2024,12 +2027,18 @@ def pop_background_scan(thread_id: str) -> "asyncio.Task[Any] | None":
 
 
 async def _scan_with_coverage(
-    provider: Any, thread_id: str, *, timeout_seconds: int | None = None
+    provider: Any, thread_id: str, *, chat_provider: str, timeout_seconds: int | None = None
 ) -> tuple["ScanReport", dict[str, Any]]:
     """The baseline scan and coverage measurement, run concurrently within a single task so
     both finish before `repo_scan_baseline_node` awaits it -- the report is NOT written to
     BASELINE_PATH here, deliberately: the node writes it once, after merging coverage in, so the
     committed file and the streamed summary never disagree about whether coverage is present.
+
+    `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
+    keyword-only, no default -- threaded straight through to measure_coverage; not resolved in
+    here. Callers include a fire-and-forget background task (start_background_scan) started from
+    scaffold_finalize_node, so this value is captured at task-creation time, same as every other
+    argument a background task closes over.
 
     The coverage half is independently guarded: it runs during the tech-stack/brownfield LLM-overlap
     window, where a sandbox hiccup (e.g. exec_in_sandbox raising) is more likely than usual. Losing
@@ -2041,7 +2050,7 @@ async def _scan_with_coverage(
     # Scanners and the coverage test run touch disjoint outputs -- run them concurrently.
     async def _guarded_coverage() -> tuple[Any, Any, Any, str, Any]:
         try:
-            return await measure_coverage(provider, thread_id, timeout_seconds=timeout_seconds)
+            return await measure_coverage(provider, thread_id, chat_provider=chat_provider, timeout_seconds=timeout_seconds)
         except Exception:  # noqa: BLE001 -- the scan must not be lost over a coverage crash
             logger.warning("repo_scan: coverage measurement crashed; keeping the completed scan", exc_info=True)
             return None, None, [], "runner_error", []
@@ -2139,11 +2148,11 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
         except Exception:  # noqa: BLE001 -- background failure falls back to a fresh inline run
             logger.warning("background repo scan failed; re-running inline", exc_info=True)
             report, coverage = await _scan_with_coverage(
-                provider, thread_id, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
+                provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
             )
     else:
         report, coverage = await _scan_with_coverage(
-            provider, thread_id, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
+            provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
         )
     report = replace(report, metrics={**report.metrics, "coverage": coverage})
     dashboard = report.to_dashboard_dict()

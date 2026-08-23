@@ -190,7 +190,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 # the new container.
                 from ..chat_model import forget_thread_sessions
 
-                forget_thread_sessions(session_id)
+                forget_thread_sessions(session_id, provider=provider)
 
             name = _container_group_name(session_id)
             # Inert now -- nothing listens on a port for either provider (Copilot's TCP/JSON-RPC
@@ -365,7 +365,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
             sandbox = self._sandboxes.pop(session_id, None)
         # The reaper routes through here too; without this pop the registry.get() guards across
         # the pipeline kept seeing a phantom session after an idle reap.
-        registry.pop(session_id)
+        await registry.pop(session_id)
         if sandbox is None:
             return
         logger.info("Terminating ACI sandbox session_id=%s container_group=%s", session_id, sandbox.container_name)

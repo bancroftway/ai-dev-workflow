@@ -779,6 +779,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         stage_key="e2e-run",
         prompt_name="e2e_run",
         schema=AppLaunchReport,
+        provider=state["provider"],
         requested_port=str(requested_port),  # render_prompt substitutes strings only
     )
     if launch.success and launch.start_command:
@@ -1126,6 +1127,7 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         thread_id,
         "e2e",
         f"fix-{state.get('run_id', 'run')}-{e2e.get('attempt', 0) + 1}",
+        provider=state["provider"],
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("e2e", "draft", state["provider"]) or model_config.get_model_name("minimal-code-to-green", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),

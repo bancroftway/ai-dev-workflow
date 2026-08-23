@@ -168,8 +168,11 @@ if __name__ == "__main__":
 
 
 async def verify_plan_diagrams(
-    thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, provider: SandboxProvider
+    thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
+    _chat_provider: str,
 ) -> "VerificationResult":
+    # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: rendering a
+    # mermaid diagram has no chat-model dispatch call of its own.
     from ..graph import VerificationResult  # local import: graph.py imports this module
 
     if not content_dict:

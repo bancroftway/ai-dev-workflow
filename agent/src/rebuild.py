@@ -81,11 +81,14 @@ def red_gate_verdict(outcomes: dict[str, str]) -> tuple[bool, list[str], int]:
     return (not passed and failed > 0), passed, failed
 
 
-async def _verify_all_red(thread_id: str) -> tuple[bool, str]:
+async def _verify_all_red(thread_id: str, chat_provider: str) -> tuple[bool, str]:
     """Deterministic TDD-red gate: run the suite, parse the runners' own structured reports, and
     require zero passing tests (and at least one failing). The scaffold fix node is INSTRUCTED to
     keep tests failing at runtime; this is the check that stops an over-implemented scaffold --
-    an accidental green here means a test that will never have its "watch it fail" moment."""
+    an accidental green here means a test that will never have its "watch it fail" moment.
+
+    `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
+    through to stack_runner.run_and_report below, which now requires it itself."""
     from .gates.ac_coverage_gate import AcTestRunReport  # local: avoids import at module load
 
     provider = get_sandbox_provider()
@@ -95,6 +98,7 @@ async def _verify_all_red(thread_id: str) -> tuple[bool, str]:
         stage_key="red-gate",
         prompt_name="ac_test_run",
         schema=AcTestRunReport,
+        provider=chat_provider,
         output_path=_RED_GATE_OUTPUT_PATH,
     )
     outcomes: dict[str, str] = {}
@@ -159,6 +163,7 @@ def make_rebuild_node(spec: RebuildSpec):
             stage_key="rebuild",
             prompt_name="rebuild_verify",
             schema=BuildVerifyReport,
+            provider=state["provider"],
             addendum=spec.fix_prompt_addendum or "",
         )
         build_ok = report.success and report.ok
@@ -176,7 +181,7 @@ def make_rebuild_node(spec: RebuildSpec):
         # wreckage as a stable regression.
         mctg_status = ((state.get("stages") or {}).get("minimal-code-to-green") or {}).get("status")
         if build_ok and spec.fix_scope == "scaffold_only" and mctg_status != "approved":
-            red_ok, red_detail = await _verify_all_red(thread_id)
+            red_ok, red_detail = await _verify_all_red(thread_id, state["provider"])
             if not red_ok:
                 build_ok = False
                 red_failed = True
@@ -256,6 +261,7 @@ def make_fix_node(spec: RebuildSpec):
             thread_id,
             f"rebuild-{spec.key}",
             "draft",
+            provider=state["provider"],
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("rebuild", "draft", state["provider"]) or model_config.get_model_name("plan", "draft", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),

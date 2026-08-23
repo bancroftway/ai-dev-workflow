@@ -46,12 +46,24 @@ class SkillCheckOutcome:
     verified: bool  # False when the log could not be read at all (fail-open path)
 
 
-async def invoked_skills(provider: SandboxProvider, thread_id: str, stage: str, role: str = "draft") -> list[str] | None:
-    """Skill names this stage's own session invoked, or None if unverifiable."""
-    session_id = get_session_id(thread_id, stage, role)
+async def invoked_skills(
+    provider: SandboxProvider, thread_id: str, stage: str, role: str = "draft", *, chat_provider: str
+) -> list[str] | None:
+    """Skill names this stage's own session invoked, or None if unverifiable.
+
+    `chat_provider` (required, keyword-only, no default -- Ruling 4,
+    docs/superpowers/plans/part-4-org-settings-tasks.md) is this THREAD's own pinned
+    "claude"/"copilot" provider, threaded in from the caller -- not resolved in here, and not to be
+    confused with `provider` above (the pre-existing SandboxProvider connection object). Required
+    because get_session_id/read_skill_invocations dispatch on it now: this function is not itself a
+    graph node, but it operates on one specific thread's session, which has its own pinned
+    provider, so it is not exempt from threading that value through just because it isn't a graph
+    node (this was a real gap in this plan's own first draft, corrected as part of Ruling 4).
+    """
+    session_id = get_session_id(thread_id, stage, role, provider=chat_provider)
     if not session_id:
         return None
-    return await read_skill_invocations(provider, thread_id, session_id)
+    return await read_skill_invocations(provider, thread_id, session_id, active_provider=chat_provider)
 
 
 # Roles whose sessions count towards a stage's required skills. A stage runs a DRAFT session and,
@@ -65,9 +77,12 @@ _ROLES_CHECKED = ("draft", "audit")
 
 
 async def check_required_skills(
-    provider: SandboxProvider, thread_id: str, stage: str, roles: tuple[str, ...] = _ROLES_CHECKED
+    provider: SandboxProvider, thread_id: str, stage: str, roles: tuple[str, ...] = _ROLES_CHECKED, *, chat_provider: str
 ) -> SkillCheckOutcome:
     """Union of every checked role's `skill.invoked` events for this stage.
+
+    `chat_provider` (required, keyword-only, no default -- Ruling 4): this thread's own pinned
+    provider, threaded straight through to invoked_skills -- see that function's own docstring.
 
     `verified` stays False only when NO role produced a readable log: one absent session (a stage
     with no audit pass) alongside one readable session is a complete answer, not an unverifiable one.
@@ -79,7 +94,7 @@ async def check_required_skills(
     invoked: list[str] = []
     any_readable = False
     for role in roles:
-        role_skills = await invoked_skills(provider, thread_id, stage, role)
+        role_skills = await invoked_skills(provider, thread_id, stage, role, chat_provider=chat_provider)
         if role_skills is None:
             continue
         any_readable = True
@@ -107,13 +122,16 @@ async def check_required_skills(
 
 
 async def skills_record(
-    provider: SandboxProvider, thread_id: str, stage: str, self_reported: list[str] | None = None
+    provider: SandboxProvider, thread_id: str, stage: str, self_reported: list[str] | None = None, *, chat_provider: str
 ) -> dict[str, Any]:
     """The stage's skill evidence, for persistence into state.json -- on the PASS path too.
 
     Previously only failures stored anything (the pass path returned early), so a healthy run left no
     trace that any skill had been used and `grep skill_gate` on a green log returned nothing. That is
     the whole reason "we force GHCP to report skills" looked unimplemented.
+
+    `chat_provider` (required, keyword-only, no default -- Ruling 4): this thread's own pinned
+    provider, threaded straight through to invoked_skills -- see that function's own docstring.
 
     `unsubstantiated` is the interesting field: a skill the model CLAIMED but never invoked. The event
     log cannot be forged, so a non-empty list here is a fabrication signal of exactly the kind that
@@ -124,7 +142,7 @@ async def skills_record(
     invoked: list[str] = []
     any_readable = False
     for role in _ROLES_CHECKED:
-        role_skills = await invoked_skills(provider, thread_id, stage, role)
+        role_skills = await invoked_skills(provider, thread_id, stage, role, chat_provider=chat_provider)
         if role_skills is None:
             continue
         any_readable = True

@@ -68,8 +68,11 @@ def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
 
 
 async def verify_adversarial_compliance(
-    _thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, _provider: Any
+    _thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, _provider: Any,
+    _chat_provider: str,
 ) -> "VerificationResult":
+    # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: this check has
+    # no chat-model dispatch call of its own.
     from ..graph import VerificationResult
 
     passed, reasons = evaluate_audit(content_dict)

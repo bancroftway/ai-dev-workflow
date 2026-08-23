@@ -200,12 +200,18 @@ async def check_write_scope(
 
 
 async def verify_ac_to_tests(
-    thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: SandboxProvider
+    thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: SandboxProvider,
+    chat_provider: str,
 ) -> "VerificationResult":
     """Combines the write-scope check above with the AC-coverage check (ac_coverage_gate.py) into
     one VerificationResult, since both answer the same question -- "is P4's output acceptable" --
     not two independently useful checks. Imported lazily to avoid a module-load-time cycle with
-    graph.py (which imports this module)."""
+    graph.py (which imports this module).
+
+    `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
+    through to check_ac_coverage below, which needs it for its own stack_runner.run_and_report
+    call -- named distinctly from `provider` (the pre-existing SandboxProvider connection object)
+    to avoid colliding with it."""
     from ..graph import VerificationResult
     from .ac_coverage_gate import check_ac_coverage
 
@@ -290,7 +296,7 @@ async def verify_ac_to_tests(
             report={"changed_paths": write_scope.changed_paths, "missing_e2e": True},
         )
 
-    coverage = await check_ac_coverage(provider, thread_id, content_dict)
+    coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
     if write_scope.reverted_paths:
         report["reverted_out_of_scope_paths"] = write_scope.reverted_paths

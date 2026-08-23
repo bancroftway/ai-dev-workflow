@@ -237,7 +237,7 @@ async def terminate_session(thread_id: str, request: Request) -> ProvisionRespon
     await provider.terminate(thread_id)
     # Explicit close discards the persistent workspace too (idle reaps deliberately keep it).
     await provider.discard_workspace(thread_id)
-    registry.pop(thread_id)
+    await registry.pop(thread_id)
     keyvault.pop_app_secrets(thread_id)
     return ProvisionResponse(status="terminated")
 
@@ -271,7 +271,7 @@ async def delete_session_full(thread_id: str, body: DeleteSessionRequest, reques
     provider = get_sandbox_provider()
     await provider.terminate(thread_id)
     await provider.discard_workspace(thread_id)
-    registry.pop(thread_id)
+    await registry.pop(thread_id)
     keyvault.pop_app_secrets(thread_id)
 
     branch_deleted = False

@@ -102,6 +102,7 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
         stage_key="test-hardening-run",
         prompt_name="test_hardening_run",
         schema=TestCommandReport,
+        provider=state["provider"],
         attempt_token=_ATTEMPT_TOKEN,
     )
     if not discovery.success or not discovery.command or _ATTEMPT_TOKEN not in discovery.result_path:
@@ -190,6 +191,7 @@ async def test_hardening_fix_node(state: dict[str, Any], config: RunnableConfig)
         thread_id,
         "test-hardening",
         f"fix-{state.get('run_id', 'run')}-{test_hardening.get('fix_attempt', 0) + 1}",
+        provider=state["provider"],
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("e2e", "draft", state["provider"]) or model_config.get_model_name("minimal-code-to-green", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
@@ -242,6 +244,7 @@ async def test_hardening_flake_triage_node(state: dict[str, Any], config: Runnab
         thread_id,
         "test-hardening-flake-triage",
         "draft",
+        provider=state["provider"],
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("test-hardening-flake-triage", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),

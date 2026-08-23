@@ -491,6 +491,7 @@ async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConf
         thread_id,
         "metrics-report",
         "draft",
+        provider=state["provider"],
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("metrics-report", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),

@@ -327,7 +327,8 @@ def _diff_ledger(prior: list[dict[str, Any]] | None, current: list[dict[str, Any
 
 
 async def verify_exit_readiness(
-    thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any
+    thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any,
+    _chat_provider: str,
 ) -> Any:
     """EXIT_SPEC's deterministic_verify: completes the manifest (greenfield re-record + commands --
     only exit has the complete picture, code exists and coverage-commands.json is final), then
@@ -335,7 +336,10 @@ async def verify_exit_readiness(
     metrics regression gate's recorded reasons, a UI app with zero e2e screenshots, or a manifest
     still missing apps/test_command/coverage_commands. Always returns passed=True with the draft
     mutated in place -- an LLM redraft can't fix a code regression or a missing screenshot; the
-    downgrade IS the outcome (the no-sandbox cannot_verify path is handled by make_verify_node)."""
+    downgrade IS the outcome (the no-sandbox cannot_verify path is handled by make_verify_node).
+
+    `_chat_provider` (StageSpec.deterministic_verify's Ruling-4 addition) is unused: this check has
+    no chat-model dispatch call of its own."""
     from . import app_discovery  # local: app_discovery imports nothing from exit_nodes, but keep the surface flat
     from .gates.ac_coverage_gate import resolve_test_command
     from .gates.test_coverage_gate import COVERAGE_COMMANDS_PATH
@@ -616,7 +620,7 @@ async def exit_finalize_node(
     # until the sandbox idle-reaper eventually took the container down.
     # Deliberately NOT done on the needs_clarification -> END path: there the user is about to
     # answer the model's own question, and that stage's conversation continuity is wanted.
-    await chat_model.close_thread_session(thread_id)
+    await chat_model.close_thread_session(thread_id, provider=state["provider"])
 
 
 def _demo() -> None:

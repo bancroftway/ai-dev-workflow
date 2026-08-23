@@ -567,14 +567,16 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
 
 
 async def _verify_specification_ledger(
-    thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider
+    thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
+    _chat_provider: str,
 ) -> VerificationResult:
     """StageSpec.deterministic_verify for the specification stage: resolves/validates every User
     Story's and Acceptance Criterion's id against spec_ledger.LEDGER_PATH (spec_ledger.py's real
     logic -- this is just the SandboxProvider-I/O wrapper) and persists the ledger on success.
 
     content_dict is stage["draft"] (the just-audited, revised Specification, mutated in place by
-    sync_ledger to carry ledger-resolved ids).
+    sync_ledger to carry ledger-resolved ids). `_chat_provider` is unused -- a pure ledger sync has
+    no dispatch call of its own (StageSpec.deterministic_verify's own docstring).
     """
     entries = await spec_ledger.load_ledger(provider, thread_id)
     user_stories = content_dict.get("user_stories") or []
@@ -865,16 +867,25 @@ class StageSpec:
     on every single run, including pure no-op re-runs."""
 
     deterministic_verify: (
-        Callable[[str, dict[str, Any], str, str | None, SandboxProvider], Awaitable[VerificationResult]] | None
+        Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str], Awaitable[VerificationResult]] | None
     ) = None
     """A routing-capable check (thread_id, revised content dict, run_id, baseline_commit,
-    provider) -> VerificationResult, inserted between audit and gate when set. baseline_commit is
-    the value StageSpec.capture_baseline_commit stored on this stage's StageState (None if that
-    flag is unset) -- write_scope_gate.py's write-scope check is the reason this exists; ledger-
-    /diagram-style checks that don't need it just ignore the argument. Never LLM self-attestation
-    -- a real script/parse. Failing routes back to draft (with VerificationResult.feedback as
-    context) up to max_verify_cycles, then to a human-interrupt escalation node -- never
-    auto-approved past a failed deterministic gate."""
+    provider, chat_provider) -> VerificationResult, inserted between audit and gate when set.
+    baseline_commit is the value StageSpec.capture_baseline_commit stored on this stage's
+    StageState (None if that flag is unset) -- write_scope_gate.py's write-scope check is the
+    reason this exists; ledger-/diagram-style checks that don't need it just ignore the argument.
+    `chat_provider` (added by Ruling 4/Task 5 fix round 2, docs/superpowers/plans/
+    part-4-org-settings-tasks.md) is this run's own pinned `state["provider"]` ("claude"/"copilot"),
+    threaded through because two real implementations (write_scope_gate.verify_ac_to_tests,
+    test_coverage_gate.verify_coverage) call into stack_runner.run_and_report, which now requires
+    it (Ruling 4) -- named distinctly from `provider` (the pre-existing SandboxProvider connection
+    object every implementation already takes) to avoid colliding with it, same disambiguation
+    chat_model.read_skill_invocations uses. Every OTHER implementation (ledger sync, diagram
+    render, remediation, adversarial-compliance, exit readiness) has no dispatch call of its own
+    and simply accepts-and-ignores this argument, the same way they already ignore baseline_commit
+    when it isn't relevant. Never LLM self-attestation -- a real script/parse. Failing routes back
+    to draft (with VerificationResult.feedback as context) up to max_verify_cycles, then to a
+    human-interrupt escalation node -- never auto-approved past a failed deterministic gate."""
 
     max_verify_cycles: int = 3
     """Safety cap for the verify->draft retry loop, independent of max_cycles (the LLM's own
@@ -1529,6 +1540,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             thread_id,
             stage_spec.key,
             "draft",
+            provider=state["provider"],
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "draft", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
@@ -1629,6 +1641,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 thread_id,
                 stage_spec.key,
                 self_reported=getattr(response, "skills_invoked", None),
+                chat_provider=state["provider"],
             )
 
         stages[stage_spec.key] = stage
@@ -1671,6 +1684,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             thread_id,
             stage_spec.key,
             "audit",
+            provider=state["provider"],
             github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "audit", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
@@ -1855,7 +1869,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         # skipped it produced work that only LOOKS finished, and no content check can see that.
         # Verified from the session's own skill.invoked events, never the model's self-report;
         # fails open when the log is unreadable (see gates/skill_gate.py).
-        skill_check = await skill_gate.check_required_skills(provider, thread_id, stage_spec.key)
+        skill_check = await skill_gate.check_required_skills(provider, thread_id, stage_spec.key, chat_provider=state["provider"])
         if not skill_check.passed:
             stage["last_verification"] = {
                 "passed": False,
@@ -1874,11 +1888,12 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             # branch returns early, so it needs its own reset -- putting it only below meant three
             # identical `invoked: []` turns with no restart between them (observed live at
             # metrics-exit, which then exhausted its budget and failed an otherwise-complete run).
-            await close_session(thread_id, stage_spec.key, "draft")
+            await close_session(thread_id, stage_spec.key, "draft", provider=state["provider"])
             return {"stages": stages}
 
         result = await stage_spec.deterministic_verify(
-            thread_id, stage["draft"], state.get("run_id", "unknown"), stage.get("baseline_commit"), provider
+            thread_id, stage["draft"], state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
+            state["provider"],
         )
         stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
         if not result.passed:
@@ -1936,7 +1951,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                         stage_spec.key, stage["verify_stall_count"],
                         signals.feedback_similar, signals.paths_unchanged, signals.coverage_not_improving,
                     )
-                await close_session(thread_id, stage_spec.key, "draft")
+                await close_session(thread_id, stage_spec.key, "draft", provider=state["provider"])
                 stage["verify_stall_count"] = 0
                 # A reset session starts fresh either way; the coverage high-water mark is about
                 # detecting non-improvement, not about the session's memory, so it is NOT cleared
@@ -2021,6 +2036,7 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             thread_id,
             stage_spec.key,
             "fix",
+            provider=state["provider"],
             github_token=os.environ.get("GITHUB_TOKEN"),
             # The `fix` role is declared in model_config precisely so this write-capable pass can be
             # tiered separately from the read-only audit it serves; falls back to the stage's draft
@@ -2085,7 +2101,7 @@ def make_draft_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, Run
         await _persist_if_sandboxed(
             thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} escalated -- draft infra exhausted",
         )
-        await close_thread_session(thread_id)
+        await close_thread_session(thread_id, provider=state["provider"])
         return {"stages": stages, "run_failure": payload}
 
     return draft_escalate_node
@@ -2134,7 +2150,7 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
         # escalated deterministic gate ENDs the run, and recovery is fix-out-of-band + resubmit,
         # which re-enters at intake and rebuilds whatever sessions it needs. Nothing downstream
         # reads these, so release them rather than leaving ~20 to ride until the idle reaper.
-        await close_thread_session(thread_id)
+        await close_thread_session(thread_id, provider=state["provider"])
         return {"stages": stages, "run_failure": payload}
 
     return escalate_node

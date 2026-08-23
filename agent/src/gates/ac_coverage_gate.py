@@ -620,7 +620,12 @@ class AcCoverageOutcome:
     report: dict[str, Any]
 
 
-async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_dict: dict[str, Any]) -> AcCoverageOutcome:
+async def check_ac_coverage(
+    provider: SandboxProvider, thread_id: str, content_dict: dict[str, Any], *, chat_provider: str
+) -> AcCoverageOutcome:
+    """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
+    keyword-only, no default -- threaded straight through to stack_runner.run_and_report below,
+    which now requires it itself; not resolved in here."""
     raw_ledger = await repo_files.read_repo_file(provider, thread_id, LEDGER_PATH)
     active_ac_ids: list[str] = []
     if raw_ledger is not None:
@@ -650,6 +655,7 @@ async def check_ac_coverage(provider: SandboxProvider, thread_id: str, content_d
         stage_key="ac-test-run",
         prompt_name="ac_test_run",
         schema=AcTestRunReport,
+        provider=chat_provider,
         output_path=AC_TEST_OUTPUT_PATH,
     )
     output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)

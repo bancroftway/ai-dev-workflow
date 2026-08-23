@@ -206,7 +206,7 @@ class LocalDockerProvider(SandboxProvider):
                 # never existed in the new container.
                 from ..chat_model import forget_thread_sessions
 
-                forget_thread_sessions(session_id)
+                forget_thread_sessions(session_id, provider=provider)
 
             # A container that survived an agent restart is reattached, not destroyed -- the old
             # path unconditionally `rm -f`'d it, throwing away the clone and every unpushed
@@ -405,7 +405,7 @@ class LocalDockerProvider(SandboxProvider):
             sandbox = self._sandboxes.pop(session_id, None)
         # The reaper routes through here too; without this pop the ~40 registry.get() guards
         # across the pipeline kept seeing a phantom session after an idle reap.
-        registry.pop(session_id)
+        await registry.pop(session_id)
         if sandbox is None:
             return
         logger.info("Terminating sandbox session_id=%s container=%s", session_id, sandbox.container_id[:12])
