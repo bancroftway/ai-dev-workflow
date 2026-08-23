@@ -224,6 +224,43 @@ was Part 3's call to make and it already made it. Cost if wrong: if the Board's 
 proves too slow, upgrading it to subscribe to the same per-run custom events this Part adds is a
 small, additive follow-up — nothing here forecloses it.
 
+## Ruling 10 — added 2026-08-23, during Task 3: `run_id` must be threaded through the chat-model
+## dispatcher before Tasks 8/9 can query captured events by run
+
+Task 3 (Copilot JSONL capture) found that `_agenerate_inner` has no access to the graph's real
+per-run `run_id` — only `graph.py`'s own node functions do, via `state["run_id"]`/`config`. It
+shipped every intermediate `RunEvent` with `run_id="unknown"`, correctly flagged as a deliberate,
+out-of-scope deviation rather than silently shipped. Left as-is, this is load-bearing: Tasks 8/9
+need `run_event_store.list_events(run_id)` to actually retrieve a specific run's events, and every
+Copilot tool-call event would collide under the literal string `"unknown"`, unqueryable by run.
+
+**Ruling: this is a shared-root-cause fix, not a per-provider one** — `chat_model.py`'s dispatcher
+(`get_chat_model_for_thread`) constructs both `ClaudeChatModel` and `CopilotChatModel` instances,
+and Task 4 (Claude's own mid-turn granularity work, next in sequence) would hit the identical wall
+if it ends up needing per-event `run_id` too. Fixing it once, now, in a small dedicated task
+(**Task 3b**) before Task 4 starts avoids Task 4 either rediscovering the same constraint blind or
+inventing an inconsistent second solution. Task 3b's implementer decides the exact mechanism (a
+constructor/instance attribute set by the dispatcher at chat-model-construction time is the most
+likely shape, mirroring however `thread_id`/`stage`/`role` already reach `self` today — verify
+against the real dispatcher code rather than assuming) — this plan does not pre-design the fix.
+Cost if wrong: contained to the dispatcher and the two provider modules' own constructors; Task
+3b's own review is the gate before Tasks 4/8/9 build on top of it.
+
+## Task 3b: thread a real `run_id` through the chat-model dispatcher (Ruling 10)
+
+Find where `chat_model.get_chat_model_for_thread` (or whatever the real dispatcher function is
+named — confirm against the actual code) constructs a provider chat-model instance for a given
+turn, and where its caller (in `graph.py`, at the same draft/audit/verify sites Tasks 1/2 already
+touch) has the real `run_id` available. Thread it through so both `claude_chat_model.py` and
+`copilot_chat_model.py` can read a real `self.run_id` (or equivalent) instead of Copilot's current
+hardcoded `"unknown"` — update `copilot_chat_model.py`'s Task-3 call site to use the real value.
+Claude's `_agenerate_inner` doesn't yet build any `RunEvent`s of its own (that's Task 4's job,
+still pending) so there's nothing to update there yet beyond making the real value reachable if
+Task 4 needs it. Self-check: extend `chat_model.py`'s own dispatcher self-check (or add one) to
+assert the constructed instance actually carries the real `run_id`, not a placeholder; extend
+`copilot_chat_model.py`'s existing translator self-check to assert `run_id` is no longer the
+literal string `"unknown"` when a real value is supplied by the caller.
+
 ## Global Constraints (apply to every task)
 
 - **Never build a view against mocked/fabricated event data.** Every frontend task must be
