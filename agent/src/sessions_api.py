@@ -158,8 +158,36 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             # session_store.create_session for a repo that was never actually created.
             logger.exception("repo scaffolding failed for project_id=%s", body.project_id)
             raise HTTPException(status_code=502, detail=f"repo scaffolding failed: {exc}") from None
-        await project_store.set_project_repo(body.project_id, scaffolded["owner"], scaffolded["repo"])
         owner, repo = scaffolded["owner"], scaffolded["repo"]
+        # The GitHub repo now genuinely exists -- losing this write would wedge the project
+        # (owner/repo stay NULL forever, and every retry re-hits create_repo with the identical
+        # slug, which GitHub now 422s as a collision). One retry covers the realistic case (a
+        # transient DB blip immediately after a successful network call), not a sustained outage;
+        # no GitHub-side reconciliation (searching for/re-linking an already-created repo) is
+        # built here -- deliberately out of scope, a human resolves the rare double-failure below.
+        try:
+            await project_store.set_project_repo(body.project_id, owner, repo)
+        except Exception:  # noqa: BLE001 -- one bounded retry, then a clean 502 with recovery detail
+            logger.exception(
+                "set_project_repo failed for project_id=%s (owner=%s repo=%s) -- retrying once",
+                body.project_id, owner, repo,
+            )
+            try:
+                await project_store.set_project_repo(body.project_id, owner, repo)
+            except Exception as exc:
+                logger.exception(
+                    "set_project_repo failed again for project_id=%s (owner=%s repo=%s) -- giving up",
+                    body.project_id, owner, repo,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"scaffolded GitHub repo {owner}/{repo} for project {body.project_id} but "
+                        "failed to record it after a retry -- a human needs to either delete "
+                        f"https://github.com/{owner}/{repo} or run project_store.set_project_repo "
+                        "manually"
+                    ),
+                ) from None
     else:
         owner, repo = body.owner, body.repo
 
