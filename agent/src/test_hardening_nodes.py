@@ -23,7 +23,6 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
-from . import chat_model
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, run_failure, spec_ledger, stack_runner, test_results
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
@@ -192,7 +191,7 @@ async def test_hardening_fix_node(state: dict[str, Any], config: RunnableConfig)
         "test-hardening",
         f"fix-{state.get('run_id', 'run')}-{test_hardening.get('fix_attempt', 0) + 1}",
         github_token=os.environ.get("GITHUB_TOKEN"),
-        model_name=model_config.get_model_name("e2e", "draft", chat_model.PROVIDER) or model_config.get_model_name("minimal-code-to-green", "draft", chat_model.PROVIDER),
+        model_name=model_config.get_model_name("e2e", "draft", state["provider"]) or model_config.get_model_name("minimal-code-to-green", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
         agent_mode="autopilot",
     )
@@ -244,7 +243,7 @@ async def test_hardening_flake_triage_node(state: dict[str, Any], config: Runnab
         "test-hardening-flake-triage",
         "draft",
         github_token=os.environ.get("GITHUB_TOKEN"),
-        model_name=model_config.get_model_name("test-hardening-flake-triage", "draft", chat_model.PROVIDER),
+        model_name=model_config.get_model_name("test-hardening-flake-triage", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )

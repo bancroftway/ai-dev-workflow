@@ -103,11 +103,18 @@ async def run_and_report(
         )
 
     try:
+        # run_and_report is a shared helper called from many different graph nodes across several
+        # modules -- it never receives `state` itself (threading state["provider"] through would
+        # mean changing StageSpec hook signatures used throughout graph.py, well beyond this
+        # call's own fix), so this is the one site in this task that reads the live setting via
+        # get_provider() rather than a pinned state["provider"] -- bounded by the same TTL cache
+        # get_chat_model_for_thread's own internal dispatch already relies on below.
+        provider = await chat_model.get_provider()
         model = get_chat_model_for_thread(
             thread_id,
             stage_key,
             "draft",
-            model_name=model_name or model_config.get_model_name(stage_key, "draft", chat_model.PROVIDER) or model_config.get_model_name("stack-run", "draft", chat_model.PROVIDER),
+            model_name=model_name or model_config.get_model_name(stage_key, "draft", provider) or model_config.get_model_name("stack-run", "draft", provider),
             sandbox=sandbox,
             agent_mode="autopilot",
             available_tools=available_tools,

@@ -169,8 +169,12 @@ class LocalDockerProvider(SandboxProvider):
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
         # a module-scope import here would cycle. Needed only to pick which of
         # COPILOT_GITHUB_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
-        # (wait_for_cli_ready) no longer branches on this.
-        from ..chat_model import PROVIDER
+        # (wait_for_cli_ready) no longer branches on this. Provisioning a new session is exactly
+        # the moment a live setting change should take effect (Ruling 2), so this reads the live
+        # setting fresh rather than a pinned state["provider"] -- there is no GraphState this deep.
+        from ..chat_model import get_provider
+
+        provider = await get_provider()
 
         async with self._lock:
             container_name = f"{_CONTAINER_NAME_PREFIX}{session_id}"
@@ -292,11 +296,11 @@ class LocalDockerProvider(SandboxProvider):
                     # Task 3 fully retired that process, and this line is the one place that never
                     # got updated to match.
                     "-e",
-                    f"COPILOT_GITHUB_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
+                    f"COPILOT_GITHUB_TOKEN={runtime_auth_token if provider == 'copilot' else ''}",
                     "-e",
-                    f"ANTHROPIC_API_KEY={runtime_auth_token if PROVIDER == 'claude' else ''}",
+                    f"ANTHROPIC_API_KEY={runtime_auth_token if provider == 'claude' else ''}",
                     "-e",
-                    f"AGENT_PROVIDER={PROVIDER}",
+                    f"AGENT_PROVIDER={provider}",
                     # Stamped into bootstrap.sh's toolchain report, so a "this repo needed a toolchain
                     # the image lacks" finding is attributable to a specific image rather than to the
                     # fleet in general.
@@ -318,7 +322,7 @@ class LocalDockerProvider(SandboxProvider):
                             "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd
                         )
 
-                    await wait_for_cli_ready(_exec, version_command=f"{PROVIDER} --version")
+                    await wait_for_cli_ready(_exec, version_command=f"{provider} --version")
                     last_exc = None
                     break
                 except Exception as exc:
@@ -378,11 +382,14 @@ class LocalDockerProvider(SandboxProvider):
             return await _run_docker("exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd)
 
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
-        # a module-scope import here would cycle.
-        from ..chat_model import PROVIDER
+        # a module-scope import here would cycle. Reattaching is part of provision()'s own flow
+        # (its only caller), so this reads the live setting fresh, same as provision() itself.
+        from ..chat_model import get_provider
+
+        provider = await get_provider()
 
         try:
-            await wait_for_cli_ready(_exec, version_command=f"{PROVIDER} --version")
+            await wait_for_cli_ready(_exec, version_command=f"{provider} --version")
         except Exception:  # noqa: BLE001 -- liveness probe; any failure means "don't reattach"
             return None
         return _RunningSandbox(container_id, 0, "")

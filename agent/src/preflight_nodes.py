@@ -22,7 +22,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
-from . import chat_model
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader, workflow_persistence
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
@@ -92,11 +91,15 @@ def _session_title(raw_requirements_text: str, run_id: str) -> str:
     return f"(untitled run {run_id})"
 
 
-async def _generate_session_title(thread_id: str, raw_requirements_text: str, run_id: str) -> str:
+async def _generate_session_title(thread_id: str, raw_requirements_text: str, run_id: str, provider: str) -> str:
     """LLM-generated session title, shown in the session-list UI -- same get_chat_model_for_thread
     / ainvoke_structured mechanism every draft node already uses (GitHub Copilot-backed), no
     separate LLM integration. Falls back to _session_title's first-line heuristic on empty input
-    or any failure -- title generation must never block scaffold."""
+    or any failure -- title generation must never block scaffold.
+
+    `provider` is threaded in from scaffold_node's own `state["provider"]` (this thread's pinned
+    org provider) rather than read here, since this helper has no `state` of its own -- same
+    per-run pinning every other model_config.get_model_name call site relies on (Ruling 2)."""
     text = (raw_requirements_text or "").strip()
     if not text:
         return _session_title(raw_requirements_text, run_id)
@@ -108,7 +111,7 @@ async def _generate_session_title(thread_id: str, raw_requirements_text: str, ru
             "session-title",
             "draft",
             github_token=os.environ.get("GITHUB_TOKEN"),
-            model_name=model_config.get_model_name("session-title", "draft", chat_model.PROVIDER),
+            model_name=model_config.get_model_name("session-title", "draft", provider),
             sandbox=sandbox_registry.get(thread_id),
         )
         response = await ainvoke_structured(
@@ -211,7 +214,7 @@ async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str
     await session_store.touch_run(
         thread_id,
         run_id=run_id,
-        title=await _generate_session_title(thread_id, raw_requirements_text, run_id),
+        title=await _generate_session_title(thread_id, raw_requirements_text, run_id, state["provider"]),
     )
 
     # Captured before anything else is written, so app_discovery's reject path can put the tree
@@ -432,17 +435,22 @@ async def prefill_tech_stack_from_repo_file(
 _TECH_STACK_EXTRACT_PROMPT = load_prompt("tech_stack_extract")
 
 
-async def _extract_tech_stack(thread_id: str, markdown: str, provider: SandboxProvider) -> dict[str, Any]:
+async def _extract_tech_stack(thread_id: str, markdown: str, provider: SandboxProvider, chat_provider: str) -> dict[str, Any]:
     """One-shot structured extraction of the TechStack schema from already-human-approved
     markdown -- no repo exploration, no clarification loop, distinct "extract" role so this never
     shares (and clobbers) the draft session's own cached conversation (get_chat_model_for_thread's
-    session cache is keyed by (thread_id, stage, role))."""
+    session cache is keyed by (thread_id, stage, role)).
+
+    `chat_provider` (this thread's pinned org provider, "claude"/"copilot") is threaded in from
+    resolve_tech_stack_submission's own `state["provider"]` -- named distinctly from `provider`
+    (the pre-existing SandboxProvider connection object this function already took) to avoid
+    colliding with it, same disambiguation chat_model.read_skill_invocations uses."""
     model = get_chat_model_for_thread(
         thread_id,
         "tech-stack",
         "extract",
         github_token=os.environ.get("GITHUB_TOKEN"),
-        model_name=model_config.get_model_name("tech-stack", "extract", chat_model.PROVIDER),
+        model_name=model_config.get_model_name("tech-stack", "extract", chat_provider),
         sandbox=sandbox_registry.get(thread_id),
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
@@ -488,7 +496,7 @@ async def resolve_tech_stack_submission(
     await git_ops.commit_paths(provider, thread_id, [TECH_STACK_MD_PATH], "ai-dev-workflow: tech stack saved")
 
     try:
-        tech_stack = await _extract_tech_stack(thread_id, markdown, provider)
+        tech_stack = await _extract_tech_stack(thread_id, markdown, provider, state["provider"])
     except Exception:
         logger.exception(
             "tech-stack extraction failed for thread_id=%s; approving with a bare summary instead "

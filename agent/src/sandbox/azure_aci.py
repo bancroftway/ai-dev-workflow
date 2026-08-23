@@ -155,8 +155,12 @@ class AzureContainerInstanceProvider(SandboxProvider):
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
         # a module-scope import here would cycle. Needed only to pick which of
         # COPILOT_GITHUB_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
-        # (wait_for_cli_ready) no longer branches on this.
-        from ..chat_model import PROVIDER
+        # (wait_for_cli_ready) no longer branches on this. Provisioning a new session is exactly
+        # the moment a live setting change should take effect (Ruling 2), so this reads the live
+        # setting fresh rather than a pinned state["provider"] -- there is no GraphState this deep.
+        from ..chat_model import get_provider
+
+        provider = await get_provider()
 
         async with self._lock:
             existing = self._sandboxes.get(session_id)
@@ -212,7 +216,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 "--environment-variables",
                 f"REPO_BRANCH={branch}",
                 f"WORK_BRANCH={work_branch}",
-                f"AGENT_PROVIDER={PROVIDER}",
+                f"AGENT_PROVIDER={provider}",
                 f"AIDW_IMAGE_REF={image or self._sandbox_image}",
                 "--secure-environment-variables",
                 f"REPO_CLONE_URL={repo_clone_url}",
@@ -238,8 +242,8 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 # `copilot --server` process (see copilot_chat_model.py's module docstring) --
                 # Task 3 fully retired that process, and this line is the one place that never got
                 # updated to match (mirrors local_docker.py's identical fix).
-                f"COPILOT_GITHUB_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
-                f"ANTHROPIC_API_KEY={runtime_auth_token if PROVIDER == 'claude' else ''}",
+                f"COPILOT_GITHUB_TOKEN={runtime_auth_token if provider == 'copilot' else ''}",
+                f"ANTHROPIC_API_KEY={runtime_auth_token if provider == 'claude' else ''}",
             ]
             if self._location:
                 args += ["--location", self._location]
@@ -305,7 +309,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                             "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {cmd}\"",
                         )
 
-                    await wait_for_cli_ready(_exec, version_command=f"{PROVIDER} --version")
+                    await wait_for_cli_ready(_exec, version_command=f"{provider} --version")
                     last_exc = None
                     break
                 except Exception as exc:

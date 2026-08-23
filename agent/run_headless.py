@@ -83,16 +83,18 @@ async def run(args: argparse.Namespace) -> int:
         return 2
 
     git_token = os.environ.get("E2E_GITHUB_TOKEN", "")
-    # The active provider's own secret -- an Anthropic API key or the shared Copilot PAT,
-    # whichever chat_model.PROVIDER currently selects (see sandbox/provider.py's provision()
-    # docstring for how the sandbox uses this).
-    runtime_auth_token = (
-        os.environ.get("ANTHROPIC_API_KEY", "")
-        if chat_model.PROVIDER == "claude"
-        else os.environ.get("GITHUB_TOKEN", "")
-    )
+    # The active provider's own secret -- an org admin's Settings-UI-saved vault credential if one
+    # is configured, else the same env-var fallback this used to compute by hand (see
+    # sandbox/provider.py's provision() docstring for how the sandbox uses this). This headless
+    # runner IS the provisioning moment (no server, no prior intake_node pinning it), so both
+    # reads go through chat_model's live resolution rather than a state["provider"] this process
+    # has not minted yet. Named `active_provider`, not `provider` -- this function later binds
+    # `provider` to the SandboxProvider connection object (below), and chat_model.py's own
+    # read_skill_invocations uses this exact same disambiguation for the identical collision.
+    active_provider = await chat_model.get_provider()
+    runtime_auth_token = await chat_model.get_runtime_auth_token()
     if not git_token or not runtime_auth_token:
-        token_env_var = "ANTHROPIC_API_KEY" if chat_model.PROVIDER == "claude" else "GITHUB_TOKEN"
+        token_env_var = "ANTHROPIC_API_KEY" if active_provider == "claude" else "GITHUB_TOKEN"
         logger.error("E2E_GITHUB_TOKEN and %s must both be set (root .env)", token_env_var)
         return 2
     if git_token.startswith("github_pat_"):

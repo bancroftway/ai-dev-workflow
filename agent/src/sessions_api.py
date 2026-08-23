@@ -116,14 +116,13 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     work_branch = branch_naming.work_branch_for(body.thread_id)
     provider = get_sandbox_provider()
     repo_clone_url = f"https://github.com/{body.owner}/{body.repo}.git"
-    # The active provider's own secret -- an Anthropic API key or the shared Copilot PAT,
-    # whichever chat_model.PROVIDER currently selects (see sandbox/provider.py's provision()
-    # docstring for how the sandbox uses this).
-    runtime_auth_token = (
-        os.environ.get("ANTHROPIC_API_KEY", "")
-        if chat_model.PROVIDER == "claude"
-        else os.environ.get("GITHUB_TOKEN", "")
-    )
+    # The active provider's own secret -- an org admin's Settings-UI-saved vault credential if one
+    # is configured, else the same env-var fallback this used to compute by hand (see
+    # sandbox/provider.py's provision() docstring for how the sandbox uses this). Provisioning a
+    # new session is exactly the moment a live setting change should take effect (Ruling 2), so
+    # this reads fresh via get_runtime_auth_token() rather than a pinned state["provider"] -- there
+    # is no GraphState here yet, this runs before intake_node ever does.
+    runtime_auth_token = await chat_model.get_runtime_auth_token()
     try:
         session = await provider.provision(
             session_id=body.thread_id,
