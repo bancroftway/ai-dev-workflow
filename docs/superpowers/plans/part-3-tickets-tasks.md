@@ -412,14 +412,39 @@ here too if `session_ready` is false — this is exactly the point the Spec's ow
 banner triggering from ("New Ticket's Assign button... whether or not it's also creating a
 project").
 
-## Task 5: Frontend — Connect a Repository
+## Task 5: Frontend — Connect a Repository (expanded 2026-08-23, after Task 4's own findings)
 
-New route/modal calling the new `POST /api/projects/connect` BFF route (thin proxy to
-`POST /projects/connect`, Task 2) with the chosen `owner`/`repo` (reusing whatever existing
-repo-listing UI `/select` already has for picking a GitHub repo — do not rebuild that picker).
-Ships without the pre-warm checkbox (Ruling 4) — connecting just creates the project row; the
-first ticket filed against it runs tech-stack/baseline detection exactly as any ticket on a
-brand-new project would.
+New route/modal calling `POST /api/projects/connect` (already built ahead of schedule by Task 4,
+per a dispatch imprecision on the controller's own part — reuse the existing file, do not
+recreate it) with the chosen `owner`/`repo` (reusing whatever existing repo-listing UI `/select`
+already has for picking a GitHub repo — do not rebuild that picker). Ships without the pre-warm
+checkbox (Ruling 4) — connecting just creates the project row; the first ticket filed against it
+runs tech-stack/baseline detection exactly as any ticket on a brand-new project would.
+
+**Two real gaps Task 4 found and correctly left for this task, both now mandatory scope:**
+
+- **`/select`'s own existing "start new session" flow provisions with no `project_id`** — broken
+  by Task 2's own backend change (the field became required), not by Task 4. This task is exactly
+  the one scoped to "repurpose `/select`'s own picker," so fixing this is this task's job, not a
+  separately-ledgered gap. Investigate the real current `/select` page and `SandboxSessionBoot.tsx`
+  before deciding the fix's exact shape, but the controller's own lean (not a mandate — confirm
+  against real routing/usage before committing): route `/select`'s existing "start new session"
+  action through the SAME connect-or-find-existing-project step this task is building (call
+  `POST /projects/connect` with the picked `owner`/`repo` to get a real `project_id` back, THEN
+  provision) rather than maintaining `/select` as a second, parallel path that has to stay in sync
+  with the New Ticket form forever. If investigation shows a cleaner resolution, use it — just
+  don't leave `/select` broken.
+- **New-ticket sessions hardcode branch `"main"`**, correct only for a freshly-scaffolded repo
+  (Task 3 always creates `main`) and wrong for a connected repo with a different real default
+  branch — `dbo.projects` has no column for it. Add one: a small migration
+  (`agent/db/migrations/0005_add_project_default_branch.sql`, next free number after `0004`) adding
+  `default_branch NVARCHAR(500) NULL` to `dbo.projects`. Populate it at connect time — GitHub's own
+  `GET /repos/{owner}/{repo}` response includes a `default_branch` field; fetch it (or extend
+  `POST /projects/connect`'s existing backend handler to fetch it) and pass it into
+  `project_store`'s connect path. Have the New Ticket form's provisioning call use
+  `project.default_branch` when set, falling back to `"main"` only when it's genuinely absent
+  (the scaffold case, or a pre-migration row) — replacing the hardcoded literal, not adding a
+  second, competing source of truth for it.
 
 ## Task 6: `sync_ledger` explicit-retirement fix + ticket-mode Speccing
 
