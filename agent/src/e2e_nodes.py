@@ -1312,9 +1312,9 @@ def _demo() -> None:
 
     # Port forcing is by ENV VAR, not a framework-specific flag -- PORT works across
     # Next/Nuxt/Vite/Express, ASPNETCORE_URLS across any ASP.NET Core host.
-    assert _with_port_env("npm run dev", 3100, "node") == "PORT=3100 npm run dev"
+    assert _with_port_env("npm run dev", 3100, "node") == "export PORT=3100; npm run dev"
     assert _with_port_env("dotnet run --project apps/api", 3101, "dotnet") == (
-        "ASPNETCORE_URLS=http://127.0.0.1:3101 dotnet run --project apps/api"
+        "export ASPNETCORE_URLS=http://127.0.0.1:3101; dotnet run --project apps/api"
     )
     # Port reservation: two picks in the same run must never collide, even though NOTHING is
     # listening yet at either call. This is the EADDRINUSE that made e2e pass or fail on timing.
