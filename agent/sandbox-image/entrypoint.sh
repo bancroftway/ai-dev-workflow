@@ -12,6 +12,14 @@
 #      are destroyed before anything repo-supplied can run. Skipped entirely when REPO_CLONE_URL
 #      is unset, so this image is also usable as a bare sandbox for exercising either CLI
 #      directly, without a target repo.
+#      SCAFFOLD_NEW_REPO=1 (set only by the new-project provisioning path, Part 3 plan Ruling 6 --
+#      never by ordinary Connect-Repository/`/select` flows) replaces the clone with `git init` +
+#      an initial README commit + push: REPO_CLONE_URL then names a repo repo_scaffold.create_repo
+#      just created empty on GitHub, so there is nothing to clone yet. Reuses this exact same
+#      credential for the push -- confirmed via sessions_api.py, not assumed: the one token
+#      (ProvisionRequest.github_token) is handed to both `git_user_token` (this container's
+#      clone/push credential, below) and git_ops.set_push_token (the agent host's own later-push
+#      credential), so it already carries whatever scope the user's GitHub grant has.
 #   2. exec `sleep infinity` so this process (still pid 1) simply holds the container open. Nothing
 #      long-lived runs in here for either provider: both Claude and Copilot are driven by a
 #      per-turn CLI exec from outside the container (agent/src/sandbox/provider.py's
@@ -28,6 +36,11 @@
 set -euo pipefail
 
 WORKSPACE_DIR="/workspace/repo"
+
+# Matches git_ops.py's _COMMIT_AUTHOR_NAME/_COMMIT_AUTHOR_EMAIL -- the scaffold path's initial
+# commit (below) shows the same author as every other commit this pipeline ever makes.
+COMMIT_AUTHOR_NAME="ai-dev-workflow"
+COMMIT_AUTHOR_EMAIL="ai-dev-workflow@users.noreply.github.com"
 
 # Local Docker provider delivers the clone credential as a pre-start file (never in Config.Env,
 # so `docker inspect` shows nothing); Azure ACI delivers it as a secure env var. Env wins when
@@ -83,9 +96,29 @@ EOF
   fi
 
   if [[ ! -d "$WORKSPACE_DIR/.git" ]]; then
-    echo "entrypoint: cloning ${REPO_CLONE_URL} (branch ${REPO_BRANCH}) into ${WORKSPACE_DIR}"
-    git -c credential.helper="$CRED_HELPER_SCRIPT" \
-      clone --branch "$REPO_BRANCH" --single-branch "$REPO_CLONE_URL" "$WORKSPACE_DIR"
+    if [[ "${SCAFFOLD_NEW_REPO:-0}" == "1" ]]; then
+      # New-project path: REPO_CLONE_URL is an empty repo repo_scaffold.create_repo just made on
+      # GitHub. `git init` + `symbolic-ref` (not `git init -b`/`checkout -b`, which vary by git
+      # version) names the unborn branch REPO_BRANCH before the first commit exists, so the
+      # commit below lands directly on it rather than on whatever init.defaultBranch happens to
+      # be. README.md's content means the first push is never empty -- an empty initial push
+      # would otherwise be rejected by branch-protection-style expectations elsewhere in this
+      # pipeline.
+      : "${PROJECT_NAME:?PROJECT_NAME is required when SCAFFOLD_NEW_REPO=1}"
+      echo "entrypoint: SCAFFOLD_NEW_REPO -- initializing ${WORKSPACE_DIR} and pushing the first commit to ${REPO_CLONE_URL}"
+      git init --quiet "$WORKSPACE_DIR"
+      git -C "$WORKSPACE_DIR" symbolic-ref HEAD "refs/heads/$REPO_BRANCH"
+      git -C "$WORKSPACE_DIR" remote add origin "$REPO_CLONE_URL"
+      printf '# %s\n' "$PROJECT_NAME" > "$WORKSPACE_DIR/README.md"
+      git -C "$WORKSPACE_DIR" add README.md
+      git -C "$WORKSPACE_DIR" -c user.name="$COMMIT_AUTHOR_NAME" -c user.email="$COMMIT_AUTHOR_EMAIL" \
+        commit --quiet -m "Initial commit"
+      git -C "$WORKSPACE_DIR" -c credential.helper="$CRED_HELPER_SCRIPT" push -u origin "$REPO_BRANCH"
+    else
+      echo "entrypoint: cloning ${REPO_CLONE_URL} (branch ${REPO_BRANCH}) into ${WORKSPACE_DIR}"
+      git -c credential.helper="$CRED_HELPER_SCRIPT" \
+        clone --branch "$REPO_BRANCH" --single-branch "$REPO_CLONE_URL" "$WORKSPACE_DIR"
+    fi
   fi
 
   # Work-branch setup. Must run BEFORE the credential material is destroyed below -- the
