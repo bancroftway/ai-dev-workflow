@@ -1,8 +1,9 @@
 This project already has an approved Implementation Plan baseline: `.ai-dev-workflow/04-plan.approved.json`
-already holds an earlier ticket's approved plan for this same project. The "immediately-prior draft"
-handed to you above (if present) is that baseline, not an abandoned attempt of your own -- read it
-as the project's existing architecture and frame this draft as EXTENDING it for this ticket's own
-Specification, not a from-scratch replacement of everything the project has ever planned.
+already holds an earlier ticket's approved plan for this same project. If this prompt also gives you
+an "immediately-prior draft," that IS the prior ticket's own approved plan, not an abandoned attempt
+of your own -- read it as the project's existing architecture and frame this draft as EXTENDING it
+for this ticket's own Specification, not a from-scratch replacement of everything the project has
+ever planned.
 
 You do not need to restate every existing Plan Step: reuse the exact same id and description for
 any step this ticket's Specification doesn't touch (including scaffolding/infrastructure work an

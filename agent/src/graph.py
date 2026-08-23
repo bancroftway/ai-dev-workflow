@@ -989,7 +989,11 @@ class StageSpec:
     signal is cheap to recompute every call and has no "must stay stable across this run's retry
     cycles" requirement (unlike capture_baseline_commit) to protect. None leaves the prompt exactly
     as it would be without this hook. Specification's ticket-mode segment
-    (spec_ledger.hydrate_ticket_mode_context) is the first and, as of this writing, only user."""
+    (spec_ledger.hydrate_ticket_mode_context) was the first user of this hook; plan
+    (hydrate_plan_ticket_mode_context) and ac-to-tests (spec_ledger.
+    hydrate_ac_to_tests_ticket_mode_context) have since added their own ticket-mode reframes on the
+    same shape -- named here rather than counted, since a count goes stale the next time a stage
+    adds one."""
 
     session_options: Callable[[GraphState, str], dict[str, Any]] | None = None
     """Extra kwargs (agent_mode/available_tools/excluded_tools/pre_tool_use_hook/mcp_servers) to
