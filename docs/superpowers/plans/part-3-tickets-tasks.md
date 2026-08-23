@@ -285,6 +285,68 @@ answering at all, belongs to whichever stage already owns whole-project regressi
 that already exists elsewhere; it only stops this gate from wrongly blocking on a fact (an older
 ticket's test is green) that was never wrong in the first place.
 
+## Ruling 8 — added 2026-08-23, after Task 7b's disclosure and the user's own decision: wire
+## Remediation's `known_gaps` into Metrics Exit's regression gate, and refresh the regression
+## baseline once a ticket completes
+
+Task 7b found, while investigating an unrelated hydrate check, that Remediation's own accepted
+`known_gaps` outcome (an honest "found this, can't fix it right now, here's why" — its own prompt
+explicitly calls this a valid result) has **zero effect** on Metrics Exit's `regression_reasons`
+gate: `metrics_nodes.regression_reasons` reads `gating_count` from a scan `summary()` that has
+never heard of `known_gaps`, so an accepted gap still counts as "still gating" and can permanently
+block a merge with no override — **on a project's very first ticket, no multi-ticket scoping
+involved.** A second, related defect in the same code: the regression baseline
+(`.ai-dev-workflow/repo-scan-baseline.json`) is written once, at true project inception, and
+`repo_scan_baseline_node`'s own docstring says re-baselining is "a manual act" — so once a project
+has run several tickets, a real regression from the CURRENT ticket can hide behind an
+still-net-positive trend against that ancient, never-refreshed baseline.
+
+Both were surfaced to the user rather than fixed autonomously (this is exactly the security-
+relevant policy class of decision the earlier Rulings in this Part were mechanical corrections,
+not policy calls, and explicitly did not touch). The user decided:
+
+- **A documented `known_gaps` entry is sufficient on its own to unblock Metrics Exit — no
+  additional human sign-off is required.** Remediation keeps its existing `requires_human_gate=
+  False` (auto-approve) behavior unchanged; nothing about Remediation's own gate needs to change.
+  Only Metrics Exit's own regression check needs to learn to read `known_gaps` and stop counting
+  an accounted-for finding as still gating.
+- **The regression baseline must refresh after every ticket.** Controller's own Ruling on the one
+  sub-question the user's answer didn't need to specify (a real default, not something worth
+  another question): refresh **only** when a ticket actually reaches `status == "completed"`
+  (a genuine, reviewed, merged outcome) — never on a `failed`/`rejected` run, which would bake a
+  possibly-broken state in as the next ticket's own "normal." This also means the existing
+  mid-ticket re-entry protection (`repo_scan_baseline_node`'s own idempotency, guarding against a
+  clarification round silently zeroing the delta) needs no change at all — nothing new writes the
+  baseline file until a ticket actually finishes, so within-ticket re-entry is exactly as safe as
+  it already is today.
+
+**Real code already confirmed, to ground Task 11 below, not guessed at:**
+- `known_gaps` is a `list[str]`, each entry shaped `"<finding_id>: <reason>"`. `accounted_for
+  (finding_id, known_gaps)` (`agent/src/gates/remediation_gate.py:57-68`) already correctly parses
+  and matches this format — reuse it, don't re-derive the matching logic.
+- `gating_count` is computed inside `repo_scan.py`'s `ScanReport.summary()` (lines ~1330-1363), by
+  counting findings where `is_gating(finding, severity_floor=..., introduced_ids=..., ...)` is
+  true. `is_gating` (~1290-1311) already takes an `introduced_ids: frozenset[str] | None` param
+  for an analogous purpose (excluding pre-existing findings from gating in some cases) — a new
+  `known_gap_ids: frozenset[str] | None` param, checked against whatever the real per-finding
+  stable-id attribute is called (confirm the exact `Finding` field — `finding_key` is used for the
+  existing `introduced_ids` check at line 1310, likely the same one `accounted_for` expects,
+  confirm rather than assume), is the natural extension of an already-existing pattern, not a new
+  mechanism.
+- `regression_reasons` (`agent/src/metrics_nodes.py:256-307`) is a pure function reading
+  `latest_summary.get("gating_count")` — fixing the count at its source (`summary()`) means this
+  function itself needs no signature change; only its caller (`metrics_nodes.py` ~390-425, the
+  node that builds `scan_report` and calls `regression_reasons`) needs to read the latest approved
+  Remediation content's `known_gaps` (via `workflow_persistence.REMEDIATION_APPROVED_PATH`, Task
+  7b) and pass the resulting `known_gap_ids` into wherever `summary()` gets called to build
+  `scan_report["summary"]` in the first place.
+- `repo_scan_baseline_node` (`agent/src/repo_scan.py:2091-...`) is the ONLY place that currently
+  writes `BASELINE_PATH`, and only when the file doesn't exist yet. The natural hook for "refresh
+  on completion" is wherever the exit stage transitions a session to `status == "completed"`
+  (`exit_finalize_node`, `agent/src/exit_nodes.py`) — write a fresh baseline there, from that same
+  run's own final `scan_report`, overwriting whatever was there before. Confirm the exact real
+  transition point before wiring anything; don't assume the function name/line without checking.
+
 ## Global Constraints (apply to every task)
 
 - **Every ticket runs the identical 8-stage `StageSpec` set, always** (`tech-stack`,
@@ -575,6 +637,59 @@ real conditions, not just unit-level self-checks. At minimum:
    warm cache, and still runs a real draft + a real, different-model audit on a cold one — for at
    least one stage besides Tech Stack, prove this against a real warm project, not by reading the
    code and asserting it should work.
+
+## Task 11: Wire `known_gaps` into Metrics Exit + refresh the regression baseline on completion
+## (Ruling 8 — added 2026-08-23, after the user's own decision)
+
+Two changes, same underlying machinery, dispatch together.
+
+**Part A — `known_gaps` exclusion.** Give `repo_scan.is_gating`/`ScanReport.summary()` a new
+`known_gap_ids: frozenset[str] | None = None` parameter, mirroring the shape of the existing
+`introduced_ids` parameter exactly (same file, same functions, ~lines 1290-1363) — confirm the
+real `Finding` attribute to match against (`finding_key` is used for `introduced_ids` at line
+~1310; confirm whether that is the same stable id `remediation_gate.accounted_for` expects, or a
+different one, before wiring anything). A finding whose id is in `known_gap_ids` never counts
+toward `gating_count`. Then, in whichever `metrics_nodes.py` function builds `scan_report` and
+calls `regression_reasons` (~lines 390-425): read the latest APPROVED Remediation content via
+`workflow_persistence.REMEDIATION_APPROVED_PATH` (Task 7b), pull its `known_gaps: list[str]`
+field, and derive `known_gap_ids` from it — reuse `gates/remediation_gate.accounted_for`'s own
+id-matching logic (or extract the id-parsing half of it into something both modules can call; your
+call which, don't duplicate the matching rule itself) rather than re-deriving how a `known_gaps`
+string maps to a finding id a second way. Pass the result into whatever now computes
+`scan_report["summary"]`. `regression_reasons` itself (the pure function, lines ~256-307) needs NO
+signature change — fixing `gating_count` at its source means every caller already inherits the
+fix, the same "fix once at the source" shape as Task 6 and Task 7c.
+
+**No human-gate change anywhere** — the user explicitly decided a documented `known_gaps` entry is
+sufficient on its own; Remediation's `requires_human_gate=False` stays exactly as it is.
+
+**Part B — baseline refresh on completion.** Find the real transition point where a session
+reaches `status == "completed"` (`exit_finalize_node`, `agent/src/exit_nodes.py` — confirm the
+real function/line, don't assume). At that point, write a fresh `repo_scan.BASELINE_PATH`
+(`.ai-dev-workflow/repo-scan-baseline.json`) from THAT SAME run's own final `scan_report` —
+overwriting whatever was there before. Do not touch `repo_scan_baseline_node`'s own idempotency
+check (its existing "don't re-baseline on a mid-ticket clarification re-entry" protection needs no
+change: nothing new writes the file until a ticket actually finishes, so a still-in-progress
+ticket's own re-entries are exactly as protected as they are today). Only a `failed`/`rejected`
+run must NOT refresh the baseline — confirm `exit_finalize_node`'s real branching handles both
+outcomes distinctly before wiring the write into the right branch only.
+
+**Verify both, empirically, not just by reading the code:**
+1. Reproduce Ruling 7's own sibling scenario for this bug: a fresh scan where an old,
+   already-known, `known_gaps`-covered finding reads as "passing/no-longer-present" — confirm
+   `regression_reasons` no longer blocks on it, while a genuinely NEW, uncovered gating finding
+   still correctly blocks.
+2. Reproduce the baseline-refresh scenario: simulate ticket #1 completing (baseline written from
+   its final state), then simulate ticket #2's own scan showing a real regression versus THAT
+   baseline — confirm it's caught. Separately confirm a `failed` run does NOT refresh the
+   baseline (the next ticket should still compare against the last genuinely completed state, not
+   a broken intermediate one).
+3. Confirm a mid-ticket clarification re-entry still does not touch the baseline file at all
+   (the existing protection `repo_scan_baseline_node` already has, untouched by this task).
+
+Do not build any regression-checking mechanism for a ticket's own changes against a PRIOR ticket's
+shipped work (explicitly out of scope per Ruling 7's own text — a different question, this task
+does not touch it).
 
 ## Non-goals (this pass)
 
