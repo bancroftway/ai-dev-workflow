@@ -78,9 +78,11 @@ class SandboxProvider(abc.ABC):
         (plan Section C.4's ordering guarantee). work_branch is this session's own unique git
         branch (agent/src/branch_naming.py, computed once at session creation and never
         recomputed here) -- passed straight through as the sandbox's WORK_BRANCH env var.
-        runtime_auth_token is the active provider's own secret -- the shared Copilot PAT
-        (agent/src/graph.py's GITHUB_TOKEN) or an Anthropic API key, whichever chat_model.PROVIDER
-        currently selects -- written into the sandbox as COPILOT_GITHUB_TOKEN or ANTHROPIC_API_KEY
+        runtime_auth_token is the active provider's own secret -- the shared Copilot PAT, an
+        Anthropic API key, or an admin's Settings-UI-saved credential (org_credential_vault.py,
+        Part 4) -- resolved by chat_model.get_runtime_auth_token() for whatever
+        chat_model.get_provider() currently selects -- written into the sandbox as
+        COPILOT_GITHUB_TOKEN or ANTHROPIC_API_KEY
         (never both real) for its own coding-agent CLI to authenticate with. (Was documented here
         as COPILOT_SDK_AUTH_TOKEN, the correct name only for the old, fully-retired SDK-based
         `copilot --server` process -- task-12-report.md BUG B / task-12b traced this docstring as

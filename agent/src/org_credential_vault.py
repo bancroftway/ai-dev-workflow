@@ -49,7 +49,10 @@ ORG_CREDENTIAL_SECRET_NAME = "org-provider-credential"
 
 
 def _vault_uri() -> str:
-    return os.environ["AZURE_ORG_VAULT_URI"]
+    uri = os.environ.get("AZURE_ORG_VAULT_URI")
+    if not uri:
+        raise VaultAccessError("AZURE_ORG_VAULT_URI is not configured")
+    return uri
 
 
 async def get_org_credential(secret_name: str) -> str:

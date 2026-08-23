@@ -53,11 +53,14 @@ def _load_config() -> dict[str, dict[str, dict[str, str | None]]]:
 
 
 def get_model_name(stage: Stage, role: Role, provider: str) -> str | None:
-    # provider is an explicit, required parameter rather than this module reading
-    # chat_model.PROVIDER itself: Part 4 (runtime-configurable provider) doesn't exist yet, and
-    # importing chat_model from here for one string would add an import-time dependency on a
-    # module that dispatches on the same env var, for no benefit -- every real call site just
-    # passes chat_model.PROVIDER along.
+    # provider is an explicit, required parameter rather than this module calling
+    # chat_model.get_provider() itself, for the same reason chat_model.py's own 7 dispatch
+    # functions take an explicit provider argument instead of resolving it themselves (Ruling 4,
+    # docs/superpowers/plans/part-4-org-settings-tasks.md): a stage's model choice must stay
+    # pinned to the run's own GraphState.provider for the run's whole lifetime, not drift mid-run
+    # if this function re-resolved the org's live setting instead of being told. Every real call
+    # site already has a pinned provider in hand (state["provider"], or chat_model.get_provider()
+    # called once by provisioning-time code with no state yet) and passes it straight through.
     stage_config = _load_config().get(stage, {}).get(provider, {})
     draft_model = stage_config.get("draft_model")
     if role in ("draft", "extract"):

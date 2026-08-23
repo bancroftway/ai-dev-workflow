@@ -115,28 +115,29 @@ def traced_node(
                 # GraphBubbleUp is excluded above on purpose -- that is a gate interrupt, where
                 # the stage's conversation continuity is exactly what we want to keep.
                 # The SYNC forget, not close_thread_session: we are inside an except about to
-                # re-raise. Not actually a blocking-call risk anymore -- forget_thread_sessions is
-                # a pure dict pop for both providers now, nothing here awaits a disconnect() (no
-                # such thing exists) -- but staying sync keeps this handler simple and correct
-                # even if the exception itself is a dead/reaped sandbox.
+                # re-raise. forget_thread_sessions_everywhere is a pure dict pop across both
+                # providers, nothing here awaits a disconnect() (no such thing exists) -- staying
+                # sync keeps this handler simple and correct even if the exception itself is a
+                # dead/reaped sandbox.
                 #
-                # forget_thread_sessions now requires an explicit `provider` (Ruling 4). This
-                # wrapper wraps EVERY node, intake included (build_graph's _TracedStateGraph), so
-                # `state` here is not always guaranteed to already carry a pinned "provider" --
-                # specifically, an exception raised inside intake_node itself, on a thread's very
-                # first-ever intake, fires this handler against a `state` that never got the
-                # chance to have "provider" written into it. `state.get("provider") or await
-                # get_provider()` is intake_node's own bridge idiom for exactly this situation
-                # (GraphState.provider's own docstring), reused here rather than a bare
-                # `state["provider"]` that would KeyError in that one narrow case and mask the
-                # real exception this handler exists to report.
+                # forget_thread_sessions_everywhere, not the single-provider forget_thread_sessions
+                # (Ruling 4): this wrapper wraps EVERY node, intake included, so `state` here is not
+                # always guaranteed to carry a pinned "provider" -- an exception inside intake_node
+                # itself, on a thread's very first-ever intake, is exactly that case. The original
+                # fix for this (state.get("provider") or await get_provider()) put a DB call inside
+                # a handler that is about to re-raise -- found by the whole-branch review: if the
+                # ORIGINATING exception was itself a DB failure (org_settings/session_store/
+                # approvals share one connection pool), this handler's own get_provider() call
+                # would fail too, replacing the real exception with a confusing new one -- exactly
+                # the masking this handler exists to prevent. It also was not needed in the first
+                # place: the only case `state` lacks "provider" is a thread's first-ever intake,
+                # where no session could exist under EITHER provider yet -- precisely
+                # forget_thread_sessions_everywhere's own no-DB, evict-both contract (see its
+                # docstring in chat_model.py).
                 if thread_id:
-                    from .chat_model import forget_thread_sessions, get_provider
+                    from .chat_model import forget_thread_sessions_everywhere
 
-                    provider = state.get("provider") if isinstance(state, dict) else None
-                    if provider is None:
-                        provider = await get_provider()
-                    forget_thread_sessions(thread_id, provider=provider)
+                    forget_thread_sessions_everywhere(thread_id)
                 raise
 
     wrapper.__name__ = getattr(fn, "__name__", name)

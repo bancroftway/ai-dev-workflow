@@ -76,6 +76,12 @@ export default function OrganizationSettingsPage() {
       setUpdatedBy(body.updated_by ?? null);
       setSave({ kind: "saved" });
     } else {
+      if (res.status === 422) {
+        // The one 422 case (sessions_api.py's put_org_settings_endpoint): switching provider
+        // with no new credential supplied. The masked "configured" display would otherwise hide
+        // the exact field the user needs to fill in to fix this -- reveal it.
+        setEditingCredential(true);
+      }
       setSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
     }
   }

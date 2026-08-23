@@ -54,12 +54,12 @@ export async function runSettingsChecks(ctx: {
   try {
     const orgRes = await fetch("/api/settings/organization");
     if (orgRes.ok) {
-      const orgSettings = (await orgRes.json()) as { credential_configured?: boolean };
-      if (!orgSettings.credential_configured) {
+      const orgSettings = (await orgRes.json()) as { session_ready?: boolean };
+      if (!orgSettings.session_ready) {
         missing.push({
           id: "org-credential",
-          label: "No coding-agent credential configured",
-          description: "Sessions can't run until a provider credential is set for the organization.",
+          label: "No usable coding-agent credential",
+          description: "No provider credential is configured or currently usable. Sessions can't run until an admin sets one for the organization.",
           fix: { kind: "link", href: "/settings/organization", label: "Open Settings" },
         });
       }

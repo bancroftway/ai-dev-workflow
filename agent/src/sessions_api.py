@@ -382,6 +382,7 @@ class OrgSettingsResponse(BaseModel):
 
     provider: str
     credential_configured: bool
+    session_ready: bool
     updated_at: datetime | None
     updated_by: str | None
 
@@ -391,8 +392,26 @@ async def _org_settings_response() -> OrgSettingsResponse:
     one layer up (chat_model.get_provider(), _PROVIDER_CACHE_TTL_SECONDS) for in-flight session
     dispatch, where up to 30s of staleness is fine; this settings-management surface must show a
     just-saved change back immediately, so it reads org_settings directly rather than going
-    through that cache."""
+    through that cache.
+
+    session_ready (whole-branch review Important finding): whether a session provisioned right
+    now would actually get a usable credential, computed by calling the SAME function real
+    provisioning calls (chat_model.get_runtime_auth_token()) rather than re-deriving that logic
+    here a second time. This is deliberately a DIFFERENT signal from credential_configured -- a
+    fresh deployment with no vault credential saved but a valid ANTHROPIC_API_KEY/GITHUB_TOKEN env
+    var is credential_configured=False but session_ready=True, and the settings-checks.ts banner
+    (Task 8) should key off THIS field, not credential_configured, to avoid a permanent false
+    alarm on every env-var-only deployment. A raised exception here (e.g. a configured vault
+    credential whose vault is currently unreachable) means sessions genuinely cannot run right
+    now -- fails closed to False, the same posture as this module's other credential checks.
+    """
     settings = await org_settings.get_org_settings()
+    try:
+        session_ready = bool(await chat_model.get_runtime_auth_token())
+    except Exception:
+        logger.warning("get_runtime_auth_token() failed while building the org-settings response", exc_info=True)
+        session_ready = False
+
     if settings is None:
         # Fresh deployment, nobody has saved a setting yet -- the exact same env-var fallback
         # chat_model.get_provider() itself falls back to, so this page's "active provider" can
@@ -400,12 +419,14 @@ async def _org_settings_response() -> OrgSettingsResponse:
         return OrgSettingsResponse(
             provider=os.environ.get("AGENT_PROVIDER", "copilot"),
             credential_configured=False,
+            session_ready=session_ready,
             updated_at=None,
             updated_by=None,
         )
     return OrgSettingsResponse(
         provider=settings.provider,
         credential_configured=settings.credential_secret_name is not None,
+        session_ready=session_ready,
         updated_at=settings.updated_at,
         updated_by=settings.updated_by,
     )
@@ -526,6 +547,7 @@ async def put_org_settings_endpoint(body: OrgSettingsPutRequest, request: Reques
         logger.info("org credential saved and validated for provider=%s", body.provider)
 
     await org_settings.set_org_settings(body.provider, secret_name, body.updated_by)
+    chat_model.invalidate_provider_cache()
     return await _org_settings_response()
 
 

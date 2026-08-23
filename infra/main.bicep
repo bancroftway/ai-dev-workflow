@@ -37,7 +37,7 @@ param authSecret string
 @secure()
 param copilotGithubToken string
 
-@description('Which coding-agent provider the agent container dispatches to at startup (agent/src/chat_model.py\'s AGENT_PROVIDER switch).')
+@description('Fallback coding-agent provider, used only until an org admin saves a setting via the Settings UI (agent/src/org_settings.py), or if that DB read ever fails. agent/src/chat_model.py\'s get_provider() checks the database first and falls back to this env var second -- it is NOT a startup-only, immutable choice: an admin can change the live provider without a redeploy (Part 4).')
 @allowed(['copilot', 'claude'])
 param agentProvider string = 'copilot'
 

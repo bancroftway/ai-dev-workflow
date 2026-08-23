@@ -77,6 +77,7 @@ provider-agnostic before this task and stays a plain re-export.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 import types
@@ -112,6 +113,8 @@ _PROVIDER_CACHE_TTL_SECONDS = 30
 # (resolved provider value, time.monotonic() at fetch) -- a plain module-level tuple, not a
 # decorator/cache library this codebase doesn't already depend on. None until the first resolution.
 _provider_cache: tuple[str, float] | None = None
+
+logger = logging.getLogger(__name__)
 
 
 def _provider_module(provider: str) -> types.ModuleType:
@@ -155,13 +158,42 @@ async def get_provider() -> str:
     only intake_node (to populate GraphState.provider once per run) and genuine provisioning-time
     code with no state yet (sessions_api.py, run_headless.py's startup, sandbox provisioning) call
     this directly; everything else is handed the resolved value as an explicit `provider` argument.
+
+    A DB read failure here (e.g. migration 0003 has not been applied on this deployment yet, or a
+    transient outage) must NOT propagate -- found by the Part 4 whole-branch review: an uncaught
+    exception here would silently convert what used to be an infallible os.environ read into a
+    hard SQL dependency on the critical path of every session provision and every run's intake,
+    directly contradicting this plan's own Global Constraint that AGENT_PROVIDER keeps working as
+    the fallback. On failure: serve the existing cache even if its TTL just expired (better than
+    nothing -- reflects the last known-good value), or fall back to the AGENT_PROVIDER env var if
+    the cache has never been populated at all (e.g. this is the very first call since process
+    start, before migration 0003 has run).
     """
     global _provider_cache
     cached = _cached_provider_if_fresh()
     if cached is not None:
         return cached
 
-    settings = await org_settings.get_org_settings()
+    try:
+        settings = await org_settings.get_org_settings()
+    except Exception:
+        if _provider_cache is not None:
+            logger.warning(
+                "org_settings.get_org_settings() failed; serving the last-resolved provider %r "
+                "past its TTL rather than failing the caller",
+                _provider_cache[0],
+                exc_info=True,
+            )
+            return _provider_cache[0]
+        fallback = os.environ.get("AGENT_PROVIDER", "copilot")
+        logger.warning(
+            "org_settings.get_org_settings() failed with no prior cached value; falling back to "
+            "AGENT_PROVIDER=%r",
+            fallback,
+            exc_info=True,
+        )
+        return fallback
+
     value = settings.provider if settings is not None else os.environ.get("AGENT_PROVIDER", "copilot")
     _provider_module(value)  # fail fast on an unrecognized value, before caching it
     _provider_cache = (value, time.monotonic())
@@ -180,9 +212,27 @@ async def get_runtime_auth_token() -> str:
     never reach a real session even once those call sites stop reading the now-removed PROVIDER
     constant -- Task 5's job is to point them at this function instead of their own copy of the
     logic.
+
+    Same DB-failure fallback as get_provider() (whole-branch review Critical finding): this
+    function calls org_settings.get_org_settings() a SECOND time on its own (get_provider() above
+    caches; this always reads fresh, deliberately -- see the module docstring's Important #2 note
+    on why that asymmetry exists and is fixed at the cache-invalidation layer, not by caching this
+    call too). A failure here falls through to the same env-var branch already used for "no row
+    saved yet" -- there is no vault credential to fetch if the row can't even be read, so the
+    env-var fallback is the correct (not merely convenient) answer, not a degraded one.
     """
     provider = await get_provider()
-    settings = await org_settings.get_org_settings()
+    try:
+        settings = await org_settings.get_org_settings()
+    except Exception:
+        logger.warning(
+            "org_settings.get_org_settings() failed while resolving the runtime auth token; "
+            "falling back to the %s env var",
+            "ANTHROPIC_API_KEY" if provider == "claude" else "GITHUB_TOKEN",
+            exc_info=True,
+        )
+        settings = None
+
     if settings is not None and settings.credential_secret_name is not None:
         return await org_credential_vault.get_org_credential(settings.credential_secret_name)
 
@@ -308,6 +358,23 @@ def forget_thread_sessions_everywhere(thread_id: str) -> None:
         module.forget_thread_sessions(thread_id)
 
 
+def invalidate_provider_cache() -> None:
+    """Force the next get_provider() call to re-read org_settings rather than serve a cached
+    value. Call this once, immediately after a successful org-settings save
+    (sessions_api.py's put_org_settings_endpoint) -- it closes the window the whole-branch review
+    found empirically: get_provider() is TTL-cached but get_runtime_auth_token() always reads
+    settings fresh, so between a save and the cache's natural expiry, the OLD (cached) provider
+    could get paired with the NEW credential value (e.g. a freshly-saved Anthropic key ending up
+    read alongside a still-cached provider="copilot", meaning the next provision would write it
+    into COPILOT_GITHUB_TOKEN instead of ANTHROPIC_API_KEY). This codebase runs the agent as a
+    single process/replica, so clearing this process's own module-level cache closes the window
+    completely -- a multi-replica deployment would need a shared invalidation signal instead, which
+    does not exist here and is out of scope (no such deployment exists).
+    """
+    global _provider_cache
+    _provider_cache = None
+
+
 async def close_session(thread_id: str, stage: str, role: str, *, provider: str) -> None:
     """Drop one (thread, stage, role) session so the next call starts fresh -- see each provider
     module's own close_session docstring for why a fresh session, not a retry in the same one, is
@@ -367,6 +434,7 @@ def secret_env_names(*, provider: str) -> set[str]:
 __all__ = [
     "get_provider",
     "get_runtime_auth_token",
+    "invalidate_provider_cache",
     "get_chat_model_for_thread",
     "close_thread_session",
     "forget_thread_sessions",

@@ -39,7 +39,7 @@ export async function PUT(request: Request) {
   // empty for anyone who actually made it past src/proxy.ts's sign-in gate.
   const updatedBy = token?.email ?? token?.name ?? token?.login ?? token?.oid;
   if (!updatedBy) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    return NextResponse.json({ detail: "Unauthorized" }, { status: 401 });
   }
 
   const { provider, credential } = (await request.json()) as {
