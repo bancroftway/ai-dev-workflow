@@ -367,12 +367,10 @@ _STALE_APP_PATTERNS = (
 )
 
 
-# Port 3000 is NOT available in this sandbox: the Copilot headless server itself listens there
-# (`copilot --headless ... --port 3000`, PID 1 -- confirmed by walking /proc/net/tcp to its owner).
-# app_discovery nevertheless defaults every node web app to 3000, so a dev server told to use it
-# quietly picks 3001/3002 instead while the readiness probe watches 3000 and reports a perfectly
-# healthy app as "never answered". Killing the holder is not an option -- it would end the session.
-# So the app gets a port from this range, verified free before use.
+# A dedicated range for e2e's dynamically-launched apps and supporting services, well clear of
+# common framework defaults (3000, 5000, 8080, ...) so a boot here is never fighting some
+# framework's own default port choice. Verified free before use regardless (_pick_free_port), so
+# this range is a starting pool, not a guarantee.
 _APP_PORT_RANGE = range(3100, 3140)
 
 
@@ -404,7 +402,7 @@ async def _pick_free_port(
     `reserved` set per e2e_run invocation and add every port handed out.
     """
     busy = await _listening_ports(provider, thread_id) | (reserved or set())
-    if preferred and preferred != 3000 and preferred not in busy:
+    if preferred and preferred not in busy:
         return preferred
     for candidate in _APP_PORT_RANGE:
         if candidate not in busy:
@@ -677,7 +675,7 @@ async def _boot_process(
         # setsid: the app becomes its own process-group leader, so teardown can kill the WHOLE
         # group. Killing the recorded pid alone left the real server (a child of the sh wrapper)
         # running -- which is how a previous attempt's dev server survived to hold port 3000.
-        f"env -u COPILOT_SDK_AUTH_TOKEN -u COPILOT_CONNECTION_TOKEN -u COPILOT_GITHUB_TOKEN -u GITHUB_TOKEN "
+        f"env -u COPILOT_SDK_AUTH_TOKEN -u COPILOT_CONNECTION_TOKEN -u COPILOT_GITHUB_TOKEN -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "
         f"{_DEBUG_BOOT_ENV} "
         f"setsid nohup sh -c {shlex.quote(command)} > {shlex.quote(log_path)} 2>&1 & "
         f"echo $! > {shlex.quote(pid_path)}",
@@ -768,8 +766,8 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # owns the launch itself: this app must outlive the GHCP turn, and a detached process started
     # inside a finished tool call has no defined lifetime.
     # The port is chosen HERE, before the agent runs, and handed to it -- rather than letting each
-    # side guess. 3000 is taken by the sandbox's own Copilot server (see _APP_PORT_RANGE), and a dev
-    # server that finds its port busy silently moves to another one, which reads as a dead app.
+    # side guess: a dev server that finds its preferred port busy silently moves to another one,
+    # which reads as a dead app to the readiness probe watching the port we asked for.
     # One set for the whole invocation: every port handed out below is added to it, so no two
     # processes can be given the same one regardless of which binds first (see _pick_free_port).
     reserved_ports: set[int] = set()
@@ -1318,9 +1316,6 @@ def _demo() -> None:
     assert _with_port_env("dotnet run --project apps/api", 3101, "dotnet") == (
         "ASPNETCORE_URLS=http://127.0.0.1:3101 dotnet run --project apps/api"
     )
-    # 3000 must never be handed out: it belongs to the sandbox's own Copilot server.
-    assert 3000 not in _APP_PORT_RANGE
-
     # Port reservation: two picks in the same run must never collide, even though NOTHING is
     # listening yet at either call. This is the EADDRINUSE that made e2e pass or fail on timing.
     import asyncio as _asyncio

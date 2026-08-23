@@ -141,7 +141,7 @@ async def wait_for_cli_ready(
 
     while time.monotonic() < deadline:
         try:
-            returncode, stdout, stderr = await exec_fn(version_command)
+            returncode, _, stderr = await exec_fn(version_command)
             if returncode == 0:
                 return
             last_error = f"returncode {returncode}: {stderr}"

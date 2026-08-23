@@ -71,33 +71,50 @@ _TOOL_NAME_MAP: dict[str, str] = {
 # Claude Code's project-transcript directory name is every non-alphanumeric character of the
 # turn's cwd replaced with "-". Every turn in this pipeline execs with cwd /workspace/repo (sandbox
 # providers always `exec -w /workspace/repo` -- see local_docker.py's WORKSPACE_DIR_IN_CONTAINER),
-# so the slug is a fixed string here, not something to compute per-thread. Per task-2-brief.md,
-# this was confirmed against a real local transcript during this plan's own prep, but NOT against a
-# real Linux container -- if the real container's slug differs, read_skill_invocations must fail
-# open (return None) rather than report a false empty list, the same "unverifiable" contract
-# gates/skill_gate.py already relies on for Copilot.
+# so the slug is a fixed string here, not something to compute per-thread. Confirmed against a
+# real local transcript during this plan's own prep AND, since then, byte-for-byte against a real
+# Linux container run -- no longer the unverified guess task-2-brief.md originally flagged it as.
+# read_skill_invocations still fails open (returns None) on any read failure regardless, the same
+# "unverifiable" contract gates/skill_gate.py already relies on for Copilot -- kept as a defensive
+# backstop, not because this path is expected to drift.
 _CLAUDE_PROJECTS_DIR = "/home/vscode/.claude/projects/-workspace-repo"
+
+
+# config.READ_ONLY_AVAILABLE_TOOLS permanently includes these two Copilot-native turn-control
+# concepts (builtin:task_complete, builtin:ask_user), which have no Claude CLI tool at all and
+# never will -- every caller that reuses that shared allowlist hits them on literally every turn
+# under AGENT_PROVIDER=claude. _map_tool_names logs these at debug rather than warning so a
+# genuinely unexpected unmapped name -- a caller typo, a new Copilot tool this map hasn't caught
+# up to -- still stands out instead of drowning in expected, permanent noise.
+_KNOWN_PERMANENTLY_UNMAPPED = {"builtin:task_complete", "builtin:ask_user"}
 
 
 def _map_tool_names(names: list[str]) -> list[str]:
     """Translate a Copilot-vocabulary tool list to Claude CLI tool names, de-duped, in order.
 
-    Unmapped entries are dropped with a warning rather than raised or silently kept -- passing an
-    unrecognized name straight through to --tools/--disallowedTools would either be rejected by the
-    CLI or silently ignored by it, and a caller reusing a read-only allowlist across both providers
-    needs to know its allowlist just got narrower on this one, not fail outright over a tool that
-    was never a real Claude concept to begin with.
+    Unmapped entries are dropped rather than raised or silently kept -- passing an unrecognized
+    name straight through to --tools/--disallowedTools would either be rejected by the CLI or
+    silently ignored by it, and a caller reusing a read-only allowlist across both providers needs
+    to know its allowlist just got narrower on this one, not fail outright over a tool that was
+    never a real Claude concept to begin with. Logged at warning for a genuinely unexpected name,
+    at debug for the two names in _KNOWN_PERMANENTLY_UNMAPPED above (expected on every turn, not a
+    caller mistake).
     """
     mapped: list[str] = []
     unmapped: list[str] = []
+    unexpected: list[str] = []
     for name in names:
         claude_name = _TOOL_NAME_MAP.get(name)
         if claude_name is None:
             unmapped.append(name)
+            if name not in _KNOWN_PERMANENTLY_UNMAPPED:
+                unexpected.append(name)
         elif claude_name not in mapped:
             mapped.append(claude_name)
-    if unmapped:
-        logger.warning("no Claude tool-name mapping for %s -- dropped from this turn's tool list", unmapped)
+    if unexpected:
+        logger.warning("no Claude tool-name mapping for %s -- dropped from this turn's tool list", unexpected)
+    elif unmapped:
+        logger.debug("no Claude tool-name mapping for %s -- dropped from this turn's tool list", unmapped)
     return mapped
 
 
@@ -294,9 +311,9 @@ class ClaudeChatModel(BaseChatModel):
         for directory in plugin_directories:
             argv += ["--plugin-dir", directory]
 
-        # Same gating as copilot_chat_model._get_session: skills only exist because --plugin-dir
-        # loaded them, so with no plugin dirs there is nothing to disable regardless of what
-        # disabled_skills says.
+        # Same gating as the old SDK version's copilot_chat_model._get_session: skills only exist
+        # because --plugin-dir loaded them, so with no plugin dirs there is nothing to disable
+        # regardless of what disabled_skills says.
         disabled_skills = (
             (self.disabled_skills if self.disabled_skills is not None else config.COPILOT_DISABLED_SKILLS)
             if plugin_directories
@@ -368,6 +385,9 @@ class ClaudeChatModel(BaseChatModel):
 
         usage = parsed.get("usage") or {}
         self._last_usage = {
+            # Not read from the CLI response like the 3 keys below -- `claude --output-format
+            # json` reports no model field at all, so the requested model name is the best
+            # available label.
             "model": self.model_name or "default",
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
@@ -497,7 +517,7 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
     `{"type": "tool_use", "name": "Skill", "input": {"skill": "<name>"}}`. Implemented as
     specified, not re-derived from first principles.
     """
-    path = f"{_CLAUDE_PROJECTS_DIR}/{shlex.quote(session_id)}.jsonl"
+    path = shlex.quote(f"{_CLAUDE_PROJECTS_DIR}/{session_id}.jsonl")
     result = await provider.exec_in_sandbox(thread_id, f"cat {path} 2>/dev/null")
     if not result.ok or not (result.stdout or "").strip():
         return None
@@ -534,6 +554,12 @@ def secret_env_names() -> set[str]:
     other way. There is deliberately no anthropic_api_key kwarg here to plumb through: whatever
     provisions the sandbox is the thing that must ensure this name is set there, and this function
     is how it discovers what name to set for this provider.
+
+    Re-exported as the same `secret_env_names()` symbol via chat_model.py for both providers, but
+    NOT the same contract: copilot_chat_model.py's function of this name means something else
+    entirely (a --secret-env-vars masking/redaction list for that turn's own shell output, not an
+    auth-source declaration -- see that module's own docstring). A reader who only ever looks at
+    one provider's version should not assume the other works the same way.
     """
     return {"ANTHROPIC_API_KEY"}
 

@@ -1,13 +1,18 @@
-"""P4's write-scope gate: Layer 2 of the two-layer enforcement (plan's Part B, P4 section) that
-the AC-to-tests stage only ever touches test files.
+"""P4's write-scope gate: the AC-to-tests stage only ever touches test files.
 
-Layer 1 (agent/src/copilot_chat_model.py's pre_tool_use_hook, wired via P4's StageSpec.
-session_options) is best-effort and SDK-level -- fast-fails a tool call before it runs, but a
-subagent's own tool or an MCP-exposed filesystem tool could bypass it. This module is Layer 2, the
-authoritative one: a plain `git diff --name-only` against the baseline commit captured before the
+Enforced with a plain `git diff --name-only` against the baseline commit captured before the
 stage's first draft attempt (graph.py's make_draft_node, StageSpec.capture_baseline_commit),
 classified against a per-stack allowlist. Never trusts the model's own claim about what it
-touched.
+touched -- this has always been the authoritative check.
+
+There used to be a "Layer 1" in front of it too: a `pre_tool_use_hook` (the old SDK-based Copilot
+session, wired via P4's StageSpec.session_options) that fast-failed an out-of-scope tool call
+before it ran. Neither current provider's CLI-exec turn has anything to translate that hook into
+-- ClaudeChatModel's and CopilotChatModel's own `_agenerate_inner` just log a warning and proceed
+when one is set -- so the wiring was removed from P4's StageSpec instead of firing that warning,
+for no enforcement benefit, on every single ac-to-tests turn. This module was always the
+authoritative layer regardless (a subagent's own tool or an MCP-exposed filesystem tool could
+bypass a pre-tool-use hook even when one existed); it is simply the only layer now.
 """
 
 from __future__ import annotations
@@ -192,65 +197,6 @@ async def check_write_scope(
     return WriteScopeOutcome(
         passed=True, violating_paths=[], changed_paths=changed_paths, reverted_paths=violating, quarantine_dir=quarantine_dir
     )
-
-
-_WRITE_TOOL_NAMES = {"builtin:create", "builtin:edit", "builtin:apply_patch"}
-_PATH_ARG_KEYS = ("path", "file_path", "filePath", "target_file", "filename")
-
-
-def _extract_candidate_paths(tool_args: Any) -> list[str]:
-    """Best-effort extraction of path-like strings from a tool call's args -- checks common key
-    names first, falls back to any string value that looks path-shaped (contains a `/` or ends in
-    a recognizable extension). NOT verified against the real Copilot CLI builtin tools' actual
-    arg shapes (Phase A0's spike confirmed the tool *names* exist and are reachable, not their
-    exact arg schema) -- Layer 2 (check_write_scope, a plain git diff) is what's actually
-    authoritative; this is a fast, best-effort first line of defense only.
-    """
-    candidates: list[str] = []
-
-    def _walk(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, val in value.items():
-                if key in _PATH_ARG_KEYS and isinstance(val, str):
-                    candidates.append(val)
-                else:
-                    _walk(val)
-        elif isinstance(value, list):
-            for item in value:
-                _walk(item)
-        elif isinstance(value, str) and ("/" in value or re.search(r"\.[A-Za-z0-9]{1,5}$", value)):
-            candidates.append(value)
-
-    _walk(tool_args)
-    return candidates
-
-
-async def pre_tool_use_write_scope_hook(hook_input: dict[str, Any], _extra: dict[str, str]) -> dict[str, Any] | None:
-    """StageSpec.session_options' pre_tool_use_hook for P4 -- Layer 1 (fast-fail, best-effort; see
-    module docstring). Denies a write-capable tool call whose path argument(s) don't look like a
-    test file, with a reason explaining the constraint so the model can self-correct within the
-    same turn. Returns None (no opinion) for every non-write tool and for a call with no
-    extractable path (avoiding a false-positive block on an args shape this doesn't recognize)."""
-    tool_name = hook_input.get("toolName")
-    if tool_name not in _WRITE_TOOL_NAMES:
-        return None
-
-    paths = _extract_candidate_paths(hook_input.get("toolArgs"))
-    if not paths:
-        return None
-
-    violating = [p for p in paths if not _is_test_path(p)]
-    if not violating:
-        return None
-
-    return {
-        "permissionDecision": "deny",
-        "permissionDecisionReason": (
-            f"This stage may only create/modify test files. {violating} does not look like a "
-            "test file path. If this really is a test file, use a path/naming convention this "
-            "repo's test projects already use."
-        ),
-    }
 
 
 async def verify_ac_to_tests(

@@ -9,9 +9,15 @@ failures so expensive to find.
 
 Evidence, not self-report: the model also reports `StageReport.skills_invoked`, but that field is
 telemetry. A model that skipped a skill will cheerfully claim it used one. The authority here is
-the Copilot session's OWN `skill.invoked` events, written by the runtime inside the sandbox at
-~/.copilot/session-state/<session-id>/events.jsonl, correlated to this exact stage via
-copilot_chat_model.get_session_id().
+`invoked_skills()` below, which calls `get_session_id()` then `read_skill_invocations()` through
+the `chat_model` provider dispatch -- and those mean different things per provider. Claude's
+implementation reads that session's own real CLI transcript inside the sandbox
+(~/.claude/projects/.../<session-id>.jsonl) and actually works. Copilot's implementation
+unconditionally returns None: the old SDK-server session log this gate used to read
+(~/.copilot/session-state/<session-id>/events.jsonl, written by a persistent `copilot --server`
+process) was retired along with that process, and no CLI-exec equivalent exists yet -- so under
+the default (Copilot) provider this gate cannot verify anything today. That is the fail-open
+contract below doing its job, not an oversight.
 
 Fails OPEN when it cannot verify (no sandbox, no session id, unreadable log): an infrastructure
 gap must not masquerade as a methodology violation. It only fails CLOSED on positive evidence that
@@ -82,7 +88,15 @@ async def check_required_skills(
                 invoked.append(skill)
 
     if not any_readable:
-        logger.info("skill gate: cannot verify invocations for stage=%s (no readable session log)", stage)
+        # Was logger.info. Under the default (Copilot) provider this fires for every
+        # skill-checked stage, every run, permanently (read_skill_invocations() unconditionally
+        # returns None there -- see its own docstring) -- a silent, PERMANENT non-enforcement, not
+        # a transient hiccup, and info buried it. Nothing here distinguishes that from a
+        # genuinely one-off "couldn't read this one session's log" case (e.g. Claude, if its
+        # transcript-path assumption ever drifts against a real container) -- both land in this
+        # same branch with identical information -- so the bump applies uniformly rather than
+        # guessing which one happened.
+        logger.warning("skill gate: cannot verify invocations for stage=%s (no readable session log)", stage)
         return SkillCheckOutcome(passed=True, required=required, invoked=[], missing=[], verified=False)
 
     missing = [skill for skill in required if skill not in invoked]

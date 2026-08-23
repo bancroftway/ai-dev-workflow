@@ -60,7 +60,7 @@ from .gates import adversarial_gate, remediation_gate, skill_gate
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
 from .gates.diagram_gate import verify_plan_diagrams
 from .gates.test_coverage_gate import verify_coverage
-from .gates.write_scope_gate import pre_tool_use_write_scope_hook, verify_ac_to_tests
+from .gates.write_scope_gate import verify_ac_to_tests
 from .infra_retry import call_with_infra_retry
 from .a2ui_tools import (
     build_ac_to_tests_envelope,
@@ -293,9 +293,15 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
     requirements_text = f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"
     attachments = state.get("requirements_attachments") or []
-    # Attachments (screenshots/documents) ride alongside the text as a multimodal content list
-    # so copilot_chat_model.py's translator can forward them to the model as real attachments,
-    # not just note their existence -- a plain string content here would lose them entirely.
+    # Attachments (screenshots/documents) ride alongside the text as a multimodal content list --
+    # but neither current provider's CLI-exec path actually has an attachment mechanism to forward
+    # them through: both claude_chat_model.py's and copilot_chat_model.py's own
+    # `_messages_to_prompt` flatten this list to a single prompt string and DROP every non-text
+    # part (logged via logger.warning), a real capability loss versus the old SDK-based Copilot
+    # session that is not restored yet -- see either module's own `_messages_to_prompt` docstring.
+    # Still built as a list rather than joined to plain text here, so a future CLI-level attachment
+    # mechanism (a per-part --file flag, e.g.) has the original structure to work from instead of
+    # information already lost upstream.
     requirements_content: str | list[dict[str, Any]] = (
         [{"type": "text", "text": requirements_text}, *attachments] if attachments else requirements_text
     )
@@ -999,8 +1005,11 @@ STAGES: list[StageSpec] = [
         max_verify_cycles=6,
         # Root cause of the long escalation streak: `builtin:edit` only edits EXISTING files -- a
         # greenfield repo with no test files yet needs `builtin:create`. That alone wasn't the
-        # full story: also needs the session `working_directory` now set unconditionally in
-        # copilot_chat_model.py's _get_session (without it, file tools are never even attempted).
+        # full story: also needed the session's working directory to actually be /workspace/repo
+        # (without it, file tools are never even attempted) -- true unconditionally now, since
+        # every CLI-exec turn already execs with cwd /workspace/repo (provider.exec_in_sandbox's
+        # own -w/cd handling, both providers), not something a per-session setting has to
+        # establish anymore the way the old SDK session once required.
         # use_custom_agent=False is EMPIRICALLY required, not stylistic -- back-to-back full runs
         # showed custom_agents + builtin:create in its own tools: list still failing (zero test
         # files, identical symptom to before create existed), while available_tools with the same
@@ -1014,7 +1023,6 @@ STAGES: list[StageSpec] = [
                     "builtin:view", "builtin:grep", "builtin:glob",
                     "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
                 ],
-                "pre_tool_use_hook": pre_tool_use_write_scope_hook,
                 # No Playwright MCP here. It was attached for UI repos so the drafting model could
                 # drive a live browser while writing specs -- but this stage runs in the TDD RED
                 # phase, before any implementation exists, so on a greenfield run there is nothing
