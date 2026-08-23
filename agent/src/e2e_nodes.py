@@ -1128,6 +1128,12 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         "e2e",
         f"fix-{state.get('run_id', 'run')}-{e2e.get('attempt', 0) + 1}",
         provider=state["provider"],
+        # Task 3b (Part 2 Ruling 10) fix-round-2: this turn runs through the same
+        # copilot_chat_model._agenerate_inner tool-call RunEvent building as graph.py's own
+        # draft/audit/fix sites -- without this it kept emitting "unknown"-tagged events despite
+        # a real run_id being right here (state.get('run_id', ...) is already read one line above
+        # for the session-key suffix). Same sentinel-fallback convention as graph.py.
+        run_id=state.get("run_id", "unknown"),
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("e2e", "draft", state["provider"]) or model_config.get_model_name("minimal-code-to-green", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),

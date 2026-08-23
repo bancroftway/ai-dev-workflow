@@ -530,6 +530,12 @@ async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConf
         "metrics-report",
         "draft",
         provider=state["provider"],
+        # Task 3b (Part 2 Ruling 10) fix-round-2: same reason as e2e_nodes.py's e2e_fix_node --
+        # this turn runs through the same copilot_chat_model._agenerate_inner tool-call RunEvent
+        # building as graph.py's own draft/audit/fix sites, and was left emitting "unknown"
+        # despite a real run_id being available on `state` (same `state.get("run_id", "unknown")`
+        # sentinel already used earlier in this file, metrics_report_node's own run_id local).
+        run_id=state.get("run_id", "unknown"),
         github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("metrics-report", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
