@@ -64,10 +64,19 @@ export function RequirementsView() {
   // this is a no-op for every session that isn't ticket-created.
   useEffect(() => {
     if (syncedRef.current) return;
-    const key = `aidw:new-ticket:${threadId}`;
-    const pending = sessionStorage.getItem(key);
+    // sessionStorage access itself (not just the payload's shape) can throw -- a browser/policy
+    // that blocks Web Storage outright (private mode variants, some lockdown policies) throws on
+    // .getItem itself, and this app has no error boundary anywhere to catch that for us. Degrade
+    // exactly like "no handoff was ever set" on any such failure.
+    let pending: string | null;
+    try {
+      const key = `aidw:new-ticket:${threadId}`;
+      pending = sessionStorage.getItem(key);
+      if (pending) sessionStorage.removeItem(key);
+    } catch {
+      return;
+    }
     if (!pending) return;
-    sessionStorage.removeItem(key);
     const combined = parseNewTicketHandoff(pending);
     if (combined) {
       // One-time seed from an external store (sessionStorage) into component state on mount --

@@ -25,6 +25,15 @@ type SubmitState =
   | { kind: "submitting" }
   | { kind: "error"; detail: string };
 
+/** Re-reads one project's current row via the list route (no GET /api/projects/:id exists) --
+ * used both to reuse an already-created "+ New Project" row on retry and to learn the owner/repo
+ * provision_session just scaffolded, since neither is echoed back by the calls that trigger them. */
+async function fetchProject(projectId: string): Promise<ProjectSummary | null> {
+  const res = await fetch("/api/projects");
+  const data = (await res.json()) as ProjectListResponse;
+  return data.projects.find((p) => p.project_id === projectId) ?? null;
+}
+
 /**
  * The single New Ticket intake path (Part 3 Task 4): pick a project (or create one inline) and
  * describe the work, then Assign. Submitting calls the same provisioning flow
@@ -48,6 +57,10 @@ export default function NewTicketPage() {
   const [description, setDescription] = useState("");
 
   const [submit, setSubmit] = useState<SubmitState>({ kind: "idle" });
+  // Set once POST /api/projects succeeds for a "+ New Project" submission -- a retry after a later
+  // failure (e.g. provisioning) must reuse this project rather than create a second, duplicate row
+  // with the same name (no uniqueness constraint applies until owner/repo are non-null).
+  const [createdProjectId, setCreatedProjectId] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/projects")
@@ -79,20 +92,31 @@ export default function NewTicketPage() {
     try {
       let project: ProjectSummary;
       if (isNewProject) {
-        const stackText = selectedStackId === FREE_TEXT_STACK_VALUE ? freeTextStack.trim() || null : null;
-        const stackId = selectedStackId === FREE_TEXT_STACK_VALUE ? null : selectedStackId;
-        const res = await fetch("/api/projects", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: newProjectName.trim(),
-            tech_stack_id: stackId,
-            tech_stack_text: stackText,
-          }),
-        });
-        const body = (await res.json()) as ProjectSummary & { detail?: string };
-        if (!res.ok) throw new Error(body.detail ?? `couldn't create project (${res.status})`);
-        project = body;
+        if (createdProjectId) {
+          // Retrying after a failure past this point (most likely provisioning) -- the project row
+          // already exists (and may already carry a scaffolded repo, if that earlier failure
+          // happened after scaffolding but before the sandbox came up), so reuse it instead of
+          // creating a second row with the same name.
+          const existing = await fetchProject(createdProjectId);
+          if (!existing) throw new Error("Project was created but can no longer be found — try again");
+          project = existing;
+        } else {
+          const stackText = selectedStackId === FREE_TEXT_STACK_VALUE ? freeTextStack.trim() || null : null;
+          const stackId = selectedStackId === FREE_TEXT_STACK_VALUE ? null : selectedStackId;
+          const res = await fetch("/api/projects", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              name: newProjectName.trim(),
+              tech_stack_id: stackId,
+              tech_stack_text: stackText,
+            }),
+          });
+          const body = (await res.json()) as ProjectSummary & { detail?: string };
+          if (!res.ok) throw new Error(body.detail ?? `couldn't create project (${res.status})`);
+          project = body;
+          setCreatedProjectId(project.project_id);
+        }
       } else {
         const found = projects?.find((p) => p.project_id === selectedProjectId);
         if (!found) throw new Error("Select a project");
@@ -128,11 +152,9 @@ export default function NewTicketPage() {
       let repo = project.repo;
       if (!owner || !repo) {
         // provision_session backfills dbo.projects with the scaffolded repo BEFORE it returns, but
-        // its own response never echoes owner/repo back -- re-reading the list is the cheapest way
-        // to learn what it picked, no new backend route needed.
-        const refetch = await fetch("/api/projects");
-        const refetched = (await refetch.json()) as ProjectListResponse;
-        const updated = refetched.projects.find((p) => p.project_id === project.project_id);
+        // its own response never echoes owner/repo back -- re-reading it is the cheapest way to
+        // learn what it picked, no new backend route needed.
+        const updated = await fetchProject(project.project_id);
         owner = updated?.owner ?? null;
         repo = updated?.repo ?? null;
       }
