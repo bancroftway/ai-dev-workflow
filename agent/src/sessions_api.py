@@ -68,12 +68,17 @@ def _check_shared_secret(request: Request) -> None:
 
 class ProvisionRequest(BaseModel):
     thread_id: str
-    # Which project (agent/src/project_store.py) this ticket belongs to -- required, no default:
-    # every session created from this point on belongs to exactly one project (Ruling 1,
-    # docs/superpowers/plans/part-3-tickets-tasks.md). When the named project has no repo yet (the
-    # "+ New Project" case), owner/repo below are not yet known to the frontend -- provision_session
-    # scaffolds a new GitHub repo for it instead of using owner/repo as sent (see provision_session).
-    project_id: str
+    # Which project (agent/src/project_store.py) this ticket belongs to -- every session belongs
+    # to exactly one project (Ruling 1, docs/superpowers/plans/part-3-tickets-tasks.md). Optional
+    # here, not required: provision_session below falls back to an EXISTING session's own stored
+    # project_id (resume, or an incidental reprovision of an already-created session) so neither
+    # the resume flow nor a stale/bookmarked workflow URL has to keep resupplying one. Only a
+    # genuinely brand-new session (no row yet) requires the caller to have actually resolved one
+    # first -- the /select and New Ticket flows do that via POST /projects/connect or /projects.
+    # When the named project has no repo yet (the "+ New Project" case), owner/repo below are not
+    # yet known to the frontend -- provision_session scaffolds a new GitHub repo for it instead of
+    # using owner/repo as sent (see provision_session).
+    project_id: str | None = None
     owner: str
     repo: str
     branch: str
@@ -112,6 +117,15 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             # resumed, regardless of what the frontend sends.
             raise HTTPException(status_code=409, detail="a completed session cannot be resumed")
 
+    # An existing session row already carries an authoritative project_id -- reused automatically
+    # (not just trusted from the request) so a resume, or an incidental reprovision of a session
+    # that already exists, never depends on the frontend re-supplying or re-discovering one. Only
+    # a genuinely brand-new session (no row yet) requires body.project_id, which the /select and
+    # New Ticket flows both resolve (via POST /projects/connect or /projects) before calling here.
+    project_id = (existing.get("project_id") if existing is not None else None) or body.project_id
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required to provision a new session")
+
     # Vault fetch happens BEFORE the sandbox boots: a misconfigured/revoked vault fails the
     # provision in seconds with the provider's own AADSTS/403 detail, instead of surfacing hours
     # later as a confusing e2e boot failure. A configured vault with no assertion (E2E bypass,
@@ -133,9 +147,9 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             body.owner, body.repo, body.thread_id,
         )
 
-    project = await project_store.get_project(body.project_id)
+    project = await project_store.get_project(project_id)
     if project is None:
-        raise HTTPException(status_code=404, detail=f"project {body.project_id} not found")
+        raise HTTPException(status_code=404, detail=f"project {project_id} not found")
 
     # "+ New Project" case (Ruling 6, part-3-tickets-tasks.md): no GitHub repo exists yet for this
     # project. Scaffold one now, under the signed-in user's own personal account -- POST
@@ -240,7 +254,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             source_branch=body.branch,
             work_branch=work_branch,
             title="(untitled session)",
-            project_id=body.project_id,
+            project_id=project_id,
         )
 
     return ProvisionResponse(status="ready")
@@ -656,7 +670,9 @@ class ProjectResponse(BaseModel):
     convention above (the frontend never queries SQL directly). owner/repo/tech_stack_id/
     tech_stack_text are all nullable: a "+ New Project" row starts with owner/repo NULL (Ruling 2)
     until scaffolding backfills them; a Connect-Repository row starts with tech_stack_id/
-    tech_stack_text NULL until brownfield detection or a later Tech Stack confirmation runs."""
+    tech_stack_text NULL until brownfield detection or a later Tech Stack confirmation runs.
+    default_branch (Task 5) is NULL for the same "not connected/scaffolded yet" reason, and also
+    stays NULL forever for a scaffolded (never connected) repo -- callers fall back to "main"."""
 
     project_id: str
     name: str
@@ -667,6 +683,7 @@ class ProjectResponse(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: datetime
+    default_branch: str | None
 
 
 class ProjectListResponse(BaseModel):
@@ -708,6 +725,47 @@ class ConnectProjectRequest(BaseModel):
     owner: str
     repo: str
     created_by: str
+    # The user's live GitHub token (BFF-forwarded from the session, same as ProvisionRequest's own
+    # github_token) -- needed below to look up the repo's real default branch before writing/
+    # refreshing this project row.
+    github_token: str
+
+
+async def _fetch_default_branch(
+    owner: str, repo: str, token: str, *, client: httpx.AsyncClient | None = None
+) -> str | None:
+    """GitHub's own source of truth for a repo's default branch (GET /repos/{owner}/{repo} ->
+    response body's `default_branch` field) -- same Bearer/Accept/API-Version headers git_ops.py's
+    open_pull_request/delete_remote_branch already send. Unlike those best-effort calls (side
+    effects after a session already succeeded), this one runs before any DB write, so a lookup
+    that fails is a hard stop (HTTPException), not a silently-swallowed None.
+
+    `client` is test-only dependency injection (see this module's own _demo), same convention as
+    repo_scaffold.create_repo's own `client` param -- every real call site omits it.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    try:
+        if client is None:
+            async with httpx.AsyncClient(timeout=30.0) as c:
+                resp = await c.get(url, headers=headers)
+        else:
+            resp = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"could not reach GitHub to look up {owner}/{repo}: {exc}"
+        ) from None
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"GitHub rejected the repo lookup for {owner}/{repo}: {resp.status_code} {resp.text[:300]}",
+        )
+    return resp.json().get("default_branch")
 
 
 @projects_router.post("/connect", response_model=ProjectResponse)
@@ -719,14 +777,62 @@ async def connect_project_route(body: ConnectProjectRequest, request: Request) -
     creates a new row with owner/repo already set; tech_stack_id/tech_stack_text stay NULL (not
     this route's job to guess brownfield tech stack). No separate "project name" field exists for
     this flow (the wireframe has none) -- `repo` doubles as the project's display name, same as
-    this codebase's own pre-Part-3 assumption that repo == project."""
+    this codebase's own pre-Part-3 assumption that repo == project.
+
+    Also (re)fetches the repo's real default_branch from GitHub on every call (Task 5) and writes
+    it via set_project_repo regardless of whether the project already existed -- cheap self-healing
+    for a pre-migration NULL, and correct for /select's "start new session"/"resume" actions, which
+    now call this route on every session start rather than just once at first connect."""
     _check_shared_secret(request)
+    default_branch = await _fetch_default_branch(body.owner, body.repo, body.github_token)
     existing = await project_store.find_project_by_repo(body.owner, body.repo)
     if existing is not None:
-        return ProjectResponse(**existing)
-    project_id = await project_store.create_project(
-        body.repo, tech_stack_id=None, tech_stack_text=None, created_by=body.created_by
-    )
-    await project_store.set_project_repo(project_id, body.owner, body.repo)
+        project_id = existing["project_id"]
+    else:
+        project_id = await project_store.create_project(
+            body.repo, tech_stack_id=None, tech_stack_text=None, created_by=body.created_by
+        )
+    await project_store.set_project_repo(project_id, body.owner, body.repo, default_branch)
     row = await project_store.get_project(project_id)
     return ProjectResponse(**row)
+
+
+def _demo() -> None:
+    """`cd agent && uv run python -m src.sessions_api`. No live network call -- httpx.MockTransport
+    stands in for api.github.com (same technique repo_scaffold.py's own self-check uses), covering
+    the one genuinely new bit of pure logic this file adds: _fetch_default_branch's success/failure
+    parsing. connect_project_route's own DB-touching logic is exercised by project_store.py's own
+    self-check instead (its default_branch round-trip assertions through set_project_repo/
+    get_project/find_project_by_repo) -- no second fake DB pool is wired up here."""
+    import asyncio
+
+    def handle_ok(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://api.github.com/repos/octocat/hello-world", str(request.url)
+        assert request.headers.get("authorization") == "Bearer tok123", dict(request.headers)
+        assert request.headers.get("x-github-api-version") == "2022-11-28", dict(request.headers)
+        return httpx.Response(200, json={"default_branch": "develop", "name": "hello-world"})
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handle_ok))
+    branch = asyncio.run(_fetch_default_branch("octocat", "hello-world", "tok123", client=mock_client))
+    asyncio.run(mock_client.aclose())
+    assert branch == "develop", branch
+
+    def handle_404(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    mock_client_404 = httpx.AsyncClient(transport=httpx.MockTransport(handle_404))
+    try:
+        asyncio.run(_fetch_default_branch("octocat", "missing-repo", "tok123", client=mock_client_404))
+        raise AssertionError("_fetch_default_branch must raise on a non-200 response")
+    except HTTPException as exc:
+        assert exc.status_code == 502 and "404" in exc.detail, exc.detail
+    finally:
+        asyncio.run(mock_client_404.aclose())
+
+    print("sessions_api self-check: all assertions passed")
+
+
+if __name__ == "__main__":  # pragma: no cover -- cd agent && uv run python -m src.sessions_api
+    from src.sessions_api import _demo as _packaged_demo  # re-dispatch via package name, see project_store.py
+
+    _packaged_demo()

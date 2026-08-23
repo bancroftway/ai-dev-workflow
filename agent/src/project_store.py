@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 _COLUMNS = [
     "project_id", "name", "owner", "repo", "tech_stack_id", "tech_stack_text",
-    "created_by", "created_at", "updated_at",
+    "created_by", "created_at", "updated_at", "default_branch",
 ]
 
 
@@ -55,8 +55,8 @@ async def create_project(
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             """
-            INSERT INTO dbo.projects (project_id, name, owner, repo, tech_stack_id, tech_stack_text, created_by)
-            VALUES (?, ?, NULL, NULL, ?, ?, ?)
+            INSERT INTO dbo.projects (project_id, name, owner, repo, tech_stack_id, tech_stack_text, created_by, default_branch)
+            VALUES (?, ?, NULL, NULL, ?, ?, ?, NULL)
             """,
             project_id,
             name,
@@ -67,15 +67,20 @@ async def create_project(
     return project_id
 
 
-async def set_project_repo(project_id: str, owner: str, repo: str) -> None:
+async def set_project_repo(project_id: str, owner: str, repo: str, default_branch: str | None = None) -> None:
     """The post-scaffold backfill (Ruling 2) -- called once Task 3's repo_scaffold.create_repo
-    succeeds for a "+ New Project" row that started with owner/repo NULL."""
+    succeeds for a "+ New Project" row that started with owner/repo NULL. Also the Connect-Repository
+    write path (Task 5): connect_project_route calls this with the real default_branch it just
+    fetched from GitHub, for both a brand-new AND an already-connected project (self-healing a
+    pre-migration NULL on every reconnect). default_branch stays None for the scaffold call site
+    above -- repo_scaffold's own repos always land on "main", which callers already fall back to."""
     pool = await session_store._get_pool()  # noqa: SLF001
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
-            "UPDATE dbo.projects SET owner = ?, repo = ?, updated_at = SYSUTCDATETIME() WHERE project_id = ?",
+            "UPDATE dbo.projects SET owner = ?, repo = ?, default_branch = ?, updated_at = SYSUTCDATETIME() WHERE project_id = ?",
             owner,
             repo,
+            default_branch,
             project_id,
         )
 
@@ -147,13 +152,14 @@ def _demo() -> None:
                         "created_by": created_by,
                         "created_at": now,
                         "updated_at": now,
+                        "default_branch": None,
                     }
                 )
             elif flat.startswith("UPDATE dbo.projects SET owner"):
-                owner, repo, project_id = params
+                owner, repo, default_branch, project_id = params
                 for row in self._rows:
                     if row["project_id"].lower() == project_id.lower():
-                        row["owner"], row["repo"] = owner, repo
+                        row["owner"], row["repo"], row["default_branch"] = owner, repo, default_branch
             elif "FROM dbo.projects WHERE project_id = ?" in flat:
                 (project_id,) = params
                 self._result = [
@@ -224,15 +230,29 @@ def _demo() -> None:
             assert row["owner"] is None and row["repo"] is None, row
             assert row["tech_stack_id"] == "nextjs-fastapi", row
             assert row["tech_stack_text"] is None, row
+            assert row["default_branch"] is None, row  # unset until a connect/scaffold backfills it
 
             assert await find_project_by_repo("octocat", "demo-repo") is None
 
-            await set_project_repo(project_id, "octocat", "demo-repo")
+            # Connect-Repository path (Task 5): default_branch round-trips through set_project_repo
+            # alongside owner/repo -- get_project/find_project_by_repo must both surface it.
+            await set_project_repo(project_id, "octocat", "demo-repo", default_branch="develop")
             row = await get_project(project_id)
             assert row["owner"] == "octocat" and row["repo"] == "demo-repo", row
+            assert row["default_branch"] == "develop", row
 
             found = await find_project_by_repo("octocat", "demo-repo")
             assert found is not None and found["project_id"] == project_id, found
+            assert found["default_branch"] == "develop", found
+
+            # Scaffold path (Task 3's call site): default_branch is never passed, so it stays None
+            # -- callers fall back to the "main" literal for exactly this case (migration docstring).
+            scaffold_id = await create_project(
+                "Scaffolded Project", tech_stack_id=None, tech_stack_text=None, created_by="hubot"
+            )
+            await set_project_repo(scaffold_id, "octocat", "scaffolded-repo")
+            scaffolded_row = await get_project(scaffold_id)
+            assert scaffolded_row["default_branch"] is None, scaffolded_row
 
             projects = await list_projects()
             assert any(p["project_id"] == project_id for p in projects), projects

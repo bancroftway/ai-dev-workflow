@@ -18,6 +18,7 @@ export function SandboxSessionBoot({
   repo,
   branch,
   resume,
+  projectId,
 }: {
   /** This session's own id -- a UUID minted client-side for a new session, or the historical
    * session being resumed. Forwarded as-is to the provision route/agent; never derived here. */
@@ -28,6 +29,11 @@ export function SandboxSessionBoot({
   /** ?resume=1 from the workflow page's searchParams (set by SessionHistory's Resume button) --
    * forwarded to the provision route so the agent's registry meta carries it into intake_node. */
   resume?: boolean;
+  /** ?projectId= from the workflow page's searchParams (set by /select's RepoBranchSection,
+   * Task 5) -- only ever needed for a genuinely brand-new session; the agent falls back to an
+   * already-existing session's own stored project_id otherwise (resume, or a plain reload of this
+   * page), so this is undefined in every other case and simply omitted from the POST body. */
+  projectId?: string;
 }) {
   const [status, setStatus] = useSandboxStatus();
   // Provision can fail with an explanatory message worth showing verbatim (e.g. the agent's
@@ -40,7 +46,7 @@ export function SandboxSessionBoot({
     fetch("/api/sessions/provision", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, owner, repo, branch, resume: Boolean(resume) }),
+      body: JSON.stringify({ sessionId, owner, repo, branch, resume: Boolean(resume), projectId }),
     })
       .then(async (res) => {
         if (cancelled) return;
@@ -58,7 +64,7 @@ export function SandboxSessionBoot({
     return () => {
       cancelled = true;
     };
-  }, [sessionId, owner, repo, branch, resume, setStatus]);
+  }, [sessionId, owner, repo, branch, resume, projectId, setStatus]);
 
   if (status === "ready") return null;
 

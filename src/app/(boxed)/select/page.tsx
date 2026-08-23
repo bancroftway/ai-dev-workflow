@@ -10,6 +10,24 @@ import { SettingsBanner } from "@/components/SettingsBanner";
 
 type OnboardedStatus = "checking" | "onboarded" | "not-onboarded" | "error";
 
+/** Get-or-create a project row for (owner, repo) via the Connect-Repository route -- shared by
+ * RepoBranchSection's "Connect repository" button AND its "start new session" action (Task 5):
+ * provisioning a session now requires a real project_id (agent/src/sessions_api.py's
+ * ProvisionRequest), and this is this task's own single resolve-a-project step, same call either
+ * way. Throws with the server's own detail message on failure. */
+async function connectProject(owner: string, repo: string): Promise<string> {
+  const res = await fetch("/api/projects/connect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ owner, repo }),
+  });
+  const body = (await res.json().catch(() => null)) as { project_id?: string; detail?: string } | null;
+  if (!res.ok || !body?.project_id) {
+    throw new Error(body?.detail ?? `couldn't connect repository (${res.status})`);
+  }
+  return body.project_id;
+}
+
 export default function SelectPage() {
   const [repos, setRepos] = useState<RepoSummary[] | null>(null);
   const [reposError, setReposError] = useState<string | null>(null);
@@ -199,6 +217,11 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
   const [branches, setBranches] = useState<BranchSummary[] | null>(null);
   const [branchesError, setBranchesError] = useState<string | null>(null);
   const [selectedBranch, setSelectedBranch] = useState<string>("");
+  // Shared between "Connect repository" and "start new session" -- both resolve a project via
+  // the same connectProject() call, so one error/busy slot covers either.
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [starting, setStarting] = useState(false);
 
   useEffect(() => {
     fetch(`/api/github/branches?owner=${repo.owner}&repo=${repo.repo}`)
@@ -213,14 +236,60 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
       .catch((err: Error) => setBranchesError(err.message));
   }, [repo]);
 
-  function startNewSession() {
+  async function startNewSession() {
     if (!selectedBranch) return;
-    const sessionId = crypto.randomUUID();
-    router.push(`/workflow/${repo.owner}/${repo.repo}/${sessionId}/${selectedBranch}`);
+    setActionError(null);
+    setStarting(true);
+    try {
+      // Task 2 made project_id required on session provisioning; this repo/branch flow had no
+      // notion of a project until now, which is exactly what left it broken (task-5-brief.md).
+      // Resolving one here -- the same connect-or-find-existing-project step Connect Repository
+      // itself uses -- is this flow's fix rather than a second, parallel path to keep in sync with
+      // the New Ticket form. Carried into the already-existing SandboxSessionBoot provisioning
+      // call via ?projectId= (same mechanism ?resume=1 already uses below/in SessionHistory).
+      const projectId = await connectProject(repo.owner, repo.repo);
+      const sessionId = crypto.randomUUID();
+      router.push(`/workflow/${repo.owner}/${repo.repo}/${sessionId}/${selectedBranch}?projectId=${projectId}`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+      setStarting(false);
+    }
+  }
+
+  async function connectRepository() {
+    setActionError(null);
+    setConnecting(true);
+    try {
+      await connectProject(repo.owner, repo.repo);
+      // ponytail: no ?project= preselect on the New Ticket form -- the just-connected project
+      // sorts newest-first in its picker, so it's already on top. Add a preselect if that's ever
+      // not enough (e.g. reconnecting an old project buried in the list).
+      router.push("/tickets/new");
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+      setConnecting(false);
+    }
   }
 
   return (
     <>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm text-neutral-500">
+          Connecting registers this repo as a project so tickets can be filed against it --
+          no session starts until the first ticket does.
+        </p>
+        <button
+          type="button"
+          className="shrink-0 self-start rounded-lg border border-neutral-300 px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
+          onClick={connectRepository}
+          disabled={connecting}
+        >
+          {connecting ? "Connecting…" : "Connect repository"}
+        </button>
+      </div>
+
+      {actionError && <p className="text-sm text-red-600">{actionError}</p>}
+
       <label className="flex flex-col gap-1">
         <span className="text-sm font-medium text-neutral-700">Branch</span>
         {branchesError && <p className="text-sm text-red-600">{branchesError}</p>}
@@ -250,8 +319,9 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
               type="button"
               className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
               onClick={startNewSession}
+              disabled={starting}
             >
-              {status === "onboarded" ? "Start new session" : "Onboard & start new session"}
+              {starting ? "Starting…" : status === "onboarded" ? "Start new session" : "Onboard & start new session"}
             </button>
           )}
         </OnboardingStatusSection>

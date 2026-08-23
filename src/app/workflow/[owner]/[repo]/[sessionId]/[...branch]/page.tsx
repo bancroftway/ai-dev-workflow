@@ -14,7 +14,7 @@ export default async function WorkflowPage({
   searchParams,
 }: {
   params: Promise<{ owner: string; repo: string; sessionId: string; branch: string[] }>;
-  searchParams: Promise<{ resume?: string }>;
+  searchParams: Promise<{ resume?: string; projectId?: string }>;
 }) {
   const session = await auth();
   const githubId = session?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
@@ -43,10 +43,17 @@ export default async function WorkflowPage({
     redirect("/select");
   }
 
+  const resolvedSearchParams = await searchParams;
   // Set by SessionHistory's Resume button (/select) as ?resume=1 -- forwarded into the
   // provision POST body (SandboxSessionBoot) and used to unconditionally fire the first run once
   // the sandbox is ready (AppShell), even on a thread that already has state.
-  const resume = (await searchParams).resume === "1";
+  const resume = resolvedSearchParams.resume === "1";
+  // Set by /select's RepoBranchSection ("start new session", Task 5) after it resolves a real
+  // project_id via POST /api/projects/connect -- only present for that brand-new-session case,
+  // forwarded as-is into SandboxSessionBoot's own provision call. Undefined for every other entry
+  // into this page (resume, a plain reload); provision_session falls back to the session's own
+  // already-stored project_id then, so this route needs no other-case handling of its own.
+  const projectId = resolvedSearchParams.projectId;
 
   // Metrics-bar grade band thresholds, read server-side at request time (NOT NEXT_PUBLIC_*, which
   // would be inlined at build time and unchangeable in a deployed image). Edit .env locally or
@@ -67,7 +74,14 @@ export default async function WorkflowPage({
               is just this route's own content, filling whatever height that shell hands it. */}
           <div className="flex h-full w-full flex-col">
             <div className="shrink-0">
-              <SandboxSessionBoot sessionId={sessionId} owner={owner} repo={repo} branch={branch} resume={resume} />
+              <SandboxSessionBoot
+                sessionId={sessionId}
+                owner={owner}
+                repo={repo}
+                branch={branch}
+                resume={resume}
+                projectId={projectId}
+              />
             </div>
             {/* min-h-0 is required here, not decorative: without it a flex child's default
                 min-height:auto lets it grow past this row's share of the column instead of

@@ -10,15 +10,15 @@ import type { CannedTechStack, TechStackCatalogResponse } from "@/lib/workflow-t
 const NEW_PROJECT_VALUE = "__new__";
 const FREE_TEXT_STACK_VALUE = "__freetext__";
 
-// ponytail: every ticket-driven session targets "main" -- this form has no branch picker (matches
-// the Spec's own wireframe: Project + Title + Description, nothing else) and dbo.projects has
-// nowhere to persist a connected repo's real default branch (Ruling 2's schema has no such
-// column). Correct for a freshly-scaffolded repo (repo_scaffold's own initial commit lands on
-// "main"); a Connect-Repository project whose actual default branch isn't "main" will fail to
-// provision from this form until a default-branch value exists somewhere to read instead.
-// Upgrade path: capture it on dbo.projects at connect time (Task 5), or look it up live via the
-// existing /api/github/repos list and match by owner/repo.
-const TICKET_BRANCH = "main";
+// Fallback only -- correct for a freshly-scaffolded repo (repo_scaffold's initial commit always
+// lands on "main") or a pre-migration project row. A connected repo's real default branch (Task 5:
+// dbo.projects.default_branch, populated at connect time from GitHub's own API) takes priority
+// whenever it's set -- see resolveBranch below.
+const FALLBACK_BRANCH = "main";
+
+function resolveBranch(project: ProjectSummary): string {
+  return project.default_branch ?? FALLBACK_BRANCH;
+}
 
 type SubmitState =
   | { kind: "idle" }
@@ -123,6 +123,10 @@ export default function NewTicketPage() {
         project = found;
       }
 
+      // Resolved once, up front, from the project as selected/created -- a "+ New Project" row has
+      // no default_branch yet either way (resolveBranch's own "main" fallback), so scaffolding
+      // backfilling owner/repo afterward below never changes what this should be.
+      const branch = resolveBranch(project);
       const sessionId = crypto.randomUUID();
       const provisionRes = await fetch("/api/sessions/provision", {
         method: "POST",
@@ -136,7 +140,7 @@ export default function NewTicketPage() {
           // check (mirroring the agent's) passes.
           owner: project.owner ?? "pending",
           repo: project.repo ?? "pending",
-          branch: TICKET_BRANCH,
+          branch,
         }),
       });
       const provisionBody = (await provisionRes.json().catch(() => null)) as
@@ -169,7 +173,7 @@ export default function NewTicketPage() {
         `aidw:new-ticket:${sessionId}`,
         JSON.stringify({ title: title.trim(), description: description.trim() }),
       );
-      router.push(`/workflow/${owner}/${repo}/${sessionId}/${TICKET_BRANCH}`);
+      router.push(`/workflow/${owner}/${repo}/${sessionId}/${branch}`);
     } catch (err) {
       setSubmit({ kind: "error", detail: err instanceof Error ? err.message : String(err) });
     }

@@ -30,21 +30,21 @@ export async function POST(request: Request) {
 
   const { sessionId, projectId, owner, repo, branch, resume } = (await request.json()) as {
     sessionId?: string;
-    // Which project (Part 3) this ticket belongs to -- required by the agent's own
-    // ProvisionRequest.project_id (no default there), so required here too rather than passing
-    // through to a less-clear 422 from the agent. The New Ticket form (src/app/(boxed)/tickets/new)
-    // is the only caller that currently sends this; SandboxSessionBoot.tsx's own call (the plain
-    // /select repo/branch flow) does not yet, which is a known pre-existing gap this route does not
-    // paper over -- see task-4-report.md.
+    // Which project (Part 3) this ticket belongs to. Optional here, not required: the agent's own
+    // ProvisionRequest.project_id (Task 5) falls back to an already-existing session's own stored
+    // project_id, so a resume (SessionHistory's Resume button) or a stale/bookmarked workflow URL
+    // needs no projectId at all -- only a genuinely brand-new session does. The New Ticket form and
+    // /select's own "start new session" action (SandboxSessionBoot.tsx, via the workflow page's
+    // ?projectId= search param) both resolve and send a real one for that case.
     projectId?: string;
     owner?: string;
     repo?: string;
     branch?: string;
     resume?: boolean;
   };
-  if (!sessionId || !projectId || !owner || !repo || !branch) {
+  if (!sessionId || !owner || !repo || !branch) {
     return NextResponse.json(
-      { error: "sessionId, projectId, owner, repo, and branch are required" },
+      { error: "sessionId, owner, repo, and branch are required" },
       { status: 400 },
     );
   }

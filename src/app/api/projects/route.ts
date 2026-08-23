@@ -13,7 +13,9 @@ import { agentFetch } from "@/lib/agent-client";
 /** Mirrors sessions_api.py's ProjectResponse -- owner/repo/tech_stack_id/tech_stack_text are all
  * nullable: a "+ New Project" row starts with owner/repo NULL until a ticket's own provisioning
  * scaffolds a repo for it; a Connect-Repository row (Task 5) starts with tech_stack_id/
- * tech_stack_text NULL instead. */
+ * tech_stack_text NULL instead. default_branch (Task 5) is the repo's real GitHub default branch,
+ * set at connect time -- null for a not-yet-connected/scaffolded project or a pre-migration row,
+ * in which case callers fall back to "main". */
 export interface ProjectSummary {
   project_id: string;
   name: string;
@@ -24,6 +26,7 @@ export interface ProjectSummary {
   created_by: string;
   created_at: string;
   updated_at: string;
+  default_branch: string | null;
 }
 
 export interface ProjectListResponse {
