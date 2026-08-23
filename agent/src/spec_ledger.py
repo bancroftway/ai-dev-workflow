@@ -90,6 +90,24 @@ async def hydrate_ticket_mode_context(
     return {"ticket_mode_baseline": True} if entries else None
 
 
+def own_ac_ids_from_specification(specification: dict[str, Any] | None) -> set[str]:
+    """This ticket's own approved Specification's AC ids (schemas.Specification shape: {id, kind,
+    ...} nested under user_stories[].acceptance_criteria[]) -- the ledger-resolved ids sync_ledger
+    already wrote back onto the draft in place, so these are real US-####.# ids, not placeholders.
+
+    Shared by hydrate_ac_to_tests_ticket_mode_context below (decides whether the ledger holds
+    another ticket's ACs too) and ac_coverage_gate.check_ac_coverage (Ruling 7: scopes its own
+    coverage check down to THIS ticket's ACs) -- one computation, so the two can never answer "this
+    ticket's own AC ids" two different, possibly-diverging ways.
+    """
+    specification = specification or {}
+    return {
+        ac.get("id")
+        for story in (specification.get("user_stories") or [])
+        for ac in (story.get("acceptance_criteria") or [])
+    }
+
+
 async def hydrate_ac_to_tests_ticket_mode_context(
     thread_id: str, state: "GraphState", provider: SandboxProvider
 ) -> dict[str, Any] | None:
@@ -111,11 +129,7 @@ async def hydrate_ac_to_tests_ticket_mode_context(
         e["id"] for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") in ("active", "revised")
     }
     specification = (state.get("stages") or {}).get("specification", {}).get("approved_content") or {}
-    own_ac_ids = {
-        ac.get("id")
-        for story in (specification.get("user_stories") or [])
-        for ac in (story.get("acceptance_criteria") or [])
-    }
+    own_ac_ids = own_ac_ids_from_specification(specification)
     return {"ticket_mode_baseline": True} if (ledger_ac_ids - own_ac_ids) else None
 
 

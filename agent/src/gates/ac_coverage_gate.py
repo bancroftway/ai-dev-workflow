@@ -32,11 +32,11 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 
-from .. import repo_files, stack_runner, tech_stack_signals, test_results
+from .. import repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from .write_scope_gate import _E2E_PATH_RE
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
-from ..spec_ledger import LEDGER_PATH
+from ..spec_ledger import LEDGER_PATH, own_ac_ids_from_specification
 
 logger = logging.getLogger(__name__)
 
@@ -637,6 +637,28 @@ async def check_ac_coverage(
         except json.JSONDecodeError:
             pass
 
+    # Ruling 7: scope down to THIS TICKET's own ACs, right at the source, before ANY downstream
+    # check (missing/tautological/depth/attribution -- all below -- read active_ac_ids uniformly).
+    # Unscoped, this list is the WHOLE PROJECT's ledger -- every ticket ever filed. On a project's
+    # second ticket, an earlier ticket's own AC is still "active" and its test is legitimately
+    # PASSING (shipped) -- the tautological check further down would then flag it as a fake-green
+    # RED-phase test forever, deterministically failing every ticket after the first. Same "this
+    # ticket's own AC ids" computation spec_ledger.hydrate_ac_to_tests_ticket_mode_context already
+    # uses for the identical question; read from the sandbox's own persisted file (this gate has
+    # thread_id/provider, never a GraphState) instead of deriving it a second, possibly-diverging
+    # way. Falls back to the old, unscoped list if the approved Specification can't be read/parsed
+    # (should not happen -- specification is a hard prerequisite stage -- but an infra hiccup here
+    # should not manufacture a NEW false coverage gap on top of it).
+    raw_spec = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH)
+    own_ac_ids: set[str] = set()
+    if raw_spec is not None:
+        try:
+            own_ac_ids = own_ac_ids_from_specification(json.loads(raw_spec))
+        except json.JSONDecodeError:
+            pass
+    if own_ac_ids:
+        active_ac_ids = [ac for ac in active_ac_ids if ac in own_ac_ids]
+
     if not active_ac_ids:
         return AcCoverageOutcome(
             passed=False,
@@ -839,6 +861,8 @@ async def check_ac_coverage(
 
 def _demo() -> None:
     """`cd agent && uv run python -m src.gates.ac_coverage_gate`."""
+    import asyncio
+
     # Level classification: e2e by PATH (the only level a path proves), integration by SYMBOL,
     # because .NET keeps unit and integration tests in one project and often one file.
     assert classify_test_level("apps/web/tests/e2e/a.spec.ts", "x") == "e2e"
@@ -1124,7 +1148,127 @@ def _demo() -> None:
         no_e2e_counts, ui_relevant={"US-0013.2"}, min_non_e2e=0
     )["US-0013.2"][0]
 
+    # --- Ruling 7: check_ac_coverage itself must not flag an EARLIER ticket's shipped, correctly-
+    # passing AC as tautological -- reproduces the exact deterministic second-ticket failure this
+    # fix closes, end to end, not just at the level of a pure helper. Full assertions live in
+    # _demo_ticket_scoping below (needs asyncio + hand-rolled sandbox fakes, kept out of the main
+    # body above since every other assertion here is synchronous and pure).
+    asyncio.run(_demo_ticket_scoping())
+
     print("ac_coverage_gate self-check: all assertions passed")
+
+
+async def _demo_ticket_scoping() -> None:
+    """Reproduces Ruling 7's exact bug against check_ac_coverage itself: ticket #1's AC test is
+    recorded PASSING (shipped, green, correct) in a structured report; ticket #2's own new AC is
+    recorded FAILING (correct RED). Both halves of the fix are asserted, because a scope that
+    accidentally swallows the RED-step check entirely would be at least as bad as the bug:
+
+      (a) ticket #1's already-green AC must never be flagged tautological (or even considered --
+          it must not appear in active_ac_ids at all once scoped to ticket #2's own Specification).
+      (b) if ticket #2's OWN new AC were ALSO suspiciously green pre-implementation, the gate must
+          still catch it -- proving the fix narrowed the check's SCOPE, not its existence.
+    """
+    class _FakeExecResult:
+        def __init__(self, ok: bool = True, stdout: str = "") -> None:
+            self.ok = ok
+            self.stdout = stdout
+
+    class _FakeCoverageProvider:
+        """Serves `cat <path>` for the paths this scenario cares about (the project ledger, ticket
+        #2's own approved Specification, the console tee, and one .trx). Every other
+        exec_in_sandbox call (the `rm -f` reset, the depth-scan's git ls-files listing) is inert --
+        ok with empty output -- since this scenario's pass/fail decision comes entirely from the
+        structured report, exactly as status_from_structured_reports' own docstring says it should."""
+
+        def __init__(self, files: dict[str, str]) -> None:
+            self._files = files
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str):  # noqa: ANN201
+            for path, content in self._files.items():
+                if path in command:
+                    return _FakeExecResult(True, content)
+            return _FakeExecResult(True, "")
+
+    # The WHOLE PROJECT's ledger: ticket #1's US-0001.1 (shipped, still "active" -- retirement is
+    # not what makes an old AC stop needing coverage, see spec_ledger.sync_ledger) plus ticket #2's
+    # own, brand-new US-0002.1.
+    ledger = json.dumps({"entries": [
+        {"id": "US-0001", "kind": "user_story", "status": "active"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0002", "kind": "user_story", "status": "active"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"},
+    ]})
+    # Ticket #2's OWN approved Specification cites only its own story -- exactly what
+    # own_ac_ids_from_specification (spec_ledger.py) reads.
+    ticket2_spec = json.dumps({
+        "title": "Ticket 2", "summary": "...",
+        "user_stories": [{
+            "id": "US-0002", "title": "Ticket 2 story", "narrative": "...",
+            "acceptance_criteria": [{"id": "US-0002.1", "description": "Ticket 2's own new rule."}],
+        }],
+    })
+    trx_correct_red = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results>'
+        '<UnitTestResult testName="[US-0001.1] ticket 1 feature, already shipped" outcome="Passed" />'
+        '<UnitTestResult testName="[US-0002.1] ticket 2 new rule" outcome="Failed" />'
+        "</Results></TestRun>"
+    )
+    base_files = {
+        LEDGER_PATH: ledger,
+        workflow_persistence.SPECIFICATION_APPROVED_PATH: ticket2_spec,
+        AC_TEST_OUTPUT_PATH: "test run finished, suite is red overall\n",
+        "TestResults/ac-run.trx": trx_correct_red,
+    }
+
+    original_run_and_report = stack_runner.run_and_report
+
+    async def _fake_run_and_report(*_args, **_kwargs) -> AcTestRunReport:
+        return AcTestRunReport(exit_ok=False, result_artifacts=["TestResults/ac-run.trx"])
+
+    stack_runner.run_and_report = _fake_run_and_report
+    try:
+        # (a) Ticket #1's shipped, green AC must be excluded entirely -- not merely un-flagged.
+        outcome = await check_ac_coverage(
+            _FakeCoverageProvider(base_files), "t", {}, chat_provider="claude"
+        )
+        assert outcome.report.get("active_ac_ids") == ["US-0002.1"], (
+            "ticket #1's own already-shipped AC leaked into a scope that should be ticket #2-only: "
+            f"{outcome.report}"
+        )
+        assert "US-0001.1" not in outcome.report.get("tautological", []), outcome.report
+        assert outcome.passed, (
+            "ticket #2's own AC is correctly RED and covered -- this must PASS, not be blocked by "
+            f"an earlier ticket's unrelated green test: {outcome.feedback}"
+        )
+
+        # (b) The negative control: if ticket #2's OWN new AC were ALSO green pre-implementation,
+        # the RED-step check must still catch IT -- proving scope narrowed, not disabled.
+        trx_tautological = trx_correct_red.replace(
+            '[US-0002.1] ticket 2 new rule" outcome="Failed"',
+            '[US-0002.1] ticket 2 new rule" outcome="Passed"',
+        )
+        assert "Passed" in trx_tautological and trx_tautological != trx_correct_red
+        tautological_files = {**base_files, "TestResults/ac-run.trx": trx_tautological}
+        outcome2 = await check_ac_coverage(
+            _FakeCoverageProvider(tautological_files), "t", {}, chat_provider="claude"
+        )
+        assert not outcome2.passed, "ticket #2's own tautological (fake-green) AC must still block"
+        assert outcome2.report.get("tautological") == ["US-0002.1"], outcome2.report
+
+        # Fallback: an unreadable/absent approved Specification must not crash, and must fall back
+        # to the pre-fix unscoped list rather than manufacturing a NEW "no active ACs" false gap --
+        # this should never happen in practice (specification is a hard prerequisite stage), but
+        # this proves the fallback is "old behavior", not a silent, different failure.
+        no_spec_files = {k: v for k, v in base_files.items() if k != workflow_persistence.SPECIFICATION_APPROVED_PATH}
+        outcome3 = await check_ac_coverage(
+            _FakeCoverageProvider(no_spec_files), "t", {}, chat_provider="claude"
+        )
+        assert outcome3.report.get("active_ac_ids") == ["US-0001.1", "US-0002.1"], outcome3.report
+        assert outcome3.report.get("tautological") == ["US-0001.1"], outcome3.report
+    finally:
+        stack_runner.run_and_report = original_run_and_report
 
 
 if __name__ == "__main__":

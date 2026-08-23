@@ -95,6 +95,13 @@ TECH_STACK_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'draft.json'
 # in-memory stages["plan"] happens to hold.
 PLAN_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('plan', 'approved.json')}"
 
+# Same reasoning again -- agent/src/gates/ac_coverage_gate.py's check_ac_coverage (Ruling 7) reads
+# this to scope its own AC-coverage check down to THIS ticket's own ACs, since that gate has only
+# thread_id/provider (no GraphState) and so cannot read state["stages"]["specification"]
+# ["approved_content"] the way spec_ledger.hydrate_ac_to_tests_ticket_mode_context does for the
+# identical "this ticket's own AC ids" question.
+SPECIFICATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('specification', 'approved.json')}"
+
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
     return await repo_files.read_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}")
@@ -286,6 +293,7 @@ def _demo() -> None:
     assert TECH_STACK_APPROVED_PATH == f"{WORKFLOW_DIR}/02-tech-stack.approved.json"
     assert TECH_STACK_DRAFT_PATH == f"{WORKFLOW_DIR}/02-tech-stack.draft.json"
     assert PLAN_APPROVED_PATH == f"{WORKFLOW_DIR}/04-plan.approved.json"
+    assert SPECIFICATION_APPROVED_PATH == f"{WORKFLOW_DIR}/03-specification.approved.json"
 
     # Padding must keep lexical order == execution order; a bare str(n) breaks at 10 stages.
     names = [_stage_file(k, "md") for k in _STAGE_ORDER]
