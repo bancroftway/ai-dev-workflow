@@ -21,6 +21,12 @@ export function WorkspaceHeader() {
         <RefreshSecretsButton />
         {session?.user && (
           <>
+            <Link
+              href="/settings/organization"
+              className="rounded-md px-2 py-1 text-neutral-500 hover:bg-neutral-100"
+            >
+              Org settings
+            </Link>
             <span className="text-neutral-600">{session.user.name ?? session.user.email}</span>
             <button
               onClick={() => signOut({ redirectTo: "/" })}
