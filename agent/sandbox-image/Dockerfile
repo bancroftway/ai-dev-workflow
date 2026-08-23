@@ -23,9 +23,12 @@ ARG COPILOT_CLI_VERSION=1.0.79
 # Claude Code CLI -- npm-installed (final stage's Node/npm layer), not curl+tar like Copilot
 # above. Same reasoning as COPILOT_CLI_VERSION now: claude_chat_model.py drives this CLI by
 # per-turn exec, not an SDK, so the pin here IS the compatibility contract for the flags
-# (--resume, --permission-mode, --json-schema, --plugin-dir, --mcp-config) and --output-format
-# json fields (session_id/usage/total_cost_usd/is_error) that module depends on -- an unpinned
-# `@latest` install could silently reshape either one out from under it.
+# (--resume, --permission-mode, --json-schema, --plugin-dir, --mcp-config, and -- Task 4 --
+# --output-format stream-json plus the --verbose it requires) and the terminal NDJSON line's
+# fields (session_id/usage/total_cost_usd/is_error) that module depends on -- an unpinned
+# `@latest` install could silently reshape either one out from under it. Task 4 (task-4-report.md)
+# verified the --verbose requirement and the real stream-json/tool_use shape against this exact
+# pinned version, 2.1.126, not an arbitrary local install.
 ARG CLAUDE_CODE_CLI_VERSION=2.1.126
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end

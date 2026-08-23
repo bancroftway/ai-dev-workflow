@@ -20,6 +20,39 @@ same stage/role wiring without a provider-specific branch), but not its SDK-spec
 -- copilot_chat_model.py is itself slated to drop its own `from copilot import ...` lines once it
 is rewritten onto this same CLI-exec shape, so this module reaching into that package for types
 would only add a dependency everything else here is in the process of removing.
+
+Update (task-4-report.md, Part 2 Task 4): `claude --help`, checked against this pipeline's own
+pinned CLI version (2.1.126 -- the exact `ARG CLAUDE_CODE_CLI_VERSION` agent/sandbox-image/
+Dockerfile pins, not an arbitrary local install), documents a third `--output-format` value beyond
+the plain "text"/"json" this module used until now: "stream-json" ("realtime streaming"), gated
+further by `--include-partial-messages`/`--include-hook-events` (both "only works with
+--output-format=stream-json"). A real, disclosed, minimal verification call against this exact
+pinned version (one turn, `--model haiku`, prompt "Use the Bash tool to run exactly this command:
+echo hello-verify. Then stop, do nothing else.", run in an isolated scratch directory outside this
+repo, `--permission-mode bypassPermissions --no-session-persistence`) confirmed three things
+`--help`'s own text does not state: (1) `-p --output-format stream-json` fails outright ("Error:
+When using --print, --output-format=stream-json requires --verbose") unless `--verbose` is also
+passed -- an undocumented required companion flag, caught for free by a first attempt that failed
+client-side before anything was actually spent; (2) with `--verbose` added, the CLI emits genuine
+multi-line NDJSON to stdout -- the same "many small JSON objects, last one result-shaped" contract
+this module already knew Copilot's (confusingly-also-named) `--output-format json` has (see
+copilot_chat_model.py), not the single terminal object plain `--output-format json` gives Claude;
+(3) the real captured assistant-message tool-call line is the same envelope this module's own
+read_skill_invocations below already treats as CONFIRMED REAL from a real on-disk transcript
+(`{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": ..., "name": ...,
+"input": ...}]}}`), plus a matching `{"type": "user", "message": {"content": [{"type":
+"tool_result", "tool_use_id": ..., "content": ..., "is_error": ...}]}}` line -- two
+independently-derived pieces of evidence in this exact codebase now agree on one real shape, not
+one inference standing alone. Full transcript, real cost (a few cents against the operator's own
+`claude.ai` team-subscription seat, not a separate API key -- see task-4-report.md), and credential
+disclosure: task-4-report.md. This is why `_agenerate_inner` below now parses stdout as NDJSON
+(`_parse_claude_jsonl`) and reads the terminal line's fields (is_error/result/session_id/usage/
+total_cost_usd -- same key names as before, just read from `events[-1]` instead of the one parsed
+object) instead of `json.loads(result.stdout)` directly. Unlike Copilot's Task 3 (where the
+multi-line shape was already the design from day one and only ADDING intermediate-line handling
+was in scope), switching Claude's own output format to get tool-call granularity necessarily
+changes how the final line is parsed too -- the old single-object code would otherwise crash
+outright (`json.JSONDecodeError: Extra data`) against genuinely multi-line stdout.
 """
 
 from __future__ import annotations
@@ -40,8 +73,11 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import BaseModel, PrivateAttr
 
 from . import config
+from . import run_event_store
+from . import run_event_stream
 from . import telemetry
 from .cli_agent_exec import _SCRATCH_DIR, run_turn, write_scratch_file
+from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
 
 logger = logging.getLogger(__name__)
@@ -238,6 +274,122 @@ async def _messages_to_prompt(
     return "\n\n".join(parts)
 
 
+def _parse_claude_jsonl(stdout: str) -> list[dict[str, Any]]:
+    """Parse `claude -p --output-format stream-json --verbose`'s NDJSON stdout into a list of
+    per-line event dicts, one dict per line.
+
+    Mirrors copilot_chat_model._parse_copilot_jsonl's defensive per-line parsing exactly (each
+    line parsed independently, so one malformed/non-JSON line cannot crash the whole turn -- it is
+    simply skipped; only dict-shaped lines are kept). Does NOT need that function's other half
+    (its defensive "scan every line for session_id" trick, worked around there because Copilot's
+    real casing turned out broken): task-4-report.md confirmed real that Claude's own session_id
+    appears, under a consistent key name, directly on the terminal `type: "result"` line -- the
+    same line every existing caller already treats as authoritative for is_error/result/usage/
+    total_cost_usd. The caller (_agenerate_inner) is what decides `events[-1]` is that line; this
+    function only parses.
+    """
+    events: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed_line = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed_line, dict):
+            events.append(parsed_line)
+    return events
+
+
+def _translate_intermediate_events(
+    intermediate_events: list[dict[str, Any]],
+    *,
+    run_id: str,
+    session_id: str,
+    stage: str,
+    node: str,
+) -> list[RunEvent]:
+    """Translate Claude's intermediate (non-final) parsed NDJSON lines into Task-1-shaped
+    RunEvents, tool-call granularity (task-4-brief.md, mirroring task-3-brief.md's Copilot
+    instruction). `_agenerate_inner` passes `events[:-1]` here -- every parsed line except the
+    last, which stays the result-shaped summary line handled separately.
+
+    CONFIRMED REAL (task-4-report.md: one real, disclosed, minimal `claude -p --output-format
+    stream-json --verbose` turn against this pipeline's own pinned CLI version, 2.1.126): an
+    assistant-role line whose `message.content` list contains a block shaped `{"type": "tool_use",
+    "id": ..., "name": ..., "input": ...}` for each tool the model invokes -- the exact same
+    envelope this module's own read_skill_invocations below already treats as confirmed real from
+    a real on-disk transcript, not a fresh guess. Every other line shape observed in that same real
+    capture (`type: "system"` init/hook lines, `type: "rate_limit_event"`) has no `message.content`
+    list at all and is silently skipped by the `isinstance` guards below, the same defensive-skip
+    spirit `_parse_claude_jsonl` already applies to a malformed line.
+
+    Unlike copilot_chat_model._translate_intermediate_events (whose `tool.call_start`/
+    `tool.call_end` become two independent, uncorrelated RunEvents -- flagged in task-3's own
+    review as a consumer gotcha, not a deliberate design choice), Claude's real shape carries a
+    genuine correlating id: a `tool_use` block's `id` is echoed back on the matching `{"type":
+    "user", "message": {"content": [{"type": "tool_result", "tool_use_id": ..., "content": ...,
+    "is_error": ...}]}}` line once the tool finishes. This function uses that id to fold the result
+    into the SAME RunEvent as its call (one full call+result per tool invocation, not two
+    fragments) -- a real improvement the Copilot side has no id to make, not scope creep. A
+    tool_use with no matching tool_result yet (unusual for a completed turn, but not impossible if
+    a turn errors out mid-call) still yields a RunEvent, just without a "result"/"is_error" payload
+    key -- fails soft, never drops the call itself.
+
+    `reasoning`/plain-text content blocks (`type: "thinking"`, `type: "text"`) are deliberately NOT
+    translated -- RunEventType.REASONING exists in the Task 1 schema but capturing it was never
+    part of what Task 3 built for Copilot (whose own `assistant.message_delta` lines are skipped
+    the same way), and this task's brief asks for "the same way Task 3 does," not a broader
+    granularity than that precedent set. A later task can add REASONING capture on top of this one
+    small, additive change if that turns out to be wanted.
+    """
+    results_by_tool_use_id: dict[str, dict[str, Any]] = {}
+    for raw_event in intermediate_events:
+        message = raw_event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tool_use_id = block.get("tool_use_id")
+                if isinstance(tool_use_id, str):
+                    results_by_tool_use_id[tool_use_id] = block
+
+    translated: list[RunEvent] = []
+    for raw_event in intermediate_events:
+        message = raw_event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name") or "unknown"
+            payload: dict[str, Any] = {"name": name, "input": block.get("input")}
+            tool_use_id = block.get("id")
+            result_block = results_by_tool_use_id.get(tool_use_id) if isinstance(tool_use_id, str) else None
+            if result_block is not None:
+                payload["result"] = result_block.get("content")
+                payload["is_error"] = result_block.get("is_error")
+            translated.append(
+                RunEvent(
+                    run_id=run_id,
+                    session_id=session_id,
+                    type=RunEventType.TOOL_CALL,
+                    stage=stage,
+                    node=node,
+                    summary=f"tool call: {name}",
+                    payload=payload,
+                )
+            )
+    return translated
+
+
 class ClaudeChatModel(BaseChatModel):
     """A LangChain chat model driving the Claude Code CLI as a per-turn subprocess exec inside the
     sandbox (cli_agent_exec.run_turn), matching CopilotChatModel's public shape so a caller can
@@ -247,8 +399,9 @@ class ClaudeChatModel(BaseChatModel):
     Session lifecycle is the opposite of Copilot's: this process holds no session object open.
     Each turn is a fresh CLI invocation; continuity comes entirely from `--resume <session_id>`,
     where session_id is whatever the CLI itself returned from the previous turn (parsed from
-    --output-format json), cached in this module's _session_ids dict keyed the same way Copilot
-    keys _sessions.
+    --output-format stream-json's terminal line, Task 4 -- previously plain --output-format json's
+    one terminal object; same field name either way), cached in this module's _session_ids dict
+    keyed the same way Copilot keys _sessions.
     """
 
     thread_id: str
@@ -305,8 +458,10 @@ class ClaudeChatModel(BaseChatModel):
     # Same shape as CopilotChatModel._last_usage (model/input_tokens/output_tokens/cost), for the
     # provider-agnostic OTEL span attributes _agenerate sets below. reasoning_tokens/
     # cache_read_tokens/cache_write_tokens are NOT included -- unlike Copilot's SDK usage event,
-    # `claude --output-format json` does not report them, and a fabricated 0 would read as
-    # "measured zero" instead of "not reported" to anything that later reads this dict.
+    # `claude`'s own terminal result line does not report them (true of both plain
+    # --output-format json and stream-json's terminal line -- same usage keys either way, task-4-
+    # report.md), and a fabricated 0 would read as "measured zero" instead of "not reported" to
+    # anything that later reads this dict.
     _last_usage: dict[str, Any] | None = PrivateAttr(default=None)
 
     @property
@@ -354,7 +509,14 @@ class ClaudeChatModel(BaseChatModel):
         provider = get_sandbox_provider()
         session_id = _session_ids.get(self._session_key)
 
-        argv = ["claude", "-p", "--output-format", "json"]
+        # Task 4 (Part 2 run-visibility): "stream-json" (real, confirmed against this pipeline's
+        # own pinned CLI version -- see this module's own docstring and task-4-report.md), not
+        # plain "json", is what actually gives per-tool-call granularity -- "json" is a single
+        # terminal object with no intermediate lines at all. --verbose is not optional here: a real
+        # invocation (not --help's own text, which never mentions this) confirmed `-p
+        # --output-format stream-json` fails outright without it ("Error: When using --print,
+        # --output-format=stream-json requires --verbose").
+        argv = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
         if session_id:
             argv += ["--resume", session_id]
 
@@ -456,36 +618,67 @@ class ClaudeChatModel(BaseChatModel):
             timeout_seconds=config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
         )
 
-        try:
-            parsed = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
+        # Task 4 (Part 2 run-visibility): stdout is now NDJSON (this module's own docstring/
+        # task-4-report.md), not one terminal object -- `json.loads(result.stdout)` directly would
+        # raise on genuinely multi-line output ("Extra data"). Every line is parsed independently
+        # (one malformed line can't sink the whole turn); a totally empty/unparseable stdout still
+        # fails loud, matching copilot_chat_model's identical guard for the identical situation.
+        events = _parse_claude_jsonl(result.stdout)
+        if not events:
             raise RuntimeError(
-                f"Claude CLI turn for {self._session_key!r} produced unparseable --output-format "
-                f"json output: {exc}\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
-            ) from exc
-
-        if parsed.get("is_error"):
-            raise RuntimeError(
-                f"Claude CLI turn for {self._session_key!r} reported an error "
-                f"(stop_reason={parsed.get('stop_reason')!r}): {parsed.get('result')!r}"
+                f"Claude CLI turn for {self._session_key!r} produced no parseable "
+                f"--output-format stream-json lines: stdout={result.stdout!r}\nstderr={result.stderr!r}"
             )
 
-        new_session_id = parsed.get("session_id")
+        # Best-effort guess, confirmed real for this pipeline's own pinned CLI version
+        # (task-4-report.md): the LAST line is the result-shaped summary event, exactly the same
+        # is_error/result/session_id/usage/total_cost_usd/stop_reason keys the old single-object
+        # `--output-format json` response had -- only WHERE they live changed (events[-1] instead
+        # of the one parsed object), not their names.
+        final = events[-1]
+
+        if final.get("is_error"):
+            raise RuntimeError(
+                f"Claude CLI turn for {self._session_key!r} reported an error "
+                f"(stop_reason={final.get('stop_reason')!r}): {final.get('result')!r}"
+            )
+
+        new_session_id = final.get("session_id")
         if new_session_id:
             _session_ids[self._session_key] = new_session_id
 
-        usage = parsed.get("usage") or {}
+        # Task 4 (Part 2 run-visibility): every intermediate NDJSON line this turn produced (all of
+        # `events` except the final result-shaped line, handled above) is translated and
+        # persisted+emitted via the same two-call pattern graph.py's draft/audit/verify sites and
+        # copilot_chat_model._agenerate_inner use for their own RunEvents -- run_event_store.
+        # append_event then run_event_stream.emit_live, rebinding to append_event's returned copy
+        # (seq/ts filled in) before the live call. Both calls fail soft internally (their own
+        # docstrings) -- no extra try/except needed here. self.run_id already carries the graph's
+        # real per-run id (Task 3b) for every caller that has one; the "unknown" fallback is only
+        # for a caller that hasn't been wired up to pass one yet, same sentinel convention as
+        # copilot_chat_model's identical call site.
+        for tool_call_event in _translate_intermediate_events(
+            events[:-1],
+            run_id=self.run_id or "unknown",
+            session_id=self.thread_id,
+            stage=self.stage,
+            node=self.role,
+        ):
+            tool_call_event = await run_event_store.append_event(tool_call_event)
+            await run_event_stream.emit_live(tool_call_event)
+
+        usage = final.get("usage") or {}
         self._last_usage = {
             # Not read from the CLI response like the 3 keys below -- `claude --output-format
-            # json` reports no model field at all, so the requested model name is the best
-            # available label.
+            # stream-json`'s terminal line reports no model field at all, so the requested model
+            # name is the best available label.
             "model": self.model_name or "default",
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
-            "cost": parsed.get("total_cost_usd"),
+            "cost": final.get("total_cost_usd"),
         }
 
-        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=parsed.get("result", "")))])
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=final.get("result", "")))])
 
     def _generate(
         self,
@@ -732,6 +925,125 @@ def _demo() -> None:
         4,
         "/tmp/x",
     ) is None, "undecodable base64 should be dropped, not raise"
+
+    # --- Task 4 (Part 2 run-visibility): _parse_claude_jsonl / _translate_intermediate_events ---
+    #
+    # REAL captured shape (task-4-report.md has the full transcript, cost, and credential
+    # disclosure): one real, disclosed, minimal `claude -p --output-format stream-json --verbose`
+    # invocation against this pipeline's own pinned CLI version (2.1.126), prompt "Use the Bash
+    # tool to run exactly this command: echo hello-verify. Then stop, do nothing else.",
+    # `--model haiku`. `session_id`/`uuid`/tool_use `id` values below are copied verbatim (random
+    # UUIDs, nothing sensitive); the `system`/init line's tools/mcp_servers/slash_commands lists
+    # and the `usage` sub-dicts on the two assistant lines are trimmed to short stand-ins (the real
+    # ones are large and carry no test signal here) -- everything else, including the surprising
+    # bits (an empty `"result":""` on a genuinely successful turn, because the prompt said "then
+    # stop" and the model took it literally), is byte-for-byte what was captured.
+    real_shape_jsonl = (
+        '{"type":"system","subtype":"init","cwd":"/workspace/repo","session_id":'
+        '"cf9ce8f4-8863-463f-acc9-82e19fab0f59","tools":["Bash","Read","Edit"],"mcp_servers":[],'
+        '"model":"claude-haiku-4-5-20251001","permissionMode":"bypassPermissions",'
+        '"apiKeySource":"none","claude_code_version":"2.1.126",'
+        '"uuid":"1b6757b7-a59a-450e-b8e9-894e0ffa9a26"}\n'
+        '{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001",'
+        '"id":"msg_011CeLGf4gHcp3LmA8QPVDpH","type":"message","role":"assistant","content":'
+        '[{"type":"thinking","thinking":"The user is asking me to run echo hello-verify, then '
+        'stop.","signature":"trimmed"}],"stop_reason":null,"usage":{"input_tokens":10,'
+        '"output_tokens":8}},"parent_tool_use_id":null,'
+        '"session_id":"cf9ce8f4-8863-463f-acc9-82e19fab0f59",'
+        '"uuid":"962294a3-f4bd-4be7-b0da-374ab6cd32e4"}\n'
+        '{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001",'
+        '"id":"msg_011CeLGf4gHcp3LmA8QPVDpH","type":"message","role":"assistant","content":'
+        '[{"type":"tool_use","id":"toolu_01TPxxQyXkVt2ZFAUepbdmqt","name":"Bash","input":'
+        '{"command":"echo hello-verify","description":"Run verification command"},"caller":'
+        '{"type":"direct"}}],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":8}},'
+        '"parent_tool_use_id":null,"session_id":"cf9ce8f4-8863-463f-acc9-82e19fab0f59",'
+        '"uuid":"18f0b459-3747-4aec-ace1-b6de6d670b7a"}\n'
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1787520600,'
+        '"rateLimitType":"five_hour","overageStatus":"rejected",'
+        '"overageDisabledReason":"org_level_disabled","isUsingOverage":false},'
+        '"uuid":"999757f8-aeef-476f-8e21-afbd1dec2950",'
+        '"session_id":"cf9ce8f4-8863-463f-acc9-82e19fab0f59"}\n'
+        '{"type":"user","message":{"role":"user","content":[{"tool_use_id":'
+        '"toolu_01TPxxQyXkVt2ZFAUepbdmqt","type":"tool_result","content":"hello-verify",'
+        '"is_error":false}]},"parent_tool_use_id":null,'
+        '"session_id":"cf9ce8f4-8863-463f-acc9-82e19fab0f59",'
+        '"uuid":"82033a77-9f5b-4943-b783-3aa47235acdd",'
+        '"timestamp":"2026-08-23T19:57:39.403Z"}\n'
+        '{"type":"result","subtype":"success","is_error":false,"duration_ms":8138,'
+        '"num_turns":2,"result":"","stop_reason":"end_turn",'
+        '"session_id":"cf9ce8f4-8863-463f-acc9-82e19fab0f59",'
+        '"total_cost_usd":0.023036500000000005,'
+        '"usage":{"input_tokens":18,"output_tokens":196}}\n'
+    )
+    real_events = _parse_claude_jsonl(real_shape_jsonl)
+    assert len(real_events) == 6, f"expected 6 parsed real-shape events, got {len(real_events)}"
+
+    # The terminal line's fields are read by _agenerate_inner exactly as before (same key names),
+    # just from events[-1] instead of the one whole-stdout-parsed object -- asserted directly here
+    # since that call site itself needs a live sandbox+CLI exec to exercise end to end.
+    real_final = real_events[-1]
+    assert real_final["is_error"] is False
+    assert real_final["session_id"] == "cf9ce8f4-8863-463f-acc9-82e19fab0f59"
+    assert real_final["total_cost_usd"] == 0.023036500000000005
+    assert real_final["usage"] == {"input_tokens": 18, "output_tokens": 196}
+    # A real, slightly funny edge case worth locking in: "result" can be genuinely EMPTY on a
+    # successful (is_error=False) turn if the model produces no final text block (here, because
+    # the prompt said "then stop" and it took that literally) -- AIMessage(content="") must not be
+    # treated as a parse failure by anything downstream.
+    assert real_final["result"] == "", "a successful turn can legitimately have an empty result"
+
+    # The actual point: fed through the translator, the one real tool_use+tool_result pair becomes
+    # exactly ONE fully-correlated RunEvent (name, input, AND result folded together via the real
+    # tool_use_id/id correlation -- see _translate_intermediate_events' own docstring for why this
+    # is possible for Claude but not for Copilot's own uncorrelated pair).
+    real_translated = _translate_intermediate_events(
+        real_events[:-1], run_id="run-real", session_id="thread-real", stage="specification", node="draft",
+    )
+    assert len(real_translated) == 1, f"expected exactly 1 correlated tool-call RunEvent, got {len(real_translated)}"
+    real_event = real_translated[0]
+    assert real_event.type is RunEventType.TOOL_CALL
+    assert real_event.run_id == "run-real" and real_event.session_id == "thread-real"
+    assert real_event.stage == "specification" and real_event.node == "draft"
+    assert real_event.summary == "tool call: Bash"
+    assert real_event.payload == {
+        "name": "Bash",
+        "input": {"command": "echo hello-verify", "description": "Run verification command"},
+        "result": "hello-verify",
+        "is_error": False,
+    }
+    assert real_event.seq is None and real_event.ts is None, "append_event fills these in, not the translator"
+
+    # Fails-soft branch, not present in the one real capture (that turn's single tool call WAS
+    # cleanly paired) -- a tool_use with no matching tool_result yet must still yield a RunEvent,
+    # just without "result"/"is_error" payload keys, rather than being dropped. Clearly a synthetic
+    # addition for this one branch, not claimed as real.
+    unpaired_jsonl = (
+        '{"type":"assistant","message":{"content":[{"type":"tool_use",'
+        '"id":"toolu_SYNTHETIC_no_result","name":"Read","input":{"file_path":"a.py"}}]},'
+        '"session_id":"s"}\n'
+    )
+    unpaired_events = _parse_claude_jsonl(unpaired_jsonl)
+    unpaired_translated = _translate_intermediate_events(
+        unpaired_events, run_id="r", session_id="s", stage="st", node="n"
+    )
+    assert len(unpaired_translated) == 1
+    assert unpaired_translated[0].payload == {"name": "Read", "input": {"file_path": "a.py"}}, (
+        "an unpaired tool_use must still produce a RunEvent, just without result/is_error keys"
+    )
+
+    # A garbage/non-JSON line, and a JSON line that isn't an object, must not crash the parser --
+    # both are skipped, not fatal (mirrors copilot_chat_model._parse_copilot_jsonl's identical
+    # guard).
+    garbage_events = _parse_claude_jsonl('not json at all\n[1, 2, 3]\n{"type": "result", "is_error": false}\n')
+    assert len(garbage_events) == 1, f"malformed/non-dict lines should be skipped, got {garbage_events}"
+
+    # Fully empty/unparseable stdout: the parser itself just reports an empty list and never raises
+    # -- _agenerate_inner is what turns that into a RuntimeError.
+    assert _parse_claude_jsonl("not json\n\n   \n") == []
+
+    # No intermediate lines at all (a turn whose only NDJSON line is the final result) must yield
+    # an empty list, not an error -- _agenerate_inner's events[:-1] is [] in that case.
+    assert _translate_intermediate_events([], run_id="r", session_id="s", stage="st", node="n") == []
 
     # Session-cache eviction: one thread's dead sandbox must not evict another thread's live
     # sessions (mirrors copilot_chat_model._demo's doomed/survivor shape -- same failure class,
