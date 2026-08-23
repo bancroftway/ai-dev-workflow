@@ -51,6 +51,7 @@ from . import metrics_nodes
 from . import exit_nodes
 from . import rebuild
 from . import run_event_store
+from . import run_event_stream
 from .run_events import RunEvent, RunEventType
 from . import run_failure
 from . import session_store
@@ -1839,7 +1840,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # its own (gone once this sandbox is torn down). Additive: the ledger write is untouched.
             # Fails soft by design -- append_event itself swallows+logs a DB error rather than
             # raising, so a transient blip here can never abort this node (see its own docstring).
-            await run_event_store.append_event(RunEvent(
+            run_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
                 type=RunEventType.NODE_FINISHED,
@@ -1848,7 +1849,14 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 summary=f"draft {'ready for review' if response.readiness else 'needs clarification'}",
                 payload={"readiness": response.readiness},
                 token_usage=model._last_usage,
-            ))
+            )
+            await run_event_store.append_event(run_event)
+            # Live counterpart (Part 2 Task 2) -- same event, third destination: a LangGraph custom
+            # event that ag_ui_langgraph's already-mounted bridge relays to the browser as an AG-UI
+            # CUSTOM event while this run is still in progress. See run_event_stream.py's module
+            # docstring for the real (verified against the installed packages) mechanism. Also
+            # fails soft, same reasoning as append_event above.
+            await run_event_stream.emit_live(run_event, config)
 
         return {"stages": stages}
 
@@ -1966,7 +1974,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # Durable counterpart (Part 2 run-visibility) -- same data, second destination, additive
             # to the ledger write above (see run_event_store.py's module docstring). Fails soft:
             # append_event swallows+logs a DB error internally rather than raising.
-            await run_event_store.append_event(RunEvent(
+            run_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
                 type=RunEventType.NODE_FINISHED,
@@ -1981,7 +1989,11 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                     "audit_skipped_infra": audit_skipped_infra,
                 },
                 token_usage=model._last_usage,
-            ))
+            )
+            await run_event_store.append_event(run_event)
+            # Live counterpart (Part 2 Task 2) -- same event, third destination; see
+            # run_event_stream.py's module docstring. Also fails soft, same reasoning as above.
+            await run_event_stream.emit_live(run_event, config)
 
         if stage_spec.post_audit_hook is not None and sandbox_registry.get(thread_id) is not None:
             await stage_spec.post_audit_hook(thread_id, content_dict, state, get_sandbox_provider())
@@ -2198,7 +2210,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             # to the ledger write above (see run_event_store.py's module docstring). No token_usage:
             # deterministic_verify is a real script/parse, never an LLM call. Fails soft:
             # append_event swallows+logs a DB error internally rather than raising.
-            await run_event_store.append_event(RunEvent(
+            run_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
                 type=RunEventType.NODE_FINISHED,
@@ -2206,7 +2218,11 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 node="verify",
                 summary=f"verify {'passed' if result.passed else 'failed'} (cycle {stage['verify_cycle_count']})",
                 payload={"passed": result.passed, "cycle": stage["verify_cycle_count"]},
-            ))
+            )
+            await run_event_store.append_event(run_event)
+            # Live counterpart (Part 2 Task 2) -- same event, third destination; see
+            # run_event_stream.py's module docstring. Also fails soft, same reasoning as above.
+            await run_event_stream.emit_live(run_event, config)
 
         # minimal-code-to-green's verify_coverage report carries a numeric line_rate whether the
         # gate passed or not -- promote it onto repo_scan so the metrics bar's coverage chip lights
