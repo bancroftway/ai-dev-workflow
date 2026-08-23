@@ -297,6 +297,12 @@ class SessionResponse(BaseModel):
     # actually leave this process now: True while `current_stage` is paused at its own human gate
     # awaiting approval, False/None otherwise.
     awaiting_gate: bool | None = None
+    # Part 2 Ruling 8: the same silent-drop bug awaiting_gate had above -- `row` (session_store's
+    # _COLUMNS) has carried project_id all along, Pydantic v2's `extra="ignore"` just never let it
+    # through because nothing declared it here. A run-detail page needs its own project_id for
+    # navigation (link back to the project/Board), which the per-session payload had no way to
+    # supply until now.
+    project_id: str | None = None
 
 
 def _row_to_response(row: dict[str, Any]) -> "SessionResponse":
@@ -868,11 +874,10 @@ def _demo() -> None:
     # Task 9 (Board pause marker): a plain dict-in, model-out check that awaiting_gate survives
     # SessionResponse(**row, ...) -- pinned here because it silently did NOT before this task
     # (Pydantic v2's default extra="ignore" dropped it, per task-1-report.md's own "not a breaking
-    # concern... yet" note). project_id is deliberately included and left unread below: the field
-    # genuinely isn't declared on SessionResponse (nothing downstream needs it in the per-session
-    # payload -- filtering already happens server-side via the query param), so this only proves
-    # THAT key is still, correctly, dropped -- a future accidental declaration of it is someone
-    # else's deliberate choice to review, not a regression this assertion should catch.
+    # concern... yet" note). Part 2 Ruling 8 found project_id had the exact same silent-drop bug
+    # (see SessionResponse's own comment above) -- a run-detail page needs its own project_id for
+    # navigation, so this now pins the opposite of what it used to: the field IS declared and DOES
+    # survive, not that it's correctly absent.
     fake_row = {
         "session_id": "11111111-1111-1111-1111-111111111111",
         "owner": "octocat", "repo": "demo", "user_login": "octocat", "title": "t",
@@ -885,7 +890,7 @@ def _demo() -> None:
     }
     resp = _row_to_response(fake_row)
     assert resp.awaiting_gate is True, resp
-    assert not hasattr(resp, "project_id"), "project_id should not be declared on SessionResponse"
+    assert resp.project_id == "22222222-2222-2222-2222-222222222222", resp
 
     global _fetch_default_branch  # reassigned further down; must precede every use in this function
 
