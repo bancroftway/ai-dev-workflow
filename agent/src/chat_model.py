@@ -192,6 +192,10 @@ async def get_provider() -> str:
             fallback,
             exc_info=True,
         )
+        _provider_module(fallback)  # same fail-fast validation the normal path already applies
+        # just below -- a DB outage must not ALSO hide a genuinely misconfigured AGENT_PROVIDER;
+        # that should still raise loudly here, not defer a confusing failure to wherever this
+        # value is first dispatched. Warning logged first so there's a breadcrumb either way.
         return fallback
 
     value = settings.provider if settings is not None else os.environ.get("AGENT_PROVIDER", "copilot")

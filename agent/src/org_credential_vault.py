@@ -37,6 +37,7 @@ environment, matching keyvault.py's own self-check limitation on this branch):
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 from .keyvault import VaultAccessError
@@ -46,6 +47,14 @@ from .keyvault import VaultAccessError
 # as the single owner of this string -- org_settings.credential_secret_name (Task 1) is populated
 # with exactly this value, never anything else.
 ORG_CREDENTIAL_SECRET_NAME = "org-provider-credential"
+
+# Bounds a real Key Vault round trip so a slow/unreachable vault degrades to a clear, fast
+# VaultAccessError instead of hanging the caller indefinitely -- found by the whole-branch
+# re-review: get_org_credential() is now called from _org_settings_response() (sessions_api.py),
+# which is polled by the frontend's settings-check on every page mount/repo switch, for every
+# signed-in user. Shorter than _probe_provider_credential's 30s (sessions_api.py) deliberately --
+# this sits on a page-load path a human is actively waiting on, not a one-shot admin save.
+_VAULT_TIMEOUT_SECONDS = 10.0
 
 
 def _vault_uri() -> str:
@@ -60,35 +69,51 @@ async def get_org_credential(secret_name: str) -> str:
     identity -- no entra_assertion, no per-user exchange. Raises VaultAccessError (keyvault.py's,
     reused rather than duplicated) with the real Azure error detail on any auth/permission/network
     failure, matching this codebase's existing fail-fast-with-the-provider's-own-error convention.
+    Bounded to _VAULT_TIMEOUT_SECONDS -- a hang here is otherwise unbounded (see that constant's
+    own comment for why this matters more here than it looks).
     """
     from azure.core.exceptions import AzureError
     from azure.identity.aio import DefaultAzureCredential
     from azure.keyvault.secrets.aio import SecretClient
 
-    try:
+    async def _fetch() -> str:
         async with DefaultAzureCredential() as credential:
             async with SecretClient(vault_url=_vault_uri(), credential=credential) as client:
                 secret = await client.get_secret(secret_name)
                 return secret.value or ""
+
+    try:
+        return await asyncio.wait_for(_fetch(), timeout=_VAULT_TIMEOUT_SECONDS)
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise VaultAccessError(
+            f"timed out after {_VAULT_TIMEOUT_SECONDS}s contacting the org vault"
+        ) from exc
 
 
 async def set_org_credential(value: str) -> str:
     """Writes `value` as a new version of ORG_CREDENTIAL_SECRET_NAME under the agent's OWN
     standing identity, and returns that name so the caller (org_settings.set_org_settings) can
-    store it without needing to know the constant itself. Same standing-identity and
-    VaultAccessError contract as get_org_credential."""
+    store it without needing to know the constant itself. Same standing-identity, VaultAccessError,
+    and _VAULT_TIMEOUT_SECONDS-bounded contract as get_org_credential."""
     from azure.core.exceptions import AzureError
     from azure.identity.aio import DefaultAzureCredential
     from azure.keyvault.secrets.aio import SecretClient
 
-    try:
+    async def _store() -> None:
         async with DefaultAzureCredential() as credential:
             async with SecretClient(vault_url=_vault_uri(), credential=credential) as client:
                 await client.set_secret(ORG_CREDENTIAL_SECRET_NAME, value)
+
+    try:
+        await asyncio.wait_for(_store(), timeout=_VAULT_TIMEOUT_SECONDS)
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise VaultAccessError(
+            f"timed out after {_VAULT_TIMEOUT_SECONDS}s contacting the org vault"
+        ) from exc
     return ORG_CREDENTIAL_SECRET_NAME
 
 
