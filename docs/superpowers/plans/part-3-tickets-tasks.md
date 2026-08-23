@@ -142,29 +142,49 @@ partial indexes) stops "Connect a Repository" from creating a second project for
 already connected, without that constraint ever colliding with the many simultaneously-`NULL`
 not-yet-scaffolded new-project rows.
 
-## Ruling 3 — `sync_ledger` gets an explicit mode; this is the load-bearing fix of the whole Part
+## Ruling 3 — `sync_ledger` drops silent auto-retire entirely; no mode parameter needed
 
-The Spec already designed the right fix (a `full_redraft` vs `scoped_ticket` mode, with
-`scoped_ticket` never auto-retiring an entry the draft simply didn't cite) — the research
-confirms it is **necessary**, not speculative: shipping the rest of this Part without it means the
-second real ticket filed against any project silently deletes the first ticket's requirements.
-Scope for *this* Part, precisely:
+**Corrected 2026-08-23, before Task 6 was dispatched**, after tracing the real call graph rather
+than building on the Spec's own (reasonable-sounding, but unverified) two-mode design. Grepped
+`sync_ledger(` across the whole codebase: there is exactly **one real call site**,
+`graph.py`'s `_verify_specification_ledger` (the `specification` stage's own
+`deterministic_verify`, `graph.py:583`). `brownfield-baseline` does not call `sync_ledger` at
+all — it only writes `.ai-dev-workflow/manifest.json` (research §6) — so the Spec's premise that
+`full_redraft` mode was needed "for brownfield-baseline" describes a call site that doesn't exist.
 
-- `sync_ledger(entries, draft_user_stories, run_id, *, mode)` gains a required, explicit `mode:
-  Literal["full_redraft", "scoped_ticket"]` (no default — the exact same "no silent resolution"
-  posture Part 4's Ruling 4 used for `chat_model.py`'s dispatch functions, for the same reason: a
-  caller that forgets to pass it should get a `TypeError`, not a guess). `full_redraft` keeps
-  today's exact behavior (untouched entries auto-retire) for `brownfield-baseline` and a
-  brand-new project's first-ever Speccing pass — those really are drafting the whole spec at once.
-  `scoped_ticket` never auto-retires on silence.
+That leaves one real question: does the ONE call site ever need "auto-retire anything not
+re-cited" as CORRECT behavior, for any project state? Traced it through: `sync_ledger`'s own
+existing "greenfield leniency" branch already makes the auto-retire step a no-op whenever the
+ledger starts empty (every id in a from-nothing draft is freshly allocated, so every id is
+trivially in `touched_ids` — nothing pre-existing exists to wrongly retire). So the auto-retire
+step was NEVER doing useful work on an empty ledger; the only condition under which it does
+anything at all is exactly the dangerous one Ruling 3 exists to fix (a non-empty ledger, i.e. a
+second-or-later ticket). There is no real scenario left where the old unconditional behavior is
+both reachable and correct — a `mode` parameter would be a switch between "no-op" and "dangerous,"
+which is not a real choice worth a parameter. Simpler fix, same safety, less machinery:
+
+- `sync_ledger` drops the unconditional auto-retire loop entirely. An entry's status only ever
+  changes to `"retired"` because the current draft *names* it — nothing is retired on silence,
+  ever, for any project state. This needs no mode, no `GraphState` pinning field (nothing to pin —
+  the behavior no longer depends on which situation this call is in), and no change to
+  `sync_ledger`'s existing signature beyond what the next bullet adds.
 - The Specification draft response schema gains `retired_ac_ids: list[str] = []` /
-  `retired_us_ids: list[str] = []` — `scoped_ticket` mode has no more "silence means retirement,"
-  so a ticket that intentionally removes a requirement has to say so. `sync_ledger` in
-  `scoped_ticket` mode retires exactly the ids named here, plus whatever `existing_ac_id`/
-  `existing_us_id` citations resolve as usual — nothing else.
-- The ticket-mode Speccing prompt (Task 6) explains this to the model plainly: don't restate
-  everything the project already has, only this ticket's own new/changed/removed requirements;
-  name anything being removed in `retired_ac_ids`/`retired_us_ids` rather than just omitting it.
+  `retired_us_ids: list[str] = []`. `sync_ledger` retires exactly the ids named here, plus whatever
+  `existing_ac_id`/`existing_us_id` citations resolve as usual (a citation always meant "revise,"
+  never "retire," and still doesn't) — nothing else, on every call, unconditionally.
+- The Speccing prompt (Task 6, both a brand-new project's first pass and every later ticket) gains
+  the same one instruction either way: state what this pass adds or changes; if something the
+  ledger already has no longer belongs, name it in `retired_ac_ids`/`retired_us_ids` rather than
+  just omitting it from the draft. A first-ever pass on an empty ledger has nothing to name and the
+  fields stay empty — same effective behavior as today, just reached by an explicit empty list
+  instead of an implicit "nothing existed to retire" fact about the ledger's starting size.
+- **Task 6's own job, not assumed here**: confirm, by reading the specification stage's actual
+  draft/audit prompts (not guessed), whether one ticket's own multiple internal draft→audit→verify
+  cycles restate that ticket's own scope in full on every cycle. If they do (expected — it's the
+  same work session iterating on the same piece of work), this fix has no within-ticket regression:
+  an ordinary revision cycle still says everything it currently means to say, and
+  `retired_ac_ids`/`retired_us_ids` covers a deliberate drop the same way a citation already covers
+  a deliberate revision. This is a real thing to verify, not an assumption to ship on.
 
 **Explicitly deferred, not part of this Part** (Non-Goals section has the full list): the
 supersession *lineage* fields (`superseded_by`/`supersedes`) and the prompt-level "revise-in-place
@@ -355,22 +375,27 @@ Ships without the pre-warm checkbox (Ruling 4) — connecting just creates the p
 first ticket filed against it runs tech-stack/baseline detection exactly as any ticket on a
 brand-new project would.
 
-## Task 6: `sync_ledger` mode split + ticket-mode Speccing
+## Task 6: `sync_ledger` explicit-retirement fix + ticket-mode Speccing
 
-Implements Ruling 3 exactly: `sync_ledger`'s new required `mode` keyword; the Specification draft
-schema's new `retired_ac_ids`/`retired_us_ids` fields; `scoped_ticket` mode's "don't auto-retire on
-silence" logic. Every real call site of `sync_ledger` today needs auditing for which mode applies
-(`brownfield-baseline` and a project's first-ever Speccing pass → `full_redraft`; every other
-ticket's Speccing pass on a project that already has a ledger → `scoped_ticket`) — find every call
-site first (this task's own research pass, mirroring how Part 4's Task 5 found its ~17+~10 call
-sites before touching any of them), don't assume there's only one.
+Implements Ruling 3 exactly: `sync_ledger` drops its unconditional "retire anything not re-cited"
+loop entirely — no mode parameter, since there is exactly one real call site
+(`graph.py:583`, `_verify_specification_ledger`, the `specification` stage's own
+`deterministic_verify` — confirmed by grep, not assumed; `brownfield-baseline` never calls this
+function at all). The Specification draft schema gains `retired_ac_ids: list[str] = []` /
+`retired_us_ids: list[str] = []`; `sync_ledger` retires exactly the ids named there (plus whatever
+`existing_ac_id`/`existing_us_id` citations already resolve as revisions), on every call,
+regardless of project/ticket state. Confirm Ruling 3's own open verification item while you're in
+this code: read the specification stage's actual draft/audit prompts and confirm one ticket's own
+multiple internal draft→audit→verify cycles restate that ticket's own scope in full each cycle
+(expected, but verify — don't assume) — this is what makes dropping silent auto-retire safe with
+no within-ticket regression, not just safe across tickets.
 
-Also this task's job: the Speccing stage's own `hydrate_from_repo_file` for the `scoped_ticket`
-case — does a cached baseline spec (`.ai-dev-workflow/spec/ledger.json` already existing and
-non-empty) mean "expand this ticket's text against the existing baseline, scoped" rather than "do
-the full read"? This is the one hydrate check the Spec calls out by name as distinct from the other
-5 in Task 7 below (it's a mode switch on the *existing* Speccing prompt, not a new draft-vs-generate
-decision the way the others are) — build it here, alongside the mode plumbing it depends on, not
+Also this task's job: the Speccing stage's own `hydrate_from_repo_file` — does a cached baseline
+spec (`.ai-dev-workflow/spec/ledger.json` already existing and non-empty) mean "expand this
+ticket's text against the existing baseline, scoped" rather than "do the full read"? This is the
+one hydrate check the Spec calls out by name as distinct from the other 5 in Task 7 below (it's a
+prompt-framing switch on the *existing* Speccing prompt, not a new draft-vs-generate decision the
+way the others are) — build it here, alongside the retirement-field plumbing it sits next to, not
 in Task 7.
 
 ## Task 7: Per-stage hydrate audit — Plan, ac-to-tests, Minimal-Code-to-Green, Remediation,
@@ -431,10 +456,10 @@ real conditions, not just unit-level self-checks. At minimum:
 
 1. **The safety-critical one**: on a real (or realistic local) DB, create a project, file ticket
    #1 through Speccing far enough to get real US/AC ids on the ledger, then file ticket #2 against
-   the *same* project and run its Speccing stage in `scoped_ticket` mode — confirm ticket #1's ids
-   are still `active`/`revised` afterward, not silently `retired`. This is the exact failure the
-   research proved would happen without Ruling 3's fix; prove it's actually fixed, empirically,
-   not just that the code compiles.
+   the *same* project and run its own Speccing stage without `retired_ac_ids`/`retired_us_ids`
+   naming ticket #1's ids — confirm ticket #1's ids are still `active`/`revised` afterward, not
+   silently `retired`. This is the exact failure the research proved would happen without Ruling
+   3's fix; prove it's actually fixed, empirically, not just that the code compiles.
 2. New-repo scaffolding end-to-end against a real (or throwaway test) GitHub repo: create, clone
    inside a real sandbox, first commit, push — confirm the whole chain the Spec's wireframe
    assumes actually works, not just that `repo_scaffold.create_repo` returns 201.
