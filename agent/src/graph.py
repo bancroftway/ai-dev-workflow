@@ -164,6 +164,47 @@ class GraphState(TypedDict):
     # first_seen_run_id/last_revised_run_id, approvals.py's ApprovalRecord.run_id) and, later,
     # metrics-report/exit's history/<run_id>-*.json snapshot naming.
     run_id: str
+    # The org-wide provider ("copilot"/"claude") this THREAD is pinned to, resolved from the live
+    # org setting via `await chat_model.get_provider()` -- Ruling 2,
+    # docs/superpowers/plans/part-4-org-settings-tasks.md: every later graph node reads this key
+    # instead of calling get_provider() again, so an admin flipping the org-wide setting mid-run can
+    # never split one pipeline execution across two providers' sessions/CLIs (a real hazard: session
+    # caches, tool allowlists and CLI transcript formats all differ per provider).
+    #
+    # Deliberately UNLIKE run_id just above: run_id reMINTS on every intake_node execution
+    # (including a same-thread "later revision" or a blank-resume reattach -- see run_id's own
+    # comment), but provider must not. intake_node computes `state.get("provider") or await
+    # chat_model.get_provider()` -- preserve-if-already-set, resolve only if genuinely absent --
+    # specifically because AppShell's blank runAgent()-on-mount reattach (intake_node's own
+    # is_new_submission dance; also AIDW_RESUME headless resume) re-enters intake_node exactly the
+    # same as a fresh submission does, and that path is by far the most common way an in-review run
+    # gets touched again. Re-resolving there would let an admin's live setting change flip the
+    # provider out from under a run that is not finished, exactly the failure Ruling 2 exists to
+    # prevent -- pinning per-THREAD (not merely per-intake-call) is what actually closes that gap.
+    #
+    # Survives a resume exactly like every other never-touched-again GraphState field (stages,
+    # run_id, StageState.baseline_commit) does: this module's compiled graph uses InMemorySaver
+    # (see compile_graph below), which gives every TypedDict key its own last-value channel, merged
+    # from the thread's last checkpoint into every invocation that doesn't overwrite it -- confirmed
+    # against real code here, not assumed, the same way this field's own brief asked for:
+    # resume_regression_check.py runs a REAL compiled graph against a REAL InMemorySaver and proves
+    # this exact round-trip for consumed_message_id (also written once by intake_node and never
+    # touched again downstream); make_draft_node's baseline_commit handling (~line 1462) documents
+    # the identical "captured once, persists via checkpoint" reliance for a plain StageState field.
+    # Nothing about a fresh top-level GraphState key makes this field any less durable than those.
+    #
+    # The one real wrinkle, independently documented in three other places in this codebase
+    # (run_headless.py's own module docstring, repo_scan.py, sandbox/registry.py): InMemorySaver is
+    # process-local. It holds nothing across a process restart, for ANY field -- provider included,
+    # but also stages, run_id, everything. The only cross-restart durability this pipeline has is
+    # workflow_persistence.hydrate_state(), and intake_node calls it to restore just `stages`
+    # (never a bare top-level field -- manifest_exists/app_scan/run_baseline_commit are all simply
+    # recomputed fresh every run instead of hydrated, same as this one will be). So
+    # `state.get("provider")` comes back empty not only for a checkpoint that predates this field,
+    # but for EVERY thread's first intake call after EVERY future restart, forever -- the `or await
+    # chat_model.get_provider()` fallback is this field's ordinary, permanent steady-state behavior,
+    # not a one-time migration shim that stops mattering once every pre-migration checkpoint is gone.
+    provider: Literal["copilot", "claude"]
     # Set by scaffold_node (preflight_nodes.py) -- manifest.json absence is the canonical
     # "never onboarded before" signal, routing into brownfield-baseline's brownfield sub-flow. Read once at
     # scaffold time and routed on from state, never re-read: app_check_record_node writes to
@@ -1252,6 +1293,15 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     thread_id = config["configurable"]["thread_id"]
     stages = {key: dict(value) for key, value in state.get("stages", {}).items()}
 
+    # Pinned per-THREAD, not re-resolved per intake call -- see GraphState.provider's own comment
+    # for the full reasoning (Ruling 2, docs/superpowers/plans/part-4-org-settings-tasks.md) and for
+    # why this deliberately does NOT follow run_id's unconditional-remint pattern just below. Short
+    # version: `or` short-circuits, so the live get_provider() read only ever fires the first time
+    # this process has seen this thread (a brand new thread, or the first intake after a restart --
+    # InMemorySaver keeps neither) -- every later intake on the same thread, including a blank-resume
+    # reattach, keeps whatever this run already pinned.
+    provider: Literal["copilot", "claude"] = state.get("provider") or await chat_model.get_provider()
+
     # Popped unconditionally, right here, on EVERY intake -- a resume=1 provision sets this meta
     # flag once, and it must not survive past the first run that consumes it (else a later,
     # unrelated follow-up message on the same thread would also skip the fresh-run stage reset
@@ -1391,6 +1441,10 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # consumed message's id on a fresh submission -- either way, the next intake's dedupe
         # check compares against exactly what this run actually consumed.
         "consumed_message_id": consumed_message_id,
+        # Echoes whatever this thread already pinned (see the `provider` local above and
+        # GraphState.provider's own comment) unless this is genuinely the first intake this
+        # process has seen for this thread, in which case it's this run's one live resolution.
+        "provider": provider,
         "e2e": e2e_state,
     }
 
