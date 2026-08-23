@@ -1837,6 +1837,8 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # Durable counterpart (Part 2 run-visibility) -- same data, second destination. See
             # run_event_store.py's module docstring for why the ledger write above isn't enough on
             # its own (gone once this sandbox is torn down). Additive: the ledger write is untouched.
+            # Fails soft by design -- append_event itself swallows+logs a DB error rather than
+            # raising, so a transient blip here can never abort this node (see its own docstring).
             await run_event_store.append_event(RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
@@ -1962,7 +1964,8 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 },
             )
             # Durable counterpart (Part 2 run-visibility) -- same data, second destination, additive
-            # to the ledger write above (see run_event_store.py's module docstring).
+            # to the ledger write above (see run_event_store.py's module docstring). Fails soft:
+            # append_event swallows+logs a DB error internally rather than raising.
             await run_event_store.append_event(RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
@@ -2193,7 +2196,8 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             )
             # Durable counterpart (Part 2 run-visibility) -- same data, second destination, additive
             # to the ledger write above (see run_event_store.py's module docstring). No token_usage:
-            # deterministic_verify is a real script/parse, never an LLM call.
+            # deterministic_verify is a real script/parse, never an LLM call. Fails soft:
+            # append_event swallows+logs a DB error internally rather than raising.
             await run_event_store.append_event(RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,

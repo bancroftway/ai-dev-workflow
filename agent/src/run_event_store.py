@@ -41,26 +41,44 @@ async def _get_pool() -> aioodbc.Pool:
 
 async def append_event(event: RunEvent) -> RunEvent:
     """Inserts one event row. Any seq/ts already set on `event` is ignored -- the DB assigns both;
-    the returned copy carries what was actually stored."""
-    pool = await _get_pool()
-    async with pool.acquire() as conn, conn.cursor() as cur:
-        await cur.execute(
-            """
-            INSERT INTO dbo.run_events (run_id, session_id, stage, node, type, summary, payload, token_usage)
-            OUTPUT INSERTED.seq, INSERTED.ts
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            event.run_id,
-            event.session_id,
-            event.stage,
-            event.node,
-            event.type.value,
-            event.summary,
-            json.dumps(event.payload) if event.payload is not None else None,
-            json.dumps(event.token_usage) if event.token_usage is not None else None,
+    the returned copy carries what was actually stored.
+
+    Best-effort, on purpose: this is non-critical instrumentation riding alongside
+    repo_files.append_ledger_entry (graph.py's real call sites write both, additively). Unlike that
+    ledger write, a failure here must never propagate -- an unhandled exception out of a node aborts
+    the whole graph invocation (telemetry.traced_node), which would mean a transient DB blip on this
+    new, purely-observational write kills an entire in-flight, LLM-cost-incurring run. Mirrors
+    _with_live_refresh's (graph.py) same swallow-and-log shape, for the same reason ("a display
+    refresh must never fail a real node"). Centralized here, not at each call site, so every current
+    and future caller gets it for free. On failure, returns `event` unchanged (seq/ts stay whatever
+    the caller passed in, normally None) instead of raising.
+    """
+    try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO dbo.run_events (run_id, session_id, stage, node, type, summary, payload, token_usage)
+                OUTPUT INSERTED.seq, INSERTED.ts
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                event.run_id,
+                event.session_id,
+                event.stage,
+                event.node,
+                event.type.value,
+                event.summary,
+                json.dumps(event.payload) if event.payload is not None else None,
+                json.dumps(event.token_usage) if event.token_usage is not None else None,
+            )
+            seq, ts = await cur.fetchone()
+        return replace(event, seq=seq, ts=ts)
+    except Exception:  # noqa: BLE001 -- best-effort instrumentation; never abort the node/run over this
+        logger.warning(
+            "append_event failed for run_id=%s stage=%s node=%s -- continuing without it",
+            event.run_id, event.stage, event.node, exc_info=True,
         )
-        seq, ts = await cur.fetchone()
-    return replace(event, seq=seq, ts=ts)
+        return event
 
 
 _COLUMNS = ["seq", "run_id", "session_id", "ts", "stage", "node", "type", "summary", "payload", "token_usage"]
@@ -99,6 +117,7 @@ async def list_events(run_id: str) -> list[RunEvent]:
 
 async def _demo() -> None:
     """Self-check against a real DB: `cd agent && uv run python -m src.run_event_store`."""
+    global _get_pool  # reassigned further down (fail-soft check); must precede every use in this function
     project_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
     run_id = uuid.uuid4().hex[:8]
@@ -160,6 +179,27 @@ async def _demo() -> None:
         assert [e.seq for e in events] == [appended.seq, second.seq], events
         assert events[1].payload == {"audit_findings_count": 0, "audit_skipped_infra": False}, events[1]
         assert events[1].token_usage is None, events[1]
+
+        # Fail-soft contract (coordinator review fix): a DB failure inside append_event must never
+        # raise into the caller -- it logs a warning and hands back the original event unchanged, so
+        # a transient blip can never abort the LLM-cost-incurring node that called it. Simulated by
+        # swapping _get_pool for one that always raises, same "plain global reassignment" technique
+        # sessions_api._demo() uses for its own monkeypatches.
+        real_get_pool = _get_pool
+
+        async def _broken_pool() -> aioodbc.Pool:
+            raise RuntimeError("simulated DB outage")
+
+        _get_pool = _broken_pool
+        try:
+            broken = RunEvent(
+                run_id=run_id, session_id=session_id, type=RunEventType.NODE_FINISHED,
+                stage="specification", node="draft", summary="should not persist",
+            )
+            result = await append_event(broken)
+            assert result == broken, result  # unchanged, not raised
+        finally:
+            _get_pool = real_get_pool
 
         print("run_event_store self-check: ok")
     finally:
