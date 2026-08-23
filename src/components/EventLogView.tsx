@@ -282,6 +282,44 @@ function EventDetail({ event }: { event: RunLogEvent }) {
   return <ToolCallDetail payload={payload} />;
 }
 
+/** Common-prefix/suffix-trimmed pseudo-diff for an Edit-tool `old_string`/`new_string` pair. No
+ * real diff-computation library is safely available here (see DiffView.tsx's module docstring for
+ * why not -- the only `diff`/jsdiff path in node_modules is an incidental transitive dependency of
+ * a test runner, not something safe to import from app code), so this isn't a full line-level diff
+ * -- no shared-context detection beyond the two ends, no moved/reordered-line tracking. It's
+ * strictly better than marking the entire block changed for the dominant real case though: a
+ * small, localized edit inside an otherwise-unchanged block, trimming the unchanged lines off both
+ * ends down to real unified-diff context lines (leading space) and marking only the differing
+ * middle chunk removed/added.
+ * ponytail: prefix/suffix trim, not LCS -- swap for a real diff lib (e.g. jsdiff) if a caller ever
+ * needs moved-line-aware diffing. */
+function buildTrimmedDiff(oldStr: string, newStr: string): string {
+  const oldLines = oldStr.split("\n");
+  const newLines = newStr.split("\n");
+
+  const maxPrefix = Math.min(oldLines.length, newLines.length);
+  let prefix = 0;
+  while (prefix < maxPrefix && oldLines[prefix] === newLines[prefix]) prefix++;
+
+  const maxSuffix = maxPrefix - prefix; // bounds the scan so prefix+suffix can never overlap
+  let suffix = 0;
+  while (suffix < maxSuffix && oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]) {
+    suffix++;
+  }
+
+  const contextBefore = oldLines.slice(0, prefix);
+  const removed = oldLines.slice(prefix, oldLines.length - suffix);
+  const added = newLines.slice(prefix, newLines.length - suffix);
+  const contextAfter = oldLines.slice(oldLines.length - suffix);
+
+  return [
+    ...contextBefore.map((l) => ` ${l}`),
+    ...removed.map((l) => `-${l}`),
+    ...added.map((l) => `+${l}`),
+    ...contextAfter.map((l) => ` ${l}`),
+  ].join("\n");
+}
+
 /** Renders EITHER real captured shape: Claude's correlated `{name, input, result, is_error}`
  * (claude_chat_model.py) or Copilot's uncorrelated raw `data` dict with no confirmed `input`/
  * `result` keys at all (copilot_chat_model.py) -- the generic JSON fallback at the end is what
@@ -308,13 +346,12 @@ function ToolCallDetail({ payload }: { payload: Record<string, unknown> }) {
   return (
     <div className="space-y-2 border-t border-neutral-100 bg-neutral-50 p-3">
       {oldStr != null && newStr != null ? (
-        // No diff-computation library is safely available here (see DiffView.tsx's module
-        // docstring) -- this is a naive whole-block "every old line removed, every new line
-        // added" view, not a real line-level diff, but it's real DiffView rendering real redacted
-        // Edit-tool content end to end.
+        // buildTrimmedDiff (see its own docstring): a common-prefix/suffix-trimmed pseudo-diff,
+        // not a full line-level one, but real DiffView rendering real redacted Edit-tool content
+        // end to end.
         <DiffView
           title={typeof inputObj?.file_path === "string" ? (inputObj.file_path as string) : undefined}
-          diff={[...oldStr.split("\n").map((l) => `-${l}`), ...newStr.split("\n").map((l) => `+${l}`)].join("\n")}
+          diff={buildTrimmedDiff(oldStr, newStr)}
         />
       ) : (
         input != null && (
