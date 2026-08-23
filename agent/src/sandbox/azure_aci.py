@@ -151,6 +151,8 @@ class AzureContainerInstanceProvider(SandboxProvider):
         git_user_token: str,
         runtime_auth_token: str,
         image: str | None = None,
+        scaffold_new_repo: bool = False,
+        project_name: str | None = None,
     ) -> SandboxSession:
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
         # a module-scope import here would cycle. Needed only to pick which of
@@ -227,6 +229,16 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 f"WORK_BRANCH={work_branch}",
                 f"AGENT_PROVIDER={provider}",
                 f"AIDW_IMAGE_REF={image or self._sandbox_image}",
+            ]
+            if scaffold_new_repo:
+                # "+ New Project" case only (Part 3 plan, Ruling 6) -- entrypoint.sh reads these to
+                # git-init-and-push instead of cloning. Appended to the SAME --environment-variables
+                # group above (az's own CLI groups consecutive non-flag args under whichever `--...`
+                # flag preceded them) -- must land before --secure-environment-variables starts its
+                # own group below, not after. Never set on an ordinary provision, so today's clone
+                # path is byte-for-byte unchanged for every other caller.
+                args += ["SCAFFOLD_NEW_REPO=1", f"PROJECT_NAME={project_name}"]
+            args += [
                 "--secure-environment-variables",
                 f"REPO_CLONE_URL={repo_clone_url}",
                 f"GIT_USER_TOKEN={git_user_token}",

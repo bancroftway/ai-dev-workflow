@@ -30,7 +30,18 @@ from fastapi import APIRouter, HTTPException, Request
 import httpx
 from pydantic import BaseModel
 
-from . import app_discovery, branch_naming, chat_model, git_ops, keyvault, org_credential_vault, org_settings, session_store
+from . import (
+    app_discovery,
+    branch_naming,
+    chat_model,
+    git_ops,
+    keyvault,
+    org_credential_vault,
+    org_settings,
+    project_store,
+    repo_scaffold,
+    session_store,
+)
 from .sandbox import get_sandbox_provider, registry
 
 logger = logging.getLogger(__name__)
@@ -39,6 +50,7 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 config_router = APIRouter(prefix="/vault-config", tags=["vault-config"])
 org_settings_router = APIRouter(prefix="/org-settings", tags=["org-settings"])
 catalog_router = APIRouter(tags=["tech-stack"])
+projects_router = APIRouter(prefix="/projects", tags=["projects"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -56,6 +68,12 @@ def _check_shared_secret(request: Request) -> None:
 
 class ProvisionRequest(BaseModel):
     thread_id: str
+    # Which project (agent/src/project_store.py) this ticket belongs to -- required, no default:
+    # every session created from this point on belongs to exactly one project (Ruling 1,
+    # docs/superpowers/plans/part-3-tickets-tasks.md). When the named project has no repo yet (the
+    # "+ New Project" case), owner/repo below are not yet known to the frontend -- provision_session
+    # scaffolds a new GitHub repo for it instead of using owner/repo as sent (see provision_session).
+    project_id: str
     owner: str
     repo: str
     branch: str
@@ -115,9 +133,39 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             body.owner, body.repo, body.thread_id,
         )
 
+    project = await project_store.get_project(body.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"project {body.project_id} not found")
+
+    # "+ New Project" case (Ruling 6, part-3-tickets-tasks.md): no GitHub repo exists yet for this
+    # project. Scaffold one now, under the signed-in user's own personal account -- POST
+    # /user/repos (repo_scaffold.create_repo) always creates under whichever account
+    # body.github_token authenticates as, so there is no separate "owner" to compute or pass here
+    # (see task-2-report.md point 5). body.owner/body.repo are NOT used below in this branch: the
+    # frontend has no repo to send yet for a project that doesn't have one. Backfilling
+    # owner/repo onto the project row immediately (before this session row is even created) means
+    # a retried or second provision call against the same project_id sees project["repo"] already
+    # set and never re-scaffolds a second repo.
+    scaffold_new_repo = project["repo"] is None
+    if scaffold_new_repo:
+        try:
+            scaffolded = await repo_scaffold.create_repo(project["name"], body.github_token)
+        except Exception as exc:  # noqa: BLE001 -- create_repo raises RuntimeError on a GitHub-side
+            # failure (a 422 name collision included) but, per its own module's report, doesn't
+            # itself wrap a raw httpx transport error -- catching broadly here, same as the
+            # provider.provision() except block below, keeps either failure mode a clean 502
+            # instead of a 500, and guarantees this request structurally cannot fall through to
+            # session_store.create_session for a repo that was never actually created.
+            logger.exception("repo scaffolding failed for project_id=%s", body.project_id)
+            raise HTTPException(status_code=502, detail=f"repo scaffolding failed: {exc}") from None
+        await project_store.set_project_repo(body.project_id, scaffolded["owner"], scaffolded["repo"])
+        owner, repo = scaffolded["owner"], scaffolded["repo"]
+    else:
+        owner, repo = body.owner, body.repo
+
     work_branch = branch_naming.work_branch_for(body.thread_id)
     provider = get_sandbox_provider()
-    repo_clone_url = f"https://github.com/{body.owner}/{body.repo}.git"
+    repo_clone_url = f"https://github.com/{owner}/{repo}.git"
     # The active provider's own secret -- an org admin's Settings-UI-saved vault credential if one
     # is configured, else the same env-var fallback this used to compute by hand (see
     # sandbox/provider.py's provision() docstring for how the sandbox uses this). Provisioning a
@@ -133,6 +181,8 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             work_branch=work_branch,
             git_user_token=body.github_token,
             runtime_auth_token=runtime_auth_token,
+            scaffold_new_repo=scaffold_new_repo,
+            project_name=project["name"] if scaffold_new_repo else None,
         )
     except Exception as exc:  # noqa: BLE001 -- surfaced to the caller as a plain 502, not swallowed
         logger.exception("sandbox provisioning failed for thread_id=%s", body.thread_id)
@@ -156,12 +206,13 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
         # requirements text to generate one from (session_store.touch_run).
         await session_store.create_session(
             body.thread_id,
-            owner=body.owner,
-            repo=body.repo,
+            owner=owner,
+            repo=repo,
             user_login=body.user_login,
             source_branch=body.branch,
             work_branch=work_branch,
             title="(untitled session)",
+            project_id=body.project_id,
         )
 
     return ProvisionResponse(status="ready")
@@ -207,13 +258,18 @@ class SessionListResponse(BaseModel):
 
 @router.get("", response_model=SessionListResponse)
 async def list_sessions(
-    request: Request, owner: str, repo: str, source_branch: str | None = None
+    request: Request,
+    owner: str,
+    repo: str,
+    source_branch: str | None = None,
+    project_id: str | None = None,
 ) -> SessionListResponse:
-    """Backs /select's session-list panel and the provision route's existence checks -- the
-    frontend calls this instead of reading `.ai-dev-workflow/sessions.json` off GitHub, since
-    that file no longer exists."""
+    """Backs /select's session-list panel, the provision route's existence checks, and (Part 3)
+    the project-scoped Board's `GET /sessions?owner=&repo=&project_id=` query -- the frontend
+    calls this instead of reading `.ai-dev-workflow/sessions.json` off GitHub, since that file no
+    longer exists."""
     _check_shared_secret(request)
-    rows = await session_store.list_sessions(owner, repo, source_branch)
+    rows = await session_store.list_sessions(owner, repo, source_branch, project_id)
     return SessionListResponse(sessions=[_row_to_response(row) for row in rows])
 
 
@@ -562,3 +618,87 @@ async def get_tech_stack_catalog(request: Request) -> TechStackCatalogResponse:
     router rather than living under /sessions or /vault-config."""
     _check_shared_secret(request)
     return TechStackCatalogResponse(stacks=app_discovery.load_stack_catalog())
+
+
+# --- projects (Part 3: tickets/board -- docs/superpowers/plans/part-3-tickets-tasks.md) --------
+
+
+class ProjectResponse(BaseModel):
+    """The single schema-aware representation of a project row -- mirrors SessionResponse's own
+    convention above (the frontend never queries SQL directly). owner/repo/tech_stack_id/
+    tech_stack_text are all nullable: a "+ New Project" row starts with owner/repo NULL (Ruling 2)
+    until scaffolding backfills them; a Connect-Repository row starts with tech_stack_id/
+    tech_stack_text NULL until brownfield detection or a later Tech Stack confirmation runs."""
+
+    project_id: str
+    name: str
+    owner: str | None
+    repo: str | None
+    tech_stack_id: str | None
+    tech_stack_text: str | None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectListResponse(BaseModel):
+    projects: list[ProjectResponse]
+
+
+@projects_router.get("", response_model=ProjectListResponse)
+async def list_projects_route(request: Request) -> ProjectListResponse:
+    """Backs the New Ticket form's project picker (GET /projects)."""
+    _check_shared_secret(request)
+    rows = await project_store.list_projects()
+    return ProjectListResponse(projects=[ProjectResponse(**row) for row in rows])
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+    tech_stack_id: str | None = None
+    tech_stack_text: str | None = None
+    created_by: str
+
+
+@projects_router.post("", response_model=ProjectResponse)
+async def create_project_route(body: CreateProjectRequest, request: Request) -> ProjectResponse:
+    """The "+ New Project" inline-fields case (New Ticket form): creates a project row with
+    owner/repo still NULL -- provision_session scaffolds the actual GitHub repo later, the first
+    time a ticket is filed against this project (see provision_session above)."""
+    _check_shared_secret(request)
+    project_id = await project_store.create_project(
+        body.name,
+        tech_stack_id=body.tech_stack_id,
+        tech_stack_text=body.tech_stack_text,
+        created_by=body.created_by,
+    )
+    row = await project_store.get_project(project_id)
+    return ProjectResponse(**row)
+
+
+class ConnectProjectRequest(BaseModel):
+    owner: str
+    repo: str
+    created_by: str
+
+
+@projects_router.post("/connect", response_model=ProjectResponse)
+async def connect_project_route(body: ConnectProjectRequest, request: Request) -> ProjectResponse:
+    """The Connect-Repository action. Idempotent: connecting an already-connected (owner, repo)
+    returns the existing project rather than erroring or duplicating (matches provision_session's
+    own idempotent-creation convention for dbo.sessions) -- UX_projects_owner_repo guarantees at
+    most one row can ever match a given pair, so find_project_by_repo is authoritative. Otherwise
+    creates a new row with owner/repo already set; tech_stack_id/tech_stack_text stay NULL (not
+    this route's job to guess brownfield tech stack). No separate "project name" field exists for
+    this flow (the wireframe has none) -- `repo` doubles as the project's display name, same as
+    this codebase's own pre-Part-3 assumption that repo == project."""
+    _check_shared_secret(request)
+    existing = await project_store.find_project_by_repo(body.owner, body.repo)
+    if existing is not None:
+        return ProjectResponse(**existing)
+    project_id = await project_store.create_project(
+        body.repo, tech_stack_id=None, tech_stack_text=None, created_by=body.created_by
+    )
+    await project_store.set_project_repo(project_id, body.owner, body.repo)
+    row = await project_store.get_project(project_id)
+    return ProjectResponse(**row)

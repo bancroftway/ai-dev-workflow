@@ -70,6 +70,8 @@ class SandboxProvider(abc.ABC):
         git_user_token: str,
         runtime_auth_token: str,
         image: str | None = None,
+        scaffold_new_repo: bool = False,
+        project_name: str | None = None,
     ) -> SandboxSession:
         """Start (or reuse) the sandbox for session_id and return how to reach it.
 
@@ -78,6 +80,15 @@ class SandboxProvider(abc.ABC):
         (plan Section C.4's ordering guarantee). work_branch is this session's own unique git
         branch (agent/src/branch_naming.py, computed once at session creation and never
         recomputed here) -- passed straight through as the sandbox's WORK_BRANCH env var.
+
+        scaffold_new_repo (Part 3 plan, Ruling 6) is True only for the "+ New Project" provision
+        call that just created repo_clone_url's own (empty) GitHub repo via repo_scaffold.
+        create_repo -- entrypoint.sh reads this as SCAFFOLD_NEW_REPO to `git init` + push an
+        initial commit instead of cloning. False (the default) for every ordinary Connect-
+        Repository/`/select` provision, exactly as before this parameter existed. project_name is
+        required (by entrypoint.sh, not this signature) whenever scaffold_new_repo is True --
+        it names the README.md the initial commit writes -- and must stay None otherwise, so a
+        caller never sets SCAFFOLD_NEW_REPO on an ordinary provision by accident.
         runtime_auth_token is the active provider's own secret -- the shared Copilot PAT, an
         Anthropic API key, or an admin's Settings-UI-saved credential (org_credential_vault.py,
         Part 4) -- resolved by chat_model.get_runtime_auth_token() for whatever

@@ -165,6 +165,8 @@ class LocalDockerProvider(SandboxProvider):
         git_user_token: str,
         runtime_auth_token: str,
         image: str | None = None,
+        scaffold_new_repo: bool = False,
+        project_name: str | None = None,
     ) -> SandboxSession:
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
         # a module-scope import here would cycle. Needed only to pick which of
@@ -258,7 +260,7 @@ class LocalDockerProvider(SandboxProvider):
                 # create -> cp(token) -> start, not `docker run`: the clone credential rides in as a
                 # one-shot file (see _inject_git_token) instead of an env var that would stay readable
                 # forever via `docker inspect`.
-                returncode, container_id, stderr = await _run_docker(
+                create_args = [
                     "create",
                     "--rm",
                     "--name",
@@ -317,8 +319,16 @@ class LocalDockerProvider(SandboxProvider):
                     # fleet in general.
                     "-e",
                     f"AIDW_IMAGE_REF={image or self._image}",
-                    image or self._image,
-                )
+                ]
+                if scaffold_new_repo:
+                    # "+ New Project" case only (Part 3 plan, Ruling 6) -- entrypoint.sh reads
+                    # these to git-init-and-push instead of cloning. Never set on an ordinary
+                    # provision, so today's clone path is byte-for-byte unchanged for every other
+                    # caller.
+                    create_args += ["-e", "SCAFFOLD_NEW_REPO=1", "-e", f"PROJECT_NAME={project_name}"]
+                create_args.append(image or self._image)
+
+                returncode, container_id, stderr = await _run_docker(*create_args)
                 if returncode != 0:
                     raise RuntimeError(f"docker create failed for session {session_id!r}: {stderr}")
 
