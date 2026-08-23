@@ -162,6 +162,62 @@ these three call sites operate on a specific thread's session and must pass that
 pinned provider like any other caller, not skip the parameter because they happen not to be a
 graph node.
 
+## Ruling 5 — added 2026-08-23, during Task 9, on the process-restart provider-pinning gap Task 4's
+## review found (Task 9 checklist item 6): accept as a documented, known, low-probability residual
+## risk; no durable-checkpointer follow-up scoped now
+
+Task 4's review found, and Task 9's own independent re-trace of `workflow_persistence.hydrate_state`
+confirms directly (its return type is `dict[str, dict[str, Any]] | None` — literally just the
+`stages` dict; no other `GraphState` field, `provider` included, is ever restored by it): if the
+agent process restarts while a run is paused mid-gate, and the org-wide setting changed since that
+run started, the next reattach re-resolves the LIVE provider via `intake_node`'s
+`state.get("provider") or await get_provider()` bridge, not the one the run actually started on.
+This is real, and Ruling 2's own "never affects an in-flight run" promise does not literally cover
+this specific scenario.
+
+**Decision**: accept this as a documented, known, low-probability residual risk. Do not scope a
+durable-checkpointer migration (or extend `workflow_persistence`'s schema to cover `provider`) as a
+follow-up right now. Reasoning:
+
+1. **Not a Part-4-introduced property — a pre-existing one Part 4's new field merely inherits.**
+   `InMemorySaver` being process-local, and `hydrate_state` restoring only `stages`, both predate
+   this plan entirely. Every other `GraphState` field that isn't `stages` (`run_id`,
+   `manifest_exists`, `app_scan`, `run_baseline_commit`, ...) already has this exact
+   does-not-survive-a-restart property today, never flagged as a "risk" before now because none of
+   them individually violates a promise this explicit. `provider` is the first one whose loss has a
+   NAMED guarantee (Ruling 2) riding on it — that is why it surfaced now, not because Part 4 made
+   this pipeline's checkpointing any less durable than it already was.
+2. **Bounded, self-healing blast radius, not data loss or a security hazard** — empirically
+   characterized, not hypothetical, by Task 5's review of the closely-related teardown bug (the same
+   wrong-provider-resolution failure shape, a different trigger): a wrong-provider resolution causes
+   one dead run (a `--resume`/session lookup against the wrong provider's tracking fails, the run
+   hits `infra_exhausted`, escalates) — not a silent wedge, not corrupted state, not a credential
+   leak. The escalate node's own cleanup runs under the correctly-(re)resolved provider, so the
+   thread does not stay stuck.
+3. **Low-probability conjunction, not an ordinary-case failure the way the pre-fix Task 5 bug was.**
+   Needs THREE things to coincide: a run paused at a gate (common), the process restarting during
+   that exact pause (happens on redeploys/scaling/crashes, not rare in isolation), AND an admin
+   changing the org-wide provider during that exact same window. The third condition is what makes
+   the conjunction rare — flipping the fleet-wide provider is inherently an infrequent
+   administrative action (it is the whole reason Part 4 exists: to make that *possible* without a
+   redeploy, not something expected to happen often), not something that coincides with an arbitrary
+   restart at any meaningful rate.
+4. **The proper fix is genuinely disproportionate to this one field.** Swapping `InMemorySaver` for
+   a durable checkpointer, or teaching `workflow_persistence` to hydrate arbitrary top-level
+   `GraphState` fields (not just `stages`), is cross-cutting infrastructure work that would apply to
+   every other non-`stages` field too — not something to justify off one narrow edge case for
+   `provider` alone — and re-architecting this pipeline's checkpoint-durability model is well outside
+   a single follow-up task's scope.
+
+**Optional, cheap mitigation worth noting (not required, not scoped as a task)**: since
+`workflow_persistence.hydrate_state` already distinguishes "this thread had prior committed stage
+state" (non-empty hydrated `stages`) from "genuinely brand new" (returns `None`), `intake_node`'s
+bridge branch could log a warning specifically when it resolves `provider` fresh AND hydration just
+restored non-trivial stage state — a real signal that this is probably a post-restart reattach of
+in-progress work, not a fresh thread, without needing any new persisted state. This is a few lines,
+not a follow-up task — left for whoever next touches `intake_node` to add if the operational
+visibility seems worth it, not blocking and not required to close this Ruling.
+
 ## Global Constraints (apply to every task)
 
 - Repo root: `d:\Projects\bancroftway\ai-dev-workflow`. Backend work under `agent/`, frontend
@@ -563,7 +619,8 @@ Tasks 1-8.
    property) — but it needs an explicit decision here: accept it as documented, known, low-probability
    residual risk, or scope a follow-up task to extend `workflow_persistence`'s durable-state schema
    (or swap `InMemorySaver` for a real durable checkpointer) to close it. Do not let this be the
-   first time anyone notices it is untested.
+   first time anyone notices it is untested. **Resolved by Ruling 5 (added during Task 9): accepted
+   as a documented, low-probability residual risk — no durable-checkpointer follow-up scoped.**
 7. **Added after Task 6's review**: confirm Task 7's BFF `PUT` route actually derives `updated_by`
    server-side from `getServerAuthToken()` (matching `vault/route.ts`'s own real precedent for
    `user_login`), never forwarding a client-supplied string verbatim — Task 6's backend correctly
