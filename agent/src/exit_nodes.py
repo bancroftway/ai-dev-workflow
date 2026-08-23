@@ -418,6 +418,27 @@ async def verify_exit_readiness(
     )
 
 
+def _baseline_refresh_payload(status: str, metrics_summary: dict[str, Any]) -> str | None:
+    """The JSON to (over)write `repo_scan.BASELINE_PATH` with on this run's completion, or None to
+    leave the baseline untouched.
+
+    Refreshes ONLY on a genuine `completed` status, from THIS SAME run's own final scan_report
+    (`metrics_summary["repo_scan"]`, the dashboard dict metrics_compute_node already built and
+    checked the regression gate against) -- never on `failed`/`rejected`, so a broken intermediate
+    ticket can never become the next ticket's comparison point; the next ticket should still diff
+    against the last genuinely completed state. Does not touch `repo_scan_baseline_node`'s own
+    idempotency check: nothing writes `BASELINE_PATH` until a ticket actually reaches the
+    `completed` branch below, so a still-in-progress ticket's mid-run clarification re-entries --
+    which never reach here -- are exactly as protected as they were before this existed.
+    """
+    if status != "completed":
+        return None
+    final_scan_report = metrics_summary.get("repo_scan")
+    if not final_scan_report:
+        return None
+    return json.dumps(final_scan_report, indent=2, default=str) + "\n"
+
+
 async def exit_finalize_node(
     thread_id: str, content: dict[str, Any], state: dict[str, Any], provider: SandboxProvider
 ) -> None:
@@ -516,6 +537,12 @@ async def exit_finalize_node(
             "feedback": "; ".join((merge_readiness or {}).get("blocking_reasons") or []) or "exit gates did not pass",
         }
 
+    # Ruling 8, Part B: refresh the regression baseline from this run's own final scan -- only on
+    # the completed branch above, see _baseline_refresh_payload's own docstring for why.
+    baseline_payload = _baseline_refresh_payload(status, metrics_summary)
+    if baseline_payload is not None:
+        await repo_files.write_repo_file(provider, thread_id, repo_scan.BASELINE_PATH, baseline_payload)
+
     pr_url = None
     if status == "completed":
         session_row = await session_store.get_session(thread_id)
@@ -605,10 +632,13 @@ async def exit_finalize_node(
     )
     await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, latest_markdown)
 
+    commit_targets = [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH]
+    if baseline_payload is not None:
+        commit_targets.append(repo_scan.BASELINE_PATH)
     await git_ops.commit_paths(
         provider,
         thread_id,
-        [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH],
+        commit_targets,
         "ai-dev-workflow: exit finalize (manifest, changelog, exit report)",
     )
 
@@ -634,6 +664,15 @@ def _demo() -> None:
     diff = _diff_ledger(prior, current)
     assert diff == {"added": ["US-0002"], "revised": ["US-0001"], "retired": ["US-0002"]}, diff
     assert _diff_ledger(None, current)["added"] == ["US-0001", "US-0002"]
+
+    # _baseline_refresh_payload (Ruling 8, Part B): refreshes ONLY on a genuine `completed` status,
+    # from that same run's own final scan_report -- never on `failed`, and never fabricated when
+    # metrics never recorded one (an old thread, or a run that died before metrics ran).
+    final_scan = {"summary": {"gating_count": 0}, "findings": []}
+    assert _baseline_refresh_payload("completed", {"repo_scan": final_scan}) == json.dumps(final_scan, indent=2, default=str) + "\n"
+    assert _baseline_refresh_payload("failed", {"repo_scan": final_scan}) is None, "a failed run must never refresh the baseline"
+    assert _baseline_refresh_payload("completed", {}) is None, "no recorded scan -- nothing to write"
+    assert _baseline_refresh_payload("completed", {"repo_scan": None}) is None
 
     # _render_history_sections: "not recorded"/"no baseline" placeholders when data is absent,
     # real content when present, and a FIXED skeleton -- the screenshots section always renders,

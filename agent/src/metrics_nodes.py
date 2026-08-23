@@ -25,8 +25,9 @@ from .prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, repo_scan, spec_ledger
+from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, workflow_persistence
 from .gates.ac_coverage_gate import id_variants
+from .gates.remediation_gate import accounted_for
 from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
 from .chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
@@ -372,6 +373,34 @@ async def collect_live_refresh(state: dict[str, Any], thread_id: str) -> dict[st
     }
 
 
+def _known_gap_finding_keys(known_gaps: list[str], findings: Any) -> frozenset[str]:
+    """Pure half (self-checked below): which of `findings`' own finding_keys the current ticket's
+    approved remediation already explained in `known_gaps`. Reuses
+    gates/remediation_gate.accounted_for's own id-matching rule -- the SAME test remediation's own
+    gate applies to a still-gating finding -- rather than a second, possibly-diverging way to read
+    a known_gaps string. `finding.get("id")` in a dashboard dict IS `finding.finding_key` (see
+    `_dashboard_finding`), so this is the same stable id either shape of finding carries."""
+    if not known_gaps:
+        return frozenset()
+    return frozenset(f.finding_key for f in findings if accounted_for(f.finding_key, known_gaps))
+
+
+async def _read_known_gaps(provider: Any, thread_id: str) -> list[str]:
+    """The current ticket's own approved remediation `known_gaps`, or [] when remediation hasn't
+    approved (yet, or ever, on an old thread) -- never fabricated. `REMEDIATION_APPROVED_PATH` is
+    a fixed, stage-owned path that remediation's own approval overwrites, so by the time
+    metrics-report runs (after remediation, same run) it already holds THIS ticket's own content,
+    not a prior ticket's (see workflow_persistence.REMEDIATION_APPROVED_PATH's own docstring)."""
+    raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.REMEDIATION_APPROVED_PATH)
+    if raw is None:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return [str(g) for g in ((parsed or {}).get("known_gaps") or [])]
+
+
 async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     run_id = state.get("run_id", "unknown")
@@ -410,6 +439,15 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     # delta engine's coverage_line_rate metric and the `measures` block both see it.
     scan = replace(scan, metrics={**scan.metrics, "coverage": coverage})
     scan_report = scan.to_dashboard_dict()
+    # Ruling 8: a still-gating finding this ticket's OWN approved remediation already explained in
+    # `known_gaps` must not block the regression gate a second time. Recomputed (not read back off
+    # scan_report) so it lands in the SAME dict that gets written to LATEST_PATH/METRICS_LATEST_PATH
+    # and handed to regression_reasons below -- every consumer of scan_report["summary"] inherits the
+    # fix from this one assignment, per-finding "gating" flags in scan_report["findings"] are left as
+    # to_dashboard_dict() computed them (display-only; nothing gates off them here).
+    known_gaps = await _read_known_gaps(provider, thread_id)
+    known_gap_ids = _known_gap_finding_keys(known_gaps, scan.findings)
+    scan_report["summary"] = scan.summary(known_gap_ids=known_gap_ids)
     await repo_files.write_repo_file(provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan_report, indent=2, default=str) + "\n")
     baseline = await _read_baseline(provider, thread_id)
     delta = repo_scan.diff_scans(baseline, scan_report)
@@ -545,6 +583,22 @@ def _demo() -> None:
     # Sub-tolerance wiggle -> passes (scan noise, not a regression).
     wiggle = {"metrics": {"coverage_line_rate": {"from": 96.5, "to": 96.0, "delta": -0.5, "direction": "regressed"}}}
     assert regression_reasons(clean_summary, wiggle, good_cov, baseline_has_findings=True, **kw) == []
+
+    # known_gaps end-to-end (Ruling 8): a finding remediation's OWN approved report already
+    # explained must stop blocking the regression gate, while a genuinely new, uncovered gating
+    # finding still blocks -- silently disabling gating entirely would be as bad as the bug this
+    # fixes, so both halves run through the real ScanReport.summary()/regression_reasons path, not
+    # a hand-typed summary dict.
+    explained = repo_scan.Finding(finding_key="aaa111", tool="t", rule_id="r1", severity="high", raw_severity="HIGH", file="app.py", line=1, message="m")
+    still_open = repo_scan.Finding(finding_key="bbb222", tool="t", rule_id="r2", severity="high", raw_severity="HIGH", file="app.py", line=2, message="m")
+    gap_report = repo_scan.ScanReport(findings=(explained, still_open), metrics={}, tools=(), repo={}, deduped_count=0)
+    gap_ids = _known_gap_finding_keys(["aaa111: no fixed version published yet, tracked upstream"], gap_report.findings)
+    assert gap_ids == frozenset({"aaa111"}), gap_ids
+
+    reasons_before = regression_reasons(gap_report.summary(), None, good_cov, baseline_has_findings=True, **kw)
+    assert any("2 gating finding" in r for r in reasons_before), reasons_before
+    reasons_after = regression_reasons(gap_report.summary(known_gap_ids=gap_ids), None, good_cov, baseline_has_findings=True, **kw)
+    assert any("1 gating finding" in r for r in reasons_after), reasons_after  # bbb222 alone still blocks
 
     # Route: clean -> next; reasons under the attempt cap -> retry; at cap -> fail.
     route = make_metrics_route_after_compute()

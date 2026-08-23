@@ -1279,16 +1279,24 @@ def is_gating(
     severity_floor: str,
     introduced_ids: frozenset[str] | None,
     direct_dependencies: frozenset[str] | None = None,
+    known_gap_ids: frozenset[str] | None = None,
 ) -> bool:
     """Security gates absolutely, at or above the floor -- an inherited CVE is still exploitable.
     Quality gates only on what this pipeline introduced, so a brownfield repo's pre-existing debt
     cannot deadlock its first gate. With no baseline (greenfield) `introduced_ids` is None and
-    every quality finding gates, which is the same rule."""
+    every quality finding gates, which is the same rule.
+
+    `known_gap_ids` is the finding_keys remediation's own `known_gaps` already explained (see
+    gates/remediation_gate.accounted_for) -- security or quality, same as remediation's own gate
+    draws no category distinction there. `None` (the default) excludes nothing, so every existing
+    caller that predates this parameter is unaffected."""
     # Checked before category: a finding outside the application never gates, however severe it
     # looks, because there is nothing in the product to fix.
     if is_non_application_path(finding.file):
         return False
     if is_advisory_rule(finding.rule_id):
+        return False
+    if known_gap_ids is not None and finding.finding_key in known_gap_ids:
         return False
     # A licence obligation inherited through a lock file is not actionable in this repository -- but
     # only when it really is inherited. With the lockfile's own direct-dependency set available, a
@@ -1327,7 +1335,13 @@ class ScanReport:
     # "we chose this LGPL package" from "our framework did" -- see direct_dependency_names.
     direct_dependencies: frozenset[str] | None = None
 
-    def summary(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
+    def summary(
+        self,
+        *,
+        severity_floor: str = SECURITY_SEVERITY_FLOOR,
+        introduced_ids: frozenset[str] | None = None,
+        known_gap_ids: frozenset[str] | None = None,
+    ) -> dict[str, Any]:
         by_severity = {level: 0 for level in SEVERITY_ORDER}
         by_category: dict[str, int] = {}
         # Security-only severity tally -- kept separate from `by_severity` above (which is every
@@ -1345,6 +1359,7 @@ class ScanReport:
                 severity_floor=severity_floor,
                 introduced_ids=introduced_ids,
                 direct_dependencies=self.direct_dependencies,
+                known_gap_ids=known_gap_ids,
             ):
                 gating += 1
         # Enum is `none|info|low|medium|high|critical` -- the full SEVERITY_ORDER vocabulary plus
@@ -2666,6 +2681,32 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert is_gating(quality, severity_floor="medium", introduced_ids=None), "greenfield: everything gates"
     assert not is_gating(quality, severity_floor="medium", introduced_ids=frozenset()), "pre-existing debt must not gate"
     assert is_gating(quality, severity_floor="medium", introduced_ids=frozenset({quality.finding_key}))
+
+    # known_gap_ids (Ruling 8): a finding remediation already explained in `known_gaps` never
+    # gates -- security or quality, same as remediation's own gate draws no category line there --
+    # but an untouched, uncovered finding still does. A fix that silently disabled gating
+    # altogether would be as bad as the bug it replaces, so both halves are asserted.
+    high_vuln = _vuln("trivy", "CVE-2024-6", "x", "high")
+    assert is_gating(high_vuln, severity_floor="medium", introduced_ids=None), "sanity: gates before known_gap_ids"
+    assert not is_gating(
+        high_vuln, severity_floor="medium", introduced_ids=None, known_gap_ids=frozenset({high_vuln.finding_key})
+    ), "a security finding named in known_gaps must not gate"
+    assert is_gating(
+        high_vuln, severity_floor="medium", introduced_ids=None, known_gap_ids=frozenset({"unrelated-finding-id"})
+    ), "a finding NOT covered by known_gaps must still gate"
+    assert not is_gating(
+        quality, severity_floor="medium", introduced_ids=frozenset({quality.finding_key}),
+        known_gap_ids=frozenset({quality.finding_key}),
+    ), "known_gap_ids excludes quality findings too"
+
+    # Wired through ScanReport.summary()'s own gating_count, not just the pure is_gating() call.
+    gap_report = ScanReport(findings=(high_vuln, quality), metrics={}, tools=(), repo={}, deduped_count=0)
+    all_gating = gap_report.summary(introduced_ids=frozenset({quality.finding_key}))
+    assert all_gating["gating_count"] == 2
+    one_excused = gap_report.summary(
+        introduced_ids=frozenset({quality.finding_key}), known_gap_ids=frozenset({high_vuln.finding_key})
+    )
+    assert one_excused["gating_count"] == 1, "summary() must drop a known_gap_ids finding from gating_count"
 
     # --- delta ------------------------------------------------------------------------------------
     baseline = {
