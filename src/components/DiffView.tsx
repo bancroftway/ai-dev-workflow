@@ -21,9 +21,8 @@ import { useEffect, useState } from "react";
  * per this Part's own Global Constraint that syntax highlighting is the one place a small focused
  * library may be justified. It is intentionally NOT load-bearing: `codeToTokens` runs in a
  * useEffect and only ever adds `color` to already-rendered plain text; if it's slow, fails, or the
- * package is ever removed from node_modules (it is undeclared in package.json -- a real, disclosed
- * fragility, see task-8-report.md), the line below still renders correctly with plain text and
- * this component's real job -- diff structure and coloring -- is unaffected.
+ * package is ever removed from node_modules, the line below still renders correctly with plain
+ * text and this component's real job -- diff structure and coloring -- is unaffected.
  */
 
 const COLLAPSE_LINE_COUNT = 16;
