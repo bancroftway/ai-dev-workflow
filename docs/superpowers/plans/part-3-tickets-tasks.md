@@ -678,7 +678,9 @@ Task 2), column = `current_stage`, `⏸` marker = whatever Task 1's verification
 "awaiting gate." Polls on a fixed interval (e.g. 15s) and on window focus (Ruling 5) — no
 CopilotKit/AG-UI subscription wiring in this task.
 
-## Task 10: Final verification sweep
+## Task 10: Final verification sweep (expanded 2026-08-23 — Tasks 11-14 landed after this was
+## first written; scope now also covers their own accumulated Minors, per Part 1's own "final
+## cleanup pass" precedent for exactly this situation)
 
 Mirrors Part 4's own Task 9: a real, non-mocked pass proving the parts that matter most under
 real conditions, not just unit-level self-checks. At minimum:
