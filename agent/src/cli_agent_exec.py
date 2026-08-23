@@ -35,14 +35,25 @@ class TurnResult:
     exit_code: int
 
 
-async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: str, content: str) -> None:
+async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: str, content: str | bytes) -> None:
     """Writes content to an arbitrary absolute path via chunked printf execs when needed.
 
     Base64-encodes `content` to avoid shell-quoting hazards for arbitrary content (quotes,
     backticks, `$`, newlines). Unlike repo_files.write_repo_file, this accepts arbitrary
     absolute paths (no validate_repo_relative_path call), since the file is NOT repo-relative.
+
+    `content` may be `str` (the original, still the common case -- prompt text, .mcp.json) or
+    raw `bytes` (task-13: decoded attachment payloads -- screenshots/documents forwarded to
+    Claude). Bytes skip the `.encode("utf-8")` step rather than going through it, since arbitrary
+    binary data (a PNG's raw bytes, say) is not valid UTF-8 in general and that round-trip would
+    corrupt it; base64 itself is encoding-agnostic, so everything below this line is unchanged
+    either way. Confirmed empirically (task-13) that this chunked echo/base64-d shell pattern
+    round-trips arbitrary binary bytes losslessly through a real `docker exec` (sha256-verified
+    before/after against a real container, not just assumed from the text-only cases already in
+    production).
     """
-    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    encoded = base64.b64encode(raw).decode("ascii")
     parent_dir = path.rsplit("/", 1)[0] if "/" in path else ""
     quoted = shlex.quote(path)
 

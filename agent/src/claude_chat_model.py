@@ -25,6 +25,8 @@ would only add a dependency everything else here is in the process of removing.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import shlex
@@ -118,18 +120,90 @@ def _map_tool_names(names: list[str]) -> list[str]:
     return mapped
 
 
-def _messages_to_prompt(messages: list[BaseMessage]) -> str:
+# Extensions for the real attachment mimeTypes RequirementsView.tsx's useAttachments config can
+# actually produce (accept: "image/*,application/pdf,.doc,.docx,.txt,.md" -- part-3-attachments-
+# research-notes.md section 3/6) -- not a general mimeType->extension table, just enough for what
+# this pipeline's one real attachment source sends today. An unrecognized mimeType falls back to
+# ".bin" in _prepare_attachment below rather than growing this table speculatively.
+_ATTACHMENT_EXT_BY_MIME: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+}
+
+
+def _prepare_attachment(item: dict[str, Any], index: int, scratch_prefix: str) -> tuple[str, bytes, str] | None:
+    """Decide whether one non-text AG-UI InputContent dict is a real, decodable attachment, and if
+    so, its scratch-file path, decoded bytes, and the prompt-text line that will reference it.
+
+    Only handles `source.type == "data"` (base64 inline) -- confirmed (part-3-attachments-
+    research-notes.md section 1/3) as the only shape RequirementsView.tsx's useAttachments
+    actually produces today, since no onUpload backend is configured. A `source.type == "url"`
+    part, the theoretical `type == "binary"` union member, or an undecodable/malformed payload
+    all return None -- dropped with a warning by the caller, same as every non-text part was
+    before this function existed, not guessed at.
+
+    Pure (no I/O) on purpose: the one caller (_messages_to_prompt) does the actual scratch-file
+    write, so this half stays unit-testable in _demo() without a live sandbox, matching this
+    module's and cli_agent_exec.py's existing "pure half only" self-check convention.
+
+    The returned label tells the model to read the file rather than embedding the bytes in the
+    prompt text itself -- confirmed empirically (task-13) against the real pinned `claude` CLI
+    that this is what actually works: `--file` requires a CLAUDE_CODE_SESSION_ACCESS_TOKEN this
+    pipeline has no reason to provision ("Error: Session token required for file downloads"), and
+    an inline base64 image block over `--input-format stream-json` reaches the model with no
+    visual content at all (its own transcript showed it reasoning "I need... a file path" and
+    asking for one) -- but a real local path mentioned in plain prompt text is exactly what
+    Claude Code's own built-in Read tool (already unrestricted for this stage/role, see
+    config.READ_ONLY_AVAILABLE_TOOLS's "builtin:view" -> "Read" mapping) already knows how to open,
+    images included, with zero new CLI flags and zero new credentials.
+    """
+    source = item.get("source")
+    if not isinstance(source, dict) or source.get("type") != "data":
+        return None
+    value = source.get("value")
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+    ext = _ATTACHMENT_EXT_BY_MIME.get(source.get("mimeType", ""), ".bin")
+    path = f"{scratch_prefix}.attach{index}{ext}"
+    metadata = item.get("metadata")
+    filename = metadata.get("filename") if isinstance(metadata, dict) else None
+    kind = item.get("type") if isinstance(item.get("type"), str) else "file"
+    described = f'{kind} "{filename}"' if filename else kind
+    label = f"[Attached {described} -- read the file at {path} to see its contents.]"
+    return path, raw, label
+
+
+async def _messages_to_prompt(
+    provider: SandboxProvider, thread_id: str, scratch_prefix: str, messages: list[BaseMessage]
+) -> str:
     """Flatten a LangChain message list into a single Claude CLI prompt string.
 
     Mirrors copilot_chat_model._messages_to_prompt's text-handling exactly (SystemMessage gets an
     "Instructions:" prefix, everything else passes through verbatim, parts joined with a blank
-    line), but drops multimodal content instead of translating it to an attachment -- the `claude`
-    CLI's -p mode takes a single stdin string, and no stage in this pipeline currently sends Claude
-    an image. Not attempted here as a ponytail-style deliberate cut, not an oversight: the upgrade
-    path, if a stage ever needs it, is to mirror write_scratch_file for binary payloads and pass
-    the result via a --file flag per part instead of dropping it.
+    line). Unlike that function (which still drops multimodal content -- no confirmed CLI
+    mechanism exists for Copilot, Ruling 9), a real non-text attachment part here is decoded and
+    written to its own scratch file (sharing scratch_prefix with the turn's prompt/mcp-config
+    files, so run_turn's own `rm -f {scratch_prefix}*` cleanup catches it too -- no separate
+    cleanup needed), then referenced by path in the returned prompt text -- see
+    _prepare_attachment's docstring for why a path reference, not a CLI flag, is what actually
+    works. Only a part _prepare_attachment recognizes gets this treatment; anything else (a
+    `source.type == "url"` part, the theoretical `binary` union member, an undecodable payload) is
+    still dropped with a warning exactly as before.
     """
     parts: list[str] = []
+    attachment_index = 0
     for message in messages:
         content = message.content
         if isinstance(content, list):
@@ -138,11 +212,19 @@ def _messages_to_prompt(messages: list[BaseMessage]) -> str:
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
                     text_parts.append(str(item.get("text", "")))
-                else:
+                    continue
+                attachment_index += 1
+                prepared = _prepare_attachment(item, attachment_index, scratch_prefix) if isinstance(item, dict) else None
+                if prepared is None:
                     dropped += 1
+                    continue
+                path, raw, label = prepared
+                await write_scratch_file(provider, thread_id, path, raw)
+                text_parts.append(label)
             if dropped:
                 logger.warning(
-                    "dropped %d non-text content part(s) -- ClaudeChatModel has no multimodal support",
+                    "dropped %d non-text content part(s) -- not a decodable data-sourced "
+                    "attachment (url-sourced or malformed)",
                     dropped,
                 )
             text = "\n".join(text_parts)
@@ -264,7 +346,6 @@ class ClaudeChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         provider = get_sandbox_provider()
-        prompt = _messages_to_prompt(messages)
         session_id = _session_ids.get(self._session_key)
 
         argv = ["claude", "-p", "--output-format", "json"]
@@ -333,10 +414,14 @@ class ClaudeChatModel(BaseChatModel):
         if self.agent:
             argv += ["--agent", self.agent]
 
-        # Every scratch file for this turn (the prompt, and the mcp-config file below when present)
-        # shares this prefix -- run_turn's own cleanup (`rm -f {scratch_prefix}*`) removes all of
-        # them together, so nothing here needs its own cleanup step.
+        # Every scratch file for this turn (the prompt, any attachment payloads below, and the
+        # mcp-config file below when present) shares this prefix -- run_turn's own cleanup
+        # (`rm -f {scratch_prefix}*`) removes all of them together, so nothing here needs its own
+        # cleanup step.
         scratch_prefix = f"{_SCRATCH_DIR}/claude-{self.stage}-{self.role}-{uuid.uuid4().hex}"
+        # Computed here (not up near provider/session_id above) because attachment parts, if any,
+        # get written to their own scratch files sharing scratch_prefix -- see _prepare_attachment.
+        prompt = await _messages_to_prompt(provider, self.thread_id, scratch_prefix, messages)
 
         if self.mcp_servers:
             # Judgment call, unconfirmed against the live CLI this session (unlike the flags table
@@ -578,6 +663,57 @@ def _demo() -> None:
     )
     assert all_known == ["Grep", "Glob", "Bash", "Skill", "Write"], f"unexpected mapping: {all_known}"
     assert _map_tool_names(["builtin:ask_user"]) == [], "fully-unknown list should map to empty, not raise"
+
+    # _prepare_attachment (task-13): the pure decode/shape half of attachment forwarding -- the
+    # actual write_scratch_file call needs a live sandbox, same "pure half only" scoping as
+    # everything else in this self-check, but this is the one branch worth locking in given it's a
+    # real parser over untrusted frontend-supplied dicts (AG-UI InputContent), not a one-liner.
+    real_png = base64.b64encode(b"\x89PNG\r\n\x1a\n-fake-but-decodable-bytes").decode("ascii")
+    prepared = _prepare_attachment(
+        {"type": "image", "source": {"type": "data", "value": real_png, "mimeType": "image/png"}},
+        1,
+        "/tmp/aidw-agent/scratch-abc",
+    )
+    assert prepared is not None, "well-formed data-sourced image attachment should not be dropped"
+    path, raw, label = prepared
+    assert path == "/tmp/aidw-agent/scratch-abc.attach1.png", f"unexpected scratch path: {path}"
+    assert raw == base64.b64decode(real_png), "decoded bytes should match the original payload exactly"
+    assert path in label and "image" in label, f"label should name the kind and reference the path: {label!r}"
+
+    # Unrecognized mimeType falls back to .bin rather than raising or guessing an extension.
+    unknown_mime = _prepare_attachment(
+        {"type": "document", "source": {"type": "data", "value": real_png, "mimeType": "application/x-weird"}},
+        2,
+        "/tmp/aidw-agent/scratch-abc",
+    )
+    assert unknown_mime is not None and unknown_mime[0].endswith(".bin"), "unknown mimeType should fall back to .bin"
+
+    # A filename in metadata is surfaced in the label for a more useful prompt reference.
+    named = _prepare_attachment(
+        {
+            "type": "image",
+            "source": {"type": "data", "value": real_png, "mimeType": "image/png"},
+            "metadata": {"filename": "screenshot.png"},
+        },
+        3,
+        "/tmp/aidw-agent/scratch-abc",
+    )
+    assert named is not None and "screenshot.png" in named[2], "filename metadata should appear in the label"
+
+    # Shapes this pipeline's one real frontend source never actually produces today (url-sourced,
+    # the theoretical "binary" union member) are dropped, not guessed at -- same as malformed
+    # base64 and a part with no "source" key at all.
+    assert _prepare_attachment(
+        {"type": "image", "source": {"type": "url", "value": "https://example.com/x.png"}}, 4, "/tmp/x"
+    ) is None, "url-sourced attachments are not handled -- no upload backend exists to have produced one"
+    assert _prepare_attachment(
+        {"type": "binary", "mimeType": "image/png", "data": real_png}, 4, "/tmp/x"
+    ) is None, "the flat 'binary' InputContent variant (no nested source) is not handled"
+    assert _prepare_attachment(
+        {"type": "image", "source": {"type": "data", "value": "not-valid-base64!!!", "mimeType": "image/png"}},
+        4,
+        "/tmp/x",
+    ) is None, "undecodable base64 should be dropped, not raise"
 
     # Session-cache eviction: one thread's dead sandbox must not evict another thread's live
     # sessions (mirrors copilot_chat_model._demo's doomed/survivor shape -- same failure class,

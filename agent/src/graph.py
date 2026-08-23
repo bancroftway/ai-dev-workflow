@@ -369,15 +369,20 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
     requirements_text = f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"
     attachments = state.get("requirements_attachments") or []
-    # Attachments (screenshots/documents) ride alongside the text as a multimodal content list --
-    # but neither current provider's CLI-exec path actually has an attachment mechanism to forward
-    # them through: both claude_chat_model.py's and copilot_chat_model.py's own
-    # `_messages_to_prompt` flatten this list to a single prompt string and DROP every non-text
-    # part (logged via logger.warning), a real capability loss versus the old SDK-based Copilot
-    # session that is not restored yet -- see either module's own `_messages_to_prompt` docstring.
-    # Still built as a list rather than joined to plain text here, so a future CLI-level attachment
-    # mechanism (a per-part --file flag, e.g.) has the original structure to work from instead of
-    # information already lost upstream.
+    # Attachments (screenshots/documents) ride alongside the text as a multimodal content list.
+    # As of task-13, claude_chat_model.py's own `_messages_to_prompt` forwards a real (data-
+    # sourced, base64-inline) part instead of dropping it: it decodes and writes the bytes to a
+    # sandbox scratch file, then references that path in the prompt text for Claude's own Read
+    # tool to open -- confirmed empirically as the mechanism that actually works, NOT a --file CLI
+    # flag (needs a CLAUDE_CODE_SESSION_ACCESS_TOKEN this pipeline never provisions) and NOT an
+    # inline content block over --input-format stream-json (reaches the model with no visual
+    # content at all). copilot_chat_model.py's own `_messages_to_prompt` still flattens this list
+    # to plain text and DROPS every non-text part (logged via logger.warning) -- a disclosed,
+    # deliberate asymmetry (Ruling 9), not an oversight: no confirmed Copilot CLI attachment
+    # mechanism exists to restore it there. See either module's own `_messages_to_prompt`
+    # docstring. Still built as a list rather than joined to plain text here either way, so
+    # Claude's real mechanism and any future Copilot one both have the original structure to work
+    # from instead of information already lost upstream.
     requirements_content: str | list[dict[str, Any]] = (
         [{"type": "text", "text": requirements_text}, *attachments] if attachments else requirements_text
     )
