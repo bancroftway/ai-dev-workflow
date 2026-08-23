@@ -113,6 +113,55 @@ validation signal," matching this codebase's existing fail-fast-with-the-provide
 pattern (`sessions_api.py`'s vault-fetch-before-provision already works this way for the
 per-repo case).
 
+## Ruling 4 — added 2026-08-23, during Task 5, correcting a real gap in Task 3's original design:
+## every dispatch function needs an explicit, required `provider` parameter — none may resolve it
+## themselves internally
+
+Task 3's original text (below, now corrected) had each of the 7 previously-re-exported functions
+resolve the active provider **internally**, by calling `get_provider()`/`_get_provider_sync()`
+themselves on every invocation. This looked right — "per-call dispatch, no stale binding" — but it
+quietly defeats Task 4's entire purpose. Task 4 pins `state["provider"]` once at intake specifically
+so a mid-run call never sees a live setting change; but if `get_chat_model_for_thread`,
+`close_session`, `close_thread_session`, `forget_thread_sessions`, `get_session_id`,
+`read_skill_invocations`, and `secret_env_names` each independently re-resolve the provider via the
+shared 30-second TTL cache, then ANY of these functions, called more than ~30 seconds after the
+last time the cache was warmed, can resolve to whatever the org setting says RIGHT NOW — not what
+`state["provider"]` says this run is pinned to. A real pipeline run spans minutes to hours; this
+is not a narrow theoretical race, it is the *ordinary* case for any run whose relevant call happens
+more than 30 seconds after the process last touched `get_provider()`. Worse: these functions cover
+session-lifecycle operations (closing a session, looking up a session id, reading its skill log) —
+a mid-run call that resolves the wrong provider wouldn't just build the wrong model, it would
+operate on the WRONG PROVIDER'S session-tracking dict for a thread that's actually running under
+the OTHER provider, which is exactly the resource-leak/wrong-dispatch bug-family that Part 1's
+Tasks 10-11 already had to hunt down and fix once (there, the bug was a hardcoded provider; here it
+would be a live-drifting one — same failure shape, different cause).
+
+**Fix**: every one of the 7 functions gains a **required**, keyword-only `provider: str`
+parameter — no default value. No internal call to `get_provider()`/`_get_provider_sync()` survives
+inside any of them; the caller always supplies the value. This is deliberate, not an oversight:
+Part 1's own Task 6→11 gap and Task 10's `COPILOT_SDK_AUTH_TOKEN`→`GITHUB_TOKEN` incident both
+trace back to a silent, implicit default standing in for a value a caller should have been forced
+to supply explicitly — a required parameter with no default forces every call site to make a
+deliberate, visible choice, and Python raises a loud `TypeError` at the one call site anyone
+forgets, rather than a `RuntimeError` three services downstream at 2am under a live provider
+switch. `get_provider()`/`get_runtime_auth_token()`/`_get_provider_sync()` remain exactly as Task 3
+built them, callable on their own — they are now used ONLY by: `intake_node` (to populate
+`state["provider"]`, once, per Task 4), and genuine provisioning-time code with no `state` yet
+(`sessions_api.py`, `run_headless.py`'s startup). Every other real caller — which means every graph
+node, and every graph-node-adjacent helper like `stack_runner.run_and_report` that these nodes call
+into — passes `provider=state["provider"]` (or threads it down as its own new parameter, for a
+helper like `run_and_report` that has no direct `state` access but is only ever called by something
+that does).
+
+This corrects both Task 3's text (below) and Task 5's text (below) — Task 3 originally specified
+internal resolution, and Task 5 originally (wrongly) claimed the `skill_gate.py`/`registry.py`/
+`telemetry.py` bare-name-import call sites of `forget_thread_sessions`/`get_session_id`/
+`read_skill_invocations` "need no behavior change" since they're not graph nodes themselves — this
+was true of the OLD (Task-3-internal-resolution) design and is false under this corrected one:
+these three call sites operate on a specific thread's session and must pass that thread's own
+pinned provider like any other caller, not skip the parameter because they happen not to be a
+graph node.
+
 ## Global Constraints (apply to every task)
 
 - Repo root: `d:\Projects\bancroftway\ai-dev-workflow`. Backend work under `agent/`, frontend
@@ -242,14 +291,23 @@ with:
 - Every currently-re-exported name (`get_chat_model_for_thread`, `close_session`,
   `close_thread_session`, `forget_thread_sessions`, `get_session_id`, `read_skill_invocations`,
   `secret_env_names`) becomes a **real function defined in `chat_model.py` itself** — not a bound
-  alias chosen once at import time — that calls `await get_provider()` (or, for the sync
-  `get_session_id`, whatever sync-safe equivalent makes sense — check its real current signature,
-  it may not be async) and dispatches to `claude_chat_model.<name>(...)` or
-  `copilot_chat_model.<name>(...)` accordingly, on every call. This is the actual fix for the
-  staleness problem the Spec's text didn't fully anticipate (see "What Part 1 actually built"
-  above) — a bare-name importer (`from .chat_model import get_chat_model_for_thread`) now gets a
-  function that re-resolves the provider every time it's called, not a stale binding from process
-  startup.
+  alias chosen once at import time — that dispatches to `claude_chat_model.<name>(...)` or
+  `copilot_chat_model.<name>(...)` accordingly. This is the actual fix for the staleness problem
+  the Spec's text didn't fully anticipate (see "What Part 1 actually built" above) — a bare-name
+  importer (`from .chat_model import get_chat_model_for_thread`) now gets a function that
+  re-executes on every call, not a stale binding from process startup.
+  **Corrected by Ruling 4 (added during Task 5, read it in full before implementing this
+  bullet)**: each of these 7 functions takes the provider to dispatch to as a **required,
+  keyword-only `provider: str` parameter — no default, and no internal call to
+  `get_provider()`/`_get_provider_sync()` inside any of these 7**. The caller always supplies it
+  (a graph node passes `state["provider"]`; nothing else legitimately calls these 7). This is
+  what actually closes the staleness problem for a run already in progress — resolving the
+  provider fresh on every call (the original idea) would still let a mid-run call drift onto a
+  LIVE setting change the instant more than one TTL window passes, defeating Task 4's whole
+  purpose. `get_provider()`/`_get_provider_sync()` themselves are unaffected by this correction —
+  they still exist, still do live resolution, they're just no longer called from inside these 7;
+  they're called only by `intake_node` (Task 4) and genuine provisioning-time code with no
+  `state` yet.
 - Both `claude_chat_model.py` and `copilot_chat_model.py` must import cleanly regardless of which
   provider is active (they both already do, per Part 1) — the module no longer picks one to import
   and skip the other; both get imported unconditionally so either can be dispatched to at call
@@ -323,13 +381,34 @@ starting list to verify, not a final one.
 
 For every call site **inside a graph node** (has access to `state`): replace `chat_model.PROVIDER`
 with `state["provider"]` (applying Task 4's resume-safety fallback if that site could plausibly run
-against a pre-migration checkpoint). For every bare-name import of a dispatched function
-(`get_chat_model_for_thread`, etc.) inside a graph node, no code change is needed beyond what Task
-3 already did — the imported name is now a real per-call-dispatching function, it just needs the
-`provider`/model-name argument threaded from `state["provider"]` wherever the call passes a
-`model_name=model_config.get_model_name(..., chat_model.PROVIDER)` argument (this is most of the 17
-sites — the third argument changes from `chat_model.PROVIDER` to `state["provider"]`, nothing else
-in that call changes).
+against a pre-migration checkpoint) wherever the call passes a `model_name=model_config.
+get_model_name(..., chat_model.PROVIDER)` argument (this is most of the 17 sites — the third
+argument changes from `chat_model.PROVIDER` to `state["provider"]`, nothing else in that call
+changes).
+
+**Corrected by Ruling 4 (added during this task, read it in full first)**: for every call site of
+one of the 7 now-required-parameter dispatch functions (`get_chat_model_for_thread`,
+`close_session`, `close_thread_session`, `forget_thread_sessions`, `get_session_id`,
+`read_skill_invocations`, `secret_env_names`) — inside a graph node OR inside a helper a graph node
+calls into (see `stack_runner.py` below) — pass `provider=state["provider"]` explicitly. This is
+now a REQUIRED keyword argument (Task 3, corrected) — omitting it is a `TypeError`, not a silent
+wrong-provider bug, so your own whole-app import checks won't catch a missed site, but running the
+pipeline (even just constructing the call in your head against the real signature) will surface it
+immediately. Grep for every call site of these 7 names yourself; do not trust a specific count from
+before this correction.
+
+**`stack_runner.py`'s `run_and_report` needs its OWN new parameter, not just an updated call site
+inside it**: `run_and_report` has no `state` of its own (it's a helper, not a graph node), but
+every one of its own callers IS a graph node with `state` — so `run_and_report` gains a required
+`provider: str` parameter, its own callers pass `provider=state["provider"]` into it, and
+`run_and_report`'s own internal call to `get_chat_model_for_thread(...)` passes that same value
+through (`provider=provider`). Find every real caller of `run_and_report` (grep for it — it's
+called from more than one file) and update all of them, even ones not otherwise in this task's
+file list above — a required-parameter signature change has to reach every caller or the whole app
+import check WILL catch it (a missing required arg is a real `TypeError` at call-construction time
+for a plain function, though note this specific one is only exercised when the node actually runs,
+same caveat as the other 7 — reason about correctness by tracing, the import check alone won't
+prove it).
 
 For every call site **outside a graph node** — `sessions_api.py`'s `provision_session`,
 `run_headless.py`'s startup, `sandbox/local_docker.py`/`sandbox/azure_aci.py`'s lazy `from
@@ -349,14 +428,21 @@ the `os.environ`-based `runtime_auth_token` computation with a call to Task 3's 
 `chat_model.get_runtime_auth_token()` (already handles the vault-fetch-with-env-var-fallback logic
 — this task just swaps the call site, no new logic here).
 
-`gates/skill_gate.py`, `sandbox/registry.py`, `telemetry.py`'s bare-name imports of
-`forget_thread_sessions`/`get_session_id`/`read_skill_invocations` need no behavior change beyond
-confirming they still import cleanly against Task 3's rework (these functions dispatch internally
-now; callers outside graph nodes that don't need a *specific* provider's behavior, just "whichever
-one is active for this session," are fine calling the dispatching function directly without
-threading a provider argument through — verify this is true for each of these three specific call
-sites, since "which session's provider" matters for these particular functions in a way it might
-not for a stateless one).
+**Corrected by Ruling 4 — this bullet was wrong in the original plan text, caught during this
+task**: `gates/skill_gate.py`, `sandbox/registry.py`, `telemetry.py`'s bare-name imports of
+`forget_thread_sessions`/`get_session_id`/`read_skill_invocations` are NOT exempt from threading a
+provider through, even though none of them is itself a graph node. Each operates on a SPECIFIC
+thread's session (closing it, looking up its id, reading its skill log) — that thread has its own
+pinned provider, and getting the wrong one for these functions means silently touching the wrong
+provider's `_session_ids` dict for a thread actually running under the other one (the exact
+resource-leak/wrong-dispatch shape Part 1 Tasks 10-11 already had to hunt down once). Each of these
+3 call sites needs its own `provider` value threaded in from wherever IT is called from — trace
+each one back to find where its own caller has `state["provider"]` available (this may mean the
+function calling `skill_gate.invoked_skills`/`registry.pop`/the telemetry wrapper itself needs a
+new `provider` parameter too, one level further out — follow the chain until you reach a real graph
+node with `state`, the same way `run_and_report` does above). This is real, traceable work, not a
+"probably fine" — do not skip threading it through at any of these three just because they're not
+graph nodes themselves.
 
 Self-check: no new self-checks — covered by re-running every already-existing self-check this task
 touches, plus Task 6's final verification.
