@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
+import { STATUS_BADGE } from "@/components/SessionHistory";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 
 // Ruling 5 (this Part's own plan): plain polling, no CopilotKit/AG-UI live subscription.
@@ -27,16 +28,6 @@ const STAGE_LABELS: Record<(typeof STAGE_KEYS_IN_ORDER)[number], string> = {
   remediation: "Remediation",
   "adversarial-compliance": "Adversarial Compliance",
   "metrics-exit": "Metrics Exit",
-};
-
-// Same 4-status palette the workflow page's own SessionHistory-adjacent progress UI uses
-// (src/app/workflow/.../page.tsx's STATUS_BADGE) -- duplicated rather than imported so this page
-// doesn't reach into another route's page module for a 4-line constant.
-const STATUS_BADGE: Record<Session["status"], string> = {
-  completed: "bg-green-100 text-green-800",
-  failed: "bg-red-100 text-red-800",
-  rejected: "bg-amber-100 text-amber-800",
-  in_progress: "bg-blue-100 text-blue-800",
 };
 
 type ProjectState =
@@ -215,13 +206,25 @@ export default function ProjectBoardPage() {
 }
 
 function SessionCard({ session, owner, repo }: { session: Session; owner: string; repo: string }) {
+  // Done cards go to the existing read-only report route instead of the workflow route -- fix
+  // round 1 (review finding): the workflow route's SandboxSessionBoot unconditionally POSTs
+  // /sessions/provision on mount, no ?resume=1 needed to trigger it. provision_session's own 409
+  // guard against resuming a completed session only fires `if body.resume`, so a plain card link
+  // sails past it into `provider.provision(...)`, which only short-circuits cheaply while this
+  // exact agent process still has the container warm in its in-memory registry -- gone after a
+  // restart/manual stop/enough time, a "Done" click would silently re-clone a work branch that
+  // may not even exist anymore post-merge. `/sessions/{owner}/{repo}/{sessionId}/{runId}/report`
+  // is this codebase's own existing target for exactly this case (SessionHistory.tsx's "View
+  // report" button, same route/param shape copied verbatim) -- no side effects, matches what
+  // "Done" actually implies. Every other status is unaffected: still the workflow route,
+  // unchanged, still deliberately without ?resume=1 (same reasoning, now only relevant to them).
+  const href =
+    session.status === "completed"
+      ? `/sessions/${owner}/${repo}/${session.session_id}/${session.run_id}/report`
+      : `/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}`;
   return (
-    // Links to the existing workflow page, unchanged -- no ?resume=1: that flag makes
-    // provision_session 409 on an already-completed session (agent/src/sessions_api.py), and this
-    // one link has to work for every column including Done, so it deliberately never sends it
-    // (plain reload semantics, same as landing on a bookmarked workflow URL).
     <Link
-      href={`/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}`}
+      href={href}
       className="flex flex-col gap-1.5 rounded-md border border-neutral-200 bg-white px-3 py-2 text-sm shadow-sm hover:border-neutral-400"
     >
       <div className="flex items-start justify-between gap-2">

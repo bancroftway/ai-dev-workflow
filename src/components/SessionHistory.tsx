@@ -5,7 +5,10 @@ import { useRouter } from "next/navigation";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 
-const STATUS_BADGE: Record<Session["status"], string> = {
+// Exported (Part 3 Task 9 fix round 1) so the project Board's own cards can reuse this exact
+// palette instead of keeping a second copy -- this was already the one real definition; the
+// workflow page's separate copy predates this and is left alone, out of this fix's scope.
+export const STATUS_BADGE: Record<Session["status"], string> = {
   completed: "bg-green-100 text-green-800",
   failed: "bg-red-100 text-red-800",
   rejected: "bg-amber-100 text-amber-800",
