@@ -325,6 +325,11 @@ def _extract_ids(value: Any, out: set[str]) -> None:
 
 SPEC_SYSTEM_PROMPT = load_prompt("specification_draft")
 
+# Appended only when spec_ledger.hydrate_ticket_mode_context (StageSpec.
+# draft_prompt_context_from_repo_file) finds a non-empty ledger -- a second-or-later ticket
+# against a project that already has an approved baseline, vs. a from-scratch first pass.
+SPEC_TICKET_MODE_SEGMENT = load_prompt("specification_ticket_mode_segment")
+
 PLAN_SYSTEM_PROMPT = load_prompt("plan_draft")
 
 PLAN_GREENFIELD_SEGMENT = load_prompt("plan_greenfield_segment")
@@ -350,6 +355,12 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
         SystemMessage(content=SPEC_SYSTEM_PROMPT),
         HumanMessage(content=requirements_content),
     ]
+    # Not a StageState field -- only ever present on the prompt-only stage copy make_draft_node
+    # builds from StageSpec.draft_prompt_context_from_repo_file's return (see that hook's own
+    # docstring and spec_ledger.hydrate_ticket_mode_context). Absent, hence falsy, on every other
+    # call path (including this function's own direct callers in tests).
+    if stage.get("ticket_mode_baseline"):
+        messages.append(HumanMessage(content=SPEC_TICKET_MODE_SEGMENT))
     if stage["draft"] is not None:
         messages.append(
             HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}")
@@ -575,12 +586,18 @@ async def _verify_specification_ledger(
     logic -- this is just the SandboxProvider-I/O wrapper) and persists the ledger on success.
 
     content_dict is stage["draft"] (the just-audited, revised Specification, mutated in place by
-    sync_ledger to carry ledger-resolved ids). `_chat_provider` is unused -- a pure ledger sync has
-    no dispatch call of its own (StageSpec.deterministic_verify's own docstring).
+    sync_ledger to carry ledger-resolved ids) -- schemas.Specification's own `retired_ac_ids`/
+    `retired_us_ids` fields (Ruling 3) live right on it, so no separate plumbing is needed to reach
+    them here. `_chat_provider` is unused -- a pure ledger sync has no dispatch call of its own
+    (StageSpec.deterministic_verify's own docstring).
     """
     entries = await spec_ledger.load_ledger(provider, thread_id)
     user_stories = content_dict.get("user_stories") or []
-    result = spec_ledger.sync_ledger(entries, user_stories, run_id)
+    retired_ac_ids = content_dict.get("retired_ac_ids") or []
+    retired_us_ids = content_dict.get("retired_us_ids") or []
+    result = spec_ledger.sync_ledger(
+        entries, user_stories, run_id, retired_ac_ids=retired_ac_ids, retired_us_ids=retired_us_ids
+    )
     if result.passed:
         # No explicit commit: the ledger lives under .ai-dev-workflow/, which the verify-pass
         # persistence commit sweeps up.
@@ -898,6 +915,23 @@ class StageSpec:
     already exists on disk (and, where relevant, there's no fresh human-submitted input this run
     that should override the skip)."""
 
+    draft_prompt_context_from_repo_file: (
+        Callable[[str, "GraphState", SandboxProvider], Awaitable[dict[str, Any] | None]] | None
+    ) = None
+    """Same (thread_id, state, provider) -> Awaitable[dict[str, Any] | None] shape as
+    hydrate_from_repo_file, but for a different purpose: hydrate_from_repo_file's non-None return
+    SKIPS drafting entirely (see its own docstring above), which is wrong for a stage whose
+    repo-file check should only change how the draft prompt is FRAMED, never whether a real
+    draft/audit/gate cycle runs (Global Constraint, docs/superpowers/plans/part-3-tickets-tasks.md:
+    "hydrate checks decide how much a stage's draft has to do, never whether audit or the human
+    gate run"). make_draft_node calls this (same guards as hydrate_from_repo_file) immediately
+    before build_prompt and, on a non-None return, merges it into a PROMPT-ONLY copy of this
+    stage's StageState -- never the state actually persisted/returned by draft_node, since the
+    signal is cheap to recompute every call and has no "must stay stable across this run's retry
+    cycles" requirement (unlike capture_baseline_commit) to protect. None leaves the prompt exactly
+    as it would be without this hook. Specification's ticket-mode segment
+    (spec_ledger.hydrate_ticket_mode_context) is the first and, as of this writing, only user."""
+
     session_options: Callable[[GraphState, str], dict[str, Any]] | None = None
     """Extra kwargs (agent_mode/available_tools/excluded_tools/pre_tool_use_hook/mcp_servers) to
     forward to get_chat_model_for_thread, called with (state, "draft"|"audit") so a stage can
@@ -997,6 +1031,7 @@ STAGES: list[StageSpec] = [
         build_audit_prompt=_build_specification_audit_prompt,
         render_markdown=render_specification_markdown,
         deterministic_verify=_verify_specification_ledger,
+        draft_prompt_context_from_repo_file=spec_ledger.hydrate_ticket_mode_context,
         sign_approval=True,
         # The one stage that may use `brainstorming` -- exploring intent and requirements before
         # anything is built is precisely its purpose. It stays disabled for every other stage
@@ -1530,6 +1565,20 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stages[stage_spec.key]["baseline_commit"] = head_result.stdout.strip() if head_result.ok else None
             state = {**state, "stages": stages}
 
+        # draft_prompt_context_from_repo_file (see its own docstring on StageSpec): unlike the
+        # hydrate_from_repo_file block above, a non-None return here must NOT skip drafting -- it
+        # only reframes the prompt. Applied to a throwaway `prompt_state` used solely for the
+        # build_prompt call just below, so it never rides along in this node's own `state`/
+        # `stages` locals (which the final `return {"stages": stages}` further down is built from)
+        # and is never persisted -- recomputed fresh from disk on every draft call instead.
+        prompt_state = state
+        if stage_spec.draft_prompt_context_from_repo_file is not None and sandbox_registry.get(thread_id) is not None:
+            prompt_context = await stage_spec.draft_prompt_context_from_repo_file(thread_id, state, get_sandbox_provider())
+            if prompt_context is not None:
+                prompt_stages = {key: dict(value) for key, value in state["stages"].items()}
+                prompt_stages[stage_spec.key] = {**prompt_stages[stage_spec.key], **prompt_context}
+                prompt_state = {**state, "stages": prompt_stages}
+
         # Load custom agent if available, falling back to legacy session_options
         custom_agents = []
         agent_config = load_agent_for_stage(stage_spec.key, "draft") if stage_spec.use_custom_agent else {}
@@ -1557,7 +1606,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             **(stage_spec.session_options(state, "draft") if stage_spec.session_options is not None else {}),
         )
 
-        prompt_messages = stage_spec.build_prompt(state)
+        prompt_messages = stage_spec.build_prompt(prompt_state)
         # Headless mode (run_headless.py): the runner cannot answer clarifying questions, so a
         # not-ready draft would dead-end the run at the needs_clarification END edge. Checked at
         # call time on purpose -- no import-order coupling. The injected message is never

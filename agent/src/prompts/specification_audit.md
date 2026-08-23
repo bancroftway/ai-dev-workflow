@@ -20,6 +20,13 @@ content you are genuinely adding. A deterministic system resolves and validates 
 these citations after you return your response -- your job is only to cite correctly, not to
 number anything.
 
+Carry the draft's `retired_ac_ids`/`retired_us_ids` forward unchanged in `revised_specification`
+unless your own audit disagrees -- these name ledger ids the draft explicitly retired, and your
+revision replaces the draft entirely, so silently dropping either list would silently un-retire
+something the draft meant to remove. If your own gap-hunting finds something that no longer
+belongs and the draft missed it, add its id to the appropriate list yourself rather than just
+leaving it out of `revised_specification`.
+
 Use the `ponytail` skill at `full` intensity for prose fields (`summary`, narratives) -- trim
 redundant/inflated wording, never cut meaning a human approver needs. This document is rendered to
 Markdown verbatim, so terser prose fields here is the only lever; never drop or shorten an

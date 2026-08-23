@@ -34,8 +34,16 @@ is the same underlying capability (even reworded or expanded), set its `existing
 deterministic system resolves the real id from that citation. For a genuinely new story or
 criterion, leave `existing_us_id`/`existing_ac_id` as `null`. Your own `id` field is just a
 same-response-scoped placeholder; the real id will always be a `US-####`/`AC-####.#` number you
-never invent. Simply omit anything from this draft that no longer applies -- that's how you
-signal it should be retired.
+never invent.
+
+State plainly what this draft adds or changes. If a User Story or Acceptance Criterion the ledger
+already has no longer belongs -- cut, descoped, superseded by something else in this same draft --
+name its existing id in `retired_ac_ids`/`retired_us_ids` rather than just leaving it out. Omitting
+something is not how you retire it: anything you don't mention simply keeps its current status, on
+purpose, so that one ticket's own narrower draft can never accidentally wipe out another ticket's
+unrelated stories just by not repeating them. Never list an id in `retired_ac_ids`/`retired_us_ids`
+that you are also citing as `existing_ac_id`/`existing_us_id` in this same response -- revise or
+retire, never both.
 
 HARD RULE: if this prompt did NOT hand you an approved Specification or prior draft containing
 real `US-####`/`AC-####.#` ids, then no such ids exist yet -- every `existing_us_id` and

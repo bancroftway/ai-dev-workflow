@@ -45,12 +45,17 @@ revision (by then, whatever tests/commits reference the "new" id have to be re-l
 ## Stories that no longer belong in the spec
 
 If a story or criterion existed in the prior version and doesn't belong in this draft anymore --
-the feature was cut, descoped, or superseded -- say so explicitly (cite its id, mark it as no
-longer active) rather than just omitting it. An omission looks like an accident to whoever
-reviews this; an explicit "this is retired, here's why" is a decision a human can evaluate.
+the feature was cut, descoped, or superseded -- say so explicitly by putting its id in
+`retired_us_ids`/`retired_ac_ids` rather than just omitting it. An omission is NOT a retirement:
+the downstream deterministic sync only ever retires an id named in one of these two fields, on
+purpose, so that one ticket's own narrower draft can never accidentally retire another ticket's
+unrelated stories just by not repeating them. An omission looks like an accident to whoever
+reviews this; an explicit "this is retired" in the right field is a decision a human can evaluate.
 Retired stories keep their id permanently -- the number is never reused for something else later,
 even if the same feature comes back in a future revision (that becomes a new story, referencing
 the retired one's id in its own narrative if useful context, not reusing the number itself).
+Retiring a story also retires its own acceptance criteria -- you don't need to separately list a
+retired story's ACs in `retired_ac_ids` too, though doing so is harmless.
 
 ## Reporting your findings
 
@@ -58,7 +63,10 @@ For every user story and acceptance criterion in your draft, make sure your stru
 includes, explicitly:
 
 - `existing_us_id` / `existing_ac_id`: the id you're revising, or empty/null if this is new.
-- For anything you believe should be retired from the prior version: its id and a short reason.
+- `retired_us_ids` / `retired_ac_ids`: the ids of anything from the prior version that no longer
+  belongs in this draft.
 
 Don't leave this implicit in prose -- the field the downstream system reads is what matters, not
-a sentence in your narrative that says "this is basically the same as before."
+a sentence in your narrative that says "this is basically the same as before." Never put the same
+id in both an `existing_*_id` citation and a `retired_*_ids` list in the same response -- an item
+is either being revised or being retired, never both at once.

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 # What a REAL ledger id looks like. The renumbering guards below only fire when the draft's own
 # `id` field is itself ledger-shaped: schemas.py documents `id` as a same-response placeholder
@@ -27,6 +27,9 @@ _REAL_ID_RE = re.compile(r"^US-\d+(\.\d+)?$")
 
 from . import repo_files
 from .sandbox.provider import SandboxProvider
+
+if TYPE_CHECKING:
+    from .graph import GraphState
 
 # Under .ai-dev-workflow/ on purpose: the pipeline never writes outside its own directory in a
 # target repo (a top-level spec/ folder appearing in someone's repo was reported as a bug). The
@@ -60,6 +63,31 @@ async def load_ledger(provider: SandboxProvider, thread_id: str) -> list[dict[st
 async def save_ledger(provider: SandboxProvider, thread_id: str, entries: list[dict[str, Any]]) -> None:
     doc = {"schema_version": SCHEMA_VERSION, "entries": entries}
     await repo_files.write_repo_file(provider, thread_id, LEDGER_PATH, json.dumps(doc, indent=2) + "\n")
+
+
+async def hydrate_ticket_mode_context(
+    thread_id: str, _state: "GraphState", provider: SandboxProvider
+) -> dict[str, Any] | None:
+    """StageSpec.draft_prompt_context_from_repo_file for the specification stage.
+
+    Signals ticket-mode framing when LEDGER_PATH already has entries -- a second-or-later ticket
+    running against a project that already has an approved baseline, as opposed to a from-scratch
+    first pass. UNLIKE preflight_nodes.hydrate_tech_stack_from_repo_file (StageSpec.
+    hydrate_from_repo_file's only user today), a non-None return here never short-circuits the
+    stage to "approved" -- see draft_prompt_context_from_repo_file's own docstring in graph.py.
+    make_draft_node merges the returned dict into a prompt-only copy of this stage's StageState so
+    _build_specification_prompt can append one extra instruction segment; a real draft, a real
+    (differently-configured) audit, and the human gate all still run in full either way (Global
+    Constraint, docs/superpowers/plans/part-3-tickets-tasks.md: "hydrate checks decide how much a
+    stage's draft has to do, never whether audit or the human gate run").
+
+    Returns None (no extra segment -- ordinary from-scratch framing) when the ledger is empty or
+    absent. Re-reads the file on every draft call rather than caching the result on GraphState --
+    it's one cheap read, and unlike StageSpec.capture_baseline_commit this signal has no "must
+    stay stable across this run's retry cycles" requirement to protect.
+    """
+    entries = await load_ledger(provider, thread_id)
+    return {"ticket_mode_baseline": True} if entries else None
 
 
 def _next_us_number(entries: list[dict[str, Any]]) -> int:
@@ -96,7 +124,11 @@ def _find(entries: list[dict[str, Any]], entry_id: str) -> dict[str, Any] | None
 
 
 def sync_ledger(
-    entries: list[dict[str, Any]], draft_user_stories: list[dict[str, Any]], run_id: str
+    entries: list[dict[str, Any]],
+    draft_user_stories: list[dict[str, Any]],
+    run_id: str,
+    retired_ac_ids: list[str] | None = None,
+    retired_us_ids: list[str] | None = None,
 ) -> LedgerSyncResult:
     """The deterministic core of P2's ledger-sync gate.
 
@@ -112,9 +144,38 @@ def sync_ledger(
     reused), an AC cited under the wrong parent user story, or the draft's own `id` field
     disagreeing with what it cited as `existing_*_id` (an attempted renumbering).
 
-    Stories/ACs present in `entries` as active/revised but not touched by this draft are marked
-    retired (never deleted) -- the previous approved spec's story that's simply absent from this
-    draft.
+    `retired_ac_ids`/`retired_us_ids` (schemas.Specification's own fields of the same name) name
+    ledger entries this draft explicitly declares no longer belong -- the ONLY way an entry's
+    status ever becomes `"retired"`. There is deliberately no "anything not re-cited this round
+    gets retired" fallback (Ruling 3, docs/superpowers/plans/part-3-tickets-tasks.md). That
+    unconditional auto-retire step used to run here, and it was safe only by accident: the
+    greenfield-leniency branch below already made it a no-op whenever the ledger started empty,
+    which was the only project state this function had ever actually run against in production
+    (one draft in flight per repo, ever, before multi-ticket-per-project existed). The instant a
+    second ticket's Specification stage ran against a project whose ledger already held a first
+    ticket's stories, that same loop retired every one of them the moment this ticket's own
+    (correctly narrower) draft failed to re-cite them -- a real, confirmed data-corruption bug,
+    not a hypothetical one. Explicit-only retirement fixes this for every project state (empty or
+    not) with no mode/flag to get wrong: a story silently absent from this ticket's draft, because
+    it belongs to unrelated work, now simply keeps whatever status it already had.
+
+    Retirement validation is fail-closed, the same posture as every existing_us_id/existing_ac_id
+    citation above: a named id that doesn't exist in the ledger, that exists but is the wrong kind
+    (a `US-####` id inside `retired_ac_ids` or vice versa -- almost certainly the two fields
+    swapped), or that's named here AND cited as existing_us_id/existing_ac_id in this same
+    response (revise and retire are contradictory instructions) all fail the whole sync and land
+    in `reasons` -- silently ignoring a malformed retirement citation would hide exactly the kind
+    of model mistake this ledger exists to catch. A named id that's already `"retired"` is a
+    harmless no-op (still guarded to only flip `"active"`/`"revised"` entries): re-naming an
+    already-gone id is not a mistake worth failing the sync over.
+
+    Retiring a `user_story` entry also retires its own still-`"active"`/`"revised"`
+    `acceptance_criterion` children, even ones not separately named in `retired_ac_ids`:
+    `agent/src/gates/ac_coverage_gate.py`'s `check_ac_coverage` filters required coverage purely
+    by each AC's OWN status and never looks at its parent story's status, so a retired story with
+    orphaned still-`"active"` ACs would keep demanding coverage for criteria whose story is gone.
+    This is a plain structural invariant (retiring a container retires its contents), not the
+    supersession-lineage machinery Ruling 3 explicitly defers.
     """
     updated = [dict(e) for e in entries]
     reasons: list[str] = []
@@ -212,11 +273,118 @@ def sync_ledger(
             ac["id"] = resolved_ac_id
             touched_ids.add(resolved_ac_id)
 
+    for us_id in retired_us_ids or []:
+        entry = _find(updated, us_id)
+        if entry is None:
+            reasons.append(f"retired_us_ids cites {us_id!r}, which does not exist in the ledger")
+            continue
+        if entry.get("kind") != "user_story":
+            reasons.append(f"retired_us_ids cites {us_id!r}, which is not a user story id")
+            continue
+        if us_id in touched_ids:
+            reasons.append(
+                f"retired_us_ids cites {us_id!r}, but this draft also revises it via "
+                "existing_us_id -- a story cannot be both revised and retired in the same draft"
+            )
+            continue
+        if entry.get("status") in ("active", "revised"):
+            entry["status"] = "retired"
+            entry["last_revised_run_id"] = run_id
+            # Cascade: see this function's own docstring -- ac_coverage_gate only looks at an
+            # AC's own status, never its parent's, so an orphaned "active" AC under a retired
+            # story would still be treated as required coverage.
+            for child in updated:
+                if (
+                    child.get("kind") == "acceptance_criterion"
+                    and child.get("parent_us_id") == us_id
+                    and child.get("status") in ("active", "revised")
+                ):
+                    child["status"] = "retired"
+                    child["last_revised_run_id"] = run_id
+
+    for ac_id in retired_ac_ids or []:
+        entry = _find(updated, ac_id)
+        if entry is None:
+            reasons.append(f"retired_ac_ids cites {ac_id!r}, which does not exist in the ledger")
+            continue
+        if entry.get("kind") != "acceptance_criterion":
+            reasons.append(f"retired_ac_ids cites {ac_id!r}, which is not an acceptance criterion id")
+            continue
+        if ac_id in touched_ids:
+            reasons.append(
+                f"retired_ac_ids cites {ac_id!r}, but this draft also revises it via "
+                "existing_ac_id -- an AC cannot be both revised and retired in the same draft"
+            )
+            continue
+        if entry.get("status") in ("active", "revised"):
+            entry["status"] = "retired"
+            entry["last_revised_run_id"] = run_id
+
     if reasons:
         return LedgerSyncResult(passed=False, reasons=reasons, updated_entries=entries)
 
-    for entry in updated:
-        if entry["id"] not in touched_ids and entry.get("status") in ("active", "revised"):
-            entry["status"] = "retired"
-
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
+
+
+def _demo() -> None:
+    """Proves the actual bug Ruling 3 fixes, with real assertions -- not just "it compiles."
+
+    `cd agent && uv run python -m src.spec_ledger`
+    """
+    seed = [
+        {
+            "id": "US-0001",
+            "kind": "user_story",
+            "status": "active",
+            "title": "Sign in",
+            "first_seen_run_id": "run-1",
+            "last_revised_run_id": "run-1",
+        },
+        {
+            "id": "US-0001.1",
+            "kind": "acceptance_criterion",
+            "parent_us_id": "US-0001",
+            "status": "active",
+            "description": "Shows an error on a wrong password.",
+            "first_seen_run_id": "run-1",
+            "last_revised_run_id": "run-1",
+        },
+    ]
+
+    # THE BUG: an unrelated ticket's draft that cites neither existing id and names neither in
+    # retired_ac_ids/retired_us_ids must leave both exactly as they were -- the old unconditional
+    # auto-retire loop would have flipped both to "retired" here.
+    other_ticket_draft = [
+        {
+            "id": "draft-1",
+            "existing_us_id": None,
+            "title": "Export CSV",
+            "acceptance_criteria": [{"id": "draft-1.1", "existing_ac_id": None, "description": "Produces a .csv file."}],
+        }
+    ]
+    result = sync_ledger([dict(e) for e in seed], other_ticket_draft, "run-2")
+    assert result.passed, result.reasons
+    us1 = next(e for e in result.updated_entries if e["id"] == "US-0001")
+    ac1 = next(e for e in result.updated_entries if e["id"] == "US-0001.1")
+    assert us1["status"] == "active", "an untouched, unnamed story must not be silently retired"
+    assert ac1["status"] == "active", "an untouched, unnamed AC must not be silently retired"
+
+    # THE FIX: naming a story in retired_us_ids DOES retire it, and cascades to its own AC.
+    result2 = sync_ledger([dict(e) for e in seed], [], "run-3", retired_us_ids=["US-0001"])
+    assert result2.passed, result2.reasons
+    us1_after = next(e for e in result2.updated_entries if e["id"] == "US-0001")
+    ac1_after = next(e for e in result2.updated_entries if e["id"] == "US-0001.1")
+    assert us1_after["status"] == "retired"
+    assert ac1_after["status"] == "retired", "retiring a story must cascade to its own ACs"
+
+    # Fail-closed: a retirement citation that doesn't resolve is a validation failure, not a
+    # silently-ignored no-op (this function's own documented choice -- see sync_ledger's docstring).
+    result3 = sync_ledger([dict(e) for e in seed], [], "run-4", retired_ac_ids=["US-9999.9"])
+    assert not result3.passed
+    assert "US-9999.9" in result3.reasons[0]
+
+    print("spec_ledger self-check: ok")
+
+
+if __name__ == "__main__":  # pragma: no cover -- cd agent && uv run python -m src.spec_ledger
+    _demo()

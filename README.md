@@ -119,7 +119,7 @@ Every LLM prompt in the pipeline is an editable markdown file under [agent/src/p
 
 ```mermaid
 flowchart LR
-    d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit."]
+    d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit.<br/>Optional reframing: adjust the draft prompt from a<br/>repo file check without skipping the draft itself<br/>(e.g. specification's ticket-mode baseline check)."]
     a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan and minimal-code-to-green<br/>configure one; every other stage goes<br/>straight from draft to verify/gate."]
     v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage."]
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves.<br/>Only specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
@@ -260,4 +260,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 714b6f1320b368d31605a44bc96486eb939d9096759371eaaa55ba85e7defebe -->
+<!-- graph-source-sha256: 8c580b88816821d070d02af136e2a910c84aa8cfc2d005e441fd31c24cbf937a -->

@@ -96,6 +96,20 @@ class Specification(BaseModel):
     user_stories: list[UserStory] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     out_of_scope: list[str] = Field(default_factory=list)
+    retired_ac_ids: list[str] = Field(
+        default_factory=list,
+        description="Stable AC-####.# ids (from the ledger you were given) that no longer belong "
+        "in this specification -- cut, descoped, or superseded. Name them here explicitly; simply "
+        "leaving an old AC out of this draft does NOT retire it (a deterministic gate only ever "
+        "retires an id you name). Never list an id you're also revising via existing_ac_id in "
+        "this same response -- revise or retire, not both.",
+    )
+    retired_us_ids: list[str] = Field(
+        default_factory=list,
+        description="Same as retired_ac_ids, for stable US-#### ids. Retiring a story also "
+        "retires its still-active acceptance criteria automatically -- you don't need to repeat "
+        "them in retired_ac_ids too, though you may.",
+    )
 
 
 class PlanStep(BaseModel):

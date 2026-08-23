@@ -17,6 +17,7 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 | `tech_stack_draft.md` | tech-stack | detect languages/frameworks (Tech Stack tab's fresh-detection path) |
 | `tech_stack_extract.md` | tech-stack | one-shot JSON extraction from the tab's saved/approved markdown |
 | `specification_draft.md` / `specification_audit.md` | specification | user stories + acceptance criteria |
+| `specification_ticket_mode_segment.md` | specification | ticket-mode: expand the existing ledger baseline, scoped to this ticket, instead of a from-scratch read |
 | `plan_draft.md` / `plan_audit.md` | plan | implementation plan, diagrams, wireframes |
 | `plan_greenfield_segment.md` | plan | greenfield: scaffold-first milestone segment |
 | `ac_to_tests_draft.md` | ac-to-tests | acceptance criteria → failing tests |
