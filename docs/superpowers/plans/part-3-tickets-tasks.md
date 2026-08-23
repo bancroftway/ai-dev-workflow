@@ -239,6 +239,52 @@ client-side pre-check duplicating GitHub's own validation. Org-owned new project
 larger feature (needs an org picker, needs to check the user's role in that org) explicitly out of
 scope here.
 
+## Ruling 7 — added 2026-08-23, during Task 7a: `ac_coverage_gate.py` needs its own ticket-scoping
+## fix, same shape as Ruling 3's, and it is just as blocking
+
+Found by Task 7a while investigating ac-to-tests' own hydrate/reframe check, not assumed from the
+Spec: `agent/src/gates/ac_coverage_gate.check_ac_coverage` computes `active_ac_ids` from the
+**entire project's** ledger (`ac_coverage_gate.py:630-636`, unscoped by ticket — every entry with
+`status in ("active", "revised")`, project-wide) and requires each one to have a currently
+**failing** test (`tautological = [ac for ac in active_ac_ids if ac_line_status.get(ac) ==
+"pass"]`, line 752) — the mechanical check for TDD's RED step. This is correct and necessary for
+a single-ticket project. It is a hard, deterministic, 100%-reproducible **blocker** for every
+second-or-later ticket on any project with prior shipped work: the moment ticket #1's feature is
+merged and its test is legitimately, correctly green, ticket #2's own ac-to-tests stage runs the
+whole suite, sees ticket #1's already-passing test, and fails the gate with "these ACs' tests are
+already PASSING with no implementation yet" — about a ticket #2 never touched and has no way to
+make red again without breaking ticket #1's shipped feature. Every downstream check in this
+function (`missing`, `depth_shortfall`, `unattributed_tests`) reads from the same unscoped
+`active_ac_ids`, so the same blindspot runs through all of them, not just the tautological check.
+
+This is the SAME shape of bug Ruling 3 fixed for `spec_ledger.sync_ledger` — an existing mechanism
+built when "one thread = one project's whole spec" was the only case, now wrong the instant a
+project can receive more than one ticket — just in a different gate, and worse in kind: Ruling 3's
+bug silently corrupted data; this one deterministically **halts all further progress on a project**
+the moment its first ticket ships. It must be fixed as part of this Part, not deferred — deferring
+it would ship a Part whose own stated purpose (more than one ticket per project) cannot work past
+the first ticket.
+
+**The fix**: scope `active_ac_ids`, once, right after it's computed, down to only the ACs the
+*current ticket's own* approved Specification actually lists — everything downstream already
+consumes `active_ac_ids` uniformly, so fixing it at the source fixes every downstream check in one
+place. The required set still has to come from an independent source, not from the model's own
+`content_dict`/`coverage_plan` claims (the gate's whole point is verifying the model's self-report
+deterministically — trusting the model's own plan for which ACs count would let it simply omit an
+inconvenient one). "This ticket's own approved Specification's AC ids" is exactly what Task 7a's
+own new `spec_ledger.hydrate_ac_to_tests_ticket_mode_context` already had to compute for a
+different reason (deciding whether to show the reframing segment) — Task 7c (below) should reuse
+or factor out that same computation rather than deriving it a second, possibly-diverging way.
+
+**Not this Part's job to solve**: whether ticket #2 should ALSO be checked for regressions against
+ticket #1's already-shipped, now-scoped-out tests. That is a real, different question (this gate's
+own docstring frames its whole job as "TDD's RED step," which is inherently ticket-scoped — you
+cannot make a shipped ticket's test red again without breaking that ticket) and, if it needs
+answering at all, belongs to whichever stage already owns whole-project regression protection
+(e2e/metrics-exit), not this gate. Scoping this gate down does not remove regression protection
+that already exists elsewhere; it only stops this gate from wrongly blocking on a fact (an older
+ticket's test is green) that was never wrong in the first place.
+
 ## Global Constraints (apply to every task)
 
 - **Every ticket runs the identical 8-stage `StageSpec` set, always** (`tech-stack`,
@@ -418,6 +464,40 @@ stage's own real artifact and cache signal differs (an architecture doc's path a
 signal is not a test suite's). Dispatch as one task if a single implementer can reasonably carry
 6 hydrate designs at once; split into multiple tasks (2-3 stages each) if that turns out too large
 once underway — either is fine, ledger the actual split chosen and why.
+
+## Task 7c: `ac_coverage_gate.py` ticket-scoping fix (Ruling 7 — added 2026-08-23, blocking)
+
+Implements Ruling 7. In `agent/src/gates/ac_coverage_gate.py`'s `check_ac_coverage`, filter
+`active_ac_ids` (currently the whole project's ledger, lines 630-636) down to just the ids that
+belong to the *current ticket's own* approved Specification, immediately after it's computed —
+before it feeds `tautological`/`missing`/depth/attribution checks, all of which already read it
+uniformly, so one filter at the source fixes every downstream use.
+
+Getting "this ticket's own AC ids" needs the same independent-source discipline
+`hydrate_ac_to_tests_ticket_mode_context` (Task 7a, `spec_ledger.py`) already established for the
+identical question, asked for a different reason — read that function first and reuse its
+approach (or factor the shared computation into one function both call) rather than deriving this
+a second, possibly-diverging way. Trace `check_ac_coverage`'s real call chain before assuming
+where to plumb this from: it's called from `agent/src/gates/write_scope_gate.py:299`
+(`verify_ac_to_tests`, the `ac-to-tests` stage's actual `deterministic_verify` — confirmed by grep,
+not the stage name alone), which has `thread_id`/`provider` but not a `GraphState` — so reading
+the current ticket's own approved Specification will most likely mean a sandbox file read (same
+`repo_files.read_repo_file` pattern every other stage-file check in this codebase already uses),
+not a new parameter threaded through five call sites. Find the actual current-ticket Specification
+file path (the same numbered-stage-file convention `workflow_persistence.py` already uses for
+`PLAN_APPROVED_PATH`/`TECH_STACK_APPROVED_PATH` — confirm the Specification stage's own persisted
+path rather than guessing it) rather than inventing a new persistence location.
+
+Do NOT build the "should ticket #2 also be checked for regressions against ticket #1's already-
+shipped tests" mechanism — Ruling 7 explicitly scopes that out of this task; it's a different
+question belonging to whichever stage already owns whole-project regression protection, not this
+gate.
+
+Verify the actual fix, not just that the code compiles: reproduce Ruling 7's exact failure
+scenario against a real or realistic fixture (ticket #1's AC test recorded as passing in a
+structured report, ticket #2's own new AC recorded as failing) and confirm `check_ac_coverage` now
+passes on ticket #2's own coverage while correctly still requiring ticket #2's own new AC to be
+red — not just that ticket #1's AC stops being flagged.
 
 ## Task 8: Delete-tool capability for retiring-ticket test cleanup
 
