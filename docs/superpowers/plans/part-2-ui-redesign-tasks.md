@@ -274,6 +274,34 @@ reconnect. **Ruling: Task 8 adds a small `GET /sessions/{session_id}/events`-sha
 stated scope, just not called out as its own line item until dispatch. Cost if wrong: contained
 to one new, additive endpoint; Task 8's own review is the gate.
 
+## Ruling 12 — added 2026-08-23, during Task 9: `verify_fix_node` gets the same NODE_STARTED/
+## NODE_FINISHED pair as draft/audit, not left uninstrumented
+
+Task 9 found a real 4th LLM-calling node in `graph.py` with zero node-lifecycle instrumentation:
+`make_verify_fix_node`/`verify_fix_node` (role `"fix"` — the same node Task 3b's own comment,
+already sitting above its dispatcher call, calls out by name: "this node builds no RunEvent of
+its own"). Confirmed by reading the function directly: it genuinely calls the LLM
+(`get_chat_model_for_thread(..., "fix", ...)`, real `model._last_usage` available after
+`await model.ainvoke(...)` returns) and does real write work (`git_ops.commit_all`) — this is not
+the deterministic `make_verify_node` (no LLM, no token_usage, already correctly instrumented with
+`NODE_STARTED`/`NODE_FINISHED` by Task 9 as one of its 3 "draft/audit/verify" sites) and not a
+separate scope question about tool-call capture either: Task 3b already threaded a real `run_id`
+into this exact call site, and Tasks 3/4's tool-call capture lives at the *provider chat-model*
+layer (`_agenerate_inner`), so any tool calls `verify_fix_node`'s own turn makes are already
+captured today, for free, with a real `run_id`. The **only** gap is the node-lifecycle pair
+itself — this node is invisible on the swimlane and absent from the event log's node lane
+entirely, exactly where a user would most want to see it (it's the node that does real code
+fixes in response to a failed deterministic check).
+
+**Ruling: extend Task 9's own NODE_STARTED/NODE_FINISHED pattern to this node too, in the same
+task, before review — not deferred.** Small, mechanical, identical shape to draft/audit
+(including `token_usage=model._last_usage`, since this IS a real LLM call, unlike
+`verify_node`'s pattern). Placed after the `if not reasons: return {}` early-return guard,
+matching Task 9's own placement principle (fire only on a path that can reach the node's own real
+work). This is conditionally-instantiated (only for stages with `stage_spec.verify_fix_prompt`
+set) but the fix lives in the one factory function, so it covers every stage that uses it. Cost if
+wrong: contained to one more additive node-lifecycle pair; Task 9's own review is the gate.
+
 ## Global Constraints (apply to every task)
 
 - **Never build a view against mocked/fabricated event data.** Every frontend task must be
