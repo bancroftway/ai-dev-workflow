@@ -570,5 +570,19 @@ Tasks 1-8.
    accepts `updated_by` as a body field because the trusted BFF layer is supposed to be the one
    populating it, but nothing in Task 6 itself enforces that Task 7 actually does. If it doesn't,
    this audit-trail field is spoofable by anyone who can reach the BFF.
-8. Write a final report naming what was verified for real, what remains unverified and why, and
+8. **Added after Task 7 found it, needs a human product decision, not an autonomous one**: no
+   org-level/admin authorization concept exists anywhere in this codebase — `hasRepoAccess` is
+   repo-scoped only, there is no owner/admin/member distinction to gate on despite the original
+   Spec assuming one already existed ("mirrors the existing owner/admin/member role distinction
+   already implied by who can touch /settings/[owner]/[repo] today" — confirmed false against the
+   real code). Task 7 correctly did NOT invent an authorization scheme; it gated the org settings
+   page/route on the same app-wide sign-in check every other page already uses — not a regression
+   (nothing more permissive existed before this feature), but it means **any signed-in user, not
+   just an intended "admin," can currently view/change the org's active AI provider and its
+   credential**. Decide before real deployment: accept this as the org settings surface's
+   permission level for now (matches this app's current overall security posture, just a
+   product-scope decision to make explicitly rather than silently), or scope a real
+   admin/owner-role mechanism as a follow-up (a materially bigger effort, out of Part 4's own
+   scope as planned).
+9. Write a final report naming what was verified for real, what remains unverified and why, and
    any place reality diverged from what Tasks 1-8 assumed — same shape as Part 1's Task 12 report.
