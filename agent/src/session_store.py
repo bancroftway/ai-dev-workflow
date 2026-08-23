@@ -50,6 +50,8 @@ def _row_to_dict(columns: list[str], row: Any) -> dict[str, Any]:
     result = dict(zip(columns, row))
     if result.get("session_id"):
         result["session_id"] = str(result["session_id"]).lower()
+    if result.get("project_id"):
+        result["project_id"] = str(result["project_id"]).lower()
     return result
 
 
@@ -62,18 +64,23 @@ async def create_session(
     source_branch: str,
     work_branch: str,
     title: str,
+    project_id: str,
 ) -> None:
     """Idempotent: called from sessions_api.provision_session before the sandbox boots. A
     reattach (same session_id provisioned again) is a no-op here -- touch_run is what refreshes
-    a session's live state on each scaffold_node round."""
+    a session's live state on each scaffold_node round.
+
+    project_id is required, not optional -- every session/ticket belongs to exactly one project
+    from this migration forward (Ruling 1, docs/superpowers/plans/part-3-tickets-tasks.md); a
+    caller that forgets to resolve one gets a TypeError, not a silent NULL."""
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             """
             IF NOT EXISTS (SELECT 1 FROM dbo.sessions WHERE session_id = ?)
             INSERT INTO dbo.sessions
-                (session_id, owner, repo, user_login, title, source_branch, work_branch, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'in_progress')
+                (session_id, owner, repo, user_login, title, source_branch, work_branch, project_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress')
             """,
             session_id,
             session_id,
@@ -83,6 +90,7 @@ async def create_session(
             title or "(untitled session)",
             source_branch,
             work_branch,
+            project_id,
         )
 
 
@@ -95,7 +103,14 @@ async def touch_run(session_id: str, *, run_id: str, title: str | None) -> None:
     run_id/title only refresh together when title is non-empty and differs from the current
     title (same heuristic session_index.py used) -- a clarification round that repeats the same
     title, or has none yet, keeps the original run's identity instead of minting a new run_id
-    per round."""
+    per round.
+
+    Also clears awaiting_gate (Part 3 Task 1), same reasoning as the other stale-prior-attempt
+    fields below: LangGraph's InMemorySaver checkpoint does not survive a process restart, so a
+    session that was genuinely paused at a gate when the process died has no real interrupt left to
+    resume into -- the next round re-enters via intake_node/draft_node like any other resume, not
+    back into the old paused gate, so a stale True here would show the board a ⏸ that no longer
+    means anything until that stage's gate is actually reached again."""
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute("SELECT title, run_id FROM dbo.sessions WHERE session_id = ?", session_id)
@@ -115,6 +130,7 @@ async def touch_run(session_id: str, *, run_id: str, title: str | None) -> None:
                 ended_at = NULL,
                 failure_stage = NULL, failure_type = NULL, failure_message = NULL,
                 merge_ready = NULL, pr_title = NULL, pr_url = NULL,
+                awaiting_gate = 0,
                 run_id = ?, title = ?,
                 updated_at = SYSUTCDATETIME()
             WHERE session_id = ?
@@ -127,13 +143,42 @@ async def touch_run(session_id: str, *, run_id: str, title: str | None) -> None:
 
 async def update_current_stage(session_id: str, stage_key: str) -> None:
     """Called from make_gate_node's gate_node closure right after a stage's approval succeeds --
-    the one choke point every stage's gate already passes through. Drives the session-list UI's
-    progress indicator."""
+    the one choke point every stage's gate already passes through (gate_node post-interrupt-resume,
+    auto_approve_node, and make_draft_node's hydrate short-circuit all funnel through
+    _run_post_approve_hook). Drives the session-list UI's progress indicator.
+
+    Also unconditionally clears awaiting_gate (Part 3 Task 1): whichever of those three paths just
+    approved this stage, it is no longer paused awaiting a human at its own gate. See
+    set_awaiting_gate below and 0004_create_projects.sql's own comment for why this column exists
+    at all -- current_stage on its own only ever advances post-approval, so it cannot distinguish
+    "still drafting stage X" from "paused at stage X's gate" while either is in flight."""
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
-            "UPDATE dbo.sessions SET current_stage = ?, updated_at = SYSUTCDATETIME() WHERE session_id = ?",
+            "UPDATE dbo.sessions SET current_stage = ?, awaiting_gate = 0, updated_at = SYSUTCDATETIME() "
+            "WHERE session_id = ?",
             stage_key,
+            session_id,
+        )
+
+
+async def set_awaiting_gate(session_id: str, awaiting: bool) -> None:
+    """Set to True immediately before make_gate_node's gate_node (graph.py) actually calls
+    interrupt() and the graph run pauses -- the durable, cross-process signal that this session is
+    sitting at a human gate right now. Needed because current_stage alone can't carry this (see
+    update_current_stage above) and LangGraph's own record of "this thread is inside an
+    interrupt()" lives only in the compiled graph's in-process InMemorySaver checkpointer -- never
+    durable, never visible to another process, gone after a restart. The board's GET /sessions
+    (Task 9) is a plain DB read and has no other way to see this.
+
+    Cleared back to False unconditionally by update_current_stage's own UPDATE once the gate
+    resolves, and by touch_run on the next resume -- so a process restart while paused (which loses
+    the in-memory checkpoint) can't leave a stale True behind once that session is next touched."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE dbo.sessions SET awaiting_gate = ?, updated_at = SYSUTCDATETIME() WHERE session_id = ?",
+            1 if awaiting else 0,
             session_id,
         )
 
@@ -188,6 +233,7 @@ _COLUMNS = [
     "session_id", "owner", "repo", "user_login", "title", "source_branch", "work_branch",
     "run_id", "current_stage", "status", "started_at", "ended_at", "merge_ready",
     "pr_title", "pr_url", "failure_stage", "failure_type", "failure_message", "updated_at",
+    "project_id", "awaiting_gate",
 ]
 
 
@@ -200,22 +246,31 @@ async def get_session(session_id: str) -> dict[str, Any] | None:
 
 
 async def list_sessions(
-    owner: str, repo: str, source_branch: str | None = None, limit: int = _DEFAULT_LIST_LIMIT
+    owner: str,
+    repo: str,
+    source_branch: str | None = None,
+    project_id: str | None = None,
+    limit: int = _DEFAULT_LIST_LIMIT,
 ) -> list[dict[str, Any]]:
+    """owner/repo stay required (the pre-existing /select history-panel query); source_branch and
+    now project_id are both optional filters layered on top -- project_id backs the board's
+    (Task 9) project-scoped listing via IX_sessions_project, e.g. GET /sessions?owner=&repo=&
+    project_id=, since every project maps to exactly one owner/repo once it has one."""
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
+        conditions = ["owner = ?", "repo = ?"]
+        params: list[Any] = [owner, repo]
         if source_branch:
-            await cur.execute(
-                f"SELECT TOP (?) {', '.join(_COLUMNS)} FROM dbo.sessions "
-                "WHERE owner = ? AND repo = ? AND source_branch = ? ORDER BY started_at DESC",
-                limit, owner, repo, source_branch,
-            )
-        else:
-            await cur.execute(
-                f"SELECT TOP (?) {', '.join(_COLUMNS)} FROM dbo.sessions "
-                "WHERE owner = ? AND repo = ? ORDER BY started_at DESC",
-                limit, owner, repo,
-            )
+            conditions.append("source_branch = ?")
+            params.append(source_branch)
+        if project_id:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        await cur.execute(
+            f"SELECT TOP (?) {', '.join(_COLUMNS)} FROM dbo.sessions "
+            f"WHERE {' AND '.join(conditions)} ORDER BY started_at DESC",
+            limit, *params,
+        )
         rows = await cur.fetchall()
         return [_row_to_dict(_COLUMNS, row) for row in rows]
 
@@ -223,7 +278,18 @@ async def list_sessions(
 async def _demo() -> None:
     """Self-check against a real DB: `cd agent && uv run python -m src.session_store`."""
     session_id = str(uuid.uuid4())
+    project_id = str(uuid.uuid4())
     owner, repo = "octocat", "demo-repo-session-store-selfcheck"
+    pool = await _get_pool()
+    # dbo.sessions.project_id is a real FK (0004_create_projects.sql) -- a throwaway dbo.projects
+    # row satisfies it for this self-check. Raw SQL here (not project_store.create_project) keeps
+    # this module's own self-check independent of a sibling module's API; cleaned up in `finally`
+    # below alongside the session row itself.
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO dbo.projects (project_id, name, created_by) VALUES (?, ?, ?)",
+            project_id, "session-store-selfcheck-project", "octocat",
+        )
     try:
         await create_session(
             session_id,
@@ -233,9 +299,12 @@ async def _demo() -> None:
             source_branch="main",
             work_branch=f"ai-dev-workflow/{session_id}",
             title="Initial request",
+            project_id=project_id,
         )
         row = await get_session(session_id)
         assert row is not None and row["status"] == "in_progress" and row["title"] == "Initial request", row
+        assert row["project_id"] == project_id, row
+        assert not row["awaiting_gate"], row  # never set yet
 
         await touch_run(session_id, run_id="r1", title="Initial request")
         row = await get_session(session_id)
@@ -251,9 +320,19 @@ async def _demo() -> None:
         row = await get_session(session_id)
         assert row["run_id"] == "r3" and row["title"] == "Initial request, revised", row
 
+        # awaiting_gate (Part 3 Task 1): set True right where a real gate_node would, immediately
+        # before its interrupt() call would pause the graph; update_current_stage must clear it
+        # unconditionally once that same stage is marked approved -- the exact "still drafting X"
+        # vs. "paused at X's gate" distinction current_stage alone cannot carry (see
+        # 0004_create_projects.sql's own comment for the full trace).
+        await set_awaiting_gate(session_id, True)
+        row = await get_session(session_id)
+        assert row["awaiting_gate"], row
+
         await update_current_stage(session_id, "tech-stack")
         row = await get_session(session_id)
         assert row["current_stage"] == "tech-stack", row
+        assert not row["awaiting_gate"], row  # cleared by that same UPDATE
 
         await close_session(
             session_id, run_id="r3", status="failed",
@@ -263,12 +342,17 @@ async def _demo() -> None:
         assert row["status"] == "failed" and row["failure_message"] == "missing screenshots", row
         assert row["ended_at"] is not None, row
 
-        # Resume: touch_run must clear the stale failure/pr fields from the failed attempt above.
+        # Resume: touch_run must clear the stale failure/pr fields from the failed attempt above,
+        # and (Part 3 Task 1) a stale awaiting_gate left behind by a process restart mid-pause --
+        # the in-memory checkpoint that would have resumed straight into that gate is gone, so the
+        # next round drafts again rather than sitting at the old gate.
+        await set_awaiting_gate(session_id, True)
         await touch_run(session_id, run_id="r4", title="Initial request, revised, again")
         row = await get_session(session_id)
         assert row["status"] == "in_progress", row
         assert row["ended_at"] is None, row
         assert row["failure_stage"] is None and row["failure_message"] is None, row
+        assert not row["awaiting_gate"], row
 
         await close_session(
             session_id, run_id="r4", status="completed",
@@ -280,6 +364,13 @@ async def _demo() -> None:
         sessions = await list_sessions(owner, repo)
         assert any(s["session_id"] == session_id for s in sessions), sessions
 
+        # project_id filter (Part 3 Task 1): scoping to the real project keeps this session, an
+        # unrelated project_id excludes it.
+        scoped = await list_sessions(owner, repo, project_id=project_id)
+        assert any(s["session_id"] == session_id for s in scoped), scoped
+        other_project = await list_sessions(owner, repo, project_id=str(uuid.uuid4()))
+        assert not any(s["session_id"] == session_id for s in other_project), other_project
+
         await delete_session(session_id)
         assert await get_session(session_id) is None
 
@@ -288,6 +379,8 @@ async def _demo() -> None:
         # Idempotent: the assertions above already deleted the row on the success path, so this
         # is only reached (and only matters) if an earlier assertion raised first.
         await delete_session(session_id)
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await cur.execute("DELETE FROM dbo.projects WHERE project_id = ?", project_id)
 
 
 async def _demo_and_close() -> None:

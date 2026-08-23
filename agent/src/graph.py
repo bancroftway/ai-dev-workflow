@@ -2205,6 +2205,24 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         resume_value: Any = None
         if stage_spec.requires_human_gate:
             extra = stage_spec.build_interrupt_extra(state) if stage_spec.build_interrupt_extra else {}
+            # Durable "paused here" signal for dbo.sessions (Part 3 Task 1,
+            # docs/superpowers/plans/part-3-tickets-tasks.md) -- current_stage alone can't tell
+            # "still drafting stage_spec.key" apart from "paused at its gate", since
+            # update_current_stage only ever fires post-approval (_run_post_approve_hook below),
+            # and LangGraph's own InMemorySaver interrupt bookkeeping is in-process only, invisible
+            # to the board's separate GET /sessions DB read and lost on a restart. Best-effort and
+            # swallowed like every other sandbox-adjacent write in this function: no sandbox
+            # registered means no row worth updating (mirrors _run_post_approve_hook's own guard).
+            # This line re-runs harmlessly on resume too -- LangGraph re-executes the node from the
+            # top, so it sets True a second time immediately before update_current_stage clears it
+            # a few lines down.
+            if sandbox_registry.get(thread_id) is not None:
+                try:
+                    await session_store.set_awaiting_gate(thread_id, True)
+                except Exception:
+                    logger.warning(
+                        "set_awaiting_gate failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True
+                    )
             resume_value = interrupt({"stage": stage_spec.key, "draft": stage["draft"], **extra})
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
