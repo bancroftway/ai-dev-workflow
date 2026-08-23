@@ -95,12 +95,13 @@ from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from . import template_loader
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
-from .sandbox.provider import SandboxProvider
+from .sandbox.provider import SandboxProvider, SandboxSession
 from .schemas import (
     PlanAuditResponse,
     PlanDraftResponse,
     SpecificationAuditResponse,
     SpecificationDraftResponse,
+    TechStack,
     TechStackDraftResponse,
 )
 from .schemas_codegen import (
@@ -1669,8 +1670,18 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
 def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     async def draft_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = config["configurable"]["thread_id"]
+        # Part 2 Task 10 review fix: a stage re-entering draft on a human REJECTION must not let
+        # either short-circuit below silently re-serve the exact pre-existing repo file content
+        # the human just rejected -- rejection never touches that file, so without this a rejected
+        # tech-stack draft (the only StageSpec with either hook today) would re-hydrate/re-prefill
+        # the SAME content, flip straight back to ready_for_review/approved, and re-present at the
+        # gate with the feedback silently discarded forever (neither short-circuit touches
+        # cycle_count, so auto-approve can't rescue it either). A rejection always means "don't
+        # just trust what's already there" -- go draft for real so reviewer_feedback (folded in by
+        # build_prompt below) actually reaches the model.
+        just_rejected = bool(state["stages"][stage_spec.key].get("reviewer_feedback"))
 
-        if stage_spec.hydrate_from_repo_file is not None and sandbox_registry.get(thread_id) is not None:
+        if stage_spec.hydrate_from_repo_file is not None and not just_rejected and sandbox_registry.get(thread_id) is not None:
             hydrated = await stage_spec.hydrate_from_repo_file(thread_id, state, get_sandbox_provider())
             if hydrated is not None:
                 stages = {key: dict(value) for key, value in state["stages"].items()}
@@ -1706,7 +1717,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             await _run_post_approve_hook(stage_spec, thread_id, stage_now["approved_content"], state)
             return {}
 
-        if stage_spec.prefill_from_repo_file is not None and sandbox_registry.get(thread_id) is not None:
+        if stage_spec.prefill_from_repo_file is not None and not just_rejected and sandbox_registry.get(thread_id) is not None:
             prefilled = await stage_spec.prefill_from_repo_file(thread_id, state, get_sandbox_provider())
             if prefilled is not None:
                 stages = {key: dict(value) for key, value in state["stages"].items()}
@@ -3550,6 +3561,77 @@ def _demo() -> None:
     # only ever reads status, which gate_node always sets to "approved" for those stages.
     route_after_gate_nongated = make_route_after_gate(by_key["ac-to-tests"])
     assert route_after_gate_nongated({"stages": {"ac-to-tests": {**default_stage_state(), "status": "approved"}}}) == "approved"
+
+    # Regression check (Part 2 Task 10 review fix -- a real Critical bug this file's own review
+    # caught): a stage re-entering make_draft_node on a REJECTION must not let
+    # prefill_from_repo_file/hydrate_from_repo_file silently re-serve the exact pre-existing repo
+    # file the human just rejected, discarding reviewer_feedback forever (neither short-circuit
+    # touches cycle_count, so auto-approve cannot rescue it either). Exercises the real
+    # make_draft_node closure for tech-stack (the only StageSpec with either hook) against a fake
+    # pre-existing tech-stack.md, called twice: once fresh, once with the exact input shape
+    # gate_node's own rejection branch produces. Same globals()-patching technique as the
+    # auto_approve persistence check above, plus a real-shaped fake SandboxSession
+    # (get_chat_model_for_thread validates it) and faked repo_files.read_repo_file/
+    # append_ledger_entry -- the only two real-I/O calls this path reaches with no real container
+    # behind the fake session (append_event/emit_live already fail soft on their own).
+    real_ainvoke_structured = ainvoke_structured
+    real_read_repo_file = repo_files.read_repo_file
+    real_append_ledger_entry = repo_files.append_ledger_entry
+    demo_thread_id = "demo-reject-prefill-thread"
+    draft_call_count = {"n": 0}
+
+    async def _fake_read_repo_file(_provider, _thread_id, path):  # noqa: ANN001
+        return "# Tech Stack\n\nFake pre-existing stack.\n" if path.endswith("tech-stack.md") else None
+
+    async def _fake_append_ledger_entry(_provider, _thread_id, _entry):  # noqa: ANN001
+        return None
+
+    async def _fake_ainvoke_structured(_model, _messages, _schema):  # noqa: ANN001
+        draft_call_count["n"] += 1
+        return TechStackDraftResponse(
+            readiness=True, clarifying_questions=[],
+            tech_stack=TechStack(summary=f"real draft call #{draft_call_count['n']}"),
+        )
+
+    globals()["ainvoke_structured"] = _fake_ainvoke_structured
+    repo_files.read_repo_file = _fake_read_repo_file
+    repo_files.append_ledger_entry = _fake_append_ledger_entry
+    sandbox_registry.set(
+        demo_thread_id, SandboxSession(session_id=demo_thread_id, host="localhost", port=0, connection_token="")
+    )
+    try:
+        draft_node_fn = make_draft_node(by_key["tech-stack"])
+        demo_cfg = {"configurable": {"thread_id": demo_thread_id}}
+
+        first = asyncio.run(
+            draft_node_fn(
+                {"stages": {"tech-stack": default_stage_state()}, "provider": "copilot", "run_id": "demo"}, demo_cfg
+            )
+        )
+        first_stage = first["stages"]["tech-stack"]
+        assert first_stage["status"] == "ready_for_review" and draft_call_count["n"] == 0, (
+            "prefill_from_repo_file should skip the LLM entirely on a fresh (never-rejected) draft"
+        )
+
+        rejected_input = {**first_stage, "status": "needs_clarification", "reviewer_feedback": "add a Python backend"}
+        second = asyncio.run(
+            draft_node_fn(
+                {"stages": {"tech-stack": rejected_input}, "provider": "copilot", "run_id": "demo"}, demo_cfg
+            )
+        )
+        second_stage = second["stages"]["tech-stack"]
+        assert draft_call_count["n"] == 1, (
+            "a rejection must force a REAL draft call -- prefill_from_repo_file silently "
+            "re-served the same pre-existing file and discarded reviewer_feedback"
+        )
+        assert second_stage["draft"] != first_stage["draft"], (
+            "post-rejection draft must not be byte-identical to the pre-rejection one"
+        )
+    finally:
+        globals()["ainvoke_structured"] = real_ainvoke_structured
+        repo_files.read_repo_file = real_read_repo_file
+        repo_files.append_ledger_entry = real_append_ledger_entry
+        sandbox_registry.pop(demo_thread_id)
 
     # _detect_verify_stall: the three heuristics, independently.
     s = _detect_verify_stall("same feedback", "same feedback", None, None, None, None)

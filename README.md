@@ -120,7 +120,7 @@ Every LLM prompt in the pipeline is an editable markdown file under [agent/src/p
 
 ```mermaid
 flowchart LR
-    d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit.<br/>Optional reframing: adjust the draft prompt from a<br/>repo file check without skipping the draft itself<br/>(e.g. specification's ticket-mode baseline check).<br/>A prior human gate rejection's feedback (below)<br/>is folded in the same way."]
+    d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit --<br/>both skipped on a REJECTED redraft, which always<br/>goes to a real LLM call so the feedback (below)<br/>can actually reach it.<br/>Optional reframing: adjust the draft prompt from a<br/>repo file check without skipping the draft itself<br/>(e.g. specification's ticket-mode baseline check).<br/>A prior human gate rejection's feedback is<br/>folded in the same way."]
     a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan and minimal-code-to-green<br/>configure one; every other stage goes<br/>straight from draft to verify/gate."]
     v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage."]
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves<br/>or rejects with feedback.<br/>tech-stack, specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
@@ -262,4 +262,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: ef611be06f9830cca966e517a8954799f1b7493a49d750adc82a20b358c0e5dd -->
+<!-- graph-source-sha256: 7d201c23181b207cdc5b079e12a1181a2793f69eec96c6fb0a30deaa75341476 -->
