@@ -261,6 +261,19 @@ assert the constructed instance actually carries the real `run_id`, not a placeh
 `copilot_chat_model.py`'s existing translator self-check to assert `run_id` is no longer the
 literal string `"unknown"` when a real value is supplied by the caller.
 
+## Ruling 11 — added 2026-08-23, before Task 8 dispatch: a historical-events GET endpoint is
+## real, necessary work folded into Task 8, not a separate task
+
+Task 8's own text already said the new tool-call-row view falls back to "a fetch of Task 1's
+durable store for a finished run" — but no task actually built that fetch mechanism. Task 1 built
+`run_event_store.list_events(run_id)` as a plain Python function; Task 2's live transport only
+delivers events during an active LangGraph run. Neither helps a finished run or a page
+reconnect. **Ruling: Task 8 adds a small `GET /sessions/{session_id}/events`-shaped endpoint to
+`sessions_api.py`** (exact route/keying decided by the implementer against the real
+`session_id`-to-`run_id` relationship, not assumed) — this was always implicit in Task 8's own
+stated scope, just not called out as its own line item until dispatch. Cost if wrong: contained
+to one new, additive endpoint; Task 8's own review is the gate.
+
 ## Global Constraints (apply to every task)
 
 - **Never build a view against mocked/fabricated event data.** Every frontend task must be
