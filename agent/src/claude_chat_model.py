@@ -77,6 +77,7 @@ from . import run_event_store
 from . import run_event_stream
 from . import telemetry
 from .cli_agent_exec import _SCRATCH_DIR, run_turn, write_scratch_file
+from .redaction import redact_text, redact_value
 from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
 
@@ -383,8 +384,14 @@ def _translate_intermediate_events(
                     type=RunEventType.TOOL_CALL,
                     stage=stage,
                     node=node,
-                    summary=f"tool call: {name}",
-                    payload=payload,
+                    # Task 5 (Part 2 run-visibility): real captured tool-call content (a Bash
+                    # command, its output, ...) reaching a human-facing event log for the first
+                    # time -- scrub it here, before this RunEvent reaches run_event_store.
+                    # append_event/run_event_stream.emit_live. Same shared helper as
+                    # copilot_chat_model.py's identical call site and telemetry.py's own
+                    # long-standing command scrub (redaction.py).
+                    summary=redact_text(f"tool call: {name}"),
+                    payload=redact_value(payload),
                 )
             )
     return translated
@@ -1065,6 +1072,45 @@ def _demo() -> None:
 
     asyncio.run(close_thread_session(survivor))
     assert not [k for k in _session_ids if k.startswith(f"{survivor}:")], "close_thread_session did not evict"
+
+    # --- Task 5 (Part 2 run-visibility): redaction at the actual capture path ---
+    #
+    # Same concrete proof as copilot_chat_model._demo()'s own Task 5 block (task-5-brief.md): a
+    # long base64-shaped fake-secret-looking token, injected into BOTH a tool_use's `input` (the
+    # command) and its paired tool_result's `content` (the output) -- task-5-brief's own example is
+    # exactly "a Bash tool's command/output" -- must not survive _translate_intermediate_events into
+    # either sink a translated RunEvent actually reaches: the JSON text run_event_store.append_event
+    # would INSERT (mirrored via json.dumps; append_event itself needs a live DB pool this module's
+    # self-check deliberately never opens) and the dict run_event_stream.emit_live actually
+    # dispatches live (_json_safe_payload is pure/side-effect-free, called directly, no live graph
+    # run needed).
+    fake_secret = "ghp_" + "x1Y2z3" * 8  # 52 chars, base64-ish -- comfortably over the 40-char floor
+    secret_use_line = json.dumps({
+        "type": "assistant",
+        "message": {"content": [{
+            "type": "tool_use", "id": "toolu_secret", "name": "Bash",
+            "input": {"command": f"echo {fake_secret}"},
+        }]},
+    }) + "\n"
+    secret_result_line = json.dumps({
+        "type": "user",
+        "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "toolu_secret",
+            "content": f"token-in-output: {fake_secret}", "is_error": False,
+        }]},
+    }) + "\n"
+    secret_events = _parse_claude_jsonl(secret_use_line + secret_result_line)
+    secret_translated = _translate_intermediate_events(
+        secret_events, run_id="run-secret", session_id="thread-secret", stage="specification", node="draft",
+    )
+    assert len(secret_translated) == 1, secret_translated
+    secret_event = secret_translated[0]
+    assert fake_secret not in (secret_event.summary or ""), "token leaked into summary"
+    stored_json = json.dumps(secret_event.payload)
+    assert fake_secret not in stored_json, f"token leaked into the JSON the DB would store: {stored_json}"
+    assert "<redacted>" in stored_json, "payload was not actually scrubbed, just happened to omit the field"
+    emitted_json = json.dumps(run_event_stream._json_safe_payload(secret_event))
+    assert fake_secret not in emitted_json, f"token leaked into the dict emit_live dispatches live: {emitted_json}"
 
     print("claude_chat_model self-check: all assertions passed")
 

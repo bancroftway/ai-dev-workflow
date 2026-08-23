@@ -16,7 +16,6 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-import re
 from typing import Any, Awaitable, Callable
 
 from langchain_core.runnables import RunnableConfig
@@ -24,15 +23,18 @@ from langgraph.errors import GraphBubbleUp
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from .redaction import redact_text
+
 logger = logging.getLogger(__name__)
 
 # ProxyTracer: resolves against whatever provider setup() installs later.
 tracer = trace.get_tracer("ai-dev-workflow-agent")
 
 # Redacts contiguous base64-ish runs (>=40 chars) from exec commands before they become span
-# attributes -- git_ops.push_head embeds its credential-helper script as one such blob. 40 is
-# deliberate: a classic 40-char ghp_ token is exactly at the threshold; never raise it.
-_B64_RUN = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
+# attributes -- git_ops.push_head embeds its credential-helper script as one such blob. Detector
+# itself now lives in redaction.py (Part 2 Task 5 extracted it so the same 40-char-threshold scrub
+# also covers Tasks 1/3/4's real captured tool-call payloads, not just this module's own span
+# attributes) -- see that module's docstring for why 40 is deliberate and must never be raised.
 _COMMAND_ATTR_MAX = 300
 
 
@@ -157,7 +159,7 @@ def traced_exec(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[An
             "sandbox/exec",
             attributes={
                 "thread_id": session_id,
-                "command": _B64_RUN.sub("<redacted>", command)[:_COMMAND_ATTR_MAX],
+                "command": redact_text(command)[:_COMMAND_ATTR_MAX],
             },
         ) as span:
             result = await fn(self, session_id, command)
@@ -166,3 +168,37 @@ def traced_exec(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[An
 
     wrapper.__name__ = getattr(fn, "__name__", "exec_in_sandbox")
     return wrapper
+
+
+def _demo() -> None:
+    """Self-check for traced_exec's own command redaction. This module had no self-check before
+    Part 2 Task 5 (nothing here needed one -- setup() needs a real FastAPI app, traced_node/
+    traced_exec are thin decorators exercised end-to-end by their real call sites); Task 5 adds one
+    now because it moved `_B64_RUN` out to redaction.py and must prove that extraction changed
+    nothing here. `original_pattern` below is an independent, hardcoded copy of the ORIGINAL inline
+    regex (deliberately NOT imported from redaction.py) so this check would actually fail if the
+    shared helper's pattern ever silently drifted from telemetry's own historical behavior --
+    proving byte-for-byte identical output, not just "still runs without crashing".
+
+    `cd agent && .venv/Scripts/python.exe -m src.telemetry`.
+    """
+    import re as _re
+
+    original_pattern = _re.compile(r"[A-Za-z0-9+/=_-]{40,}")
+    token = "x1Y2z3" * 8  # 48 chars, base64-ish -- comfortably over the 40-char threshold
+    for command in (
+        f"git push https://x-access-token:{token}@github.com/o/r.git",
+        "git status",
+        "a" * 39,  # just under the 40-char threshold -- must NOT be redacted
+        "a" * 40,  # exactly at the 40-char threshold -- MUST be redacted
+        "b" * 500,  # long enough to also exercise the _COMMAND_ATTR_MAX truncation below
+    ):
+        expected = original_pattern.sub("<redacted>", command)[:_COMMAND_ATTR_MAX]
+        actual = redact_text(command)[:_COMMAND_ATTR_MAX]
+        assert actual == expected, (command, actual, expected)
+
+    print("telemetry self-check: ok")
+
+
+if __name__ == "__main__":  # pragma: no cover -- cd agent && .venv/Scripts/python.exe -m src.telemetry
+    _demo()

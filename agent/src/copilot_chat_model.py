@@ -68,6 +68,7 @@ from . import run_event_store
 from . import run_event_stream
 from . import telemetry
 from .cli_agent_exec import _SCRATCH_DIR, run_turn, write_scratch_file
+from .redaction import redact_text, redact_value
 from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
 
@@ -217,8 +218,13 @@ def _translate_intermediate_events(
                 type=RunEventType.TOOL_CALL,
                 stage=stage,
                 node=node,
-                summary=f"tool call: {tool_name}",
-                payload=payload,
+                # Task 5 (Part 2 run-visibility): this is real captured tool-call content reaching
+                # a human-facing event log for the first time -- redact_text/redact_value
+                # (redaction.py, shared with telemetry.py's own long-standing command scrub) scrub
+                # it here, before this RunEvent ever reaches run_event_store.append_event/
+                # run_event_stream.emit_live.
+                summary=redact_text(f"tool call: {tool_name}"),
+                payload=redact_value(payload),
             )
         )
     return translated
@@ -1022,6 +1028,34 @@ def _demo() -> None:
     # read_skill_invocations must fail open unconditionally (module docstring) -- None args are
     # safe here because the function never touches them, by contract.
     assert asyncio.run(read_skill_invocations(None, "thread", "session")) is None, "must always fail open"
+
+    # --- Task 5 (Part 2 run-visibility): redaction at the actual capture path ---
+    #
+    # The concrete proof task-5-brief.md asks for: a payload containing a long base64-shaped
+    # fake-secret-looking token, run through this module's own _translate_intermediate_events, must
+    # not leak that token into either sink a translated RunEvent actually reaches -- the JSON text
+    # run_event_store.append_event would INSERT (mirrored here via json.dumps; append_event itself
+    # needs a live DB pool this module's self-check deliberately never opens -- module docstring)
+    # and the dict run_event_stream.emit_live actually dispatches live (_json_safe_payload is pure
+    # and side-effect-free, called directly here for the same "no live graph run needed" reason).
+    fake_secret = "ghp_" + "x1Y2z3" * 8  # 52 chars, base64-ish -- comfortably over the 40-char floor
+    secret_line = json.dumps({
+        "type": "tool.call_start",
+        "data": {"name": "bash", "input": {"command": f"curl -H Authorization:Bearer_{fake_secret}"}},
+        "id": "sec-1", "timestamp": "2026-01-01T00:00:00.000Z", "parentId": "sec-0",
+    }) + "\n"
+    secret_events, _ = _parse_copilot_jsonl(secret_line)
+    secret_translated = _translate_intermediate_events(
+        secret_events, run_id="run-secret", session_id="thread-secret", stage="specification", node="draft",
+    )
+    assert len(secret_translated) == 1, secret_translated
+    secret_event = secret_translated[0]
+    assert fake_secret not in (secret_event.summary or ""), "token leaked into summary"
+    stored_json = json.dumps(secret_event.payload)
+    assert fake_secret not in stored_json, f"token leaked into the JSON the DB would store: {stored_json}"
+    assert "<redacted>" in stored_json, "payload was not actually scrubbed, just happened to omit the field"
+    emitted_json = json.dumps(run_event_stream._json_safe_payload(secret_event))
+    assert fake_secret not in emitted_json, f"token leaked into the dict emit_live dispatches live: {emitted_json}"
 
     print("copilot_chat_model self-check: all assertions passed")
 
