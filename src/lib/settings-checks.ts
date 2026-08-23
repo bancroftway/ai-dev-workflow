@@ -6,7 +6,7 @@ import type { Session } from "next-auth";
  * returning a MissingSetting with whatever fix action applies.
  */
 export type MissingSetting = {
-  id: "entra-session" | "github-connected" | "key-vault";
+  id: "entra-session" | "github-connected" | "key-vault" | "org-credential";
   label: string;
   description: string;
   fix:
@@ -39,6 +39,24 @@ export async function runSettingsChecks(ctx: {
       description: "Connect your GitHub account to list repositories, read branches, and push work.",
       fix: { kind: "connect-github" },
     });
+  }
+
+  // Session-scoped, org-wide: no owner/repo needed, unlike the key-vault check below. This
+  // codebase has no admin/role concept (checked src/lib/session-access.ts and grepped the rest of
+  // src/ -- confirmed again while wiring this in): every signed-in user already has the same
+  // access to /settings/organization, so there is no "admin vs. non-admin" copy to branch on here
+  // -- everyone gets the same actionable link.
+  const orgRes = await fetch("/api/settings/organization");
+  if (orgRes.ok) {
+    const orgSettings = (await orgRes.json()) as { credential_configured?: boolean };
+    if (!orgSettings.credential_configured) {
+      missing.push({
+        id: "org-credential",
+        label: "No coding-agent credential configured",
+        description: "Sessions can't run until a provider credential is set for the organization.",
+        fix: { kind: "link", href: "/settings/organization", label: "Open Settings" },
+      });
+    }
   }
 
   // Repo-scoped: only meaningful once a repo is selected and GitHub is linked (the vault lookup
