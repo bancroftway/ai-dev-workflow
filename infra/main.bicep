@@ -267,6 +267,12 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
             // set (vs. the local Trusted_Connection path for dev) -- see agent/src/db.py.
             { name: 'AZURE_SQL_SERVER', value: '${sqlServer.name}.database.windows.net' }
             { name: 'AZURE_SQL_DATABASE', value: sqlDatabase.name }
+            // Org-wide coding-agent credential vault (agent/src/org_credential_vault.py) -- read
+            // via this SAME standing managed identity (AZURE_USE_MANAGED_IDENTITY above), NOT the
+            // OBO exchange the AIDW_AGENT_* vars above use for per-repo vaults. Deliberately a
+            // different access pattern for a fleet-wide secret with no natural per-user owner --
+            // see this file's orgVault/kvSecretsOfficerRoleAgent resources and Part 4 Ruling 1.
+            { name: 'AZURE_ORG_VAULT_URI', value: orgVault.properties.vaultUri }
           ]
           resources: {
             cpu: json('0.5')
@@ -381,6 +387,62 @@ resource acrPullRoleFrontend 'Microsoft.Authorization/roleAssignments@2022-04-01
     principalId: frontendApp.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d') // AcrPull
+  }
+}
+
+// Org-wide coding-agent credential (Anthropic API key or Copilot PAT), Part 4 org settings --
+// dedicated, minimal vault for exactly one secret. Deliberately separate from
+// agent/src/keyvault.py's per-repo vaults (customer-owned, reached only via OBO -- the agent holds
+// no standing access there, by design). That design doesn't fit here: this secret is fleet-wide
+// with no natural per-user owner to exchange an OBO assertion on behalf of (plan Part 4 Ruling 1),
+// so the agent's OWN managed identity gets standing access below, scoped to this one vault only.
+resource orgVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  // Key Vault names are globally unique across all of Azure AND capped at 24 chars -- tighter
+  // than every other resource name in this file (ACR tolerates 50 chars, just no hyphens). Relies
+  // on the same "namePrefix is already unique-ish" assumption acr's own name does, just with less
+  // headroom -- a long namePrefix fails this specific resource at deploy time before anything else.
+  name: '${namePrefix}-vault'
+  location: location
+  properties: {
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    tenantId: subscription().tenantId
+    // RBAC, not the legacy vault access-policy model -- required for the role assignment below to
+    // have any effect at all; under the access-policy model it would silently grant nothing.
+    enableRbacAuthorization: true
+  }
+}
+
+// Standing access for the org-wide credential -- Ruling 1's deliberate divergence from the OBO
+// pattern everywhere else in this codebase: the agent's OWN system-assigned identity, not a
+// per-user assertion, because a fleet-wide secret has no natural per-user owner to delegate
+// through (contrast agent/src/keyvault.py's module docstring, which is the pattern this is NOT).
+//
+// Role: built-in "Key Vault Secrets Officer" (dataActions: Microsoft.KeyVault/vaults/secrets/*,
+// i.e. full CRUD on secrets specifically, NOT vault administration or permission management).
+// The plan's Ruling 1 and this task's own brief both say "Key Vault Secrets User" -- deliberately
+// NOT followed literally here, because that role's dataActions are only getSecret + readMetadata
+// (verified against Microsoft's own built-in-roles reference just before writing this). It cannot
+// set a secret. org_credential_vault.py's set_org_credential runs under this exact identity
+// (called from sessions_api.py inside this same container, per Part 4 Task 6) and needs the
+// setSecret data action -- Secrets User would 403 the very first time an admin saves an org
+// credential. Secrets Officer is the minimal built-in role that actually covers both
+// get_org_credential and set_org_credential, still without widening into vault administration or
+// permission management. Flagged in the Task 2 report as a deliberate spec deviation, not a
+// silent one.
+//
+// Scope: this ONE vault's resource ID only, never the resource group -- verify the `scope` in the
+// generated ARM JSON after `az bicep build`, don't trust the source read alone (Ruling 1's own
+// stated cost-if-wrong: an over-scoped grant here would be a real security regression).
+resource kvSecretsOfficerRoleAgent 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(orgVault.id, agentApp.id, 'KeyVaultSecretsOfficer')
+  scope: orgVault
+  properties: {
+    principalId: agentApp.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7') // Key Vault Secrets Officer
   }
 }
 
