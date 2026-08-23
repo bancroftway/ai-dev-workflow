@@ -1,20 +1,46 @@
-"""Provider dispatch for chat models: resolves Claude vs Copilot on EVERY call, not once at
+"""Provider dispatch for chat models: Claude vs Copilot, chosen by whoever calls in, not once at
 process start.
 
-Until this task, PROVIDER was computed ONCE from AGENT_PROVIDER at module-import time, and every
-name below (get_chat_model_for_thread, close_session, ...) was bound then too, directly to
-whichever provider module happened to be active at that moment. That binding is permanent for the
-life of the process -- and this codebase's real processes are long-lived: sessions_api.py's uvicorn
-server handles many sessions over hours/days, run_headless.py's own run can span a full pipeline.
-Once an org admin uses the Settings UI (a later task, built on org_settings.py/Task 1) to change
-the active provider in the DB, an import-time-bound name -- including every OTHER module's own
-`from .chat_model import get_chat_model_for_thread`, captured at ITS OWN import time -- would keep
-calling the OLD provider forever, with no way to notice the change short of restarting every worker
-process. That is the real bug this file fixes, not a hypothetical: get_provider() below re-resolves
-the org's saved setting on a short TTL, and every previously-re-exported name is now a real
-function that calls it (or a sync-safe equivalent, for the handful that are themselves sync) on
-every invocation -- so a caller that imported one of these names once, at ITS OWN module-load time,
-still tracks the live setting rather than a snapshot from whenever it happened to import this file.
+Until Task 3, PROVIDER was computed ONCE from AGENT_PROVIDER at module-import time, and every name
+below (get_chat_model_for_thread, close_session, ...) was bound then too, directly to whichever
+provider module happened to be active at that moment. That binding is permanent for the life of
+the process -- and this codebase's real processes are long-lived: sessions_api.py's uvicorn server
+handles many sessions over hours/days, run_headless.py's own run can span a full pipeline. Once an
+org admin uses the Settings UI (org_settings.py/Task 1) to change the active provider in the DB, an
+import-time-bound name -- including every OTHER module's own `from .chat_model import
+get_chat_model_for_thread`, captured at ITS OWN import time -- would keep calling the OLD provider
+forever, with no way to notice the change short of restarting every worker process. get_provider()
+below is the fix for THAT bug: it re-resolves the org's saved setting on a short TTL rather than
+once at import time.
+
+Ruling 4 (docs/superpowers/plans/part-4-org-settings-tasks.md), added after Task 3's first pass
+got this next part wrong: the 7 functions below that actually DO the dispatching
+(get_chat_model_for_thread, close_session, close_thread_session, forget_thread_sessions,
+get_session_id, read_skill_invocations, secret_env_names) do NOT call get_provider() (or
+_get_provider_sync()) themselves. Each takes the provider to dispatch to as a **required,
+keyword-only `provider` parameter** instead, with no default. The first version of this file had
+each of these 7 resolve the live setting internally on every call -- which looked like the same
+"per-call, not per-process" fix as get_provider() itself, but actually defeated the entire point of
+GraphState.provider (Task 4): a run pins its provider ONCE, at intake, specifically so a live
+setting change never splits one run across two providers' sessions/CLIs mid-flight. If these 7
+functions each independently re-read the shared 30-second-TTL cache, then any one of them, called
+more than ~30 seconds after the cache was last warmed (the ordinary case for a run spanning minutes
+to hours), would resolve to whatever the org setting says RIGHT NOW rather than what the run is
+pinned to -- silently undoing Task 4's pinning for the very call sites it exists to protect. Worse
+for the session-lifecycle functions specifically (close_session, get_session_id,
+forget_thread_sessions): a wrong-provider resolution doesn't just build the wrong model, it
+operates on the WRONG PROVIDER'S own session-tracking dict for a thread actually running under the
+other one -- the same resource-leak/wrong-dispatch shape Part 1's Tasks 10-11 already had to hunt
+down once (there, a hardcoded value; here, a live-drifting one). So: the caller resolves the
+provider exactly once (a graph node reads its own pinned `state["provider"]`; genuine
+provisioning-time code with no state yet calls get_provider() itself) and hands it to whichever of
+these 7 it needs -- nothing in this module quietly re-derives it on their behalf.
+
+get_provider() itself is unaffected by Ruling 4 -- it still exists, still does the live,
+TTL-cached DB read, and is still exactly what intake_node (GraphState.provider, once per run) and
+genuine provisioning-time code (sessions_api.py, run_headless.py's startup, the sandbox
+provisioning lazy imports) call to get that one live value in the first place. It just no longer
+gets called from inside the other 7 -- those are told, not asked.
 
 sandbox/factory.py's get_sandbox_provider() looks superficially similar (env var -> module
 selection) but is solving a different problem: which SandboxProvider backend to run against (local
@@ -25,10 +51,10 @@ redeploy -- so a permanent memoized value would just be the same bug under a dif
 short TTL cache (re-resolved periodically, never forever) fits that requirement.
 
 get_runtime_auth_token() below is a related but separate fix: sessions_api.py and run_headless.py
-currently read ANTHROPIC_API_KEY/GITHUB_TOKEN from the process environment directly, by hand, via
+used to read ANTHROPIC_API_KEY/GITHUB_TOKEN from the process environment directly, by hand, via
 their own `chat_model.PROVIDER == "claude"` ternary -- so an admin's Settings-UI-saved credential
-(org_credential_vault.py/Task 2) would never reach a real sandboxed session even after this task
-ships. Defined here because it is new chat_model.py surface, not a call-site conversion.
+(org_credential_vault.py/Task 2) would never reach a real sandboxed session. Defined here because
+it is new chat_model.py surface, not a call-site conversion.
 
 ainvoke_structured (from structured_output.py) is unaffected by any of this -- it was already
 provider-agnostic before this task and stays a plain re-export.
@@ -112,8 +138,10 @@ async def get_provider() -> str:
     os.environ.get("AGENT_PROVIDER", "copilot") when that returns None (a fresh deployment whose
     admin hasn't visited the Settings UI yet -- org_settings.get_org_settings's own docstring notes
     this is exactly where that fallback belongs). This is the ONLY place in this module that ever
-    hits the DB; every dispatching function below calls this (or _get_provider_sync(), for the
-    handful that are themselves sync) instead of re-implementing the cache/fallback logic itself.
+    hits the DB. Per Ruling 4, the 7 dispatch functions below no longer call this themselves --
+    only intake_node (to populate GraphState.provider once per run) and genuine provisioning-time
+    code with no state yet (sessions_api.py, run_headless.py's startup, sandbox provisioning) call
+    this directly; everything else is handed the resolved value as an explicit `provider` argument.
     """
     global _provider_cache
     cached = _cached_provider_if_fresh()
@@ -128,31 +156,31 @@ async def get_provider() -> str:
 
 
 def _get_provider_sync() -> str:
-    """Sync-safe stand-in for get_provider(), used only by the re-exported functions that are
-    themselves sync (get_chat_model_for_thread, forget_thread_sessions, get_session_id,
-    secret_env_names -- all four are plain `def`s in BOTH provider modules, doing no I/O) and
-    therefore cannot `await get_provider()`. Any of these can be called from inside code that is
-    itself already running an event loop (e.g. a LangGraph async node calling
-    get_chat_model_for_thread without awaiting it, since it isn't a coroutine function) --
-    `asyncio.run()` in that situation raises RuntimeError("cannot be called from a running event
-    loop"), so there is no safe way to fall through to a real DB read from here.
+    """Sync-safe stand-in for get_provider() -- a live, TTL-cached-or-env-var read with no
+    `await`, for a sync caller that cannot use get_provider() itself (asyncio.run() from inside
+    code already running an event loop raises RuntimeError("cannot be called from a running event
+    loop"), so there is no safe way for a plain `def` to fall through to a real DB read).
+
+    Pre-Ruling-4, this was called internally by the 4 dispatch functions that are themselves sync
+    (get_chat_model_for_thread, forget_thread_sessions, get_session_id, secret_env_names) to
+    resolve their own provider. Ruling 4 removed all of those internal calls -- each of the 7
+    dispatch functions now takes an explicit, required `provider` argument from its caller instead
+    of resolving one itself, sync or otherwise -- so this function currently has no caller inside
+    this module. Left in place, unchanged, as Task 3 built it: it is still correct, sync-safe
+    infrastructure for a future genuinely-sync caller that needs a live-ish read of the provider
+    setting with no event loop available, the same role it has always had; Ruling 4 changed who
+    resolves the provider for the 7 dispatch functions, not what this helper itself does.
 
     Reads the same shared cache get_provider() populates -- a sync caller benefits from whatever an
     async caller already fetched, within the same TTL window -- but on a cold/expired cache it
     never itself hits the DB, and never writes _provider_cache either; it only ever falls back
     straight to the env var, the same default get_provider() itself falls back to. Net effect: the
     staleness bound here is NOT a fixed _PROVIDER_CACHE_TTL_SECONDS -- it is self-correcting rather
-    than time-bounded. A sync-only call path can lag an admin's DB-saved provider change for as
-    long as it takes until the NEXT time any async-dispatched function in this module
-    (get_provider(), close_session(), close_thread_session(), read_skill_invocations(), or
-    get_runtime_auth_token()) actually runs and warms the shared cache -- if none of those ever
-    run in a given process, this function never once consults the DB, no matter how much time
-    passes. In practice that window is normally short (a real graph run's own lifecycle calls
-    close_session/close_thread_session, and Task 5 is expected to wire get_runtime_auth_token()
-    early in session provisioning), but that is a fact about this codebase's call patterns, not a
-    guarantee this function itself enforces. This is an explicit trade-off, not an oversight -- the
-    alternative is blocking a sync function on network I/O it cannot safely perform, or risking the
-    RuntimeError above.
+    than time-bounded, bounded only by however often something else in the process still calls
+    get_provider()/get_runtime_auth_token() (intake_node, once per run; genuine provisioning-time
+    code) and thereby warms the shared cache this function opportunistically reads. This is an
+    explicit trade-off, not an oversight -- the alternative is blocking a sync function on network
+    I/O it cannot safely perform, or risking the RuntimeError above.
     """
     cached = _cached_provider_if_fresh()
     if cached is not None:
@@ -190,6 +218,7 @@ def get_chat_model_for_thread(
     stage: str,
     role: str,
     *,
+    provider: str,
     github_token: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
@@ -205,13 +234,16 @@ def get_chat_model_for_thread(
     response_schema: type[BaseModel] | None = None,
 ) -> BaseChatModel:
     """Build the chat model for one LangGraph thread's (stage, role) session, dispatching to
-    whichever provider is active FOR THIS CALL (module docstring) rather than a name bound at
-    import time.
+    whichever provider the caller says (module docstring, Ruling 4) rather than a name bound at
+    import time OR resolved fresh in here.
 
-    Sync, not async: both claude_chat_model.get_chat_model_for_thread and
-    copilot_chat_model.get_chat_model_for_thread are themselves plain `def`s (they only construct a
-    pydantic model, no I/O), so this uses _get_provider_sync() rather than `await get_provider()`
-    -- see that helper's own docstring for the event-loop hazard that rules out the alternative.
+    `provider` is required, keyword-only, no default (Ruling 4): a graph node passes its own
+    pinned `state["provider"]`; nothing else legitimately calls this. This function used to resolve
+    it itself via _get_provider_sync() -- removed, since a call late in a long-running graph run
+    could then silently pick up a live setting change instead of the run's own pinned value,
+    defeating GraphState.provider's whole purpose. See that helper's own docstring for why a sync
+    function couldn't `await get_provider()` even before this correction -- moot now that nothing
+    in here resolves the provider at all.
 
     github_token and response_schema are each accepted by only ONE provider's real function
     (github_token: copilot_chat_model only; response_schema: claude_chat_model only -- see each
@@ -224,7 +256,6 @@ def get_chat_model_for_thread(
     TypeError("unexpected keyword argument") the moment AGENT_PROVIDER=claude actually runs, which
     is what calling the OLD import-time-bound alias directly would have done.
     """
-    provider = _get_provider_sync()
     common: dict[str, Any] = dict(
         model_name=model_name,
         sandbox=sandbox,
@@ -249,55 +280,61 @@ def get_chat_model_for_thread(
     raise ValueError(f"Unknown provider {provider!r}, expected 'copilot' or 'claude'")
 
 
-async def close_thread_session(thread_id: str) -> None:
+async def close_thread_session(thread_id: str, *, provider: str) -> None:
     """Evict every cached session for a thread (call on graph run completion/error).
+
+    `provider` is required, keyword-only, no default (Ruling 4) -- the caller's own pinned
+    `state["provider"]`, not resolved in here; see chat_model.py's module docstring for why an
+    internal live re-resolution would silently defeat GraphState.provider's per-run pinning.
 
     Async in both providers only for call-site parity -- neither actually awaits anything
     internally, session eviction is a pure dict pop either way (see each module's own docstring).
-    Dispatches per-call, same as every function in this module.
     """
-    provider = await get_provider()
     await _provider_module(provider).close_thread_session(thread_id)
 
 
-def forget_thread_sessions(thread_id: str) -> None:
+def forget_thread_sessions(thread_id: str, *, provider: str) -> None:
     """Drop cached session ids for a thread whose sandbox is already gone.
 
-    Sync in both providers (a pure dict-key-prefix pop, no I/O) -- uses _get_provider_sync() rather
-    than `await get_provider()` for the same event-loop-safety reason get_chat_model_for_thread
-    does. sandbox.registry.pop() already routes through this name for Copilot today; per-call
-    dispatch here is what lets the same call site also reach Claude sessions once registry.py is
-    updated to call this module instead of copilot_chat_model directly (Task 5's job, not this
-    module's -- see this task's report).
+    `provider` is required, keyword-only, no default (Ruling 4) -- the caller's own pinned
+    `state["provider"]` (or, at a genuine provisioning-time call with no state yet, whatever that
+    call already resolved via get_provider()), not resolved in here. Sync in both providers (a pure
+    dict-key-prefix pop, no I/O). sandbox.registry.pop() already routes through this name for
+    Copilot today; per-call dispatch here is what lets the same call site also reach Claude
+    sessions, PROVIDED its own caller threads the right thread's pinned provider through (Task 5's
+    job, not this module's -- see that task's report).
     """
-    provider = _get_provider_sync()
     _provider_module(provider).forget_thread_sessions(thread_id)
 
 
-async def close_session(thread_id: str, stage: str, role: str) -> None:
+async def close_session(thread_id: str, stage: str, role: str, *, provider: str) -> None:
     """Drop one (thread, stage, role) session so the next call starts fresh -- see each provider
     module's own close_session docstring for why a fresh session, not a retry in the same one, is
     what actually recovers from a stage whose session history contains a fabricated claim.
-    Dispatches to whichever provider is active for THIS call, the actual fix for a caller that
-    imported this name once, at process start (module docstring).
+
+    `provider` is required, keyword-only, no default (Ruling 4) -- the caller's own pinned
+    `state["provider"]`, not resolved in here. Dispatches to whichever provider the caller says --
+    the actual fix for a caller that imported this name once, at process start (module docstring);
+    resolving the provider inside this function instead of accepting it would have reintroduced a
+    different staleness bug (Ruling 4), not fixed the original one.
     """
-    provider = await get_provider()
     await _provider_module(provider).close_session(thread_id, stage, role)
 
 
-def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
+def get_session_id(thread_id: str, stage: str, role: str, *, provider: str) -> str | None:
     """The session id backing one (thread, stage, role), or None if none was created yet -- lets a
     gate (gates/skill_gate.py) verify what a stage's session actually did, rather than trusting the
     model's self-report.
 
-    Sync in both providers (a dict lookup); see _get_provider_sync()'s docstring for why this can't
-    `await get_provider()`.
+    `provider` is required, keyword-only, no default (Ruling 4) -- the specific thread's own pinned
+    provider, threaded in from its caller. Sync in both providers (a dict lookup).
     """
-    provider = _get_provider_sync()
     return _provider_module(provider).get_session_id(thread_id, stage, role)
 
 
-async def read_skill_invocations(provider: SandboxProvider, thread_id: str, session_id: str) -> list[str] | None:
+async def read_skill_invocations(
+    provider: SandboxProvider, thread_id: str, session_id: str, *, active_provider: str
+) -> list[str] | None:
     """Skill names a session actually invoked, read from its own transcript, or None if
     unverifiable -- see each provider module's own docstring for its fail-open contract (an
     infrastructure gap must never masquerade as "no skills were invoked").
@@ -305,25 +342,24 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
     `provider` here is the pre-existing SandboxProvider connection-object parameter (the
     exec_in_sandbox target) -- kept under its original name so a keyword-calling caller
     (`read_skill_invocations(provider=...)`) is unaffected by this rewrite. It is unrelated to this
-    module's own "claude"/"copilot" provider string, resolved separately below as `active_provider`
-    to avoid the naming collision.
+    module's own "claude"/"copilot" provider string, which is why THAT one is named
+    `active_provider` here rather than colliding with the existing `provider` parameter -- required,
+    keyword-only, no default (Ruling 4): the specific thread's own pinned provider, threaded in from
+    its caller, not resolved in here.
     """
-    active_provider = await get_provider()
     return await _provider_module(active_provider).read_skill_invocations(provider, thread_id, session_id)
 
 
-def secret_env_names() -> set[str]:
+def secret_env_names(*, provider: str) -> set[str]:
     """Provider-specific env var names -- see each provider module's own docstring, since despite
     the shared name this means two DIFFERENT things per provider (Claude: what the sandbox must
     already have set for the CLI to authenticate; Copilot: what to redact from a turn's own shell
     output). A reader who only ever looks at one provider's version should not assume the other
     works the same way; this dispatcher does not paper over that, it just forwards to whichever
-    provider is active.
+    provider the caller says.
 
-    Sync in both providers; see _get_provider_sync()'s docstring for why this can't
-    `await get_provider()`.
+    `provider` is required, keyword-only, no default (Ruling 4) -- not resolved in here.
     """
-    provider = _get_provider_sync()
     return _provider_module(provider).secret_env_names()
 
 
@@ -342,19 +378,21 @@ __all__ = [
 
 
 def _demo() -> None:
-    """Self-check: proves get_provider()'s TTL cache + env-var fallback, and proves every
-    re-exported name dispatches PER CALL rather than once (the actual bug this task fixes -- see
-    module docstring), by forcing the resolved provider to flip between calls in the same process
-    and confirming each function follows it to the correct underlying module. A stale binding
-    captured once at import time (the old design) could never do this -- only a function that
-    re-resolves the provider on every call can.
+    """Self-check: proves get_provider()'s TTL cache + env-var fallback (still forced/flipped via
+    _force_provider() below, since those two are the only remaining live-resolution surface in
+    this module), and proves each of the 7 dispatch functions sends its call to the module its
+    caller's explicit `provider` argument names (Ruling 4) -- passed directly per call now, not
+    forced through the env var/cache the way it was pre-Ruling-4, since none of these 7 reads that
+    cache anymore. Section 2 got SIMPLER for exactly that reason: no _force_provider() dance, just
+    two calls with two different literal `provider=` values and a check each landed on the right
+    module.
 
     Offline only, matching org_settings.py's and org_credential_vault.py's own self-check
     limitation on this branch: org_settings.get_org_settings and
     org_credential_vault.get_org_credential are monkeypatched throughout (no live DB/vault in this
-    environment); _provider_cache is force-cleared between flips as a stand-in for real TTL expiry,
-    which is time-based and would otherwise make a same-process demo wait out the full 30 seconds
-    between every assertion.
+    environment); _provider_cache is force-cleared between get_provider()/get_runtime_auth_token()
+    flips as a stand-in for real TTL expiry, which is time-based and would otherwise make a
+    same-process demo wait out the full 30 seconds between every assertion.
     """
     from datetime import datetime
 
@@ -396,30 +434,27 @@ def _demo() -> None:
         assert resolved_again == "claude", f"cached call changed the resolved value: {resolved_again!r}"
         assert stub_calls["n"] == 1, "get_provider() re-fetched instead of serving the TTL cache"
 
-        # === 2. Per-call dispatch proof for every re-exported name. ===
-        org_settings.get_org_settings = _stub_no_settings  # keep the env-var path active throughout
+        # === 2. Per-call dispatch proof for every one of the 7 functions that now take a
+        # required, keyword-only `provider` argument (Ruling 4) -- passed directly below, no
+        # _force_provider()/cache interaction, since none of these 7 reads the shared cache
+        # anymore (that is precisely the point of Ruling 4's correction). ===
 
         # get_chat_model_for_thread (sync): each provider's model class reports a distinct
         # _llm_type ("claude-code" vs "github-copilot") -- a real signal already on the class, no
-        # seeding required. Flipped twice, in both directions, to rule out a one-way fluke.
-        _force_provider("claude")
-        assert get_chat_model_for_thread(thread_id, stage, role)._llm_type == "claude-code"
-        _force_provider("copilot")
-        assert get_chat_model_for_thread(thread_id, stage, role)._llm_type == "github-copilot"
-        _force_provider("claude")
-        assert get_chat_model_for_thread(thread_id, stage, role)._llm_type == "claude-code", "flip back to claude failed"
+        # seeding required. Called with both literal values, then "claude" again, to rule out a
+        # one-way fluke (e.g. a stale default only visible on the second call).
+        assert get_chat_model_for_thread(thread_id, stage, role, provider="claude")._llm_type == "claude-code"
+        assert get_chat_model_for_thread(thread_id, stage, role, provider="copilot")._llm_type == "github-copilot"
+        assert get_chat_model_for_thread(thread_id, stage, role, provider="claude")._llm_type == "claude-code", "flip back to claude failed"
 
         # get_session_id / forget_thread_sessions (sync): seed each provider's OWN _session_ids
         # dict with a distinguishing marker under the same key; confirm the right one comes back.
         claude_chat_model._session_ids[key] = "claude-marker"
         copilot_chat_model._session_ids[key] = "copilot-marker"
-        _force_provider("claude")
-        assert get_session_id(thread_id, stage, role) == "claude-marker"
-        _force_provider("copilot")
-        assert get_session_id(thread_id, stage, role) == "copilot-marker"
+        assert get_session_id(thread_id, stage, role, provider="claude") == "claude-marker"
+        assert get_session_id(thread_id, stage, role, provider="copilot") == "copilot-marker"
 
-        _force_provider("claude")
-        forget_thread_sessions(thread_id)
+        forget_thread_sessions(thread_id, provider="claude")
         assert key not in claude_chat_model._session_ids, "forget_thread_sessions did not reach claude_chat_model"
         assert copilot_chat_model._session_ids.get(key) == "copilot-marker", "forget_thread_sessions touched the wrong provider"
         copilot_chat_model._session_ids.pop(key, None)
@@ -427,20 +462,16 @@ def _demo() -> None:
         # close_session / close_thread_session (async): same idea, dispatched through asyncio.run.
         claude_chat_model._session_ids[key] = "claude-marker"
         copilot_chat_model._session_ids[key] = "copilot-marker"
-        _force_provider("claude")
-        asyncio.run(close_session(thread_id, stage, role))
+        asyncio.run(close_session(thread_id, stage, role, provider="claude"))
         assert key not in claude_chat_model._session_ids, "close_session did not reach claude_chat_model"
         assert copilot_chat_model._session_ids.get(key) == "copilot-marker", "close_session touched the wrong provider"
-        _force_provider("copilot")
-        asyncio.run(close_thread_session(thread_id))
+        asyncio.run(close_thread_session(thread_id, provider="copilot"))
         assert key not in copilot_chat_model._session_ids, "close_thread_session did not reach copilot_chat_model"
 
         # secret_env_names (sync): each provider returns a different literal set (see each
         # module's own docstring for why the shared name means two different things per provider).
-        _force_provider("claude")
-        assert secret_env_names() == {"ANTHROPIC_API_KEY"}
-        _force_provider("copilot")
-        assert secret_env_names() == {
+        assert secret_env_names(provider="claude") == {"ANTHROPIC_API_KEY"}
+        assert secret_env_names(provider="copilot") == {
             "COPILOT_SDK_AUTH_TOKEN",
             "COPILOT_CONNECTION_TOKEN",
             "COPILOT_GITHUB_TOKEN",
@@ -451,7 +482,10 @@ def _demo() -> None:
         # unconditionally (per its own docstring); Claude's real implementation parses a fake
         # sandbox's transcript output and returns a real list. A minimal duck-typed fake stands in
         # for SandboxProvider -- read_skill_invocations only ever calls .exec_in_sandbox on it, so
-        # nothing else needs implementing.
+        # nothing else needs implementing. `active_provider=` here is this module's own
+        # "claude"/"copilot" dispatch argument -- not to be confused with the positional
+        # `fake_provider` (the SandboxProvider connection-object stand-in), the exact collision
+        # this function's own docstring explains it avoids by using two different names.
         class _FakeSandboxResult:
             ok = True
             stdout = '{"type": "assistant", "message": {"content": []}}\n'
@@ -462,10 +496,8 @@ def _demo() -> None:
                 return _FakeSandboxResult()
 
         fake_provider = _FakeSandboxProvider()
-        _force_provider("copilot")
-        assert asyncio.run(read_skill_invocations(fake_provider, thread_id, "sess-1")) is None
-        _force_provider("claude")
-        assert asyncio.run(read_skill_invocations(fake_provider, thread_id, "sess-1")) == [], (
+        assert asyncio.run(read_skill_invocations(fake_provider, thread_id, "sess-1", active_provider="copilot")) is None
+        assert asyncio.run(read_skill_invocations(fake_provider, thread_id, "sess-1", active_provider="claude")) == [], (
             "claude_chat_model.read_skill_invocations should have parsed the fake transcript"
         )
 
