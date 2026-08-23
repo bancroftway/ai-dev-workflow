@@ -27,6 +27,12 @@ something the draft meant to remove. If your own gap-hunting finds something tha
 belongs and the draft missed it, add its id to the appropriate list yourself rather than just
 leaving it out of `revised_specification`.
 
+Carry the draft's `attachment_notes` forward unchanged in `revised_specification` too, unless you
+have good reason to revise the wording -- you never receive the original attachments yourself,
+only the draft's own distillation of them, and your revision replaces the draft entirely, so
+silently dropping this field would leave Plan with no way to know an attachment ever existed. If
+you genuinely improve or correct a note, keep it in the same list position rather than removing it.
+
 Use the `ponytail` skill at `full` intensity for prose fields (`summary`, narratives) -- trim
 redundant/inflated wording, never cut meaning a human approver needs. This document is rendered to
 Markdown verbatim, so terser prose fields here is the only lever; never drop or shorten an

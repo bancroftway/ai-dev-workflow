@@ -3328,10 +3328,18 @@ def _demo() -> None:
         for m in _build_plan_prompt(plan_demo_state)  # type: ignore[arg-type]
     ), "attachment_notes content must reach _build_plan_prompt unmodified via approved_content"
 
-    # Both prompts actually teach the behavior, not just the schema silently accepting the field.
+    # All three prompts actually teach the behavior, not just the schema silently accepting the
+    # field. The audit leg has no deterministic code to prove wired (unlike _build_plan_prompt
+    # above, revised_specification's content is whatever the LLM decides to return) -- same
+    # ceiling as the pre-existing retired_ac_ids/retired_us_ids carry-forward instruction, which
+    # is likewise only ever verified as prompt text, never as enforced behavior.
     assert "attachment_notes" in SPEC_SYSTEM_PROMPT, "specification_draft.md must name the field it's asked to populate"
     assert "attachment" in SPEC_SYSTEM_PROMPT.lower(), "specification_draft.md must instruct the model to use attachments"
     assert "attachment_notes" in PLAN_SYSTEM_PROMPT, "plan_draft.md must explain the attachment_notes field it receives"
+    assert "attachment_notes" in SPEC_AUDIT_SYSTEM_PROMPT, (
+        "specification_audit.md must instruct the model to carry attachment_notes forward, "
+        "mirroring its existing retired_ac_ids/retired_us_ids carry-forward instruction"
+    )
 
     # spec_ledger.hydrate_ac_to_tests_ticket_mode_context: a coarser "the ledger has entries" check
     # would ALWAYS fire here, even on a project's first-ever ticket (its own spec just populated
