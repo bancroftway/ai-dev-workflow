@@ -251,6 +251,16 @@ with:
   this is free).
 - `ainvoke_structured` (from `structured_output.py`) is unaffected — it was already
   provider-agnostic, not part of this dispatch.
+- **New**: `async def get_runtime_auth_token() -> str` — calls `get_provider()`, then, if
+  `org_settings.get_org_settings()` has a non-`None` `credential_secret_name`, fetches the real
+  value via `org_credential_vault.get_org_credential(secret_name)` (Task 2); otherwise falls back
+  to `os.environ.get("ANTHROPIC_API_KEY", "")` (provider `"claude"`) or
+  `os.environ.get("GITHUB_TOKEN", "")` (provider `"copilot"`) — the same fallback-default
+  requirement as `get_provider()` itself. This is Task 5's fix for a real gap found while drafting
+  this plan: without it, an admin's UI-saved credential would never reach a real session, since
+  `sessions_api.py`/`run_headless.py` currently read the env var directly. Defined here (not in
+  Task 5) because it's new `chat_model.py` surface, not a call-site conversion — Task 5 just calls
+  it at the two real sites that need it.
 
 Self-check: `_demo()` needs real rework too — it can no longer assert a single `PROVIDER` value
 (there isn't one anymore); instead assert that calling `get_provider()` returns the env-var
@@ -320,6 +330,17 @@ For every call site **outside a graph node** — `sessions_api.py`'s `provision_
 says should keep reading live: change `from ..chat_model import PROVIDER` (a now-broken bare-name
 import, since `PROVIDER` is no longer a module-level constant) to `from ..chat_model import
 get_provider` and `await get_provider()` at the call site instead.
+
+**Real gap this task must also close, found while drafting this plan — not just the provider
+string, the credential VALUE too**: `sessions_api.py`'s `provision_session` and
+`run_headless.py`'s startup currently compute `runtime_auth_token` by reading
+`os.environ.get("ANTHROPIC_API_KEY", "")`/`os.environ.get("GITHUB_TOKEN", "")` directly (Task 11
+of Part 1's own work). If this task only converts the *provider* read and leaves the *credential*
+read as a bare `os.environ` lookup, an admin's UI-saved credential (Task 2/6) would never actually
+reach a real session — the whole point of Part 4 would be cosmetic. At both call sites, replace
+the `os.environ`-based `runtime_auth_token` computation with a call to Task 3's new
+`chat_model.get_runtime_auth_token()` (already handles the vault-fetch-with-env-var-fallback logic
+— this task just swaps the call site, no new logic here).
 
 `gates/skill_gate.py`, `sandbox/registry.py`, `telemetry.py`'s bare-name imports of
 `forget_thread_sessions`/`get_session_id`/`read_skill_invocations` need no behavior change beyond
