@@ -13,16 +13,19 @@
 ARG BASE_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0
 
 # ── Global version ARGs (declared pre-FROM so both stages can redeclare and inherit them) ──────
-# Pinned to match agent/.venv's installed github-copilot-sdk build (agent/.venv/Lib/site-packages/
-# copilot/_cli_version.py's CLI_VERSION) so the SDK's minimum protocol version check
-# (client.py's _MIN_PROTOCOL_VERSION) never rejects this server on a stale binary.
+# copilot_chat_model.py drives this CLI by per-turn exec, not an SDK (Task 3's CLI-exec rewrite
+# retired the old github-copilot-sdk / `copilot --server` mechanism this pin used to check
+# against) -- so what this pin actually buys today is flag/output-shape stability: the exact
+# --mode/--no-ask-user/--secret-env-vars/--additional-mcp-config flags and the --output-format
+# json fields (result/is_error/usage/session_id/total_cost_usd) that module depends on, confirmed
+# against this one version rather than whatever an unpinned `@latest` ships next.
 ARG COPILOT_CLI_VERSION=1.0.79
 # Claude Code CLI -- npm-installed (final stage's Node/npm layer), not curl+tar like Copilot
-# above, so this pin has no sibling SDK protocol check to lean on: claude_chat_model.py drives
-# this CLI by per-turn exec, not an SDK, so the pin here IS the compatibility contract for the
-# flags (--resume, --permission-mode, --json-schema, --plugin-dir, --mcp-config) and
-# --output-format json fields (session_id/usage/total_cost_usd/is_error) that module depends on --
-# an unpinned `@latest` install could silently reshape either one out from under it.
+# above. Same reasoning as COPILOT_CLI_VERSION now: claude_chat_model.py drives this CLI by
+# per-turn exec, not an SDK, so the pin here IS the compatibility contract for the flags
+# (--resume, --permission-mode, --json-schema, --plugin-dir, --mcp-config) and --output-format
+# json fields (session_id/usage/total_cost_usd/is_error) that module depends on -- an unpinned
+# `@latest` install could silently reshape either one out from under it.
 ARG CLAUDE_CODE_CLI_VERSION=2.1.126
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end
@@ -167,8 +170,10 @@ RUN set -eux; \
 # binary above -- that pattern is for GitHub-releases-hosted prebuilt binaries, and
 # @anthropic-ai/claude-code is a plain npm package, the same install path as eslint/typescript/
 # playwright elsewhere in this file. Both CLIs are baked into every image regardless of which
-# AGENT_PROVIDER a given deployment runs -- entrypoint.sh picks between them at container start,
-# not build time.
+# AGENT_PROVIDER a given deployment runs -- neither is started by entrypoint.sh at container
+# start (it only picks which credential to warn about when empty; see its own header comment).
+# The per-turn exec launched from OUTSIDE the container, driven by AGENT_PROVIDER, is what
+# actually picks which CLI runs, one turn at a time.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates gnupg python3 python3-pip; \

@@ -37,7 +37,8 @@ def pop(thread_id: str) -> SandboxSession | None:
     # reliably evict the Copilot sessions pointing INTO that container. Without it they survive as
     # live-looking handles to a destroyed sandbox -- the same phantom-state bug the `registry.pop`
     # comments in terminate() describe, one layer up. Imported here, not at module scope:
-    # copilot_chat_model imports .sandbox, so a top-level import cycles.
+    # chat_model imports .sandbox (transitively, via whichever provider module it dispatches to),
+    # so a top-level import cycles.
     from ..chat_model import forget_thread_sessions
 
     forget_thread_sessions(thread_id)

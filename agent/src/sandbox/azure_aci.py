@@ -130,10 +130,11 @@ class AzureContainerInstanceProvider(SandboxProvider):
         self._cache_storage_account = os.environ.get("AIDW_CACHE_STORAGE_ACCOUNT")
         self._cache_storage_key = os.environ.get("AIDW_CACHE_STORAGE_KEY")
         # Parity with LocalDockerProvider: same env var, same override semantics. The idle
-        # reaper's blind spot during a silent Copilot turn is closed by
-        # copilot_chat_model.py's _touch_sandbox() calls; this env var remains an explicit
-        # override for a caller that wants a different idle window (e.g. run_headless.py's
-        # belt-and-suspenders 86400s).
+        # reaper's blind spot during a long silent turn is closed by run_turn's own polling loop
+        # (cli_agent_exec.py) plus exec_in_sandbox's `last_active` bump below, both of which fire
+        # repeatedly over the course of a single long turn for either provider; this env var
+        # remains an explicit override for a caller that wants a different idle window (e.g.
+        # run_headless.py's belt-and-suspenders 86400s).
         env_timeout = os.environ.get("AIDW_SANDBOX_IDLE_TIMEOUT")
         self._idle_timeout_seconds = float(env_timeout) if env_timeout else idle_timeout_seconds
         self._sandboxes: dict[str, _RunningSandbox] = {}
@@ -178,9 +179,11 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 )
                 del self._sandboxes[session_id]
                 # Mirrors LocalDockerProvider: a destruction path that bypasses registry.pop
-                # because the reprovision below overwrites the registry entry anyway. On ACI the
-                # replacement group also gets a new IP, so stale Copilot sessions would dial a
-                # dead address rather than merely a dead port.
+                # because the reprovision below overwrites the registry entry anyway. The
+                # replacement group also gets a fresh $HOME, so every cached Claude/Copilot
+                # session id for this thread is unresumable against it -- forget them here or the
+                # next stage's --resume/--session-id points at a session that never existed in
+                # the new container.
                 from ..chat_model import forget_thread_sessions
 
                 forget_thread_sessions(session_id)

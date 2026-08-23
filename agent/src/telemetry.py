@@ -115,8 +115,10 @@ def traced_node(
                 # GraphBubbleUp is excluded above on purpose -- that is a gate interrupt, where
                 # the stage's conversation continuity is exactly what we want to keep.
                 # The SYNC forget, not close_thread_session: we are inside an except about to
-                # re-raise, and the exception may itself be a dead/reaped sandbox -- awaiting
-                # disconnect() there would block until timeout and turn a fast failure slow.
+                # re-raise. Not actually a blocking-call risk anymore -- forget_thread_sessions is
+                # a pure dict pop for both providers now, nothing here awaits a disconnect() (no
+                # such thing exists) -- but staying sync keeps this handler simple and correct
+                # even if the exception itself is a dead/reaped sandbox.
                 if thread_id:
                     from .chat_model import forget_thread_sessions
 

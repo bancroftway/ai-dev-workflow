@@ -4,11 +4,6 @@ Mirrors the production Azure Container Apps sessions-pool provider's shape -- sa
 SandboxSession, same sandbox-image startup contract -- so switching SANDBOX_PROVIDER between
 "local" and "azure" (see get_sandbox_provider()) is pure wiring, not a behavior change in
 copilot_chat_model.py.
-
-Explicit limitation, not parity (plan Section E): `docker run` publishes a real host TCP port
-with nothing in between, so RuntimeConnection.for_uri("localhost:<port>") trivially succeeds here
-regardless of whether Azure's sessions-pool proxy can carry the same raw-socket JSON-RPC protocol.
-This provider working end-to-end is not evidence the Azure path will work.
 """
 
 from __future__ import annotations
@@ -148,11 +143,12 @@ class LocalDockerProvider(SandboxProvider):
         idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         self._image = image
-        # The idle reaper's blind spot during a long silent Copilot turn (all activity inside
-        # the container over the Copilot TCP session, no agent-side exec) is now closed by
-        # copilot_chat_model.py's _touch_sandbox() calls. This env var remains an explicit
-        # override for a caller that wants a different idle window (e.g. run_headless.py's
-        # belt-and-suspenders 86400s).
+        # The idle reaper's blind spot during a long silent turn used to be a real risk (all
+        # activity inside the container over Copilot's old TCP session, no agent-side exec) --
+        # closed now by run_turn's own polling loop (cli_agent_exec.py) plus exec_in_sandbox's
+        # `last_active` bump below, both of which fire repeatedly over the course of a single
+        # long turn for either provider. This env var remains an explicit override for a caller
+        # that wants a different idle window (e.g. run_headless.py's belt-and-suspenders 86400s).
         env_timeout = os.environ.get("AIDW_SANDBOX_IDLE_TIMEOUT")
         self._idle_timeout_seconds = float(env_timeout) if env_timeout else idle_timeout_seconds
         self._sandboxes: dict[str, _RunningSandbox] = {}
@@ -200,9 +196,10 @@ class LocalDockerProvider(SandboxProvider):
                 # A destruction path that does NOT route through registry.pop (the registry
                 # entry is about to be overwritten by the reprovision below, so it was never
                 # popped). AzureContainerInstanceProvider.provision has the same branch and needs
-                # the same call. The reprovisioned container gets a NEW host port, so every cached
-                # Copilot session for this thread now points at the old one -- forget them here or
-                # the next stage dials a dead port.
+                # the same call. The reprovisioned container gets a fresh $HOME, so every cached
+                # Claude/Copilot session id for this thread is unresumable against it -- forget
+                # them here or the next stage's --resume/--session-id points at a session that
+                # never existed in the new container.
                 from ..chat_model import forget_thread_sessions
 
                 forget_thread_sessions(session_id)

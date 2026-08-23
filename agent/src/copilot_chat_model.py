@@ -228,8 +228,8 @@ class CopilotChatModel(BaseChatModel):
     agent: str | None = None
 
     # Copilot SDK terminal-tool objects. Never translated into a flag -- see the logger.warning at
-    # its one use site in _agenerate_inner; ainvoke_structured below is this provider's
-    # structured-output mechanism instead.
+    # its one use site in _agenerate_inner; structured_output.ainvoke_structured is this
+    # provider's structured-output mechanism instead.
     tools: list[Any] | None = None
 
     # Per-stage override of config.COPILOT_DISABLED_SKILLS, reused as-is -- same plugin-marketplace
@@ -360,8 +360,9 @@ class CopilotChatModel(BaseChatModel):
         if self.tools:
             logger.warning(
                 "CopilotChatModel.tools is set but there is no CLI terminal-tool mechanism to "
-                "translate it into -- ainvoke_structured's JSON-schema-prompting retry loop below "
-                "is this provider's structured-output mechanism instead; this turn ignores it"
+                "translate it into -- structured_output.ainvoke_structured's JSON-schema-prompting "
+                "retry loop is this provider's structured-output mechanism instead; this turn "
+                "ignores it"
             )
         if self.custom_agents:
             logger.warning(
@@ -689,6 +690,15 @@ def secret_env_names() -> set[str]:
     inside the sandbox, which is exactly what COPILOT_GITHUB_TOKEN avoids). All four are harmless
     to list even when unset -- redacting a name that never appears in the output is a no-op, not an
     error.
+
+    Re-exported as the same `secret_env_names()` symbol via chat_model.py for both providers, but
+    NOT the same contract: claude_chat_model.py's function of this name means something else
+    entirely (env var names the sandbox must already have set for that CLI to authenticate, not a
+    redaction list -- see that module's own docstring). A reader who only ever looks at one
+    provider's version should not assume the other works the same way. The asymmetry runs deeper
+    than naming, too: the Claude CLI has no `--secret-env-vars` equivalent at all, so there is
+    currently no redaction mechanism for anything a Claude turn's own shell output might echo --
+    a real, previously-undocumented gap.
     """
     return {"COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN"}
 

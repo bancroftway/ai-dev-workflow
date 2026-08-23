@@ -88,9 +88,13 @@ COPILOT_DISABLED_SKILLS_SPECIFICATION = ["using-superpowers"]
 CLI_AGENT_TURN_TIMEOUT_SECONDS = int(os.environ.get("CLI_AGENT_TURN_TIMEOUT_SECONDS", "2400"))
 
 # Skills each stage is REQUIRED to invoke, enforced deterministically rather than trusted: the
-# stage's prompt names them, and gates/skill_gate.py verifies against the Copilot session's own
-# `skill.invoked` events (the model's self-report in StageReport.skills_invoked is telemetry, not
-# evidence -- a model that skipped a skill will happily claim it used one).
+# stage's prompt names them, and gates/skill_gate.py verifies via chat_model's provider dispatch
+# (get_session_id + read_skill_invocations) -- which means different things per provider. Claude's
+# implementation reads that session's real CLI transcript and works; Copilot's unconditionally
+# returns None (no CLI-exec equivalent exists yet to the old SDK-server session log this used to
+# read), so verification is permanently unavailable under the default provider today -- see
+# skill_gate.py's own module docstring. Self-report (StageReport.skills_invoked) is telemetry, not
+# evidence regardless -- a model that skipped a skill will happily claim it used one.
 REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
     "specification": ["brainstorming"],
     "plan": ["writing-plans"],
