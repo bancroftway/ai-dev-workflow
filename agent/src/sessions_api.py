@@ -170,7 +170,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             # provider.provision() except block below, keeps either failure mode a clean 502
             # instead of a 500, and guarantees this request structurally cannot fall through to
             # session_store.create_session for a repo that was never actually created.
-            logger.exception("repo scaffolding failed for project_id=%s", body.project_id)
+            logger.exception("repo scaffolding failed for project_id=%s", project_id)
             raise HTTPException(status_code=502, detail=f"repo scaffolding failed: {exc}") from None
         owner, repo = scaffolded["owner"], scaffolded["repo"]
         # The GitHub repo now genuinely exists -- losing this write would wedge the project
@@ -180,23 +180,23 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
         # no GitHub-side reconciliation (searching for/re-linking an already-created repo) is
         # built here -- deliberately out of scope, a human resolves the rare double-failure below.
         try:
-            await project_store.set_project_repo(body.project_id, owner, repo)
+            await project_store.set_project_repo(project_id, owner, repo)
         except Exception:  # noqa: BLE001 -- one bounded retry, then a clean 502 with recovery detail
             logger.exception(
                 "set_project_repo failed for project_id=%s (owner=%s repo=%s) -- retrying once",
-                body.project_id, owner, repo,
+                project_id, owner, repo,
             )
             try:
-                await project_store.set_project_repo(body.project_id, owner, repo)
+                await project_store.set_project_repo(project_id, owner, repo)
             except Exception as exc:
                 logger.exception(
                     "set_project_repo failed again for project_id=%s (owner=%s repo=%s) -- giving up",
-                    body.project_id, owner, repo,
+                    project_id, owner, repo,
                 )
                 raise HTTPException(
                     status_code=502,
                     detail=(
-                        f"scaffolded GitHub repo {owner}/{repo} for project {body.project_id} but "
+                        f"scaffolded GitHub repo {owner}/{repo} for project {project_id} but "
                         "failed to record it after a retry -- a human needs to either delete "
                         f"https://github.com/{owner}/{repo} or run project_store.set_project_repo "
                         "manually"
@@ -768,6 +768,18 @@ async def _fetch_default_branch(
     return resp.json().get("default_branch")
 
 
+def _needs_default_branch_fetch(existing: dict[str, Any] | None) -> bool:
+    """Whether connect_project_route has a real reason to hit GitHub for this repo's default
+    branch: a genuinely new connect (no existing row), or an existing row whose default_branch is
+    still NULL (a pre-migration row, or a previously-failed fetch). False for an already-connected
+    row that already has one -- the actual idempotent path (review fix): GitHub must never be hit
+    on that path, since /select's "start new session"/"resume" actions now call this route on
+    every session start and don't even use the returned value themselves. Pulled out as its own
+    pure predicate so this exact rule -- the one the review's Important finding was about -- has a
+    direct, DB-free assertion in this module's own self-check, not just an inline `if`."""
+    return existing is None or not existing.get("default_branch")
+
+
 @projects_router.post("/connect", response_model=ProjectResponse)
 async def connect_project_route(body: ConnectProjectRequest, request: Request) -> ProjectResponse:
     """The Connect-Repository action. Idempotent: connecting an already-connected (owner, repo)
@@ -779,19 +791,29 @@ async def connect_project_route(body: ConnectProjectRequest, request: Request) -
     this flow (the wireframe has none) -- `repo` doubles as the project's display name, same as
     this codebase's own pre-Part-3 assumption that repo == project.
 
-    Also (re)fetches the repo's real default_branch from GitHub on every call (Task 5) and writes
-    it via set_project_repo regardless of whether the project already existed -- cheap self-healing
-    for a pre-migration NULL, and correct for /select's "start new session"/"resume" actions, which
-    now call this route on every session start rather than just once at first connect."""
+    default_branch (Task 5) is only ever fetched from GitHub when there's a real reason to: a
+    genuinely new connect, or an existing row whose default_branch is still NULL (a pre-migration
+    row, or a previously-failed fetch) -- self-healing, never on an already-connected row that
+    already has one. That matters because /select's "start new session"/"resume" actions now call
+    this route on every session start (Task 5), not just an explicit Connect click, and don't even
+    use the returned default_branch themselves (they already have the user's own explicitly-picked
+    branch) -- unconditionally re-hitting GitHub on that hot path would mean a transient GitHub
+    hiccup (rate limit, brief outage, timeout) could newly block starting a session on an
+    already-connected, previously-working repo, a capability that worked unconditionally before
+    this feature existed."""
     _check_shared_secret(request)
-    default_branch = await _fetch_default_branch(body.owner, body.repo, body.github_token)
     existing = await project_store.find_project_by_repo(body.owner, body.repo)
-    if existing is not None:
-        project_id = existing["project_id"]
-    else:
-        project_id = await project_store.create_project(
+    if existing is not None and not _needs_default_branch_fetch(existing):
+        return ProjectResponse(**existing)
+
+    project_id = (
+        existing["project_id"]
+        if existing is not None
+        else await project_store.create_project(
             body.repo, tech_stack_id=None, tech_stack_text=None, created_by=body.created_by
         )
+    )
+    default_branch = await _fetch_default_branch(body.owner, body.repo, body.github_token)
     await project_store.set_project_repo(project_id, body.owner, body.repo, default_branch)
     row = await project_store.get_project(project_id)
     return ProjectResponse(**row)
@@ -800,11 +822,21 @@ async def connect_project_route(body: ConnectProjectRequest, request: Request) -
 def _demo() -> None:
     """`cd agent && uv run python -m src.sessions_api`. No live network call -- httpx.MockTransport
     stands in for api.github.com (same technique repo_scaffold.py's own self-check uses), covering
-    the one genuinely new bit of pure logic this file adds: _fetch_default_branch's success/failure
-    parsing. connect_project_route's own DB-touching logic is exercised by project_store.py's own
-    self-check instead (its default_branch round-trip assertions through set_project_repo/
-    get_project/find_project_by_repo) -- no second fake DB pool is wired up here."""
+    the two genuinely new bits of pure logic this file adds: _needs_default_branch_fetch's
+    skip-when-already-connected rule (the review's own Important finding), and
+    _fetch_default_branch's success/failure parsing. connect_project_route's own DB-touching logic
+    is exercised by project_store.py's own self-check instead (its default_branch round-trip
+    assertions through set_project_repo/get_project/find_project_by_repo) -- no second fake DB
+    pool is wired up here."""
     import asyncio
+
+    # A brand-new connect (no row yet) and a pre-migration/previously-failed row (NULL or empty
+    # default_branch) both need the GitHub call; an already-connected row that already has a real
+    # default_branch must not -- that's the exact case a transient GitHub hiccup must never block.
+    assert _needs_default_branch_fetch(None) is True
+    assert _needs_default_branch_fetch({"default_branch": None}) is True
+    assert _needs_default_branch_fetch({"default_branch": ""}) is True
+    assert _needs_default_branch_fetch({"default_branch": "develop"}) is False
 
     def handle_ok(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://api.github.com/repos/octocat/hello-world", str(request.url)
