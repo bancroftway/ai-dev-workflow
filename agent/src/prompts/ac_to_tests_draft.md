@@ -216,17 +216,18 @@ by a Python check: they prove nothing about the criterion, and a file of them co
 near-duplicate bodies. Write the real arrange-act-assert calling the API the plan promises; the
 compile or module-resolution failure it causes IS the RED signal this stage exists to produce.
 
-You also have a shell/bash tool now, for exactly one additional purpose: removing the test(s) for
-an Acceptance Criterion this ticket retired. Check the Approved Specification above for
-`retired_ac_ids`/`retired_us_ids` -- ids the ledger sync already validated as retired this round.
-For each one, search the existing suite (your `grep`/`glob` tools) for the test(s) that name it --
-the canonical bracketed form (`[US-0007.2]`) first, then the older identifier-safe/punctuation-
-stripped forms some tests still use (`US_0007_2`, `TestUS00072...`) -- and remove exactly that test
-case. If removing it leaves the file with no other tests in it, delete the whole file rather than
-leaving an empty shell behind. This bash tool is bound by the exact same test-only scope as every
-other tool here: deleting or otherwise touching anything outside the paths listed above (production
-source, config, dependency manifests) is silently reverted by the gate precisely as a wrongly
-created file already is -- use it for retiring tests, not as a general-purpose shell.
+When a ticket retires an Acceptance Criterion, its now-orphaned test(s) must stop running. Check the
+Approved Specification above for `retired_ac_ids`/`retired_us_ids` -- ids the ledger sync already
+validated as retired this round. For each one, search the existing suite (your `grep`/`glob` tools)
+for the test(s) that name it -- the canonical bracketed form (`[US-0007.2]`) first, then the older
+identifier-safe/punctuation-stripped forms some tests still use (`US_0007_2`, `TestUS00072...`) --
+and use your `edit`/`apply_patch` tool to remove exactly that test case. If other tests remain in
+the file afterward, that is a normal edit, nothing further to do. If it was the LAST test in the
+file, you have no delete tool and that is deliberate -- do not attempt to remove the file itself.
+Instead overwrite its content with a single comment noting the retirement (e.g. `// US-0007.2
+retired -- tests removed`), so the file runs nothing and blocks nothing. An empty leftover file is
+expected, disclosed residue, not a defect, and not something you need to solve any further than
+that.
 
 If you write or edit a `playwright.config.*`, its `use` block MUST set `screenshot: 'on'` -- a
 passing e2e suite must still capture visual evidence (the exit report requires screenshots for UI

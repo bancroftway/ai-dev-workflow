@@ -1210,23 +1210,21 @@ STAGES: list[StageSpec] = [
                 "available_tools": [
                     "builtin:view", "builtin:grep", "builtin:glob",
                     "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
-                    # Task 8: this stage's scope now also covers REMOVING a test whose AC was just
-                    # retired (Specification.retired_ac_ids/retired_us_ids, Task 6 -- visible here
-                    # verbatim in the Approved Specification message below, since sync_ledger never
-                    # strips those fields off approved_content). Neither CLI this pipeline drives
-                    # has a dedicated delete-file tool (see claude_chat_model._TOOL_NAME_MAP and
-                    # this project's own copilot ToolSet usage: view/grep/glob/edit/create/
-                    # apply_patch/bash/skill is the complete real vocabulary), so bash is the only
-                    # actual mechanism for `rm`. Safe to grant here specifically because
-                    # write_scope_gate.check_write_scope classifies every changed path -- a DELETED
-                    # one included, `git diff --name-only` carries no operation type, only the path
-                    # string -- through the exact same test-file regex it already applies to a
-                    # create/edit, and auto-reverts (restores) anything outside that scope. bash
-                    # cannot sneak a production-code change past that gate any more than
-                    # edit/create/apply_patch already could; it only adds the one thing those three
-                    # never could do, making a path disappear.
-                    "builtin:bash",
                 ],
+                # No bash here, deliberately reconsidered for Task 8 (retired-AC test cleanup) and
+                # rejected, not merely never proposed. write_scope_gate.check_write_scope reverts by
+                # RESULTING path regardless of which tool produced a change, so bash could not have
+                # smuggled an out-of-scope FILE edit past that gate -- but that gate is file-diff-only
+                # and has no visibility at all into what else a shell can do in the same turn: exfiltrate
+                # a sandbox secret (GITHUB_TOKEN, the git-credential-helper script) over the network
+                # before any revert ever runs, write into `.git/hooks/` to persist past a file-level
+                # revert, read outside the repo, spawn processes. That is a categorically different risk
+                # than "can this tool's file writes be reverted," and the practical need (a retired AC's
+                # test stops running/blocking) is fully met without it: `edit`/`apply_patch` already
+                # remove one test case from a file with siblings, and empty a file down to nothing (or a
+                # one-line "intentionally retired" comment) when it was the last test in it -- the file
+                # lingers, inert, in the tree; Adversarial Review's dead-code scan is the intended
+                # backstop for that cosmetic residue, not a reason to grant shell execution here.
                 # No Playwright MCP here. It was attached for UI repos so the drafting model could
                 # drive a live browser while writing specs -- but this stage runs in the TDD RED
                 # phase, before any implementation exists, so on a greenfield run there is nothing
@@ -3427,22 +3425,24 @@ def _demo() -> None:
         for m in _build_minimal_code_to_green_prompt(mctg_demo_state)  # type: ignore[arg-type]
     )
 
-    # Task 8: ac-to-tests' draft session must carry a delete-capable tool (bash -- neither CLI
-    # vocabulary this pipeline drives has a dedicated delete-file tool; see the comment on this
-    # stage's own available_tools list) so it can remove a test whose AC
-    # schemas.Specification.retired_ac_ids/retired_us_ids just retired. The audit role must stay
-    # exactly as read-only as every other stage's audit -- never more trust than it needs.
+    # Task 8: ac-to-tests handles a just-retired AC's now-orphaned test with the edit/create/
+    # apply_patch tools it already had -- bash was considered and deliberately rejected (see the
+    # comment on this stage's own available_tools list: write_scope_gate only reverts file-content
+    # drift, and has no visibility into what else a shell can do in the same turn -- network
+    # exfiltration of a sandbox secret, `.git/hooks/` persistence, reading outside the repo). This
+    # guards against a future re-introduction as much as it proves today's state: neither role gets
+    # it, and the audit role must stay exactly as read-only as every other stage's audit regardless.
     ac_to_tests_spec = by_key["ac-to-tests"]
     draft_tools = ac_to_tests_spec.session_options({}, "draft")["available_tools"]  # type: ignore[misc]
-    assert "builtin:bash" in draft_tools, "ac-to-tests draft needs bash to delete a retired AC's orphaned test"
+    assert "builtin:bash" not in draft_tools, "ac-to-tests draft must not get shell execution -- see Task 8 report"
     audit_tools = ac_to_tests_spec.session_options({}, "audit")["available_tools"]  # type: ignore[misc]
     assert "builtin:bash" not in audit_tools, "ac-to-tests audit must stay read-only like every other stage's audit"
     assert audit_tools == workflow_config.READ_ONLY_AVAILABLE_TOOLS
 
-    # The prompt actually teaches this, not just the tool wiring -- same "wired, not just correct
-    # in isolation" proof already used above for the wireframe-scoping and ticket-mode segments.
+    # The prompt actually teaches the retirement-cleanup behavior, not just leaving the tool wiring
+    # unchanged -- same "wired, not just correct in isolation" proof already used above for the
+    # wireframe-scoping and ticket-mode segments.
     assert "retired_ac_ids" in AC_TO_TESTS_SYSTEM_PROMPT and "retired_us_ids" in AC_TO_TESTS_SYSTEM_PROMPT
-    assert "bash" in AC_TO_TESTS_SYSTEM_PROMPT.lower()
 
     print("graph self-check: all assertions passed")
 
