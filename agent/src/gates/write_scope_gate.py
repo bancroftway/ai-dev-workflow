@@ -327,6 +327,18 @@ def _demo() -> None:
     # non-test and pipeline-owned files never count as tests
     assert not _has_non_e2e_test(["apps/web/src/app/page.tsx"])
     assert not _has_non_e2e_test([".ai-dev-workflow/ledger.jsonl"])
+
+    # Task 8: prove check_write_scope's classifier is operation-agnostic BY CONSTRUCTION, not just
+    # by inspection. `git diff --name-only` (the only source check_write_scope's changed_paths is
+    # built from) prints a bare path for an added, edited, OR deleted file alike -- no status
+    # letter ever reaches this module. _is_test_path, the function that decides violating-vs-not,
+    # takes only that path string, so a DELETED test path and an EDITED test path are, and always
+    # were, indistinguishable to this gate: both are in-scope. A deleted non-test path is flagged
+    # and reverted (git checkout -- restores it, undoing the delete) exactly like an edited one
+    # already was. No gate change was needed to support test-retirement deletes; this assertion
+    # just makes that fact a standing check instead of a one-time reading of the source.
+    assert _is_test_path("apps/api.Tests/TaskTests.cs")  # true whether this path was added, edited, or deleted
+    assert not _is_test_path("apps/api/Startup.cs")  # same regardless of operation -- always reverted if changed
     print("write_scope_gate self-check: all assertions passed")
 
 

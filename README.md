@@ -25,7 +25,7 @@ flowchart TD
     
     stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Gate: human approval + sign to APPROVALS.md"]
     
-    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red)<br/>Agent: ac-to-tests-draft (scaffold-only rebuild)<br/>Gate: write-scope + AC-coverage deterministic checks<br/>Post-scaffold TDD-red gate: suite must RUN with zero passing tests"]
+    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red); remove tests for ACs retired this ticket<br/>Agent: ac-to-tests-draft (scaffold-only rebuild, write+bash)<br/>Gate: write-scope + AC-coverage deterministic checks<br/>Post-scaffold TDD-red gate: suite must RUN with zero passing tests"]
     
     stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
     
@@ -260,4 +260,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: ee419236b2aec6de92255beaba21c4ce8f7eb0eefa2f6d8e394b70ba2bc9b920 -->
+<!-- graph-source-sha256: 8a8cf6aa5f5804c13b541f3e1ee31fc51329cac26e6883893d3b06d24846f870 -->
