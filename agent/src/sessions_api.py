@@ -800,12 +800,23 @@ async def connect_project_route(body: ConnectProjectRequest, request: Request) -
     branch) -- unconditionally re-hitting GitHub on that hot path would mean a transient GitHub
     hiccup (rate limit, brief outage, timeout) could newly block starting a session on an
     already-connected, previously-working repo, a capability that worked unconditionally before
-    this feature existed."""
+    this feature existed.
+
+    The fetch also runs BEFORE create_project, not after (review fix round 2): for a genuinely new
+    connect, a DB row must never exist before its GitHub lookup has actually succeeded. Creating
+    the row first and fetching second would leave an orphaned, unreachable project (owner/repo
+    still NULL) on a fetch failure -- find_project_by_repo filters on the real (owner, repo), which
+    an orphan doesn't have, so it could never be found or completed again, every retry would create
+    ANOTHER orphan, and it would still surface, selectable, in GET /projects (the New Ticket form's
+    picker) -- picking it would scaffold a brand-new GitHub repo instead of the one actually being
+    connected. The already-connected short-circuit above has no such risk either way (no new row
+    is ever created on that path), so this ordering only matters for the branch below."""
     _check_shared_secret(request)
     existing = await project_store.find_project_by_repo(body.owner, body.repo)
     if existing is not None and not _needs_default_branch_fetch(existing):
         return ProjectResponse(**existing)
 
+    default_branch = await _fetch_default_branch(body.owner, body.repo, body.github_token)
     project_id = (
         existing["project_id"]
         if existing is not None
@@ -813,7 +824,6 @@ async def connect_project_route(body: ConnectProjectRequest, request: Request) -
             body.repo, tech_stack_id=None, tech_stack_text=None, created_by=body.created_by
         )
     )
-    default_branch = await _fetch_default_branch(body.owner, body.repo, body.github_token)
     await project_store.set_project_repo(project_id, body.owner, body.repo, default_branch)
     row = await project_store.get_project(project_id)
     return ProjectResponse(**row)
@@ -829,6 +839,8 @@ def _demo() -> None:
     assertions through set_project_repo/get_project/find_project_by_repo) -- no second fake DB
     pool is wired up here."""
     import asyncio
+
+    global _fetch_default_branch  # reassigned further down; must precede every use in this function
 
     # A brand-new connect (no row yet) and a pre-migration/previously-failed row (NULL or empty
     # default_branch) both need the GitHub call; an already-connected row that already has a real
@@ -860,6 +872,54 @@ def _demo() -> None:
         assert exc.status_code == 502 and "404" in exc.detail, exc.detail
     finally:
         asyncio.run(mock_client_404.aclose())
+
+    # Review fix round 2: for a genuinely new connect (existing is None), create_project must
+    # never run before a successful fetch -- creating the row first would orphan it forever on a
+    # fetch failure (owner/repo stay NULL, so find_project_by_repo can never find it again to
+    # finish the job; every retry would create ANOTHER orphan, and the orphan would still surface,
+    # selectable, in GET /projects). Monkeypatches project_store.find_project_by_repo/create_project
+    # (module attributes, same technique project_store.py's own self-check uses for
+    # session_store._get_pool) and this module's own _fetch_default_branch (a plain global
+    # reassignment -- connect_project_route resolves that name from this module's globals at call
+    # time, so this affects it exactly like a real patch would) to run the REAL route function
+    # against a simulated GitHub failure, and asserts create_project was never even called.
+    calls: list[str] = []
+
+    async def fake_find_project_by_repo(owner: str, repo: str) -> dict[str, Any] | None:
+        return None  # "existing is None" -- a genuinely new connect, nothing to short-circuit on
+
+    async def fake_create_project(*args: Any, **kwargs: Any) -> str:
+        calls.append("create_project")
+        return "should-never-be-created"
+
+    async def fake_fetch_that_fails(*args: Any, **kwargs: Any) -> str | None:
+        calls.append("fetch_default_branch")
+        raise HTTPException(status_code=502, detail="simulated GitHub outage")
+
+    class _FakeRequest:
+        headers: dict[str, str] = {}
+
+    original_find = project_store.find_project_by_repo
+    original_create = project_store.create_project
+    original_fetch = _fetch_default_branch
+    project_store.find_project_by_repo = fake_find_project_by_repo  # type: ignore[assignment]
+    project_store.create_project = fake_create_project  # type: ignore[assignment]
+    _fetch_default_branch = fake_fetch_that_fails
+    try:
+        body = ConnectProjectRequest(owner="octocat", repo="new-repo", created_by="octocat", github_token="tok123")
+        try:
+            asyncio.run(connect_project_route(body, _FakeRequest()))  # type: ignore[arg-type]
+            raise AssertionError("connect_project_route must propagate a fetch failure, not swallow it")
+        except HTTPException:
+            pass
+    finally:
+        project_store.find_project_by_repo = original_find  # type: ignore[assignment]
+        project_store.create_project = original_create  # type: ignore[assignment]
+        _fetch_default_branch = original_fetch
+
+    assert calls == ["fetch_default_branch"], (
+        f"create_project must never run before a successful fetch -- orphan-row bug reintroduced, calls={calls}"
+    )
 
     print("sessions_api self-check: all assertions passed")
 
