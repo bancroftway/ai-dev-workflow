@@ -564,5 +564,11 @@ Tasks 1-8.
    residual risk, or scope a follow-up task to extend `workflow_persistence`'s durable-state schema
    (or swap `InMemorySaver` for a real durable checkpointer) to close it. Do not let this be the
    first time anyone notices it is untested.
-7. Write a final report naming what was verified for real, what remains unverified and why, and
+7. **Added after Task 6's review**: confirm Task 7's BFF `PUT` route actually derives `updated_by`
+   server-side from `getServerAuthToken()` (matching `vault/route.ts`'s own real precedent for
+   `user_login`), never forwarding a client-supplied string verbatim — Task 6's backend correctly
+   accepts `updated_by` as a body field because the trusted BFF layer is supposed to be the one
+   populating it, but nothing in Task 6 itself enforces that Task 7 actually does. If it doesn't,
+   this audit-trail field is spoofable by anyone who can reach the BFF.
+8. Write a final report naming what was verified for real, what remains unverified and why, and
    any place reality diverged from what Tasks 1-8 assumed — same shape as Part 1's Task 12 report.
