@@ -15,7 +15,7 @@ export function RequirementsView() {
   // mounted above this) already registers the proxied agent once -- registerProxiedAgent throws
   // "already registered" if a second call site re-registers the same agentId (confirmed live),
   // so every other consumer just binds to the existing registration by id.
-  const { localAgentId } = useWorkflowThread();
+  const { localAgentId, threadId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
   const [text, setText] = useState("");
@@ -54,6 +54,32 @@ export function RequirementsView() {
   const rawRequirementsContent =
     ((rawRequirements?.approved_content ?? rawRequirements?.draft) as { content?: string } | null)?.content ??
     state.raw_requirements_text;
+
+  // One-shot handoff from the New Ticket form (src/app/(boxed)/tickets/new/page.tsx): title +
+  // description typed there before this session's sandbox even existed, stashed in sessionStorage
+  // (same-tab client navigation preserves it) since a brand-new session has no server-side draft
+  // yet for the rehydrate effect below to find. Runs first so its syncedRef write, if any, short-
+  // circuits that effect on this same mount; removed immediately so it can never reapply after the
+  // human clears the box. A session opened any other way (e.g. /select) never had this key set, so
+  // this is a no-op for every session that isn't ticket-created.
+  useEffect(() => {
+    if (syncedRef.current) return;
+    const key = `aidw:new-ticket:${threadId}`;
+    const pending = sessionStorage.getItem(key);
+    if (!pending) return;
+    sessionStorage.removeItem(key);
+    const combined = parseNewTicketHandoff(pending);
+    if (combined) {
+      // One-time seed from an external store (sessionStorage) into component state on mount --
+      // there's no dependency this could "react" to instead (sessionStorage isn't observable), so
+      // this doesn't fit the rule's "derive state from a changed dependency" shape it otherwise
+      // checks for. Guarded by syncedRef the same way the server-state rehydrate effect below is,
+      // so this never re-fires or clobbers text the human is actively editing.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setText(combined);
+      syncedRef.current = true;
+    }
+  }, [threadId]);
 
   // Rehydrate the textarea once from server state (e.g. after a remount),
   // without ever clobbering text the human is actively editing.
@@ -258,4 +284,19 @@ function ModeButton({ label, active, onClick }: { label: string; active: boolean
       {label}
     </button>
   );
+}
+
+/** Parses the New Ticket form's sessionStorage handoff payload (see the rehydrate effect above)
+ * into the combined requirements text, or null for a missing/malformed/empty payload -- kept
+ * outside the effect body so that one stays a flat, single-branch setState-from-external-state
+ * read. */
+function parseNewTicketHandoff(raw: string): string | null {
+  try {
+    const { title, description } = JSON.parse(raw) as { title: string; description: string };
+    const combined = description ? `${title}\n\n${description}` : title;
+    return combined.trim() ? combined : null;
+  } catch {
+    // Malformed handoff payload -- ignore, fall through to the normal server-state rehydrate.
+    return null;
+  }
 }

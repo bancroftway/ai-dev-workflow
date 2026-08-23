@@ -28,16 +28,23 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { sessionId, owner, repo, branch, resume } = (await request.json()) as {
+  const { sessionId, projectId, owner, repo, branch, resume } = (await request.json()) as {
     sessionId?: string;
+    // Which project (Part 3) this ticket belongs to -- required by the agent's own
+    // ProvisionRequest.project_id (no default there), so required here too rather than passing
+    // through to a less-clear 422 from the agent. The New Ticket form (src/app/(boxed)/tickets/new)
+    // is the only caller that currently sends this; SandboxSessionBoot.tsx's own call (the plain
+    // /select repo/branch flow) does not yet, which is a known pre-existing gap this route does not
+    // paper over -- see task-4-report.md.
+    projectId?: string;
     owner?: string;
     repo?: string;
     branch?: string;
     resume?: boolean;
   };
-  if (!sessionId || !owner || !repo || !branch) {
+  if (!sessionId || !projectId || !owner || !repo || !branch) {
     return NextResponse.json(
-      { error: "sessionId, owner, repo, and branch are required" },
+      { error: "sessionId, projectId, owner, repo, and branch are required" },
       { status: 400 },
     );
   }
@@ -47,6 +54,7 @@ export async function POST(request: Request) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       thread_id: sessionId,
+      project_id: projectId,
       owner,
       repo,
       branch,

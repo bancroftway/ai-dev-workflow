@@ -52,11 +52,21 @@ export default function SelectPage() {
 
   return (
     <div className="flex h-full w-full flex-col gap-4 p-6">
-      <div>
-        <h1 className="text-lg font-semibold">Select a repository</h1>
-        <p className="text-sm text-neutral-500">
-          Choose the GitHub repository and branch to work in.
-        </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-lg font-semibold">Select a repository</h1>
+          <p className="text-sm text-neutral-500">
+            Choose the GitHub repository and branch to work in.
+          </p>
+        </div>
+        {/* Part 3's project/ticket intake path (no existing page to extend it from) -- kept
+            reachable from here since this is where "start new session" has always lived. */}
+        <Link
+          href="/tickets/new"
+          className="shrink-0 rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800"
+        >
+          + New Ticket
+        </Link>
       </div>
 
       {/* Missing-settings banners: session-scoped always; the key-vault check joins once a repo
