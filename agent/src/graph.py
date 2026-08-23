@@ -1765,6 +1765,30 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                     "assumption in the document, and deliver the COMPLETE draft with readiness true."
                 )
             prompt_messages = [*prompt_messages, HumanMessage(content=headless_note)]
+
+        # Durable + live NODE_STARTED (Part 2 Task 9 run-visibility) -- placed right before the
+        # actual model call, not at this function's top, so it only ever fires on the path that can
+        # reach this node's own NODE_FINISHED below (the hydrate/prefill/should_skip_draft
+        # early-returns above never touch either event). Gives the wall-clock swimlane a real
+        # start+end span for this node instead of only the single end-of-node point NODE_FINISHED
+        # alone provides -- see task-9-report.md for why this was genuinely missing (no call site
+        # anywhere emitted NODE_STARTED before this). An infra-exhausted draft (the TimeoutError/
+        # RuntimeError branch just below) still returns early without a matching NODE_FINISHED --
+        # a legitimate "started, never finished" span, not a bug; the swimlane renders that as
+        # open-ended rather than silently dropping it. Same fail-soft two-call pattern (append_event
+        # then emit_live, rebind before the live call) as every other RunEvent site in this file.
+        if sandbox_registry.get(thread_id) is not None:
+            start_event = RunEvent(
+                run_id=state.get("run_id", "unknown"),
+                session_id=thread_id,
+                type=RunEventType.NODE_STARTED,
+                stage=stage_spec.key,
+                node="draft",
+                summary="draft started",
+            )
+            start_event = await run_event_store.append_event(start_event)
+            await run_event_stream.emit_live(start_event, config)
+
         try:
             response = await call_with_infra_retry(
                 lambda: ainvoke_structured(model, prompt_messages, stage_spec.response_schema),
@@ -1908,6 +1932,26 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
         audit_skipped_infra = False
+
+        # Durable + live NODE_STARTED (Part 2 Task 9 run-visibility) -- same placement rationale as
+        # make_draft_node's identical block above: right before the model call, paired with this
+        # node's own NODE_FINISHED below on every path that reaches it (the ValidationError/
+        # ValueError/TimeoutError/RuntimeError catches below still fall through to that same
+        # NODE_FINISHED; only a genuinely unhandled exception would leave this unpaired, which the
+        # swimlane renders open-ended rather than dropping). Same fail-soft two-call pattern as
+        # every other RunEvent site in this file.
+        if sandbox_registry.get(thread_id) is not None:
+            start_event = RunEvent(
+                run_id=state.get("run_id", "unknown"),
+                session_id=thread_id,
+                type=RunEventType.NODE_STARTED,
+                stage=stage_spec.key,
+                node="audit",
+                summary="audit started",
+            )
+            start_event = await run_event_store.append_event(start_event)
+            await run_event_stream.emit_live(start_event, config)
+
         try:
             response = await call_with_infra_retry(
                 lambda: ainvoke_structured(model, prompt_messages, stage_spec.audit_response_schema),
@@ -2122,6 +2166,25 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             # metrics-exit, which then exhausted its budget and failed an otherwise-complete run).
             await close_session(thread_id, stage_spec.key, "draft", provider=state["provider"])
             return {"stages": stages}
+
+        # Durable + live NODE_STARTED (Part 2 Task 9 run-visibility) -- same pattern as
+        # make_draft_node/make_audit_node's identical blocks. Placed here rather than at this
+        # function's top: the no-sandbox and missing-required-skill branches above already return
+        # early with no RunEvent of any kind today, so sandbox_registry.get(thread_id) is
+        # guaranteed not-None by the time execution reaches this point -- the same guard is kept
+        # anyway, purely for literal consistency with the other two nodes' identical blocks. Fails
+        # soft, same two-call pattern as every other RunEvent site in this file.
+        if sandbox_registry.get(thread_id) is not None:
+            start_event = RunEvent(
+                run_id=state.get("run_id", "unknown"),
+                session_id=thread_id,
+                type=RunEventType.NODE_STARTED,
+                stage=stage_spec.key,
+                node="verify",
+                summary="verify started",
+            )
+            start_event = await run_event_store.append_event(start_event)
+            await run_event_stream.emit_live(start_event, config)
 
         result = await stage_spec.deterministic_verify(
             thread_id, stage["draft"], state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,

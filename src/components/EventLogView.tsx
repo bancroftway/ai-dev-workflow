@@ -1,43 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useAgent } from "@copilotkit/react-core/v2";
+import { useState } from "react";
 import { Chip } from "@/components/MetricsBar";
 import { DiffView, looksLikeDiff } from "@/components/DiffView";
 import { ViewContainer } from "@/components/ViewContainer";
-import { useWorkflowThread } from "@/lib/workflow-thread-context";
+import { formatDuration, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
 
 /**
  * Folding tool-call-row event log -- Part 2 Task 8. Standalone/reusable on purpose (brief's own
  * instruction): Task 13 decides which tab this lives in, this component only needs a session_id
  * to render itself anywhere it's mounted.
  *
- * Data comes from BOTH of Task 1/2's real destinations for the same underlying event, merged by
- * `seq` (the durable store's own dedup key -- an event is only ever live-dispatched AFTER
- * run_event_store.append_event has already assigned it one, see run_event_stream.py's docstring):
- *  - `GET /sessions/{session_id}/events` (this task's new backend route) -- history-so-far,
- *    fetched once per session_id. Covers a finished run and a fresh page load/reconnect, since...
- *  - ...the live AG-UI CUSTOM event channel (Task 2) only fires while THIS browser tab is
- *    subscribed to an agent that is actively streaming a run. `agent.subscribe({onCustomEvent})`
- *    is the documented, always-safe way to observe it (see useAgent's own JSDoc in
- *    @copilotkit/react-core/v2 -- "calling agent.subscribe(...) ... is always safe").
- * No polling: a mount-time fetch plus a live subscription for the rest of this tab's lifetime
- * already covers every real case (opened before a run starts, opened mid-run, opened after the
- * run finished) without inventing a refresh loop nothing asked for.
+ * Data comes from useRunEvents() (src/lib/use-run-events.ts) -- factored out from this component's
+ * own original fetch/merge effects when Task 9 needed the identical data for a second component
+ * (Swimlane.tsx). See that hook's own docstring for the full "why" (merges Task 1/2's two real
+ * destinations for the same underlying event, deduped by `seq`, no polling); this file no longer
+ * owns that plumbing, only how the resulting event list renders.
  */
-
-interface RunLogEvent {
-  seq: number;
-  run_id: string;
-  session_id: string;
-  ts: string;
-  stage: string | null;
-  node: string | null;
-  type: "node_started" | "node_finished" | "tool_call" | "reasoning" | "gate_paused" | "gate_resolved";
-  summary: string | null;
-  payload: Record<string, unknown> | null;
-  token_usage: Record<string, unknown> | null;
-}
 
 /** Same dot-color vocabulary as AppShell.tsx's own DOT_CLASS (blue/amber/emerald/red) plus the
  * neutral tones MetricsBar.tsx's CHIP_CLASS already uses for "no strong signal" -- not a new
@@ -50,23 +29,6 @@ const TYPE_DOT: Record<RunLogEvent["type"], string> = {
   gate_paused: "bg-amber-500",
   gate_resolved: "bg-emerald-500",
 };
-
-function mergeEvents(prev: RunLogEvent[], incoming: RunLogEvent[]): RunLogEvent[] {
-  const bySeq = new Map(prev.map((e) => [e.seq, e]));
-  for (const e of incoming) bySeq.set(e.seq, e);
-  return Array.from(bySeq.values()).sort((a, b) => a.seq - b.seq);
-}
-
-/** Both providers build a TOOL_CALL event's `summary` as literally `tool call: {name}`
- * (claude_chat_model.py / copilot_chat_model.py's own `_translate_intermediate_events`) -- reading
- * the tool name back out of `summary` works identically for either provider's payload shape,
- * unlike reading a `name`/`toolName`/`tool_name` key off `payload` directly (Claude's is `name`;
- * Copilot's is unconfirmed and may not exist at all, see that module's own docstring). */
-function toolNameOf(e: RunLogEvent): string | null {
-  if (e.type !== "tool_call") return null;
-  const m = e.summary?.match(/^tool call: (.+)$/);
-  return m ? m[1] : "tool";
-}
 
 function truncateOneLine(s: string, max: number): string {
   const oneLine = s.replace(/\s+/g, " ").trim();
@@ -91,10 +53,13 @@ function argSummary(payload: Record<string, unknown> | null): string | null {
 }
 
 /** NODE_FINISHED's duration, when a matching NODE_STARTED for the same (run_id, stage, node)
- * precedes it -- no real call site emits NODE_STARTED yet (graph.py only ever emits
- * NODE_FINISHED today), so this never fires against current real data, but the type has carried
- * NODE_STARTED since Task 1 specifically so a later call site can add it without a schema change;
- * this is that "duration if available" consumer already being ready for it. */
+ * precedes it. graph.py's draft/audit/verify nodes emit NODE_STARTED as of Part 2 Task 9 (see
+ * task-9-report.md) -- before that, no call site emitted it and this never fired against real
+ * data; the type had carried NODE_STARTED since Task 1 specifically so a later call site could add
+ * it without a schema change, and Task 9 is that call site. An unmatched NODE_STARTED (a node that
+ * started but errored before reaching its own NODE_FINISHED) is left in `openStarts` and simply
+ * never produces a duration -- not a bug, see Swimlane.tsx for the view that renders that case
+ * explicitly as an open-ended span rather than silently dropping it. */
 function computeDurations(events: RunLogEvent[]): Map<number, number> {
   const durations = new Map<number, number>();
   const openStarts = new Map<string, RunLogEvent>();
@@ -112,13 +77,6 @@ function computeDurations(events: RunLogEvent[]): Map<number, number> {
     }
   }
   return durations;
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 }
 
 /** A consecutive run of same-tool TOOL_CALL events -- any other event (including a lone/unpaired
@@ -143,48 +101,7 @@ function groupConsecutive(events: RunLogEvent[]): Run[] {
 }
 
 export function EventLogView() {
-  const { threadId, localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
-  const [events, setEvents] = useState<RunLogEvent[]>([]);
-
-  useEffect(() => {
-    // No synchronous setEvents([]) reset here (react-hooks/set-state-in-effect) -- threadId is
-    // effectively stable for this component's mounted lifetime, the same assumption every sibling
-    // view (MetricsBar, SessionOverview, ...) already makes via useWorkflowThread/useAgent: a
-    // session switch is a full Next.js route navigation (a different [sessionId] param), which
-    // remounts this subtree, not an in-place threadId prop change.
-    let cancelled = false;
-    fetch(`/api/sessions/${encodeURIComponent(threadId)}/events`)
-      .then((r) => (r.ok ? (r.json() as Promise<{ events: RunLogEvent[] }>) : null))
-      .then((data) => {
-        if (!cancelled && data) setEvents((prev) => mergeEvents(prev, data.events));
-      })
-      .catch(() => {
-        // History fetch is a best-effort fallback (see module docstring) -- the live subscription
-        // below still works even if this request fails (offline history, transient 5xx, ...).
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [threadId]);
-
-  useEffect(() => {
-    const { unsubscribe } = agent.subscribe({
-      onCustomEvent: ({ event }) => {
-        if (event.name !== "run_event") return;
-        try {
-          const raw: unknown = event.value;
-          const value = (typeof raw === "string" ? JSON.parse(raw) : raw) as RunLogEvent;
-          setEvents((prev) => mergeEvents(prev, [value]));
-        } catch {
-          // Malformed live payload -- ignore; the durable store already has the real row and a
-          // future refetch/reconnect will pick it up.
-        }
-      },
-    });
-    return unsubscribe;
-  }, [agent]);
-
+  const events = useRunEvents();
   const durations = computeDurations(events);
   const runs = groupConsecutive(events);
 
