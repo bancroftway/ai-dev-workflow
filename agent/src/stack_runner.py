@@ -81,7 +81,10 @@ async def run_and_report(
     stage_key: str,
     prompt_name: str,
     schema: type[ReportT],
-    provider: str,
+    provider: str,  # reserved against **render_values below -- no current prompt template has a
+    # `{provider}` placeholder, but a future one that adds one would silently stop reaching
+    # render_prompt (it would bind here instead) rather than erroring; worth knowing if that ever
+    # needs debugging.
     available_tools: list[str] | None = None,
     model_name: str | None = None,
     **render_values: str,

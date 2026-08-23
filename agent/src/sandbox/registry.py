@@ -31,33 +31,33 @@ def set(thread_id: str, session: SandboxSession) -> None:
     _sessions[thread_id] = session
 
 
-async def pop(thread_id: str) -> SandboxSession | None:
+def pop(thread_id: str) -> SandboxSession | None:
     # Every container-destruction path routes through here (both providers' terminate(), the idle
     # reaper via terminate(), and DELETE /{thread_id}), so this is also the one place that can
-    # reliably evict the Copilot sessions pointing INTO that container. Without it they survive as
-    # live-looking handles to a destroyed sandbox -- the same phantom-state bug the `registry.pop`
-    # comments in terminate() describe, one layer up. Imported here, not at module scope:
-    # chat_model imports .sandbox (transitively, via whichever provider module it dispatches to),
-    # so a top-level import cycles.
+    # reliably evict the Copilot/Claude sessions pointing INTO that container. Without it they
+    # survive as live-looking handles to a destroyed sandbox -- the same phantom-state bug the
+    # `registry.pop` comments in terminate() describe, one layer up. Imported here, not at module
+    # scope: chat_model imports .sandbox (transitively, via whichever provider module it dispatches
+    # to), so a top-level import cycles.
     #
-    # forget_thread_sessions now requires an explicit `provider` (Ruling 4,
-    # docs/superpowers/plans/part-4-org-settings-tasks.md) -- traced every real call path into this
-    # function (both providers' terminate(), which is ALSO the idle reaper's own teardown path, plus
-    # sessions_api.py's two DELETE-style endpoints) and none of them ever has a GraphState to read
-    # a pinned provider from: a session teardown is not a graph-node execution, it can fire from a
-    # timer with no run in progress at all. This is genuinely the same category Ruling 2 already
-    # carves out for session PROVISIONING (no state yet, read the live setting) -- destroying a
-    # session is the mirror-image infrastructure operation, not a mid-run LLM dispatch, so this
-    # function was made async (all 4 real callers already awaited an async function at this call
-    # site, so this cost nothing) specifically so it can resolve the live setting itself via
-    # get_provider() rather than fabricate a "pinned" value that does not exist anywhere in this
-    # call chain. Worst case on a provider that changed since this session's own sessions were
-    # created: this evicts the (now-)wrong provider's _session_ids entry and leaves the real one
-    # stale -- a harmless cleanup miss, never a wrong dispatch or a crash (chat_model.py module
-    # docstring's own framing of what this function protects).
-    from ..chat_model import forget_thread_sessions, get_provider
+    # forget_thread_sessions_everywhere(), not forget_thread_sessions(thread_id, provider=...): a
+    # first attempt at this function tried to resolve a single `provider` live (via
+    # get_provider()) and evict just that one -- reasoning that a session teardown has no
+    # GraphState to read a pinned provider from, so live-resolving here was the same category
+    # Ruling 2 already allows for session PROVISIONING. That reasoning missed that teardown isn't
+    # actually symmetric with provisioning: provisioning needs to know which provider to build
+    # a NEW session for, a question the live setting correctly answers; teardown just needs to
+    # forget whatever ALREADY EXISTS, a question the live setting can get wrong. Reproduced
+    # empirically: pin a thread to claude, flip the org setting to copilot, tear the thread down --
+    # the live resolution evicted copilot's (empty) dict and left the thread's real claude session
+    # ids untouched, which later surfaced as dead `--resume` tokens against the freshly recreated
+    # container. forget_thread_sessions_everywhere() sidesteps the whole question by evicting both
+    # (see its own docstring for why that's always safe, never just "usually fine") -- no DB call,
+    # so this function is back to a plain sync `def` (it was only ever made async for the
+    # `await get_provider()` this fix removes; every other line here was already synchronous).
+    from ..chat_model import forget_thread_sessions_everywhere
 
-    forget_thread_sessions(thread_id, provider=await get_provider())
+    forget_thread_sessions_everywhere(thread_id)
     _meta.pop(thread_id, None)
     return _sessions.pop(thread_id, None)
 

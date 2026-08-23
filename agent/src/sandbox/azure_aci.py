@@ -188,9 +188,18 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 # session id for this thread is unresumable against it -- forget them here or the
                 # next stage's --resume/--session-id points at a session that never existed in
                 # the new container.
-                from ..chat_model import forget_thread_sessions
+                #
+                # forget_thread_sessions_everywhere(), not forget_thread_sessions(session_id,
+                # provider=provider): `provider` above is this call's own live resolution (correct
+                # for the fresh container about to be built below), but intake_node preserves the
+                # run's original pinned state["provider"] across this exact reprovision -- if the
+                # org setting changed since the run started, evicting only `provider`'s dict here
+                # could miss the OLD container's real provider entirely. Mirrors
+                # local_docker.py's identical fix; see chat_model.forget_thread_sessions_
+                # everywhere's own docstring for why evicting both is always safe here.
+                from ..chat_model import forget_thread_sessions_everywhere
 
-                forget_thread_sessions(session_id, provider=provider)
+                forget_thread_sessions_everywhere(session_id)
 
             name = _container_group_name(session_id)
             # Inert now -- nothing listens on a port for either provider (Copilot's TCP/JSON-RPC
@@ -365,7 +374,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
             sandbox = self._sandboxes.pop(session_id, None)
         # The reaper routes through here too; without this pop the registry.get() guards across
         # the pipeline kept seeing a phantom session after an idle reap.
-        await registry.pop(session_id)
+        registry.pop(session_id)
         if sandbox is None:
             return
         logger.info("Terminating ACI sandbox session_id=%s container_group=%s", session_id, sandbox.container_name)

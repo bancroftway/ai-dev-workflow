@@ -16,8 +16,8 @@ once at import time.
 Ruling 4 (docs/superpowers/plans/part-4-org-settings-tasks.md), added after Task 3's first pass
 got this next part wrong: the 7 functions below that actually DO the dispatching
 (get_chat_model_for_thread, close_session, close_thread_session, forget_thread_sessions,
-get_session_id, read_skill_invocations, secret_env_names) do NOT call get_provider() (or
-_get_provider_sync()) themselves. Each takes the provider to dispatch to as a **required,
+get_session_id, read_skill_invocations, secret_env_names) do NOT call get_provider() themselves.
+Each takes the provider to dispatch to as a **required,
 keyword-only `provider` parameter** instead, with no default. The first version of this file had
 each of these 7 resolve the live setting internally on every call -- which looked like the same
 "per-call, not per-process" fix as get_provider() itself, but actually defeated the entire point of
@@ -41,6 +41,20 @@ TTL-cached DB read, and is still exactly what intake_node (GraphState.provider, 
 genuine provisioning-time code (sessions_api.py, run_headless.py's startup, the sandbox
 provisioning lazy imports) call to get that one live value in the first place. It just no longer
 gets called from inside the other 7 -- those are told, not asked.
+
+forget_thread_sessions_everywhere() below is a THIRD category, discovered chasing Ruling 4's own
+"never live-resolve" logic to its actual conclusion at teardown: sandbox/registry.py's pop() and
+the sandbox provision() reprovision branches (local_docker.py, azure_aci.py) all evict a dying
+thread's cached session ids, and the first attempt at fixing them (per the required-provider
+pattern above) had each resolve `provider` live and call plain forget_thread_sessions(thread_id,
+provider=provider) -- which reintroduced Ruling 4's exact bug at a new location: pin a thread to
+claude, flip the org setting to copilot, tear the thread down, and the live resolution evicts
+COPILOT's (empty) dict while the thread's real claude session ids survive, later becoming dead
+`--resume` tokens against a freshly recreated container. The actual fix is not "resolve the RIGHT
+provider" -- at teardown there is no right provider left to resolve, since the sandbox is already
+gone and neither provider's cached session is resumable either way. The answer is "evict from
+both"; a thread only ever has real entries under the one provider it actually ran under, so
+clearing the other one is a guaranteed no-op, never a correctness risk.
 
 sandbox/factory.py's get_sandbox_provider() looks superficially similar (env var -> module
 selection) but is solving a different problem: which SandboxProvider backend to run against (local
@@ -118,9 +132,8 @@ def _provider_module(provider: str) -> types.ModuleType:
 def _cached_provider_if_fresh() -> str | None:
     """Sync, non-blocking read of the shared TTL cache -- None on a cold or expired cache.
 
-    Shared by get_provider() (the authoritative async path, which repopulates it from the DB) and
-    _get_provider_sync() (the sync fallback below), so a value either one fetched benefits the
-    other for the rest of its TTL window.
+    Split out of get_provider() (its only caller) so the cache-hit check itself stays trivially
+    testable/readable on its own.
     """
     if _provider_cache is None:
         return None
@@ -152,41 +165,6 @@ async def get_provider() -> str:
     value = settings.provider if settings is not None else os.environ.get("AGENT_PROVIDER", "copilot")
     _provider_module(value)  # fail fast on an unrecognized value, before caching it
     _provider_cache = (value, time.monotonic())
-    return value
-
-
-def _get_provider_sync() -> str:
-    """Sync-safe stand-in for get_provider() -- a live, TTL-cached-or-env-var read with no
-    `await`, for a sync caller that cannot use get_provider() itself (asyncio.run() from inside
-    code already running an event loop raises RuntimeError("cannot be called from a running event
-    loop"), so there is no safe way for a plain `def` to fall through to a real DB read).
-
-    Pre-Ruling-4, this was called internally by the 4 dispatch functions that are themselves sync
-    (get_chat_model_for_thread, forget_thread_sessions, get_session_id, secret_env_names) to
-    resolve their own provider. Ruling 4 removed all of those internal calls -- each of the 7
-    dispatch functions now takes an explicit, required `provider` argument from its caller instead
-    of resolving one itself, sync or otherwise -- so this function currently has no caller inside
-    this module. Left in place, unchanged, as Task 3 built it: it is still correct, sync-safe
-    infrastructure for a future genuinely-sync caller that needs a live-ish read of the provider
-    setting with no event loop available, the same role it has always had; Ruling 4 changed who
-    resolves the provider for the 7 dispatch functions, not what this helper itself does.
-
-    Reads the same shared cache get_provider() populates -- a sync caller benefits from whatever an
-    async caller already fetched, within the same TTL window -- but on a cold/expired cache it
-    never itself hits the DB, and never writes _provider_cache either; it only ever falls back
-    straight to the env var, the same default get_provider() itself falls back to. Net effect: the
-    staleness bound here is NOT a fixed _PROVIDER_CACHE_TTL_SECONDS -- it is self-correcting rather
-    than time-bounded, bounded only by however often something else in the process still calls
-    get_provider()/get_runtime_auth_token() (intake_node, once per run; genuine provisioning-time
-    code) and thereby warms the shared cache this function opportunistically reads. This is an
-    explicit trade-off, not an oversight -- the alternative is blocking a sync function on network
-    I/O it cannot safely perform, or risking the RuntimeError above.
-    """
-    cached = _cached_provider_if_fresh()
-    if cached is not None:
-        return cached
-    value = os.environ.get("AGENT_PROVIDER", "copilot")
-    _provider_module(value)  # same fail-fast validation as get_provider()
     return value
 
 
@@ -239,11 +217,9 @@ def get_chat_model_for_thread(
 
     `provider` is required, keyword-only, no default (Ruling 4): a graph node passes its own
     pinned `state["provider"]`; nothing else legitimately calls this. This function used to resolve
-    it itself via _get_provider_sync() -- removed, since a call late in a long-running graph run
-    could then silently pick up a live setting change instead of the run's own pinned value,
-    defeating GraphState.provider's whole purpose. See that helper's own docstring for why a sync
-    function couldn't `await get_provider()` even before this correction -- moot now that nothing
-    in here resolves the provider at all.
+    it itself internally -- removed, since a call late in a long-running graph run could then
+    silently pick up a live setting change instead of the run's own pinned value, defeating
+    GraphState.provider's whole purpose.
 
     github_token and response_schema are each accepted by only ONE provider's real function
     (github_token: copilot_chat_model only; response_schema: claude_chat_model only -- see each
@@ -294,17 +270,42 @@ async def close_thread_session(thread_id: str, *, provider: str) -> None:
 
 
 def forget_thread_sessions(thread_id: str, *, provider: str) -> None:
-    """Drop cached session ids for a thread whose sandbox is already gone.
+    """Drop cached session ids for a thread whose sandbox is already gone, for the ONE provider
+    the caller names.
 
     `provider` is required, keyword-only, no default (Ruling 4) -- the caller's own pinned
-    `state["provider"]` (or, at a genuine provisioning-time call with no state yet, whatever that
-    call already resolved via get_provider()), not resolved in here. Sync in both providers (a pure
-    dict-key-prefix pop, no I/O). sandbox.registry.pop() already routes through this name for
-    Copilot today; per-call dispatch here is what lets the same call site also reach Claude
-    sessions, PROVIDED its own caller threads the right thread's pinned provider through (Task 5's
-    job, not this module's -- see that task's report).
+    `state["provider"]`, not resolved in here. Sync in both providers (a pure dict-key-prefix pop,
+    no I/O). NOT what teardown code should call -- see forget_thread_sessions_everywhere() just
+    below for why a single dying-sandbox eviction has no correct single `provider` to resolve at
+    all, live or otherwise.
     """
     _provider_module(provider).forget_thread_sessions(thread_id)
+
+
+def forget_thread_sessions_everywhere(thread_id: str) -> None:
+    """Teardown eviction: drop this thread's cached session ids under BOTH providers.
+
+    The only real callers are sandbox/registry.py's pop() and the sandbox provision() reprovision
+    branches (local_docker.py, azure_aci.py) -- all three destroy the sandbox a cached session id
+    would have pointed into, so nothing under EITHER provider is resumable afterward regardless of
+    which one this thread actually ran under. There is no live setting to resolve here, unlike
+    every other function in this module: `provider` (this module's usual required argument) names
+    which provider a session should be built for or looked up under going forward, a question that
+    only makes sense while the sandbox it would run in still exists. A first attempt at this
+    function tried to resolve `provider` anyway (live, via get_provider(), following the same
+    pattern as forget_thread_sessions above) -- reproduced empirically as a real bug: pin a thread
+    to claude, flip the org setting to copilot, tear the thread down, and the live resolution
+    evicts copilot's (empty) dict while the thread's real claude session ids survive, later
+    becoming dead `--resume` tokens the moment the container is recreated with a fresh $HOME. That
+    is Ruling 4's exact failure shape relocated to teardown, not a different bug -- the fix is not
+    "resolve the right provider," it is recognizing there IS no single right provider to resolve at
+    a moment when neither one's cached session is usable anyway. Evicting both is provably safe: a
+    given thread can only ever have real entries in ONE provider's `_session_ids` dict within a
+    single process (whichever one it actually dispatched to), so the other provider's call here is
+    always a no-op pop-of-nothing.
+    """
+    for module in (claude_chat_model, copilot_chat_model):
+        module.forget_thread_sessions(thread_id)
 
 
 async def close_session(thread_id: str, stage: str, role: str, *, provider: str) -> None:
@@ -369,6 +370,7 @@ __all__ = [
     "get_chat_model_for_thread",
     "close_thread_session",
     "forget_thread_sessions",
+    "forget_thread_sessions_everywhere",
     "close_session",
     "get_session_id",
     "read_skill_invocations",
@@ -385,7 +387,9 @@ def _demo() -> None:
     forced through the env var/cache the way it was pre-Ruling-4, since none of these 7 reads that
     cache anymore. Section 2 got SIMPLER for exactly that reason: no _force_provider() dance, just
     two calls with two different literal `provider=` values and a check each landed on the right
-    module.
+    module. Section 2 also proves forget_thread_sessions_everywhere() clears both providers with
+    no `provider` argument at all, and that the 7 functions' "required, no default" contract itself
+    actually holds (a `TypeError` on the missing-argument call, not a silent fallback).
 
     Offline only, matching org_settings.py's and org_credential_vault.py's own self-check
     limitation on this branch: org_settings.get_org_settings and
@@ -501,6 +505,33 @@ def _demo() -> None:
             "claude_chat_model.read_skill_invocations should have parsed the fake transcript"
         )
 
+        # forget_thread_sessions_everywhere (sync): the teardown-only eighth function, deliberately
+        # NOT one of the 7 that take a `provider` argument -- it has none, by design (module
+        # docstring: there is no single right provider to resolve at teardown, so it evicts both).
+        # Seeds both providers' _session_ids under the same key and confirms one call clears both.
+        claude_chat_model._session_ids[key] = "claude-marker"
+        copilot_chat_model._session_ids[key] = "copilot-marker"
+        forget_thread_sessions_everywhere(thread_id)
+        assert key not in claude_chat_model._session_ids, "forget_thread_sessions_everywhere missed claude_chat_model"
+        assert key not in copilot_chat_model._session_ids, "forget_thread_sessions_everywhere missed copilot_chat_model"
+
+        # Ruling 4's "required, no default" contract itself -- not just that the 7 dispatch
+        # perform correctly when given a provider, but that omitting it fails loudly rather than
+        # silently. Locks this in against a later "just add provider=None for convenience" edit
+        # quietly reopening the exact mid-run staleness bug Ruling 4 exists to close.
+        # get_session_id stands in for all 7 (the contract -- keyword-only, no default -- is
+        # identical across them; this is not testing get_session_id's own logic again).
+        try:
+            get_session_id(thread_id, stage, role)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(
+                "get_session_id must require `provider` with no default -- a default would let a "
+                "forgetful caller silently fall back to a live-resolved value, reopening Ruling 4's "
+                "mid-run staleness bug"
+            )
+
         # === 3. get_runtime_auth_token(): vault path + env-var fallback path. ===
         async def _stub_settings_with_secret():
             return org_settings.OrgSettings(
@@ -577,7 +608,11 @@ def _demo() -> None:
                 os.environ[name] = original
         _provider_cache = None
 
-    print("chat_model dispatch self-check: all assertions passed (per-call dispatch proven for all 7 re-exported names)")
+    print(
+        "chat_model dispatch self-check: all assertions passed (per-call dispatch proven for all "
+        "7 required-provider functions, forget_thread_sessions_everywhere's both-provider evict, "
+        "and the required-argument contract itself)"
+    )
 
 
 if __name__ == "__main__":

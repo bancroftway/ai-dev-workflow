@@ -204,9 +204,20 @@ class LocalDockerProvider(SandboxProvider):
                 # Claude/Copilot session id for this thread is unresumable against it -- forget
                 # them here or the next stage's --resume/--session-id points at a session that
                 # never existed in the new container.
-                from ..chat_model import forget_thread_sessions
+                #
+                # forget_thread_sessions_everywhere(), not forget_thread_sessions(session_id,
+                # provider=provider): `provider` above is this call's own LIVE resolution (correct
+                # for the fresh container about to be built below), but intake_node preserves the
+                # RUN's original pinned state["provider"] across this exact reprovision -- if the
+                # org setting changed since the run started, `provider` here can already name a
+                # different value than whatever the OLD container's sessions actually dispatched
+                # to, which would evict the wrong provider's dict and leave the real (now-dead)
+                # session ids behind. Same root cause chat_model.forget_thread_sessions_everywhere's
+                # own docstring documents for registry.pop() -- evicting both is what's actually
+                # correct here, not resolving harder.
+                from ..chat_model import forget_thread_sessions_everywhere
 
-                forget_thread_sessions(session_id, provider=provider)
+                forget_thread_sessions_everywhere(session_id)
 
             # A container that survived an agent restart is reattached, not destroyed -- the old
             # path unconditionally `rm -f`'d it, throwing away the clone and every unpushed
@@ -381,12 +392,20 @@ class LocalDockerProvider(SandboxProvider):
         async def _exec(cmd: str) -> tuple[int, str, str]:
             return await _run_docker("exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd)
 
-        # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
-        # a module-scope import here would cycle. Reattaching is part of provision()'s own flow
-        # (its only caller), so this reads the live setting fresh, same as provision() itself.
-        from ..chat_model import get_provider
-
-        provider = await get_provider()
+        # The container's OWN baked-in AGENT_PROVIDER (already parsed into `env` above, from
+        # provision()'s own `docker create -e AGENT_PROVIDER={provider}`) -- NOT a live
+        # get_provider() read. This container has the CLI for whichever provider it was actually
+        # built with; if the org setting changed since then, a live read here would run the wrong
+        # CLI's --version inside a perfectly good container, failing this liveness probe for a
+        # reason that has nothing to do with whether the container is actually alive (same root
+        # cause as the reprovision-branch forget_thread_sessions_everywhere fix just above --
+        # resolving live at a moment when the ACTUAL fact is already sitting right there). Declines
+        # reattach on anything unrecognized, same as every other anomaly check in this function --
+        # worst case this provisions a fresh container instead (workspace volume preserved), never
+        # runs the wrong CLI.
+        provider = env.get("AGENT_PROVIDER")
+        if provider not in ("claude", "copilot"):
+            return None
 
         try:
             await wait_for_cli_ready(_exec, version_command=f"{provider} --version")
@@ -405,7 +424,7 @@ class LocalDockerProvider(SandboxProvider):
             sandbox = self._sandboxes.pop(session_id, None)
         # The reaper routes through here too; without this pop the ~40 registry.get() guards
         # across the pipeline kept seeing a phantom session after an idle reap.
-        await registry.pop(session_id)
+        registry.pop(session_id)
         if sandbox is None:
             return
         logger.info("Terminating sandbox session_id=%s container=%s", session_id, sandbox.container_id[:12])
