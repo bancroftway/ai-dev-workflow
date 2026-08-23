@@ -1,9 +1,6 @@
 "use client";
 
 import {
-  CopilotChatInput,
-  type CopilotChatInputProps,
-  CopilotSidebar,
   UseAgentUpdate,
   useAgent,
   useCopilotKit,
@@ -118,8 +115,9 @@ export function AppShell({
   }, [sandboxStatus, state.stages, agent, copilotkit, resume]);
 
   // Section 8: the interrupt UI must be reachable regardless of which view is open. renderInChat
-  // defaults to true, publishing into the CopilotSidebar's chat feed, which is mounted around
-  // every view below.
+  // defaults to true, but the CopilotSidebar it used to publish into is gone (Task 7) and no
+  // replacement render target exists yet -- render() below still runs, it just has nowhere to
+  // mount, so the interrupt card is effectively invisible until Task 10 gives it a real home.
   //
   // The backend delivers the interrupt payload as a JSON *string* (ag_ui_langgraph's
   // dump_json_safe) -- parsing it is what makes the gate/escalation distinction work at all.
@@ -175,7 +173,6 @@ export function AppShell({
 
   return (
     <InterruptProvider>
-    <div className="flex min-h-full flex-1">
       <div className="flex min-h-full flex-1 flex-col">
         {sandboxStatus === "error" && (
           <div className="border-b border-red-300 bg-red-50 px-4 py-2 text-sm text-red-900">
@@ -257,9 +254,6 @@ export function AppShell({
           {activeView === "overview" && <SessionOverview />}
         </main>
       </div>
-
-      <CopilotSidebar agentId={localAgentId} input={GatedChatInput} />
-    </div>
     </InterruptProvider>
   );
 }
@@ -348,32 +342,6 @@ function InterruptCard({
     </div>
   );
 }
-
-// Chat input gating (WS9): a running agent should not be interrupted by free-text chat. While
-// running, the slot shows a pulsing progress line naming the stage currently drafting -- driven
-// by the same AG-UI streamed state AppShell subscribes to (this child re-renders with it).
-// Module-level with CopilotChatInput's statics copied on (Object.assign) so it satisfies the
-// `typeof CopilotChatInput` slot type and keeps a stable identity across renders -- an inline
-// component would remount the input every render and drop in-progress text.
-const GatedChatInput = Object.assign(
-  function GatedChatInputImpl(props: CopilotChatInputProps) {
-    const { localAgentId } = useWorkflowThread();
-    const { agent } = useAgent({ agentId: localAgentId });
-    const state = (agent.state ?? {}) as WorkflowState;
-    if (agent.isRunning) {
-      const draftingStage = PIPELINE_STAGE_ORDER.find((s) => state.stages?.[s.key]?.status === "drafting");
-      return (
-        <div className="border-t border-neutral-200 px-4 py-3 text-sm text-neutral-400">
-          <span className="animate-pulse">
-            ⋯ {draftingStage ? `Drafting ${draftingStage.label}` : "Working"} — chat opens when the agent needs you
-          </span>
-        </div>
-      );
-    }
-    return <CopilotChatInput {...props} />;
-  },
-  CopilotChatInput,
-);
 
 function TabButton({
   label,
