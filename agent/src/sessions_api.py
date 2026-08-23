@@ -27,15 +27,17 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
+import httpx
 from pydantic import BaseModel
 
-from . import app_discovery, branch_naming, chat_model, git_ops, keyvault, session_store
+from . import app_discovery, branch_naming, chat_model, git_ops, keyvault, org_credential_vault, org_settings, session_store
 from .sandbox import get_sandbox_provider, registry
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 config_router = APIRouter(prefix="/vault-config", tags=["vault-config"])
+org_settings_router = APIRouter(prefix="/org-settings", tags=["org-settings"])
 catalog_router = APIRouter(tags=["tech-stack"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
@@ -368,6 +370,140 @@ async def put_vault_config(body: VaultConfigPutRequest, request: Request) -> Ses
         raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
     await keyvault.set_vault_uri(body.owner, body.repo, body.user_login, vault_uri)
     return SessionActionResponse(secret_count=len(app_secrets))
+
+
+# --- org-wide coding-agent provider settings (settings page, Part 4) --------------------------
+
+
+class OrgSettingsResponse(BaseModel):
+    """Never carries the credential value itself -- write-only once saved (Part 4 Spec's own
+    explicit gap resolution), matching VaultConfigResponse's own convention above. The only signal
+    the Settings UI gets about the credential is `credential_configured`."""
+
+    provider: str
+    credential_configured: bool
+    updated_at: datetime | None
+    updated_by: str | None
+
+
+async def _org_settings_response() -> OrgSettingsResponse:
+    """Shared GET/PUT response builder -- always a fresh, uncached DB read. The TTL cache lives
+    one layer up (chat_model.get_provider(), _PROVIDER_CACHE_TTL_SECONDS) for in-flight session
+    dispatch, where up to 30s of staleness is fine; this settings-management surface must show a
+    just-saved change back immediately, so it reads org_settings directly rather than going
+    through that cache."""
+    settings = await org_settings.get_org_settings()
+    if settings is None:
+        # Fresh deployment, nobody has saved a setting yet -- the exact same env-var fallback
+        # chat_model.get_provider() itself falls back to, so this page's "active provider" can
+        # never disagree with what a real session would actually run under.
+        return OrgSettingsResponse(
+            provider=os.environ.get("AGENT_PROVIDER", "copilot"),
+            credential_configured=False,
+            updated_at=None,
+            updated_by=None,
+        )
+    return OrgSettingsResponse(
+        provider=settings.provider,
+        credential_configured=settings.credential_secret_name is not None,
+        updated_at=settings.updated_at,
+        updated_by=settings.updated_by,
+    )
+
+
+@org_settings_router.get("", response_model=OrgSettingsResponse)
+async def get_org_settings_endpoint(request: Request) -> OrgSettingsResponse:
+    _check_shared_secret(request)
+    return await _org_settings_response()
+
+
+class OrgSettingsPutRequest(BaseModel):
+    provider: Literal["copilot", "claude"]
+    # None/omitted means "keep whatever's already saved" (the masked-dots-plus-Update-button UI
+    # pattern) -- only a non-None value here triggers the save-and-test-fetch below.
+    credential: str | None = None
+    # Mirrors VaultConfigPutRequest's own user_login above: who to attribute this save to. Not
+    # derivable from anything this agent process itself knows -- there is no end-user session at
+    # this layer, only the shared-secret check that authenticates "the Next.js server", not "which
+    # admin clicked save" -- so the frontend BFF route (Part 4 Task 7) must supply it, the same way
+    # it already supplies user_login for the per-repo vault-config PUT above.
+    updated_by: str
+
+
+# The two real, lightweight, already-authenticated checks this task found: each is the SAME class
+# of "does the identity service accept this credential at all" probe, not a full completion/CLI
+# turn. Anthropic's Models list needs a valid x-api-key and cannot run for a session anyway;
+# GitHub's authenticated-user lookup is this codebase's own established way to prove a PAT is live
+# (git_ops.py already calls api.github.com with an identical Bearer header for PR/branch
+# operations). Neither proves the deeper, provider-specific entitlement (a syntactically valid
+# Anthropic key this org still can't call a model with; a GitHub PAT valid but lacking an actual
+# Copilot seat) -- proving that needs a real sandboxed CLI turn, which is exactly the latency this
+# endpoint must not wait on (see _probe_provider_credential's own docstring).
+_ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
+_ANTHROPIC_API_VERSION = "2023-06-01"
+_GITHUB_USER_URL = "https://api.github.com/user"
+
+
+async def _probe_provider_credential(provider: str, value: str) -> None:
+    """Ruling 3's actual validation gate: one lightweight GET against the TARGET PROVIDER's own
+    API -- deliberately not just a Key Vault round trip, which would only prove our own vault
+    plumbing works, never that the admin didn't just paste a typo'd or already-revoked key. This
+    is the smallest real check available without a full sandboxed CLI turn -- see the module
+    constants just above for why these two specific endpoints were chosen. Raises HTTPException
+    with the provider's own real response on any failure; the credential value itself never
+    appears in the raised detail, only the provider's own response body/status.
+    """
+    if provider == "claude":
+        url = _ANTHROPIC_MODELS_URL
+        headers = {"x-api-key": value, "anthropic-version": _ANTHROPIC_API_VERSION}
+    else:
+        url = _GITHUB_USER_URL
+        headers = {
+            "Authorization": f"Bearer {value}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"could not reach {provider}'s API to validate the credential: {exc}"
+            ) from None
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{provider} rejected the credential: {resp.status_code} {resp.text[:300]}",
+        )
+
+
+@org_settings_router.put("", response_model=OrgSettingsResponse)
+async def put_org_settings_endpoint(body: OrgSettingsPutRequest, request: Request) -> OrgSettingsResponse:
+    """Save the org-wide active provider + credential -- but, per Ruling 3, only after proving a
+    NEWLY provided credential actually works: saved to the vault, read back, then probed against
+    the real provider API. Nothing is persisted to org_settings on a failed save/read-back/probe --
+    the previous setting stays live at chat_model.get_provider() exactly as the brief requires. A
+    `credential` of None carries the existing credential_secret_name forward untouched and
+    unrevalidated -- switching only the provider choice, or re-saving with nothing new to prove,
+    is not a new credential to test."""
+    _check_shared_secret(request)
+    existing = await org_settings.get_org_settings()
+    secret_name = existing.credential_secret_name if existing is not None else None
+
+    if body.credential is not None:
+        credential = body.credential.strip()
+        try:
+            secret_name = await org_credential_vault.set_org_credential(credential)
+            fetched = await org_credential_vault.get_org_credential(secret_name)
+        except keyvault.VaultAccessError as exc:
+            raise HTTPException(status_code=502, detail=f"org credential vault is not accessible: {exc}") from None
+        await _probe_provider_credential(body.provider, fetched)
+        logger.info("org credential saved and validated for provider=%s", body.provider)
+
+    await org_settings.set_org_settings(body.provider, secret_name, body.updated_by)
+    return await _org_settings_response()
 
 
 class TechStackCatalogResponse(BaseModel):
