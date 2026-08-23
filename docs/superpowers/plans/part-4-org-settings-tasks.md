@@ -65,8 +65,14 @@ something else, defeating the point of centralizing it in a vault at all.
 
 **Decision**: a small, dedicated Key Vault (or a clearly-namespaced secret in an existing one —
 Task 2 below decides which, after checking what's actually provisioned in `infra/main.bicep`
-today) that the agent's own managed identity has **standing, narrowly-scoped** read access to —
-`Key Vault Secrets User`, RBAC-scoped to *only* this one vault/secret, nothing else. This is a
+today) that the agent's own managed identity has **standing, narrowly-scoped** access to —
+`Key Vault Secrets Officer` (not `Secrets User` — corrected 2026-08-22, during Task 2, after
+verifying against Microsoft's own built-in-roles reference: `Secrets User`'s DataActions are only
+`getSecret`/`readMetadata`, genuinely read-only, no `setSecret` at all; the same agent identity
+needs to *write* the credential too, since Task 6's settings-save endpoint has no other identity
+to do it as — `Secrets Officer`'s DataActions are `vaults/secrets/*`, full secret CRUD, but still
+scoped to secrets only, never certificates/keys/vault management), RBAC-scoped to *only* this one
+vault/secret, nothing else. This is a
 deliberate, narrow, documented exception to "no standing vault access," not a reversal of that
 principle — the principle exists to stop one identity reaching into *every team's* vault; a single
 fleet-wide secret with no natural per-user owner is exactly the case that principle doesn't cover.
@@ -191,8 +197,9 @@ be scoped into without widening its existing access to anything else, prefer reu
 resource); if not, add a new, minimal Key Vault resource dedicated to this one purpose.
 
 Add (whichever the read above determines): the vault resource (if new), an RBAC role assignment
-granting the agent's Container App managed identity `Key Vault Secrets User`, **scoped to this one
-vault only** (verify the scope string in the generated ARM JSON after `az bicep build`, don't just
+granting the agent's Container App managed identity `Key Vault Secrets Officer` (per Ruling 1's
+correction above — this identity both reads and writes the credential, `Secrets User` alone would
+403 on the write), **scoped to this one vault only** (verify the scope string in the generated ARM JSON after `az bicep build`, don't just
 trust the bicep source reads right — this is exactly the kind of thing worth a real check per
 Ruling 1's own stated cost-if-wrong).
 
