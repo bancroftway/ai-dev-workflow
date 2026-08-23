@@ -122,59 +122,68 @@ async def run_turn(
     err_path = f"{scratch_prefix}.err"
     exit_path = f"{scratch_prefix}.exit"
 
-    # Write prompt to scratch file.
-    await write_scratch_file(provider, thread_id, prompt_path, prompt)
-
-    # Launch backgrounded. Use `;` before the backgrounded setsid, NEVER `&&`: with `&&`,
-    # `cmd1 && cmd2 &` backgrounds the whole compound as one job, so `$!` would report the
-    # wrong PID and a timeout-kill would target the wrong process group.
-    startup_command = _build_startup_command(command, prompt_path, out_path, err_path, exit_path, pid_path)
-    result = await provider.exec_in_sandbox(thread_id, startup_command)
-    if not result.ok:
-        raise RuntimeError(f"failed to launch turn: {result.stderr}")
-
-    # Poll for completion.
-    start_time = time.time()
-    while True:
-        elapsed = time.time() - start_time
-        if elapsed > timeout_seconds:
-            # Timeout: kill the process group, then raise.
-            kill_cmd = (
-                f"kill -TERM -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; "
-                f"kill -KILL -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; true"
-            )
-            await provider.exec_in_sandbox(thread_id, kill_cmd)
-            raise TimeoutError(f"turn did not complete within {timeout_seconds} seconds")
-
-        # Check if exit file exists.
-        check_cmd = f"test -f {shlex.quote(exit_path)} && echo DONE || echo PENDING"
-        check_result = await provider.exec_in_sandbox(thread_id, check_cmd)
-        if check_result.ok and "DONE" in check_result.stdout:
-            break
-
-        # Sleep before next poll.
-        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-
-    # Read results.
-    stdout_result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(out_path)} 2>/dev/null || true")
-    stdout = stdout_result.stdout if stdout_result.ok else ""
-
-    stderr_result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(err_path)} 2>/dev/null || true")
-    stderr = stderr_result.stdout if stderr_result.ok else ""
-
-    exit_code_result = await provider.exec_in_sandbox(
-        thread_id, f"cat {shlex.quote(exit_path)} 2>/dev/null || echo 1"
-    )
     try:
-        exit_code = int(exit_code_result.stdout.strip()) if exit_code_result.ok else 1
-    except (ValueError, AttributeError):
-        exit_code = 1
+        # Write prompt to scratch file.
+        await write_scratch_file(provider, thread_id, prompt_path, prompt)
 
-    # Cleanup (rm -f with glob removes the prefix and all siblings sharing it).
-    cleanup_cmd = f"rm -f {shlex.quote(scratch_prefix)}*"
-    await provider.exec_in_sandbox(thread_id, cleanup_cmd)
+        # Launch backgrounded. Use `;` before the backgrounded setsid, NEVER `&&`: with `&&`,
+        # `cmd1 && cmd2 &` backgrounds the whole compound as one job, so `$!` would report the
+        # wrong PID and a timeout-kill would target the wrong process group.
+        startup_command = _build_startup_command(command, prompt_path, out_path, err_path, exit_path, pid_path)
+        result = await provider.exec_in_sandbox(thread_id, startup_command)
+        if not result.ok:
+            raise RuntimeError(f"failed to launch turn: {result.stderr}")
 
-    return TurnResult(stdout=stdout, stderr=stderr, exit_code=exit_code)
+        # Poll for completion.
+        start_time = time.time()
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout_seconds:
+                # Timeout: kill the process group, then raise.
+                kill_cmd = (
+                    f"kill -TERM -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; "
+                    f"kill -KILL -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; true"
+                )
+                await provider.exec_in_sandbox(thread_id, kill_cmd)
+                raise TimeoutError(f"turn did not complete within {timeout_seconds} seconds")
+
+            # Check if exit file exists.
+            check_cmd = f"test -f {shlex.quote(exit_path)} && echo DONE || echo PENDING"
+            check_result = await provider.exec_in_sandbox(thread_id, check_cmd)
+            if check_result.ok and "DONE" in check_result.stdout:
+                break
+
+            # Sleep before next poll.
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+
+        # Read results.
+        stdout_result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(out_path)} 2>/dev/null || true")
+        stdout = stdout_result.stdout if stdout_result.ok else ""
+
+        stderr_result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(err_path)} 2>/dev/null || true")
+        stderr = stderr_result.stdout if stderr_result.ok else ""
+
+        exit_code_result = await provider.exec_in_sandbox(
+            thread_id, f"cat {shlex.quote(exit_path)} 2>/dev/null || echo 1"
+        )
+        try:
+            exit_code = int(exit_code_result.stdout.strip()) if exit_code_result.ok else 1
+        except (ValueError, AttributeError):
+            exit_code = 1
+
+        return TurnResult(stdout=stdout, stderr=stderr, exit_code=exit_code)
+    finally:
+        # Cleanup (rm -f with glob removes the prefix and all siblings sharing it) now runs on
+        # EVERY exit path, not just success -- previously a TimeoutError or a launch RuntimeError
+        # returned/raised before this line was ever reached, leaving the prompt/pid/out/err/exit
+        # scratch files behind in /tmp/aidw-agent inside the container. Wrapped in its own
+        # try/except so a cleanup failure (e.g. the sandbox is already gone) can never replace
+        # whatever real exception this function is in the middle of propagating -- same
+        # "best-effort, result ignored" contract the success path already had.
+        try:
+            await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(scratch_prefix)}*")
+        except Exception:
+            pass
 
 
 def _demo() -> None:
