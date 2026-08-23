@@ -143,7 +143,7 @@ def _parse_copilot_jsonl(stdout: str) -> tuple[list[dict[str, Any]], str | None]
     return events, session_id
 
 
-def _build_copilot_wrapper_script(argv: list[str], prompt_path: str, timeout_seconds: float) -> str:
+def _build_copilot_wrapper_script(argv: list[str], prompt_path: str, timeout_seconds: int) -> str:
     """Build the text of the tiny wrapper script that feeds `-p` its value via shell expansion.
 
     Pure string construction, no I/O -- so _demo can assert its exact shape without a live sandbox
@@ -193,7 +193,9 @@ class CopilotChatModel(BaseChatModel):
     # (no-sandbox) CopilotClient's own environment; that whole code path -- and the
     # local-child-process mode it belonged to -- no longer exists under CLI-exec, where every turn
     # always execs into an already-provisioned sandbox (cli_agent_exec.run_turn) whose own
-    # GITHUB_TOKEN env var (see secret_env_names below) is what the copilot CLI actually reads.
+    # COPILOT_GITHUB_TOKEN env var (see secret_env_names below) is what the copilot CLI actually
+    # reads (task-12b fix-round-1: not the plain GITHUB_TOKEN name, which `gh`/git/npm also read
+    # ambiently -- see this task's report for why that matters).
     # Not warned on the way pre_tool_use_hook/tools/custom_agents/disabled_skills are below --
     # unlike those, this is set on EVERY call, so a warning here would be constant noise, not
     # signal.
@@ -462,14 +464,35 @@ class CopilotChatModel(BaseChatModel):
         # metacharacters left for any provider's own re-embedding to mishandle. Verified against the
         # real LocalDockerProvider container below (task-12b-report.md); AzureContainerInstance
         # itself was not re-verified live (no ACI target in this environment, matching Task 12's
-        # own stated limitation) -- but this shape does not depend on that provider's quoting
-        # fidelity to be correct the way the plain-embed alternative would have.
+        # own stated limitation). Precisely stated (fix-round-1 correction -- the original wording
+        # here overstated this): this shape adds NO NEW dependence on that provider's pre-existing
+        # quoting fragility, it does not make Copilot-on-ACI independent of a gap the whole
+        # pipeline already has. exec_in_sandbox's shared startup_command already carries other
+        # metacharacters (`'`, `;`, `&`, redirects) through that same re-embedding for BOTH
+        # providers today, regardless of this fix. What this shape actually buys is narrower and
+        # real: `command` itself now carries zero shell metacharacters instead of two guaranteed
+        # `"` characters, which is strictly safer for every SandboxProvider -- Claude's included,
+        # and any future one -- not a workaround scoped only to the one gap named above.
+        #
+        # Two known fidelity gaps versus the old (broken) stdin path, neither a correctness risk
+        # for this pipeline's real prompts, both worth stating plainly rather than leaving implicit:
+        # - POSIX command substitution always strips trailing newlines from `$(cat ...)`'s output --
+        #   irrelevant here since _messages_to_prompt never appends one and a stripped trailing
+        #   newline has no semantic effect on an LLM prompt.
+        # - A NUL byte in prompt content would be silently truncated (argv strings are
+        #   NUL-terminated in the shell/kernel, unlike a stdin byte stream) -- not a realistic risk
+        #   for LLM conversation text, and not currently checked for.
         # ponytail: `$(cat ...)` becomes a single argv word at exec time, capped by the container
-        # kernel's MAX_ARG_STRLEN (128 KiB per argv element on Linux) -- comfortably enough for
-        # normal stage prompts, unlike the old stdin path this replaces, which had no such ceiling.
-        # If a stage ever grows a prompt anywhere near that, this wrapper script is the place to
-        # change (e.g. write the prompt into a shell variable via a `read` builtin instead of a
-        # single command-substitution word), not a reason to raise the limit blindly.
+        # kernel's MAX_ARG_STRLEN (128 KiB per argv element on Linux) -- measured, distant for this
+        # pipeline's real prompts (largest static prompt template is ~17KB,
+        # src/prompts/ac_to_tests_draft.md; every other interpolated block is already
+        # hard-truncated well under it -- e.g. preflight_nodes.py's [:4000]/[:20000], graph.py's
+        # [:8000], several [-4000:]/[-3000:] truncations elsewhere), unlike the old stdin path this
+        # replaces, which had no such ceiling at all. No real workaround exists short of shrinking
+        # the prompt further or a CLI-side file-based prompt flag (which does not exist today) -- a
+        # `read` builtin would still land the prompt in one argv-sized shell word to hand `-p`, so
+        # it would hit the identical ceiling, not raise it; that is not an upgrade path, just a
+        # different way to write the same failure.
         wrapper_path = f"{scratch_prefix}.cmd.sh"
         wrapper_script = _build_copilot_wrapper_script(argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS)
         await write_scratch_file(provider, self.thread_id, wrapper_path, wrapper_script)
@@ -651,17 +674,23 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
 
 
 def secret_env_names() -> set[str]:
-    """Env var names the sandbox container must already have set for this provider's CLI to
-    authenticate -- unchanged from what the old SDK-server implementation already relied on
-    (COPILOT_SDK_AUTH_TOKEN/COPILOT_CONNECTION_TOKEN gate the now-retired `copilot --server`
-    process per entrypoint.sh; GITHUB_TOKEN is the underlying PAT that copilot_auth_token itself
-    threads through, per sandbox/provider.py's provision() docstring).
+    """Names to redact from this turn's own shell output via --secret-env-vars (see
+    _agenerate_inner) -- a masking/redaction list, NOT a declaration of what actually authenticates
+    the CLI (fix-round-1 correction: the docstring here previously conflated the two). If the
+    wrapped shell command a turn runs happens to echo one of these names' value, the CLI scrubs it
+    from its own output; nothing here sets or reads any of these values itself.
 
-    Also fed straight into every turn's own --secret-env-vars flag (see _agenerate_inner) so the
-    CLI can redact these values from its own output if the wrapped shell command happens to echo
-    one of them.
+    COPILOT_GITHUB_TOKEN is the one that matters today -- sandbox/provider.py's provision()
+    docstring and local_docker.py/azure_aci.py are what actually write the real secret there.
+    COPILOT_SDK_AUTH_TOKEN/COPILOT_CONNECTION_TOKEN gated the now-retired `copilot --server`
+    process (per entrypoint.sh's own history) and are never set by anything anymore; GITHUB_TOKEN
+    is listed defensively even though this codebase deliberately no longer sets it for Copilot's
+    sandbox env (task-12b fix-round-1: a plain GITHUB_TOKEN is also read ambiently by `gh`/git/npm
+    inside the sandbox, which is exactly what COPILOT_GITHUB_TOKEN avoids). All four are harmless
+    to list even when unset -- redacting a name that never appears in the output is a no-op, not an
+    error.
     """
-    return {"COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "GITHUB_TOKEN"}
+    return {"COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN"}
 
 
 def _demo() -> None:
@@ -738,7 +767,12 @@ def _demo() -> None:
     asyncio.run(close_thread_session(survivor))
     assert not [k for k in _session_ids if k.startswith(f"{survivor}:")], "close_thread_session did not evict"
 
-    assert secret_env_names() == {"COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "GITHUB_TOKEN"}
+    assert secret_env_names() == {
+        "COPILOT_SDK_AUTH_TOKEN",
+        "COPILOT_CONNECTION_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "GITHUB_TOKEN",
+    }
 
     # read_skill_invocations must fail open unconditionally (module docstring) -- None args are
     # safe here because the function never touches them, by contract.

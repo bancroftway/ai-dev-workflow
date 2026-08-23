@@ -22,7 +22,7 @@
 #
 # Ordering note (plan Section C.4): once devcontainer.json onCreateCommand/postCreateCommand
 # support lands, it must run strictly after step 1's credential material is already gone and
-# strictly before the active provider's own credential (GITHUB_TOKEN or ANTHROPIC_API_KEY,
+# strictly before the active provider's own credential (COPILOT_GITHUB_TOKEN or ANTHROPIC_API_KEY,
 # whichever AGENT_PROVIDER selects) is relied upon by anything -- an untrusted repo's own
 # postCreateCommand runs with the same privileges as this script.
 set -euo pipefail
@@ -191,14 +191,21 @@ if [[ "$AGENT_PROVIDER" == "claude" ]]; then
          "but any session creation will fail auth" >&2
   fi
 else
-  # GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B / task-12b): this warning
-  # used to check the old SDK-server process's env var, which the real `copilot` CLI (v1.0.79)
-  # never reads at all -- it reads GITHUB_TOKEN (see local_docker.py/azure_aci.py's own fix for
-  # the same root cause). Left checking the old name, this warning would stay silent on a
-  # genuinely-empty GITHUB_TOKEN and could fire falsely if COPILOT_SDK_AUTH_TOKEN alone were ever
-  # set -- same symptom as the bug itself, not a separate one.
-  if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-    echo "entrypoint: WARNING -- GITHUB_TOKEN is empty; the copilot runtime will start" \
+  # COPILOT_GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B) and not plain
+  # GITHUB_TOKEN either (task-12b fix-round-1): this warning used to check the old SDK-server
+  # process's env var, which the real `copilot` CLI (v1.0.79) never reads at all -- it reads
+  # COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN (see local_docker.py/azure_aci.py's own fix for the
+  # same root cause). COPILOT_GITHUB_TOKEN specifically, not plain GITHUB_TOKEN: `gh` (installed in
+  # this image) and git credential helpers auto-authenticate from a plain GITHUB_TOKEN/GH_TOKEN
+  # with zero extra config, which would silently hand the shared fleet PAT to `gh`/git/any
+  # repo-supplied script under a turn already running --no-ask-user -- exactly the ambient
+  # long-lived credential exposure this image's own credential handling elsewhere (the one-shot git
+  # token file above, destroyed before repo content runs) is designed to avoid. Left checking a
+  # stale name, this warning would stay silent on a genuinely-empty COPILOT_GITHUB_TOKEN and could
+  # fire falsely if some other name alone were ever set -- same symptom as the bug itself, not a
+  # separate one.
+  if [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]]; then
+    echo "entrypoint: WARNING -- COPILOT_GITHUB_TOKEN is empty; the copilot runtime will start" \
          "but any session creation will fail auth" >&2
   fi
 fi

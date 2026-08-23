@@ -153,7 +153,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
     ) -> SandboxSession:
         # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
         # a module-scope import here would cycle. Needed only to pick which of
-        # GITHUB_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
+        # COPILOT_GITHUB_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
         # (wait_for_cli_ready) no longer branches on this.
         from ..chat_model import PROVIDER
 
@@ -218,16 +218,24 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 # on provider itself -- the sandbox-image entrypoint is what picks which one it
                 # actually needs. Harmless unused env either way.
                 #
-                # GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B / task-12b):
-                # the real Copilot CLI's own `copilot help environment` documents GITHUB_TOKEN (or
-                # GH_TOKEN/COPILOT_GITHUB_TOKEN) as what it actually reads for auth -- confirmed
-                # empirically too (setting GITHUB_TOKEN to any nonempty value moves the CLI's own
+                # COPILOT_GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B) and
+                # not plain GITHUB_TOKEN either (task-12b fix-round-1): the real Copilot CLI's own
+                # `copilot help environment` documents COPILOT_GITHUB_TOKEN, GH_TOKEN, and
+                # GITHUB_TOKEN (in that precedence order) as what it reads for auth -- confirmed
+                # empirically too (setting any of the three to a nonempty value moves the CLI's own
                 # error past "no auth found" into real token-format validation; COPILOT_SDK_AUTH_TOKEN
-                # never does anything). COPILOT_SDK_AUTH_TOKEN was the correct name only for the old
-                # SDK-based `copilot --server` process (see copilot_chat_model.py's module
-                # docstring) -- Task 3 fully retired that process, and this line is the one place
-                # that never got updated to match (mirrors local_docker.py's identical fix).
-                f"GITHUB_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
+                # never does anything). COPILOT_GITHUB_TOKEN specifically (not plain GITHUB_TOKEN)
+                # because `gh` is installed in this image (sandbox-image/Dockerfile) and
+                # auto-authenticates from a plain GITHUB_TOKEN/GH_TOKEN with zero extra config -- so
+                # would git credential helpers and any repo-supplied build/postinstall script that
+                # opportunistically reads GITHUB_TOKEN, all silently as the shared fleet PAT, under
+                # a turn already running --no-ask-user. That is exactly the ambient-long-lived-
+                # credential pattern this class's own provision() docstring says to avoid.
+                # COPILOT_SDK_AUTH_TOKEN was the correct name only for the old SDK-based
+                # `copilot --server` process (see copilot_chat_model.py's module docstring) --
+                # Task 3 fully retired that process, and this line is the one place that never got
+                # updated to match (mirrors local_docker.py's identical fix).
+                f"COPILOT_GITHUB_TOKEN={runtime_auth_token if PROVIDER == 'copilot' else ''}",
                 f"ANTHROPIC_API_KEY={runtime_auth_token if PROVIDER == 'claude' else ''}",
             ]
             if self._location:

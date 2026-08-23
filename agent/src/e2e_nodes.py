@@ -677,7 +677,7 @@ async def _boot_process(
         # setsid: the app becomes its own process-group leader, so teardown can kill the WHOLE
         # group. Killing the recorded pid alone left the real server (a child of the sh wrapper)
         # running -- which is how a previous attempt's dev server survived to hold port 3000.
-        f"env -u COPILOT_SDK_AUTH_TOKEN -u COPILOT_CONNECTION_TOKEN -u GITHUB_TOKEN "
+        f"env -u COPILOT_SDK_AUTH_TOKEN -u COPILOT_CONNECTION_TOKEN -u COPILOT_GITHUB_TOKEN -u GITHUB_TOKEN "
         f"{_DEBUG_BOOT_ENV} "
         f"setsid nohup sh -c {shlex.quote(command)} > {shlex.quote(log_path)} 2>&1 & "
         f"echo $! > {shlex.quote(pid_path)}",

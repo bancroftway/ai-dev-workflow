@@ -80,12 +80,18 @@ class SandboxProvider(abc.ABC):
         recomputed here) -- passed straight through as the sandbox's WORK_BRANCH env var.
         runtime_auth_token is the active provider's own secret -- the shared Copilot PAT
         (agent/src/graph.py's GITHUB_TOKEN) or an Anthropic API key, whichever chat_model.PROVIDER
-        currently selects -- written into the sandbox as GITHUB_TOKEN or ANTHROPIC_API_KEY (never
-        both real) for its own coding-agent CLI to authenticate with. (Was documented here as
-        COPILOT_SDK_AUTH_TOKEN, the correct name only for the old, fully-retired SDK-based
+        currently selects -- written into the sandbox as COPILOT_GITHUB_TOKEN or ANTHROPIC_API_KEY
+        (never both real) for its own coding-agent CLI to authenticate with. (Was documented here
+        as COPILOT_SDK_AUTH_TOKEN, the correct name only for the old, fully-retired SDK-based
         `copilot --server` process -- task-12-report.md BUG B / task-12b traced this docstring as
         the design doc for what turned out to be a real defect in local_docker.py/azure_aci.py's
-        own env-var name, now fixed to match what the real Copilot CLI actually reads.)
+        own env-var name. Fixed once to plain GITHUB_TOKEN, per the real Copilot CLI's own
+        documented env vars -- then corrected again, same task's fix-round-1, to
+        COPILOT_GITHUB_TOKEN specifically: `gh`, git credential helpers, and any repo-supplied
+        script all read a plain GITHUB_TOKEN ambiently with zero extra config, which would silently
+        hand the shared fleet PAT to arbitrary repo-supplied tooling running under --no-ask-user.
+        COPILOT_GITHUB_TOKEN authenticates the same CLI identically -- it is one of the same three
+        documented names -- without that ambient exposure.)
         """
 
     @abc.abstractmethod
