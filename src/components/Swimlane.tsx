@@ -2,7 +2,7 @@
 
 import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { ViewContainer } from "@/components/ViewContainer";
-import { formatDuration, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
+import { formatDuration, parseEventTs, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
 
 /**
  * Wall-clock swimlane -- Part 2 Task 9. Two lanes over one real time axis, built from the same
@@ -32,9 +32,8 @@ import { formatDuration, toolNameOf, useRunEvents, type RunLogEvent } from "@/li
 /** One node's real execution span. `startTs`/`endTs` are epoch-ms, both from real DB-assigned
  * `ts` values -- never fabricated. Either end can be missing:
  *  - `startTs == null`: a NODE_FINISHED with no matching NODE_STARTED -- real for every event
- *    recorded before this task's graph.py change (or a future event from an untouched node, e.g.
- *    verify_fix_node/"fix", which still emits no RunEvent of any kind -- see task-9-report.md).
- *    Rendered as a point marker, not a bar with a guessed start.
+ *    recorded before this task's graph.py change (draft/audit/verify/fix all emit both now, per
+ *    Ruling 12). Rendered as a point marker, not a bar with a guessed start.
  *  - `endTs == null`: a NODE_STARTED with no NODE_FINISHED yet -- the node is either still running
  *    or crashed before reaching it (a real, legitimate outcome, e.g. draft_node's infra-exhausted
  *    escalate branch, which returns before its own NODE_FINISHED). Rendered as an open-ended bar,
@@ -73,8 +72,8 @@ function buildNodeSpans(events: RunLogEvent[]): NodeSpan[] {
         key: `${key}|${e.seq}`,
         stage: e.stage,
         node: e.node,
-        startTs: start ? new Date(start.ts).getTime() : null,
-        endTs: new Date(e.ts).getTime(),
+        startTs: start ? parseEventTs(start.ts) : null,
+        endTs: parseEventTs(e.ts),
         summary: e.summary,
       });
       if (start) openStarts.delete(key);
@@ -87,7 +86,7 @@ function buildNodeSpans(events: RunLogEvent[]): NodeSpan[] {
       key: `${key}|${start.seq}|open`,
       stage: start.stage,
       node: start.node,
-      startTs: new Date(start.ts).getTime(),
+      startTs: parseEventTs(start.ts),
       endTs: null,
       summary: start.summary,
     });
@@ -100,7 +99,7 @@ function buildToolTicks(events: RunLogEvent[]): ToolTick[] {
     .filter((e) => e.type === "tool_call")
     .map((e) => ({
       key: `${e.run_id}|${e.seq}`,
-      ts: new Date(e.ts).getTime(),
+      ts: parseEventTs(e.ts),
       name: toolNameOf(e),
       stage: e.stage,
       summary: e.summary,
@@ -111,10 +110,15 @@ function buildToolTicks(events: RunLogEvent[]): ToolTick[] {
 // same border-300/bg-50 shading MetricsBar.tsx's CHIP_CLASS already uses for green/amber/red --
 // "blue" here follows that identical formula rather than inventing a new one; this app's real
 // palette (grep-confirmed) never uses anything outside red/blue/amber/emerald/neutral/green.
+// "fix" (verify_fix_node, Ruling 12) gets "green" -- a real, separately-used family from
+// "emerald" (already claimed by verify) -- rather than "red", which this app's own DOT_CLASS/
+// CHIP_CLASS convention reserves for error/failure states verify_fix_node's normal operation is
+// not.
 const NODE_COLOR: Record<string, { bg: string; border: string; text: string }> = {
   draft: { bg: "bg-blue-100", border: "border-blue-400", text: "text-blue-900" },
   audit: { bg: "bg-amber-100", border: "border-amber-400", text: "text-amber-900" },
   verify: { bg: "bg-emerald-100", border: "border-emerald-400", text: "text-emerald-900" },
+  fix: { bg: "bg-green-100", border: "border-green-400", text: "text-green-900" },
 };
 const DEFAULT_NODE_COLOR = { bg: "bg-neutral-200", border: "border-neutral-400", text: "text-neutral-900" };
 
@@ -133,7 +137,7 @@ function formatClock(ts: number): string {
  * window when there is no data yet, and pads a single-instant range (one event, or several sharing
  * one ts), so scaleX below never divides by zero. */
 function computeFullRange(events: RunLogEvent[]): [number, number] {
-  const timestamps = events.map((e) => new Date(e.ts).getTime()).filter((t) => !Number.isNaN(t));
+  const timestamps = events.map((e) => parseEventTs(e.ts)).filter((t) => !Number.isNaN(t));
   if (timestamps.length === 0) {
     const now = Date.now();
     return [now - 60_000, now];
@@ -372,6 +376,7 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
         <LegendSwatch className="border-blue-400 bg-blue-100" label="draft" />
         <LegendSwatch className="border-amber-400 bg-amber-100" label="audit" />
         <LegendSwatch className="border-emerald-400 bg-emerald-100" label="verify" />
+        <LegendSwatch className="border-green-400 bg-green-100" label="fix" />
         <LegendSwatch className="rounded-full border-neutral-500 bg-neutral-400" label="tool call" />
         <span className="text-neutral-400">dashed = still running/no finish recorded &middot; diamond = point only, no start recorded</span>
       </div>

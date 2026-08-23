@@ -29,6 +29,24 @@ export interface RunLogEvent {
   token_usage: Record<string, unknown> | null;
 }
 
+/** `RunLogEvent.ts` arrives as a real UTC instant (`dbo.run_events.ts` is SYSUTCDATETIME-assigned,
+ * run_event_store.py) but serialized with NO "Z"/offset suffix (confirmed against the real
+ * backend response: `"2026-08-23T22:26:03"`, not `"...03Z"` -- FastAPI's default encoding of a
+ * naive-but-semantically-UTC `datetime`). Per the ECMAScript Date Time String spec, a date-TIME
+ * string with no offset parses as the *browser's local* time zone, not UTC -- so a bare
+ * `new Date(e.ts)` silently reads a UTC value as local, shifting every absolute clock reading by
+ * the viewer's own UTC offset (0 on a UTC-local dev box, which is why this stayed unnoticed until
+ * Swimlane.tsx -- Part 2 Task 9 -- became the first consumer to render an absolute clock label;
+ * EventLogView's own `computeDurations` only ever subtracts two equally-shifted values, which
+ * cancels the error). Appending "Z" before parsing (only when not already offset-qualified, so a
+ * future backend change to include one doesn't get double-corrected) is the fix -- applied once
+ * here rather than at each of the 6 call sites across EventLogView.tsx/Swimlane.tsx that parse a
+ * `.ts` string. */
+export function parseEventTs(ts: string): number {
+  const qualified = /Z$|[+-]\d\d:?\d\d$/.test(ts) ? ts : `${ts}Z`;
+  return new Date(qualified).getTime();
+}
+
 function mergeEvents(prev: RunLogEvent[], incoming: RunLogEvent[]): RunLogEvent[] {
   const bySeq = new Map(prev.map((e) => [e.seq, e]));
   for (const e of incoming) bySeq.set(e.seq, e);

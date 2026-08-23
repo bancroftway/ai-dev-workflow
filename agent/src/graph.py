@@ -2344,6 +2344,25 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
         if not reasons:
             return {}
 
+        # Durable + live NODE_STARTED (Part 2 Task 9 run-visibility, Ruling 12) -- same pattern as
+        # make_draft_node/make_audit_node's identical blocks, placed after the only early-return
+        # above so it only ever fires on the path that reaches this node's own NODE_FINISHED below.
+        # Unlike make_verify_node (a deterministic script, no LLM), this node genuinely calls the
+        # model (see model.ainvoke below) -- same "real work" shape as draft/audit, just missing
+        # its own lifecycle pair until now. Fails soft, same two-call pattern as every other
+        # RunEvent site in this file.
+        if sandbox_registry.get(thread_id) is not None:
+            start_event = RunEvent(
+                run_id=state.get("run_id", "unknown"),
+                session_id=thread_id,
+                type=RunEventType.NODE_STARTED,
+                stage=stage_spec.key,
+                node="fix",
+                summary="fix started",
+            )
+            start_event = await run_event_store.append_event(start_event)
+            await run_event_stream.emit_live(start_event, config)
+
         model = get_chat_model_for_thread(
             thread_id,
             stage_spec.key,
@@ -2383,6 +2402,21 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             await git_ops.commit_all(
                 get_sandbox_provider(), thread_id, f"ai-dev-workflow: {stage_spec.key} conformance fixes"
             )
+            # Durable + live NODE_FINISHED (Part 2 Task 9 run-visibility, Ruling 12) -- pairs with
+            # NODE_STARTED above. token_usage=model._last_usage included, unlike make_verify_node's
+            # NODE_FINISHED, because this genuinely is an LLM call (mirrors draft/audit's own
+            # NODE_FINISHED shape, not verify's no-LLM one).
+            run_event = RunEvent(
+                run_id=state.get("run_id", "unknown"),
+                session_id=thread_id,
+                type=RunEventType.NODE_FINISHED,
+                stage=stage_spec.key,
+                node="fix",
+                summary="fix applied",
+                token_usage=model._last_usage,
+            )
+            run_event = await run_event_store.append_event(run_event)
+            await run_event_stream.emit_live(run_event, config)
         return {}
 
     return verify_fix_node

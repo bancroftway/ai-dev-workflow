@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Chip } from "@/components/MetricsBar";
 import { DiffView, looksLikeDiff } from "@/components/DiffView";
 import { ViewContainer } from "@/components/ViewContainer";
-import { formatDuration, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
+import { formatDuration, parseEventTs, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
 
 /**
  * Folding tool-call-row event log -- Part 2 Task 8. Standalone/reusable on purpose (brief's own
@@ -70,7 +70,7 @@ function computeDurations(events: RunLogEvent[]): Map<number, number> {
     } else if (e.type === "node_finished") {
       const start = openStarts.get(key);
       if (start) {
-        const ms = new Date(e.ts).getTime() - new Date(start.ts).getTime();
+        const ms = parseEventTs(e.ts) - parseEventTs(start.ts);
         if (ms >= 0) durations.set(e.seq, ms);
         openStarts.delete(key);
       }
