@@ -89,6 +89,12 @@ def _stage_file(stage_key: str, kind: str) -> str:
 TECH_STACK_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'approved.json')}"
 TECH_STACK_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'draft.json')}"
 
+# Same "one truth, derived from the numbering" reasoning as the tech-stack constants above --
+# graph.py's plan-stage ticket-mode hydrate hook (Task 7a) reads this to detect an earlier ticket's
+# approved Implementation Plan for this same project, independent of whatever this run's own
+# in-memory stages["plan"] happens to hold.
+PLAN_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('plan', 'approved.json')}"
+
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
     return await repo_files.read_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}")
@@ -279,6 +285,7 @@ def _demo() -> None:
     # name while persistence wrote the numbered one, so branches carried BOTH files.
     assert TECH_STACK_APPROVED_PATH == f"{WORKFLOW_DIR}/02-tech-stack.approved.json"
     assert TECH_STACK_DRAFT_PATH == f"{WORKFLOW_DIR}/02-tech-stack.draft.json"
+    assert PLAN_APPROVED_PATH == f"{WORKFLOW_DIR}/04-plan.approved.json"
 
     # Padding must keep lexical order == execution order; a bare str(n) breaks at 10 stages.
     names = [_stage_file(k, "md") for k in _STAGE_ORDER]

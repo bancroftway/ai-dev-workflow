@@ -20,9 +20,12 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 | `specification_ticket_mode_segment.md` | specification | ticket-mode: expand the existing ledger baseline, scoped to this ticket, instead of a from-scratch read |
 | `plan_draft.md` / `plan_audit.md` | plan | implementation plan, diagrams, wireframes |
 | `plan_greenfield_segment.md` | plan | greenfield: scaffold-first milestone segment |
+| `plan_ticket_mode_segment.md` | plan | ticket-mode: extend the existing approved Plan baseline, scoped to this ticket, instead of a from-scratch read |
 | `ac_to_tests_draft.md` | ac-to-tests | acceptance criteria → failing tests |
 | `ac_to_tests_greenfield_segment.md` | ac-to-tests | greenfield: test-scaffolding-only segment (app may not exist yet) |
+| `ac_to_tests_ticket_mode_segment.md` | ac-to-tests | ticket-mode: scope test-writing to this ticket's own ACs, not the ledger's whole-project active list |
 | `minimal_code_to_green_draft.md` / `minimal_code_to_green_audit.md` | minimal-code-to-green | minimal code to pass tests |
+| `minimal_code_to_green_brownfield_segment.md` | minimal-code-to-green | brownfield: extend this repo's existing code conventions instead of assuming a blank repo |
 | `quality_remediation_triage.md` | quality-remediation | fix/suppress decision per quality finding |
 | `quality_remediation_fix.md` | quality-remediation | apply fixes + suppression markers |
 | `security_remediation_triage.md` | security-remediation | fix/suppress decision per security finding |

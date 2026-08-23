@@ -90,6 +90,35 @@ async def hydrate_ticket_mode_context(
     return {"ticket_mode_baseline": True} if entries else None
 
 
+async def hydrate_ac_to_tests_ticket_mode_context(
+    thread_id: str, state: "GraphState", provider: SandboxProvider
+) -> dict[str, Any] | None:
+    """StageSpec.draft_prompt_context_from_repo_file for the ac-to-tests stage.
+
+    hydrate_ticket_mode_context's own sibling, but a coarser "the ledger has entries" check is
+    wrong here: by the time ac-to-tests drafts, THIS ticket's own specification stage has already
+    run sync_ledger and populated the ledger with its own ACs, so "entries exist" is trivially true
+    even on a project's very first ticket. What actually matters is whether the ledger holds any
+    ACTIVE Acceptance Criterion this ticket's own approved Specification doesn't itself list --
+    i.e. a genuine multi-ticket project, not a first pass.
+
+    Returns None (no extra segment) when every active ledger AC belongs to this ticket's own
+    Specification. Never short-circuits drafting -- see draft_prompt_context_from_repo_file's own
+    docstring on StageSpec; ac-to-tests still writes real tests for its own ACs either way, this
+    only tells it not to also chase every other ticket's."""
+    entries = await load_ledger(provider, thread_id)
+    ledger_ac_ids = {
+        e["id"] for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") in ("active", "revised")
+    }
+    specification = (state.get("stages") or {}).get("specification", {}).get("approved_content") or {}
+    own_ac_ids = {
+        ac.get("id")
+        for story in (specification.get("user_stories") or [])
+        for ac in (story.get("acceptance_criteria") or [])
+    }
+    return {"ticket_mode_baseline": True} if (ledger_ac_ids - own_ac_ids) else None
+
+
 def _next_us_number(entries: list[dict[str, Any]]) -> int:
     numbers = [int(e["id"].split("-")[1]) for e in entries if e.get("kind") == "user_story"]
     return (max(numbers) + 1) if numbers else 1
@@ -382,6 +411,51 @@ def _demo() -> None:
     result3 = sync_ledger([dict(e) for e in seed], [], "run-4", retired_ac_ids=["US-9999.9"])
     assert not result3.passed
     assert "US-9999.9" in result3.reasons[0]
+
+    # hydrate_ac_to_tests_ticket_mode_context (Task 7a): cache hit vs. cache miss actually changes
+    # its answer, not just that it runs. A minimal duck-typed fake stands in for SandboxProvider --
+    # load_ledger only ever calls .exec_in_sandbox on it (via repo_files.read_repo_file).
+    import asyncio
+
+    class _FakeReadResult:
+        def __init__(self, ok: bool, stdout: str = "") -> None:
+            self.ok = ok
+            self.stdout = stdout
+
+    class _FakeProvider:
+        def __init__(self, files: dict[str, str]) -> None:
+            self._files = files
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str):  # noqa: ANN201
+            for path, content in self._files.items():
+                if path in command:
+                    return _FakeReadResult(True, content)
+            return _FakeReadResult(False)
+
+    own_spec = {"user_stories": [{"acceptance_criteria": [{"id": "US-0002.1"}]}]}
+    ticket_state = {"stages": {"specification": {"approved_content": own_spec}}}
+
+    # MISS: every active ledger AC belongs to this ticket's own Specification (a first-ever
+    # ticket, or a solo project) -- no reframe needed.
+    ledger_only_own = json.dumps({"entries": [{"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"}]})
+    assert asyncio.run(
+        hydrate_ac_to_tests_ticket_mode_context("t", ticket_state, _FakeProvider({LEDGER_PATH: ledger_only_own}))
+    ) is None
+
+    # HIT: the ledger has an earlier ticket's AC too -- a genuine multi-ticket project.
+    ledger_with_other_ticket = json.dumps(
+        {
+            "entries": [
+                {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+                {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"},
+            ]
+        }
+    )
+    assert asyncio.run(
+        hydrate_ac_to_tests_ticket_mode_context(
+            "t", ticket_state, _FakeProvider({LEDGER_PATH: ledger_with_other_ticket})
+        )
+    ) == {"ticket_mode_baseline": True}
 
     print("spec_ledger self-check: ok")
 

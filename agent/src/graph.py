@@ -334,6 +334,36 @@ PLAN_SYSTEM_PROMPT = load_prompt("plan_draft")
 
 PLAN_GREENFIELD_SEGMENT = load_prompt("plan_greenfield_segment")
 
+# Appended only when hydrate_plan_ticket_mode_context (StageSpec.draft_prompt_context_from_repo_file)
+# finds an earlier ticket's approved Plan already on disk -- spec_ledger.hydrate_ticket_mode_context's
+# own sibling for the plan stage, same reasoning, different artifact.
+PLAN_TICKET_MODE_SEGMENT = load_prompt("plan_ticket_mode_segment")
+
+
+async def hydrate_plan_ticket_mode_context(
+    thread_id: str, _state: "GraphState", provider: SandboxProvider
+) -> dict[str, Any] | None:
+    """StageSpec.draft_prompt_context_from_repo_file for the plan stage.
+
+    Signals ticket-mode framing when workflow_persistence.PLAN_APPROVED_PATH already exists on
+    disk -- an earlier ticket's approved Implementation Plan for this same project, the plan
+    stage's own analogue of spec_ledger.hydrate_ticket_mode_context (same shape, same "reframe,
+    never skip" contract -- see draft_prompt_context_from_repo_file's own docstring on StageSpec).
+
+    Deliberately reads the FILE rather than state["stages"]["plan"]["draft"]/["approved_content"]:
+    those are already surfaced to the prompt separately by _build_plan_prompt's own
+    "Your immediately-prior draft" block below, which is what actually carries a hydrated prior
+    ticket's plan content into this ticket's very first draft call (workflow_persistence.
+    hydrate_state repopulates a brand-new thread's stage state from this same repo's last commit
+    before intake_node's fresh-run reset -- see intake_node's own comments -- clears only the
+    per-run bookkeeping, not the content fields). This hook's only job is deciding whether that
+    content should be read as "your own abandoned draft" (a first ticket's ordinary retry) or "the
+    project's existing architecture to extend" (a later ticket) -- exactly the ambiguity
+    PLAN_TICKET_MODE_SEGMENT resolves.
+    """
+    raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.PLAN_APPROVED_PATH)
+    return {"ticket_mode_baseline": True} if raw is not None else None
+
 
 def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
@@ -383,6 +413,12 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
         messages.append(HumanMessage(content=PLAN_GREENFIELD_SEGMENT))
     if _tech_stack_has_ui_framework(state):
         messages.append(HumanMessage(content=IMPECCABLE_PLAN_SEGMENT))
+    # Not a StageState field -- only ever present on the prompt-only stage copy make_draft_node
+    # builds from StageSpec.draft_prompt_context_from_repo_file's return (see
+    # hydrate_plan_ticket_mode_context's own docstring). Absent, hence falsy, on every other call
+    # path (including this function's own direct callers in tests).
+    if plan_stage.get("ticket_mode_baseline"):
+        messages.append(HumanMessage(content=PLAN_TICKET_MODE_SEGMENT))
     if plan_stage["draft"] is not None:
         messages.append(
             HumanMessage(content=f"Your immediately-prior draft (JSON):\n{plan_stage['draft']}")
@@ -620,6 +656,13 @@ AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft").replace(
 
 AC_TO_TESTS_GREENFIELD_SEGMENT = load_prompt("ac_to_tests_greenfield_segment")
 
+# Appended only when spec_ledger.hydrate_ac_to_tests_ticket_mode_context (StageSpec.
+# draft_prompt_context_from_repo_file) finds ledger ACs beyond this ticket's own approved
+# Specification -- a genuine multi-ticket project, not merely "the ledger has entries" (which is
+# trivially true by ac-to-tests time even on a project's first-ever ticket, since specification's
+# own sync_ledger run just populated it moments before).
+AC_TO_TESTS_TICKET_MODE_SEGMENT = load_prompt("ac_to_tests_ticket_mode_segment")
+
 
 def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
     spec_stage = state["stages"]["specification"]
@@ -632,6 +675,10 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
     ]
     if tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=AC_TO_TESTS_GREENFIELD_SEGMENT))
+    # Not a StageState field -- see hydrate_plan_ticket_mode_context's docstring for the general
+    # shape (this stage's own copy lives in spec_ledger.hydrate_ac_to_tests_ticket_mode_context).
+    if stage.get("ticket_mode_baseline"):
+        messages.append(HumanMessage(content=AC_TO_TESTS_TICKET_MODE_SEGMENT))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
     if stage.get("last_verification"):
@@ -645,6 +692,16 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
 MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_draft")
 
 MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_audit")
+
+# Brownfield counterpart of PLAN_GREENFIELD_SEGMENT/AC_TO_TESTS_GREENFIELD_SEGMENT, gated on the
+# SAME tech_stack_signals.is_greenfield_repo() app-scan signal those two already use (deliberately
+# NOT a new StageSpec.draft_prompt_context_from_repo_file hook: that would be a second, independent
+# repo scan re-answering the exact question app_discovery_pre_node already computed once per run
+# for every other stage that needs it -- see is_greenfield_repo's own docstring). This stage was
+# the one of the three still missing either half of the greenfield/brownfield pair: Plan and
+# ac-to-tests both already frame the greenfield case, but nothing told minimal-code-to-green the
+# repo already has code and conventions worth extending on a brownfield/later-ticket run.
+MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT = load_prompt("minimal_code_to_green_brownfield_segment")
 
 
 def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
@@ -660,6 +717,8 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
     ]
     if _tech_stack_has_ui_framework(state):
         messages.append(HumanMessage(content=IMPECCABLE_CODEGEN_SEGMENT))
+    if not tech_stack_signals.is_greenfield_repo(state):
+        messages.append(HumanMessage(content=MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior iteration (JSON):\n{stage['draft']}"))
     if stage.get("last_verification"):
@@ -1054,6 +1113,7 @@ STAGES: list[StageSpec] = [
         render_markdown=render_plan_markdown,
         sign_approval=True,
         deterministic_verify=verify_plan_diagrams,
+        draft_prompt_context_from_repo_file=hydrate_plan_ticket_mode_context,
         # Wireframes are LLM-emitted self-contained HTML validated by verify_plan_diagrams -- no
         # MCP servers needed (Excalidraw MCP deleted: never spike-tested, fetched unpinned
         # `npx -y mcp-excalidraw` at runtime, and had no export path). The UI-repo branch keeps
@@ -1084,6 +1144,7 @@ STAGES: list[StageSpec] = [
         requires_human_gate=False,
         capture_baseline_commit=True,
         deterministic_verify=verify_ac_to_tests,
+        draft_prompt_context_from_repo_file=spec_ledger.hydrate_ac_to_tests_ticket_mode_context,
         # Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block --
         # the model returns a fully-detailed coverage_plan claiming it "created failing RED-phase
         # tests" while making zero write calls (confirmed from its own session log: glob/view/skill
@@ -3142,6 +3203,124 @@ def _demo() -> None:
         sig = _detect_verify_stall("f", "f2", None, None, rate, best)
         best = sig.new_best_coverage_rate
         assert not sig.coverage_not_improving, f"a strictly-improving rate ({rate}) must never count as a stall"
+
+    # Task 7a: the plan/ac-to-tests ticket-mode reframe hooks actually change behavior on a cache
+    # hit vs. a cache miss -- not just that they compile. A minimal duck-typed fake stands in for
+    # SandboxProvider, same pattern as chat_model.py's own self-check: read_repo_file only ever
+    # calls .exec_in_sandbox on it.
+    class _FakeReadResult:
+        def __init__(self, ok: bool, stdout: str = "") -> None:
+            self.ok = ok
+            self.stdout = stdout
+
+    class _FakeRepoFileProvider:
+        def __init__(self, files: dict[str, str]) -> None:
+            self._files = files
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str):  # noqa: ANN201
+            for path, content in self._files.items():
+                if path in command:
+                    return _FakeReadResult(True, content)
+            return _FakeReadResult(False)
+
+    # Cache MISS (no 04-plan.approved.json on disk -- project's first-ever ticket): no reframe.
+    assert asyncio.run(
+        hydrate_plan_ticket_mode_context("t", {}, _FakeRepoFileProvider({}))  # type: ignore[arg-type]
+    ) is None
+    # Cache HIT (an earlier ticket's approved plan already exists): reframe as ticket-mode.
+    assert asyncio.run(
+        hydrate_plan_ticket_mode_context(  # type: ignore[arg-type]
+            "t", {}, _FakeRepoFileProvider({workflow_persistence.PLAN_APPROVED_PATH: "{}"})
+        )
+    ) == {"ticket_mode_baseline": True}
+
+    # The hook is wired, not just correct in isolation: _build_plan_prompt actually appends
+    # PLAN_TICKET_MODE_SEGMENT when (and only when) the prompt-only stage copy carries the signal.
+    plan_demo_state = {
+        "stages": {
+            "specification": {**default_stage_state(), "approved_content": {}},
+            "plan": {**default_stage_state()},
+        },
+        "app_scan": {"candidates": [{"path": "."}]},
+    }
+    assert not any(
+        PLAN_TICKET_MODE_SEGMENT in str(m.content) for m in _build_plan_prompt(plan_demo_state)  # type: ignore[arg-type]
+    )
+    plan_demo_state["stages"]["plan"]["ticket_mode_baseline"] = True
+    assert any(
+        PLAN_TICKET_MODE_SEGMENT in str(m.content) for m in _build_plan_prompt(plan_demo_state)  # type: ignore[arg-type]
+    )
+
+    # spec_ledger.hydrate_ac_to_tests_ticket_mode_context: a coarser "the ledger has entries" check
+    # would ALWAYS fire here, even on a project's first-ever ticket (its own spec just populated
+    # the ledger moments before) -- must fire only when the ledger holds an AC beyond this ticket's
+    # own approved Specification.
+    own_spec = {"user_stories": [{"acceptance_criteria": [{"id": "US-0002.1"}]}]}
+    solo_ticket_state = {"stages": {"specification": {"approved_content": own_spec}}}
+    ledger_only_own = json.dumps(
+        {"entries": [{"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"}]}
+    )
+    assert asyncio.run(
+        spec_ledger.hydrate_ac_to_tests_ticket_mode_context(  # type: ignore[arg-type]
+            "t", solo_ticket_state, _FakeRepoFileProvider({spec_ledger.LEDGER_PATH: ledger_only_own})
+        )
+    ) is None, "a first ticket must not be reframed around other tickets' ACs that don't exist"
+
+    ledger_with_other_ticket = json.dumps(
+        {
+            "entries": [
+                {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+                {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"},
+            ]
+        }
+    )
+    assert asyncio.run(
+        spec_ledger.hydrate_ac_to_tests_ticket_mode_context(  # type: ignore[arg-type]
+            "t", solo_ticket_state, _FakeRepoFileProvider({spec_ledger.LEDGER_PATH: ledger_with_other_ticket})
+        )
+    ) == {"ticket_mode_baseline": True}, "a genuine multi-ticket project must trigger the reframe"
+
+    # Same wiring proof as plan, for _build_ac_to_tests_prompt.
+    ac_demo_state = {
+        "stages": {
+            "specification": {"approved_content": own_spec},
+            "plan": {"approved_content": {}},
+            "ac-to-tests": {**default_stage_state()},
+        },
+        "app_scan": {"candidates": [{"path": "."}]},
+    }
+    assert not any(
+        AC_TO_TESTS_TICKET_MODE_SEGMENT in str(m.content)
+        for m in _build_ac_to_tests_prompt(ac_demo_state)  # type: ignore[arg-type]
+    )
+    ac_demo_state["stages"]["ac-to-tests"]["ticket_mode_baseline"] = True
+    assert any(
+        AC_TO_TESTS_TICKET_MODE_SEGMENT in str(m.content)
+        for m in _build_ac_to_tests_prompt(ac_demo_state)  # type: ignore[arg-type]
+    )
+
+    # minimal-code-to-green's brownfield segment deliberately reuses tech_stack_signals.
+    # is_greenfield_repo directly rather than a new StageSpec hook (see
+    # MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT's own comment) -- so the "cache" here is app_scan,
+    # already computed once per run for every other stage that needs it. Same hit/miss proof.
+    mctg_demo_state = {
+        "stages": {
+            "specification": {"approved_content": {}},
+            "plan": {"approved_content": {}},
+            "ac-to-tests": {"approved_content": {}},
+            "minimal-code-to-green": {**default_stage_state()},
+        },
+        "app_scan": {},  # no candidates found == greenfield
+    }
+    assert not any(
+        MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT in str(m.content)
+        for m in _build_minimal_code_to_green_prompt(mctg_demo_state)  # type: ignore[arg-type]
+    )
+    mctg_demo_state["app_scan"] = {"candidates": [{"path": "."}]}
+    assert any(
+        MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT in str(m.content)
+        for m in _build_minimal_code_to_green_prompt(mctg_demo_state)  # type: ignore[arg-type]
+    )
 
     print("graph self-check: all assertions passed")
 
