@@ -3,10 +3,11 @@
 import { useAgent, useAttachments, useCopilotKit } from "@copilotkit/react-core/v2";
 import type { InputContent } from "@ag-ui/core";
 import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { takeHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -19,31 +20,18 @@ export function RequirementsView() {
   const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
   const [text, setText] = useState("");
-  const [mode, setMode] = useState<"edit" | "preview">("edit");
   const [submitting, setSubmitting] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const syncedRef = useRef(false);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const {
-    attachments,
-    containerRef,
-    fileInputRef,
-    handleFileUpload,
-    handleDragOver,
-    handleDragLeave,
-    handleDrop,
-    removeAttachment,
-    consumeAttachments,
-    processFiles,
-  } = useAttachments({
+  const attachmentsApi = useAttachments({
     config: {
       enabled: true,
-      accept: "image/*,application/pdf,.doc,.docx,.txt,.md",
-      maxSize: 20 * 1024 * 1024,
+      ...SHARED_ATTACHMENTS_CONFIG,
       onUploadFailed: ({ file, message }) => setUploadError(`${file.name}: ${message}`),
     },
   });
+  const { consumeAttachments, processFiles } = attachmentsApi;
 
   const state = (agent.state ?? {}) as WorkflowState;
   const rawRequirements = state.stages?.["raw-requirements"];
@@ -77,6 +65,13 @@ export function RequirementsView() {
       return;
     }
     if (!pending) return;
+    // Attachments queued on the New Ticket form travel via an in-memory handoff, not
+    // sessionStorage (new-ticket-attachment-handoff.ts explains why) -- re-fed through the same
+    // processFiles path a real file-picker/paste/drop selection uses, so they re-validate and land
+    // in this session's attachment queue exactly as if selected here. Independent of whether the
+    // text below parses: a malformed text payload shouldn't also drop attachments the user added.
+    const handoffFiles = takeHandoffAttachments(threadId);
+    if (handoffFiles.length > 0) void processFiles(handoffFiles);
     const combined = parseNewTicketHandoff(pending);
     if (combined) {
       // One-time seed from an external store (sessionStorage) into component state on mount --
@@ -88,7 +83,7 @@ export function RequirementsView() {
       setText(combined);
       syncedRef.current = true;
     }
-  }, [threadId]);
+  }, [threadId, processFiles]);
 
   // Rehydrate the textarea once from server state (e.g. after a remount),
   // without ever clobbering text the human is actively editing.
@@ -104,44 +99,6 @@ export function RequirementsView() {
   // review is open -- an enabled button there is a lie.
   const { interrupt: openInterrupt } = useOpenInterrupt();
   const disabled = text.trim().length === 0 || agent.isRunning || submitting || openInterrupt.open;
-
-  /** Pasted images upload through the normal attachment queue AND insert a markdown ref at the
-   * cursor. Each pasted file is renamed to a unique name first -- clipboard images all arrive as
-   * "image.png", and the `attachment:` ref resolves by filename, so uniqueness is what keeps two
-   * pastes from resolving to the same image. Non-image pastes (text) proceed untouched. */
-  function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
-    const images = Array.from(event.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
-    if (images.length === 0) return;
-    event.preventDefault();
-    const renamed = images.map(
-      (f, i) => new File([f], `pasted-${Date.now()}-${i + 1}.${(f.type.split("/")[1] ?? "png").split("+")[0]}`, { type: f.type }),
-    );
-    void processFiles(renamed);
-    const refs = renamed.map((f) => `![screenshot](attachment:${f.name})`).join("\n");
-    const el = textareaRef.current;
-    const start = el?.selectionStart ?? text.length;
-    const end = el?.selectionEnd ?? text.length;
-    const next = `${text.slice(0, start)}${refs}${text.slice(end)}`;
-    setText(next);
-    requestAnimationFrame(() => {
-      el?.focus();
-      el?.setSelectionRange(start + refs.length, start + refs.length);
-    });
-  }
-
-  /** Resolves attachment:<filename> refs in the preview to a renderable URL from the live
-   * attachment queue. Refs whose attachment is gone (e.g. after submit -- consumeAttachments
-   * clears the queue) render as the alt text, which is acceptable: the image itself already
-   * reached the pipeline as an InputContent part. */
-  function resolveUrl(url: string): string {
-    if (!url.startsWith("attachment:")) return url;
-    const name = decodeURIComponent(url.slice("attachment:".length));
-    const att = attachments.find((a) => a.filename === name);
-    if (!att) return "";
-    if (att.thumbnail) return att.thumbnail;
-    if (att.source.type === "data") return `data:${att.source.mimeType};base64,${att.source.value}`;
-    return att.source.value;
-  }
 
   async function handleSubmit() {
     const trimmed = text.trim();
@@ -186,79 +143,14 @@ export function RequirementsView() {
         hint="Answer by editing the requirements text below, then resubmit."
       />
 
-      <div
-        ref={containerRef}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-        className="flex min-h-0 flex-1 flex-col rounded-lg border border-neutral-300 focus-within:ring-1 focus-within:ring-neutral-400"
-      >
-        <div className="flex items-center gap-1 border-b border-neutral-200 px-2 py-1">
-          <ModeButton label="Edit" active={mode === "edit"} onClick={() => setMode("edit")} />
-          <ModeButton label="Preview" active={mode === "preview"} onClick={() => setMode("preview")} />
-        </div>
-
-        {mode === "edit" ? (
-          <textarea
-            ref={textareaRef}
-            className="min-h-[240px] w-full flex-1 resize-none p-3 text-sm outline-none"
-            placeholder="Describe your software idea... (markdown supported; paste or drag screenshots in)"
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            onPaste={handlePaste}
-            disabled={agent.isRunning || submitting}
-          />
-        ) : (
-          <div className="prose prose-sm min-h-[240px] max-w-none flex-1 overflow-y-auto p-3 [&_img]:max-h-80 [&_img]:rounded-md [&_img]:border">
-            {text.trim() ? (
-              <ReactMarkdown urlTransform={resolveUrl}>{text}</ReactMarkdown>
-            ) : (
-              <p className="text-sm text-neutral-400">Nothing to preview yet.</p>
-            )}
-          </div>
-        )}
-
-        {attachments.length > 0 && (
-          <ul className="flex flex-wrap gap-2 border-t border-neutral-200 p-2">
-            {attachments.map((att) => (
-              <li
-                key={att.id}
-                className="flex items-center gap-1.5 rounded-full border border-neutral-200 bg-neutral-50 px-2.5 py-1 text-xs text-neutral-700"
-              >
-                <span>{att.filename ?? "attachment"}</span>
-                <span className="text-neutral-400">({att.status})</span>
-                <button
-                  type="button"
-                  className="ml-0.5 text-neutral-400 hover:text-neutral-700"
-                  onClick={() => removeAttachment(att.id)}
-                  aria-label={`Remove ${att.filename ?? "attachment"}`}
-                >
-                  ×
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        <div className="flex items-center justify-between gap-2 border-t border-neutral-200 p-2">
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={handleFileUpload}
-          />
-          <button
-            type="button"
-            className="rounded-md border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-700 hover:bg-neutral-100"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={agent.isRunning || submitting}
-          >
-            Attach screenshot/document
-          </button>
-          {uploadError && <span className="text-xs text-red-600">{uploadError}</span>}
-        </div>
-      </div>
+      <AttachmentEditor
+        value={text}
+        onChange={setText}
+        attachmentsApi={attachmentsApi}
+        disabled={agent.isRunning || submitting}
+        placeholder="Describe your software idea... (markdown supported; paste or drag screenshots in)"
+        uploadError={uploadError}
+      />
 
       <div className="flex items-center justify-end gap-3">
         {openInterrupt.open && (
@@ -277,21 +169,6 @@ export function RequirementsView() {
         </button>
       </div>
     </ViewContainer>
-  );
-}
-
-function ModeButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      className={[
-        "rounded px-2 py-0.5 text-xs font-medium",
-        active ? "bg-neutral-900 text-white" : "text-neutral-500 hover:bg-neutral-100",
-      ].join(" ")}
-      onClick={onClick}
-    >
-      {label}
-    </button>
   );
 }
 

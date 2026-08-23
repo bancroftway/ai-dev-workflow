@@ -1,9 +1,12 @@
 "use client";
 
+import { useAttachments } from "@copilotkit/react-core/v2";
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { SettingsBanner } from "@/components/SettingsBanner";
+import { stashHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
 import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
 import type { CannedTechStack, TechStackCatalogResponse } from "@/lib/workflow-types";
 
@@ -55,6 +58,17 @@ export default function NewTicketPage() {
 
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  // Same shared config RequirementsView.tsx uses -- the New Ticket -> workflow-page handoff
+  // (new-ticket-attachment-handoff.ts) re-validates these attachments through that same hook on
+  // the other end, which only stays correct if both sides agree on what's acceptable.
+  const attachmentsApi = useAttachments({
+    config: {
+      enabled: true,
+      ...SHARED_ATTACHMENTS_CONFIG,
+      onUploadFailed: ({ file, message }) => setUploadError(`${file.name}: ${message}`),
+    },
+  });
 
   const [submit, setSubmit] = useState<SubmitState>({ kind: "idle" });
   // Set once POST /api/projects succeeds for a "+ New Project" submission -- a retry after a later
@@ -169,6 +183,15 @@ export default function NewTicketPage() {
       // One-shot handoff for RequirementsView.tsx: a brand-new session has no server-side draft
       // yet for its own server-state rehydrate effect to find, so title/description ride along in
       // sessionStorage (same-tab client navigation preserves it) and get consumed there once.
+      // Attachments travel separately, in memory (new-ticket-attachment-handoff.ts) rather than
+      // through sessionStorage's own much smaller size quota -- consumed last, right before the
+      // navigation that's the only thing that can ever collect it on the other end, so an earlier
+      // failure in this same try block (still retryable above) never drains the queue the user
+      // sees on screen.
+      const readyAttachments = attachmentsApi.consumeAttachments();
+      if (readyAttachments.length > 0) {
+        stashHandoffAttachments(sessionId, readyAttachments);
+      }
       sessionStorage.setItem(
         `aidw:new-ticket:${sessionId}`,
         JSON.stringify({ title: title.trim(), description: description.trim() }),
@@ -286,16 +309,18 @@ export default function NewTicketPage() {
           />
         </label>
 
-        <label className="flex flex-col gap-1">
+        <div className="flex flex-col gap-1">
           <span className="text-sm font-medium text-neutral-700">Description</span>
-          <textarea
-            className="min-h-[160px] rounded-md border border-neutral-300 px-3 py-2 text-sm"
-            placeholder="Describe what you want built. You can refine this further once the session opens."
+          <AttachmentEditor
             value={description}
-            onChange={(event) => setDescription(event.target.value)}
+            onChange={setDescription}
+            attachmentsApi={attachmentsApi}
             disabled={busy}
+            placeholder="Describe what you want built. You can refine this further once the session opens. Paste or drag screenshots in."
+            minHeightClassName="min-h-[160px]"
+            uploadError={uploadError}
           />
-        </label>
+        </div>
 
         <div className="flex items-center gap-3">
           <button
