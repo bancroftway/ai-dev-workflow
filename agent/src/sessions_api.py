@@ -482,24 +482,47 @@ async def _probe_provider_credential(provider: str, value: str) -> None:
 @org_settings_router.put("", response_model=OrgSettingsResponse)
 async def put_org_settings_endpoint(body: OrgSettingsPutRequest, request: Request) -> OrgSettingsResponse:
     """Save the org-wide active provider + credential -- but, per Ruling 3, only after proving a
-    NEWLY provided credential actually works: saved to the vault, read back, then probed against
-    the real provider API. Nothing is persisted to org_settings on a failed save/read-back/probe --
-    the previous setting stays live at chat_model.get_provider() exactly as the brief requires. A
-    `credential` of None carries the existing credential_secret_name forward untouched and
-    unrevalidated -- switching only the provider choice, or re-saving with nothing new to prove,
-    is not a new credential to test."""
+    NEWLY provided credential actually works. Fix round 1 correctness note: the probe MUST run
+    against the raw candidate BEFORE it ever touches the vault, never after writing it.
+    org_credential_vault.py's secret name is one fixed, shared slot -- get_runtime_auth_token()
+    (every real session's own credential fetch) always reads whatever is CURRENTLY in that slot,
+    with no version pinning. Writing the candidate first and validating second would mean a
+    REJECTED save still overwrites the live, previously-working credential for the window between
+    this request and the next successful save -- wrong at the credential-value layer even though
+    the org_settings DB row (checked at the previous line) stays untouched and correctly implies
+    nothing changed. So: probe first; only a passing candidate ever reaches
+    org_credential_vault.set_org_credential. No separate read-back-from-vault check afterward --
+    once the raw value has already passed the real provider's own probe, a subsequent write
+    succeeding or not is a vault-plumbing question (set_org_credential's own VaultAccessError
+    already covers that), not a credential-validity one.
+
+    A `credential` of None carries the existing credential_secret_name forward untouched and
+    unrevalidated -- but only when `provider` is not actually changing. The vault slot is
+    provider-agnostic (one fixed name for either provider's credential), so carrying last time's
+    secret into a genuinely DIFFERENT provider would silently mark the new, wrong-typed credential
+    as `credential_configured: true` with nothing having ever proven it works for that provider --
+    rejected outright below instead.
+    """
     _check_shared_secret(request)
     existing = await org_settings.get_org_settings()
     secret_name = existing.credential_secret_name if existing is not None else None
 
-    if body.credential is not None:
+    if body.credential is None:
+        if existing is not None and secret_name is not None and body.provider != existing.provider:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "switching provider requires a new credential -- the currently saved "
+                    "credential belongs to the current provider and cannot carry over"
+                ),
+            )
+    else:
         credential = body.credential.strip()
+        await _probe_provider_credential(body.provider, credential)
         try:
             secret_name = await org_credential_vault.set_org_credential(credential)
-            fetched = await org_credential_vault.get_org_credential(secret_name)
         except keyvault.VaultAccessError as exc:
             raise HTTPException(status_code=502, detail=f"org credential vault is not accessible: {exc}") from None
-        await _probe_provider_credential(body.provider, fetched)
         logger.info("org credential saved and validated for provider=%s", body.provider)
 
     await org_settings.set_org_settings(body.provider, secret_name, body.updated_by)
