@@ -41,8 +41,10 @@ from . import (
     org_settings,
     project_store,
     repo_scaffold,
+    run_event_store,
     session_store,
 )
+from .run_events import RunEvent, RunEventType
 from .sandbox import get_sandbox_provider, registry
 
 logger = logging.getLogger(__name__)
@@ -339,6 +341,66 @@ async def get_session_row(session_id: str, request: Request) -> SessionResponse:
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
     return _row_to_response(row)
+
+
+class RunEventResponse(BaseModel):
+    """The single schema-aware representation of a dbo.run_events row -- mirrors SessionResponse's
+    own convention above (the frontend never queries SQL directly). Field names/shape match
+    run_events.RunEvent verbatim (and therefore also match run_event_stream.emit_live's live AG-UI
+    CUSTOM event payload field-for-field -- both are the SAME event, just two different delivery
+    paths), so the frontend can merge a live-streamed event and a fetched-from-history one by
+    identical shape without a translation layer."""
+
+    seq: int
+    run_id: str
+    session_id: str
+    ts: datetime
+    stage: str | None
+    node: str | None
+    type: str
+    summary: str | None
+    payload: dict[str, Any] | None
+    token_usage: dict[str, Any] | None
+
+
+class SessionEventsResponse(BaseModel):
+    events: list[RunEventResponse]
+
+
+@router.get("/{session_id}/events", response_model=SessionEventsResponse)
+async def get_session_events(session_id: str, request: Request) -> SessionEventsResponse:
+    """Backs Part 2 Task 8's EventLogView: the durable-history half of run visibility (Task 2's
+    live AG-UI transport only delivers events during an ACTIVE run this browser tab is watching --
+    nothing for a finished run, or a page load/reconnect that needs to see history-so-far).
+
+    Keyed by session_id, not by first looking up the session's current run_id and calling
+    run_event_store.list_events(run_id) -- deliberately: 0006_create_run_events.sql's own column
+    comment says sessions.run_id "remints across resumes... not a stable target", confirmed in
+    session_store.touch_run (a resume with a revised title mints a genuinely new run_id), so a
+    session can accumulate more than one run_id over its lifetime and dbo.sessions only stores the
+    current one. Keying on the current run_id alone would silently drop every event from a prior
+    attempt on resume -- see run_event_store.list_events_by_session's own docstring for the full
+    reasoning. 404 (not an empty list) for an unknown session_id, matching get_session_row just
+    above, so a typo'd/foreign id can't be confused with "a real session that hasn't run yet."
+    """
+    _check_shared_secret(request)
+    row = await session_store.get_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    events = await run_event_store.list_events_by_session(session_id)
+    # Explicit field-by-field construction, NOT dataclasses.asdict(e) -- run_event_stream.py's own
+    # _json_safe_payload docstring flags exactly this gotcha: asdict() leaves a dataclass's Enum
+    # field as the enum MEMBER, not its string value, so `type=e.type.value` here mirrors that
+    # same already-established fix rather than relying on RunEventType's StrEnum-is-a-str behavior
+    # to happen to serialize correctly.
+    return SessionEventsResponse(events=[
+        RunEventResponse(
+            seq=e.seq, run_id=e.run_id, session_id=e.session_id, ts=e.ts,
+            stage=e.stage, node=e.node, type=e.type.value, summary=e.summary,
+            payload=e.payload, token_usage=e.token_usage,
+        )
+        for e in events
+    ])
 
 
 @router.delete("/{thread_id}")
@@ -1024,6 +1086,67 @@ def _demo() -> None:
         project_store.set_project_repo = original_set_repo  # type: ignore[assignment]
         _fetch_default_branch = original_fetch2
     assert find_calls == 2, f"expected exactly one retry lookup after losing the race, find_calls={find_calls}"
+
+    # get_session_events (Part 2 Task 8): real RunEvent dataclass instances (not hand-written
+    # JSON) in both of this task's real captured shapes -- Claude's correlated tool_use+result
+    # (claude_chat_model._translate_intermediate_events) and a plain node-lifecycle event
+    # (graph.py's draft_node) -- round-tripping through the route into RunEventResponse. Pins the
+    # exact gotcha this route's own comment calls out: `type` must come back the plain string
+    # "tool_call"/"node_finished", never the RunEventType member itself.
+    fake_events = [
+        RunEvent(
+            run_id="r1", session_id="44444444-4444-4444-4444-444444444444", seq=1,
+            ts=datetime(2026, 1, 1, 12, 0, 0), type=RunEventType.NODE_FINISHED,
+            stage="specification", node="draft", summary="draft ready for review",
+            payload={"readiness": True}, token_usage={"model": "m", "input_tokens": 1, "output_tokens": 1, "cost": 0.0},
+        ),
+        RunEvent(
+            run_id="r2", session_id="44444444-4444-4444-4444-444444444444", seq=2,
+            ts=datetime(2026, 1, 1, 12, 0, 5), type=RunEventType.TOOL_CALL,
+            stage="plan", node="draft", summary="tool call: Bash",
+            payload={"name": "Bash", "input": {"command": "ls"}, "result": "file.txt", "is_error": False},
+            token_usage=None,
+        ),
+    ]
+
+    async def fake_list_events_by_session(session_id: str) -> list[RunEvent]:
+        assert session_id == "44444444-4444-4444-4444-444444444444", session_id
+        return fake_events
+
+    async def fake_get_session_found(session_id: str) -> dict[str, Any] | None:
+        return {"session_id": session_id}  # get_session_events only checks this is not None
+
+    original_list_events_by_session = run_event_store.list_events_by_session
+    original_get_session = session_store.get_session
+    run_event_store.list_events_by_session = fake_list_events_by_session  # type: ignore[assignment]
+    session_store.get_session = fake_get_session_found  # type: ignore[assignment]
+    try:
+        response = asyncio.run(get_session_events("44444444-4444-4444-4444-444444444444", _FakeRequest()))  # type: ignore[arg-type]
+    finally:
+        run_event_store.list_events_by_session = original_list_events_by_session  # type: ignore[assignment]
+        session_store.get_session = original_get_session  # type: ignore[assignment]
+
+    assert len(response.events) == 2, response.events
+    assert response.events[0].type == "node_finished", response.events[0].type  # plain str, not the enum member
+    assert response.events[1].type == "tool_call", response.events[1].type
+    assert response.events[1].payload == {"name": "Bash", "input": {"command": "ls"}, "result": "file.txt", "is_error": False}, response.events[1]
+    assert response.events[1].token_usage is None, response.events[1]
+    assert response.events[0].seq == 1 and response.events[1].seq == 2, response.events
+
+    # 404 for an unknown session_id -- matches get_session_row's own contract just above (never an
+    # empty events list for "no such session," so a typo'd id can't be confused with "exists but
+    # hasn't run yet").
+    async def fake_get_session_missing(session_id: str) -> dict[str, Any] | None:
+        return None
+
+    session_store.get_session = fake_get_session_missing  # type: ignore[assignment]
+    try:
+        asyncio.run(get_session_events("does-not-exist", _FakeRequest()))  # type: ignore[arg-type]
+        raise AssertionError("get_session_events must 404 for an unknown session_id")
+    except HTTPException as exc:
+        assert exc.status_code == 404, exc.status_code
+    finally:
+        session_store.get_session = original_get_session  # type: ignore[assignment]
 
     print("sessions_api self-check: all assertions passed")
 

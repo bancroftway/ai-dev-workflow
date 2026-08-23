@@ -115,6 +115,37 @@ async def list_events(run_id: str) -> list[RunEvent]:
         return [_row_to_event(row) for row in rows]
 
 
+async def list_events_by_session(session_id: str) -> list[RunEvent]:
+    """Oldest-first, across EVERY run_id this session has ever had -- not just its current one.
+
+    Part 2 Task 8 (the new `GET /sessions/{session_id}/events` route, sessions_api.py) needs "this
+    session's full event history," and keying that by session_id rather than run_id is a deliberate
+    choice, not an arbitrary one: 0006_create_run_events.sql's own column comment spells out that
+    `sessions.run_id` "remints across resumes" -- confirmed in session_store.touch_run, which mints
+    a genuinely new run_id whenever a resume carries a revised title (`refresh_identity`) -- so a
+    session that failed, got resumed, and ran again has MORE THAN ONE run_id in its lifetime, and
+    dbo.sessions only ever stores the current one. Looking up that current run_id first and calling
+    list_events(run_id) above would silently drop every event from a prior attempt on resume -- the
+    exact durability this table exists for (outliving a torn-down sandbox) would then not actually
+    outlive a resume either. session_id, unlike run_id, is the one stable identifier a run_events
+    row always carries (NOT NULL, FK'd to dbo.sessions) for this session's entire lifetime, so
+    filtering on it directly is correct where list_events's run_id filter would not be.
+
+    Ordering by seq is still correct here for the same reason list_events's own docstring gives:
+    seq is one monotonic, table-wide IDENTITY counter, so "oldest first" holds across a session's
+    several run_ids exactly as it does within a single one -- no separate per-run_id merge/sort
+    needed.
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"SELECT {', '.join(_COLUMNS)} FROM dbo.run_events WHERE session_id = ? ORDER BY seq ASC",
+            session_id,
+        )
+        rows = await cur.fetchall()
+        return [_row_to_event(row) for row in rows]
+
+
 async def _demo() -> None:
     """Self-check against a real DB: `cd agent && uv run python -m src.run_event_store`."""
     global _get_pool  # reassigned further down (fail-soft check); must precede every use in this function
@@ -169,8 +200,12 @@ async def _demo() -> None:
             stage="specification", node="audit", summary="audit found 0 finding(s)",
             payload={"audit_findings_count": 0, "audit_skipped_infra": False},
         ))
+        # other_run_id's event is ALSO under `session_id` -- deliberately the exact real scenario
+        # list_events_by_session below exists for (a different run_id under the SAME session_id,
+        # which is exactly what a resume mints; see that function's own docstring), not just a
+        # throwaway "unrelated" fixture.
         other_run_id = uuid.uuid4().hex[:8]
-        await append_event(RunEvent(
+        other_event = await append_event(RunEvent(
             run_id=other_run_id, session_id=session_id, type=RunEventType.NODE_FINISHED,
             stage="specification", node="draft", summary="unrelated run",
         ))
@@ -179,6 +214,14 @@ async def _demo() -> None:
         assert [e.seq for e in events] == [appended.seq, second.seq], events
         assert events[1].payload == {"audit_findings_count": 0, "audit_skipped_infra": False}, events[1]
         assert events[1].token_usage is None, events[1]
+
+        # list_events_by_session (Part 2 Task 8): unlike list_events(run_id) just above (which
+        # correctly excludes other_event), list_events_by_session(session_id) must include all
+        # three events, oldest first -- proving a session's full history survives a run_id remint
+        # instead of silently losing the pre-resume attempt's events.
+        by_session = await list_events_by_session(session_id)
+        assert [e.seq for e in by_session] == [appended.seq, second.seq, other_event.seq], by_session
+        assert {e.run_id for e in by_session} == {run_id, other_run_id}, by_session
 
         # Fail-soft contract (coordinator review fix): a DB failure inside append_event must never
         # raise into the caller -- it logs a warning and hands back the original event unchanged, so
