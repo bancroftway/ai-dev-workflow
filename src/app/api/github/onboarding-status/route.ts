@@ -1,7 +1,5 @@
 import { NextResponse } from "next/server";
-import { getServerAuthToken } from "@/auth";
-import { E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
-import { getOctokit } from "@/lib/github";
+import { getOctokit, githubConnected } from "@/lib/github";
 
 /**
  * Onboarding detection (architecture plan Section A.2): presence of `.ai-dev-workflow/` on the
@@ -20,8 +18,7 @@ export async function GET(request: Request) {
     );
   }
 
-  const token = await getServerAuthToken();
-  if (!token?.accessToken && !(E2E_MODE && E2E_GITHUB_TOKEN)) {
+  if (!(await githubConnected())) {
     return NextResponse.json({ error: "github_not_connected" }, { status: 401 });
   }
 

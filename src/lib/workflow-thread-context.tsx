@@ -2,7 +2,7 @@
 
 import { createContext, useContext, type ReactNode } from "react";
 
-export const RUNTIME_AGENT_ID = "workflow";
+const RUNTIME_AGENT_ID = "workflow";
 
 interface WorkflowThreadValue {
   threadId: string;

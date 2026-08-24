@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -114,7 +114,6 @@ async def _generate_session_title(thread_id: str, raw_requirements_text: str, ru
             # Task 3b (Part 2 Ruling 10) fix-round-3: `run_id` is already this function's own
             # parameter (used above for the fallback title) -- just wasn't forwarded here.
             run_id=run_id,
-            github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("session-title", "draft", provider),
             sandbox=sandbox_registry.get(thread_id),
         )
@@ -539,7 +538,6 @@ async def _extract_tech_stack(
         "extract",
         provider=chat_provider,
         run_id=run_id,
-        github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("tech-stack", "extract", chat_provider),
         sandbox=sandbox_registry.get(thread_id),
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,

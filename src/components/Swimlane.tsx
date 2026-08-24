@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import { ViewContainer } from "@/components/ViewContainer";
 import { formatDuration, parseEventTs, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
 
@@ -258,7 +258,7 @@ function computeFullRange(events: RunLogEvent[]): [number, number] {
 
 export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
   const events = useRunEvents();
-  const containerRef = useRef<HTMLDivElement>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const [width, setWidth] = useState(0);
   const [viewRange, setViewRange] = useState<[number, number] | null>(null);
   const [dragBox, setDragBox] = useState<{ startX: number; endX: number } | null>(null);
@@ -266,16 +266,21 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
 
   // ResizeObserver's own contract fires its callback once immediately on observe() with the
   // current size, so the initial measurement comes from that first (async) invocation rather than
-  // a synchronous getBoundingClientRect() call in the effect body itself.
-  const setContainerRef = (el: HTMLDivElement | null) => {
-    containerRef.current = el;
+  // a synchronous getBoundingClientRect() call in the effect body itself. useCallback([]) keeps
+  // the ref identity stable so React only calls this on attach/detach (never per render -- an
+  // inline arrow here re-ran every render, leaking one never-disconnected observer each time);
+  // the previous observer is disconnected before a new one is created, and on detach (el = null).
+  const setContainerRef = useCallback((el: HTMLDivElement | null) => {
+    resizeObserverRef.current?.disconnect();
+    resizeObserverRef.current = null;
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
       const w = entries[0]?.contentRect.width;
       if (w) setWidth(w);
     });
     observer.observe(el);
-  };
+    resizeObserverRef.current = observer;
+  }, []);
 
   const fullRange = computeFullRange(events);
   const effectiveRange = viewRange ?? fullRange;
@@ -353,9 +358,11 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
     }
   }
 
-  const nodeSpans = buildNodeSpans(events);
-  const toolTicks = buildToolTicks(events);
-  const gateSpans = buildGateSpans(events);
+  // Memoized on [events]: renders fire at mousemove rate during a drag-zoom, and none of these
+  // depend on anything but the event list itself.
+  const nodeSpans = useMemo(() => buildNodeSpans(events), [events]);
+  const toolTicks = useMemo(() => buildToolTicks(events), [events]);
+  const gateSpans = useMemo(() => buildGateSpans(events), [events]);
   // An open span (endTs == null) has no real end yet, so it must not be hidden just because
   // viewEnd falls before some fabricated cutoff -- treated as extending indefinitely rightward
   // (Infinity) for this overlap test only; rendering below still clips its drawn width to the

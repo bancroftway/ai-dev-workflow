@@ -76,7 +76,7 @@ export function gradeHigherIsBetter(value: number, [a, b, c, d]: Thresholds4): G
   return "E";
 }
 
-export type DeltaArrow = "▲" | "▼" | "—";
+type DeltaArrow = "▲" | "▼" | "—";
 
 export interface Delta {
   arrow: DeltaArrow;

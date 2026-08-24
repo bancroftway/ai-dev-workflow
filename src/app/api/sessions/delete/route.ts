@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
+import { githubAccessToken } from "@/lib/e2e";
 import { lookupSessionWithAuthorization } from "@/lib/session-access";
 
 /**
@@ -23,7 +23,7 @@ export async function POST(request: Request) {
   }
 
   const token = await getServerAuthToken();
-  const githubToken = token?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : "");
+  const githubToken = githubAccessToken(token);
 
   const response = await agentFetch(`sessions/${encodeURIComponent(sessionId)}/delete`, {
     method: "POST",

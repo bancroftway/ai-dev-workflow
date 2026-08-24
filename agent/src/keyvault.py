@@ -22,6 +22,7 @@ Offline self-check (name mapping + env rendering): `cd agent && uv run python -m
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shlex
@@ -112,13 +113,19 @@ async def fetch_app_secrets(vault_uri: str, entra_assertion: str) -> dict[str, s
     try:
         async with _obo_credential(entra_assertion) as credential:
             async with SecretClient(vault_url=vault_uri, credential=credential) as client:
-                async for prop in client.list_properties_of_secrets():
-                    if prop.enabled is False or not prop.name:
-                        continue
-                    secret = await client.get_secret(prop.name)
-                    env_name = secret_name_to_env(prop.name)
+                # List first, then fetch the values concurrently -- N sequential get_secret round
+                # trips were the provision path's slowest serial loop. gather preserves order, so
+                # the resulting dict (collision warning included) is the same as the old loop's.
+                names = [
+                    prop.name
+                    async for prop in client.list_properties_of_secrets()
+                    if prop.enabled is not False and prop.name
+                ]
+                fetched = await asyncio.gather(*(client.get_secret(name) for name in names))
+                for name, secret in zip(names, fetched):
+                    env_name = secret_name_to_env(name)
                     if env_name in secrets:
-                        logger.warning("vault %s: secret %r collides with an earlier name after env mapping", vault_uri, prop.name)
+                        logger.warning("vault %s: secret %r collides with an earlier name after env mapping", vault_uri, name)
                     secrets[env_name] = secret.value or ""
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc

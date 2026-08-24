@@ -15,7 +15,6 @@ after quality-remediation, after security-remediation, after audit-cluster), eac
 from __future__ import annotations
 
 import logging
-import os
 import shlex
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, TypedDict
@@ -269,7 +268,6 @@ def make_fix_node(spec: RebuildSpec):
             # Task 3b (Part 2 Ruling 10) fix-round-3 -- same mechanism/fix as every other
             # graph-node call site in this task.
             run_id=state.get("run_id", "unknown"),
-            github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=model_config.get_model_name("rebuild", "draft", state["provider"]) or model_config.get_model_name("plan", "draft", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
             available_tools=[

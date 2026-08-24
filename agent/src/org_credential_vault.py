@@ -64,6 +64,26 @@ def _vault_uri() -> str:
     return uri
 
 
+# Lazily-initialized module-level SecretClient (with its own DefaultAzureCredential), shared by
+# get_org_credential/set_org_credential. Previously each call built and tore down a fresh
+# credential+client pair -- a real cost on get_org_credential's hot path (polled by the frontend's
+# settings check on every page mount/repo switch). Both azure aio classes are designed to be
+# long-lived and reused; neither is ever closed here -- they live for the process, like
+# session_store's pool. Lazy (not import-time) so importing this module never requires
+# AZURE_ORG_VAULT_URI or the azure SDKs to be present.
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        from azure.identity.aio import DefaultAzureCredential
+        from azure.keyvault.secrets.aio import SecretClient
+
+        _client = SecretClient(vault_url=_vault_uri(), credential=DefaultAzureCredential())
+    return _client
+
+
 async def get_org_credential(secret_name: str) -> str:
     """Fetches `secret_name`'s current value from the org vault under the agent's OWN standing
     identity -- no entra_assertion, no per-user exchange. Raises VaultAccessError (keyvault.py's,
@@ -73,14 +93,10 @@ async def get_org_credential(secret_name: str) -> str:
     own comment for why this matters more here than it looks).
     """
     from azure.core.exceptions import AzureError
-    from azure.identity.aio import DefaultAzureCredential
-    from azure.keyvault.secrets.aio import SecretClient
 
     async def _fetch() -> str:
-        async with DefaultAzureCredential() as credential:
-            async with SecretClient(vault_url=_vault_uri(), credential=credential) as client:
-                secret = await client.get_secret(secret_name)
-                return secret.value or ""
+        secret = await _get_client().get_secret(secret_name)
+        return secret.value or ""
 
     try:
         return await asyncio.wait_for(_fetch(), timeout=_VAULT_TIMEOUT_SECONDS)
@@ -98,13 +114,9 @@ async def set_org_credential(value: str) -> str:
     store it without needing to know the constant itself. Same standing-identity, VaultAccessError,
     and _VAULT_TIMEOUT_SECONDS-bounded contract as get_org_credential."""
     from azure.core.exceptions import AzureError
-    from azure.identity.aio import DefaultAzureCredential
-    from azure.keyvault.secrets.aio import SecretClient
 
     async def _store() -> None:
-        async with DefaultAzureCredential() as credential:
-            async with SecretClient(vault_url=_vault_uri(), credential=credential) as client:
-                await client.set_secret(ORG_CREDENTIAL_SECRET_NAME, value)
+        await _get_client().set_secret(ORG_CREDENTIAL_SECRET_NAME, value)
 
     try:
         await asyncio.wait_for(_store(), timeout=_VAULT_TIMEOUT_SECONDS)

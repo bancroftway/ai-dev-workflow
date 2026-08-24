@@ -16,7 +16,7 @@ import { createContext, useContext, useMemo, useState, type ReactNode } from "re
  *   markdown, not just approve the draft verbatim. `draftMarkdown`/`fileExisted` are tech-stack-
  *   specific (graph.py's build_interrupt_extra for that stage); undefined for every other gate.
  */
-export interface InterruptInfo {
+interface InterruptInfo {
   open: boolean;
   stage?: string;
   draft?: unknown;

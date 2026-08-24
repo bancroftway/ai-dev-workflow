@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
-import { E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
+import { githubAccessToken } from "@/lib/e2e";
 import { getOctokit } from "@/lib/github";
 
 const CONTENT_TYPE_BY_EXT: Record<string, string> = {
@@ -38,7 +38,7 @@ function notFound() {
  */
 export async function GET(request: Request) {
   const token = await getServerAuthToken();
-  const accessToken = token?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
+  const accessToken = githubAccessToken(token);
   if (!accessToken) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401, headers: HARDENED_HEADERS });
   }

@@ -746,7 +746,6 @@ async def check_ac_coverage(
         ac_ids_in_line = {ac_id for ac_id, variants in variants_by_id.items() if any(v in line for v in variants)}
         if not ac_ids_in_line:
             continue
-        lowered = line.lower()
         is_fail = _has_marker(line, _FAIL_MARKERS)
         is_pass = _has_marker(line, _PASS_MARKERS)
         for ac_id in ac_ids_in_line - decided_by_schema:

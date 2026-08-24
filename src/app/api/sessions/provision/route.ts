@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_GITHUB_ID, E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
+import { E2E_GITHUB_ID, E2E_MODE, githubAccessToken } from "@/lib/e2e";
 
 /**
  * Server-to-server proxy into the agent's sandbox provisioning endpoint (architecture plan
@@ -21,7 +21,7 @@ import { E2E_GITHUB_ID, E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
  */
 export async function POST(request: Request) {
   const token = await getServerAuthToken();
-  const accessToken = token?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
+  const accessToken = githubAccessToken(token);
   const githubId = token?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
   const userLogin = token?.login ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
   if (!accessToken || !githubId) {

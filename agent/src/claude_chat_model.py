@@ -68,7 +68,7 @@ from typing import Any, Literal
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import BaseModel, PrivateAttr
 
@@ -76,82 +76,30 @@ from . import config
 from . import run_event_store
 from . import run_event_stream
 from . import telemetry
-from .cli_agent_exec import _SCRATCH_DIR, ResumeState, classify_resume, run_turn, write_scratch_file
+from .cli_agent_exec import (
+    _RESUME_REJECTED_MARKERS,
+    _SCRATCH_DIR,
+    ResumeState,
+    SessionCache,
+    classify_resume,
+    flatten_messages_to_prompt,
+    run_turn,
+    write_scratch_file,
+)
 from .redaction import redact_text, redact_value
 from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
 
 logger = logging.getLogger(__name__)
 
-# Keyed "{thread_id}:{stage}:{role}", exactly like copilot_chat_model._sessions -- a single
-# LangGraph thread runs multiple stages, each with a draft and an audit role, and each of those
-# (stage, role) pairs is its own independent Claude CLI conversation (its own --resume chain). The
-# value is the CLI's own session_id string, nothing more -- there is no client or connection object
-# to key alongside it the way Copilot needs (see this module's own docstring for why).
-_session_ids: dict[str, str] = {}
-
-# Phase E audit C-2: per-session-key resume-continuity classification, keyed identically to
-# _session_ids ("{thread_id}:{stage}:{role}") -- see cli_agent_exec.classify_resume for the
-# tri-state RULE and the real killed-turn experiment it is built from. Absent key means "no
-# --resume has ever been attempted for this key yet", which is deliberately distinct from
-# "unknown" (attempted, and the outcome could not be confirmed) -- a fresh first turn makes no
-# continuity claim at all, so there is nothing to classify.
-_resume_states: dict[str, ResumeState] = {}
-
-# CLI error text that positively indicates a rejected resume, checked case-insensitively.
-# INFERENCE, not confirmed real: the one real killed-turn experiment this module's classify_resume
-# call is built from (fix-e3a-report.md) resumed CLEANLY -- it never triggered an actual
-# rejection, so no real Claude CLI rejection message has been captured anywhere in this codebase.
-# These are a defensible guess at plausible phrasing, not a verified fact; classify_resume's own
-# conservative default (UNKNOWN, not REJECTED, when no marker matches) means a wrong guess here
-# only under-detects REJECTED into UNKNOWN, it never mis-labels an unrelated error as a resume
-# rejection.
-_RESUME_REJECTED_MARKERS: tuple[str, ...] = (
-    "no conversation found",
-    "session not found",
-    "no such session",
-    "invalid session",
-    "unable to resume",
-)
-
-
-def _record_resume_state(session_key: str, resume_state: ResumeState) -> None:
-    """Record this turn's resume classification for `session_key`, and drop the cached session id
-    outright when it was positively REJECTED (Phase E review, Important 1).
-
-    Shared by both classification call sites in _agenerate_inner (the empty-stdout branch and the
-    main classify_resume branch) -- a dead id must never survive to be `--resume`d again: without
-    this, infra_retry's own backoff (5s then 20s) would `--resume` the SAME dead session two more
-    times before the stage escalates infra_exhausted, burning real retry budget for a session that
-    can never work again. Factored out (rather than duplicated inline at both call sites) so this
-    is directly testable without a live sandbox -- see _demo()'s own pin for the proof.
-    """
-    _resume_states[session_key] = resume_state
-    if resume_state == "rejected":
-        _session_ids.pop(session_key, None)
-
-
-def _cache_session_id(session_key: str, new_session_id: str, resume_state: ResumeState | None) -> None:
-    """Cache the CLI's returned session id for the next turn, and drop any resume-state verdict
-    that no longer describes it (Phase E review residual, on top of Important 1/Minor).
-
-    The invariant: a `_resume_states` entry must never describe a session id that is no longer the
-    one cached under this key. `classify_resume` only ever returns "resumed" when the returned id
-    equals the id that was actually asked to resume -- that is the ONE case where the verdict just
-    recorded (by `_record_resume_state`, called earlier in the same turn) is genuinely ABOUT the id
-    being cached here. Every other case reaching this function means the id about to be cached has
-    no verdict of its own yet, so any stale entry left over from whatever this key described
-    before must be cleared rather than left to mislabel a fresh, unrelated session:
-    - `resume_state is None` -- no resume was even requested this turn (e.g. the turn right after
-      a REJECTED id was popped: the next attempt starts fresh, `classify_resume` returns None by
-      contract, and without this the stale "rejected" would otherwise sit on this key forever,
-      since nothing short of a FUTURE resume attempt would ever overwrite it again).
-    - `resume_state == "unknown"` with a different returned id (a suspected silent fresh start) --
-      the verdict describes the OLD id's fate, not this new one.
-    """
-    _session_ids[session_key] = new_session_id
-    if resume_state != "resumed":
-        _resume_states.pop(session_key, None)
+# Shared session-id + resume-state cache (cli_agent_exec.SessionCache -- see its docstring for the
+# keying, eviction, and Phase E audit C-2 tri-state rules both providers used to duplicate here).
+# This module's own instance, never shared with copilot_chat_model's: evicting one provider's
+# sessions must not touch the other's. The two dict aliases below are the SAME objects as the
+# cache's own (not copies) -- chat_model._demo and this module's _demo reach them by these names.
+_session_cache = SessionCache("Claude")
+_session_ids = _session_cache.session_ids
+_resume_states = _session_cache.resume_states
 
 
 # Copilot and Claude ship disjoint tool vocabularies, so a caller's available_tools/excluded_tools
@@ -291,52 +239,44 @@ async def _messages_to_prompt(
 ) -> str:
     """Flatten a LangChain message list into a single Claude CLI prompt string.
 
-    Mirrors copilot_chat_model._messages_to_prompt's text-handling exactly (SystemMessage gets an
-    "Instructions:" prefix, everything else passes through verbatim, parts joined with a blank
-    line). Unlike that function (which still drops multimodal content -- no confirmed CLI
-    mechanism exists for Copilot, Ruling 9), a real non-text attachment part here is decoded and
-    written to its own scratch file (sharing scratch_prefix with the turn's prompt/mcp-config
-    files, so run_turn's own `rm -f {scratch_prefix}*` cleanup catches it too -- no separate
-    cleanup needed), then referenced by path in the returned prompt text -- see
-    _prepare_attachment's docstring for why a path reference, not a CLI flag, is what actually
-    works. Only a part _prepare_attachment recognizes gets this treatment; anything else (a
-    `source.type == "url"` part, the theoretical `binary` union member, an undecodable payload) is
-    still dropped with a warning exactly as before.
+    The text-flatten core is cli_agent_exec.flatten_messages_to_prompt, shared with
+    copilot_chat_model._messages_to_prompt (SystemMessage gets an "Instructions:" prefix,
+    everything else passes through verbatim, parts joined with a blank line). Unlike that provider
+    (which drops all multimodal content -- no confirmed CLI mechanism exists for Copilot, Ruling
+    9), a real non-text attachment part here is first decoded and written to its own scratch file
+    (sharing scratch_prefix with the turn's prompt/mcp-config files, so run_turn's own
+    `rm -f {scratch_prefix}*` cleanup catches it too -- no separate cleanup needed), then replaced
+    with a text part referencing that path -- see _prepare_attachment's docstring for why a path
+    reference, not a CLI flag, is what actually works. Only a part _prepare_attachment recognizes
+    gets this treatment; anything else (a `source.type == "url"` part, the theoretical `binary`
+    union member, an undecodable payload) is left for the shared flattener to drop with a warning,
+    exactly as before.
     """
-    parts: list[str] = []
+    processed: list[BaseMessage] = []
     attachment_index = 0
     for message in messages:
         content = message.content
         if isinstance(content, list):
-            text_parts: list[str] = []
-            dropped = 0
+            new_content: list[Any] = []
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    text_parts.append(str(item.get("text", "")))
+                    new_content.append(item)
                     continue
                 attachment_index += 1
                 prepared = _prepare_attachment(item, attachment_index, scratch_prefix) if isinstance(item, dict) else None
                 if prepared is None:
-                    dropped += 1
+                    new_content.append(item)  # not a decodable attachment -- the flattener drops it with a warning
                     continue
                 path, raw, label = prepared
                 await write_scratch_file(provider, thread_id, path, raw)
-                text_parts.append(label)
-            if dropped:
-                logger.warning(
-                    "dropped %d non-text content part(s) -- not a decodable data-sourced "
-                    "attachment (url-sourced or malformed)",
-                    dropped,
-                )
-            text = "\n".join(text_parts)
-        else:
-            text = str(content)
-
-        if isinstance(message, SystemMessage):
-            parts.append(f"Instructions:\n{text}")
-        else:
-            parts.append(text)
-    return "\n\n".join(parts)
+                new_content.append({"type": "text", "text": label})
+            message = message.model_copy(update={"content": new_content})
+        processed.append(message)
+    return flatten_messages_to_prompt(
+        processed,
+        "dropped %d non-text content part(s) -- not a decodable data-sourced "
+        "attachment (url-sourced or malformed)",
+    )
 
 
 def _parse_claude_jsonl(stdout: str) -> list[dict[str, Any]]:
@@ -782,7 +722,7 @@ class ClaudeChatModel(BaseChatModel):
             if session_id:
                 combined_text = f"{result.stdout} {result.stderr}"
                 rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
-                _record_resume_state(self._session_key, "rejected" if rejected else "unknown")
+                _session_cache.record_resume_state(self._session_key, "rejected" if rejected else "unknown")
             raise RuntimeError(
                 f"Claude CLI turn for {self._session_key!r} produced no parseable "
                 f"--output-format stream-json lines (resume_state="
@@ -808,7 +748,7 @@ class ClaudeChatModel(BaseChatModel):
             session_id, new_session_id, is_error, str(final.get("result") or ""), _RESUME_REJECTED_MARKERS,
         )
         if resume_state is not None:
-            _record_resume_state(self._session_key, resume_state)
+            _session_cache.record_resume_state(self._session_key, resume_state)
             if resume_state == "unknown":
                 logger.warning(
                     "resume continuity for session %r at %r is UNKNOWN this turn (requested=%r "
@@ -824,7 +764,7 @@ class ClaudeChatModel(BaseChatModel):
             )
 
         if new_session_id:
-            _cache_session_id(self._session_key, new_session_id, resume_state)
+            _session_cache.cache_session_id(self._session_key, new_session_id, resume_state)
 
         # Task 4 (Part 2 run-visibility) + Phase E audit finding 5: every intermediate NDJSON line
         # this turn produced (all of `events` except the final result-shaped line, handled above)
@@ -930,49 +870,32 @@ async def close_thread_session(thread_id: str) -> None:
 
     Declared async only for call-site parity with copilot_chat_model.close_thread_session -- a
     future provider-agnostic dispatcher awaits whichever provider's version is active without
-    needing to know which one that is. There is nothing to await here: unlike Copilot, a Claude
-    session holds no client or connection object this process needs to close, so eviction is the
-    same pure dict pop as forget_thread_sessions, not a network call that can fail or hang against
-    an already-dead sandbox.
+    needing to know which one that is. There is nothing to await here: eviction is a pure dict pop
+    (cli_agent_exec.SessionCache), not a network call that can fail or hang against an
+    already-dead sandbox.
     """
-    forget_thread_sessions(thread_id)
+    _session_cache.forget_thread_sessions(thread_id)
 
 
 def forget_thread_sessions(thread_id: str) -> None:
     """Drop cached Claude session ids for a thread whose sandbox is already gone.
 
-    Sync and network-free for the same reason close_thread_session is (see its docstring). Meant
-    to be called from sandbox.registry.pop() once this provider is wired into it alongside
-    copilot_chat_model.forget_thread_sessions -- the one choke point every container-destruction
-    path routes through -- but that wiring is a later task's job, not this module's; registry.py
-    is untouched here.
+    Sync and network-free for the same reason close_thread_session is (see its docstring). Called
+    from sandbox.registry.pop()/chat_model.forget_thread_sessions_everywhere -- the choke points
+    every container-destruction path routes through.
     """
-    prefix = f"{thread_id}:"
-    stale = [key for key in _session_ids if key.startswith(prefix)]
-    for key in stale:
-        _session_ids.pop(key, None)
-        _resume_states.pop(key, None)
-    if stale:
-        logger.info("forgot %d Claude session id(s) for thread_id=%s (sandbox gone)", len(stale), thread_id)
+    _session_cache.forget_thread_sessions(thread_id)
 
 
 async def close_session(thread_id: str, stage: str, role: str) -> None:
     """Drop one (thread, stage, role) Claude session id so the next call starts fresh (omits
     --resume), the same recovery mechanism as copilot_chat_model.close_session for a stage whose
-    session history now contains a fabricated claim -- see that function's docstring for why a
-    fresh session, not a retry in the same one, is what actually recovers from it.
-
-    Also drops any cached resume-continuity classification (Phase E audit C-2) for the same key --
-    a fresh session that hasn't attempted a resume yet has no continuity claim to report, so a
-    stale "unknown"/"rejected" from the session this just replaced must not linger and be read as
-    if it described the new one.
+    session history now contains a fabricated claim. Also drops any cached resume-continuity
+    classification for the same key (SessionCache.close_session's docstring covers why).
 
     Async for the same call-site-parity reason as close_thread_session; nothing here awaits either.
     """
-    session_key = f"{thread_id}:{stage}:{role}"
-    _session_ids.pop(session_key, None)
-    _resume_states.pop(session_key, None)
-    logger.info("closed Claude session %r so the next attempt starts fresh", session_key)
+    _session_cache.close_session(thread_id, stage, role)
 
 
 def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
@@ -982,7 +905,7 @@ def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
     actually did against its own transcript (read_skill_invocations below) rather than trusting
     the model's self-report.
     """
-    return _session_ids.get(f"{thread_id}:{stage}:{role}")
+    return _session_cache.get_session_id(thread_id, stage, role)
 
 
 def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | None:
@@ -996,7 +919,7 @@ def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | Non
     reset can tell "this session's continuity was already suspect before the reset" apart from
     "this session looked fine and got reset anyway for an unrelated reason."
     """
-    return _resume_states.get(f"{thread_id}:{stage}:{role}")
+    return _session_cache.get_resume_state(thread_id, stage, role)
 
 
 async def read_skill_invocations(provider: SandboxProvider, thread_id: str, session_id: str) -> list[str] | None:
@@ -1332,7 +1255,7 @@ def _demo() -> None:
     # calls, not a re-derived tautology.
     pin_key = "pin-thread:pin-stage:draft"
     _session_ids[pin_key] = "dead-session-id"
-    _record_resume_state(pin_key, "rejected")
+    _session_cache.record_resume_state(pin_key, "rejected")
     assert pin_key not in _session_ids, "a REJECTED classification must drop the cached session id"
     assert _resume_states[pin_key] == "rejected"
 
@@ -1340,7 +1263,7 @@ def _demo() -> None:
     # that drops it.
     _session_ids[pin_key] = "still-good-session-id"
     for harmless_state in ("unknown", "resumed"):
-        _record_resume_state(pin_key, harmless_state)
+        _session_cache.record_resume_state(pin_key, harmless_state)
         assert _session_ids[pin_key] == "still-good-session-id", (
             f"{harmless_state!r} must NOT drop the cached session id, only 'rejected' does"
         )
@@ -1348,15 +1271,15 @@ def _demo() -> None:
     _session_ids.pop(pin_key, None)
 
     # Phase E review residual, pinned directly: rejected -> pop -> the very next turn requests no
-    # resume (classify_resume(None, ...) returns None by contract) -> _cache_session_id must still
+    # resume (classify_resume(None, ...) returns None by contract) -> _session_cache.cache_session_id must still
     # clear the stale "rejected" verdict when it caches the fresh, unrelated new id, even though
-    # _record_resume_state itself never ran this turn (resume_state is None, not "rejected").
+    # record_resume_state itself never ran this turn (resume_state is None, not "rejected").
     _session_ids[pin_key] = "dead-session-id"
-    _record_resume_state(pin_key, "rejected")
+    _session_cache.record_resume_state(pin_key, "rejected")
     assert pin_key not in _session_ids and _resume_states[pin_key] == "rejected"  # pre-condition
 
     fresh_new_id = "brand-new-unrelated-session-id"
-    _cache_session_id(pin_key, fresh_new_id, None)  # None: no resume was requested this turn
+    _session_cache.cache_session_id(pin_key, fresh_new_id, None)  # None: no resume was requested this turn
     assert _session_ids[pin_key] == fresh_new_id
     assert pin_key not in _resume_states, (
         "a stale 'rejected' verdict from the OLD id must not survive to mislabel the fresh new id"

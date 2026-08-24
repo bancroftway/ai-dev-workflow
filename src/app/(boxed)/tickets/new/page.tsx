@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { SettingsBanner } from "@/components/SettingsBanner";
 import { stashHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
+import { fetchProject } from "@/lib/agent-client";
 import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
 import type { CannedTechStack, TechStackCatalogResponse } from "@/lib/workflow-types";
 import { providerLabel, useOrgProvider } from "@/lib/use-org-provider";
@@ -28,16 +29,6 @@ type SubmitState =
   | { kind: "idle" }
   | { kind: "submitting" }
   | { kind: "error"; detail: string };
-
-/** Re-reads one project's current row via the list route (no GET /api/projects/:id exists) --
- * used both to reuse an already-created "+ New Project" row on retry and to learn the owner/repo
- * provision_session just scaffolded, since neither is echoed back by the calls that trigger them. */
-async function fetchProject(projectId: string): Promise<ProjectSummary | null> {
-  const res = await fetch("/api/projects");
-  if (!res.ok) throw new Error(`Failed to load projects (${res.status})`);
-  const data = (await res.json()) as ProjectListResponse;
-  return data.projects.find((p) => p.project_id === projectId) ?? null;
-}
 
 /**
  * The single New Ticket intake path (Part 3 Task 4): pick a project (or create one inline) and

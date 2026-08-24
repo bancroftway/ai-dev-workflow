@@ -84,6 +84,19 @@ export async function getServerAuthToken(): Promise<JWT | null> {
   return null;
 }
 
+/**
+ * Server-derived audit-trail identity (updated_by / created_by fields) -- must come from the
+ * session JWT, never from a client body. Entra is the primary sign-in and GitHub only a linked
+ * credential, so token.login (GitHub handle, only present once GitHub is linked) isn't the right
+ * first choice -- an Entra-only user who never linked GitHub must still be able to save. Prefer
+ * the Entra profile fields every signed-in session actually carries (email, then name), falling
+ * back to token.login, then to the immutable Entra object id so this is never empty for anyone
+ * who actually made it past src/proxy.ts's sign-in gate.
+ */
+export function auditIdentity(token: JWT | null): string | undefined {
+  return token?.email ?? token?.name ?? token?.login ?? token?.oid;
+}
+
 async function refreshEntraIfNeeded(token: JWT): Promise<JWT> {
   if (!token.entraRefreshToken || !token.entraExpiresAt) return token;
   const msLeft = token.entraExpiresAt * 1000 - Date.now();

@@ -146,6 +146,17 @@ def _cached_provider_if_fresh() -> str | None:
     return value
 
 
+def env_fallback_provider() -> str:
+    """The env-var fallback provider ("claude" unless AGENT_PROVIDER overrides it) -- the single
+    definition behind get_provider()'s DB-failure/no-row branches AND sessions_api's org-settings
+    response, so the Settings page's "active provider" can never disagree with what a real session
+    would actually run under. Default "claude", not "copilot": user decision 2026-08-24 -- Claude's
+    skill gate is the live one (Copilot's headless CLI has no known invocation log, so its gate
+    fail-opens permanently; Phase E audit M-3), making Claude the safer default posture.
+    """
+    return os.environ.get("AGENT_PROVIDER", "claude")
+
+
 async def get_provider() -> str:
     """The org's active provider ("claude" or "copilot"), resolved fresh at most once per
     _PROVIDER_CACHE_TTL_SECONDS.
@@ -185,10 +196,7 @@ async def get_provider() -> str:
                 exc_info=True,
             )
             return _provider_cache[0]
-        # Default "claude", not "copilot": user decision 2026-08-24 -- Claude's skill gate is the
-        # live one (Copilot's headless CLI has no known invocation log, so its gate fail-opens
-        # permanently; Phase E audit M-3), making Claude the safer default posture.
-        fallback = os.environ.get("AGENT_PROVIDER", "claude")
+        fallback = env_fallback_provider()
         logger.warning(
             "org_settings.get_org_settings() failed with no prior cached value; falling back to "
             "AGENT_PROVIDER=%r",
@@ -201,7 +209,7 @@ async def get_provider() -> str:
         # value is first dispatched. Warning logged first so there's a breadcrumb either way.
         return fallback
 
-    value = settings.provider if settings is not None else os.environ.get("AGENT_PROVIDER", "claude")
+    value = settings.provider if settings is not None else env_fallback_provider()
     _provider_module(value)  # fail fast on an unrecognized value, before caching it
     _provider_cache = (value, time.monotonic())
     return value
@@ -285,7 +293,6 @@ def get_chat_model_for_thread(
     *,
     provider: str,
     run_id: str | None = None,
-    github_token: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
     agent_mode: Literal["interactive", "plan", "autopilot", "shell"] = "plan",
@@ -309,16 +316,11 @@ def get_chat_model_for_thread(
     silently pick up a live setting change instead of the run's own pinned value, defeating
     GraphState.provider's whole purpose.
 
-    github_token and response_schema are each accepted by only ONE provider's real function
-    (github_token: copilot_chat_model only; response_schema: claude_chat_model only -- see each
-    module's own get_chat_model_for_thread docstring for why). Every current call site
-    unconditionally passes github_token=os.environ.get("GITHUB_TOKEN") regardless of which provider
-    is actually active (confirmed across every call site: graph.py x3, e2e_nodes.py, metrics_nodes.
-    py, preflight_nodes.py x2, rebuild.py, test_hardening_nodes.py x2; stack_runner.py is the one
-    exception that omits it) -- accepting it here and simply not forwarding it on the claude branch
-    keeps that unconditional pattern working under either provider, rather than raising
-    TypeError("unexpected keyword argument") the moment AGENT_PROVIDER=claude actually runs, which
-    is what calling the OLD import-time-bound alias directly would have done.
+    response_schema is accepted by only ONE provider's real function (claude_chat_model -- see
+    that module's own get_chat_model_for_thread docstring for why); it is simply not forwarded on
+    the copilot branch. (The old SDK era's github_token kwarg is gone from this whole chain:
+    nothing read it since the CLI-exec rewrite -- the sandbox's own COPILOT_GITHUB_TOKEN env var
+    is what the copilot CLI actually authenticates from.)
 
     run_id (Task 3b, Part 2 Ruling 10): the graph's real per-run id, forwarded unchanged to both
     provider modules so their chat-model instances can carry a genuine `self.run_id` instead of
@@ -348,9 +350,7 @@ def get_chat_model_for_thread(
             thread_id, stage, role, response_schema=response_schema, **common
         )
     if provider == "copilot":
-        return copilot_chat_model.get_chat_model_for_thread(
-            thread_id, stage, role, github_token=github_token, **common
-        )
+        return copilot_chat_model.get_chat_model_for_thread(thread_id, stage, role, **common)
     raise ValueError(f"Unknown provider {provider!r}, expected 'copilot' or 'claude'")
 
 
@@ -496,6 +496,7 @@ def secret_env_names(*, provider: str) -> set[str]:
 
 
 __all__ = [
+    "env_fallback_provider",
     "get_provider",
     "get_runtime_auth_token",
     "invalidate_provider_cache",

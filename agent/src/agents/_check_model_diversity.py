@@ -10,7 +10,6 @@ Exit code 0: all pairs pass.
 Exit code 1: any pair uses the same model, or audit file missing when draft exists.
 """
 
-import os
 import sys
 from pathlib import Path
 

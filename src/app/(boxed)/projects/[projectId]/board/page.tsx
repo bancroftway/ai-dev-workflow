@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
+import type { ProjectSummary } from "@/app/api/projects/route";
+import { fetchProject } from "@/lib/agent-client";
 import { SettingsBanner } from "@/components/SettingsBanner";
 import { STATUS_BADGE } from "@/components/SessionHistory";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
@@ -73,15 +74,6 @@ function columnFor(session: Session): string {
   // gracefully the way SessionHistory.tsx's own ProgressIndicator already does for this same case.
   if (index === -1) return STAGE_KEYS_IN_ORDER[0];
   return STAGE_KEYS_IN_ORDER[Math.min(index + 1, STAGE_KEYS_IN_ORDER.length - 1)];
-}
-
-/** Re-reads the project list and finds this one -- no `GET /api/projects/:id` exists (same
- * technique src/app/(boxed)/tickets/new/page.tsx's own fetchProject already uses). */
-async function fetchProject(projectId: string): Promise<ProjectSummary | null> {
-  const res = await fetch("/api/projects");
-  if (!res.ok) throw new Error(`Failed to load projects (${res.status})`);
-  const data = (await res.json()) as ProjectListResponse;
-  return data.projects.find((p) => p.project_id === projectId) ?? null;
 }
 
 /**

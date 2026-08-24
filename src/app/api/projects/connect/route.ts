@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getServerAuthToken } from "@/auth";
+import { auditIdentity, getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
+import { githubAccessToken } from "@/lib/e2e";
 
 /**
  * Connect-a-Repository proxy (Task 5's own form calls this; built now alongside its sibling
@@ -14,13 +14,12 @@ import { E2E_GITHUB_TOKEN, E2E_MODE } from "@/lib/e2e";
  */
 export async function POST(request: Request) {
   const token = await getServerAuthToken();
-  const createdBy = token?.email ?? token?.name ?? token?.login ?? token?.oid;
+  const createdBy = auditIdentity(token);
   if (!createdBy) {
     return NextResponse.json({ detail: "Unauthorized" }, { status: 401 });
   }
-  // Same read/E2E-fallback pattern as ../../sessions/provision/route.ts's own accessToken --
-  // needed server-side so the agent can look up the repo's real default branch on GitHub.
-  const githubToken = token?.accessToken ?? (E2E_MODE ? E2E_GITHUB_TOKEN : undefined);
+  // Needed server-side so the agent can look up the repo's real default branch on GitHub.
+  const githubToken = githubAccessToken(token);
   if (!githubToken) {
     return NextResponse.json({ detail: "GitHub is not connected" }, { status: 401 });
   }

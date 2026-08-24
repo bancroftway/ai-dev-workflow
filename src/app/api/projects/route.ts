@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getServerAuthToken } from "@/auth";
+import { auditIdentity, getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
 
 /**
@@ -41,10 +41,9 @@ export async function GET() {
 export async function POST(request: Request) {
   const token = await getServerAuthToken();
   // created_by is an audit-trail field: derived server-side only, never trusted from the client
-  // body -- same precedent and same field-preference order as org-settings' route.ts's updated_by
-  // (Entra profile fields every signed-in session carries, falling back to the GitHub login, then
-  // the immutable Entra object id).
-  const createdBy = token?.email ?? token?.name ?? token?.login ?? token?.oid;
+  // body -- same precedent as org-settings' route.ts's updated_by (field-preference rationale on
+  // auditIdentity itself, src/auth.ts).
+  const createdBy = auditIdentity(token);
   if (!createdBy) {
     return NextResponse.json({ detail: "Unauthorized" }, { status: 401 });
   }

@@ -237,7 +237,6 @@ async def verify_remediation(
 ) -> "VerificationResult":
     # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: this check has
     # no chat-model dispatch call of its own.
-    from .. import repo_files, repo_scan
     from ..graph import VerificationResult
 
     scan: dict[str, Any] | None = None

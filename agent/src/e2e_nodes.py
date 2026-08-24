@@ -38,7 +38,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import re
 import shlex
 from typing import Any, Literal, TypedDict
@@ -1163,7 +1162,6 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         # a real run_id being right here (state.get('run_id', ...) is already read one line above
         # for the session-key suffix). Same sentinel-fallback convention as graph.py.
         run_id=state.get("run_id", "unknown"),
-        github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("e2e", "draft", state["provider"]) or model_config.get_model_name("minimal-code-to-green", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
         agent_mode="autopilot",

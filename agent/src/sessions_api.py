@@ -251,7 +251,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             )
             try:
                 await project_store.set_project_repo(project_id, owner, repo)
-            except Exception as exc:
+            except Exception:
                 logger.exception(
                     "set_project_repo failed again for project_id=%s (owner=%s repo=%s) -- giving up",
                     project_id, owner, repo,
@@ -756,7 +756,7 @@ async def _org_settings_response() -> OrgSettingsResponse:
         # chat_model.get_provider() itself falls back to, so this page's "active provider" can
         # never disagree with what a real session would actually run under.
         return OrgSettingsResponse(
-            provider=os.environ.get("AGENT_PROVIDER", "claude"),
+            provider=chat_model.env_fallback_provider(),
             credential_configured=False,
             credential_kind=None,
             session_ready=session_ready,

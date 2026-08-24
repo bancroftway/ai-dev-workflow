@@ -13,9 +13,9 @@ uv run python -m src.session_store`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 import aioodbc
@@ -32,7 +32,9 @@ _pool: aioodbc.Pool | None = None
 async def _get_pool() -> aioodbc.Pool:
     global _pool
     if _pool is None:
-        _pool = await aioodbc.create_pool(autocommit=True, **db.connection_kwargs())
+        # to_thread: db.connection_kwargs() does synchronous HTTP (an AAD token fetch) in Azure
+        # mode -- run it off the event loop rather than blocking every other coroutine on it.
+        _pool = await aioodbc.create_pool(autocommit=True, **(await asyncio.to_thread(db.connection_kwargs)))
     return _pool
 
 

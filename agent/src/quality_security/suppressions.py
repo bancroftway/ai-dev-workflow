@@ -9,9 +9,8 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass
-from typing import Any
 
-from .. import git_ops, repo_files
+from .. import repo_files
 from ..sandbox.provider import SandboxProvider
 from .sarif import Finding
 

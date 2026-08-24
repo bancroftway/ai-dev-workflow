@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import shlex
 import time
 from dataclasses import dataclass
 from typing import Literal
 
+from langchain_core.messages import BaseMessage, SystemMessage
+
 from .sandbox.provider import SandboxProvider
+
+logger = logging.getLogger(__name__)
 
 # Keep each exec's command line well under Windows' ~32K CreateProcess cap (WinError 206).
 _EXEC_CMD_BUDGET = 16000
@@ -38,11 +43,10 @@ class TurnResult:
 
 # Phase E audit C-2 ("Resume-rejected is not a distinct signal ... collapsed exactly as the Spec
 # forbade"): shared tri-state vocabulary for both claude_chat_model.py and copilot_chat_model.py,
-# which each keep their own per-session-key `_resume_states: dict[str, ResumeState]` dict (mirroring
-# their own `_session_ids`) -- this module stays session-agnostic (it has no `_session_ids` of its
-# own, just like it has no `--resume`/`--session-id` argv knowledge), so the STATE lives with the
-# callers; only the classification VOCABULARY and RULE are shared, the same split RunEventType
-# (run_events.py) makes between "what the value means" and "who writes it."
+# which each hold their own per-provider SessionCache instance (see that class below) -- the STATE
+# lives with the callers, this module has no `--resume`/`--session-id` argv knowledge; the
+# classification VOCABULARY and RULE are shared, the same split RunEventType (run_events.py) makes
+# between "what the value means" and "who writes it."
 ResumeState = Literal["resumed", "rejected", "unknown"]
 
 
@@ -90,6 +94,130 @@ def classify_resume(
     if not is_error and returned_id == requested_id:
         return "resumed"
     return "unknown"
+
+
+# CLI error text that positively indicates a rejected resume, checked case-insensitively.
+# INFERENCE, not confirmed real: the one real killed-turn experiment classify_resume is built from
+# (fix-e3a-report.md) resumed CLEANLY -- no real rejection message has been captured for EITHER
+# provider's CLI anywhere in this codebase. These are a defensible guess at plausible phrasing;
+# classify_resume's own conservative default (UNKNOWN, not REJECTED, when no marker matches) means
+# a wrong guess here only under-detects REJECTED into UNKNOWN, it never mis-labels an unrelated
+# error as a resume rejection.
+_RESUME_REJECTED_MARKERS: tuple[str, ...] = (
+    "no conversation found",
+    "session not found",
+    "no such session",
+    "invalid session",
+    "unable to resume",
+)
+
+
+class SessionCache:
+    """Per-provider session-id + resume-state cache, keyed "{thread_id}:{stage}:{role}".
+
+    A single LangGraph thread runs multiple stages, each with a draft and an audit role, and each
+    of those (stage, role) pairs is its own independent CLI conversation (its own
+    --resume/--session-id chain). The value is the CLI's own session_id string, nothing more --
+    there is no client or connection object to key alongside it under the per-turn CLI-exec model.
+
+    Both provider modules used to carry byte-identical copies of these dicts and methods; the
+    STATE still lives with each provider (each module holds its own instance -- eviction of one
+    provider's sessions must never touch the other's), only the mechanics are shared here.
+    `provider_label` only affects log text.
+
+    `resume_states` (Phase E audit C-2) mirrors `session_ids`' keying and eviction: an absent key
+    means "no resume has ever been attempted for this key yet", deliberately distinct from
+    "unknown" (attempted, outcome unconfirmed) -- see classify_resume above for the tri-state rule.
+    """
+
+    def __init__(self, provider_label: str) -> None:
+        self.provider_label = provider_label
+        self.session_ids: dict[str, str] = {}
+        self.resume_states: dict[str, ResumeState] = {}
+
+    def record_resume_state(self, session_key: str, resume_state: ResumeState) -> None:
+        """Record this turn's resume classification for `session_key`, and drop the cached session
+        id outright when it was positively REJECTED (Phase E review, Important 1) -- a dead id must
+        never survive to be resumed again: infra_retry's own backoff would otherwise resume the
+        SAME dead session two more times before the stage escalates infra_exhausted.
+        """
+        self.resume_states[session_key] = resume_state
+        if resume_state == "rejected":
+            self.session_ids.pop(session_key, None)
+
+    def cache_session_id(self, session_key: str, new_session_id: str, resume_state: ResumeState | None) -> None:
+        """Cache the CLI's returned session id for the next turn, and drop any resume-state verdict
+        that no longer describes it (Phase E review residual).
+
+        The invariant: a `resume_states` entry must never describe a session id that is no longer
+        the one cached under this key. classify_resume only ever returns "resumed" when the
+        returned id equals the id actually asked to resume -- the ONE case where the verdict just
+        recorded is genuinely about the id being cached here. Every other case (None: no resume
+        requested this turn, e.g. right after a REJECTED id was popped; "unknown" with a different
+        returned id: a suspected silent fresh start) means the id being cached has no verdict of
+        its own yet, so any stale entry must be cleared rather than left to mislabel it.
+        """
+        self.session_ids[session_key] = new_session_id
+        if resume_state != "resumed":
+            self.resume_states.pop(session_key, None)
+
+    def forget_thread_sessions(self, thread_id: str) -> None:
+        """Drop every cached session id (and resume verdict) for a thread whose sandbox is gone."""
+        prefix = f"{thread_id}:"
+        stale = [key for key in self.session_ids if key.startswith(prefix)]
+        for key in stale:
+            self.session_ids.pop(key, None)
+            self.resume_states.pop(key, None)
+        if stale:
+            logger.info(
+                "forgot %d %s session id(s) for thread_id=%s (sandbox gone)",
+                len(stale), self.provider_label, thread_id,
+            )
+
+    def close_session(self, thread_id: str, stage: str, role: str) -> None:
+        """Drop one (thread, stage, role) session id -- and any stale resume verdict -- so the next
+        call starts fresh."""
+        session_key = f"{thread_id}:{stage}:{role}"
+        self.session_ids.pop(session_key, None)
+        self.resume_states.pop(session_key, None)
+        logger.info("closed %s session %r so the next attempt starts fresh", self.provider_label, session_key)
+
+    def get_session_id(self, thread_id: str, stage: str, role: str) -> str | None:
+        return self.session_ids.get(f"{thread_id}:{stage}:{role}")
+
+    def get_resume_state(self, thread_id: str, stage: str, role: str) -> ResumeState | None:
+        return self.resume_states.get(f"{thread_id}:{stage}:{role}")
+
+
+def flatten_messages_to_prompt(messages: list[BaseMessage], drop_warning: str) -> str:
+    """Flatten a LangChain message list into a single CLI prompt string -- the text core shared by
+    both providers' _messages_to_prompt wrappers: a SystemMessage gets an "Instructions:" prefix,
+    everything else passes through verbatim, list-shaped content keeps only its text-typed parts
+    (anything else is dropped, warned once per message via `drop_warning` -- a logging format
+    string with one %d slot for the dropped count), and messages are joined with a blank line.
+    """
+    parts: list[str] = []
+    for message in messages:
+        content = message.content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            dropped = 0
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(str(item.get("text", "")))
+                else:
+                    dropped += 1
+            if dropped:
+                logger.warning(drop_warning, dropped)
+            text = "\n".join(text_parts)
+        else:
+            text = str(content)
+
+        if isinstance(message, SystemMessage):
+            parts.append(f"Instructions:\n{text}")
+        else:
+            parts.append(text)
+    return "\n\n".join(parts)
 
 
 async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: str, content: str | bytes) -> None:

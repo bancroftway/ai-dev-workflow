@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useSession, signOut } from "next-auth/react";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
+import { terminateSession } from "@/lib/agent-client";
 import { useOptionalSandboxStatus } from "@/lib/sandbox-status-context";
 
 /** Minimal app-wide header: brand (doubles as "back to repositories" nav), the live sandbox
@@ -58,20 +59,9 @@ function SandboxConnectionIndicator() {
 
   async function stopContainer() {
     if (!sessionId) return;
-    const confirmed = window.confirm(
-      "Stop this session's dev-tool container? This discards its in-progress sandbox workspace. " +
-        "Work already pushed to GitHub is unaffected, but the container can't be reconnected -- " +
-        "resuming this session later provisions a fresh one.",
-    );
-    if (!confirmed) return;
     setStopping(true);
     try {
-      const res = await fetch("/api/sessions/terminate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId }),
-      });
-      if (res.ok) {
+      if (await terminateSession(sessionId)) {
         setStatus("terminated");
         router.push("/select");
       }

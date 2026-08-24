@@ -167,6 +167,32 @@ class SandboxProvider(abc.ABC):
         """
 
 
+def runtime_auth_env(provider: str, runtime_auth_token: str, runtime_auth_kind: str | None) -> list[tuple[str, str]]:
+    """The provider-credential env pairs every provisioner bakes into a sandbox, in a fixed order
+    -- each backend formats them into its own CLI syntax (docker `-e NAME=value`, az `NAME=value`)
+    rather than duplicating the name/kind choice itself.
+
+    COPILOT_GITHUB_TOKEN is always present, real-or-empty, so no caller needs to branch on
+    provider for THAT name -- the sandbox-image entrypoint is what picks whether it actually needs
+    it; a harmless unused env when empty. (COPILOT_GITHUB_TOKEN specifically, not
+    COPILOT_SDK_AUTH_TOKEN -- task-12-report.md BUG B -- and not plain GITHUB_TOKEN either --
+    task-12b fix-round-1: `gh`, git credential helpers, and repo-supplied scripts all read a plain
+    GITHUB_TOKEN ambiently under --no-ask-user, exactly the ambient-long-lived-credential pattern
+    provision()'s docstring above says to avoid; the CLI reads COPILOT_GITHUB_TOKEN identically
+    without that exposure.)
+
+    Phase E audit C-1: when provider == "claude", exactly ONE of ANTHROPIC_API_KEY /
+    CLAUDE_CODE_OAUTH_TOKEN is included (picked by runtime_auth_kind) -- the other is omitted
+    entirely, never emitted as an empty string; see provision()'s docstring above for why even a
+    real-plus-empty pair is avoided on this dimension.
+    """
+    pairs = [("COPILOT_GITHUB_TOKEN", runtime_auth_token if provider == "copilot" else "")]
+    if provider == "claude":
+        claude_var_name = "CLAUDE_CODE_OAUTH_TOKEN" if runtime_auth_kind == "oauth" else "ANTHROPIC_API_KEY"
+        pairs.append((claude_var_name, runtime_auth_token))
+    return pairs
+
+
 async def wait_for_cli_ready(
     exec_fn: Callable[[str], Awaitable[tuple[int, str, str]]], version_command: str
 ) -> None:

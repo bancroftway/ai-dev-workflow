@@ -21,7 +21,7 @@ from dataclasses import replace
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from .prompt_loader import load_prompt_pair, render_prompt
+from .prompt_loader import load_prompt_pair
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
@@ -536,7 +536,6 @@ async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConf
         # despite a real run_id being available on `state` (same `state.get("run_id", "unknown")`
         # sentinel already used earlier in this file, metrics_report_node's own run_id local).
         run_id=state.get("run_id", "unknown"),
-        github_token=os.environ.get("GITHUB_TOKEN"),
         model_name=model_config.get_model_name("metrics-report", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,

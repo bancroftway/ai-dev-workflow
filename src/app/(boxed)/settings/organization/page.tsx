@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { PROVIDER_LABELS, invalidateOrgProvider } from "@/lib/use-org-provider";
 
 type Provider = "copilot" | "claude";
 // C-1 (whole-branch review): the two Claude billing modes. Meaningless for provider === "copilot"
@@ -39,11 +40,6 @@ type SaveState =
   | { kind: "saving" }
   | { kind: "saved" }
   | { kind: "error"; detail: string };
-
-const PROVIDER_LABELS: Record<Provider, string> = {
-  copilot: "GitHub Copilot",
-  claude: "Claude Code",
-};
 
 /**
  * Org-wide active coding-agent provider + credential. Sibling of the per-repo settings page
@@ -107,6 +103,7 @@ export default function OrganizationSettingsPage() {
       setCredentialInput("");
       setUpdatedAt(body.updated_at ?? null);
       setUpdatedBy(body.updated_by ?? null);
+      invalidateOrgProvider();
       setSave({ kind: "saved" });
     } else {
       if (res.status === 422) {

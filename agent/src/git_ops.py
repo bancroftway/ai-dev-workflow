@@ -442,6 +442,22 @@ def generated_ignore_entries(untracked: list[str], tracked: list[str]) -> list[s
     return sorted(entries)
 
 
+async def _append_missing_gitignore_entries(
+    provider: SandboxProvider, thread_id: str, candidates: list[str], header: str
+) -> list[str]:
+    """Append whichever of `candidates` .gitignore doesn't already have, under a `header` comment
+    line, and return them (empty when nothing was missing). Appended, never overwritten: a repo
+    (or a stage) may have its own entries that matter. Shared by ignore_generated_files and
+    ensure_gitignore below."""
+    existing = await provider.exec_in_sandbox(thread_id, "cat .gitignore 2>/dev/null || true")
+    current = {line.strip() for line in str(existing.stdout or "").splitlines()}
+    missing = [entry for entry in candidates if entry not in current]
+    if missing:
+        block = "\n".join([header, *missing])
+        await provider.exec_in_sandbox(thread_id, f"printf '%s\\n' {shlex.quote(block)} >> .gitignore")
+    return missing
+
+
 async def ignore_generated_files(provider: SandboxProvider, thread_id: str) -> list[str]:
     """Append ignore entries for anything the toolchain produced but nothing tracks. Returns them.
 
@@ -462,14 +478,12 @@ async def ignore_generated_files(provider: SandboxProvider, thread_id: str) -> l
         return []
 
     candidates = generated_ignore_entries(untracked, tracked)
-    existing = await provider.exec_in_sandbox(thread_id, "cat .gitignore 2>/dev/null || true")
-    current = {line.strip() for line in str(existing.stdout or "").splitlines()}
-    missing = [entry for entry in candidates if entry not in current]
+    missing = await _append_missing_gitignore_entries(
+        provider, thread_id, candidates,
+        "# Detected as generated: untracked after build/boot, nothing authored it.",
+    )
     if not missing:
         return []
-
-    block = "\n".join(["# Detected as generated: untracked after build/boot, nothing authored it.", *missing])
-    await provider.exec_in_sandbox(thread_id, f"printf '%s\\n' {shlex.quote(block)} >> .gitignore")
     logger.info(
         "gitignore: %d generated path(s) detected and ignored: %s",
         len(missing),
@@ -493,15 +507,7 @@ async def ensure_gitignore(provider: SandboxProvider, thread_id: str) -> list[st
         return []
     _GITIGNORE_ENSURED.add(thread_id)
 
-    existing = await provider.exec_in_sandbox(thread_id, "cat .gitignore 2>/dev/null || true")
-    current_lines = {line.strip() for line in str(existing.stdout or "").splitlines()}
-    missing = [entry for entry in _GITIGNORE_ENTRIES if entry not in current_lines]
-    if missing:
-        block = "\n".join([_GITIGNORE_HEADER, *missing])
-        # Appended, never overwritten: a repo (or a stage) may have its own entries that matter.
-        await provider.exec_in_sandbox(
-            thread_id, f"printf '%s\\n' {shlex.quote(block)} >> .gitignore"
-        )
+    missing = await _append_missing_gitignore_entries(provider, thread_id, _GITIGNORE_ENTRIES, _GITIGNORE_HEADER)
 
     # `git ls-files -i -c --exclude-standard` = tracked files that the ignore rules now match.
     # Listed BEFORE removing them -- listing afterwards returns the empty set by construction, which

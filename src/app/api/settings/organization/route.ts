@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getServerAuthToken } from "@/auth";
+import { auditIdentity, getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
 
 /**
@@ -31,13 +31,9 @@ export async function PUT(request: Request) {
   const token = await getServerAuthToken();
   // updated_by is an audit-trail field: it must come from the server-side session, never from the
   // client body, the same real precedent vault/route.ts's PUT already sets for user_login (derived
-  // from token.login there, never trusted from the request JSON). This context has no repo/GitHub
-  // dependency, so token.login (GitHub handle, only present once a GitHub account is linked) isn't
-  // the right first choice here -- an Entra-only admin who never linked GitHub must still be able
-  // to save. Prefer the Entra profile fields every signed-in session actually carries (email, then
-  // name), falling back to token.login, then to the immutable Entra object id so this is never
-  // empty for anyone who actually made it past src/proxy.ts's sign-in gate.
-  const updatedBy = token?.email ?? token?.name ?? token?.login ?? token?.oid;
+  // from token.login there, never trusted from the request JSON). Field-preference rationale lives
+  // on auditIdentity itself (src/auth.ts).
+  const updatedBy = auditIdentity(token);
   if (!updatedBy) {
     return NextResponse.json({ detail: "Unauthorized" }, { status: 401 });
   }

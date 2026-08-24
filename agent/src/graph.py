@@ -81,9 +81,7 @@ from .chat_model import ainvoke_structured, close_session, close_thread_session,
 from .markdown_render import (
     render_ac_to_tests_markdown,
     render_adversarial_audit_markdown,
-    render_dedup_markdown,
     render_exit_markdown,
-    render_license_audit_markdown,
     render_minimal_code_to_green_markdown,
     render_brownfield_baseline_markdown,
     render_plan_markdown,
@@ -106,6 +104,7 @@ from .schemas import (
 )
 from .schemas_codegen import (
     AcceptanceCriteriaTestsDraftResponse,
+    AcToTestsAuditResponse,
     MinimalCodeToGreenAuditResponse,
     MinimalCodeToGreenDraftResponse,
 )
@@ -751,6 +750,24 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
     return messages
 
 
+AC_TO_TESTS_AUDIT_SYSTEM_PROMPT = load_prompt("ac_to_tests_audit")
+
+
+def _build_ac_to_tests_audit_prompt(state: GraphState) -> list[BaseMessage]:
+    """Unlike mcg's audit (draft JSON alone is enough context there), this audit also needs the
+    Approved Specification: its own job includes catching an AC the spec/ledger lists that nothing
+    in the draft's test_files actually covers, which the draft JSON alone cannot reveal -- it only
+    says what the draft itself chose to report. The audit session's own read-only tools (see this
+    stage's session_options, role="audit") can additionally open the ledger and the real test
+    files on disk, same as every other tool-writing stage's audit."""
+    spec_stage = state["stages"]["specification"]
+    stage = state["stages"]["ac-to-tests"]
+    return [
+        SystemMessage(content=AC_TO_TESTS_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
+        HumanMessage(content=f"Draft test suite to audit (JSON):\n{stage['draft']}"),
+    ]
+
 
 MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_draft")
 
@@ -993,13 +1010,15 @@ class StageSpec:
     max_cycles: int
     render_markdown: Callable[[dict[str, Any]], str]
 
-    # The adversarial audit leg is OPT-IN: only specification, plan, and minimal-code-to-green
-    # configure it (a second model revising the artifact a human will approve / that becomes
-    # code). Every other stage's draft flows straight to verify/gate -- an audit nobody reads was
-    # pure latency. All three fields must be set together or left None together.
+    # The adversarial audit leg is OPT-IN: specification, plan, ac-to-tests, and
+    # minimal-code-to-green configure it (a second model revising the artifact a human will
+    # approve / that becomes code / that gates every downstream stage). Every other stage's draft
+    # flows straight to verify/gate -- an audit nobody reads was pure latency. All three fields
+    # must be set together or left None together.
     audit_response_schema: (
         type[SpecificationAuditResponse]
         | type[PlanAuditResponse]
+        | type[AcToTestsAuditResponse]
         | type[MinimalCodeToGreenAuditResponse]
         | None
     ) = None
@@ -1243,6 +1262,13 @@ STAGES: list[StageSpec] = [
         build_envelope=build_ac_to_tests_envelope,
         build_prompt=_build_ac_to_tests_prompt,
         max_cycles=workflow_config.AC_TO_TESTS_MAX_CLARIFICATION_CYCLES,
+        # User decision 2026-08-24: ac-to-tests writes the failing TDD-RED tests every downstream
+        # stage builds against, so it now gets the same second-model adversarial leg as
+        # specification/plan/minimal-code-to-green -- a bad test suite here is a bad foundation for
+        # everything after it.
+        audit_response_schema=AcToTestsAuditResponse,
+        audit_content_field="revised_test_suite",
+        build_audit_prompt=_build_ac_to_tests_audit_prompt,
         render_markdown=render_ac_to_tests_markdown,
         requires_human_gate=False,
         capture_baseline_commit=True,
@@ -1843,7 +1869,6 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # the "unknown" placeholder -- same sentinel-fallback convention this file already
             # uses at the RunEvent(...) construction just below.
             run_id=state.get("run_id", "unknown"),
-            github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "draft", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
@@ -2035,7 +2060,6 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) -- see the draft-role call's own comment above.
             run_id=state.get("run_id", "unknown"),
-            github_token=os.environ.get("GITHUB_TOKEN"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "audit", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
@@ -2082,7 +2106,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # retry, not a formatting fluke ainvoke_structured's own retry loop could fix) must
             # not crash the whole run over a draft that already passed its OWN readiness check --
             # "an audit nobody reads was pure latency" is this codebase's own stated bar for when
-            # skipping the audit is fine (ac-to-tests has none at all). Keep the pre-audit draft
+            # skipping the audit is fine (tech-stack has none at all). Keep the pre-audit draft
             # unchanged rather than lose the whole run to a nice-to-have adversarial pass.
             logger.warning("audit response failed to parse for stage %s -- keeping pre-audit draft unchanged", stage_spec.key, exc_info=exc)
             content_dict = stage["draft"]
@@ -2510,7 +2534,6 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             # still runs through _agenerate_inner's own tool-call RunEvent building, which would
             # otherwise keep seeing "unknown" the same as every other un-threaded call site.
             run_id=state.get("run_id", "unknown"),
-            github_token=os.environ.get("GITHUB_TOKEN"),
             # The `fix` role is declared in model_config precisely so this write-capable pass can be
             # tiered separately from the read-only audit it serves; falls back to the stage's draft
             # model, matching how e2e_fix resolves its own.
@@ -3279,9 +3302,9 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
     builder.add_node(draft_escalate_name, make_draft_escalate_node(stage_spec))
     builder.add_edge(draft_escalate_name, END)
 
-    # The adversarial audit leg is opt-in (specification/plan/minimal-code-to-green only): a
-    # stage without audit config routes its ready draft straight to verify (when present) or the
-    # gate. Everything else -- persistence, signing, hooks -- happens in the gate body either way.
+    # The adversarial audit leg is opt-in (specification/plan/ac-to-tests/minimal-code-to-green
+    # only): a stage without audit config routes its ready draft straight to verify (when present)
+    # or the gate. Everything else -- persistence, signing, hooks -- happens in the gate body either way.
     if stage_spec.audit_response_schema is not None:
         after_draft = f"{stage_spec.key}_audit"
         builder.add_node(after_draft, make_audit_node(stage_spec))
@@ -4229,6 +4252,14 @@ def _demo() -> None:
     audit_tools = ac_to_tests_spec.session_options({}, "audit")["available_tools"]  # type: ignore[misc]
     assert "builtin:bash" not in audit_tools, "ac-to-tests audit must stay read-only like every other stage's audit"
     assert audit_tools == workflow_config.READ_ONLY_AVAILABLE_TOOLS
+
+    # User decision 2026-08-24 added ac-to-tests as a 4th audited stage (it writes the failing
+    # TDD-RED tests every downstream stage builds against) -- pin the whole set so a future
+    # regression (a StageSpec losing its audit_response_schema, or a fifth one added without
+    # updating models.yaml/README alongside it) fails loudly here instead of silently drifting
+    # from what those two files document.
+    audited_stage_keys = {spec.key for spec in STAGES if spec.audit_response_schema is not None}
+    assert audited_stage_keys == {"specification", "plan", "ac-to-tests", "minimal-code-to-green"}, audited_stage_keys
 
     # The prompt actually teaches the retirement-cleanup behavior, not just leaving the tool wiring
     # unchanged -- same "wired, not just correct in isolation" proof already used above for the

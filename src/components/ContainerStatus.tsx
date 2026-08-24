@@ -9,7 +9,7 @@ import type { SandboxStatus } from "@/lib/sandbox-status-context";
  * header reads live client state from SandboxStatusProvider; history rows read the agent's
  * `container_alive` flag from `GET /sessions` and only ever resolve to "ready" or "terminated".
  */
-export const CONTAINER_STATUS_META: Record<SandboxStatus, { label: string; dot: string; pulse: boolean }> = {
+const CONTAINER_STATUS_META: Record<SandboxStatus, { label: string; dot: string; pulse: boolean }> = {
   provisioning: { label: "Connecting…", dot: "bg-amber-400", pulse: true },
   ready: { label: "Connected", dot: "bg-green-500", pulse: true },
   error: { label: "Disconnected", dot: "bg-red-500", pulse: false },

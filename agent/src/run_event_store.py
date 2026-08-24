@@ -23,21 +23,15 @@ import uuid
 from dataclasses import replace
 from typing import Any
 
-import aioodbc
-
-from . import db
+from . import session_store
 from .run_events import RunEvent, RunEventType
 
 logger = logging.getLogger(__name__)
 
-_pool: aioodbc.Pool | None = None
-
-
-async def _get_pool() -> aioodbc.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await aioodbc.create_pool(autocommit=True, **db.connection_kwargs())
-    return _pool
+# Borrows session_store's shared aioodbc pool (the project_store.py/keyvault.py convention)
+# instead of opening a second one against the same DB. Kept as a module-level name rather than
+# inlined at each call site because _demo() swaps it out to prove the fail-soft paths.
+_get_pool = session_store._get_pool  # noqa: SLF001 -- same package; one shared pool, not a second one
 
 
 async def append_event(event: RunEvent) -> RunEvent:
@@ -345,7 +339,7 @@ async def _demo() -> None:
         # sessions_api._demo() uses for its own monkeypatches.
         real_get_pool = _get_pool
 
-        async def _broken_pool() -> aioodbc.Pool:
+        async def _broken_pool():
             raise RuntimeError("simulated DB outage")
 
         _get_pool = _broken_pool
@@ -420,7 +414,7 @@ async def _demo() -> None:
         # Same fail-soft contract as append_event's own check just above.
         real_get_pool_for_batch = _get_pool
 
-        async def _broken_pool_batch() -> aioodbc.Pool:
+        async def _broken_pool_batch():
             raise RuntimeError("simulated DB outage")
 
         _get_pool = _broken_pool_batch

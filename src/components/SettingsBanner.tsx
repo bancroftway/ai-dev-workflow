@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { signIn, useSession } from "next-auth/react";
-import { runSettingsChecks, type MissingSetting } from "@/lib/settings-checks";
+import { checkKeyVault, runSettingsChecks, type MissingSetting } from "@/lib/settings-checks";
 
 /**
  * Amber banners for missing settings (settings-checks.ts) -- one per finding, nothing when all
@@ -27,18 +27,24 @@ export function SettingsBanner({
   onReadyChange?: (ready: boolean) => void;
 }) {
   const { data: session, status } = useSession();
-  const [missing, setMissing] = useState<MissingSetting[]>([]);
+  const [orgMissing, setOrgMissing] = useState<MissingSetting[]>([]);
+  const [vaultMissing, setVaultMissing] = useState<MissingSetting[]>([]);
   const githubConnected = session?.githubConnected;
   const entraAuthError = session?.entraAuthError;
 
+  // Session/org-scoped checks (entra-session, github-connected, org-credential) -- deliberately
+  // NOT keyed on owner/repo: none of them depend on which repo is picked, and keying them there
+  // re-ran the org-credential backend round trip (DB + Key Vault) on every repo click. Calling
+  // runSettingsChecks without owner/repo skips its repo-scoped key-vault block (its own guard);
+  // that check lives in the separate owner/repo-keyed effect below.
   useEffect(() => {
     // Signed-out is handled by the render guard, never by resetting state here
     // (react-hooks/set-state-in-effect).
     if (status !== "authenticated") return;
     let cancelled = false;
-    runSettingsChecks({ session, owner, repo }).then((found) => {
+    runSettingsChecks({ session }).then((found) => {
       if (cancelled) return;
-      setMissing(found);
+      setOrgMissing(found);
       onReadyChange?.(!found.some((item) => item.id === "org-credential"));
     });
     return () => {
@@ -49,7 +55,29 @@ export function SettingsBanner({
     // would otherwise re-create this effect every render for no reason -- this only ever needs to
     // fire after a genuine re-check, not after the caller merely re-rendered.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, githubConnected, entraAuthError, owner, repo]);
+  }, [status, githubConnected, entraAuthError]);
+
+  // Repo-scoped key-vault check, keyed on the repo it's about.
+  useEffect(() => {
+    if (status !== "authenticated" || !owner || !repo || !githubConnected) return;
+    let cancelled = false;
+    checkKeyVault(owner, repo)
+      .then((finding) => {
+        if (!cancelled) setVaultMissing(finding ? [finding] : []);
+      })
+      .catch(() => {
+        // Same outcome as the composed runSettingsChecks call on a thrown vault fetch: no state
+        // update (the banner call site never had a .catch either).
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [status, githubConnected, owner, repo]);
+
+  // Same combined shape/order runSettingsChecks returned (org findings first, key-vault last).
+  // The owner/repo guard drops a stale vault finding at render time when the repo is deselected,
+  // instead of a synchronous state reset in the effect (react-hooks/set-state-in-effect).
+  const missing = owner && repo && githubConnected ? [...orgMissing, ...vaultMissing] : orgMissing;
 
   if (status !== "authenticated" || missing.length === 0) return null;
 

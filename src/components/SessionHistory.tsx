@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
+import { terminateSession } from "@/lib/agent-client";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 
 // Exported (Part 3 Task 9 fix round 1) so the project Board's own cards can reuse this exact
@@ -88,20 +89,9 @@ export function SessionHistory({
   }
 
   async function stopContainer(session: Session) {
-    const confirmed = window.confirm(
-      "Stop this session's dev-tool container? Its in-progress sandbox workspace is discarded " +
-        "-- work already pushed to GitHub is unaffected, but resuming this session later " +
-        "provisions a fresh container.",
-    );
-    if (!confirmed) return;
     setStoppingId(session.session_id);
     try {
-      const res = await fetch("/api/sessions/terminate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: session.session_id }),
-      });
-      if (res.ok) {
+      if (await terminateSession(session.session_id)) {
         setSessions((prev) =>
           prev?.map((s) => (s.session_id === session.session_id ? { ...s, container_alive: false } : s)) ?? prev,
         );

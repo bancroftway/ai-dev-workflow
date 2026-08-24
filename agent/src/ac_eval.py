@@ -33,7 +33,7 @@ from typing import Any
 
 from . import repo_files, spec_ledger, test_results
 from .test_results import attributed_ac_ids, attribution_health
-from .gates.ac_coverage_gate import classify_test_level, count_tests_per_ac, id_variants
+from .gates.ac_coverage_gate import classify_test_level, count_tests_per_ac
 from .gates.test_coverage_gate import _with_timeout
 from .sandbox.provider import SandboxProvider
 

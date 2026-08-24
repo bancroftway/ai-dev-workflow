@@ -63,96 +63,57 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import shlex
 import uuid
 from typing import Any, Literal
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import BaseModel, PrivateAttr
+from pydantic import PrivateAttr
 
 from . import config
 from . import run_event_store
 from . import run_event_stream
 from . import telemetry
-from .cli_agent_exec import _SCRATCH_DIR, ResumeState, classify_resume, run_turn, write_scratch_file
+from .cli_agent_exec import (
+    _RESUME_REJECTED_MARKERS,
+    _SCRATCH_DIR,
+    ResumeState,
+    SessionCache,
+    classify_resume,
+    flatten_messages_to_prompt,
+    run_turn,
+    write_scratch_file,
+)
 from .redaction import redact_text, redact_value
 from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
 
 logger = logging.getLogger(__name__)
 
-# Keyed "{thread_id}:{stage}:{role}", exactly like claude_chat_model._session_ids -- a single
-# LangGraph thread runs multiple stages, each with a draft and an audit (and sometimes fix) role,
-# and each of those (stage, role) pairs is its own independent Copilot CLI conversation (its own
-# --session-id chain). The value is the CLI's own session_id string, nothing more -- there is no
-# client or connection object to key alongside it anymore now that every turn is a fresh subprocess
-# exec rather than a persistent TCP session (see this module's own docstring).
-_session_ids: dict[str, str] = {}
-
-# Phase E audit C-2: per-session-key resume-continuity classification, same shape and eviction
-# rules as claude_chat_model._resume_states -- see cli_agent_exec.classify_resume for the shared
-# tri-state rule. Copilot side is QUOTA-BLOCKED (per this module's own docstring, no authenticated
-# `copilot` binary in this environment as of this task) -- the classification RULE itself is
-# identical to Claude's (same shared classify_resume call), but every real-world trigger of it here
-# is inference, never confirmed against a real killed-then-resumed Copilot session.
-_resume_states: dict[str, ResumeState] = {}
-
-# CLI error text that positively indicates a rejected --session-id resume, checked case-
-# insensitively. PURE INFERENCE, more so than Claude's own equivalent list: this provider is
-# quota-blocked (module docstring), so there is no real Copilot CLI output of ANY kind to check
-# this against, let alone a real rejection message -- these are the same plausible-phrasing guesses
-# as Claude's list, carried over for lack of anything more specific to this CLI. classify_resume's
-# conservative default (UNKNOWN, not REJECTED, when nothing matches) bounds how wrong this can go:
-# a miss here only under-detects REJECTED into UNKNOWN, never mislabels an unrelated error.
-_RESUME_REJECTED_MARKERS: tuple[str, ...] = (
-    "no conversation found",
-    "session not found",
-    "no such session",
-    "invalid session",
-    "unable to resume",
-)
-
-
-def _record_resume_state(session_key: str, resume_state: ResumeState) -> None:
-    """Record this turn's resume classification for `session_key`, and drop the cached session id
-    outright when it was positively REJECTED (Phase E review, Important 1).
-
-    Same shared helper as claude_chat_model.py's identical function -- see that module's own
-    docstring for why (a dead id must never survive to be `--session-id`'d again) and why this is
-    factored out rather than duplicated inline at both classification call sites in
-    _agenerate_inner.
-    """
-    _resume_states[session_key] = resume_state
-    if resume_state == "rejected":
-        _session_ids.pop(session_key, None)
-
-
-def _cache_session_id(session_key: str, new_session_id: str, resume_state: ResumeState | None) -> None:
-    """Cache the CLI's returned session id for the next turn, and drop any resume-state verdict
-    that no longer describes it (Phase E review residual, on top of Important 1/Minor).
-
-    Same shared helper as claude_chat_model.py's identical function -- see that module's own
-    docstring for the invariant ("a _resume_states entry must never describe a session id that is
-    no longer the one cached under this key") and why `resume_state != "resumed"` is the correct
-    clear condition: `classify_resume` only ever returns "resumed" when the returned id equals the
-    one actually asked to resume, so that is the one case where the verdict just recorded is
-    genuinely about the id being cached here.
-    """
-    _session_ids[session_key] = new_session_id
-    if resume_state != "resumed":
-        _resume_states.pop(session_key, None)
+# Shared session-id + resume-state cache (cli_agent_exec.SessionCache -- see its docstring for the
+# keying, eviction, and Phase E audit C-2 tri-state rules both providers used to duplicate here).
+# This module's own instance, never shared with claude_chat_model's: evicting one provider's
+# sessions must not touch the other's. The Copilot side of the resume classification is
+# QUOTA-BLOCKED (module docstring: no authenticated `copilot` binary in this environment) -- the
+# RULE is identical to Claude's (same shared classify_resume call), but every real-world trigger of
+# it here is inference, never confirmed against a real killed-then-resumed Copilot session. The two
+# dict aliases below are the SAME objects as the cache's own (not copies) -- chat_model._demo and
+# this module's _demo reach them by these names.
+_session_cache = SessionCache("Copilot")
+_session_ids = _session_cache.session_ids
+_resume_states = _session_cache.resume_states
 
 
 def _messages_to_prompt(messages: list[BaseMessage]) -> str:
     """Flatten a LangChain message list into a single Copilot CLI prompt string.
 
-    Mirrors claude_chat_model._messages_to_prompt exactly (SystemMessage gets an "Instructions:"
-    prefix, everything else passes through verbatim, parts joined with a blank line) and, like that
-    function, drops multimodal content instead of translating it to an attachment. The old SDK
+    The text-flatten core is cli_agent_exec.flatten_messages_to_prompt, shared with
+    claude_chat_model._messages_to_prompt (SystemMessage gets an "Instructions:" prefix, everything
+    else passes through verbatim, parts joined with a blank line). Unlike Claude's wrapper, this
+    one drops ALL multimodal content instead of translating any of it to an attachment. The old SDK
     version translated image_url parts into a Copilot Attachment over the live session
     (_content_part_to_attachment, now deleted along with the rest of the SDK plumbing); the
     verified Copilot CLI flags table (task-3-brief.md) has no attachment/file flag to translate one
@@ -161,32 +122,11 @@ def _messages_to_prompt(messages: list[BaseMessage]) -> str:
     upgrade path as Claude's: mirror write_scratch_file for binary payloads and pass the result via
     a flag per part, if a real Copilot CLI flag for it is ever confirmed.
     """
-    parts: list[str] = []
-    for message in messages:
-        content = message.content
-        if isinstance(content, list):
-            text_parts: list[str] = []
-            dropped = 0
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_parts.append(str(item.get("text", "")))
-                else:
-                    dropped += 1
-            if dropped:
-                logger.warning(
-                    "dropped %d non-text content part(s) -- CopilotChatModel has no multimodal "
-                    "support over the CLI",
-                    dropped,
-                )
-            text = "\n".join(text_parts)
-        else:
-            text = str(content)
-
-        if isinstance(message, SystemMessage):
-            parts.append(f"Instructions:\n{text}")
-        else:
-            parts.append(text)
-    return "\n\n".join(parts)
+    return flatten_messages_to_prompt(
+        messages,
+        "dropped %d non-text content part(s) -- CopilotChatModel has no multimodal "
+        "support over the CLI",
+    )
 
 
 def _parse_copilot_jsonl(stdout: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -456,21 +396,6 @@ class CopilotChatModel(BaseChatModel):
     # second one.
     run_id: str | None = None
     model_name: str | None = None
-    # Vestigial: every real call site (graph.py, e2e_nodes.py, metrics_nodes.py,
-    # preflight_nodes.py, test_hardening_nodes.py, rebuild.py) unconditionally passes
-    # github_token=os.environ.get("GITHUB_TOKEN") into get_chat_model_for_thread, so the kwarg
-    # must keep accepting a value without erroring -- but nothing in _agenerate_inner reads
-    # self.github_token anymore. The old SDK version honored it only for a locally-spawned
-    # (no-sandbox) CopilotClient's own environment; that whole code path -- and the
-    # local-child-process mode it belonged to -- no longer exists under CLI-exec, where every turn
-    # always execs into an already-provisioned sandbox (cli_agent_exec.run_turn) whose own
-    # COPILOT_GITHUB_TOKEN env var (see secret_env_names below) is what the copilot CLI actually
-    # reads (task-12b fix-round-1: not the plain GITHUB_TOKEN name, which `gh`/git/npm also read
-    # ambiently -- see this task's report for why that matters).
-    # Not warned on the way pre_tool_use_hook/tools/custom_agents/disabled_skills are below --
-    # unlike those, this is set on EVERY call, so a warning here would be constant noise, not
-    # signal.
-    github_token: str | None = None
     # Purely a gating flag now, not a live-connection selector: unlike the old SDK version (which
     # spawned a local child process when this was None), every turn always execs through
     # cli_agent_exec.run_turn, which requires a sandbox already registered for thread_id regardless
@@ -811,7 +736,7 @@ class CopilotChatModel(BaseChatModel):
             if session_id:
                 combined_text = f"{result.stdout} {result.stderr}"
                 rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
-                _record_resume_state(self._session_key, "rejected" if rejected else "unknown")
+                _session_cache.record_resume_state(self._session_key, "rejected" if rejected else "unknown")
             raise RuntimeError(
                 f"Copilot CLI turn for {self._session_key!r} produced no parseable JSONL lines "
                 f"under --output-format json (resume_state="
@@ -874,7 +799,7 @@ class CopilotChatModel(BaseChatModel):
             session_id, new_session_id, is_error, str(final.get("result") or ""), _RESUME_REJECTED_MARKERS,
         )
         if resume_state is not None:
-            _record_resume_state(self._session_key, resume_state)
+            _session_cache.record_resume_state(self._session_key, resume_state)
             if resume_state == "unknown":
                 logger.warning(
                     "resume continuity for session %r at %r is UNKNOWN this turn (requested=%r "
@@ -890,7 +815,7 @@ class CopilotChatModel(BaseChatModel):
             )
 
         if new_session_id:
-            _cache_session_id(self._session_key, new_session_id, resume_state)
+            _session_cache.cache_session_id(self._session_key, new_session_id, resume_state)
 
         self._last_usage = _extract_usage(final, self.model_name)
 
@@ -912,7 +837,6 @@ def get_chat_model_for_thread(
     role: str,
     *,
     run_id: str | None = None,
-    github_token: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
     agent_mode: Literal["interactive", "plan", "autopilot", "shell"] = "plan",
@@ -927,12 +851,12 @@ def get_chat_model_for_thread(
 ) -> CopilotChatModel:
     """Return the chat model for the given LangGraph thread's (stage, role) Copilot session.
 
-    Every kwarg name and default is unchanged from the pre-rewrite SDK version -- every call site
-    in this codebase (graph.py, e2e_nodes.py, metrics_nodes.py, preflight_nodes.py,
-    test_hardening_nodes.py, rebuild.py) depends on this exact surface staying stable; only
-    _agenerate_inner's insides changed. github_token is now vestigial -- kept only so those call
-    sites' unconditional `github_token=os.environ.get("GITHUB_TOKEN")` keeps working unchanged, see
-    CopilotChatModel.github_token's own comment for why it is never read anymore.
+    Every other kwarg name and default is unchanged from the pre-rewrite SDK version -- every call
+    site in this codebase (graph.py, e2e_nodes.py, metrics_nodes.py, preflight_nodes.py,
+    test_hardening_nodes.py, rebuild.py) depends on this surface staying stable; only
+    _agenerate_inner's insides changed. (The old SDK version's github_token kwarg is gone: nothing
+    read it since the CLI-exec rewrite -- the sandbox's own COPILOT_GITHUB_TOKEN env var, see
+    secret_env_names below, is what the copilot CLI actually authenticates from.)
 
     run_id (Task 3b, Part 2 Ruling 10): optional, defaults to None -- see CopilotChatModel.run_id's
     own comment for who passes a real value and why a caller that doesn't is not a regression.
@@ -942,7 +866,6 @@ def get_chat_model_for_thread(
         stage=stage,
         role=role,
         run_id=run_id,
-        github_token=github_token,
         model_name=model_name,
         sandbox=sandbox,
         agent_mode=agent_mode,
@@ -962,11 +885,11 @@ async def close_thread_session(thread_id: str) -> None:
 
     No live connection to close anymore -- see this module's own docstring for why. Declared async
     only for call-site parity with every caller here (run_headless.py, exit_nodes.py, graph.py)
-    that already awaits this function; eviction itself is the same pure dict pop as
-    forget_thread_sessions, not a network call that can fail or hang against an already-dead
+    that already awaits this function; eviction itself is a pure dict pop
+    (cli_agent_exec.SessionCache), not a network call that can fail or hang against an already-dead
     sandbox.
     """
-    forget_thread_sessions(thread_id)
+    _session_cache.forget_thread_sessions(thread_id)
 
 
 def forget_thread_sessions(thread_id: str) -> None:
@@ -978,31 +901,18 @@ def forget_thread_sessions(thread_id: str) -> None:
     container-destruction path routes through (both providers' terminate(), the idle reaper, and
     the DELETE /{thread_id} endpoint).
     """
-    prefix = f"{thread_id}:"
-    stale = [key for key in _session_ids if key.startswith(prefix)]
-    for key in stale:
-        _session_ids.pop(key, None)
-        _resume_states.pop(key, None)
-    if stale:
-        logger.info("forgot %d Copilot session id(s) for thread_id=%s (sandbox gone)", len(stale), thread_id)
+    _session_cache.forget_thread_sessions(thread_id)
 
 
 async def close_session(thread_id: str, stage: str, role: str) -> None:
     """Drop one (thread, stage, role) Copilot session id so the next call starts fresh (omits
     --session-id), the same recovery mechanism as claude_chat_model.close_session for a stage whose
-    session history now contains a fabricated claim -- see that function's docstring for why a
-    fresh session, not a retry in the same one, is what actually recovers from it.
-
-    Also drops any cached resume-continuity classification (Phase E audit C-2) for the same key --
-    see claude_chat_model.close_session's identical addition for why a stale verdict must not
-    survive past the session it described.
+    session history now contains a fabricated claim. Also drops any cached resume-continuity
+    classification for the same key (SessionCache.close_session's docstring covers why).
 
     Async for the same call-site-parity reason as close_thread_session; nothing here awaits either.
     """
-    session_key = f"{thread_id}:{stage}:{role}"
-    _session_ids.pop(session_key, None)
-    _resume_states.pop(session_key, None)
-    logger.info("closed Copilot session %r so the next attempt starts fresh", session_key)
+    _session_cache.close_session(thread_id, stage, role)
 
 
 def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
@@ -1012,7 +922,7 @@ def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
     calls this today. read_skill_invocations below is where that verification logic is moving to
     (task-3-brief.md), not this function.
     """
-    return _session_ids.get(f"{thread_id}:{stage}:{role}")
+    return _session_cache.get_session_id(thread_id, stage, role)
 
 
 def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | None:
@@ -1025,7 +935,7 @@ def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | Non
     identical so a caller (chat_model.get_resume_state) can dispatch to either provider without a
     provider-specific branch.
     """
-    return _resume_states.get(f"{thread_id}:{stage}:{role}")
+    return _session_cache.get_resume_state(thread_id, stage, role)
 
 
 async def read_skill_invocations(provider: SandboxProvider, thread_id: str, session_id: str) -> list[str] | None:
@@ -1335,13 +1245,13 @@ def _demo() -> None:
     # calls, not a re-derived tautology.
     pin_key = "pin-thread:pin-stage:draft"
     _session_ids[pin_key] = "dead-session-id"
-    _record_resume_state(pin_key, "rejected")
+    _session_cache.record_resume_state(pin_key, "rejected")
     assert pin_key not in _session_ids, "a REJECTED classification must drop the cached session id"
     assert _resume_states[pin_key] == "rejected"
 
     _session_ids[pin_key] = "still-good-session-id"
     for harmless_state in ("unknown", "resumed"):
-        _record_resume_state(pin_key, harmless_state)
+        _session_cache.record_resume_state(pin_key, harmless_state)
         assert _session_ids[pin_key] == "still-good-session-id", (
             f"{harmless_state!r} must NOT drop the cached session id, only 'rejected' does"
         )
@@ -1349,15 +1259,15 @@ def _demo() -> None:
     _session_ids.pop(pin_key, None)
 
     # Phase E review residual, pinned directly: rejected -> pop -> the very next turn requests no
-    # resume (classify_resume(None, ...) returns None by contract) -> _cache_session_id must still
+    # resume (classify_resume(None, ...) returns None by contract) -> _session_cache.cache_session_id must still
     # clear the stale "rejected" verdict when it caches the fresh, unrelated new id, even though
-    # _record_resume_state itself never ran this turn (resume_state is None, not "rejected").
+    # record_resume_state itself never ran this turn (resume_state is None, not "rejected").
     _session_ids[pin_key] = "dead-session-id"
-    _record_resume_state(pin_key, "rejected")
+    _session_cache.record_resume_state(pin_key, "rejected")
     assert pin_key not in _session_ids and _resume_states[pin_key] == "rejected"  # pre-condition
 
     fresh_new_id = "brand-new-unrelated-session-id"
-    _cache_session_id(pin_key, fresh_new_id, None)  # None: no resume was requested this turn
+    _session_cache.cache_session_id(pin_key, fresh_new_id, None)  # None: no resume was requested this turn
     assert _session_ids[pin_key] == fresh_new_id
     assert pin_key not in _resume_states, (
         "a stale 'rejected' verdict from the OLD id must not survive to mislabel the fresh new id"

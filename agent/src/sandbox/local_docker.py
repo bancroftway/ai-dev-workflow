@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from . import registry
 from .. import config as workflow_config
 from ..telemetry import traced_exec
-from .provider import ExecResult, SandboxProvider, SandboxSession, wait_for_cli_ready
+from .provider import ExecResult, SandboxProvider, SandboxSession, runtime_auth_env, wait_for_cli_ready
 
 logger = logging.getLogger(__name__)
 
@@ -259,16 +259,6 @@ class LocalDockerProvider(SandboxProvider):
                 # failed attempt on a retry, since the container name is fixed per session_id.
                 await _run_docker("rm", "-f", container_name)
 
-                # Phase E audit C-1: exactly one of ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN is
-                # ever passed to `docker create -e ...` below -- the other is omitted from argv
-                # entirely, never passed as `-e NAME=` (empty). See provider.py's provision()
-                # docstring for why an empty-string sibling is avoided rather than treated as
-                # harmless, unlike COPILOT_GITHUB_TOKEN's own real-or-empty pattern just below.
-                claude_env_args: list[str] = []
-                if provider == "claude":
-                    claude_var_name = "CLAUDE_CODE_OAUTH_TOKEN" if runtime_auth_kind == "oauth" else "ANTHROPIC_API_KEY"
-                    claude_env_args = ["-e", f"{claude_var_name}={runtime_auth_token}"]
-
                 # create -> cp(token) -> start, not `docker run`: the clone credential rides in as a
                 # one-shot file (see _inject_git_token) instead of an env var that would stay readable
                 # forever via `docker inspect`.
@@ -298,33 +288,16 @@ class LocalDockerProvider(SandboxProvider):
                     f"REPO_BRANCH={branch}",
                     "-e",
                     f"WORK_BRANCH={work_branch}",
-                    # COPILOT_GITHUB_TOKEN is set unconditionally, real or empty, so this call never
-                    # needs to branch on provider for THIS one name -- the sandbox-image entrypoint
-                    # is what picks whether it actually needs it. Harmless unused env when empty.
-                    # The Claude side (claude_env_args, spliced in below) does NOT follow this same
-                    # always-both pattern -- see that block's own comment for why.
-                    #
-                    # COPILOT_GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B)
-                    # and not plain GITHUB_TOKEN either (task-12b fix-round-1): the real Copilot
-                    # CLI's own `copilot help environment` documents COPILOT_GITHUB_TOKEN, GH_TOKEN,
-                    # and GITHUB_TOKEN (in that precedence order) as what it reads for auth --
-                    # confirmed empirically too (setting any of the three to a nonempty value moves
-                    # the CLI's own error past "no auth found" into real token-format validation;
-                    # COPILOT_SDK_AUTH_TOKEN never does anything). COPILOT_GITHUB_TOKEN specifically
-                    # (not plain GITHUB_TOKEN) because `gh` is installed in this image
-                    # (sandbox-image/Dockerfile) and auto-authenticates from a plain GITHUB_TOKEN/
-                    # GH_TOKEN with zero extra config -- so would git credential helpers and any
-                    # repo-supplied build/postinstall script that opportunistically reads
-                    # GITHUB_TOKEN, all silently as the shared fleet PAT, under a turn already
-                    # running --no-ask-user. That is exactly the ambient-long-lived-credential
-                    # pattern this class's own provision() docstring says to avoid.
-                    # COPILOT_SDK_AUTH_TOKEN was the correct name only for the old SDK-based
-                    # `copilot --server` process (see copilot_chat_model.py's module docstring) --
-                    # Task 3 fully retired that process, and this line is the one place that never
-                    # got updated to match.
-                    "-e",
-                    f"COPILOT_GITHUB_TOKEN={runtime_auth_token if provider == 'copilot' else ''}",
-                    *claude_env_args,
+                    # Provider-credential env pairs (runtime_auth_env, sandbox/provider.py):
+                    # COPILOT_GITHUB_TOKEN always real-or-empty; exactly one of ANTHROPIC_API_KEY /
+                    # CLAUDE_CODE_OAUTH_TOKEN when provider == "claude" (Phase E audit C-1) -- see
+                    # that helper's docstring for the full name-choice history (task-12 BUG B,
+                    # task-12b fix-round-1).
+                    *(
+                        arg
+                        for name, value in runtime_auth_env(provider, runtime_auth_token, runtime_auth_kind)
+                        for arg in ("-e", f"{name}={value}")
+                    ),
                     "-e",
                     f"AGENT_PROVIDER={provider}",
                     # Stamped into bootstrap.sh's toolchain report, so a "this repo needed a toolchain

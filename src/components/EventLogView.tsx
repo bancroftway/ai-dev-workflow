@@ -1,6 +1,6 @@
 "use client";
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Chip } from "@/components/MetricsBar";
 import { DiffView, looksLikeDiff } from "@/components/DiffView";
 import { ViewContainer } from "@/components/ViewContainer";
@@ -168,8 +168,8 @@ function isLoneReasoning(run: Run): run is Run & { events: [RunLogEvent] } {
 
 export function EventLogView() {
   const events = useRunEvents();
-  const durations = computeDurations(events);
-  const runs = groupConsecutive(events);
+  const durations = useMemo(() => computeDurations(events), [events]);
+  const runs = useMemo(() => groupConsecutive(events), [events]);
   const { containerRef, onScroll, newCount, jumpToLatest } = useStickToBottom(events);
 
   return (

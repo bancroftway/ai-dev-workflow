@@ -48,6 +48,22 @@ export function parseEventTs(ts: string): number {
 }
 
 function mergeEvents(prev: RunLogEvent[], incoming: RunLogEvent[]): RunLogEvent[] {
+  // Fast path (the normal live-append case: one CUSTOM event per call): incoming is strictly
+  // ascending AND entirely newer than prev's last seq, so a plain append is already deduped and
+  // sorted -- no Map rebuild, no full re-sort per live event. Strict > against prev's last seq
+  // rejects any seq already held; the same strict > within incoming rejects internal dupes and
+  // out-of-order batches, which fall through to the Map+sort path below (history merges).
+  let last = prev.length > 0 ? prev[prev.length - 1].seq : -Infinity;
+  let appendable = true;
+  for (const e of incoming) {
+    if (e.seq > last) {
+      last = e.seq;
+    } else {
+      appendable = false;
+      break;
+    }
+  }
+  if (appendable) return incoming.length === 0 ? prev : [...prev, ...incoming];
   const bySeq = new Map(prev.map((e) => [e.seq, e]));
   for (const e of incoming) bySeq.set(e.seq, e);
   return Array.from(bySeq.values()).sort((a, b) => a.seq - b.seq);

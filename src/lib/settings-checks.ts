@@ -24,11 +24,7 @@ const ORG_CREDENTIAL_FINDING: MissingSetting = {
   fix: { kind: "link", href: "/settings/organization", label: "Open Settings" },
 };
 
-export async function runSettingsChecks(ctx: {
-  session: Session | null;
-  owner?: string;
-  repo?: string;
-}): Promise<MissingSetting[]> {
+export async function runSettingsChecks(ctx: { session: Session | null }): Promise<MissingSetting[]> {
   const missing: MissingSetting[] = [];
   if (!ctx.session) return missing;
 
@@ -91,24 +87,25 @@ export async function runSettingsChecks(ctx: {
     missing.push(ORG_CREDENTIAL_FINDING);
   }
 
-  // Repo-scoped: only meaningful once a repo is selected and GitHub is linked (the vault lookup
-  // is keyed by the GitHub login).
-  if (ctx.owner && ctx.repo && ctx.session.githubConnected) {
-    const params = new URLSearchParams({ owner: ctx.owner, repo: ctx.repo });
-    const res = await fetch(`/api/repos/vault?${params}`);
-    if (res.status === 404) {
-      missing.push({
-        id: "key-vault",
-        label: "No Key Vault configured",
-        description: `Sessions on ${ctx.owner}/${ctx.repo} will run the app without secrets. Point this repo at your Azure Key Vault to inject them automatically.`,
-        fix: {
-          kind: "link",
-          href: `/settings/${encodeURIComponent(ctx.owner)}/${encodeURIComponent(ctx.repo)}`,
-          label: "Configure",
-        },
-      });
-    }
-  }
-
   return missing;
+}
+
+/** Repo-scoped key-vault check, separate from runSettingsChecks so SettingsBanner can key it on
+ * the selected repo without re-running the org-credential round trip. Only a 404 is a finding;
+ * a thrown fetch rejects and the caller keeps its previous state (same as the old composed call,
+ * whose call site had no .catch). */
+export async function checkKeyVault(owner: string, repo: string): Promise<MissingSetting | null> {
+  const params = new URLSearchParams({ owner, repo });
+  const res = await fetch(`/api/repos/vault?${params}`);
+  if (res.status !== 404) return null;
+  return {
+    id: "key-vault",
+    label: "No Key Vault configured",
+    description: `Sessions on ${owner}/${repo} will run the app without secrets. Point this repo at your Azure Key Vault to inject them automatically.`,
+    fix: {
+      kind: "link",
+      href: `/settings/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+      label: "Configure",
+    },
+  };
 }

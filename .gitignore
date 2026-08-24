@@ -43,6 +43,7 @@ agent/sandbox-image/plugins/*/skills/*-workspace/
 agent/sandbox-image/plugins/*/skills/*/evals/
 **/agent-work/
 **/*.log
+agent/e2e_results.json
 
 # Vendored 3rd-party skill packs are fetched at Docker build time (and on demand locally) by
 # fetch-vendor-plugins.sh, not committed -- vendor-lock.json is the provenance record, the script

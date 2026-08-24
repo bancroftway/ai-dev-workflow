@@ -22,7 +22,7 @@ export async function hasRepoAccess(owner: string, repo: string): Promise<boolea
   }
 }
 
-export type SessionLookupResult =
+type SessionLookupResult =
   | { kind: "not_found" }
   | { kind: "denied" }
   | { kind: "authorized"; session: Session };
