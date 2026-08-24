@@ -7,6 +7,7 @@ import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/rou
 import { SettingsBanner } from "@/components/SettingsBanner";
 import { STATUS_BADGE } from "@/components/SessionHistory";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
+import { providerLabel, useOrgProvider } from "@/lib/use-org-provider";
 
 // Ruling 5 (this Part's own plan): plain polling, no CopilotKit/AG-UI live subscription.
 const POLL_INTERVAL_MS = 15_000;
@@ -38,24 +39,40 @@ type ProjectState =
   | { kind: "ready"; project: ProjectSummary };
 
 /** Which column a session/ticket card belongs in: the one terminal bucket for a finished run,
- * else wherever `current_stage` says it is right now -- failed/rejected sessions are NOT split
- * into a separate pipeline column (that would be inventing a 9th "stage" that doesn't correspond
- * to any real StageSpec, the exact mistake the plan's own wireframe legend made). They stay in the
- * real stage column they died in, with the status badge below doing the "this one didn't make it"
- * visible treatment instead. `current_stage` is only ever null before a session's first stage
- * approval (still drafting tech-stack, or it never got that far) -- the one real position that
- * gap can actually mean, so it falls into the first column rather than a fabricated "unstarted"
- * bucket. */
+ * else wherever the ticket is actually being worked right now -- failed/rejected sessions are NOT
+ * split into a separate pipeline column (that would be inventing a 9th "stage" that doesn't
+ * correspond to any real StageSpec, the exact mistake the plan's own wireframe legend made). They
+ * stay in the real stage column they died in, with the status badge below doing the "this one
+ * didn't make it" visible treatment instead.
+ *
+ * Phase E audit finding 2 (off-by-one): `current_stage` is NOT "the stage this ticket is in" --
+ * it's the LAST APPROVED stage. Its single writer, `session_store.update_current_stage`, is only
+ * ever called post-approval (agent/src/graph.py's `_run_post_approve_hook`), and that writer's own
+ * docstring says so verbatim (session_store.py): "current_stage on its own only ever advances
+ * post-approval, so it cannot distinguish 'still drafting stage X' from 'paused at stage X's
+ * gate'." So a ticket drafting `plan`, or paused at `plan`'s gate awaiting approval, both still
+ * report `current_stage: "specification"` -- one stage behind reality either way.
+ *
+ * Coordinator ruling: fix HERE, at the display layer, rather than changing current_stage's backend
+ * semantics -- those are documented as deliberate elsewhere and resume/persistence code may depend
+ * on them. A non-completed card's column is therefore the stage AFTER current_stage in
+ * STAGE_KEYS_IN_ORDER, clamped at the last real stage (an all-8-approved ticket that hasn't
+ * flipped to status "completed" yet has nowhere further to go but Done, and Done is reserved for
+ * that status specifically -- see the branch above). `current_stage === null` means "before the
+ * first stage's own approval" (still drafting tech-stack, or never got that far) and keeps landing
+ * in the first column, same result "shift index -1 by one" would already give. */
 function columnFor(session: Session): string {
   if (session.status === "completed") return DONE_COLUMN;
   const stage = session.current_stage;
-  // Same fallback already used for the null case, now also covering a non-null value that isn't
-  // one of the 8 real keys (Task 10 sweep item #14) -- defense in depth only, since current_stage
-  // is documented elsewhere as never actually holding a non-STAGES value. Without this, such a
+  if (stage == null) return STAGE_KEYS_IN_ORDER[0];
+  const index = (STAGE_KEYS_IN_ORDER as readonly string[]).indexOf(stage);
+  // Defensive (Task 10 sweep item #14): a non-null value that isn't one of the 8 real keys can't
+  // be shifted by one -- same first-column fallback as the null case above. Without this, such a
   // session would land in a `grouped` bucket the render loop below never iterates (it only maps
   // over the fixed `columns` list), silently vanishing from the board instead of degrading
   // gracefully the way SessionHistory.tsx's own ProgressIndicator already does for this same case.
-  return stage && (STAGE_KEYS_IN_ORDER as readonly string[]).includes(stage) ? stage : STAGE_KEYS_IN_ORDER[0];
+  if (index === -1) return STAGE_KEYS_IN_ORDER[0];
+  return STAGE_KEYS_IN_ORDER[Math.min(index + 1, STAGE_KEYS_IN_ORDER.length - 1)];
 }
 
 /** Re-reads the project list and finds this one -- no `GET /api/projects/:id` exists (same
@@ -82,6 +99,10 @@ export default function ProjectBoardPage() {
   const [projectState, setProjectState] = useState<ProjectState>({ kind: "loading" });
   const [sessions, setSessions] = useState<Session[] | null>(null);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
+  // Minor 10: "shown once in the board header, not repeated per card" -- SessionCard renders no
+  // provider string of its own (finding B.2, still correct), this is the one positive affordance
+  // for the whole board.
+  const provider = useOrgProvider();
 
   // Reset both to a loading/empty state the moment projectId itself changes (Task 10 sweep item
   // #13): without this, direct board-to-board navigation (browser back/forward, a typed URL) kept
@@ -196,6 +217,11 @@ export default function ProjectBoardPage() {
         <p className="text-sm text-neutral-500">
           {project.owner && project.repo ? `${project.owner}/${project.repo}` : "Repository not yet created"}
         </p>
+        {provider && (
+          <p className="text-xs text-neutral-400">
+            <span aria-hidden>ⓘ</span> Runs on {providerLabel(provider)}
+          </p>
+        )}
       </div>
 
       {/* I-2(a), whole-branch review: the Spec named the board explicitly as a persistent-banner
