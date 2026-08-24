@@ -78,7 +78,7 @@ from . import config
 from . import run_event_store
 from . import run_event_stream
 from . import telemetry
-from .cli_agent_exec import _SCRATCH_DIR, run_turn, write_scratch_file
+from .cli_agent_exec import _SCRATCH_DIR, ResumeState, classify_resume, run_turn, write_scratch_file
 from .redaction import redact_text, redact_value
 from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
@@ -92,6 +92,29 @@ logger = logging.getLogger(__name__)
 # client or connection object to key alongside it anymore now that every turn is a fresh subprocess
 # exec rather than a persistent TCP session (see this module's own docstring).
 _session_ids: dict[str, str] = {}
+
+# Phase E audit C-2: per-session-key resume-continuity classification, same shape and eviction
+# rules as claude_chat_model._resume_states -- see cli_agent_exec.classify_resume for the shared
+# tri-state rule. Copilot side is QUOTA-BLOCKED (per this module's own docstring, no authenticated
+# `copilot` binary in this environment as of this task) -- the classification RULE itself is
+# identical to Claude's (same shared classify_resume call), but every real-world trigger of it here
+# is inference, never confirmed against a real killed-then-resumed Copilot session.
+_resume_states: dict[str, ResumeState] = {}
+
+# CLI error text that positively indicates a rejected --session-id resume, checked case-
+# insensitively. PURE INFERENCE, more so than Claude's own equivalent list: this provider is
+# quota-blocked (module docstring), so there is no real Copilot CLI output of ANY kind to check
+# this against, let alone a real rejection message -- these are the same plausible-phrasing guesses
+# as Claude's list, carried over for lack of anything more specific to this CLI. classify_resume's
+# conservative default (UNKNOWN, not REJECTED, when nothing matches) bounds how wrong this can go:
+# a miss here only under-detects REJECTED into UNKNOWN, never mislabels an unrelated error.
+_RESUME_REJECTED_MARKERS: tuple[str, ...] = (
+    "no conversation found",
+    "session not found",
+    "no such session",
+    "invalid session",
+    "unable to resume",
+)
 
 
 def _messages_to_prompt(messages: list[BaseMessage]) -> str:
@@ -239,6 +262,25 @@ def _translate_intermediate_events(
     their own) -- NOT a confirmed-real shape. Task 14's whole-Part sweep against a real Copilot run
     is what actually proves or disproves this guess; flagged here rather than papered over, the
     same standard this module already holds `_parse_copilot_jsonl` to.
+
+    Phase E audit finding 3 (capture half), same INFERENCE caveat as the "tool" namespace guess
+    above (this provider is quota-blocked -- module docstring -- so nothing here is confirmed
+    against real narration content): an `assistant.message_delta` line -- the exact type string
+    this module's own docstring already names as one of the real confirmed `type` values this CLI
+    emits, just never captured carrying real content (the one real capture hit quota first) --
+    becomes a RunEventType.REASONING event when `data` carries a plausible text field (`text` or
+    `content`, the same defensive multi-spelling-scan spirit `_parse_copilot_jsonl`'s own
+    session_id lookup already uses for an unconfirmed key name). Any other shape for that line --
+    no `data`, no text-shaped field inside it, an empty string -- is silently skipped rather than
+    fabricated: fail-soft on a surprise shape is the same standing contract every guess in this
+    module already follows.
+
+    Phase E audit finding 6 (capture half): every real captured envelope line -- tool-shaped or
+    not -- carries a real `timestamp` sibling field (module docstring: "an `id`, a `timestamp`,
+    and a `parentId`"). Folded into every event's payload as `envelope_ts` when present, never
+    fabricated when the line happens to lack one -- named distinctly from `RunEvent.ts` (the
+    dataclass field DB-assigns on append) so nothing downstream conflates the CLI's own reported
+    timestamp with the store's insertion timestamp; they answer different questions.
     """
     translated: list[RunEvent] = []
     for raw_event in intermediate_events:
@@ -246,32 +288,60 @@ def _translate_intermediate_events(
         if not isinstance(event_type, str):
             continue
         namespace, _, verb = event_type.partition(".")
-        if namespace != "tool":
-            continue
-        data = raw_event.get("data")
-        payload = data if isinstance(data, dict) else {}
-        # Defensive key-name scan (same spirit as _parse_copilot_jsonl's own session_id scan just
-        # above): which key actually carries the tool's name is exactly as unconfirmed as the
-        # "tool.*" namespace guess itself, so try the plausible spellings rather than committing to
-        # one -- `verb` (e.g. "call_start" in "tool.call_start") is the last-resort fallback so a
-        # tool call with no recognizable name field still yields a non-empty summary.
-        tool_name = payload.get("name") or payload.get("toolName") or payload.get("tool_name") or verb or "unknown"
-        translated.append(
-            RunEvent(
-                run_id=run_id,
-                session_id=session_id,
-                type=RunEventType.TOOL_CALL,
-                stage=stage,
-                node=node,
-                # Task 5 (Part 2 run-visibility): this is real captured tool-call content reaching
-                # a human-facing event log for the first time -- redact_text/redact_value
-                # (redaction.py, shared with telemetry.py's own long-standing command scrub) scrub
-                # it here, before this RunEvent ever reaches run_event_store.append_event/
-                # run_event_stream.emit_live.
-                summary=redact_text(f"tool call: {tool_name}"),
-                payload=redact_value(payload),
+        raw_data = raw_event.get("data")
+        data = raw_data if isinstance(raw_data, dict) else {}
+        ts = raw_event.get("timestamp")
+
+        if namespace == "tool":
+            # Defensive key-name scan (same spirit as _parse_copilot_jsonl's own session_id scan
+            # just above): which key actually carries the tool's name is exactly as unconfirmed as
+            # the "tool.*" namespace guess itself, so try the plausible spellings rather than
+            # committing to one -- `verb` (e.g. "call_start" in "tool.call_start") is the
+            # last-resort fallback so a tool call with no recognizable name field still yields a
+            # non-empty summary.
+            tool_name = data.get("name") or data.get("toolName") or data.get("tool_name") or verb or "unknown"
+            payload = dict(data)  # copy -- never mutate the caller's own parsed event in place
+            if ts is not None:
+                payload["envelope_ts"] = ts
+            translated.append(
+                RunEvent(
+                    run_id=run_id,
+                    session_id=session_id,
+                    type=RunEventType.TOOL_CALL,
+                    stage=stage,
+                    node=node,
+                    # Task 5 (Part 2 run-visibility): this is real captured tool-call content
+                    # reaching a human-facing event log for the first time -- redact_text/
+                    # redact_value (redaction.py, shared with telemetry.py's own long-standing
+                    # command scrub) scrub it here, before this RunEvent ever reaches
+                    # run_event_store.append_event/run_event_stream.emit_live.
+                    summary=redact_text(f"tool call: {tool_name}"),
+                    payload=redact_value(payload),
+                )
             )
-        )
+            continue
+
+        if event_type == "assistant.message_delta":
+            text = data.get("text") or data.get("content")
+            if not isinstance(text, str) or not text:
+                continue  # surprise shape, or genuinely nothing to narrate -- never fabricate
+            head = text[:160]
+            if len(text) > 160:
+                head += "..."
+            payload = {"text": text}
+            if ts is not None:
+                payload["envelope_ts"] = ts
+            translated.append(
+                RunEvent(
+                    run_id=run_id,
+                    session_id=session_id,
+                    type=RunEventType.REASONING,
+                    stage=stage,
+                    node=node,
+                    summary=redact_text(head),
+                    payload=redact_value(payload),
+                )
+            )
     return translated
 
 
@@ -300,6 +370,36 @@ def _build_copilot_wrapper_script(argv: list[str], prompt_path: str, timeout_sec
     # builds (_SCRATCH_DIR + stage/role/uuid4().hex) is already shlex-safe with no quoting needed.
     prompt_expr = f'"$(cat {shlex.quote(prompt_path)})"'
     return f"COPILOT_TASK_WAIT_TIMEOUT_SECONDS={timeout_seconds} copilot -p {prompt_expr} {shlex.join(argv[1:])}\n"
+
+
+def _apply_disabled_skills_instruction(prompt: str, disabled_skills: list[str] | None) -> str:
+    """Prepend the Spec's soft `disabled_skills` instruction to the prompt text, or return
+    `prompt` unchanged when there is nothing to disable (Phase E audit I-4).
+
+    The Spec: "`disabled_skills` stays a soft `--append-system-prompt` instruction for both"
+    providers. Claude has that flag; the verified Copilot CLI flags table has no equivalent (or
+    any) system-prompt-append flag at all, and inventing one would be exactly the "speculative
+    extra flag beyond the brief's table" this codebase's own review culture already warns against
+    elsewhere in this module. The Spec's own fallback needs no flag, though: the identical
+    instruction text claude_chat_model.py passes via --append-system-prompt (see that module's
+    `_agenerate_inner`) works exactly as well prepended to the prompt TEXT itself, which every
+    Copilot turn already sends over `-p`. This regressed a real capability the pre-rewrite SDK
+    path enforced (`disabled_skills=disabled_skills` passed into the old SDK session) --
+    confirmed live (config.py's own COPILOT_DISABLED_SKILLS comment): with these two skills
+    reachable, a draft stage spent its whole turn invoking skills instead of writing code. A
+    prompt-level instruction is soft (a model can still ignore it -- the same ceiling
+    --append-system-prompt itself has on the Claude side), but strictly better than the
+    unconditional silent drop this replaces.
+
+    Pure, so _demo can assert the exact text without a live sandbox -- same "pure half only"
+    scoping as _build_copilot_wrapper_script above.
+    """
+    if not disabled_skills:
+        return prompt
+    return (
+        "Do not invoke these skills this turn under any circumstances: "
+        f"{', '.join(disabled_skills)}.\n\n{prompt}"
+    )
 
 
 class CopilotChatModel(BaseChatModel):
@@ -536,18 +636,10 @@ class CopilotChatModel(BaseChatModel):
             if plugin_directories
             else None
         )
-        if disabled_skills:
-            # Unlike claude_chat_model (which works around this exact gap with
-            # --append-system-prompt), the verified Copilot CLI flags table has no equivalent flag
-            # at all -- inventing one here would be exactly the "speculative extra flag beyond the
-            # brief's table" this task's own self-review explicitly warns against. Logged and
-            # ignored rather than silently dropped.
-            logger.warning(
-                "CopilotChatModel.disabled_skills=%s requested but no verified Copilot CLI flag "
-                "exists to translate it into -- this turn proceeds with those skills still "
-                "reachable",
-                disabled_skills,
-            )
+        # Phase E audit I-4: see _apply_disabled_skills_instruction's own docstring for why this
+        # is a prompt-text prepend rather than a CLI flag, and why that is the Spec-required
+        # fallback rather than a workaround.
+        prompt = _apply_disabled_skills_instruction(prompt, disabled_skills)
 
         if self.model_name:
             argv += ["--model", self.model_name]
@@ -648,32 +740,64 @@ class CopilotChatModel(BaseChatModel):
         wrapper_script = _build_copilot_wrapper_script(argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS)
         await write_scratch_file(provider, self.thread_id, wrapper_path, wrapper_script)
         command = f"sh {shlex.quote(wrapper_path)}"
-        result = await run_turn(
-            provider,
-            self.thread_id,
-            command,
-            prompt,
-            scratch_prefix,
-            timeout_seconds=config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
-        )
+        try:
+            result = await run_turn(
+                provider,
+                self.thread_id,
+                command,
+                prompt,
+                scratch_prefix,
+                timeout_seconds=config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            # Phase E audit C-2: same shape as claude_chat_model's identical guard -- see this
+            # module's own _RESUME_REJECTED_MARKERS comment for why the classification RULE is
+            # shared but every trigger of it here is inference (quota-blocked, no real killed-then-
+            # resumed Copilot session was or could be captured for this task). Marked "unknown",
+            # never dropped outright -- the real Claude-side experiment (cli_agent_exec.
+            # classify_resume's own docstring) showed a killed session can resume cleanly, and there
+            # is no reason to assume Copilot's CLI is strictly worse at this than Claude's; keeping
+            # the id lets the next turn's own real --session-id attempt decide for real.
+            if session_id:
+                _resume_states[self._session_key] = "unknown"
+                logger.warning(
+                    "Copilot turn for %r was killed mid-turn -- resume continuity for cached "
+                    "session %r is now UNKNOWN (kept, not dropped). The next turn's own "
+                    "--session-id attempt will classify the real outcome.",
+                    self._session_key, session_id,
+                )
+            raise TimeoutError(
+                f"{exc} -- resume continuity for session {session_id!r} at "
+                f"{self._session_key!r} is now UNKNOWN (killed mid-turn)"
+            ) from exc
 
         events, new_session_id = _parse_copilot_jsonl(result.stdout)
         if not events:
+            # Phase E audit C-2: a resume the CLI rejects outright, before ever invoking the model,
+            # would plausibly produce no parseable stdout at all -- same reasoning as
+            # claude_chat_model's identical guard. No real captured example of an actual Copilot
+            # resume rejection exists (quota-blocked); classify defensively from the real text on
+            # hand rather than claim more than is known.
+            if session_id:
+                combined_text = f"{result.stdout} {result.stderr}"
+                rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
+                _resume_states[self._session_key] = "rejected" if rejected else "unknown"
             raise RuntimeError(
                 f"Copilot CLI turn for {self._session_key!r} produced no parseable JSONL lines "
-                f"under --output-format json: stdout={result.stdout!r}\nstderr={result.stderr!r}"
+                f"under --output-format json (resume_state="
+                f"{_resume_states.get(self._session_key)!r}): stdout={result.stdout!r}\n"
+                f"stderr={result.stderr!r}"
             )
-        if new_session_id:
-            _session_ids[self._session_key] = new_session_id
 
-        # Task 3 (Part 2 run-visibility): every intermediate JSONL line this turn produced (all of
-        # `events` except the final result-shaped line, handled below/untouched) is translated and
-        # persisted+emitted via the same two-call pattern graph.py's draft/audit/verify sites use
-        # for their own NODE_FINISHED event -- run_event_store.append_event then
-        # run_event_stream.emit_live, rebinding to append_event's returned copy (seq/ts filled in)
-        # before the live call. See _translate_intermediate_events' own docstring for exactly what
-        # is/isn't confirmed real about which lines qualify. Both calls fail soft internally (their
-        # own docstrings) -- no extra try/except needed here.
+        # Task 3 (Part 2 run-visibility) + Phase E audit finding 5: every intermediate JSONL line
+        # this turn produced (all of `events` except the final result-shaped line, handled below)
+        # is translated, then the whole batch is appended in ONE round trip
+        # (run_event_store.append_events -- was a per-event append_event/emit_live loop, N
+        # sequential DB round-trips for a chatty turn) before still emitting each one live
+        # individually: emit_live is an in-process custom-event dispatch, not a DB write. See
+        # _translate_intermediate_events' own docstring for exactly what is/isn't confirmed real
+        # about which lines qualify. Both calls fail soft internally (their own docstrings) -- no
+        # extra try/except needed here.
         #
         # Task 3b (Part 2 Ruling 10) fix: self.run_id is now the graph's real per-run id, set by
         # chat_model.get_chat_model_for_thread at construction time from whatever the caller has on
@@ -684,15 +808,17 @@ class CopilotChatModel(BaseChatModel):
         # second one. Previously always "unknown" unconditionally (task-3-report.md); see that
         # report for the concrete cost this left: events not retrievable via
         # run_event_store.list_events(run_id) for a specific run.
-        for tool_call_event in _translate_intermediate_events(
+        translated_events = _translate_intermediate_events(
             events[:-1],
             run_id=self.run_id or "unknown",
             session_id=self.thread_id,
             stage=self.stage,
             node=self.role,
-        ):
-            tool_call_event = await run_event_store.append_event(tool_call_event)
-            await run_event_stream.emit_live(tool_call_event)
+        )
+        if translated_events:
+            translated_events = await run_event_store.append_events(translated_events)
+            for translated_event in translated_events:
+                await run_event_stream.emit_live(translated_event)
 
         # Best-effort guess, NOT confirmed against real output (module docstring): the LAST line is
         # the result-shaped summary event, by analogy with Claude's single terminal JSON object
@@ -708,11 +834,33 @@ class CopilotChatModel(BaseChatModel):
                 sorted(final.keys()),
             )
 
-        if final.get("is_error"):
+        is_error = bool(final.get("is_error"))
+
+        # Phase E audit C-2: classify THIS turn's resume continuity from what was actually
+        # observed -- None when no --session-id was requested this turn. See
+        # cli_agent_exec.classify_resume's own docstring for the tri-state rule. Computed before
+        # the is_error raise below so the raised message can carry it.
+        resume_state = classify_resume(
+            session_id, new_session_id, is_error, str(final.get("result") or ""), _RESUME_REJECTED_MARKERS,
+        )
+        if resume_state is not None:
+            _resume_states[self._session_key] = resume_state
+            if resume_state == "unknown":
+                logger.warning(
+                    "resume continuity for session %r at %r is UNKNOWN this turn (requested=%r "
+                    "returned=%r is_error=%s) -- never assumed continuous without a matching id",
+                    session_id, self._session_key, session_id, new_session_id, is_error,
+                )
+
+        if is_error:
             raise RuntimeError(
                 f"Copilot CLI turn for {self._session_key!r} reported an error "
-                f"(stop_reason={final.get('stop_reason')!r}): {final.get('result')!r}"
+                f"(stop_reason={final.get('stop_reason')!r}, resume_state={resume_state!r}): "
+                f"{final.get('result')!r}"
             )
+
+        if new_session_id:
+            _session_ids[self._session_key] = new_session_id
 
         self._last_usage = _extract_usage(final, self.model_name)
 
@@ -804,6 +952,7 @@ def forget_thread_sessions(thread_id: str) -> None:
     stale = [key for key in _session_ids if key.startswith(prefix)]
     for key in stale:
         _session_ids.pop(key, None)
+        _resume_states.pop(key, None)
     if stale:
         logger.info("forgot %d Copilot session id(s) for thread_id=%s (sandbox gone)", len(stale), thread_id)
 
@@ -814,10 +963,15 @@ async def close_session(thread_id: str, stage: str, role: str) -> None:
     session history now contains a fabricated claim -- see that function's docstring for why a
     fresh session, not a retry in the same one, is what actually recovers from it.
 
+    Also drops any cached resume-continuity classification (Phase E audit C-2) for the same key --
+    see claude_chat_model.close_session's identical addition for why a stale verdict must not
+    survive past the session it described.
+
     Async for the same call-site-parity reason as close_thread_session; nothing here awaits either.
     """
     session_key = f"{thread_id}:{stage}:{role}"
     _session_ids.pop(session_key, None)
+    _resume_states.pop(session_key, None)
     logger.info("closed Copilot session %r so the next attempt starts fresh", session_key)
 
 
@@ -829,6 +983,19 @@ def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
     (task-3-brief.md), not this function.
     """
     return _session_ids.get(f"{thread_id}:{stage}:{role}")
+
+
+def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | None:
+    """The last-observed resume-continuity classification for one (thread, stage, role), or None
+    if no --session-id resume has ever been attempted for this key yet.
+
+    Same purpose as claude_chat_model.get_resume_state -- see that function's own docstring. This
+    provider's classification is INFERENCE (module docstring: quota-blocked, no real killed-then-
+    resumed Copilot session was captured for this task), but the accessor and eviction shape are
+    identical so a caller (chat_model.get_resume_state) can dispatch to either provider without a
+    provider-specific branch.
+    """
+    return _resume_states.get(f"{thread_id}:{stage}:{role}")
 
 
 async def read_skill_invocations(provider: SandboxProvider, thread_id: str, session_id: str) -> list[str] | None:
@@ -1039,20 +1206,47 @@ def _demo() -> None:
         synthetic_events[:-1],  # drop the final result-shaped line, exactly like _agenerate_inner does
         run_id="run-1", session_id="thread-1", stage="specification", node="draft",
     )
-    # Exactly 2 of the 3 intermediate lines are tool-call-shaped ("tool.*") -- the
-    # assistant.message_delta line must be skipped, proving "not every line is a tool call" on the
-    # positive-fixture side too.
-    assert len(synthetic_translated) == 2, f"expected 2 tool-call RunEvents, got {len(synthetic_translated)}"
-    assert all(e.type is RunEventType.TOOL_CALL for e in synthetic_translated)
+    # Phase E audit finding 3 (capture half): the assistant.message_delta line, previously
+    # skipped entirely, now yields a REASONING event of its own -- so all 3 of the 3 intermediate
+    # lines translate, not 2. "Not every line is a tool call" still holds (skip-if-unrecognized is
+    # still the rule); it's just no longer "everything that isn't a tool call is dropped."
+    assert len(synthetic_translated) == 3, (
+        f"expected 2 tool-call + 1 REASONING RunEvent, got {len(synthetic_translated)}"
+    )
+    tool_start, reasoning_event, tool_end = synthetic_translated
+    assert tool_start.type is RunEventType.TOOL_CALL and tool_end.type is RunEventType.TOOL_CALL
+    assert reasoning_event.type is RunEventType.REASONING
     assert all(e.run_id == "run-1" and e.session_id == "thread-1" for e in synthetic_translated)
     assert all(e.stage == "specification" and e.node == "draft" for e in synthetic_translated)
-    assert synthetic_translated[0].payload == {"name": "str_replace_editor", "input": {"path": "a.py"}}
-    assert synthetic_translated[0].summary == "tool call: str_replace_editor"
-    assert synthetic_translated[1].payload == {"toolName": "bash", "exitCode": 0}
-    assert synthetic_translated[1].summary == "tool call: bash"
+    # Phase E audit finding 6 (capture half): every one of these synthetic lines carries a real-
+    # shaped "timestamp" sibling field (matching the module's own confirmed-real envelope shape);
+    # each translated payload must carry it forward as envelope_ts, never fabricating one where
+    # absent.
+    assert tool_start.payload == {
+        "name": "str_replace_editor", "input": {"path": "a.py"}, "envelope_ts": "2026-01-01T00:00:00.000Z",
+    }
+    assert tool_start.summary == "tool call: str_replace_editor"
+    assert reasoning_event.payload == {"text": "...", "envelope_ts": "2026-01-01T00:00:00.100Z"}
+    assert reasoning_event.summary == "..."
+    assert tool_end.payload == {
+        "toolName": "bash", "exitCode": 0, "envelope_ts": "2026-01-01T00:00:00.200Z",
+    }
+    assert tool_end.summary == "tool call: bash"
     # seq/ts are never pre-set by the translator -- append_event (run_event_store.py) fills those
     # in on actual persistence, the same contract as every other RunEvent built in this codebase.
+    # (RunEvent.ts, the dataclass field, is distinct from the payload's own envelope_ts above.)
     assert all(e.seq is None and e.ts is None for e in synthetic_translated)
+
+    # A surprise shape for assistant.message_delta -- no recognizable text field, or an explicitly
+    # empty one -- must be silently skipped, never fabricated (module's own fail-soft contract).
+    surprise_jsonl = (
+        json.dumps({"type": "assistant.message_delta", "data": {"unexpected": "shape"}, "timestamp": "t"}) + "\n"
+        + json.dumps({"type": "assistant.message_delta", "data": {"text": ""}, "timestamp": "t"}) + "\n"
+    )
+    surprise_events, _ = _parse_copilot_jsonl(surprise_jsonl)
+    assert _translate_intermediate_events(
+        surprise_events, run_id="r", session_id="s", stage="st", node="n"
+    ) == [], "an unrecognized or empty assistant.message_delta shape must yield no event, not a guess"
 
     # No intermediate lines at all (a turn whose only JSONL line is the final result) must yield
     # an empty list, not an error -- _agenerate_inner's events[:-1] is [] in that case.
@@ -1080,19 +1274,47 @@ def _demo() -> None:
     for thread in (doomed, survivor):
         for suffix in ("specification:draft", "plan:audit"):
             _session_ids[f"{thread}:{suffix}"] = f"sess-{thread}-{suffix}"
+            # Phase E audit C-2: _resume_states mirrors _session_ids' own eviction shape.
+            _resume_states[f"{thread}:{suffix}"] = "unknown"
 
     forget_thread_sessions(doomed)
     assert not [k for k in _session_ids if k.startswith(f"{doomed}:")], "doomed sessions survived"
     assert len([k for k in _session_ids if k.startswith(f"{survivor}:")]) == 2, "evicted the wrong thread"
+    assert not [k for k in _resume_states if k.startswith(f"{doomed}:")], "doomed resume_states survived"
+    assert len([k for k in _resume_states if k.startswith(f"{survivor}:")]) == 2, (
+        "forget_thread_sessions evicted the wrong thread's resume_states"
+    )
 
     forget_thread_sessions("never-existed")  # must not raise
 
     asyncio.run(close_session(survivor, "specification", "draft"))
     assert get_session_id(survivor, "specification", "draft") is None, "close_session did not evict"
     assert get_session_id(survivor, "plan", "audit") is not None, "close_session evicted the wrong key"
+    assert get_resume_state(survivor, "specification", "draft") is None, "close_session did not evict resume_state"
+    assert get_resume_state(survivor, "plan", "audit") == "unknown", "close_session evicted the wrong resume_state key"
 
     asyncio.run(close_thread_session(survivor))
     assert not [k for k in _session_ids if k.startswith(f"{survivor}:")], "close_thread_session did not evict"
+    assert not [k for k in _resume_states if k.startswith(f"{survivor}:")], (
+        "close_thread_session did not evict resume_states"
+    )
+    assert get_resume_state("thread-never-seen", "x", "y") is None, "an unseen key must report None, not raise"
+
+    # Phase E audit I-4: _apply_disabled_skills_instruction, pure and directly testable (the
+    # actual _agenerate_inner call site needs a live sandbox -- see this module's own "pure half
+    # only" scoping convention).
+    assert _apply_disabled_skills_instruction("do the work", None) == "do the work", (
+        "no disabled_skills -- prompt must pass through completely unchanged"
+    )
+    assert _apply_disabled_skills_instruction("do the work", []) == "do the work", (
+        "an empty disabled_skills list is the same as None -- nothing to disable"
+    )
+    injected = _apply_disabled_skills_instruction("do the work", ["using-superpowers", "brainstorming"])
+    assert injected == (
+        "Do not invoke these skills this turn under any circumstances: "
+        "using-superpowers, brainstorming.\n\ndo the work"
+    ), f"unexpected instruction text/placement: {injected!r}"
+    assert injected.endswith("do the work"), "the original prompt content must survive verbatim, just prefixed"
 
     assert secret_env_names() == {
         "COPILOT_SDK_AUTH_TOKEN",
@@ -1132,6 +1354,26 @@ def _demo() -> None:
     assert "<redacted>" in stored_json, "payload was not actually scrubbed, just happened to omit the field"
     emitted_json = json.dumps(run_event_stream._json_safe_payload(secret_event))
     assert fake_secret not in emitted_json, f"token leaked into the dict emit_live dispatches live: {emitted_json}"
+
+    # Phase E audit finding 3's own redaction requirement, Copilot side: a secret-shaped string
+    # inside the model's own (inferred) narration must be scrubbed exactly like one inside a tool
+    # call's input/output is.
+    secret_delta_line = json.dumps({
+        "type": "assistant.message_delta",
+        "data": {"text": f"the token is {fake_secret}, using it now"},
+        "timestamp": "2026-01-01T00:00:00.000Z",
+    }) + "\n"
+    secret_reasoning_events, _ = _parse_copilot_jsonl(secret_delta_line)
+    secret_reasoning_translated = _translate_intermediate_events(
+        secret_reasoning_events, run_id="run-secret", session_id="thread-secret", stage="specification", node="draft",
+    )
+    assert len(secret_reasoning_translated) == 1, secret_reasoning_translated
+    secret_reasoning_event = secret_reasoning_translated[0]
+    assert secret_reasoning_event.type is RunEventType.REASONING
+    assert fake_secret not in (secret_reasoning_event.summary or ""), "token leaked into REASONING summary"
+    reasoning_stored_json = json.dumps(secret_reasoning_event.payload)
+    assert fake_secret not in reasoning_stored_json, f"token leaked into REASONING payload: {reasoning_stored_json}"
+    assert "<redacted>" in reasoning_stored_json, "REASONING payload was not actually scrubbed"
 
     print("copilot_chat_model self-check: all assertions passed")
 
