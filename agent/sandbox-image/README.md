@@ -93,39 +93,56 @@ The in-container path (`/opt/ai-dev-workflow-plugins`) must stay in sync with
 
 ## Confirming a plugin change actually reaches the sandbox (the "spike" smoke test)
 
-Every finding below came from a real Docker build + a real Copilot CLI session, not
+Doc rot fix (Phase E audit M-8): this section used to describe connecting to a persistent
+`copilot --server` process over a published port via the Python SDK (`RuntimeConnection.for_uri`,
+`CopilotClient`, `client.create_session(...)`). That whole mechanism was retired by Part 1's
+per-turn CLI-exec rewrite -- there is no server, no port, and no SDK any more (see
+`sandbox/provider.py`'s own module docstring). A "session" today is nothing but a `docker exec`
+running the real `copilot`/`claude` binary once per turn, so verifying plugin content means
+execing that same binary directly, the same way the real pipeline does.
+
+Every finding below came from a real Docker build + a real CLI exec inside the container, not
 documentation-reading -- repeat this whenever a plugin-loading assumption needs re-checking:
 
 1. Build under a throwaway tag so `DEFAULT_IMAGE`/`latest` are untouched:
    `docker build -t ai-dev-workflow-sandbox:spike agent/sandbox-image`.
-2. Run it locally with a real `COPILOT_SDK_AUTH_TOKEN` (the same `GITHUB_TOKEN` used elsewhere),
-   publish the Copilot port, e.g.
-   `docker run -d --rm -p 18080:3000 -e COPILOT_SDK_AUTH_TOKEN=... -e COPILOT_CONNECTION_TOKEN=... -e COPILOT_SERVER_PORT=3000 ai-dev-workflow-sandbox:spike`.
-3. Connect via the Python SDK directly (`RuntimeConnection.for_uri("localhost:18080", connection_token=...)`,
-   `CopilotClient(connection=...)`, `client.create_session(plugin_directories=[...], ...)`) and
-   send a prompt that should only succeed if the skill/tool/server actually loaded.
+2. Run it with a real credential and no published port -- entrypoint.sh's steady state is
+   `exec sleep infinity` (nothing ever listens on a port), and `REPO_CLONE_URL` can stay unset to
+   get a bare sandbox with no target repo:
+   `docker run -d --rm --name spike -e AGENT_PROVIDER=copilot -e COPILOT_GITHUB_TOKEN=... ai-dev-workflow-sandbox:spike`
+   (swap in `-e AGENT_PROVIDER=claude -e ANTHROPIC_API_KEY=...` to spike the Claude side instead).
+3. `docker exec` straight into it and run the CLI one-shot, pointed at the plugin directory under
+   test, e.g. `docker exec spike copilot -p "<prompt>" --plugin-dir /opt/ai-dev-workflow-plugins/ai-dev-workflow`
+   (Claude: `docker exec spike claude -p "<prompt>" --plugin-dir ...`) -- see
+   `copilot_chat_model.py`/`claude_chat_model.py`'s own `_agenerate_inner` for the exact current
+   flag set (`--available-tools`/`--excluded-tools`, `--mode`/`--permission-mode`, `--agents`/
+   `--agent`, ...). No SDK, no client library, no session object to construct -- the CLI binary is
+   the whole surface now. Send a prompt that should only succeed if the skill/tool/server actually
+   loaded.
 4. Always pair a positive test with a negative control (same prompt, the mechanism unset) to rule
    out a lucky/hallucinated match.
 
 ### Known findings from the last full spike run (do not re-derive)
 
-- `plugin_directories` must point at the **plugin root** (containing `.claude-plugin/plugin.json`),
-  not a scannable parent -- confirmed working exactly as designed.
-- Tool filter entries (`available_tools`/`excluded_tools`) must be **source-qualified**:
-  `"builtin:<name>"`, `"mcp:<name>"`, `"custom:<name>"` -- bare names like `"write"` are not a
-  real filter target.
-- **Blocklisting write-capable tools via `excluded_tools` is unsafe/incomplete.** With
-  `agent_mode="autopilot"`, excluding `builtin:create` alone still let the model write via
+- `--plugin-dir` must point at the **plugin root** (containing `.claude-plugin/plugin.json`), not a
+  scannable parent -- confirmed working exactly as designed.
+- Tool filter entries (`--available-tools`/`--excluded-tools` on Copilot; `--tools`/
+  `--disallowedTools` on Claude) must be **source-qualified**: `"builtin:<name>"`, `"mcp:<name>"`,
+  `"custom:<name>"` -- bare names like `"write"` are not a real filter target.
+- **Blocklisting write-capable tools is unsafe/incomplete.** With write access granted
+  (`autopilot`/`bypassPermissions`), excluding `builtin:create` alone still let the model write via
   `builtin:bash` (shell redirection); excluding `create`+`bash` still let it through via
   `builtin:edit`; excluding all three still let it through via a fourth tool, `builtin:apply_patch`.
-  **Use `available_tools` (an allowlist) for every read-only stage instead** -- confirmed to work
-  cleanly: `available_tools=["builtin:view","builtin:grep","builtin:glob","builtin:task_complete","builtin:ask_user","builtin:skill"]`
-  with `agent_mode="autopilot"` produced a clean refusal and the target file was genuinely never
-  created (see `agent/src/config.py`'s `READ_ONLY_AVAILABLE_TOOLS`).
-- `agent_mode="autopilot"` genuinely grants write access; `hooks={"on_pre_tool_use": ...}` fires
-  for every attempted tool call (useful for logging/telemetry) but is not itself what blocks
-  execution -- `available_tools`/`excluded_tools` do that.
-- Session events expose real, per-call token usage: `SessionEventType.ASSISTANT_USAGE`
-  (`input_tokens`, `output_tokens`, `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens`,
-  `cost`, `duration`, `model`) and session-level `SESSION_USAGE_INFO`/`SESSION_USAGE_CHECKPOINT`
-  -- no estimate/heuristic fallback needed for token-consumption tracking.
+  **Use an allowlist (`--available-tools`) for every read-only stage instead** -- confirmed to work
+  cleanly (see `agent/src/config.py`'s `READ_ONLY_AVAILABLE_TOOLS`).
+- There is no pre-tool-use hook on either CLI. The old SDK's `hooks={"on_pre_tool_use": ...}`
+  (fired for every attempted tool call, useful for logging) has no CLI-exec equivalent for either
+  provider -- both provider modules say so explicitly and defer entirely to Layer 2
+  (`gates/write_scope_gate.py`'s post-hoc diff check) instead. Don't design a new mechanism around
+  a pre-tool-use hook existing here; it doesn't.
+- Per-call token usage no longer streams live during a session. Each turn's real usage comes back
+  once, in the CLI's own terminal output at the end of that turn (Claude's `--output-format json`/
+  `stream-json` terminal object's `usage`/`total_cost_usd`; Copilot's JSONL stream's own terminal
+  line) -- not a live per-tool-call event the way the old SDK's `SessionEventType.ASSISTANT_USAGE`/
+  `SESSION_USAGE_INFO` events worked. Still a real, measured number either way (no estimate/
+  heuristic fallback needed) -- but nothing to read until the turn actually finishes.

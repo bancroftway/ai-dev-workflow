@@ -37,10 +37,14 @@ E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "120
 # misfires -- see infra_retry.py's own env vars for the matching draft/audit-side knob.
 VERIFY_STALL_LAPS = int(os.environ.get("AIDW_VERIFY_STALL_LAPS", "2"))
 
-# Bounded retry when a sandbox container starts but its copilot --server never completes the
-# connect handshake (sandbox/provider.py's wait_for_copilot_ready) -- distinguishes "the container
-# is slow" (worth retrying) from "the container never came up" (retrying the same dead process is
-# just spent time). See sandbox/local_docker.py's provision().
+# Bounded retry when a sandbox container starts but its CLI tool (whichever provider's --
+# `claude --version`/`copilot --version`, per sandbox/provider.py's wait_for_cli_ready) never
+# responds within that function's own readiness deadline -- distinguishes "the container is slow"
+# (worth retrying) from "the container never came up" (retrying the same dead process is just spent
+# time). Doc rot fix (Phase E audit M-8): this used to describe the retired SDK-based `copilot
+# --server` connect handshake and its wait_for_copilot_ready check, both fully removed by the
+# per-turn CLI-exec rewrite (see sandbox/provider.py's own module docstring). See
+# sandbox/local_docker.py's provision().
 SANDBOX_PROVISION_RETRY_ATTEMPTS = int(os.environ.get("AIDW_SANDBOX_PROVISION_RETRY_ATTEMPTS", "2"))
 
 # In-container path the sandbox image bakes the Agent Plugin content to (agent/sandbox-image/
