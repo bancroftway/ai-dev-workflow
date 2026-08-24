@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Chip } from "@/components/MetricsBar";
 import { DiffView, looksLikeDiff } from "@/components/DiffView";
 import { ViewContainer } from "@/components/ViewContainer";
@@ -16,7 +16,62 @@ import { formatDuration, parseEventTs, toolNameOf, useRunEvents, type RunLogEven
  * (Swimlane.tsx). See that hook's own docstring for the full "why" (merges Task 1/2's two real
  * destinations for the same underlying event, deduped by `seq`, no polling); this file no longer
  * owns that plumbing, only how the resulting event list renders.
+ *
+ * Part 2 Task 12 added the scroll-anchoring/live-follow behavior below (`useStickToBottom`): the
+ * row list is now its own bounded, independently-scrolling region (not the page-level scroll
+ * AppShell's `<main>` owns) specifically so it can be pinned to the newest row while a run is
+ * live, exactly like a chat/terminal log.
  */
+
+/** "Close enough to the bottom to count as at the bottom," in px -- a couple of row-heights of
+ * slack so sub-pixel scroll math never misses an exact-0 comparison. */
+const BOTTOM_THRESHOLD_PX = 24;
+
+/** Pin-to-bottom / live-follow for the scrollable event list -- this Part's own explicitly-
+ * flagged footgun ("a naive implementation fights the user's own scroll position"). Auto-follow
+ * starts ON (a freshly opened log shows the newest event first, same convention as a chat/
+ * terminal); any manual scroll away from the bottom -- wheel, touch, keyboard, drag all funnel
+ * through the same native `scroll` event on this one container, so a single listener covers every
+ * input method -- turns it off. Scrolling back within BOTTOM_THRESHOLD_PX turns it back on. While
+ * off, a new arrival never moves the scrollbar; `newCount`/`jumpToLatest` back the "N new events"
+ * pill instead. */
+function useStickToBottom(events: RunLogEvent[]) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [stuckToBottom, setStuckToBottom] = useState(true);
+  // The newest seq that existed at the moment the user scrolled away -- null while stuck to the
+  // bottom (nothing "missed" yet) or once re-engaged. State, not a ref: eslint's react-hooks/refs
+  // rule (correctly) forbids reading ref.current during render, and `newCount` below needs this
+  // value during render to decide whether to show the pill.
+  const [lastSeenSeq, setLastSeenSeq] = useState<number | null>(null);
+
+  // useLayoutEffect (not useEffect): this adjusts scroll position after the new rows are in the
+  // DOM but before the browser paints, so a pinned view never shows one visible frame at the old
+  // position before jumping -- React's own documented case for this hook.
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el || !stuckToBottom) return;
+    el.scrollTop = el.scrollHeight;
+  }, [events, stuckToBottom]);
+
+  function onScroll(e: React.UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_THRESHOLD_PX;
+    setStuckToBottom(atBottom);
+    // Snapshot once, right as the user leaves the bottom (prev ?? ...) -- must NOT keep advancing
+    // on every later scroll tick while they stay away, or newCount would never grow. Cleared back
+    // to null on re-arrival so the next disengage starts a fresh snapshot.
+    setLastSeenSeq((prev) => (atBottom ? null : prev ?? events[events.length - 1]?.seq ?? null));
+  }
+
+  const newCount = stuckToBottom || lastSeenSeq == null ? 0 : events.filter((e) => e.seq > lastSeenSeq).length;
+
+  function jumpToLatest() {
+    setStuckToBottom(true);
+    setLastSeenSeq(null);
+  }
+
+  return { containerRef, onScroll, newCount, jumpToLatest };
+}
 
 /** Same dot-color vocabulary as AppShell.tsx's own DOT_CLASS (blue/amber/emerald/red) plus the
  * neutral tones MetricsBar.tsx's CHIP_CLASS already uses for "no strong signal" -- not a new
@@ -104,23 +159,43 @@ export function EventLogView() {
   const events = useRunEvents();
   const durations = computeDurations(events);
   const runs = groupConsecutive(events);
+  const { containerRef, onScroll, newCount, jumpToLatest } = useStickToBottom(events);
 
   return (
     <ViewContainer>
-      <div>
+      <div className="shrink-0">
         <h1 className="text-lg font-semibold">Event Log</h1>
         <p className="text-sm text-neutral-500">Every node, tool call, and gate captured for this run, oldest first.</p>
       </div>
       {events.length === 0 ? (
         <p className="text-sm text-neutral-400">No events yet.</p>
       ) : (
-        <div className="flex flex-col divide-y divide-neutral-100 rounded-lg border border-neutral-200">
-          {runs.map((run) =>
-            run.tool && run.events.length > 1 ? (
-              <GroupRow key={run.events[0].seq} tool={run.tool} events={run.events} durations={durations} />
-            ) : (
-              <EventRow key={run.events[0].seq} event={run.events[0]} duration={durations.get(run.events[0].seq)} />
-            ),
+        <div className="relative min-h-0 flex-1">
+          <div
+            ref={containerRef}
+            onScroll={onScroll}
+            tabIndex={0}
+            className="flex h-full flex-col divide-y divide-neutral-100 overflow-y-auto rounded-lg border border-neutral-200"
+          >
+            {runs.map((run) =>
+              run.tool && run.events.length > 1 ? (
+                <GroupRow key={run.events[0].seq} tool={run.tool} events={run.events} durations={durations} />
+              ) : (
+                <EventRow key={run.events[0].seq} event={run.events[0]} duration={durations.get(run.events[0].seq)} />
+              ),
+            )}
+          </div>
+          {/* Shown only while auto-follow is disengaged AND real content arrived since -- blue,
+              not amber/red: this is a neutral "there's more" nudge, not a warning, same hue
+              AppShell's own DOT_CLASS already uses for "running/live" (node_started). */}
+          {newCount > 0 && (
+            <button
+              type="button"
+              onClick={jumpToLatest}
+              className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full border border-blue-300 bg-blue-50 px-3 py-1 text-xs font-medium text-blue-800 shadow-sm hover:bg-blue-100"
+            >
+              {newCount} new event{newCount === 1 ? "" : "s"} ↓
+            </button>
           )}
         </div>
       )}
