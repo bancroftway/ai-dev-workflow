@@ -425,6 +425,71 @@ async def hydrate_tech_stack_from_repo_file(
         return None
 
 
+def _resolve_ticket_tech_stack_markdown(
+    tech_stack_id: str | None, tech_stack_text: str | None, catalog: list[dict[str, Any]]
+) -> str | None:
+    """Pure decision behind _prefill_from_ticket_tech_stack_selection: given a project's own
+    ticket-filing-time picker selection and the loaded catalog, what markdown (if any) should
+    prefill the tech-stack draft. None means "nothing to prefill" -- the caller falls through to
+    fresh detection exactly as if this fallback didn't exist.
+
+    tech_stack_id (a catalog pick) wins over tech_stack_text (free-text description) when a
+    project somehow has both -- mirrors the New Ticket form's own catalog-vs-"describe it myself"
+    framing, a catalog id being the more specific of the two selections. Free text is still a real
+    user selection, not a lesser one -- prefilled too, just clearly labeled as the user's own
+    words rather than passed off as this tool's own markdown convention (a catalog entry's
+    rendered file, or an LLM's detection draft)."""
+    if tech_stack_id:
+        catalog_entry = next((s for s in catalog if s["id"] == tech_stack_id), None)
+        return catalog_entry["markdown"] if catalog_entry is not None else None
+    if tech_stack_text:
+        return f"# Tech Stack\n\n(As described by the user when filing this ticket.)\n\n{tech_stack_text}"
+    return None
+
+
+async def _prefill_from_ticket_tech_stack_selection(thread_id: str) -> dict[str, Any] | None:
+    """Fallback half of prefill_tech_stack_from_repo_file (Phase E audit, B-Critical-1): the New
+    Ticket form's tech-stack picker (dbo.projects.tech_stack_id/tech_stack_text, written by
+    project_store.create_project at ticket-filing time) used to be written and read by NOTHING --
+    a user picked a stack, Assign scaffolded an empty repo, and the tech-stack stage then detected
+    against that empty repo with no knowledge the user had already answered, asking again at the
+    gate. Only reached when the repo carries no tech-stack.md of its own (this function's only
+    caller already checked that) -- a connected brownfield repo's committed stack always wins over
+    a picker choice made at ticket-filing time, the same precedence hydrate_from_repo_file already
+    gives tech-stack.approved.json over everything else.
+
+    Local imports (project_store, app_discovery): app_discovery imports FROM this module
+    (preflight_nodes.update_manifest) at module load time, so a top-level import back the other
+    way would be circular; project_store has no such cycle but is kept local too, for symmetry --
+    both are only ever needed once this function actually runs. The actual choice of WHAT to
+    return lives in the pure, synchronously-testable _resolve_ticket_tech_stack_markdown above --
+    this async half is pure I/O plumbing around it.
+    """
+    from . import project_store
+
+    session = await session_store.get_session(thread_id)
+    project_id = session.get("project_id") if session else None
+    if not project_id:
+        return None
+    project = await project_store.get_project(project_id)
+    if project is None:
+        return None
+
+    from . import app_discovery
+
+    tech_stack_id = project.get("tech_stack_id")
+    markdown = _resolve_ticket_tech_stack_markdown(
+        tech_stack_id, project.get("tech_stack_text"), app_discovery.load_stack_catalog()
+    )
+    if markdown is None and tech_stack_id:
+        logger.warning(
+            "project %s picked tech_stack_id=%r at ticket-filing time, but no catalog entry has "
+            "that id any more -- falling through to fresh detection instead of prefilling",
+            project_id, tech_stack_id,
+        )
+    return {"markdown": markdown} if markdown is not None else None
+
+
 async def prefill_tech_stack_from_repo_file(
     thread_id: str, _state: "GraphState", provider: SandboxProvider
 ) -> dict[str, Any] | None:
@@ -433,9 +498,21 @@ async def prefill_tech_stack_from_repo_file(
     approved above) -- show the file's own content in the Tech Stack tab, zero LLM calls, zero
     repo exploration. Unlike hydrate, the result becomes an UNAPPROVED draft that still passes
     through the human gate (make_draft_node), since the file's content was never reviewed through
-    this tool before."""
+    this tool before.
+
+    Falls back (Phase E audit, B-Critical-1) to the New Ticket form's own tech-stack picker
+    (dbo.projects.tech_stack_id/tech_stack_text) when the repo has no tech-stack.md of its own --
+    see _prefill_from_ticket_tech_stack_selection. That fallback only ever fires for a project that
+    actually recorded a picker choice (a "+ New Project" ticket); a Connect-Repository project's
+    tech_stack_id/tech_stack_text stay NULL forever (project_store.py's own docstring), so this
+    changes nothing for that flow. Same just_rejected guard as every other prefill_from_repo_file
+    caller (make_draft_node) -- a human's gate rejection always redrafts for real, never re-serves
+    this same prefill.
+    """
     raw = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_MD_PATH)
-    return {"markdown": raw} if raw is not None else None
+    if raw is not None:
+        return {"markdown": raw}
+    return await _prefill_from_ticket_tech_stack_selection(thread_id)
 
 
 _TECH_STACK_EXTRACT_PROMPT = load_prompt("tech_stack_extract")
@@ -840,5 +917,23 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     assert _template_version("no stamp here") == 0
     assert _is_ours("... DO NOT MODIFY THIS FILE DURING FEATURE WORK ...")
     assert not _is_ours("# someone's own eslint config")
+
+    # _resolve_ticket_tech_stack_markdown (Phase E audit B-Critical-1): the New Ticket form's
+    # picker selection must actually resolve to something, not just round-trip through the DB
+    # unread -- this is the pure decision the write-only-picker fix rests on.
+    fake_catalog = [{"id": "nextjs-fastapi", "title": "Next.js + FastAPI", "markdown": "# Next.js + FastAPI\n..."}]
+    assert _resolve_ticket_tech_stack_markdown("nextjs-fastapi", None, fake_catalog) == "# Next.js + FastAPI\n..."
+    # An id that no longer names a real catalog entry (e.g. the templates directory changed since
+    # the ticket was filed) must fall through to None, not raise or fabricate content.
+    assert _resolve_ticket_tech_stack_markdown("retired-stack-id", None, fake_catalog) is None
+    # Free text is a real selection too, prefilled but clearly labeled as the user's own words.
+    described = _resolve_ticket_tech_stack_markdown(None, "Rails + Postgres, no frontend yet", fake_catalog)
+    assert described is not None and "Rails + Postgres" in described and "user" in described.lower(), described
+    # A catalog id wins over free text when a project somehow has both.
+    assert _resolve_ticket_tech_stack_markdown("nextjs-fastapi", "ignored text", fake_catalog) == "# Next.js + FastAPI\n..."
+    # Neither field set (a Connect-Repository project, or a "+ New Project" ticket that picked
+    # neither) -- nothing to prefill, the caller falls through to fresh detection unchanged.
+    assert _resolve_ticket_tech_stack_markdown(None, None, fake_catalog) is None
+    assert _resolve_ticket_tech_stack_markdown("", "", fake_catalog) is None
 
     print("preflight_nodes self-check: ok")
