@@ -161,6 +161,17 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             status_code=409,
             detail="no coding-agent credential configured for this organization -- set one in Settings",
         )
+
+    # Minor 3 (Phase E audit I-3 review): a session created before migration 0008 added the
+    # provider column has provider=NULL forever -- create_session only ever writes it on a
+    # session's first-ever provision, which already happened for this row. Left alone, that one
+    # legacy row would keep resolving live on every single future reprovision, the exact gap I-3
+    # exists to close, indefinitely. Backfilled here, now that chat_provider has been resolved
+    # anyway for the credential fetch above -- set_session_provider's own `WHERE provider IS NULL`
+    # makes this a no-op once stamped and safe to call unconditionally on every reprovision.
+    if existing is not None and stored_provider is None:
+        await session_store.set_session_provider(body.thread_id, chat_provider)
+
     if body.resume:
         if existing is None:
             raise HTTPException(status_code=404, detail="no session found to resume")
@@ -1922,17 +1933,25 @@ def _demo() -> None:
             i3_calls.append(("provider.provision", kwargs.get("provider")))
             return SandboxSession(kwargs["session_id"], "localhost", 0, "")
 
+    async def _i3_set_session_provider_must_not_be_called(thread_id: str, provider: str) -> None:
+        raise AssertionError(
+            "set_session_provider must never be called when this session already has a stored "
+            "provider -- Minor 3's backfill is for a NULL-provider legacy row only"
+        )
+
     original_get_session_i3 = session_store.get_session
     original_get_provider_i3 = chat_model.get_provider
     original_get_runtime_auth_token_i3 = chat_model.get_runtime_auth_token
     original_get_vault_uri_i3 = keyvault.get_vault_uri
     original_get_project_i3 = project_store.get_project
     original_get_sandbox_provider_i3 = get_sandbox_provider
+    original_set_session_provider_i3 = session_store.set_session_provider
     session_store.get_session = _i3_get_session_with_stored_provider  # type: ignore[assignment]
     chat_model.get_provider = _i3_get_provider_live_disagrees  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _i3_get_runtime_auth_token  # type: ignore[assignment]
     keyvault.get_vault_uri = _i3_get_vault_uri  # type: ignore[assignment]
     project_store.get_project = _i3_get_project  # type: ignore[assignment]
+    session_store.set_session_provider = _i3_set_session_provider_must_not_be_called  # type: ignore[assignment]
     get_sandbox_provider = lambda: _I3FakeSandboxProvider()  # noqa: E731
     try:
         response = asyncio.run(provision_session(
@@ -1948,12 +1967,77 @@ def _demo() -> None:
         chat_model.get_runtime_auth_token = original_get_runtime_auth_token_i3  # type: ignore[assignment]
         keyvault.get_vault_uri = original_get_vault_uri_i3  # type: ignore[assignment]
         project_store.get_project = original_get_project_i3  # type: ignore[assignment]
+        session_store.set_session_provider = original_set_session_provider_i3  # type: ignore[assignment]
         get_sandbox_provider = original_get_sandbox_provider_i3
         registry.pop("t-i3-selfcheck")
 
     assert i3_calls == [("get_runtime_auth_token", "claude"), ("provider.provision", "claude")], (
         f"the session's STORED provider ('claude') must reach both calls, and live get_provider() "
         f"must never even be invoked (it would have returned the disagreeing 'copilot') -- got {i3_calls}"
+    )
+
+    # Minor 3 (Phase E audit I-3 review): a legacy pre-0008 row (existing, but provider=None) must
+    # get backfilled via set_session_provider with whatever chat_provider resolved to (the live
+    # setting, since there's no stored value to prefer) -- so it stops resolving live on every
+    # future reprovision instead of just this one.
+    m3_calls: list[tuple[str, str]] = []
+
+    async def _m3_get_session_null_provider(thread_id: str) -> dict[str, Any] | None:
+        return {"project_id": "proj-m3-selfcheck", "status": "in_progress", "provider": None}
+
+    async def _m3_get_provider_live() -> str:
+        return "claude"
+
+    async def _m3_get_runtime_auth_token(provider: str | None = None) -> tuple[str, str | None]:
+        return "fake-token-m3", "api_key"
+
+    async def _m3_get_vault_uri(owner: str, repo: str, user_login: str) -> str | None:
+        return None
+
+    async def _m3_get_project(project_id: str) -> dict[str, Any] | None:
+        return {"name": "m3-project", "repo": "already-connected-repo"}
+
+    async def _m3_set_session_provider(thread_id: str, provider: str) -> None:
+        m3_calls.append((thread_id, provider))
+
+    class _M3FakeSandboxProvider:
+        async def provision(self, **kwargs: Any) -> SandboxSession:
+            return SandboxSession(kwargs["session_id"], "localhost", 0, "")
+
+    original_get_session_m3 = session_store.get_session
+    original_get_provider_m3 = chat_model.get_provider
+    original_get_runtime_auth_token_m3 = chat_model.get_runtime_auth_token
+    original_get_vault_uri_m3 = keyvault.get_vault_uri
+    original_get_project_m3 = project_store.get_project
+    original_set_session_provider_m3 = session_store.set_session_provider
+    original_get_sandbox_provider_m3 = get_sandbox_provider
+    session_store.get_session = _m3_get_session_null_provider  # type: ignore[assignment]
+    chat_model.get_provider = _m3_get_provider_live  # type: ignore[assignment]
+    chat_model.get_runtime_auth_token = _m3_get_runtime_auth_token  # type: ignore[assignment]
+    keyvault.get_vault_uri = _m3_get_vault_uri  # type: ignore[assignment]
+    project_store.get_project = _m3_get_project  # type: ignore[assignment]
+    session_store.set_session_provider = _m3_set_session_provider  # type: ignore[assignment]
+    get_sandbox_provider = lambda: _M3FakeSandboxProvider()  # noqa: E731
+    try:
+        asyncio.run(provision_session(
+            ProvisionRequest(
+                thread_id="t-m3-selfcheck", owner="octocat", repo="already-connected-repo", branch="main",
+            ),
+            _FakeRequest(),  # type: ignore[arg-type]
+        ))
+    finally:
+        session_store.get_session = original_get_session_m3  # type: ignore[assignment]
+        chat_model.get_provider = original_get_provider_m3  # type: ignore[assignment]
+        chat_model.get_runtime_auth_token = original_get_runtime_auth_token_m3  # type: ignore[assignment]
+        keyvault.get_vault_uri = original_get_vault_uri_m3  # type: ignore[assignment]
+        project_store.get_project = original_get_project_m3  # type: ignore[assignment]
+        session_store.set_session_provider = original_set_session_provider_m3  # type: ignore[assignment]
+        get_sandbox_provider = original_get_sandbox_provider_m3
+        registry.pop("t-m3-selfcheck")
+
+    assert m3_calls == [("t-m3-selfcheck", "claude")], (
+        f"a legacy NULL-provider row must be stamped with the live-resolved chat_provider on "
+        f"reprovision, got {m3_calls}"
     )
 
     print("sessions_api self-check: all assertions passed")

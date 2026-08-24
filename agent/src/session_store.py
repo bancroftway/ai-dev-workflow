@@ -193,6 +193,31 @@ async def set_awaiting_gate(session_id: str, awaiting: bool) -> None:
         )
 
 
+async def set_session_provider(session_id: str, provider: str) -> None:
+    """Backfill a pre-0008-migration row's NULL provider once a reprovision resolves one, so it
+    stops falling back to a live re-resolve forever (Phase E audit I-3 review, Minor 3).
+
+    create_session's own IF NOT EXISTS guard only ever WRITES provider on a session's first-ever
+    provision -- a session created before migration 0008 added the column has provider=NULL
+    permanently, since create_session never runs for it again. Without this, sessions_api.
+    provision_session's stored-or-live resolution keeps resolving live on every single reprovision
+    of that one legacy row, exactly the gap I-3 exists to close, just for however long that row
+    keeps getting reused.
+
+    `WHERE provider IS NULL` makes this safe to call unconditionally on every reprovision: a no-op
+    once the row is stamped (idempotent), and it can never clobber an already-pinned value even if
+    called with a different one by mistake -- provider, once set, stays exactly as write-once as
+    create_session's own IF NOT EXISTS already makes it for a brand-new row."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE dbo.sessions SET provider = ?, updated_at = SYSUTCDATETIME() "
+            "WHERE session_id = ? AND provider IS NULL",
+            provider,
+            session_id,
+        )
+
+
 async def close_session(
     session_id: str,
     *,
@@ -333,6 +358,32 @@ async def _demo() -> None:
         assert row["provider"] == "claude", (
             f"create_session's IF NOT EXISTS guard must leave the first-pinned provider alone, got {row['provider']!r}"
         )
+
+        # set_session_provider (Phase E audit I-3 review, Minor 3): backfills a pre-0008-migration
+        # row's NULL provider once something resolves one -- own session_id since `session_id`
+        # above already has a real (non-NULL) provider from create_session.
+        legacy_session_id = str(uuid.uuid4())
+        await create_session(
+            legacy_session_id, owner=owner, repo=repo, user_login="octocat", source_branch="main",
+            work_branch=f"ai-dev-workflow/{legacy_session_id}", title="Legacy row", project_id=project_id,
+            # provider omitted -- simulates a session created before migration 0008 (provider=NULL).
+        )
+        row = await get_session(legacy_session_id)
+        assert row["provider"] is None, row  # premise check
+
+        await set_session_provider(legacy_session_id, "copilot")
+        row = await get_session(legacy_session_id)
+        assert row["provider"] == "copilot", row
+
+        # WHERE provider IS NULL guard: a second stamp with a DIFFERENT value must be a no-op, not
+        # an overwrite -- once set (by this function or by create_session), provider stays exactly
+        # as write-once as create_session's own IF NOT EXISTS already makes it for a brand-new row.
+        await set_session_provider(legacy_session_id, "claude")
+        row = await get_session(legacy_session_id)
+        assert row["provider"] == "copilot", (
+            f"set_session_provider must never overwrite an already-stamped value, got {row['provider']!r}"
+        )
+        await delete_session(legacy_session_id)
 
         await touch_run(session_id, run_id="r1", title="Initial request")
         row = await get_session(session_id)
