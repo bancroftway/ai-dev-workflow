@@ -111,6 +111,31 @@ class ProvisionResponse(BaseModel):
 async def provision_session(body: ProvisionRequest, request: Request) -> ProvisionResponse:
     _check_shared_secret(request)
 
+    # I-A fix round (Important, proved by execution): moved here, before ANY side effect --
+    # get_runtime_auth_token() itself is side-effect-free, so there is no reason this has to wait
+    # until immediately before provider.provision(). It used to sit after the Key Vault fetch AND
+    # after repo_scaffold.create_repo/set_project_repo, so a credential-less org's "+ New Project"
+    # Assign created a REAL GitHub repo and recorded it against the project row before 409ing --
+    # the repo survives the 409 (nothing rolls it back), so a subsequent retry after the admin
+    # actually configures a credential reuses that same real repo, not a phantom. Computed once,
+    # reused unchanged all the way down to provider.provision() below -- calling
+    # get_runtime_auth_token() a second time later would be pure waste (same TTL-cached provider,
+    # same fresh-read credential) and could theoretically observe a different value if a save
+    # landed in between, which would defeat the point of gating on the value checked here.
+    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token()
+    if not runtime_auth_token:
+        # I-2(c), the real backstop (whole-branch review): a session with no usable credential
+        # used to sail straight into provider.provision() -- minutes of container boot/clone/
+        # bootstrap, then a confusing auth failure buried inside the first CLI turn. Mirrors
+        # run_headless.py's own pre-existing gate (its "E2E_GITHUB_TOKEN and %s must both be set"
+        # check) -- that entry point already fails fast on exactly this; the one real users hit
+        # (this one) did not, until now. The Settings-UI banner (I-2 a/b) is the advisory version
+        # of this same check; this 409 is what actually enforces it when the banner goes unread.
+        raise HTTPException(
+            status_code=409,
+            detail="no coding-agent credential configured for this organization -- set one in Settings",
+        )
+
     existing = await session_store.get_session(body.thread_id)
     if body.resume:
         if existing is None:
@@ -211,25 +236,8 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     work_branch = branch_naming.work_branch_for(body.thread_id)
     provider = get_sandbox_provider()
     repo_clone_url = f"https://github.com/{owner}/{repo}.git"
-    # The active provider's own secret -- an org admin's Settings-UI-saved vault credential if one
-    # is configured, else the same env-var fallback this used to compute by hand (see
-    # sandbox/provider.py's provision() docstring for how the sandbox uses this). Provisioning a
-    # new session is exactly the moment a live setting change should take effect (Ruling 2), so
-    # this reads fresh via get_runtime_auth_token() rather than a pinned state["provider"] -- there
-    # is no GraphState here yet, this runs before intake_node ever does.
-    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token()
-    if not runtime_auth_token:
-        # I-2(c), the real backstop (whole-branch review): a session with no usable credential
-        # used to sail straight into provider.provision() -- minutes of container boot/clone/
-        # bootstrap, then a confusing auth failure buried inside the first CLI turn. Mirrors
-        # run_headless.py's own pre-existing gate (its "E2E_GITHUB_TOKEN and %s must both be set"
-        # check) -- that entry point already fails fast on exactly this; the one real users hit
-        # (this one) did not, until now. The Settings-UI banner (I-2 a/b) is the advisory version
-        # of this same check; this 409 is what actually enforces it when the banner goes unread.
-        raise HTTPException(
-            status_code=409,
-            detail="no coding-agent credential configured for this organization -- set one in Settings",
-        )
+    # runtime_auth_token/runtime_auth_kind: resolved (and empty-checked, I-2c/I-A) at the very top
+    # of this function now, before any side effect -- see that block's own comment for why.
     try:
         session = await provider.provision(
             session_id=body.thread_id,
@@ -607,9 +615,18 @@ async def _maybe_reprobe_credential(settings: org_settings.OrgSettings) -> bool 
     _probe_provider_credential's own docstring for why inventing one isn't done here either;
     session_ready for that case honestly stays on the plain non-emptiness check, same as before this
     function existed). Otherwise returns the freshly-observed (or still-fresh-enough cached) ok/not-
-    ok. Failures while re-probing (network, vault) are treated as NOT ok and logged, not raised --
-    this runs inside a GET's response-building path, and a stale-check hiccup must surface as "not
-    ready", never as a 500 on the settings page itself.
+    ok.
+
+    C-B fix round (whole-branch review Critical, proved by execution): a failure while re-probing
+    is NOT uniformly "not ok". _probe_provider_credential distinguishes a DEFINITIVE rejection (the
+    provider's own 403, or the oauth shape-check's 422 -- both mean the credential is genuinely bad)
+    from a transport-class failure (502 -- a network blip, or the vault being briefly unreachable,
+    which proves nothing about the credential itself). Only the former persists ok=False; the
+    latter logs and returns the PREVIOUS verdict unchanged, without writing a fresh timestamp --
+    the old code's blanket `except Exception: ok = False` conflated the two, so one transient
+    network hiccup could persist a perfectly good credential as invalid for a full hour (this
+    function's own staleness window), with no way to force an earlier recheck since the timestamp
+    it also stamped looked exactly as fresh as a real rejection would have.
     """
     if settings.credential_secret_name is None:
         return None
@@ -624,12 +641,33 @@ async def _maybe_reprobe_credential(settings: org_settings.OrgSettings) -> bool 
     try:
         value = await org_credential_vault.get_org_credential(settings.credential_secret_name)
         await _probe_provider_credential(settings.provider, value, kind=kind)
-        ok = True
+    except HTTPException as exc:
+        if exc.status_code in (403, 422):
+            # Definitive: the provider (or, for oauth, our own shape check) actively rejected it.
+            logger.warning("org credential re-validation: definitively rejected (I-1): %s", exc.detail)
+            await org_settings.record_validation_result(False)
+            return False
+        # Transport-class (502, from _probe_provider_credential's own httpx.HTTPError catch) --
+        # can't tell whether the credential is actually bad. Preserve the prior verdict/timestamp
+        # rather than overwrite it, so the NEXT call retries immediately instead of waiting out a
+        # falsely-fresh hour.
+        logger.warning(
+            "org credential re-validation: could not reach the provider (I-1) -- preserving the "
+            "last known verdict rather than overwriting it: %s", exc.detail,
+        )
+        return settings.last_validation_ok
     except Exception:
-        logger.warning("periodic org-credential re-validation failed (I-1)", exc_info=True)
-        ok = False
-    await org_settings.record_validation_result(ok)
-    return ok
+        # Anything else (e.g. the vault fetch itself failing) is the same "can't tell" case as a
+        # transport failure above, not a definitive rejection -- same treatment.
+        logger.warning(
+            "org credential re-validation: unexpected failure (I-1) -- preserving the last known "
+            "verdict rather than overwriting it",
+            exc_info=True,
+        )
+        return settings.last_validation_ok
+
+    await org_settings.record_validation_result(True)
+    return True
 
 
 async def _org_settings_response() -> OrgSettingsResponse:
@@ -867,6 +905,16 @@ async def put_org_settings_endpoint(body: OrgSettingsPutRequest, request: Reques
         logger.info(
             "org credential saved and %s for provider=%s kind=%s", validation_note, body.provider, credential_kind
         )
+        # C-B fix round (whole-branch review Critical, proved by execution): a credential that
+        # just passed the probe above is, by definition, valid RIGHT NOW -- record that instead of
+        # leaving I-1's last_validation_ok/last_validated_at untouched. Without this, a stale
+        # persisted False from an earlier failed check survived a successful save and kept
+        # session_ready pinned False for up to an hour, deadlocking the exact admin recovery path
+        # (banner -> paste a fresh working credential -> save) I-1 exists to unblock. Harmless for
+        # oauth too (its own row is never read back through this path -- _maybe_reprobe_credential
+        # short-circuits before ever looking at these columns for an oauth kind -- but recording an
+        # honest "shape-checked, now" is no worse than leaving stale/absent values behind).
+        await org_settings.record_validation_result(True)
 
     await org_settings.set_org_settings(body.provider, secret_name, body.updated_by, credential_kind)
     chat_model.invalidate_provider_cache()
@@ -1417,6 +1465,38 @@ def _demo() -> None:
         _probe_provider_credential = _failing_probe
         assert asyncio.run(_maybe_reprobe_credential(stale_cred)) is False
         assert reprobe_calls == ["get_org_credential", "record_validation_result:False"], reprobe_calls
+        reprobe_calls.clear()
+
+        # C-B fix round (Critical, proved by execution): a TRANSPORT-class failure (502 -- a
+        # network blip, or the vault being briefly unreachable) is NOT the same as a definitive
+        # rejection. stale_cred still carries its ORIGINAL last_validation_ok=True (a frozen
+        # dataclass -- unaffected by the two calls above) -- must come back True (the prior
+        # verdict, preserved) and must NOT call record_validation_result at all, unlike the
+        # definitive-403 case just above which explicitly records False.
+        async def _transport_failing_probe(provider: str, value: str, *, kind: str | None = None) -> None:
+            raise HTTPException(status_code=502, detail="could not reach claude's API")
+
+        _probe_provider_credential = _transport_failing_probe
+        assert asyncio.run(_maybe_reprobe_credential(stale_cred)) is True, (
+            "a transport-class failure must preserve the prior verdict, not flip it to False"
+        )
+        assert reprobe_calls == ["get_org_credential"], (
+            f"a transport-class failure must NOT call record_validation_result, got {reprobe_calls}"
+        )
+        reprobe_calls.clear()
+
+        # Same "can't tell" treatment for a non-HTTPException failure (e.g. the vault fetch
+        # itself blowing up) -- not just the transport-class HTTPException case above.
+        async def _vault_failing_get_org_credential(secret_name: str) -> str:
+            reprobe_calls.append("get_org_credential")
+            raise RuntimeError("vault unreachable")
+
+        org_credential_vault.get_org_credential = _vault_failing_get_org_credential  # type: ignore[assignment]
+        assert asyncio.run(_maybe_reprobe_credential(stale_cred)) is True, (
+            "a non-HTTPException failure must also preserve the prior verdict"
+        )
+        assert reprobe_calls == ["get_org_credential"], reprobe_calls
+        org_credential_vault.get_org_credential = _tracking_get_org_credential  # type: ignore[assignment]
     finally:
         org_credential_vault.get_org_credential = original_get_org_credential  # type: ignore[assignment]
         org_settings.record_validation_result = original_record_validation_result  # type: ignore[assignment]
@@ -1445,6 +1525,14 @@ def _demo() -> None:
     async def _tracking_probe_ok(provider: str, value: str, *, kind: str | None = None) -> None:
         probe_calls.append((provider, kind))
 
+    async def _stub_record_validation_result(ok: bool) -> None:
+        # No-op: this block's own assertions are about set_org_settings's credential_kind
+        # argument, not about record_validation_result (C-B's dedicated fake-row test below
+        # exercises that properly, with real before/after state) -- mocked here purely so the
+        # credential-accepted branch's new `await org_settings.record_validation_result(True)`
+        # call doesn't reach the real DB from this block's otherwise fully-mocked I/O boundaries.
+        pass
+
     def _existing_claude_api_key() -> org_settings.OrgSettings:
         # last_validated_at deliberately "just now" -- keeps this stub inside _maybe_reprobe_
         # credential's 1-hour freshness window (I-1), so put_org_settings_endpoint's own trailing
@@ -1462,8 +1550,10 @@ def _demo() -> None:
     original_set_org_credential = org_credential_vault.set_org_credential
     original_get_runtime_auth_token = chat_model.get_runtime_auth_token
     original_get_org_settings2 = org_settings.get_org_settings
+    original_record_validation_result2 = org_settings.record_validation_result
     original_probe2 = _probe_provider_credential
     org_settings.set_org_settings = _stub_set_org_settings  # type: ignore[assignment]
+    org_settings.record_validation_result = _stub_record_validation_result  # type: ignore[assignment]
     org_credential_vault.set_org_credential = _stub_set_org_credential  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _stub_get_runtime_auth_token  # type: ignore[assignment]
     _probe_provider_credential = _tracking_probe_ok
@@ -1511,28 +1601,126 @@ def _demo() -> None:
             assert exc.status_code == 422, exc.status_code
     finally:
         org_settings.set_org_settings = original_set_org_settings  # type: ignore[assignment]
+        org_settings.record_validation_result = original_record_validation_result2  # type: ignore[assignment]
         org_credential_vault.set_org_credential = original_set_org_credential  # type: ignore[assignment]
         chat_model.get_runtime_auth_token = original_get_runtime_auth_token  # type: ignore[assignment]
         org_settings.get_org_settings = original_get_org_settings2  # type: ignore[assignment]
         _probe_provider_credential = original_probe2
 
-    # provision_session's 409 backstop (I-2c): an empty runtime_auth_token must fail fast, BEFORE
-    # ever reaching provider.provision() -- proven by making that call raise if it's ever reached,
-    # not just by catching the 409 (which a differently-broken function could also raise).
+    # C-B fix round (Critical, proved by execution): the actual admin recovery path I-1 exists for
+    # -- a persisted last_validation_ok=False (revoked credential, banner up) + the admin pastes a
+    # NEW working credential + saves -- must flip session_ready True IMMEDIATELY, not leave it
+    # falsely stuck for up to an hour. The static _get_existing() stub above (fixed
+    # last_validation_ok=True) could never have caught this -- proving it needs a STATEFUL fake
+    # row, since the bug is specifically about what put_org_settings_endpoint's own trailing
+    # _org_settings_response() call reads back AFTER the save actually ran.
+    class _FakeRow:
+        def __init__(self) -> None:
+            self.provider = "claude"
+            self.credential_secret_name = "org-credential-secret"
+            self.credential_kind = "api_key"
+            self.last_validation_ok = False  # the exact stuck state the review reproduced
+            self.last_validated_at = datetime.utcnow() - timedelta(minutes=1)  # fresh -- inside the 1h window
+            self.updated_at = datetime(2026, 1, 1)
+            self.updated_by = "admin"
+
+        def snapshot(self) -> org_settings.OrgSettings:
+            return org_settings.OrgSettings(
+                provider=self.provider, credential_secret_name=self.credential_secret_name,
+                credential_kind=self.credential_kind, updated_at=self.updated_at, updated_by=self.updated_by,
+                last_validation_ok=self.last_validation_ok, last_validated_at=self.last_validated_at,
+            )
+
+    fake_row = _FakeRow()
+
+    async def _recovery_get_org_settings() -> org_settings.OrgSettings:
+        return fake_row.snapshot()
+
+    async def _recovery_set_org_settings(provider: str, secret_name: str | None, updated_by: str, credential_kind: str | None = None) -> None:
+        fake_row.provider, fake_row.credential_secret_name, fake_row.credential_kind, fake_row.updated_by = (
+            provider, secret_name, credential_kind, updated_by,
+        )
+
+    async def _recovery_record_validation_result(ok: bool) -> None:
+        fake_row.last_validation_ok = ok
+        fake_row.last_validated_at = datetime.utcnow()
+
+    async def _recovery_get_org_credential(secret_name: str) -> str:
+        return "irrelevant-for-this-check"
+
+    async def _recovery_set_org_credential(value: str) -> str:
+        return "org-credential-secret"
+
+    async def _recovery_get_runtime_auth_token() -> tuple[str, str | None]:
+        return "fresh-good-key", "api_key"
+
+    recovery_original_get_org_settings = org_settings.get_org_settings
+    recovery_original_set_org_settings = org_settings.set_org_settings
+    recovery_original_record_validation_result = org_settings.record_validation_result
+    recovery_original_get_org_credential = org_credential_vault.get_org_credential
+    recovery_original_set_org_credential = org_credential_vault.set_org_credential
+    recovery_original_get_runtime_auth_token = chat_model.get_runtime_auth_token
+    recovery_original_probe = _probe_provider_credential
+    org_settings.get_org_settings = _recovery_get_org_settings  # type: ignore[assignment]
+    org_settings.set_org_settings = _recovery_set_org_settings  # type: ignore[assignment]
+    org_settings.record_validation_result = _recovery_record_validation_result  # type: ignore[assignment]
+    org_credential_vault.get_org_credential = _recovery_get_org_credential  # type: ignore[assignment]
+    org_credential_vault.set_org_credential = _recovery_set_org_credential  # type: ignore[assignment]
+    chat_model.get_runtime_auth_token = _recovery_get_runtime_auth_token  # type: ignore[assignment]
+    _probe_provider_credential = _tracking_probe_ok
+    try:
+        # Premise check -- proves the setup genuinely reproduces the stuck state the review found
+        # (not a vacuous test that would pass regardless): a plain re-read, no save, must already
+        # report session_ready=False from the persisted False alone.
+        stuck = asyncio.run(_org_settings_response())
+        assert stuck.session_ready is False, f"premise check failed -- setup does not reproduce the stuck state: {stuck}"
+
+        response = asyncio.run(put_org_settings_endpoint(
+            OrgSettingsPutRequest(provider="claude", credential="sk-ant-fresh-good-key", updated_by="admin"),
+            _FakeRequest(),  # type: ignore[arg-type]
+        ))
+        assert response.session_ready is True, (
+            f"a successful save must flip session_ready True immediately, not leave a stale "
+            f"persisted False stuck for up to an hour: {response}"
+        )
+        assert fake_row.last_validation_ok is True, "record_validation_result(True) was never called on a successful save"
+    finally:
+        org_settings.get_org_settings = recovery_original_get_org_settings  # type: ignore[assignment]
+        org_settings.set_org_settings = recovery_original_set_org_settings  # type: ignore[assignment]
+        org_settings.record_validation_result = recovery_original_record_validation_result  # type: ignore[assignment]
+        org_credential_vault.get_org_credential = recovery_original_get_org_credential  # type: ignore[assignment]
+        org_credential_vault.set_org_credential = recovery_original_set_org_credential  # type: ignore[assignment]
+        chat_model.get_runtime_auth_token = recovery_original_get_runtime_auth_token  # type: ignore[assignment]
+        _probe_provider_credential = recovery_original_probe
+
+    # provision_session's 409 backstop (I-2c) + its ordering (I-A fix round, Important, proved by
+    # execution): an empty runtime_auth_token must fail fast as the very FIRST thing after
+    # _check_shared_secret -- before session_store.get_session, the Key Vault fetch, and (the real
+    # regression the review caught by executing it) repo_scaffold.create_repo/set_project_repo for
+    # a "+ New Project" Assign, which used to create a REAL GitHub repo and record it against the
+    # project row before ever 409ing. Proven here by making EVERY one of those calls raise if
+    # reached at all -- not just by catching the 409 itself, which a differently-broken function
+    # could also raise, possibly after already doing real damage.
     global get_sandbox_provider
 
     class _ProvisionMustNotBeCalled:
         async def provision(self, **kwargs: Any) -> Any:
             raise AssertionError("provider.provision() must never be reached when the credential is empty")
 
-    async def _stub_get_session_none(thread_id: str) -> dict[str, Any] | None:
-        return None
+    async def _must_not_reach_get_session(thread_id: str) -> dict[str, Any] | None:
+        raise AssertionError("session_store.get_session must never be reached when the credential is empty")
 
-    async def _stub_get_vault_uri_none(owner: str, repo: str, user_login: str) -> str | None:
-        return None
+    async def _must_not_reach_get_vault_uri(owner: str, repo: str, user_login: str) -> str | None:
+        raise AssertionError("keyvault.get_vault_uri must never be reached when the credential is empty")
 
-    async def _stub_get_project_existing(project_id: str) -> dict[str, Any] | None:
-        return {"project_id": project_id, "name": "proj", "repo": "existing-repo", "owner": "octocat"}
+    async def _must_not_reach_get_project(project_id: str) -> dict[str, Any] | None:
+        raise AssertionError("project_store.get_project must never be reached when the credential is empty")
+
+    async def _must_not_reach_create_repo(name: str, github_token: str) -> dict[str, str]:
+        raise AssertionError(
+            "repo_scaffold.create_repo must never be reached when the credential is empty -- this "
+            "is the exact regression I-A's fix closes (a real GitHub repo created before the 409)"
+        )
 
     async def _stub_empty_runtime_auth_token() -> tuple[str, str | None]:
         return "", None
@@ -1540,15 +1728,20 @@ def _demo() -> None:
     original_get_session3 = session_store.get_session
     original_get_vault_uri = keyvault.get_vault_uri
     original_get_project = project_store.get_project
+    original_create_repo = repo_scaffold.create_repo
     original_get_sandbox_provider = get_sandbox_provider
-    session_store.get_session = _stub_get_session_none  # type: ignore[assignment]
-    keyvault.get_vault_uri = _stub_get_vault_uri_none  # type: ignore[assignment]
-    project_store.get_project = _stub_get_project_existing  # type: ignore[assignment]
+    session_store.get_session = _must_not_reach_get_session  # type: ignore[assignment]
+    keyvault.get_vault_uri = _must_not_reach_get_vault_uri  # type: ignore[assignment]
+    project_store.get_project = _must_not_reach_get_project  # type: ignore[assignment]
+    repo_scaffold.create_repo = _must_not_reach_create_repo  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _stub_empty_runtime_auth_token  # type: ignore[assignment]
     get_sandbox_provider = lambda: _ProvisionMustNotBeCalled()  # noqa: E731
     try:
         asyncio.run(provision_session(
-            ProvisionRequest(thread_id="t-selfcheck", project_id="p-selfcheck", owner="octocat", repo="existing-repo", branch="main"),
+            # A "+ New Project" shaped request (no owner/repo yet) -- the exact shape that used to
+            # reach repo_scaffold.create_repo before this fix. If the 409 didn't actually fire
+            # first, this would hit _must_not_reach_get_session immediately.
+            ProvisionRequest(thread_id="t-selfcheck", project_id="p-selfcheck", owner="pending", repo="pending", branch="main"),
             _FakeRequest(),  # type: ignore[arg-type]
         ))
         raise AssertionError("provision_session must 409 when no runtime auth credential is configured")
@@ -1558,6 +1751,7 @@ def _demo() -> None:
         session_store.get_session = original_get_session3  # type: ignore[assignment]
         keyvault.get_vault_uri = original_get_vault_uri  # type: ignore[assignment]
         project_store.get_project = original_get_project  # type: ignore[assignment]
+        repo_scaffold.create_repo = original_create_repo  # type: ignore[assignment]
         chat_model.get_runtime_auth_token = original_get_runtime_auth_token  # type: ignore[assignment]
         get_sandbox_provider = original_get_sandbox_provider
 

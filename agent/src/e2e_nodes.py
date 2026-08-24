@@ -50,7 +50,7 @@ from pydantic import Field
 from . import app_discovery
 from . import config as workflow_config
 from . import git_ops, keyvault, model_config, repo_files, run_failure, session_store
-from .chat_model import get_chat_model_for_thread
+from .chat_model import get_chat_model_for_thread, secret_env_names
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
 
@@ -651,6 +651,31 @@ _DEBUG_BOOT_ENV = (
 )
 
 
+def _fleet_secret_env_names() -> set[str]:
+    """Every fleet-credential env var name to strip from a launched app's environment, regardless
+    of which provider is currently active.
+
+    Security fix-round finding C-A: this used to be a hand-maintained literal list. Phase E audit
+    C-1 added CLAUDE_CODE_OAUTH_TOKEN as a second, mutually-exclusive-with-ANTHROPIC_API_KEY
+    Claude credential -- an org running Claude+oauth has NO ANTHROPIC_API_KEY (the whole point of
+    that change) but a LIVE CLAUDE_CODE_OAUTH_TOKEN, so the old literal list unset an already-
+    absent var and left the real, live one sitting in the started app's environment for arbitrary
+    repo-supplied postinstall/dev-server code to inherit and potentially leak onto an error page
+    (this function's caller's own docstring explains why that's a real, not theoretical, exposure).
+    A hand-maintained list can silently miss the NEXT credential var the same way; this instead
+    takes the union of BOTH providers' own chat_model.secret_env_names() -- the same
+    single-source-of-truth declaration claude_chat_model.py/copilot_chat_model.py already keep
+    current for their own provider -- unioned with the pre-existing literal names so this can only
+    ever gain coverage from a future edit, never lose it even if secret_env_names() were ever
+    narrowed.
+    """
+    return (
+        secret_env_names(provider="copilot")
+        | secret_env_names(provider="claude")
+        | {"COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY"}
+    )
+
+
 async def _boot_process(
     provider: Any, thread_id: str, launch_command: str, log_path: str, pid_path: str, *, env_file: bool
 ) -> None:
@@ -669,12 +694,15 @@ async def _boot_process(
     command = launch_command
     if env_file:
         command = f"set -a; . {keyvault.APP_ENV_PATH} 2>/dev/null; set +a; {launch_command}"
+    # sorted(): deterministic/testable command string, same convention copilot_chat_model.py's own
+    # --secret-env-vars construction already uses for the identical reason.
+    env_unset = " ".join(f"-u {name}" for name in sorted(_fleet_secret_env_names()))
     await provider.exec_in_sandbox(
         thread_id,
         # setsid: the app becomes its own process-group leader, so teardown can kill the WHOLE
         # group. Killing the recorded pid alone left the real server (a child of the sh wrapper)
         # running -- which is how a previous attempt's dev server survived to hold port 3000.
-        f"env -u COPILOT_SDK_AUTH_TOKEN -u COPILOT_CONNECTION_TOKEN -u COPILOT_GITHUB_TOKEN -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "
+        f"env {env_unset} "
         f"{_DEBUG_BOOT_ENV} "
         f"setsid nohup sh -c {shlex.quote(command)} > {shlex.quote(log_path)} 2>&1 & "
         f"echo $! > {shlex.quote(pid_path)}",
@@ -1366,6 +1394,17 @@ def _demo() -> None:
     assert _sorted[0]["path"] == "apps/api", _sorted
     _primary = next((a for a in _sorted if _candidate_class(a) == "web"), None)
     assert _primary is not None and _primary["path"] == "apps/web", _primary
+
+    # C-A (security fix round): the fleet-secret scrub list must be built from the union of BOTH
+    # providers' chat_model.secret_env_names(), not a stale literal -- proven here by asserting
+    # the oauth token specifically is present (the exact gap this fix closes: an oauth-billed
+    # Claude org has no ANTHROPIC_API_KEY but a live CLAUDE_CODE_OAUTH_TOKEN, and the OLD literal
+    # list never named it), and that every previously-hardcoded name still survives the union.
+    _scrub_names = _fleet_secret_env_names()
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in _scrub_names, _scrub_names
+    assert "ANTHROPIC_API_KEY" in _scrub_names, _scrub_names
+    for _name in ("COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN"):
+        assert _name in _scrub_names, (_name, _scrub_names)
 
     print("e2e_nodes self-check: ok")
 
