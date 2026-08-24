@@ -87,14 +87,18 @@ class SandboxProvider(abc.ABC):
         this container -- the caller's own already-resolved choice, not something this method
         re-derives. sessions_api.provision_session resolves it as "this session's own stored
         provider (dbo.sessions), or the live org setting if there is no prior row" before ever
-        calling here, the same preserve-if-pinned shape GraphState.provider already uses one layer
-        up -- so a container being reprovisioned after an idle reap is built for whichever provider
-        the checkpointed graph is actually still dispatching to, not whatever the org setting
-        happens to say at that later moment. A genuinely brand-new session has no prior row to
-        prefer, so the caller's own live fallback is what supplies this value in that case --
-        exactly the "provisioning a new session is the moment a live change should take effect"
-        behavior this method used to implement itself, before I-3 found that doing it here (rather
-        than once, at the caller) missed the reprovision case entirely.
+        calling here. `graph.py`'s `intake_node` resolves `GraphState.provider` the SAME way
+        (state -> dbo.sessions.provider -> live, Important-1 follow-up review) -- so a container
+        being reprovisioned after an idle reap OR after a full backend restart (which wipes
+        LangGraph's in-memory checkpoint entirely, per GraphState.provider's own comment) is built
+        for whichever provider `dbo.sessions.provider` durably records, and dispatch resolves to
+        that exact same value independently -- the two sides agree because they consult the SAME
+        durable row, not because either one is reading the other's live state. A genuinely
+        brand-new session has no prior row to prefer, so each side's own live fallback is what
+        supplies this value in that case -- exactly the "provisioning a new session is the moment a
+        live change should take effect" behavior this method used to implement itself, before I-3
+        found that doing it here (rather than once, at the caller) missed the reprovision case
+        entirely.
 
         scaffold_new_repo (Part 3 plan, Ruling 6) is True only for the "+ New Project" provision
         call that just created repo_clone_url's own (empty) GitHub repo via repo_scaffold.

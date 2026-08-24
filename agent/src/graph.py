@@ -188,14 +188,33 @@ class GraphState(TypedDict):
     #
     # Deliberately UNLIKE run_id just above: run_id reMINTS on every intake_node execution
     # (including a same-thread "later revision" or a blank-resume reattach -- see run_id's own
-    # comment), but provider must not. intake_node computes `state.get("provider") or await
-    # chat_model.get_provider()` -- preserve-if-already-set, resolve only if genuinely absent --
-    # specifically because AppShell's blank runAgent()-on-mount reattach (intake_node's own
-    # is_new_submission dance; also AIDW_RESUME headless resume) re-enters intake_node exactly the
-    # same as a fresh submission does, and that path is by far the most common way an in-review run
-    # gets touched again. Re-resolving there would let an admin's live setting change flip the
-    # provider out from under a run that is not finished, exactly the failure Ruling 2 exists to
-    # prevent -- pinning per-THREAD (not merely per-intake-call) is what actually closes that gap.
+    # comment), but provider must not. intake_node computes `state.get("provider") or
+    # (await session_store.get_session(thread_id) or {}).get("provider") or await
+    # chat_model.get_provider()` -- preserve-if-already-set, THEN prefer this session's own stored
+    # row, resolve live only if genuinely neither exists -- specifically because AppShell's blank
+    # runAgent()-on-mount reattach (intake_node's own is_new_submission dance; also AIDW_RESUME
+    # headless resume) re-enters intake_node exactly the same as a fresh submission does, and that
+    # path is by far the most common way an in-review run gets touched again. Re-resolving live
+    # there would let an admin's live setting change flip the provider out from under a run that is
+    # not finished, exactly the failure Ruling 2 exists to prevent -- pinning per-THREAD (not merely
+    # per-intake-call) is what actually closes that gap.
+    #
+    # The session_store fallback (Phase E audit I-3 review, Important 1) closes a gap the original
+    # two-level fallback opened for itself: after a backend restart, `state.get("provider")` is
+    # ALWAYS empty (see the InMemorySaver paragraph below) for every thread's first post-restart
+    # intake -- INCLUDING one that is only reattaching, not genuinely new. Falling straight to a
+    # live `get_provider()` read there means intake and `sessions_api.provision_session` (which
+    # itself now prefers `dbo.sessions.provider` -- see that module and session_store.create_session)
+    # each resolve independently: if the org setting changed since this session was first
+    # provisioned, intake would dispatch to the NEW live value while provisioning had already baked
+    # the container for the OLD stored one (or vice versa, whichever runs first), reintroducing the
+    # exact split-provider hazard this field exists to prevent -- just moved from "mid-run" to
+    # "across a restart." Checking `session_store.get_session(thread_id).get("provider")` BEFORE the
+    # live fallback makes both sides agree on the same durable value again, even with an empty
+    # checkpoint: it is a plain SELECT on the same branch that was already going to hit the DB for
+    # `get_provider()`'s own `org_settings` read, so this adds a second rare-path query, not a new
+    # cost class on the hot path (every later intake on the same thread still short-circuits on
+    # `state.get("provider")` and touches the DB not at all).
     #
     # Survives a resume exactly like every other never-touched-again GraphState field (stages,
     # run_id, StageState.baseline_commit) does: this module's compiled graph uses InMemorySaver
@@ -1502,18 +1521,45 @@ def _split_text_and_attachments(content: Any) -> tuple[str, list[dict[str, Any]]
     return str(content), []
 
 
+async def _resolve_thread_provider(thread_id: str, state: GraphState) -> Literal["copilot", "claude"]:
+    """The 3-level provider-pinning fallback GraphState.provider's own comment documents in full:
+    prefer this thread's already-pinned state, then this session's own durable `dbo.sessions` row,
+    resolve the live org setting only if genuinely neither exists. Split out of intake_node (its
+    only caller) so this one expression has a direct, real self-check below instead of needing to
+    drive intake_node's much larger body just to reach it.
+
+    Pinned per-THREAD, not re-resolved per intake call -- see GraphState.provider's own comment for
+    the full reasoning (Ruling 2, docs/superpowers/plans/part-4-org-settings-tasks.md) and for why
+    this deliberately does NOT follow run_id's unconditional-remint pattern. The `or` chain
+    short-circuits at each step -- both across plain values AND across `await`s, since Python
+    evaluates operands left-to-right and stops at the first truthy one -- so the DB reads below only
+    ever fire the first time this process has seen this thread (a brand new thread, or the first
+    intake after a restart -- InMemorySaver keeps neither): every later intake on the same thread,
+    including a blank-resume reattach, keeps whatever this run already pinned and touches the DB
+    not at all.
+
+    The middle term (Phase E audit I-3 review, Important 1) prefers this session's OWN stored
+    `dbo.sessions.provider` over a live re-resolve when the checkpoint is empty -- without it, a
+    post-restart intake and sessions_api.provision_session's own stored-or-live resolution could
+    each independently land on a DIFFERENT value if the org setting changed since this session was
+    first provisioned (intake live-resolving the NEW setting while the container was already baked,
+    or about to be rebaked, for the OLD stored one) -- the exact split-provider hazard this field
+    exists to prevent, just relocated from "mid-run" to "across a restart." `get_session` returning
+    None (a genuinely new thread) or a row with no stored provider (pre-migration-0008) both fall
+    through to the live read exactly as before.
+    """
+    return (
+        state.get("provider")
+        or (await session_store.get_session(thread_id) or {}).get("provider")
+        or await chat_model.get_provider()
+    )
+
+
 async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     stages = {key: dict(value) for key, value in state.get("stages", {}).items()}
 
-    # Pinned per-THREAD, not re-resolved per intake call -- see GraphState.provider's own comment
-    # for the full reasoning (Ruling 2, docs/superpowers/plans/part-4-org-settings-tasks.md) and for
-    # why this deliberately does NOT follow run_id's unconditional-remint pattern just below. Short
-    # version: `or` short-circuits, so the live get_provider() read only ever fires the first time
-    # this process has seen this thread (a brand new thread, or the first intake after a restart --
-    # InMemorySaver keeps neither) -- every later intake on the same thread, including a blank-resume
-    # reattach, keeps whatever this run already pinned.
-    provider: Literal["copilot", "claude"] = state.get("provider") or await chat_model.get_provider()
+    provider: Literal["copilot", "claude"] = await _resolve_thread_provider(thread_id, state)
 
     # Popped unconditionally, right here, on EVERY intake -- a resume=1 provision sets this meta
     # flag once, and it must not survive past the first run that consumes it (else a later,
@@ -3776,6 +3822,60 @@ def _demo() -> None:
         globals()["_persist_if_sandboxed"] = real_persist_2
         globals()["_run_post_approve_hook"] = real_hook_2
         sandbox_registry.pop(demo_gate_thread)
+
+    # _resolve_thread_provider (Phase E audit I-3 review, Important 1): the restart scenario --
+    # an empty checkpoint (state.get("provider") falsy) must prefer this session's OWN stored
+    # dbo.sessions.provider over a live re-resolve, so a post-restart intake and
+    # sessions_api.provision_session's own stored-or-live resolution can't independently land on
+    # different values. session_store.get_session and chat_model.get_provider are faked to
+    # DISAGREE on purpose ("claude" stored vs. "copilot" live) so a regression that fell back to
+    # live can't accidentally pass by coincidence.
+    async def _fake_get_session_stored_claude(session_id):  # noqa: ANN001, ANN202
+        return {"provider": "claude"}
+
+    async def _fake_get_provider_live_copilot():  # noqa: ANN202
+        return "copilot"
+
+    real_get_session_provider = session_store.get_session
+    real_get_provider_thread = chat_model.get_provider
+    session_store.get_session = _fake_get_session_stored_claude
+    chat_model.get_provider = _fake_get_provider_live_copilot
+    try:
+        # Empty checkpoint -- must resolve the STORED "claude", never the disagreeing live "copilot".
+        resolved = asyncio.run(_resolve_thread_provider("restart-thread", {}))
+        assert resolved == "claude", (
+            f"an empty checkpoint must prefer the session's stored provider over a live "
+            f"re-resolve, got {resolved!r}"
+        )
+
+        # Already-pinned state wins over BOTH the stored row and the live setting -- neither fake
+        # above is even consulted (both would fail this assertion if reached, since neither returns
+        # "claude-pinned").
+        resolved = asyncio.run(_resolve_thread_provider("pinned-thread", {"provider": "claude-pinned"}))
+        assert resolved == "claude-pinned", resolved
+    finally:
+        session_store.get_session = real_get_session_provider
+        chat_model.get_provider = real_get_provider_thread
+
+    # Genuinely new thread (no prior dbo.sessions row at all) -- falls through to the live setting,
+    # exactly the "provisioning is the moment a live change takes effect" behavior for a real first
+    # provision.
+    async def _fake_get_session_none(session_id):  # noqa: ANN001, ANN202
+        return None
+
+    async def _fake_get_provider_live_claude():  # noqa: ANN202
+        return "claude"
+
+    real_get_session_new = session_store.get_session
+    real_get_provider_new = chat_model.get_provider
+    session_store.get_session = _fake_get_session_none
+    chat_model.get_provider = _fake_get_provider_live_claude
+    try:
+        resolved = asyncio.run(_resolve_thread_provider("brand-new-thread", {}))
+        assert resolved == "claude", resolved
+    finally:
+        session_store.get_session = real_get_session_new
+        chat_model.get_provider = real_get_provider_new
 
     # Regression check (Part 2 Task 10 review fix -- a real Critical bug this file's own review
     # caught): a stage re-entering make_draft_node on a REJECTION must not let
