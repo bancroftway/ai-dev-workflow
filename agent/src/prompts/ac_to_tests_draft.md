@@ -12,9 +12,10 @@ every path you are about to list in `test_files`, you must have actually called 
 it in THIS turn. If you have not written a single file, you are not finished -- do not answer yet.
 Exploring the repo (glob/view) and loading skills is not progress; only written files are. Read the approved Specification's Acceptance Criteria (via
 `.ai-dev-workflow/spec/ledger.json`'s active entries, and the Specification itself for their descriptions) and the
-approved Implementation Plan. Use the `ac-to-tests` skill for judgment on test kind and how to
-write a test that actually proves the AC, and the `test-driven-development` skill for the
-RED-before-GREEN discipline this stage exists to enforce.
+approved Implementation Plan. Invoke the `ac-to-tests` skill with your Skill tool for judgment on
+test kind and how to write a test that actually proves the AC, and the `test-driven-development`
+skill for the RED-before-GREEN discipline this stage exists to enforce -- the latter is REQUIRED
+and deterministically verified against your session's own transcript.
 
 For every active Acceptance Criterion, write one or more real, runnable test(s) that will FAIL
 right now (no implementation exists yet) and will only pass once the AC is genuinely satisfied --

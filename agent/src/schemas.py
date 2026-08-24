@@ -6,6 +6,8 @@ target for the drafting nodes' model calls.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -41,10 +43,11 @@ class StageReport(BaseModel):
     skills_invoked: list[str] = Field(
         default_factory=list,
         description=(
-            "Every skill you invoked this turn, by name (e.g. 'test-driven-development'). Report "
-            "what you ACTUALLY invoked, not what you were asked to -- this is cross-checked "
-            "against the session's own skill-invocation log, and a mismatch is treated as a "
-            "false report."
+            "Every skill you invoked this turn, by name (e.g. 'test-driven-development'; a plugin "
+            "slash command counts -- report its bare name), plus any subagents you launched, "
+            "reported as 'agent:<name>'. Report what you ACTUALLY invoked, not what you were "
+            "asked to -- this is cross-checked against the session's own skill-invocation log, "
+            "and a mismatch is treated as a false report."
         ),
     )
 
@@ -93,6 +96,16 @@ class UserStory(BaseModel):
 class Specification(BaseModel):
     title: str
     summary: str
+    work_kind: Literal["bug", "feature"] = Field(
+        default="feature",
+        description="What this ticket's raw requirements actually ask for: 'bug' when the text "
+        "reports something broken/regressed/failing in EXISTING behavior (error reports, 'X "
+        "stopped working', wrong output); 'feature' for new or changed capability, including "
+        "enhancements and chores. Classify from the requirements text itself -- downstream "
+        "stages gate a reproduce-first debugging discipline on 'bug', so a misclassified "
+        "feature costs a pointless debugging pass and a misclassified bug skips the discipline "
+        "the fix depends on.",
+    )
     user_stories: list[UserStory] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     out_of_scope: list[str] = Field(default_factory=list)
@@ -184,8 +197,10 @@ class SpecificationDraftResponse(BaseModel):
     )
     skills_invoked: list[str] = Field(
         default_factory=list,
-        description="Exact names of skills you invoked with your `skill` tool this turn, and only "
-        "those. Cross-checked against the session's own recorded invocations -- a name you did not "
+        description="Exact names of skills you invoked with your `skill` tool this turn (a plugin "
+        "slash command counts -- report its bare name, e.g. 'code-review'), plus any subagents you "
+        "launched with your subagent (Agent/Task) tool, reported as 'agent:<name>'. Only what you ACTUALLY invoked. "
+        "Cross-checked against the session's own recorded invocations -- a name you did not "
         "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
     )
 
@@ -202,8 +217,10 @@ class PlanDraftResponse(BaseModel):
     )
     skills_invoked: list[str] = Field(
         default_factory=list,
-        description="Exact names of skills you invoked with your `skill` tool this turn, and only "
-        "those. Cross-checked against the session's own recorded invocations -- a name you did not "
+        description="Exact names of skills you invoked with your `skill` tool this turn (a plugin "
+        "slash command counts -- report its bare name, e.g. 'code-review'), plus any subagents you "
+        "launched with your subagent (Agent/Task) tool, reported as 'agent:<name>'. Only what you ACTUALLY invoked. "
+        "Cross-checked against the session's own recorded invocations -- a name you did not "
         "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
     )
 

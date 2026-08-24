@@ -24,7 +24,7 @@
 # vendor-lock.json stays the human-readable provenance record (who vendored what, when, why); the
 # sourceUrl/ref/sha/sourcePath values below are duplicated from it as plain shell variables rather
 # than JSON-parsed at build time, so this script needs no new tool installed into the Dockerfile's
-# minimal `fetch` stage (which has git + coreutils and nothing else) -- five fixed plugins do not
+# minimal `fetch` stage (which has git + coreutils and nothing else) -- nine fixed plugins do not
 # earn a generic JSON-driven config reader.
 
 set -eu
@@ -146,5 +146,52 @@ sed -i \
   -e '/^| `live` | Iterate |.*reference\/live\.md.*$/d' \
   -e '/^\*\*Hooks:\*\* `\/impeccable hooks /d' \
   "$IMP/skills/impeccable/SKILL.md"
+
+echo "== anthropics/claude-plugins-official (frontend-design, code-review, code-simplifier) =="
+# security-guidance deliberately NOT fetched: it is hooks-ONLY, its SessionStart hook pip-installs
+# claude-agent-sdk at session runtime (network -- a live sandbox session must stay
+# network-independent), and stripping hooks (the impeccable precedent for unvalidated mechanisms)
+# would leave an empty plugin. plugin-dev/skill-creator/claude-code-setup and every MCP-server
+# plugin (context7, playwright, chrome-devtools-mcp, github, mintlify) skipped too -- see
+# vendor-lock.json's "skipped" array for each rationale.
+clone_at https://github.com/anthropics/claude-plugins-official.git 340e33aef211d95769d252324854497af871dafe cpo-src
+install_plugin cpo-src plugins/frontend-design anthropics-claude-plugins-official/frontend-design
+install_plugin cpo-src plugins/code-review anthropics-claude-plugins-official/code-review
+install_plugin cpo-src plugins/code-simplifier anthropics-claude-plugins-official/code-simplifier
+
+echo "== mattpocock/skills (7 skills of a larger collection -- MIT) =="
+# Requested set: grill-me, grill-with-docs, diagnosing-bugs, improve-codebase-architecture -- plus
+# the three support skills those four call via the Skill tool (verified in their own SKILL.md
+# bodies): grilling, domain-modeling, codebase-design. tdd and to-spec deliberately skipped (see
+# vendor-lock.json). Each skill ships an agents/openai.yaml (other-platform packaging) -- stripped.
+# diagnosing-bugs/scripts/ and improve-codebase-architecture/HTML-REPORT.md stay: both are
+# referenced from their own SKILL.md.
+clone_at https://github.com/mattpocock/skills.git 6654f6b60cd9d5be8b54c6fafe44346dabeb3b76 mattpocock-src
+MPS="$DEST_ROOT/mattpocock-skills/mattpocock-skills"
+install_plugin mattpocock-src skills/productivity/grill-me mattpocock-skills/mattpocock-skills/skills/grill-me
+install_plugin mattpocock-src skills/productivity/grilling mattpocock-skills/mattpocock-skills/skills/grilling
+install_plugin mattpocock-src skills/engineering/grill-with-docs mattpocock-skills/mattpocock-skills/skills/grill-with-docs
+install_plugin mattpocock-src skills/engineering/diagnosing-bugs mattpocock-skills/mattpocock-skills/skills/diagnosing-bugs
+install_plugin mattpocock-src skills/engineering/improve-codebase-architecture mattpocock-skills/mattpocock-skills/skills/improve-codebase-architecture
+install_plugin mattpocock-src skills/engineering/domain-modeling mattpocock-skills/mattpocock-skills/skills/domain-modeling
+install_plugin mattpocock-src skills/engineering/codebase-design mattpocock-skills/mattpocock-skills/skills/codebase-design
+cp "$WORK/mattpocock-src/LICENSE" "$MPS/LICENSE"
+write_wrapper "$SCRIPT_DIR/wrappers/mattpocock-skills/plugin.json" "$MPS"
+strip_paths "$MPS" \
+  skills/grill-me/agents \
+  skills/grilling/agents \
+  skills/grill-with-docs/agents \
+  skills/diagnosing-bugs/agents \
+  skills/improve-codebase-architecture/agents \
+  skills/domain-modeling/agents \
+  skills/codebase-design/agents
+# Upstream marks the user-invoked skills `disable-model-invocation: true` -- correct for a human
+# driving a chat, fatal here: this pipeline's sessions ARE the model, headless, so a skill the
+# model cannot invoke via its Skill tool is unreachable. Flip the flag on the three we prompt
+# stages to use; the support skills (grilling/domain-modeling/codebase-design) and diagnosing-bugs
+# are already model-invocable upstream.
+for s in grill-me grill-with-docs improve-codebase-architecture; do
+  sed -i 's/^disable-model-invocation: true$/disable-model-invocation: false/' "$MPS/skills/$s/SKILL.md"
+done
 
 echo "All vendored plugins fetched and curated under $DEST_ROOT"

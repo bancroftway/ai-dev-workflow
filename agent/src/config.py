@@ -29,6 +29,17 @@ E2E_MAX_FIX_CYCLES = int(os.environ.get("E2E_MAX_FIX_CYCLES", "8"))
 TEST_HARDENING_MAX_FIX_CYCLES = int(os.environ.get("TEST_HARDENING_MAX_FIX_CYCLES", "4"))
 E2E_APP_READY_TIMEOUT_SECONDS = int(os.environ.get("E2E_APP_READY_TIMEOUT_SECONDS", "120"))
 E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "1200"))
+# Lighthouse (performance + accessibility) runs inside e2e_run_node's live-app window -- the ONE
+# place a served app exists (deliberately NOT a repo_scan tool: repo_scan's contract is offline,
+# no running app). Worst-of-routes scores (0-100) below either floor count as an e2e failure and
+# feed the same e2e_fix loop/cap above with the failing audit titles. 0 disables that gate (scores
+# still measured and reported). Defaults: a11y gated at 90 (axe-backed, deterministic, and its
+# failing audits are concrete code fixes an LLM lap can actually make); perf REPORT-ONLY by
+# default -- dev-server numbers on the headless shell are timing-noisy, and a score hovering near
+# a floor flip-flops across fix laps, burning up to E2E_MAX_FIX_CYCLES paid model turns on a
+# number a code change can't reliably move (2026-08-24 audit). Set a floor explicitly to gate it.
+LIGHTHOUSE_PERF_MIN = int(os.environ.get("LIGHTHOUSE_PERF_MIN", "0"))
+LIGHTHOUSE_A11Y_MIN = int(os.environ.get("LIGHTHOUSE_A11Y_MIN", "90"))
 
 # make_verify_node's stall-detector (graph.py's _detect_verify_stall): resets the draft session
 # after this many consecutive verify laps report near-identical feedback, an unchanged
@@ -59,6 +70,10 @@ COPILOT_PLUGIN_DIRECTORIES = [
     f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/juliusbrussee-caveman/caveman",
     f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/github-awesome-copilot/security-review",
     f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/pbakaus-impeccable/impeccable",
+    f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/anthropics-claude-plugins-official/frontend-design",
+    f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/anthropics-claude-plugins-official/code-review",
+    f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/anthropics-claude-plugins-official/code-simplifier",
+    f"{COPILOT_PLUGIN_ROOT_IN_CONTAINER}/vendor/mattpocock-skills/mattpocock-skills",
 ]
 
 # Skills that are loaded but must never be offered to a pipeline session. Both are written as
@@ -103,12 +118,38 @@ REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
     "specification": ["brainstorming"],
     "plan": ["writing-plans"],
     "ac-to-tests": ["test-driven-development"],
-    "minimal-code-to-green": ["executing-plans", "requesting-code-review", "verification-before-completion"],
+    # ponytail: minimal_code_to_green_draft.md has mandated it for as long as the prompt existed --
+    # requiring it here just closes the prompt-says/gate-checks gap the skill gate exists for.
+    # code-review: the Claude CLI's BUILT-IN code-review skill (2.1.x bundles it; commands unified
+    # into the Skill tool, so it shows up in the transcript like any other skill). The vendored
+    # anthropics code-review PLUGIN also loads, but its command body is gh-PR-hardwired and fans
+    # out ~10 subagents -- the built-in reviews the working tree diff directly. See
+    # gates/skill_gate.py's known-set assert and the prompt mandate in
+    # minimal_code_to_green_draft.md.
+    "minimal-code-to-green": [
+        "executing-plans",
+        "requesting-code-review",
+        "verification-before-completion",
+        "ponytail",
+        "code-review",
+    ],
+    # agent:code-simplifier -- the "agent:" prefix means a Task-tool subagent launch, not a Skill
+    # invocation (see claude_chat_model.read_skill_invocations' naming scheme). Requires
+    # builtin:task in remediation's available_tools (graph.py session_options).
+    # security-review: the diff-based security pass (built-in skill; the vendored awesome-copilot
+    # skill answers to the same name -- either satisfies the gate). Restores the P10-era mandate
+    # that was lost when the security stage consolidated into remediation.
+    "remediation": ["agent:code-simplifier", "security-review"],
     "adversarial-compliance": ["receiving-code-review", "verification-before-completion"],
     "metrics-exit": ["finishing-a-development-branch"],
     # dispatching-parallel-agents is deliberately NOT required: it applies only when the plan has
     # genuinely independent steps, so mandating it would force a nonsense invocation on a linear
     # plan. systematic-debugging likewise -- the fix nodes it belongs to only run on failure.
+    # The mattpocock skills (grill-me, grill-with-docs, diagnosing-bugs,
+    # improve-codebase-architecture) and frontend-design are prompt-ENCOURAGED, not required:
+    # the grill-* pair is interactive by nature, frontend-design only applies to UI repos (this
+    # static map cannot express that), and promotion to required is telemetry-driven from the
+    # skills evidence each run persists.
 }
 
 # Read-only tool allowlist (Phase A0 spike finding: excluded_tools blocklisting write-capable

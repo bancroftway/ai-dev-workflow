@@ -32,7 +32,6 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 | `security_remediation_triage.md` | security-remediation | fix/suppress decision per security finding |
 | `security_remediation_fix.md` | security-remediation | apply security fixes |
 | `adversarial_audit_draft.md` | adversarial-audit | adversarial code audit |
-| `dedup_draft.md` | dedup-simplify | duplication removal |
 | `finding_cluster_dependency_upgrade.md` | finding-cluster | dependency upgrades |
 | `finding_cluster_risk_review.md` | finding-cluster | upgrade risk review |
 | `license_audit_draft.md` | license-audit | license compliance |

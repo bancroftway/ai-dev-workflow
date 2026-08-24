@@ -39,6 +39,28 @@ rule's severity, no deleting or weakening a test, no adding a scanner exclusion 
 disappear. If a finding is a genuine false positive for this codebase, leave the code alone and
 explain why in `known_gaps` -- do not silence the scanner.
 
+Two REQUIRED tool-verified steps (both checked deterministically against your session's own
+transcript, not your say-so):
+
+- **Security pass**: invoke the `security-review` skill with your Skill tool over this branch's
+  changes and fix what it surfaces. The scanners above are pattern-based; this pass is the
+  reasoning-based complement that catches what rules cannot (auth logic, injection paths, secrets
+  handling). The first-party `security-triage` skill is the discipline for judging which security
+  findings are real versus test vectors/false positives -- invoke it when that judgment call comes
+  up.
+- **Simplification pass**: for `duplication` and `maintainability` findings, launch the
+  `code-simplifier` agent with your subagent tool (Agent/Task; subagent type `code-simplifier`),
+  scoped to the flagged files only -- give it the file list in your prompt. It simplifies while
+  preserving behavior; you still own the result: build and run the tests after it returns, and
+  revert anything that changed observable behavior.
+
+For structural findings that keep recurring (a module whose shape generates complexity findings
+faster than they can be fixed), the `improve-codebase-architecture` skill proposes deepening
+refactors -- invoke it scoped to that module and report its proposals in `remediation_summary`
+(skip its HTML report; plain findings in your response are what this pipeline reads). The
+`quality-triage` and `license-audit` skills carry the fix-vs-suppress and licence-bucket
+disciplines for their finding kinds.
+
 ## Licences
 
 A `license` finding on a transitive dependency is usually informational. Replace the dependency only

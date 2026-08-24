@@ -34,9 +34,23 @@ from typing import Any
 
 from .. import config as workflow_config
 from ..chat_model import get_session_id, read_skill_invocations
+from ..claude_chat_model import normalize_skill_name
 from ..sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
+
+
+# Required-name prefixes beyond a plain Skill invocation. "agent:<name>" is a Task-tool subagent
+# launch (see claude_chat_model.read_skill_invocations' naming scheme). Plugin slash commands need
+# NO prefix: the CLI unifies commands into the Skill tool, so they arrive as plain skill names.
+_KNOWN_PREFIXES = ("agent:",)
+
+
+def _requirement_phrase(name: str) -> str:
+    """How to tell the model to satisfy one required entry, matched to its invocation kind."""
+    if name.startswith("agent:"):
+        return f"launch the `{name.removeprefix('agent:')}` agent with your Agent/Task (subagent) tool"
+    return f"invoke `{name}` with your Skill tool"
 
 
 @dataclass(frozen=True)
@@ -49,9 +63,13 @@ class SkillCheckOutcome:
 
 
 async def invoked_skills(
-    provider: SandboxProvider, thread_id: str, stage: str, role: str = "draft", *, chat_provider: str
+    provider: SandboxProvider | None, thread_id: str, stage: str, role: str = "draft", *, chat_provider: str
 ) -> list[str] | None:
     """Skill names this stage's own session invoked, or None if unverifiable.
+
+    `provider` may be None (no sandbox registered for this thread) -- that is just another
+    unverifiable case, same None as a missing session id, so skills_record can run on every path
+    and still always emit a record (the provider-evidence requirement, 2026-08-24).
 
     `chat_provider` (required, keyword-only, no default -- Ruling 4,
     docs/superpowers/plans/part-4-org-settings-tasks.md) is this THREAD's own pinned
@@ -62,6 +80,8 @@ async def invoked_skills(
     provider, so it is not exempt from threading that value through just because it isn't a graph
     node (this was a real gap in this plan's own first draft, corrected as part of Ruling 4).
     """
+    if provider is None:
+        return None
     session_id = get_session_id(thread_id, stage, role, provider=chat_provider)
     if not session_id:
         return None
@@ -79,12 +99,26 @@ _ROLES_CHECKED = ("draft", "audit")
 
 
 async def check_required_skills(
-    provider: SandboxProvider, thread_id: str, stage: str, roles: tuple[str, ...] = _ROLES_CHECKED, *, chat_provider: str
+    provider: SandboxProvider | None,
+    thread_id: str,
+    stage: str,
+    roles: tuple[str, ...] = _ROLES_CHECKED,
+    *,
+    chat_provider: str,
+    prior_invoked: list[str] | None = None,
 ) -> SkillCheckOutcome:
     """Union of every checked role's `skill.invoked` events for this stage.
 
     `chat_provider` (required, keyword-only, no default -- Ruling 4): this thread's own pinned
     provider, threaded straight through to invoked_skills -- see that function's own docstring.
+
+    `prior_invoked` is the stage's previously PERSISTED invoked list (stage["skills"]["invoked"],
+    passed in by make_verify_node). It exists because a failed skill check closes the draft
+    session (make_verify_node's reset), and the fresh session's transcript no longer contains what
+    lap 1 genuinely invoked -- without this union, one missed skill retroactively "un-invokes"
+    every other requirement and the redraft must re-run all of them or fail again (2026-08-24 plan
+    audit, session-reset amplification). The persisted list is itself transcript evidence from an
+    earlier lap, never self-report, so unioning it keeps the "evidence, not self-report" contract.
 
     `verified` stays False only when NO role produced a readable log: one absent session (a stage
     with no audit pass) alongside one readable session is a complete answer, not an unverifiable one.
@@ -93,7 +127,7 @@ async def check_required_skills(
     if not required:
         return SkillCheckOutcome(passed=True, required=[], invoked=[], missing=[], verified=True)
 
-    invoked: list[str] = []
+    invoked: list[str] = [s for s in (prior_invoked or []) if isinstance(s, str)]
     any_readable = False
     for role in roles:
         role_skills = await invoked_skills(provider, thread_id, stage, role, chat_provider=chat_provider)
@@ -114,7 +148,10 @@ async def check_required_skills(
         # same branch with identical information -- so the bump applies uniformly rather than
         # guessing which one happened.
         logger.warning("skill gate: cannot verify invocations for stage=%s (no readable session log)", stage)
-        return SkillCheckOutcome(passed=True, required=required, invoked=[], missing=[], verified=False)
+        # invoked keeps whatever prior_invoked carried: fail-open means "cannot verify THIS lap",
+        # not "prior transcript evidence stopped existing" -- returning [] here made the
+        # verification report and feedback contradict the persisted record (2026-08-24 audit).
+        return SkillCheckOutcome(passed=True, required=required, invoked=invoked, missing=[], verified=False)
 
     missing = [skill for skill in required if skill not in invoked]
     if missing:
@@ -124,7 +161,13 @@ async def check_required_skills(
 
 
 async def skills_record(
-    provider: SandboxProvider, thread_id: str, stage: str, self_reported: list[str] | None = None, *, chat_provider: str
+    provider: SandboxProvider | None,
+    thread_id: str,
+    stage: str,
+    self_reported: list[str] | None = None,
+    *,
+    chat_provider: str,
+    prior_invoked: list[str] | None = None,
 ) -> dict[str, Any]:
     """The stage's skill evidence, for persistence into state.json -- on the PASS path too.
 
@@ -133,7 +176,25 @@ async def skills_record(
     the whole reason "we force GHCP to report skills" looked unimplemented.
 
     `chat_provider` (required, keyword-only, no default -- Ruling 4): this thread's own pinned
-    provider, threaded straight through to invoked_skills -- see that function's own docstring.
+    provider, threaded straight through to invoked_skills -- see that function's own docstring. It
+    is ALSO persisted into the record itself (`provider` key, user requirement 2026-08-24): every
+    stage's evidence must say which coding-agent provider produced it, not leave that to be
+    reconstructed from run-level state later. `provider` (the SandboxProvider) may be None -- the
+    record then persists as unverified but still carries the provider name.
+
+    `prior_invoked` is the stage's PREVIOUS persisted record's `invoked` list, unioned in (and
+    reflected in `missing`/`unsubstantiated`). Load-bearing, not telemetry polish (2026-08-24
+    audit HIGH finding): a failed skill check closes the draft session, and the redraft's fresh
+    transcript no longer contains lap 1's invocations -- without this union the draft node's own
+    record overwrite destroys exactly the evidence make_verify_node's prior_invoked union was
+    added to preserve, re-creating the lap-oscillation this whole mechanism exists to prevent.
+    Prior entries are themselves transcript evidence from an earlier lap, never self-report.
+
+    Self-reported names are normalized (claude_chat_model.normalize_skill_name) before comparison:
+    a model that ran /code-review and honestly reports "/code-review" or
+    "code-review:code-review" must not be flagged as fabricating just for the spelling. Claims
+    that normalize to nothing (whitespace, a bare "/", a trailing-colon fragment) are dropped
+    rather than kept as empty-string fabrication-signal noise.
 
     `unsubstantiated` is the interesting field: a skill the model CLAIMED but never invoked. The event
     log cannot be forged, so a non-empty list here is a fabrication signal of exactly the kind that
@@ -141,7 +202,7 @@ async def skills_record(
     often it fires before blocking on it.
     """
     required = list(workflow_config.REQUIRED_SKILLS_BY_STAGE.get(stage, []))
-    invoked: list[str] = []
+    invoked: list[str] = [s for s in (prior_invoked or []) if isinstance(s, str) and s]
     any_readable = False
     for role in _ROLES_CHECKED:
         role_skills = await invoked_skills(provider, thread_id, stage, role, chat_provider=chat_provider)
@@ -151,12 +212,16 @@ async def skills_record(
         for skill in role_skills:
             if skill not in invoked:
                 invoked.append(skill)
-    claimed = [str(s) for s in (self_reported or [])]
+    claimed = [n for n in (normalize_skill_name(str(s)) for s in (self_reported or [])) if n]
+    # An "agent:x" transcript entry substantiates a bare "x" claim too -- the self-report schemas
+    # ask for skill names, not this gate's internal prefix vocabulary.
+    invoked_bare = {name.split(":", 1)[-1] for name in invoked}
     return {
+        "provider": chat_provider,
         "required": required,
         "invoked": invoked,
         "self_reported": claimed,
-        "unsubstantiated": [s for s in claimed if s not in invoked],
+        "unsubstantiated": [s for s in claimed if s not in invoked and s not in invoked_bare],
         "missing": [s for s in required if s not in invoked],
         # False means NO role produced a readable log. Kept distinct from `missing: []` on purpose:
         # "no evidence" must never read as "enforced".
@@ -165,32 +230,71 @@ async def skills_record(
 
 
 def feedback_for(outcome: SkillCheckOutcome) -> str:
+    actions = "; ".join(_requirement_phrase(name) for name in outcome.missing)
     return (
         f"You did not invoke {outcome.missing} this turn. This stage is built around "
         f"{'that methodology' if len(outcome.missing) == 1 else 'those methodologies'}, and the "
         "prompt requires it -- skipping it produces work that looks finished but skipped the "
-        "discipline it depends on. Invoke it with your `skill` tool, follow it, and redo this "
-        f"turn's work under it. (Skills actually invoked: {outcome.invoked or 'none'}.)"
+        f"discipline it depends on. To satisfy the requirement: {actions}; follow what it says, "
+        f"and redo this turn's work under it. (Actually invoked: {outcome.invoked or 'none'}.)"
     )
 
 
 def _demo() -> None:
     """Self-check for the pure half; the log read itself needs a sandbox."""
+    import asyncio
+
     ok = SkillCheckOutcome(passed=True, required=["a"], invoked=["a"], missing=[], verified=True)
     bad = SkillCheckOutcome(passed=False, required=["a", "b"], invoked=["a"], missing=["b"], verified=True)
     assert ok.passed and not bad.passed
     assert "['b']" in feedback_for(bad)
     assert "a" in feedback_for(bad)  # names what WAS invoked, so the model can see the gap
-    # Every stage that requires skills must name skills the vendored packs actually ship.
+    # Per-kind feedback wording: an agent requirement names the subagent tool, a skill the Skill tool.
+    agent_bad = SkillCheckOutcome(
+        passed=False, required=["agent:code-simplifier"], invoked=[], missing=["agent:code-simplifier"], verified=True
+    )
+    assert "subagent" in feedback_for(agent_bad)
+    assert "Skill tool" in feedback_for(bad)
+    # Every stage that requires skills must name skills the vendored packs (or the CLI's own
+    # bundled skills: code-review, security-review, simplify) actually ship. "agent:" entries name
+    # subagents launched via the Task tool.
     known = {
         "brainstorming", "writing-plans", "test-driven-development", "executing-plans",
         "requesting-code-review", "receiving-code-review", "verification-before-completion",
         "finishing-a-development-branch", "systematic-debugging", "dispatching-parallel-agents",
-        "subagent-driven-development",
+        "subagent-driven-development", "ponytail", "code-review", "security-review", "simplify",
+        "agent:code-simplifier", "frontend-design",
     }
     for stage, skills in workflow_config.REQUIRED_SKILLS_BY_STAGE.items():
         for skill in skills:
             assert skill in known, f"{stage} requires unknown skill {skill!r}"
+            if ":" in skill:
+                assert skill.startswith(_KNOWN_PREFIXES), f"{stage} requires unknown prefix in {skill!r}"
+
+    # skills_record must always carry the provider, even fully unverifiable (no sandbox at all) --
+    # the always-present provider-evidence requirement (2026-08-24). The None provider short-
+    # circuits in invoked_skills, so no fake sandbox is needed here.
+    record = asyncio.run(skills_record(None, "thread-x", "plan", ["/writing-plans"], chat_provider="claude"))
+    assert record["provider"] == "claude", f"provider missing from evidence record: {record}"
+    assert record["verified"] is False and record["invoked"] == []
+    assert record["self_reported"] == ["writing-plans"], f"self-report not normalized: {record}"
+
+    # prior_invoked union: a lap-1 transcript's evidence survives the session reset a lap-2 miss
+    # triggers -- required entries already substantiated must not come back as missing.
+    outcome = asyncio.run(
+        check_required_skills(None, "thread-x", "plan", chat_provider="claude", prior_invoked=["writing-plans"])
+    )
+    # No readable session (None provider) -- fail-open branch still wins over prior_invoked, and
+    # the outcome keeps the prior evidence rather than reporting "invoked: none" against it.
+    assert outcome.verified is False and outcome.passed is True
+    assert outcome.invoked == ["writing-plans"], f"fail-open dropped prior evidence: {outcome}"
+    # The same union inside skills_record: a redraft's fresh record must never shrink `invoked`
+    # below what earlier laps proved (the 2026-08-24 audit's HIGH finding -- the draft node's
+    # record overwrite used to destroy exactly the evidence the verify-node union depended on).
+    record2 = asyncio.run(
+        skills_record(None, "thread-x", "plan", chat_provider="claude", prior_invoked=["writing-plans"])
+    )
+    assert record2["invoked"] == ["writing-plans"] and record2["missing"] == [], f"prior union lost: {record2}"
     # A stage key that does not exist silently disables enforcement for it -- worse than a crash,
     # because everything still looks configured. Two stale keys ("exit", "adversarial-audit") got
     # in this way before this check existed.

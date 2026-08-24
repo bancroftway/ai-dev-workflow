@@ -215,23 +215,6 @@ def render_adversarial_audit_markdown(content: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def render_dedup_markdown(content: dict[str, Any]) -> str:
-    lines: list[str] = ["# De-dup / Simplify", "", content.get("approach_summary", ""), ""]
-    before, after = content.get("duplication_percent_before"), content.get("duplication_percent_after")
-    lines.append(f"Duplication: {before if before is not None else '?'}% -> {after if after is not None else '?'}%")
-    lines.append(f"Regression risk: {content.get('regression_risk', '')}")
-    lines.append("")
-    for cf in content.get("changed_files") or []:
-        lines.append(f"- **{cf.get('change_kind', '')}** `{cf.get('path', '')}` -- {cf.get('summary', '')}")
-    ponytail_rejected = content.get("ponytail_rejected") or []
-    if ponytail_rejected:
-        lines.append("")
-        lines.append("## Ponytail Proposals Rejected")
-        lines.append("")
-        lines.extend(f"- {item}" for item in ponytail_rejected)
-    return "\n".join(lines).strip() + "\n"
-
-
 def render_license_audit_markdown(content: dict[str, Any]) -> str:
     lines: list[str] = ["# License Audit", "", content.get("summary", ""), ""]
     for c in content.get("classifications") or []:

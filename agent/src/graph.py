@@ -495,6 +495,17 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
 _tech_stack_has_ui_framework = tech_stack_signals.tech_stack_has_ui_framework
 
 
+def _spec_work_kind(state: GraphState) -> str:
+    """The approved Specification's work_kind classification ("bug"/"feature"), defaulting to
+    "feature" for pre-classification specs (persisted before schemas.Specification grew the field)
+    and for anything malformed -- the bug segment is an extra discipline, so absence of evidence
+    means don't add it."""
+    approved = state["stages"]["specification"].get("approved_content")
+    if isinstance(approved, dict) and approved.get("work_kind") == "bug":
+        return "bug"
+    return "feature"
+
+
 # Impeccable (vendored design skill, plugins/vendor/pbakaus-impeccable) -- per-stage prompt
 # segments appended ONLY for UI-framework repos (same _tech_stack_has_ui_framework gate as the
 # Playwright/Excalidraw MCPs), so non-UI runs never spend context on design guidance. Each segment
@@ -524,22 +535,33 @@ IMPECCABLE_CODEGEN_SEGMENT = (
     f" {_IMPECCABLE_SKILL_DIR} -- its scripts run with plain `node`."
 )
 
-IMPECCABLE_CRITIQUE_SEGMENT = (
-    "This repository has a UI framework. Additionally run an `impeccable critique`-style review"
-    " over the UI surfaces the implementation touched: load the `impeccable` skill's"
-    " `reference/critique.md` and apply its heuristic review by READING code only -- this session"
-    " cannot run scripts, so skip every `node ...` step and score from the source. Fold any brownfield-baseline/P1"
-    " design findings into `divergence_findings` with concrete file evidence, severity mapped"
-    " honestly (a brownfield-baseline design defect is at most `major` here unless it violates the Specification)."
+# IMPECCABLE_CRITIQUE_SEGMENT and IMPECCABLE_DEDUP_SEGMENT were deleted 2026-08-24: both lost
+# their only consumers when the standalone critique/dedup-simplify stages consolidated into
+# adversarial-compliance/remediation, and dead prompt segments read as wired when they aren't.
+# KNOWN REGRESSION (flagged, not fixed here): adversarial-compliance no longer receives any
+# impeccable-critique framing on UI repos -- re-adding it means a new segment appended in that
+# stage's build_prompt, not resurrecting the old constant unwired.
+
+FRONTEND_DESIGN_SEGMENT = (
+    "This repository has a UI framework. Before writing any new UI surface, invoke the"
+    " `frontend-design` skill with your Skill tool and apply its direction (typography, aesthetic"
+    " intent, avoiding templated defaults) alongside the impeccable design rules above -- the two"
+    " are complementary: frontend-design sets the visual direction, impeccable enforces the craft"
+    " floor."
 )
 
-IMPECCABLE_DEDUP_SEGMENT = (
-    "This repository has a UI framework. After the de-dup work, also run the `impeccable` skill's"
-    " deterministic design detector over the UI files you touched or that adversarial-audit flagged:"
-    f" `node {_IMPECCABLE_SKILL_DIR}/scripts/detect.mjs --json <files>` -- and fix the mechanical"
-    " findings it reports. If the adversarial-audit report below carries design (impeccable critique) findings,"
-    " apply the `impeccable polish` flow (its `reference/polish.md`) scoped to those findings'"
-    " files. Design fixes must never change observable behavior -- same bar as the de-dup work."
+# Appended to minimal-code-to-green's prompt only when the approved Specification classified this
+# ticket's work_kind as "bug" (schemas.SpecificationDraftResponse.work_kind) -- same
+# conditional-segment shape as the ticket-mode and UI-framework segments above. Prompt-level
+# mandate; systematic-debugging is deliberately NOT in REQUIRED_SKILLS_BY_STAGE because that map
+# is static and this requirement only exists for bug tickets.
+BUG_FIX_SEGMENT = (
+    "This ticket fixes a BUG (classified in the approved Specification). Before writing the fix,"
+    " invoke the `systematic-debugging` skill with your Skill tool and follow it: reproduce the"
+    " failure first -- a failing test or a captured command output that goes red on this bug --"
+    " then diagnose, then fix, and keep the reproduction as a regression test. The"
+    " `diagnosing-bugs` skill is the complementary red-green diagnosis loop; invoke it too when"
+    " the cause is not obvious from the reproduction."
 )
 
 
@@ -797,6 +819,9 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
     ]
     if _tech_stack_has_ui_framework(state):
         messages.append(HumanMessage(content=IMPECCABLE_CODEGEN_SEGMENT))
+        messages.append(HumanMessage(content=FRONTEND_DESIGN_SEGMENT))
+    if _spec_work_kind(state) == "bug":
+        messages.append(HumanMessage(content=BUG_FIX_SEGMENT))
     if not tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT))
     if stage["draft"] is not None:
@@ -817,9 +842,6 @@ def _build_minimal_code_to_green_audit_prompt(state: GraphState) -> list[BaseMes
 
 
 ADVERSARIAL_AUDIT_SYSTEM_PROMPT = load_prompt("adversarial_audit_draft")
-
-
-DEDUP_SYSTEM_PROMPT = load_prompt("dedup_draft")
 
 
 LICENSE_AUDIT_SYSTEM_PROMPT = load_prompt("license_audit_draft")
@@ -1365,9 +1387,16 @@ STAGES: list[StageSpec] = [
         session_options=lambda _state, role: (
             {
                 "agent_mode": "autopilot",
+                # builtin:task (Claude's subagent-launch tool, real CLI name "Agent"): the prompt
+                # has ALWAYS mandated subagent-driven-development/dispatching-parallel-agents
+                # here, but until the 2026-08-24 audit nothing mapped a subagent tool into
+                # --tools, so the mandate was dangling -- the model was told to delegate with a
+                # tool the allowlist had stripped. Copilot's CLI has no such tool;
+                # copilot_chat_model filters it (_CLAUDE_ONLY_TOOLS) before --available-tools.
                 "available_tools": [
                     "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",
                     "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+                    "builtin:task",
                 ],
             }
             if role == "draft"
@@ -1394,12 +1423,15 @@ STAGES: list[StageSpec] = [
         max_verify_cycles=3,
         # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
         # edits source to fix scanner findings. Without them it could only ever describe the work --
-        # which is exactly what it did, for every run, until now.
+        # which is exactly what it did, for every run, until now. builtin:task is what lets the
+        # required code-simplifier agent launch (REQUIRED_SKILLS_BY_STAGE's "agent:code-simplifier"
+        # entry) -- without the mapping the requirement would be physically unsatisfiable.
         session_options=lambda _state, _role: {
             "agent_mode": "autopilot",
             "available_tools": [
                 "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",
                 "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+                "builtin:task",
             ],
         },
     ),
@@ -1759,6 +1791,32 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     }
 
 
+async def _stage_skills_evidence(
+    thread_id: str, stage_key: str, state: "GraphState", self_reported: list[str] | None = None
+) -> dict[str, Any]:
+    """One stage's skill-evidence record, sandbox or not (2026-08-24 provider-evidence
+    requirement: EVERY stage record carries the chat provider that ran it). With no sandbox
+    registered, skills_record's None-provider path emits an honest
+    {provider, verified: False, invoked: []} stub instead of skipping the record entirely --
+    the shape every early-return path in make_draft_node reuses too, so "which provider ran
+    this stage" never depends on which path the node exited through.
+
+    The stage's previously persisted `invoked` list is unioned in (skills_record's
+    prior_invoked): a redraft after a skill-gate session reset reads a FRESH transcript, and a
+    plain overwrite here destroyed lap-1 evidence right before make_verify_node tried to union
+    it -- the lap-oscillation bug the 2026-08-24 audit caught in this very change's first cut."""
+    sandbox = get_sandbox_provider() if sandbox_registry.get(thread_id) is not None else None
+    prior = (state["stages"].get(stage_key) or {}).get("skills") or {}
+    return await skill_gate.skills_record(
+        sandbox,
+        thread_id,
+        stage_key,
+        self_reported,
+        chat_provider=state["provider"],
+        prior_invoked=prior.get("invoked"),
+    )
+
+
 def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     async def draft_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = config["configurable"]["thread_id"]
@@ -1786,6 +1844,10 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 stage["readiness"] = True
                 stage["ever_ready_for_review"] = True
                 stage["used_ids"] = sorted(used_ids)
+                # No session ran (hydrated straight from disk) -- record still says which provider
+                # owned the run, verified False. Never overwrite real evidence a prior lap stored.
+                if not stage.get("skills"):
+                    stage["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
                 stages[stage_spec.key] = stage
                 # The whole point of post_approve_hook (vs post_audit_hook): this branch routes
                 # "already_approved" straight past audit_node and gate_node, so this is the ONLY
@@ -1807,6 +1869,12 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # resumed run that re-ran e2e and metrics left the PREVIOUS run's report on the branch
             # -- still reading "no e2e screenshots were captured" beside 14 fresh screenshots.
             await _run_post_approve_hook(stage_spec, thread_id, stage_now["approved_content"], state)
+            if not stage_now.get("skills"):
+                # A resumed stage usually hydrates its original run's evidence; only when that's
+                # absent does this stub in the provider record ({} return would omit it entirely).
+                stages = {key: dict(value) for key, value in state["stages"].items()}
+                stages[stage_spec.key]["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
+                return {"stages": stages}
             return {}
 
         if stage_spec.prefill_from_repo_file is not None and not just_rejected and sandbox_registry.get(thread_id) is not None:
@@ -1819,6 +1887,8 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 stage["ever_ready_for_review"] = True
                 stage["status"] = "ready_for_review"
                 stage["clarifying_questions"] = []
+                if not stage.get("skills"):
+                    stage["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
                 stages[stage_spec.key] = stage
                 logger.info("draft prefilled from repo file for stage %s, skipping LLM", stage_spec.key)
                 return {"stages": stages}
@@ -1949,6 +2019,8 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stages = {key: dict(value) for key, value in state["stages"].items()}
             stages[stage_spec.key]["infra_exhausted"] = True
             stages[stage_spec.key]["last_infra_error"] = str(exc)[-2000:]
+            if not stages[stage_spec.key].get("skills"):
+                stages[stage_spec.key]["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
             return {"stages": stages}
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
@@ -1985,15 +2057,13 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         # Recorded here rather than in the verify branch because make_draft_node is the one node every
         # StageSpec has: doing it in verify skipped stages with no deterministic_verify entirely, and
         # skipped the pass path even where verify existed, which is why a green run left no trace that
-        # any skill had been used. Persisted into state.json's per-stage record.
-        if sandbox_registry.get(thread_id) is not None:
-            stage["skills"] = await skill_gate.skills_record(
-                get_sandbox_provider(),
-                thread_id,
-                stage_spec.key,
-                self_reported=getattr(response, "skills_invoked", None),
-                chat_provider=state["provider"],
-            )
+        # any skill had been used. Persisted into state.json's per-stage record. Unconditional now
+        # (2026-08-24 provider-evidence requirement): with no sandbox registered, skills_record's
+        # None-provider path still emits a {provider, verified: False} record, so which coding-agent
+        # provider ran a stage is never reconstructable-only.
+        stage["skills"] = await _stage_skills_evidence(
+            thread_id, stage_spec.key, state, self_reported=getattr(response, "skills_invoked", None)
+        )
 
         stages[stage_spec.key] = stage
 
@@ -2285,8 +2355,30 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         # around a skill (RED-before-GREEN, writing-plans, receiving-code-review) that silently
         # skipped it produced work that only LOOKS finished, and no content check can see that.
         # Verified from the session's own skill.invoked events, never the model's self-report;
-        # fails open when the log is unreadable (see gates/skill_gate.py).
-        skill_check = await skill_gate.check_required_skills(provider, thread_id, stage_spec.key, chat_provider=state["provider"])
+        # fails open when the log is unreadable (see gates/skill_gate.py). prior_invoked is the
+        # stage's already-persisted transcript evidence: the close_session below wipes the live
+        # transcript this check reads, so without the union one missed skill would retroactively
+        # "un-invoke" everything lap 1 genuinely did and the fresh session would have to re-run
+        # all of it or fail again (session-reset amplification, 2026-08-24 plan audit).
+        prior_invoked = [
+            s for s in (stage.get("skills") or {}).get("invoked", []) if isinstance(s, str)
+        ]
+        skill_check = await skill_gate.check_required_skills(
+            provider, thread_id, stage_spec.key, chat_provider=state["provider"], prior_invoked=prior_invoked
+        )
+        if skill_check.verified:
+            # Refresh the persisted evidence with this check's union: the draft node records
+            # BEFORE the lap's audit session runs, so audit-role invocations (and the union with
+            # earlier laps) only reach state.json through this write -- without it the telemetry
+            # the encouraged-skill promotion decision reads permanently undercounts audit skills
+            # (2026-08-24 audit, "lesser wart" on the HIGH finding).
+            stage["skills"] = {
+                **(stage.get("skills") or {}),
+                "invoked": skill_check.invoked,
+                "missing": skill_check.missing,
+                "verified": True,
+            }
+            stages[stage_spec.key] = stage
         if not skill_check.passed:
             stage["last_verification"] = {
                 "passed": False,

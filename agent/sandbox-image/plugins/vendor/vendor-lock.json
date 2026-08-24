@@ -1,5 +1,5 @@
 {
-  "_readme": "Provenance record for the 5 third-party skill packs fetch-vendor-plugins.sh builds at Docker build time (and locally, on demand). This file is tracked in git; the fetched plugin content it describes is NOT (see .gitignore) -- fetch-vendor-plugins.sh is the single source of truth for reproducing it, this file is the human-readable record of what was decided and why. destDir/wrapper/stripped_paths/extra_files/patches describe exactly what the script does for each entry; they are not machine-parsed by the script (five fixed plugins do not earn a generic JSON-driven config reader in the Dockerfile's minimal `fetch` build stage) -- keep them in sync with the script by hand when either changes.",
+  "_readme": "Provenance record for the 9 third-party skill packs fetch-vendor-plugins.sh builds at Docker build time (and locally, on demand). This file is tracked in git; the fetched plugin content it describes is NOT (see .gitignore) -- fetch-vendor-plugins.sh is the single source of truth for reproducing it, this file is the human-readable record of what was decided and why. destDir/wrapper/stripped_paths/extra_files/patches describe exactly what the script does for each entry; they are not machine-parsed by the script (nine fixed plugins do not earn a generic JSON-driven config reader in the Dockerfile's minimal `fetch` build stage) -- keep them in sync with the script by hand when either changes. The `skipped` array records plugins that were EVALUATED and deliberately not vendored, with why -- so the decision is not re-litigated from scratch next time someone asks.",
   "vendored": [
     {
       "name": "superpowers",
@@ -136,6 +136,109 @@
         }
       ],
       "notes": "Apache-2.0 (LICENSE + NOTICE.md copied to the plugin root per Apache attribution requirement -- see extra_files above). Source repo ships an official Claude plugin at plugin/ (v4.1.1); its .claude-plugin/plugin.json and skills/impeccable payload copied. Stripped as interactive/unvalidated in a headless pipeline: the .grok-plugin (other-platform) directory, the four impeccable-* subagents, the hooks system, and the whole 'live' visual-iteration feature (server, browser injection, per-framework adapters) -- see stripped_paths above. The SKILL.md rows/paragraphs referencing the stripped features are removed so no instruction points at a missing file -- see patches above. Every '.claude/skills/impeccable' script-path fallback in SKILL.md and reference/*.md is rewritten to the absolute in-container path. scripts/ (everything not stripped) is left byte-identical -- they resolve their own paths relative to the module. Used by graph.py's UI-repo-gated prompt segments: shape (P3, methodology only), design rules + document (P6), critique (P11a), audit detectors + polish (P11b). All of the above verified against a real clone at the pinned sha via fetch-vendor-plugins.sh, diffed byte-for-byte against what was previously committed."
+    },
+    {
+      "name": "frontend-design",
+      "sourceUrl": "https://github.com/anthropics/claude-plugins-official.git",
+      "sourcePath": "plugins/frontend-design/",
+      "ref": "main",
+      "sha": "340e33aef211d95769d252324854497af871dafe",
+      "vendoredAt": "2026-08-24",
+      "vendoredBy": "andy@denalidatasystems.com",
+      "destDir": "anthropics-claude-plugins-official/frontend-design",
+      "wrapper": null,
+      "extra_files": [],
+      "stripped_paths": [],
+      "patches": [],
+      "notes": "One skill (skills/frontend-design/SKILL.md), ships its own .claude-plugin/plugin.json and LICENSE (Apache-2.0) inside the plugin dir -- copied verbatim, no curation needed. Prompt-encouraged (UI repos only) at minimal-code-to-green via graph.py's FRONTEND_DESIGN_SEGMENT, alongside the impeccable segments."
+    },
+    {
+      "name": "code-review",
+      "sourceUrl": "https://github.com/anthropics/claude-plugins-official.git",
+      "sourcePath": "plugins/code-review/",
+      "ref": "main",
+      "sha": "340e33aef211d95769d252324854497af871dafe",
+      "vendoredAt": "2026-08-24",
+      "vendoredBy": "andy@denalidatasystems.com",
+      "destDir": "anthropics-claude-plugins-official/code-review",
+      "wrapper": null,
+      "extra_files": [],
+      "stripped_paths": [],
+      "patches": [],
+      "notes": "One model-invocable command (commands/code-review.md, disable-model-invocation: false). CAUTION: the command body is GitHub-PR-centric (allowed-tools all Bash(gh pr ...) forms, aborts without an open PR) and fans out ~10 subagents (5 parallel Sonnet reviewers + Haiku scorers) -- real token cost. The CLI's own BUILT-IN code-review skill is preferred for the minimal-code-to-green requirement if the container spike shows it is model-invocable headless; this vendored plugin is the fallback and exists mainly for local-parity with the team's plugin set."
+    },
+    {
+      "name": "code-simplifier",
+      "sourceUrl": "https://github.com/anthropics/claude-plugins-official.git",
+      "sourcePath": "plugins/code-simplifier/",
+      "ref": "main",
+      "sha": "340e33aef211d95769d252324854497af871dafe",
+      "vendoredAt": "2026-08-24",
+      "vendoredBy": "andy@denalidatasystems.com",
+      "destDir": "anthropics-claude-plugins-official/code-simplifier",
+      "wrapper": null,
+      "extra_files": [],
+      "stripped_paths": [],
+      "patches": [],
+      "notes": "One agent (agents/code-simplifier.md) with frontmatter `model: opus` -- every invocation runs on Opus, a real per-remediation cost bump, accepted and scoped by the remediation prompt to flagged files only. Launched via the Task tool (requires builtin:task in the stage's available_tools -- see claude_chat_model._TOOL_NAME_MAP). The CLI's own BUILT-IN simplify skill is preferred for the remediation requirement if the spike shows it is model-invocable headless; the agent is the fallback."
+    },
+    {
+      "name": "mattpocock-skills",
+      "sourceUrl": "https://github.com/mattpocock/skills.git",
+      "sourcePath": "skills/{productivity,engineering}/<7 skills>",
+      "ref": "main",
+      "sha": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76",
+      "vendoredAt": "2026-08-24",
+      "vendoredBy": "andy@denalidatasystems.com",
+      "destDir": "mattpocock-skills/mattpocock-skills",
+      "wrapper": "wrappers/mattpocock-skills/plugin.json",
+      "extra_files": [
+        {"from": "LICENSE", "to": "LICENSE"}
+      ],
+      "stripped_paths": [
+        "skills/*/agents (other-platform openai.yaml packaging, per skill)"
+      ],
+      "patches": [
+        {
+          "files": "skills/{grill-me,grill-with-docs,improve-codebase-architecture}/SKILL.md",
+          "find": "disable-model-invocation: true",
+          "replace": "disable-model-invocation: false",
+          "reason": "Upstream marks user-invoked skills non-model-invocable -- correct for a human-driven chat, fatal in this headless pipeline where the model IS the invoker. Flipped so prompt-encouraged stages can actually reach them via the Skill tool."
+        }
+      ],
+      "notes": "MIT (LICENSE copied to plugin root). 7 of ~25 skills vendored: the requested grill-me, grill-with-docs, diagnosing-bugs, improve-codebase-architecture PLUS the three support skills their own SKILL.md bodies invoke via the Skill tool (grilling, domain-modeling, codebase-design) -- vendoring the four without the three would leave dangling Skill calls. diagnosing-bugs/scripts/hitl-loop.template.sh, improve-codebase-architecture/HTML-REPORT.md, domain-modeling/{ADR,CONTEXT}-FORMAT.md, codebase-design/{DEEPENING,DESIGN-IT-TWICE}.md kept -- all referenced from their own SKILL.md. All prompt-ENCOURAGED (not gate-required) initially; promotion to REQUIRED_SKILLS_BY_STAGE is telemetry-driven from persisted skills evidence."
+    }
+  ],
+  "skipped": [
+    {
+      "name": "security-guidance",
+      "sourceUrl": "https://github.com/anthropics/claude-plugins-official.git",
+      "evaluatedAt": "2026-08-24",
+      "reason": "Hooks-ONLY plugin (no skills/commands/agents). Its SessionStart hook (ensure_agent_sdk.py) pip-installs claude-agent-sdk into a venv at session runtime -- a network fetch inside the sandbox, which must stay network-independent (it runs untrusted repos). Its UserPromptSubmit/PostToolUse/Stop hooks use asyncRewake background-rewake semantics that are undefined under this pipeline's per-turn headless `claude -p` runner. Stripping hooks (the impeccable precedent for unvalidated mechanisms) would leave an empty plugin. Security coverage already exists: the vendored security-review skill, the CLI's built-in security-review skill, and the deterministic semgrep/gitleaks/trivy/osv scan gates feeding remediation."
+    },
+    {
+      "name": "tdd (mattpocock/skills)",
+      "sourceUrl": "https://github.com/mattpocock/skills.git",
+      "evaluatedAt": "2026-08-24",
+      "reason": "Duplicates superpowers' test-driven-development, which is already REQUIRED at ac-to-tests and enforced by the skill gate. Requiring or even loading both invites a duplicate-methodology invocation with no added signal. Superpowers' version kept (user decision 2026-08-24)."
+    },
+    {
+      "name": "to-spec (mattpocock/skills)",
+      "sourceUrl": "https://github.com/mattpocock/skills.git",
+      "evaluatedAt": "2026-08-24",
+      "reason": "Publishes the synthesized spec to an issue tracker (gh) -- no network/auth in the sandbox -- and duplicates this pipeline's own specification stage + spec ledger machinery. Its conversation-to-spec synthesis discipline was folded into agent/src/prompts/specification_draft.md instead (user decision 2026-08-24)."
+    },
+    {
+      "name": "MCP-server plugins: context7, playwright, chrome-devtools-mcp, github, mintlify",
+      "sourceUrl": "https://github.com/anthropics/claude-plugins-official.git",
+      "evaluatedAt": "2026-08-24",
+      "reason": "All are MCP servers needing runtime network and/or auth (context7 API, GitHub API, live browser control). Sandbox sessions are network-independent by design; the @playwright/mcp server was previously REMOVED from this image deliberately (see Dockerfile's PLAYWRIGHT_VERSION header). Lighthouse/a11y needs are met by the lighthouse CLI baked into the image and driven deterministically from e2e_nodes.py -- no MCP required."
+    },
+    {
+      "name": "claude-code-setup, plugin-dev, skill-creator",
+      "sourceUrl": "https://github.com/anthropics/claude-plugins-official.git",
+      "evaluatedAt": "2026-08-24",
+      "reason": "Meta/authoring plugins (setup recommendations, plugin/skill development) with no role in a pipeline session. plugin-dev and skill-creator were explicitly excluded by the user (crossed out in the requesting screenshot)."
     }
   ]
 }

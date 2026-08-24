@@ -106,6 +106,12 @@ _session_cache = SessionCache("Copilot")
 _session_ids = _session_cache.session_ids
 _resume_states = _session_cache.resume_states
 
+# Allowlist entries that name Claude-only capabilities and must never reach this CLI's
+# --available-tools/--excluded-tools: builtin:task is Claude's subagent-launch tool (Agent),
+# added to shared stage allowlists 2026-08-24 -- Copilot has no equivalent, and an unknown
+# builtin here is unverified behavior (reject vs ignore), so it is filtered rather than risked.
+_CLAUDE_ONLY_TOOLS = frozenset({"builtin:task"})
+
 
 def _messages_to_prompt(messages: list[BaseMessage]) -> str:
     """Flatten a LangChain message list into a single Copilot CLI prompt string.
@@ -550,10 +556,21 @@ class CopilotChatModel(BaseChatModel):
         # blocklist when both are set, same precedent as the old SDK version and Claude's CLI
         # mapping (Phase A0's spike: blocklisting is incomplete, an allowlist is the only reliable
         # read-only boundary).
+        #
+        # _CLAUDE_ONLY_TOOLS is the one exception to "passed straight through": builtin:task names
+        # Claude's subagent-launch tool (Agent) and exists in no Copilot CLI vocabulary. Stage
+        # allowlists are written once for both providers, so it must be filtered here rather than
+        # trusted to be "silently ignored" -- whether this CLI rejects or ignores an unknown
+        # builtin is unverified, and a rejected flag would fail every minimal-code-to-green/
+        # remediation draft turn under this provider (2026-08-24 audit).
         if self.available_tools:
-            argv += ["--available-tools", ",".join(self.available_tools)]
+            passthrough = [t for t in self.available_tools if t not in _CLAUDE_ONLY_TOOLS]
+            if passthrough:
+                argv += ["--available-tools", ",".join(passthrough)]
         elif self.excluded_tools:
-            argv += ["--excluded-tools", ",".join(self.excluded_tools)]
+            passthrough = [t for t in self.excluded_tools if t not in _CLAUDE_ONLY_TOOLS]
+            if passthrough:
+                argv += ["--excluded-tools", ",".join(passthrough)]
 
         if self.pre_tool_use_hook is not None:
             logger.warning(

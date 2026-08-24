@@ -64,6 +64,11 @@ export interface ScanMeasures {
   duplication_percent: number | null;
   mean_ccn: number | null;
   coverage_line_rate: number | null;
+  /** Lighthouse worst-of-routes scores (0-100), measured by e2e against the live app. Absent/null
+   * for non-UI repos, runs whose e2e never produced a score, and pre-lighthouse baselines --
+   * chips hide on absence, never render a zero. */
+  lighthouse_performance?: number | null;
+  accessibility_score?: number | null;
 }
 
 /** repo_scan.py's ScanReport.summary() shape -- streamed via the repo_scan state channel. */

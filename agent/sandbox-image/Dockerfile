@@ -27,9 +27,11 @@ ARG COPILOT_CLI_VERSION=1.0.79
 # --output-format stream-json plus the --verbose it requires) and the terminal NDJSON line's
 # fields (session_id/usage/total_cost_usd/is_error) that module depends on -- an unpinned
 # `@latest` install could silently reshape either one out from under it. Task 4 (task-4-report.md)
-# verified the --verbose requirement and the real stream-json/tool_use shape against this exact
-# pinned version, 2.1.126, not an arbitrary local install.
-ARG CLAUDE_CODE_CLI_VERSION=2.1.126
+# verified the --verbose requirement and the real stream-json/tool_use shape against 2.1.126;
+# bumped to 2.1.241 (npm latest 2026-08-23, user directive 2026-08-24) for its bundled built-in
+# skills (security-review/code-review/simplify) -- the same contract points MUST be re-verified
+# against a rebuilt image before trusting a run (see plan's verification section).
+ARG CLAUDE_CODE_CLI_VERSION=2.1.241
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end
 # against a rebuilt image -- see each gate module's own docstring.
@@ -109,9 +111,13 @@ ARG NODE_MAJOR=22
 # redeclaration in the fetch stage.
 ARG CLAUDE_CODE_CLI_VERSION
 # Azure Functions Core Tools: `func` is what actually builds and runs a Functions project, and
-# app discovery (agent/src/app_discovery.py) classifies Azure Functions repos as in scope. Pinned
-# to a major only -- nothing parses its output, same reasoning as jscpd/lizard below.
-ARG FUNC_CORE_TOOLS_MAJOR=4
+# app discovery (agent/src/app_discovery.py) classifies Azure Functions repos as in scope. Was
+# pinned to a major only ("nothing parses its output") until 2026-08-24, when 4.14.0 shipped
+# 401-broken within the hour AND 4.13.2/4.13.1's postinstall CDN blobs went 404 -- so the pin
+# must be a version whose cdn.functions.azure.com zip actually still exists, verified by real
+# install: 4.13.0 OK, 4.12.1 OK, 4.13.1/4.13.2 404, 4.14.0 401. Exact pin now, same reasoning as
+# every other tool here: a build must not fail because upstream published (or unpublished) today.
+ARG FUNC_CORE_TOOLS_VERSION=4.13.0
 # The @playwright/mcp server was REMOVED, not left dormant: nothing attached it once ac-to-tests
 # stopped (graph.py's "Deleted rather than left dormant" note explains why -- that stage runs before
 # any app exists, and selectors are authored via data-testid rather than discovered). Keeping an
@@ -122,6 +128,14 @@ ARG FUNC_CORE_TOOLS_MAJOR=4
 # the ac-to-tests SKILL.md and in two prompts that pin `@playwright/test` to it, so all four change
 # together or the browser revision stops matching the baked build.
 ARG PLAYWRIGHT_VERSION=1.63.0-alpha-2026-08-05
+# Lighthouse: e2e_nodes.py runs it against the booted app (performance + accessibility categories
+# only) inside e2e's live-app window -- deliberately NOT part of repo_scan (whose contract is
+# offline, no running app). Pinned like every gate tool: a score is only comparable across runs if
+# the auditor didn't move underneath it. It drives the SAME baked headless shell as everything
+# else via CHROME_PATH (no second browser download) -- compatibility verified against a rebuilt
+# image before any run trusts the numbers; if the headless shell proves insufficient, bake full
+# chromium here instead of ever fetching at session time.
+ARG LIGHTHOUSE_VERSION=13.4.1
 
 USER root
 
@@ -214,12 +228,16 @@ RUN set -eux; \
 # keeps the baked browser revision correct.
 RUN set -eux; \
     npm install -g "playwright@${PLAYWRIGHT_VERSION}" \
-        "@playwright/test@${PLAYWRIGHT_VERSION}"; \
+        "@playwright/test@${PLAYWRIGHT_VERSION}" \
+        "lighthouse@${LIGHTHOUSE_VERSION}"; \
     playwright install chromium-headless-shell; \
     chmod -R a+rX /opt/playwright-browsers; \
     ln -s "$(ls /opt/playwright-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell)" \
         /usr/local/bin/aidw-headless-shell
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/aidw-headless-shell
+# Lighthouse's chrome-launcher honors CHROME_PATH the same way Puppeteer honors the line above --
+# one baked browser serves Playwright e2e, mermaid-cli, and lighthouse.
+ENV CHROME_PATH=/usr/local/bin/aidw-headless-shell
 
 # P3's diagram-validation gate (agent/src/gates/diagram_gate.py) renders Mermaid source via
 # @mermaid-js/mermaid-cli, which needs a headless Chromium (Puppeteer). Real finding from a live
@@ -251,7 +269,7 @@ RUN set -eux; \
 # runs as root here. Nothing in the pipeline invokes `func` yet -- it earns its size for
 # Node-based Functions projects downstream, in R's build and P13's test runs.
 RUN set -eux; \
-    npm install -g jscpd "azure-functions-core-tools@${FUNC_CORE_TOOLS_MAJOR}" --unsafe-perm true; \
+    npm install -g jscpd "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}" --unsafe-perm true; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep checkov interrogate
 
 # Front-end and Python quality toolchain. These are the deterministic signal for non-.NET repos:
@@ -383,7 +401,7 @@ COPY bootstrap.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh
 # directly like everything else in this stage.
 COPY plugins/ai-dev-workflow/ /opt/ai-dev-workflow-plugins/ai-dev-workflow/
 COPY plugins/.claude-plugin/ /opt/ai-dev-workflow-plugins/.claude-plugin/
-# vendor/ is five third-party skill packs -- NOT committed to git (see vendor-lock.json's own
+# vendor/ is nine third-party skill packs -- NOT committed to git (see vendor-lock.json's own
 # "_readme" and this repo's .gitignore): fetched here, at build time, from their pinned commits,
 # with the exact curation (stripped files, patched paths, extra license files)
 # fetch-vendor-plugins.sh and vendor-lock.json document. Build-time, never session-runtime, for

@@ -28,6 +28,31 @@
       "name": "security-review",
       "source": "./vendor/github-awesome-copilot/security-review",
       "description": "Vendored from github/awesome-copilot -- reasoning-based vulnerability analysis."
+    },
+    {
+      "name": "impeccable",
+      "source": "./vendor/pbakaus-impeccable/impeccable",
+      "description": "Vendored from pbakaus/impeccable -- UI design rules, critique, and audit skills (hooks/agents/live stripped)."
+    },
+    {
+      "name": "frontend-design",
+      "source": "./vendor/anthropics-claude-plugins-official/frontend-design",
+      "description": "Vendored from anthropics/claude-plugins-official -- distinctive, intentional visual design guidance."
+    },
+    {
+      "name": "code-review",
+      "source": "./vendor/anthropics-claude-plugins-official/code-review",
+      "description": "Vendored from anthropics/claude-plugins-official -- multi-agent PR review command (gh-PR-centric; built-in code-review preferred in-pipeline)."
+    },
+    {
+      "name": "code-simplifier",
+      "source": "./vendor/anthropics-claude-plugins-official/code-simplifier",
+      "description": "Vendored from anthropics/claude-plugins-official -- agent that simplifies code while preserving functionality (model: opus)."
+    },
+    {
+      "name": "mattpocock-skills",
+      "source": "./vendor/mattpocock-skills/mattpocock-skills",
+      "description": "Vendored subset of mattpocock/skills -- grill-me, grill-with-docs, diagnosing-bugs, improve-codebase-architecture + their grilling/domain-modeling/codebase-design support skills."
     }
   ]
 }

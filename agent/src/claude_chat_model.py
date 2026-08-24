@@ -21,9 +21,10 @@ same stage/role wiring without a provider-specific branch), but not its SDK-spec
 is rewritten onto this same CLI-exec shape, so this module reaching into that package for types
 would only add a dependency everything else here is in the process of removing.
 
-Update (task-4-report.md, Part 2 Task 4): `claude --help`, checked against this pipeline's own
-pinned CLI version (2.1.126 -- the exact `ARG CLAUDE_CODE_CLI_VERSION` agent/sandbox-image/
-Dockerfile pins, not an arbitrary local install), documents a third `--output-format` value beyond
+Update (task-4-report.md, Part 2 Task 4): `claude --help`, checked against the then-pinned CLI
+version (2.1.126; the Dockerfile's `ARG CLAUDE_CODE_CLI_VERSION` has since moved to 2.1.241 --
+2026-08-24, for the bundled built-in skills -- and every contract point below must be re-verified
+against a rebuilt image whenever that pin moves), documents a third `--output-format` value beyond
 the plain "text"/"json" this module used until now: "stream-json" ("realtime streaming"), gated
 further by `--include-partial-messages`/`--include-hook-events` (both "only works with
 --output-format=stream-json"). A real, disclosed, minimal verification call against this exact
@@ -117,6 +118,15 @@ _TOOL_NAME_MAP: dict[str, str] = {
     "builtin:apply_patch": "Edit",
     "builtin:bash": "Bash",
     "builtin:skill": "Skill",
+    # Claude's subagent-launch tool. Without this entry, any stage allowlist naming it was
+    # silently dropped by _map_tool_names, so prompts that mandate subagent use
+    # (subagent-driven-development, dispatching-parallel-agents, the code-simplifier agent)
+    # instructed the model to use a tool the --tools flag had stripped -- a real dangling-mandate
+    # bug found in the 2026-08-24 plan audit, not a new capability. "Agent", not "Task": a live
+    # 2.1.241 container spike's transcript records the launch as
+    # {"type":"tool_use","name":"Agent","input":{"subagent_type":...}} -- read_skill_invocations
+    # accepts both spellings defensively, but the --tools grant must use the real name.
+    "builtin:task": "Agent",
 }
 
 # Claude Code's project-transcript directory name is every non-alphanumeric character of the
@@ -321,7 +331,8 @@ def _translate_intermediate_events(
     last, which stays the result-shaped summary line handled separately.
 
     CONFIRMED REAL (task-4-report.md: one real, disclosed, minimal `claude -p --output-format
-    stream-json --verbose` turn against this pipeline's own pinned CLI version, 2.1.126): an
+    stream-json --verbose` turn against the then-pinned CLI version, 2.1.126; shape re-confirmed
+    live against the current 2.1.241 pin on 2026-08-24): an
     assistant-role line whose `message.content` list contains a block shaped `{"type": "tool_use",
     "id": ..., "name": ..., "input": ...}` for each tool the model invokes -- the exact same
     envelope this module's own read_skill_invocations below already treats as confirmed real from
@@ -922,16 +933,40 @@ def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | Non
     return _session_cache.get_resume_state(thread_id, stage, role)
 
 
+def normalize_skill_name(name: str) -> str:
+    """One bare skill name from whatever form a transcript or self-report carries.
+
+    Plugin-loaded skills can appear plugin-qualified ("code-review:code-review"); models
+    self-reporting sometimes write the slash-command spelling ("/code-review"). Both collapse to
+    the bare name the required-skills config uses, so gate matching stays plain string equality.
+    Shared with gates/skill_gate.py's self-report comparison -- one normalization, not two.
+    Degenerate inputs (whitespace, a bare "/", a trailing-colon fragment) normalize to "" --
+    callers drop falsy results rather than record empty-string noise.
+    """
+    return name.strip().strip("/").rsplit(":", 1)[-1].strip()
+
+
 async def read_skill_invocations(provider: SandboxProvider, thread_id: str, session_id: str) -> list[str] | None:
-    """Skill names this Claude session actually invoked, read from its own transcript, or None if
-    unverifiable -- see _CLAUDE_PROJECTS_DIR's docstring for the fail-open contract this follows
-    (an infrastructure gap here must never masquerade as "no skills were invoked").
+    """Skill/command/agent names this Claude session actually invoked, read from its own
+    transcript, or None if unverifiable -- see _CLAUDE_PROJECTS_DIR's docstring for the fail-open
+    contract this follows (an infrastructure gap here must never masquerade as "no skills were
+    invoked").
 
     Transcript line shape per task-2-brief.md, confirmed there against a real transcript during
     this plan's own prep: an assistant-role JSONL entry (`type == "assistant"`) whose
     `message.content` contains a block shaped
-    `{"type": "tool_use", "name": "Skill", "input": {"skill": "<name>"}}`. Implemented as
-    specified, not re-derived from first principles.
+    `{"type": "tool_use", "name": "Skill", "input": {"skill": "<name>"}}`. Two extensions
+    (2026-08-24 plan, "extend gate detection to commands/agents"):
+
+    - Plugin slash COMMANDS are unified into the Skill tool by the CLI (there is no SlashCommand
+      tool), so they already arrive through the same branch -- the only work is normalizing a
+      possibly plugin-qualified name ("code-review:code-review") to its bare form.
+    - AGENT launches appear as a Task tool_use ("Agent" accepted defensively -- the tool's public
+      name has moved before) whose input carries `subagent_type`; recorded as
+      "agent:<bare name>" so a required-skills entry can demand a subagent by name while staying
+      distinguishable from a Skill invocation. Caveat: only the LAUNCH is visible here -- a skill
+      invoked *inside* the subagent lives in that child's own separate transcript, never this
+      one, so never make such an inner skill required.
     """
     path = shlex.quote(f"{_CLAUDE_PROJECTS_DIR}/{session_id}.jsonl")
     result = await provider.exec_in_sandbox(thread_id, f"cat {path} 2>/dev/null")
@@ -939,6 +974,11 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
         return None
 
     names: list[str] = []
+
+    def _record(name: str) -> None:
+        if name and name not in names:
+            names.append(name)
+
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -953,10 +993,22 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
         if not isinstance(content, list):
             continue
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Skill":
-                name = (block.get("input") or {}).get("skill")
-                if isinstance(name, str) and name not in names:
-                    names.append(name)
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                continue
+            tool = block.get("name")
+            block_input = block.get("input")
+            if not isinstance(block_input, dict):
+                # A malformed line must degrade to "not an invocation", never crash the gate
+                # (fail-open contract) -- `or {}` alone still let a truthy non-dict through.
+                continue
+            if tool == "Skill":
+                name = block_input.get("skill")
+                if isinstance(name, str):
+                    _record(normalize_skill_name(name))
+            elif tool in ("Task", "Agent"):
+                subagent = block_input.get("subagent_type")
+                if isinstance(subagent, str):
+                    _record(f"agent:{normalize_skill_name(subagent)}")
     return names
 
 
@@ -996,10 +1048,21 @@ def _demo() -> None:
     mapped = _map_tool_names(["builtin:view", "builtin:edit", "builtin:apply_patch", "builtin:task_complete"])
     assert mapped == ["Read", "Edit"], f"expected de-duped known names only, got {mapped}"
     all_known = _map_tool_names(
-        ["builtin:grep", "builtin:glob", "builtin:bash", "builtin:skill", "builtin:create"]
+        ["builtin:grep", "builtin:glob", "builtin:bash", "builtin:skill", "builtin:create", "builtin:task"]
     )
-    assert all_known == ["Grep", "Glob", "Bash", "Skill", "Write"], f"unexpected mapping: {all_known}"
+    assert all_known == ["Grep", "Glob", "Bash", "Skill", "Write", "Agent"], f"unexpected mapping: {all_known}"
     assert _map_tool_names(["builtin:ask_user"]) == [], "fully-unknown list should map to empty, not raise"
+
+    # normalize_skill_name: qualified plugin names, slash-command spellings, and bare names all
+    # collapse to the same gate-matchable form.
+    assert normalize_skill_name("code-review:code-review") == "code-review"
+    assert normalize_skill_name("/code-review") == "code-review"
+    assert normalize_skill_name(" ponytail ") == "ponytail"
+    assert normalize_skill_name("security-review") == "security-review"
+    # Degenerate inputs collapse to "" (callers drop falsy results), trailing slash stripped.
+    assert normalize_skill_name("code-review/") == "code-review"
+    assert normalize_skill_name("  /  ") == ""
+    assert normalize_skill_name("x:") == ""
 
     # Task 3b (Part 2 Ruling 10): run_id threads through the constructor same as CopilotChatModel's
     # (shape parity, even though nothing here reads it yet -- see ClaudeChatModel.run_id's comment).
@@ -1063,7 +1126,8 @@ def _demo() -> None:
     #
     # REAL captured shape (task-4-report.md has the full transcript, cost, and credential
     # disclosure): one real, disclosed, minimal `claude -p --output-format stream-json --verbose`
-    # invocation against this pipeline's own pinned CLI version (2.1.126), prompt "Use the Bash
+    # invocation against the then-pinned CLI version (2.1.126; terminal-line shape re-confirmed
+    # live on the current 2.1.241 pin, 2026-08-24), prompt "Use the Bash
     # tool to run exactly this command: echo hello-verify. Then stop, do nothing else.",
     # `--model haiku`. `session_id`/`uuid`/tool_use `id` values below are copied verbatim (random
     # UUIDs, nothing sensitive); the `system`/init line's tools/mcp_servers/slash_commands lists

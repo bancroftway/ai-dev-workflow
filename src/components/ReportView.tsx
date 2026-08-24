@@ -175,6 +175,13 @@ function MetricChips({
   const dup = measures.duplication_percent;
   const dupGrade = dup != null ? gradeLowerIsBetter(dup, thresholds.dup) : null;
 
+  // Hidden (not "—") when unmeasured: absence usually means "not a UI repo", not "not yet" --
+  // same treatment as MetricsBar's live chips.
+  const perf = measures.lighthouse_performance;
+  const perfGrade = perf != null ? gradeHigherIsBetter(perf, thresholds.lhPerf) : null;
+  const a11y = measures.accessibility_score;
+  const a11yGrade = a11y != null ? gradeHigherIsBetter(a11y, thresholds.a11y) : null;
+
   return (
     <>
       <Chip label="Security" value={`${secGrade} · ${secCount}`} tone={GRADE_TONE[secGrade]} />
@@ -193,6 +200,12 @@ function MetricChips({
         value={dup != null && dupGrade ? `${dupGrade} · ${dup.toFixed(1)}%` : "—"}
         tone={dupGrade ? GRADE_TONE[dupGrade] : "gray"}
       />
+      {perf != null && perfGrade && (
+        <Chip label="Performance" value={`${perfGrade} · ${perf.toFixed(0)}`} tone={GRADE_TONE[perfGrade]} />
+      )}
+      {a11y != null && a11yGrade && (
+        <Chip label="A11y" value={`${a11yGrade} · ${a11y.toFixed(0)}`} tone={GRADE_TONE[a11yGrade]} />
+      )}
       {gatingCount != null && (
         <Chip label="Gate" value={gatingCount === 0 ? "Pass" : `Fail · ${gatingCount}`} tone={gatingCount === 0 ? "green" : "red"} />
       )}

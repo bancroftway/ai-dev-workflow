@@ -51,8 +51,9 @@ ReportT = TypeVar("ReportT", bound=StageReport)
 # consecutive turns having made zero write calls).
 SKILLS_REPORT_RULES = """
 Also report `skills_invoked`: the exact names of the skills you invoked with your `skill` tool during
-this turn, and only those. Do not list a skill you merely read about, intended to use, or believe
-would have been appropriate. This is cross-checked against the session's own recorded skill
+this turn (a plugin slash command counts -- report its bare name), plus any subagents you launched,
+reported as `agent:<name>` -- and only those. Do not list a skill you merely read about, intended to
+use, or believe would have been appropriate. This is cross-checked against the session's own recorded
 invocations, so a name you did not actually invoke is visible as an unsubstantiated claim -- an empty
 list is a perfectly good answer, an inaccurate one is not.
 """

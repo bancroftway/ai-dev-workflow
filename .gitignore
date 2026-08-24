@@ -56,5 +56,7 @@ agent/sandbox-image/plugins/vendor/juliusbrussee-caveman/
 agent/sandbox-image/plugins/vendor/github-awesome-copilot/
 agent/sandbox-image/plugins/vendor/obra-superpowers/
 agent/sandbox-image/plugins/vendor/pbakaus-impeccable/
+agent/sandbox-image/plugins/vendor/anthropics-claude-plugins-official/
+agent/sandbox-image/plugins/vendor/mattpocock-skills/
 
 .superpowers/

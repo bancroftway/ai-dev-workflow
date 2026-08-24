@@ -31,7 +31,7 @@ flowchart TD
     
     stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes quality+security+dedup+license findings (autopilot, write+bash)<br/>Gate: deterministic re-scan blocks any unexplained finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
     
-    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
+    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
     
     stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Closes the back half: audits finished repo vs approved Plan + wireframes<br/>Agent: adversarial-compliance-draft (read-only, full-repo review)<br/>Gate: deterministic claim-verification + fix prompt. Rebuild gate after."]
     
@@ -163,6 +163,40 @@ Cross-cutting behavior that is not drawn above, because it happens in nearly eve
 | metrics-exit | draft | sonnet | gpt-5.4 |
 | brownfield-baseline | draft | haiku | gpt-5.4-mini |
 
+### Per-stage skills, commands and agents
+
+Skills reach the sandbox CLI via `--plugin-dir` flags ([agent/src/config.py](agent/src/config.py)'s
+`COPILOT_PLUGIN_DIRECTORIES`, content vendored at pinned commits by
+[agent/sandbox-image/plugins/vendor/](agent/sandbox-image/plugins/vendor/vendor-lock.json)), plus the
+CLI's own bundled built-ins (`code-review`, `security-review`, `simplify`). **Required** entries are
+enforced deterministically by [agent/src/gates/skill_gate.py](agent/src/gates/skill_gate.py) against
+the session's own transcript — never the model's self-report — with `REQUIRED_SKILLS_BY_STAGE` as the
+source of truth; a miss fails the verify lap with feedback and a session reset (evidence already
+persisted from earlier laps stays credited). `agent:<name>` means a Task-tool subagent launch rather
+than a Skill invocation. Verification works under the Claude provider (transcript parse); Copilot
+fails open (no readable session log). Every stage's persisted skills evidence also records the
+`provider` that ran it.
+
+| Stage | Required (gate-enforced) | Encouraged (prompt-mandated, not gated) | Source |
+|---|---|---|---|
+| brownfield-baseline | — | preflight-baseline, tech-stack-conventions, caveman | first-party, caveman |
+| tech-stack | — | tech-stack-conventions | first-party |
+| specification | brainstorming | spec-sync, grill-me, grill-with-docs; audit: ponytail | superpowers, first-party, mattpocock, ponytail |
+| plan | writing-plans | audit: ponytail | superpowers, ponytail |
+| ac-to-tests | test-driven-development | ac-to-tests | superpowers, first-party |
+| minimal-code-to-green | executing-plans, requesting-code-review, verification-before-completion, ponytail, code-review | subagent-driven-development, dispatching-parallel-agents; UI repos: frontend-design + impeccable segments; bug tickets: systematic-debugging + diagnosing-bugs | superpowers, ponytail, CLI built-in, frontend-design, impeccable, mattpocock |
+| remediation | agent:code-simplifier, security-review | quality-triage, security-triage, license-audit, improve-codebase-architecture | code-simplifier, CLI built-in / awesome-copilot, first-party, mattpocock |
+| adversarial-compliance | receiving-code-review, verification-before-completion | fix pass: systematic-debugging | superpowers |
+| metrics-exit | finishing-a-development-branch | caveman (exit report) | superpowers, caveman |
+| e2e (node cluster) | — (deterministic lighthouse perf/a11y floors gate the fix loop) | fix laps: systematic-debugging, diagnosing-bugs | lighthouse CLI (baked), superpowers, mattpocock |
+| fix nodes (rebuild / test-hardening) | — | systematic-debugging, diagnosing-bugs | superpowers, mattpocock |
+
+The mattpocock skills (grill-me, grill-with-docs, diagnosing-bugs, improve-codebase-architecture +
+their grilling/domain-modeling/codebase-design support skills) start prompt-encouraged; promotion to
+required is decided from the per-run skills evidence (`invoked`/`unsubstantiated`), not upfront.
+Bug-ticket conditionality comes from the specification stage's `work_kind` classification
+(schemas.Specification), which gates minimal-code-to-green's reproduce-first debugging segment.
+
 ---
 
 ## Headless runner (full pipeline, no UI)
@@ -278,4 +312,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 0c8b5baa2c4f638a1487f82905003497cd8ae6f10723c150f601b14cf995b709 -->
+<!-- graph-source-sha256: 46d6e82e23077dec192f75117516ffff8be241ef86bcec7d693335d41117de85 -->

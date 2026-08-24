@@ -1382,6 +1382,12 @@ class ScanReport:
                 "duplication_percent": (self.metrics.get("duplication") or {}).get("percent"),
                 "mean_ccn": (self.metrics.get("complexity") or {}).get("mean_ccn"),
                 "coverage_line_rate": (self.metrics.get("coverage") or {}).get("line_rate"),
+                # Measured by e2e_nodes against the LIVE app and merged into metrics by
+                # metrics_compute_node -- never by a scan tool here (this module's contract is
+                # offline, no running app). None/absent on non-UI repos and runs whose e2e never
+                # produced a score; the frontend hides the chips on absence.
+                "lighthouse_performance": (self.metrics.get("lighthouse") or {}).get("performance"),
+                "accessibility_score": (self.metrics.get("lighthouse") or {}).get("accessibility"),
             },
         }
 
@@ -1404,10 +1410,16 @@ class ScanReport:
         # must hash identically with it present.
         if self.ac_verification is not None:
             body["ac_verification"] = self.ac_verification
+        # OUTSIDE the hash: lighthouse scores are timing-noisy live-app measurements merged in by
+        # metrics_compute_node, not worktree analysis -- hashing them would break the "unchanged
+        # repo hashes identically" contract the module docstring promises (same reasoning as
+        # ac_execution below, except lighthouse must stay inside `metrics` because the delta
+        # engine digs metrics.lighthouse.* -- so the HASH excludes it rather than the report).
+        hash_body = {**body, "metrics": {k: v for k, v in metrics.items() if k != "lighthouse"}}
         report = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "content_hash": content_hash(body),
+            "content_hash": content_hash(hash_body),
             "repo": self.repo,
             "summary": self.summary(severity_floor=severity_floor, introduced_ids=introduced_ids),
             **body,
@@ -1426,12 +1438,24 @@ class ScanReport:
 # security-remediation's runs only semgrep/trivy/gitleaks/osv-scanner) must not blank the OTHER
 # loop's measures just because this scan's tool set doesn't touch them -- merge_measures keeps the
 # prior value for any key not in this set. A profile absent from this mapping (namely "full", the
-# baseline/metrics-report scan) measures everything summary() can report, so merge_measures is a
-# no-op for it.
+# baseline/metrics-report scan) measures everything a SCANNER can report, so merge_measures is a
+# scanner-key no-op for it -- but NOT a full no-op: the _E2E_SOURCED_MEASURES below come from
+# e2e's live-app run rather than any scan tool, are deliberately NOT listed in any profile here
+# (listing them would blank them with fresh Nones), and are prior-preserved on every profile.
 PROFILE_MEASURES: dict[str, frozenset[str]] = {
     "quality": frozenset({"duplication_percent", "mean_ccn"}),
     "security": frozenset({"security"}),
 }
+
+
+# Measures NO scan profile computes: lighthouse comes from e2e_nodes' live-app run, merged into
+# metrics only by metrics_compute_node. Deliberately absent from every PROFILE_MEASURES set AND
+# preserved from the prior summary on every merge (including "full"): a "full" scan measures
+# everything a SCANNER can report, but these two come from outside the scanner set entirely, so
+# any post-metrics summary writer (the per-commit background refresh, a re-entrant remediation
+# re-scan) would otherwise overwrite real scores with None and hide the chips it just showed
+# (2026-08-24 audit).
+_E2E_SOURCED_MEASURES = frozenset({"lighthouse_performance", "accessibility_score"})
 
 
 def merge_measures(prior_summary: dict[str, Any] | None, new_summary: dict[str, Any], profile: str) -> dict[str, Any]:
@@ -1440,15 +1464,23 @@ def merge_measures(prior_summary: dict[str, Any] | None, new_summary: dict[str, 
     gating_count, by_severity, ...) is this scan's own and is returned untouched; only `measures`
     keys the profile's own tools didn't compute fall back to the prior value, so quality-remediation's
     scan can't zero out security's chip mid-run (or security-remediation's blank quality's).
+
+    _E2E_SOURCED_MEASURES fall back to the prior value whenever this scan didn't carry them --
+    on EVERY profile, "full" included, since no scanner ever measures them (see the constant's
+    own comment above).
     """
-    measured = PROFILE_MEASURES.get(profile)
-    if measured is None or prior_summary is None:
+    if prior_summary is None:
         return new_summary
+    measured = PROFILE_MEASURES.get(profile)
     prior_measures = prior_summary.get("measures") or {}
     new_measures = dict(new_summary.get("measures") or {})
-    for key in new_measures:
-        if key not in measured and key in prior_measures:
-            new_measures[key] = prior_measures[key]
+    for key, prior_value in prior_measures.items():
+        scanner_gap = measured is not None and key not in measured and key in new_measures
+        e2e_gap = key in _E2E_SOURCED_MEASURES and new_measures.get(key) is None
+        if scanner_gap or e2e_gap:
+            new_measures[key] = prior_value
+    if new_measures == (new_summary.get("measures") or {}):
+        return new_summary
     return {**new_summary, "measures": new_measures}
 
 
@@ -1536,6 +1568,11 @@ _METRIC_DIRECTIONS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     # framework install is not a regression -- but "this run added 47 components" is exactly the
     # kind of change that should be visible in a review rather than discovered later.
     ("sbom_component_count", ("metrics", "sbom", "component_count"), "neutral"),
+    # Lighthouse, measured live by e2e_nodes and merged in by metrics_compute_node (see
+    # summary()'s measures comment). _dig returns None when absent, and the delta engine already
+    # skips None-on-either-side metrics, so non-UI repos never report a lighthouse regression.
+    ("lighthouse_performance", ("metrics", "lighthouse", "performance"), "higher_is_better"),
+    ("accessibility_score", ("metrics", "lighthouse", "accessibility"), "higher_is_better"),
 )
 
 

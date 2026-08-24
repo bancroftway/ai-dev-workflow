@@ -1,8 +1,9 @@
 # Sandbox image: Agent Plugin content
 
-This directory builds the per-session sandbox container that runs GitHub Copilot CLI headless.
+This directory builds the per-session sandbox container that runs the coding-agent CLI headless
+(Claude Code by default, GitHub Copilot CLI as the alternate provider).
 `plugins/ai-dev-workflow/` (this project's own first-party skill pack) and `plugins/vendor/`'s
-five third-party skill packs both end up at `/opt/ai-dev-workflow-plugins/` in the image, but they
+nine third-party skill packs both end up at `/opt/ai-dev-workflow-plugins/` in the image, but they
 get there differently:
 
 ```
@@ -19,7 +20,7 @@ plugins/
 ```
 
 `ai-dev-workflow/` is copied into the image directly (`Dockerfile`'s
-`COPY plugins/ai-dev-workflow/ ...`). `vendor/`'s five packs are fetched from their pinned commits
+`COPY plugins/ai-dev-workflow/ ...`). `vendor/`'s nine packs are fetched from their pinned commits
 and curated (stripped files, patched paths, extra license files -- see `vendor-lock.json`) by
 `fetch-vendor-plugins.sh`, run as a Docker `RUN` step, never at session runtime -- a live sandbox
 session runs untrusted repos and must stay network-independent, the same reason this image already
@@ -82,14 +83,14 @@ The in-container path (`/opt/ai-dev-workflow-plugins`) must stay in sync with
    project's own small authored content, not vendored) and set the entry's `wrapper` field to its
    path.
 6. Add the new entry's clone/curate/patch steps to `fetch-vendor-plugins.sh` itself (the script is
-   not JSON-driven -- five-then-six fixed plugins don't earn a generic config reader; write the
+   not JSON-driven -- a small fixed set of plugins doesn't earn a generic config reader; write the
    steps as a new block matching the existing ones), then add its `destDir` to `.gitignore`
-   alongside the other four.
+   alongside the existing vendor lines.
 7. Register a `marketplace.json` entry and append its in-container path to
    `agent/src/config.py`'s `COPILOT_PLUGIN_DIRECTORIES`.
 8. **Verify by actually running the script**: `sh fetch-vendor-plugins.sh /tmp/vendor-verify` and
    inspect the output, or run it in place and confirm `git status` shows no unexpected changes to
-   the other four plugins. Then re-verify via the spike technique below before merging.
+   the other plugins. Then re-verify via the spike technique below before merging.
 
 ## Confirming a plugin change actually reaches the sandbox (the "spike" smoke test)
 

@@ -24,6 +24,10 @@ export interface MetricThresholds {
   ccn: Thresholds4;
   coverage: Thresholds4;
   dup: Thresholds4;
+  /** Lighthouse performance score bands (higher is better, 0-100). */
+  lhPerf: Thresholds4;
+  /** Lighthouse accessibility score bands (higher is better, 0-100). */
+  a11y: Thresholds4;
 }
 
 const CHIP_CLASS: Record<Tone, string> = {
@@ -225,6 +229,41 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
         `Percentage of code duplicated across files; lower means fixes don't need repeating in copies. ${dup.toFixed(1)}% duplicated.`,
     });
 
+    // Lighthouse chips HIDE entirely when unmeasured (non-UI repo, e2e skipped, pre-lighthouse
+    // data) instead of showing a permanent "—" placeholder -- unlike coverage/dup, absence here
+    // usually means "not applicable", not "not yet".
+    const perfValue = measures?.lighthouse_performance;
+    const performance = perfValue == null ? null : bandedChip({
+      metricKey: "lhperf",
+      label: "Performance",
+      value: perfValue,
+      baseValue: baseMeasures?.lighthouse_performance,
+      thresholds: thresholds.lhPerf,
+      higherIsBetter: true,
+      decimals: 0,
+      unit: "",
+      hasBaseline,
+      placeholderTitle: "Not measured.",
+      title: (score) =>
+        `Lighthouse performance score for the slowest measured route (0-100); higher means faster loads. Worst route: ${score.toFixed(0)}.`,
+    });
+
+    const a11yValue = measures?.accessibility_score;
+    const accessibility = a11yValue == null ? null : bandedChip({
+      metricKey: "a11y",
+      label: "A11y",
+      value: a11yValue,
+      baseValue: baseMeasures?.accessibility_score,
+      thresholds: thresholds.a11y,
+      higherIsBetter: true,
+      decimals: 0,
+      unit: "",
+      hasBaseline,
+      placeholderTitle: "Not measured.",
+      title: (score) =>
+        `Lighthouse accessibility score (axe-based) for the worst measured route (0-100); higher means more usable with assistive tech. Worst route: ${score.toFixed(0)}.`,
+    });
+
     const gatingCount = summary.gating_count;
     const gate = (
       <Chip
@@ -242,6 +281,8 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
         {maintainability}
         {coverage}
         {duplication}
+        {performance}
+        {accessibility}
         {gate}
       </>
     );

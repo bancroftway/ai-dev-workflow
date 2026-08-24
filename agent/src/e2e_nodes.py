@@ -35,6 +35,7 @@ spec's title reached the fix node's feedback intact.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -84,6 +85,9 @@ class E2EState(TypedDict):
     same_size_screenshots: list[str]  # exact-byte-size matches: reported, never gated on
     screenshot_commit: str | None  # short sha the captures depict, for staleness detection
     page_state: str  # what the browser saw on failure: status, title, console errors, rendered text
+    lighthouse: dict[str, Any] | None  # worst-of-routes perf/a11y scores + failing audits, or None
+    # when lighthouse never produced a score (non-UI repo, tool/browser gap) -- fail-open, same
+    # contract as the skill gate: an infra gap must never read as a score of zero.
 
 
 class AppLaunchReport(StageReport):
@@ -116,6 +120,7 @@ def default_e2e_state() -> E2EState:
         "same_size_screenshots": [],
         "screenshot_commit": None,
         "page_state": "",
+        "lighthouse": None,
     }
 
 
@@ -1041,6 +1046,12 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     e2e["screenshots"] = screenshots
     e2e["routes"] = routes
 
+    # Lighthouse performance + accessibility, while the app is still up (the ONLY window it exists
+    # -- _finalize_run below kills the process group). UI repos only: scoring an API's JSON root
+    # against a browser-rendering rubric is noise, not signal.
+    if tech_stack_has_ui_framework(state):
+        e2e["lighthouse"] = await _run_lighthouse(provider, thread_id, port, routes)
+
     # Which commit these images actually depict. Stages that run AFTER e2e can still change UI source
     # -- the conformance audit's fix pass does exactly that -- and the screenshots are then evidence
     # of a tree that no longer exists. The audit caught this itself and filed it as a divergence
@@ -1092,6 +1103,32 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         }
     e2e.update(status="passed" if not parsed["failed_tests"] else "failed", **parsed)
 
+    # Lighthouse thresholds gate the same fix loop the suite does: a measured score below the floor
+    # is a fixable defect with named audits, exactly the shape e2e_fix consumes. Fail-open when
+    # lighthouse produced no score at all (e2e["lighthouse"] is None) -- an infra gap is not a
+    # failing app. A floor of 0 disables that metric's gate; scores are still reported.
+    lighthouse = e2e.get("lighthouse")
+    if lighthouse:
+        below: list[str] = []
+        perf, a11y = lighthouse.get("performance"), lighthouse.get("accessibility")
+        if perf is not None and workflow_config.LIGHTHOUSE_PERF_MIN and perf < workflow_config.LIGHTHOUSE_PERF_MIN:
+            below.append(f"performance {perf} < {workflow_config.LIGHTHOUSE_PERF_MIN}")
+        if a11y is not None and workflow_config.LIGHTHOUSE_A11Y_MIN and a11y < workflow_config.LIGHTHOUSE_A11Y_MIN:
+            below.append(f"accessibility {a11y} < {workflow_config.LIGHTHOUSE_A11Y_MIN}")
+        if below:
+            audit_lines = "; ".join(
+                f"[{a.get('route', '/')}] {a.get('id')}: {a.get('title')}"
+                + (f" (e.g. {a['selector']})" if a.get("selector") else "")
+                for a in lighthouse.get("failing_audits") or []
+            )
+            failures = list(e2e.get("failed_tests") or [])
+            failures.append({
+                "title": "lighthouse thresholds",
+                "error": f"worst-of-routes scores below floor ({', '.join(below)}). Failing audits: {audit_lines or 'none reported'}",
+            })
+            e2e["failed_tests"] = failures
+            e2e["status"] = "failed"
+
     # On failure, probe the app and attach what the BROWSER saw. Without this the fix node reads
     # "element(s) not found" and starts guessing, while the page itself is displaying the cause --
     # the live example being a Next.js overlay saying "Missing <html> and <body> tags in the root
@@ -1112,6 +1149,92 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             )
 
     return await _finalize_run(provider, thread_id, e2e)
+
+
+# In-container extractor for one lighthouse JSON report -- runs on the image's python3 so the
+# multi-hundred-KB report never crosses the exec boundary; only this one summary line does.
+# Failing audits are any scored audit below 0.9 (lighthouse's own "needs work" line), capped and
+# sorted worst-first, each with its first failing node's selector when the report carries one --
+# the fix prompt wants the worst offenders and where to look, not an exhaustive dump.
+_LH_EXTRACT_PY = (
+    "import json,sys\n"
+    "d=json.load(open(sys.argv[1]))\n"
+    "c=d.get('categories') or {}\n"
+    "def s(k):\n"
+    "    v=(c.get(k) or {}).get('score')\n"
+    "    return round(v*100) if isinstance(v,(int,float)) else None\n"
+    "def sel(v):\n"
+    "    for item in ((v.get('details') or {}).get('items') or [])[:1]:\n"
+    "        node=item.get('node') if isinstance(item,dict) else None\n"
+    "        if isinstance(node,dict) and node.get('selector'):\n"
+    "            return str(node['selector'])[:120]\n"
+    "    return None\n"
+    "f=[{'id':k,'title':(v.get('title') or '')[:120],'score':v.get('score'),'selector':sel(v)}\n"
+    "   for k,v in (d.get('audits') or {}).items()\n"
+    "   if isinstance(v.get('score'),(int,float)) and v['score']<0.9]\n"
+    "f.sort(key=lambda a:a['score'])\n"
+    "print(json.dumps({'performance':s('performance'),'accessibility':s('accessibility'),'failing':f[:12]}))\n"
+)
+# base64-piped rather than shlex-quoted inline: the script is full of single quotes, and
+# shlex.quote would embed '"'"' sequences that survive LocalDocker's argv-passed sh -c but break
+# inside azure_aci's own `/bin/sh -c "..."` wrapper -- the same reason cli_agent_exec base64-chunks
+# prompts (see sandbox/provider.py's write_scratch_file convention). 2026-08-24 audit finding.
+_LH_EXTRACT_B64 = base64.b64encode(_LH_EXTRACT_PY.encode("utf-8")).decode("ascii")
+
+
+async def _run_lighthouse(provider: Any, thread_id: str, port: int, routes: list[str]) -> dict[str, Any] | None:
+    """Worst-of-routes lighthouse performance/accessibility scores for the LIVE app, or None when
+    no route produced a score (tool missing, browser incompatibility, non-HTML responses) -- the
+    same fail-open contract as the skill gate: an infra gap must never read as a score of 0.
+
+    Runs here, inside e2e's live-app window, and deliberately NOT in repo_scan: repo_scan's
+    contract is offline/no-running-app determinism, and lighthouse needs the served app. Drives
+    the image's one baked browser via the image-wide CHROME_PATH env (Dockerfile), pinned
+    lighthouse via the same npm-global block as playwright.
+    """
+    per_route: dict[str, dict[str, Any]] = {}
+    failing: list[dict[str, Any]] = []
+    seen_audits: set[str] = set()
+    for index, route in enumerate(routes[:12], start=1):
+        report_file = f"/tmp/aidw-lighthouse-{index}.json"
+        url = f"http://localhost:{port}{route}"
+        run = await provider.exec_in_sandbox(
+            thread_id,
+            f"timeout 150 lighthouse {shlex.quote(url)} --output=json "
+            f"--output-path={shlex.quote(report_file)} "
+            "--only-categories=performance,accessibility "
+            "--chrome-flags='--headless --no-sandbox --disable-gpu' --quiet 2>&1",
+        )
+        extract = await provider.exec_in_sandbox(
+            thread_id,
+            f"echo {_LH_EXTRACT_B64} | base64 -d | python3 - {shlex.quote(report_file)} 2>/dev/null",
+        )
+        await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(report_file)}")
+        try:
+            summary = json.loads((extract.stdout or "").strip())
+        except json.JSONDecodeError:
+            logger.warning(
+                "lighthouse produced no readable report for %s (tail: %s)", url, (run.stdout or "")[-300:]
+            )
+            continue
+        if summary.get("performance") is None and summary.get("accessibility") is None:
+            continue
+        per_route[route] = {"performance": summary.get("performance"), "accessibility": summary.get("accessibility")}
+        for audit in summary.get("failing") or []:
+            if audit.get("id") not in seen_audits:
+                seen_audits.add(audit.get("id"))
+                failing.append({**audit, "route": route})
+    if not per_route:
+        return None
+    perf_scores = [r["performance"] for r in per_route.values() if r["performance"] is not None]
+    a11y_scores = [r["accessibility"] for r in per_route.values() if r["accessibility"] is not None]
+    return {
+        # Worst route is the score: one inaccessible screen is an inaccessible app.
+        "performance": min(perf_scores) if perf_scores else None,
+        "accessibility": min(a11y_scores) if a11y_scores else None,
+        "per_route": per_route,
+        "failing_audits": sorted(failing, key=lambda a: a.get("score") or 0)[:12],
+    }
 
 
 def make_e2e_route_after_run():

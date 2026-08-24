@@ -64,6 +64,8 @@ export default async function WorkflowPage({
     ccn: parseThresholds(process.env.METRIC_CCN_GRADES, [5, 10, 15, 20], "METRIC_CCN_GRADES", true),
     coverage: parseThresholds(process.env.METRIC_COVERAGE_GRADES, [80, 70, 50, 30], "METRIC_COVERAGE_GRADES", false),
     dup: parseThresholds(process.env.METRIC_DUP_GRADES, [3, 5, 10, 20], "METRIC_DUP_GRADES", true),
+    lhPerf: parseThresholds(process.env.METRIC_LH_PERF_GRADES, [90, 75, 60, 40], "METRIC_LH_PERF_GRADES", false),
+    a11y: parseThresholds(process.env.METRIC_A11Y_GRADES, [95, 90, 80, 60], "METRIC_A11Y_GRADES", false),
   };
 
   return (

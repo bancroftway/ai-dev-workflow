@@ -654,7 +654,16 @@ def _demo() -> None:
         # this function's own docstring explains it avoids by using two different names.
         class _FakeSandboxResult:
             ok = True
-            stdout = '{"type": "assistant", "message": {"content": []}}\n'
+            # One line per detection branch: a bare Skill, a plugin-qualified Skill (command
+            # unified into the Skill tool), and a Task subagent launch -- the three transcript
+            # shapes claude_chat_model.read_skill_invocations now parses.
+            stdout = (
+                '{"type": "assistant", "message": {"content": ['
+                '{"type": "tool_use", "name": "Skill", "input": {"skill": "ponytail"}}, '
+                '{"type": "tool_use", "name": "Skill", "input": {"skill": "code-review:code-review"}}, '
+                '{"type": "tool_use", "name": "Task", "input": {"subagent_type": "code-simplifier"}}'
+                "]}}\n"
+            )
             stderr = ""
 
         class _FakeSandboxProvider:
@@ -663,9 +672,11 @@ def _demo() -> None:
 
         fake_provider = _FakeSandboxProvider()
         assert asyncio.run(read_skill_invocations(fake_provider, thread_id, "sess-1", active_provider="copilot")) is None
-        assert asyncio.run(read_skill_invocations(fake_provider, thread_id, "sess-1", active_provider="claude")) == [], (
-            "claude_chat_model.read_skill_invocations should have parsed the fake transcript"
-        )
+        assert asyncio.run(read_skill_invocations(fake_provider, thread_id, "sess-1", active_provider="claude")) == [
+            "ponytail",
+            "code-review",
+            "agent:code-simplifier",
+        ], "claude_chat_model.read_skill_invocations should have parsed all three invocation shapes"
 
         # forget_thread_sessions_everywhere (sync): the teardown-only eighth function, deliberately
         # NOT one of the 7 that take a `provider` argument -- it has none, by design (module

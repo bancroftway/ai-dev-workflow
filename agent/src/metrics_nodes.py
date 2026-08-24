@@ -437,7 +437,15 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         coverage = await _read_coverage_summary(provider, thread_id)
     # Merged in BEFORE the dashboard dict is built (and BEFORE LATEST_PATH is written) so the
     # delta engine's coverage_line_rate metric and the `measures` block both see it.
-    scan = replace(scan, metrics={**scan.metrics, "coverage": coverage})
+    # Lighthouse rides the same merge: measured by e2e_nodes while the app was live (repo_scan
+    # itself stays offline/no-app by contract), promoted here so the summary measures, the delta
+    # engine, and the frontend chips all read it from the one scan report. None (non-UI repo,
+    # tool gap, e2e skipped) merges as an absent key -- chips hide, delta skips it.
+    lighthouse = (state.get("e2e") or {}).get("lighthouse")
+    scan = replace(
+        scan,
+        metrics={**scan.metrics, "coverage": coverage, **({"lighthouse": lighthouse} if lighthouse else {})},
+    )
     scan_report = scan.to_dashboard_dict()
     # Ruling 8: a still-gating finding this ticket's OWN approved remediation already explained in
     # `known_gaps` must not block the regression gate a second time. Recomputed (not read back off
