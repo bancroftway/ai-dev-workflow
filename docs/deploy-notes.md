@@ -28,28 +28,32 @@ benefit (zero interrupted runs) that isn't actually necessary -- every interrupt
 not a shortcut: nothing is being hidden, and nothing about a user's ticket is silently lost forever
 (the sandbox's own git branch/work is untouched; only the agent process's in-memory run state is).
 
-**The mitigation.** `agent/src/deploy_drain.py`: at the moment before a deploy replaces the agent
-process, it walks every sandbox that process still has registered
-(`SandboxProvider.list_active()`) and, for whichever of those sessions `dbo.sessions` still calls
-`in_progress`, marks it `failed` with a plain, user-visible reason
+**The mitigation.** `agent/src/deploy_drain.py`: one plain DB query --
+`SELECT session_id, run_id, current_stage FROM dbo.sessions WHERE status = 'in_progress' AND
+(awaiting_gate = 0 OR awaiting_gate IS NULL)` -- finds every session still in flight and NOT
+currently paused at a human gate, and marks each `failed` with a plain, user-visible reason
 (`"interrupted by deploy -- resubmit to retry"`) via `session_store.close_session` -- so the board
 shows a red pill with an actionable message instead of a silently stale "in progress" card.
 
-**Known limitation, not glossed over.** `SandboxProvider.list_active()` (both the local Docker and
-Azure ACI implementations) reports session_ids from an **in-memory** dict scoped to the process
-that provisioned them -- it does not query Docker/ACI directly. `deploy_drain.py` can therefore
-only ever see what the *current* agent process itself provisioned. Run as a freshly spawned,
-separate process **after** the old agent process has already exited (e.g. a naive post-deploy
-step), it sees an empty registry and silently drains nothing -- correct behavior for the code as
-written, but worthless as a mitigation if invoked that way. To do anything real, it must run
-*inside* the process being replaced, e.g. wired into that process's own graceful-shutdown handling
-(a SIGTERM/shutdown-event hook). `agent/main.py` has no shutdown hook of any kind today -- wiring
-one up is a real follow-up task, deliberately left out of this fix's scope (it touches the FastAPI
-app's lifecycle, not just this one script), and is the next thing to build if this mitigation is to
-run automatically rather than being invoked by hand immediately before a manual restart.
+Gate-paused sessions (`awaiting_gate = 1`) are deliberately excluded: they have a real recovery
+path most other in-progress sessions don't (an approved stage's content survives in the sandbox's
+own `.ai-dev-workflow/*.approved.json`, re-read on the next intake regardless of whether the
+in-memory checkpoint did), so failing a human-waiting queue on every deploy would make the
+mitigation worse than the problem for that population. One disclosed exception, not glossed over:
+`tech-stack` is the only stage with neither an audit pass nor a `deterministic_verify` check, so a
+freshly-LLM-drafted (not hydrated/prefilled) tech-stack draft is never persisted to disk before its
+gate pauses -- a restart while specifically THAT gate is paused does lose the pending draft; the
+next intake just re-runs detection from scratch. See `deploy_drain.py`'s own module docstring for
+the full trace. Every other stage's gate-paused draft is confirmed durable.
 
-Until that wiring exists, run it by hand, from inside the process about to be replaced (e.g. a
-one-off `docker exec`/shell into the running agent container, not a new deploy step process):
+**Revision note:** an earlier version of this script read `SandboxProvider.list_active()`, an
+in-memory registry scoped to the process that provisioned each sandbox -- structurally unable to
+see anything when run as a freshly spawned, separate process after the old agent process had
+already exited, which is exactly how a deploy step invokes it. The DB query above needs no
+in-process state at all, so there is no special caveat left: `deploy_drain.py --run` is now a
+plain, ordinary deploy step.
+
+Run it as a normal, detached step, any time after (or during) a deploy:
 `cd agent && uv run python -m src.deploy_drain --run`. `cd agent && uv run python -m src.deploy_drain`
-(no `--run`) runs its offline self-check instead -- the safe default, matching every other module
-in this package.
+(no `--run`) runs its self-check against a real DB instead (scoped to its own seeded rows, safe to
+run against a populated database) -- the safe default, matching every other module in this package.

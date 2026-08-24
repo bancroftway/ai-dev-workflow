@@ -2,9 +2,8 @@
 legible instead of silent).
 
 The Part 1 Spec asked an explicit question this branch never answered anywhere: what happens to a
-session already mid-run (provisioned under the old TCP-session architecture, or just mid-flight
-under this one) when a deploy restarts the agent process? The honest answer, unavoidable given this
-pipeline's own architecture, is that it gets orphaned: `graph.py`'s compiled graph uses
+session already mid-run when a deploy restarts the agent process? The honest answer, unavoidable
+given this pipeline's own architecture, is that it gets orphaned: `graph.py`'s compiled graph uses
 `InMemorySaver` (see `GraphState.provider`'s own comment), which holds every run's `stages`,
 `run_id`, and pinned `provider` in process memory ONLY -- a restart drops all of it, for every
 in-flight thread, with nothing durable left to resume into. The sandbox container itself can
@@ -13,34 +12,64 @@ without this module a user's ticket just sits there silently: no error, no banne
 shows "in progress," and the only way to discover it is stale is to poke it and watch it fail
 strangely on reattach.
 
-This module is the "make it legible" half the Spec called for: at the moment BEFORE a deploy
-replaces this process, walk every sandbox this process still has registered and, for whichever of
-those sessions the DB still calls "in_progress", mark it failed with a plain, user-visible reason
-("interrupted by deploy -- resubmit to retry") instead of leaving it to fail confusingly later. A
-drain WINDOW (Spec option (a) -- stop accepting new sessions, wait for in-flight ones to finish) was
-considered and rejected as the larger option: it needs a "stop accepting new work" flag this
-codebase has no mechanism for today, for a benefit (zero interrupted runs) this option (b) doesn't
-need either, since every interrupted run already has a clear, actionable, resubmit-and-retry path.
+This module is the "make it legible" half the Spec called for: enumerate every session the DB
+still calls `in_progress` and NOT currently paused at a human gate, and mark each one failed with a
+plain, user-visible reason ("interrupted by deploy -- resubmit to retry") instead of leaving it to
+fail confusingly later. A drain WINDOW (Spec option (a) -- stop accepting new sessions, wait for
+in-flight ones to finish) was considered and rejected as the larger option: it needs a "stop
+accepting new work" flag this codebase has no mechanism for today, for a benefit (zero interrupted
+runs) this option (b) doesn't need either, since every interrupted run already has a clear,
+actionable, resubmit-and-retry path.
 
-CRITICAL CAVEAT, found while building this (worth recording, not glossing over): `SandboxProvider.
-list_active()` (both `LocalDockerProvider` and `AzureContainerInstanceProvider`) reports session_ids
-from an IN-MEMORY dict scoped to the process that provisioned them -- it does not query Docker/ACI
-directly. That means `drain()` can only ever see what THIS process itself provisioned. Run as a
-freshly spawned, separate `python -m src.deploy_drain --run` process AFTER the old agent process has
-already exited, it sees nothing (a new interpreter's provider starts with an empty registry) and
-silently drains zero sessions -- which is exactly the kind of gate that "measures nothing while
-looking healthy" this codebase's own retrospectives warn about. For this module to see anything real,
-`drain()` must be called from INSIDE the process that is about to be replaced -- e.g. wired into that
-process's own graceful-shutdown handling (a SIGTERM/shutdown-event hook in `main.py`, not built here:
-out of this task's stated scope, and main.py has no shutdown hook of any kind today to hang it off
-of) -- not invoked as an independent post-mortem script. The `--run` CLI entry point below is real
-and correct for that in-process case; it is not a substitute for that wiring, and running it as a
-detached step after the old process is already gone will do nothing.
+One plain DB query, no sandbox provider, no in-memory registry (review round 1 fix: the first
+version of this module read `SandboxProvider.list_active()`, an in-memory dict scoped to the
+process that provisioned each sandbox -- structurally unable to see anything when run as a freshly
+spawned, separate process after the old agent process has already exited, which is exactly how a
+deploy step invokes it. Querying `dbo.sessions` directly instead needs no in-process state at all,
+so `python -m src.deploy_drain --run` is now genuinely functional as an ordinary, detached deploy
+step -- no special "must run inside the old process" caveat, unlike the first version):
 
-Usage: `cd agent && uv run python -m src.deploy_drain` runs the offline self-check (safe default,
-matches every other module in this package). `cd agent && uv run python -m src.deploy_drain --run`
-performs a REAL drain against the live sandbox provider and session_store -- only meaningful when
-invoked from inside the process being replaced, per the caveat above.
+    SELECT session_id, run_id, current_stage FROM dbo.sessions
+    WHERE status = 'in_progress' AND awaiting_gate = 0
+
+`dbo.sessions.status`'s own CHECK constraint (`0001_create_sessions.sql`) closes the vocabulary to
+`('in_progress','completed','failed','rejected')`, so `in_progress` is the only non-terminal value
+-- nothing else needs excluding on that axis. No container-liveness cross-check either: a sandbox
+that has already been reaped only makes an in_progress-and-not-awaiting-gate row MORE certainly
+orphaned, never less, so there is nothing a liveness probe could add here.
+
+**Why `awaiting_gate = 1` is excluded** (review round 2): a session paused at a human gate has a
+real recovery path a plain in-progress one doesn't -- `session_store.set_awaiting_gate`'s own
+docstring, and `workflow_persistence.hydrate_state`/`persist_state` restore an approved stage's
+content from the sandbox's own `.ai-dev-workflow/*.approved.json` on the next intake regardless of
+whether the in-memory checkpoint survived. Failing a human-waiting queue on every deploy -- when the
+human might approve five minutes later and the run would otherwise continue exactly where it left
+off -- would make the mitigation worse than the problem for that population. Verified, not merely
+inferred, for the PENDING-DRAFT half specifically (the part the review asked to check rather than
+assume): `graph.py`'s `_persist_if_sandboxed` is called from `make_audit_node` (after the audit
+pass) and from `make_verify_node` (on a passing `deterministic_verify`) -- both BEFORE `gate_node`
+ever reaches `interrupt()` -- for every stage that has an audit pass or a deterministic_verify.
+Grepping `graph.py`'s own `STAGES` list: every stage from `specification` through `metrics-exit` has
+at least one of the two. The lone exception is `tech-stack` -- the only StageSpec with neither
+`audit_response_schema` nor `deterministic_verify` set. For a tech-stack draft that reached the gate
+via a genuinely fresh LLM detection (no `hydrate_from_repo_file`/`prefill_from_repo_file` match --
+a real, common case: any Connect-Repository/brownfield project's first-ever tech-stack stage, with
+no committed `tech-stack.md` and no ticket-time picker selection either), NOTHING persists that
+draft to `.ai-dev-workflow/*.draft.json` before `interrupt()` pauses -- confirmed by reading
+`gate_node`'s own body, which writes only the durable `awaiting_gate` flag and a `GATE_PAUSED`
+event, never the draft content, immediately before calling `interrupt()`. A backend restart while
+THAT specific gate is paused genuinely loses the pending draft; the next intake simply re-runs
+tech-stack detection from scratch (cheap and close to idempotent, not a lost user submission -- the
+human's own Raw Requirements Text, which is what they actually typed, is unaffected). Excluding
+`awaiting_gate = 1` unconditionally is still the right call in aggregate -- one stage's worst case
+is "redo a deterministic scan," versus failing a real human-waiting queue (including every OTHER
+stage's gate, where nothing is lost) on every single deploy -- but it is a known, narrow, disclosed
+gap in the "every gate-paused session has a recovery path" premise, not a universal guarantee.
+
+Usage: `cd agent && uv run python -m src.deploy_drain` runs the self-check against a real DB (safe:
+scoped to its own seeded rows, see `_demo` below -- matches every other module in this package's
+"bare invocation runs the self-check" convention). `cd agent && uv run python -m src.deploy_drain
+--run` performs a REAL drain -- a plain, ordinary deploy step, no process-locality caveat.
 """
 
 from __future__ import annotations
@@ -49,7 +78,6 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from . import session_store
-from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
 
@@ -58,40 +86,45 @@ logger = logging.getLogger(__name__)
 INTERRUPTED_BY_DEPLOY_MESSAGE = "interrupted by deploy -- resubmit to retry"
 
 
+async def _list_drainable_sessions() -> list[dict[str, Any]]:
+    """The one query this module needs: every session still `in_progress` and not paused at a
+    human gate. See the module docstring for why both predicates are exactly right and nothing
+    else (container liveness included) needs checking."""
+    pool = await session_store._get_pool()  # noqa: SLF001 -- same package, same reuse convention project_store.py/org_settings.py already use for session_store's own pool
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        # awaiting_gate is `BIT NULL` with no column default (0004_create_projects.sql) -- a
+        # freshly created session that has never reached a gate is NULL, not 0, and SQL's
+        # three-valued logic means `awaiting_gate = 0` alone silently excludes it (`NULL = 0` is
+        # UNKNOWN, never TRUE). Treat NULL the same as 0/not-awaiting, matching every other reader
+        # in this codebase (session_store._row_to_response, gate_node's own
+        # `bool(existing_session and existing_session.get("awaiting_gate"))`).
+        await cur.execute(
+            "SELECT session_id, run_id, current_stage FROM dbo.sessions "
+            "WHERE status = 'in_progress' AND (awaiting_gate = 0 OR awaiting_gate IS NULL)"
+        )
+        rows = await cur.fetchall()
+        # SQL Server hands UNIQUEIDENTIFIER back uppercase -- normalize to lowercase, same
+        # convention session_store._row_to_dict already applies for every other reader.
+        return [{"session_id": str(r[0]).lower(), "run_id": r[1], "current_stage": r[2]} for r in rows]
+
+
 async def drain(
-    provider: SandboxProvider,
     *,
-    get_session: Callable[[str], Awaitable[dict[str, Any] | None]] = session_store.get_session,
+    list_drainable: Callable[[], Awaitable[list[dict[str, Any]]]] = _list_drainable_sessions,
     close_session: Callable[..., Awaitable[None]] = session_store.close_session,
 ) -> list[str]:
-    """Marks every still-`in_progress` session whose sandbox `provider` currently has registered
-    as `failed`, with `INTERRUPTED_BY_DEPLOY_MESSAGE` as the reason. Returns the session_ids
-    actually marked (a session `list_active()` names that is already terminal, or that
-    session_store has no row for at all, is left untouched and simply not included).
+    """Marks every session `list_drainable` names as `failed`, with `INTERRUPTED_BY_DEPLOY_MESSAGE`
+    as the reason. Returns the session_ids actually marked.
 
-    get_session/close_session default to the real session_store functions -- overridable so this
-    module's own self-check (_demo below) can prove the SELECTION and MESSAGE logic without a real
-    DB or a real sandbox provider; `provider` has no default for the same reason (see this
-    module's own docstring for why a real deploy invocation needs the CALLER's already-running
-    provider instance, not a freshly constructed one).
-
-    Deliberately narrow: only a session still `in_progress` is touched. A live sandbox attached to
-    an already-completed/failed/rejected session (its container just hasn't been reaped yet) is
-    left exactly as it is -- this is a rescue for genuinely orphaned in-flight work, not a blanket
-    status stamp over every row a sandbox happens to still exist for.
+    list_drainable/close_session default to the real functions -- overridable so this module's own
+    self-check (`_demo` below) can scope which rows it touches to its own seeded fixture, without
+    which running the REAL, unfiltered query during a self-check could drain a genuinely in-progress
+    session that happens to exist in whatever DB the check runs against.
     """
-    session_ids = await provider.list_active()
+    rows = await list_drainable()
     marked: list[str] = []
-    for session_id in session_ids:
-        row = await get_session(session_id)
-        if row is None:
-            logger.warning(
-                "deploy_drain: sandbox is live for session_id=%s but session_store has no row for "
-                "it -- skipping (nothing to mark)", session_id,
-            )
-            continue
-        if row.get("status") != "in_progress":
-            continue
+    for row in rows:
+        session_id = row["session_id"]
         await close_session(
             session_id,
             run_id=row.get("run_id"),
@@ -107,59 +140,77 @@ async def drain(
     return marked
 
 
-def _demo() -> None:
-    """Offline self-check: a fake provider + fake session_store functions, no real DB or Docker --
-    proves the SELECTION (in_progress only, tolerate a missing row) and the MESSAGE (status/type/
-    feedback shape close_session actually receives), which is this module's own real logic. The
-    I/O underneath (a real SandboxProvider, a real dbo.sessions row) is exactly what
-    session_store.py's/local_docker.py's own self-checks already cover -- not re-proven here."""
-    import asyncio
+async def _demo() -> None:
+    """Self-check against a real DB: `cd agent && uv run python -m src.deploy_drain`. Seeds three
+    real dbo.sessions rows in the shapes that matter (in_progress+not-awaiting -> drained;
+    in_progress+awaiting_gate -> untouched; completed -> untouched), runs the REAL query and the
+    REAL drain(), and asserts. Safe against a populated real DB: the candidate list `drain()` acts
+    on is the real `_list_drainable_sessions()` output post-filtered to this fixture's own three
+    session_ids, so an unrelated real in-progress session in the same database is never touched --
+    the real WHERE clause is still exercised for real, just not blindly trusted with the whole
+    table during a self-check."""
+    import uuid
 
-    class _FakeProvider:
-        async def list_active(self) -> list[str]:
-            return ["live-in-progress", "live-but-completed", "live-but-no-row"]
+    from . import project_store
 
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def _fake_get_session(session_id: str) -> dict[str, Any] | None:
-        return {
-            "live-in-progress": {"status": "in_progress", "run_id": "r1", "current_stage": "plan"},
-            "live-but-completed": {"status": "completed", "run_id": "r2", "current_stage": "metrics-exit"},
-            # "live-but-no-row" deliberately absent -- a sandbox the provider knows about but
-            # session_store has no row for (e.g. a bare spike sandbox with no real session).
-        }.get(session_id)
-
-    async def _fake_close_session(session_id: str, **kwargs: Any) -> None:
-        calls.append((session_id, kwargs))
-
-    marked = asyncio.run(
-        drain(_FakeProvider(), get_session=_fake_get_session, close_session=_fake_close_session)  # type: ignore[arg-type]
+    project_id = await project_store.create_project(
+        "deploy-drain-selfcheck-project", tech_stack_id=None, tech_stack_text=None, created_by="octocat"
     )
+    drainable_id, gated_id, completed_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    fixture_ids = {drainable_id, gated_id, completed_id}
+    try:
+        for session_id in fixture_ids:
+            await session_store.create_session(
+                session_id, owner="octocat", repo="deploy-drain-selfcheck-repo", user_login="octocat",
+                source_branch="main", work_branch=f"ai-dev-workflow/{session_id}", title="t",
+                project_id=project_id,
+            )
+        await session_store.set_awaiting_gate(gated_id, True)
+        await session_store.close_session(completed_id, run_id="rdone", status="completed")
 
-    assert marked == ["live-in-progress"], (
-        f"only the genuinely in_progress session must be marked -- an already-completed session "
-        f"or a sandbox with no session row at all must be left alone, got {marked}"
-    )
-    assert len(calls) == 1, f"close_session must be called exactly once, got {calls}"
-    session_id, kwargs = calls[0]
-    assert session_id == "live-in-progress", session_id
-    assert kwargs["run_id"] == "r1", kwargs
-    assert kwargs["status"] == "failed", kwargs
-    assert kwargs["failure"]["type"] == "interrupted_by_deploy", kwargs
-    assert kwargs["failure"]["stage"] == "plan", kwargs
-    assert kwargs["failure"]["feedback"] == INTERRUPTED_BY_DEPLOY_MESSAGE, kwargs
+        # Proves the real SQL predicate directly, against real rows, before drain() ever runs:
+        # the awaiting-gate and completed rows must not even be candidates.
+        raw = await _list_drainable_sessions()
+        raw_ids = {r["session_id"] for r in raw}
+        assert drainable_id in raw_ids, "the plain in_progress+not-awaiting row must be a candidate"
+        assert gated_id not in raw_ids, "an awaiting_gate=1 row must never be a candidate"
+        assert completed_id not in raw_ids, "a completed row must never be a candidate"
 
-    print("deploy_drain self-check: all assertions passed")
+        async def _scoped_list() -> list[dict[str, Any]]:
+            return [r for r in raw if r["session_id"] in fixture_ids]
+
+        marked = await drain(list_drainable=_scoped_list)
+
+        assert marked == [drainable_id], (
+            f"only the in_progress+not-awaiting session must be drained, got {marked}"
+        )
+
+        drained_row = await session_store.get_session(drainable_id)
+        assert drained_row["status"] == "failed", drained_row
+        assert drained_row["failure_type"] == "interrupted_by_deploy", drained_row
+        assert drained_row["failure_message"] == INTERRUPTED_BY_DEPLOY_MESSAGE, drained_row
+
+        gated_row = await session_store.get_session(gated_id)
+        assert gated_row["status"] == "in_progress", "a gate-paused session must be left untouched"
+
+        completed_row = await session_store.get_session(completed_id)
+        assert completed_row["status"] == "completed", "an already-terminal session must be left untouched"
+
+        print("deploy_drain self-check: all assertions passed")
+    finally:
+        for session_id in fixture_ids:
+            await session_store.delete_session(session_id)
+        pool = await session_store._get_pool()  # noqa: SLF001
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await cur.execute("DELETE FROM dbo.projects WHERE project_id = ?", project_id)
 
 
-async def _run_for_real() -> None:  # pragma: no cover -- exercises the real provider/DB, not offline-safe
-    from .sandbox.factory import get_sandbox_provider
-
-    marked = await drain(get_sandbox_provider())
+async def _run_for_real() -> None:  # pragma: no cover -- mutates real dbo.sessions rows
+    marked = await drain()
     if marked:
         print(f"deploy_drain: marked {len(marked)} session(s) as interrupted-by-deploy: {', '.join(marked)}")
     else:
-        print("deploy_drain: no in-progress sessions found on this process's live sandbox registry")
+        print("deploy_drain: no drainable (in_progress, not awaiting a gate) sessions found")
 
 
 if __name__ == "__main__":  # pragma: no cover -- cd agent && uv run python -m src.deploy_drain [--run]
@@ -168,15 +219,12 @@ if __name__ == "__main__":  # pragma: no cover -- cd agent && uv run python -m s
 
     logging.basicConfig(level=logging.INFO)
     if "--run" in sys.argv[1:]:
-        # See this module's own docstring CAVEAT before wiring this into a real deploy step --
-        # it only sees what THIS process provisioned, so it must run inside the process being
-        # replaced, not as a separately spawned post-mortem script.
         asyncio.run(_run_for_real())
     else:
         # Default (no args), same convention as every other module in this package
-        # (session_store.py, project_store.py, model_config.py, ...): run the offline self-check.
+        # (session_store.py, project_store.py, model_config.py, ...): run the self-check.
         # Re-dispatched through the PACKAGE name so this module isn't imported twice under two
         # different sys.modules identities, same reason those other modules' own __main__ blocks do.
         from src.deploy_drain import _demo as _packaged_demo
 
-        _packaged_demo()
+        asyncio.run(_packaged_demo())
