@@ -76,7 +76,7 @@ from . import config
 from . import run_event_store
 from . import run_event_stream
 from . import telemetry
-from .cli_agent_exec import _SCRATCH_DIR, run_turn, write_scratch_file
+from .cli_agent_exec import _SCRATCH_DIR, ResumeState, classify_resume, run_turn, write_scratch_file
 from .redaction import redact_text, redact_value
 from .run_events import RunEvent, RunEventType
 from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
@@ -89,6 +89,30 @@ logger = logging.getLogger(__name__)
 # value is the CLI's own session_id string, nothing more -- there is no client or connection object
 # to key alongside it the way Copilot needs (see this module's own docstring for why).
 _session_ids: dict[str, str] = {}
+
+# Phase E audit C-2: per-session-key resume-continuity classification, keyed identically to
+# _session_ids ("{thread_id}:{stage}:{role}") -- see cli_agent_exec.classify_resume for the
+# tri-state RULE and the real killed-turn experiment it is built from. Absent key means "no
+# --resume has ever been attempted for this key yet", which is deliberately distinct from
+# "unknown" (attempted, and the outcome could not be confirmed) -- a fresh first turn makes no
+# continuity claim at all, so there is nothing to classify.
+_resume_states: dict[str, ResumeState] = {}
+
+# CLI error text that positively indicates a rejected resume, checked case-insensitively.
+# INFERENCE, not confirmed real: the one real killed-turn experiment this module's classify_resume
+# call is built from (fix-e3a-report.md) resumed CLEANLY -- it never triggered an actual
+# rejection, so no real Claude CLI rejection message has been captured anywhere in this codebase.
+# These are a defensible guess at plausible phrasing, not a verified fact; classify_resume's own
+# conservative default (UNKNOWN, not REJECTED, when no marker matches) means a wrong guess here
+# only under-detects REJECTED into UNKNOWN, it never mis-labels an unrelated error as a resume
+# rejection.
+_RESUME_REJECTED_MARKERS: tuple[str, ...] = (
+    "no conversation found",
+    "session not found",
+    "no such session",
+    "invalid session",
+    "unable to resume",
+)
 
 # Copilot and Claude ship disjoint tool vocabularies, so a caller's available_tools/excluded_tools
 # list -- written once, in Copilot's own "builtin:<name>" vocabulary (config.
@@ -338,13 +362,29 @@ def _translate_intermediate_events(
     a turn errors out mid-call) still yields a RunEvent, just without a "result"/"is_error" payload
     key -- fails soft, never drops the call itself.
 
-    `reasoning`/plain-text content blocks (`type: "thinking"`, `type: "text"`) are deliberately NOT
-    translated -- RunEventType.REASONING exists in the Task 1 schema but capturing it was never
-    part of what Task 3 built for Copilot (whose own `assistant.message_delta` lines are skipped
-    the same way), and this task's brief asks for "the same way Task 3 does," not a broader
-    granularity than that precedent set. A later task can add REASONING capture on top of this one
-    small, additive change if that turns out to be wanted.
+    Phase E audit finding 3 (capture half): `type: "thinking"`/`type: "text"` content blocks --
+    previously deliberately NOT translated (see this module's git history for the original
+    reasoning: matching Task 3's then-current Copilot scope, not a broader granularity) -- now
+    become one RunEventType.REASONING event PER BLOCK. One event per contiguous block, never
+    per-token/per-line, is already what this CLI's real captured shape gives for free: every real
+    sample seen in this module (including the fresh one behind classify_resume's own docstring)
+    delivers a "thinking" or "text" block as one COMPLETE block on its own assistant-role line, not
+    as fragmentary deltas across many lines -- this pipeline never passes
+    `--include-partial-messages`, so there is no sub-block streaming to coalesce here. `summary`
+    is a short head of the text (never the full text -- that stays in `payload` only); both are
+    redacted through the same redact_text/redact_value calls the TOOL_CALL path below already
+    uses, since agent narration is exactly as capable of echoing a secret-shaped string as a tool
+    call's own input/output is.
+
+    Phase E audit finding 6 (capture half): the real captured `tool_result` line carries a real
+    `"timestamp"` field (module's own `_demo()` sample); the matching `tool_use` line does not.
+    That timestamp lives on the tool_result's OUTER envelope (the line), not inside the
+    `tool_result` content block itself -- `results_by_tool_use_id` below now keeps both. Folded
+    into the TOOL_CALL payload as `result_ts` when present, never fabricating a start time or a
+    duration -- this makes a real per-call span derivable later (once a real start time is ALSO
+    captured) without inventing one now.
     """
+    _REASONING_HEAD_CHARS = 160
     results_by_tool_use_id: dict[str, dict[str, Any]] = {}
     for raw_event in intermediate_events:
         message = raw_event.get("message")
@@ -357,7 +397,12 @@ def _translate_intermediate_events(
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 tool_use_id = block.get("tool_use_id")
                 if isinstance(tool_use_id, str):
-                    results_by_tool_use_id[tool_use_id] = block
+                    results_by_tool_use_id[tool_use_id] = {
+                        "content": block.get("content"),
+                        "is_error": block.get("is_error"),
+                        # Real (finding 6): the timestamp is on raw_event, not the block itself.
+                        "timestamp": raw_event.get("timestamp"),
+                    }
 
     translated: list[RunEvent] = []
     for raw_event in intermediate_events:
@@ -368,15 +413,42 @@ def _translate_intermediate_events(
         if not isinstance(content, list):
             continue
         for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+
+            if block_type in ("thinking", "text"):
+                text = block.get("thinking") if block_type == "thinking" else block.get("text")
+                text = text if isinstance(text, str) else ""
+                if not text:
+                    continue  # nothing to narrate (e.g. an empty text block) -- no event for it
+                head = text[:_REASONING_HEAD_CHARS]
+                if len(text) > _REASONING_HEAD_CHARS:
+                    head += "..."
+                translated.append(
+                    RunEvent(
+                        run_id=run_id,
+                        session_id=session_id,
+                        type=RunEventType.REASONING,
+                        stage=stage,
+                        node=node,
+                        summary=redact_text(head),
+                        payload=redact_value({"kind": block_type, "text": text}),
+                    )
+                )
+                continue
+
+            if block_type != "tool_use":
                 continue
             name = block.get("name") or "unknown"
             payload: dict[str, Any] = {"name": name, "input": block.get("input")}
             tool_use_id = block.get("id")
             result_block = results_by_tool_use_id.get(tool_use_id) if isinstance(tool_use_id, str) else None
             if result_block is not None:
-                payload["result"] = result_block.get("content")
-                payload["is_error"] = result_block.get("is_error")
+                payload["result"] = result_block["content"]
+                payload["is_error"] = result_block["is_error"]
+                if result_block["timestamp"] is not None:
+                    payload["result_ts"] = result_block["timestamp"]
             translated.append(
                 RunEvent(
                     run_id=run_id,
@@ -616,14 +688,40 @@ class ClaudeChatModel(BaseChatModel):
             argv += ["--json-schema", json.dumps(self.response_schema.model_json_schema())]
 
         command = shlex.join(argv)
-        result = await run_turn(
-            provider,
-            self.thread_id,
-            command,
-            prompt,
-            scratch_prefix,
-            timeout_seconds=config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
-        )
+        try:
+            result = await run_turn(
+                provider,
+                self.thread_id,
+                command,
+                prompt,
+                scratch_prefix,
+                timeout_seconds=config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            # Phase E audit C-2: cli_agent_exec.run_turn's own SIGKILL-the-process-group path just
+            # fired. Mark this session's resume continuity UNKNOWN -- never leave the prior
+            # classification (if any) standing unqualified, and never silently drop the cached id
+            # either. See classify_resume's own docstring for the real experiment this is based
+            # on: one real Claude session, killed this exact way (`timeout -s KILL` mid-tool-call),
+            # later `--resume`d CLEANLY (same session_id, no error). Unconditionally dropping the
+            # id here would trade a real, sometimes-avoidable loss of accumulated context/budget
+            # for a hypothetical corruption that this experiment did not actually observe. Keeping
+            # it lets the next turn's own real --resume attempt -- and this same classification
+            # logic, applied to THAT attempt's real outcome -- decide for real, which is what makes
+            # this legible instead of either silently trusting or silently discarding.
+            if session_id:
+                _resume_states[self._session_key] = "unknown"
+                logger.warning(
+                    "Claude turn for %r was killed mid-turn -- resume continuity for cached "
+                    "session %r is now UNKNOWN (kept, not dropped: a real experiment showed a "
+                    "killed session can still resume cleanly). The next turn's own --resume "
+                    "attempt will classify the real outcome.",
+                    self._session_key, session_id,
+                )
+            raise TimeoutError(
+                f"{exc} -- resume continuity for session {session_id!r} at "
+                f"{self._session_key!r} is now UNKNOWN (killed mid-turn)"
+            ) from exc
 
         # Task 4 (Part 2 run-visibility): stdout is now NDJSON (this module's own docstring/
         # task-4-report.md), not one terminal object -- `json.loads(result.stdout)` directly would
@@ -632,9 +730,24 @@ class ClaudeChatModel(BaseChatModel):
         # fails loud, matching copilot_chat_model's identical guard for the identical situation.
         events = _parse_claude_jsonl(result.stdout)
         if not events:
+            # Phase E audit C-2: a resume the CLI rejects outright, before ever invoking the model,
+            # would plausibly look exactly like this -- empty/unparseable stdout, a message on
+            # stderr only (this module's own docstring records exactly this shape of failure for a
+            # different bad invocation: "Error: When using --print, --output-format=stream-json
+            # requires --verbose" arrived on stderr with no stdout at all). No real captured
+            # example of an actual resume rejection exists anywhere in this codebase yet -- this
+            # task's one real killed-turn experiment resumed cleanly instead (classify_resume's own
+            # docstring) -- so this classifies defensively from the real text actually on hand
+            # rather than claim more than is known.
+            if session_id:
+                combined_text = f"{result.stdout} {result.stderr}"
+                rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
+                _resume_states[self._session_key] = "rejected" if rejected else "unknown"
             raise RuntimeError(
                 f"Claude CLI turn for {self._session_key!r} produced no parseable "
-                f"--output-format stream-json lines: stdout={result.stdout!r}\nstderr={result.stderr!r}"
+                f"--output-format stream-json lines (resume_state="
+                f"{_resume_states.get(self._session_key)!r}): stdout={result.stdout!r}\n"
+                f"stderr={result.stderr!r}"
             )
 
         # Best-effort guess, confirmed real for this pipeline's own pinned CLI version
@@ -643,36 +756,59 @@ class ClaudeChatModel(BaseChatModel):
         # `--output-format json` response had -- only WHERE they live changed (events[-1] instead
         # of the one parsed object), not their names.
         final = events[-1]
+        is_error = bool(final.get("is_error"))
+        new_session_id = final.get("session_id")
 
-        if final.get("is_error"):
+        # Phase E audit C-2: classify THIS turn's resume continuity from what was actually
+        # observed -- None when no --resume was requested this turn (a fresh session's first
+        # turn makes no continuity claim). See classify_resume's own docstring for the tri-state
+        # rule and the real experiment it is built from. Computed before the is_error raise below
+        # so the raised message can carry it (Spec: "surface the state in exception messages").
+        resume_state = classify_resume(
+            session_id, new_session_id, is_error, str(final.get("result") or ""), _RESUME_REJECTED_MARKERS,
+        )
+        if resume_state is not None:
+            _resume_states[self._session_key] = resume_state
+            if resume_state == "unknown":
+                logger.warning(
+                    "resume continuity for session %r at %r is UNKNOWN this turn (requested=%r "
+                    "returned=%r is_error=%s) -- never assumed continuous without a matching id",
+                    session_id, self._session_key, session_id, new_session_id, is_error,
+                )
+
+        if is_error:
             raise RuntimeError(
                 f"Claude CLI turn for {self._session_key!r} reported an error "
-                f"(stop_reason={final.get('stop_reason')!r}): {final.get('result')!r}"
+                f"(stop_reason={final.get('stop_reason')!r}, resume_state={resume_state!r}): "
+                f"{final.get('result')!r}"
             )
 
-        new_session_id = final.get("session_id")
         if new_session_id:
             _session_ids[self._session_key] = new_session_id
 
-        # Task 4 (Part 2 run-visibility): every intermediate NDJSON line this turn produced (all of
-        # `events` except the final result-shaped line, handled above) is translated and
-        # persisted+emitted via the same two-call pattern graph.py's draft/audit/verify sites and
-        # copilot_chat_model._agenerate_inner use for their own RunEvents -- run_event_store.
-        # append_event then run_event_stream.emit_live, rebinding to append_event's returned copy
-        # (seq/ts filled in) before the live call. Both calls fail soft internally (their own
+        # Task 4 (Part 2 run-visibility) + Phase E audit finding 5: every intermediate NDJSON line
+        # this turn produced (all of `events` except the final result-shaped line, handled above)
+        # is translated, then the whole batch is appended in ONE round trip
+        # (run_event_store.append_events -- was a per-event append_event/emit_live loop, N
+        # sequential DB round-trips for a chatty turn) before still emitting each one live
+        # individually: emit_live is an in-process custom-event dispatch, not a DB write, so the
+        # Spec's "batched... not one write per X" requirement is about the append_events call, not
+        # about making the live stream batch too. Both calls fail soft internally (their own
         # docstrings) -- no extra try/except needed here. self.run_id already carries the graph's
         # real per-run id (Task 3b) for every caller that has one; the "unknown" fallback is only
         # for a caller that hasn't been wired up to pass one yet, same sentinel convention as
         # copilot_chat_model's identical call site.
-        for tool_call_event in _translate_intermediate_events(
+        translated_events = _translate_intermediate_events(
             events[:-1],
             run_id=self.run_id or "unknown",
             session_id=self.thread_id,
             stage=self.stage,
             node=self.role,
-        ):
-            tool_call_event = await run_event_store.append_event(tool_call_event)
-            await run_event_stream.emit_live(tool_call_event)
+        )
+        if translated_events:
+            translated_events = await run_event_store.append_events(translated_events)
+            for translated_event in translated_events:
+                await run_event_stream.emit_live(translated_event)
 
         usage = final.get("usage") or {}
         self._last_usage = {
@@ -775,6 +911,7 @@ def forget_thread_sessions(thread_id: str) -> None:
     stale = [key for key in _session_ids if key.startswith(prefix)]
     for key in stale:
         _session_ids.pop(key, None)
+        _resume_states.pop(key, None)
     if stale:
         logger.info("forgot %d Claude session id(s) for thread_id=%s (sandbox gone)", len(stale), thread_id)
 
@@ -785,10 +922,16 @@ async def close_session(thread_id: str, stage: str, role: str) -> None:
     session history now contains a fabricated claim -- see that function's docstring for why a
     fresh session, not a retry in the same one, is what actually recovers from it.
 
+    Also drops any cached resume-continuity classification (Phase E audit C-2) for the same key --
+    a fresh session that hasn't attempted a resume yet has no continuity claim to report, so a
+    stale "unknown"/"rejected" from the session this just replaced must not linger and be read as
+    if it described the new one.
+
     Async for the same call-site-parity reason as close_thread_session; nothing here awaits either.
     """
     session_key = f"{thread_id}:{stage}:{role}"
     _session_ids.pop(session_key, None)
+    _resume_states.pop(session_key, None)
     logger.info("closed Claude session %r so the next attempt starts fresh", session_key)
 
 
@@ -800,6 +943,20 @@ def get_session_id(thread_id: str, stage: str, role: str) -> str | None:
     the model's self-report.
     """
     return _session_ids.get(f"{thread_id}:{stage}:{role}")
+
+
+def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | None:
+    """The last-observed resume-continuity classification for one (thread, stage, role), or None
+    if no --resume has ever been attempted for this key yet (a fresh key, or one just cleared by
+    close_session/forget_thread_sessions).
+
+    Phase E audit C-2: this is the accessor that makes resume continuity legible to a caller
+    outside this module -- graph.py's make_verify_node reads it (via chat_model.get_resume_state)
+    right where it already resets a stalled/fabricating draft session, so a human/log reading that
+    reset can tell "this session's continuity was already suspect before the reset" apart from
+    "this session looked fine and got reset anyway for an unrelated reason."
+    """
+    return _resume_states.get(f"{thread_id}:{stage}:{role}")
 
 
 async def read_skill_invocations(provider: SandboxProvider, thread_id: str, session_id: str) -> list[str] | None:
@@ -1009,11 +1166,25 @@ def _demo() -> None:
     # exactly ONE fully-correlated RunEvent (name, input, AND result folded together via the real
     # tool_use_id/id correlation -- see _translate_intermediate_events' own docstring for why this
     # is possible for Claude but not for Copilot's own uncorrelated pair).
+    #
+    # Phase E audit finding 3 (capture half): this exact real capture ALSO contains a real
+    # "thinking" block (line 2, unchanged since task-4) that was previously dropped on the floor --
+    # it now yields its own REASONING event, so this proof runs against the same real sample
+    # task-4 already captured, not a freshly-invented fixture built to agree with the new code.
     real_translated = _translate_intermediate_events(
         real_events[:-1], run_id="run-real", session_id="thread-real", stage="specification", node="draft",
     )
-    assert len(real_translated) == 1, f"expected exactly 1 correlated tool-call RunEvent, got {len(real_translated)}"
-    real_event = real_translated[0]
+    assert len(real_translated) == 2, (
+        f"expected 1 REASONING + 1 correlated tool-call RunEvent, got {len(real_translated)}"
+    )
+    real_reasoning, real_event = real_translated
+    assert real_reasoning.type is RunEventType.REASONING
+    assert real_reasoning.run_id == "run-real" and real_reasoning.session_id == "thread-real"
+    assert real_reasoning.summary == "The user is asking me to run echo hello-verify, then stop."
+    assert real_reasoning.payload == {
+        "kind": "thinking",
+        "text": "The user is asking me to run echo hello-verify, then stop.",
+    }
     assert real_event.type is RunEventType.TOOL_CALL
     assert real_event.run_id == "run-real" and real_event.session_id == "thread-real"
     assert real_event.stage == "specification" and real_event.node == "draft"
@@ -1023,6 +1194,9 @@ def _demo() -> None:
         "input": {"command": "echo hello-verify", "description": "Run verification command"},
         "result": "hello-verify",
         "is_error": False,
+        # Phase E audit finding 6 (capture half): the real tool_result line's own real timestamp,
+        # never fabricated -- see _translate_intermediate_events' own docstring.
+        "result_ts": "2026-08-23T19:57:39.403Z",
     }
     assert real_event.seq is None and real_event.ts is None, "append_event fills these in, not the translator"
 
@@ -1043,6 +1217,26 @@ def _demo() -> None:
     assert unpaired_translated[0].payload == {"name": "Read", "input": {"file_path": "a.py"}}, (
         "an unpaired tool_use must still produce a RunEvent, just without result/is_error keys"
     )
+
+    # Phase E audit finding 3: synthetic coverage for branches the one real capture doesn't
+    # exercise -- a "text" block (the real capture only has "thinking"), a block long enough to
+    # need its summary head-truncated, and an empty block that must yield NO event at all (nothing
+    # to narrate). Clearly labelled synthetic, not claimed as real.
+    long_text = "word " * 40  # 200 chars, over _REASONING_HEAD_CHARS=160
+    reasoning_jsonl = (
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": long_text}]}}) + "\n"
+        + json.dumps({"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": ""}]}}) + "\n"
+    )
+    reasoning_events = _parse_claude_jsonl(reasoning_jsonl)
+    reasoning_translated = _translate_intermediate_events(
+        reasoning_events, run_id="r", session_id="s", stage="st", node="n"
+    )
+    assert len(reasoning_translated) == 1, "an empty thinking/text block must yield no event -- nothing to narrate"
+    long_event = reasoning_translated[0]
+    assert long_event.type is RunEventType.REASONING
+    assert long_event.payload == {"kind": "text", "text": long_text}, "full text always in payload, never truncated"
+    assert long_event.summary == long_text[:160] + "...", "summary should be a truncated head, not the full text"
+    assert len(long_event.summary) < len(long_text), "summary must actually be shorter than the full text"
 
     # A garbage/non-JSON line, and a JSON line that isn't an object, must not crash the parser --
     # both are skipped, not fatal (mirrors copilot_chat_model._parse_copilot_jsonl's identical
@@ -1065,19 +1259,33 @@ def _demo() -> None:
     for thread in (doomed, survivor):
         for suffix in ("specification:draft", "plan:audit"):
             _session_ids[f"{thread}:{suffix}"] = f"sess-{thread}-{suffix}"
+            # Phase E audit C-2: _resume_states must mirror _session_ids' own eviction shape --
+            # seeded here so forget_thread_sessions/close_session/close_thread_session below are
+            # proven to clear BOTH dicts, not just the session-id one.
+            _resume_states[f"{thread}:{suffix}"] = "unknown"
 
     forget_thread_sessions(doomed)
     assert not [k for k in _session_ids if k.startswith(f"{doomed}:")], "doomed sessions survived"
     assert len([k for k in _session_ids if k.startswith(f"{survivor}:")]) == 2, "evicted the wrong thread"
+    assert not [k for k in _resume_states if k.startswith(f"{doomed}:")], "doomed resume_states survived"
+    assert len([k for k in _resume_states if k.startswith(f"{survivor}:")]) == 2, (
+        "forget_thread_sessions evicted the wrong thread's resume_states"
+    )
 
     forget_thread_sessions("never-existed")  # must not raise
 
     asyncio.run(close_session(survivor, "specification", "draft"))
     assert get_session_id(survivor, "specification", "draft") is None, "close_session did not evict"
     assert get_session_id(survivor, "plan", "audit") is not None, "close_session evicted the wrong key"
+    assert get_resume_state(survivor, "specification", "draft") is None, "close_session did not evict resume_state"
+    assert get_resume_state(survivor, "plan", "audit") == "unknown", "close_session evicted the wrong resume_state key"
 
     asyncio.run(close_thread_session(survivor))
     assert not [k for k in _session_ids if k.startswith(f"{survivor}:")], "close_thread_session did not evict"
+    assert not [k for k in _resume_states if k.startswith(f"{survivor}:")], (
+        "close_thread_session did not evict resume_states"
+    )
+    assert get_resume_state("thread-never-seen", "x", "y") is None, "an unseen key must report None, not raise"
 
     # --- Task 5 (Part 2 run-visibility): redaction at the actual capture path ---
     #
@@ -1117,6 +1325,26 @@ def _demo() -> None:
     assert "<redacted>" in stored_json, "payload was not actually scrubbed, just happened to omit the field"
     emitted_json = json.dumps(run_event_stream._json_safe_payload(secret_event))
     assert fake_secret not in emitted_json, f"token leaked into the dict emit_live dispatches live: {emitted_json}"
+
+    # Phase E audit finding 3's own redaction requirement ("redacted with the same redact_text/
+    # redact_value calls the TOOL_CALL path already uses on the same line") -- proof that a
+    # secret-shaped string inside the model's own narration is scrubbed exactly like one inside a
+    # tool call's input/output is, both in the summary head and the full payload text.
+    secret_thinking_line = json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "thinking", "thinking": f"the token is {fake_secret}, using it now"}]},
+    }) + "\n"
+    secret_reasoning_events = _parse_claude_jsonl(secret_thinking_line)
+    secret_reasoning_translated = _translate_intermediate_events(
+        secret_reasoning_events, run_id="run-secret", session_id="thread-secret", stage="specification", node="draft",
+    )
+    assert len(secret_reasoning_translated) == 1, secret_reasoning_translated
+    secret_reasoning_event = secret_reasoning_translated[0]
+    assert secret_reasoning_event.type is RunEventType.REASONING
+    assert fake_secret not in (secret_reasoning_event.summary or ""), "token leaked into REASONING summary"
+    reasoning_stored_json = json.dumps(secret_reasoning_event.payload)
+    assert fake_secret not in reasoning_stored_json, f"token leaked into REASONING payload: {reasoning_stored_json}"
+    assert "<redacted>" in reasoning_stored_json, "REASONING payload was not actually scrubbed"
 
     print("claude_chat_model self-check: all assertions passed")
 
