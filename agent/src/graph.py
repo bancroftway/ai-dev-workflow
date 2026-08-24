@@ -2297,6 +2297,26 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                         stage_spec.key, stage["verify_stall_count"],
                         signals.feedback_similar, signals.paths_unchanged, signals.coverage_not_improving,
                     )
+                # Phase E audit C-2: make resume continuity legible right where a stalled/
+                # fabricating draft session is about to be reset -- without restructuring
+                # _detect_verify_stall's own pure signature/logic (untouched; this only reads an
+                # existing per-provider cache one layer up, via chat_model's dispatcher). If the
+                # session's last known resume state was already "unknown"/"rejected" (e.g. a prior
+                # turn was killed mid-turn -- see cli_agent_exec.classify_resume's own docstring),
+                # this reset may be discarding a session whose continuity was already suspect
+                # BEFORE this stall/fabrication trigger ever fired, not one this reset itself is
+                # the first thing to disturb -- worth knowing when diagnosing why a stage looks
+                # stuck.
+                resume_state = chat_model.get_resume_state(
+                    thread_id, stage_spec.key, "draft", provider=state["provider"]
+                )
+                if resume_state in ("unknown", "rejected"):
+                    logger.warning(
+                        "resetting draft session for stage %s while its last resume continuity "
+                        "was %s -- this session's context may already have been suspect before "
+                        "this stall/fabrication trigger fired",
+                        stage_spec.key, resume_state,
+                    )
                 await close_session(thread_id, stage_spec.key, "draft", provider=state["provider"])
                 stage["verify_stall_count"] = 0
                 # A reset session starts fresh either way; the coverage high-water mark is about
@@ -2625,6 +2645,25 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     logger.warning(
                         "set_awaiting_gate failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True
                     )
+                # Phase E audit finding 4: GATE_PAUSED had no producer anywhere, so the event log
+                # jumped straight from one node's finish to the next node's start with an
+                # unexplained gap for however long a human took to review -- the single most
+                # operationally significant wait in the whole pipeline, invisible in the view built
+                # to explain where time went. Same fail-soft append_event-then-emit_live rebind
+                # pattern the four existing NODE_* sites in this file already use, colocated with
+                # the set_awaiting_gate(True) call right above (same "immediately before interrupt()
+                # actually pauses" placement, same re-runs-harmlessly-on-resume caveat that call's
+                # own comment already documents -- additive only, no topology change).
+                pause_event = RunEvent(
+                    run_id=state.get("run_id", "unknown"),
+                    session_id=thread_id,
+                    type=RunEventType.GATE_PAUSED,
+                    stage=stage_spec.key,
+                    node="gate",
+                    summary=f"gate paused for review: {stage_spec.key}",
+                )
+                pause_event = await run_event_store.append_event(pause_event)
+                await run_event_stream.emit_live(pause_event, config)
             resume_value = interrupt({"stage": stage_spec.key, "draft": stage["draft"], **extra})
 
         # Part 2 Task 10 (Ruling 3): the one resume shape that means a human REJECTION --
@@ -2657,6 +2696,21 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     logger.warning(
                         "set_awaiting_gate failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True
                     )
+                # Phase E audit finding 4: GATE_RESOLVED, rejection branch. Payload carries the
+                # decision (approved/rejected) since gate_node is the one place that already knows
+                # which branch it took -- see the approval tail below for the other outcome. Same
+                # fail-soft pattern as GATE_PAUSED above.
+                resolved_event = RunEvent(
+                    run_id=state.get("run_id", "unknown"),
+                    session_id=thread_id,
+                    type=RunEventType.GATE_RESOLVED,
+                    stage=stage_spec.key,
+                    node="gate",
+                    summary=f"gate rejected: {stage_spec.key}",
+                    payload={"decision": "rejected"},
+                )
+                resolved_event = await run_event_store.append_event(resolved_event)
+                await run_event_stream.emit_live(resolved_event, config)
             await _persist_if_sandboxed(
                 thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} rejected by reviewer"
             )
@@ -2681,6 +2735,25 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         # unrelated future redraft (e.g. a later escalate-and-revoke on a DIFFERENT gate).
         approved["reviewer_feedback"] = None
         stages[stage_spec.key] = approved
+
+        # Phase E audit finding 4: GATE_RESOLVED, approval branch -- the far more common outcome
+        # than rejection, and the one that closes out most of the "how long was this gate open"
+        # gaps GATE_PAUSED above now makes visible. Only for stages that actually paused
+        # (requires_human_gate) -- the 5 non-gated stages fall through this whole function with no
+        # GATE_PAUSED to resolve, so emitting one here for them would describe a pause that never
+        # happened. Same fail-soft pattern as the other two sites.
+        if stage_spec.requires_human_gate and sandbox_registry.get(thread_id) is not None:
+            resolved_event = RunEvent(
+                run_id=state.get("run_id", "unknown"),
+                session_id=thread_id,
+                type=RunEventType.GATE_RESOLVED,
+                stage=stage_spec.key,
+                node="gate",
+                summary=f"gate approved: {stage_spec.key}",
+                payload={"decision": "approved"},
+            )
+            resolved_event = await run_event_store.append_event(resolved_event)
+            await run_event_stream.emit_live(resolved_event, config)
 
         await _persist_if_sandboxed(thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} approved")
 
