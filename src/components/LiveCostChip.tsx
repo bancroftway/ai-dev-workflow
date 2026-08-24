@@ -11,7 +11,9 @@ import { useRunEvents } from "@/lib/use-run-events";
  *
  * draft/audit/fix's NODE_FINISHED events each carry a real `token_usage`
  * (claude_chat_model.py / copilot_chat_model.py's `_last_usage`: {model, input_tokens,
- * output_tokens, cost}); verify_node's NODE_FINISHED has none (not an LLM call), and no
+ * output_tokens, cost} -- Copilot's also carries `premium_requests`, and its token/cost fields
+ * are honest nulls when the CLI doesn't report them); verify_node's NODE_FINISHED has none (not
+ * an LLM call), and no
  * NODE_STARTED/TOOL_CALL/gate event ever sets one either -- confirmed by grepping every
  * `token_usage=` RunEvent call site in graph.py. Summing over every event that HAS one is
  * therefore safe: nothing double-counts. `cost` can be null on an individual event even when
