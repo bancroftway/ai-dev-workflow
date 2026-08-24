@@ -81,7 +81,10 @@ repo-root/
   coverlet.msbuild`, and `dotnet sln add apps/api.Tests/Api.Tests.csproj`. Run with `dotnet test`.
 - **Web (Vitest)**: `cd apps/web && npm install -D vitest @testing-library/react
   @testing-library/jest-dom jsdom @vitejs/plugin-react @vitest/coverage-v8`; add a
-  `vitest.config.ts` with the React plugin and `test: { environment: "jsdom", globals: true }`.
+  `vitest.config.ts` with the React plugin and
+  `test: { environment: "jsdom", globals: true, passWithNoTests: true }` -- the last option matters:
+  an AC-retirement fallback can legitimately leave a file with a placeholder test only, and without
+  it a file Vitest discovers but that registers zero tests is a hard runner error, not a pass.
   Run with `npx vitest run`. Use Playwright (already available to this pipeline's build stage via
   MCP) for anything that needs a real browser/route.
 

@@ -84,10 +84,14 @@ npm workspaces — one lockfile at the repo root covers both `apps/web` and `app
 
 - **API (Vitest)**: `npm install -D vitest supertest @types/supertest --workspace apps/api`. Export
   the Express `app` (don't call `.listen()` at import time) so tests can drive it with
-  `supertest(app)`. Run with `npm run test --workspace apps/api` (`vitest run`).
+  `supertest(app)`. Add `test: { passWithNoTests: true }` to `apps/api`'s own vitest config -- an
+  AC-retirement fallback can legitimately leave a file with a placeholder test only, and without
+  this a file Vitest discovers but that registers zero tests is a hard runner error, not a pass.
+  Run with `npm run test --workspace apps/api` (`vitest run`).
 - **Web (Vitest)**: `npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom
-  @vitest/coverage-v8 --workspace apps/web`; add `test: { environment: "jsdom", globals: true }` to
-  `vite.config.ts`. Run with `npm run test --workspace apps/web`.
+  @vitest/coverage-v8 --workspace apps/web`; add
+  `test: { environment: "jsdom", globals: true, passWithNoTests: true }` to `vite.config.ts` (same
+  reason as the API workspace above). Run with `npm run test --workspace apps/web`.
 
 **Coverage contract**: the two workspaces have different Vitest environments (`jsdom` for the web
 app's components, plain Node for the API), so a single un-scoped `vitest run` at the repo root

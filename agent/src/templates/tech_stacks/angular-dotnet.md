@@ -83,7 +83,10 @@ repo-root/
   coverlet.msbuild`, and `dotnet sln add apps/api.Tests/Api.Tests.csproj`. Run with `dotnet test`.
 - **Web (Vitest)**: install with `cd apps/web && npm install -D vitest @analogjs/vite-plugin-angular
   @analogjs/platform jsdom @vitest/coverage-v8`, add a `vite.config.ts` using the `angular()` plugin
-  with `test: { globals: true, environment: "jsdom", setupFiles: ["src/test-setup.ts"] }`, and a
+  with `test: { globals: true, environment: "jsdom", setupFiles: ["src/test-setup.ts"],
+  passWithNoTests: true }` -- the last option matters: an AC-retirement fallback can legitimately
+  leave a file with a placeholder test only, and without it a file Vitest discovers but that
+  registers zero tests is a hard runner error, not a pass -- and a
   `src/test-setup.ts` that initializes Angular's TestBed environment. Run with `npx vitest run`.
 
 **Coverage contract** (this pipeline's coverage gate replays `.ai-dev-workflow/coverage-commands.json`

@@ -224,10 +224,17 @@ identifier-safe/punctuation-stripped forms some tests still use (`US_0007_2`, `T
 and use your `edit`/`apply_patch` tool to remove exactly that test case. If other tests remain in
 the file afterward, that is a normal edit, nothing further to do. If it was the LAST test in the
 file, you have no delete tool and that is deliberate -- do not attempt to remove the file itself.
-Instead overwrite its content with a single comment noting the retirement (e.g. `// US-0007.2
-retired -- tests removed`), so the file runs nothing and blocks nothing. An empty leftover file is
-expected, disclosed residue, not a defect, and not something you need to solve any further than
-that.
+Instead overwrite its content with ONE trivially-passing placeholder test naming the retired id
+(e.g. for JS/TS, `test("US-0007.2 retired -- tests removed", () => { expect(true).toBe(true); });`;
+for .NET, `[Fact] public void US_0007_2_Retired() { }`; for pytest,
+`def test_us_0007_2_retired(): pass`), never a bare comment with no test case at all. This matters
+mechanically, not just stylistically: under Vitest (this pipeline's baked JS/TS runner), a file
+that matches the runner's own file-discovery pattern but registers zero actual tests is a hard
+runner ERROR ("No test suite found in file"), not a pass -- confirmed live against the pinned
+version in `agent/sandbox-image/test/package.json` -- so a comment-only file would fail the NEXT
+stage's suite for a reason that has nothing to do with anything that stage did. A real, passing,
+named placeholder test is expected, disclosed residue, not a defect, and not something you need to
+solve any further than that.
 
 If you write or edit a `playwright.config.*`, its `use` block MUST set `screenshot: 'on'` -- a
 passing e2e suite must still capture visual evidence (the exit report requires screenshots for UI
