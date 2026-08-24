@@ -15,6 +15,15 @@ export type MissingSetting = {
     | { kind: "signin-entra" };
 };
 
+// Shared across the "not ready", "non-2xx", and "fetch threw" branches below (M-9 fix: all three
+// now push this same finding -- fail CLOSED, not silently fail-open on the latter two).
+const ORG_CREDENTIAL_FINDING: MissingSetting = {
+  id: "org-credential",
+  label: "No usable coding-agent credential",
+  description: "No provider credential is configured or currently usable. Sessions can't run until an admin sets one for the organization.",
+  fix: { kind: "link", href: "/settings/organization", label: "Open Settings" },
+};
+
 export async function runSettingsChecks(ctx: {
   session: Session | null;
   owner?: string;
@@ -46,26 +55,40 @@ export async function runSettingsChecks(ctx: {
   // src/ -- confirmed again while wiring this in): every signed-in user already has the same
   // access to /settings/organization, so there is no "admin vs. non-admin" copy to branch on here
   // -- everyone gets the same actionable link.
+  //
+  // Keyed off `session_ready`, deliberately NOT the same field
+  // src/app/(boxed)/settings/organization/page.tsx keys its own UI off (`credential_configured`).
+  // That's not a bug, it's two different questions answered from the same response: the settings
+  // page asks "is a credential saved in the vault" (so it knows whether to show the masked-dots
+  // display or an empty input); this banner asks "would a session provisioned right now actually
+  // get a usable credential" (agent/src/sessions_api.py's own `_org_settings_response()` docstring
+  // spells out why they're deliberately different signals -- an env-var-only deployment is
+  // credential_configured=false but session_ready=true, and keying this banner off
+  // credential_configured would make it permanently, falsely warn on every such deployment).
+  //
   // try/catch scoped to just this check: unlike the key-vault fetch below (only reachable once a
-  // repo is picked), this one runs unconditionally on every call, so a real network failure here
-  // must not reject the whole runSettingsChecks promise -- that would also discard the two
-  // synchronous, unrelated findings above at the SettingsBanner call site, which has no .catch().
-  // A thrown fetch fails closed: same as "couldn't determine, don't add a finding".
+  // repo is picked), this one runs unconditionally on every call, so a network failure here must
+  // not reject the whole runSettingsChecks promise -- that would also discard the two synchronous,
+  // unrelated findings above at the SettingsBanner call site, which has no .catch().
+  //
+  // Fails CLOSED, on both a thrown fetch and a non-2xx response: this banner exists specifically
+  // to catch "sessions can't actually run" before a user wastes container-minutes discovering that
+  // themselves (sessions_api.py's own provision-time 409 is the backstop; this is the advisory
+  // version of the same check) -- staying silent on "couldn't tell" is exactly the wrong default
+  // for that job. A transient blip reaching our own same-origin BFF route is rare enough that an
+  // occasional false-positive banner is the cheaper mistake here, not the reverse.
   try {
     const orgRes = await fetch("/api/settings/organization");
     if (orgRes.ok) {
       const orgSettings = (await orgRes.json()) as { session_ready?: boolean };
       if (!orgSettings.session_ready) {
-        missing.push({
-          id: "org-credential",
-          label: "No usable coding-agent credential",
-          description: "No provider credential is configured or currently usable. Sessions can't run until an admin sets one for the organization.",
-          fix: { kind: "link", href: "/settings/organization", label: "Open Settings" },
-        });
+        missing.push(ORG_CREDENTIAL_FINDING);
       }
+    } else {
+      missing.push(ORG_CREDENTIAL_FINDING);
     }
   } catch {
-    // Network failure reaching the BFF -- fail closed, same as a non-2xx response.
+    missing.push(ORG_CREDENTIAL_FINDING);
   }
 
   // Repo-scoped: only meaningful once a repo is selected and GitHub is linked (the vault lookup

@@ -71,6 +71,16 @@ export default function NewTicketPage() {
     },
   });
 
+  // I-2(b), whole-branch review: folded into canSubmit below so Assign disables when no
+  // coding-agent credential is configured, not just decoratively bannered. Optimistic default
+  // (true) until SettingsBanner's own check resolves -- matches the banner's own "show nothing
+  // until proven otherwise" posture on first mount, and the provision-time 409 backstop
+  // (sessions_api.py's provision_session) still enforces this for real regardless of what this
+  // client-side flag says. Sourced from SettingsBanner's onReadyChange callback rather than a
+  // second fetch of /api/settings/organization -- that banner already fetches this exact signal
+  // for its own render below.
+  const [orgCredentialReady, setOrgCredentialReady] = useState(true);
+
   const [submit, setSubmit] = useState<SubmitState>({ kind: "idle" });
   // Set once POST /api/projects succeeds for a "+ New Project" submission -- a retry after a later
   // failure (e.g. provisioning) must reuse this project rather than create a second, duplicate row
@@ -100,7 +110,10 @@ export default function NewTicketPage() {
   const isNewProject = selectedProjectId === NEW_PROJECT_VALUE;
   const busy = submit.kind === "submitting";
   const canSubmit =
-    !busy && title.trim().length > 0 && (!isNewProject || newProjectName.trim().length > 0);
+    !busy &&
+    orgCredentialReady &&
+    title.trim().length > 0 &&
+    (!isNewProject || newProjectName.trim().length > 0);
 
   async function handleAssign() {
     setSubmit({ kind: "submitting" });
@@ -216,7 +229,7 @@ export default function NewTicketPage() {
         </p>
       </div>
 
-      <SettingsBanner />
+      <SettingsBanner onReadyChange={setOrgCredentialReady} />
 
       <section className="flex max-w-2xl flex-col gap-4 rounded-lg border border-neutral-200 p-4">
         <label className="flex flex-col gap-1">

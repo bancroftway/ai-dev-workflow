@@ -4,12 +4,34 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 
 type Provider = "copilot" | "claude";
+// C-1 (whole-branch review): the two Claude billing modes. Meaningless for provider === "copilot"
+// (the backend records credential_kind=null there). "api_key" matches what every credential saved
+// before this column existed necessarily was -- see BILLING_MODE_LABELS' own default handling
+// below for where that matters in this UI.
+type BillingMode = "api_key" | "oauth";
 
 type OrgSettings = {
   provider: Provider;
+  // Whether a credential is SAVED (vault has a secret under the org's one fixed slot) -- NOT
+  // whether one would actually work right now. This page keys its masked-dots-vs-input display
+  // off this field; SettingsBanner/settings-checks.ts instead key off the response's
+  // `session_ready` field (a different, deliberately narrower question: "would a session
+  // provisioned right now get a usable credential", which also covers the env-var-fallback and
+  // last-probe-failed cases this field says nothing about). Documented on both sides
+  // (agent/src/sessions_api.py's `_org_settings_response()` docstring is the backend original) so
+  // a reader who notices this page and the banner check two different fields doesn't mistake it
+  // for drift -- it's deliberate.
   credential_configured: boolean;
+  // null means "no credential saved" OR "saved before this column existed" -- read as "api_key"
+  // in the UI below (BILLING_MODE_LABELS' own default), never as "unknown".
+  credential_kind: BillingMode | null;
   updated_at: string | null;
   updated_by: string | null;
+};
+
+const BILLING_MODE_LABELS: Record<BillingMode, string> = {
+  oauth: "Subscription (Pro / Max / Team)",
+  api_key: "API key (metered)",
 };
 
 type SaveState =
@@ -38,6 +60,9 @@ const PROVIDER_LABELS: Record<Provider, string> = {
  */
 export default function OrganizationSettingsPage() {
   const [provider, setProvider] = useState<Provider>("copilot");
+  // Defaults to "api_key" -- matches every credential saved before this control existed, and the
+  // GET response's own credential_kind: null default (see OrgSettings' own comment above).
+  const [billingMode, setBillingMode] = useState<BillingMode>("api_key");
   const [credentialConfigured, setCredentialConfigured] = useState(false);
   const [editingCredential, setEditingCredential] = useState(false);
   const [credentialInput, setCredentialInput] = useState("");
@@ -52,6 +77,7 @@ export default function OrganizationSettingsPage() {
       .then((data: OrgSettings | null) => {
         if (!data) return;
         setProvider(data.provider);
+        setBillingMode(data.credential_kind === "oauth" ? "oauth" : "api_key");
         setCredentialConfigured(data.credential_configured);
         setEditingCredential(!data.credential_configured);
         setUpdatedAt(data.updated_at);
@@ -65,11 +91,18 @@ export default function OrganizationSettingsPage() {
     const res = await fetch("/api/settings/organization", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider, credential: credentialInput.trim() || null }),
+      body: JSON.stringify({
+        provider,
+        credential: credentialInput.trim() || null,
+        // Only meaningful for claude -- the backend ignores/records null for copilot anyway, but
+        // sending it unconditionally means this component never has to special-case the omission.
+        credential_kind: provider === "claude" ? billingMode : null,
+      }),
     });
     const body = (await res.json()) as OrgSettings & { detail?: string };
     if (res.ok) {
       setCredentialConfigured(body.credential_configured ?? false);
+      setBillingMode(body.credential_kind === "oauth" ? "oauth" : "api_key");
       setEditingCredential(!body.credential_configured);
       setCredentialInput("");
       setUpdatedAt(body.updated_at ?? null);
@@ -124,8 +157,29 @@ export default function OrganizationSettingsPage() {
           ))}
         </div>
 
+        {provider === "claude" && (
+          <div className="flex flex-col gap-2 border-t border-neutral-100 pt-3">
+            <span className="text-sm font-medium text-neutral-700">Claude billing mode</span>
+            {(Object.keys(BILLING_MODE_LABELS) as BillingMode[]).map((value) => (
+              <label key={value} className="flex items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="billing-mode"
+                  value={value}
+                  checked={billingMode === value}
+                  onChange={() => setBillingMode(value)}
+                  disabled={!loaded}
+                />
+                {BILLING_MODE_LABELS[value]}
+              </label>
+            ))}
+          </div>
+        )}
+
         <label className="flex flex-col gap-1">
-          <span className="text-sm font-medium text-neutral-700">{PROVIDER_LABELS[provider]} credential</span>
+          <span className="text-sm font-medium text-neutral-700">
+            {provider === "claude" ? (billingMode === "oauth" ? "Subscription token" : "API key") : PROVIDER_LABELS[provider]} credential
+          </span>
           {credentialConfigured && !editingCredential ? (
             <div className="flex items-center gap-3">
               <span className="rounded-md border border-neutral-300 bg-neutral-50 px-3 py-2 text-sm text-neutral-500">
@@ -144,7 +198,13 @@ export default function OrganizationSettingsPage() {
               type="password"
               autoComplete="off"
               className="rounded-md border border-neutral-300 px-3 py-2 text-sm"
-              placeholder={credentialConfigured ? "New credential" : `${PROVIDER_LABELS[provider]} API key or token`}
+              placeholder={
+                credentialConfigured
+                  ? "New credential"
+                  : provider === "claude" && billingMode === "oauth"
+                    ? "Generate with `claude setup-token`, paste here"
+                    : `${PROVIDER_LABELS[provider]} API key or token`
+              }
               value={credentialInput}
               onChange={(event) => setCredentialInput(event.target.value)}
               disabled={!loaded}

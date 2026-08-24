@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
+import { SettingsBanner } from "@/components/SettingsBanner";
 import { STATUS_BADGE } from "@/components/SessionHistory";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 
@@ -196,6 +197,12 @@ export default function ProjectBoardPage() {
           {project.owner && project.repo ? `${project.owner}/${project.repo}` : "Repository not yet created"}
         </p>
       </div>
+
+      {/* I-2(a), whole-branch review: the Spec named the board explicitly as a persistent-banner
+          site (tickets live here) -- previously the only two mounts were New Ticket and /select.
+          No owner/repo (matches tickets/new's own bare mount): those only feed the unrelated
+          per-repo key-vault check, out of this finding's scope. */}
+      <SettingsBanner />
 
       {sessionsError && <p className="text-sm text-red-600">{sessionsError}</p>}
       {!owner || !repo ? (

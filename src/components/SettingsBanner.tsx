@@ -9,8 +9,23 @@ import { runSettingsChecks, type MissingSetting } from "@/lib/settings-checks";
  * Amber banners for missing settings (settings-checks.ts) -- one per finding, nothing when all
  * pass. Renders nothing without an authenticated session, which also keeps it out of the way in
  * E2E-bypass mode (no session exists there).
+ *
+ * onReadyChange (I-2b, whole-branch review): fires with whether the org-credential check passed,
+ * every time this banner's own single runSettingsChecks call resolves -- lets a page (tickets/new)
+ * fold the SAME signal it's already displaying into its own submit-gating logic, without a second
+ * fetch of /api/settings/organization. Optional and unused by every other mount site
+ * (select/page.tsx, the board page) -- this banner's own fetch-and-render behavior is unchanged
+ * whether or not a caller passes it.
  */
-export function SettingsBanner({ owner, repo }: { owner?: string; repo?: string }) {
+export function SettingsBanner({
+  owner,
+  repo,
+  onReadyChange,
+}: {
+  owner?: string;
+  repo?: string;
+  onReadyChange?: (ready: boolean) => void;
+}) {
   const { data: session, status } = useSession();
   const [missing, setMissing] = useState<MissingSetting[]>([]);
   const githubConnected = session?.githubConnected;
@@ -22,12 +37,17 @@ export function SettingsBanner({ owner, repo }: { owner?: string; repo?: string 
     if (status !== "authenticated") return;
     let cancelled = false;
     runSettingsChecks({ session, owner, repo }).then((found) => {
-      if (!cancelled) setMissing(found);
+      if (cancelled) return;
+      setMissing(found);
+      onReadyChange?.(!found.some((item) => item.id === "org-credential"));
     });
     return () => {
       cancelled = true;
     };
     // session object identity churns per render -- the fields the checks read are the real deps.
+    // onReadyChange deliberately excluded too: an inline arrow function prop (the expected usage)
+    // would otherwise re-create this effect every render for no reason -- this only ever needs to
+    // fire after a genuine re-check, not after the caller merely re-rendered.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, githubConnected, entraAuthError, owner, repo]);
 

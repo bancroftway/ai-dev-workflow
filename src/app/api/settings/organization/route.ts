@@ -42,9 +42,13 @@ export async function PUT(request: Request) {
     return NextResponse.json({ detail: "Unauthorized" }, { status: 401 });
   }
 
-  const { provider, credential } = (await request.json()) as {
+  const { provider, credential, credential_kind } = (await request.json()) as {
     provider?: string;
     credential?: string | null;
+    // C-1 (whole-branch review): which Claude billing mode `credential` is ("api_key" | "oauth").
+    // Irrelevant for copilot -- forwarded through as-is either way, the agent's own
+    // OrgSettingsPutRequest.credential_kind ignores it for a non-claude provider.
+    credential_kind?: string | null;
   };
   if (provider !== "copilot" && provider !== "claude") {
     return NextResponse.json({ detail: 'provider must be "copilot" or "claude"' }, { status: 400 });
@@ -58,6 +62,7 @@ export async function PUT(request: Request) {
       // Omitted/blank means "keep whatever's already saved" -- matches the agent's own
       // OrgSettingsPutRequest.credential: str | None = None contract.
       credential: typeof credential === "string" && credential.trim() ? credential.trim() : null,
+      credential_kind: credential_kind === "oauth" || credential_kind === "api_key" ? credential_kind : null,
       updated_by: updatedBy,
     }),
   });
