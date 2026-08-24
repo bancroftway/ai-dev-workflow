@@ -82,20 +82,53 @@ async def append_event(event: RunEvent) -> RunEvent:
         return event
 
 
+# Each event row binds 8 params (run_id, session_id, stage, node, type, summary, payload,
+# token_usage). SQL Server's hard per-statement parameter cap is 2100, so a single multi-row
+# INSERT tops out at 2100 // 8 = 262 rows -- a bare 263-row batch fails outright ("07002 COUNT
+# field incorrect"), confirmed against the real DB in code review. The ORIGINAL single-INSERT
+# append_events swallowed that failure via its own fail-soft `except` below, silently losing the
+# ENTIRE turn's log past 262 events while run_event_stream.emit_live kept firing live regardless
+# (rows visible in the live view that vanish on refresh) -- strictly worse than the serial
+# append_event loop it replaced, and REASONING capture (finding 3) roughly doubles events/turn, so
+# the audit's own "200 tool calls" scenario is realistically over the line. 250 keeps real
+# headroom below the 262 ceiling, not tuned to hug it exactly.
+_PARAMS_PER_EVENT_ROW = 8
+_MAX_ROWS_PER_INSERT = 250
+
+
 async def append_events(events: list[RunEvent]) -> list[RunEvent]:
-    """Batch counterpart to append_event (Phase E audit finding 5): one multi-row INSERT for a
-    whole turn's worth of events instead of N sequential round-trips. Both chat models' per-tool-
-    call translation loops (claude_chat_model.py, copilot_chat_model.py) call this once per turn
-    with the whole translated list, then still call run_event_stream.emit_live per event
+    """Batch counterpart to append_event (Phase E audit finding 5): multi-row INSERTs, chunked at
+    _MAX_ROWS_PER_INSERT rows (see that constant's own comment for the SQL Server parameter-count
+    ceiling this respects), instead of N sequential single-row round-trips. Both chat models'
+    per-tool-call translation loops (claude_chat_model.py, copilot_chat_model.py) call this once
+    per turn with the whole translated list, then still call run_event_stream.emit_live per event
     afterward -- that dispatch is in-process, not a DB write, so the Spec's "batched... not one
     write per X" requirement is about THIS function, not about making emit_live batch too.
 
-    Same fail-soft-swallow contract as append_event (its own docstring): a DB blip must never
-    abort the LLM-cost-incurring node that produced these events. On failure, returns `events`
-    unchanged (seq/ts left as whatever the caller passed in, normally None) instead of raising.
+    Each chunk is independently fail-soft (see _append_events_chunk's own docstring) -- one bad
+    chunk can never sink sibling chunks in the same batch, so a batch bigger than one chunk
+    degrades gracefully (partial persistence) rather than losing everything on one transient blip,
+    same spirit as append_event's own single-event fail-soft contract just applied per chunk.
 
-    Empty list in, empty list out, no query issued -- an empty VALUES clause is invalid SQL and
-    there is nothing to batch.
+    Order is preserved across chunk boundaries: chunk K's events keep their position relative to
+    chunk K+1's in the returned list, same as within one chunk (see _append_events_chunk).
+
+    Empty list in, empty list out, no query issued.
+    """
+    if not events:
+        return []
+    results: list[RunEvent] = []
+    for start in range(0, len(events), _MAX_ROWS_PER_INSERT):
+        chunk = events[start : start + _MAX_ROWS_PER_INSERT]
+        results.extend(await _append_events_chunk(chunk))
+    return results
+
+
+async def _append_events_chunk(events: list[RunEvent]) -> list[RunEvent]:
+    """One multi-row INSERT for a single chunk (<= _MAX_ROWS_PER_INSERT rows -- append_events'
+    own job is never handing this more than that). Same fail-soft-swallow contract as
+    append_event: on failure, returns THIS chunk's events unchanged (seq/ts left as whatever the
+    caller passed in, normally None) rather than raising or affecting any other chunk.
 
     Row-to-event correlation: the returned rows are sorted by `seq` ascending before zipping
     against `events` in the caller's own list order. This is deliberately NOT "trust whatever
@@ -110,8 +143,6 @@ async def append_events(events: list[RunEvent]) -> list[RunEvent]:
     VALUES order every time either way -- sorting by seq is the belt-and-braces version of an
     already-observed-correct behavior, not a defense against an observed failure.
     """
-    if not events:
-        return []
     try:
         pool = await _get_pool()
         placeholders = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(events))
@@ -141,7 +172,7 @@ async def append_events(events: list[RunEvent]) -> list[RunEvent]:
         return [replace(event, seq=row[0], ts=row[1]) for event, row in zip(events, ordered)]
     except Exception:  # noqa: BLE001 -- best-effort instrumentation; never abort the node/run over this
         logger.warning(
-            "append_events failed for %d event(s) starting run_id=%s -- continuing without it",
+            "append_events failed for a %d-event chunk starting run_id=%s -- continuing without it",
             len(events), events[0].run_id, exc_info=True,
         )
         return events
@@ -353,6 +384,38 @@ async def _demo() -> None:
         )
         fetched_batch = await list_events(batch_run_id)
         assert [e.payload["i"] for e in fetched_batch] == list(range(5)), fetched_batch
+
+        # Phase E review (Critical): the bug the reviewer actually measured on the real DB --
+        # n=262 worked, n=263 failed outright (07002 COUNT field incorrect), swallowed by the
+        # fail-soft except, losing the WHOLE turn's log while emit_live kept firing live. Proven
+        # fixed against the real DB, not just chunk-math asserted: a genuine 300-row batch (over
+        # the 262-row single-INSERT ceiling, split into two _MAX_ROWS_PER_INSERT=250-row chunks by
+        # this fix) must persist ALL 300 rows, in the right order, across that chunk boundary.
+        big_run_id = uuid.uuid4().hex[:8]
+        big_batch = [
+            RunEvent(
+                run_id=big_run_id, session_id=session_id, type=RunEventType.TOOL_CALL,
+                stage="minimal-code-to-green", node="draft", summary=f"tool call: probe-{i}",
+                payload={"i": i},
+            )
+            for i in range(300)
+        ]
+        appended_big = await append_events(big_batch)
+        assert len(appended_big) == 300, f"expected all 300 rows to come back, got {len(appended_big)}"
+        assert all(e.seq is not None and e.ts is not None for e in appended_big), (
+            "every row across both chunks must come back with a real seq/ts"
+        )
+        assert [e.payload["i"] for e in appended_big] == list(range(300)), (
+            "300-row batch must preserve input order across the chunk boundary"
+        )
+        assert [e.seq for e in appended_big] == sorted(e.seq for e in appended_big), (
+            "seq must be monotonically increasing across the whole 300-row batch, not just within one chunk"
+        )
+        fetched_big = await list_events(big_run_id)
+        assert len(fetched_big) == 300, f"expected all 300 rows actually persisted in the DB, got {len(fetched_big)}"
+        assert [e.payload["i"] for e in fetched_big] == list(range(300)), (
+            "rows fetched back by seq must be in original order too, not just the append_events return value"
+        )
 
         # Same fail-soft contract as append_event's own check just above.
         real_get_pool_for_batch = _get_pool
