@@ -1,6 +1,6 @@
 # ai-dev-workflow
 
-A human-gated, LLM-driven software delivery pipeline built as a single [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Every stage drafts an artifact and runs a *deterministic* check (a real script or parse — never LLM self-attestation). Exactly three stages get an adversarial second-model audit (specification, plan, minimal-code-to-green); exactly three pause for a human by default (tech-stack, specification, plan) — the tech-stack pause is skipped once a repo carries an approved sidecar, and a greenfield (no existing app) repository gets a stack picker at that same pause. A human may approve or reject at any of those three gates; a rejection loops back to that stage's own draft with the reviewer's feedback folded into the next attempt, rather than ending the run. Every other failure ENDs the run with a `run_failure` record instead of waiting on a person. All work happens inside a per-session sandbox container holding a clone of the target repo/branch.
+A human-gated, LLM-driven software delivery pipeline built as a single [LangGraph](https://langchain-ai.github.io/langgraph/) state graph. Every stage drafts an artifact and runs a *deterministic* check (a real script or parse — never LLM self-attestation). Exactly four stages get an adversarial second-model audit (specification, plan, ac-to-tests, minimal-code-to-green); exactly three pause for a human by default (tech-stack, specification, plan) — the tech-stack pause is skipped once a repo carries an approved sidecar, and a greenfield (no existing app) repository gets a stack picker at that same pause. A human may approve or reject at any of those three gates; a rejection loops back to that stage's own draft with the reviewer's feedback folded into the next attempt, rather than ending the run. Every other failure ENDs the run with a `run_failure` record instead of waiting on a person. All work happens inside a per-session sandbox container holding a clone of the target repo/branch.
 
 - Graph definition: [agent/src/graph.py](agent/src/graph.py)
 - Frontend (AG-UI / CopilotKit): [src/](src/)
@@ -25,7 +25,7 @@ flowchart TD
     
     stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Gate: human approval + sign to APPROVALS.md"]
     
-    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red); retire tests for cut ACs via edit (no delete tool, by design)<br/>Agent: ac-to-tests-draft (scaffold-only rebuild)<br/>Gate: write-scope + AC-coverage deterministic checks<br/>Post-scaffold TDD-red gate: suite must RUN with zero passing tests"]
+    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red); retire tests for cut ACs via edit (no delete tool, by design)<br/>Agents: ac-to-tests-draft → ac-to-tests-audit (scaffold-only rebuild)<br/>Gate: write-scope + AC-coverage deterministic checks<br/>Post-scaffold TDD-red gate: suite must RUN with zero passing tests"]
     
     stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
     
@@ -121,7 +121,7 @@ Every LLM prompt in the pipeline is an editable markdown file under [agent/src/p
 ```mermaid
 flowchart LR
     d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit.<br/>The repo-file short-circuit is skipped on a<br/>REJECTED redraft, which always goes to a real LLM<br/>call so the feedback (below) can actually reach it<br/>(baseline-commit's own owning stages have no human<br/>gate, so they can never reach a rejected state).<br/>Optional reframing: adjust the draft prompt from a<br/>repo file check without skipping the draft itself<br/>(e.g. specification's ticket-mode baseline check).<br/>A prior human gate rejection's feedback is<br/>folded in the same way."]
-    a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan and minimal-code-to-green<br/>configure one; every other stage goes<br/>straight from draft to verify/gate."]
+    a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan, ac-to-tests and<br/>minimal-code-to-green configure one; every<br/>other stage goes straight from draft to verify/gate."]
     v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage."]
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves<br/>or rejects with feedback.<br/>tech-stack, specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
     aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>skips the audit and the human gate —<br/>never the deterministic verify. Approval is<br/>persisted only after verify passes."]
@@ -146,6 +146,22 @@ flowchart LR
 ```
 
 Cross-cutting behavior that is not drawn above, because it happens in nearly every node: state is persisted to the sandbox repo and committed after each audit, verify and gate — and every successful commit is pushed to the single, repo-shared `ai-dev-workflow` work branch on origin (`--force-with-lease`, not plain `--force` — WS0's single-branch migration means every session/user on a repo shares this one branch, so a losing race is rejected instead of silently overwriting another session's already-pushed commits; a failed push is logged, surfaced in the UI via streamed `last_push` state, and never blocks the run). Generated source code is committed separately (`git add -A`) at every green rebuild and after each quality/security/dependency fix round, so the pushed branch always carries the code, not just the artifacts. Every LLM node appends a ledger entry with its token usage; a fresh run always re-enters at `intake`, abandoning any interrupt a previous run left open. Each of those code commits also kicks a display-only background full-profile scan, collected non-blocking at the next node boundary, so the metrics bar (including its running $ Cost chip, re-summed from the ledger) tracks the code as it churns instead of going stale between the gate scans — the gates' own scans stay authoritative.
+
+### Per-stage model legs
+
+[agent/config/models.yaml](agent/config/models.yaml) is the source of truth — this table reflects its defaults as of this writing (2026-08-24) for the StageSpec-based pipeline stages above; it does not enumerate the internal tool-runner passes (`*-run`, `stack-run`, fix nodes, etc.) that share the same file.
+
+| Stage | Legs | Claude: draft / audit / fix | Copilot: draft / audit / fix |
+|---|---|---|---|
+| tech-stack | draft | haiku | gpt-5.4-mini |
+| specification | draft + audit | haiku / sonnet | gpt-5.4-mini / gemini-3.6-flash |
+| plan | draft + audit | sonnet / opus | gpt-5.4 / gemini-3.6-flash |
+| ac-to-tests | draft + audit | sonnet / opus | gpt-5.3-codex / gemini-3.6-flash |
+| minimal-code-to-green | draft + audit | sonnet / opus | gpt-5.4 / gemini-3.6-flash |
+| remediation | draft | sonnet | gpt-5.4 |
+| adversarial-compliance | draft + fix | sonnet / — / sonnet | gpt-5.4 / — / gpt-5.4 |
+| metrics-exit | draft | sonnet | gpt-5.4 |
+| brownfield-baseline | draft | haiku | gpt-5.4-mini |
 
 ---
 
@@ -262,4 +278,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 56fef87b08a0c9bef122c46ecd4fbdd498a7224796bcaf3ac9fb7c0ab5da9c38 -->
+<!-- graph-source-sha256: 0c8b5baa2c4f638a1487f82905003497cd8ae6f10723c150f601b14cf995b709 -->

@@ -92,6 +92,16 @@ class AcceptanceCriteriaTestsDraftResponse(BaseModel):
     )
 
 
+class AcToTestsAuditResponse(BaseModel):
+    """Second opinion on ac-to-tests-draft's test_suite -- same audit contract as
+    MinimalCodeToGreenAuditResponse below (revise the metadata, list findings; this role's session
+    is read-only, so a finding that needs a real test-file edit belongs in audit_findings, not
+    here)."""
+
+    revised_test_suite: AcceptanceCriteriaTestSuite
+    audit_findings: list[str] = Field(default_factory=list)
+
+
 class ChangedFile(BaseModel):
     path: str
     change_kind: Literal["created", "modified", "deleted"]

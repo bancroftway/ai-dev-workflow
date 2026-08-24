@@ -6,9 +6,11 @@
 # (or leaving stale) the other provider's block cannot affect a live run on the active one.
 #
 # `null` (or an absent key) lets the active CLI pick its own default model for that call.
-# `audit_model` applies ONLY to the three stages with an adversarial audit pass
-# (specification, plan, minimal-code-to-green) and should differ from draft_model -- the audit
-# exists to get a second opinion from a *different* model. Other stages have no audit leg.
+# `audit_model` applies ONLY to the four stages with an adversarial audit pass
+# (specification, plan, ac-to-tests, minimal-code-to-green) and should differ from draft_model --
+# the audit exists to get a second opinion from a *different* model. Other stages have no audit leg.
+# ac-to-tests joined this list 2026-08-24 (user decision): it writes the failing TDD-RED tests every
+# downstream stage builds against, so a bad suite here is a bad foundation for everything after it.
 #
 # COPILOT roster: valid model ids depend on your GitHub Copilot account/plan -- list what's
 # actually available with `CopilotClient.list_models()` (agent/.venv, `uv run python -c "..."`),
@@ -64,8 +66,13 @@ ac-to-tests:
     # use_custom_agent=False for this stage) -- custom_agents was empirically confirmed to silently
     # drop part of its own declared tools:, so there is no agents/ac-to-tests-draft.md.
     draft_model: gpt-5.3-codex
+    # Same different-vendor-than-draft convention as every other audited stage below.
+    audit_model: gemini-3.6-flash
   claude:
     draft_model: sonnet
+    # User-specified default (2026-08-24), not the usual one-tier-up-from-draft placeholder: this
+    # audit gates every downstream stage, so it gets the top tier regardless of the draft's own tier.
+    audit_model: opus
 minimal-code-to-green:
   copilot:
     # gpt-5.4 (not -mini) on purpose: the codegen stage's 70k+-token drafting turn is above the

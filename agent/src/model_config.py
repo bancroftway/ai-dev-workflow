@@ -104,6 +104,13 @@ def _demo() -> None:
     assert get_model_name("specification", "audit", "copilot") == "gemini-3.6-flash"
     assert get_model_name("specification", "audit", "claude") == "sonnet"
 
+    # "ac-to-tests" joined the audited stages 2026-08-24 -- same shape as "specification" above,
+    # and the Claude side is a USER-SPECIFIED default (opus), not the usual one-tier-up placeholder.
+    assert get_model_name("ac-to-tests", "draft", "copilot") == "gpt-5.3-codex"
+    assert get_model_name("ac-to-tests", "draft", "claude") == "sonnet"
+    assert get_model_name("ac-to-tests", "audit", "copilot") == "gemini-3.6-flash"
+    assert get_model_name("ac-to-tests", "audit", "claude") == "opus"
+
     # "tech-stack" has no audit_model on either provider -- audit must fall back to that SAME
     # provider's own draft_model, never leaking across to the other provider's value.
     assert get_model_name("tech-stack", "draft", "copilot") == "gpt-5.4-mini"

@@ -5,7 +5,7 @@ the agent (prompts are cached at first load via `lru_cache` in `src/prompt_loade
 
 Naming: `<stage-id>_<purpose>.md`.
 - `draft` — writes the stage's artifact.
-- `audit` — adversarial second-opinion pass by a separately configured model (`agent/config/models.yaml`); the auditor **fixes the artifact directly** — its revised output replaces the draft. Only specification, plan, and minimal-code-to-green have one.
+- `audit` — adversarial second-opinion pass by a separately configured model (`agent/config/models.yaml`); the auditor **fixes the artifact directly** — its revised output replaces the draft. Only specification, plan, ac-to-tests, and minimal-code-to-green have one.
 - Files with a `---` separator line are system/human pairs (`load_prompt_pair`): text above `---` is the system prompt, below is the human message template with `<<placeholder>>` tokens filled at runtime.
 
 Raw requirements have no prompt at all: the human's text is recorded verbatim by a deterministic
@@ -21,7 +21,7 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 | `plan_draft.md` / `plan_audit.md` | plan | implementation plan, diagrams, wireframes |
 | `plan_greenfield_segment.md` | plan | greenfield: scaffold-first milestone segment |
 | `plan_ticket_mode_segment.md` | plan | ticket-mode: extend the existing approved Plan baseline, scoped to this ticket, instead of a from-scratch read |
-| `ac_to_tests_draft.md` | ac-to-tests | acceptance criteria → failing tests |
+| `ac_to_tests_draft.md` / `ac_to_tests_audit.md` | ac-to-tests | acceptance criteria → failing tests |
 | `ac_to_tests_greenfield_segment.md` | ac-to-tests | greenfield: test-scaffolding-only segment (app may not exist yet) |
 | `ac_to_tests_ticket_mode_segment.md` | ac-to-tests | ticket-mode: scope test-writing to this ticket's own ACs, not the ledger's whole-project active list |
 | `minimal_code_to_green_draft.md` / `minimal_code_to_green_audit.md` | minimal-code-to-green | minimal code to pass tests |
