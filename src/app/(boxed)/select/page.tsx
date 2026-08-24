@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { RepoSummary } from "@/app/api/github/repos/route";
 import type { BranchSummary } from "@/app/api/github/branches/route";
+import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
 import { SessionHistory } from "@/components/SessionHistory";
 import { SettingsBanner } from "@/components/SettingsBanner";
 
@@ -36,11 +37,32 @@ export default function SelectPage() {
   const [githubNotConnected, setGithubNotConnected] = useState(false);
   const [selectedFullName, setSelectedFullName] = useState<string>("");
   const [filter, setFilter] = useState("");
+  // Minor 15 (Phase E audit): the board's only entry point in the whole app was the New Ticket
+  // form. This page already lists repos, but has no notion of "project" until Connect Repository
+  // (connectProject, below) actually runs -- so a board link can only ever exist for a repo that's
+  // ALREADY connected. Same full-list-then-match technique board/page.tsx's own fetchProject and
+  // tickets/new's fetchProject already use -- no `GET /api/projects?owner=&repo=` exists, and one
+  // ticket's worth of board-link plumbing doesn't earn a new backend route.
+  const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
 
   const selectedRepo = useMemo(
     () => repos?.find((r) => r.fullName === selectedFullName) ?? null,
     [repos, selectedFullName],
   );
+
+  // Case-insensitive: GitHub's own casing for owner/repo reaches dbo.projects via whichever path
+  // first connected it (Connect Repository here, or a "+ New Project" ticket's scaffold), and
+  // nothing in this codebase asserts the two paths agree on case -- defensive, not evidence of a
+  // real mismatch seen anywhere.
+  const selectedProjectId = useMemo(() => {
+    if (!selectedRepo || !projects) return null;
+    const match = projects.find(
+      (p) =>
+        p.owner?.toLowerCase() === selectedRepo.owner.toLowerCase() &&
+        p.repo?.toLowerCase() === selectedRepo.repo.toLowerCase(),
+    );
+    return match?.project_id ?? null;
+  }, [selectedRepo, projects]);
 
   // Already sorted updated-desc by the API's own octokit query -- filter only, no re-sort needed.
   const filteredRepos = useMemo(() => {
@@ -66,6 +88,18 @@ export default function SelectPage() {
         if (data) setRepos(data.repos);
       })
       .catch((err: Error) => setReposError(err.message));
+  }, []);
+
+  useEffect(() => {
+    // Best-effort only: a failed/slow fetch just means no board link shows yet (selectedProjectId
+    // stays null) -- not worth a second error slot on this page for a link that's a bonus, not the
+    // page's own job.
+    fetch("/api/projects")
+      .then((res) => (res.ok ? (res.json() as Promise<ProjectListResponse>) : null))
+      .then((data) => {
+        if (data) setProjects(data.projects);
+      })
+      .catch(() => {});
   }, []);
 
   return (
@@ -133,7 +167,7 @@ export default function SelectPage() {
           {/* Keyed by repo so switching repositories always starts this section's state fresh,
               rather than manually resetting branch/onboarding state via an effect. */}
           {selectedRepo ? (
-            <RepoBranchSection key={selectedRepo.fullName} repo={selectedRepo} />
+            <RepoBranchSection key={selectedRepo.fullName} repo={selectedRepo} projectId={selectedProjectId} />
           ) : (
             <p className="text-sm text-neutral-500">Select a repository to see its branches and sessions.</p>
           )}
@@ -212,7 +246,7 @@ function timeAgo(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-function RepoBranchSection({ repo }: { repo: RepoSummary }) {
+function RepoBranchSection({ repo, projectId }: { repo: RepoSummary; projectId: string | null }) {
   const router = useRouter();
   const [branches, setBranches] = useState<BranchSummary[] | null>(null);
   const [branchesError, setBranchesError] = useState<string | null>(null);
@@ -287,6 +321,18 @@ function RepoBranchSection({ repo }: { repo: RepoSummary }) {
           {connecting ? "Connecting…" : "Connect repository"}
         </button>
       </div>
+
+      {/* Minor 15: the board's per-project entry point -- only shows once this repo already has a
+          project row (see selectedProjectId above), same "connecting is what creates a project"
+          rule the paragraph above already states. */}
+      {projectId && (
+        <Link
+          href={`/projects/${projectId}/board`}
+          className="self-start text-xs text-neutral-500 underline hover:text-neutral-800"
+        >
+          View board →
+        </Link>
+      )}
 
       {actionError && <p className="text-sm text-red-600">{actionError}</p>}
 
