@@ -457,6 +457,12 @@ async def delete_session_full(thread_id: str, body: DeleteSessionRequest, reques
             owner=row["owner"], repo=row["repo"], branch=row["work_branch"], token=body.github_token
         )
 
+    # Part 2 Task 1 added dbo.run_events with a plain FK to dbo.sessions (no ON DELETE CASCADE) --
+    # session_store.delete_session below 500s with a REFERENCE constraint violation for any
+    # session that ever emitted a single real RunEvent (any sandboxed node run) without this,
+    # found live via this exact endpoint during Task 14's end-to-end sweep. Must run before the
+    # sessions row delete, same order run_event_store._demo()'s own cleanup already uses.
+    await run_event_store.delete_events_by_session(thread_id)
     await session_store.delete_session(thread_id)
     return DeleteSessionResponse(status="deleted", branch_deleted=branch_deleted)
 

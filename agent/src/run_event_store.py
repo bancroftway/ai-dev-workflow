@@ -146,6 +146,24 @@ async def list_events_by_session(session_id: str) -> list[RunEvent]:
         return [_row_to_event(row) for row in rows]
 
 
+async def delete_events_by_session(session_id: str) -> None:
+    """Deletes every row this session has ever had, across all its run_ids -- same session_id
+    scoping as list_events_by_session above, for the opposite direction.
+
+    Required before a caller can delete the dbo.sessions row itself: 0006_create_run_events.sql's
+    `session_id` column is `NOT NULL REFERENCES dbo.sessions(session_id)`, no `ON DELETE CASCADE`,
+    so a session that has ever emitted a single real RunEvent (any sandboxed node run, or Part 2's
+    own live-verification seeding technique) makes `DELETE FROM dbo.sessions` fail outright with a
+    REFERENCE constraint violation otherwise -- confirmed live via sessions_api.delete_session_full
+    (Task 14's real end-to-end sweep), not a theoretical gap: run_event_store._demo()'s own cleanup
+    already deletes in this same run_events-before-sessions order for exactly this reason, but that
+    discipline had never been carried into the actual production "Delete session" endpoint.
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute("DELETE FROM dbo.run_events WHERE session_id = ?", session_id)
+
+
 async def _demo() -> None:
     """Self-check against a real DB: `cd agent && uv run python -m src.run_event_store`."""
     global _get_pool  # reassigned further down (fail-soft check); must precede every use in this function
