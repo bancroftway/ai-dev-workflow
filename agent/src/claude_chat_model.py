@@ -114,6 +114,22 @@ _RESUME_REJECTED_MARKERS: tuple[str, ...] = (
     "unable to resume",
 )
 
+
+def _record_resume_state(session_key: str, resume_state: ResumeState) -> None:
+    """Record this turn's resume classification for `session_key`, and drop the cached session id
+    outright when it was positively REJECTED (Phase E review, Important 1).
+
+    Shared by both classification call sites in _agenerate_inner (the empty-stdout branch and the
+    main classify_resume branch) -- a dead id must never survive to be `--resume`d again: without
+    this, infra_retry's own backoff (5s then 20s) would `--resume` the SAME dead session two more
+    times before the stage escalates infra_exhausted, burning real retry budget for a session that
+    can never work again. Factored out (rather than duplicated inline at both call sites) so this
+    is directly testable without a live sandbox -- see _demo()'s own pin for the proof.
+    """
+    _resume_states[session_key] = resume_state
+    if resume_state == "rejected":
+        _session_ids.pop(session_key, None)
+
 # Copilot and Claude ship disjoint tool vocabularies, so a caller's available_tools/excluded_tools
 # list -- written once, in Copilot's own "builtin:<name>" vocabulary (config.
 # READ_ONLY_AVAILABLE_TOOLS) -- needs translating rather than passing through unchanged. Two
@@ -742,7 +758,7 @@ class ClaudeChatModel(BaseChatModel):
             if session_id:
                 combined_text = f"{result.stdout} {result.stderr}"
                 rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
-                _resume_states[self._session_key] = "rejected" if rejected else "unknown"
+                _record_resume_state(self._session_key, "rejected" if rejected else "unknown")
             raise RuntimeError(
                 f"Claude CLI turn for {self._session_key!r} produced no parseable "
                 f"--output-format stream-json lines (resume_state="
@@ -768,7 +784,7 @@ class ClaudeChatModel(BaseChatModel):
             session_id, new_session_id, is_error, str(final.get("result") or ""), _RESUME_REJECTED_MARKERS,
         )
         if resume_state is not None:
-            _resume_states[self._session_key] = resume_state
+            _record_resume_state(self._session_key, resume_state)
             if resume_state == "unknown":
                 logger.warning(
                     "resume continuity for session %r at %r is UNKNOWN this turn (requested=%r "
@@ -785,6 +801,14 @@ class ClaudeChatModel(BaseChatModel):
 
         if new_session_id:
             _session_ids[self._session_key] = new_session_id
+            # Phase E review (Minor): "unknown" here described the OLD id's fate (a different id
+            # came back -- a suspected silent fresh start); now that the cache has moved on to
+            # this NEW id, leaving "unknown" attached would misdescribe a session that was never
+            # even asked to resume anything, not the old one whose continuity is genuinely in
+            # question. Clear it so the log is honest immediately -- it would otherwise self-heal
+            # only after this new session's own next classified turn, one turn later than it could.
+            if resume_state == "unknown" and new_session_id != session_id:
+                _resume_states.pop(self._session_key, None)
 
         # Task 4 (Part 2 run-visibility) + Phase E audit finding 5: every intermediate NDJSON line
         # this turn produced (all of `events` except the final result-shaped line, handled above)
@@ -1286,6 +1310,26 @@ def _demo() -> None:
         "close_thread_session did not evict resume_states"
     )
     assert get_resume_state("thread-never-seen", "x", "y") is None, "an unseen key must report None, not raise"
+
+    # Phase E review (Important 1), pinned directly: a REJECTED classification must drop the
+    # cached session id outright -- proven against the real function _agenerate_inner actually
+    # calls, not a re-derived tautology.
+    pin_key = "pin-thread:pin-stage:draft"
+    _session_ids[pin_key] = "dead-session-id"
+    _record_resume_state(pin_key, "rejected")
+    assert pin_key not in _session_ids, "a REJECTED classification must drop the cached session id"
+    assert _resume_states[pin_key] == "rejected"
+
+    # Every OTHER classification must leave a good cached id alone -- REJECTED is the only one
+    # that drops it.
+    _session_ids[pin_key] = "still-good-session-id"
+    for harmless_state in ("unknown", "resumed"):
+        _record_resume_state(pin_key, harmless_state)
+        assert _session_ids[pin_key] == "still-good-session-id", (
+            f"{harmless_state!r} must NOT drop the cached session id, only 'rejected' does"
+        )
+    _resume_states.pop(pin_key, None)
+    _session_ids.pop(pin_key, None)
 
     # --- Task 5 (Part 2 run-visibility): redaction at the actual capture path ---
     #
