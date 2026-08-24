@@ -45,6 +45,17 @@ session identifier is camelCase `sessionId`, not the snake_case `session_id` thi
 for, so real multi-turn `--session-id` continuity is very likely broken today. That is final-line
 parsing, out of THIS task's scope (task-3-brief.md: "the existing final-result parsing... is
 untouched") -- flagged here rather than silently carried forward uncorrected.
+
+Update (Phase E known-bugs fix, this task): the two gaps flagged directly above are now fixed.
+_parse_copilot_jsonl checks "sessionId" first (snake_case kept only as a cheap, non-contractual
+fallback), so --session-id continuity now works against the real capture instead of silently never
+firing. Separately, the real capture's `usage` object ({"premiumRequests", "totalApiDurationMs",
+"sessionDurationMs", "codeChanges"}) shares no keys with the input_tokens/output_tokens this module
+used to read with a fabricated `0` default -- _extract_usage (defined below _parse_copilot_jsonl)
+now reads them with no fabricated default, so "not reported" comes back None rather than a
+misleading "measured zero"; premiumRequests (the one real cost-adjacent number this CLI version
+actually reports) is surfaced under its own name instead. Both fixes are proven against the same
+real captured sample in _demo(), not a fixture invented to agree with the code.
 """
 
 from __future__ import annotations
@@ -155,10 +166,44 @@ def _parse_copilot_jsonl(stdout: str) -> tuple[list[dict[str, Any]], str | None]
 
     session_id: str | None = None
     for event in events:
-        candidate = event.get("session_id")
+        # Real capture (2026-08-23, task-3-report.md): the CLI's own terminal line names this
+        # field camelCase "sessionId", checked first since it is the one confirmed-real key.
+        # "session_id" stays as a cheap fallback -- never observed, not contractual, but free to
+        # keep in case some line/future CLI version reports the snake_case spelling instead.
+        candidate = event.get("sessionId") or event.get("session_id")
         if isinstance(candidate, str) and candidate:
             session_id = candidate
     return events, session_id
+
+
+def _extract_usage(final: dict[str, Any], model_name: str | None) -> dict[str, Any]:
+    """Build the `_last_usage`-shaped dict from a turn's final result-shaped JSONL line.
+
+    Pure, so _demo can assert this against the real captured sample without a live sandbox (same
+    "pure half only" scoping as _parse_copilot_jsonl above) -- _agenerate_inner just calls this and
+    assigns the result to self._last_usage.
+
+    Real capture (2026-08-23, task-3-report.md): the terminal line's `usage` object is
+    {"premiumRequests": 0, "totalApiDurationMs": ..., "sessionDurationMs": ..., "codeChanges":
+    {...}} -- it shares NO keys with input_tokens/output_tokens, and there is no total_cost_usd
+    anywhere on the line. Reading those with a fabricated `0`/None default (the old code) made
+    Copilot's token/cost tracking silently report "measured zero" for every real turn, which is a
+    different claim than the true one: this CLI version does not report a token count or a dollar
+    cost at all. `.get()` with no fabricated default is used instead, so a genuinely absent number
+    comes back None -- the same "never fabricate a 0" principle claude_chat_model.py's own
+    _last_usage comment states. Old snake_case keys are kept as the read path (not renamed) in case
+    a future CLI version reports them; premiumRequests -- GitHub Copilot's own billing unit, the one
+    real cost-adjacent number this version does report -- is surfaced under its own honest name
+    rather than mislabeled as a token count or a dollar cost, which it is neither.
+    """
+    usage = final.get("usage") or {}
+    return {
+        "model": model_name or "default",
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cost": final.get("total_cost_usd"),
+        "premium_requests": usage.get("premiumRequests"),
+    }
 
 
 def _translate_intermediate_events(
@@ -335,11 +380,13 @@ class CopilotChatModel(BaseChatModel):
     # at its use site.
     disabled_skills: list[str] | None = None
 
-    # Same shape as claude_chat_model.ClaudeChatModel._last_usage, for the provider-agnostic OTEL
-    # span attributes _agenerate sets below. reasoning_tokens/cache_read_tokens/cache_write_tokens
-    # are NOT included -- unlike the old SDK's ASSISTANT_USAGE event, the JSONL shape this parses
-    # is unverified (module docstring) and a fabricated 0 would read as "measured zero" instead of
-    # "not reported" to anything that later reads this dict.
+    # Same core shape as claude_chat_model.ClaudeChatModel._last_usage (model/input_tokens/
+    # output_tokens/cost), for the provider-agnostic OTEL span attributes _agenerate sets below,
+    # plus one Copilot-only key (premium_requests) -- see _extract_usage's own docstring for the
+    # real 2026-08-23 capture this is built from. reasoning_tokens/cache_read_tokens/
+    # cache_write_tokens are NOT included -- unlike the old SDK's ASSISTANT_USAGE event, this CLI's
+    # real usage shape reports none of them, and a fabricated 0 would read as "measured zero"
+    # instead of "not reported" to anything that later reads this dict.
     _last_usage: dict[str, Any] | None = PrivateAttr(default=None)
 
     @property
@@ -372,8 +419,15 @@ class CopilotChatModel(BaseChatModel):
             self._last_usage = None  # never attach a previous call's numbers to this span
             result = await self._agenerate_inner(messages, stop=stop, run_manager=run_manager, **kwargs)
             if self._last_usage is not None:
-                llm_span.set_attribute("gen_ai.usage.input_tokens", self._last_usage["input_tokens"])
-                llm_span.set_attribute("gen_ai.usage.output_tokens", self._last_usage["output_tokens"])
+                # input_tokens/output_tokens are None, not 0, when this CLI version's real usage
+                # shape doesn't report them (_extract_usage's own docstring) -- set_attribute
+                # rejects a None value (logs an error, does not raise), so it is only called when
+                # there is a real number to attach; an unreported count means no attribute at all,
+                # never a fabricated 0 span value.
+                if self._last_usage["input_tokens"] is not None:
+                    llm_span.set_attribute("gen_ai.usage.input_tokens", self._last_usage["input_tokens"])
+                if self._last_usage["output_tokens"] is not None:
+                    llm_span.set_attribute("gen_ai.usage.output_tokens", self._last_usage["output_tokens"])
                 llm_span.set_attribute("gen_ai.response.model", self._last_usage["model"])
             return result
 
@@ -660,13 +714,7 @@ class CopilotChatModel(BaseChatModel):
                 f"(stop_reason={final.get('stop_reason')!r}): {final.get('result')!r}"
             )
 
-        usage = final.get("usage") or {}
-        self._last_usage = {
-            "model": self.model_name or "default",
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-            "cost": final.get("total_cost_usd"),
-        }
+        self._last_usage = _extract_usage(final, self.model_name)
 
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=final.get("result", "")))])
 
@@ -834,11 +882,13 @@ def secret_env_names() -> set[str]:
 
 def _demo() -> None:
     """Self-check for the JSONL parser's defensive scanning (session_id found on ANY line, not
-    just the assumed-final one), the Bug A wrapper-script shape (task-12b), _translate_intermediate_
-    events (Task 3, Part 2 -- both against a real captured shape and a clearly-labeled synthetic
-    one, see that function's own docstring), and the session-cache eviction path -- the live
-    CLI-exec path needs a sandbox, see cli_agent_exec.py's and claude_chat_model.py's own demos for
-    the same "pure half only" scoping.
+    just the assumed-final one, and now the real camelCase "sessionId" key -- Phase E known-bugs
+    fix), the Bug A wrapper-script shape (task-12b), _translate_intermediate_events (Task 3, Part 2
+    -- both against a real captured shape and a clearly-labeled synthetic one, see that function's
+    own docstring), _extract_usage's honest-absence usage parsing (Phase E known-bugs fix, same
+    real + synthetic samples), and the session-cache eviction path -- the live CLI-exec path needs
+    a sandbox, see cli_agent_exec.py's and claude_chat_model.py's own demos for the same "pure half
+    only" scoping.
     """
     # Bug A fix (task-12b): the wrapper script must feed `-p` an explicit, double-quoted
     # command-substitution value -- never bare/stdin-fed (the real CLI has no such mode -- see
@@ -923,15 +973,15 @@ def _demo() -> None:
     )
     real_events, real_session_id = _parse_copilot_jsonl(real_shape_jsonl)
     assert len(real_events) == 5, f"expected 5 parsed real-shape events, got {len(real_events)}"
-    # Real, concrete, out-of-scope-for-this-task finding (module docstring / task-3-report.md): the
-    # real terminal line's session identifier is camelCase "sessionId", not the snake_case
-    # "session_id" _parse_copilot_jsonl scans for -- against genuinely real output, new_session_id
-    # comes back None every turn. Asserted here, not silently glossed over, so this trips if
-    # someone fixes the scan without updating this comment; NOT touched by this task (final-line
-    # parsing is explicitly out of scope -- task-3-brief.md).
-    assert real_session_id is None, (
-        "if this now finds a session id, _parse_copilot_jsonl's snake_case-only scan was fixed for "
-        "the real camelCase 'sessionId' shape -- update this comment, it documents that real gap"
+    # Phase E known-bugs fix (this task) -- proof, not a tripwire: the real terminal line's session
+    # identifier is camelCase "sessionId", not the snake_case "session_id" _parse_copilot_jsonl
+    # used to scan for exclusively -- against genuinely real output, new_session_id used to come
+    # back None every turn, silently breaking --session-id multi-turn continuity. This used to
+    # assert `real_session_id is None` (a known-bug tripwire, pinned so a future fix would trip it
+    # and have to update the comment); now flipped into a proof the fix actually works against the
+    # real captured sample, the same flip sessions_api.py did for project_id in an earlier task.
+    assert real_session_id == "8d6fbad9-d488-4558-90bd-a8e8bffac2ab", (
+        f"expected the real camelCase 'sessionId' to be found by the defensive scan, got {real_session_id!r}"
     )
     # The actual point of Part A: fed through the translation function, real captured non-tool-call
     # lines must yield ZERO RunEvents -- proves "not every line is a tool call" against genuinely
@@ -940,6 +990,20 @@ def _demo() -> None:
         real_events[:-1], run_id="run-real", session_id="thread-real", stage="specification", node="draft",
     )
     assert real_translated == [], f"real non-tool-call lines must translate to nothing, got {real_translated}"
+
+    # Phase E known-bugs fix (this task) -- _extract_usage against the SAME real captured sample's
+    # final ("result") line: the real usage object has no input_tokens/output_tokens and the real
+    # line has no total_cost_usd at all, so both must come back None (honest absence), never a
+    # fabricated 0 -- and premiumRequests (a real, actually-reported 0 in this capture, not a
+    # synthesized default) must surface under its own premium_requests key.
+    real_usage = _extract_usage(real_events[-1], "claude-sonnet-5")
+    assert real_usage == {
+        "model": "claude-sonnet-5",
+        "input_tokens": None,
+        "output_tokens": None,
+        "cost": None,
+        "premium_requests": 0,
+    }, f"real usage sample must parse honestly (no fabricated 0s for unreported tokens/cost): {real_usage}"
 
     # Part B -- SYNTHETIC, explicitly NOT confirmed real (module docstring / task-3-report.md): no
     # real tool-call-shaped line has ever been captured (Part A's real turn failed on quota before
@@ -959,6 +1023,18 @@ def _demo() -> None:
     )
     synthetic_events, _ = _parse_copilot_jsonl(synthetic_jsonl)
     assert len(synthetic_events) == 4
+    # This fixture's final line uses the OLD hypothetical shape ({"input_tokens": 5,
+    # "output_tokens": 3}, no premiumRequests/total_cost_usd) -- proves _extract_usage's kept-cheap
+    # snake_case fallback still works if some future CLI version reports it, and that a genuinely
+    # absent field (premium_requests here) comes back None rather than a fabricated 0.
+    synthetic_usage = _extract_usage(synthetic_events[-1], None)
+    assert synthetic_usage == {
+        "model": "default",
+        "input_tokens": 5,
+        "output_tokens": 3,
+        "cost": None,
+        "premium_requests": None,
+    }, f"old-shape input_tokens/output_tokens keys must still work as a fallback: {synthetic_usage}"
     synthetic_translated = _translate_intermediate_events(
         synthetic_events[:-1],  # drop the final result-shaped line, exactly like _agenerate_inner does
         run_id="run-1", session_id="thread-1", stage="specification", node="draft",
