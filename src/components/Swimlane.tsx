@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import { ViewContainer } from "@/components/ViewContainer";
 import { formatDuration, parseEventTs, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
 
@@ -11,22 +11,35 @@ import { formatDuration, parseEventTs, toolNameOf, useRunEvents, type RunLogEven
  * library (this Part's own Global Constraint). Standalone/reusable like EventLogView.tsx -- Task
  * 13 decides which tab this lives in.
  *
- * Real-timing investigation (task-9-report.md has the full writeup): before this task, graph.py's
- * draft/audit/verify nodes emitted only NODE_FINISHED -- a single end-of-node point, not a span --
- * and neither provider's tool-call translator (claude_chat_model.py / copilot_chat_model.py) keeps
- * any per-call timestamp in a TOOL_CALL event's payload (confirmed by reading both functions; the
- * one real timestamp that exists anywhere in Claude's own captured sample, on the tool_result
- * line, is read by neither translator). Even if it were kept, RunEvent.ts is DB-assigned at
- * append_event's INSERT time, and every TOOL_CALL a turn produces is appended in one tight loop
- * right after that whole CLI turn's subprocess has already exited -- so per-call timestamps would
- * still cluster within DB round-trip time of each other, not spread across the turn's real
- * duration. This task added real NODE_STARTED emission (graph.py) so the node lane has a genuine
- * measured start+end span; TOOL_CALL events still carry only a single real timestamp, so the tool
- * lane renders them as instantaneous ticks, never a fabricated-width bar.
+ * Real-timing investigation (task-9-report.md has the full writeup): before Part 2 Task 9,
+ * graph.py's draft/audit/verify nodes emitted only NODE_FINISHED -- a single end-of-node point,
+ * not a span -- and neither provider's tool-call translator kept any per-call timestamp in a
+ * TOOL_CALL event's payload. Task 9 added real NODE_STARTED emission (graph.py) so lane 1 has a
+ * genuine measured start+end span; it is node execution (draft/audit/verify/fix), NOT
+ * model-thinking-time -- it includes whatever tool time happens inside that node, since neither
+ * translator could separate the two at the time. Labelled "Node execution" below, honestly, not
+ * "model thinking" (Phase E audit finding 6b): the Spec's own model-vs-tool split is a real,
+ * documented, unmet commitment (see task-9-report.md), not something this lane's label should
+ * imply it delivers.
  *
- * GATE_PAUSED/GATE_RESOLVED are deliberately not drawn here -- the brief asks for exactly two
- * lanes (model/node time, tool time); gate pauses are human wait time, a third kind of segment,
- * and already visible in EventLogView's log. Out of scope by omission, not an oversight.
+ * Phase E audit finding 6 (rendering half): two things changed once E-3a's capture-half fix
+ * landed (fix-e3a-report.md):
+ *
+ * 1. TOOL_CALL ticks now position at a real per-call timestamp when one exists -- Claude's payload
+ *    carries `result_ts` (the tool_result envelope's own timestamp), Copilot's carries
+ *    `envelope_ts` on every event -- rather than always falling back to RunEvent.ts (DB INSERT
+ *    time). That fallback is still real and still necessary: `ts` is the only thing older data (or
+ *    a tool_use with no matching tool_result) has, but every TOOL_CALL in one turn appended via it
+ *    alone would cluster within DB round-trip time of each other regardless of when the real call
+ *    happened. Still never a fabricated-width bar -- no per-call *duration* exists either way, so
+ *    the tool lane renders instantaneous ticks, just more truthfully placed ones.
+ * 2. GATE_PAUSED/GATE_RESOLVED now have real producers (graph.py's make_gate_node). The comment
+ *    that used to live here -- justifying the lack of a gate lane by claiming a pause was "already
+ *    visible in EventLogView's log" -- was false when written (nothing emitted either event, so
+ *    there was nothing to be visible) and is only true now, by coincidence of this same fix
+ *    landing on both views. Being visible as one more dense log line was never the point anyway:
+ *    a gate pause is the single most user-relevant wait in the whole pipeline (a run can sit there
+ *    for hours), so it gets lane 3 below, a visually distinct band, not just a line in a list.
  */
 
 /** One node's real execution span. `startTs`/`endTs` are epoch-ms, both from real DB-assigned
@@ -53,6 +66,26 @@ interface ToolTick {
   name: string | null;
   stage: string | null;
   summary: string | null;
+  // Finding 6d: true when `ts` came from the payload's own result_ts/envelope_ts (a real per-call
+  // instant), false when it fell back to RunEvent.ts (DB INSERT time -- see realToolTs below).
+  realTs: boolean;
+}
+
+/** One human-review wait, GATE_PAUSED -> GATE_RESOLVED. `startTs`/`endTs` are epoch-ms from real
+ * DB-assigned `ts` values, same honesty rule as NodeSpan above:
+ *  - `startTs == null`: a GATE_RESOLVED with no matching GATE_PAUSED -- shouldn't happen for data
+ *    written after this fix (graph.py's make_gate_node fires both from the same code path), but
+ *    handled the same defensive way an unmatched NODE_FINISHED is: a point marker, not a fabricated
+ *    start.
+ *  - `endTs == null`: a GATE_PAUSED with no GATE_RESOLVED yet -- the run is sitting at this gate
+ *    RIGHT NOW. Rendered open-ended, same convention as an open node span.
+ * `decision` ("approved"/"rejected", from GATE_RESOLVED's own payload) is null while still open. */
+interface GateSpan {
+  key: string;
+  stage: string | null;
+  startTs: number | null;
+  endTs: number | null;
+  decision: string | null;
 }
 
 /** Same pairing key/algorithm as EventLogView.tsx's own computeDurations (run_id|stage|node) --
@@ -94,16 +127,79 @@ function buildNodeSpans(events: RunLogEvent[]): NodeSpan[] {
   return spans;
 }
 
+/** Finding 6c: pairs GATE_PAUSED -> GATE_RESOLVED by stage, same open-map-and-delete-on-match
+ * shape as buildNodeSpans above (keyed on run_id|stage rather than run_id|stage|node -- every gate
+ * event's own `node` is always the literal "gate", per graph.py's make_gate_node, so it adds no
+ * discriminating value). That shape is what makes a reject-then-redraft-then-re-pause cycle on the
+ * SAME stage pair correctly into two separate spans rather than one: the first GATE_PAUSED opens,
+ * the rejection's GATE_RESOLVED closes it, the re-pause's GATE_PAUSED opens a fresh one under the
+ * same key. graph.py's own gate_node self-check asserts exactly this shape (2 genuine pauses, 2
+ * resolutions, in order) against a scripted pause/reject/re-pause/approve sequence -- this reads
+ * the identical two event types the same way. */
+function buildGateSpans(events: RunLogEvent[]): GateSpan[] {
+  const spans: GateSpan[] = [];
+  const openPauses = new Map<string, RunLogEvent>();
+  for (const e of events) {
+    if (e.type !== "gate_paused" && e.type !== "gate_resolved") continue;
+    const key = `${e.run_id}|${e.stage ?? ""}`;
+    if (e.type === "gate_paused") {
+      openPauses.set(key, e);
+    } else {
+      const start = openPauses.get(key);
+      const decision = typeof e.payload?.decision === "string" ? (e.payload.decision as string) : null;
+      spans.push({
+        key: `${key}|${e.seq}`,
+        stage: e.stage,
+        startTs: start ? parseEventTs(start.ts) : null,
+        endTs: parseEventTs(e.ts),
+        decision,
+      });
+      if (start) openPauses.delete(key);
+    }
+  }
+  // A GATE_PAUSED left open is a real, currently-active pause -- the run is waiting on a human
+  // right now. Rendered open-ended below, same convention as an open node span.
+  for (const [key, start] of openPauses) {
+    spans.push({
+      key: `${key}|${start.seq}|open`,
+      stage: start.stage,
+      startTs: parseEventTs(start.ts),
+      endTs: null,
+      decision: null,
+    });
+  }
+  return spans;
+}
+
+/** Finding 6d: Claude's TOOL_CALL payload carries a real `result_ts` (the tool_result envelope's
+ * own timestamp, folded in by claude_chat_model.py); Copilot's carries `envelope_ts` on every
+ * event (copilot_chat_model.py). Either is a genuine CLI-reported instant for THIS call, unlike
+ * RunEvent.ts (DB INSERT time, shared by every event in a turn regardless of when the real call
+ * happened -- see the module docstring above). Prefers result_ts arbitrarily when a payload
+ * somehow carried both (never happens for either real translator today, both are provider-
+ * exclusive keys) rather than picking one and silently ignoring the other. Returns null -- never a
+ * guess -- when neither key is present, so the caller can fall back to `ts` and know it did. */
+function realToolTs(e: RunLogEvent): number | null {
+  const raw = e.payload?.result_ts ?? e.payload?.envelope_ts;
+  if (typeof raw !== "string") return null;
+  const parsed = parseEventTs(raw);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
 function buildToolTicks(events: RunLogEvent[]): ToolTick[] {
   return events
     .filter((e) => e.type === "tool_call")
-    .map((e) => ({
-      key: `${e.run_id}|${e.seq}`,
-      ts: parseEventTs(e.ts),
-      name: toolNameOf(e),
-      stage: e.stage,
-      summary: e.summary,
-    }));
+    .map((e) => {
+      const real = realToolTs(e);
+      return {
+        key: `${e.run_id}|${e.seq}`,
+        ts: real ?? parseEventTs(e.ts),
+        name: toolNameOf(e),
+        stage: e.stage,
+        summary: e.summary,
+        realTs: real != null,
+      };
+    });
 }
 
 // Same identity colors as AppShell.tsx's DOT_CLASS/EventLogView.tsx's TYPE_DOT extended with the
@@ -121,6 +217,17 @@ const NODE_COLOR: Record<string, { bg: string; border: string; text: string }> =
   fix: { bg: "bg-green-100", border: "border-green-400", text: "text-green-900" },
 };
 const DEFAULT_NODE_COLOR = { bg: "bg-neutral-200", border: "border-neutral-400", text: "text-neutral-900" };
+
+/** Finding 6c: the gate-wait band's hatched fill -- deliberately not a flat NODE_COLOR-style swatch
+ * so "waiting on a human" reads as visually distinct from "a node is running" at a glance, not just
+ * a differently-labelled bar in the same style. Same amber family this app already reserves for
+ * "needs attention" (TYPE_DOT's gate_paused, EventLogView.tsx; the "audit" node color above) --
+ * not a new hue. Plain CSS (repeating-linear-gradient), no chart library, matching this whole
+ * component's own constraint. */
+const GATE_HATCH_STYLE = {
+  backgroundImage:
+    "repeating-linear-gradient(135deg, rgba(180,83,9,0.35) 0px, rgba(180,83,9,0.35) 3px, rgba(253,230,138,0.45) 3px, rgba(253,230,138,0.45) 6px)",
+};
 
 const MIN_BAR_PX = 4;
 const TICK_PX = 6;
@@ -226,12 +333,29 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
   }
 
   function selectTick(t: ToolTick) {
-    setSelected({ label: `tool: ${t.name ?? "unknown"}${t.stage ? ` (${t.stage})` : ""}`, detail: formatClock(t.ts), ts: t.ts });
+    const suffix = t.realTs ? "" : " (log write time, not a real per-call timestamp)";
+    setSelected({ label: `tool: ${t.name ?? "unknown"}${t.stage ? ` (${t.stage})` : ""}`, detail: `${formatClock(t.ts)}${suffix}`, ts: t.ts });
     onSeek?.(new Date(t.ts));
+  }
+
+  function selectGateSpan(s: GateSpan) {
+    const label = `gate wait${s.stage ? ` (${s.stage})` : ""}`;
+    if (s.startTs != null && s.endTs != null) {
+      const detail = `${formatClock(s.startTs)} -> ${formatClock(s.endTs)} (${formatDuration(s.endTs - s.startTs)})${s.decision ? `, ${s.decision}` : ""}`;
+      setSelected({ label, detail, ts: s.startTs });
+      onSeek?.(new Date(s.startTs));
+    } else if (s.endTs == null && s.startTs != null) {
+      setSelected({ label, detail: `${formatClock(s.startTs)} -> still waiting on a human (no resolution yet)`, ts: s.startTs });
+      onSeek?.(new Date(s.startTs));
+    } else if (s.startTs == null && s.endTs != null) {
+      setSelected({ label, detail: `${formatClock(s.endTs)} (no GATE_PAUSED recorded -- point only)`, ts: s.endTs });
+      onSeek?.(new Date(s.endTs));
+    }
   }
 
   const nodeSpans = buildNodeSpans(events);
   const toolTicks = buildToolTicks(events);
+  const gateSpans = buildGateSpans(events);
   // An open span (endTs == null) has no real end yet, so it must not be hidden just because
   // viewEnd falls before some fabricated cutoff -- treated as extending indefinitely rightward
   // (Infinity) for this overlap test only; rendering below still clips its drawn width to the
@@ -242,6 +366,12 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
     return effectiveEnd >= viewStart && effectiveStart <= viewEnd;
   });
   const visibleTicks = toolTicks.filter((t) => t.ts >= viewStart && t.ts <= viewEnd);
+  // Same open-ended-extends-rightward overlap rule as visibleSpans above.
+  const visibleGateSpans = gateSpans.filter((s) => {
+    const effectiveEnd = s.endTs ?? Infinity;
+    const effectiveStart = s.startTs ?? s.endTs ?? -Infinity;
+    return effectiveEnd >= viewStart && effectiveStart <= viewEnd;
+  });
 
   const ticks = 6;
   const gridlines = Array.from({ length: ticks + 1 }, (_, i) => viewStart + (span * i) / ticks);
@@ -252,7 +382,7 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
         <div>
           <h1 className="text-lg font-semibold">Timeline</h1>
           <p className="text-sm text-neutral-500">
-            Node execution and tool calls over real wall-clock time. Drag to zoom, click to seek.
+            Node execution, tool calls, and gate waits over real wall-clock time. Drag to zoom, click to seek.
           </p>
         </div>
         {viewRange && (
@@ -334,23 +464,85 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
             </div>
 
             {/* Lane 2: tool calls -- ticks only, never a fabricated-width bar (see module docstring
-                for why no real per-call duration exists today). */}
-            <div className="relative h-10">
+                for why no real per-call duration exists today). Positioned at the real per-call
+                result_ts/envelope_ts when the payload carries one (finding 6d), DB append time
+                otherwise -- the tooltip says which. */}
+            <div className="relative h-10 border-b border-neutral-100">
               <span className="absolute left-1 top-1 z-10 text-[10px] font-medium text-neutral-400">Tool calls</span>
               {width > 0 &&
                 visibleTicks.map((t) => (
                   <button
                     key={t.key}
                     type="button"
-                    title={`${t.name ?? "tool"} at ${formatClock(t.ts)}`}
+                    title={`${t.name ?? "tool"} at ${formatClock(t.ts)}${t.realTs ? "" : " (log write time -- no real per-call timestamp captured)"}`}
                     onClick={(e) => {
                       e.stopPropagation();
                       selectTick(t);
                     }}
-                    className="absolute top-5 h-3 w-1.5 rounded-full border border-neutral-500 bg-neutral-400"
+                    className={`absolute top-5 h-3 w-1.5 rounded-full border border-neutral-500 bg-neutral-400 ${t.realTs ? "" : "opacity-50"}`}
                     style={{ left: scaleX(t.ts) - TICK_PX / 2 }}
                   />
                 ))}
+            </div>
+
+            {/* Lane 3: gate wait -- finding 6c. GATE_PAUSED/GATE_RESOLVED (graph.py's
+                make_gate_node, added by E-3a) paired by stage via buildGateSpans above, the same
+                open-map-and-close-on-match shape lane 1's NODE_STARTED/NODE_FINISHED pairing
+                already uses. The backend guards against LangGraph's own replay-from-top-on-resume
+                double-firing a pause (graph.py's `already_paused` check before emitting
+                GATE_PAUSED), so one PAUSED really does mean one genuine pause -- this is the
+                single most user-relevant wait in the whole pipeline (a run can sit here for
+                hours), finally derivable from real events instead of an unexplained gap between
+                two node spans. */}
+            <div className="relative h-10">
+              <span className="absolute left-1 top-1 z-10 text-[10px] font-medium text-neutral-400">Gate wait</span>
+              {width > 0 &&
+                visibleGateSpans.map((s) => {
+                  if (s.startTs == null && s.endTs != null) {
+                    // No matching GATE_PAUSED -- shouldn't happen for data written after this fix
+                    // (both events fire from the same gate_node execution), handled defensively
+                    // the same way an unmatched NODE_FINISHED is: a point, not a fabricated start.
+                    const left = scaleX(s.endTs) - TICK_PX / 2;
+                    return (
+                      <button
+                        key={s.key}
+                        type="button"
+                        title={`gate resolved at ${formatClock(s.endTs)} (no matching pause recorded)`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          selectGateSpan(s);
+                        }}
+                        className="absolute top-5 h-3 w-3 rotate-45 border border-amber-600 bg-amber-200 opacity-60"
+                        style={{ left }}
+                      />
+                    );
+                  }
+                  const startTs = s.startTs ?? viewStart;
+                  const rawLeft = scaleX(startTs);
+                  const rawRight = scaleX(s.endTs ?? viewEnd);
+                  const left = Math.max(0, rawLeft);
+                  const barWidth = Math.max(rawRight - left, MIN_BAR_PX);
+                  const open = s.endTs == null;
+                  return (
+                    <button
+                      key={s.key}
+                      type="button"
+                      title={
+                        open
+                          ? `waiting on human review${s.stage ? ` (${s.stage})` : ""} since ${formatClock(startTs)} -- still open`
+                          : `waited on human review${s.stage ? ` (${s.stage})` : ""}: ${formatDuration((s.endTs as number) - startTs)}${s.decision ? `, ${s.decision}` : ""}`
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        selectGateSpan(s);
+                      }}
+                      className={`absolute top-5 h-6 overflow-hidden rounded border border-amber-600 px-1 text-left text-[10px] leading-6 text-amber-900 ${open ? "border-dashed opacity-70" : ""}`}
+                      style={{ left, width: barWidth, ...GATE_HATCH_STYLE }}
+                    >
+                      <span className="whitespace-nowrap">{open ? "waiting…" : (s.decision ?? "gate")}</span>
+                    </button>
+                  );
+                })}
             </div>
 
             {/* Seek playhead */}
@@ -378,7 +570,11 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
         <LegendSwatch className="border-emerald-400 bg-emerald-100" label="verify" />
         <LegendSwatch className="border-green-400 bg-green-100" label="fix" />
         <LegendSwatch className="rounded-full border-neutral-500 bg-neutral-400" label="tool call" />
-        <span className="text-neutral-400">dashed = still running/no finish recorded &middot; diamond = point only, no start recorded</span>
+        <LegendSwatch className="border-amber-600" style={GATE_HATCH_STYLE} label="gate wait" />
+        <span className="text-neutral-400">
+          dashed = still running/waiting, no finish recorded &middot; diamond = point only, no start recorded &middot;
+          faded tick = no real per-call timestamp, log write time shown instead
+        </span>
       </div>
 
       {selected && <p className="text-sm text-neutral-600">{selected.label}: {selected.detail}</p>}
@@ -386,10 +582,18 @@ export function Swimlane({ onSeek }: { onSeek?: (ts: Date) => void }) {
   );
 }
 
-function LegendSwatch({ className, label }: { className: string; label: string }) {
+function LegendSwatch({
+  className,
+  style,
+  label,
+}: {
+  className: string;
+  style?: CSSProperties;
+  label: string;
+}) {
   return (
     <span className="inline-flex items-center gap-1.5">
-      <span aria-hidden className={`inline-block h-3 w-3 border ${className}`} />
+      <span aria-hidden className={`inline-block h-3 w-3 border ${className}`} style={style} />
       {label}
     </span>
   );
