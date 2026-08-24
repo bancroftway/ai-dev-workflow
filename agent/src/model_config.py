@@ -112,6 +112,19 @@ def _demo() -> None:
     assert get_model_name("tech-stack", "audit", "claude") == get_model_name("tech-stack", "draft", "claude")
     assert get_model_name("tech-stack", "audit", "copilot") != get_model_name("tech-stack", "audit", "claude")
 
+    # Phase E audit M-5: "e2e-run"/"test-hardening-run" are declared Stage values that genuinely
+    # call get_model_name (via stack_runner.run_and_report's own fallback chain -- e2e_nodes.py and
+    # test_hardening_nodes.py never pass an explicit model_name). get_model_name's return value
+    # can't distinguish "key absent" from "key present with an explicit null" -- both resolve to
+    # None -- so the only thing worth asserting here is that models.yaml actually DECLARES them
+    # (an explicit, documented null) rather than leaving them silently missing from the file, which
+    # is exactly what M-5 flagged. A future regression that deletes these blocks again fails this.
+    config = _load_config()
+    assert "e2e-run" in config, "e2e-run must have an explicit models.yaml block (Phase E audit M-5)"
+    assert "test-hardening-run" in config, "test-hardening-run must have an explicit models.yaml block (Phase E audit M-5)"
+    assert get_model_name("e2e-run", "draft", "copilot") is None
+    assert get_model_name("test-hardening-run", "draft", "claude") is None
+
     print("model_config self-check: provider-keyed draft/audit lookups all resolved correctly")
 
 

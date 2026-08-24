@@ -108,6 +108,19 @@ e2e:
     draft_model: gpt-5.4
   claude:
     draft_model: sonnet
+# Phase E audit M-5: model_config.Stage declares "e2e-run" (e2e_nodes.py's stack_runner.
+# run_and_report call, stage_key="e2e-run") and it genuinely DOES call get_model_name -- via
+# run_and_report's own model_name-or-get_model_name(stage_key,...)-or-get_model_name("stack-run",...)
+# fallback chain (stack_runner.py), since e2e_nodes.py never passes an explicit model_name. Explicit
+# `null` here (rather than leaving the key absent) documents that on purpose: this stage has no
+# draft-tier choice of its own and is meant to fall through to stack-run's config below, same as
+# "let the CLI choose" elsewhere in this file -- an absent key looked identical to "nobody noticed
+# this stage exists," which is what M-5 flagged.
+e2e-run:
+  copilot:
+    draft_model: null
+  claude:
+    draft_model: null
 # src/stack_runner.py sessions: a GHCP agent explores the repo, works out how to run a real
 # toolchain command there, runs it, and reports through a schema-validated terminal tool. Exploring
 # a generated monorepo and getting a build/test/coverage invocation right is the same class of work
@@ -130,6 +143,16 @@ ac-test-run:
     draft_model: gpt-5.4
   claude:
     draft_model: sonnet
+# Phase E audit M-5: same shape as e2e-run above -- test_hardening_nodes.py's stack_runner.
+# run_and_report call (stage_key="test-hardening-run") never passes an explicit model_name either,
+# so it too falls through run_and_report's own fallback chain to stack-run's config below. Explicit
+# `null` documents that this stage deliberately has no draft-tier choice of its own, rather than
+# leaving the key silently absent from the declared stage set.
+test-hardening-run:
+  copilot:
+    draft_model: null
+  claude:
+    draft_model: null
 remediation:
   copilot:
     # Previously carried by agents/remediation-draft.md's own `model:`; custom_agents is now off by
