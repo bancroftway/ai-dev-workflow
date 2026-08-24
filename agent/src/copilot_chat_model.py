@@ -117,6 +117,20 @@ _RESUME_REJECTED_MARKERS: tuple[str, ...] = (
 )
 
 
+def _record_resume_state(session_key: str, resume_state: ResumeState) -> None:
+    """Record this turn's resume classification for `session_key`, and drop the cached session id
+    outright when it was positively REJECTED (Phase E review, Important 1).
+
+    Same shared helper as claude_chat_model.py's identical function -- see that module's own
+    docstring for why (a dead id must never survive to be `--session-id`'d again) and why this is
+    factored out rather than duplicated inline at both classification call sites in
+    _agenerate_inner.
+    """
+    _resume_states[session_key] = resume_state
+    if resume_state == "rejected":
+        _session_ids.pop(session_key, None)
+
+
 def _messages_to_prompt(messages: list[BaseMessage]) -> str:
     """Flatten a LangChain message list into a single Copilot CLI prompt string.
 
@@ -781,7 +795,7 @@ class CopilotChatModel(BaseChatModel):
             if session_id:
                 combined_text = f"{result.stdout} {result.stderr}"
                 rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
-                _resume_states[self._session_key] = "rejected" if rejected else "unknown"
+                _record_resume_state(self._session_key, "rejected" if rejected else "unknown")
             raise RuntimeError(
                 f"Copilot CLI turn for {self._session_key!r} produced no parseable JSONL lines "
                 f"under --output-format json (resume_state="
@@ -844,7 +858,7 @@ class CopilotChatModel(BaseChatModel):
             session_id, new_session_id, is_error, str(final.get("result") or ""), _RESUME_REJECTED_MARKERS,
         )
         if resume_state is not None:
-            _resume_states[self._session_key] = resume_state
+            _record_resume_state(self._session_key, resume_state)
             if resume_state == "unknown":
                 logger.warning(
                     "resume continuity for session %r at %r is UNKNOWN this turn (requested=%r "
@@ -861,6 +875,12 @@ class CopilotChatModel(BaseChatModel):
 
         if new_session_id:
             _session_ids[self._session_key] = new_session_id
+            # Phase E review (Minor): see claude_chat_model.py's identical reconciliation for why
+            # -- "unknown" described the OLD id's fate; once the cache moves on to this NEW id
+            # (never itself asked to resume anything), leaving "unknown" attached would misdescribe
+            # it rather than the old session whose continuity is genuinely in question.
+            if resume_state == "unknown" and new_session_id != session_id:
+                _resume_states.pop(self._session_key, None)
 
         self._last_usage = _extract_usage(final, self.model_name)
 
@@ -1299,6 +1319,24 @@ def _demo() -> None:
         "close_thread_session did not evict resume_states"
     )
     assert get_resume_state("thread-never-seen", "x", "y") is None, "an unseen key must report None, not raise"
+
+    # Phase E review (Important 1), pinned directly: a REJECTED classification must drop the
+    # cached session id outright -- proven against the real function _agenerate_inner actually
+    # calls, not a re-derived tautology.
+    pin_key = "pin-thread:pin-stage:draft"
+    _session_ids[pin_key] = "dead-session-id"
+    _record_resume_state(pin_key, "rejected")
+    assert pin_key not in _session_ids, "a REJECTED classification must drop the cached session id"
+    assert _resume_states[pin_key] == "rejected"
+
+    _session_ids[pin_key] = "still-good-session-id"
+    for harmless_state in ("unknown", "resumed"):
+        _record_resume_state(pin_key, harmless_state)
+        assert _session_ids[pin_key] == "still-good-session-id", (
+            f"{harmless_state!r} must NOT drop the cached session id, only 'rejected' does"
+        )
+    _resume_states.pop(pin_key, None)
+    _session_ids.pop(pin_key, None)
 
     # Phase E audit I-4: _apply_disabled_skills_instruction, pure and directly testable (the
     # actual _agenerate_inner call site needs a live sandbox -- see this module's own "pure half
