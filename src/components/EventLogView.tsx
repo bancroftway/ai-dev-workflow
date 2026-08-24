@@ -175,6 +175,7 @@ export function EventLogView() {
             ref={containerRef}
             onScroll={onScroll}
             tabIndex={0}
+            aria-label="Event log"
             className="flex h-full flex-col divide-y divide-neutral-100 overflow-y-auto rounded-lg border border-neutral-200"
           >
             {runs.map((run) =>
