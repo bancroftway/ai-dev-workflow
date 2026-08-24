@@ -13,6 +13,7 @@ import base64
 import shlex
 import time
 from dataclasses import dataclass
+from typing import Literal
 
 from .sandbox.provider import SandboxProvider
 
@@ -33,6 +34,62 @@ class TurnResult:
     stdout: str
     stderr: str
     exit_code: int
+
+
+# Phase E audit C-2 ("Resume-rejected is not a distinct signal ... collapsed exactly as the Spec
+# forbade"): shared tri-state vocabulary for both claude_chat_model.py and copilot_chat_model.py,
+# which each keep their own per-session-key `_resume_states: dict[str, ResumeState]` dict (mirroring
+# their own `_session_ids`) -- this module stays session-agnostic (it has no `_session_ids` of its
+# own, just like it has no `--resume`/`--session-id` argv knowledge), so the STATE lives with the
+# callers; only the classification VOCABULARY and RULE are shared, the same split RunEventType
+# (run_events.py) makes between "what the value means" and "who writes it."
+ResumeState = Literal["resumed", "rejected", "unknown"]
+
+
+def classify_resume(
+    requested_id: str | None,
+    returned_id: str | None,
+    is_error: bool,
+    error_text: str,
+    rejected_markers: tuple[str, ...],
+) -> ResumeState | None:
+    """Classify one completed turn's resume continuity against what the CLI actually reported --
+    never against what a caller merely hoped for.
+
+    Returns None when `requested_id` is falsy: no `--resume`/`--session-id` was requested this
+    turn, so there is no continuity claim to classify (a fresh session succeeding says nothing
+    about a PRIOR session's fate -- callers must leave any earlier `_resume_states` entry for a
+    different key untouched in that case, not overwrite it with a verdict about an unrelated turn).
+
+    Real experiment (Phase E, fix-e3a-report.md -- Spec Verification 4, "the single highest-risk
+    untested behavior in the whole shared runner"): one real Claude Code turn (haiku,
+    `--output-format stream-json --verbose`, forced into a long `sleep 180` Bash tool call) was
+    SIGKILLed mid-tool-call via `timeout -s KILL 8`, confirmed genuinely killed (exit 137, no
+    terminal `result` line ever written). A real `claude --resume <that session_id>` attempt
+    immediately after came back CLEAN: `is_error: false`, the terminal line's own `session_id`
+    EQUAL to the requested id, model replied coherently. So a killed-mid-tool-call session is NOT
+    automatically unresumable -- this function's job is to tell the three real outcomes apart
+    after observing one, never to assume the worst (or the best) before that.
+
+    - REJECTED: `is_error` and `error_text` positively matches one of `rejected_markers` -- a
+      provider-specific set of substrings. Neither provider has a real captured example of an
+      actual rejection message yet (this experiment's one real resume attempt succeeded instead)
+      -- see each call site's own comment for why its marker tuple is labelled inference.
+    - RESUMED: not `is_error` and `returned_id == requested_id` -- the terminal line's own report
+      of which session it used matches what was asked for. This is what the real experiment above
+      actually observed.
+    - UNKNOWN: anything else that isn't "no resume requested" -- a different `returned_id` (a
+      silent fresh start), a missing/unparseable one, or an `is_error` turn that matches none of
+      the rejection markers. Conservative default: never claim RESUMED without the id match
+      actually confirming it.
+    """
+    if not requested_id:
+        return None
+    if is_error and any(marker in error_text.lower() for marker in rejected_markers):
+        return "rejected"
+    if not is_error and returned_id == requested_id:
+        return "resumed"
+    return "unknown"
 
 
 async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: str, content: str | bytes) -> None:
@@ -232,6 +289,41 @@ def _demo() -> None:
     assert " & echo $! > " in startup_cmd, "pidfile capture should follow backgrounding"
     assert "setsid nohup sh -c" in startup_cmd, "should use setsid nohup sh -c structure"
     assert ">/dev/null 2>&1 &" in startup_cmd, "should redirect setsid/nohup output before backgrounding"
+
+    # --- Phase E audit C-2: classify_resume, including the REAL killed-turn experiment's outcome ---
+    #
+    # No resume requested this turn -> nothing to classify, regardless of how the turn went.
+    assert classify_resume(None, "any-id", False, "", ()) is None
+    assert classify_resume("", "any-id", True, "session not found", ("session not found",)) is None
+
+    # REAL (fix-e3a-report.md): a Claude turn SIGKILLed mid-tool-call, then really `--resume`d --
+    # came back with the SAME session_id and is_error=False. This is exactly RESUMED, not a
+    # hedge -- the real experiment's own actual result, not a synthetic stand-in for it.
+    real_requested = "96d76a68-6f54-47d3-97ac-c75b896b0717"
+    assert classify_resume(real_requested, real_requested, False, "resumed-ok", ()) == "resumed"
+
+    # A returned id that DIFFERS from what was requested is a silent-fresh-start suspect, even
+    # with is_error=False -- never trust a same-shaped success to mean "continued," only a
+    # matching id does.
+    assert classify_resume(real_requested, "some-other-session-id", False, "ok", ()) == "unknown"
+
+    # A missing/unparseable returned id on an otherwise-clean turn: still unknown, not resumed --
+    # no id match was actually confirmed.
+    assert classify_resume(real_requested, None, False, "ok", ()) == "unknown"
+
+    # is_error=True with text matching one of the caller's (inference-labelled) rejection markers
+    # -> REJECTED. Synthetic: neither provider has a real captured rejection message yet (module
+    # docstring), so this exercises the marker-matching RULE, not a claim about real CLI text.
+    assert classify_resume(real_requested, None, True, "Error: no conversation found for that id", (
+        "no conversation found",
+    )) == "rejected"
+
+    # is_error=True but the text matches none of the markers: conservative default is UNKNOWN, not
+    # a guessed REJECTED -- an unrelated content-level error must not be misread as a resume
+    # rejection just because a resume happened to be requested that turn.
+    assert classify_resume(real_requested, None, True, "Error: the model output was truncated", (
+        "no conversation found",
+    )) == "unknown"
 
     print("cli_agent_exec self-check: all assertions passed")
 
