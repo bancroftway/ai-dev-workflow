@@ -2639,6 +2639,31 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
             # top, so it sets True a second time immediately before update_current_stage clears it
             # a few lines down.
             if sandbox_registry.get(thread_id) is not None:
+                # Phase E review (Important 2, on top of finding 4): this whole block re-runs on
+                # EVERY resumed replay of this node, not just the genuine first pause -- the
+                # set_awaiting_gate(True) call below already documents that as harmless for its own
+                # idempotent DB write, but an append-only event log is not idempotent, and a naive
+                # copy of that comment's reasoning onto GATE_PAUSED double-emitted it (once for the
+                # real pause, once again milliseconds later when the resumed replay reaches this
+                # exact point right before interrupt() returns the resume value instead of pausing
+                # again). No in-memory `state` field distinguishes the two executions -- LangGraph
+                # replays this node with the SAME input state both times, and nothing between them
+                # writes a different value into state["stages"][stage_spec.key] (gate_node itself
+                # hasn't returned anything yet either time). The one reliable, durable signal is the
+                # cross-process awaiting_gate column set_awaiting_gate already exists to answer:
+                # read it BEFORE writing True. False (or unreadable) means this is a genuine new
+                # pause; True means this is the resumed replay of an already-recorded one.
+                already_paused = False
+                try:
+                    existing_session = await session_store.get_session(thread_id)
+                    already_paused = bool(existing_session and existing_session.get("awaiting_gate"))
+                except Exception:
+                    logger.warning(
+                        "reading awaiting_gate failed for stage=%s thread_id=%s -- assuming this "
+                        "is a genuine new pause (may double-emit GATE_PAUSED for this one "
+                        "occurrence if it is actually a replay)",
+                        stage_spec.key, thread_id, exc_info=True,
+                    )
                 try:
                     await session_store.set_awaiting_gate(thread_id, True)
                 except Exception:
@@ -2650,20 +2675,20 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                 # unexplained gap for however long a human took to review -- the single most
                 # operationally significant wait in the whole pipeline, invisible in the view built
                 # to explain where time went. Same fail-soft append_event-then-emit_live rebind
-                # pattern the four existing NODE_* sites in this file already use, colocated with
-                # the set_awaiting_gate(True) call right above (same "immediately before interrupt()
-                # actually pauses" placement, same re-runs-harmlessly-on-resume caveat that call's
-                # own comment already documents -- additive only, no topology change).
-                pause_event = RunEvent(
-                    run_id=state.get("run_id", "unknown"),
-                    session_id=thread_id,
-                    type=RunEventType.GATE_PAUSED,
-                    stage=stage_spec.key,
-                    node="gate",
-                    summary=f"gate paused for review: {stage_spec.key}",
-                )
-                pause_event = await run_event_store.append_event(pause_event)
-                await run_event_stream.emit_live(pause_event, config)
+                # pattern the four existing NODE_* sites in this file already use. Guarded by
+                # `not already_paused` (see above) so this fires once per genuine pause, not once
+                # per replay -- additive only, no topology change.
+                if not already_paused:
+                    pause_event = RunEvent(
+                        run_id=state.get("run_id", "unknown"),
+                        session_id=thread_id,
+                        type=RunEventType.GATE_PAUSED,
+                        stage=stage_spec.key,
+                        node="gate",
+                        summary=f"gate paused for review: {stage_spec.key}",
+                    )
+                    pause_event = await run_event_store.append_event(pause_event)
+                    await run_event_stream.emit_live(pause_event, config)
             resume_value = interrupt({"stage": stage_spec.key, "draft": stage["draft"], **extra})
 
         # Part 2 Task 10 (Ruling 3): the one resume shape that means a human REJECTION --
@@ -3634,6 +3659,123 @@ def _demo() -> None:
     # only ever reads status, which gate_node always sets to "approved" for those stages.
     route_after_gate_nongated = make_route_after_gate(by_key["ac-to-tests"])
     assert route_after_gate_nongated({"stages": {"ac-to-tests": {**default_stage_state(), "status": "approved"}}}) == "approved"
+
+    # Phase E review (Important 2): GATE_PAUSED must fire once per GENUINE pause, not once per
+    # replay -- LangGraph re-executes gate_node from the top on every resume, and the naive
+    # version double-emitted (once on the real pause, once again on the replay, right before
+    # interrupt() returns the resume value instead of pausing again). Drives the REAL gate_node
+    # closure through a scripted pause -> reject -> re-pause -> approve sequence, same
+    # globals()-patching technique the auto_approve/draft checks above already use for a real
+    # LangGraph mechanism this file cannot cheaply compile+run for real (see make_route_after_gate's
+    # own comment above for why that full round-trip is otherwise exercised separately, not here):
+    # `interrupt` is faked to behave like the real one (raises to simulate a pause, returns a
+    # scripted resume value to simulate a resume); session_store.get_session/set_awaiting_gate are
+    # faked with a tiny in-memory awaiting_gate flag -- the actual durable signal this fix reads;
+    # a fake sandbox_registry entry makes gate_node take the awaiting_gate/GATE_PAUSED branch at
+    # all; RunEvent emission is captured via a spy on run_event_store.append_event.
+    class _FakeGraphInterrupt(Exception):
+        pass
+
+    demo_gate_spec = StageSpec(
+        key="demo-gate",
+        response_schema=object,  # unused by gate_node
+        content_field=None,
+        surface_tool_name="demo",
+        build_envelope=lambda *a: {},
+        build_prompt=lambda *a: [],
+        max_cycles=1,
+        render_markdown=lambda *a: "",
+    )
+    assert demo_gate_spec.requires_human_gate and not demo_gate_spec.sign_approval and demo_gate_spec.resolve_from_interrupt is None, (
+        "this fixture must take the plain pause/approve/reject path with no extra side hooks"
+    )
+
+    fake_awaiting_gate = {"value": False}
+    scripted_resume: list[Any] = []
+
+    def _fake_interrupt(payload):  # noqa: ANN001, ANN202
+        if scripted_resume:
+            return scripted_resume.pop(0)
+        raise _FakeGraphInterrupt()
+
+    async def _fake_get_session(session_id):  # noqa: ANN001, ANN202
+        return {"awaiting_gate": fake_awaiting_gate["value"]}
+
+    async def _fake_set_awaiting_gate(session_id, awaiting):  # noqa: ANN001, ANN202
+        fake_awaiting_gate["value"] = awaiting
+
+    captured_gate_events: list[RunEvent] = []
+
+    async def _fake_append_event(event):  # noqa: ANN001, ANN202
+        captured_gate_events.append(event)
+        return event
+
+    async def _fake_emit_live(event, config=None):  # noqa: ANN001, ANN202, ARG001
+        return None
+
+    real_interrupt = globals()["interrupt"]
+    real_get_session = session_store.get_session
+    real_set_awaiting_gate = session_store.set_awaiting_gate
+    real_append_event = run_event_store.append_event
+    real_emit_live = run_event_stream.emit_live
+    real_persist_2, real_hook_2 = _persist_if_sandboxed, _run_post_approve_hook
+    demo_gate_thread = "demo-gate-pause-thread"
+    sandbox_registry.set(demo_gate_thread, SandboxSession(session_id=demo_gate_thread, host="fake", port=0, connection_token=""))
+    globals()["interrupt"] = _fake_interrupt
+    session_store.get_session = _fake_get_session
+    session_store.set_awaiting_gate = _fake_set_awaiting_gate
+    run_event_store.append_event = _fake_append_event
+    run_event_stream.emit_live = _fake_emit_live
+    globals()["_persist_if_sandboxed"] = _skip_hook
+    globals()["_run_post_approve_hook"] = _skip_hook
+    try:
+        gate_fn = make_gate_node(demo_gate_spec)
+        gate_state = {
+            "stages": {demo_gate_spec.key: {**default_stage_state(), "draft": {"x": 1}, "status": "ready_for_review"}},
+            "run_id": "demo-gate-run",
+        }
+        gate_cfg = {"configurable": {"thread_id": demo_gate_thread}}
+
+        # 1st genuine pause: awaiting_gate starts False -> must emit GATE_PAUSED, then "pause".
+        try:
+            asyncio.run(gate_fn(gate_state, gate_cfg))
+            raise AssertionError("expected the fake interrupt to pause (raise) on a genuine pause")
+        except _FakeGraphInterrupt:
+            pass
+
+        # Simulate LangGraph's replay-on-resume: gate_node re-executes from the top (awaiting_gate
+        # is now True from the pause above) -- must NOT re-emit GATE_PAUSED -- and this time
+        # interrupt() returns a REJECTED resume value instead of pausing again.
+        scripted_resume.append({"decision": "rejected", "feedback": "needs more detail"})
+        asyncio.run(gate_fn(gate_state, gate_cfg))
+
+        # Redraft happens for real between here and the next pause (not simulated -- out of scope
+        # for this test); the rejection branch already reset awaiting_gate to False, so the stage
+        # becoming ready again is a SECOND genuine pause.
+        try:
+            asyncio.run(gate_fn(gate_state, gate_cfg))
+            raise AssertionError("expected the fake interrupt to pause again for the second genuine pause")
+        except _FakeGraphInterrupt:
+            pass
+
+        # Replay again, this time approved.
+        scripted_resume.append({"decision": "approved"})
+        asyncio.run(gate_fn(gate_state, gate_cfg))
+
+        paused = [e for e in captured_gate_events if e.type is RunEventType.GATE_PAUSED]
+        resolved = [e for e in captured_gate_events if e.type is RunEventType.GATE_RESOLVED]
+        assert len(paused) == 2, f"expected exactly 2 GATE_PAUSED for 2 genuine pauses, got {len(paused)}"
+        assert len(resolved) == 2, f"expected exactly 2 GATE_RESOLVED (1 rejected + 1 approved), got {len(resolved)}"
+        assert [r.payload["decision"] for r in resolved] == ["rejected", "approved"], resolved
+    finally:
+        globals()["interrupt"] = real_interrupt
+        session_store.get_session = real_get_session
+        session_store.set_awaiting_gate = real_set_awaiting_gate
+        run_event_store.append_event = real_append_event
+        run_event_stream.emit_live = real_emit_live
+        globals()["_persist_if_sandboxed"] = real_persist_2
+        globals()["_run_post_approve_hook"] = real_hook_2
+        sandbox_registry.pop(demo_gate_thread)
 
     # Regression check (Part 2 Task 10 review fix -- a real Critical bug this file's own review
     # caught): a stage re-entering make_draft_node on a REJECTION must not let
