@@ -1547,12 +1547,32 @@ async def _resolve_thread_provider(thread_id: str, state: GraphState) -> Literal
     exists to prevent, just relocated from "mid-run" to "across a restart." `get_session` returning
     None (a genuinely new thread) or a row with no stored provider (pre-migration-0008) both fall
     through to the live read exactly as before.
+
+    The `get_session` call is try/excepted (Phase E audit I-3 review round 2) -- unlike
+    chat_model.get_provider() right after it, which was already hardened (chat_model.py:149-204,
+    Part 4 whole-branch review) to serve stale cache or the env var rather than raise on a DB blip.
+    Without this, a transient DB error here raises straight through intake_node and hard-fails the
+    run -- and per this field's own comment above, this branch runs on EVERY thread's first
+    post-restart intake, a permanent steady-state condition, not a rare one-off. Falls through to
+    get_provider() on failure -- exactly the pre-fix behavior (live-resolve), so a DB blip degrades
+    to "briefly no better than before I-3" rather than "run dies."
     """
-    return (
-        state.get("provider")
-        or (await session_store.get_session(thread_id) or {}).get("provider")
-        or await chat_model.get_provider()
-    )
+    pinned = state.get("provider")
+    if pinned:
+        return pinned
+
+    stored_provider = None
+    try:
+        stored_row = await session_store.get_session(thread_id)
+        stored_provider = (stored_row or {}).get("provider")
+    except Exception:
+        logger.warning(
+            "session_store.get_session failed while resolving provider for thread_id=%s -- "
+            "falling through to the live org setting",
+            thread_id, exc_info=True,
+        )
+
+    return stored_provider or await chat_model.get_provider()
 
 
 async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
@@ -3876,6 +3896,26 @@ def _demo() -> None:
     finally:
         session_store.get_session = real_get_session_new
         chat_model.get_provider = real_get_provider_new
+
+    # DB-blip case (Phase E audit I-3 review round 3): session_store.get_session raising must NOT
+    # propagate out of _resolve_thread_provider -- it must fall through to the live get_provider()
+    # path (already hardened to survive its OWN DB failure), same degraded-but-alive behavior as
+    # before this field's stored-provider preference existed.
+    async def _fake_get_session_raises(session_id):  # noqa: ANN001, ANN202
+        raise RuntimeError("simulated transient DB blip")
+
+    real_get_session_blip = session_store.get_session
+    real_get_provider_blip = chat_model.get_provider
+    session_store.get_session = _fake_get_session_raises
+    chat_model.get_provider = _fake_get_provider_live_claude
+    try:
+        resolved = asyncio.run(_resolve_thread_provider("db-blip-thread", {}))
+        assert resolved == "claude", (
+            f"a raising get_session must degrade to the live path, not propagate, got {resolved!r}"
+        )
+    finally:
+        session_store.get_session = real_get_session_blip
+        chat_model.get_provider = real_get_provider_blip
 
     # Regression check (Part 2 Task 10 review fix -- a real Critical bug this file's own review
     # caught): a stage re-entering make_draft_node on a REJECTION must not let
