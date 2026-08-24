@@ -9,6 +9,7 @@ import { SettingsBanner } from "@/components/SettingsBanner";
 import { stashHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
 import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
 import type { CannedTechStack, TechStackCatalogResponse } from "@/lib/workflow-types";
+import { providerLabel, useOrgProvider } from "@/lib/use-org-provider";
 
 const NEW_PROJECT_VALUE = "__new__";
 const FREE_TEXT_STACK_VALUE = "__freetext__";
@@ -55,6 +56,11 @@ export default function NewTicketPage() {
   const [newProjectName, setNewProjectName] = useState("");
   const [catalog, setCatalog] = useState<CannedTechStack[] | null>(null);
   const [selectedStackId, setSelectedStackId] = useState<string>(FREE_TEXT_STACK_VALUE);
+  // Minor 16: catalog picker is primary, free-text is the fallback -- tracks whether the user has
+  // ever touched the control themselves, so the catalog-default effect below only ever claims the
+  // untouched initial state, never overwrites a real choice (including a deliberate "Describe it
+  // myself" pick made in the narrow window before the catalog fetch resolves).
+  const [stackPickerTouched, setStackPickerTouched] = useState(false);
   const [freeTextStack, setFreeTextStack] = useState("");
 
   const [title, setTitle] = useState("");
@@ -106,6 +112,24 @@ export default function NewTicketPage() {
       .then((data: TechStackCatalogResponse) => setCatalog(data.stacks))
       .catch(() => setCatalog([]));
   }, []);
+
+  // Minor 16 (Phase E audit): the Spec calls for "catalog picker primary, free-text fallback" --
+  // this used to default to (and stay on) free-text permanently, since the catalog fetch above is
+  // async and the picker's own initial state can't know the first catalog entry synchronously.
+  // Claims the untouched default the instant a non-empty catalog arrives; a no-op once the user
+  // has touched the control, or when the catalog genuinely has nothing in it (free-text stays the
+  // only option, correctly). Adjusting state during render off a tracked previous value, not a
+  // useEffect calling setState -- the same sanctioned "adjusting state when a value changes"
+  // pattern board/page.tsx's own resetForProjectId already uses in this codebase, required here
+  // for the same reason (react-hooks/set-state-in-effect, an enforced lint error, forbids the
+  // naive useEffect-body version).
+  const [catalogDefaultedFor, setCatalogDefaultedFor] = useState<CannedTechStack[] | null>(null);
+  if (catalog !== catalogDefaultedFor && catalog && catalog.length > 0) {
+    setCatalogDefaultedFor(catalog);
+    if (!stackPickerTouched) setSelectedStackId(catalog[0].id);
+  }
+
+  const provider = useOrgProvider();
 
   const isNewProject = selectedProjectId === NEW_PROJECT_VALUE;
   const busy = submit.kind === "submitting";
@@ -227,6 +251,13 @@ export default function NewTicketPage() {
           File a ticket against a project. A brand-new project scaffolds its own private GitHub
           repo the moment this ticket provisions.
         </p>
+        {/* Minor 10: the wireframe's positive provider affordance -- distinct from SettingsBanner
+            below, which only ever renders the negative "nothing configured" case. */}
+        {provider && (
+          <p className="text-xs text-neutral-400">
+            <span aria-hidden>ⓘ</span> Runs on {providerLabel(provider)} — this org&apos;s configured provider
+          </p>
+        )}
       </div>
 
       <SettingsBanner onReadyChange={setOrgCredentialReady} />
@@ -282,15 +313,21 @@ export default function NewTicketPage() {
               <select
                 className="rounded-md border border-neutral-300 px-3 py-2 text-sm"
                 value={selectedStackId}
-                onChange={(event) => setSelectedStackId(event.target.value)}
+                onChange={(event) => {
+                  setStackPickerTouched(true);
+                  setSelectedStackId(event.target.value);
+                }}
                 disabled={!catalog || busy}
               >
-                <option value={FREE_TEXT_STACK_VALUE}>Describe it myself</option>
+                {/* Catalog primary, free-text fallback (Minor 16) -- listed in that order so the
+                    default (and the visual "top of the list") position matches the Spec's own
+                    "catalog picker primary" wording, not just the initial selection. */}
                 {catalog?.map((stack) => (
                   <option key={stack.id} value={stack.id}>
                     {stack.title}
                   </option>
                 ))}
+                <option value={FREE_TEXT_STACK_VALUE}>Describe it myself</option>
               </select>
             </label>
 
