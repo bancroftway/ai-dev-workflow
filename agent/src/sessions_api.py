@@ -1154,6 +1154,47 @@ def _demo() -> None:
     finally:
         session_store.get_session = original_get_session  # type: ignore[assignment]
 
+    # Part 2 Task 14 fix-round (coordinator review Minor): delete_session_full -- the actual code
+    # path production traffic uses -- must succeed for a session that has emitted a real
+    # RunEvent. 0006_create_run_events.sql's session_id FK (NOT NULL, no ON DELETE CASCADE) 500'd
+    # this real endpoint for exactly that case until run_event_store.delete_events_by_session was
+    # added and wired in ahead of session_store.delete_session (see both functions' own
+    # docstrings; reproduced live against the real DB in task-14-report.md, not theoretical).
+    # Real rows, real delete, real DB, one event loop throughout -- monkeypatching either delete
+    # call would defeat the point: this must fail if delete_events_by_session is ever removed
+    # from delete_session_full, or reordered to run after session_store.delete_session.
+    import uuid
+
+    async def _check_delete_survives_real_run_events() -> None:
+        project_id = await project_store.create_project(
+            "sessions-api-selfcheck-delete-project", tech_stack_id=None, tech_stack_text=None, created_by="octocat"
+        )
+        session_id = str(uuid.uuid4())
+        try:
+            await session_store.create_session(
+                session_id, owner="octocat", repo="demo-repo-delete-selfcheck", user_login="octocat",
+                source_branch="main", work_branch=f"ai-dev-workflow/{session_id}", title="t",
+                project_id=project_id,
+            )
+            await run_event_store.append_event(RunEvent(
+                run_id=uuid.uuid4().hex[:8], session_id=session_id, type=RunEventType.NODE_FINISHED,
+                stage="tech-stack", node="draft", summary="draft ready for review",
+            ))
+            await delete_session_full(session_id, DeleteSessionRequest(github_token=""), _FakeRequest())  # type: ignore[arg-type]
+            assert await session_store.get_session(session_id) is None, "session row must be gone after delete_session_full"
+            assert await run_event_store.list_events_by_session(session_id) == [], "run_events rows must be gone too"
+        finally:
+            # Defensive only, not the normal path: delete_session_full's own success path above
+            # already removes the session row and its run_events -- this only fires anything if
+            # that call raised (e.g. a mutation-tested regression) and left rows behind.
+            pool = await session_store._get_pool()  # noqa: SLF001 -- same package, one shared pool
+            async with pool.acquire() as conn, conn.cursor() as cur:
+                await cur.execute("DELETE FROM dbo.run_events WHERE session_id = ?", session_id)
+                await cur.execute("DELETE FROM dbo.sessions WHERE session_id = ?", session_id)
+                await cur.execute("DELETE FROM dbo.projects WHERE project_id = ?", project_id)
+
+    asyncio.run(_check_delete_survives_real_run_events())
+
     print("sessions_api self-check: all assertions passed")
 
 
