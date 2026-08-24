@@ -222,9 +222,14 @@ fi
 # use it, which is the right layer to fail loudly at, not this script.
 AGENT_PROVIDER="${AGENT_PROVIDER:-copilot}"
 if [[ "$AGENT_PROVIDER" == "claude" ]]; then
-  if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "entrypoint: WARNING -- ANTHROPIC_API_KEY is empty; the claude runtime will start" \
-         "but any session creation will fail auth" >&2
+  # Phase E audit C-1: the sandbox now sets exactly ONE of ANTHROPIC_API_KEY /
+  # CLAUDE_CODE_OAUTH_TOKEN (local_docker.py/azure_aci.py's provision() -- never both, not even
+  # one real + one empty), so this warning must check both names, not just the API-key one --
+  # a subscription (oauth) session with only CLAUDE_CODE_OAUTH_TOKEN set is correctly configured
+  # and must NOT trigger a false "will fail auth" warning.
+  if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo "entrypoint: WARNING -- neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set;" \
+         "the claude runtime will start but any session creation will fail auth" >&2
   fi
 else
   # COPILOT_GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B) and not plain

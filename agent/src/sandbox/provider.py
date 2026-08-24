@@ -69,6 +69,7 @@ class SandboxProvider(abc.ABC):
         work_branch: str,
         git_user_token: str,
         runtime_auth_token: str,
+        runtime_auth_kind: str | None = None,
         image: str | None = None,
         scaffold_new_repo: bool = False,
         project_name: str | None = None,
@@ -90,11 +91,22 @@ class SandboxProvider(abc.ABC):
         it names the README.md the initial commit writes -- and must stay None otherwise, so a
         caller never sets SCAFFOLD_NEW_REPO on an ordinary provision by accident.
         runtime_auth_token is the active provider's own secret -- the shared Copilot PAT, an
-        Anthropic API key, or an admin's Settings-UI-saved credential (org_credential_vault.py,
-        Part 4) -- resolved by chat_model.get_runtime_auth_token() for whatever
-        chat_model.get_provider() currently selects -- written into the sandbox as
-        COPILOT_GITHUB_TOKEN or ANTHROPIC_API_KEY
-        (never both real) for its own coding-agent CLI to authenticate with. (Was documented here
+        Anthropic API key, an Anthropic subscription OAuth token, or an admin's Settings-UI-saved
+        credential (org_credential_vault.py, Part 4) -- resolved by
+        chat_model.get_runtime_auth_token() for whatever chat_model.get_provider() currently
+        selects -- written into the sandbox as COPILOT_GITHUB_TOKEN, ANTHROPIC_API_KEY, or
+        CLAUDE_CODE_OAUTH_TOKEN. runtime_auth_kind ("api_key" | "oauth" | None, the second half of
+        get_runtime_auth_token()'s return) picks WHICH of the two Claude-only names gets the real
+        value when provider == "claude"; ignored (no such choice exists) when provider ==
+        "copilot". Phase E audit finding C-1: exactly one of ANTHROPIC_API_KEY /
+        CLAUDE_CODE_OAUTH_TOKEN is ever set on the container -- the OTHER one is omitted from the
+        container's env entirely, not set to "". A real-plus-empty pair was the original design
+        (matching COPILOT_GITHUB_TOKEN vs. the Anthropic side, still real-plus-empty across THAT
+        provider dimension below) but the Spec's own precedence warning -- "ANTHROPIC_API_KEY
+        always wins if both are set" -- doesn't cite whether "set" means non-empty or merely
+        present, so an empty ANTHROPIC_API_KEY could in principle still shadow a real
+        CLAUDE_CODE_OAUTH_TOKEN; omitting it entirely removes the question rather than betting on
+        an unverified reading of "set". (Was documented here
         as COPILOT_SDK_AUTH_TOKEN, the correct name only for the old, fully-retired SDK-based
         `copilot --server` process -- task-12-report.md BUG B / task-12b traced this docstring as
         the design doc for what turned out to be a real defect in local_docker.py/azure_aci.py's

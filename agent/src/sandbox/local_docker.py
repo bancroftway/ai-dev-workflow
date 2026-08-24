@@ -164,6 +164,7 @@ class LocalDockerProvider(SandboxProvider):
         work_branch: str,
         git_user_token: str,
         runtime_auth_token: str,
+        runtime_auth_kind: str | None = None,
         image: str | None = None,
         scaffold_new_repo: bool = False,
         project_name: str | None = None,
@@ -257,6 +258,16 @@ class LocalDockerProvider(SandboxProvider):
                 # failed attempt on a retry, since the container name is fixed per session_id.
                 await _run_docker("rm", "-f", container_name)
 
+                # Phase E audit C-1: exactly one of ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN is
+                # ever passed to `docker create -e ...` below -- the other is omitted from argv
+                # entirely, never passed as `-e NAME=` (empty). See provider.py's provision()
+                # docstring for why an empty-string sibling is avoided rather than treated as
+                # harmless, unlike COPILOT_GITHUB_TOKEN's own real-or-empty pattern just below.
+                claude_env_args: list[str] = []
+                if provider == "claude":
+                    claude_var_name = "CLAUDE_CODE_OAUTH_TOKEN" if runtime_auth_kind == "oauth" else "ANTHROPIC_API_KEY"
+                    claude_env_args = ["-e", f"{claude_var_name}={runtime_auth_token}"]
+
                 # create -> cp(token) -> start, not `docker run`: the clone credential rides in as a
                 # one-shot file (see _inject_git_token) instead of an env var that would stay readable
                 # forever via `docker inspect`.
@@ -286,9 +297,11 @@ class LocalDockerProvider(SandboxProvider):
                     f"REPO_BRANCH={branch}",
                     "-e",
                     f"WORK_BRANCH={work_branch}",
-                    # Both set unconditionally, one real one empty, so this call never needs to
-                    # branch on provider itself -- the sandbox-image entrypoint is what picks
-                    # which one it actually needs. Harmless unused env either way.
+                    # COPILOT_GITHUB_TOKEN is set unconditionally, real or empty, so this call never
+                    # needs to branch on provider for THIS one name -- the sandbox-image entrypoint
+                    # is what picks whether it actually needs it. Harmless unused env when empty.
+                    # The Claude side (claude_env_args, spliced in below) does NOT follow this same
+                    # always-both pattern -- see that block's own comment for why.
                     #
                     # COPILOT_GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B)
                     # and not plain GITHUB_TOKEN either (task-12b fix-round-1): the real Copilot
@@ -310,8 +323,7 @@ class LocalDockerProvider(SandboxProvider):
                     # got updated to match.
                     "-e",
                     f"COPILOT_GITHUB_TOKEN={runtime_auth_token if provider == 'copilot' else ''}",
-                    "-e",
-                    f"ANTHROPIC_API_KEY={runtime_auth_token if provider == 'claude' else ''}",
+                    *claude_env_args,
                     "-e",
                     f"AGENT_PROVIDER={provider}",
                     # Stamped into bootstrap.sh's toolchain report, so a "this repo needed a toolchain

@@ -32,6 +32,16 @@ class OrgSettings:
     credential_secret_name: str | None
     updated_at: datetime
     updated_by: str | None
+    # Migration 0007 (Phase E audit C-1/I-1). credential_kind: 'api_key' | 'oauth' | None -- None
+    # means either "no credential saved" or "saved before this column existed"; callers that need a
+    # concrete value (chat_model.get_runtime_auth_token(), the Settings UI) default a non-None
+    # credential_secret_name's None kind to 'api_key', never to "unknown" -- see this module's own
+    # header comment on the migration for why that's the correct read, not just a convenient one.
+    # last_validation_ok/last_validated_at: I-1's periodic re-probe result, written by
+    # record_validation_result() below; both None until the first probe ever runs.
+    credential_kind: str | None = None
+    last_validation_ok: bool | None = None
+    last_validated_at: datetime | None = None
 
 
 async def get_org_settings() -> OrgSettings | None:
@@ -41,15 +51,21 @@ async def get_org_settings() -> OrgSettings | None:
     pool = await session_store._get_pool()  # noqa: SLF001 -- same package; one shared aioodbc pool, not a second one
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
-            "SELECT provider, credential_secret_name, updated_at, updated_by FROM dbo.org_settings WHERE id = 1"
+            "SELECT provider, credential_secret_name, updated_at, updated_by, credential_kind, "
+            "last_validation_ok, last_validated_at FROM dbo.org_settings WHERE id = 1"
         )
         row = await cur.fetchone()
         if row is None:
             return None
-        return OrgSettings(provider=row[0], credential_secret_name=row[1], updated_at=row[2], updated_by=row[3])
+        return OrgSettings(
+            provider=row[0], credential_secret_name=row[1], updated_at=row[2], updated_by=row[3],
+            credential_kind=row[4], last_validation_ok=row[5], last_validated_at=row[6],
+        )
 
 
-async def set_org_settings(provider: str, credential_secret_name: str | None, updated_by: str) -> None:
+async def set_org_settings(
+    provider: str, credential_secret_name: str | None, updated_by: str, credential_kind: str | None = None
+) -> None:
     """MERGE upsert against the single fixed row (id=1), mirroring keyvault.set_vault_uri's exact
     shape -- the only difference is the key being a constant rather than caller-supplied columns,
     since this table has no natural key beyond "the one row"."""
@@ -60,11 +76,26 @@ async def set_org_settings(provider: str, credential_secret_name: str | None, up
             MERGE dbo.org_settings AS target
             USING (SELECT 1 AS id) AS src
               ON target.id = src.id
-            WHEN MATCHED THEN UPDATE SET provider = ?, credential_secret_name = ?, updated_by = ?, updated_at = SYSUTCDATETIME()
-            WHEN NOT MATCHED THEN INSERT (id, provider, credential_secret_name, updated_by) VALUES (1, ?, ?, ?);
+            WHEN MATCHED THEN UPDATE SET provider = ?, credential_secret_name = ?, updated_by = ?, credential_kind = ?, updated_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN INSERT (id, provider, credential_secret_name, updated_by, credential_kind) VALUES (1, ?, ?, ?, ?);
             """,
-            provider, credential_secret_name, updated_by,
-            provider, credential_secret_name, updated_by,
+            provider, credential_secret_name, updated_by, credential_kind,
+            provider, credential_secret_name, updated_by, credential_kind,
+        )
+
+
+async def record_validation_result(ok: bool) -> None:
+    """I-1's periodic re-probe write-back: a plain UPDATE, deliberately not routed through
+    set_org_settings's MERGE above -- this only ever runs against an already-existing row (there is
+    nothing to (re)validate before some provider/credential has been saved at least once), and a
+    bare UPDATE can't accidentally resurrect a deleted row or touch provider/credential_secret_name/
+    credential_kind, which this call has no opinion on. Called from sessions_api._org_settings_
+    response()'s staleness check, never from the PUT path -- see that function's own docstring."""
+    pool = await session_store._get_pool()  # noqa: SLF001
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE dbo.org_settings SET last_validation_ok = ?, last_validated_at = SYSUTCDATETIME() WHERE id = 1",
+            ok,
         )
 
 
@@ -78,11 +109,28 @@ def _demo() -> None:
         credential_secret_name="org-claude-api-key",
         updated_at=datetime(2026, 8, 21, 12, 0, 0),
         updated_by="octocat",
+        credential_kind="oauth",
+        last_validation_ok=True,
+        last_validated_at=datetime(2026, 8, 21, 12, 0, 0),
     )
     assert settings.provider == "claude", settings
     assert settings.credential_secret_name == "org-claude-api-key", settings
     assert settings.updated_at == datetime(2026, 8, 21, 12, 0, 0), settings
     assert settings.updated_by == "octocat", settings
+    assert settings.credential_kind == "oauth", settings
+    assert settings.last_validation_ok is True, settings
+
+    # credential_kind/last_validation_ok/last_validated_at all default to None (migration 0007's
+    # three new nullable columns) -- a caller building an OrgSettings from a pre-0007 row (or from
+    # any SELECT that hasn't been widened, if one is ever added later) must not be forced to name
+    # them, and must get None rather than a constructor error.
+    defaulted = OrgSettings(
+        provider="claude", credential_secret_name="org-claude-api-key",
+        updated_at=datetime(2026, 8, 21, 12, 0, 0), updated_by="octocat",
+    )
+    assert defaulted.credential_kind is None, defaulted
+    assert defaulted.last_validation_ok is None, defaulted
+    assert defaulted.last_validated_at is None, defaulted
 
     # frozen=True must actually block mutation, not just be decorative.
     try:

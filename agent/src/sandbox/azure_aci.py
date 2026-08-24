@@ -150,6 +150,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
         work_branch: str,
         git_user_token: str,
         runtime_auth_token: str,
+        runtime_auth_kind: str | None = None,
         image: str | None = None,
         scaffold_new_repo: bool = False,
         project_name: str | None = None,
@@ -215,6 +216,17 @@ class AzureContainerInstanceProvider(SandboxProvider):
             # group with that name still exists.
             await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
 
+            # Phase E audit C-1: exactly one of ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN is ever
+            # passed to `--secure-environment-variables` below -- the other is omitted from argv
+            # entirely, never passed as `NAME=` (empty). Mirrors local_docker.py's identical fix;
+            # see provider.py's provision() docstring for why an empty-string sibling is avoided
+            # rather than treated as harmless, unlike COPILOT_GITHUB_TOKEN's own real-or-empty
+            # pattern just below.
+            claude_env_args: list[str] = []
+            if provider == "claude":
+                claude_var_name = "CLAUDE_CODE_OAUTH_TOKEN" if runtime_auth_kind == "oauth" else "ANTHROPIC_API_KEY"
+                claude_env_args = [f"{claude_var_name}={runtime_auth_token}"]
+
             args = [
                 "container", "create",
                 "--resource-group", self._resource_group,
@@ -242,9 +254,11 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 "--secure-environment-variables",
                 f"REPO_CLONE_URL={repo_clone_url}",
                 f"GIT_USER_TOKEN={git_user_token}",
-                # Both set unconditionally, one real one empty, so this call never needs to branch
-                # on provider itself -- the sandbox-image entrypoint is what picks which one it
-                # actually needs. Harmless unused env either way.
+                # COPILOT_GITHUB_TOKEN is set unconditionally, real or empty, so this call never
+                # needs to branch on provider for THIS one name -- the sandbox-image entrypoint is
+                # what picks whether it actually needs it. Harmless unused env when empty. The
+                # Claude side (claude_env_args, spliced in below) does NOT follow this same
+                # always-both pattern -- see that block's own comment above.
                 #
                 # COPILOT_GITHUB_TOKEN, not COPILOT_SDK_AUTH_TOKEN (task-12-report.md BUG B) and
                 # not plain GITHUB_TOKEN either (task-12b fix-round-1): the real Copilot CLI's own
@@ -264,7 +278,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 # Task 3 fully retired that process, and this line is the one place that never got
                 # updated to match (mirrors local_docker.py's identical fix).
                 f"COPILOT_GITHUB_TOKEN={runtime_auth_token if provider == 'copilot' else ''}",
-                f"ANTHROPIC_API_KEY={runtime_auth_token if provider == 'claude' else ''}",
+                *claude_env_args,
             ]
             if self._location:
                 args += ["--location", self._location]

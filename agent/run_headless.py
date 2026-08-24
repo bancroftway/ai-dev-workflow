@@ -92,7 +92,7 @@ async def run(args: argparse.Namespace) -> int:
     # `provider` to the SandboxProvider connection object (below), and chat_model.py's own
     # read_skill_invocations uses this exact same disambiguation for the identical collision.
     active_provider = await chat_model.get_provider()
-    runtime_auth_token = await chat_model.get_runtime_auth_token()
+    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token()
     if not git_token or not runtime_auth_token:
         token_env_var = "ANTHROPIC_API_KEY" if active_provider == "claude" else "GITHUB_TOKEN"
         logger.error("E2E_GITHUB_TOKEN and %s must both be set (root .env)", token_env_var)
@@ -130,6 +130,7 @@ async def run(args: argparse.Namespace) -> int:
         work_branch=branch_naming.work_branch_for(thread_id),
         git_user_token=git_token,
         runtime_auth_token=runtime_auth_token,
+        runtime_auth_kind=runtime_auth_kind,
     )
     registry.set(thread_id, session)
     git_ops.set_push_token(thread_id, git_token)

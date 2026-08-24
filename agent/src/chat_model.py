@@ -204,11 +204,12 @@ async def get_provider() -> str:
     return value
 
 
-async def get_runtime_auth_token() -> str:
+async def get_runtime_auth_token() -> tuple[str, str | None]:
     """The credential a sandboxed turn needs to authenticate as the CURRENTLY active provider's
-    CLI: the org's saved vault credential if an admin has configured one, else the same
-    provider-keyed env var get_provider()'s own fallback already implies (ANTHROPIC_API_KEY for
-    claude, GITHUB_TOKEN for copilot).
+    CLI, plus which of the two Claude credential shapes it is: the org's saved vault credential if
+    an admin has configured one, else the same provider-keyed env var get_provider()'s own fallback
+    already implies (ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN for claude, GITHUB_TOKEN for
+    copilot).
 
     Fixes a real gap: sessions_api.py and run_headless.py each hand-roll this exact
     `"claude" -> ANTHROPIC_API_KEY else GITHUB_TOKEN` choice today by reading chat_model.PROVIDER
@@ -216,6 +217,16 @@ async def get_runtime_auth_token() -> str:
     never reach a real session even once those call sites stop reading the now-removed PROVIDER
     constant -- Task 5's job is to point them at this function instead of their own copy of the
     logic.
+
+    Returns (value, kind). kind is "api_key" or "oauth" when provider == "claude" (Phase E audit
+    C-1: the sandbox must set exactly one of ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, never
+    both -- even one real + one empty, per the Spec's own precedence warning -- so a caller that
+    only gets the value back has no way to know which env var name to use). None when provider ==
+    "copilot", where the kind distinction doesn't apply. A saved vault credential with
+    credential_kind=NULL (a row written before migration 0007 added the column) is read as
+    "api_key" -- every credential saved before this feature existed was necessarily an API key,
+    since oauth mode didn't exist yet; treating NULL as "unknown" here would be dishonest, not
+    cautious.
 
     Same DB-failure fallback as get_provider() (whole-branch review Critical finding): this
     function calls org_settings.get_org_settings() a SECOND time on its own (get_provider() above
@@ -238,11 +249,23 @@ async def get_runtime_auth_token() -> str:
         settings = None
 
     if settings is not None and settings.credential_secret_name is not None:
-        return await org_credential_vault.get_org_credential(settings.credential_secret_name)
+        value = await org_credential_vault.get_org_credential(settings.credential_secret_name)
+        kind = (settings.credential_kind or "api_key") if provider == "claude" else None
+        return value, kind
 
     if provider == "claude":
-        return os.environ.get("ANTHROPIC_API_KEY", "")
-    return os.environ.get("GITHUB_TOKEN", "")
+        # ANTHROPIC_API_KEY checked first, matching the Claude CLI's own documented
+        # precedence (Spec "Auth: API key vs. subscription") rather than inventing a different
+        # tie-break at this layer -- a deployment that (mis)configures both env vars gets the
+        # same winner here as it would inside the sandbox.
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            return api_key, "api_key"
+        oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        if oauth_token:
+            return oauth_token, "oauth"
+        return "", "api_key"
+    return os.environ.get("GITHUB_TOKEN", ""), None
 
 
 def get_chat_model_for_thread(
@@ -500,6 +523,7 @@ def _demo() -> None:
     original_get_org_credential = org_credential_vault.get_org_credential
     original_agent_provider_env = os.environ.get("AGENT_PROVIDER")
     original_anthropic_env = os.environ.get("ANTHROPIC_API_KEY")
+    original_oauth_env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     original_github_env = os.environ.get("GITHUB_TOKEN")
 
     try:
@@ -570,7 +594,7 @@ def _demo() -> None:
 
         # secret_env_names (sync): each provider returns a different literal set (see each
         # module's own docstring for why the shared name means two different things per provider).
-        assert secret_env_names(provider="claude") == {"ANTHROPIC_API_KEY"}
+        assert secret_env_names(provider="claude") == {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}
         assert secret_env_names(provider="copilot") == {
             "COPILOT_SDK_AUTH_TOKEN",
             "COPILOT_CONNECTION_TOKEN",
@@ -628,13 +652,18 @@ def _demo() -> None:
                 "mid-run staleness bug"
             )
 
-        # === 3. get_runtime_auth_token(): vault path + env-var fallback path. ===
+        # === 3. get_runtime_auth_token(): vault path + env-var fallback path, now also proving
+        # the (value, kind) round-trip Phase E audit C-1 added -- each branch gets its own
+        # assertion on BOTH halves of the tuple, since a regression could plausibly get the value
+        # right while silently dropping/mislabeling kind (exactly the bug this tuple exists to
+        # prevent: a caller that only looked at the value would never notice). ===
         async def _stub_settings_with_secret():
             return org_settings.OrgSettings(
                 provider="claude",
                 credential_secret_name="org-provider-credential",
                 updated_at=datetime(2026, 8, 21, 12, 0, 0),
                 updated_by="admin",
+                credential_kind="oauth",
             )
 
         async def _stub_get_org_credential(secret_name: str) -> str:
@@ -645,8 +674,24 @@ def _demo() -> None:
         org_credential_vault.get_org_credential = _stub_get_org_credential
         _force_provider("claude")
         assert asyncio.run(get_provider()) == "claude"
-        token = asyncio.run(get_runtime_auth_token())
-        assert token == "vault-secret-value", f"expected the vault-fetched credential, got {token!r}"
+        value, kind = asyncio.run(get_runtime_auth_token())
+        assert value == "vault-secret-value", f"expected the vault-fetched credential, got {value!r}"
+        assert kind == "oauth", f"expected the vault row's own credential_kind='oauth', got {kind!r}"
+
+        # Same vault row, credential_kind=NULL (a row written before migration 0007) -- must read
+        # as "api_key", not None/"unknown" (every pre-0007 credential was necessarily an API key).
+        async def _stub_settings_null_kind():
+            return org_settings.OrgSettings(
+                provider="claude",
+                credential_secret_name="org-provider-credential",
+                updated_at=datetime(2026, 8, 21, 12, 0, 0),
+                updated_by="admin",
+                credential_kind=None,
+            )
+
+        org_settings.get_org_settings = _stub_settings_null_kind
+        _, kind = asyncio.run(get_runtime_auth_token())
+        assert kind == "api_key", f"a pre-0007 row (credential_kind=NULL) must default to 'api_key', got {kind!r}"
 
         # Claude + no configured secret: must fall back to ANTHROPIC_API_KEY, not the vault and
         # not the other provider's env var. Symmetric with the copilot case below -- both no-secret
@@ -662,9 +707,21 @@ def _demo() -> None:
 
         org_settings.get_org_settings = _stub_settings_claude_no_secret
         os.environ["ANTHROPIC_API_KEY"] = "anthropic-test-token"
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         _force_provider("claude")
-        token = asyncio.run(get_runtime_auth_token())
-        assert token == "anthropic-test-token", f"expected ANTHROPIC_API_KEY fallback, got {token!r}"
+        value, kind = asyncio.run(get_runtime_auth_token())
+        assert value == "anthropic-test-token", f"expected ANTHROPIC_API_KEY fallback, got {value!r}"
+        assert kind == "api_key", f"ANTHROPIC_API_KEY fallback must report kind='api_key', got {kind!r}"
+
+        # Claude + no configured secret + no ANTHROPIC_API_KEY but a CLAUDE_CODE_OAUTH_TOKEN is
+        # set: the env-var fallback's second branch (C-1's bicep sibling param lands here) --
+        # its own line, needs its own proof, not covered by the ANTHROPIC_API_KEY case above.
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-test-token"
+        value, kind = asyncio.run(get_runtime_auth_token())
+        assert value == "oauth-test-token", f"expected CLAUDE_CODE_OAUTH_TOKEN fallback, got {value!r}"
+        assert kind == "oauth", f"CLAUDE_CODE_OAUTH_TOKEN fallback must report kind='oauth', got {kind!r}"
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
 
         async def _stub_settings_no_secret():
             return org_settings.OrgSettings(
@@ -677,8 +734,9 @@ def _demo() -> None:
         org_settings.get_org_settings = _stub_settings_no_secret
         os.environ["GITHUB_TOKEN"] = "gh-test-token"
         _force_provider("copilot")
-        token = asyncio.run(get_runtime_auth_token())
-        assert token == "gh-test-token", f"expected GITHUB_TOKEN fallback, got {token!r}"
+        value, kind = asyncio.run(get_runtime_auth_token())
+        assert value == "gh-test-token", f"expected GITHUB_TOKEN fallback, got {value!r}"
+        assert kind is None, f"copilot's kind is not a concept -- expected None, got {kind!r}"
 
         # === 4. Unknown provider value fails loud, same as the old import-time if/elif/else. ===
         try:
@@ -696,6 +754,7 @@ def _demo() -> None:
         for name, original in (
             ("AGENT_PROVIDER", original_agent_provider_env),
             ("ANTHROPIC_API_KEY", original_anthropic_env),
+            ("CLAUDE_CODE_OAUTH_TOKEN", original_oauth_env),
             ("GITHUB_TOKEN", original_github_env),
         ):
             if original is None:

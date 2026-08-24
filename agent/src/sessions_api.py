@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -217,7 +217,19 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     # new session is exactly the moment a live setting change should take effect (Ruling 2), so
     # this reads fresh via get_runtime_auth_token() rather than a pinned state["provider"] -- there
     # is no GraphState here yet, this runs before intake_node ever does.
-    runtime_auth_token = await chat_model.get_runtime_auth_token()
+    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token()
+    if not runtime_auth_token:
+        # I-2(c), the real backstop (whole-branch review): a session with no usable credential
+        # used to sail straight into provider.provision() -- minutes of container boot/clone/
+        # bootstrap, then a confusing auth failure buried inside the first CLI turn. Mirrors
+        # run_headless.py's own pre-existing gate (its "E2E_GITHUB_TOKEN and %s must both be set"
+        # check) -- that entry point already fails fast on exactly this; the one real users hit
+        # (this one) did not, until now. The Settings-UI banner (I-2 a/b) is the advisory version
+        # of this same check; this 409 is what actually enforces it when the banner goes unread.
+        raise HTTPException(
+            status_code=409,
+            detail="no coding-agent credential configured for this organization -- set one in Settings",
+        )
     try:
         session = await provider.provision(
             session_id=body.thread_id,
@@ -226,6 +238,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             work_branch=work_branch,
             git_user_token=body.github_token,
             runtime_auth_token=runtime_auth_token,
+            runtime_auth_kind=runtime_auth_kind,
             scaffold_new_repo=scaffold_new_repo,
             project_name=project["name"] if scaffold_new_repo else None,
         )
@@ -563,9 +576,60 @@ class OrgSettingsResponse(BaseModel):
 
     provider: str
     credential_configured: bool
+    # None until a credential has actually been saved (mirrors credential_configured=False), or
+    # for a provider="copilot" row, where the api_key/oauth distinction doesn't apply (C-1). Lets
+    # the Settings UI (page.tsx) pre-select the right billing-mode radio on load instead of always
+    # defaulting to "Subscription" the moment a saved Claude credential exists.
+    credential_kind: str | None
     session_ready: bool
     updated_at: datetime | None
     updated_by: str | None
+
+
+# I-1 (lazy version, whole-branch review): re-probing a saved credential on every settings-page
+# load or session provision would add real latency/cost to a hot path for a check that changes
+# rarely -- an hour-old "still valid" answer is plenty fresh for a banner. Not a scheduler either
+# (new machinery for a once-an-hour check) -- just a staleness gate in front of the SAME probe
+# _probe_provider_credential already runs at save time, folded into the one place that already
+# computes session_ready.
+_VALIDATION_STALENESS = timedelta(hours=1)
+
+
+async def _maybe_reprobe_credential(settings: org_settings.OrgSettings) -> bool | None:
+    """I-1: re-run the save-time probe against the CURRENTLY saved credential when it's never been
+    checked or the check is over an hour old, and persist the result -- so a credential that was
+    valid at save time but got revoked/rotated later actually flips session_ready to False instead
+    of staying silently green forever (Spec Verification 10).
+
+    Returns None when there's nothing to (re)probe: no credential saved (env-var-only deployment --
+    those were never probed at save time either, see put_org_settings_endpoint), or an oauth-kind
+    credential (C-1: no live probe exists for a subscription token -- see
+    _probe_provider_credential's own docstring for why inventing one isn't done here either;
+    session_ready for that case honestly stays on the plain non-emptiness check, same as before this
+    function existed). Otherwise returns the freshly-observed (or still-fresh-enough cached) ok/not-
+    ok. Failures while re-probing (network, vault) are treated as NOT ok and logged, not raised --
+    this runs inside a GET's response-building path, and a stale-check hiccup must surface as "not
+    ready", never as a 500 on the settings page itself.
+    """
+    if settings.credential_secret_name is None:
+        return None
+    kind = settings.credential_kind or "api_key"
+    if kind == "oauth":
+        return None
+    if settings.last_validated_at is not None and (
+        datetime.utcnow() - settings.last_validated_at < _VALIDATION_STALENESS
+    ):
+        return settings.last_validation_ok
+
+    try:
+        value = await org_credential_vault.get_org_credential(settings.credential_secret_name)
+        await _probe_provider_credential(settings.provider, value, kind=kind)
+        ok = True
+    except Exception:
+        logger.warning("periodic org-credential re-validation failed (I-1)", exc_info=True)
+        ok = False
+    await org_settings.record_validation_result(ok)
+    return ok
 
 
 async def _org_settings_response() -> OrgSettingsResponse:
@@ -585,13 +649,24 @@ async def _org_settings_response() -> OrgSettingsResponse:
     alarm on every env-var-only deployment. A raised exception here (e.g. a configured vault
     credential whose vault is currently unreachable) means sessions genuinely cannot run right
     now -- fails closed to False, the same posture as this module's other credential checks.
+
+    I-1: session_ready now also folds in _maybe_reprobe_credential's periodic re-validation, not
+    just the plain non-emptiness check -- a revoked vault-stored api_key credential flips
+    session_ready to False here even though get_runtime_auth_token() still happily returns its
+    (stale, now-rejected) string value.
     """
     settings = await org_settings.get_org_settings()
     try:
-        session_ready = bool(await chat_model.get_runtime_auth_token())
+        runtime_value, _runtime_kind = await chat_model.get_runtime_auth_token()
+        session_ready = bool(runtime_value)
     except Exception:
         logger.warning("get_runtime_auth_token() failed while building the org-settings response", exc_info=True)
         session_ready = False
+
+    if session_ready and settings is not None:
+        validation_ok = await _maybe_reprobe_credential(settings)
+        if validation_ok is False:
+            session_ready = False
 
     if settings is None:
         # Fresh deployment, nobody has saved a setting yet -- the exact same env-var fallback
@@ -600,6 +675,7 @@ async def _org_settings_response() -> OrgSettingsResponse:
         return OrgSettingsResponse(
             provider=os.environ.get("AGENT_PROVIDER", "copilot"),
             credential_configured=False,
+            credential_kind=None,
             session_ready=session_ready,
             updated_at=None,
             updated_by=None,
@@ -607,6 +683,7 @@ async def _org_settings_response() -> OrgSettingsResponse:
     return OrgSettingsResponse(
         provider=settings.provider,
         credential_configured=settings.credential_secret_name is not None,
+        credential_kind=settings.credential_kind,
         session_ready=session_ready,
         updated_at=settings.updated_at,
         updated_by=settings.updated_by,
@@ -624,6 +701,11 @@ class OrgSettingsPutRequest(BaseModel):
     # None/omitted means "keep whatever's already saved" (the masked-dots-plus-Update-button UI
     # pattern) -- only a non-None value here triggers the save-and-test-fetch below.
     credential: str | None = None
+    # C-1: which of the two Claude billing modes `credential` is. Only meaningful when
+    # provider == "claude"; ignored for copilot. None means "not specified" -- defaults to
+    # "api_key" below (instruction: null kind = api_key, same rule the Settings UI applies for an
+    # existing saved row with no recorded kind).
+    credential_kind: Literal["api_key", "oauth"] | None = None
     # Mirrors VaultConfigPutRequest's own user_login above: who to attribute this save to. Not
     # derivable from anything this agent process itself knows -- there is no end-user session at
     # this layer, only the shared-secret check that authenticates "the Next.js server", not "which
@@ -646,7 +728,20 @@ _ANTHROPIC_API_VERSION = "2023-06-01"
 _GITHUB_USER_URL = "https://api.github.com/user"
 
 
-async def _probe_provider_credential(provider: str, value: str) -> None:
+# C-1: a subscription (oauth) token has no equivalent "GET something and check for 200" endpoint
+# citable against real evidence. Checked the installed Claude CLI's own --help/docs surface (the
+# only surface this task's brief allows checking for this) -- `claude --help`'s only auth-adjacent
+# commands are `setup-token` (mints the token interactively, no validation mode) and `auth status`
+# (reads the CLI's own local keychain/config, not a network call this endpoint could make on its
+# behalf). Neither documents a standalone HTTP endpoint that accepts a bare `sk-ant-oat...` token.
+# No network call is made with a fabricated token to "see what happens" -- that would be inventing
+# evidence, not finding it. So: shape-only validation for oauth, honestly recorded as such in both
+# this function's own behavior and put_org_settings_endpoint's log line below, not disguised as an
+# equivalent check to the api_key probe.
+_OAUTH_TOKEN_PREFIX = "sk-ant-oat"
+
+
+async def _probe_provider_credential(provider: str, value: str, *, kind: str | None = None) -> None:
     """Ruling 3's actual validation gate: one lightweight GET against the TARGET PROVIDER's own
     API -- deliberately not just a Key Vault round trip, which would only prove our own vault
     plumbing works, never that the admin didn't just paste a typo'd or already-revoked key. This
@@ -654,7 +749,25 @@ async def _probe_provider_credential(provider: str, value: str) -> None:
     constants just above for why these two specific endpoints were chosen. Raises HTTPException
     with the provider's own real response on any failure; the credential value itself never
     appears in the raised detail, only the provider's own response body/status.
+
+    kind matters only for provider == "claude": "oauth" skips the live probe entirely (see
+    _OAUTH_TOKEN_PREFIX's own comment for why one doesn't exist here) and instead only checks that
+    the value is non-empty, with the documented `sk-ant-oat` prefix treated as a soft hint (logged,
+    not enforced -- Anthropic could change that prefix without this becoming a hard validation
+    error for a token that otherwise works fine). "api_key" (the default) and copilot both keep the
+    existing live-probe behavior, unchanged.
     """
+    if provider == "claude" and kind == "oauth":
+        if not value:
+            raise HTTPException(status_code=422, detail="oauth token must not be empty")
+        if not value.startswith(_OAUTH_TOKEN_PREFIX):
+            logger.warning(
+                "saved Claude oauth credential does not start with the documented %r prefix -- "
+                "accepted anyway (shape hint only, not enforced)",
+                _OAUTH_TOKEN_PREFIX,
+            )
+        return
+
     if provider == "claude":
         url = _ANTHROPIC_MODELS_URL
         headers = {"x-api-key": value, "anthropic-version": _ANTHROPIC_API_VERSION}
@@ -703,31 +816,59 @@ async def put_org_settings_endpoint(body: OrgSettingsPutRequest, request: Reques
     provider-agnostic (one fixed name for either provider's credential), so carrying last time's
     secret into a genuinely DIFFERENT provider would silently mark the new, wrong-typed credential
     as `credential_configured: true` with nothing having ever proven it works for that provider --
-    rejected outright below instead.
+    rejected outright below instead. C-1 extends this same guard to a same-provider CLAUDE billing-
+    mode switch with no new credential: an existing api_key-shaped secret relabeled "oauth" (or vice
+    versa) with nothing having validated it AS that kind is the identical hazard one level down --
+    worse for a switch TO oauth specifically, since C-1's own probe skips live validation for that
+    kind, so nothing would ever catch the mismatch later either.
     """
     _check_shared_secret(request)
     existing = await org_settings.get_org_settings()
     secret_name = existing.credential_secret_name if existing is not None else None
+    # Carried forward unchanged unless the `else` branch below (a genuinely new credential) sets
+    # it -- a PUT that only touches provider/updated_by must not blank out an already-recorded kind.
+    credential_kind = existing.credential_kind if existing is not None else None
 
     if body.credential is None:
-        if existing is not None and secret_name is not None and body.provider != existing.provider:
+        # Normalized the same way credential_kind's own dataclass comment says to: None (no
+        # existing row, or a pre-0007 row) reads as "api_key", never as "unknown" -- computed as
+        # its own name here specifically so the operator-precedence trap of inlining `x if y else
+        # None or z` (silently parsed as `x if y else (None or z)`, NOT `(x if y else None) or z`)
+        # can't quietly reintroduce a wrong default for the existing-row-with-NULL-kind case.
+        existing_kind = (existing.credential_kind if existing is not None else None) or "api_key"
+        kind_changing = (
+            body.provider == "claude"
+            and body.credential_kind is not None
+            and body.credential_kind != existing_kind
+        )
+        if existing is not None and secret_name is not None and (body.provider != existing.provider or kind_changing):
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "switching provider requires a new credential -- the currently saved "
-                    "credential belongs to the current provider and cannot carry over"
+                    "switching provider or Claude billing mode requires a new credential -- the "
+                    "currently saved credential belongs to the current provider/mode and cannot "
+                    "carry over"
                 ),
             )
     else:
         credential = body.credential.strip()
-        await _probe_provider_credential(body.provider, credential)
+        # Default a missing kind to "api_key" (same rule the Settings UI applies for an existing
+        # row with no recorded kind: null/omitted means the mode that existed before oauth did).
+        # None for copilot -- the kind distinction is meaningless there.
+        credential_kind = (body.credential_kind or "api_key") if body.provider == "claude" else None
+        await _probe_provider_credential(body.provider, credential, kind=credential_kind)
         try:
             secret_name = await org_credential_vault.set_org_credential(credential)
         except keyvault.VaultAccessError as exc:
             raise HTTPException(status_code=502, detail=f"org credential vault is not accessible: {exc}") from None
-        logger.info("org credential saved and validated for provider=%s", body.provider)
+        # Honest about what actually happened (C-1): "validated" for api_key/copilot, since a live
+        # probe ran; oauth only ever got a shape check, so it says so instead of implying parity.
+        validation_note = "validated" if credential_kind != "oauth" else "shape-checked (validated on first use)"
+        logger.info(
+            "org credential saved and %s for provider=%s kind=%s", validation_note, body.provider, credential_kind
+        )
 
-    await org_settings.set_org_settings(body.provider, secret_name, body.updated_by)
+    await org_settings.set_org_settings(body.provider, secret_name, body.updated_by, credential_kind)
     chat_model.invalidate_provider_cache()
     return await _org_settings_response()
 
@@ -1194,6 +1335,231 @@ def _demo() -> None:
                 await cur.execute("DELETE FROM dbo.projects WHERE project_id = ?", project_id)
 
     asyncio.run(_check_delete_survives_real_run_events())
+
+    # === Phase E audit C-1/I-1/I-2: org-settings credential-kind + validation-staleness + the
+    # provision 409 backstop. All against the REAL functions with only I/O boundaries (DB, vault,
+    # network) monkeypatched -- same technique as connect_project_route's own check above -- since
+    # dbo.org_settings is a real singleton row (id=1) on whatever DB this runs against, and this
+    # self-check must not touch (let alone clobber) that one real row. ===
+    global _probe_provider_credential  # reassigned further down; must precede every use in this function
+
+    # _probe_provider_credential's oauth branch (C-1): shape-only, no network call for either
+    # sub-case -- an empty value is rejected, a non-empty one is accepted without ever reaching
+    # the httpx.AsyncClient block below it (if it did, this call would need real network access
+    # and a real api.anthropic.com response, which this offline self-check has neither).
+    asyncio.run(_probe_provider_credential("claude", "sk-ant-oat-fake-for-selfcheck", kind="oauth"))
+    try:
+        asyncio.run(_probe_provider_credential("claude", "", kind="oauth"))
+        raise AssertionError("_probe_provider_credential must reject an empty oauth token")
+    except HTTPException as exc:
+        assert exc.status_code == 422, exc.status_code
+
+    # _maybe_reprobe_credential (I-1): the staleness gate in front of the probe, and the oauth
+    # no-probe-exists rule, each on their own real inputs -- no OrgSettings row ever touches a DB.
+    reprobe_calls: list[str] = []
+
+    async def _tracking_get_org_credential(secret_name: str) -> str:
+        reprobe_calls.append("get_org_credential")
+        return "fake-value"
+
+    async def _tracking_record_validation_result(ok: bool) -> None:
+        reprobe_calls.append(f"record_validation_result:{ok}")
+
+    original_get_org_credential = org_credential_vault.get_org_credential
+    original_record_validation_result = org_settings.record_validation_result
+    original_probe = _probe_provider_credential
+    org_credential_vault.get_org_credential = _tracking_get_org_credential  # type: ignore[assignment]
+    org_settings.record_validation_result = _tracking_record_validation_result  # type: ignore[assignment]
+    try:
+        # No credential saved at all -- nothing to (re)probe.
+        no_cred = org_settings.OrgSettings(
+            provider="claude", credential_secret_name=None, updated_at=datetime(2026, 1, 1), updated_by="a",
+        )
+        assert asyncio.run(_maybe_reprobe_credential(no_cred)) is None
+        assert reprobe_calls == [], f"nothing should have been probed for no_cred, got {reprobe_calls}"
+
+        # oauth kind -- C-1's own "no live probe exists" rule means this must also skip, even
+        # though a credential IS saved.
+        oauth_cred = org_settings.OrgSettings(
+            provider="claude", credential_secret_name="secret-1", credential_kind="oauth",
+            updated_at=datetime(2026, 1, 1), updated_by="a",
+        )
+        assert asyncio.run(_maybe_reprobe_credential(oauth_cred)) is None
+        assert reprobe_calls == [], f"oauth-kind must never probe, got {reprobe_calls}"
+
+        # api_key kind, validated 5 minutes ago -- well inside the 1-hour staleness window, so the
+        # cached last_validation_ok must come back WITHOUT a new probe.
+        fresh_cred = org_settings.OrgSettings(
+            provider="claude", credential_secret_name="secret-1", credential_kind="api_key",
+            updated_at=datetime(2026, 1, 1), updated_by="a",
+            last_validation_ok=True, last_validated_at=datetime.utcnow() - timedelta(minutes=5),
+        )
+        assert asyncio.run(_maybe_reprobe_credential(fresh_cred)) is True
+        assert reprobe_calls == [], f"a fresh (<1h) validation must not re-probe, got {reprobe_calls}"
+
+        # api_key kind, validated 2 hours ago -- stale, must re-probe and write the result back.
+        _probe_provider_credential = lambda provider, value, kind=None: asyncio.sleep(0)  # noqa: E731 -- succeeds
+        stale_cred = org_settings.OrgSettings(
+            provider="claude", credential_secret_name="secret-1", credential_kind="api_key",
+            updated_at=datetime(2026, 1, 1), updated_by="a",
+            last_validation_ok=True, last_validated_at=datetime.utcnow() - timedelta(hours=2),
+        )
+        assert asyncio.run(_maybe_reprobe_credential(stale_cred)) is True
+        assert reprobe_calls == ["get_org_credential", "record_validation_result:True"], reprobe_calls
+        reprobe_calls.clear()
+
+        # Same staleness, but the re-probe itself fails (revoked upstream, Spec Verification 10) --
+        # must come back False and still write the (negative) result back, not raise past this
+        # function or silently keep reporting the old True.
+        async def _failing_probe(provider: str, value: str, *, kind: str | None = None) -> None:
+            raise HTTPException(status_code=403, detail="revoked")
+
+        _probe_provider_credential = _failing_probe
+        assert asyncio.run(_maybe_reprobe_credential(stale_cred)) is False
+        assert reprobe_calls == ["get_org_credential", "record_validation_result:False"], reprobe_calls
+    finally:
+        org_credential_vault.get_org_credential = original_get_org_credential  # type: ignore[assignment]
+        org_settings.record_validation_result = original_record_validation_result  # type: ignore[assignment]
+        _probe_provider_credential = original_probe
+
+    # put_org_settings_endpoint's credential_kind round-trip + the kind-switch-without-a-new-
+    # credential 422 guard (C-1) -- the real route function, with only its I/O boundaries (DB
+    # read/write, vault write, live credential probe, chat_model's cache-invalidation + runtime-
+    # token read) stubbed. _probe_provider_credential's own REAL behavior (oauth shape-check vs.
+    # api_key live network probe) already has dedicated coverage above -- mocked here to a
+    # tracking no-op so this block can use a plain fake api_key string without it actually
+    # reaching api.anthropic.com and 401ing (real behavior, observed while first writing this
+    # check -- a fake credential is exactly what the real probe correctly rejects).
+    put_calls: list[tuple] = []
+    probe_calls: list[tuple] = []
+
+    async def _stub_set_org_settings(provider: str, secret_name: str | None, updated_by: str, credential_kind: str | None = None) -> None:
+        put_calls.append((provider, secret_name, credential_kind))
+
+    async def _stub_set_org_credential(value: str) -> str:
+        return "org-credential-secret"
+
+    async def _stub_get_runtime_auth_token() -> tuple[str, str | None]:
+        return "irrelevant-for-this-check", "oauth"
+
+    async def _tracking_probe_ok(provider: str, value: str, *, kind: str | None = None) -> None:
+        probe_calls.append((provider, kind))
+
+    def _existing_claude_api_key() -> org_settings.OrgSettings:
+        # last_validated_at deliberately "just now" -- keeps this stub inside _maybe_reprobe_
+        # credential's 1-hour freshness window (I-1), so put_org_settings_endpoint's own trailing
+        # `return await _org_settings_response()` takes the cached-answer branch and never reaches
+        # a real vault fetch/network probe/DB write. Those paths already have their own dedicated,
+        # explicitly-mocked coverage just above -- this block is only testing set_org_settings's
+        # credential_kind argument, not I-1's re-probe machinery a second time.
+        return org_settings.OrgSettings(
+            provider="claude", credential_secret_name="org-credential-secret", credential_kind="api_key",
+            updated_at=datetime(2026, 1, 1), updated_by="admin",
+            last_validation_ok=True, last_validated_at=datetime.utcnow(),
+        )
+
+    original_set_org_settings = org_settings.set_org_settings
+    original_set_org_credential = org_credential_vault.set_org_credential
+    original_get_runtime_auth_token = chat_model.get_runtime_auth_token
+    original_get_org_settings2 = org_settings.get_org_settings
+    original_probe2 = _probe_provider_credential
+    org_settings.set_org_settings = _stub_set_org_settings  # type: ignore[assignment]
+    org_credential_vault.set_org_credential = _stub_set_org_credential  # type: ignore[assignment]
+    chat_model.get_runtime_auth_token = _stub_get_runtime_auth_token  # type: ignore[assignment]
+    _probe_provider_credential = _tracking_probe_ok
+    try:
+        # A brand-new oauth credential, kind explicit -- set_org_settings must be called with
+        # credential_kind="oauth" (not silently defaulted, not dropped), and the probe must have
+        # been invoked with that same kind (the threading this whole finding is about).
+        async def _get_existing():
+            return _existing_claude_api_key()
+
+        org_settings.get_org_settings = _get_existing  # type: ignore[assignment]
+        asyncio.run(put_org_settings_endpoint(
+            OrgSettingsPutRequest(provider="claude", credential="sk-ant-oat-newtoken", credential_kind="oauth", updated_by="admin"),
+            _FakeRequest(),  # type: ignore[arg-type]
+        ))
+        assert put_calls[-1] == ("claude", "org-credential-secret", "oauth"), put_calls[-1]
+        assert probe_calls[-1] == ("claude", "oauth"), probe_calls[-1]
+
+        # A brand-new credential with NO kind specified -- must default to "api_key" (instruction:
+        # null kind = api_key), not None/"unknown".
+        asyncio.run(put_org_settings_endpoint(
+            OrgSettingsPutRequest(provider="claude", credential="sk-ant-new-api-key", updated_by="admin"),
+            _FakeRequest(),  # type: ignore[arg-type]
+        ))
+        assert put_calls[-1] == ("claude", "org-credential-secret", "api_key"), put_calls[-1]
+        assert probe_calls[-1] == ("claude", "api_key"), probe_calls[-1]
+
+        # Keep-existing PUT (credential=None, kind unspecified) against an existing api_key row --
+        # must carry the existing kind forward untouched, not blank it to None.
+        asyncio.run(put_org_settings_endpoint(
+            OrgSettingsPutRequest(provider="claude", updated_by="admin"),
+            _FakeRequest(),  # type: ignore[arg-type]
+        ))
+        assert put_calls[-1] == ("claude", "org-credential-secret", "api_key"), put_calls[-1]
+
+        # The new guard: switching billing mode (api_key -> oauth) with NO new credential must
+        # 422, the same shape as the pre-existing provider-switch guard just above it in the code.
+        try:
+            asyncio.run(put_org_settings_endpoint(
+                OrgSettingsPutRequest(provider="claude", credential_kind="oauth", updated_by="admin"),
+                _FakeRequest(),  # type: ignore[arg-type]
+            ))
+            raise AssertionError("switching billing mode with no new credential must 422")
+        except HTTPException as exc:
+            assert exc.status_code == 422, exc.status_code
+    finally:
+        org_settings.set_org_settings = original_set_org_settings  # type: ignore[assignment]
+        org_credential_vault.set_org_credential = original_set_org_credential  # type: ignore[assignment]
+        chat_model.get_runtime_auth_token = original_get_runtime_auth_token  # type: ignore[assignment]
+        org_settings.get_org_settings = original_get_org_settings2  # type: ignore[assignment]
+        _probe_provider_credential = original_probe2
+
+    # provision_session's 409 backstop (I-2c): an empty runtime_auth_token must fail fast, BEFORE
+    # ever reaching provider.provision() -- proven by making that call raise if it's ever reached,
+    # not just by catching the 409 (which a differently-broken function could also raise).
+    global get_sandbox_provider
+
+    class _ProvisionMustNotBeCalled:
+        async def provision(self, **kwargs: Any) -> Any:
+            raise AssertionError("provider.provision() must never be reached when the credential is empty")
+
+    async def _stub_get_session_none(thread_id: str) -> dict[str, Any] | None:
+        return None
+
+    async def _stub_get_vault_uri_none(owner: str, repo: str, user_login: str) -> str | None:
+        return None
+
+    async def _stub_get_project_existing(project_id: str) -> dict[str, Any] | None:
+        return {"project_id": project_id, "name": "proj", "repo": "existing-repo", "owner": "octocat"}
+
+    async def _stub_empty_runtime_auth_token() -> tuple[str, str | None]:
+        return "", None
+
+    original_get_session3 = session_store.get_session
+    original_get_vault_uri = keyvault.get_vault_uri
+    original_get_project = project_store.get_project
+    original_get_sandbox_provider = get_sandbox_provider
+    session_store.get_session = _stub_get_session_none  # type: ignore[assignment]
+    keyvault.get_vault_uri = _stub_get_vault_uri_none  # type: ignore[assignment]
+    project_store.get_project = _stub_get_project_existing  # type: ignore[assignment]
+    chat_model.get_runtime_auth_token = _stub_empty_runtime_auth_token  # type: ignore[assignment]
+    get_sandbox_provider = lambda: _ProvisionMustNotBeCalled()  # noqa: E731
+    try:
+        asyncio.run(provision_session(
+            ProvisionRequest(thread_id="t-selfcheck", project_id="p-selfcheck", owner="octocat", repo="existing-repo", branch="main"),
+            _FakeRequest(),  # type: ignore[arg-type]
+        ))
+        raise AssertionError("provision_session must 409 when no runtime auth credential is configured")
+    except HTTPException as exc:
+        assert exc.status_code == 409, exc.status_code
+    finally:
+        session_store.get_session = original_get_session3  # type: ignore[assignment]
+        keyvault.get_vault_uri = original_get_vault_uri  # type: ignore[assignment]
+        project_store.get_project = original_get_project  # type: ignore[assignment]
+        chat_model.get_runtime_auth_token = original_get_runtime_auth_token  # type: ignore[assignment]
+        get_sandbox_provider = original_get_sandbox_provider
 
     print("sessions_api self-check: all assertions passed")
 

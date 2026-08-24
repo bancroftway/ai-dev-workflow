@@ -41,9 +41,13 @@ param copilotGithubToken string
 @allowed(['copilot', 'claude'])
 param agentProvider string = 'copilot'
 
-@description('Anthropic API key for the Claude provider (agent/src/claude_chat_model.py). Left blank when agentProvider is \'copilot\' -- unused in that mode.')
+@description('Anthropic API key for the Claude provider, metered billing (agent/src/claude_chat_model.py). Left blank when agentProvider is \'copilot\' -- unused in that mode. Mutually exclusive with anthropicOAuthToken -- see that param\'s own description for the precedence rule if both are somehow set.')
 @secure()
 param anthropicApiKey string = ''
+
+@description('Anthropic subscription (Pro/Max/Team) OAuth token for the Claude provider, from `claude setup-token` (agent/src/chat_model.py\'s get_runtime_auth_token() env-var fallback path; Phase E audit C-1). Left blank when agentProvider is \'copilot\', or when the deployment bills by API key instead. Sibling of anthropicApiKey, same secret/env pattern -- deploy with exactly one of the two non-empty, never both: the Claude CLI\'s own documented precedence has ANTHROPIC_API_KEY win if both are set, and this container-level env var is only the FALLBACK anyway (agent/src/org_settings.py\'s Settings-UI-saved credential, if any, always wins over both once an admin has saved one).')
+@secure()
+param anthropicOAuthToken string = ''
 
 @description('Entra tenant id (single-tenant deployment).')
 param entraTenantId string
@@ -229,6 +233,7 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
       secrets: [
         { name: 'copilot-github-token', value: copilotGithubToken }
         { name: 'anthropic-api-key', value: anthropicApiKey }
+        { name: 'anthropic-oauth-token', value: anthropicOAuthToken }
         { name: 'entra-client-secret', value: entraClientSecret }
         { name: 'agent-shared-secret', value: agentSharedSecret }
       ]
@@ -244,6 +249,15 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
           env: [
             { name: 'GITHUB_TOKEN', secretRef: 'copilot-github-token' }
             { name: 'ANTHROPIC_API_KEY', secretRef: 'anthropic-api-key' }
+            // C-1 (Phase E audit): sibling of ANTHROPIC_API_KEY above, same secret/env pattern.
+            // This is the container-level FALLBACK only -- chat_model.get_runtime_auth_token()
+            // checks ANTHROPIC_API_KEY first, then this, and an org admin's Settings-UI-saved
+            // credential (org_settings.py) wins over both once one exists. Deploy with at most one
+            // of anthropicApiKey/anthropicOAuthToken actually non-empty for a given billing mode --
+            // this template sets both env vars unconditionally (empty string is harmless, same
+            // "both always set, one real one empty" convention as GITHUB_TOKEN/ANTHROPIC_API_KEY
+            // above), it's the deploy-time PARAMETER values that must not both be real.
+            { name: 'CLAUDE_CODE_OAUTH_TOKEN', secretRef: 'anthropic-oauth-token' }
             { name: 'AGENT_PROVIDER', value: agentProvider }
             { name: 'SANDBOX_PROVIDER', value: 'azure' }
             // On-behalf-of Key Vault exchange (agent/src/keyvault.py): the shared Entra app

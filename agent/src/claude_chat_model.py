@@ -851,13 +851,19 @@ def secret_env_names() -> set[str]:
     provisions the sandbox is the thing that must ensure this name is set there, and this function
     is how it discovers what name to set for this provider.
 
+    Two names, not one (Phase E audit C-1: the subscription/CLAUDE_CODE_OAUTH_TOKEN billing mode) --
+    but the sandbox still only ever sets exactly ONE of them for a given session, never both (see
+    sandbox/local_docker.py's/azure_aci.py's own provision() for why even a real+empty pair is
+    avoided, not just a real+real one). This function is a declaration of the two POSSIBLE names,
+    not a claim that both are simultaneously set.
+
     Re-exported as the same `secret_env_names()` symbol via chat_model.py for both providers, but
     NOT the same contract: copilot_chat_model.py's function of this name means something else
     entirely (a --secret-env-vars masking/redaction list for that turn's own shell output, not an
     auth-source declaration -- see that module's own docstring). A reader who only ever looks at
     one provider's version should not assume the other works the same way.
     """
-    return {"ANTHROPIC_API_KEY"}
+    return {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}
 
 
 def _demo() -> None:
