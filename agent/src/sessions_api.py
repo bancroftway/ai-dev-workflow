@@ -779,7 +779,9 @@ _GITHUB_USER_URL = "https://api.github.com/user"
 _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 
 
-async def _probe_provider_credential(provider: str, value: str, *, kind: str | None = None) -> None:
+async def _probe_provider_credential(
+    provider: str, value: str, *, kind: str | None = None, client: httpx.AsyncClient | None = None
+) -> None:
     """Ruling 3's actual validation gate: one lightweight GET against the TARGET PROVIDER's own
     API -- deliberately not just a Key Vault round trip, which would only prove our own vault
     plumbing works, never that the admin didn't just paste a typo'd or already-revoked key. This
@@ -787,6 +789,19 @@ async def _probe_provider_credential(provider: str, value: str, *, kind: str | N
     constants just above for why these two specific endpoints were chosen. Raises HTTPException
     with the provider's own real response on any failure; the credential value itself never
     appears in the raised detail, only the provider's own response body/status.
+
+    Raised status is a CLASSIFICATION, not just a passthrough of whatever the provider returned
+    (second Minor fix round): 401/403 (and claude's 422) mean the provider itself is saying the
+    credential is bad -- raised as a 403 here, which _maybe_reprobe_credential's caller treats as a
+    definitive rejection worth persisting. A connection-level failure, a 429 rate limit, or any 5xx
+    means the PROVIDER had a bad moment, not that the credential is bad -- all raised as a 502,
+    which that same caller preserves the prior verdict for instead of overwriting it to False. An
+    unrecognized status code is treated the same as the 502 case (logged, not raised as a
+    rejection) -- misclassifying an unknown status as definitive is the harmful direction.
+
+    `client` is test-only dependency injection (see this module's own _demo), same convention as
+    _fetch_default_branch's/repo_scaffold.create_repo's own `client` param -- every real call site
+    omits it, letting this build its own short-lived httpx.AsyncClient as before.
 
     kind matters only for provider == "claude": "oauth" skips the live probe entirely (see
     _OAUTH_TOKEN_PREFIX's own comment for why one doesn't exist here) and instead only checks that
@@ -817,19 +832,54 @@ async def _probe_provider_credential(provider: str, value: str, *, kind: str | N
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
+    try:
+        if client is None:
+            async with httpx.AsyncClient(timeout=30.0) as c:
+                resp = await c.get(url, headers=headers)
+        else:
             resp = await client.get(url, headers=headers)
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                status_code=502, detail=f"could not reach {provider}'s API to validate the credential: {exc}"
-            ) from None
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"could not reach {provider}'s API to validate the credential: {exc}"
+        ) from None
 
-    if resp.status_code != 200:
+    if resp.status_code == 200:
+        return
+
+    # Second Minor fix round (same shape as C-B, one layer up): a status code alone doesn't tell
+    # you whether the CREDENTIAL is bad or the PROVIDER is having a bad day -- classify before
+    # raising, since _maybe_reprobe_credential's caller-side fix only helps if what lands in its
+    # hands is actually shaped right (a definitive-rejection 403 vs. a transport-class 502).
+    if resp.status_code in (401, 403) or (provider == "claude" and resp.status_code == 422):
+        # Definitive: the provider itself says this credential is bad.
         raise HTTPException(
             status_code=403,
             detail=f"{provider} rejected the credential: {resp.status_code} {resp.text[:300]}",
         )
+    if resp.status_code == 429 or resp.status_code >= 500:
+        # Transport-class: a rate limit or an upstream outage proves nothing about the credential
+        # itself. Same 502 shape the connection-level failure above already raises, so
+        # _maybe_reprobe_credential's existing preserve-the-prior-verdict branch handles this with
+        # no changes on that side -- and, at save time, put_org_settings_endpoint surfaces this to
+        # the admin as "try again", not "your brand-new credential was rejected", which is the
+        # honest read of what actually happened.
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not validate the credential right now -- {provider} returned {resp.status_code} {resp.text[:300]}",
+        )
+    # Anything else unrecognized: lean transport-class (preserve the prior verdict on re-probe,
+    # "try again" on save) rather than definitive -- misclassifying an unknown status as a
+    # rejection is the harmful direction (it persists a possibly-good credential as invalid for an
+    # hour, or tells an admin their working credential is bad). Logged so an actually-new
+    # provider-side status code doesn't silently vanish into "try again" forever.
+    logger.warning(
+        "%s returned unexpected status %s while validating a credential -- treating as "
+        "transport-class, not a definitive rejection", provider, resp.status_code,
+    )
+    raise HTTPException(
+        status_code=502,
+        detail=f"could not validate the credential right now -- {provider} returned an unexpected {resp.status_code} {resp.text[:300]}",
+    )
 
 
 @org_settings_router.put("", response_model=OrgSettingsResponse)
@@ -1497,6 +1547,39 @@ def _demo() -> None:
         )
         assert reprobe_calls == ["get_org_credential"], reprobe_calls
         org_credential_vault.get_org_credential = _tracking_get_org_credential  # type: ignore[assignment]
+        reprobe_calls.clear()
+
+        # Second Minor fix round: the REAL classification (not a hand-rolled fake exception shape
+        # like the two cases above) -- an actual httpx.MockTransport response fed through the TRUE
+        # _probe_provider_credential (original_probe, captured before any monkeypatching in this
+        # block), proving the whole chain at once: the status-code classification itself, AND
+        # _maybe_reprobe_credential's handling of whatever it produces.
+        def _probe_returning_status(status: int):
+            async def _wrapped(provider: str, value: str, *, kind: str | None = None) -> None:
+                client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status)))
+                try:
+                    await original_probe(provider, value, kind=kind, client=client)
+                finally:
+                    await client.aclose()
+            return _wrapped
+
+        # 401 -- the common revocation signal (re-review's own words) -- pinned explicitly:
+        # definitive, must persist False.
+        _probe_provider_credential = _probe_returning_status(401)
+        assert asyncio.run(_maybe_reprobe_credential(stale_cred)) is False, "a 401 must persist False"
+        assert reprobe_calls == ["get_org_credential", "record_validation_result:False"], reprobe_calls
+        reprobe_calls.clear()
+
+        # 429 rate-limit -- the exact gap the review found -- transport-class: must preserve the
+        # prior verdict (True), not flip it to False.
+        _probe_provider_credential = _probe_returning_status(429)
+        assert asyncio.run(_maybe_reprobe_credential(stale_cred)) is True, (
+            "a 429 rate-limit must preserve the prior verdict, not flip it to False"
+        )
+        assert reprobe_calls == ["get_org_credential"], (
+            f"a 429 rate-limit must NOT call record_validation_result, got {reprobe_calls}"
+        )
+        reprobe_calls.clear()
     finally:
         org_credential_vault.get_org_credential = original_get_org_credential  # type: ignore[assignment]
         org_settings.record_validation_result = original_record_validation_result  # type: ignore[assignment]
