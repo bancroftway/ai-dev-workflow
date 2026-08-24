@@ -16,8 +16,10 @@ implementation reads that session's own real CLI transcript inside the sandbox
 unconditionally returns None: the old SDK-server session log this gate used to read
 (~/.copilot/session-state/<session-id>/events.jsonl, written by a persistent `copilot --server`
 process) was retired along with that process, and no CLI-exec equivalent exists yet -- so under
-the default (Copilot) provider this gate cannot verify anything today. That is the fail-open
-contract below doing its job, not an oversight.
+the Copilot provider this gate cannot verify anything today. That is the fail-open contract below
+doing its job, not an oversight -- and it is WHY the deployment default flipped to Claude
+(user decision 2026-08-24, Phase E audit M-3): the default posture should be the provider whose
+gate actually enforces.
 
 Fails OPEN when it cannot verify (no sandbox, no session id, unreadable log): an infrastructure
 gap must not masquerade as a methodology violation. It only fails CLOSED on positive evidence that
@@ -103,7 +105,7 @@ async def check_required_skills(
                 invoked.append(skill)
 
     if not any_readable:
-        # Was logger.info. Under the default (Copilot) provider this fires for every
+        # Was logger.info. Under the Copilot provider this fires for every
         # skill-checked stage, every run, permanently (read_skill_invocations() unconditionally
         # returns None there -- see its own docstring) -- a silent, PERMANENT non-enforcement, not
         # a transient hiccup, and info buried it. Nothing here distinguishes that from a

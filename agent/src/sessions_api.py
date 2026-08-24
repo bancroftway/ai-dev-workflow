@@ -756,7 +756,7 @@ async def _org_settings_response() -> OrgSettingsResponse:
         # chat_model.get_provider() itself falls back to, so this page's "active provider" can
         # never disagree with what a real session would actually run under.
         return OrgSettingsResponse(
-            provider=os.environ.get("AGENT_PROVIDER", "copilot"),
+            provider=os.environ.get("AGENT_PROVIDER", "claude"),
             credential_configured=False,
             credential_kind=None,
             session_ready=session_ready,

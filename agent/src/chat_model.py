@@ -151,7 +151,7 @@ async def get_provider() -> str:
     _PROVIDER_CACHE_TTL_SECONDS.
 
     Reads org_settings.get_org_settings() on a cold/expired cache; falls back to
-    os.environ.get("AGENT_PROVIDER", "copilot") when that returns None (a fresh deployment whose
+    os.environ.get("AGENT_PROVIDER", "claude") when that returns None (a fresh deployment whose
     admin hasn't visited the Settings UI yet -- org_settings.get_org_settings's own docstring notes
     this is exactly where that fallback belongs). This is the ONLY place in this module that ever
     hits the DB. Per Ruling 4, the 7 dispatch functions below no longer call this themselves --
@@ -185,7 +185,10 @@ async def get_provider() -> str:
                 exc_info=True,
             )
             return _provider_cache[0]
-        fallback = os.environ.get("AGENT_PROVIDER", "copilot")
+        # Default "claude", not "copilot": user decision 2026-08-24 -- Claude's skill gate is the
+        # live one (Copilot's headless CLI has no known invocation log, so its gate fail-opens
+        # permanently; Phase E audit M-3), making Claude the safer default posture.
+        fallback = os.environ.get("AGENT_PROVIDER", "claude")
         logger.warning(
             "org_settings.get_org_settings() failed with no prior cached value; falling back to "
             "AGENT_PROVIDER=%r",
@@ -198,7 +201,7 @@ async def get_provider() -> str:
         # value is first dispatched. Warning logged first so there's a breadcrumb either way.
         return fallback
 
-    value = settings.provider if settings is not None else os.environ.get("AGENT_PROVIDER", "copilot")
+    value = settings.provider if settings is not None else os.environ.get("AGENT_PROVIDER", "claude")
     _provider_module(value)  # fail fast on an unrecognized value, before caching it
     _provider_cache = (value, time.monotonic())
     return value

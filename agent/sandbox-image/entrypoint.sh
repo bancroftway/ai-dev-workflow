@@ -217,10 +217,11 @@ fi
 # here -- both are driven by a per-turn `docker exec`/`az container exec` from outside (see this
 # file's own header comment, responsibility #2) -- so the only provider-specific thing left is
 # which credential gets warned about when empty. An unrecognized AGENT_PROVIDER value falls
-# through to the copilot-shaped warning below rather than crashing the container here;
+# through to the copilot-shaped warning below rather than crashing the container here (an
+# unrecognized value fails the [[ == "claude" ]] test, so it lands in the else arm);
 # chat_model.py's own dispatch already raises ValueError the moment a session actually tries to
 # use it, which is the right layer to fail loudly at, not this script.
-AGENT_PROVIDER="${AGENT_PROVIDER:-copilot}"
+AGENT_PROVIDER="${AGENT_PROVIDER:-claude}"
 if [[ "$AGENT_PROVIDER" == "claude" ]]; then
   # Phase E audit C-1: the sandbox now sets exactly ONE of ANTHROPIC_API_KEY /
   # CLAUDE_CODE_OAUTH_TOKEN (local_docker.py/azure_aci.py's provision() -- never both, not even

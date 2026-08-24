@@ -39,7 +39,7 @@ param copilotGithubToken string
 
 @description('Fallback coding-agent provider, used only until an org admin saves a setting via the Settings UI (agent/src/org_settings.py), or if that DB read ever fails. agent/src/chat_model.py\'s get_provider() checks the database first and falls back to this env var second -- it is NOT a startup-only, immutable choice: an admin can change the live provider without a redeploy (Part 4).')
 @allowed(['copilot', 'claude'])
-param agentProvider string = 'copilot'
+param agentProvider string = 'claude'
 
 @description('Anthropic API key for the Claude provider, metered billing (agent/src/claude_chat_model.py). Left blank when agentProvider is \'copilot\' -- unused in that mode. Mutually exclusive with anthropicOAuthToken -- see that param\'s own description for the precedence rule if both are somehow set.')
 @secure()
