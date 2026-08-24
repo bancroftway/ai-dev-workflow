@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from dataclasses import replace
 from typing import Any
@@ -79,6 +80,71 @@ async def append_event(event: RunEvent) -> RunEvent:
             event.run_id, event.stage, event.node, exc_info=True,
         )
         return event
+
+
+async def append_events(events: list[RunEvent]) -> list[RunEvent]:
+    """Batch counterpart to append_event (Phase E audit finding 5): one multi-row INSERT for a
+    whole turn's worth of events instead of N sequential round-trips. Both chat models' per-tool-
+    call translation loops (claude_chat_model.py, copilot_chat_model.py) call this once per turn
+    with the whole translated list, then still call run_event_stream.emit_live per event
+    afterward -- that dispatch is in-process, not a DB write, so the Spec's "batched... not one
+    write per X" requirement is about THIS function, not about making emit_live batch too.
+
+    Same fail-soft-swallow contract as append_event (its own docstring): a DB blip must never
+    abort the LLM-cost-incurring node that produced these events. On failure, returns `events`
+    unchanged (seq/ts left as whatever the caller passed in, normally None) instead of raising.
+
+    Empty list in, empty list out, no query issued -- an empty VALUES clause is invalid SQL and
+    there is nothing to batch.
+
+    Row-to-event correlation: the returned rows are sorted by `seq` ascending before zipping
+    against `events` in the caller's own list order. This is deliberately NOT "trust whatever
+    order OUTPUT/fetchall() hand back" -- Microsoft's own docs do not contractually guarantee the
+    OUTPUT clause preserves row order for a multi-row statement. What IS relied on instead: a
+    plain `INSERT ... VALUES (...), (...), ...` assigns IDENTITY values to rows in the literal
+    listed order (a row-constructor scan, not a re-orderable query plan the way INSERT...SELECT
+    with no ORDER BY would be) -- so sorting the OUTPUT rows by the IDENTITY column (`seq`) itself
+    recovers the original VALUES order regardless of what order they came back in. Verified
+    empirically against this project's own real local SQL Server (ODBC Driver 18) before writing
+    this, not assumed from docs alone: a 10-row batch, repeated across 4 trials, came back in
+    VALUES order every time either way -- sorting by seq is the belt-and-braces version of an
+    already-observed-correct behavior, not a defense against an observed failure.
+    """
+    if not events:
+        return []
+    try:
+        pool = await _get_pool()
+        placeholders = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(events))
+        params: list[Any] = []
+        for event in events:
+            params += [
+                event.run_id,
+                event.session_id,
+                event.stage,
+                event.node,
+                event.type.value,
+                event.summary,
+                json.dumps(event.payload) if event.payload is not None else None,
+                json.dumps(event.token_usage) if event.token_usage is not None else None,
+            ]
+        async with pool.acquire() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                INSERT INTO dbo.run_events (run_id, session_id, stage, node, type, summary, payload, token_usage)
+                OUTPUT INSERTED.seq, INSERTED.ts
+                VALUES {placeholders}
+                """,
+                *params,
+            )
+            rows = await cur.fetchall()
+        ordered = sorted(rows, key=lambda row: row[0])  # by seq -- see docstring for why
+        return [replace(event, seq=row[0], ts=row[1]) for event, row in zip(events, ordered)]
+    except Exception:  # noqa: BLE001 -- best-effort instrumentation; never abort the node/run over this
+        logger.warning(
+            "append_events failed for %d event(s) starting run_id=%s -- continuing without it",
+            len(events), events[0].run_id, exc_info=True,
+        )
+        return events
 
 
 _COLUMNS = ["seq", "run_id", "session_id", "ts", "stage", "node", "type", "summary", "payload", "token_usage"]
@@ -261,6 +327,85 @@ async def _demo() -> None:
             assert result == broken, result  # unchanged, not raised
         finally:
             _get_pool = real_get_pool
+
+        # --- Phase E audit finding 5: append_events batch counterpart + Verification 11 ---
+        #
+        # Correctness first: a real 5-row batch must round-trip seq/ts per event in the SAME
+        # order as the input list -- see append_events' own docstring for why sorting the
+        # returned rows by seq, rather than trusting fetchall()'s raw order, is what actually
+        # makes this safe (Microsoft does not contractually guarantee OUTPUT's row order).
+        batch_run_id = uuid.uuid4().hex[:8]
+        small_batch = [
+            RunEvent(
+                run_id=batch_run_id, session_id=session_id, type=RunEventType.TOOL_CALL,
+                stage="specification", node="draft", summary=f"tool call: probe-{i}", payload={"i": i},
+            )
+            for i in range(5)
+        ]
+        appended_batch = await append_events(small_batch)
+        assert len(appended_batch) == 5, appended_batch
+        assert all(e.seq is not None and e.ts is not None for e in appended_batch), appended_batch
+        assert [e.payload["i"] for e in appended_batch] == list(range(5)), (
+            "batch results must line up with the input list's own order, not DB-return order"
+        )
+        assert [e.seq for e in appended_batch] == sorted(e.seq for e in appended_batch), (
+            "seq should come back monotonically increasing in input order for one batch"
+        )
+        fetched_batch = await list_events(batch_run_id)
+        assert [e.payload["i"] for e in fetched_batch] == list(range(5)), fetched_batch
+
+        # Same fail-soft contract as append_event's own check just above.
+        real_get_pool_for_batch = _get_pool
+
+        async def _broken_pool_batch() -> aioodbc.Pool:
+            raise RuntimeError("simulated DB outage")
+
+        _get_pool = _broken_pool_batch
+        try:
+            unwritten = [RunEvent(run_id=batch_run_id, session_id=session_id, type=RunEventType.TOOL_CALL, summary="x")]
+            broken_result = await append_events(unwritten)
+            assert broken_result == unwritten, broken_result  # unchanged, not raised
+        finally:
+            _get_pool = real_get_pool_for_batch
+        assert await append_events([]) == [], "empty input must short-circuit -- no query issued"
+
+        # Verification 11 (the Spec's own throughput/batching requirement -- "confirm the chosen
+        # transport actually carries the... throughput... at the batching interval chosen" --
+        # never previously performed; Phase E audit finding 5 names it explicitly unperformed).
+        # ~200 REAL RunEvents through the REAL store against the REAL local DB: serial
+        # append_event vs one append_events batch. Real numbers recorded in fix-e3a-report.md,
+        # not just here. This assertion only pins the DIRECTION (batch not slower than serial) --
+        # absolute wall-clock varies by machine/DB load and has no business being a hardcoded
+        # threshold in a self-check.
+        chatty_run_serial = uuid.uuid4().hex[:8]
+        chatty_run_batch = uuid.uuid4().hex[:8]
+        chatty_events = [
+            RunEvent(
+                run_id=chatty_run_serial, session_id=session_id, type=RunEventType.TOOL_CALL,
+                stage="minimal-code-to-green", node="draft", summary=f"tool call: Bash #{i}",
+                payload={"command": f"echo {i}", "i": i},
+            )
+            for i in range(200)
+        ]
+        serial_start = time.monotonic()
+        for event in chatty_events:
+            await append_event(event)
+        serial_elapsed = time.monotonic() - serial_start
+
+        batch_events = [replace(event, run_id=chatty_run_batch) for event in chatty_events]
+        batch_start = time.monotonic()
+        await append_events(batch_events)
+        batch_elapsed = time.monotonic() - batch_start
+
+        speedup = (serial_elapsed / batch_elapsed) if batch_elapsed else float("inf")
+        print(
+            f"run_event_store Verification 11: serial append_event x200 = {serial_elapsed:.3f}s, "
+            f"batch append_events x200 = {batch_elapsed:.3f}s ({speedup:.1f}x)"
+        )
+        assert batch_elapsed < serial_elapsed, (
+            f"batch ({batch_elapsed:.3f}s) should not be slower than 200 serial round-trips "
+            f"({serial_elapsed:.3f}s) -- Verification 11 regression"
+        )
 
         print("run_event_store self-check: ok")
     finally:
