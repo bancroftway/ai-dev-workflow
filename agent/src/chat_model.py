@@ -438,6 +438,22 @@ def get_session_id(thread_id: str, stage: str, role: str, *, provider: str) -> s
     return _provider_module(provider).get_session_id(thread_id, stage, role)
 
 
+def get_resume_state(thread_id: str, stage: str, role: str, *, provider: str) -> str | None:
+    """The last-observed resume-continuity classification ("resumed"/"rejected"/"unknown") for one
+    (thread, stage, role), or None if no --resume/--session-id has ever been attempted for this
+    key yet -- see each provider module's own `classify_resume`-based docstring (Phase E audit
+    C-2) for the tri-state rule and the real killed-turn experiment it is built from.
+
+    An 8th function alongside the 7 Ruling-4 dispatchers above, same contract: `provider` is
+    required, keyword-only, no default -- the caller's own pinned `state["provider"]`, not
+    resolved in here, for the identical staleness reason the module docstring gives for the other
+    7. graph.py's make_verify_node reads this right where it already resets a stalled/fabricating
+    draft session, so a human/log reading that reset can see whether this session's continuity was
+    already suspect before the reset happened.
+    """
+    return _provider_module(provider).get_resume_state(thread_id, stage, role)
+
+
 async def read_skill_invocations(
     provider: SandboxProvider, thread_id: str, session_id: str, *, active_provider: str
 ) -> list[str] | None:
@@ -479,6 +495,7 @@ __all__ = [
     "forget_thread_sessions_everywhere",
     "close_session",
     "get_session_id",
+    "get_resume_state",
     "read_skill_invocations",
     "secret_env_names",
     "ainvoke_structured",
@@ -488,11 +505,12 @@ __all__ = [
 def _demo() -> None:
     """Self-check: proves get_provider()'s TTL cache + env-var fallback (still forced/flipped via
     _force_provider() below, since those two are the only remaining live-resolution surface in
-    this module), and proves each of the 7 dispatch functions sends its call to the module its
-    caller's explicit `provider` argument names (Ruling 4) -- passed directly per call now, not
-    forced through the env var/cache the way it was pre-Ruling-4, since none of these 7 reads that
-    cache anymore. Section 2 got SIMPLER for exactly that reason: no _force_provider() dance, just
-    two calls with two different literal `provider=` values and a check each landed on the right
+    this module), and proves each of the 7 Ruling-4 dispatch functions PLUS get_resume_state
+    (Phase E audit C-2's own 8th, added later in the same required-provider shape) sends its call
+    to the module its caller's explicit `provider` argument names -- passed directly per call now,
+    not forced through the env var/cache the way it was pre-Ruling-4, since none of these reads
+    that cache anymore. Section 2 got SIMPLER for exactly that reason: no _force_provider() dance,
+    just two calls with two different literal `provider=` values and a check each landed on the right
     module. Section 2 also proves forget_thread_sessions_everywhere() clears both providers with
     no `provider` argument at all, and that the 7 functions' "required, no default" contract itself
     actually holds (a `TypeError` on the missing-argument call, not a silent fallback).
@@ -578,6 +596,19 @@ def _demo() -> None:
         assert get_session_id(thread_id, stage, role, provider="claude") == "claude-marker"
         assert get_session_id(thread_id, stage, role, provider="copilot") == "copilot-marker"
 
+        # get_resume_state (Phase E audit C-2): the 8th dispatch function, same per-provider-dict
+        # dispatch proof as get_session_id just above.
+        claude_chat_model._resume_states[key] = "resumed"
+        copilot_chat_model._resume_states[key] = "unknown"
+        assert get_resume_state(thread_id, stage, role, provider="claude") == "resumed"
+        assert get_resume_state(thread_id, stage, role, provider="copilot") == "unknown"
+        assert get_resume_state(thread_id, stage, role, provider="claude") is not None
+        claude_chat_model._resume_states.pop(key, None)
+        copilot_chat_model._resume_states.pop(key, None)
+        assert get_resume_state(thread_id, stage, role, provider="claude") is None, (
+            "an unseen key must report None, not raise or invent a default"
+        )
+
         forget_thread_sessions(thread_id, provider="claude")
         assert key not in claude_chat_model._session_ids, "forget_thread_sessions did not reach claude_chat_model"
         assert copilot_chat_model._session_ids.get(key) == "copilot-marker", "forget_thread_sessions touched the wrong provider"
@@ -635,12 +666,13 @@ def _demo() -> None:
         assert key not in claude_chat_model._session_ids, "forget_thread_sessions_everywhere missed claude_chat_model"
         assert key not in copilot_chat_model._session_ids, "forget_thread_sessions_everywhere missed copilot_chat_model"
 
-        # Ruling 4's "required, no default" contract itself -- not just that the 7 dispatch
-        # perform correctly when given a provider, but that omitting it fails loudly rather than
-        # silently. Locks this in against a later "just add provider=None for convenience" edit
-        # quietly reopening the exact mid-run staleness bug Ruling 4 exists to close.
-        # get_session_id stands in for all 7 (the contract -- keyword-only, no default -- is
-        # identical across them; this is not testing get_session_id's own logic again).
+        # Ruling 4's "required, no default" contract itself -- not just that the required-provider
+        # dispatch functions perform correctly when given a provider, but that omitting it fails
+        # loudly rather than silently. Locks this in against a later "just add provider=None for
+        # convenience" edit quietly reopening the exact mid-run staleness bug Ruling 4 exists to
+        # close. get_session_id stands in for all 8 (the 7 Ruling 4 named plus get_resume_state --
+        # the contract, keyword-only no default, is identical across them; this is not testing
+        # get_session_id's own logic again).
         try:
             get_session_id(thread_id, stage, role)  # type: ignore[call-arg]
         except TypeError:
@@ -751,6 +783,8 @@ def _demo() -> None:
         org_credential_vault.get_org_credential = original_get_org_credential
         claude_chat_model._session_ids.pop(key, None)
         copilot_chat_model._session_ids.pop(key, None)
+        claude_chat_model._resume_states.pop(key, None)
+        copilot_chat_model._resume_states.pop(key, None)
         for name, original in (
             ("AGENT_PROVIDER", original_agent_provider_env),
             ("ANTHROPIC_API_KEY", original_anthropic_env),
@@ -765,7 +799,7 @@ def _demo() -> None:
 
     print(
         "chat_model dispatch self-check: all assertions passed (per-call dispatch proven for all "
-        "7 required-provider functions, forget_thread_sessions_everywhere's both-provider evict, "
+        "8 required-provider functions, forget_thread_sessions_everywhere's both-provider evict, "
         "and the required-argument contract itself)"
     )
 
