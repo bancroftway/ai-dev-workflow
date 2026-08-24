@@ -131,6 +131,22 @@ def _record_resume_state(session_key: str, resume_state: ResumeState) -> None:
         _session_ids.pop(session_key, None)
 
 
+def _cache_session_id(session_key: str, new_session_id: str, resume_state: ResumeState | None) -> None:
+    """Cache the CLI's returned session id for the next turn, and drop any resume-state verdict
+    that no longer describes it (Phase E review residual, on top of Important 1/Minor).
+
+    Same shared helper as claude_chat_model.py's identical function -- see that module's own
+    docstring for the invariant ("a _resume_states entry must never describe a session id that is
+    no longer the one cached under this key") and why `resume_state != "resumed"` is the correct
+    clear condition: `classify_resume` only ever returns "resumed" when the returned id equals the
+    one actually asked to resume, so that is the one case where the verdict just recorded is
+    genuinely about the id being cached here.
+    """
+    _session_ids[session_key] = new_session_id
+    if resume_state != "resumed":
+        _resume_states.pop(session_key, None)
+
+
 def _messages_to_prompt(messages: list[BaseMessage]) -> str:
     """Flatten a LangChain message list into a single Copilot CLI prompt string.
 
@@ -874,13 +890,7 @@ class CopilotChatModel(BaseChatModel):
             )
 
         if new_session_id:
-            _session_ids[self._session_key] = new_session_id
-            # Phase E review (Minor): see claude_chat_model.py's identical reconciliation for why
-            # -- "unknown" described the OLD id's fate; once the cache moves on to this NEW id
-            # (never itself asked to resume anything), leaving "unknown" attached would misdescribe
-            # it rather than the old session whose continuity is genuinely in question.
-            if resume_state == "unknown" and new_session_id != session_id:
-                _resume_states.pop(self._session_key, None)
+            _cache_session_id(self._session_key, new_session_id, resume_state)
 
         self._last_usage = _extract_usage(final, self.model_name)
 
@@ -1335,6 +1345,23 @@ def _demo() -> None:
         assert _session_ids[pin_key] == "still-good-session-id", (
             f"{harmless_state!r} must NOT drop the cached session id, only 'rejected' does"
         )
+    _resume_states.pop(pin_key, None)
+    _session_ids.pop(pin_key, None)
+
+    # Phase E review residual, pinned directly: rejected -> pop -> the very next turn requests no
+    # resume (classify_resume(None, ...) returns None by contract) -> _cache_session_id must still
+    # clear the stale "rejected" verdict when it caches the fresh, unrelated new id, even though
+    # _record_resume_state itself never ran this turn (resume_state is None, not "rejected").
+    _session_ids[pin_key] = "dead-session-id"
+    _record_resume_state(pin_key, "rejected")
+    assert pin_key not in _session_ids and _resume_states[pin_key] == "rejected"  # pre-condition
+
+    fresh_new_id = "brand-new-unrelated-session-id"
+    _cache_session_id(pin_key, fresh_new_id, None)  # None: no resume was requested this turn
+    assert _session_ids[pin_key] == fresh_new_id
+    assert pin_key not in _resume_states, (
+        "a stale 'rejected' verdict from the OLD id must not survive to mislabel the fresh new id"
+    )
     _resume_states.pop(pin_key, None)
     _session_ids.pop(pin_key, None)
 

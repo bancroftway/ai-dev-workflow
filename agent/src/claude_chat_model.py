@@ -130,6 +130,30 @@ def _record_resume_state(session_key: str, resume_state: ResumeState) -> None:
     if resume_state == "rejected":
         _session_ids.pop(session_key, None)
 
+
+def _cache_session_id(session_key: str, new_session_id: str, resume_state: ResumeState | None) -> None:
+    """Cache the CLI's returned session id for the next turn, and drop any resume-state verdict
+    that no longer describes it (Phase E review residual, on top of Important 1/Minor).
+
+    The invariant: a `_resume_states` entry must never describe a session id that is no longer the
+    one cached under this key. `classify_resume` only ever returns "resumed" when the returned id
+    equals the id that was actually asked to resume -- that is the ONE case where the verdict just
+    recorded (by `_record_resume_state`, called earlier in the same turn) is genuinely ABOUT the id
+    being cached here. Every other case reaching this function means the id about to be cached has
+    no verdict of its own yet, so any stale entry left over from whatever this key described
+    before must be cleared rather than left to mislabel a fresh, unrelated session:
+    - `resume_state is None` -- no resume was even requested this turn (e.g. the turn right after
+      a REJECTED id was popped: the next attempt starts fresh, `classify_resume` returns None by
+      contract, and without this the stale "rejected" would otherwise sit on this key forever,
+      since nothing short of a FUTURE resume attempt would ever overwrite it again).
+    - `resume_state == "unknown"` with a different returned id (a suspected silent fresh start) --
+      the verdict describes the OLD id's fate, not this new one.
+    """
+    _session_ids[session_key] = new_session_id
+    if resume_state != "resumed":
+        _resume_states.pop(session_key, None)
+
+
 # Copilot and Claude ship disjoint tool vocabularies, so a caller's available_tools/excluded_tools
 # list -- written once, in Copilot's own "builtin:<name>" vocabulary (config.
 # READ_ONLY_AVAILABLE_TOOLS) -- needs translating rather than passing through unchanged. Two
@@ -800,15 +824,7 @@ class ClaudeChatModel(BaseChatModel):
             )
 
         if new_session_id:
-            _session_ids[self._session_key] = new_session_id
-            # Phase E review (Minor): "unknown" here described the OLD id's fate (a different id
-            # came back -- a suspected silent fresh start); now that the cache has moved on to
-            # this NEW id, leaving "unknown" attached would misdescribe a session that was never
-            # even asked to resume anything, not the old one whose continuity is genuinely in
-            # question. Clear it so the log is honest immediately -- it would otherwise self-heal
-            # only after this new session's own next classified turn, one turn later than it could.
-            if resume_state == "unknown" and new_session_id != session_id:
-                _resume_states.pop(self._session_key, None)
+            _cache_session_id(self._session_key, new_session_id, resume_state)
 
         # Task 4 (Part 2 run-visibility) + Phase E audit finding 5: every intermediate NDJSON line
         # this turn produced (all of `events` except the final result-shaped line, handled above)
@@ -1328,6 +1344,23 @@ def _demo() -> None:
         assert _session_ids[pin_key] == "still-good-session-id", (
             f"{harmless_state!r} must NOT drop the cached session id, only 'rejected' does"
         )
+    _resume_states.pop(pin_key, None)
+    _session_ids.pop(pin_key, None)
+
+    # Phase E review residual, pinned directly: rejected -> pop -> the very next turn requests no
+    # resume (classify_resume(None, ...) returns None by contract) -> _cache_session_id must still
+    # clear the stale "rejected" verdict when it caches the fresh, unrelated new id, even though
+    # _record_resume_state itself never ran this turn (resume_state is None, not "rejected").
+    _session_ids[pin_key] = "dead-session-id"
+    _record_resume_state(pin_key, "rejected")
+    assert pin_key not in _session_ids and _resume_states[pin_key] == "rejected"  # pre-condition
+
+    fresh_new_id = "brand-new-unrelated-session-id"
+    _cache_session_id(pin_key, fresh_new_id, None)  # None: no resume was requested this turn
+    assert _session_ids[pin_key] == fresh_new_id
+    assert pin_key not in _resume_states, (
+        "a stale 'rejected' verdict from the OLD id must not survive to mislabel the fresh new id"
+    )
     _resume_states.pop(pin_key, None)
     _session_ids.pop(pin_key, None)
 
