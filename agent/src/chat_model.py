@@ -204,12 +204,19 @@ async def get_provider() -> str:
     return value
 
 
-async def get_runtime_auth_token() -> tuple[str, str | None]:
-    """The credential a sandboxed turn needs to authenticate as the CURRENTLY active provider's
-    CLI, plus which of the two Claude credential shapes it is: the org's saved vault credential if
-    an admin has configured one, else the same provider-keyed env var get_provider()'s own fallback
-    already implies (ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN for claude, GITHUB_TOKEN for
-    copilot).
+async def get_runtime_auth_token(provider: str | None = None) -> tuple[str, str | None]:
+    """The credential a sandboxed turn needs to authenticate as the given provider's CLI (or, if
+    `provider` is omitted, the CURRENTLY active one), plus which of the two Claude credential
+    shapes it is: the org's saved vault credential if an admin has configured one, else the same
+    provider-keyed env var get_provider()'s own fallback already implies (ANTHROPIC_API_KEY/
+    CLAUDE_CODE_OAUTH_TOKEN for claude, GITHUB_TOKEN for copilot).
+
+    `provider` (Phase E audit I-3): optional override so a caller that already knows which
+    provider it must fetch a credential FOR -- sessions_api.provision_session, reprovisioning a
+    session already pinned to a stored provider -- can ask for that one explicitly instead of this
+    function silently re-resolving the live org setting and fetching the wrong provider's
+    credential. None (every call site before this fix, unchanged) keeps resolving live via
+    get_provider(), same as always.
 
     Fixes a real gap: sessions_api.py and run_headless.py each hand-roll this exact
     `"claude" -> ANTHROPIC_API_KEY else GITHUB_TOKEN` choice today by reading chat_model.PROVIDER
@@ -236,7 +243,7 @@ async def get_runtime_auth_token() -> tuple[str, str | None]:
     saved yet" -- there is no vault credential to fetch if the row can't even be read, so the
     env-var fallback is the correct (not merely convenient) answer, not a degraded one.
     """
-    provider = await get_provider()
+    provider = provider or await get_provider()
     try:
         settings = await org_settings.get_org_settings()
     except Exception:

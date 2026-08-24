@@ -111,6 +111,28 @@ class ProvisionResponse(BaseModel):
 async def provision_session(body: ProvisionRequest, request: Request) -> ProvisionResponse:
     _check_shared_secret(request)
 
+    # Phase E audit I-3: read BEFORE the credential resolution below -- a plain SELECT, so this
+    # doesn't disturb I-A's "no side effect before the credential check" ordering (that fix was
+    # about repo_scaffold.create_repo/the Key Vault fetch, real side effects; a DB read has none).
+    # Needed here specifically so the credential fetch below can ask for the RIGHT provider's
+    # credential on a reprovision, not just so the project_id fallback further down has it.
+    existing = await session_store.get_session(body.thread_id)
+
+    # The in-flight guarantee's container/credential half (I-3): GraphState.provider is pinned
+    # per-thread and never re-resolved once a run starts (graph.py:1516's own `state.get("provider")
+    # or await chat_model.get_provider()`) -- but provisioning used to always read the LIVE org
+    # setting, one layer down, with no memory of what a PRIOR provision for this exact session
+    # actually used. A run pinned to "claude" whose container gets idle-reaped after an admin flips
+    # the org setting to "copilot" would reprovision onto a copilot-flavored container/credential
+    # while the checkpointed graph kept correctly dispatching to claude -- every turn then fails
+    # auth. Fixed the same way graph.py:1516 fixed the same shape one layer up: prefer this
+    # session's OWN stored provider (dbo.sessions.provider, written once at first provision by
+    # session_store.create_session below) and only fall back to the live org setting when there is
+    # genuinely no prior row -- a real brand-new session, for which "provisioning is the moment a
+    # live setting change takes effect" is still exactly the right behavior.
+    stored_provider = existing.get("provider") if existing is not None else None
+    chat_provider = stored_provider or await chat_model.get_provider()
+
     # I-A fix round (Important, proved by execution): moved here, before ANY side effect --
     # get_runtime_auth_token() itself is side-effect-free, so there is no reason this has to wait
     # until immediately before provider.provision(). It used to sit after the Key Vault fetch AND
@@ -122,7 +144,11 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     # get_runtime_auth_token() a second time later would be pure waste (same TTL-cached provider,
     # same fresh-read credential) and could theoretically observe a different value if a save
     # landed in between, which would defeat the point of gating on the value checked here.
-    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token()
+    #
+    # provider=chat_provider (I-3): fetches the credential for the PINNED provider, not whatever
+    # chat_model.get_provider() would say live -- the exact fix this finding calls for; without it,
+    # a reprovision could still 200 with a real token, just the wrong provider's.
+    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token(provider=chat_provider)
     if not runtime_auth_token:
         # I-2(c), the real backstop (whole-branch review): a session with no usable credential
         # used to sail straight into provider.provision() -- minutes of container boot/clone/
@@ -135,8 +161,6 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             status_code=409,
             detail="no coding-agent credential configured for this organization -- set one in Settings",
         )
-
-    existing = await session_store.get_session(body.thread_id)
     if body.resume:
         if existing is None:
             raise HTTPException(status_code=404, detail="no session found to resume")
@@ -238,6 +262,9 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     repo_clone_url = f"https://github.com/{owner}/{repo}.git"
     # runtime_auth_token/runtime_auth_kind: resolved (and empty-checked, I-2c/I-A) at the very top
     # of this function now, before any side effect -- see that block's own comment for why.
+    # provider=chat_provider (I-3): the same pinned-or-live choice resolved above, so the container
+    # this call bakes AGENT_PROVIDER/credentials into always matches the credential that was just
+    # fetched for it -- see SandboxProvider.provision's own docstring for the full reasoning.
     try:
         session = await provider.provision(
             session_id=body.thread_id,
@@ -246,6 +273,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             work_branch=work_branch,
             git_user_token=body.github_token,
             runtime_auth_token=runtime_auth_token,
+            provider=chat_provider,
             runtime_auth_kind=runtime_auth_kind,
             scaffold_new_repo=scaffold_new_repo,
             project_name=project["name"] if scaffold_new_repo else None,
@@ -270,6 +298,11 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
         # Idempotent creation: a reattach (same session_id provisioned again, non-resume) is a
         # no-op inside create_session. The real title arrives later, once scaffold_node has
         # requirements text to generate one from (session_store.touch_run).
+        #
+        # provider=chat_provider (I-3): only ever written here, on a session's first real
+        # provision (existing is None) -- create_session's own IF NOT EXISTS guard means this
+        # write can never happen twice for the same session_id, so this is genuinely a
+        # write-once-pin, not just a default that a later call could overwrite.
         await session_store.create_session(
             body.thread_id,
             owner=owner,
@@ -279,6 +312,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             work_branch=work_branch,
             title="(untitled session)",
             project_id=project_id,
+            provider=chat_provider,
         )
 
     return ProvisionResponse(status="ready")
@@ -1777,21 +1811,27 @@ def _demo() -> None:
         _probe_provider_credential = recovery_original_probe
 
     # provision_session's 409 backstop (I-2c) + its ordering (I-A fix round, Important, proved by
-    # execution): an empty runtime_auth_token must fail fast as the very FIRST thing after
-    # _check_shared_secret -- before session_store.get_session, the Key Vault fetch, and (the real
-    # regression the review caught by executing it) repo_scaffold.create_repo/set_project_repo for
-    # a "+ New Project" Assign, which used to create a REAL GitHub repo and record it against the
-    # project row before ever 409ing. Proven here by making EVERY one of those calls raise if
-    # reached at all -- not just by catching the 409 itself, which a differently-broken function
-    # could also raise, possibly after already doing real damage.
+    # execution): an empty runtime_auth_token must fail fast -- before the Key Vault fetch, and
+    # (the real regression the review caught by executing it) repo_scaffold.create_repo/
+    # set_project_repo for a "+ New Project" Assign, which used to create a REAL GitHub repo and
+    # record it against the project row before ever 409ing. Proven here by making EVERY one of
+    # those calls raise if reached at all -- not just by catching the 409 itself, which a
+    # differently-broken function could also raise, possibly after already doing real damage.
+    #
+    # session_store.get_session is deliberately NOT in that must-not-reach set any more (Phase E
+    # audit I-3): it now runs before the credential check on purpose, a pure read used to prefer
+    # this session's own stored provider over a live re-resolve -- stubbed below to return None
+    # (a genuinely new session, same as this test's real premise) rather than asserting it's
+    # unreached. chat_model.get_provider is stubbed too, so this offline check never needs a real
+    # org_settings row to resolve chat_provider deterministically.
     global get_sandbox_provider
 
     class _ProvisionMustNotBeCalled:
         async def provision(self, **kwargs: Any) -> Any:
             raise AssertionError("provider.provision() must never be reached when the credential is empty")
 
-    async def _must_not_reach_get_session(thread_id: str) -> dict[str, Any] | None:
-        raise AssertionError("session_store.get_session must never be reached when the credential is empty")
+    async def _stub_get_session_none(thread_id: str) -> dict[str, Any] | None:
+        return None  # "no prior row" -- this test's own session_id has never been provisioned
 
     async def _must_not_reach_get_vault_uri(owner: str, repo: str, user_login: str) -> str | None:
         raise AssertionError("keyvault.get_vault_uri must never be reached when the credential is empty")
@@ -1805,7 +1845,14 @@ def _demo() -> None:
             "is the exact regression I-A's fix closes (a real GitHub repo created before the 409)"
         )
 
-    async def _stub_empty_runtime_auth_token() -> tuple[str, str | None]:
+    async def _stub_get_provider_fixed() -> str:
+        return "claude"
+
+    async def _stub_empty_runtime_auth_token(provider: str | None = None) -> tuple[str, str | None]:
+        assert provider == "claude", (
+            f"provision_session must resolve chat_provider (stored-or-live) BEFORE fetching the "
+            f"credential, and pass that same value through -- got provider={provider!r}"
+        )
         return "", None
 
     original_get_session3 = session_store.get_session
@@ -1813,17 +1860,19 @@ def _demo() -> None:
     original_get_project = project_store.get_project
     original_create_repo = repo_scaffold.create_repo
     original_get_sandbox_provider = get_sandbox_provider
-    session_store.get_session = _must_not_reach_get_session  # type: ignore[assignment]
+    original_get_provider = chat_model.get_provider
+    session_store.get_session = _stub_get_session_none  # type: ignore[assignment]
     keyvault.get_vault_uri = _must_not_reach_get_vault_uri  # type: ignore[assignment]
     project_store.get_project = _must_not_reach_get_project  # type: ignore[assignment]
     repo_scaffold.create_repo = _must_not_reach_create_repo  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _stub_empty_runtime_auth_token  # type: ignore[assignment]
+    chat_model.get_provider = _stub_get_provider_fixed  # type: ignore[assignment]
     get_sandbox_provider = lambda: _ProvisionMustNotBeCalled()  # noqa: E731
     try:
         asyncio.run(provision_session(
             # A "+ New Project" shaped request (no owner/repo yet) -- the exact shape that used to
             # reach repo_scaffold.create_repo before this fix. If the 409 didn't actually fire
-            # first, this would hit _must_not_reach_get_session immediately.
+            # first, this would hit _must_not_reach_get_vault_uri immediately.
             ProvisionRequest(thread_id="t-selfcheck", project_id="p-selfcheck", owner="pending", repo="pending", branch="main"),
             _FakeRequest(),  # type: ignore[arg-type]
         ))
@@ -1836,7 +1885,76 @@ def _demo() -> None:
         project_store.get_project = original_get_project  # type: ignore[assignment]
         repo_scaffold.create_repo = original_create_repo  # type: ignore[assignment]
         chat_model.get_runtime_auth_token = original_get_runtime_auth_token  # type: ignore[assignment]
+        chat_model.get_provider = original_get_provider  # type: ignore[assignment]
         get_sandbox_provider = original_get_sandbox_provider
+
+    # Phase E audit I-3, the actual fix (not just the fallback exercised above): a session that
+    # already has a STORED provider must have that value reach both get_runtime_auth_token and
+    # provider.provision -- never a live re-read, even when the live org setting has since
+    # changed to something else. "copilot" below is deliberately the OPPOSITE of the stored
+    # "claude" so a regression that fell back to live can't accidentally pass by coincidence, and
+    # chat_model.get_provider is tracked too, proving it is never even CALLED (short-circuited by
+    # `stored_provider or ...`), not merely overridden after the fact.
+    from .sandbox.provider import SandboxSession
+
+    i3_calls: list[tuple[str, str | None]] = []
+
+    async def _i3_get_session_with_stored_provider(thread_id: str) -> dict[str, Any] | None:
+        return {"project_id": "proj-i3-selfcheck", "status": "in_progress", "provider": "claude"}
+
+    async def _i3_get_provider_live_disagrees() -> str:
+        i3_calls.append(("get_provider", None))
+        return "copilot"
+
+    async def _i3_get_runtime_auth_token(provider: str | None = None) -> tuple[str, str | None]:
+        i3_calls.append(("get_runtime_auth_token", provider))
+        return "fake-token-i3", "api_key"
+
+    async def _i3_get_vault_uri(owner: str, repo: str, user_login: str) -> str | None:
+        return None  # no vault configured -- skip that branch entirely
+
+    async def _i3_get_project(project_id: str) -> dict[str, Any] | None:
+        assert project_id == "proj-i3-selfcheck", project_id
+        return {"name": "i3-project", "repo": "already-connected-repo"}  # repo set -- no scaffolding
+
+    class _I3FakeSandboxProvider:
+        async def provision(self, **kwargs: Any) -> SandboxSession:
+            i3_calls.append(("provider.provision", kwargs.get("provider")))
+            return SandboxSession(kwargs["session_id"], "localhost", 0, "")
+
+    original_get_session_i3 = session_store.get_session
+    original_get_provider_i3 = chat_model.get_provider
+    original_get_runtime_auth_token_i3 = chat_model.get_runtime_auth_token
+    original_get_vault_uri_i3 = keyvault.get_vault_uri
+    original_get_project_i3 = project_store.get_project
+    original_get_sandbox_provider_i3 = get_sandbox_provider
+    session_store.get_session = _i3_get_session_with_stored_provider  # type: ignore[assignment]
+    chat_model.get_provider = _i3_get_provider_live_disagrees  # type: ignore[assignment]
+    chat_model.get_runtime_auth_token = _i3_get_runtime_auth_token  # type: ignore[assignment]
+    keyvault.get_vault_uri = _i3_get_vault_uri  # type: ignore[assignment]
+    project_store.get_project = _i3_get_project  # type: ignore[assignment]
+    get_sandbox_provider = lambda: _I3FakeSandboxProvider()  # noqa: E731
+    try:
+        response = asyncio.run(provision_session(
+            ProvisionRequest(
+                thread_id="t-i3-selfcheck", owner="octocat", repo="already-connected-repo", branch="main",
+            ),
+            _FakeRequest(),  # type: ignore[arg-type]
+        ))
+        assert response.status == "ready", response
+    finally:
+        session_store.get_session = original_get_session_i3  # type: ignore[assignment]
+        chat_model.get_provider = original_get_provider_i3  # type: ignore[assignment]
+        chat_model.get_runtime_auth_token = original_get_runtime_auth_token_i3  # type: ignore[assignment]
+        keyvault.get_vault_uri = original_get_vault_uri_i3  # type: ignore[assignment]
+        project_store.get_project = original_get_project_i3  # type: ignore[assignment]
+        get_sandbox_provider = original_get_sandbox_provider_i3
+        registry.pop("t-i3-selfcheck")
+
+    assert i3_calls == [("get_runtime_auth_token", "claude"), ("provider.provision", "claude")], (
+        f"the session's STORED provider ('claude') must reach both calls, and live get_provider() "
+        f"must never even be invoked (it would have returned the disagreeing 'copilot') -- got {i3_calls}"
+    )
 
     print("sessions_api self-check: all assertions passed")
 

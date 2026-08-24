@@ -69,6 +69,7 @@ class SandboxProvider(abc.ABC):
         work_branch: str,
         git_user_token: str,
         runtime_auth_token: str,
+        provider: str,
         runtime_auth_kind: str | None = None,
         image: str | None = None,
         scaffold_new_repo: bool = False,
@@ -82,6 +83,19 @@ class SandboxProvider(abc.ABC):
         branch (agent/src/branch_naming.py, computed once at session creation and never
         recomputed here) -- passed straight through as the sandbox's WORK_BRANCH env var.
 
+        provider ("copilot"/"claude", Phase E audit I-3): which CLI/credential shape to bake into
+        this container -- the caller's own already-resolved choice, not something this method
+        re-derives. sessions_api.provision_session resolves it as "this session's own stored
+        provider (dbo.sessions), or the live org setting if there is no prior row" before ever
+        calling here, the same preserve-if-pinned shape GraphState.provider already uses one layer
+        up -- so a container being reprovisioned after an idle reap is built for whichever provider
+        the checkpointed graph is actually still dispatching to, not whatever the org setting
+        happens to say at that later moment. A genuinely brand-new session has no prior row to
+        prefer, so the caller's own live fallback is what supplies this value in that case --
+        exactly the "provisioning a new session is the moment a live change should take effect"
+        behavior this method used to implement itself, before I-3 found that doing it here (rather
+        than once, at the caller) missed the reprovision case entirely.
+
         scaffold_new_repo (Part 3 plan, Ruling 6) is True only for the "+ New Project" provision
         call that just created repo_clone_url's own (empty) GitHub repo via repo_scaffold.
         create_repo -- entrypoint.sh reads this as SCAFFOLD_NEW_REPO to `git init` + push an
@@ -93,8 +107,10 @@ class SandboxProvider(abc.ABC):
         runtime_auth_token is the active provider's own secret -- the shared Copilot PAT, an
         Anthropic API key, an Anthropic subscription OAuth token, or an admin's Settings-UI-saved
         credential (org_credential_vault.py, Part 4) -- resolved by
-        chat_model.get_runtime_auth_token() for whatever chat_model.get_provider() currently
-        selects -- written into the sandbox as COPILOT_GITHUB_TOKEN, ANTHROPIC_API_KEY, or
+        chat_model.get_runtime_auth_token(provider=provider) for this SAME `provider` value
+        (Phase E audit I-3: no longer a second, independent call to chat_model.get_provider() that
+        could silently disagree with the `provider` argument above) -- written into the sandbox as
+        COPILOT_GITHUB_TOKEN, ANTHROPIC_API_KEY, or
         CLAUDE_CODE_OAUTH_TOKEN. runtime_auth_kind ("api_key" | "oauth" | None, the second half of
         get_runtime_auth_token()'s return) picks WHICH of the two Claude-only names gets the real
         value when provider == "claude"; ignored (no such choice exists) when provider ==

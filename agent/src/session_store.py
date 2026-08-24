@@ -65,6 +65,7 @@ async def create_session(
     work_branch: str,
     title: str,
     project_id: str,
+    provider: str | None = None,
 ) -> None:
     """Idempotent: called from sessions_api.provision_session before the sandbox boots. A
     reattach (same session_id provisioned again) is a no-op here -- touch_run is what refreshes
@@ -72,15 +73,23 @@ async def create_session(
 
     project_id is required, not optional -- every session/ticket belongs to exactly one project
     from this migration forward (Ruling 1, docs/superpowers/plans/part-3-tickets-tasks.md); a
-    caller that forgets to resolve one gets a TypeError, not a silent NULL."""
+    caller that forgets to resolve one gets a TypeError, not a silent NULL.
+
+    provider (Phase E audit I-3, 0008_add_sessions_provider.sql): the "copilot"/"claude" this
+    session's FIRST real provision actually used -- written once, here, and never updated again
+    (mirrors GraphState.provider's own "pinned per-thread, never re-resolved" contract one layer
+    up). Optional/None only because the IF NOT EXISTS guard below makes this whole INSERT a no-op
+    on a reattach -- a caller re-provisioning an existing row is not, in practice, expected to omit
+    it, but nothing here enforces that; provision_session always resolves and passes a real value
+    for a genuinely new session, which is the only case this INSERT ever actually fires for."""
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             """
             IF NOT EXISTS (SELECT 1 FROM dbo.sessions WHERE session_id = ?)
             INSERT INTO dbo.sessions
-                (session_id, owner, repo, user_login, title, source_branch, work_branch, project_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress')
+                (session_id, owner, repo, user_login, title, source_branch, work_branch, project_id, provider, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress')
             """,
             session_id,
             session_id,
@@ -91,6 +100,7 @@ async def create_session(
             source_branch,
             work_branch,
             project_id,
+            provider,
         )
 
 
@@ -233,7 +243,7 @@ _COLUMNS = [
     "session_id", "owner", "repo", "user_login", "title", "source_branch", "work_branch",
     "run_id", "current_stage", "status", "started_at", "ended_at", "merge_ready",
     "pr_title", "pr_url", "failure_stage", "failure_type", "failure_message", "updated_at",
-    "project_id", "awaiting_gate",
+    "project_id", "awaiting_gate", "provider",
 ]
 
 
@@ -300,11 +310,29 @@ async def _demo() -> None:
             work_branch=f"ai-dev-workflow/{session_id}",
             title="Initial request",
             project_id=project_id,
+            provider="claude",
         )
         row = await get_session(session_id)
         assert row is not None and row["status"] == "in_progress" and row["title"] == "Initial request", row
         assert row["project_id"] == project_id, row
         assert not row["awaiting_gate"], row  # never set yet
+        # Phase E audit I-3: written once at first provision, round-trips exactly -- this is the
+        # value sessions_api.provision_session must prefer over a live get_provider() re-resolve
+        # on every later reprovision of this same session.
+        assert row["provider"] == "claude", row
+
+        # The IF NOT EXISTS guard makes a second create_session call for the SAME session_id a
+        # true no-op -- a reattach with a different (e.g. live-resolved) provider must NOT
+        # overwrite the pinned value from the session's first real provision.
+        await create_session(
+            session_id, owner=owner, repo=repo, user_login="octocat", source_branch="main",
+            work_branch=f"ai-dev-workflow/{session_id}", title="Initial request", project_id=project_id,
+            provider="copilot",
+        )
+        row = await get_session(session_id)
+        assert row["provider"] == "claude", (
+            f"create_session's IF NOT EXISTS guard must leave the first-pinned provider alone, got {row['provider']!r}"
+        )
 
         await touch_run(session_id, run_id="r1", title="Initial request")
         row = await get_session(session_id)

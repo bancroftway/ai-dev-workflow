@@ -92,7 +92,11 @@ async def run(args: argparse.Namespace) -> int:
     # `provider` to the SandboxProvider connection object (below), and chat_model.py's own
     # read_skill_invocations uses this exact same disambiguation for the identical collision.
     active_provider = await chat_model.get_provider()
-    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token()
+    # provider=active_provider (Phase E audit I-3): reuse the SAME resolved value rather than a
+    # second independent live read -- both are TTL-cached so they'd almost always agree anyway,
+    # but there is no reason to leave even a rare cache-boundary disagreement on the table when the
+    # value is already sitting right here.
+    runtime_auth_token, runtime_auth_kind = await chat_model.get_runtime_auth_token(provider=active_provider)
     if not git_token or not runtime_auth_token:
         token_env_var = "ANTHROPIC_API_KEY" if active_provider == "claude" else "GITHUB_TOKEN"
         logger.error("E2E_GITHUB_TOKEN and %s must both be set (root .env)", token_env_var)
@@ -130,6 +134,7 @@ async def run(args: argparse.Namespace) -> int:
         work_branch=branch_naming.work_branch_for(thread_id),
         git_user_token=git_token,
         runtime_auth_token=runtime_auth_token,
+        provider=active_provider,
         runtime_auth_kind=runtime_auth_kind,
     )
     registry.set(thread_id, session)

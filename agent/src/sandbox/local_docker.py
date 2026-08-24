@@ -164,21 +164,21 @@ class LocalDockerProvider(SandboxProvider):
         work_branch: str,
         git_user_token: str,
         runtime_auth_token: str,
+        provider: str,
         runtime_auth_kind: str | None = None,
         image: str | None = None,
         scaffold_new_repo: bool = False,
         project_name: str | None = None,
     ) -> SandboxSession:
-        # Lazy: chat_model imports whichever provider module is active, which imports .sandbox --
-        # a module-scope import here would cycle. Needed only to pick which of
-        # COPILOT_GITHUB_TOKEN/ANTHROPIC_API_KEY gets the real secret below -- readiness itself
-        # (wait_for_cli_ready) no longer branches on this. Provisioning a new session is exactly
-        # the moment a live setting change should take effect (Ruling 2), so this reads the live
-        # setting fresh rather than a pinned state["provider"] -- there is no GraphState this deep.
-        from ..chat_model import get_provider
-
-        provider = await get_provider()
-
+        # Phase E audit I-3: `provider` used to be resolved HERE, live, on every call
+        # ("provisioning a new session is exactly the moment a live setting change should take
+        # effect"). True for a genuinely new session, wrong for a reprovision of one already
+        # pinned to a run's own state["provider"] -- a container idle-reaped after an admin flips
+        # the org setting would come back built for the NEW provider while the checkpointed graph
+        # kept dispatching to the OLD one, failing auth on every turn. Fixed one layer up instead:
+        # sessions_api.provision_session now resolves "this session's stored provider, or live if
+        # there's no prior row" before calling here, so this method just uses whatever it's told --
+        # see SandboxProvider.provision's own docstring (provider.py) for the full reasoning.
         async with self._lock:
             container_name = f"{_CONTAINER_NAME_PREFIX}{session_id}"
 
@@ -209,15 +209,16 @@ class LocalDockerProvider(SandboxProvider):
                 # never existed in the new container.
                 #
                 # forget_thread_sessions_everywhere(), not forget_thread_sessions(session_id,
-                # provider=provider): `provider` above is this call's own LIVE resolution (correct
-                # for the fresh container about to be built below), but intake_node preserves the
-                # RUN's original pinned state["provider"] across this exact reprovision -- if the
-                # org setting changed since the run started, `provider` here can already name a
-                # different value than whatever the OLD container's sessions actually dispatched
-                # to, which would evict the wrong provider's dict and leave the real (now-dead)
-                # session ids behind. Same root cause chat_model.forget_thread_sessions_everywhere's
-                # own docstring documents for registry.pop() -- evicting both is what's actually
-                # correct here, not resolving harder.
+                # provider=provider): `provider` above is now the caller's already-resolved choice
+                # (Phase E audit I-3 -- normally this session's own stored provider, which is
+                # exactly the run's pinned state["provider"]), but it can still theoretically differ
+                # from whatever the OLD container's sessions actually dispatched to -- e.g. a row
+                # that predates the 0008 migration and so has no stored provider, whose caller then
+                # fell back to a live read that has since drifted from the run's real pin. Evicting
+                # BOTH dicts unconditionally is correct regardless of which case this is; same root
+                # cause chat_model.forget_thread_sessions_everywhere's own docstring documents for
+                # registry.pop() -- evicting both is what's actually correct here, not resolving
+                # harder.
                 from ..chat_model import forget_thread_sessions_everywhere
 
                 forget_thread_sessions_everywhere(session_id)
