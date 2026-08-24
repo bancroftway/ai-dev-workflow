@@ -155,6 +155,17 @@ function groupConsecutive(events: RunLogEvent[]): Run[] {
   return runs;
 }
 
+/** Finding 3 (Phase E audit): "prose stays open" -- the Spec's own stated core lesson, previously
+ * unmet because REASONING had no producer at all. E-3a gave it a real one (both providers,
+ * redacted); this is that event type's dedicated render path -- every other type still goes
+ * through EventRow's dense one-liner below. groupConsecutive (above) never merges a `reasoning`
+ * event into a tool run (`toolNameOf` returns null for it), so every one always arrives here as its
+ * own length-1 run; the `run.events.length === 1` guard at the call site is defense in depth, not
+ * load-bearing. */
+function isLoneReasoning(run: Run): run is Run & { events: [RunLogEvent] } {
+  return run.events.length === 1 && run.events[0].type === "reasoning";
+}
+
 export function EventLogView() {
   const events = useRunEvents();
   const durations = computeDurations(events);
@@ -178,13 +189,16 @@ export function EventLogView() {
             aria-label="Event log"
             className="flex h-full flex-col divide-y divide-neutral-100 overflow-y-auto rounded-lg border border-neutral-200"
           >
-            {runs.map((run) =>
-              run.tool && run.events.length > 1 ? (
+            {runs.map((run) => {
+              if (isLoneReasoning(run)) {
+                return <ReasoningRow key={run.events[0].seq} event={run.events[0]} />;
+              }
+              return run.tool && run.events.length > 1 ? (
                 <GroupRow key={run.events[0].seq} tool={run.tool} events={run.events} durations={durations} />
               ) : (
                 <EventRow key={run.events[0].seq} event={run.events[0]} duration={durations.get(run.events[0].seq)} />
-              ),
-            )}
+              );
+            })}
           </div>
           {/* Shown only while auto-follow is disengaged AND real content arrived since -- blue,
               not amber/red: this is a neutral "there's more" nudge, not a warning, same hue
@@ -232,11 +246,69 @@ function GroupRow({ tool, events, durations }: { tool: string; events: RunLogEve
   );
 }
 
+/** Character-counted, not line-counted, unlike DiffView's own COLLAPSE_LINE_COUNT -- a "thinking"
+ * block is frequently one long unbroken paragraph with no line structure to count. Same
+ * truncate-and-expand shape DiffView.tsx already established (a length check, a "show more"
+ * toggle, no unbounded height), just measured the way prose actually varies in size. */
+const REASONING_COLLAPSE_CHARS = 480;
+
+/** Full-width prose, never folded, quieter than a tool row (no dot, no group chrome, no click-to-
+ * expand-detail -- the content is already fully on screen, exactly the inversion the Spec calls
+ * the core lesson). Reads `payload.text` directly rather than `summary` (summary is only a
+ * 160-char head, per both translators' own docstrings) -- falls back to summary for the
+ * pathological case of a payload that didn't survive redaction/serialization as expected, so this
+ * never renders blank. */
+function ReasoningRow({ event }: { event: RunLogEvent }) {
+  const [expanded, setExpanded] = useState(false);
+  const payload = event.payload;
+  const text = typeof payload?.text === "string" ? (payload.text as string) : (event.summary ?? "");
+  // Claude's payload carries `kind: "thinking" | "text"` (claude_chat_model.py); Copilot's has no
+  // such field (its one real narration shape, assistant.message_delta, doesn't distinguish the
+  // two) -- shown when present, silently omitted otherwise, same fail-soft convention every other
+  // payload-shape read in this file already follows.
+  const kind = typeof payload?.kind === "string" ? (payload.kind as string) : null;
+  const isLong = text.length > REASONING_COLLAPSE_CHARS;
+  const visible = expanded || !isLong ? text : `${text.slice(0, REASONING_COLLAPSE_CHARS)}…`;
+
+  return (
+    <div className="bg-neutral-50/70 px-4 py-3">
+      <div className="mb-1 flex items-center gap-2 text-[10px] font-medium uppercase tracking-wide text-neutral-400">
+        <span>{kind === "thinking" ? "thinking" : "reasoning"}</span>
+        {event.stage && <span>· {event.stage}</span>}
+      </div>
+      <p className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-800">{visible}</p>
+      {isLong && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1 text-xs font-medium text-neutral-500 hover:text-neutral-700"
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Minor 9 (Phase E audit): the data's already on the row (draft/audit/fix's NODE_FINISHED, per
+ * LiveCostChip.tsx's own docstring on which events actually carry `token_usage`) -- this just
+ * reads it. Honest-null rule: `cost` missing or explicitly null (Copilot's honest "the CLI didn't
+ * report one" case, same as LiveCostChip's own doc note) returns null, not 0 -- a real "$0.00" chip
+ * would claim something was reported that wasn't. Unlike LiveCostChip's run-total (2 decimals, a
+ * sum large enough for cents to matter), a single real turn is frequently sub-cent (fix-e3a-report's
+ * own disclosed real calls: $0.0062, $0.0217) -- 4 decimals here so a genuine tiny cost doesn't
+ * round down to the exact same "$0.00" the null case must never show. */
+function turnCost(event: RunLogEvent): number | null {
+  const raw = event.token_usage?.cost;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+}
+
 function EventRow({ event, duration }: { event: RunLogEvent; duration?: number }) {
   const [expanded, setExpanded] = useState(false);
   const tool = toolNameOf(event);
   const arg = tool ? argSummary(event.payload) : null;
   const hasDetail = event.payload != null && Object.keys(event.payload).length > 0;
+  const cost = turnCost(event);
 
   return (
     <div>
@@ -257,6 +329,7 @@ function EventRow({ event, duration }: { event: RunLogEvent; duration?: number }
         {arg && <span className="truncate font-mono text-xs text-neutral-400">{arg}</span>}
         {event.stage && <span className="ml-auto shrink-0 text-xs text-neutral-400">{event.stage}</span>}
         {duration != null && <span className="shrink-0 text-xs text-neutral-400">{formatDuration(duration)}</span>}
+        {cost != null && <Chip label="Cost" value={`$${cost.toFixed(4)}`} tone="gray" title="LLM spend for this turn" />}
       </button>
       {expanded && hasDetail && <EventDetail event={event} />}
     </div>
