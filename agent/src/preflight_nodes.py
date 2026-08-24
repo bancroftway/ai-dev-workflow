@@ -292,7 +292,9 @@ async def scaffold_finalize_node(state: "GraphState", config: RunnableConfig) ->
     # brownfield LLM chain instead of serializing behind it (repo_scan_baseline_node awaits it).
     # Guarded on baseline absence -- a returning thread must never be re-measured.
     if await repo_files.read_repo_file(provider, thread_id, repo_scan.BASELINE_PATH) is None:
-        repo_scan.start_background_scan(thread_id, provider, chat_provider=state["provider"])
+        repo_scan.start_background_scan(
+            thread_id, provider, chat_provider=state["provider"], run_id=state.get("run_id", "unknown")
+        )
     return {}
 
 

@@ -85,6 +85,7 @@ async def run_and_report(
     # `{provider}` placeholder, but a future one that adds one would silently stop reaching
     # render_prompt (it would bind here instead) rather than erroring; worth knowing if that ever
     # needs debugging.
+    run_id: str = "unknown",
     available_tools: list[str] | None = None,
     model_name: str | None = None,
     **render_values: str,
@@ -99,6 +100,14 @@ async def run_and_report(
     `provider` argument (Ruling 4) means it has to come from somewhere, and reading get_provider()
     fresh in here instead would silently let a run drift onto a live setting change mid-run, exactly
     the bug Ruling 4 exists to close everywhere else in this module.
+
+    `run_id` (Phase E known-bugs fix): optional, defaults to "unknown" -- same reasoning as
+    `provider` above, this function has no `state` of its own, so a real run_id (when the caller
+    has one -- graph.py's own `state.get("run_id", "unknown")` sentinel convention) must be threaded
+    in from outside rather than resolved here. Defaulting to "unknown" rather than requiring it
+    keeps every pre-existing caller working unchanged; without it, a Copilot turn run through this
+    function tags its own tool-call RunEvents "unknown" regardless of whether a real run_id was
+    available one frame up.
 
     Always returns a report -- never raises for model misbehavior. If the session ends without a
     valid report (or there is no sandbox at all), a success=False report is synthesized so the
@@ -120,6 +129,7 @@ async def run_and_report(
             stage_key,
             "draft",
             provider=provider,
+            run_id=run_id,
             model_name=model_name or model_config.get_model_name(stage_key, "draft", provider) or model_config.get_model_name("stack-run", "draft", provider),
             sandbox=sandbox,
             agent_mode="autopilot",

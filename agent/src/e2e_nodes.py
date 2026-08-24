@@ -780,6 +780,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         prompt_name="e2e_run",
         schema=AppLaunchReport,
         provider=state["provider"],
+        run_id=run_id,
         requested_port=str(requested_port),  # render_prompt substitutes strings only
     )
     if launch.success and launch.start_command:

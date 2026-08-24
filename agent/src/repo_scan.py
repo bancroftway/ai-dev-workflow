@@ -1996,14 +1996,18 @@ def _extract_db_version(version_output: str) -> str | None:
 _BACKGROUND_SCANS: dict[str, "asyncio.Task[Any]"] = {}
 
 
-def start_background_scan(thread_id: str, provider: Any, *, chat_provider: str) -> None:
+def start_background_scan(thread_id: str, provider: Any, *, chat_provider: str, run_id: str = "unknown") -> None:
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required, no
     default -- threaded straight through to the background task's own _scan_with_coverage call;
-    not resolved in here."""
+    not resolved in here. `run_id` (Phase E known-bugs fix) is threaded the same way, defaulting
+    to "unknown"; its one caller (scaffold_finalize_node) has a real one in scope."""
     if thread_id in _BACKGROUND_SCANS:
         return
     _BACKGROUND_SCANS[thread_id] = asyncio.create_task(
-        _scan_with_coverage(provider, thread_id, chat_provider=chat_provider, timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS)
+        _scan_with_coverage(
+            provider, thread_id, chat_provider=chat_provider,
+            timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS, run_id=run_id,
+        )
     )
 
 
@@ -2042,7 +2046,8 @@ def pop_background_scan(thread_id: str) -> "asyncio.Task[Any] | None":
 
 
 async def _scan_with_coverage(
-    provider: Any, thread_id: str, *, chat_provider: str, timeout_seconds: int | None = None
+    provider: Any, thread_id: str, *, chat_provider: str, timeout_seconds: int | None = None,
+    run_id: str = "unknown",
 ) -> tuple["ScanReport", dict[str, Any]]:
     """The baseline scan and coverage measurement, run concurrently within a single task so
     both finish before `repo_scan_baseline_node` awaits it -- the report is NOT written to
@@ -2053,7 +2058,10 @@ async def _scan_with_coverage(
     keyword-only, no default -- threaded straight through to measure_coverage; not resolved in
     here. Callers include a fire-and-forget background task (start_background_scan) started from
     scaffold_finalize_node, so this value is captured at task-creation time, same as every other
-    argument a background task closes over.
+    argument a background task closes over. `run_id` (Phase E known-bugs fix) is threaded the same
+    way and captured the same way, defaulting to "unknown" -- both real roots
+    (scaffold_finalize_node via start_background_scan, and repo_scan_baseline_node's own direct
+    fallback calls below) have a real `state.get("run_id", "unknown")` in scope and now pass it.
 
     The coverage half is independently guarded: it runs during the tech-stack/brownfield LLM-overlap
     window, where a sandbox hiccup (e.g. exec_in_sandbox raising) is more likely than usual. Losing
@@ -2065,7 +2073,7 @@ async def _scan_with_coverage(
     # Scanners and the coverage test run touch disjoint outputs -- run them concurrently.
     async def _guarded_coverage() -> tuple[Any, Any, Any, str, Any]:
         try:
-            return await measure_coverage(provider, thread_id, chat_provider=chat_provider, timeout_seconds=timeout_seconds)
+            return await measure_coverage(provider, thread_id, chat_provider=chat_provider, timeout_seconds=timeout_seconds, run_id=run_id)
         except Exception:  # noqa: BLE001 -- the scan must not be lost over a coverage crash
             logger.warning("repo_scan: coverage measurement crashed; keeping the completed scan", exc_info=True)
             return None, None, [], "runner_error", []
@@ -2163,11 +2171,13 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
         except Exception:  # noqa: BLE001 -- background failure falls back to a fresh inline run
             logger.warning("background repo scan failed; re-running inline", exc_info=True)
             report, coverage = await _scan_with_coverage(
-                provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
+                provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS,
+                run_id=state.get("run_id", "unknown"),
             )
     else:
         report, coverage = await _scan_with_coverage(
-            provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS
+            provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS,
+            run_id=state.get("run_id", "unknown"),
         )
     report = replace(report, metrics={**report.metrics, "coverage": coverage})
     dashboard = report.to_dashboard_dict()

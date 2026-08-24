@@ -296,7 +296,7 @@ async def verify_ac_to_tests(
             report={"changed_paths": write_scope.changed_paths, "missing_e2e": True},
         )
 
-    coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider)
+    coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
     if write_scope.reverted_paths:
         report["reverted_out_of_scope_paths"] = write_scope.reverted_paths

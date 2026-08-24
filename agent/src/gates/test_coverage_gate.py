@@ -699,14 +699,15 @@ def _with_timeout(command: str, timeout_seconds: int | None) -> str:
 
 
 async def _run_coverage_via_ghcp(
-    provider: SandboxProvider, thread_id: str, *, chat_provider: str
+    provider: SandboxProvider, thread_id: str, *, chat_provider: str, run_id: str = "unknown"
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
     """Acquisition half: one GHCP session finds every test root, runs it with coverage, and
     reports where the report files landed; THIS function parses those files and does the math.
 
     `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
     keyword-only, no default -- threaded straight through to stack_runner.run_and_report below,
-    which now requires it itself; not resolved in here.
+    which now requires it itself; not resolved in here. `run_id` (Phase E known-bugs fix) is
+    threaded the same way, defaulting to "unknown".
 
     Replaces three deleted code paths that all guessed commands in Python (a canned `dotnet test`
     at the repo root -> MSB1003 on every greenfield monorepo; a canned image-baked vitest
@@ -728,6 +729,7 @@ async def _run_coverage_via_ghcp(
         prompt_name="coverage_run",
         schema=CoverageRunReport,
         provider=chat_provider,
+        run_id=run_id,
         failure_detail=(
             "No prior automatic attempt: determine how to run this repository's tests with "
             "coverage from scratch."
@@ -828,14 +830,17 @@ async def _check_exclusion_gaming(provider: SandboxProvider, thread_id: str) -> 
 
 
 async def measure_coverage(
-    provider: SandboxProvider, thread_id: str, *, chat_provider: str, timeout_seconds: int | None = None
+    provider: SandboxProvider, thread_id: str, *, chat_provider: str, timeout_seconds: int | None = None,
+    run_id: str = "unknown",
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
     """Acquisition half of `verify_coverage`: a GHCP session runs the tests with coverage and
     reports its artifacts, which THIS module parses (see `_run_coverage_via_ghcp`).
 
     `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
     keyword-only, no default -- threaded straight through to `_run_coverage_via_ghcp`; not
-    resolved in here.
+    resolved in here. `run_id` (Phase E known-bugs fix) is threaded the same way, defaulting to
+    "unknown" -- reached from both `verify_coverage` (a real run_id already in scope there) and
+    repo_scan.py's `_scan_with_coverage` (same).
 
     Returns (line_rate, branch_rate, gaps, reason, entry_reports) with line_rate=None on any
     failure -- NEVER a fabricated 0, the same rule the gate's callers already depend on. `reason`
@@ -865,7 +870,7 @@ async def measure_coverage(
         logger.info("repo_scan coverage: reusing measurement for unchanged tree")
         return cached[1]
 
-    result = await _run_coverage_via_ghcp(provider, thread_id, chat_provider=chat_provider)
+    result = await _run_coverage_via_ghcp(provider, thread_id, chat_provider=chat_provider, run_id=run_id)
     if result[0] is not None:
         _COVERAGE_MEMO[thread_id] = (memo_key, result)
     return result
@@ -943,13 +948,18 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
 
 
 async def verify_coverage(
-    thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
+    thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
     chat_provider: str,
 ) -> "VerificationResult":
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
     through to measure_coverage below, which needs it for its own stack_runner.run_and_report
     call -- named distinctly from `provider` (the pre-existing SandboxProvider connection object)
-    to avoid colliding with it."""
+    to avoid colliding with it. `run_id` (Phase E known-bugs fix) was previously accepted-and-
+    ignored (`_run_id`, the same leading-underscore convention `_baseline_commit` below still
+    uses) -- graph.py's deterministic_verify call site already passes a real one
+    (`state.get("run_id", "unknown")`) positionally, it just wasn't threaded any further than this
+    function's own signature. Now threaded through to measure_coverage the same way chat_provider
+    is."""
     from ..graph import VerificationResult
     from .write_scope_gate import _is_pipeline_owned, _is_test_path
 
@@ -1016,7 +1026,7 @@ async def verify_coverage(
             report={"infra_error": "integration_fidelity"},
         )
 
-    line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id, chat_provider=chat_provider)
+    line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id, chat_provider=chat_provider, run_id=run_id)
 
     if line_rate is None:
         # Infra failure, not a coverage gap: the coverage run itself never produced a readable

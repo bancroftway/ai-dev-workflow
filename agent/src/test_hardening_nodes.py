@@ -103,6 +103,7 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
         prompt_name="test_hardening_run",
         schema=TestCommandReport,
         provider=state["provider"],
+        run_id=state.get("run_id", "unknown"),
         attempt_token=_ATTEMPT_TOKEN,
     )
     if not discovery.success or not discovery.command or _ATTEMPT_TOKEN not in discovery.result_path:

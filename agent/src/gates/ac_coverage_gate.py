@@ -621,11 +621,14 @@ class AcCoverageOutcome:
 
 
 async def check_ac_coverage(
-    provider: SandboxProvider, thread_id: str, content_dict: dict[str, Any], *, chat_provider: str
+    provider: SandboxProvider, thread_id: str, content_dict: dict[str, Any], *, chat_provider: str,
+    run_id: str = "unknown",
 ) -> AcCoverageOutcome:
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
     keyword-only, no default -- threaded straight through to stack_runner.run_and_report below,
-    which now requires it itself; not resolved in here."""
+    which now requires it itself; not resolved in here. `run_id` (Phase E known-bugs fix) is
+    threaded the same way, defaulting to "unknown" -- its caller (verify_ac_to_tests) already
+    carries a real one in scope."""
     raw_ledger = await repo_files.read_repo_file(provider, thread_id, LEDGER_PATH)
     active_ac_ids: list[str] = []
     all_ledger_ac_ids: list[str] = []
@@ -691,6 +694,7 @@ async def check_ac_coverage(
         prompt_name="ac_test_run",
         schema=AcTestRunReport,
         provider=chat_provider,
+        run_id=run_id,
         output_path=AC_TEST_OUTPUT_PATH,
     )
     output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)

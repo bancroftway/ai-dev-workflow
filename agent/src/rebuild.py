@@ -81,14 +81,16 @@ def red_gate_verdict(outcomes: dict[str, str]) -> tuple[bool, list[str], int]:
     return (not passed and failed > 0), passed, failed
 
 
-async def _verify_all_red(thread_id: str, chat_provider: str) -> tuple[bool, str]:
+async def _verify_all_red(thread_id: str, chat_provider: str, run_id: str = "unknown") -> tuple[bool, str]:
     """Deterministic TDD-red gate: run the suite, parse the runners' own structured reports, and
     require zero passing tests (and at least one failing). The scaffold fix node is INSTRUCTED to
     keep tests failing at runtime; this is the check that stops an over-implemented scaffold --
     an accidental green here means a test that will never have its "watch it fail" moment.
 
     `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
-    through to stack_runner.run_and_report below, which now requires it itself."""
+    through to stack_runner.run_and_report below, which now requires it itself. `run_id` (Phase E
+    known-bugs fix) is threaded the same way, defaulting to "unknown" -- this function has no
+    `state` of its own, same reasoning as chat_provider."""
     from .gates.ac_coverage_gate import AcTestRunReport  # local: avoids import at module load
 
     provider = get_sandbox_provider()
@@ -99,6 +101,7 @@ async def _verify_all_red(thread_id: str, chat_provider: str) -> tuple[bool, str
         prompt_name="ac_test_run",
         schema=AcTestRunReport,
         provider=chat_provider,
+        run_id=run_id,
         output_path=_RED_GATE_OUTPUT_PATH,
     )
     outcomes: dict[str, str] = {}
@@ -164,6 +167,7 @@ def make_rebuild_node(spec: RebuildSpec):
             prompt_name="rebuild_verify",
             schema=BuildVerifyReport,
             provider=state["provider"],
+            run_id=state.get("run_id", "unknown"),
             addendum=spec.fix_prompt_addendum or "",
         )
         build_ok = report.success and report.ok
@@ -181,7 +185,7 @@ def make_rebuild_node(spec: RebuildSpec):
         # wreckage as a stable regression.
         mctg_status = ((state.get("stages") or {}).get("minimal-code-to-green") or {}).get("status")
         if build_ok and spec.fix_scope == "scaffold_only" and mctg_status != "approved":
-            red_ok, red_detail = await _verify_all_red(thread_id, state["provider"])
+            red_ok, red_detail = await _verify_all_red(thread_id, state["provider"], run_id=state.get("run_id", "unknown"))
             if not red_ok:
                 build_ok = False
                 red_failed = True
