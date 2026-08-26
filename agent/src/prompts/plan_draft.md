@@ -57,8 +57,17 @@ user-facing screens, include one Wireframe per new/changed screen (at most 6). E
 complete, self-contained, high-fidelity HTML page: ALL styling inline in one `<style>` block, a
 system font stack (`-apple-system, Segoe UI, Roboto, sans-serif`), CSS shapes/gradients for any
 imagery. Absolutely no `<script>` tags, no inline event handlers, no external URLs of any kind
-(no CDN css/js, no web fonts, no remote images), and no `<iframe>`/`<object>`/`<embed>`/`<base>`/
-`<form>` tags (use plain `<input>`/`<button>` elements with no wrapping `<form>` for any
-data-entry UI) -- a deterministic step rejects violations and your draft will be sent back. Keep each under 30 KB; these ride along in every review prompt,
+(no CDN css/js, no web fonts, no remote images), and no `data:`/`javascript:`/`file:` URIs
+anywhere -- an inline base64 `data:image/...` placeholder icon is rejected exactly like a remote
+one, so draw imagery with CSS shapes/gradients or omit it -- and no `<iframe>`/`<object>`/
+`<embed>`/`<base>`/`<form>` tags (use plain `<input>`/`<button>` elements with no wrapping
+`<form>` for any data-entry UI) -- a deterministic step rejects violations and your draft will be
+sent back. Keep each under 30 KB; these ride along in every review prompt,
 so spend the bytes on layout fidelity, not boilerplate. Show realistic example content, not
 lorem ipsum. Skip wireframes entirely for non-UI plans.
+
+Naming, also gate-checked: each wireframe's `screen` name and each diagram's `name` must match
+`^[A-Za-z0-9_-]{1,64}$` -- letters, digits, `_`, `-` only. `login-form` and `ER_model` pass;
+`Login Page` and `data model` (spaces) are rejected before anything renders. And every
+wireframe's `html_source` must contain real markup (at minimum an `<html>`, `<body>` or `<div>`
+tag) -- a prose or ASCII sketch in that field is rejected as not-HTML.

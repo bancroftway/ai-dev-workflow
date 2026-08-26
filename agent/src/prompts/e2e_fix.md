@@ -9,11 +9,29 @@ resolves it.
 Fix the application code, or the test's own setup/fixtures, so each test passes for the RIGHT
 reason. NEVER delete a test, skip it (`.skip`/`test.fixme`), or weaken its assertions to make it
 pass -- a test that no longer proves the behavior it was written for is a regression dressed up as
-a fix.
+a fix. One carve-out, spelled out below: removing a network-shape wait
+(`waitForResponse`/`waitForRequest`/`page.route`) in favour of a web-first assertion on the same
+user-visible effect is explicitly NOT weakening; it is the required fix.
 
-Two failures here are environmental rather than bugs in the app, and are fixed in the suite's own
-files:
+Five failures here are environmental or spec-shape problems rather than bugs in the app, and are
+fixed in the suite's own files:
 
+- **"Test timeout of 30000ms exceeded" on a `page.waitForResponse` / `waitForRequest` /
+  `page.route` line** -- the spec guessed the app's network shape and the guess was wrong, so it
+  waits out its full timeout every run, every fix lap. Delete that wait and assert the same
+  action's user-visible effect instead (`await
+  expect(page.getByTestId('book-row')).toContainText('On loan')`) -- web-first assertions
+  auto-retry and prove more. Endpoint paths and query strings are an implementation detail no
+  stage promised the spec. Observed live: a checkout journey burned all 8 fix laps on one such
+  predicate.
+- **"connect ECONNREFUSED 127.0.0.1:<port>" from `apiRequestContext` or `page.goto`** -- the spec
+  hardcoded a port. The orchestrator picks the ports and passes them in: the suite gets
+  `process.env.BASE_URL`, the app gets its API base URL in its own env var. Read them; a literal
+  `http://127.0.0.1:8080` points at nothing.
+- **"Timed out waiting 60000ms from config.webServer" / "Port 3000 is in use by an unknown
+  process"** -- `playwright.config.ts` is trying to boot a server the orchestrator has ALREADY
+  booted on a different port. Remove the `webServer` block and rely on
+  `baseURL: process.env.BASE_URL`.
 - **"did not expect test.beforeEach() to be called here" / "two different versions of
   @playwright/test"** -- the config and the specs are importing the runner under DIFFERENT
   specifiers, which loads two copies of it. Make every file (`playwright.config.ts` and every spec)

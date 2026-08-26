@@ -142,12 +142,11 @@ Three details are not stylistic -- get them wrong and the suite cannot run at al
   attached to the run's exit report, so they are needed when tests PASS.
 - **`baseURL` from `process.env.BASE_URL`.** The orchestrator boots the app on a port it chooses and
   passes it in; a hardcoded URL points at nothing.
-- **If you add `@playwright/test` to a package.json, pin it to exactly `1.63.0-alpha-2026-08-05`** --
-  the sandbox image's own Playwright version. Playwright fetches a browser build matched to its own
-  version and the image bakes exactly one; a mismatch fails at run time with "Executable doesn't
-  exist at .../chromium_headless_shell-<rev>". Observed live: `^1.55.0` resolved to 1.62.1, wanting
-  revision 1234 against an image holding 1237. This is the one dependency you should NOT let the
-  package manager resolve to "latest".
+- **Do NOT add `@playwright/test` to any `package.json`.** The sandbox image bakes a pinned
+  Playwright (`1.63.0-alpha-2026-08-05`) and the orchestrator guarantees `'@playwright/test'`
+  resolves with no manifest change. A manifest edit here is silently reverted before the next
+  stage runs -- a version pin you write would not survive anyway, and manifest edits are the most
+  frequently reverted out-of-scope write in this stage's history (8 of 11 observed reverts).
 
 E2E specs may assert ONLY on contracted surfaces: `data-testid` locators and user-visible text/
 state. Never `page.waitForResponse`/`waitForRequest`/`page.route` with a URL or predicate -- the
@@ -218,7 +217,13 @@ above: anything under a `tests/`, `test/`, `__tests__/`, or `e2e/` directory; an
 or `*.spec.ts(x)`; `vitest.config.ts` and `playwright.config.ts`; any `*.Tests/` directory,
 `*Tests.csproj`, or `*Tests.cs`; and Python `test_*.py`, `*_test.py`, `conftest.py`. Editing
 `package.json` (or any other dependency manifest) is NOT permitted and will be reverted -- use
-the sandbox's baked test runners instead of adding dependencies. Never touch production source code,
+the sandbox's baked test runners instead of adding dependencies. Do not RUN the suite you are
+writing: this stage produces a RED suite by design, and executing it only litters the tree with
+generated output -- `test-results/`, `coverage/`, `.coverage`, `coverage.cobertura.xml`,
+`__pycache__/`, `*.tsbuildinfo`, `next-env.d.ts` -- none of which is a test file, all of which
+the write-scope gate deletes before the next stage sees it. Write the files and answer. For the
+same reason never edit `.gitignore`, `tsconfig.json`, or any framework config (`next.config.*`,
+`vite.config.*`): those are the application's, not the suite's. Never touch production source code,
 even to make a test compile; if a test needs a symbol that doesn't exist yet, that's expected and
 correct at this stage (a later, separate stage adds minimal scaffolding to make it compile without
 making it pass). For the same reason, NEVER write a body that fails by fiat -- `Assert.True(false,

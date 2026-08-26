@@ -44,8 +44,13 @@ _TS_TEST_PATTERNS = [
     r"\.test\.tsx?$",
     r"\.spec\.tsx?$",
     r"(^|/)(tests|__tests__|test|e2e)/",
-    r"(^|/)playwright\.config\.tsx?$",
-    r"(^|/)vitest\.config\.tsx?$",
+    # [cm]?[jt]s covers the ESM/CJS flavours (`.mts`, `.mjs`, `.cts`, `.cjs`, plain `.js`) a
+    # package's own "type" field can REQUIRE -- observed live: legitimate `vitest.config.mts`
+    # files at apps/jobs and packages/db were silently reverted because only `.ts(x)` matched,
+    # while _E2E_PATH_RE below already accepted `playwright.config.[jt]sx?`. Configs the stage is
+    # explicitly told to write must never be deleted over their extension.
+    r"(^|/)playwright\.config\.[cm]?[jt]sx?$",
+    r"(^|/)vitest\.config\.[cm]?[jt]sx?$",
 ]
 _PY_TEST_PATTERNS = [
     r"(^|/)test_[A-Za-z0-9_]+\.py$",

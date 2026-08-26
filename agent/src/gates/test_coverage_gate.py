@@ -927,7 +927,11 @@ _REASON_FEEDBACK: dict[str, str] = {
     REASON_CONTRACT_REPLAY_FAILED: f"every entry in {COVERAGE_COMMANDS_PATH} failed on replay (see server logs for details)",
     REASON_NO_TOOLING_MAPPING: (
         "no coverage tooling mapping for this stack. Record working coverage command(s) in "
-        f"{COVERAGE_COMMANDS_PATH} (see the drafting instructions) so the gate can replay them."
+        f"{COVERAGE_COMMANDS_PATH} -- a JSON `entries` list where each entry has `command` (runs "
+        "the suite with coverage), `artifact` (the file that command writes), `format` "
+        "('cobertura' or 'istanbul-json-summary'), and `root` (the directory the command runs "
+        "from; '' = repo root) -- one entry per app/test root, so the gate can replay them. The "
+        "tech-stack doc's Testing section shows this stack's exact entries."
     ),
 }
 

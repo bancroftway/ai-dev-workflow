@@ -79,3 +79,10 @@ real `US-####`/`AC-####.#` ids, then no such ids exist yet -- every `existing_us
 `existing_ac_id` in your response MUST be `null`. Never cite an id you were not literally given
 in this conversation; the deterministic gate rejects invented citations and your draft will be
 bounced back to you.
+
+The same rule binds `retired_ac_ids`/`retired_us_ids`, and there is NO first-draft leniency for
+them: unlike `existing_us_id`/`existing_ac_id` (forgiven when the ledger is empty), a retirement
+citation is always checked strictly. Leave both lists EMPTY unless this prompt literally handed
+you the id you are naming. The gate rejects the whole draft when a named id does not exist in the
+ledger, or when a `US-####` story id appears in `retired_ac_ids` (or an `US-####.#` criterion id
+in `retired_us_ids`) -- that shape is almost always the two fields swapped.

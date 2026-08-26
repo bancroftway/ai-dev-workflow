@@ -22,6 +22,11 @@ Rules that matter more than speed:
   evidence that refutes it -- quote the Plan text and the code that satisfies it. An honest, evidenced
   rebuttal is a valid outcome. Silently ignoring a finding is not, and neither is "fixing" it by
   editing the finding's own severity.
+- **A finding whose resolution is a judgement, not a list, is under-specified -- close it to the
+  letter and say what you closed.** "Not close enough to the wireframe" is closed by enumerating
+  every field, action, section, and state the wireframe shows, then reporting each as present or
+  absent in your summary. Leaving one unlisted is how the same finding returns next lap at the same
+  severity with your changes already in the tree.
 - If a test the audit asks for genuinely cannot be written in this environment (it needs a service
   this sandbox does not have, say), write the nearest test that DOES prove the behaviour and explain
   the substitution.

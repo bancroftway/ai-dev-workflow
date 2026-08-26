@@ -46,6 +46,16 @@ You are read-only in this session. Report a `plan_conformance_summary`, every `d
 `unresolved_risk_notes` for anything you're not confident about either way, and an
 `overall_verdict`.
 
+Every `critical`/`major` finding's `proposed_resolution` must be an EXHAUSTIVE, checkable list of
+what closing it requires -- the specific elements, states, or test names that must exist -- never a
+judgement like "still not close enough" or "does not verify all behaviors the plan requires". The
+fix agent cannot close a verdict; it can only close an enumerated list, and a finding it cannot
+close comes straight back to you next lap at the same severity. Observed live: four laps of real
+code changes against feedback that was byte-similar each time, ending in escalation. If you are
+RE-RAISING a finding from a previous lap, state what the last lap actually fixed and enumerate only
+what remains -- a re-raise with the same text as last lap is a defect in this report, not in the
+code.
+
 If you cannot meaningfully assess conformance (e.g. the repo state is inconsistent with what the
 Plan describes), set readiness to false and explain why in a clarifying question.
 

@@ -2538,8 +2538,13 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             start_event = await run_event_store.append_event(start_event)
             await run_event_stream.emit_live(start_event, config)
 
+        # `or {}`: on the safety-cap auto-approve path a stage can reach verify with draft=None,
+        # and a gate doing content_dict.get(...) then dies with AttributeError instead of a
+        # verdict -- observed live (diagram_gate crashed two whole runs before ITS local guard
+        # was added; _verify_specification_ledger had the identical latent crash). Guarded once
+        # here so no individual gate has to remember to.
         result = await stage_spec.deterministic_verify(
-            thread_id, stage["draft"], state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
+            thread_id, stage["draft"] or {}, state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
             state["provider"],
         )
         stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}

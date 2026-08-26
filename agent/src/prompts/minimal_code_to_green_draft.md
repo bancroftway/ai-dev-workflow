@@ -116,15 +116,34 @@ backend's tests then prove nothing about the running product no matter how high 
 Observed live: a run shipped a C# class library with no host at all next to a Next.js app persisting
 to `localStorage`, passed every gate, and delivered an "API" that was dead code.
 
-**The backend must be instrumented with OpenTelemetry, regardless of stack.** A deterministic gate
-checks for an OpenTelemetry SDK signal in the backend's project and entry files. Add it at startup,
+**Build every framework the Tech Stack declares, not just the one you find easiest.** The same gate
+reads the approved Tech Stack and, for each declared UI framework, requires BOTH its unmistakable
+source signature on disk (`.razor` for Blazor, `.component.ts` for Angular, `.vue` for Vue/Nuxt,
+`.tsx`/`.jsx` for React/Next, `.svelte`) AND a real dependency on it in a `package.json` where the
+framework has one (`next`, `react`, `vue`, `@angular/core`). Observed live: a run declared a
+Next.js frontend, wrote one `page.tsx` beside a `package.json` with no dependencies and a
+`node -e "console.log('web build placeholder')"` build script, and the gate correctly called the
+frontend nonexistent. A file with the right extension is not the frontend.
+
+**Do not re-implement the backend inside the frontend.** A same-origin `fetch('/api/...')` served
+by your own framework route handler (`app/api/*/route.ts`, `pages/api/*`) does NOT count as calling
+the declared backend if that handler keeps the state itself -- the gate names each such handler and
+blocks. Either call the backend's endpoints directly with its base URL from configuration, or keep
+those handlers as thin proxies that forward every request. Never satisfy this by deleting the
+backend; the Tech Stack that declares it is approved.
+
+**The app must be instrumented with OpenTelemetry -- frontend AND backend -- regardless of stack.**
+A deterministic gate checks for an OpenTelemetry SDK signal in each declared framework's project and
+entry files, per the tech-stack doc's Observability section. Add it at startup,
 before mapping routes/handlers: for ASP.NET Core, the `OpenTelemetry.Extensions.Hosting` +
 `OpenTelemetry.Instrumentation.AspNetCore` NuGet packages and a
 `builder.Services.AddOpenTelemetry()...AddAspNetCoreInstrumentation()` call in `Program.cs`; for
 Express/Nest, `@opentelemetry/api` + `@opentelemetry/sdk-node` initialized before the app's other
 imports -- OTel's own convention is a dedicated `tracing.js`/`instrumentation.js` file required
 first, which the deterministic check also looks for; for FastAPI/Flask/Django, `opentelemetry-api`
-+ the matching `opentelemetry-instrumentation-*` package, initialized at app startup. Use a console exporter (or
++ the matching `opentelemetry-instrumentation-*` package, initialized at app startup; for a Next.js
+frontend, `instrumentation.ts` with the `NEXT_RUNTIME === 'nodejs'` guard (or `@vercel/otel`); for
+React/Vue/Angular, `@opentelemetry/sdk-trace-web` in the app entry. Use a console exporter (or
 respect `OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_TRACES_EXPORTER=none` if either is set in the
 environment) -- this is not decoration: it is what lets a later e2e failure be traced to the actual
 handler or downstream call that broke, instead of only a frontend symptom.
@@ -146,6 +165,16 @@ checks every implemented screen against its wireframe and blocks the run on a mi
 now, while the code is still yours to write, is the cheap version of that fix -- catching it after
 the fact is the expensive one (that stage's own fix-lap cap is 6, specifically because wireframe
 rework is heavy). No wireframe for a screen means nothing to check here.
+
+**If the Plan names a test, write that test -- by that name.** Plan steps routinely spell out
+coverage in prose ("API integration tests cover restart persistence", "verify US-0001.1-3"). Each
+such phrase is a named artifact the adversarial-compliance stage later looks for by hand, and a
+suite that proves the behaviour *incidentally* does not satisfy it: a test exercising GET/POST/GET
+inside one factory lifetime is not a restart-persistence test. Grep the approved Plan for every
+coverage sentence and confirm one test maps to each. Observed live: three consecutive conformance
+laps all blocked on "Missing direct tests for reload sync, reset behavior, and zero-floor" and "no
+restart-persistence test. Plan explicitly called for it" -- every one writable here, in the stage
+that owns tests.
 
 ## Tests you add here
 
