@@ -123,6 +123,68 @@ one):
 - Lint: `eslint --max-warnings=0` + `tsc --noEmit` on the web app; the API's analyzer warnings are
   build errors via `Directory.Build.props`.
 
+## Observability
+
+Both apps ship OpenTelemetry from the first commit, Console exporter by default (the pipeline's
+coverage gate verifies the packages are present; respect `OTEL_EXPORTER_OTLP_ENDPOINT` /
+`OTEL_TRACES_EXPORTER=none` when set, the same convention as everywhere else in this pipeline).
+
+- **API**: `dotnet add apps/api package OpenTelemetry.Extensions.Hosting`, `dotnet add apps/api
+  package OpenTelemetry.Instrumentation.AspNetCore`, `dotnet add apps/api package
+  OpenTelemetry.Exporter.Console`, then in `Program.cs`:
+  ```csharp
+  builder.Services.AddOpenTelemetry()
+      .ConfigureResource(r => r.AddService("api"))
+      .WithTracing(t => t.AddAspNetCoreInstrumentation().AddConsoleExporter());
+  ```
+- **Web (Next.js 15/16)**: `cd apps/web && npm install @opentelemetry/sdk-node
+  @opentelemetry/exporter-trace-otlp-http`. `instrumentation.ts` at the app root with the runtime
+  guard — `NodeSDK` crashes on the edge runtime, so the import must be dynamic and node-only:
+  ```ts
+  // instrumentation.ts
+  export async function register() {
+    if (process.env.NEXT_RUNTIME === "nodejs") {
+      await import("./instrumentation.node");
+    }
+  }
+  ```
+  ```ts
+  // instrumentation.node.ts
+  import { NodeSDK, tracing } from "@opentelemetry/sdk-node";
+  const sdk = new NodeSDK({
+    serviceName: "web",
+    spanProcessors: [new tracing.SimpleSpanProcessor(new tracing.ConsoleSpanExporter())],
+  });
+  sdk.start();
+  ```
+
+## Authentication
+
+Only when this run carries the enterprise authentication requirement (the pipeline injects it,
+with the anonymous-route allowlist, when the repo's settings demand it):
+
+- **API**: `dotnet add apps/api package Microsoft.Identity.Web`; in `Program.cs` bind the standard
+  section — env vars `AzureAd__ClientId` / `AzureAd__ClientSecret` / `AzureAd__TenantId` arrive at
+  runtime, never hardcode values:
+  ```csharp
+  builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+      .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
+  builder.Services.AddAuthorizationBuilder()
+      .SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build());
+  app.UseAuthentication();
+  app.UseAuthorization();
+  ```
+  The fallback policy is the point: every endpoint requires auth unless it opts out with
+  `[AllowAnonymous]` — and only allowlisted routes may opt out. Unauthenticated API calls answer
+  401, never a 200 login page.
+- **Web**: protect every page with Auth.js (`next-auth`) + the Microsoft Entra ID provider and a
+  root `middleware.ts` whose matcher excludes ONLY the allowlisted anonymous routes and Next's
+  own static assets (`_next/*`). Unauthenticated page loads redirect to the provider.
+- **Test seam**: when `process.env.AIDW_TEST_AUTH === "1"` (and ONLY then), enable a test sign-in
+  path (a Credentials provider on the web side; a test JWT authentication scheme on the API) so
+  the Playwright suite can authenticate without a live Entra round-trip. It must be completely
+  inert when the variable is unset — the enforcement gate probes without it.
+
 ## Stack facts
 
 dotnet_detected: true

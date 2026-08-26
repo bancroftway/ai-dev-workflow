@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import approvals, chat_model, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
+from . import config as workflow_config
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
@@ -36,6 +37,11 @@ _GATE_OWNED_REASON_MARKERS = (
     "coverage below threshold",
     "exceeds the",          # duplication threshold
     "regressed",            # coverage/health regression deltas
+    # Any NEW deterministic blocker vocabulary must be added here too, or a blocker fixed on run
+    # N re-blocks every later run: the drafting model reads the committed EXIT-REPORT.md and
+    # copies old blockers forward verbatim (see verify_exit_readiness's stale-blocker filter).
+    "README.md",            # readme leg's hard structure problems (verify_exit_readiness)
+    "authentication enforcement",  # auth gate wording, incl. the e2e-skipped named problem
 )
 
 CHANGELOG_PATH = "CHANGELOG.md"
@@ -415,8 +421,34 @@ async def verify_exit_readiness(
     metrics = _parse(await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json"))
     if metrics.get("run_id") == run_id:
         problems.extend((metrics.get("regression_gate") or {}).get("reasons") or [])
+        # README leg (W7): hard standard-readme problems still open after the leg's own retry
+        # laps block the merge -- but only when the leg OWNS the README (a human-authored
+        # brownfield README is advisory-only by design, readme_write_node's rule).
+        readme = metrics.get("readme") or {}
+        if readme.get("owned"):
+            problems.extend(readme.get("problems") or [])
     else:
         problems.append("metrics were not recorded for this run -- the regression gate never passed")
+
+    # --- auth enforcement can't silently vanish (W4): a run that REQUIRED auth but whose e2e
+    # never ran (non-UI repo, runner missing, suite skipped) verified nothing -- exactly the
+    # repos (API-only) where auth matters most. A named blocker, not a silent pass. Read from
+    # metrics-latest.json (metrics_compute persists app_auth + the e2e snapshot for exactly this
+    # check) -- deterministic verifies are file-based, never graph-state-based.
+    if metrics.get("run_id") == run_id:
+        app_auth = metrics.get("app_auth") or {}
+        e2e_snapshot = metrics.get("e2e") or {}
+        auth_required = (
+            workflow_config.AIDW_AUTH_GATE
+            and app_auth.get("auth_mode") in ("required", "anonymous_list")
+            and bool(app_auth.get("secrets_present"))
+        )
+        if auth_required and e2e_snapshot.get("status") in (None, "skipped"):
+            problems.append(
+                "authentication enforcement was required for this run but the e2e pass that "
+                f"verifies it never ran (status: {e2e_snapshot.get('status') or 'never started'})"
+                " -- the auth posture is unverified"
+            )
 
     # Drop STALE deterministic blockers the model carried over from a previous run's report.
     #

@@ -1,6 +1,7 @@
 "use client";
 
 import { useAgent } from "@copilotkit/react-core/v2";
+import { HealthRing } from "@/components/HealthRing";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import { PIPELINE_STAGE_ORDER, type E2EState, type ScanMeasures, type WorkflowState } from "@/lib/workflow-types";
 import {
@@ -275,8 +276,20 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
       />
     );
 
+    // The annular health ring leads the strip. Guarded on the SCORE (not just the summary):
+    // pre-v2 stored baselines can rehydrate with health_score null when nothing was measurable.
+    const healthRing = summary.health_score == null ? null : (
+      <HealthRing
+        key="health"
+        score={summary.health_score}
+        baseline={hasBaseline ? scan?.baseline_summary?.health_score : null}
+        comparable={summary.health_score_comparable}
+      />
+    );
+
     chips = (
       <>
+        {healthRing}
         {security}
         {maintainability}
         {coverage}

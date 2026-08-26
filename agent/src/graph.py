@@ -299,6 +299,12 @@ class GraphState(TypedDict):
     # background refresh scan lands (metrics_nodes.collect_live_refresh) -- feeds the metrics
     # bar's Cost chip during the run; metrics_report's token_usage_summary is the final word.
     token_usage_running: dict[str, Any] | None
+    # The generated app's authentication posture for THIS run: {auth_mode, anonymous_routes,
+    # secrets_present}. Seeded once by record_raw_requirements_node from repo_auth_settings'
+    # per-thread store (provision wrote it) + keyvault's secret cache; read everywhere via
+    # get_app_auth(state) -- NEVER a direct subscript, because every checkpoint written before
+    # this field shipped lacks it, and a gate-approval resume re-enters PAST the seeding node.
+    app_auth: dict[str, Any]
 
 
 def default_stage_state() -> StageState:
@@ -367,6 +373,44 @@ SPEC_TICKET_MODE_SEGMENT = load_prompt("specification_ticket_mode_segment")
 PLAN_SYSTEM_PROMPT = load_prompt("plan_draft")
 
 PLAN_GREENFIELD_SEGMENT = load_prompt("plan_greenfield_segment")
+
+# Appended to specification/plan/ac-to-tests/minimal-code-to-green drafts when the repo's auth
+# posture requires it AND Key Vault auth secrets are actually present (an app cannot demand Entra
+# sign-in with no ClientId to sign in against -- see get_app_auth/auth_enforced below).
+AUTH_REQUIREMENT_SEGMENT = load_prompt("auth_requirement_segment")
+
+# W9: repo-durable memory (.ai-dev-workflow/memory.md -- the only store that outlives the
+# container, since $HOME and its .claude transcripts die on every reprovision). Appended to the
+# write-capable stages that actually learn stack quirks: ac-to-tests, minimal-code-to-green,
+# remediation. Advisory by design -- no gate ever blocks on memory.
+MEMORY_SEGMENT = load_prompt("memory_segment")
+
+_APP_AUTH_DEFAULT: dict[str, Any] = {"auth_mode": "required", "anonymous_routes": [], "secrets_present": False}
+
+
+def get_app_auth(state: "GraphState") -> dict[str, Any]:
+    """The ONLY way to read state['app_auth']: every checkpoint written before the field shipped
+    lacks it, and a gate-approval resume re-enters PAST record_raw_requirements_node's seeding --
+    a direct subscript is a guaranteed KeyError on every in-flight session at deploy time. The
+    default has secrets_present=False, so enforcement is inert until genuinely seeded."""
+    return state.get("app_auth") or dict(_APP_AUTH_DEFAULT)
+
+
+def auth_enforced(state: "GraphState") -> bool:
+    """True when the generated app must be locked down AND the run can actually satisfy that:
+    auth mode requires it, Key Vault auth secrets were injected, and the operator kill-switch
+    (AIDW_AUTH_GATE) is on. The same predicate guards prompt injection and the e2e auth gate, so
+    the pipeline never demands what it cannot verify (or vice versa)."""
+    if not workflow_config.AIDW_AUTH_GATE:
+        return False
+    app_auth = get_app_auth(state)
+    return app_auth.get("auth_mode") in ("required", "anonymous_list") and bool(app_auth.get("secrets_present"))
+
+
+def _auth_segment_message(state: "GraphState") -> HumanMessage:
+    routes = get_app_auth(state).get("anonymous_routes") or []
+    rendered = "\n".join(f"  - {r}" for r in routes) if routes else "  (none -- every route requires sign-in)"
+    return HumanMessage(content=AUTH_REQUIREMENT_SEGMENT.replace("<<anonymous_routes>>", rendered))
 
 # Appended only when hydrate_plan_ticket_mode_context (StageSpec.draft_prompt_context_from_repo_file)
 # finds an earlier ticket's approved Plan already on disk -- spec_ledger.hydrate_ticket_mode_context's
@@ -438,6 +482,8 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
         SystemMessage(content=SPEC_SYSTEM_PROMPT),
         HumanMessage(content=requirements_content),
     ]
+    if auth_enforced(state):
+        messages.append(_auth_segment_message(state))
     # Not a StageState field -- only ever present on the prompt-only stage copy make_draft_node
     # builds from StageSpec.draft_prompt_context_from_repo_file's return (see that hook's own
     # docstring and spec_ledger.hydrate_ticket_mode_context). Absent, hence falsy, on every other
@@ -465,6 +511,8 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
         SystemMessage(content=PLAN_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
     ]
+    if auth_enforced(state):
+        messages.append(_auth_segment_message(state))
     if tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=PLAN_GREENFIELD_SEGMENT))
     if _tech_stack_has_ui_framework(state):
@@ -694,7 +742,15 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
         }
     stages["raw-requirements"] = stage
     await _persist_if_sandboxed(thread_id, state, stages, "ai-dev-workflow: raw requirements recorded")
-    return {"stages": stages}
+    # Seed the run's app-auth posture ONCE, here (the one deterministic node every fresh run passes
+    # through after provision): repo settings from the per-thread store sessions_api populated,
+    # plus whether Key Vault actually delivered auth secrets -- auth_enforced() needs both.
+    # Checkpointed like every other GraphState field; resumes re-read it from the checkpoint.
+    from . import keyvault, repo_auth_settings
+
+    auth_settings = repo_auth_settings.get_for_thread(thread_id)
+    app_auth = {**auth_settings, "secrets_present": bool(keyvault.get_app_secrets(thread_id))}
+    return {"stages": stages, "app_auth": app_auth}
 
 
 async def _verify_specification_ledger(
@@ -757,6 +813,12 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
     ]
+    # The suite must KNOW about auth: without this, every positive-path AC test hits a 302-to-
+    # Entra, and the cheapest way for a fix lap to go green is deleting the middleware -- which
+    # then re-fails the auth gate. The segment mandates the AIDW_TEST_AUTH seam tests sign in with.
+    if auth_enforced(state):
+        messages.append(_auth_segment_message(state))
+    messages.append(HumanMessage(content=MEMORY_SEGMENT))
     if tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=AC_TO_TESTS_GREENFIELD_SEGMENT))
     # Not a StageState field -- see hydrate_plan_ticket_mode_context's docstring for the general
@@ -817,6 +879,9 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{plan_stage['approved_content']}"),
         HumanMessage(content=f"Approved Test Suite from P4 (JSON):\n\n{tests_stage['approved_content']}"),
     ]
+    if auth_enforced(state):
+        messages.append(_auth_segment_message(state))
+    messages.append(HumanMessage(content=MEMORY_SEGMENT))
     if _tech_stack_has_ui_framework(state):
         messages.append(HumanMessage(content=IMPECCABLE_CODEGEN_SEGMENT))
         messages.append(HumanMessage(content=FRONTEND_DESIGN_SEGMENT))
@@ -917,6 +982,7 @@ def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
     messages: list[BaseMessage] = [
         SystemMessage(content=REMEDIATION_SYSTEM_PROMPT),
         HumanMessage(content=REMEDIATION_HUMAN_TEMPLATE),
+        HumanMessage(content=MEMORY_SEGMENT),
     ]
     if state["stages"]["remediation"].get("ticket_mode_baseline"):
         messages.append(HumanMessage(content=REMEDIATION_TICKET_MODE_SEGMENT))
@@ -981,6 +1047,9 @@ def _build_adversarial_compliance_prompt(state: GraphState) -> list[BaseMessage]
         "failed_tests": (e2e.get("failed_tests") or [])[:10],
         "screenshots": e2e.get("screenshots") or [],
         "skipped_reason": e2e.get("skipped_reason"),
+        # Its own key, NOT competing for the failed_tests[:10] slots: a 12-route auth failure
+        # must not push the real test failures out of the auditor's view (or vice versa).
+        "auth_check": (e2e.get("auth_check") or {}).get("feedback"),
     }
     messages: list[BaseMessage] = [
         SystemMessage(content=ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT),
@@ -3205,7 +3274,12 @@ REBUILD_FOR_ADVERSARIAL_COMPLIANCE = rebuild.RebuildSpec(
     # code-writing stage: everything this gate lets through goes straight to metrics-exit, which can
     # only fail the run. See RebuildSpec.scan_delta_gate for the run this was written from.
     scan_delta_gate=True,
-    next_node="metrics_compute",
+    # Into readme_write (W7), which chains to metrics_compute -- the README leg runs BEFORE the
+    # final scan so metrics-latest and the exit report cover the finished tree, README included.
+    # This is the ONLY next_node="metrics_compute" in the file (verified), so every normal
+    # successful path gets the README leg; failure/escalate paths route straight to
+    # metrics-exit_draft and deliberately skip it.
+    next_node="readme_write",
 )
 
 # Maps a STAGES entry's key -> the R placement immediately after it, so build_graph()'s per-stage
@@ -3338,9 +3412,13 @@ def _wire_p14(builder: StateGraph) -> None:
     exit.md/manifest/session close still happen and exit's verify blocks the merge.
     Verification status: NOT exercised against a real sandbox, same caveat as
     quality-remediation/security-remediation/audit-cluster/test-hardening."""
+    builder.add_node("readme_write", metrics_nodes.readme_write_node)
     builder.add_node("metrics_compute", metrics_nodes.metrics_compute_node)
     builder.add_node("metrics_regression_record", metrics_nodes.metrics_regression_record_node)
     builder.add_node("metrics_ponytail_gain", metrics_nodes.metrics_ponytail_gain_node)
+    # The README leg (W7) fronts the metrics pass -- REBUILD_FOR_ADVERSARIAL_COMPLIANCE's
+    # next_node lands here, and the final scan then covers the committed README.
+    builder.add_edge("readme_write", "metrics_compute")
     builder.add_conditional_edges(
         "metrics_compute",
         metrics_nodes.make_metrics_route_after_compute(),
@@ -3664,6 +3742,7 @@ REQUIRED_PIPELINE_NODES = (
     "test_hardening_run_tests",  # runs the suite N x to find flakes
     "e2e_gate_check",
     "e2e_run",  # boots the app, drives playwright, harvests screenshots
+    "readme_write",  # standard-readme leg -- runs before the final scan so it covers the README
     "metrics_compute",  # final scan + baseline delta -> metrics-latest.json
     "metrics_regression_record",
 )

@@ -71,9 +71,22 @@ export interface ScanMeasures {
   accessibility_score?: number | null;
 }
 
-/** repo_scan.py's ScanReport.summary() shape -- streamed via the repo_scan state channel. */
+/** repo_scan.py's ScanReport.summary() shape -- streamed via the repo_scan state channel.
+ * The health_* fields are v2 additions and OPTIONAL: pre-v2 baseline files (rehydrated via
+ * _summary_from_stored) carry only health_score, and a scan where nothing was measurable can
+ * even carry null there -- render nothing, never crash. */
 export interface ScanSummary {
-  health_score: number;
+  health_score: number | null;
+  /** Per-subscore 0-100 values, null = unmeasured (its weight was redistributed). */
+  health_subscores?: Record<string, number | null>;
+  /** The renormalized weights the score ACTUALLY used -- ground truth for comparability. */
+  health_weights_used?: Record<string, number>;
+  health_score_version?: number;
+  /** False when the baseline was scored under a different formula/measured set -- the UI greys
+   * the baseline delta instead of presenting a meaningless comparison. */
+  health_score_comparable?: boolean;
+  /** Names of scan tools that failed/were missing this scan -- signals the summary is partial. */
+  degraded?: string[];
   by_severity: Record<string, number>;
   by_category: Record<string, number>;
   deduped_count: number;

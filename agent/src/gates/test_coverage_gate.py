@@ -193,20 +193,29 @@ _HTTP_CALL_MARKERS = ("fetch(", "axios", "httpclient", "$fetch", "xmlhttprequest
 # declared stack, so an e2e failure traces to the handler/downstream call that actually broke
 # instead of only a frontend symptom (agent/src/telemetry.py sets up the identical thing for the
 # orchestrator itself; this is the same pattern applied to what the pipeline generates).
-_OTEL_MARKERS: tuple[tuple[str, str], ...] = (
-    ("asp.net", "opentelemetry"),
-    ("aspnet", "opentelemetry"),
-    ("fastapi", "opentelemetry"),
-    ("flask", "opentelemetry"),
-    ("django", "opentelemetry"),
-    ("express", "opentelemetry"),
-    ("nest", "opentelemetry"),
+_OTEL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("asp.net", ("opentelemetry",)),
+    ("aspnet", ("opentelemetry",)),
+    ("blazor", ("opentelemetry",)),
+    ("fastapi", ("opentelemetry",)),
+    ("flask", ("opentelemetry",)),
+    ("django", ("opentelemetry",)),
+    ("express", ("opentelemetry",)),
+    ("nest", ("opentelemetry",)),
+    # Frontends (W6): the JS-ecosystem signal lives in package.json / instrumentation.ts, both of
+    # which otel_extra_paths already reads. "@opentelemetry" (the scoped packages) OR "@vercel/otel"
+    # (Next's recommended wrapper, which pulls zero direct @opentelemetry deps) -- NOT a bare
+    # "otel" needle, which "hotel" would satisfy.
+    ("next", ("@opentelemetry", "@vercel/otel")),
+    ("react", ("@opentelemetry", "@vercel/otel")),
+    ("vue", ("@opentelemetry",)),
+    ("angular", ("@opentelemetry",)),
 )
 
 
 def missing_otel_instrumentation(frameworks: list[str], project_texts: dict[str, str]) -> str | None:
-    """A declared, actually-hosted backend framework with no OpenTelemetry signal anywhere in its
-    project/entry files, or None.
+    """A declared, actually-hosted framework (backend OR frontend) with no OpenTelemetry signal
+    anywhere in its project/entry files, or None.
 
     Fails OPEN (returns None) when there is nothing to read -- only positive evidence of absence
     counts, same discipline as missing_hosted_backend. Deliberately permissive (one substring match
@@ -219,10 +228,10 @@ def missing_otel_instrumentation(frameworks: list[str], project_texts: dict[str,
     blob = "\n".join(project_texts.values()).lower()
     for framework in frameworks:
         name = str(framework).lower()
-        for marker, needle in _OTEL_MARKERS:
+        for marker, needles in _OTEL_MARKERS:
             if marker not in name:
                 continue
-            if needle not in blob:
+            if not any(needle in blob for needle in needles):
                 return str(framework)
             break
     return None
@@ -415,19 +424,22 @@ async def _check_integration_fidelity(
     missing_otel = missing_otel_instrumentation(frameworks, {**texts, **otel_extra_texts})
     if missing_otel:
         return (
-            f"The approved Tech Stack declares {missing_otel} as this app's backend, and it is "
-            f"hosted, but no OpenTelemetry SDK signal is present anywhere in its project or entry "
-            f"files. Every generated backend must be instrumented regardless of the declared stack, "
-            f"so an e2e failure traces to the handler or downstream call that actually broke instead "
-            f"of only a frontend symptom. Add the OpenTelemetry SDK for this ecosystem -- for ASP.NET "
-            f"Core: the OpenTelemetry.Extensions.Hosting + OpenTelemetry.Instrumentation.AspNetCore "
-            f"NuGet packages and a builder.Services.AddOpenTelemetry()...AddAspNetCoreInstrumentation() "
-            f"call in Program.cs; for Express/Nest: @opentelemetry/api + @opentelemetry/sdk-node "
-            f"initialized before the app's other imports; for FastAPI/Flask/Django: "
-            f"opentelemetry-api + the matching opentelemetry-instrumentation-* package, initialized "
-            f"at app startup -- with a console or OTLP exporter (respect OTEL_EXPORTER_OTLP_ENDPOINT "
-            f"/ OTEL_TRACES_EXPORTER=none if set, the same convention this pipeline's own "
-            f"telemetry.py already uses for itself)."
+            f"The approved Tech Stack declares {missing_otel} for this app, but no OpenTelemetry "
+            f"SDK signal is present anywhere in its project or entry files. Every generated app "
+            f"(frontend AND backend) must be instrumented regardless of the declared stack, so an "
+            f"e2e failure traces to the handler or downstream call that actually broke instead "
+            f"of only a symptom. Follow the tech-stack doc's Observability section. Backends -- "
+            f"ASP.NET Core: OpenTelemetry.Extensions.Hosting + OpenTelemetry.Instrumentation.AspNetCore "
+            f"and builder.Services.AddOpenTelemetry()...AddAspNetCoreInstrumentation() in Program.cs; "
+            f"Express/Nest: @opentelemetry/api + @opentelemetry/sdk-node initialized before the "
+            f"app's other imports; FastAPI/Flask/Django: opentelemetry-api + the matching "
+            f"opentelemetry-instrumentation-* package at startup. Frontends -- Next.js: "
+            f"instrumentation.ts register() guarded by process.env.NEXT_RUNTIME === 'nodejs' with a "
+            f"dynamically-imported instrumentation.node.ts (NodeSDK crashes on edge runtime), or "
+            f"@vercel/otel; React/Vue/Angular: @opentelemetry/sdk-trace-web with a "
+            f"ConsoleSpanExporter. Console exporter by default; respect OTEL_EXPORTER_OTLP_ENDPOINT "
+            f"/ OTEL_TRACES_EXPORTER=none if set (the same convention this pipeline's own "
+            f"telemetry.py uses for itself)."
         )
 
     # Only ask the "does the frontend call it" question when a backend was actually declared --
@@ -1358,8 +1370,14 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert missing_otel_instrumentation(
         ["FastAPI"], {"api/main.py": "from opentelemetry import trace\napp = FastAPI()"}
     ) is None
+    # Frontends are checked too (W6): a Next.js app with readable files and no OTel signal fails;
+    # either the scoped packages or Next's own @vercel/otel wrapper passes. A bare "hotel" string
+    # must NOT pass (the needle is the scoped-package prefix, not "otel").
+    assert missing_otel_instrumentation(["Next.js", "xUnit"], _lib_only) == "Next.js"
+    assert missing_otel_instrumentation(["Next.js"], {"package.json": '"@vercel/otel": "^1.0"'}) is None
+    assert missing_otel_instrumentation(["Next.js"], {"package.json": '"@opentelemetry/sdk-node": "^0.52"'}) is None
+    assert missing_otel_instrumentation(["Next.js"], {"web/app.tsx": "const hotel = bookHotel()"}) == "Next.js"
     # Fails OPEN: nothing declared, or nothing readable -- same discipline as missing_hosted_backend.
-    assert missing_otel_instrumentation(["Next.js", "xUnit"], _lib_only) is None
     assert missing_otel_instrumentation(["ASP.NET Core"], {}) is None
 
     # Frontend that never calls the API is the other half of the same defect.

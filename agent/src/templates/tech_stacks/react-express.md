@@ -125,6 +125,51 @@ fallback when present, so register BOTH entries together, never just one):
   `src/index.ts` limited to app setup and route registration.
 - Lint: `eslint --max-warnings=0` + `tsc --noEmit`, enforced identically in both workspaces.
 
+## Observability
+
+Both apps ship OpenTelemetry from the first commit, Console exporter by default (the pipeline's
+coverage gate verifies the packages are present; respect `OTEL_EXPORTER_OTLP_ENDPOINT` /
+`OTEL_TRACES_EXPORTER=none` when set, the same convention as everywhere else in this pipeline).
+
+- **API**: `npm install @opentelemetry/sdk-node --workspace apps/api`; a `src/tracing.ts` that
+  starts the SDK, loaded BEFORE anything else — the first import in `src/index.ts` (or
+  `node -r ./dist/tracing.js dist/index.js` in production):
+  ```ts
+  import { NodeSDK, tracing } from "@opentelemetry/sdk-node";
+  const sdk = new NodeSDK({
+    serviceName: "api",
+    spanProcessors: [new tracing.SimpleSpanProcessor(new tracing.ConsoleSpanExporter())],
+  });
+  sdk.start();
+  ```
+- **Web**: `npm install @opentelemetry/sdk-trace-web @opentelemetry/context-zone --workspace
+  apps/web`, then initialize in `src/main.tsx`:
+  ```ts
+  import { WebTracerProvider, SimpleSpanProcessor, ConsoleSpanExporter } from "@opentelemetry/sdk-trace-web";
+  const provider = new WebTracerProvider({
+    spanProcessors: [new SimpleSpanProcessor(new ConsoleSpanExporter())],
+  });
+  provider.register();
+  ```
+
+## Authentication
+
+Only when this run carries the enterprise authentication requirement (the pipeline injects it,
+with the anonymous-route allowlist, when the repo's settings demand it):
+
+- **API**: JWT bearer validation middleware applied app-wide — verify the Entra-issued token's
+  signature against the tenant's JWKS, audience = the app's client id; env vars `CLIENT_ID` /
+  `TENANT_ID` (or the `AzureAd__*` names) arrive at runtime, never hardcode values. Only
+  allowlisted paths are exempt; unauthenticated API calls answer 401, never a 200 login page.
+- **Web**: the dev server serves the SPA shell to everyone (the enforcement gate knows this and
+  probes the API instead), so REAL enforcement lives entirely in the API's JWT validation. The SPA
+  uses MSAL (`@azure/msal-browser`) for the sign-in UX and attaches bearer tokens to API calls;
+  unauthenticated API calls must answer 401.
+- **Test seam**: when `process.env.AIDW_TEST_AUTH === "1"` (and ONLY then), enable a test sign-in
+  path (a test JWT signing endpoint on the API) so the Playwright suite can authenticate without a
+  live Entra round-trip. It must be completely inert when the variable is unset — the enforcement
+  gate probes without it.
+
 ## Stack facts
 
 dotnet_detected: false

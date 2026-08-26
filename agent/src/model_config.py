@@ -39,6 +39,7 @@ Stage = Literal[
     "test-hardening-run",
     "test-hardening-flake-triage",
     "metrics-report",
+    "readme",
     "session-title",
 ]
 # "fix" is a WRITE-capable pass that closes what a stage's deterministic verify reported (see
@@ -129,6 +130,10 @@ def _demo() -> None:
     config = _load_config()
     assert "e2e-run" in config, "e2e-run must have an explicit models.yaml block (Phase E audit M-5)"
     assert "test-hardening-run" in config, "test-hardening-run must have an explicit models.yaml block (Phase E audit M-5)"
+    # W7: readme_write_node's write-capable pass -- an unlisted stage silently resolves to None
+    # (the CLI picks its own default), so both providers must carry a real draft_model here.
+    assert get_model_name("readme", "draft", "copilot"), "readme stage needs a copilot draft_model"
+    assert get_model_name("readme", "draft", "claude"), "readme stage needs a claude draft_model"
     assert get_model_name("e2e-run", "draft", "copilot") is None
     assert get_model_name("test-hardening-run", "draft", "claude") is None
 

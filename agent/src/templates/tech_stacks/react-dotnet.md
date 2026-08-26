@@ -119,6 +119,58 @@ one):
 - Lint: `eslint --max-warnings=0` + `tsc --noEmit` on the web app; the API's analyzer warnings are
   build errors via `Directory.Build.props`.
 
+## Observability
+
+Both apps ship OpenTelemetry from the first commit, Console exporter by default (the pipeline's
+coverage gate verifies the packages are present; respect `OTEL_EXPORTER_OTLP_ENDPOINT` /
+`OTEL_TRACES_EXPORTER=none` when set, the same convention as everywhere else in this pipeline).
+
+- **API**: `dotnet add apps/api package OpenTelemetry.Extensions.Hosting`, `dotnet add apps/api
+  package OpenTelemetry.Instrumentation.AspNetCore`, `dotnet add apps/api package
+  OpenTelemetry.Exporter.Console`, then in `Program.cs`:
+  ```csharp
+  builder.Services.AddOpenTelemetry()
+      .ConfigureResource(r => r.AddService("api"))
+      .WithTracing(t => t.AddAspNetCoreInstrumentation().AddConsoleExporter());
+  ```
+- **Web**: `cd apps/web && npm install @opentelemetry/sdk-trace-web @opentelemetry/context-zone`,
+  then initialize in `src/main.tsx`:
+  ```ts
+  import { WebTracerProvider, SimpleSpanProcessor, ConsoleSpanExporter } from "@opentelemetry/sdk-trace-web";
+  const provider = new WebTracerProvider({
+    spanProcessors: [new SimpleSpanProcessor(new ConsoleSpanExporter())],
+  });
+  provider.register();
+  ```
+
+## Authentication
+
+Only when this run carries the enterprise authentication requirement (the pipeline injects it,
+with the anonymous-route allowlist, when the repo's settings demand it):
+
+- **API**: `dotnet add apps/api package Microsoft.Identity.Web`; in `Program.cs` bind the standard
+  section — env vars `AzureAd__ClientId` / `AzureAd__ClientSecret` / `AzureAd__TenantId` arrive at
+  runtime, never hardcode values:
+  ```csharp
+  builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+      .AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
+  builder.Services.AddAuthorizationBuilder()
+      .SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build());
+  app.UseAuthentication();
+  app.UseAuthorization();
+  ```
+  The fallback policy is the point: every endpoint requires auth unless it opts out with
+  `[AllowAnonymous]` — and only allowlisted routes may opt out. Unauthenticated API calls answer
+  401, never a 200 login page.
+- **Web**: the dev server serves the SPA shell to everyone (the enforcement gate knows this and
+  probes the API instead), so REAL enforcement lives entirely in the API's JWT validation. The SPA
+  uses MSAL (`@azure/msal-browser`) for the sign-in UX and attaches bearer tokens to API calls;
+  unauthenticated API calls must answer 401.
+- **Test seam**: when `AIDW_TEST_AUTH=1` is set in the environment (and ONLY then), enable a test
+  sign-in path (a test JWT signing endpoint on the API) so the Playwright suite can authenticate
+  without a live Entra round-trip. It must be completely inert when the variable is unset — the
+  enforcement gate probes without it.
+
 ## Stack facts
 
 dotnet_detected: true

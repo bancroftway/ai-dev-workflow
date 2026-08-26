@@ -44,8 +44,14 @@ Steps:
    Pages Router one per file under `pages/`, and Angular/Vue/Svelte apps declare them in a router
    config. Include only routes a person can open directly -- not API endpoints, not dynamic
    segments you have no id for (`/expenses/[id]`), not error/layout files. A single-page app
-   legitimately has just `/`.
-4. If the app cannot be started at all, that is a real finding: report it rather than guessing a
+   legitimately has just `/`. If the app enforces sign-in, protected routes may render a login
+   page or redirect when opened unauthenticated -- list them anyway; that is expected and the
+   screenshots legitimately show the login screen.
+4. Separately list the app's HTTP API ENDPOINT paths (`api_routes`) from the API's own routing
+   source (controllers, minimal-API `Map*` calls, FastAPI/Flask decorators, `app/api/*/route.ts`).
+   Concrete paths only -- skip dynamic segments you have no id for. Empty is fine for an app with
+   no API surface. These are probed by the authentication-enforcement gate, never screenshotted.
+5. If the app cannot be started at all, that is a real finding: report it rather than guessing a
    command you never saw work.
 
 Then report:
@@ -54,6 +60,7 @@ Then report:
 - `routes`: every route path from step 3, each beginning with `/`. These are screenshotted one by
   one as the visual record of what this app looks like, so a missed route is a screen the human
   reviewing this run never sees.
+- `api_routes`: every API endpoint path from step 4, each beginning with `/`.
 - `success`: true ONLY if you saw the app answer an HTTP request on that port.
 - `error`: if it could not be started, the real reason and the most relevant log output.
 - `summary`: where the app lives, what you ran, and how long it took to answer.

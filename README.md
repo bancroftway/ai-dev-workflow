@@ -31,17 +31,19 @@ flowchart TD
     
     stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes quality+security+dedup+license findings (autopilot, write+bash)<br/>Gate: deterministic re-scan blocks any unexplained finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
     
-    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
+    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>Auth-enforcement gate (repo setting + Key Vault secrets present):<br/>probes every route + API unauthenticated; a 2xx on a protected route joins the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
     
     stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Closes the back half: audits finished repo vs approved Plan + wireframes<br/>Agent: adversarial-compliance-draft (read-only, full-repo review)<br/>Gate: deterministic claim-verification + fix prompt. Rebuild gate after."]
     
-    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan + coverage + traceability<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign"]
+    readme["README LEG (metrics-exit)<br/>Writes/updates README.md per standard-readme, grounded in the code<br/>Deterministic structure check between laps (3); human-authored README left untouched<br/>Committed BEFORE the final scan so metrics cover it"]
+    
+    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan (health score v2, 9 weighted subscores) + coverage + traceability + outdated-packages probe<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign<br/>Blockers include: regression gate reasons, README hard problems,<br/>auth-required-but-unverified, missing UI screenshots"]
     
     done["END<br/>Repo ready for merge or run_failure recorded"]
     
     session --> intake --> scaffold --> stage1 --> stage2
     stage2 --> stage3 --> stage4 --> stage5
-    stage5 --> stage6 --> harden --> stage7 --> stage8 --> done
+    stage5 --> stage6 --> harden --> stage7 --> readme --> stage8 --> done
     
     scaffold -.->|suitable path| scaffold_fin --> stage1
     stage1 -.->|not ready, or rejected| stage1
@@ -95,6 +97,30 @@ Two caveats worth stating rather than burying:
 - **A repo that lints its own way keeps its own lint contract.** Any ESLint config of the repo's own (any `.eslintrc*`, any `eslint.config.*`) makes the pipeline defer entirely — the image-baked config only ever applies to repos with no lint setup at all.
 
 A file already present and not written by this pipeline is left alone. Our own files carry a version stamp in their header and are replaced when the bundled template moves forward; a file without that header is treated as human-authored.
+
+## The health score
+
+One number, 0–100, computed in one function ([agent/src/repo_scan.py](agent/src/repo_scan.py) `health_score()`, version 2) as a **weighted blend of nine subscores**, each itself 0–100 and each `null` when its input was not measured. Security carries the most weight by design — this is an enterprise pipeline and a leaked secret matters more than a duplicated helper.
+
+| Subscore | Weight | Derivation (clamped to 0–100) |
+|---|---|---|
+| Security | 0.40 | `100 − (40·critical + 15·high + 5·medium + 1·low)` counting **security findings only** (vulnerabilities, secrets, SAST, misconfig, licence). `null` — not 100 — when any security scanner failed to run: a semgrep timeout must read as "unmeasured", never "clean". Three criticals zero this leg and cap the composite at 60. That is intended. |
+| Coverage | 0.12 | `0.75·line + 0.25·branch` — the raw percentages, not distance-to-the-95%-gate (the gate is enforced separately; a leg that saturates at 100 on every passing run measures nothing). |
+| Dependencies | 0.12 | `100 − min(100, 5·outdated_packages)` from the `outdated` scanner leg (`npm outdated` / `dotnet list package --outdated` / `pip list --outdated` — the pipeline's one deliberately networked probe, fail-open). Staleness only: dependency CVEs and licence findings already score in Security, and counting them twice would double-charge. |
+| AC verification | 0.10 | `100 · (solidly-verified ACs + 0.5·flaky ACs) / total ACs` from the Eval layer. |
+| Accessibility | 0.07 | Lighthouse accessibility, worst measured route, used as-is. `null` until e2e has run. |
+| Complexity | 0.06 | `0.7·(100 − 10·max(0, mean_ccn − 5)) + 0.3·(100 − 2·max(0, max_ccn − 15))` — the max-CCN term stops one monster function hiding behind a good mean. Measured over application files only (vendored/build paths are filtered). |
+| Performance | 0.05 | Lighthouse performance, worst measured route. Lowest weight because it is timing-noisy. |
+| Duplication | 0.04 | `100 − 3·duplication_percent`. |
+| Maintainability | 0.04 | `100 − 3·(maintainability findings)` — excluding complexity and docstring findings, which already score elsewhere — averaged with Python docstring coverage when measured. |
+
+**Unmeasured subscores redistribute.** A `null` leg's weight is spread proportionally over the measured ones, so a pre-e2e scan is still a 0–100 score — and `health_weights_used` on the summary records what the score *actually* weighed. That field is also the comparability key: the regression gate ([agent/src/metrics_nodes.py](agent/src/metrics_nodes.py)) only blocks on a health drop when baseline and latest used the **same** weights, and says so in the ledger when it skips. Scores whose `health_weights_used` differ are different formulas, not a regression.
+
+Weights are env-overridable (`HEALTH_WEIGHT_SECURITY`, `HEALTH_WEIGHT_COVERAGE`, `HEALTH_WEIGHT_DEPENDENCIES`, `HEALTH_WEIGHT_AC_VERIFICATION`, `HEALTH_WEIGHT_ACCESSIBILITY`, `HEALTH_WEIGHT_COMPLEXITY`, `HEALTH_WEIGHT_PERFORMANCE`, `HEALTH_WEIGHT_DUPLICATION`, `HEALTH_WEIGHT_MAINTAINABILITY`); the defaults above are asserted in `repo_scan`'s self-check so this table cannot silently drift. The `outdated` leg is excluded from the report's `content_hash` (an upstream registry publishing a release must not change the hash of an unchanged worktree) and runs only in the final metrics scan, never in the per-commit background refresh.
+
+The metrics bar renders the score as an **annular ring** (sweep = score, color red→green); the Quality tab shows the full per-subscore breakdown with the weights used.
+
+*Version 1, for the archaeology:* `100 − (25·crit + 10·high + 3·med + 0.5·low over all findings) − 2·(dup% over 3) − 3·(mean_ccn over 5)` — it ignored coverage, dependencies, AC verification and Lighthouse entirely, and counted quality findings at security prices.
 
 ## The sandbox filesystem
 
@@ -160,6 +186,7 @@ Cross-cutting behavior that is not drawn above, because it happens in nearly eve
 | minimal-code-to-green | draft + audit | sonnet / opus | gpt-5.4 / gemini-3.6-flash |
 | remediation | draft | sonnet | gpt-5.4 |
 | adversarial-compliance | draft + fix | sonnet / — / sonnet | gpt-5.4 / — / gpt-5.4 |
+| readme (metrics-exit leg) | draft | sonnet | gpt-5.4 |
 | metrics-exit | draft | sonnet | gpt-5.4 |
 | brownfield-baseline | draft | haiku | gpt-5.4-mini |
 
@@ -312,4 +339,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 8633a80ab6e9384845c892680fb58526b0aaea5b42428256aec2e734d4e36ee8 -->
+<!-- graph-source-sha256: c75d64352e983dd8e5fd49d429ffa8f44f1ed3ba392a167f0cedba8d065f122c -->

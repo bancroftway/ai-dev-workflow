@@ -21,11 +21,12 @@ from dataclasses import replace
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from .prompt_loader import load_prompt_pair
+from .prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, workflow_persistence
+from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, tech_stack_signals, workflow_persistence
+from .gates import readme_gate
 from .gates.ac_coverage_gate import id_variants
 from .gates.remediation_gate import accounted_for
 from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
@@ -260,6 +261,7 @@ def regression_reasons(
     coverage: dict[str, Any],
     *,
     baseline_has_findings: bool,
+    health_comparable: bool = True,
     min_coverage: float | None = None,
     tolerance: float | None = None,
     health_tolerance: float | None = None,
@@ -302,8 +304,15 @@ def regression_reasons(
         d = metric_deltas.get(name) or {}
         if d.get("direction") == "regressed" and abs(d.get("delta") or 0) > tol:
             reasons.append(f"{name} regressed {d.get('from')} -> {d.get('to')} (beyond {tol}pt tolerance)")
+    # `health_comparable` is the caller's verdict on whether baseline and latest were scored with
+    # the same formula AND the same measured subscore set (health_weights_used equality) -- a
+    # pre-build v1 baseline against a post-build v2 latest is not a regression signal. The skip is
+    # loud at the call site (ledger note + summary.health_score_comparable), never silent here.
     health = metric_deltas.get("health_score") or {}
-    if baseline_has_findings and health.get("direction") == "regressed" and abs(health.get("delta") or 0) > health_tol:
+    if (
+        baseline_has_findings and health_comparable
+        and health.get("direction") == "regressed" and abs(health.get("delta") or 0) > health_tol
+    ):
         reasons.append(f"health_score regressed {health.get('from')} -> {health.get('to')} (beyond {health_tol}pt tolerance)")
     return reasons
 
@@ -419,7 +428,13 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     # for EVAL_ATTEMPTS suite runs buys the per-AC verified/executed/flake numbers the exit report
     # is judged on. Every other caller (the four gate scan points, and the per-commit background
     # refresh) leaves include_eval at its False default and never runs a suite.
-    scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full", include_eval=True)
+    # The ONE caller that opts into the networked `outdated` staleness probe, for the same reason
+    # it opts into eval: this is the run's final measurement. The per-commit background refresh
+    # stays on the offline "full" profile.
+    scan = await repo_scan.run_repo_scan(
+        provider, thread_id, profile="full",
+        tools=[*repo_scan.PROFILES["full"], "outdated"], include_eval=True,
+    )
     # Prefer the contract-merged number graph.py's make_verify_node / audit_gates.py's
     # audit_exit_gate_node already promoted onto state.repo_scan.coverage: both read the SAME
     # coverage artifact minimal-code-to-green's own gate produced, whereas _read_coverage_summary
@@ -465,9 +480,18 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
 
     delta_summ = repo_scan.delta_summary(delta)
     attempt = int(((state.get("repo_scan") or {}).get("metrics_gate") or {}).get("attempt") or 0) + 1
+    # Comparability: the health regression check only means something when baseline and latest
+    # were scored by the same formula over the same measured subscore set. health_weights_used IS
+    # that identity (it also differs between v1 baselines, which lack the key entirely, and v2).
+    baseline_summary = (baseline or {}).get("summary") or {}
+    health_comparable = (
+        baseline_summary.get("health_weights_used") == scan_report["summary"].get("health_weights_used")
+    )
+    scan_report["summary"]["health_score_comparable"] = health_comparable
     gate_reasons = regression_reasons(
         scan_report["summary"], delta_summ, coverage,
         baseline_has_findings=bool((baseline or {}).get("findings")),
+        health_comparable=health_comparable,
     )
 
     metrics = {
@@ -484,6 +508,13 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
             "untested": sum(1 for r in traceability_rows if r["status"] == "untested"),
         },
         "token_usage_summary": token_usage_summary,
+        # readme_write_node ran just before this node and parked its verdict on the streamed
+        # metrics_report channel; carried into the PERSISTED metrics dict here because exit's
+        # deterministic verify reads metrics-latest.json, never graph state.
+        "readme": ((state.get("metrics_report") or {}).get("metrics") or {}).get("readme"),
+        # This run's auth posture, for the same reason: exit's verify must know whether auth
+        # enforcement was required-but-unverified (e2e skipped) without access to graph state.
+        "app_auth": state.get("app_auth"),
         # The Eval layer's two halves, lifted out of the scan report so the exit report and the
         # dashboard do not have to know where inside it they live. `solidly_verified` (linked AND
         # green AND not flaky) is the number this pipeline should be judged on.
@@ -504,7 +535,11 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     await repo_files.append_ledger_entry(
         provider, thread_id,
         {"stage": "metrics_report", "node": "metrics", "traceability_summary": metrics["traceability_summary"],
-         "health_score": scan_report["summary"]["health_score"], "finding_count": len(scan.findings)},
+         "health_score": scan_report["summary"]["health_score"], "finding_count": len(scan.findings),
+         # Loud, never silent: when the health regression check was skipped, the ledger says so.
+         **({} if health_comparable else {
+             "health_note": "health regression check skipped: baseline scored with different formula/measured set"}),
+         },
     )
     await git_ops.commit_paths(
         provider, thread_id,
@@ -561,6 +596,101 @@ async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConf
     return {"metrics_report": metrics_report}
 
 
+_README_MARKER = "<!-- Managed by ai-dev-workflow -->"
+_README_MAX_LAPS = 3
+
+
+async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+    """The README leg of metrics-exit (W7): an LLM writes/updates the repo's README.md per
+    standard-readme, checked by gates/readme_gate between laps, committed BEFORE metrics_compute
+    so the final scan (gitleaks included) covers the finished tree, README and all.
+
+    Failure containment is the point of this node's shape:
+      * every LLM error degrades to a recorded problem -- this node sits before the final scan,
+        the exit report, manifest completion and session close, and a README polish step must
+        never brick any of those (e2e_nodes.e2e_fix_node documents the 50-minute run one
+        unhandled timeout killed).
+      * each lap uses a FRESH session role (readme-{run_id}-{lap}) -- reusing one session across
+        laps poisoned e2e's fix loop with 'already addressed' answers (e2e_nodes.py:1473).
+      * brownfield: a human-authored README (exists, non-empty, no pipeline marker, repo wasn't
+        greenfield this run) is LEFT ALONE -- hard problems are then advisory-only, because
+        blocking a merge over a doc the ticket never mentioned is not this pipeline's call.
+    """
+    thread_id = config["configurable"]["thread_id"]
+    metrics_report = dict(state.get("metrics_report") or {"metrics": {}})
+    metrics = dict(metrics_report.get("metrics") or {})
+    if sandbox_registry.get(thread_id) is None:
+        return {"metrics_report": metrics_report}
+    provider = get_sandbox_provider()
+    run_id = state.get("run_id", "unknown")
+
+    existing = await repo_files.read_repo_file(provider, thread_id, "README.md")
+    owned = (
+        not (existing or "").strip()
+        or _README_MARKER in (existing or "")
+        or tech_stack_signals.is_greenfield_repo(state)
+    )
+    if not owned:
+        _hard, advisories = readme_gate.readme_problems(existing), readme_gate.readme_advisories(existing)
+        metrics["readme"] = {
+            "owned": False, "problems": [],  # human-authored: never blocking
+            "advisories": _hard + advisories,
+            "note": "human-authored README left untouched (no pipeline marker, brownfield)",
+        }
+        metrics_report["metrics"] = metrics
+        logger.info("readme_write: human-authored README left untouched for thread_id=%s", thread_id)
+        return {"metrics_report": metrics_report}
+
+    system_prompt, human_template = load_prompt_pair("readme_draft")
+    problems: list[str] = []
+    advisories: list[str] = []
+    for lap in range(1, _README_MAX_LAPS + 1):
+        feedback = (
+            "A deterministic structure check rejected your previous README with these problems -- fix them:\n"
+            + "\n".join(f"- {p}" for p in problems)
+        ) if problems else ""
+        model = get_chat_model_for_thread(
+            thread_id,
+            "readme",
+            f"draft-{run_id}-{lap}",
+            provider=state["provider"],
+            run_id=run_id,
+            model_name=model_config.get_model_name("readme", "draft", state["provider"]),
+            sandbox=sandbox_registry.get(thread_id),
+            agent_mode="autopilot",
+            # A README writer needs to read the repo and write ONE file -- no bash, no skills.
+            available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:edit", "builtin:create"],
+        )
+        try:
+            await model.ainvoke(
+                [SystemMessage(content=system_prompt),
+                 HumanMessage(content=render_prompt(human_template, blocking_feedback=feedback))],
+                config={"metadata": {"emit-messages": False}},
+            )
+        except (TimeoutError, RuntimeError) as exc:
+            problems = [f"README draft lap {lap} failed: {type(exc).__name__}: {exc}"]
+            logger.warning("readme_write: lap %d failed for thread_id=%s -- degrading, never raising", lap, thread_id, exc_info=True)
+            break
+        problems, advisories = await readme_gate.check_readme(provider, thread_id)
+        if not problems:
+            break
+        logger.info("readme_write: lap %d left %d hard problem(s) for thread_id=%s", lap, len(problems), thread_id)
+
+    # Stamp the ownership marker (idempotent) so later tickets know this README is ours to rewrite.
+    raw = await repo_files.read_repo_file(provider, thread_id, "README.md")
+    if raw and _README_MARKER not in raw:
+        await repo_files.write_repo_file(provider, thread_id, "README.md", raw.rstrip("\n") + f"\n\n{_README_MARKER}\n")
+
+    metrics["readme"] = {"owned": True, "problems": problems, "advisories": advisories}
+    metrics_report["metrics"] = metrics
+    await repo_files.append_ledger_entry(
+        provider, thread_id,
+        {"stage": "metrics_report", "node": "readme_write", "problems": problems, "advisories": advisories},
+    )
+    await git_ops.commit_all(provider, thread_id, "ai-dev-workflow: readme")
+    return {"metrics_report": metrics_report}
+
+
 def _demo() -> None:
     """Self-check for the pure traceability matching -- the ledger mints US-####.# ids and tests
     may spell them four ways; every spelling must count, and covered must not require commit ids."""
@@ -585,6 +715,10 @@ def _demo() -> None:
     assert regression_reasons(clean_summary, delta, good_cov, baseline_has_findings=False, **kw) == []
     # Same health regression with a real (non-empty) baseline -> blocks.
     assert any("health_score" in r for r in regression_reasons(clean_summary, delta, good_cov, baseline_has_findings=True, **kw))
+    # ...but NOT when baseline and latest were scored over different measured sets (a pre-build v1
+    # baseline vs a post-build v2 latest is two formulas, not a regression). The call site emits
+    # the loud ledger note; this half only proves the skip works.
+    assert regression_reasons(clean_summary, delta, good_cov, baseline_has_findings=True, health_comparable=False, **kw) == []
     # Gating finding -> blocks.
     assert any("gating" in r for r in regression_reasons({"gating_count": 1, "severity_floor": "medium"}, None, good_cov, baseline_has_findings=False, **kw))
     # Coverage null -> blocks; below threshold -> blocks; the 81.8%-branch incident is caught.

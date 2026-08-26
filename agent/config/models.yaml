@@ -101,6 +101,14 @@ metrics-report:
     draft_model: gpt-5.4-mini
   claude:
     draft_model: haiku
+readme:
+  # readme_write_node (metrics_nodes.py): reads the repo and WRITES README.md with file tools.
+  # Not mini-tier: mini models have twice failed to actually call file-write tools in this
+  # pipeline's write-capable passes (see the rebuild/e2e comments in this file).
+  copilot:
+    draft_model: gpt-5.4
+  claude:
+    draft_model: sonnet
 rebuild:
   copilot:
     # Shared by every R placement (rebuild.py): both the GHCP build-VERIFICATION session and the

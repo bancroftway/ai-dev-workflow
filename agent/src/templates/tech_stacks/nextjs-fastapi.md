@@ -130,6 +130,62 @@ together, never just one):
 - Lint: `eslint --max-warnings=0` + `tsc --noEmit` on the web app; `ruff check .` + `mypy .` on the
   API (both build-blocking, per this pipeline's Python conventions).
 
+## Observability
+
+Both apps ship OpenTelemetry from the first commit, Console exporter by default (the pipeline's
+coverage gate verifies the packages are present; respect `OTEL_EXPORTER_OTLP_ENDPOINT` /
+`OTEL_TRACES_EXPORTER=none` when set, the same convention as everywhere else in this pipeline).
+
+- **API**: `cd apps/api && pip install opentelemetry-sdk opentelemetry-instrumentation-fastapi`
+  (re-freeze `requirements.txt`), then at startup in `main.py`:
+  ```python
+  from opentelemetry import trace
+  from opentelemetry.sdk.trace import TracerProvider
+  from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+  from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+  provider = TracerProvider()
+  provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+  trace.set_tracer_provider(provider)
+  FastAPIInstrumentor.instrument_app(app)
+  ```
+- **Web (Next.js 15/16)**: `cd apps/web && npm install @opentelemetry/sdk-node
+  @opentelemetry/exporter-trace-otlp-http`. `instrumentation.ts` at the app root with the runtime
+  guard — `NodeSDK` crashes on the edge runtime, so the import must be dynamic and node-only:
+  ```ts
+  // instrumentation.ts
+  export async function register() {
+    if (process.env.NEXT_RUNTIME === "nodejs") {
+      await import("./instrumentation.node");
+    }
+  }
+  ```
+  ```ts
+  // instrumentation.node.ts
+  import { NodeSDK, tracing } from "@opentelemetry/sdk-node";
+  const sdk = new NodeSDK({
+    serviceName: "web",
+    spanProcessors: [new tracing.SimpleSpanProcessor(new tracing.ConsoleSpanExporter())],
+  });
+  sdk.start();
+  ```
+
+## Authentication
+
+Only when this run carries the enterprise authentication requirement (the pipeline injects it,
+with the anonymous-route allowlist, when the repo's settings demand it):
+
+- **API**: validate the Entra-issued JWT bearer on every endpoint — verify the signature against
+  the tenant's JWKS, audience = the app's client id; env vars `CLIENT_ID` / `TENANT_ID` (or the
+  `AzureAd__*` names) arrive at runtime, never hardcode values. Unauthenticated API calls answer
+  401, never a 200 login page — only allowlisted paths are exempt.
+- **Web**: protect every page with Auth.js (`next-auth`) + the Microsoft Entra ID provider and a
+  root `middleware.ts` whose matcher excludes ONLY the allowlisted anonymous routes and Next's
+  own static assets (`_next/*`). Unauthenticated page loads redirect to the provider.
+- **Test seam**: when `process.env.AIDW_TEST_AUTH === "1"` (and ONLY then), enable a test sign-in
+  path (a Credentials provider on the web side; a test JWT issuance path on the API) so the
+  Playwright suite can authenticate without a live Entra round-trip. It must be completely inert
+  when the variable is unset — the enforcement gate probes without it.
+
 ## Stack facts
 
 dotnet_detected: false

@@ -140,6 +140,18 @@ repository layout documented there -- including for a from-scratch (greenfield) 
 this file describes the stack and layout to scaffold the application into.
 """
 
+_MEMORY_SENTINEL = _guidance_sentinel("repo-memory")
+
+_MEMORY_PARAGRAPH = f"""
+{_MEMORY_SENTINEL}
+## Repo memory
+
+`.ai-dev-workflow/memory.md` is this repository's durable memory: build quirks, commands that
+work, config traps -- lessons previous agent runs paid for. Read it before starting work; append
+a dated bullet when you learn something durable and repo-specific the code itself doesn't say.
+Never write secrets or task narration into it.
+"""
+
 TECH_STACK_MD_PATH = ".ai-dev-workflow/tech-stack.md"
 # One truth, derived from the stage-file numbering -- see workflow_persistence.
 TECH_STACK_APPROVED_JSON_PATH = workflow_persistence.TECH_STACK_APPROVED_PATH
@@ -258,16 +270,19 @@ async def scaffold_finalize_node(state: "GraphState", config: RunnableConfig) ->
             provider, thread_id, "AGENTS.md", template_loader.load_template("agents-md/AGENTS.md")
         )
         written_paths.append("AGENTS.md")
-    elif _TECH_STACK_SENTINEL not in agents_md and ".ai-dev-workflow/tech-stack.md" not in agents_md:
+    else:
         # A human-authored AGENTS.md is never overwritten -- but leaving it entirely alone means
-        # the repo's own agents never learn that .ai-dev-workflow/tech-stack.md exists, which is
-        # the file every convention this pipeline detects is written into. Append the pointer
-        # only, guarded by its own sentinel (and by a plain substring check, so a hand-written
-        # reference to the same path also counts as "already covered").
-        await repo_files.write_repo_file(
-            provider, thread_id, "AGENTS.md", agents_md.rstrip() + "\n" + _TECH_STACK_PARAGRAPH
-        )
-        written_paths.append("AGENTS.md")
+        # the repo's own agents never learn about the pipeline's pointer files. Append each
+        # missing paragraph only, guarded by its own sentinel (and by a plain substring check, so
+        # a hand-written reference to the same path also counts as "already covered").
+        appended = agents_md
+        if _TECH_STACK_SENTINEL not in appended and ".ai-dev-workflow/tech-stack.md" not in appended:
+            appended = appended.rstrip() + "\n" + _TECH_STACK_PARAGRAPH
+        if _MEMORY_SENTINEL not in appended and ".ai-dev-workflow/memory.md" not in appended:
+            appended = appended.rstrip() + "\n" + _MEMORY_PARAGRAPH
+        if appended != agents_md:
+            await repo_files.write_repo_file(provider, thread_id, "AGENTS.md", appended)
+            written_paths.append("AGENTS.md")
 
     copilot_instructions = await repo_files.read_repo_file(provider, thread_id, ".github/copilot-instructions.md")
     if copilot_instructions is None:

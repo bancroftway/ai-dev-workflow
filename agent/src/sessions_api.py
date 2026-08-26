@@ -40,6 +40,7 @@ from . import (
     org_credential_vault,
     org_settings,
     project_store,
+    repo_auth_settings,
     repo_scaffold,
     run_event_store,
     session_store,
@@ -54,6 +55,25 @@ config_router = APIRouter(prefix="/vault-config", tags=["vault-config"])
 org_settings_router = APIRouter(prefix="/org-settings", tags=["org-settings"])
 catalog_router = APIRouter(tags=["tech-stack"])
 projects_router = APIRouter(prefix="/projects", tags=["projects"])
+repo_auth_settings_router = APIRouter(prefix="/repo-auth-settings", tags=["repo-auth-settings"])
+
+
+async def _resolve_vault(
+    owner: str, repo: str, login_candidates: list[str],
+) -> tuple[str | None, "keyvault.Selection | None"]:
+    """One resolver for every vault lookup (provision AND refresh-secrets previously disagreed):
+    the first candidate login with a vault row wins, returning (vault_uri, secret_selection).
+    The pointer row grants nothing by itself -- reads are always OBO with the CALLER's assertion,
+    so Azure RBAC on the vault stays the enforcement whoever's row is used."""
+    seen: set[str] = set()
+    for login in login_candidates:
+        if not login or login in seen:
+            continue
+        seen.add(login)
+        vault_uri = await keyvault.get_vault_uri(owner, repo, login)
+        if vault_uri:
+            return vault_uri, await keyvault.get_secret_selection(owner, repo, login)
+    return None, None
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -193,10 +213,14 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     # provision in seconds with the provider's own AADSTS/403 detail, instead of surfacing hours
     # later as a confusing e2e boot failure. A configured vault with no assertion (E2E bypass,
     # headless) is only a warning -- those runs proceed secretless, exactly as before.
-    vault_uri = await keyvault.get_vault_uri(body.owner, body.repo, body.user_login)
+    # The row is resolved through _resolve_vault (caller's row first, then the session creator's):
+    # teammates share a repo's sessions, and B provisioning A's session must still find A's vault
+    # pointer -- the OBO read is with B's OWN assertion, so Azure RBAC still decides what B gets.
+    vault_login_candidates = [body.user_login] + ([existing["user_login"]] if existing else [])
+    vault_uri, vault_selection = await _resolve_vault(body.owner, body.repo, vault_login_candidates)
     if vault_uri and body.entra_assertion:
         try:
-            app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion)
+            app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion, vault_selection)
         except keyvault.VaultAccessError as exc:
             raise HTTPException(
                 status_code=403,
@@ -267,6 +291,11 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
                 ) from None
     else:
         owner, repo = body.owner, body.repo
+
+    # Seed this thread's application-auth posture ((owner, repo)-scoped, migration 0010) into the
+    # per-thread store graph.py reads at record_raw_requirements. A brand-new scaffolded repo has
+    # no row and gets the locked default -- which stays INERT until a vault provides auth secrets.
+    repo_auth_settings.set_for_thread(body.thread_id, await repo_auth_settings.get_settings(owner, repo))
 
     work_branch = branch_naming.work_branch_for(body.thread_id)
     provider = get_sandbox_provider()
@@ -559,13 +588,14 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
         raise HTTPException(status_code=404, detail="session not found")
 
     # Only "refresh-secrets" exists; a second action turns this into a match on body.action.
-    vault_uri = await keyvault.get_vault_uri(row["owner"], row["repo"], row["user_login"])
+    # Same resolver as provision (they previously disagreed about whose row to read).
+    vault_uri, vault_selection = await _resolve_vault(row["owner"], row["repo"], [row["user_login"]])
     if not vault_uri:
         raise HTTPException(status_code=404, detail="no key vault is configured for this repo")
     if not body.entra_assertion:
         raise HTTPException(status_code=401, detail="no Entra assertion -- sign in again")
     try:
-        app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion)
+        app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion, vault_selection)
     except keyvault.VaultAccessError as exc:
         raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
 
@@ -617,6 +647,102 @@ async def put_vault_config(body: VaultConfigPutRequest, request: Request) -> Ses
         raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
     await keyvault.set_vault_uri(body.owner, body.repo, body.user_login, vault_uri)
     return SessionActionResponse(secret_count=len(app_secrets))
+
+
+class VaultSecretsRequest(BaseModel):
+    owner: str
+    repo: str
+    user_login: str
+    entra_assertion: str
+
+
+class VaultSecretsResponse(BaseModel):
+    names: list[str]
+    selection: list[dict[str, str | None]] | None
+
+
+@config_router.post("/secrets", response_model=VaultSecretsResponse)
+async def list_vault_secrets(body: VaultSecretsRequest, request: Request) -> VaultSecretsResponse:
+    """Secret NAMES (never values) for the settings page's picker, plus the saved selection.
+    POST, not GET: the assertion is a bearer credential and does not belong in a URL/query log."""
+    _check_shared_secret(request)
+    vault_uri = await keyvault.get_vault_uri(body.owner, body.repo, body.user_login)
+    if not vault_uri:
+        raise HTTPException(status_code=404, detail="no key vault configured")
+    try:
+        names = await keyvault.list_secret_names(vault_uri, body.entra_assertion)
+    except keyvault.VaultAccessError as exc:
+        raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
+    selection = await keyvault.get_secret_selection(body.owner, body.repo, body.user_login)
+    return VaultSecretsResponse(names=names, selection=selection)
+
+
+class VaultSelectionPutRequest(BaseModel):
+    owner: str
+    repo: str
+    user_login: str
+    # [{"name": "...", "env_name": null | "OVERRIDE"}] -- an empty list means "expose nothing".
+    selection: list[dict[str, str | None]]
+
+
+@config_router.put("/selection", response_model=SessionActionResponse)
+async def put_vault_selection(body: VaultSelectionPutRequest, request: Request) -> SessionActionResponse:
+    """Persists which secrets reach the sandbox and under which env names. Env names are the
+    security boundary (the rendered file is shell-sourced) -- validated here server-side via
+    resolve_env_names, which also rejects duplicate resolved names. 404 when no vault row exists
+    (a silent 200 on a zero-row UPDATE hid exactly this bug class)."""
+    _check_shared_secret(request)
+    selection: keyvault.Selection = [
+        {"name": str(entry.get("name") or ""), "env_name": entry.get("env_name") or None}
+        for entry in body.selection
+    ]
+    if any(not entry["name"] for entry in selection):
+        raise HTTPException(status_code=422, detail="every selection entry needs a secret name")
+    try:
+        keyvault.resolve_env_names(selection)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if not await keyvault.set_secret_selection(body.owner, body.repo, body.user_login, selection):
+        raise HTTPException(status_code=404, detail="no key vault configured -- save the vault URI first")
+    return SessionActionResponse(secret_count=len(selection))
+
+
+# --- per-repo application auth settings (settings page) ---------------------------------------
+
+
+class RepoAuthSettingsResponse(BaseModel):
+    auth_mode: str
+    anonymous_routes: list[str]
+
+
+@repo_auth_settings_router.get("", response_model=RepoAuthSettingsResponse)
+async def get_repo_auth_settings(request: Request, owner: str, repo: str) -> RepoAuthSettingsResponse:
+    _check_shared_secret(request)
+    settings = await repo_auth_settings.get_settings(owner, repo)
+    return RepoAuthSettingsResponse(**settings)
+
+
+class RepoAuthSettingsPutRequest(BaseModel):
+    owner: str
+    repo: str
+    user_login: str
+    auth_mode: str
+    anonymous_routes: list[str] = []
+
+
+@repo_auth_settings_router.put("", response_model=RepoAuthSettingsResponse)
+async def put_repo_auth_settings(body: RepoAuthSettingsPutRequest, request: Request) -> RepoAuthSettingsResponse:
+    _check_shared_secret(request)
+    if body.auth_mode not in repo_auth_settings.AUTH_MODES:
+        raise HTTPException(status_code=422, detail=f"auth_mode must be one of {repo_auth_settings.AUTH_MODES}")
+    routes = [r.strip() for r in body.anonymous_routes if r.strip()]
+    if any(not r.startswith("/") for r in routes):
+        raise HTTPException(status_code=422, detail="anonymous route patterns must start with '/'")
+    if any(r in ("/*",) or r == "*" for r in routes):
+        raise HTTPException(status_code=422, detail="a bare wildcard is not an allowlist -- use auth_mode 'none' instead")
+    settings = {"auth_mode": body.auth_mode, "anonymous_routes": routes}
+    await repo_auth_settings.set_settings(body.owner, body.repo, settings, updated_by=body.user_login)
+    return RepoAuthSettingsResponse(**repo_auth_settings.normalize(settings))
 
 
 # --- org-wide coding-agent provider settings (settings page, Part 4) --------------------------

@@ -1,4 +1,5 @@
 import ReactMarkdown from "react-markdown";
+import { HealthRing } from "@/components/HealthRing";
 import { Chip, type MetricThresholds } from "@/components/MetricsBar";
 import { ViewContainer } from "@/components/ViewContainer";
 import {
@@ -90,6 +91,12 @@ export function ReportView({ report, metrics, deltaSummary, filesChanged, screen
       <div>
         <h2 className="mb-2 text-sm font-medium text-neutral-700">Metrics</h2>
         <div className="flex flex-wrap items-center gap-2">
+          {metrics?.repo_scan?.summary?.health_score != null && (
+            <HealthRing
+              score={metrics.repo_scan.summary.health_score}
+              comparable={metrics.repo_scan.summary.health_score_comparable}
+            />
+          )}
           {measures ? (
             <MetricChips measures={measures} gatingCount={gatingCount} thresholds={thresholds} />
           ) : (

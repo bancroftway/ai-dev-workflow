@@ -88,6 +88,8 @@ class E2EState(TypedDict):
     lighthouse: dict[str, Any] | None  # worst-of-routes perf/a11y scores + failing audits, or None
     # when lighthouse never produced a score (non-UI repo, tool/browser gap) -- fail-open, same
     # contract as the skill gate: an infra gap must never read as a score of zero.
+    service_urls: list[str]  # base urls of the supporting services this run booted (API probes)
+    auth_check: dict[str, Any] | None  # gates/auth_gate report + passed/feedback, or None (not run)
 
 
 class AppLaunchReport(StageReport):
@@ -99,6 +101,11 @@ class AppLaunchReport(StageReport):
         default_factory=list,
         description="Every user-facing route path the app serves, e.g. ['/', '/expenses']. Used to "
         "screenshot each screen; '/' alone is acceptable for a single-page app.",
+    )
+    api_routes: list[str] = Field(
+        default_factory=list,
+        description="HTTP API endpoint paths the app serves (e.g. ['/api/expenses']). Probed by "
+        "the auth-enforcement gate; empty is acceptable for an app with no API surface.",
     )
 
 
@@ -121,6 +128,8 @@ def default_e2e_state() -> E2EState:
         "screenshot_commit": None,
         "page_state": "",
         "lighthouse": None,
+        "service_urls": [],
+        "auth_check": None,
     }
 
 
@@ -1038,6 +1047,9 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # Boot order is no longer meaningful after the retry pass, but url ORDER still is: service_urls
     # keeps the single-service fallback below pointing at the one service a repo actually has.
     service_urls = [url for _candidate, url in booted_services]
+    # Persisted for the auth gate below (API probes go to the service that owns them -- a Blazor
+    # UI port would 404 every /api/* probe, a false pass) and for the exit report.
+    e2e["service_urls"] = service_urls
 
     # Point the UI at the API we actually started. Without this the app keeps its baked-in default
     # (a port nothing is listening on, since Python chose the API's port), every request fails, and
@@ -1302,6 +1314,47 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             })
             e2e["failed_tests"] = failures
             e2e["status"] = "failed"
+
+    # Authentication enforcement gate (gates/auth_gate.py) -- while the app is still up, probing
+    # WITHOUT the AIDW_TEST_AUTH seam the suite signs in with. Deliberately NOT fail-open: an
+    # unauthenticated 200 on a protected route is a verified defect that joins failed_tests and
+    # feeds the same fix loop. Runs only when graph.auth_enforced says the run both requires auth
+    # AND could satisfy it (posture + secrets + kill-switch) -- the same predicate that injected
+    # the auth prompt segments, so the gate never demands what the prompts never asked for.
+    from .graph import auth_enforced as _auth_enforced, get_app_auth as _get_app_auth  # lazy: graph imports this module
+
+    if _auth_enforced(state):
+        from .gates import auth_gate
+
+        app_auth = _get_app_auth(state)
+        auth_result = await auth_gate.check_auth(
+            provider, thread_id,
+            ui_port=port,
+            routes=routes,
+            api_routes=list(getattr(launch, "api_routes", None) or []),
+            service_urls=list(e2e.get("service_urls") or []),
+            anonymous_routes=list(app_auth.get("anonymous_routes") or []),
+        )
+        e2e["auth_check"] = {**auth_result.report, "passed": auth_result.passed, "feedback": auth_result.feedback}
+        # Routes VERIFIED protected legitimately screenshot as the IdP/login page -- often a tiny
+        # PNG. Exempt exactly those from the blank-screenshot blocker (never from reporting).
+        protected_slugs = {
+            _route_slug(v["route"])
+            for v in auth_result.report.get("verdicts", [])
+            if v.get("verdict") == "protected" and _route_slug(str(v.get("route") or ""))
+        }
+        if protected_slugs and e2e.get("degenerate_screenshots"):
+            e2e["degenerate_screenshots"] = [
+                p for p in e2e["degenerate_screenshots"]
+                if not any(f"-{slug}.png" in str(p) for slug in protected_slugs)
+            ]
+        if not auth_result.passed:
+            failures = list(e2e.get("failed_tests") or [])
+            failures.append({"title": "authentication enforcement", "error": auth_result.feedback})
+            e2e["failed_tests"] = failures
+            e2e["status"] = "failed"
+        else:
+            logger.info("e2e auth gate: %s", auth_result.feedback)
 
     # On failure, probe the app and attach what the BROWSER saw. Without this the fix node reads
     # "element(s) not found" and starts guessing, while the page itself is displaying the cause --

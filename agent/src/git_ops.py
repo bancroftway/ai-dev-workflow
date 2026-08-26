@@ -315,6 +315,15 @@ _GITIGNORE_ENTRIES = (
     ".env.local",
     ".DS_Store",
     "*.user",
+    # Python: the union list is ecosystem-neutral (a `.venv/` entry in a dotnet repo costs nothing),
+    # and generated_ignore_entries can never derive these itself -- `.py` is in _AUTHORED_SUFFIXES,
+    # so `__pycache__/` contents would read as authored files.
+    ".venv/",
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    "htmlcov/",
+    ".coverage",
 )
 _GITIGNORE_HEADER = "# Managed by ai-dev-workflow: build output and scratch must not reach the review branch."
 # Suffixes a stage plausibly AUTHORED: source, and the manifests/configs that declare a project.

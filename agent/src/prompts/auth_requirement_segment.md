@@ -1,0 +1,11 @@
+ENTERPRISE AUTHENTICATION REQUIREMENT (repo setting, enforced by a deterministic gate):
+
+This application MUST require Microsoft Entra ID sign-in on every route and every API endpoint. This is verified by an automated gate that probes the running app unauthenticated: any protected page or API answering 2xx to an unauthenticated request FAILS the run. Design for it from the start:
+
+- Enforce centrally -- middleware / an authorization filter / a route-guard applied to the whole app -- never per-page opt-in. A forgotten page is a gate failure.
+- Unauthenticated requests to pages must redirect to the identity provider (or answer 401/403); unauthenticated API requests must answer 401 or 403, never 2xx and never an HTML login page with status 200.
+- Credentials arrive as environment variables at runtime (injected from Azure Key Vault; never hardcode, never commit values): the Entra client id, client secret, and tenant id. Read them via your stack's configuration system (for .NET use the standard `AzureAd__*` section binding; for Node read `process.env`). If the repo already binds auth config from an existing settings file (brownfield), KEEP that binding shape and let environment variables override it -- do not restructure config files, and never write secret values into them.
+- Anonymous allowlist -- these route patterns (and ONLY these) must stay reachable without sign-in, answering 2xx:
+<<anonymous_routes>>
+- The end-to-end test suite must be able to authenticate WITHOUT a real Entra round-trip: implement a test-only sign-in seam that is active ONLY when the environment variable `AIDW_TEST_AUTH=1` is set (e.g. a test authentication handler / a signed test session cookie endpoint). It must be inert -- completely disabled -- when that variable is unset; the enforcement gate probes WITHOUT it, so the seam being active in production configuration is itself a security failure. Playwright tests use this seam to reach protected pages.
+- Health/readiness endpoints belong on the anonymous allowlist above if the app needs them; do not invent unauthenticated endpoints the allowlist doesn't name.

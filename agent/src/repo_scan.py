@@ -111,6 +111,43 @@ REPO_SCAN_COVERAGE_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIME
 SECURITY_CATEGORIES = frozenset({"vulnerability", "secret", "sast", "misconfig", "license"})
 QUALITY_CATEGORIES = frozenset({"duplication", "maintainability"})
 
+# The tools whose findings feed SECURITY_CATEGORIES. The health score's security subscore is only
+# trustworthy when every one of these that was selected actually ran ok -- a semgrep timeout that
+# yields zero findings must read as "unmeasured", never as "clean" (at 40% weight, a tool crash
+# would otherwise INFLATE the score).
+_SECURITY_TOOL_NAMES = frozenset({"semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"})
+
+
+def _health_weight(env_name: str, default: float) -> float:
+    """Env-overridable weight that can never crash module import on a garbage value."""
+    try:
+        return float(os.environ.get(env_name, str(default)))
+    except ValueError:
+        logger.warning("repo_scan: ignoring non-numeric %s", env_name)
+        return default
+
+
+# Health score v2 nominal weights, summing to 1.0. When a subscore is unmeasured (None) its weight
+# is redistributed proportionally over the measured ones -- `health_weights_used` on the summary is
+# the ground truth for what a given score actually weighed. Documented in README.md "Health score".
+HEALTH_WEIGHTS: dict[str, float] = {
+    "security": _health_weight("HEALTH_WEIGHT_SECURITY", 0.40),
+    "coverage": _health_weight("HEALTH_WEIGHT_COVERAGE", 0.12),
+    "dependencies": _health_weight("HEALTH_WEIGHT_DEPENDENCIES", 0.12),
+    "ac_verification": _health_weight("HEALTH_WEIGHT_AC_VERIFICATION", 0.10),
+    "accessibility": _health_weight("HEALTH_WEIGHT_ACCESSIBILITY", 0.07),
+    "complexity": _health_weight("HEALTH_WEIGHT_COMPLEXITY", 0.06),
+    "performance": _health_weight("HEALTH_WEIGHT_PERFORMANCE", 0.05),
+    "duplication": _health_weight("HEALTH_WEIGHT_DUPLICATION", 0.04),
+    "maintainability": _health_weight("HEALTH_WEIGHT_MAINTAINABILITY", 0.04),
+}
+HEALTH_SCORE_VERSION = 2
+# lizard findings score in the complexity subscore and interrogate's percentage is blended directly,
+# so their findings must not ALSO count in the maintainability subscore (double-counting).
+_MAINTAINABILITY_EXCLUDED_RULE_IDS = frozenset({
+    "high-cyclomatic-complexity", "docstring-coverage-under-threshold",
+})
+
 _CVE_RE = re.compile(r"^CVE-\d{4}-\d+$", re.IGNORECASE)
 _GHSA_RE = re.compile(r"^GHSA-", re.IGNORECASE)
 _TRIVY_DB_RE = re.compile(r"UpdatedAt:\s*(.+)")
@@ -266,6 +303,12 @@ def parse_lizard(raw: str) -> ParseResult:
         functions.append(
             {"path": _norm_path(row[6]), "function": row[7].strip(), "ccn": ccn, "nloc": nloc}
         )
+
+    # lizard has no ignore list (unlike jscpd two ToolSpecs down), so without this filter mean_ccn
+    # is the mean over node_modules/, .venv/ and build output -- thousands of trivial vendored
+    # functions dragging the mean toward 2 and pinning the complexity signal at "fine" regardless
+    # of what the application code looks like.
+    functions = [f for f in functions if not is_non_application_path(f["path"])]
 
     if not functions:
         return [], {}
@@ -1055,6 +1098,61 @@ def parse_syft(raw: str) -> ParseResult:
     return [], {"sbom": sbom}
 
 
+_OUTDATED_SECTION_RE = re.compile(r"^### (npm|dotnet|pypi)\b")
+_DOTNET_OUTDATED_ROW_RE = re.compile(r"^\s*>\s+\S")
+
+
+def parse_outdated(raw: str) -> ParseResult:
+    """Counts outdated packages per ecosystem from the marker-sectioned output the `outdated`
+    ToolSpec's compound script writes. Strictly fail-open: a garbage or empty section contributes
+    nothing, and no sections at all returns `{}` so the dependencies health subscore reads
+    "unmeasured" (weight redistributes) rather than 100.
+
+    npm sections hold `npm outdated --json` (dict keyed by package), pypi sections hold
+    `pip list --outdated --format=json` (a list), dotnet sections hold the human-readable
+    `dotnet list package --outdated` table whose data rows start with `> `."""
+    counts = {"npm": 0, "nuget": 0, "pypi": 0}
+    checked: list[str] = []
+    section: str | None = None
+    buffer: list[str] = []
+
+    def _flush() -> None:
+        nonlocal buffer, section
+        if section is None:
+            buffer = []
+            return
+        text = "\n".join(buffer).strip()
+        buffer = []
+        if section == "dotnet":
+            counts["nuget"] += sum(1 for line in text.splitlines() if _DOTNET_OUTDATED_ROW_RE.match(line))
+            return
+        if not text:
+            return
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        if section == "npm" and isinstance(doc, dict):
+            counts["npm"] += len(doc)
+        elif section == "pypi" and isinstance(doc, list):
+            counts["pypi"] += len(doc)
+
+    for line in raw.splitlines():
+        match = _OUTDATED_SECTION_RE.match(line)
+        if match:
+            _flush()
+            section = match.group(1)
+            if section not in checked:
+                checked.append(section)
+        else:
+            buffer.append(line)
+    _flush()
+
+    if not checked:
+        return [], {}
+    return [], {"outdated": {**counts, "total": sum(counts.values()), "checked": checked}}
+
+
 # --- dedup ------------------------------------------------------------------------------------
 
 
@@ -1202,21 +1300,122 @@ def sort_findings(findings: Sequence[Finding]) -> list[Finding]:
 # --- report assembly --------------------------------------------------------------------------
 
 
-def health_score(by_severity: dict[str, int], metrics: dict[str, Any]) -> int:
-    """One explicit formula in one place, so arguing with the number means editing four constants
-    rather than reverse-engineering a rollup. Deliberately simple; not calibrated against anything.
+def _clamp(value: float) -> float:
+    return max(0.0, min(100.0, value))
+
+
+def health_score(
+    *,
+    security_by_severity: dict[str, int],
+    security_measured: bool,
+    maintainability_count: int,
+    metrics: dict[str, Any],
+    ac_verification: dict[str, Any] | None = None,
+    ac_execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One explicit formula in one place: nine 0-100 subscores, each None when its input was not
+    measured, combined by HEALTH_WEIGHTS with unmeasured weights redistributed proportionally.
+    Returns {"score": int|None, "subscores": {...}, "weights_used": {...}} -- `weights_used` is what
+    the score actually weighed and is the comparability key for the regression gate (a pre-build
+    baseline and a post-build latest legitimately measure different sets).
+
+    Deliberate shapes, documented in README.md "Health score":
+      * security counts SECURITY_CATEGORIES findings only (a lizard complexity "high" is not a
+        security issue) and is None -- not 100 -- when a security tool failed to run.
+      * coverage/duplication are the raw measurements, not distance-to-the-gate: those thresholds
+        are already hard gates elsewhere, and a leg that saturates at 100 on every passing run
+        measures nothing.
+      * dependency CVEs and licence findings score in `security`; the dependencies leg is
+        staleness only (no double-counting).
+      * three criticals zero the security leg and cap the composite at 60 -- intended.
+
+    v1 (removed): 100 - (25*crit + 10*high + 3*med + 0.5*low over ALL findings)
+                  - 2*(dup% over 3) - 3*(mean_ccn over 5).
     """
-    penalty = (
-        25 * by_severity.get("critical", 0)
-        + 10 * by_severity.get("high", 0)
-        + 3 * by_severity.get("medium", 0)
-        + 0.5 * by_severity.get("low", 0)
+    complexity = metrics.get("complexity") or {}
+    coverage = metrics.get("coverage") or {}
+    lighthouse = metrics.get("lighthouse") or {}
+    outdated = metrics.get("outdated") or {}
+
+    security: float | None = None
+    if security_measured:
+        security = _clamp(
+            100.0
+            - 40 * security_by_severity.get("critical", 0)
+            - 15 * security_by_severity.get("high", 0)
+            - 5 * security_by_severity.get("medium", 0)
+            - 1 * security_by_severity.get("low", 0)
+        )
+
+    line, branch = coverage.get("line_rate"), coverage.get("branch_rate")
+    coverage_sub: float | None = None
+    if isinstance(line, (int, float)):
+        if isinstance(branch, (int, float)):
+            coverage_sub = _clamp(0.75 * line + 0.25 * branch)
+        else:
+            coverage_sub = _clamp(float(line))
+
+    dependencies: float | None = None
+    if isinstance(outdated.get("total"), int):
+        dependencies = _clamp(100.0 - min(100.0, 5.0 * outdated["total"]))
+
+    ac_sub: float | None = None
+    total_acs = (ac_verification or {}).get("total")
+    execution = ac_execution or {}
+    if (
+        isinstance(total_acs, int) and total_acs > 0
+        and execution.get("status") not in (None, "not_evaluated")
+        and isinstance(execution.get("solidly_verified"), int)
+    ):
+        flaky = len(execution.get("flaky") or [])
+        ac_sub = _clamp(100.0 * (execution["solidly_verified"] + 0.5 * flaky) / total_acs)
+
+    accessibility = lighthouse.get("accessibility")
+    accessibility = _clamp(float(accessibility)) if isinstance(accessibility, (int, float)) else None
+    performance = lighthouse.get("performance")
+    performance = _clamp(float(performance)) if isinstance(performance, (int, float)) else None
+
+    complexity_sub: float | None = None
+    mean_ccn, max_ccn = complexity.get("mean_ccn"), complexity.get("max_ccn")
+    if isinstance(mean_ccn, (int, float)):
+        mean_part = _clamp(100.0 - 10.0 * max(0.0, mean_ccn - 5.0))
+        max_part = _clamp(100.0 - 2.0 * max(0.0, (max_ccn or 0) - 15.0))
+        complexity_sub = _clamp(0.7 * mean_part + 0.3 * max_part)
+
+    duplication_pct = (metrics.get("duplication") or {}).get("percent")
+    duplication_sub = (
+        _clamp(100.0 - 3.0 * duplication_pct) if isinstance(duplication_pct, (int, float)) else None
     )
-    duplication = (metrics.get("duplication") or {}).get("percent") or 0.0
-    penalty += max(0.0, duplication - MAX_DUPLICATION_PERCENT) * 2
-    mean_ccn = (metrics.get("complexity") or {}).get("mean_ccn") or 0.0
-    penalty += max(0.0, mean_ccn - 5.0) * 3
-    return max(0, min(100, round(100 - penalty)))
+
+    # Findings-count part is always computable; the docstring percentage blends in when present.
+    maintainability_sub = _clamp(100.0 - 3.0 * maintainability_count)
+    docstring_pct = (metrics.get("documentation") or {}).get("python_docstring_coverage_percent")
+    if isinstance(docstring_pct, (int, float)):
+        maintainability_sub = _clamp((maintainability_sub + docstring_pct) / 2.0)
+
+    subscores: dict[str, float | None] = {
+        "security": security,
+        "coverage": coverage_sub,
+        "dependencies": dependencies,
+        "ac_verification": ac_sub,
+        "accessibility": accessibility,
+        "complexity": complexity_sub,
+        "performance": performance,
+        "duplication": duplication_sub,
+        "maintainability": maintainability_sub,
+    }
+
+    present = {name: HEALTH_WEIGHTS[name] for name, sub in subscores.items() if sub is not None}
+    total_weight = sum(present.values())
+    if not present or total_weight <= 0:
+        return {"score": None, "subscores": subscores, "weights_used": {}}
+    weights_used = {name: round(w / total_weight, 4) for name, w in present.items()}
+    score = round(sum(subscores[name] * weights_used[name] for name in weights_used))
+    return {
+        "score": max(0, min(100, score)),
+        "subscores": {k: (round(v, 1) if v is not None else None) for k, v in subscores.items()},
+        "weights_used": weights_used,
+    }
 
 
 # Paths whose findings are REPORTED but never block a merge: they are not the application. Three
@@ -1349,11 +1548,17 @@ class ScanReport:
         # is not a security issue. Reusing that confusion is the live bug measures.security fixes.
         security_by_severity = {level: 0 for level in SEVERITY_ORDER}
         gating = 0
+        maintainability_count = 0
         for finding in self.findings:
             by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
             by_category[finding.category] = by_category.get(finding.category, 0) + 1
             if finding.category in SECURITY_CATEGORIES:
                 security_by_severity[finding.severity] = security_by_severity.get(finding.severity, 0) + 1
+            elif (
+                finding.category == "maintainability"
+                and finding.rule_id not in _MAINTAINABILITY_EXCLUDED_RULE_IDS
+            ):
+                maintainability_count += 1
             if is_gating(
                 finding,
                 severity_floor=severity_floor,
@@ -1370,8 +1575,26 @@ class ScanReport:
         worst_open_severity = next(
             (level for level in reversed(SEVERITY_ORDER) if security_by_severity.get(level, 0)), "none"
         )
+        # A security tool that was selected but failed/missing means the security subscore is
+        # unmeasured, never "clean" -- and `degraded` names every non-ok tool so consumers can see
+        # which signals this summary is missing.
+        security_runs = [t for t in self.tools if t.get("name") in _SECURITY_TOOL_NAMES]
+        security_measured = bool(security_runs) and all(t.get("status") == "ok" for t in security_runs)
+        degraded = sorted(t["name"] for t in self.tools if t.get("status") != "ok")
+        health = health_score(
+            security_by_severity=security_by_severity,
+            security_measured=security_measured,
+            maintainability_count=maintainability_count,
+            metrics=self.metrics,
+            ac_verification=self.ac_verification,
+            ac_execution=self.ac_execution,
+        )
         return {
-            "health_score": health_score(by_severity, self.metrics),
+            "health_score": health["score"],
+            "health_subscores": health["subscores"],
+            "health_weights_used": health["weights_used"],
+            "health_score_version": HEALTH_SCORE_VERSION,
+            "degraded": degraded,
             "by_severity": by_severity,
             "by_category": dict(sorted(by_category.items())),
             "deduped_count": self.deduped_count,
@@ -1415,7 +1638,9 @@ class ScanReport:
         # repo hashes identically" contract the module docstring promises (same reasoning as
         # ac_execution below, except lighthouse must stay inside `metrics` because the delta
         # engine digs metrics.lighthouse.* -- so the HASH excludes it rather than the report).
-        hash_body = {**body, "metrics": {k: v for k, v in metrics.items() if k != "lighthouse"}}
+        # `outdated` is excluded for the same reason from the other direction: an upstream registry
+        # publishing a release changes it with zero repo change.
+        hash_body = {**body, "metrics": {k: v for k, v in metrics.items() if k not in ("lighthouse", "outdated")}}
         report = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1697,6 +1922,9 @@ class ToolSpec:
 
 # Every command is offline by construction: no `--config auto`, no DB update, no registry fetch.
 # The databases are baked into the sandbox image at build time -- see agent/sandbox-image/Dockerfile.
+# ONE deliberate exception: `outdated` (bottom of the tuple) asks the live registries which
+# packages have newer releases -- staleness cannot be measured offline. It is strictly fail-open,
+# excluded from content_hash, and NOT in any profile: only metrics_compute_node opts into it.
 TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         "scc", "MIT", True,
@@ -1783,6 +2011,20 @@ TOOLS: tuple[ToolSpec, ...] = (
         "syft dir:. -o cyclonedx-json=agent-work/sbom.json",
         "agent-work/sbom.json", parse_syft, "syft version",
     ),
+    ToolSpec(
+        # The one networked tool -- see the exception note above the tuple. Every probe is
+        # `|| true`-guarded and appends into one marker-sectioned file; _run_one judges success on
+        # that file, not on exit codes (`npm outdated` exits 1 whenever anything IS outdated).
+        # dotnet needs a restore first (`project.assets.json`) -- doing it here rather than relying
+        # on the concurrently-running dotnet-docs build, whose ordering under the semaphore is
+        # undefined.
+        "outdated", "n/a", True,
+        "mkdir -p agent-work && : > agent-work/outdated.txt && "
+        "{ for d in . apps/*; do [ -f \"$d/package.json\" ] && { echo \"### npm $d\"; (cd \"$d\" && npm outdated --json 2>/dev/null); } >> agent-work/outdated.txt || true; done; } && "
+        "{ ls *.sln */*.csproj apps/*/*.csproj >/dev/null 2>&1 && { dotnet restore >/dev/null 2>&1 || true; echo '### dotnet' >> agent-work/outdated.txt; dotnet list package --outdated >> agent-work/outdated.txt 2>/dev/null || true; } || true; } && "
+        "{ for v in .venv apps/*/.venv; do [ -x \"$v/bin/pip\" ] && { echo \"### pypi $v\"; \"$v/bin/pip\" list --outdated --format=json 2>/dev/null; } >> agent-work/outdated.txt || true; done; }",
+        "agent-work/outdated.txt", parse_outdated, "npm --version",
+    ),
 )
 
 TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
@@ -1790,7 +2032,10 @@ TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 PROFILES: dict[str, tuple[str, ...]] = {
     "quality": ("scc", "lizard", "jscpd", "interrogate", "dotnet-docs"),
     "security": ("semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"),
-    "full": tuple(tool.name for tool in TOOLS),
+    # `outdated` is deliberately NOT in "full": start_background_refresh runs "full" after every
+    # commit_all, and a networked registry probe per code commit would both hammer the registry
+    # and make the streamed health score flicker as the dependencies subscore blinks in and out.
+    "full": tuple(tool.name for tool in TOOLS if tool.name != "outdated"),
     # The Eval layer runs no scanner tools at all -- it reads the ledger, the test files and the
     # suites' own output. Deliberately its own profile and NOT part of "full": see run_repo_scan's
     # `include_eval` docstring for why adding it to an existing profile would run the test suite on
@@ -1800,7 +2045,7 @@ PROFILES: dict[str, tuple[str, ...]] = {
 
 # Tools whose only output is measurement, skipped entirely when a gate caller passes
 # include_metrics=False.
-METRIC_ONLY_TOOLS = frozenset({"scc", "git-churn", "dotnet-docs", "syft"})
+METRIC_ONLY_TOOLS = frozenset({"scc", "git-churn", "dotnet-docs", "syft", "outdated"})
 
 
 def select_tools(profile: str, tools: Sequence[str] | None, include_metrics: bool) -> list[ToolSpec]:
@@ -2145,7 +2390,16 @@ def _summary_from_stored(stored: dict[str, Any]) -> dict[str, Any]:
     report = ScanReport(
         findings=findings, metrics=stored.get("metrics") or {}, tools=(), repo=stored.get("repo") or {}, deduped_count=0
     )
-    return report.summary()
+    recomputed = report.summary()
+    # Prefer the STORED summary block wherever it exists: recomputing the health score here would
+    # stamp today's formula (and health_score_version) onto a baseline scored under a different
+    # one, giving the delta engine and the UI two different "baseline" numbers for the same file.
+    # Only `measures` (the reason this function exists -- old files predate that block) is taken
+    # from the recomputation, and only when the stored file doesn't already carry it.
+    stored_summary = stored.get("summary")
+    if isinstance(stored_summary, dict) and stored_summary.get("health_score") is not None:
+        return {"measures": recomputed["measures"], **stored_summary}
+    return recomputed
 
 
 async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -2606,6 +2860,80 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert '"tool"' in json.dumps([f.to_dict() for f in report.findings]), "gate payload must attribute tools"
     assert dashboard["summary"]["by_severity"]["critical"] == 1
     assert dashboard["summary"]["health_score"] < 100
+
+    # --- health score v2 -----------------------------------------------------------------------
+    assert abs(sum(HEALTH_WEIGHTS.values()) - 1.0) < 1e-9, "nominal weights must sum to 1.0"
+    # The README's weights table documents these defaults -- keep them in lockstep (the assert is
+    # skipped when an env override is actually set, since then HEALTH_WEIGHTS is deliberately off
+    # the documented defaults).
+    if not any(os.environ.get(f"HEALTH_WEIGHT_{name.upper()}") for name in HEALTH_WEIGHTS):
+        assert HEALTH_WEIGHTS == {
+            "security": 0.40, "coverage": 0.12, "dependencies": 0.12, "ac_verification": 0.10,
+            "accessibility": 0.07, "complexity": 0.06, "performance": 0.05,
+            "duplication": 0.04, "maintainability": 0.04,
+        }, "README.md 'The health score' documents different defaults -- update both together"
+    # This fixture's trivy entry has no status:"ok", so security is UNMEASURED -> None, and its
+    # weight redistributes over the measured legs (weights_used re-sums to 1.0).
+    summary_v2 = dashboard["summary"]
+    assert summary_v2["health_score_version"] == HEALTH_SCORE_VERSION
+    assert summary_v2["health_subscores"]["security"] is None, "failed/absent security tools must read unmeasured, not clean"
+    assert "security" not in summary_v2["health_weights_used"]
+    assert abs(sum(summary_v2["health_weights_used"].values()) - 1.0) < 1e-3, summary_v2["health_weights_used"]
+    # A clean security run scores 100; three criticals zero the leg (and cap the composite at 60).
+    clean = health_score(
+        security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=True,
+        maintainability_count=0, metrics={},
+    )
+    assert clean["subscores"]["security"] == 100.0 and clean["score"] == 100, clean
+    three_crit = health_score(
+        security_by_severity={**{lvl: 0 for lvl in SEVERITY_ORDER}, "critical": 3},
+        security_measured=True, maintainability_count=0, metrics={},
+    )
+    assert three_crit["subscores"]["security"] == 0.0, three_crit
+    # Nothing measured at all -> score None, never a fabricated number.
+    nothing = health_score(
+        security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=False,
+        maintainability_count=0, metrics={},
+    )
+    # maintainability's count part is always computable, so at least that leg is present -- but a
+    # weights table zeroed by env override must not divide by zero either.
+    assert nothing["score"] is not None and nothing["subscores"]["security"] is None
+    # Coverage is the raw measurement, not distance-to-the-95%-gate: 95% must NOT read as 100.
+    covered = health_score(
+        security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=True,
+        maintainability_count=0, metrics={"coverage": {"line_rate": 95.0, "branch_rate": 95.0}},
+    )
+    assert covered["subscores"]["coverage"] == 95.0, covered["subscores"]
+    # AC leg: flaky counts half.
+    ac = health_score(
+        security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=True,
+        maintainability_count=0, metrics={},
+        ac_verification={"total": 4}, ac_execution={"status": "ok", "solidly_verified": 2, "flaky": ["AC-1.1"]},
+    )
+    assert ac["subscores"]["ac_verification"] == 62.5, ac["subscores"]
+
+    # --- outdated leg: parser + hash exclusion -------------------------------------------------
+    _, outdated_metrics = parse_outdated(
+        "### npm .\n{\"react\": {\"current\": \"18.0.0\", \"latest\": \"19.0.0\"}}\n"
+        "### dotnet\nProject `api` has the following updates\n   > Microsoft.NET.Test.Sdk  17.0.0  17.9.0\n"
+        "### pypi .venv\n[{\"name\": \"flask\"}]\n"
+    )
+    assert outdated_metrics["outdated"]["total"] == 3, outdated_metrics
+    assert outdated_metrics["outdated"] == {"npm": 1, "nuget": 1, "pypi": 1, "total": 3, "checked": ["npm", "dotnet", "pypi"]}
+    assert parse_outdated("garbage with no markers") == ([], {}), "no sections must read unmeasured, not zero"
+    with_outdated = ScanReport(
+        findings=report.findings, metrics={**metrics, "outdated": outdated_metrics["outdated"]},
+        tools=report.tools, repo=report.repo, deduped_count=report.deduped_count,
+    )
+    assert with_outdated.to_dashboard_dict()["content_hash"] == dashboard["content_hash"], (
+        "a registry publish (outdated delta) must never change the content hash"
+    )
+
+    # --- _summary_from_stored must keep the stored score, not restamp today's formula ----------
+    stored_v1 = {"summary": {"health_score": 61}, "findings": [], "metrics": {}}
+    restored = _summary_from_stored(stored_v1)
+    assert restored["health_score"] == 61 and "health_score_version" not in restored, restored
+    assert "measures" in restored
 
     # --- measures: security must not see quality's findings ------------------------------------
     measures = dashboard["summary"]["measures"]

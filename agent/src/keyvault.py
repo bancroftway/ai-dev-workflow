@@ -23,14 +23,22 @@ Offline self-check (name mapping + env rendering): `cd agent && uv run python -m
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import shlex
 
 from . import session_store
 from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
+
+# The one legal shape for an env var name that ends up in APP_ENV_PATH. SECURITY BOUNDARY, not a
+# style rule: the env file is `. `-sourced by a shell inside the sandbox (e2e_nodes._boot_process),
+# so a free-form name like `X; rm -rf / #` would EXECUTE. Enforced at selection-save time in
+# sessions_api AND defensively in render_env_file below; the UI's client-side check is advisory.
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 # Home of the sandbox user -- outside /workspace/repo so repo tooling (gitleaks, commits, find)
 # never sees it. Constant, never interpolated from user input.
@@ -89,6 +97,66 @@ async def set_vault_uri(owner: str, repo: str, user_login: str, vault_uri: str) 
         )
 
 
+# selection: list of {"name": str, "env_name": str | None}. None (no row / NULL column) means
+# "expose all enabled secrets" -- the pre-selection behavior. An EMPTY list means "expose
+# nothing"; every consumer must branch on `is None`, never truthiness (migration 0009).
+Selection = list[dict[str, str | None]]
+
+
+async def get_secret_selection(owner: str, repo: str, user_login: str) -> Selection | None:
+    pool = await session_store._get_pool()  # noqa: SLF001
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT secret_selection FROM dbo.repo_vaults WHERE owner = ? AND repo = ? AND user_login = ?",
+            owner, repo, user_login,
+        )
+        row = await cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        parsed = json.loads(row[0])
+    except json.JSONDecodeError:
+        logger.warning("repo_vaults.secret_selection for %s/%s is not JSON; treating as no selection", owner, repo)
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [
+        {"name": str(entry.get("name")), "env_name": entry.get("env_name") or None}
+        for entry in parsed
+        if isinstance(entry, dict) and entry.get("name")
+    ]
+
+
+async def set_secret_selection(owner: str, repo: str, user_login: str, selection: Selection) -> bool:
+    """False when no vault row exists to attach the selection to (a plain UPDATE matching zero
+    rows would otherwise 200 silently -- the API turns False into a 404)."""
+    pool = await session_store._get_pool()  # noqa: SLF001
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE dbo.repo_vaults SET secret_selection = ?, updated_at = SYSUTCDATETIME() "
+            "WHERE owner = ? AND repo = ? AND user_login = ?",
+            json.dumps(selection), owner, repo, user_login,
+        )
+        return (cur.rowcount or 0) > 0
+
+
+def resolve_env_names(selection: Selection) -> dict[str, str]:
+    """secret name -> final env name (override wins, else the automap). Raises ValueError naming
+    the offender on an invalid env name or a duplicate resolved name -- callers surface it as 422."""
+    resolved: dict[str, str] = {}
+    by_env: dict[str, str] = {}
+    for entry in selection:
+        name = entry["name"] or ""
+        env_name = entry.get("env_name") or secret_name_to_env(name)
+        if not ENV_NAME_RE.match(env_name):
+            raise ValueError(f"invalid env name {env_name!r} for secret {name!r} (must match {ENV_NAME_RE.pattern})")
+        if env_name in by_env:
+            raise ValueError(f"secrets {by_env[env_name]!r} and {name!r} both resolve to env name {env_name!r}")
+        by_env[env_name] = name
+        resolved[name] = env_name
+    return resolved
+
+
 # --- OBO fetch --------------------------------------------------------------------------------
 
 
@@ -103,9 +171,18 @@ def _obo_credential(entra_assertion: str):
     )
 
 
-async def fetch_app_secrets(vault_uri: str, entra_assertion: str) -> dict[str, str]:
-    """All enabled secrets in the vault, as an env-var dict. Raises VaultAccessError with the
-    provider's own detail on any auth/permission/network failure -- callers surface it verbatim."""
+async def fetch_app_secrets(
+    vault_uri: str, entra_assertion: str, selection: Selection | None = None,
+) -> dict[str, str]:
+    """Enabled secrets in the vault as an env-var dict. Raises VaultAccessError with the
+    provider's own detail on any auth/permission/network failure -- callers surface it verbatim.
+
+    `selection=None` (the default, and every pre-selection caller) fetches ALL enabled secrets.
+    A selection fetches only the named secrets under their resolved env names -- and an EMPTY
+    selection fetches nothing (the `is None` branch is load-bearing: a user who unchecked every
+    box must not get the whole vault). A selected secret that has since been disabled or deleted
+    degrades to a logged warning, never a failed provision -- the vault-save test-read already
+    proved access, and one stale name must not brick the session."""
     from azure.core.exceptions import AzureError
     from azure.keyvault.secrets.aio import SecretClient
 
@@ -113,23 +190,55 @@ async def fetch_app_secrets(vault_uri: str, entra_assertion: str) -> dict[str, s
     try:
         async with _obo_credential(entra_assertion) as credential:
             async with SecretClient(vault_url=vault_uri, credential=credential) as client:
-                # List first, then fetch the values concurrently -- N sequential get_secret round
-                # trips were the provision path's slowest serial loop. gather preserves order, so
-                # the resulting dict (collision warning included) is the same as the old loop's.
-                names = [
-                    prop.name
-                    async for prop in client.list_properties_of_secrets()
-                    if prop.enabled is not False and prop.name
-                ]
-                fetched = await asyncio.gather(*(client.get_secret(name) for name in names))
+                if selection is None:
+                    # List first, then fetch the values concurrently -- N sequential get_secret
+                    # round trips were the provision path's slowest serial loop.
+                    names = [
+                        prop.name
+                        async for prop in client.list_properties_of_secrets()
+                        if prop.enabled is not False and prop.name
+                    ]
+                    env_by_name = {name: secret_name_to_env(name) for name in names}
+                else:
+                    env_by_name = resolve_env_names(selection)
+                    names = list(env_by_name)
+                fetched = await asyncio.gather(
+                    *(client.get_secret(name) for name in names), return_exceptions=True
+                )
                 for name, secret in zip(names, fetched):
-                    env_name = secret_name_to_env(name)
+                    if isinstance(secret, BaseException):
+                        if selection is None or not isinstance(secret, AzureError):
+                            raise secret
+                        logger.warning(
+                            "vault %s: selected secret %r unavailable (%s) -- skipped",
+                            vault_uri, name, type(secret).__name__,
+                        )
+                        continue
+                    env_name = env_by_name[name]
                     if env_name in secrets:
                         logger.warning("vault %s: secret %r collides with an earlier name after env mapping", vault_uri, name)
                     secrets[env_name] = secret.value or ""
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
     return secrets
+
+
+async def list_secret_names(vault_uri: str, entra_assertion: str) -> list[str]:
+    """Names (properties only, never values) of the vault's enabled secrets, for the settings
+    page's picker. Same OBO path and error contract as fetch_app_secrets."""
+    from azure.core.exceptions import AzureError
+    from azure.keyvault.secrets.aio import SecretClient
+
+    try:
+        async with _obo_credential(entra_assertion) as credential:
+            async with SecretClient(vault_url=vault_uri, credential=credential) as client:
+                return sorted([
+                    prop.name
+                    async for prop in client.list_properties_of_secrets()
+                    if prop.enabled is not False and prop.name
+                ])
+    except AzureError as exc:
+        raise VaultAccessError(str(exc)) from exc
 
 
 # --- env-file rendering + sandbox injection ---------------------------------------------------
@@ -144,8 +253,16 @@ def secret_name_to_env(name: str) -> str:
 
 def render_env_file(secrets: dict[str, str]) -> str:
     """`KEY=<quoted>` lines consumable by `set -a; . file; set +a` -- values are shlex-quoted so
-    spaces/quotes/$ in secret values survive the shell parse literally."""
-    return "".join(f"{key}={shlex.quote(value)}\n" for key, value in sorted(secrets.items()))
+    spaces/quotes/$ in secret values survive the shell parse literally. Keys are validated against
+    ENV_NAME_RE here DEFENSIVELY (sessions_api already rejects them at save): this file is
+    executed by a shell, so a malformed key is dropped with a warning, never emitted."""
+    lines = []
+    for key, value in sorted(secrets.items()):
+        if not ENV_NAME_RE.match(key):
+            logger.warning("refusing to render env entry with invalid name %r", key)
+            continue
+        lines.append(f"{key}={shlex.quote(value)}\n")
+    return "".join(lines)
 
 
 async def write_env_file(provider: SandboxProvider, thread_id: str, secrets: dict[str, str]) -> None:
@@ -187,6 +304,29 @@ def _demo() -> None:
     assert get_app_secrets("t1") == {"K": "v"}
     pop_app_secrets("t1")
     assert get_app_secrets("t1") is None
+
+    # --- selection env-name resolution: the security boundary ---------------------------------
+    resolved = resolve_env_names([
+        {"name": "client-id", "env_name": None},
+        {"name": "client-secret", "env_name": "AzureAd__ClientSecret"},
+    ])
+    assert resolved == {"client-id": "CLIENT_ID", "client-secret": "AzureAd__ClientSecret"}, resolved
+    # An empty override string means "use the automap", same as null -- the UI's placeholder.
+    assert resolve_env_names([{"name": "api-key", "env_name": ""}]) == {"api-key": "API_KEY"}
+    for bad in ("X; touch /tmp/pwned #", "A=B", "has space", "1LEADING-"):
+        try:
+            resolve_env_names([{"name": "s", "env_name": bad}])
+            raise AssertionError(f"env name {bad!r} must be rejected")
+        except ValueError:
+            pass
+    try:
+        resolve_env_names([{"name": "client-id", "env_name": None}, {"name": "legacy", "env_name": "CLIENT_ID"}])
+        raise AssertionError("duplicate resolved env names must be rejected")
+    except ValueError:
+        pass
+    # render_env_file's defensive half: a malformed key is DROPPED, never emitted into a file a
+    # shell will source.
+    assert render_env_file({"OK_KEY": "v", "X; touch /tmp/pwned #": "v"}) == "OK_KEY=v\n"
     print("keyvault self-check: ok")
 
 

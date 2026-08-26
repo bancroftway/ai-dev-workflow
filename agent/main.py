@@ -24,6 +24,7 @@ from src.sessions_api import catalog_router as tech_stack_catalog_router
 from src.sessions_api import config_router as vault_config_router
 from src.sessions_api import org_settings_router
 from src.sessions_api import projects_router
+from src.sessions_api import repo_auth_settings_router
 from src.sessions_api import router as sessions_router
 from src.telemetry import setup as telemetry_setup
 
@@ -40,6 +41,7 @@ app.include_router(vault_config_router)
 app.include_router(org_settings_router)
 app.include_router(tech_stack_catalog_router)
 app.include_router(projects_router)
+app.include_router(repo_auth_settings_router)
 
 add_langgraph_fastapi_endpoint(
     app=app,

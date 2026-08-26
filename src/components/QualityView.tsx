@@ -1,6 +1,7 @@
 "use client";
 
 import { useAgent } from "@copilotkit/react-core/v2";
+import { HealthBreakdown } from "@/components/HealthRing";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { RemediationFinding, WorkflowState } from "@/lib/workflow-types";
@@ -87,16 +88,25 @@ export function QualityView() {
         </p>
       </div>
 
-      {baselineHealth != null && (
+      {(latestHealth != null || baselineHealth != null) && (
         <Section title="Health score">
-          <p className="text-sm text-neutral-700">
-            Baseline {baselineHealth}
-            {latestHealth != null && (
-              <>
-                {" → "}latest <span className={latestHealth >= baselineHealth ? "text-emerald-600" : "text-red-600"}>{latestHealth}</span>
-              </>
-            )}
-          </p>
+          {scan?.latest_summary?.health_subscores || scan?.baseline_summary?.health_subscores ? (
+            // v2: ring + the accessible per-subscore breakdown (this section, not a tooltip, is
+            // the one place the weights and unmeasured legs are actually readable).
+            <HealthBreakdown
+              summary={(scan.latest_summary?.health_subscores ? scan.latest_summary : scan.baseline_summary)!}
+              baseline={scan.latest_summary?.health_subscores ? scan.baseline_summary : null}
+            />
+          ) : (
+            <p className="text-sm text-neutral-700">
+              Baseline {baselineHealth}
+              {latestHealth != null && baselineHealth != null && (
+                <>
+                  {" → "}latest <span className={latestHealth >= baselineHealth ? "text-emerald-600" : "text-red-600"}>{latestHealth}</span>
+                </>
+              )}
+            </p>
+          )}
         </Section>
       )}
 
