@@ -105,12 +105,22 @@ def _demo() -> None:
     assert get_model_name("specification", "audit", "copilot") == "gemini-3.6-flash"
     assert get_model_name("specification", "audit", "claude") == "sonnet"
 
-    # "ac-to-tests" joined the audited stages 2026-08-24 -- same shape as "specification" above,
-    # and the Claude side is a USER-SPECIFIED default (opus), not the usual one-tier-up placeholder.
+    # "ac-to-tests" joined the audited stages 2026-08-24 -- same shape as "specification" above.
+    # Claude audit was opus (2026-08-24 user default) until the 2026-08-26 cheaper-models
+    # directive dropped every opus leg to sonnet (two runs died on the 5h usage window).
     assert get_model_name("ac-to-tests", "draft", "copilot") == "gpt-5.3-codex"
     assert get_model_name("ac-to-tests", "draft", "claude") == "sonnet"
     assert get_model_name("ac-to-tests", "audit", "copilot") == "gemini-3.6-flash"
-    assert get_model_name("ac-to-tests", "audit", "claude") == "opus"
+    assert get_model_name("ac-to-tests", "audit", "claude") == "sonnet"
+    # ...and nothing on the Claude side asks for opus at all now -- the whole roster fits the
+    # cheap tiers. A reintroduction should be a deliberate decision that updates this assert.
+    config_all = _load_config()
+    assert not any(
+        v == "opus"
+        for stage_cfg in config_all.values()
+        for m in (stage_cfg.get("claude") or {}).values()
+        for v in [m]
+    ), "an opus leg reappeared in the claude roster -- deliberate? update this assert"
 
     # "tech-stack" has no audit_model on either provider -- audit must fall back to that SAME
     # provider's own draft_model, never leaking across to the other provider's value.
