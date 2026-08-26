@@ -20,7 +20,12 @@ is only Playwright specs for a criterion that also has rules provable beneath th
 draft's own instructions call that shape wrong, but the RED-phase deterministic gate does not
 enforce a non-e2e minimum yet (that arrives at minimal-code-to-green), so nothing else will catch it
 here. Also flag padding in the opposite direction: near-identical tests added only to satisfy a
-category-spread count without asserting any new observable behavior.
+category-spread count without asserting any new observable behavior. And flag every test that
+asserts ONLY absence (`toHaveCount(0)`, `.not.*`, `Assert.Null`/`False`/`Empty` and friends) with
+no positive anchor proving anything rendered or exists first -- on a blank screen every absence
+check is trivially true, and a deterministic gate WILL reject the whole draft for exactly this, so
+catching it in your revision saves a full redraft lap: add the anchor assertion yourself in
+`revised_test_suite` rather than merely reporting it.
 
 Return a fully revised `revised_test_suite` reflecting what you found and list each gap in
 `audit_findings`; if you found none, return an empty list. You cannot edit files yourself -- if a

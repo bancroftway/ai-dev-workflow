@@ -190,7 +190,7 @@ categories you covered for each AC in that entry's `categories` field. Never pad
 tautological variants -- every additional test must assert a distinct observable behavior that no
 existing test already proves, not restate the same assertion in a new wrapper.
 
-These three anti-padding rules are checked by Python and will BLOCK the stage, so they are worth
+These four anti-padding rules are checked by Python and will BLOCK the stage, so they are worth
 reading as requirements rather than advice:
 
 1. **Distinct assertion targets.** Each AC needs at least two tests asserting genuinely different
@@ -201,6 +201,16 @@ reading as requirements rather than advice:
    one test. Renaming a test and changing a literal does not produce a second test.
 3. **Category spread.** An AC whose `categories` contains only `happy_path` is blocked. At least one
    negative, edge, or adversarial case per criterion.
+4. **Positive anchor before absence checks.** A test that asserts ONLY absence -- `toHaveCount(0)`,
+   `.not.*`, `expect(x).toBeNull()`, `Assert.Null`/`Assert.False`/`Assert.Empty` and friends, with
+   no assertion that anything IS present -- is blocked. On a page that never rendered (or an object
+   that was never built), every absence check is trivially true, so such a test passes against a
+   blank screen and would pass just as well if the app were entirely broken. Before the first
+   absence assertion, anchor on something that must exist for the scenario to be meaningful:
+   `await expect(page.getByTestId('...')).toBeVisible()` in an e2e/component test,
+   `Assert.NotNull(result)` on the object whose property you then assert absent, a rendered
+   element/text in a React Testing Library test. This applies to EVERY test, including "does not
+   show X" / "no longer renders Y" negatives -- prove the page rendered, THEN prove X is absent.
 
 You have write access, but ONLY to test files -- test projects/files themselves, and their own
 config. Concretely, these paths are permitted, and they are enough to build the full pyramid
