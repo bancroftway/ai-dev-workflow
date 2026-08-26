@@ -58,7 +58,12 @@ plan:
     audit_model: gemini-3.6-flash
   claude:
     draft_model: sonnet
-    audit_model: opus
+    # sonnet, not opus (2026-08-26, user directive: cheaper models -- two runs died on the 5h
+    # subscription window). Costs the "audit differs from draft" property on this provider
+    # (Claude has no second full-tier vendor); the audit still runs in a FRESH session with an
+    # adversarial prompt, which is where most of its value observably comes from. Restore opus
+    # here first if plan-audit quality regresses.
+    audit_model: sonnet
 ac-to-tests:
   copilot:
     # gpt-5.3-codex: mini and plain gpt-5.4 both drafted structured metadata describing test files
@@ -70,9 +75,11 @@ ac-to-tests:
     audit_model: gemini-3.6-flash
   claude:
     draft_model: sonnet
-    # User-specified default (2026-08-24), not the usual one-tier-up-from-draft placeholder: this
-    # audit gates every downstream stage, so it gets the top tier regardless of the draft's own tier.
-    audit_model: opus
+    # Was opus per the 2026-08-24 "top tier regardless" decision; downshifted 2026-08-26 by the
+    # newer user directive (cheaper models -- the 5h usage window killed two runs, and this audit
+    # fires on EVERY draft lap, 3-6 per run). Same same-model caveat as plan's audit above;
+    # restore opus here first if suite-quality rejections stop being caught before the gate.
+    audit_model: sonnet
 minimal-code-to-green:
   copilot:
     # gpt-5.4 (not -mini) on purpose: the codegen stage's 70k+-token drafting turn is above the
@@ -82,7 +89,10 @@ minimal-code-to-green:
     audit_model: gemini-3.6-flash
   claude:
     draft_model: sonnet
-    audit_model: opus
+    # sonnet, not opus (2026-08-26 cheaper-models directive): this stage runs up to 12 verify
+    # cycles, each with an audit pass -- the single largest opus burn in the pipeline. Same
+    # same-model caveat and restore-first rule as the plan/ac-to-tests audits above.
+    audit_model: sonnet
 brownfield-baseline:
   copilot:
     draft_model: gpt-5.4-mini
