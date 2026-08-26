@@ -50,7 +50,11 @@ repo-root/
 6. In `apps/web/vite.config.ts`, add a dev proxy:
    ```ts
    export default defineConfig({
-     server: { proxy: { "/api": { target: "http://localhost:5080", changeOrigin: true } } },
+     // process.env, not a literal: the e2e harness starts the API on a port it verifies is
+     // free and exports API_BASE_URL with the real value. A hardcoded 5080 proxies to
+     // nothing the moment that port is taken, and the UI reports it cannot reach the API
+     // on an app that is entirely correct.
+     server: { proxy: { "/api": { target: process.env.API_BASE_URL || "http://localhost:5080", changeOrigin: true } } },
    });
    ```
 

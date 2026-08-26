@@ -84,7 +84,18 @@ async def _run_docker(*args: str, input_bytes: bytes | None = None) -> tuple[int
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate(input=input_bytes)
-    return proc.returncode or 0, stdout.decode().strip(), stderr.decode().strip()
+    # errors="replace", not strict: a sandbox command's output is arbitrary bytes, and a strict
+    # decode turns any of them into an unhandled UnicodeDecodeError that propagates out of the
+    # calling node and kills the whole graph invocation. Observed live: ac_coverage_gate's test-file
+    # listing matched Playwright's `test-failed-1.png` screenshots, read one back through
+    # repo_files.read_repo_file, and the leading 0x89 of the PNG header ended a run that was 50
+    # minutes and four approved stages in. No caller here wants a hard crash over undecodable
+    # bytes -- they want the text, however mangled, so the gate above can judge it.
+    return (
+        proc.returncode or 0,
+        stdout.decode(errors="replace").strip(),
+        stderr.decode(errors="replace").strip(),
+    )
 
 
 async def _container_repo_branch(container_name: str) -> str | None:

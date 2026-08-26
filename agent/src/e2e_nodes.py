@@ -367,6 +367,19 @@ def _candidate_class(candidate: dict[str, Any]) -> str:
 _STALE_APP_PATTERNS = (
     "next dev", "next start", "next-server", "npm run dev", "vite", "ng serve",
     "dotnet run", "dotnet exec", "bin/Debug", "uvicorn", "flask run",
+    # The Blazor WASM dev server, which is what actually BINDS the port for a Blazor web app --
+    # `dotnet run` merely spawns it. Its command line is
+    # `dotnet /opt/aidw/cache/nuget/microsoft.aspnetcore.components.webassembly.devserver/.../
+    # blazor-devserver.dll`, matching none of the patterns above: not "dotnet run" (that is the
+    # parent), not "dotnet exec", not "bin/Debug" (it runs from the NuGet cache). So it survived
+    # every sweep and kept holding 5150 after its run ended.
+    #
+    # The consequence is not a leaked process, it is a FAILED NEXT RUN: _pick_free_port finds the
+    # declared port busy, relocates the web app to the 3100 range, and the API's CORS policy --
+    # which the blazor-dotnet stack template tells the model to pin to http://localhost:5150 --
+    # then rejects every request from the new origin. Observed twice, both times reported as
+    # 2/16 e2e tests passing with "Couldn't reach the counter service", on an app that was fine.
+    "blazor-devserver", "components.webassembly",
 )
 
 
@@ -409,6 +422,24 @@ async def _pick_free_port(
         return preferred
     for candidate in _APP_PORT_RANGE:
         if candidate not in busy:
+            # Relocating a DECLARED port is a loud event, not routine bookkeeping. Every stack
+            # template hardcodes the cross-process URL somewhere the harness cannot reach:
+            # blazor-dotnet pins the API's CORS policy to http://localhost:5150, angular-dotnet
+            # pins proxy.conf.json's target to http://localhost:5080 (and a .json proxy file cannot
+            # read the env var this module injects). So moving a declared port silently breaks the
+            # OTHER process's ability to talk to this one, and the symptom surfaces far away as
+            # "Couldn't reach the counter service" on an app that is completely fine.
+            #
+            # Observed twice on blazor-dotnet (2/16 e2e both times) before the cause was found.
+            # This log is what turns that into a one-line diagnosis instead of an afternoon.
+            if preferred:
+                logger.warning(
+                    "e2e: declared port %d is busy -- relocating to %d. The stack's own hardcoded "
+                    "cross-process URL (CORS origin / dev-server proxy target) still points at %d, "
+                    "so expect the other process to be unreachable unless it reads its peer's URL "
+                    "from the environment.",
+                    preferred, candidate, preferred,
+                )
             return candidate
     return _APP_PORT_RANGE.start
 
@@ -421,6 +452,39 @@ async def _pick_free_port(
 # so the very name this exists to find never matched.
 _ENV_NAME_RE = re.compile(r"(?:process\.env|import\.meta\.env)\.([A-Z][A-Z0-9_]*)")
 _API_ENV_HINTS = ("API", "BACKEND", "SERVER")
+
+
+def _service_name_tokens(candidate: dict[str, Any]) -> set[str]:
+    """Identifying words for a service, from its name and the last segments of its path.
+
+    `apps/orders-api` -> {"apps", "orders", "api", "orders-api"} minus the noise words below, so
+    "orders" survives as the distinguishing token and "api"/"apps" do not. Pure, so the matching
+    below is testable without a repo.
+    """
+    raw = f"{candidate.get('name') or ''} {candidate.get('path') or ''}"
+    tokens = {t for t in re.split(r"[^A-Za-z0-9]+", raw.lower()) if len(t) > 2}
+    # Words shared by every service in a monorepo carry no signal and would match everything.
+    return tokens - {"apps", "app", "api", "src", "srv", "service", "services", "server", "backend", "web"}
+
+
+def _url_for_env_name(env_name: str, services: list[tuple[dict[str, Any], str]], fallback: str) -> str:
+    """The booted service this env var is asking for, or `fallback` when nothing distinguishes it.
+
+    Every discovered env name used to receive service_urls[0] -- the FIRST booted service. With one
+    API that is correct and this function returns the same answer. With two it silently wired the
+    frontend to whichever sorted first and left the other unreachable: it booted, passed its
+    readiness probe, and nothing ever told the app where it was.
+
+    Matched on the service's own distinguishing tokens appearing in the variable name, which is how
+    these are conventionally spelled (ORDERS_API_URL for apps/orders-api, AUTH_BASE_URL for
+    apps/auth). No match means no evidence, and inventing one would be worse than the documented
+    single-service behaviour -- so the fallback is preserved exactly.
+    """
+    lowered = env_name.lower()
+    matches = [url for candidate, url in services if any(tok in lowered for tok in _service_name_tokens(candidate))]
+    # Exactly one service claims this name -> unambiguous. Two or more -> the name does not actually
+    # distinguish them, so guessing would be arbitrary; fall back rather than pick.
+    return matches[0] if len(matches) == 1 else fallback
 
 
 async def _api_env_names(provider: Any, thread_id: str) -> list[str]:
@@ -540,6 +604,26 @@ def summarise_page_state(route: str, state: dict[str, Any]) -> str:
 # look like evidence. Observed live: a failed run produced five PNGs of IDENTICAL 4254 bytes. Flagged
 # rather than deleted -- and never fatal, since two genuinely identical pages are possible.
 _DEGENERATE_PNG_MAX_BYTES = 8192
+
+
+# `playwright screenshot` shoots as soon as navigation resolves, which is BEFORE a client-rendered
+# app has painted anything. Blazor WebAssembly is the worst case in scope: the browser must download
+# and boot a multi-megabyte .NET runtime before the first element exists, so the capture caught an
+# empty document while the suite's own screenshots -- taken mid-test, after assertions had waited on
+# elements -- rendered perfectly.
+#
+# That mismatch was not cosmetic. degenerate_screenshots() gates on it ("a green suite whose
+# screenshots are all blank is not evidence of a working UI"), so a 16/16-passing run was routed
+# into the e2e fix loop over a capture artefact no code change could repair. Measured on the live
+# blazor-dotnet app, same URL, app already serving: no wait -> 5,482 bytes (blank); 5s wait ->
+# 14,322 bytes (fully rendered), matching the suite captures that were always fine.
+#
+# Waits rather than --wait-for-selector: there is no selector that generalises across every stack
+# this pipeline builds, and waiting on the wrong one would hang the capture instead of producing a
+# slightly-early one. Escalating rather than fixed, because hydration time is variable (see the
+# capture loop's own comment): a fast stack pays only the first rung, a cold Blazor boot climbs.
+# Total worst case per route is ~28s, bounded by the 12-route cap on captures.
+_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS = (3000, 10000, 15000)
 
 
 def degenerate_screenshots(sizes: dict[str, int]) -> list[str]:
@@ -863,7 +947,17 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # error states or empty lists, and that image would still satisfy exit's "screenshots exist"
     # check -- shipping visual evidence of an app that does not work. Failing here with the API's own
     # log tail is strictly more useful than a green run with misleading pictures.
+    # Booted services, in boot order, as (candidate, url) -- so the env injection below can match a
+    # discovered env-var name to the RIGHT service instead of giving every name the first one's url.
     service_urls: list[str] = []
+    booted_services: list[tuple[dict[str, Any], str]] = []
+    # Services that failed readiness on the first pass. NOT a failure yet: with no declared
+    # dependency graph anywhere in app_discovery's candidates (they carry name/path/port/class and
+    # nothing else), boot order among several APIs is arbitrary, so a service that needs a sibling
+    # during startup can fail purely because that sibling had not been booted yet. Retried once
+    # after every other service is up, which resolves any acyclic dependency chain without needing
+    # to know the graph. Only a service still dead after that is a real failure.
+    deferred: list[tuple[int, dict[str, Any], int, str]] = []
     for index, other in enumerate([a for a in startable if a is not app], start=1):
         other_log = f"agent-work/e2e-service-{index}.log"
         # An explicit, verified-free port for every service too -- otherwise a .NET API takes the
@@ -875,26 +969,75 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         )
         reserved_ports.add(other_port)
         service_urls.append(f"http://127.0.0.1:{other_port}")
+        # The reverse of the api_env injection below: tell the SERVICE where the UI is. Only the
+        # forward direction existed, which is asymmetric in a way that bites -- a browser-side
+        # framework needs the API's URL, but an API enforcing CORS needs the UI's ORIGIN, and
+        # nothing supplied it. blazor-dotnet's template pins that origin to http://localhost:5150,
+        # so the moment the web app landed on any other port every browser request was rejected by
+        # CORS and the suite reported a working app as broken.
+        #
+        # A FIXED name, not discovery: `_api_env_names` greps JS/TS only, so it can never see what a
+        # .cs file reads. `localhost`, not `127.0.0.1` -- a CORS origin is compared as a STRING
+        # against the browser's Origin header, and the browser sends the host the page was loaded
+        # from, which is what playwright navigates to.
+        #
+        # WEB_ORIGIN ONLY, deliberately. An earlier version also exported CORS_ALLOWED_ORIGINS, and
+        # that is a common enough convention that a BROWNFIELD API may already read it -- plausibly
+        # as a comma-separated list of several origins. Overwriting it with this single value would
+        # silently break a working repo, which is a far worse failure than the greenfield problem
+        # this exists to solve. WEB_ORIGIN is niche enough to be safe, and for the canned stacks
+        # both ends are ours, so one name is sufficient.
+        web_origin = f"http://localhost:{requested_port}"
+        service_command = _with_port_env(
+            _scanned_launch_command(other), other_port, str(other.get("runtime") or "")
+        )
+        service_command = f"export WEB_ORIGIN={shlex.quote(web_origin)}; {service_command}"
         await _boot_process(
-            provider, thread_id,
-            _with_port_env(_scanned_launch_command(other), other_port, str(other.get("runtime") or "")),
+            provider, thread_id, service_command,
             other_log, f"agent-work/e2e-service-{index}.pid", env_file=use_env_file,
         )
-        if not await _wait_ready(provider, thread_id, other_port):
-            log_tail = (await repo_files.read_repo_file(provider, thread_id, other_log) or "")[-3000:]
-            e2e.update(
-                status="failed", total=0, passed=0, screenshots=[],
-                failed_tests=[{
-                    "title": f"{other.get('name') or other.get('path')} readiness",
-                    "error": (
-                        f"the {_candidate_class(other) or 'supporting'} app at {other.get('path')} never "
-                        f"answered on port {other_port} within "
-                        f"{workflow_config.E2E_APP_READY_TIMEOUT_SECONDS}s, so the UI would be "
-                        f"exercised against a dead backend -- log tail:\n{log_tail}"
-                    ),
-                }],
+        if await _wait_ready(provider, thread_id, other_port):
+            booted_services.append((other, f"http://127.0.0.1:{other_port}"))
+        else:
+            logger.info(
+                "e2e: service %s not ready yet on port %d -- deferring one retry until its siblings are up",
+                other.get("name") or other.get("path"), other_port,
             )
-            return await _finalize_run(provider, thread_id, e2e)
+            deferred.append((index, other, other_port, service_command))
+
+    # Second pass for anything that lost the ordering race. Same command, same port -- the only
+    # thing that changed is that every other service is now listening.
+    for index, other, other_port, service_command in deferred:
+        other_log = f"agent-work/e2e-service-{index}.log"
+        await _boot_process(
+            provider, thread_id, service_command,
+            other_log, f"agent-work/e2e-service-{index}.pid", env_file=use_env_file,
+        )
+        if await _wait_ready(provider, thread_id, other_port):
+            logger.info(
+                "e2e: service %s came up on the dependency-ordering retry",
+                other.get("name") or other.get("path"),
+            )
+            booted_services.append((other, f"http://127.0.0.1:{other_port}"))
+            continue
+        log_tail = (await repo_files.read_repo_file(provider, thread_id, other_log) or "")[-3000:]
+        e2e.update(
+            status="failed", total=0, passed=0, screenshots=[],
+            failed_tests=[{
+                "title": f"{other.get('name') or other.get('path')} readiness",
+                "error": (
+                    f"the {_candidate_class(other) or 'supporting'} app at {other.get('path')} never "
+                    f"answered on port {other_port} within "
+                    f"{workflow_config.E2E_APP_READY_TIMEOUT_SECONDS}s, even on a second attempt "
+                    f"made after every other service was listening (so this is not a start-order "
+                    f"problem), so the UI would be exercised against a dead backend -- log tail:\n{log_tail}"
+                ),
+            }],
+        )
+        return await _finalize_run(provider, thread_id, e2e)
+    # Boot order is no longer meaningful after the retry pass, but url ORDER still is: service_urls
+    # keeps the single-service fallback below pointing at the one service a repo actually has.
+    service_urls = [url for _candidate, url in booted_services]
 
     # Point the UI at the API we actually started. Without this the app keeps its baked-in default
     # (a port nothing is listening on, since Python chose the API's port), every request fails, and
@@ -902,7 +1045,10 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     if service_urls:
         # export, not a prefix assignment -- see _with_port_env's comment: a `VAR=x cd .. && cmd`
         # prefix dies at the `&&` and the app never hears about the API's real port.
-        api_env = "; ".join(f"export {name}={shlex.quote(service_urls[0])}" for name in await _api_env_names(provider, thread_id))
+        api_env = "; ".join(
+            f"export {name}={shlex.quote(_url_for_env_name(name, booted_services, service_urls[0]))}"
+            for name in await _api_env_names(provider, thread_id)
+        )
         if api_env:
             logger.info("e2e: pointing app env at booted service: %s", api_env)
             start_command = f"{api_env}; {start_command}"
@@ -1025,12 +1171,40 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     routes = [r for r in (launch.routes or []) if str(r).startswith("/")] or ["/"]
     for index, route in enumerate(routes[:12], start=1):
         dest = f"{screens_dir}/{index:03d}-{_route_slug(route)}.png"
-        shot = await provider.exec_in_sandbox(
-            thread_id,
-            f"PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
-            f"{shot_cmd} --full-page {shlex.quote(f'http://localhost:{port}{route}')} "
-            f"{shlex.quote(dest)} 2>&1",
-        )
+        # Escalating waits rather than one fixed pause: hydration time is genuinely variable, so no
+        # single number is right. Measured on the SAME app minutes apart -- 3s produced a fully
+        # rendered 14,322-byte capture once the server was warm, while 5s still caught 'Loading...'
+        # on a cold start, because a Blazor WASM first paint waits on a multi-megabyte runtime
+        # download that a warm second visit skips. A fixed wait long enough for the worst case would
+        # also burn that wait on every route of every fast stack (up to 12 routes per run).
+        #
+        # The retry predicate is the SAME size threshold degenerate_screenshots() gates on, so this
+        # loop cannot disagree with the gate it exists to satisfy: it stops as soon as the capture
+        # would pass, and a genuinely blank page still exhausts the ladder and is still reported
+        # blank. Never weakens the gate -- only stops handing it a photo taken too early.
+        shot = None
+        for attempt_ms in _ROUTE_SCREENSHOT_HYDRATE_LADDER_MS:
+            shot = await provider.exec_in_sandbox(
+                thread_id,
+                f"PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
+                f"{shot_cmd} --full-page --wait-for-timeout {attempt_ms} "
+                f"{shlex.quote(f'http://localhost:{port}{route}')} "
+                f"{shlex.quote(dest)} 2>&1",
+            )
+            sized = await provider.exec_in_sandbox(
+                thread_id, f"stat -c%s {shlex.quote(dest)} 2>/dev/null || echo 0"
+            )
+            try:
+                captured_bytes = int((sized.stdout or "0").strip() or 0)
+            except ValueError:
+                captured_bytes = 0
+            if captured_bytes > _DEGENERATE_PNG_MAX_BYTES:
+                break
+            if captured_bytes:
+                logger.info(
+                    "e2e route screenshot still blank at %dms for thread_id=%s route=%s (%d bytes)",
+                    attempt_ms, thread_id, route, captured_bytes,
+                )
         landed = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(dest)} 2>/dev/null")
         if (landed.stdout or "").strip():
             screenshots.append(dest)
@@ -1140,6 +1314,34 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         e2e["page_state"] = state_line
         failures = list(e2e.get("failed_tests") or [])
         failures.append({"title": "page state at failure", "error": state_line})
+        # Name the blank captures as their own fixable item, on EVERY failing lap -- not only when
+        # the suite otherwise passed. A suite-level failure used to hide them completely: the fix
+        # node saw the failing assertions and the page state, and nothing telling it which tests
+        # produced an empty photo, so it repaired the assertions lap after lap while the blank
+        # screenshot that gates the stage stayed exactly as it was (observed live: US-0006.1 was
+        # still byte-identical after a 32-minute fix lap took the suite from 8/16 to 15/16).
+        #
+        # A suite-captured screenshot is blank because THAT test never waited for anything to
+        # render -- which usually means it only asserts absence, and would pass against a broken
+        # app. So the guidance is the fix, not a description of the symptom.
+        blank = e2e.get("degenerate_screenshots") or []
+        if blank:
+            named = ", ".join(str(p).rsplit("/", 1)[-1] for p in blank[:5]) + (
+                f", and {len(blank) - 5} more" if len(blank) > 5 else ""
+            )
+            failures.append({
+                "title": "blank screenshots",
+                "error": (
+                    f"{len(blank)} screenshot(s) captured an unrendered page: {named}. A suite "
+                    "screenshot is named after the test that produced it. Such a test asserted "
+                    "nothing that required the page to render -- typically only absence checks "
+                    "(toHaveCount(0), .not.*), which pass just as well against a blank screen or a "
+                    "completely broken app. Fix the NAMED test by asserting something present "
+                    "first (e.g. `await expect(page.getByTestId('...')).toBeVisible()`) before any "
+                    "absence assertion, so the capture depicts the real UI. This gates the stage "
+                    "even when every test passes."
+                ),
+            })
         e2e["failed_tests"] = failures
         if e2e.get("degenerate_screenshots") and e2e["status"] != "failed":
             # A green suite whose screenshots are all blank is not evidence of a working UI.

@@ -9,6 +9,24 @@ repository (source, tests, everything since P6). For every Plan Step and Accepta
 verify -- don't assume -- that the actual code satisfies it. Cite concrete evidence (file/line,
 test name, actual behavior) for every divergence you report; never a bare assertion.
 
+Out-of-scope conformance is part of this audit, and it is the half most often missed. The approved
+Specification carries an `out_of_scope` list -- things it explicitly decided NOT to build. Check
+every entry on it against the delivered repository: a dependency, configuration block, endpoint,
+table, or UI affordance that implements an out-of-scope item is a divergence exactly as much as a
+missing Plan Step is, and it ships code the approved Specification says should not exist. Report it
+with the same severity discipline as anything else (an unused-but-wired dependency is typically
+`major`, since it enlarges the supply chain and the attack surface for a capability nobody asked
+for). Cite the out_of_scope entry verbatim alongside the file/line that implements it.
+
+Look at what the code PULLS IN, not only what it does: package references, service registrations,
+middleware, and startup wiring are where an excluded capability usually appears, and none of them
+show up as a failing test. Observed live: an approved Specification listed "Analytics or telemetry"
+out of scope, an earlier stage flagged the OpenTelemetry packages and wiring as "CODE ACTION
+REQUIRED", no later stage carried that forward, and this audit never looked at `out_of_scope` at
+all -- so it reached the final merge-readiness report as a blocker with no remaining loop able to
+fix it. This audit HAS a fix loop; the exit report does not. Catching it here is the difference
+between a fixed problem and a blocked merge.
+
 Wireframe conformance is part of this audit whenever the approved Implementation Plan above lists
 any `wireframes`: for each one it lists (`.ai-dev-workflow/plan/wireframes/<screen>.html`), find
 the implemented screen (route/page/component) and verify it closely follows the wireframe -- every

@@ -90,6 +90,27 @@ def _app_dir(path: str) -> str:
 
 
 def _csproj_signals(text: str) -> dict[str, Any] | None:
+    # Checked BEFORE Sdk.Web: "Microsoft.NET.Sdk.BlazorWebAssembly" contains no "Microsoft.NET.Sdk.Web"
+    # substring so the order is not load-bearing today, but a Blazor project is a UI and must never
+    # fall through to the api/library branches below.
+    #
+    # Without this branch a Blazor WASM frontend was invisible to discovery entirely: its Sdk matches
+    # neither `Microsoft.NET.Sdk.Web` nor the bare `Microsoft.NET.Sdk` (that regex's closing quote
+    # excludes the longer name), so _csproj_signals returned None and apps/web produced no candidate
+    # at all. Observed live (blazor-dotnet s01): `startable` held only apps/api, so nothing was left
+    # to boot as a supporting service, the launch agent started the web app itself on the API's own
+    # port, the API never ran, and all 19 e2e screenshots showed the UI stuck on "Loading current
+    # count..." with every control disabled -- visual "evidence" of an app that did not work, which
+    # is precisely what the supporting-service boot in e2e_nodes exists to prevent.
+    #
+    # Sdk.Razor is deliberately NOT here: that is a Razor Class Library (not startable). Blazor
+    # SERVER projects use Sdk.Web and are already caught by the branch below.
+    if re.search(r'Sdk\s*=\s*"Microsoft\.NET\.Sdk\.BlazorWebAssembly"', text):
+        return {
+            "likely_class": "web",
+            "runtime": "dotnet",
+            "marker": 'Sdk="Microsoft.NET.Sdk.BlazorWebAssembly"',
+        }
     if re.search(r'Sdk\s*=\s*"Microsoft\.NET\.Sdk\.Web"', text):
         return {"likely_class": "api", "runtime": "dotnet", "marker": 'Sdk="Microsoft.NET.Sdk.Web"'}
     # An ASP.NET FrameworkReference makes a plain-Sdk project a web host just as surely as Sdk.Web
@@ -354,6 +375,26 @@ def _demo() -> None:
     apps = classify_candidates(webapi)
     api = next(a for a in apps if a["source"].endswith(".csproj"))
     assert api["likely_class"] == "api" and api["path"] == "src/Api", apps
+
+    # A Blazor WASM frontend must classify as a startable "web" app, not vanish. Its Sdk matches
+    # neither Sdk.Web nor the bare Sdk (whose regex ends at a closing quote), so before this was
+    # handled _csproj_signals returned None and the whole app produced NO candidate -- e2e then had
+    # only the API in `startable`, booted no supporting service, and every screenshot showed a UI
+    # stuck loading against a backend that was never started (observed live, blazor-dotnet s01).
+    blazor = {
+        "apps/web/Web.csproj": '<Project Sdk="Microsoft.NET.Sdk.BlazorWebAssembly"></Project>',
+        "apps/web/Properties/launchSettings.json": '{"profiles":{"http":{"applicationUrl":"http://localhost:5150"}}}',
+        "apps/api/Api.csproj": '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>',
+        "apps/api/Properties/launchSettings.json": '{"profiles":{"http":{"applicationUrl":"http://localhost:5080"}}}',
+    }
+    _blazor_apps = classify_candidates(blazor)
+    _web = next(a for a in _blazor_apps if a["path"] == "apps/web")
+    assert _web["likely_class"] == "web", _blazor_apps
+    assert _web["start_command"] == "dotnet run --project apps/web", _web
+    assert _web["port"] == 5150, _web
+    # Both halves startable == e2e boots the API as a supporting service before driving the UI.
+    _startable = {a["path"] for a in _blazor_apps if (a.get("start_command") or "").strip()}
+    assert _startable == {"apps/web", "apps/api"}, _startable
 
     # A plain-Sdk project with an ASP.NET FrameworkReference is a web host too. Classifying it
     # "library" left it with no start_command, so e2e booted only the frontend and screenshotted a

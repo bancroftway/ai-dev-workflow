@@ -15,7 +15,7 @@ repo-root/
 ├── apps/
 │   ├── web/                   # Angular app (Angular CLI workspace)
 │   │   ├── src/
-│   │   ├── proxy.conf.json    # dev-server proxy: /api -> http://localhost:5080
+│   │   ├── proxy.conf.js      # dev-server proxy: /api -> $API_BASE_URL (default :5080)
 │   │   ├── angular.json
 │   │   └── package.json
 │   ├── api/                   # ASP.NET Core Web API
@@ -50,12 +50,23 @@ repo-root/
    *.user
    ```
 6. In `apps/web/src/environments/`, point the API base URL at `/api` (dev) and the real API origin
-   (prod); add `apps/web/proxy.conf.json`:
-   ```json
-   { "/api": { "target": "http://localhost:5080", "secure": false, "pathRewrite": { "^/api": "" } } }
+   (prod); add `apps/web/proxy.conf.js` — a `.js` file, NOT `.json`:
+   ```js
+   // .js because a .json proxy file cannot read the environment, and the API's port is not
+   // guaranteed to be 5080: the e2e harness starts it on a port it verifies is free and exports
+   // API_BASE_URL with the real value. A .json pinned to 5080 silently proxies to nothing the
+   // moment that port is taken, and the failure surfaces as the UI being unable to reach the API
+   // on an app that is entirely correct.
+   module.exports = {
+     "/api": {
+       target: process.env.API_BASE_URL || "http://localhost:5080",
+       secure: false,
+       pathRewrite: { "^/api": "" },
+     },
+   };
    ```
 7. In `apps/web/angular.json`, set the `serve` target's `options.proxyConfig` to
-   `"apps/web/proxy.conf.json"`.
+   `"apps/web/proxy.conf.js"`.
 
 ## Package managers
 

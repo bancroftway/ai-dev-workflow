@@ -52,7 +52,10 @@ repo-root/
    ```ts
    const nextConfig = {
      async rewrites() {
-       return [{ source: "/api/:path*", destination: "http://localhost:5080/:path*" }];
+       // process.env, not a literal -- the e2e harness picks a free port for the API and
+       // exports API_BASE_URL. A hardcoded 5080 rewrites to nothing once that port is taken.
+       const api = process.env.API_BASE_URL || "http://localhost:5080";
+       return [{ source: "/api/:path*", destination: `${api}/:path*` }];
      },
    };
    ```

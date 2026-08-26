@@ -41,7 +41,7 @@ logger = logging.getLogger("run_headless")
 from langchain_core.messages import HumanMessage  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
-from src import app_discovery, branch_naming, chat_model, git_ops  # noqa: E402
+from src import app_discovery, branch_naming, chat_model, git_ops, project_store, session_store  # noqa: E402
 from src.graph import graph  # noqa: E402
 from src.sandbox import get_sandbox_provider, registry  # noqa: E402
 
@@ -70,6 +70,53 @@ def _parse_args() -> argparse.Namespace:
         "pass's own draft, same as every other gate.",
     )
     return parser.parse_args()
+
+
+async def _ensure_session_row(thread_id: str, args: argparse.Namespace, provider: str) -> None:
+    """Create the dbo.sessions row (and the dbo.projects row it belongs to) that dbo.run_events
+    FKs to, before anything can emit an event against thread_id.
+
+    An API-driven session gets this from sessions_api.provision_session; this runner deliberately
+    bypasses the API, so without it every run_event_store.append_event violates
+    `run_events.session_id -> sessions.session_id` and a headless run persists ZERO events -- the
+    swimlane and GET /sessions/{id}/events have nothing to replay once the sandbox is torn down.
+    The failure was invisible in practice because append_event is best-effort and only warns.
+
+    Fail-soft for that same reason (see run_event_store.append_event's own docstring): losing
+    observability must never abort an LLM-cost-incurring run. create_session is idempotent, so a
+    --thread resume re-runs this harmlessly.
+    """
+    try:
+        project = await project_store.find_project_by_repo(args.owner, args.repo)
+        if project is None:
+            # create_project starts owner/repo NULL by design (its "+ New Project" call path), so
+            # set_project_repo has to backfill them or find_project_by_repo above would miss this
+            # row next run and mint a fresh project for every headless run.
+            project_id = await project_store.create_project(
+                f"{args.owner}/{args.repo}",
+                tech_stack_id=args.greenfield_stack,
+                tech_stack_text=None,
+                created_by="run_headless",
+            )
+            await project_store.set_project_repo(project_id, args.owner, args.repo, args.branch)
+        else:
+            project_id = project["project_id"]
+        await session_store.create_session(
+            thread_id,
+            owner=args.owner,
+            repo=args.repo,
+            user_login="run_headless",
+            source_branch=args.branch,
+            work_branch=branch_naming.work_branch_for(thread_id),
+            title=f"headless {args.greenfield_stack or 'detected-stack'}: {Path(args.requirements_file).stem}",
+            project_id=project_id,
+            provider=provider,
+        )
+    except Exception:  # noqa: BLE001 -- observability setup must never sink the run
+        logger.warning(
+            "could not create the sessions row for thread %s -- run events will not persist",
+            thread_id, exc_info=True,
+        )
 
 
 def _stage_statuses(values: dict) -> dict[str, str]:
@@ -124,6 +171,8 @@ async def run(args: argparse.Namespace) -> int:
         logger.info("greenfield auto-select armed: stack_id=%s", args.greenfield_stack)
     cfg = {"configurable": {"thread_id": thread_id}}
     started = time.monotonic()
+
+    await _ensure_session_row(thread_id, args, active_provider)
 
     provider = get_sandbox_provider()
     logger.info("provisioning sandbox for %s/%s@%s (thread %s)", args.owner, args.repo, args.branch, thread_id)

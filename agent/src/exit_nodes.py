@@ -24,6 +24,20 @@ from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
 
+# Phrases the metrics regression gate OWNS -- every one of these comes from
+# metrics_nodes.regression_reasons and from nowhere else. A blocking reason containing one of them
+# is a claim about a deterministic measurement, so this run's gate output is the only authority on
+# whether it is true. Anything outside this vocabulary is the drafting model's own reasoning and is
+# never second-guessed here. Kept as substrings, not exact strings, because the gate interpolates
+# live numbers ("duplication 10.5% exceeds...") that will not match a previous run's text.
+_GATE_OWNED_REASON_MARKERS = (
+    "gating finding(s) open",
+    "coverage unmeasured",
+    "coverage below threshold",
+    "exceeds the",          # duplication threshold
+    "regressed",            # coverage/health regression deltas
+)
+
 CHANGELOG_PATH = "CHANGELOG.md"
 HISTORY_DIR = ".ai-dev-workflow/history"
 # Stable, run-id-free location for the LATEST run's exit report, so a human landing on the delivered
@@ -404,11 +418,52 @@ async def verify_exit_readiness(
     else:
         problems.append("metrics were not recorded for this run -- the regression gate never passed")
 
+    # Drop STALE deterministic blockers the model carried over from a previous run's report.
+    #
+    # The metrics regression gate owns a fixed vocabulary of reasons, and it is authoritative: if a
+    # reason in that vocabulary is not in THIS run's gate output, this run did not have that
+    # problem. The drafting model reads the repository, and a previous EXIT-REPORT.md is committed
+    # in it -- so it can and does copy old blockers forward verbatim. Observed live (run 45e08f64):
+    # regression_gate.reasons was EMPTY, coverage measured 100/100, duplication 0.0%, gating count
+    # 0 -- and the report still blocked the merge on "coverage unmeasured", "duplication 10.5%
+    # exceeds the 3% threshold" and "1 gating finding(s) open", all three verbatim strings from a
+    # previous run. Nothing challenged them, because the check below only ever ADDS blockers.
+    #
+    # Only gate-owned phrasing is filtered. A prose blocker the model reasoned out for itself (an
+    # out-of-scope dependency, a broken replay contract) is exactly what this stage is for and is
+    # never touched here.
+    gate_reasons = set(problems)
+    model_reasons = list(content_dict.get("blocking_reasons") or [])
+    kept_reasons, stale_reasons = [], []
+    for reason in model_reasons:
+        owned = any(marker in reason for marker in _GATE_OWNED_REASON_MARKERS)
+        (stale_reasons if owned and reason not in gate_reasons else kept_reasons).append(reason)
+    if stale_reasons:
+        logger.warning(
+            "exit verify: dropping %d blocking reason(s) this run's regression gate did not raise "
+            "(carried over from an earlier report): %s",
+            len(stale_reasons), "; ".join(r[:120] for r in stale_reasons),
+        )
+        content_dict["blocking_reasons"] = kept_reasons
+
     if problems:
         content_dict["merge_ready"] = False
         existing = list(content_dict.get("blocking_reasons") or [])
         content_dict["blocking_reasons"] = existing + [p for p in problems if p not in existing]
         feedback = f"merge_ready forced False: {len(problems)} deterministic blocker(s)"
+    elif stale_reasons and not kept_reasons and content_dict.get("merge_ready") is False:
+        # Every deterministic check passed AND every blocker the model listed was a stale copy of a
+        # gate reason this run did not produce. There is nothing left holding the merge shut, so the
+        # False verdict was inherited rather than earned. Left alone, this is precisely the
+        # "Ready to merge: False on a clean tree" outcome that sends a human hunting for a defect
+        # that was already fixed.
+        content_dict["merge_ready"] = True
+        logger.warning(
+            "exit verify: merge_ready flipped False -> True -- every deterministic check passed and "
+            "all %d model-supplied blocker(s) were stale gate reasons from an earlier run",
+            len(stale_reasons),
+        )
+        feedback = "deterministic exit checks passed; cleared stale carried-over blockers"
     else:
         feedback = "deterministic exit checks passed (manifest complete, screenshots present for UI, metrics gate clean)"
     return VerificationResult(

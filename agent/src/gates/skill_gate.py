@@ -49,7 +49,21 @@ _KNOWN_PREFIXES = ("agent:",)
 def _requirement_phrase(name: str) -> str:
     """How to tell the model to satisfy one required entry, matched to its invocation kind."""
     if name.startswith("agent:"):
-        return f"launch the `{name.removeprefix('agent:')}` agent with your Agent/Task (subagent) tool"
+        bare = name.removeprefix("agent:")
+        # Name BOTH spellings. A plugin-provided agent registers under a plugin-qualified
+        # subagent_type ("code-simplifier:code-simplifier"), and the CLI rejects the bare name
+        # outright: `Agent type 'code-simplifier' not found. Available agents: claude,
+        # code-simplifier:code-simplifier, Explore, general-purpose, ...`. Telling the model to
+        # launch the bare name sent it down a dead end -- observed live (run 026dee4f, remediation):
+        # it tried `code-simplifier`, got not-found, fell back to `general-purpose`, and burned all
+        # three laps failing the same requirement. Both spellings satisfy the gate, because
+        # claude_chat_model.normalize_skill_name already rsplits the plugin prefix off the evidence.
+        return (
+            f"launch the `{bare}` agent with your Agent/Task (subagent) tool -- if that "
+            f"subagent_type is reported as not found, it is plugin-provided and registers under "
+            f"the qualified name `{bare}:{bare}`, so launch that instead (either spelling counts, "
+            f"but a DIFFERENT agent such as general-purpose does not)"
+        )
     return f"invoke `{name}` with your Skill tool"
 
 
@@ -96,6 +110,18 @@ async def invoked_skills(
 # draft invoked seven skills while `verification-before-completion` was reported missing, and real
 # runs do create `plan:audit` and `minimal-code-to-green:audit` sessions.
 _ROLES_CHECKED = ("draft", "audit")
+
+
+# Providers whose sessions leave a transcript this gate can actually read. Claude writes one per
+# session (claude_chat_model.read_skill_invocations); Copilot's counterpart is documented as
+# "currently always None" -- a standing capability gap, not a per-run hiccup. The distinction is
+# what lets an unreadable log fail SHUT where a log was expected, without making every Copilot run
+# unpassable. Add a provider here only once its read_skill_invocations genuinely returns evidence.
+_TRANSCRIPT_VERIFIABLE_PROVIDERS = frozenset({"claude"})
+
+
+def _provider_can_verify_transcripts(chat_provider: str) -> bool:
+    return (chat_provider or "").strip().lower() in _TRANSCRIPT_VERIFIABLE_PROVIDERS
 
 
 async def check_required_skills(
@@ -147,10 +173,51 @@ async def check_required_skills(
         # transcript-path assumption ever drifts against a real container) -- both land in this
         # same branch with identical information -- so the bump applies uniformly rather than
         # guessing which one happened.
-        logger.warning("skill gate: cannot verify invocations for stage=%s (no readable session log)", stage)
-        # invoked keeps whatever prior_invoked carried: fail-open means "cannot verify THIS lap",
-        # not "prior transcript evidence stopped existing" -- returning [] here made the
+        # invoked keeps whatever prior_invoked carried, on BOTH branches below: "cannot verify THIS
+        # lap" never means "prior transcript evidence stopped existing" -- returning [] made the
         # verification report and feedback contradict the persisted record (2026-08-24 audit).
+        #
+        # FAIL SHUT where verification is actually possible (user directive, 2026-08-25: a required
+        # agent "must always be launched"). On such a provider an unreadable log is a real anomaly,
+        # and waving the stage through was indistinguishable from a clean run -- the only trace was
+        # a `verified: false` in state.json that nothing surfaced. A stage that cannot prove it did
+        # the work now gets rejected and redrafts, same as one that provably skipped it.
+        if _provider_can_verify_transcripts(chat_provider):
+            # Only what is still UNPROVEN fails. `invoked` already carries prior_invoked -- itself
+            # transcript evidence from an earlier lap, kept because the session reset a miss
+            # triggers wipes the live transcript. Discarding it would re-break the session-reset
+            # amplification this union exists to prevent (2026-08-24 audit): one unreadable log
+            # would retroactively "un-invoke" everything earlier laps genuinely proved. So a
+            # requirement already substantiated stays substantiated; only the rest fails shut.
+            unproven = [skill for skill in required if skill not in invoked]
+            if unproven:
+                logger.error(
+                    "skill gate: stage=%s FAILED SHUT -- provider %r should produce a readable "
+                    "session log but none could be read, so %s cannot be proven; treating as "
+                    "not-invoked rather than waving the stage through",
+                    stage, chat_provider, unproven,
+                )
+                return SkillCheckOutcome(
+                    passed=False, required=required, invoked=invoked, missing=unproven, verified=False
+                )
+            logger.warning(
+                "skill gate: stage=%s log unreadable, but every required skill %s is already "
+                "substantiated by earlier-lap transcript evidence -- passing on that evidence",
+                stage, required,
+            )
+            return SkillCheckOutcome(
+                passed=True, required=required, invoked=invoked, missing=[], verified=False
+            )
+        # Copilot has NO transcript to read -- read_skill_invocations there is documented as
+        # "currently always None", a capability gap rather than an anomaly. Failing shut would make
+        # every skill-checked stage of every Copilot run unpassable, so that provider keeps the
+        # documented fail-open. Logged at error (not warning) because it is permanent, silent
+        # non-enforcement, and should read as a standing capability gap in any run that hits it.
+        logger.error(
+            "skill gate: stage=%s NOT ENFORCED -- provider %r cannot produce a readable session log "
+            "at all, so required skills %s are unverifiable and the stage is passing unchecked",
+            stage, chat_provider, required,
+        )
         return SkillCheckOutcome(passed=True, required=required, invoked=invoked, missing=[], verified=False)
 
     missing = [skill for skill in required if skill not in invoked]
@@ -254,6 +321,28 @@ def _demo() -> None:
         passed=False, required=["agent:code-simplifier"], invoked=[], missing=["agent:code-simplifier"], verified=True
     )
     assert "subagent" in feedback_for(agent_bad)
+    # The bare subagent_type is NOT launchable for a plugin-provided agent -- the CLI answers
+    # "Agent type 'code-simplifier' not found. Available agents: ... code-simplifier:code-simplifier
+    # ...". Feedback that names only the bare form walks the model into that dead end (observed
+    # live: three laps burned, each falling back to general-purpose), so it must offer the
+    # qualified spelling too. normalize_skill_name accepts either as evidence.
+    # Fail-shut contract (user directive 2026-08-25): where a transcript is EXPECTED, an unreadable
+    # one must reject the stage rather than wave it through -- an unverifiable run used to be
+    # indistinguishable from a clean one. Copilot keeps the documented fail-open because its
+    # read_skill_invocations is "currently always None": failing shut there would make every
+    # skill-checked stage of every Copilot run permanently unpassable.
+    _shut = asyncio.run(check_required_skills(None, "t", "remediation", chat_provider="claude"))
+    assert not _shut.passed and _shut.missing and not _shut.verified, _shut
+    _open = asyncio.run(check_required_skills(None, "t", "remediation", chat_provider="copilot"))
+    assert _open.passed and not _open.verified, _open
+    # Prior transcript evidence from an earlier lap must survive a fail-shut, never be erased.
+    _prior = asyncio.run(
+        check_required_skills(None, "t", "remediation", chat_provider="claude", prior_invoked=["security-review"])
+    )
+    assert "security-review" in _prior.invoked, _prior
+    assert "code-simplifier:code-simplifier" in feedback_for(agent_bad), (
+        "agent feedback must name the plugin-qualified subagent_type the CLI will actually accept"
+    )
     assert "Skill tool" in feedback_for(bad)
     # Every stage that requires skills must name skills the vendored packs (or the CLI's own
     # bundled skills: code-review, security-review, simplify) actually ship. "agent:" entries name

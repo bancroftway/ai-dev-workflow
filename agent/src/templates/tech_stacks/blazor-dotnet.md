@@ -44,13 +44,20 @@ repo-root/
    *.user
    ```
 6. In `apps/api/Program.cs`, enable CORS for the web app's dev origin so the two Kestrel processes
-   can talk to each other locally:
+   can talk to each other locally. Read the origin from the environment, falling back to the
+   documented dev port — do NOT hardcode it as the only value:
    ```csharp
+   var webOrigin = Environment.GetEnvironmentVariable("WEB_ORIGIN") ?? "http://localhost:5150";
    builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
-       p.WithOrigins("http://localhost:5150").AllowAnyHeader().AllowAnyMethod()));
+       p.WithOrigins(webOrigin).AllowAnyHeader().AllowAnyMethod()));
    // ...
    app.UseCors();
    ```
+   Why the env var matters: the e2e harness starts both processes on ports it verifies are free,
+   and if 5150 is taken it puts the web app somewhere else and exports `WEB_ORIGIN` with the real
+   value. A policy pinned to the literal 5150 then rejects every browser request, and the failure
+   shows up far away as the UI reporting it cannot reach the API — on an app that is entirely
+   correct. This was observed twice before the fallback was made an override.
 7. In `apps/web/Program.cs`, register a named `HttpClient` whose `BaseAddress` is the API's dev URL
    (`http://localhost:5080`), configurable via `apps/web/wwwroot/appsettings.json` for other
    environments.

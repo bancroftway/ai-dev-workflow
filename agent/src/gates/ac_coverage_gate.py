@@ -383,6 +383,58 @@ def duplicate_test_pairs(ac_id: str, test_files: dict[str, str]) -> list[tuple[s
     return pairs
 
 
+# An assertion that something is ABSENT. On a page that never rendered, every one of these is
+# trivially true -- so a test built only from them passes against a blank screen and proves nothing.
+# Observed live (blazor-dotnet, US-0006.1 "no sign-in UI is present anywhere"): `goto('/')` followed
+# by four `toHaveCount(0)` checks and nothing else. It passed while its screenshot was a 5,482-byte
+# blank, and would have passed identically had the app been completely broken.
+_ABSENCE_ASSERTION_RE = re.compile(
+    r"toHaveCount\s*\(\s*0\s*\)"
+    r"|\.not\s*\.\s*to\w+"
+    r"|toBeNull\s*\(\s*\)"
+    r"|toBeUndefined\s*\(\s*\)"
+    r"|toBeEmpty\s*\(\s*\)"
+    r"|Assert\.(?:Null|Empty|False|DoesNotContain)"
+    r"|assertIsNone|assertFalse|assertNotIn",
+    re.IGNORECASE,
+)
+
+# An assertion that something IS there -- the anchor that makes the absence checks meaningful,
+# because it cannot pass until the app has actually rendered.
+_PRESENCE_ASSERTION_RE = re.compile(
+    r"toBeVisible\s*\(\s*\)"
+    r"|toHaveText\s*\(|toContainText\s*\(|toHaveValue\s*\(|toHaveAttribute\s*\("
+    r"|toBeEnabled\s*\(\s*\)|toBeChecked\s*\(\s*\)|toBeFocused\s*\(\s*\)"
+    r"|toHaveCount\s*\(\s*[1-9]"
+    r"|toBe\s*\(|toEqual\s*\(|toMatch\s*\("
+    r"|Assert\.(?:NotNull|NotEmpty|True|Equal|Contains)"
+    r"|assertEqual|assertTrue|assertIn|assertIsNotNone",
+    re.IGNORECASE,
+)
+
+
+def absence_only_test_labels(ac_id: str, test_files: dict[str, str]) -> list[str]:
+    """Labels of this AC's tests that assert ONLY absence, with no presence anchor.
+
+    Pure, like every other check here. A test qualifies only if it asserts at least one absence and
+    zero presences: a test with both is fine (the presence assertion forces a render before the
+    absence checks are evaluated), and a test asserting neither is a RED-phase stub the fiat/count
+    checks above already own.
+
+    `.not.to*` is treated as absence even though `expect(x).not.toBe(y)` is a value comparison: on
+    an unrendered page a locator-based `.not.` assertion is exactly the trivially-true shape this
+    exists to catch, and a test that ALSO makes a positive assertion is cleared regardless.
+    """
+    labels: list[str] = []
+    for decl, body in _tests_for_ac(ac_id, test_files):
+        if not _ABSENCE_ASSERTION_RE.search(body):
+            continue
+        if _PRESENCE_ASSERTION_RE.search(body):
+            continue
+        labels.append(decl)
+    return labels
+
+
 # A fiat-failure call: an assertion that fails unconditionally. Full-call patterns, case-sensitive
 # on each language's own keyword casing, so a REAL assertion whose message merely mentions "false"
 # is not caught.
@@ -562,6 +614,24 @@ def depth_shortfalls(
                     f"Assert.Fail / expect(true).toBe(false) placeholder bodies): {named} -- "
                     "write the real arrange-act-assert against the not-yet-existing API instead; "
                     "a compile or module-resolution failure is the expected RED signal at this stage"
+                )
+
+            # Absence-only tests, named right after the fiat stubs and for the same reason: both
+            # are shapes that pass without proving anything, and both need naming directly rather
+            # than being described in the abstract. The fix is one line, so the feedback says so.
+            absence_labels = absence_only_test_labels(ac, test_files)
+            if absence_labels:
+                named = "; ".join(absence_labels[:3]) + (
+                    f"; and {len(absence_labels) - 3} more" if len(absence_labels) > 3 else ""
+                )
+                problems.append(
+                    f"{len(absence_labels)} of its test(s) assert ONLY absence (toHaveCount(0), "
+                    f".not.*, Assert.Null/False and friends) with no assertion that anything is "
+                    f"present: {named} -- on a page that never rendered every such check is "
+                    "trivially true, so these pass against a blank screen and would pass just as "
+                    "well if the app were entirely broken. Add a positive anchor FIRST (e.g. "
+                    "`await expect(page.getByTestId('...')).toBeVisible()`) so the absence checks "
+                    "are evaluated against a rendered page"
                 )
 
         # Anti-padding, only where there are tests to inspect: an AC with no tests already failed
@@ -797,7 +867,18 @@ async def check_ac_coverage(
     listing = await provider.exec_in_sandbox(
         thread_id,
         "git ls-files -co --exclude-standard | grep -iE '(test|spec)' "
-        r"| grep -vE '(^|/)(node_modules|\.playwright-browsers|bin|obj|dist|build|\.next|\.venv|vendor|TestResults|coverage|\.ai-dev-workflow|agent-work)/' "
+        # `test-?results` with -i, not the old case-sensitive bare `TestResults`: that spelling is
+        # .NET's, and Playwright writes its failure artifacts to `test-results/` (hyphen, lowercase)
+        # which sailed straight through. One e2e run's output then dominated the whole listing --
+        # 53 of the 60 slots below were screenshots and error-context dumps, crowding the real test
+        # sources out of the depth analysis, and reading a `test-failed-1.png` as source crashed the
+        # run outright.
+        r"| grep -viE '(^|/)(node_modules|\.playwright-browsers|bin|obj|dist|build|\.next|\.venv|vendor|test-?results|coverage|\.ai-dev-workflow|agent-work)/' "
+        # Binary artifacts can be named anything and still match (test|spec); this gate reads every
+        # path it lists as text, so they must never reach it regardless of which directory they sit
+        # in. A denylist rather than a source-extension allowlist, so an unfamiliar stack's test
+        # files are never silently dropped from coverage.
+        r"| grep -viE '\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|mp4|webm|woff2?|ttf|eot|dll|exe|so|dylib|pyc|class|jar)$' "
         "| head -60 || true",
     )
     test_paths = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
@@ -931,6 +1012,36 @@ def _demo() -> None:
     }
     labels = fiat_stub_labels("US-0006.1", fiat_files)
     assert len(labels) == 1 and "US_0006_1_Lists" in labels[0], labels
+
+    # Absence-only tests: every assertion checks that something is NOT there, so the whole test is
+    # trivially true on a page that never rendered. Taken verbatim from the live blazor-dotnet run
+    # whose screenshot for this exact test came back a 5,482-byte blank while the test "passed".
+    _absence_body = "\n".join([
+        "test('[US-0006.1] no sign-in, sign-up, or account UI is present', async ({ page }) => {",
+        "  await page.goto('/');",
+        "  await expect(page.getByText(/sign in/i)).toHaveCount(0);",
+        "  await expect(page.locator(\"input[type='password']\")).toHaveCount(0);",
+        "});",
+    ])
+    assert absence_only_test_labels("US-0006.1", {"apps/web/tests/e2e/counter.spec.ts": _absence_body}), (
+        "absence-only test must be flagged"
+    )
+    # The same test with a presence anchor is fine -- the anchor cannot pass until the app renders,
+    # which is what makes the absence checks mean anything. One added line clears it.
+    _anchored_body = "\n".join([
+        "test('[US-0006.1] no sign-in, sign-up, or account UI is present', async ({ page }) => {",
+        "  await page.goto('/');",
+        "  await expect(page.getByTestId('counter-value')).toBeVisible();",
+        "  await expect(page.getByText(/sign in/i)).toHaveCount(0);",
+        "});",
+    ])
+    assert not absence_only_test_labels("US-0006.1", {"apps/web/tests/e2e/counter.spec.ts": _anchored_body}), (
+        "a test with a presence anchor must NOT be flagged -- the anchor forces a render first"
+    )
+    # A RED-phase stub asserting nothing at all is the fiat/count checks' business, not this one.
+    assert not absence_only_test_labels("US-0006.1", {
+        "t.spec.ts": "test('[US-0006.1] pending', async ({ page }) => { await page.goto('/'); });",
+    }), "a test with no assertions at all must not be reported as absence-only"
 
     # Near-duplicate pairs carry both names, so the feedback points at the exact tests to rewrite --
     # count-only feedback sent a live run rewriting the Playwright spec for 6 laps while the

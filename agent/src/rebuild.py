@@ -22,7 +22,7 @@ from typing import Any, Callable, Literal, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import git_ops, model_config, repo_files, run_failure, stack_runner, test_results
+from . import git_ops, model_config, repo_files, run_failure, stack_runner, test_results, workflow_persistence
 from .chat_model import get_chat_model_for_thread
 from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
@@ -63,6 +63,19 @@ class RebuildSpec:
     fix_prompt_addendum: str
     fix_scope: FixScope
     next_node: str
+    # Re-scan after a green build and block on anything the TERMINAL metrics gate would block on.
+    #
+    # Set on the LAST placement that follows a code-writing stage. The metrics gate is terminal: it
+    # can fail a run but never fix one, so any defect introduced after the final remediation pass
+    # surfaces an hour later as an unfixable verdict. Observed live (run 026dee4f): remediation
+    # approved with health 100 and duplication 0.0%, then adversarial-compliance spent FIVE fix laps
+    # rewriting scaffolding and wireframes, and the terminal gate reported duplication 10.5%, one
+    # gating finding, and coverage that had gone from measured (38/38, 99/99 lines) to unmeasurable.
+    # Nothing between those two points scanned anything, so nothing could act on it.
+    #
+    # This closes that window: the same findings now fail the rebuild that caused them, while a fix
+    # loop still exists and the feedback can name what regressed.
+    scan_delta_gate: bool = False
 
 
 # Where the TDD-red gate's suite run tees its console output (same convention as the AC gate's
@@ -78,6 +91,63 @@ def red_gate_verdict(outcomes: dict[str, str]) -> tuple[bool, list[str], int]:
     passed = sorted(name for name, outcome in outcomes.items() if outcome == "pass")
     failed = sum(1 for outcome in outcomes.values() if outcome == "fail")
     return (not passed and failed > 0), passed, failed
+
+
+async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[str, Any]) -> list[str]:
+    """What the TERMINAL metrics gate would block this tree on, evaluated now.
+
+    Calls metrics_nodes.regression_reasons -- the same pure decision function the exit gate uses --
+    rather than re-deriving "too much duplication" here. Two definitions of the same threshold drift
+    apart, and a pre-gate that disagreed with the gate it front-runs would be worse than no pre-gate
+    at all: it would either block work the exit gate would have passed, or pass work it will not.
+
+    Fails OPEN (returns []) if THE SCAN cannot run. An infrastructure gap must not read as a quality
+    regression -- the terminal gate still stands behind this, so nothing is waved through
+    permanently; it just is not blocked HERE on evidence that was never collected.
+
+    The try covers ONLY the scan call, deliberately. A first version wrapped the whole body, and
+    when this function read `scan.summary` as an attribute instead of calling the method, the
+    resulting AttributeError was swallowed and logged as "could not scan" -- a programming error
+    wearing an infrastructure error's clothes, silently disabling the gate on a live run. Everything
+    after the scan is pure dict work over data that already exists: if it raises, that is a bug in
+    THIS function and it should be loud.
+    """
+    from . import metrics_nodes, repo_scan
+
+    try:
+        scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
+    except Exception:  # noqa: BLE001 -- scan execution only; see the fail-open contract above
+        logger.warning(
+            "scan-delta gate: scan could not run for thread %s -- not blocking on it",
+            thread_id[:8], exc_info=True,
+        )
+        return []
+
+    # summary() is a METHOD with keyword args, not an attribute. Called the same way metrics_nodes
+    # calls it, so both gates see the same shape.
+    latest_summary = scan.summary()
+    # Prefer the contract-merged coverage minimal-code-to-green's own gate promoted onto state,
+    # then FALL BACK to parsing the artifacts off disk -- exactly the order metrics_nodes uses.
+    #
+    # The fallback is not optional. On a resume, minimal-code-to-green hydrates as approved and its
+    # verify never runs, so nothing promotes coverage onto state -- and reading only the promoted
+    # value reported "coverage unmeasured" while both cobertura files sat in
+    # apps/{api,web}.Tests/TestResults/. That is an unfixable instruction: the gate demanded the
+    # agent repair a measurement that was already correct, and it burned fix laps on it while the
+    # two genuine findings beside it were cleared in one.
+    coverage = (state.get("repo_scan") or {}).get("coverage") or {}
+    if not (isinstance(coverage.get("line_rate"), (int, float)) and isinstance(coverage.get("branch_rate"), (int, float))):
+        coverage = await metrics_nodes._read_coverage_summary(provider, thread_id)  # noqa: SLF001 -- same package, one reader
+    baseline = (state.get("repo_scan") or {}).get("baseline_summary") or {}
+    reasons = metrics_nodes.regression_reasons(
+        latest_summary,
+        None,  # no delta: this is an absolute check on the tree as it stands right now
+        coverage,
+        baseline_has_findings=bool((baseline.get("gating_count") or 0)),
+    )
+    if reasons:
+        logger.warning("scan-delta gate: blocking on %d reason(s): %s", len(reasons), "; ".join(reasons))
+    return reasons
 
 
 async def _verify_all_red(thread_id: str, chat_provider: str, run_id: str = "unknown") -> tuple[bool, str]:
@@ -177,29 +247,77 @@ def make_rebuild_node(spec: RebuildSpec):
         # passing test names via last_stderr_tail); at the cap the run ENDs with run_failure.
         red_detail = ""
         red_failed = False
-        # Only while the implementation stage has NOT yet run: on a resumed thread with
-        # minimal-code-to-green already approved, the suite is legitimately GREEN here -- observed
-        # live (s04 run 7): the red gate on a resume stripped the finished implementation back to
-        # stubs to satisfy all-red, mctg was hydrated-skipped, and test-hardening flagged the
-        # wreckage as a stable regression.
-        mctg_status = ((state.get("stages") or {}).get("minimal-code-to-green") or {}).get("status")
-        if build_ok and spec.fix_scope == "scaffold_only" and mctg_status != "approved":
+        # Only while the implementation stage has NOT yet run: on a resumed thread where
+        # minimal-code-to-green has already produced code, the suite is legitimately GREEN here --
+        # observed live (s04 run 7): the red gate on a resume stripped the finished implementation
+        # back to stubs to satisfy all-red, mctg was hydrated-skipped, and test-hardening flagged
+        # the wreckage as a stable regression.
+        #
+        # The guard tests "has mctg run at all", NOT "is mctg approved". On a fresh run this node
+        # always precedes the implementation stage, so the status is "not_started" and the red gate
+        # fires normally. Any other value means that stage has already written code into this
+        # workspace, and demanding all-red again asks the fix node to DELETE it. `approved` alone
+        # missed the case that actually bit (run 026dee4f): the codegen turn wrote a full
+        # implementation, committed it green, then died on a provider quota outage leaving mctg at
+        # `needs_clarification` -- so the resume walked straight into the red gate reporting
+        # "56 test(s) PASSED after scaffolding" against code it should have been protecting.
+        # Asked of the WORKSPACE, not of stage bookkeeping. `status` cannot answer this on a
+        # resume: intake's hydration reset (graph.py) puts every unapproved stage back to
+        # "not_started", which is indistinguishable from "codegen has never run", and a killed run
+        # persists the same value. A tree scan ("is there app source?") cannot answer it either --
+        # scaffolding creates Program.cs/App.razor long before this node. The draft ARTIFACT is
+        # written only when the implementation stage actually produced a draft, is committed to the
+        # branch, and rides the workspace volume across container swaps, so it is the one signal
+        # that survives everything above.
+        mctg_never_ran = await repo_files.read_repo_file(
+            provider, thread_id, workflow_persistence.MINIMAL_CODE_TO_GREEN_DRAFT_PATH
+        ) is None
+        if build_ok and spec.fix_scope == "scaffold_only" and mctg_never_ran:
             red_ok, red_detail = await _verify_all_red(thread_id, state["provider"], run_id=state.get("run_id", "unknown"))
             if not red_ok:
                 build_ok = False
                 red_failed = True
+
+        # Scan-delta gate: same question the terminal metrics gate asks, asked here where it is
+        # still actionable. See RebuildSpec.scan_delta_gate for why this placement exists.
+        scan_detail = ""
+        if build_ok and spec.scan_delta_gate:
+            scan_reasons = await _scan_regression_reasons(provider, thread_id, state)
+            if scan_reasons:
+                build_ok = False
+                scan_detail = (
+                    "The build is green, but a full re-scan of the tree you just modified reports "
+                    "problems the FINAL metrics gate will refuse to merge on. Fix them now, while "
+                    "this loop can still act on them:\n"
+                    + "\n".join(f"- {reason}" for reason in scan_reasons)
+                    + "\n\nThese are regressions introduced by the fix work in this stage: the "
+                    "remediation stage earlier in this run left the tree clean. Duplication usually "
+                    "means the same edit was pasted across components -- extract it. 'coverage "
+                    "unmeasured' means the coverage command itself no longer runs, which is a "
+                    "broken build/test configuration, not a missing test."
+                )
 
         rb["status"] = "clean" if build_ok else "failed"
         rb["last_exit_ok"] = build_ok
         rb["last_stdout_tail"] = (report.stdout_tail or "")[-4000:]
         # A red-gate violation replaces the (green) build's stderr as the fix node's feedback --
         # the passing test names are the actionable part, not a clean compiler log.
-        rb["last_stderr_tail"] = (red_detail if red_failed else (report.stderr_tail or report.error or ""))[-4000:]
+        rb["last_stderr_tail"] = (
+            red_detail if red_failed
+            else scan_detail if scan_detail
+            else (report.stderr_tail or report.error or "")
+        )[-4000:]
         rebuild[spec.key] = rb
 
         ledger_entry: dict[str, Any] = {"stage": spec.key, "node": "rebuild", "ok": build_ok, "cycle": rb["fix_cycle_count"]}
         if red_detail:
-            ledger_entry["red_gate"] = red_detail[:300]
+            # 1500, not 300: this is the DURABLE record of why the red gate blocked, and the detail
+            # is a LIST of the tests that wrongly passed. 300 characters stopped inside the first
+            # entry ("41 test(s) PASSED after scaffolding (16 failed): [US-0001.1] displays the
+            # value..."), so the ledger recorded that the gate fired without recording what it
+            # found -- the same truncation that made an adversarial-compliance rejection
+            # unreadable in the run log.
+            ledger_entry["red_gate"] = red_detail[:1500]
         await repo_files.append_ledger_entry(provider, thread_id, ledger_entry)
         if build_ok:
             # A green build is the checkpoint where the code-writing sessions' source changes

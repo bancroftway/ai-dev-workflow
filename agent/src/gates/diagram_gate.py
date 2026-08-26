@@ -80,6 +80,18 @@ def _looks_like_infra_failure(stderr: str) -> bool:
     return classify_failure(stderr) == "infra_transient"
 
 
+# mmdc names a genuine source problem in one of these shapes. Anything else it fails on -- a
+# missing puppeteer config, no browser binary, a crashed Chromium -- is environmental, and telling
+# the draft node to "fix your Mermaid" for it is unactionable: the model rewrites correct source
+# every lap until max_verify_cycles runs out. Observed live (blazor-dotnet s01): the config file
+# named by _render_one's own -p flag did not exist in the image, classify_failure called that
+# `gate_exhausted` rather than infra, and the plan stage thrashed on syntax feedback for diagrams
+# that rendered fine the moment the file was created.
+_MERMAID_SYNTAX_MARKERS = re.compile(
+    r"parse error|syntax error|expecting|unrecognized text|no diagram type detected", re.IGNORECASE
+)
+
+
 def _mermaid_error_summary(output: str) -> str:
     """The actionable mermaid parse error ('Parse error on line N ... Expecting ...') is at the
     TOP of mmdc's output; the tail is a useless puppeteer JS stack. Feeding the tail back to the
@@ -126,9 +138,26 @@ async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[s
         f"-p /opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json 2>&1"
     )
     result = await provider.exec_in_sandbox(thread_id, command)
-    stderr_tail = (result.stdout or result.stderr or "")[-2000:]
+    # HEAD as well as tail. _mermaid_error_summary below takes the first meaningful lines because
+    # that is where mmdc puts the actionable "Parse error on line N ... Expecting ..." -- but a
+    # plain `[-2000:]` threw that away before the summariser ever ran, leaving it to summarise the
+    # puppeteer stack this file already documents as useless. Keeping both ends means the parse
+    # error survives on a long output AND the tail is still there for a failure that only shows up
+    # at the end (a crash, a non-zero exit message).
+    raw_output = result.stdout or result.stderr or ""
+    stderr_tail = (
+        raw_output
+        if len(raw_output) <= 4000
+        else f"{raw_output[:2000]}\n...[{len(raw_output) - 4000} chars omitted]...\n{raw_output[-2000:]}"
+    )
+    # Infra unless mmdc actually named a source problem -- see _MERMAID_SYNTAX_MARKERS. The
+    # classify_failure call stays as the first test so this gate keeps agreeing with the rest of
+    # the pipeline on the transient failures it already recognizes.
+    is_infra = not result.ok and (
+        _looks_like_infra_failure(stderr_tail) or not _MERMAID_SYNTAX_MARKERS.search(stderr_tail)
+    )
     return DiagramRenderOutcome(
-        name=name, ok=result.ok, is_infra_failure=(not result.ok and _looks_like_infra_failure(stderr_tail)), stderr_tail=stderr_tail
+        name=name, ok=result.ok, is_infra_failure=is_infra, stderr_tail=stderr_tail
     )
 
 
@@ -160,6 +189,15 @@ def _demo() -> None:
     assert check_wireframe("s", '<meta charset="utf-8"><div>x</div>') is None
     # same-document anchors stay legal
     assert check_wireframe("s", '<a href="#section">jump</a><div id="section">x</div>') is None
+    # Infra-vs-syntax split (_MERMAID_SYNTAX_MARKERS): a real mmdc parse error must stay a content
+    # failure the draft node can act on, while an environment failure must NOT be fed back as
+    # "fix your Mermaid" -- that is what burned the plan stage's whole cycle budget live.
+    assert _MERMAID_SYNTAX_MARKERS.search("Parse error on line 3: ... Expecting 'SEMI'")
+    assert _MERMAID_SYNTAX_MARKERS.search("No diagram type detected matching given configuration")
+    assert not _MERMAID_SYNTAX_MARKERS.search(
+        'Configuration file "/opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json" doesn\'t exist'
+    )
+    assert not _MERMAID_SYNTAX_MARKERS.search("Failed to launch the browser process! spawn ENOENT")
     print("diagram_gate wireframe self-check: all assertions passed")
 
 

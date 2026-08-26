@@ -89,6 +89,13 @@ def _stage_file(stage_key: str, kind: str) -> str:
 TECH_STACK_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'approved.json')}"
 TECH_STACK_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'draft.json')}"
 
+# Same derived-constant reasoning. rebuild.py reads this to answer "has the implementation stage
+# ever produced a draft in this workspace?" -- the precondition for its scaffold-only TDD-red gate.
+# Stage bookkeeping cannot answer that on a resume (intake's hydration reset returns every
+# unapproved stage to "not_started"), and this artifact can: it is written only by a real draft,
+# committed to the branch, and carried on the workspace volume across container swaps.
+MINIMAL_CODE_TO_GREEN_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('minimal-code-to-green', 'draft.json')}"
+
 # Same "one truth, derived from the numbering" reasoning as the tech-stack constants above --
 # graph.py's plan-stage ticket-mode hydrate hook (Task 7a) reads this to detect an earlier ticket's
 # approved Implementation Plan for this same project, independent of whatever this run's own

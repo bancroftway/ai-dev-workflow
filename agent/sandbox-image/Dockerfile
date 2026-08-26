@@ -344,14 +344,35 @@ ENV AIDW_OSV_DB_DIR=/opt/aidw/osv-db \
 # java-db (~1 GB) deliberately not baked -- no Java repos in scope (this team is dotnet/node/
 # python, see the BASE_IMAGE header), and repo_scan.py runs trivy with --skip-java-db-update, so
 # trivy just skips JAR analysis with a warning instead of fetching.
+# osv-scanner downloads a database ONLY for an ecosystem it actually finds a lockfile for, so the
+# seed directory below is not decoration -- this step used to run in a bare `/tmp`, found no
+# lockfiles, downloaded nothing, and swallowed it with `|| true`. Every scan since then failed at
+# runtime with `could not load db for npm ecosystem: unable to fetch OSV database: no offline
+# version of the OSV database is available` the moment a repo grew a package-lock.json (observed
+# live, blazor-dotnet: osv-scanner exit 127, dependency-CVE coverage silently single-sourced to
+# trivy for the whole run). One seed lockfile per ecosystem in scope -- npm, NuGet, PyPI, matching
+# the dotnet/node/python scope named in the BASE_IMAGE header.
 RUN set -eux; \
-    mkdir -p "$TRIVY_CACHE_DIR" "$AIDW_OSV_DB_DIR"; \
+    mkdir -p "$TRIVY_CACHE_DIR" "$AIDW_OSV_DB_DIR" /tmp/osv-seed; \
     trivy image --download-db-only --cache-dir "$TRIVY_CACHE_DIR"; \
-    ( cd /tmp && osv-scanner scan source --download-offline-databases \
+    printf '%s' '{"name":"seed","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"seed","version":"1.0.0","dependencies":{"lodash":"4.17.20"}},"node_modules/lodash":{"version":"4.17.20","resolved":"https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"}}}' \
+        > /tmp/osv-seed/package-lock.json; \
+    printf '%s' '{"version":1,"dependencies":{".NETCoreApp,Version=v8.0":{"Newtonsoft.Json":{"type":"Direct","requested":"[13.0.1, )","resolved":"13.0.1","contentHash":"seed"}}}}' \
+        > /tmp/osv-seed/packages.lock.json; \
+    echo 'requests==2.31.0' > /tmp/osv-seed/requirements.txt; \
+    ( cd /tmp/osv-seed && osv-scanner scan source --recursive --download-offline-databases \
         --local-db-path "$AIDW_OSV_DB_DIR" --offline-vulnerabilities . || true ); \
+    rm -rf /tmp/osv-seed; \
     chmod -R a+rX "$TRIVY_CACHE_DIR" "$AIDW_OSV_DB_DIR"; \
-    test -n "$(ls -A "$AIDW_OSV_DB_DIR")"; \
-    test -n "$(ls -A "$TRIVY_CACHE_DIR")"
+    test -n "$(ls -A "$TRIVY_CACHE_DIR")"; \
+    # Assert the ECOSYSTEM DATABASES exist, not merely that the parent directory is non-empty --
+    # the old `test -n "$(ls -A "$AIDW_OSV_DB_DIR")"` passed on an empty `osv-scanner/` subdir,
+    # which is exactly how an image with a completely empty OSV database shipped while claiming to
+    # "fail the build loudly rather than ship an image whose offline scan silently finds nothing".
+    for ecosystem in npm NuGet PyPI; do \
+        test -s "$AIDW_OSV_DB_DIR/osv-scanner/$ecosystem/all.zip" \
+            || { echo "OSV offline db missing for $ecosystem" >&2; exit 1; }; \
+    done
 
 # Semgrep rules, fetched from a pinned tag at BUILD time rather than via `--config auto` at scan
 # time. `auto` means a network fetch on every run, rules that change underneath a baseline
@@ -415,6 +436,24 @@ COPY plugins/vendor/wrappers/ /opt/ai-dev-workflow-plugins/vendor/wrappers/
 RUN set -eux; \
     chmod +x /opt/ai-dev-workflow-plugins/vendor/fetch-vendor-plugins.sh; \
     sh /opt/ai-dev-workflow-plugins/vendor/fetch-vendor-plugins.sh /opt/ai-dev-workflow-plugins/vendor
+# The puppeteer config the mermaid-cli comment far above (and diagram_gate._render_one's own `-p`
+# flag) has always named, but which nothing ever created: mmdc aborted with `Configuration file
+# "/opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json" doesn't exist` on EVERY diagram, so
+# verify_plan_diagrams failed the plan stage on every lap and spent its whole max_verify_cycles
+# budget redrafting a plan whose Mermaid was fine (observed live, blazor-dotnet s01: two wasted
+# laps; the identical source rendered the moment this file existed). Written here, last, rather
+# than beside the mermaid install: this is a leaf artifact nothing above depends on, so a change to
+# it rebuilds one cheap layer instead of every expensive install below it. "headless": "shell"
+# matches the Playwright headless shell PUPPETEER_EXECUTABLE_PATH points at; --no-sandbox is
+# required to run it as a non-root container user without --cap-add=SYS_ADMIN. The chown below
+# covers this file too.
+RUN printf '%s\n' \
+      '{' \
+      '  "headless": "shell",' \
+      '  "args": ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]' \
+      '}' \
+      > /opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json
+
 RUN chmod +x /usr/local/bin/ai-dev-workflow-entrypoint.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh && \
     mkdir -p /workspace && chown -R vscode:vscode /workspace /opt/ai-dev-workflow-plugins /opt/aidw && \
     # /opt/aidw/tools/bin is first on PATH (see the ENV PATH above) but nothing installs into it --

@@ -90,6 +90,15 @@ _SOURCE_EXTENSIONS = (
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
     ".cs", ".fs", ".vb", ".py", ".go", ".rb", ".java", ".kt", ".rs", ".php",
     ".html", ".css", ".scss",
+    # Every extension _FRONTEND_SIGNATURES below names MUST appear here, or that signature is dead
+    # code: _is_application_source filters source_files BEFORE missing_declared_frontend inspects
+    # it, so an unlisted extension is invisible to the very check that looks for it. `.razor` was
+    # missing while ("blazor", (".razor",)) sat in the signature table -- observed live on
+    # blazor-dotnet: a complete Blazor WASM frontend (CounterPage.razor, App.razor, _Imports.razor,
+    # Program.cs) was on disk and the gate still reported "the repository does not actually contain
+    # that frontend", redrafting a correct implementation. `.dart`/`.swift` had the same latent gap
+    # for the flutter/swiftui signatures.
+    ".razor", ".dart", ".swift",
 )
 # Filenames that are configuration/manifests even though they carry a source-ish extension.
 _CONFIG_FILE_RE = re.compile(
@@ -1291,6 +1300,18 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert missing_declared_frontend(["Blazor"], ["apps/web/Pages/Index.razor"]) is None
     assert missing_declared_frontend(["Blazor"], ["apps/api/Program.cs"]) == "Blazor"
     assert missing_declared_frontend(["Angular"], ["apps/web/src/app/app.component.ts"]) is None
+    # Cross-table invariant, not another fixture: verify_coverage filters source_files through
+    # _is_application_source BEFORE missing_declared_frontend sees them, so a signature suffix the
+    # extension allowlist rejects is dead code and the framework reads as "never built". The
+    # assertions above pass a path list in directly, so they proved the pure function correct while
+    # production was rejecting every .razor file -- which is exactly how the blazor-dotnet false
+    # negative survived. Assert the two tables agree instead of trusting another hand-written path.
+    for _marker, _suffixes in _FRONTEND_SIGNATURES:
+        for _suffix in _suffixes:
+            assert _is_application_source(f"apps/web/src/thing{_suffix}"), (
+                f"_FRONTEND_SIGNATURES declares {_suffix!r} for {_marker!r} but "
+                "_is_application_source rejects it -- that signature can never match"
+            )
     # Backend-only stacks must never be flagged -- no UI framework is declared at all.
     assert missing_declared_frontend(["FastAPI", "ASP.NET Core"], ["apps/api/main.py"]) is None
 

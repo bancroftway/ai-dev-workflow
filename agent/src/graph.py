@@ -860,7 +860,7 @@ def _build_exit_prompt(state: GraphState, stage_key: str = "metrics-exit") -> li
         SystemMessage(content=EXIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{state['stages']['specification']['approved_content']}"),
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{state['stages']['plan']['approved_content']}"),
-        HumanMessage(content=f"metrics-report metrics summary (JSON):\n\n{json.dumps(metrics_compute)[:8000]}"),
+        HumanMessage(content=f"metrics-report metrics summary (JSON):\n\n{_bounded_json(metrics_compute, 8000)}"),
     ]
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior report (JSON):\n{stage['draft']}"))
@@ -920,7 +920,45 @@ def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
     ]
     if state["stages"]["remediation"].get("ticket_mode_baseline"):
         messages.append(HumanMessage(content=REMEDIATION_TICKET_MODE_SEGMENT))
+    # The rejection feedback, same as spec/plan/coverage/adversarial-compliance already do. Without
+    # it this stage's redrafts were unreachable by their own gate: a skill-gate failure resets the
+    # draft session (make_verify_node), so the retry opens a FRESH transcript and was handed the
+    # identical original prompt with no hint anything had been rejected. Observed live (run
+    # 026dee4f): three laps in a row launched `general-purpose` instead of the required
+    # code-simplifier agent, each shorter than the last, because the model was never told. The
+    # docstring above rules out echoing a prior DRAFT (the scan is re-read live each attempt) --
+    # that reasoning never applied to the gate's own verdict, which exists nowhere else.
+    if state["stages"]["remediation"].get("last_verification"):
+        messages.append(
+            HumanMessage(
+                content="Your previous attempt was rejected by the deterministic gate:\n\n"
+                f"{state['stages']['remediation']['last_verification'].get('feedback')}"
+            )
+        )
     return messages
+
+
+def _bounded_json(payload: Any, limit: int) -> str:
+    """Serialise `payload`, never handing a model JSON that was cut mid-token.
+
+    `json.dumps(x)[:N]` is the obvious thing and it is wrong: slicing a serialised object almost
+    always lands inside a string or between a key and its value, so the model receives a blob
+    labelled "(JSON)" that no parser will accept -- and has to guess at the shape of its own input.
+    When the payload genuinely does not fit, say so IN valid JSON and put the clipped text in a
+    string field, where being clipped is honest rather than corrupting.
+    """
+    text = json.dumps(payload, default=str)
+    if len(text) <= limit:
+        return text
+    return json.dumps(
+        {
+            "_truncated": True,
+            "_original_chars": len(text),
+            "_note": "payload exceeded the prompt budget; `preview` is the leading fragment",
+            "preview": text[: max(0, limit - 240)],
+        },
+        default=str,
+    )
 
 
 ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT = load_prompt("adversarial_audit_draft")
@@ -948,7 +986,7 @@ def _build_adversarial_compliance_prompt(state: GraphState) -> list[BaseMessage]
         SystemMessage(content=ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{state['stages']['specification']['approved_content']}"),
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{state['stages']['plan']['approved_content']}"),
-        HumanMessage(content=f"End-to-end run outcome (JSON):\n\n{json.dumps(e2e_summary, default=str)[:4000]}"),
+        HumanMessage(content=f"End-to-end run outcome (JSON):\n\n{_bounded_json(e2e_summary, 4000)}"),
     ]
     stage = state["stages"]["adversarial-compliance"]
     if stage.get("draft") is not None and stage.get("last_verification"):
@@ -2119,7 +2157,14 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         # Load custom agent if available, falling back to legacy session_options
         custom_agents = []
-        agent_config = load_agent_for_stage(stage_spec.key, "audit")
+        # Same use_custom_agent gate the draft node applies. Without it the audit leg loaded
+        # agents/<stage>-audit.md unconditionally, which (a) passed --agent <name> against a
+        # --agents payload the Claude CLI never registers, so every audit turn died with
+        # "--agent 'plan-audit' not found" and the stage redrafted forever, and (b) let that
+        # file's Copilot-era `model: gemini-3.6-flash` shadow models.yaml's provider-keyed
+        # choice. The audit system prompt lives in prompts/<stage>_audit.md (build_audit_prompt)
+        # either way, so nothing is lost by skipping the agent file.
+        agent_config = load_agent_for_stage(stage_spec.key, "audit") if stage_spec.use_custom_agent else {}
         if agent_config:
             custom_agents = [agent_config]
 
@@ -2390,6 +2435,11 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 },
             }
             stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
+            logger.warning(
+                "%s: REDRAFT %d/%d (skill gate) -- missing %s",
+                stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles,
+                skill_check.missing,
+            )
             stages[stage_spec.key] = stage
             # Restart the draft session, for the reason spelled out in the deterministic_verify
             # branch below: a skill shapes HOW a turn is done, so it must be invoked before the
@@ -2426,6 +2476,21 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
         if not result.passed:
             stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
+            # A redraft is otherwise invisible in the log: the run just shows <stage>_verify
+            # followed by <stage>_draft again, with no reason. Diagnosing a thrashing stage then
+            # means reconstructing it from whatever the failing sub-system happened to log, which
+            # is exactly how an audit outage masqueraded as "the plan keeps getting rejected".
+            # 1200, not 300: a single-line gate verdict fits in 300, but an adversarial-compliance
+            # rejection is a LIST of findings and 300 characters stops inside the first one --
+            # observed live, the log preserved only "[major] PS-1 (scaffol" and the rest of the
+            # audit was unrecoverable from disk, since state.json holds the hydration snapshot
+            # rather than in-flight state. A truncated reason is barely better than no reason: the
+            # whole point of this line is that a thrash explains itself without a container autopsy.
+            logger.warning(
+                "%s: REDRAFT %d/%d -- %s",
+                stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles,
+                " ".join((result.feedback or "no feedback").split())[:1200],
+            )
             # Reset the session ONLY when the stage fabricated -- i.e. claimed work while writing
             # nothing but pipeline artifacts. That specific failure is self-reinforcing: the false
             # claim sits in the session's own history and the model re-reads and repeats it (six
@@ -3135,6 +3200,11 @@ REBUILD_FOR_ADVERSARIAL_COMPLIANCE = rebuild.RebuildSpec(
     # verification evidence still not present", citing an e2e outcome of all-nulls, which was simply
     # e2e not having run. An audit that demands evidence the pipeline emits after it is a deadlock,
     # not a gate.
+    #
+    # The one placement with scan_delta_gate on, because it is the LAST rebuild after the LAST
+    # code-writing stage: everything this gate lets through goes straight to metrics-exit, which can
+    # only fail the run. See RebuildSpec.scan_delta_gate for the run this was written from.
+    scan_delta_gate=True,
     next_node="metrics_compute",
 )
 
