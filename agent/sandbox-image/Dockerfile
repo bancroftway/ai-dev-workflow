@@ -327,7 +327,9 @@ RUN set -eux; \
 # shell that would otherwise run automatically before anything else in the container starts.
 
 # ── Offline scan data: the vulnerability databases and semgrep rules, baked at BUILD time ──────
-# Nothing in src/repo_scan.py touches the network at scan time. Two reasons, both load-bearing:
+# Nothing in src/repo_scan.py touches the network at scan time -- with ONE deliberate exception:
+# the `outdated` staleness probe (metrics_compute only), which is fail-open and excluded from
+# content_hash for exactly the reproducibility reason below. Two reasons, both load-bearing:
 #
 #   1. Reproducibility. A scan is only comparable against a baseline taken days earlier if the
 #      database did not move underneath it -- otherwise the delta reports advisory-feed churn as

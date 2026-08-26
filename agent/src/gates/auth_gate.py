@@ -83,11 +83,22 @@ def classify_response(
     return "inconclusive"
 
 
-async def _probe(provider: Any, thread_id: str, url: str) -> tuple[int, str]:
-    """(status, final_url) for one unauthenticated GET, following redirects. status 0 = no answer."""
+def split_method(route: str) -> tuple[str, str]:
+    """'POST /api/orders' -> ('POST', '/api/orders'); a bare '/path' -> ('GET', '/path'). Lets
+    discovery declare non-GET endpoints (ASP.NET answers 405 from ROUTING for a wrong-method
+    probe, before auth ever runs -- a GET-only prober can never get a verdict on a POST API)."""
+    parts = route.split(None, 1)
+    if len(parts) == 2 and parts[0].isalpha() and parts[1].startswith("/"):
+        return parts[0].upper(), parts[1]
+    return "GET", route
+
+
+async def _probe(provider: Any, thread_id: str, url: str, method: str = "GET") -> tuple[int, str]:
+    """(status, final_url) for one unauthenticated request, following redirects. 0 = no answer."""
+    method_arg = f"-X {shlex.quote(method)} " if method != "GET" else ""
     result = await provider.exec_in_sandbox(
         thread_id,
-        f"curl -s -L --max-redirs 5 --max-time {_CURL_TIMEOUT_SECONDS} "
+        f"curl -s -L --max-redirs 5 --max-time {_CURL_TIMEOUT_SECONDS} {method_arg}"
         f"-o /dev/null -w '%{{http_code}} %{{url_effective}}' {shlex.quote(url)} 2>/dev/null || true",
     )
     parts = ((result.stdout or "").strip() or "0").split(None, 1)
@@ -122,26 +133,30 @@ async def check_auth(
     spa_shell = 200 <= catchall_status < 300 and (not catchall_host or catchall_host in _LOCAL_HOSTS)
 
     page_routes = [r for r in routes if isinstance(r, str) and r.startswith("/")]
-    api_paths = [r for r in api_routes if isinstance(r, str) and r.startswith("/")]
-    # API probes go to every booted service (Blazor-style absolute API base means the UI port
-    # would 404 them -- a false pass); one-process stacks fall back to the UI port itself.
-    api_bases = service_urls or [base]
+    api_paths = [r for r in api_routes if isinstance(r, str) and split_method(r)[1].startswith("/")]
+    # API probes go to the UI base AND every booted service: a Next.js route handler lives on the
+    # UI port (probing only the FastAPI service 404s it -- false pass), while a Blazor-style
+    # absolute API base lives on its service (probing only the UI port 404s THAT). Deduped.
+    api_bases = list(dict.fromkeys([base, *service_urls]))
 
     verdicts: list[dict[str, Any]] = []
-    probes: list[tuple[str, str, bool]] = []  # (label, url, allowlisted)
-    for route in page_routes:
-        probes.append((route, f"{base}{route}", is_allowlisted(route, anonymous_routes)))
-    for path in api_paths:
+    probes: list[tuple[str, str, str, bool]] = []  # (label, url, method, allowlisted)
+    # API probes FIRST: on an SPA shell every page verdict is not_applicable, so the APIs carry
+    # the whole verdict -- they must never be the ones truncated by the probe cap.
+    for raw in api_paths:
+        method, path = split_method(raw)
         for api_base in api_bases:
-            probes.append((path, f"{api_base}{path}", is_allowlisted(path, anonymous_routes)))
+            probes.append((raw, f"{api_base}{path}", method, is_allowlisted(path, anonymous_routes)))
+    for route in page_routes:
+        probes.append((route, f"{base}{route}", "GET", is_allowlisted(route, anonymous_routes)))
     dropped = max(0, len(probes) - _MAX_PROBES)
     probes = probes[:_MAX_PROBES]
 
-    for label, url, allowlisted in probes:
-        status, final_url = await _probe(provider, thread_id, url)
+    for label, url, method, allowlisted in probes:
+        status, final_url = await _probe(provider, thread_id, url, method)
         verdict = classify_response(status, final_url, allowlisted=allowlisted, spa_shell=spa_shell)
         verdicts.append({
-            "route": label, "url": url, "status": status, "final_url": final_url,
+            "route": label, "url": url, "method": method, "status": status, "final_url": final_url,
             "allowlisted": allowlisted, "verdict": verdict,
         })
 
@@ -179,6 +194,8 @@ async def check_auth(
         feedback += " (SPA shell detected -- page-route 200s not applicable, APIs carried the verdict)"
     if inconclusive:
         feedback += f"; {len(inconclusive)} inconclusive (404/405/5xx before auth) -- reported, not blocking"
+    if dropped:
+        feedback += f"; {dropped} probe(s) dropped over the {_MAX_PROBES} cap"
     return VerificationResult(passed=True, feedback=feedback, report=report)
 
 
@@ -208,6 +225,12 @@ def _demo() -> None:
     assert is_allowlisted("/health/live", ["/health*"])
     assert not is_allowlisted("/health/live", ["/health"]), "bare /health must NOT cover the subtree"
     assert not is_allowlisted("/Admin", ["/admin"]), "matching must be case-sensitive like the Linux sandbox"
+
+    # Method-prefixed api_routes: 'POST /api/orders' probes with -X POST; a bare path stays GET.
+    assert split_method("POST /api/orders") == ("POST", "/api/orders")
+    assert split_method("/api/orders") == ("GET", "/api/orders")
+    assert split_method("delete /api/x") == ("DELETE", "/api/x")
+    assert split_method("not a route") == ("GET", "not a route")
     print("auth_gate self-check: ok")
 
 

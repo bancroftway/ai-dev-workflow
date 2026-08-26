@@ -81,6 +81,10 @@ async def get_vault_uri(owner: str, repo: str, user_login: str) -> str | None:
 
 
 async def set_vault_uri(owner: str, repo: str, user_login: str, vault_uri: str) -> None:
+    # secret_selection is RESET on every save: a selection names secrets in a specific vault, and
+    # keeping it while the URI changes leaves a phantom selection whose every name 404s in the new
+    # vault -- the sandbox then boots secretless while enforcement silently goes inert. NULL =
+    # "expose all", the safe compat default the picker re-populates from.
     pool = await session_store._get_pool()  # noqa: SLF001
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
@@ -88,13 +92,30 @@ async def set_vault_uri(owner: str, repo: str, user_login: str, vault_uri: str) 
             MERGE dbo.repo_vaults AS target
             USING (SELECT ? AS owner, ? AS repo, ? AS user_login) AS src
               ON target.owner = src.owner AND target.repo = src.repo AND target.user_login = src.user_login
-            WHEN MATCHED THEN UPDATE SET vault_uri = ?, updated_at = SYSUTCDATETIME()
+            WHEN MATCHED THEN UPDATE SET vault_uri = ?, secret_selection = NULL, updated_at = SYSUTCDATETIME()
             WHEN NOT MATCHED THEN INSERT (owner, repo, user_login, vault_uri) VALUES (?, ?, ?, ?);
             """,
             owner, repo, user_login,
             vault_uri,
             owner, repo, user_login, vault_uri,
         )
+
+
+async def resolve_vault(owner: str, repo: str, login_candidates: list[str]) -> tuple[str | None, "Selection | None"]:
+    """THE vault lookup, shared by provision, refresh-secrets, and e2e's escalation check (they
+    previously each hand-rolled it and disagreed): the first candidate login with a vault row wins,
+    returning (vault_uri, secret_selection). The pointer row grants nothing by itself -- reads are
+    always OBO with the CALLER's assertion, so Azure RBAC on the vault stays the enforcement
+    whoever's row is used."""
+    seen: set[str] = set()
+    for login in login_candidates:
+        if not login or login in seen:
+            continue
+        seen.add(login)
+        vault_uri = await get_vault_uri(owner, repo, login)
+        if vault_uri:
+            return vault_uri, await get_secret_selection(owner, repo, login)
+    return None, None
 
 
 # selection: list of {"name": str, "env_name": str | None}. None (no row / NULL column) means

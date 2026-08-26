@@ -358,6 +358,13 @@ async def collect_live_refresh(state: dict[str, Any], thread_id: str) -> dict[st
     prior_summary = ((state.get("repo_scan") or {}).get("latest_summary")
                      or (state.get("repo_scan") or {}).get("baseline_summary"))
     summary = repo_scan.merge_measures(prior_summary, report.to_dashboard_dict()["summary"], "full")
+    # A refresh scan measures a SMALLER subscore set than the gate scans (no coverage merge, no
+    # lighthouse, no eval, no outdated), so its score is not directly comparable to what sat on
+    # the strip before it. Stamp comparability against the summary being replaced so the ring can
+    # caveat the delta instead of showing an uncaveated jump.
+    summary["health_score_comparable"] = (
+        summary.get("health_weights_used") == (prior_summary or {}).get("health_weights_used")
+    )
     prior_repo_scan = dict(state.get("repo_scan") or {})
     prior_repo_scan.update(
         latest_summary=summary,
@@ -471,8 +478,17 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     known_gaps = await _read_known_gaps(provider, thread_id)
     known_gap_ids = _known_gap_finding_keys(known_gaps, scan.findings)
     scan_report["summary"] = scan.summary(known_gap_ids=known_gap_ids)
-    await repo_files.write_repo_file(provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan_report, indent=2, default=str) + "\n")
     baseline = await _read_baseline(provider, thread_id)
+    # Comparability: the health regression check only means something when baseline and latest
+    # were scored by the same formula over the same measured subscore set. health_weights_used IS
+    # that identity (it also differs between v1 baselines, which lack the key entirely, and v2).
+    # Stamped BEFORE the LATEST_PATH write so the committed file carries it too.
+    baseline_summary = (baseline or {}).get("summary") or {}
+    health_comparable = (
+        baseline_summary.get("health_weights_used") == scan_report["summary"].get("health_weights_used")
+    )
+    scan_report["summary"]["health_score_comparable"] = health_comparable
+    await repo_files.write_repo_file(provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan_report, indent=2, default=str) + "\n")
     delta = repo_scan.diff_scans(baseline, scan_report)
 
     traceability_rows = await _build_traceability_matrix(provider, thread_id)
@@ -480,14 +496,6 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
 
     delta_summ = repo_scan.delta_summary(delta)
     attempt = int(((state.get("repo_scan") or {}).get("metrics_gate") or {}).get("attempt") or 0) + 1
-    # Comparability: the health regression check only means something when baseline and latest
-    # were scored by the same formula over the same measured subscore set. health_weights_used IS
-    # that identity (it also differs between v1 baselines, which lack the key entirely, and v2).
-    baseline_summary = (baseline or {}).get("summary") or {}
-    health_comparable = (
-        baseline_summary.get("health_weights_used") == scan_report["summary"].get("health_weights_used")
-    )
-    scan_report["summary"]["health_score_comparable"] = health_comparable
     gate_reasons = regression_reasons(
         scan_report["summary"], delta_summ, coverage,
         baseline_has_findings=bool((baseline or {}).get("findings")),
@@ -625,11 +633,16 @@ async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> di
     run_id = state.get("run_id", "unknown")
 
     existing = await repo_files.read_repo_file(provider, thread_id, "README.md")
-    owned = (
-        not (existing or "").strip()
-        or _README_MARKER in (existing or "")
-        or tech_stack_signals.is_greenfield_repo(state)
+    # Ownership: absent/empty, pipeline-marked, or the scaffold's own initial stub (a couple of
+    # lines, on a repo the app scan called greenfield -- entrypoint.sh's SCAFFOLD_NEW_REPO path
+    # writes an unmarked one-liner). Deliberately NOT a bare is_greenfield disjunct: a repo
+    # initialized on GitHub with a real hand-written README and no code yet is "greenfield" to
+    # the scan, and overwriting that README is exactly the brownfield harm this rule prevents.
+    stripped = (existing or "").strip()
+    is_scaffold_stub = (
+        len(stripped.splitlines()) <= 3 and tech_stack_signals.is_greenfield_repo(state)
     )
+    owned = not stripped or _README_MARKER in stripped or is_scaffold_stub
     if not owned:
         _hard, advisories = readme_gate.readme_problems(existing), readme_gate.readme_advisories(existing)
         metrics["readme"] = {
@@ -644,11 +657,20 @@ async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> di
     system_prompt, human_template = load_prompt_pair("readme_draft")
     problems: list[str] = []
     advisories: list[str] = []
+    infra_errors: list[str] = []
+    last_usage: dict[str, Any] | None = None
     for lap in range(1, _README_MAX_LAPS + 1):
-        feedback = (
-            "A deterministic structure check rejected your previous README with these problems -- fix them:\n"
-            + "\n".join(f"- {p}" for p in problems)
-        ) if problems else ""
+        feedback_parts = []
+        if problems:
+            feedback_parts.append(
+                "A deterministic structure check rejected your previous README with these problems -- fix them:\n"
+                + "\n".join(f"- {p}" for p in problems)
+            )
+        if advisories:
+            feedback_parts.append(
+                "Non-blocking polish worth fixing while you are in the file:\n"
+                + "\n".join(f"- {a}" for a in advisories)
+            )
         model = get_chat_model_for_thread(
             thread_id,
             "readme",
@@ -664,30 +686,43 @@ async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> di
         try:
             await model.ainvoke(
                 [SystemMessage(content=system_prompt),
-                 HumanMessage(content=render_prompt(human_template, blocking_feedback=feedback))],
+                 HumanMessage(content=render_prompt(human_template, blocking_feedback="\n\n".join(feedback_parts)))],
                 config={"metadata": {"emit-messages": False}},
             )
+            last_usage = model._last_usage  # noqa: SLF001 -- same access every LLM node uses
         except (TimeoutError, RuntimeError) as exc:
-            problems = [f"README draft lap {lap} failed: {type(exc).__name__}: {exc}"]
+            # An infra failure is a LOST LAP, never a merge blocker: it must not land in
+            # `problems` (exit turns those into deterministic blockers) and must not eat the
+            # remaining laps -- e2e_fix documents the 50-minute run one unhandled timeout killed.
+            infra_errors.append(f"lap {lap}: {type(exc).__name__}: {exc}")
             logger.warning("readme_write: lap %d failed for thread_id=%s -- degrading, never raising", lap, thread_id, exc_info=True)
-            break
+            continue
         problems, advisories = await readme_gate.check_readme(provider, thread_id)
         if not problems:
             break
         logger.info("readme_write: lap %d left %d hard problem(s) for thread_id=%s", lap, len(problems), thread_id)
 
-    # Stamp the ownership marker (idempotent) so later tickets know this README is ours to rewrite.
-    raw = await repo_files.read_repo_file(provider, thread_id, "README.md")
-    if raw and _README_MARKER not in raw:
-        await repo_files.write_repo_file(provider, thread_id, "README.md", raw.rstrip("\n") + f"\n\n{_README_MARKER}\n")
-
-    metrics["readme"] = {"owned": True, "problems": problems, "advisories": advisories}
+    metrics["readme"] = {
+        "owned": True, "problems": problems, "advisories": advisories,
+        **({"infra_errors": infra_errors} if infra_errors else {}),
+    }
     metrics_report["metrics"] = metrics
-    await repo_files.append_ledger_entry(
-        provider, thread_id,
-        {"stage": "metrics_report", "node": "readme_write", "problems": problems, "advisories": advisories},
-    )
-    await git_ops.commit_all(provider, thread_id, "ai-dev-workflow: readme")
+    # Tail is best-effort for the same reason the loop is: this node sits before the final scan,
+    # the exit report, manifest completion and session close -- README polish never bricks those.
+    try:
+        # Stamp the ownership marker (idempotent) so later tickets know this README is ours.
+        raw = await repo_files.read_repo_file(provider, thread_id, "README.md")
+        if raw and _README_MARKER not in raw:
+            await repo_files.write_repo_file(provider, thread_id, "README.md", raw.rstrip("\n") + f"\n\n{_README_MARKER}\n")
+        await repo_files.append_ledger_entry(
+            provider, thread_id,
+            {"stage": "metrics_report", "node": "readme_write", "problems": problems,
+             "advisories": advisories, "infra_errors": infra_errors,
+             **({"token_usage": last_usage} if last_usage else {})},
+        )
+        await git_ops.commit_all(provider, thread_id, "ai-dev-workflow: readme")
+    except (TimeoutError, RuntimeError) as exc:
+        logger.warning("readme_write: finalization failed for thread_id=%s (%s) -- continuing into metrics", thread_id, exc)
     return {"metrics_report": metrics_report}
 
 

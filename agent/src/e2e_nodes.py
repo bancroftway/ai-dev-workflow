@@ -926,12 +926,17 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # as an env file sourced only into the app's own shell. Cache empty but a vault IS configured
     # means the agent restarted since provision -- an infra/user-action gap the e2e fix LLM can't
     # patch, so escalate (cannot_verify) instead of burning fix cycles booting a secretless app.
+    from .graph import auth_enforced as _auth_enforced, get_app_auth as _get_app_auth  # lazy: graph imports this module
+
+    test_auth_enforced = _auth_enforced(state)
     app_secrets = keyvault.get_app_secrets(thread_id)
     if app_secrets is None:
         sess_row = await session_store.get_session(thread_id)
-        if sess_row is not None and await keyvault.get_vault_uri(
-            sess_row["owner"], sess_row["repo"], sess_row["user_login"]
-        ):
+        vault_uri_configured, _sel = (
+            await keyvault.resolve_vault(sess_row["owner"], sess_row["repo"], [sess_row["user_login"]])
+            if sess_row is not None else (None, None)
+        )
+        if vault_uri_configured:
             e2e["status"] = "failed"
             e2e["cannot_verify"] = True
             e2e["failed_tests"] = [{
@@ -1001,6 +1006,12 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             _scanned_launch_command(other), other_port, str(other.get("runtime") or "")
         )
         service_command = f"export WEB_ORIGIN={shlex.quote(web_origin)}; {service_command}"
+        if test_auth_enforced:
+            # The test-only sign-in seam the auth prompt segment mandates: active for the suite's
+            # app processes ONLY. The auth gate's own probes carry no credential, so a route that
+            # honors an unauthenticated request still fails the gate -- the seam being ON here
+            # never weakens what is verified.
+            service_command = f"export AIDW_TEST_AUTH=1; {service_command}"
         await _boot_process(
             provider, thread_id, service_command,
             other_log, f"agent-work/e2e-service-{index}.pid", env_file=use_env_file,
@@ -1064,6 +1075,9 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         if api_env:
             logger.info("e2e: pointing app env at booted service: %s", api_env)
             start_command = f"{api_env}; {start_command}"
+    if test_auth_enforced:
+        # Same seam as the services above -- see that comment.
+        start_command = f"export AIDW_TEST_AUTH=1; {start_command}"
     await _boot_process(
         provider, thread_id, start_command, E2E_APP_LOG_PATH, E2E_APP_PID_PATH, env_file=use_env_file
     )
@@ -1129,7 +1143,10 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             f"{cd_prefix}{node_path_env}PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
             f"PLAYWRIGHT_JSON_OUTPUT_NAME={shlex.quote(_report_path_for(config_dir))} "
             f"BASE_URL=http://localhost:{port} "
-            f"timeout {workflow_config.E2E_SUITE_TIMEOUT_SECONDS} {run_cmd} --reporter=json 2>&1"
+            # The suite sees the seam flag too, so tests can branch on it (e.g. hit the test
+            # sign-in endpoint) -- the seam itself lives in the APP, exported at boot above.
+            + ("AIDW_TEST_AUTH=1 " if test_auth_enforced else "")
+            + f"timeout {workflow_config.E2E_SUITE_TIMEOUT_SECONDS} {run_cmd} --reporter=json 2>&1"
         )
         keepalive = asyncio.create_task(_keepalive_touch(provider, thread_id))
         try:
@@ -1316,14 +1333,13 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             e2e["status"] = "failed"
 
     # Authentication enforcement gate (gates/auth_gate.py) -- while the app is still up, probing
-    # WITHOUT the AIDW_TEST_AUTH seam the suite signs in with. Deliberately NOT fail-open: an
+    # WITHOUT the AIDW_TEST_AUTH seam (the probe carries no env; the seam lives in the app's own
+    # process and only answers a caller who USES it). Deliberately NOT fail-open: an
     # unauthenticated 200 on a protected route is a verified defect that joins failed_tests and
     # feeds the same fix loop. Runs only when graph.auth_enforced says the run both requires auth
     # AND could satisfy it (posture + secrets + kill-switch) -- the same predicate that injected
     # the auth prompt segments, so the gate never demands what the prompts never asked for.
-    from .graph import auth_enforced as _auth_enforced, get_app_auth as _get_app_auth  # lazy: graph imports this module
-
-    if _auth_enforced(state):
+    if test_auth_enforced:
         from .gates import auth_gate
 
         app_auth = _get_app_auth(state)
@@ -1337,16 +1353,23 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         )
         e2e["auth_check"] = {**auth_result.report, "passed": auth_result.passed, "feedback": auth_result.feedback}
         # Routes VERIFIED protected legitimately screenshot as the IdP/login page -- often a tiny
-        # PNG. Exempt exactly those from the blank-screenshot blocker (never from reporting).
-        protected_slugs = {
-            _route_slug(v["route"])
+        # PNG. Exempt exactly those captures from the blank-screenshot blocker (never from
+        # reporting). Exact filenames, not slug substrings: a protected /new must not exempt
+        # 002-expenses-new.png for an unprotected /expenses/new.
+        protected_routes = {
+            str(v.get("route"))
             for v in auth_result.report.get("verdicts", [])
-            if v.get("verdict") == "protected" and _route_slug(str(v.get("route") or ""))
+            if v.get("verdict") == "protected"
         }
-        if protected_slugs and e2e.get("degenerate_screenshots"):
+        exempt_names = {
+            f"{index:03d}-{_route_slug(route)}.png"
+            for index, route in enumerate(routes[:12], start=1)
+            if route in protected_routes
+        }
+        if exempt_names and e2e.get("degenerate_screenshots"):
             e2e["degenerate_screenshots"] = [
                 p for p in e2e["degenerate_screenshots"]
-                if not any(f"-{slug}.png" in str(p) for slug in protected_slugs)
+                if str(p).rsplit("/", 1)[-1] not in exempt_names
             ]
         if not auth_result.passed:
             failures = list(e2e.get("failed_tests") or [])

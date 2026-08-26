@@ -40,8 +40,14 @@ _GATE_OWNED_REASON_MARKERS = (
     # Any NEW deterministic blocker vocabulary must be added here too, or a blocker fixed on run
     # N re-blocks every later run: the drafting model reads the committed EXIT-REPORT.md and
     # copies old blockers forward verbatim (see verify_exit_readiness's stale-blocker filter).
-    "README.md",            # readme leg's hard structure problems (verify_exit_readiness)
-    "authentication enforcement",  # auth gate wording, incl. the e2e-skipped named problem
+    # These MUST be phrases only the deterministic checks emit -- a generic substring (an early
+    # draft used bare "README.md") deletes the model's own legitimate prose blockers that merely
+    # mention the file, and can flip merge_ready back to True on a run that earned its False.
+    "README.md is missing or empty",           # readme_gate hard problems (verbatim prefixes)
+    "standard-readme requires it",
+    "has no H1 title",
+    "must be the LAST section",
+    "authentication enforcement was required for this run",  # verify_exit_readiness's own blocker
 )
 
 CHANGELOG_PATH = "CHANGELOG.md"
@@ -443,12 +449,23 @@ async def verify_exit_readiness(
             and app_auth.get("auth_mode") in ("required", "anonymous_list")
             and bool(app_auth.get("secrets_present"))
         )
-        if auth_required and e2e_snapshot.get("status") in (None, "skipped"):
+        # Keyed on the auth gate's own verdict, not e2e.status: an e2e that "passed" without the
+        # auth probe ever running (gate exception, posture arriving late on a resumed checkpoint)
+        # is just as unverified as a skipped one.
+        if auth_required and not (e2e_snapshot.get("auth_check") or {}).get("passed"):
             problems.append(
-                "authentication enforcement was required for this run but the e2e pass that "
-                f"verifies it never ran (status: {e2e_snapshot.get('status') or 'never started'})"
-                " -- the auth posture is unverified"
+                "authentication enforcement was required for this run but was not verified "
+                f"(e2e status: {e2e_snapshot.get('status') or 'never started'}; auth probe "
+                f"{'failed' if e2e_snapshot.get('auth_check') else 'never ran'})"
             )
+        elif auth_required:
+            # Verified: surface the gate's per-route verdict summary in the exit report (via the
+            # report's own risk-notes section) -- the "reported, not blocking" inconclusives
+            # otherwise live only in metrics-latest.json.
+            auth_note = f"Authentication enforcement verified: {(e2e_snapshot.get('auth_check') or {}).get('feedback')}"
+            notes = list(content_dict.get("risk_notes") or [])
+            if auth_note not in notes:
+                content_dict["risk_notes"] = notes + [auth_note]
 
     # Drop STALE deterministic blockers the model carried over from a previous run's report.
     #

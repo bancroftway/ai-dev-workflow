@@ -31,14 +31,8 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 | `coverage_run.md` | minimal-code-to-green | replay the coverage contract and report the measured numbers |
 | `remediation_draft.md` | remediation | fix or explain every gating finding |
 | `remediation_ticket_mode_segment.md` | remediation | ticket-mode: carry an earlier ticket's own accepted `known_gaps` reasoning forward instead of re-investigating it from scratch |
-| `quality_remediation_triage.md` | quality-remediation | fix/suppress decision per quality finding |
-| `quality_remediation_fix.md` | quality-remediation | apply fixes + suppression markers |
-| `security_remediation_triage.md` | security-remediation | fix/suppress decision per security finding |
-| `security_remediation_fix.md` | security-remediation | apply security fixes |
 | `adversarial_audit_draft.md` | adversarial-audit | adversarial code audit |
 | `adversarial_compliance_fix.md` | adversarial-compliance | write-capable pass closing the compliance audit's divergences |
-| `finding_cluster_dependency_upgrade.md` | finding-cluster | dependency upgrades |
-| `finding_cluster_risk_review.md` | finding-cluster | upgrade risk review |
 | `license_audit_draft.md` | license-audit | license compliance |
 | `test_hardening_run.md` / `test_hardening_fix.md` | test-hardening | run the suite N× / fix the flakes it caught |
 | `test_hardening_flake_triage.md` | test-hardening | flaky-test triage |

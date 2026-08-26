@@ -193,23 +193,32 @@ _HTTP_CALL_MARKERS = ("fetch(", "axios", "httpclient", "$fetch", "xmlhttprequest
 # declared stack, so an e2e failure traces to the handler/downstream call that actually broke
 # instead of only a frontend symptom (agent/src/telemetry.py sets up the identical thing for the
 # orchestrator itself; this is the same pattern applied to what the pipeline generates).
+# Needles are ECOSYSTEM-SPECIFIC on purpose: the evidence blob is one flat string across backend
+# AND frontend texts, so a generic "opentelemetry" needle let the frontend's
+# `@opentelemetry/sdk-trace-web` import satisfy the .NET backend's requirement (and vice versa) --
+# W6's own templates guarantee that string exists in every dual-stack repo, which silently
+# no-op'ed the backend half of this blocking gate. Each row's needles can only be produced by
+# instrumenting THAT ecosystem.
+_DOTNET_OTEL_NEEDLES = ("opentelemetry.extensions", "addopentelemetry", "opentelemetry.instrumentation.aspnetcore")
+_PYTHON_OTEL_NEEDLES = ("opentelemetry-instrumentation", "opentelemetry.instrumentation", "opentelemetry-sdk", "opentelemetry.sdk")
+_NODE_BACKEND_OTEL_NEEDLES = ("@opentelemetry/sdk-node", "@opentelemetry/auto-instrumentations")
+_BROWSER_OTEL_NEEDLES = ("@opentelemetry/sdk-trace-web", "@vercel/otel")
 _OTEL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("asp.net", ("opentelemetry",)),
-    ("aspnet", ("opentelemetry",)),
-    ("blazor", ("opentelemetry",)),
-    ("fastapi", ("opentelemetry",)),
-    ("flask", ("opentelemetry",)),
-    ("django", ("opentelemetry",)),
-    ("express", ("opentelemetry",)),
-    ("nest", ("opentelemetry",)),
-    # Frontends (W6): the JS-ecosystem signal lives in package.json / instrumentation.ts, both of
-    # which otel_extra_paths already reads. "@opentelemetry" (the scoped packages) OR "@vercel/otel"
-    # (Next's recommended wrapper, which pulls zero direct @opentelemetry deps) -- NOT a bare
-    # "otel" needle, which "hotel" would satisfy.
-    ("next", ("@opentelemetry", "@vercel/otel")),
-    ("react", ("@opentelemetry", "@vercel/otel")),
-    ("vue", ("@opentelemetry",)),
-    ("angular", ("@opentelemetry",)),
+    ("asp.net", _DOTNET_OTEL_NEEDLES),
+    ("aspnet", _DOTNET_OTEL_NEEDLES),
+    ("blazor", _DOTNET_OTEL_NEEDLES),
+    ("fastapi", _PYTHON_OTEL_NEEDLES),
+    ("flask", _PYTHON_OTEL_NEEDLES),
+    ("django", _PYTHON_OTEL_NEEDLES),
+    ("express", _NODE_BACKEND_OTEL_NEEDLES),
+    ("nest", _NODE_BACKEND_OTEL_NEEDLES),
+    # Frontends (W6): the signal lives in package.json / instrumentation.ts / the app entry file,
+    # all of which otel_extra_paths reads. Next.js server-side instrumentation legitimately uses
+    # sdk-node (instrumentation.node.ts) or @vercel/otel.
+    ("next", ("@vercel/otel", "@opentelemetry/sdk-node")),
+    ("react", _BROWSER_OTEL_NEEDLES),
+    ("vue", _BROWSER_OTEL_NEEDLES),
+    ("angular", _BROWSER_OTEL_NEEDLES),
 )
 
 
@@ -391,18 +400,29 @@ async def _check_integration_fidelity(
     # OTel's own Node.js docs recommend a SEPARATE bootstrap file (tracing.js/instrumentation.js)
     # required before anything else in the entrypoint -- a correctly-instrumented app following
     # that idiomatic pattern would false-positive-fail missing_otel_instrumentation if it only ever
-    # saw `texts` above, since the entrypoint itself would contain nothing but a bare `require(...)`
-    # and the OTel setup call lives in a file this function never otherwise reads. package.json is
-    # also checked directly: the most reliable "was the dependency even added" signal regardless of
-    # which file the setup code lives in. Kept as a SEPARATE dict (not merged into `texts`) so this
-    # widening only affects the OTel check, not missing_hosted_backend's already-established input.
+    # saw `texts` above. Frontend entry files (main.tsx etc.) carry the WebTracerProvider evidence
+    # the W6 frontend markers need. package.json comes from its OWN git listing: `source_files` is
+    # pre-filtered by _is_application_source, which rejects manifests -- deriving it from there
+    # (the original code) meant the "package.json is checked" claim was simply false, and a
+    # correctly-instrumented React app failed this gate forever.
     otel_extra_paths = [
         path for path in source_files
-        if path.endswith(("tracing.js", "tracing.ts", "instrumentation.js", "instrumentation.ts", "otel.js", "otel.ts", "package.json"))
+        if path.endswith((
+            "tracing.js", "tracing.ts", "instrumentation.js", "instrumentation.ts",
+            "instrumentation.node.ts", "otel.js", "otel.ts",
+            "main.ts", "main.tsx", "main.jsx", "index.tsx",
+        ))
         and not _non_app(path)
     ]
+    manifest_files = await provider.exec_in_sandbox(
+        thread_id, "git ls-files '*package.json' && git ls-files --others --exclude-standard '*package.json'"
+    )
+    otel_extra_paths += [
+        line.strip() for line in (manifest_files.stdout or "").splitlines()
+        if line.strip() and not _non_app(line.strip())
+    ]
     otel_extra_texts: dict[str, str] = {}
-    for path in sorted(set(otel_extra_paths))[:10]:
+    for path in sorted(set(otel_extra_paths))[:14]:
         content = await repo_files.read_repo_file(provider, thread_id, path)
         if content is not None:
             otel_extra_texts[path] = content
@@ -1368,8 +1388,20 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert missing_otel_instrumentation(["ASP.NET Core Web API"], _hosted_with_otel) is None
     assert missing_otel_instrumentation(["FastAPI"], {"api/main.py": "app = FastAPI()"}) == "FastAPI"
     assert missing_otel_instrumentation(
-        ["FastAPI"], {"api/main.py": "from opentelemetry import trace\napp = FastAPI()"}
+        ["FastAPI"], {"api/main.py": "from opentelemetry.sdk.trace import TracerProvider\napp = FastAPI()"}
     ) is None
+    # The needles are ecosystem-specific: the frontend's @opentelemetry/sdk-trace-web import must
+    # NOT satisfy the .NET backend's requirement (one flat evidence blob made exactly that exploit
+    # possible -- W6's own templates guarantee the frontend string exists in every dual-stack repo).
+    assert missing_otel_instrumentation(
+        ["ASP.NET Core Web API", "Vue"],
+        {**_hosted, "apps/web/src/main.ts": 'import { WebTracerProvider } from "@opentelemetry/sdk-trace-web"'},
+    ) == "ASP.NET Core Web API"
+    # ...and the backend's sdk-node must not satisfy an uninstrumented React frontend.
+    assert missing_otel_instrumentation(
+        ["React", "Express"],
+        {"apps/api/src/tracing.ts": 'import { NodeSDK } from "@opentelemetry/sdk-node"'},
+    ) == "React"
     # Frontends are checked too (W6): a Next.js app with readable files and no OTel signal fails;
     # either the scoped packages or Next's own @vercel/otel wrapper passes. A bare "hotel" string
     # must NOT pass (the needle is the scoped-package prefix, not "otel").

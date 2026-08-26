@@ -13,12 +13,13 @@ export const HEALTH_SUBSCORE_LABELS: ReadonlyArray<[key: string, label: string]>
   ["maintainability", "Maintainability"],
 ];
 
-/** Continuous red(0) -> yellow(~50) -> green(100) hue sweep. Lightness 55%: 42% red fails the
- * 3:1 WCAG 1.4.11 contrast minimum against a dark background, and this component renders on
- * both the light metrics strip and themed report pages. */
+/** Continuous red(0) -> yellow(~50) -> green(100) hue sweep. Lightness 45%: no single lightness
+ * clears WCAG 1.4.11's 3:1 on BOTH the light strip and a dark page (green@55% is 1.9:1 on
+ * neutral-50), so the hue is deliberately redundant encoding -- the score is always also
+ * rendered as text -- and 45% favors the light surfaces this app actually styles for. */
 export function healthColor(score: number): string {
   const clamped = Math.max(0, Math.min(100, score));
-  return `hsl(${Math.round(clamped * 1.2)}, 70%, 55%)`;
+  return `hsl(${Math.round(clamped * 1.2)}, 70%, 45%)`;
 }
 
 function ringTitle(score: number, baseline: number | null | undefined, comparable: boolean | undefined): string {
@@ -55,7 +56,9 @@ export function HealthRing({
       className="shrink-0"
     >
       <title>{ringTitle(score, baseline, comparable)}</title>
-      <circle cx="18" cy="18" r="15.915" fill="none" stroke="#e5e7eb" strokeWidth="3.5" />
+      {/* currentColor at low opacity: inherits the surrounding text color, so the track and
+          numeral stay legible on dark surfaces too (hardcoded #e5e7eb was invisible there). */}
+      <circle cx="18" cy="18" r="15.915" fill="none" stroke="currentColor" opacity="0.15" strokeWidth="3.5" />
       {score > 0 && (
         <circle
           cx="18"
@@ -74,7 +77,7 @@ export function HealthRing({
         y="18"
         textAnchor="middle"
         dominantBaseline="central"
-        className="fill-neutral-800"
+        fill="currentColor"
         fontSize="12"
         fontWeight="600"
       >
@@ -86,7 +89,17 @@ export function HealthRing({
 
 /** The accessible breakdown list the ring links to -- one row per subscore, weight alongside,
  * unmeasured subscores named rather than hidden (their weight was redistributed). */
-export function HealthBreakdown({ summary, baseline }: { summary: ScanSummary; baseline?: ScanSummary | null }) {
+export function HealthBreakdown({
+  summary,
+  baseline,
+  label = "Health",
+}: {
+  summary: ScanSummary;
+  baseline?: ScanSummary | null;
+  /** "Baseline health" when the latest scan hasn't landed yet -- presenting the pre-build
+   * baseline as the current score sends a reader chasing a number no code has earned. */
+  label?: string;
+}) {
   const subscores = summary.health_subscores;
   if (!subscores || summary.health_score == null) return null;
   const weights = summary.health_weights_used ?? {};
@@ -101,7 +114,7 @@ export function HealthBreakdown({ summary, baseline }: { summary: ScanSummary; b
       />
       <div className="text-sm text-neutral-700">
         <p>
-          Health {summary.health_score} / 100
+          {label} {summary.health_score} / 100
           {baseline?.health_score != null && baseline.health_score !== summary.health_score && (
             <span className="text-neutral-500">
               {" "}(baseline {baseline.health_score}

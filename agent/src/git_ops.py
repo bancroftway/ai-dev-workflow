@@ -315,9 +315,11 @@ _GITIGNORE_ENTRIES = (
     ".env.local",
     ".DS_Store",
     "*.user",
-    # Python: the union list is ecosystem-neutral (a `.venv/` entry in a dotnet repo costs nothing),
-    # and generated_ignore_entries can never derive these itself -- `.py` is in _AUTHORED_SUFFIXES,
-    # so `__pycache__/` contents would read as authored files.
+    # Python: the union list is ecosystem-neutral (a `.venv/` entry in a dotnet repo costs nothing).
+    # `.venv/` is the load-bearing one: `.venv/lib/.../flask/app.py` ends in `.py`, which IS in
+    # _AUTHORED_SUFFIXES, so generated_ignore_entries would read a vendored venv as authored files
+    # and commit it. (`__pycache__/` was derivable -- .pyc isn't an authored suffix -- but an
+    # explicit entry beats deriving it fresh per repo.)
     ".venv/",
     "__pycache__/",
     "*.pyc",

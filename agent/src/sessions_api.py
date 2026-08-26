@@ -57,24 +57,6 @@ catalog_router = APIRouter(tags=["tech-stack"])
 projects_router = APIRouter(prefix="/projects", tags=["projects"])
 repo_auth_settings_router = APIRouter(prefix="/repo-auth-settings", tags=["repo-auth-settings"])
 
-
-async def _resolve_vault(
-    owner: str, repo: str, login_candidates: list[str],
-) -> tuple[str | None, "keyvault.Selection | None"]:
-    """One resolver for every vault lookup (provision AND refresh-secrets previously disagreed):
-    the first candidate login with a vault row wins, returning (vault_uri, secret_selection).
-    The pointer row grants nothing by itself -- reads are always OBO with the CALLER's assertion,
-    so Azure RBAC on the vault stays the enforcement whoever's row is used."""
-    seen: set[str] = set()
-    for login in login_candidates:
-        if not login or login in seen:
-            continue
-        seen.add(login)
-        vault_uri = await keyvault.get_vault_uri(owner, repo, login)
-        if vault_uri:
-            return vault_uri, await keyvault.get_secret_selection(owner, repo, login)
-    return None, None
-
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
 
@@ -217,7 +199,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     # teammates share a repo's sessions, and B provisioning A's session must still find A's vault
     # pointer -- the OBO read is with B's OWN assertion, so Azure RBAC still decides what B gets.
     vault_login_candidates = [body.user_login] + ([existing["user_login"]] if existing else [])
-    vault_uri, vault_selection = await _resolve_vault(body.owner, body.repo, vault_login_candidates)
+    vault_uri, vault_selection = await keyvault.resolve_vault(body.owner, body.repo, vault_login_candidates)
     if vault_uri and body.entra_assertion:
         try:
             app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion, vault_selection)
@@ -511,6 +493,7 @@ async def terminate_session(thread_id: str, request: Request) -> ProvisionRespon
     await provider.discard_workspace(thread_id)
     registry.pop(thread_id)
     keyvault.pop_app_secrets(thread_id)
+    repo_auth_settings.pop_for_thread(thread_id)
     return ProvisionResponse(status="terminated")
 
 
@@ -545,6 +528,7 @@ async def delete_session_full(thread_id: str, body: DeleteSessionRequest, reques
     await provider.discard_workspace(thread_id)
     registry.pop(thread_id)
     keyvault.pop_app_secrets(thread_id)
+    repo_auth_settings.pop_for_thread(thread_id)
 
     branch_deleted = False
     if body.github_token:
@@ -589,7 +573,7 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
 
     # Only "refresh-secrets" exists; a second action turns this into a match on body.action.
     # Same resolver as provision (they previously disagreed about whose row to read).
-    vault_uri, vault_selection = await _resolve_vault(row["owner"], row["repo"], [row["user_login"]])
+    vault_uri, vault_selection = await keyvault.resolve_vault(row["owner"], row["repo"], [row["user_login"]])
     if not vault_uri:
         raise HTTPException(status_code=404, detail="no key vault is configured for this repo")
     if not body.entra_assertion:
@@ -600,6 +584,10 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
         raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
 
     keyvault.set_app_secrets(thread_id, app_secrets)
+    # Refresh is also the recovery path after an agent restart -- re-seed the per-thread auth
+    # posture too, or record_raw_requirements_node's next read falls back to the locked default
+    # for a repo the user explicitly set to 'none'.
+    repo_auth_settings.set_for_thread(thread_id, await repo_auth_settings.get_settings(row["owner"], row["repo"]))
     if registry.get(thread_id) is not None:
         await keyvault.write_env_file(get_sandbox_provider(), thread_id, app_secrets)
     logger.info("refreshed %d app secret(s) for thread_id=%s", len(app_secrets), thread_id)
@@ -641,12 +629,15 @@ async def put_vault_config(body: VaultConfigPutRequest, request: Request) -> Ses
     vault_uri = body.vault_uri.strip()
     if not _VAULT_URI_RE.match(vault_uri):
         raise HTTPException(status_code=422, detail="vault_uri must look like https://<name>.vault.azure.net/")
+    # Properties-only listing, NOT fetch_app_secrets: the save-time proof only needs to show the
+    # vault is readable as this user -- downloading every secret VALUE for a UI click was an
+    # unnecessary bulk plaintext transfer, and its count contradicted the picker's selection.
     try:
-        app_secrets = await keyvault.fetch_app_secrets(vault_uri, body.entra_assertion)
+        names = await keyvault.list_secret_names(vault_uri, body.entra_assertion)
     except keyvault.VaultAccessError as exc:
         raise HTTPException(status_code=403, detail=f"key vault {vault_uri} is not readable as you: {exc}") from None
     await keyvault.set_vault_uri(body.owner, body.repo, body.user_login, vault_uri)
-    return SessionActionResponse(secret_count=len(app_secrets))
+    return SessionActionResponse(secret_count=len(names))
 
 
 class VaultSecretsRequest(BaseModel):

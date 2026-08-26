@@ -49,8 +49,10 @@ Steps:
    screenshots legitimately show the login screen.
 4. Separately list the app's HTTP API ENDPOINT paths (`api_routes`) from the API's own routing
    source (controllers, minimal-API `Map*` calls, FastAPI/Flask decorators, `app/api/*/route.ts`).
-   Concrete paths only -- skip dynamic segments you have no id for. Empty is fine for an app with
-   no API surface. These are probed by the authentication-enforcement gate, never screenshotted.
+   Concrete paths only -- skip dynamic segments you have no id for. Prefix non-GET endpoints with
+   their method (`"POST /api/orders"`, `"DELETE /api/orders/1"` -- skip delete/put entries whose
+   id you have no value for); a bare path means GET. Empty is fine for an app with no API surface.
+   These are probed by the authentication-enforcement gate, never screenshotted.
 5. If the app cannot be started at all, that is a real finding: report it rather than guessing a
    command you never saw work.
 

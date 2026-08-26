@@ -18,33 +18,52 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# Section titles that satisfy each hard requirement (case-insensitive H2 match). standard-readme
-# fixes the names; "Installation" is accepted for Install because refusing a merge over that one
-# word helps nobody.
-_HARD_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Install", ("install", "installation")),
-    ("Usage", ("usage",)),
-    ("License", ("license", "licence")),
+# Word-boundary patterns that satisfy each hard requirement (case-insensitive H2 match). \b
+# search rather than startswith: real headings carry emoji, numbering and phrasing ("## 📦
+# Install", "## 2. Installation") that a prefix match wrongly hard-blocks a merge over.
+# standard-readme fixes the names; "Installation" is accepted for Install.
+_HARD_SECTIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("Install", re.compile(r"\binstall(ation)?\b")),
+    ("Usage", re.compile(r"\busage\b")),
+    ("License", re.compile(r"\blicen[cs]e\b")),
 )
+_LICENSE_RE = re.compile(r"\blicen[cs]e\b")
 
-_H1_RE = re.compile(r"^# \S", re.MULTILINE)
-_H2_RE = re.compile(r"^## +(.+?)\s*$", re.MULTILINE)
+# Up to 3 leading spaces is still an ATX heading per CommonMark.
+_H1_RE = re.compile(r"^ {0,3}#\s+\S")
+_H2_RE = re.compile(r"^ {0,3}## +(.+?)\s*$")
+_SETEXT_H1_RE = re.compile(r"^ {0,3}=+\s*$")
 
 
-def _h2_titles(markdown: str) -> list[str]:
-    """H2 titles outside fenced code blocks, in order."""
-    titles: list[str] = []
-    in_fence = False
+def _content_lines(markdown: str) -> list[str]:
+    """Lines outside ``` and ~~~ fenced code blocks."""
+    lines: list[str] = []
+    fence: str | None = None
     for line in markdown.splitlines():
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
+        stripped = line.lstrip()
+        if fence is not None:
+            if stripped.startswith(fence):
+                fence = None
             continue
-        if in_fence:
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
             continue
-        match = _H2_RE.match(line)
-        if match:
-            titles.append(match.group(1).strip())
-    return titles
+        lines.append(line)
+    return lines
+
+
+def _structure(markdown: str) -> tuple[bool, list[str]]:
+    """(has_h1, h2_titles) over fence-stripped lines -- H1 counts as ATX `# x` or a setext
+    `Title\\n====` pair, and headings inside code fences never count."""
+    lines = _content_lines(markdown)
+    has_h1 = any(_H1_RE.match(line) for line in lines)
+    if not has_h1:
+        has_h1 = any(
+            _SETEXT_H1_RE.match(lines[i + 1]) and lines[i].strip() and not lines[i].lstrip().startswith("#")
+            for i in range(len(lines) - 1)
+        )
+    titles = [m.group(1).strip() for line in lines if (m := _H2_RE.match(line))]
+    return has_h1, titles
 
 
 def readme_problems(markdown: str | None) -> list[str]:
@@ -52,16 +71,14 @@ def readme_problems(markdown: str | None) -> list[str]:
     if not markdown or not markdown.strip():
         return ["README.md is missing or empty"]
     problems: list[str] = []
-    if not _H1_RE.search(markdown):
+    has_h1, titles = _structure(markdown)
+    if not has_h1:
         problems.append("README.md has no H1 title (`# <project name>` on the first line)")
-    titles = _h2_titles(markdown)
-    lowered = [t.lower().strip("`*_ ") for t in titles]
-    for label, accepted in _HARD_SECTIONS:
-        if not any(any(t.startswith(a) for a in accepted) for t in lowered):
+    lowered = [t.lower() for t in titles]
+    for label, pattern in _HARD_SECTIONS:
+        if not any(pattern.search(t) for t in lowered):
             problems.append(f"README.md is missing a `## {label}` section (standard-readme requires it)")
-    license_indexes = [
-        i for i, t in enumerate(lowered) if any(t.startswith(a) for a in ("license", "licence"))
-    ]
+    license_indexes = [i for i, t in enumerate(lowered) if _LICENSE_RE.search(t)]
     if license_indexes and license_indexes[-1] != len(lowered) - 1:
         problems.append("the `## License` section must be the LAST section of README.md")
     return problems
@@ -93,20 +110,19 @@ def readme_advisories(markdown: str | None) -> list[str]:
             advisories.append("the short description line after the title should be under 120 characters")
 
     # ToC anchors that resolve to no heading. Duplicate-heading suffixes (-1, -2) accepted.
+    # Both halves run over the SAME fence-stripped lines -- a ```-fenced example heading neither
+    # mints a slug nor has its example links flagged.
+    content = _content_lines(markdown)
     slugs: dict[str, int] = {}
     known: set[str] = set()
-    in_fence = False
-    for line in lines:
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
+    for line in content:
+        if not re.match(r"^ {0,3}#{1,6} ", line):
             continue
-        if in_fence or not re.match(r"^#{1,6} ", line):
-            continue
-        slug = _github_slug(re.sub(r"^#{1,6} ", "", line).strip())
+        slug = _github_slug(re.sub(r"^ {0,3}#{1,6} ", "", line).strip())
         count = slugs.get(slug, 0)
         slugs[slug] = count + 1
         known.add(slug if count == 0 else f"{slug}-{count}")
-    for anchor in re.findall(r"\]\(#([^)]+)\)", markdown):
+    for anchor in re.findall(r"\]\(#([^)]+)\)", "\n".join(content)):
         if anchor not in known:
             advisories.append(f"table-of-contents link `#{anchor}` resolves to no heading")
     return advisories
@@ -145,6 +161,17 @@ def _demo() -> None:
     assert readme_problems("# x\n\n## Installation\n\na\n\n## Usage\n\nb\n\n## License\n\nMIT\n") == []
     fenced = "# x\n\n```md\n## License\n```\n\n## Install\n\na\n\n## Usage\n\nb\n\n## License\n\nMIT\n"
     assert readme_problems(fenced) == [], readme_problems(fenced)
+    # ~~~ fences hide headings the same way ``` ones do.
+    tilde = fenced.replace("```md", "~~~md").replace("```", "~~~")
+    assert readme_problems(tilde) == [], readme_problems(tilde)
+    # Legal markdown the first cut hard-blocked: setext H1, up-to-3-space-indented ATX, emoji
+    # headings ("## 📄 License" still counts, and still counts as LAST).
+    setext = "Widget API\n==========\n\nshort.\n\n## Install\n\na\n\n## Usage\n\nb\n\n## 📄 License\n\nMIT\n"
+    assert readme_problems(setext) == [], readme_problems(setext)
+    assert readme_problems("   # x\n\n## Install\n\na\n\n## Usage\n\nb\n\n## License\n\nMIT\n") == []
+    # An H1 that exists ONLY inside a fence is not a title.
+    h1_fenced = "```\n# not a title\n```\n\n## Install\n\na\n\n## Usage\n\nb\n\n## License\n\nMIT\n"
+    assert any("H1" in p for p in readme_problems(h1_fenced)), readme_problems(h1_fenced)
 
     # Advisory, never blocking: a broken ToC anchor and a long description.
     broken_toc = good.replace("(#usage)", "(#useage)")

@@ -44,7 +44,7 @@ LIGHTHOUSE_A11Y_MIN = int(os.environ.get("LIGHTHOUSE_A11Y_MIN", "90"))
 # Operator kill-switch for the whole application-auth enforcement chain (prompt segments + the
 # e2e auth gate). On by default; "0" disables everything auth-related without touching per-repo
 # settings -- the escape hatch for a deployment where the gate misbehaves.
-AIDW_AUTH_GATE = os.environ.get("AIDW_AUTH_GATE", "1") not in ("0", "false", "")
+AIDW_AUTH_GATE = os.environ.get("AIDW_AUTH_GATE", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 # make_verify_node's stall-detector (graph.py's _detect_verify_stall): resets the draft session
 # after this many consecutive verify laps report near-identical feedback, an unchanged

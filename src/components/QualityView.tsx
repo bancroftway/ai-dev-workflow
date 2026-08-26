@@ -92,10 +92,12 @@ export function QualityView() {
         <Section title="Health score">
           {scan?.latest_summary?.health_subscores || scan?.baseline_summary?.health_subscores ? (
             // v2: ring + the accessible per-subscore breakdown (this section, not a tooltip, is
-            // the one place the weights and unmeasured legs are actually readable).
+            // the one place the weights and unmeasured legs are actually readable). Before the
+            // first latest scan lands, what's on screen is the pre-build BASELINE -- say so.
             <HealthBreakdown
               summary={(scan.latest_summary?.health_subscores ? scan.latest_summary : scan.baseline_summary)!}
               baseline={scan.latest_summary?.health_subscores ? scan.baseline_summary : null}
+              label={scan.latest_summary?.health_subscores ? "Health" : "Baseline health"}
             />
           ) : (
             <p className="text-sm text-neutral-700">

@@ -140,10 +140,15 @@ export default function RepoSettingsPage() {
 
   async function saveSelection() {
     setSelectionSave({ kind: "saving" });
-    const payload = [...selection.entries()].map(([name, override]) => ({
-      name,
-      env_name: override || null,
-    }));
+    // Only names the picker actually shows: a stale selection entry for a secret since deleted
+    // from the vault would otherwise be re-saved forever (and could 422 on an env-name collision
+    // with a row the user cannot see).
+    const payload = [...selection.entries()]
+      .filter(([name]) => secretNames?.includes(name))
+      .map(([name, override]) => ({
+        name,
+        env_name: override || null,
+      }));
     const res = await fetch("/api/repos/vault/selection", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -177,6 +182,9 @@ export default function RepoSettingsPage() {
     const body = (await res.json()) as { detail?: string };
     if (res.ok) {
       setAuthSave({ kind: "saved", secretCount: 0 });
+      // The server stores [] for non-anonymous modes -- clear the textarea so switching back
+      // doesn't show routes that no longer exist server-side.
+      if (authMode !== "anonymous_list") setAnonRoutes("");
     } else {
       setAuthSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
     }

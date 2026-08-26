@@ -307,15 +307,19 @@ def parse_lizard(raw: str) -> ParseResult:
     # lizard has no ignore list (unlike jscpd two ToolSpecs down), so without this filter mean_ccn
     # is the mean over node_modules/, .venv/ and build output -- thousands of trivial vendored
     # functions dragging the mean toward 2 and pinning the complexity signal at "fine" regardless
-    # of what the application code looks like.
-    functions = [f for f in functions if not is_non_application_path(f["path"])]
+    # of what the application code looks like. METRICS ONLY: findings still come from the full
+    # set, preserving the existing reported-but-non-gating contract for vendored paths (is_gating
+    # already excludes them) and avoiding a batch of phantom "fixed" findings in the first v2
+    # delta.
+    app_functions = [f for f in functions if not is_non_application_path(f["path"])]
 
     if not functions:
         return [], {}
 
-    ccns = [f["ccn"] for f in functions]
+    ccns = [f["ccn"] for f in app_functions] or [f["ccn"] for f in functions]
     over = [f for f in functions if f["ccn"] > LIZARD_MAX_CCN]
     over.sort(key=lambda f: (-f["ccn"], f["path"], f["function"]))
+    app_over = [f for f in over if not is_non_application_path(f["path"])]
 
     findings = [
         Finding(
@@ -340,14 +344,16 @@ def parse_lizard(raw: str) -> ParseResult:
 
     return findings, {
         "complexity": {
+            # Application-scoped (app_functions/app_over) -- see the filter comment above. The
+            # `or`-fallback in `ccns` keeps a pure-vendored tree measurable rather than crashing.
             "mean_ccn": round(sum(ccns) / len(ccns), 2),
             "max_ccn": max(ccns),
-            "functions_total": len(functions),
-            "functions_over_threshold": len(over),
+            "functions_total": len(app_functions or functions),
+            "functions_over_threshold": len(app_over),
             "threshold": LIZARD_MAX_CCN,
-            "worst": over[:10],
+            "worst": app_over[:10],
             # Consumed by the churn join, not serialized -- see _assemble_metrics.
-            "_by_path": _max_ccn_by_path(functions),
+            "_by_path": _max_ccn_by_path(app_functions or functions),
         }
     }
 
@@ -1099,22 +1105,30 @@ def parse_syft(raw: str) -> ParseResult:
 
 
 _OUTDATED_SECTION_RE = re.compile(r"^### (npm|dotnet|pypi)\b")
-_DOTNET_OUTDATED_ROW_RE = re.compile(r"^\s*>\s+\S")
+_DOTNET_OUTDATED_ROW_RE = re.compile(r"^\s*>\s+(\S+)")
 
 
 def parse_outdated(raw: str) -> ParseResult:
     """Counts outdated packages per ecosystem from the marker-sectioned output the `outdated`
-    ToolSpec's compound script writes. Strictly fail-open: a garbage or empty section contributes
-    nothing, and no sections at all returns `{}` so the dependencies health subscore reads
-    "unmeasured" (weight redistributes) rather than 100.
+    ToolSpec's compound script writes. Strictly fail-open: a section only counts as MEASURED when
+    the probe's own output actually parses -- a bare `### npm` marker whose probe produced nothing
+    (registry unreachable, no node_modules, MSB error) contributes neither a count nor a
+    "measured" claim, so the dependencies subscore reads null (weight redistributes), never a
+    fabricated 100. No measured sections at all returns `{}`.
 
-    npm sections hold `npm outdated --json` (dict keyed by package), pypi sections hold
-    `pip list --outdated --format=json` (a list), dotnet sections hold the human-readable
-    `dotnet list package --outdated` table whose data rows start with `> `."""
+    npm sections hold `npm outdated --json` (dict keyed by package; an `error` key is a FAILED
+    probe, not one outdated package named "error"), pypi sections hold `pip list --outdated
+    --format=json` (a list), dotnet sections hold the human-readable `dotnet list package
+    --outdated` table -- credited only when the table header or the explicit "no updates" phrasing
+    is present, with `> ` rows deduped by package name (multi-project solutions repeat them)."""
     counts = {"npm": 0, "nuget": 0, "pypi": 0}
-    checked: list[str] = []
+    measured: list[str] = []
     section: str | None = None
     buffer: list[str] = []
+
+    def _mark(name: str) -> None:
+        if name not in measured:
+            measured.append(name)
 
     def _flush() -> None:
         nonlocal buffer, section
@@ -1124,7 +1138,10 @@ def parse_outdated(raw: str) -> ParseResult:
         text = "\n".join(buffer).strip()
         buffer = []
         if section == "dotnet":
-            counts["nuget"] += sum(1 for line in text.splitlines() if _DOTNET_OUTDATED_ROW_RE.match(line))
+            if "Top-level Package" in text or "no updates given" in text or "has no updates" in text:
+                packages = {m.group(1) for line in text.splitlines() if (m := _DOTNET_OUTDATED_ROW_RE.match(line))}
+                counts["nuget"] += len(packages)
+                _mark("dotnet")
             return
         if not text:
             return
@@ -1133,24 +1150,26 @@ def parse_outdated(raw: str) -> ParseResult:
         except json.JSONDecodeError:
             return
         if section == "npm" and isinstance(doc, dict):
-            counts["npm"] += len(doc)
+            if "error" in doc:
+                return  # npm's own failure report on stdout -- a failed probe, not a package
+            counts["npm"] += sum(1 for v in doc.values() if isinstance(v, (dict, list)))
+            _mark("npm")
         elif section == "pypi" and isinstance(doc, list):
             counts["pypi"] += len(doc)
+            _mark("pypi")
 
     for line in raw.splitlines():
         match = _OUTDATED_SECTION_RE.match(line)
         if match:
             _flush()
             section = match.group(1)
-            if section not in checked:
-                checked.append(section)
         else:
             buffer.append(line)
     _flush()
 
-    if not checked:
+    if not measured:
         return [], {}
-    return [], {"outdated": {**counts, "total": sum(counts.values()), "checked": checked}}
+    return [], {"outdated": {**counts, "total": sum(counts.values()), "checked": measured}}
 
 
 # --- dedup ------------------------------------------------------------------------------------
@@ -1580,7 +1599,10 @@ class ScanReport:
         # which signals this summary is missing.
         security_runs = [t for t in self.tools if t.get("name") in _SECURITY_TOOL_NAMES]
         security_measured = bool(security_runs) and all(t.get("status") == "ok" for t in security_runs)
-        degraded = sorted(t["name"] for t in self.tools if t.get("status") != "ok")
+        # `outdated` excluded: it is fail-open-by-design and networked, so its failure already
+        # reads as an unmeasured (null) subscore -- listing it here would park a permanent false
+        # "summary is partial" flag on every airgapped deployment.
+        degraded = sorted(t["name"] for t in self.tools if t.get("status") != "ok" and t.get("name") != "outdated")
         health = health_score(
             security_by_severity=security_by_severity,
             security_measured=security_measured,
@@ -2018,12 +2040,21 @@ TOOLS: tuple[ToolSpec, ...] = (
         # dotnet needs a restore first (`project.assets.json`) -- doing it here rather than relying
         # on the concurrently-running dotnet-docs build, whose ordering under the semaphore is
         # undefined.
+        # `find | grep -q` for the dotnet guard, NOT `ls glob glob`: under sh an unmatched glob
+        # stays literal and `ls` exits 2 even when the OTHER operands exist, so an `ls *.sln
+        # */*.csproj` guard required every shape to match at once -- no generated monorepo does,
+        # and 6 of 8 stacks silently got zero NuGet staleness. The `### marker` header is echoed
+        # unconditionally per attempted ecosystem; parse_outdated only counts a section as
+        # MEASURED when the probe's own output parses (a bare marker = the probe failed = null).
         "outdated", "n/a", True,
-        "mkdir -p agent-work && : > agent-work/outdated.txt && "
-        "{ for d in . apps/*; do [ -f \"$d/package.json\" ] && { echo \"### npm $d\"; (cd \"$d\" && npm outdated --json 2>/dev/null); } >> agent-work/outdated.txt || true; done; } && "
-        "{ ls *.sln */*.csproj apps/*/*.csproj >/dev/null 2>&1 && { dotnet restore >/dev/null 2>&1 || true; echo '### dotnet' >> agent-work/outdated.txt; dotnet list package --outdated >> agent-work/outdated.txt 2>/dev/null || true; } || true; } && "
-        "{ for v in .venv apps/*/.venv; do [ -x \"$v/bin/pip\" ] && { echo \"### pypi $v\"; \"$v/bin/pip\" list --outdated --format=json 2>/dev/null; } >> agent-work/outdated.txt || true; done; }",
-        "agent-work/outdated.txt", parse_outdated, "npm --version",
+        # The leading comment line keeps the file non-empty on a repo with NO ecosystems at all:
+        # _run_one reads an empty output file as status=failed, which would park `outdated` in
+        # summary.degraded forever on such repos (fail-open means null subscore, not a red flag).
+        "mkdir -p agent-work && echo '# aidw outdated probe' > agent-work/outdated.txt && "
+        "{ for d in . apps/*; do [ -f \"$d/package.json\" ] && { echo \"### npm $d\"; (cd \"$d\" && npm outdated --json 2>/dev/null); echo; } >> agent-work/outdated.txt || true; done; } ; "
+        "{ find . -maxdepth 3 \\( -name '*.sln' -o -name '*.csproj' \\) -not -path '*/obj/*' -not -path '*/node_modules/*' 2>/dev/null | grep -q . && { dotnet restore >/dev/null 2>&1 || true; echo '### dotnet' >> agent-work/outdated.txt; dotnet list package --outdated >> agent-work/outdated.txt 2>/dev/null || true; } || true; } ; "
+        "{ for v in .venv apps/*/.venv; do [ -x \"$v/bin/pip\" ] && { echo \"### pypi $v\"; \"$v/bin/pip\" list --outdated --format=json 2>/dev/null; echo; } >> agent-work/outdated.txt || true; done; } ; true",
+        "agent-work/outdated.txt", parse_outdated, "sh -c 'echo probe-ok'",
     ),
 )
 
@@ -2911,16 +2942,52 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
         ac_verification={"total": 4}, ac_execution={"status": "ok", "solidly_verified": 2, "flaky": ["AC-1.1"]},
     )
     assert ac["subscores"]["ac_verification"] == 62.5, ac["subscores"]
+    # Every curve constant the README's derivation column documents, pinned (the weights assert
+    # below covers only the weights -- without these, a constant could drift from the doc while
+    # every self-check stayed green).
+    _zero = {lvl: 0 for lvl in SEVERITY_ORDER}
+
+    def _leg(**kwargs: Any) -> dict[str, Any]:
+        return health_score(
+            security_by_severity=_zero, security_measured=True, maintainability_count=0, **kwargs
+        )["subscores"]
+
+    assert health_score(
+        security_by_severity={**_zero, "high": 1, "medium": 1, "low": 1},
+        security_measured=True, maintainability_count=0, metrics={},
+    )["subscores"]["security"] == 79.0  # 100 - 15 - 5 - 1
+    assert _leg(metrics={"coverage": {"line_rate": 100.0, "branch_rate": 0.0}})["coverage"] == 75.0  # 0.75/0.25 blend
+    assert _leg(metrics={"outdated": {"total": 4}})["dependencies"] == 80.0  # 100 - 5*4
+    assert _leg(metrics={"complexity": {"mean_ccn": 7.0, "max_ccn": 25.0}})["complexity"] == 80.0  # 0.7*80 + 0.3*80
+    assert _leg(metrics={"duplication": {"percent": 3.0}})["duplication"] == 91.0  # 100 - 3*pct
+    assert health_score(
+        security_by_severity=_zero, security_measured=True, maintainability_count=4, metrics={},
+    )["subscores"]["maintainability"] == 88.0  # 100 - 3*count
 
     # --- outdated leg: parser + hash exclusion -------------------------------------------------
     _, outdated_metrics = parse_outdated(
+        "# aidw outdated probe\n"
         "### npm .\n{\"react\": {\"current\": \"18.0.0\", \"latest\": \"19.0.0\"}}\n"
-        "### dotnet\nProject `api` has the following updates\n   > Microsoft.NET.Test.Sdk  17.0.0  17.9.0\n"
+        "### dotnet\nProject `Api` has the following updates to its packages\n"
+        "   Top-level Package      Requested   Resolved   Latest\n"
+        "   > Microsoft.NET.Test.Sdk  17.0.0  17.0.0  17.9.0\n"
+        "Project `Api.Tests` has the following updates to its packages\n"
+        "   Top-level Package      Requested   Resolved   Latest\n"
+        "   > Microsoft.NET.Test.Sdk  17.0.0  17.0.0  17.9.0\n"
         "### pypi .venv\n[{\"name\": \"flask\"}]\n"
     )
+    # The dotnet row appears in TWO projects but is ONE stale package -- deduped by name.
     assert outdated_metrics["outdated"]["total"] == 3, outdated_metrics
     assert outdated_metrics["outdated"] == {"npm": 1, "nuget": 1, "pypi": 1, "total": 3, "checked": ["npm", "dotnet", "pypi"]}
     assert parse_outdated("garbage with no markers") == ([], {}), "no sections must read unmeasured, not zero"
+    # A bare marker whose probe produced nothing = FAILED probe = unmeasured, never a perfect 0.
+    assert parse_outdated("### npm .\n") == ([], {}), "a failed probe must not score dependency health 100"
+    assert parse_outdated("### dotnet\nMSB1003: Specify a project file.\n") == ([], {})
+    # npm's own failure report rides stdout as {"error": {...}} -- a failed probe, not 1 package.
+    assert parse_outdated('### npm .\n{"error": {"code": "ENOTFOUND"}}\n') == ([], {})
+    # An empty-but-valid answer IS measured: everything current -> 0 outdated, subscore 100.
+    ok_empty = parse_outdated("### npm .\n{}\n")[1]
+    assert ok_empty["outdated"]["total"] == 0 and ok_empty["outdated"]["checked"] == ["npm"], ok_empty
     with_outdated = ScanReport(
         findings=report.findings, metrics={**metrics, "outdated": outdated_metrics["outdated"]},
         tools=report.tools, repo=report.repo, deduped_count=report.deduped_count,

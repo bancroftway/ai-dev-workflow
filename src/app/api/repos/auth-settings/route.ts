@@ -20,6 +20,11 @@ export async function GET(request: Request) {
   if (!owner || !repo) {
     return NextResponse.json({ error: "owner and repo are required" }, { status: 400 });
   }
+  // Unlike the per-user vault row, this table is (owner, repo)-keyed -- without this check any
+  // signed-in user could read another team's auth posture and anonymous-route list.
+  if (!(await hasRepoAccess(owner, repo))) {
+    return NextResponse.json({ detail: "You do not have access to this repository" }, { status: 403 });
+  }
   const params = new URLSearchParams({ owner, repo });
   const response = await agentFetch(`repo-auth-settings?${params}`);
   return NextResponse.json(await response.json(), { status: response.status });
