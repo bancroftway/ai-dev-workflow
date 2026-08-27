@@ -626,12 +626,18 @@ def depth_shortfalls(
                 )
                 problems.append(
                     f"{len(absence_labels)} of its test(s) assert ONLY absence (toHaveCount(0), "
-                    f".not.*, Assert.Null/False and friends) with no assertion that anything is "
-                    f"present: {named} -- on a page that never rendered every such check is "
-                    "trivially true, so these pass against a blank screen and would pass just as "
-                    "well if the app were entirely broken. Add a positive anchor FIRST (e.g. "
-                    "`await expect(page.getByTestId('...')).toBeVisible()`) so the absence checks "
-                    "are evaluated against a rendered page"
+                    f".not.*, expect(...).resolves.toBeUndefined(), Assert.Null/False and friends) "
+                    f"with no assertion that anything is present: {named} -- when nothing rendered "
+                    "or nothing was called, every such check is trivially true, so these pass "
+                    "against a blank screen (or a function that does nothing) and would pass just "
+                    "as well if the app were entirely broken. Add a positive anchor FIRST, matched "
+                    "to what the test drives: a browser/component test anchors on the page "
+                    "(`await expect(page.getByTestId('...')).toBeVisible()` / a rendered element), "
+                    "while a unit test of an API client/service/store anchors on the observable "
+                    "call or state (`expect(fetchMock).toHaveBeenCalledWith('/api/tasks/1', "
+                    "expect.objectContaining({method: 'DELETE'}))`, or assert the store no longer "
+                    "contains the item AFTER first asserting it did). `resolves` alone proves only "
+                    "that no exception was thrown"
                 )
 
         # Anti-padding, only where there are tests to inspect: an AC with no tests already failed
