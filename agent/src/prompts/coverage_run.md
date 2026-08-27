@@ -10,6 +10,10 @@ misleading error (e.g. .NET's MSB1003 "Specify a project or solution file").
 <<failure_detail>>
 
 Steps:
+0. **If `.ai-dev-workflow/coverage-commands.json` exists, it is the CONTRACT: replay its entries
+   exactly** -- run each entry's `command` from its `root` and expect its `artifact`. Do not
+   invent your own commands when a contract exists; only deviate if a replayed command provably
+   fails, and then say exactly what failed in `summary` and report what you ran instead.
 1. Explore the tree (view/glob/bash) and find every place that has tests. A polyglot monorepo has
    more than one -- e.g. a .NET test project AND a web app's unit tests. Handle each separately.
 2. For each one, run its tests with coverage enabled from that project's own directory, emitting
@@ -23,7 +27,13 @@ Steps:
 4. Do NOT pass a "skip the build" flag (e.g. .NET's `--no-build`). Nothing rebuilds between the
    last edit and this run, so such a flag measures the PREVIOUS build's assemblies: the report
    file is freshly written and looks valid while describing code that no longer exists.
-5. Confirm with your own eyes that each report file actually exists after the run, and that it
+5. **Delete each root's previous coverage output BEFORE running** (`rm -rf TestResults coverage
+   .coverage` in that root as applicable), and NEVER report an artifact you did not just produce
+   in THIS session: the gate compares every reported artifact's mtime against this run's start
+   and rejects stale files as fabricated evidence -- a leftover report from an earlier lap fails
+   the whole gate no matter how plausible its path looks (observed live: three consecutive laps
+   burned reporting a dead `TestResults/<guid>/` directory found on disk).
+6. Confirm with your own eyes that each report file actually exists after the run, and that it
    reports a non-zero number of instrumented lines. A run that "succeeds" while instrumenting
    nothing is a failure -- usually it means the runner matched no real source files.
 
