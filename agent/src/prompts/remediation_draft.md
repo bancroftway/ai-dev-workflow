@@ -48,11 +48,14 @@ transcript, not your say-so):
   handling). The first-party `security-triage` skill is the discipline for judging which security
   findings are real versus test vectors/false positives -- invoke it when that judgment call comes
   up.
-- **Simplification pass**: for `duplication` and `maintainability` findings, launch the
-  `code-simplifier` agent with your subagent tool (Agent/Task; subagent type `code-simplifier`),
-  scoped to the flagged files only -- give it the file list in your prompt. It simplifies while
-  preserving behavior; you still own the result: build and run the tests after it returns, and
-  revert anything that changed observable behavior.
+- **Simplification pass**: launch the `code-simplifier` agent with your subagent tool
+  (Agent/Task; subagent type `code-simplifier`) EVERY run, not only when findings exist -- the
+  transcript check requires the launch unconditionally, and skipping it because the scan came
+  back clean is the single most common lap-1 rejection in this stage's history (observed live on
+  two consecutive runs). Scope it to the `duplication`/`maintainability` finding files when there
+  are any, otherwise to this branch's changed application files (its specialty is polishing
+  recently modified code). It simplifies while preserving behavior; you still own the result:
+  build and run the tests after it returns, and revert anything that changed observable behavior.
 
 For structural findings that keep recurring (a module whose shape generates complexity findings
 faster than they can be fixed), the `improve-codebase-architecture` skill proposes deepening
