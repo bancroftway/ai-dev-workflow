@@ -592,9 +592,17 @@ async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConf
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
     gain_system, gain_human = load_prompt_pair("metrics_report_ponytail_gain")
-    response = await model.ainvoke(
-        [SystemMessage(content=gain_system), HumanMessage(content=gain_human)]
-    )
+    # Same containment as readme_write_node above, for the same reason: this node sits at the
+    # second-to-last position of an otherwise-finished run, and a benchmark SCORECARD must never
+    # cost the exit report/manifest/session close. Observed live (run e890f410): an uncontained
+    # quota RuntimeError here killed a run whose every stage was approved and whose e2e was green.
+    try:
+        response = await model.ainvoke(
+            [SystemMessage(content=gain_system), HumanMessage(content=gain_human)]
+        )
+    except (TimeoutError, RuntimeError) as exc:
+        logger.warning("metrics_ponytail_gain: LLM call failed (%s) -- skipping the scorecard, never the exit", exc)
+        return {"metrics_report": metrics_report}
     provider = get_sandbox_provider()
     metrics = dict(metrics_report.get("metrics") or {})
     metrics["ponytail_benchmark"] = getattr(response, "content", str(response))
