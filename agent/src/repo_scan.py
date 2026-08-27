@@ -1450,7 +1450,11 @@ def health_score(
 _NON_APPLICATION_PATH_RE = re.compile(
     r"(^|/)("
     r"agent-work|\.ai-dev-workflow|node_modules|\.playwright-browsers|"
-    r"bin|obj|dist|build|out|\.next|\.nuxt|\.venv|vendor|TestResults|coverage"
+    # .angular is Angular's build cache -- its vite/deps/*.js are vendored framework bundles,
+    # exactly .next's equivalent. Observed live (run e890f410): four lizard complexity findings
+    # in .angular/cache/.../deps/@angular_platform-browser.js gated an adversarial rebuild to
+    # escalation before this entry existed.
+    r"bin|obj|dist|build|out|\.next|\.nuxt|\.angular|\.venv|vendor|TestResults|coverage"
     r")/",
 )
 
