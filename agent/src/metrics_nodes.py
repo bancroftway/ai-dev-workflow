@@ -633,16 +633,19 @@ async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> di
     run_id = state.get("run_id", "unknown")
 
     existing = await repo_files.read_repo_file(provider, thread_id, "README.md")
-    # Ownership: absent/empty, pipeline-marked, or the scaffold's own initial stub (a couple of
-    # lines, on a repo the app scan called greenfield -- entrypoint.sh's SCAFFOLD_NEW_REPO path
-    # writes an unmarked one-liner). Deliberately NOT a bare is_greenfield disjunct: a repo
-    # initialized on GitHub with a real hand-written README and no code yet is "greenfield" to
-    # the scan, and overwriting that README is exactly the brownfield harm this rule prevents.
+    # Ownership: absent/empty, pipeline-marked, or a stub of <= 3 lines (the scaffold path's
+    # unmarked one-liner, GitHub's "# repo-name" auto-README, and their kin -- observed live:
+    # "# empty_sample_repo\nempty sample repo"). NOT gated on is_greenfield: that signal reads
+    # the CURRENT app scan, which flips false the moment a resume re-scans a tree the run itself
+    # already filled with code -- exactly when this leg runs (observed live: run ff4f80ce's
+    # 2-line stub was skipped as "human-authored" after its fourth resume). A real hand-written
+    # README worth preserving is longer than 3 lines; one that isn't has no content to lose.
     stripped = (existing or "").strip()
-    is_scaffold_stub = (
-        len(stripped.splitlines()) <= 3 and tech_stack_signals.is_greenfield_repo(state)
+    owned = (
+        not stripped
+        or _README_MARKER in stripped
+        or len(stripped.splitlines()) <= 3
     )
-    owned = not stripped or _README_MARKER in stripped or is_scaffold_stub
     if not owned:
         _hard, advisories = readme_gate.readme_problems(existing), readme_gate.readme_advisories(existing)
         metrics["readme"] = {
