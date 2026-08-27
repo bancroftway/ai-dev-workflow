@@ -25,7 +25,7 @@ from .prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, tech_stack_signals, workflow_persistence
+from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, workflow_persistence
 from .gates import readme_gate
 from .gates.ac_coverage_gate import id_variants
 from .gates.remediation_gate import accounted_for
