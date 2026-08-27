@@ -145,6 +145,30 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
         coverage,
         baseline_has_findings=bool((baseline.get("gating_count") or 0)),
     )
+    # NAME the gating findings, never just count them. "4 gating finding(s) open" with no
+    # identities is an unfixable instruction: the fix agent changed real code for four straight
+    # laps against a byte-identical count and escalated a run whose every stage was approved
+    # (observed live, run e890f410) -- and because this scan is in-memory only, not even a human
+    # could see what the four findings WERE afterward. Same "enumerated list, not judgement"
+    # rule the adversarial audit prompt already carries.
+    if any("gating finding" in reason for reason in reasons):
+        gating = [
+            f for f in scan.findings
+            if repo_scan.is_gating(
+                f,
+                severity_floor=latest_summary.get("severity_floor") or repo_scan.SECURITY_SEVERITY_FLOOR,
+                introduced_ids=None,
+                direct_dependencies=scan.direct_dependencies,
+            )
+        ]
+        for f in gating[:10]:
+            reasons.append(
+                f"  gating: [{f.severity}] {f.category}/{f.rule_id} @ {f.file or '?'}"
+                + (f":{f.line}" if f.line else "")
+                + f" -- {(f.title or f.message or '')[:110]}"
+            )
+        if len(gating) > 10:
+            reasons.append(f"  ...and {len(gating) - 10} more gating finding(s)")
     if reasons:
         logger.warning("scan-delta gate: blocking on %d reason(s): %s", len(reasons), "; ".join(reasons))
     return reasons
