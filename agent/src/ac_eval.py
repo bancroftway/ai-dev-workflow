@@ -141,7 +141,20 @@ def execution_summary(ac_ids: list[str], attempts: list[dict[str, str]]) -> dict
             solidly_verified.append(ac_id)
         else:
             failing += 1
-        per_ac[ac_id] = {"runs": len(seen), "passed": passed, "flaky": flaky, "status": status}
+        # The runner-reported test names attributing to this criterion -- MEASURED provenance,
+        # recorded on the ledger as `test_ids` when the criterion passes (metrics_compute_node).
+        test_names = sorted(
+            {
+                name
+                for outcomes in attempts
+                for name in outcomes
+                if ac_id in attributed_ac_ids(name)[0]
+            }
+        )
+        per_ac[ac_id] = {
+            "runs": len(seen), "passed": passed, "flaky": flaky, "status": status,
+            "test_names": test_names,
+        }
 
     flaky_ids = sorted(ac_id for ac_id, row in per_ac.items() if row["flaky"])
     return {
@@ -402,8 +415,13 @@ def _demo() -> None:
         {"Increment_US-0001.1_Works": "pass", "US-0002.1 thing": "pass"},
     ]
     summary = execution_summary(ac_ids, attempts)
-    assert summary["per_ac"]["US-0001.1"] == {"runs": 3, "passed": 2, "flaky": True, "status": "fail"}, summary["per_ac"]
+    assert summary["per_ac"]["US-0001.1"] == {
+        "runs": 3, "passed": 2, "flaky": True, "status": "fail",
+        "test_names": ["Increment_US-0001.1_Works"],
+    }, summary["per_ac"]
     assert summary["per_ac"]["US-0002.1"]["status"] == "pass"
+    # Measured provenance: the runner-reported names attributing to the criterion.
+    assert summary["per_ac"]["US-0002.1"]["test_names"] == ["US-0002.1 thing"]
     assert summary["flaky"] == ["US-0001.1"], summary
     # Only US-0002.1 is linked AND green AND stable.
     assert summary["solidly_verified"] == 1, summary

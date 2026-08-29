@@ -952,7 +952,16 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
     from ..spec_ledger import load_ledger
 
     entries = await load_ledger(provider, thread_id)
-    ac_ids = sorted({str(e.get("id")) for e in entries if "." in str(e.get("id") or "")})
+    # Live criteria only: a RETIRED AC's tests are deliberately deleted (deletion propagation), so
+    # counting it here would demand >=MIN tests for a criterion whose tests must not exist --
+    # a deterministic deadlock on every ticket that removes a feature.
+    ac_ids = sorted(
+        {
+            str(e.get("id"))
+            for e in entries
+            if "." in str(e.get("id") or "") and e.get("status") in ("active", "revised")
+        }
+    )
     if not ac_ids:
         return None  # no ledger, nothing to attribute -- never a fabricated failure
 

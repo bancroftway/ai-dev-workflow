@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -502,6 +503,30 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         health_comparable=health_comparable,
     )
 
+    # Delivery stamps -- the ONLY writer of coded_*/tested_*/test_ids, and only on a healthy run
+    # (regression gate clean): see spec_ledger.stamp_delivery. Scoped to this ticket's own live
+    # criteria -- ac_eval evaluates every ledger AC, retired and other-ticket ones included, and
+    # stamping those would pull them into the completed-AC protections forever.
+    ledger_committed_paths: list[str] = []
+    if not gate_reasons:
+        raw_spec = await repo_files.read_repo_file(
+            provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+        )
+        own_ac_ids: set[str] = set()
+        if raw_spec is not None:
+            try:
+                own_ac_ids = spec_ledger.own_ac_ids_from_specification(json.loads(raw_spec))
+            except json.JSONDecodeError:
+                pass
+        if own_ac_ids:
+            ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            if spec_ledger.stamp_delivery(
+                ledger_entries, own_ac_ids, scan_report.get("ac_execution"), run_id, now_iso
+            ):
+                await spec_ledger.save_ledger(provider, thread_id, ledger_entries)
+                ledger_committed_paths = [spec_ledger.LEDGER_PATH]
+
     metrics = {
         "run_id": run_id,
         "repo_scan": scan_report,
@@ -552,7 +577,8 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     await git_ops.commit_paths(
         provider, thread_id,
         [history_path, METRICS_LATEST_PATH, TRACEABILITY_MATRIX_PATH, repo_scan.LATEST_PATH]
-        + ([repo_scan.DELTA_PATH] if delta is not None else []),
+        + ([repo_scan.DELTA_PATH] if delta is not None else [])
+        + ledger_committed_paths,
         "ai-dev-workflow: metrics_report metrics + repo scan + traceability matrix",
     )
     # Curated, small keys for the frontend metrics bar (repo_scan is a LastValue channel -- spread).

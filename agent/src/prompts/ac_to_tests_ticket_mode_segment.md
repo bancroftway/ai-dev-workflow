@@ -13,3 +13,15 @@ behavior rather than starting a parallel suite for it. Every criterion the Speci
 actually lists still needs its own new, currently-failing test exactly as described below --
 ticket-scoping means you don't chase the rest of the ledger, not that you write fewer tests for
 what this ticket does introduce.
+
+Deletion propagation, gate-checked: if the Specification above lists `retired_ac_ids`/
+`retired_us_ids`, those features are REMOVED -- DELETE every test case that names a retired id
+(delete the whole file when it holds nothing else). A deterministic gate greps every test file
+and fails this stage while any retired id remains.
+
+Completed-work protection, also gate-checked: criteria already delivered by earlier runs (the
+ledger stamps them coded/tested) keep their regression tests exactly as they are. Never add,
+modify, rename, or delete a test for an already-delivered criterion -- the gate compares the tree
+against the ledger and rejects both a missing regression test and new test lines naming a
+completed criterion. A criterion already delivered needs NO new test from you even if it appears
+in the Specification above.

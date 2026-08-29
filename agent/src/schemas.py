@@ -134,8 +134,19 @@ class Specification(BaseModel):
 
 class PlanStep(BaseModel):
     id: str = Field(description="Stable identifier (e.g. PS-1).")
-    description: str = Field(
-        description="One concrete action. Reference fulfilled Acceptance Criteria ids where meaningful."
+    description: str = Field(description="One concrete action.")
+    ac_ids: list[str] = Field(
+        default_factory=list,
+        description="The ledger Acceptance Criterion ids (US-####.#) this step fulfils, copied "
+        "exactly from the approved Specification -- never invented, never a retired id. Empty is "
+        "only valid when kind='infrastructure'. A deterministic gate enforces this in both "
+        "directions: every step cites live criteria (or is infrastructure), and every criterion "
+        "still awaiting delivery is cited by at least one step.",
+    )
+    kind: Literal["feature", "infrastructure"] = Field(
+        default="feature",
+        description="'infrastructure' marks scaffolding/tooling/config steps that fulfil no "
+        "single criterion; every other step is 'feature' and must cite ac_ids.",
     )
 
 

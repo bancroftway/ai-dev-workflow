@@ -40,6 +40,20 @@ SCHEMA_VERSION = 1
 EntryStatus = Literal["active", "retired", "revised"]
 EntryKind = Literal["user_story", "acceptance_criterion"]
 
+# Per-AC execution provenance, written by exactly three pipeline-owned sites (never the model):
+# apply_tracking_resets_hook (spec approval -- clears them when the requirement really changed),
+# stamp_plan_links_hook (plan approval -- plan_step_ids), and metrics_nodes.metrics_compute_node
+# (healthy runs only -- coded_*/tested_*/test_ids). Absent fields mean "never coded/tested";
+# schema_version stays 1 because every reader tolerates missing keys.
+TRACKING_FIELDS = ("plan_step_ids", "coded_run_id", "coded_at", "tested_run_id", "tested_at", "test_ids")
+
+# Two-phase reset marker: sync_ledger (verify time, persisted BEFORE the human gate) only marks a
+# genuinely-reworded AC with the run id that reworded it; the destructive TRACKING_FIELDS clear
+# happens in apply_tracking_resets_hook, which fires only on spec APPROVAL. A rejected or
+# abandoned draft therefore never destroys delivered-work stamps -- sync_ledger drops stale
+# markers (from runs that never reached approval) on its next pass.
+PENDING_RESET_FIELD = "pending_reset_run_id"
+
 
 @dataclass(frozen=True)
 class LedgerSyncResult:
@@ -224,6 +238,12 @@ def sync_ledger(
     reasons: list[str] = []
     touched_ids: set[str] = set()
 
+    # Drop reset markers left by runs that never reached spec approval (rejected/abandoned drafts)
+    # -- their stamp clears must never execute. This run's own markers are re-derived below.
+    for entry in updated:
+        if entry.get(PENDING_RESET_FIELD) not in (None, run_id):
+            entry.pop(PENDING_RESET_FIELD, None)
+
     # Greenfield leniency: on an EMPTY ledger there is nothing an id citation could protect, and
     # models reliably hallucinate `existing_us_id: "US-1"` on a first run (observed live: three
     # verify cycles burned re-citing ids that never existed). Treat every citation as "new" then
@@ -252,8 +272,13 @@ def sync_ledger(
                 )
                 continue
             entry["status"] = "revised"
-            entry["title"] = story.get("title", entry.get("title", ""))
-            entry["last_revised_run_id"] = run_id
+            # last_revised_run_id bumps ONLY on a real title change: an identical re-cite is not a
+            # revision, and stamping it polluted _diff_ledger/CHANGELOG with phantom "Revised"
+            # rows and would misreport change_status as "modified".
+            new_title = story.get("title", entry.get("title", ""))
+            if new_title != entry.get("title"):
+                entry["title"] = new_title
+                entry["last_revised_run_id"] = run_id
             resolved_us_id = existing_us_id
         else:
             resolved_us_id = allocate_next_id(updated, "user_story")
@@ -296,8 +321,19 @@ def sync_ledger(
                     )
                     continue
                 ac_entry["status"] = "revised"
-                ac_entry["description"] = ac.get("description", ac_entry.get("description", ""))
-                ac_entry["last_revised_run_id"] = run_id
+                new_description = ac.get("description", ac_entry.get("description", ""))
+                if new_description != ac_entry.get("description"):
+                    # The requirement genuinely changed: mark it for a tracking-field reset at
+                    # spec APPROVAL (two-phase -- see PENDING_RESET_FIELD) so its delivered code/
+                    # tests are redone, and bump last_revised only for real changes (see the
+                    # matching user-story comment above).
+                    ac_entry["description"] = new_description
+                    ac_entry["last_revised_run_id"] = run_id
+                    ac_entry[PENDING_RESET_FIELD] = run_id
+                elif ac_entry.get(PENDING_RESET_FIELD) == run_id:
+                    # A later verify lap reverted the wording back to what the ledger already
+                    # holds -- the pending reset no longer applies.
+                    ac_entry.pop(PENDING_RESET_FIELD, None)
                 resolved_ac_id = existing_ac_id
             else:
                 resolved_ac_id = allocate_next_id(updated, "acceptance_criterion", resolved_us_id)
@@ -379,6 +415,152 @@ def sync_ledger(
         return LedgerSyncResult(passed=False, reasons=reasons, updated_entries=entries)
 
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
+
+
+def change_status(entry: dict[str, Any], run_id: str) -> Literal["new", "modified", "deleted", "unchanged"]:
+    """Derived per-run change classification -- deliberately computed, never stored: sync_ledger
+    already stamps first_seen/last_revised (and retire paths stamp last_revised), so a stored copy
+    could only ever drift from these. "deleted" wins over "new" for an entry created and retired
+    inside the same run's draft laps.
+    """
+    if entry.get("status") == "retired" and entry.get("last_revised_run_id") == run_id:
+        return "deleted"
+    if entry.get("first_seen_run_id") == run_id:
+        return "new"
+    if entry.get("last_revised_run_id") == run_id:
+        return "modified"
+    return "unchanged"
+
+
+def eligible_ac_ids(entries: list[dict[str, Any]], own_ac_ids: set[str]) -> list[str]:
+    """The work queue: this ticket's own ACs that are live and have never been delivered by a
+    healthy run (no coded_run_id -- stamps are written only by metrics_compute on a
+    regression-clean run, and cleared on spec approval when the requirement's wording really
+    changed). Completed ACs are deliberately absent: gates must never send delivered work back
+    for rework.
+    """
+    return [
+        e["id"]
+        for e in entries
+        if e.get("kind") == "acceptance_criterion"
+        and e.get("status") in ("active", "revised")
+        and e.get("id") in own_ac_ids
+        and not e.get("coded_run_id")
+    ]
+
+
+def stamp_delivery(
+    entries: list[dict[str, Any]],
+    own_ac_ids: set[str],
+    ac_execution: dict[str, Any] | None,
+    run_id: str,
+    now_iso: str,
+) -> bool:
+    """Mutates `entries` with delivery stamps; returns whether anything changed. Pure.
+
+    Called ONLY from metrics_compute_node on a regression-clean run -- a failed run stamps
+    nothing, so its work stays in the queue (stamping at minimal-code-to-green approval put a
+    failed run's criteria beyond rework: empty work queue + still-failing tests, an infinite
+    failure loop).
+
+    `coded_*` stamps every eligible own-spec criterion (stamp-if-empty: the whole suite was green
+    and gate-verified RED tests preceded it -- transitive, spec-scoped evidence). `tested_*`
+    stamps per-criterion from the MEASURED eval (`per_ac[id].status == "pass"`; pass already
+    implies not-flaky). `test_ids` is always refreshed on a pass -- freezing it would fossilize
+    the first run's names and permanently trip the completed-AC protection after any legitimate
+    rename.
+    """
+    per_ac = (ac_execution or {}).get("per_ac") or {}
+    changed = False
+    for entry in entries:
+        if entry.get("kind") != "acceptance_criterion" or entry.get("status") not in ("active", "revised"):
+            continue
+        ac_id = entry.get("id")
+        if ac_id not in own_ac_ids:
+            continue
+        if not entry.get("coded_run_id"):
+            entry["coded_run_id"] = run_id
+            entry["coded_at"] = now_iso
+            changed = True
+        row = per_ac.get(ac_id) or {}
+        if row.get("status") == "pass":
+            if not entry.get("tested_run_id"):
+                entry["tested_run_id"] = run_id
+                entry["tested_at"] = now_iso
+                changed = True
+            names = row.get("test_names") or []
+            if names and entry.get("test_ids") != names:
+                entry["test_ids"] = names
+                changed = True
+    return changed
+
+
+async def apply_tracking_resets_hook(
+    thread_id: str, content: dict[str, Any], state: "GraphState", provider: SandboxProvider
+) -> None:
+    """StageSpec.post_approve_hook for the specification stage: executes the second phase of the
+    two-phase tracking reset (see PENDING_RESET_FIELD). Only markers stamped by THIS run's own
+    sync are honored; markers from abandoned runs are dropped without clearing anything.
+
+    ponytail: fires through _run_post_approve_hook, so a sandbox evicted at the gate or a raised
+    save skips/loses the reset silently (logged) -- pre-existing hook ceiling, the next healthy
+    sync re-marks a still-changed description.
+    """
+    del content  # the marker on the ledger entry, not the approved spec, is the authority
+    run_id = state.get("run_id", "unknown")
+    entries = await load_ledger(provider, thread_id)
+    changed = False
+    for entry in entries:
+        marker = entry.get(PENDING_RESET_FIELD)
+        if marker is None:
+            continue
+        if marker == run_id:
+            for field in TRACKING_FIELDS:
+                entry.pop(field, None)
+        entry.pop(PENDING_RESET_FIELD, None)
+        changed = True
+    if changed:
+        await save_ledger(provider, thread_id, entries)
+        from . import git_ops
+
+        await git_ops.commit_paths(
+            provider, thread_id, [LEDGER_PATH], "ai-dev-workflow: spec approval -- tracking resets applied"
+        )
+
+
+async def stamp_plan_links_hook(
+    thread_id: str, content: dict[str, Any], state: "GraphState", provider: SandboxProvider
+) -> None:
+    """StageSpec.post_approve_hook for the plan stage: records US/AC -> plan-step provenance
+    (`plan_step_ids`) on live AC entries from the approved plan's own step citations. Overwrite
+    semantics, so it is idempotent under resume re-fires; retired entries keep whatever historical
+    links they had.
+    """
+    del state
+    steps = content.get("plan_steps") or []
+    links: dict[str, list[str]] = {}
+    for step in steps:
+        for ac_id in step.get("ac_ids") or []:
+            links.setdefault(ac_id, []).append(step.get("id") or "?")
+    entries = await load_ledger(provider, thread_id)
+    changed = False
+    for entry in entries:
+        if entry.get("kind") != "acceptance_criterion" or entry.get("status") not in ("active", "revised"):
+            continue
+        new_links = sorted(set(links.get(entry["id"], [])))
+        if new_links and entry.get("plan_step_ids") != new_links:
+            entry["plan_step_ids"] = new_links
+            changed = True
+        elif not new_links and "plan_step_ids" in entry:
+            entry.pop("plan_step_ids", None)
+            changed = True
+    if changed:
+        await save_ledger(provider, thread_id, entries)
+        from . import git_ops
+
+        await git_ops.commit_paths(
+            provider, thread_id, [LEDGER_PATH], "ai-dev-workflow: plan approval -- plan-step links recorded"
+        )
 
 
 def _demo() -> None:
@@ -482,6 +664,110 @@ def _demo() -> None:
             "t", ticket_state, _FakeProvider({LEDGER_PATH: ledger_with_other_ticket})
         )
     ) == {"ticket_mode_baseline": True}
+
+    # --- Tracking-field lifecycle (provenance work) ---
+    coded_seed = [
+        dict(seed[0]),
+        {
+            **seed[1],
+            "coded_run_id": "run-1",
+            "coded_at": "t1",
+            "tested_run_id": "run-1",
+            "tested_at": "t1",
+            "test_ids": ["[US-0001.1] shows error"],
+            "plan_step_ids": ["PS-2"],
+        },
+    ]
+    recite_changed = [
+        {
+            "id": "US-0001",
+            "existing_us_id": "US-0001",
+            "title": "Sign in",
+            "acceptance_criteria": [
+                {"id": "US-0001.1", "existing_ac_id": "US-0001.1", "description": "Locks the account after 5 wrong passwords."}
+            ],
+        }
+    ]
+    r = sync_ledger([dict(e) for e in coded_seed], [dict(s) for s in recite_changed], "run-5")
+    assert r.passed, r.reasons
+    ac = next(e for e in r.updated_entries if e["id"] == "US-0001.1")
+    # Two-phase reset: verify only MARKS; stamps survive until approval executes the clear.
+    assert ac[PENDING_RESET_FIELD] == "run-5"
+    assert ac["coded_run_id"] == "run-1", "stamps must survive until spec approval"
+    assert ac["last_revised_run_id"] == "run-5"
+    us = next(e for e in r.updated_entries if e["id"] == "US-0001")
+    assert us["last_revised_run_id"] == "run-1", "identical title re-cite must not bump last_revised"
+
+    # Identical re-cite: no marker, no bump -- completed work is never re-queued.
+    recite_same = [
+        {
+            "id": "US-0001",
+            "existing_us_id": "US-0001",
+            "title": "Sign in",
+            "acceptance_criteria": [
+                {"id": "US-0001.1", "existing_ac_id": "US-0001.1", "description": "Shows an error on a wrong password."}
+            ],
+        }
+    ]
+    r2 = sync_ledger([dict(e) for e in coded_seed], [dict(s) for s in recite_same], "run-5")
+    assert r2.passed, r2.reasons
+    ac2 = next(e for e in r2.updated_entries if e["id"] == "US-0001.1")
+    assert PENDING_RESET_FIELD not in ac2 and ac2["coded_run_id"] == "run-1"
+    assert ac2["last_revised_run_id"] == "run-1", "identical re-cite must not bump last_revised"
+
+    # A stale marker from an abandoned run is dropped by the next sync without clearing stamps.
+    stale = [dict(coded_seed[0]), {**coded_seed[1], PENDING_RESET_FIELD: "run-dead"}]
+    r3 = sync_ledger([dict(e) for e in stale], [], "run-6")
+    assert r3.passed
+    ac3 = next(e for e in r3.updated_entries if e["id"] == "US-0001.1")
+    assert PENDING_RESET_FIELD not in ac3 and ac3["coded_run_id"] == "run-1"
+
+    # change_status: full matrix, deleted wins over new for same-run create+retire.
+    assert change_status({"status": "retired", "first_seen_run_id": "r", "last_revised_run_id": "r"}, "r") == "deleted"
+    assert change_status({"status": "active", "first_seen_run_id": "r", "last_revised_run_id": "r"}, "r") == "new"
+    assert change_status({"status": "revised", "first_seen_run_id": "r0", "last_revised_run_id": "r"}, "r") == "modified"
+    assert change_status({"status": "active", "first_seen_run_id": "r0", "last_revised_run_id": "r0"}, "r") == "unchanged"
+    assert change_status({"status": "retired", "first_seen_run_id": "r0", "last_revised_run_id": "r0"}, "r") == "unchanged"
+    # Retire paths stamp last_revised (pre-existing behavior "deleted" depends on -- pin it).
+    retired_now = next(e for e in result2.updated_entries if e["id"] == "US-0001.1")
+    assert change_status(retired_now, "run-3") == "deleted"
+
+    # eligible_ac_ids: excludes coded, retired, and other-ticket ids.
+    pool = [
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1"},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "status": "revised"},
+        {"id": "US-0001.3", "kind": "acceptance_criterion", "status": "retired"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0001", "kind": "user_story", "status": "active"},
+    ]
+    assert eligible_ac_ids(pool, {"US-0001.1", "US-0001.2", "US-0001.3"}) == ["US-0001.2"]
+
+    # stamp_delivery: coded for eligible own ACs, tested per measured pass, test_ids refreshed,
+    # never stamps retired/foreign entries, stamp-if-empty for run ids.
+    delivery_pool = [
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "status": "revised",
+         "coded_run_id": "r1", "coded_at": "t1", "tested_run_id": "r1", "tested_at": "t1",
+         "test_ids": ["old name"]},
+        {"id": "US-0001.3", "kind": "acceptance_criterion", "status": "retired"},
+        {"id": "US-0009.1", "kind": "acceptance_criterion", "status": "active"},  # other ticket
+    ]
+    execution = {"per_ac": {
+        "US-0001.1": {"status": "pass", "test_names": ["[US-0001.1] works"]},
+        "US-0001.2": {"status": "pass", "test_names": ["new name"]},
+        "US-0001.3": {"status": "pass", "test_names": ["zombie"]},
+        "US-0009.1": {"status": "pass", "test_names": ["foreign"]},
+    }}
+    changed = stamp_delivery(delivery_pool, {"US-0001.1", "US-0001.2", "US-0001.3"}, execution, "r2", "t2")
+    assert changed
+    fresh = delivery_pool[0]
+    assert fresh["coded_run_id"] == "r2" and fresh["tested_run_id"] == "r2" and fresh["test_ids"] == ["[US-0001.1] works"]
+    already = delivery_pool[1]
+    assert already["coded_run_id"] == "r1" and already["tested_run_id"] == "r1", "stamp-if-empty for run ids"
+    assert already["test_ids"] == ["new name"], "test_ids always refreshed on a pass"
+    assert "coded_run_id" not in delivery_pool[2], "retired entries never stamped"
+    assert "coded_run_id" not in delivery_pool[3], "other tickets' entries never stamped"
+    assert not stamp_delivery(delivery_pool, {"US-0001.1", "US-0001.2"}, execution, "r2", "t2"), "idempotent"
 
     print("spec_ledger self-check: ok")
 

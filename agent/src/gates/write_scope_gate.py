@@ -163,6 +163,37 @@ async def check_write_scope(
     )
     changed_paths = sorted({line.strip() for line in (result.stdout or "").splitlines() if line.strip()})
     violating = [p for p in changed_paths if not _is_test_path(p) and not _is_pipeline_owned(p)]
+    if violating:
+        # Retirement carve-out: deleting a test file for a RETIRED criterion is exactly what the
+        # residue check demands, but on a stack _ALL_PATTERNS doesn't recognize (Go, Rust, Java
+        # outside tests/) the deletion classifies as a violation and the revert below would restore
+        # the file -- an infinite fight between two deterministic checks. A deleted path whose
+        # baseline content names a retired AC id is therefore in-scope by definition.
+        from .. import spec_ledger
+        from ..test_results import ac_ids_in_name
+
+        retired_ids = {
+            e["id"]
+            for e in await spec_ledger.load_ledger(provider, thread_id)
+            if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
+        }
+        if retired_ids:
+            still_violating = []
+            for p in violating:
+                validate_repo_relative_path(p)
+                probe = await provider.exec_in_sandbox(
+                    thread_id,
+                    f"if [ -e {shlex.quote(p)} ]; then echo __EXISTS__; "
+                    f"else git show {shlex.quote(baseline_commit)}:{shlex.quote(p)} 2>/dev/null; fi",
+                )
+                out = probe.stdout or ""
+                if "__EXISTS__" not in out.splitlines()[:1] and any(
+                    set(ac_ids_in_name(line)) & retired_ids for line in out.splitlines()
+                ):
+                    logger.info("write-scope gate: allowing retirement delete of %s (thread %s)", p, thread_id)
+                    continue
+                still_violating.append(p)
+            violating = still_violating
     if not violating:
         return WriteScopeOutcome(passed=True, violating_paths=[], changed_paths=changed_paths, reverted_paths=[])
 
@@ -217,8 +248,14 @@ async def verify_ac_to_tests(
     through to check_ac_coverage below, which needs it for its own stack_runner.run_and_report
     call -- named distinctly from `provider` (the pre-existing SandboxProvider connection object)
     to avoid colliding with it."""
+    from .. import spec_ledger
     from ..graph import VerificationResult
-    from .ac_coverage_gate import check_ac_coverage
+    from .ac_coverage_gate import (
+        check_ac_coverage,
+        check_completed_ac_protection,
+        check_ledger_integrity,
+        check_retired_ac_residue,
+    )
 
     write_scope = await check_write_scope(provider, thread_id, baseline_commit, run_id)
     if not write_scope.passed:
@@ -235,12 +272,40 @@ async def verify_ac_to_tests(
             report={"violating_paths": write_scope.violating_paths, "changed_paths": write_scope.changed_paths},
         )
 
+    # Provenance protections, before any content checks: the ledger must be untampered (it is the
+    # truth every check below reads), retired criteria's tests must be gone, and completed
+    # criteria's tests must be untouched.
+    ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+    protection_problems = (
+        await check_ledger_integrity(provider, thread_id)
+        + await check_retired_ac_residue(provider, thread_id, ledger_entries)
+        + await check_completed_ac_protection(provider, thread_id, baseline_commit, ledger_entries)
+    )
+    if protection_problems:
+        return VerificationResult(
+            passed=False,
+            feedback="; ".join(protection_problems),
+            report={"changed_paths": write_scope.changed_paths, "protection_problems": protection_problems},
+        )
+
+    # Work-queue scoping: when every one of this ticket's own criteria is already delivered (or the
+    # ticket only retires criteria), writing no new tests is CORRECT -- the wrote-nothing and
+    # test-pyramid checks below would otherwise demand work the pipeline forbids re-doing.
+    own_ac_ids: set[str] = set()
+    raw_spec = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH)
+    if raw_spec is not None:
+        try:
+            own_ac_ids = spec_ledger.own_ac_ids_from_specification(json.loads(raw_spec))
+        except json.JSONDecodeError:
+            pass
+    no_eligible_work = raw_spec is not None and not spec_ledger.eligible_ac_ids(ledger_entries, own_ac_ids)
+
     # A draft that changed nothing but pipeline artifacts DESCRIBED tests instead of creating
     # them (observed live, run 13: three laps of readiness=true structured replies, zero file
     # writes). Name that failure exactly -- "no test found covering US-xxxx" reads to the model
     # like a naming problem, not a you-never-wrote-files problem.
     real_changes = [p for p in write_scope.changed_paths if not p.startswith((".ai-dev-workflow/", "APPROVALS.md", "AGENTS.md"))]
-    if not real_changes:
+    if not real_changes and not no_eligible_work:
         return VerificationResult(
             passed=False,
             feedback=(
@@ -258,7 +323,7 @@ async def verify_ac_to_tests(
     # heuristic. That suite is slow, brittle, and proves no rule below the UI; it also leaves the
     # coverage gate with nothing instrumentable, since a unit runner cannot execute Playwright
     # specs. Enforced here rather than left to the prompt, which the model can silently ignore.
-    if not _has_non_e2e_test(real_changes):
+    if not _has_non_e2e_test(real_changes) and not no_eligible_work:
         return VerificationResult(
             passed=False,
             feedback=(
@@ -279,7 +344,7 @@ async def verify_ac_to_tests(
     # outermost layer, and no-e2e leaves the running app unproven and (just as concretely) leaves the
     # e2e stage with nothing to run, which is how every delivered branch ended up with zero
     # screenshots and a blocked merge.
-    if await _stack_has_ui(provider, thread_id) and not _has_e2e_test(real_changes):
+    if not no_eligible_work and await _stack_has_ui(provider, thread_id) and not _has_e2e_test(real_changes):
         return VerificationResult(
             passed=False,
             feedback=(

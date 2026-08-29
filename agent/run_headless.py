@@ -60,6 +60,14 @@ def _parse_args() -> argparse.Namespace:
         "stage already APPROVED there (sets AIDW_RESUME=1). Stages mid-flight redraft.",
     )
     parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        help="with --thread: reattach the earlier thread's sandbox/volume/work-branch but do NOT "
+        "set AIDW_RESUME -- the new requirements submission runs the FULL pipeline again as a "
+        "second-or-later ticket (ticket-mode delta against the existing spec/plan/ledger), "
+        "instead of skipping stages the earlier run approved.",
+    )
+    parser.add_argument(
         "--greenfield-stack",
         default=None,
         metavar="STACK_ID",
@@ -156,7 +164,10 @@ async def run(args: argparse.Namespace) -> int:
     # column is SQL Server `uniqueidentifier`; a short hex-only string fails that conversion
     # (matches the format session_store.create_session mints for API-driven sessions).
     thread_id = args.thread or str(uuid.uuid4())
-    if args.thread:
+    if args.thread and args.fresh_run:
+        os.environ.pop("AIDW_RESUME", None)
+        logger.info("fresh run on thread %s -- full pipeline re-runs as a delta ticket", thread_id)
+    elif args.thread:
         os.environ["AIDW_RESUME"] = "1"
         logger.info("resuming thread %s -- approved stages will be skipped", thread_id)
     greenfield_stack_markdown: str | None = None
@@ -221,6 +232,7 @@ async def run(args: argparse.Namespace) -> int:
                 # screenshots were captured" from 40 minutes earlier. Proof of THIS run finishing is
                 # its own exit report, which only exit_finalize writes.
                 run_id = values.get("run_id")
+                outcome["run_id"] = run_id
                 if outcome["ok"] and run_id:
                     probe = await provider.exec_in_sandbox(
                         thread_id, f"ls .ai-dev-workflow/history/{run_id}-exit.md 2>/dev/null"

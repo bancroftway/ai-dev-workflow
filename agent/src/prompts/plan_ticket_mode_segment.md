@@ -14,3 +14,10 @@ or remove it -- it simply means this ticket has no reason to mention it, and eve
 keeps whatever the project already built. Add Risk Notes only for risks this ticket itself
 introduces, and add Diagrams/Wireframes only for what this ticket adds or changes, not a redraw of
 the whole existing system.
+
+Carry-over discipline, gate-checked: a step you restate from the prior plan must keep BOTH its id
+and its description byte-for-byte -- any edit to the description makes it a "new/changed" step to
+the deterministic gate, which then rejects it if it cites only already-delivered criteria. Never
+write a new or changed step whose only cited criteria are already coded and tested (the ledger
+stamps them; delivered work is never re-planned). Drop any prior step whose every cited criterion
+this ticket's Specification retires -- that feature is removed.

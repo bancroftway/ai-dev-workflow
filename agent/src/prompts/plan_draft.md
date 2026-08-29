@@ -11,9 +11,22 @@ approved tech stack is at `.ai-dev-workflow/tech-stack.md` (and `tech-stack.appr
 the repo tree is yours to inspect. If the repository is empty, that is expected: this is a
 greenfield build and your plan's first steps are the ones that scaffold it.
 Read the given approved Specification's full structured content and produce an Implementation
-Plan: an overview, an ordered list of Plan Steps (each with a stable id and a description of one
-concrete action, referencing the id(s) of any Acceptance Criteria it fulfills wherever that
-traceability is meaningful), and a list of Risk Notes.
+Plan: an overview, an ordered list of Plan Steps (each with a stable id, a description of one
+concrete action, its `ac_ids`, and its `kind`), and a list of Risk Notes.
+
+Plan-step provenance is a HARD, gate-checked contract, both directions:
+- Every step's `ac_ids` lists the Acceptance Criterion id(s) it fulfils, copied EXACTLY as they
+  appear in the Specification (`US-####.#`) -- never invented, never reformatted, never a retired
+  id. A step that fulfils no single criterion (scaffolding, tooling, CI, project setup) is
+  `kind: "infrastructure"` with an empty `ac_ids`; every other step is `kind: "feature"` and MUST
+  cite at least one id.
+- Every Acceptance Criterion in the Specification that still awaits delivery must be cited by at
+  least one step. Marking steps "infrastructure" to dodge citation fails the other direction of
+  the same gate.
+- If the Specification lists `retired_us_ids`/`retired_ac_ids`, those features are REMOVED: no
+  step may cite a retired id, and any prior step whose every cited criterion is retired is simply
+  dropped from this draft. Add a step for the removal work itself only if there is concrete code
+  to delete, citing no retired ids (`kind: "infrastructure"` if it fulfils no live criterion).
 
 The Specification JSON may include `attachment_notes`: the Specification author's own
 distillation of what any screenshots or documents attached to the original request actually
