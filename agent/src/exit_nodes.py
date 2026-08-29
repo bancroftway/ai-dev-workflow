@@ -48,6 +48,11 @@ _GATE_OWNED_REASON_MARKERS = (
     "has no H1 title",
     "must be the LAST section",
     "authentication enforcement was required for this run",  # verify_exit_readiness's own blocker
+    # exit_finalize_node's run_failure injection. Deliberately NOT "run failed at" -- that exact
+    # phrase appears in git_ops's failure commit message (rendered inside the report's own Commits
+    # section) and in ordinary model prose ("the smoke-test run failed at login"), so it would both
+    # get copied forward and falsely filter legitimate reasons.
+    "terminal pipeline failure recorded at",
 )
 
 CHANGELOG_PATH = "CHANGELOG.md"
@@ -227,6 +232,278 @@ def _render_supply_chain_section(metrics_summary: dict[str, Any] | None) -> list
     return lines + [""]
 
 
+def _failure_detail(run_failure: dict[str, Any]) -> str:
+    """The most specific text a terminal failure recorded, whichever key the escalate site used
+    (rebuild: stderr_tail/feedback; stage verify-cap: feedback/report; draft-infra: detail)."""
+    for key in ("feedback", "stderr_tail", "detail", "report", "stdout_tail"):
+        value = run_failure.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _failure_headline(run_failure: dict[str, Any]) -> str:
+    """First non-empty line of the failure detail, single-line, bounded -- for the blocking bullet."""
+    detail = _failure_detail(run_failure)
+    first = next((line.strip() for line in detail.splitlines() if line.strip()), "")
+    return first[:300]
+
+
+def _render_terminal_failure(run_failure: dict[str, Any] | None) -> str:
+    """'## Terminal failure' section: stage, type, failure_type and the recorded output tail
+    verbatim in a code block, so the report itself names why the run died."""
+    if not run_failure:
+        return ""
+    lines = [
+        "## Terminal failure",
+        "",
+        f"- **Stage**: {run_failure.get('stage')}",
+        f"- **Type**: {run_failure.get('type')} (classified: {run_failure.get('failure_type') or 'unclassified'})",
+    ]
+    subsequent = run_failure.get("subsequent_failure")
+    if subsequent:
+        lines.append(f"- **Followed by**: {subsequent.get('stage')}: {subsequent.get('type')}")
+    detail = _failure_detail(run_failure)
+    if detail:
+        lines += ["", "```", detail[-2500:], "```"]
+    return "\n".join(lines) + "\n"
+
+
+def _divergence_ledger(snapshots: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """(report rows, markdown section) from adversarial-compliance's per-lap divergence snapshots
+    (adversarial_gate._snapshot_findings ledger rows, one per verify lap, in lap order).
+
+    Deterministic disposition, no model self-report: a finding is CLOSED when its plan_reference
+    stops appearing in the final lap's audit -- the re-audit is the referee for what the fix laps
+    actually closed -- and OPEN when the final audit still reports it (with the auditor's own
+    proposed_resolution as the "what it would take"). Matched by plan_reference: finding ids are
+    per-response placeholders and descriptions get reworded between laps; the Plan step / AC
+    reference is the stable anchor. Empty input (pre-feature runs, audit never ran) renders
+    nothing."""
+    if not snapshots:
+        return [], ""
+    first_seen: dict[str, int] = {}
+    latest: dict[str, dict[str, Any]] = {}
+    for lap, snapshot in enumerate(snapshots, start=1):
+        for finding in snapshot.get("findings") or []:
+            ref = str(finding.get("plan_reference") or "unknown plan reference")
+            first_seen.setdefault(ref, lap)
+            latest[ref] = finding
+    final_refs = {
+        str(f.get("plan_reference") or "unknown plan reference")
+        for f in (snapshots[-1].get("findings") or [])
+    }
+    rows = [
+        {
+            "plan_reference": ref,
+            "severity": latest[ref].get("severity"),
+            "description": latest[ref].get("description"),
+            "status": "open" if ref in final_refs else "closed",
+            "first_seen_lap": first_seen[ref],
+            "proposed_resolution": latest[ref].get("proposed_resolution") if ref in final_refs else None,
+        }
+        for ref in sorted(first_seen, key=lambda r: (first_seen[r], r))
+    ]
+    lines = [
+        "## Divergence Ledger (adversarial-compliance)",
+        "",
+        f"{len(snapshots)} audit lap(s). Dispositions are deterministic: a finding is closed when "
+        "the final audit no longer reports it (matched by plan reference), open when it does.",
+        "",
+    ]
+    if not rows:
+        lines.append("No divergences were reported on any audit lap.")
+    for row in rows:
+        if row["status"] == "closed":
+            lines.append(
+                f"- CLOSED [{row['severity']}] {row['plan_reference']}: {row['description']} "
+                f"(first seen lap {row['first_seen_lap']}; absent from the final audit)"
+            )
+        else:
+            lines.append(
+                f"- OPEN [{row['severity']}] {row['plan_reference']}: {row['description']} -- "
+                f"below the fix threshold; auditor's proposed resolution: "
+                f"{row['proposed_resolution'] or '(none given)'}"
+            )
+    return rows, "\n".join(lines) + "\n"
+
+
+async def _load_ledger_rows(provider: Any, thread_id: str) -> list[dict[str, Any]]:
+    """Every parseable row of this attempt's workflow ledger, in write order (the ledger is reset
+    at scaffold on every attempt, resumes included -- so this is one attempt, not the thread)."""
+    raw = await repo_files.read_repo_file(provider, thread_id, repo_files.LEDGER_PATH)
+    rows: list[dict[str, Any]] = []
+    for line in (raw or "").splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+async def _load_divergence_snapshots(provider: Any, thread_id: str, run_id: str) -> list[dict[str, Any]]:
+    """This run's divergence_snapshot rows from the workflow ledger, in write (lap) order."""
+    return [
+        entry for entry in await _load_ledger_rows(provider, thread_id)
+        if entry.get("node") == "divergence_snapshot" and entry.get("run_id") == run_id
+    ]
+
+
+# Ledger stage keys of the tool-runner sub-reports (stack_runner stage_report rows) that fire
+# INSIDE another node's execution. They inherit the stage of the next non-report row, which is the
+# node that ran them: rebuild/red-gate inside an r_* placement, coverage-run inside mctg's verify,
+# e2e-run inside e2e, test-hardening-run inside test_hardening.
+_SUB_REPORT_NODES = frozenset({"stage_report"})
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _stage_summary(
+    rows: list[dict[str, Any]],
+    stages: dict[str, Any] | None,
+    run_failure: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """(report rows, markdown section): per-stage runtime, laps, tokens, cost and recorded facts.
+
+    All deterministic, all from THIS attempt's ledger (see _load_ledger_rows): runtime is the sum
+    of each row's delta from the previous row (nodes run sequentially, rows are appended at node
+    completion, so a row's delta is that node's own wall time); laps are the max of draft-row
+    count, verify/rebuild cycle+1 and run-row count; tokens/cost sum token_usage rows (a Copilot
+    run reports tokens but cost null -> "n/a"). Notes list only what the ledger and state
+    recorded -- gate rejections, fix laps, red-gate blocks, tool-run failures, e2e/test-hardening
+    outcomes, the terminal failure -- never a summary the model wrote."""
+    if not rows and not stages:
+        return [], ""
+    ordered = sorted(rows, key=lambda r: r.get("timestamp") or 0)
+    # Attribute sub-report rows to the node that ran them (the next non-report row's stage).
+    attributed: list[tuple[str, dict[str, Any]]] = []
+    pending: list[dict[str, Any]] = []
+    for row in ordered:
+        if row.get("node") in _SUB_REPORT_NODES:
+            pending.append(row)
+            continue
+        stage = str(row.get("stage") or "unknown")
+        attributed.extend((stage, p) for p in pending)
+        pending = []
+        attributed.append((stage, row))
+    attributed.extend(("unknown", p) for p in pending)
+
+    per: dict[str, dict[str, Any]] = {}
+    prev_ts: float | None = None
+    for stage, row in attributed:
+        entry = per.setdefault(stage, {
+            "stage": stage, "runtime_seconds": 0.0, "laps": 0, "input_tokens": 0, "output_tokens": 0,
+            "cost": 0.0, "cost_known": False, "notes": [], "_drafts": 0, "_cycle_max": -1, "_runs": 0,
+        })
+        ts = row.get("timestamp")
+        if isinstance(ts, (int, float)):
+            if prev_ts is not None and row.get("node") not in _SUB_REPORT_NODES:
+                entry["runtime_seconds"] += max(0.0, ts - prev_ts)
+            if row.get("node") not in _SUB_REPORT_NODES:
+                prev_ts = ts
+        node = row.get("node")
+        usage = row.get("token_usage") or {}
+        if usage:
+            entry["input_tokens"] += int(usage.get("input_tokens") or 0)
+            entry["output_tokens"] += int(usage.get("output_tokens") or 0)
+            if usage.get("cost") is not None:
+                entry["cost"] += float(usage["cost"])
+                entry["cost_known"] = True
+        if node == "draft":
+            entry["_drafts"] += 1
+        if node in ("verify", "rebuild") and isinstance(row.get("cycle"), int):
+            entry["_cycle_max"] = max(entry["_cycle_max"], row["cycle"])
+        if node in ("run", "run_tests"):
+            entry["_runs"] += 1
+        notes = entry["notes"]
+        if node == "verify" and row.get("passed") is False:
+            notes.append(f"verify rejected lap {row.get('cycle', '?')}")
+        if node == "audit":
+            if row.get("audit_skipped_infra"):
+                notes.append("audit skipped (infra)")
+            elif row.get("audit_findings_count"):
+                notes.append(f"audit: {row['audit_findings_count']} finding(s)")
+        if node == "rebuild":
+            if row.get("ok") is False:
+                notes.append(f"build/red-gate blocked cycle {row.get('cycle', '?')} ({row.get('verify', 'discovery')})")
+            if row.get("red_gate") and str(row["red_gate"]).startswith("TDD-red gate"):
+                notes.append("TDD-red gate blocked")
+        if node == "stage_report" and row.get("success") is False:
+            notes.append(f"tool run failed: {str(row.get('error') or row.get('summary') or '')[:80]}")
+        if node == "run":
+            notes.append(f"e2e {row.get('status')}: {row.get('passed')}/{row.get('total')} passed (attempt {row.get('attempt')})")
+        if node == "run_tests":
+            notes.append(f"flaky {row.get('flaky_count')}, stable failures {row.get('stable_fail_count')}")
+        if node == "metrics" and row.get("health_score") is not None:
+            notes.append(f"health {row['health_score']}, findings {row.get('finding_count')}")
+        if node == "readme_write" and row.get("problems"):
+            notes.append(f"readme: {len(row['problems'])} problem(s)")
+        if node == "run_failure":
+            notes.append(f"TERMINAL: {row.get('type')}")
+        if node == "divergence_snapshot":
+            notes.append(f"audit lap: {len(row.get('findings') or [])} divergence(s)")
+    if run_failure and run_failure.get("stage"):
+        entry = per.setdefault(str(run_failure["stage"]), {
+            "stage": str(run_failure["stage"]), "runtime_seconds": 0.0, "laps": 0, "input_tokens": 0,
+            "output_tokens": 0, "cost": 0.0, "cost_known": False, "notes": [], "_drafts": 0, "_cycle_max": -1, "_runs": 0,
+        })
+        marker = f"TERMINAL: {run_failure.get('type')}"
+        if marker not in entry["notes"]:
+            entry["notes"].append(marker)
+    # Stages the state knows but the ledger never saw: approved-on-resume skips, or never reached.
+    for key, stage_state in (stages or {}).items():
+        if key in per:
+            continue
+        status = (stage_state or {}).get("status", "not_started")
+        note = "skipped (approved on resume)" if status == "approved" else f"not reached ({status})"
+        per[key] = {
+            "stage": key, "runtime_seconds": 0.0, "laps": 0, "input_tokens": 0, "output_tokens": 0,
+            "cost": 0.0, "cost_known": False, "notes": [note], "_drafts": 0, "_cycle_max": -1, "_runs": 0,
+        }
+
+    report_rows: list[dict[str, Any]] = []
+    for entry in per.values():
+        laps = max(entry["_drafts"], entry["_cycle_max"] + 1, entry["_runs"])
+        report_rows.append({
+            "stage": entry["stage"],
+            "runtime_seconds": round(entry["runtime_seconds"], 1),
+            "laps": laps,
+            "input_tokens": entry["input_tokens"],
+            "output_tokens": entry["output_tokens"],
+            "cost": round(entry["cost"], 4) if entry["cost_known"] else None,
+            "notes": entry["notes"],
+        })
+    lines = [
+        "## Stage summary (this attempt)",
+        "",
+        "Runtime is wall time between ledger rows; laps count draft/verify/fix cycles; notes are "
+        "recorded facts only. The ledger resets on every attempt, so a resumed thread's earlier "
+        "attempts are not included.",
+        "",
+        "| Stage | Runtime | Laps | Tokens in/out | Cost | Notes |",
+        "|---|---|---|---|---|---|",
+    ]
+    total_seconds = 0.0
+    total_cost = 0.0
+    any_cost = False
+    for r in report_rows:
+        total_seconds += r["runtime_seconds"]
+        if r["cost"] is not None:
+            total_cost += r["cost"]
+            any_cost = True
+        cost = f"${r['cost']:.2f}" if r["cost"] is not None else ("n/a" if (r["input_tokens"] or r["output_tokens"]) else "-")
+        tokens = f"{r['input_tokens']:,}/{r['output_tokens']:,}" if (r["input_tokens"] or r["output_tokens"]) else "-"
+        notes = "; ".join(r["notes"]).replace("|", "\\|") if r["notes"] else "-"
+        lines.append(f"| {r['stage']} | {_fmt_duration(r['runtime_seconds'])} | {r['laps'] or '-'} | {tokens} | {cost} | {notes} |")
+    lines.append(f"| **Total** | **{_fmt_duration(total_seconds)}** | | | **{'$' + format(total_cost, '.2f') if any_cost else 'n/a'}** | |")
+    return report_rows, "\n".join(lines) + "\n"
+
+
 def _render_history_sections(
     *,
     files_changed_stat: str,
@@ -238,6 +515,9 @@ def _render_history_sections(
     e2e: dict[str, Any] | None = None,
     screenshot_prefix: str = "./",
     stages: dict[str, Any] | None = None,
+    us_ac_rows: list[dict[str, Any]] | None = None,
+    carried_over: list[str] | None = None,
+    fallback_metrics: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
     markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
@@ -264,6 +544,28 @@ def _render_history_sections(
             f"- **Tokens**: {tokens.get('total_input_tokens', 0)} in / {tokens.get('total_output_tokens', 0)} out "
             f"(${tokens.get('total_cost', 0):.4f})"
         )
+    elif fallback_metrics:
+        # A run that never reached metrics_compute (every escalate path enters exit directly)
+        # still has the per-commit background scan and the token ledger -- degraded, labelled as
+        # such, but far better than "Not recorded" on the report a human reads to learn why the
+        # run died. Never the final measurement: no coverage merge, no lighthouse, no eval.
+        scan = fallback_metrics.get("latest_scan") or {}
+        measures = scan.get("measures") or {}
+        tokens = fallback_metrics.get("token_usage_summary") or {}
+        lines.append("_metrics_compute did not run this attempt -- figures below are the last background scan, not the final measurement._")
+        if scan:
+            lines.append(
+                f"- **Last scan**: health {scan.get('health_score', '--')}, "
+                f"duplication {measures.get('duplication_percent', '--')}%, "
+                f"mean CCN {measures.get('mean_ccn', '--')}, gating findings {scan.get('gating_count', '--')}"
+            )
+        if tokens:
+            lines.append(
+                f"- **Tokens**: {tokens.get('total_input_tokens', 0)} in / {tokens.get('total_output_tokens', 0)} out "
+                f"(${tokens.get('total_cost', 0):.4f})"
+            )
+        if not scan and not tokens:
+            lines.append("Not recorded for this run.")
     else:
         lines.append("Not recorded for this run.")
     e2e = e2e or {}
@@ -293,6 +595,7 @@ def _render_history_sections(
 
     # Unconditional sections -- the exit report has a fixed skeleton, and "no screenshots" / "not
     # evaluated" must be stated facts with reasons, never silently missing headings.
+    lines += _render_us_ac_section(us_ac_rows, carried_over, run_id)
     lines += _render_eval_section(metrics_summary)
     lines += _render_supply_chain_section(metrics_summary)
     lines += _render_skills_section(stages)
@@ -338,6 +641,142 @@ def _render_history_sections(
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _us_ac_rows(
+    entries: list[dict[str, Any]],
+    own_us_ids: set[str],
+    own_ac_ids: set[str],
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """Per-US/AC provenance rows for this run's exit report. Pure.
+
+    Row set: everything in this run's own approved Specification, plus anything whose derived
+    change_status is not "unchanged" (captures retirements, which the spec lists only by id), plus
+    anything STAMPED this run (a run can deliver a criterion an earlier run reset -- its change
+    column reads "unchanged" but its delivery is this run's news).
+
+    User stories with no acceptance-criterion children are skipped: test-hardening mints synthetic
+    "[Flaky test] ..." story entries into the same ledger, and rendering those as requirements
+    rows misreports the run. A US row's coded/tested derive from its children (all live children
+    stamped -> the latest child stamp), since stamps live only on AC entries.
+    """
+    ac_children: dict[str, list[dict[str, Any]]] = {}
+    for e in entries:
+        if e.get("kind") == "acceptance_criterion" and e.get("parent_us_id"):
+            ac_children.setdefault(e["parent_us_id"], []).append(e)
+
+    rows: list[dict[str, Any]] = []
+    for e in entries:
+        kind = e.get("kind")
+        entry_id = e.get("id")
+        change = spec_ledger.change_status(e, run_id)
+        if kind == "user_story":
+            children = ac_children.get(entry_id) or []
+            if not children:
+                continue
+            include = entry_id in own_us_ids or change != "unchanged" or any(
+                c.get("coded_run_id") == run_id or c.get("tested_run_id") == run_id for c in children
+            )
+            if not include:
+                continue
+            live = [c for c in children if c.get("status") in ("active", "revised")]
+            coded = sorted(c.get("coded_run_id") for c in live) if live and all(c.get("coded_run_id") for c in live) else []
+            tested = sorted(c.get("tested_run_id") for c in live) if live and all(c.get("tested_run_id") for c in live) else []
+            rows.append(
+                {
+                    "id": entry_id, "kind": kind, "title_or_description": e.get("title", ""),
+                    "change": change,
+                    "coded_run_id": coded[-1] if coded else None, "coded_at": None,
+                    "tested_run_id": tested[-1] if tested else None, "tested_at": None,
+                    "test_ids": [],
+                }
+            )
+        elif kind == "acceptance_criterion":
+            include = (
+                entry_id in own_ac_ids
+                or change != "unchanged"
+                or e.get("coded_run_id") == run_id
+                or e.get("tested_run_id") == run_id
+            )
+            if not include:
+                continue
+            rows.append(
+                {
+                    "id": entry_id, "kind": kind, "title_or_description": e.get("description", ""),
+                    "change": change,
+                    "coded_run_id": e.get("coded_run_id"), "coded_at": e.get("coded_at"),
+                    "tested_run_id": e.get("tested_run_id"), "tested_at": e.get("tested_at"),
+                    "test_ids": e.get("test_ids") or [],
+                }
+            )
+    rows.sort(key=lambda r: r["id"])
+    return rows
+
+
+def _undelivered_ac_ids(entries: list[dict[str, Any]]) -> list[str]:
+    """Live criteria never delivered by any healthy run, across the WHOLE ledger -- an AC reset by
+    a failed run and never re-cited would otherwise be permanently invisible (silent work loss).
+    Rendered as the exit report's "carried over" list; the spec ticket-mode prompt tells the next
+    ticket to re-cite them."""
+    return sorted(
+        e["id"]
+        for e in entries
+        if e.get("kind") == "acceptance_criterion"
+        and e.get("status") in ("active", "revised")
+        and not e.get("coded_run_id")
+    )
+
+
+def _render_us_ac_section(
+    us_ac_rows: list[dict[str, Any]] | None, carried_over: list[str] | None, run_id: str
+) -> list[str]:
+    """The "which requirements did this run touch/deliver" section -- fixed skeleton, same
+    convention as every other exit section."""
+    lines = ["## User stories & acceptance criteria this run", ""]
+    rows = us_ac_rows or []
+    if not rows:
+        lines += ["(none recorded -- the specification stage did not run or the ledger is empty)", ""]
+    else:
+        lines += ["| Id | Change | Title / Description | Coded (run) | Tested (run) | Tests |", "|---|---|---|---|---|---|"]
+        for r in rows:
+            desc = (r.get("title_or_description") or "").replace("|", "\\|")
+            if len(desc) > 90:
+                desc = desc[:87] + "..."
+            if r.get("kind") == "user_story":
+                desc = f"**{desc}**"
+            coded = r.get("coded_run_id") or "--"
+            if coded != "--" and r.get("coded_run_id") == run_id:
+                coded = f"{coded} (this run)"
+            tested = r.get("tested_run_id") or "--"
+            if tested != "--" and r.get("tested_run_id") == run_id:
+                tested = f"{tested} (this run)"
+            tests = ", ".join((r.get("test_ids") or [])[:3])
+            extra = len(r.get("test_ids") or []) - 3
+            if extra > 0:
+                tests += f", +{extra} more"
+            lines.append(
+                f"| {r['id']} | {r.get('change')} | {desc} | {coded} | {tested} | {tests or '--'} |"
+            )
+        lines.append("")
+        coded_not_tested = [
+            r["id"] for r in rows
+            if r.get("kind") == "acceptance_criterion" and r.get("coded_run_id") and not r.get("tested_run_id")
+        ]
+        if coded_not_tested:
+            lines += [
+                f"**Coded but not test-verified**: {', '.join(coded_not_tested)} -- delivered code "
+                "whose per-criterion eval never recorded a stable pass.",
+                "",
+            ]
+    if carried_over:
+        lines += [
+            f"**Carried over -- not delivered**: {', '.join(carried_over)}. These live criteria "
+            "have never been delivered by a healthy run; the next ticket's Specification should "
+            "re-cite them (unchanged wording) to schedule them.",
+            "",
+        ]
+    return lines
 
 
 def _diff_ledger(prior: list[dict[str, Any]] | None, current: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -559,9 +998,36 @@ async def exit_finalize_node(
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     merge_readiness = content
 
+    terminal_failure = state.get("run_failure")
+    if terminal_failure:
+        # A terminal escalate (rebuild/e2e/test-hardening) routed into this stage so the report
+        # still gets written -- but the drafting model never sees run_failure, so without this the
+        # report blames whatever incidental gaps it found ("metrics were not recorded") and never
+        # names the actual killer. Injected before update_manifest below so the manifest,
+        # report.json, both exit markdowns and the session close all carry it. Phrase is listed in
+        # _GATE_OWNED_REASON_MARKERS -- see that tuple's comment.
+        # The bullet carries the error's first meaningful line -- the report is the artifact a human
+        # reads on the branch, and a bare "rebuild_cap_exceeded" sent the drafting model guessing at
+        # a root cause (observed live, run d16959d3: it blamed a missing project reference; the real
+        # killer was an MSB4025 XML-comment error that only the DB row and ledger named). The full
+        # tail lands in its own section below.
+        reason = (
+            f"terminal pipeline failure recorded at {terminal_failure.get('stage')}: "
+            f"{terminal_failure.get('type')}"
+        )
+        detail_line = _failure_headline(terminal_failure)
+        if detail_line:
+            reason = f"{reason} -- {detail_line}"
+        existing_reasons = list(merge_readiness.get("blocking_reasons") or [])
+        if reason not in existing_reasons:
+            merge_readiness["blocking_reasons"] = [reason, *existing_reasons]
+        merge_readiness["merge_ready"] = False
+
     spec_approval = await approvals.latest_approval(provider, thread_id, "specification")
     plan_approval = await approvals.latest_approval(provider, thread_id, "plan")
-    raw_requirements = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/raw-requirements.approved.json")
+    raw_requirements = await repo_files.read_repo_file(
+        provider, thread_id, workflow_persistence.RAW_REQUIREMENTS_APPROVED_PATH
+    )
     raw_metrics = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json")
     metrics_summary = json.loads(raw_metrics) if raw_metrics else {}
     if metrics_summary.get("run_id") != run_id:
@@ -591,6 +1057,13 @@ async def exit_finalize_node(
     )
 
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+    # US/AC provenance rows: this run's own spec scope from STATE (already in hand -- no sandbox
+    # read; the approved file equals it byte-for-byte), row set + carried-over from the ledger.
+    own_spec = ((state.get("stages") or {}).get("specification") or {}).get("approved_content") or {}
+    own_us_ids = {s.get("id") for s in (own_spec.get("user_stories") or []) if s.get("id")}
+    own_ac_ids = spec_ledger.own_ac_ids_from_specification(own_spec)
+    us_ac_rows = _us_ac_rows(ledger_entries, own_us_ids, own_ac_ids, run_id)
+    carried_over = _undelivered_ac_ids(ledger_entries)
     snapshot_path = f"{HISTORY_DIR}/{run_id}-ledger-snapshot.json"
     prior_snapshot = await _find_prior_ledger_snapshot(provider, thread_id, run_id)
     diff = _diff_ledger(prior_snapshot, ledger_entries)
@@ -686,6 +1159,23 @@ async def exit_finalize_node(
     files_changed_stat, commits_log = await _files_changed(provider, thread_id, state.get("run_baseline_commit"))
     screenshots = await _list_screenshots(provider, thread_id, run_id)
     delta_summary = repo_scan.delta_summary(metrics_summary.get("repo_scan_delta"))
+    ledger_rows = await _load_ledger_rows(provider, thread_id)
+    divergence_rows, divergence_section = _divergence_ledger(
+        [r for r in ledger_rows if r.get("node") == "divergence_snapshot" and r.get("run_id") == run_id]
+    )
+    stage_rows, stage_section = _stage_summary(ledger_rows, state.get("stages"), terminal_failure)
+    fallback_metrics: dict[str, Any] | None = None
+    if not metrics_summary:
+        # Escalated runs skip metrics_compute; surface what already exists instead of nothing.
+        from . import metrics_nodes
+
+        latest_scan = (state.get("repo_scan") or {}).get("latest_summary") or (state.get("repo_scan") or {}).get("baseline_summary")
+        try:
+            token_totals = await metrics_nodes._sum_token_usage(provider, thread_id)  # noqa: SLF001 -- same package
+        except Exception:  # noqa: BLE001 -- ledger read is best-effort here
+            token_totals = None
+        if latest_scan or token_totals:
+            fallback_metrics = {"latest_scan": latest_scan, "token_usage_summary": token_totals}
 
     report_path = f"{HISTORY_DIR}/{run_id}-report.json"
     exit_md_path = f"{HISTORY_DIR}/{run_id}-exit.md"
@@ -704,7 +1194,20 @@ async def exit_finalize_node(
         "commits": commits_log,
         "e2e": state.get("e2e"),
         "screenshots": screenshots,
+        # Machine-readable US/AC provenance for this run -- same rows the markdown section renders.
+        "us_ac": us_ac_rows,
+        "carried_over_ac_ids": carried_over,
+        # Machine-readable divergence dispositions -- same rows the Divergence Ledger section renders.
+        "divergence_ledger": divergence_rows,
+        # The terminal failure verbatim (None on a run that reached exit normally) -- the report
+        # page and the support-issue body read this, not the prose blockers.
+        "run_failure": terminal_failure,
+        # Per-stage runtime/laps/tokens/cost/notes -- same rows the Stage summary section renders.
+        "stage_summary": stage_rows,
     }
+    failure_section = _render_terminal_failure(terminal_failure)
+    if stage_section:
+        failure_section = stage_section + ("\n" + failure_section if failure_section else "")
     await repo_files.write_repo_file(provider, thread_id, report_path, json.dumps(report_payload, indent=2, default=str) + "\n")
 
     exit_markdown = render_exit_markdown(merge_readiness or {}) + "\n" + _render_history_sections(
@@ -716,7 +1219,10 @@ async def exit_finalize_node(
         run_id=run_id,
         e2e=state.get("e2e"),
         stages=state.get("stages"),
-    )
+        us_ac_rows=us_ac_rows,
+        carried_over=carried_over,
+        fallback_metrics=fallback_metrics,
+    ) + ("\n" + failure_section if failure_section else "") + ("\n" + divergence_section if divergence_section else "")
     await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
 
     # A second copy at a FIXED, obvious path. The per-run file above is the archive, but its name
@@ -733,7 +1239,10 @@ async def exit_finalize_node(
         e2e=state.get("e2e"),
         screenshot_prefix="history/",
         stages=state.get("stages"),
-    )
+        us_ac_rows=us_ac_rows,
+        carried_over=carried_over,
+        fallback_metrics=fallback_metrics,
+    ) + ("\n" + failure_section if failure_section else "") + ("\n" + divergence_section if divergence_section else "")
     await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, latest_markdown)
 
     commit_targets = [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH]
@@ -747,9 +1256,9 @@ async def exit_finalize_node(
     )
 
     # Graceful end-of-run release of this thread's ~20 Copilot sessions. metrics-exit is genuinely
-    # the last stage -- every other terminal path (metrics regression, test-hardening, e2e escalate)
-    # routes INTO metrics-exit_draft rather than END, and all four POST_STAGE_REBUILD placements sit
-    # before it -- so nothing downstream needs a session. run_headless.py already did this at
+    # the last stage -- every other terminal path (metrics regression, test-hardening, e2e escalate,
+    # and the four rebuild escalates on their sandbox-alive branch) routes INTO metrics-exit_draft
+    # rather than END -- so nothing downstream needs a session. run_headless.py already did this at
     # process exit; the server path never did, which left every completed run's sessions riding
     # until the sandbox idle-reaper eventually took the container down.
     # Deliberately NOT done on the needs_clarification -> END path: there the user is about to
@@ -777,6 +1286,86 @@ def _demo() -> None:
     assert _baseline_refresh_payload("failed", {"repo_scan": final_scan}) is None, "a failed run must never refresh the baseline"
     assert _baseline_refresh_payload("completed", {}) is None, "no recorded scan -- nothing to write"
     assert _baseline_refresh_payload("completed", {"repo_scan": None}) is None
+
+    # Fallback metrics on a run that never reached metrics_compute: the last background scan and
+    # the token ledger, explicitly labelled as not the final measurement.
+    degraded = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None, screenshots=[], run_id="r1",
+        e2e=None,
+        fallback_metrics={
+            "latest_scan": {"health_score": 22, "gating_count": 0, "measures": {"duplication_percent": 0.0, "mean_ccn": 1.2}},
+            "token_usage_summary": {"total_input_tokens": 10, "total_output_tokens": 20, "total_cost": 4.17},
+        },
+    )
+    assert "not the final measurement" in degraded and "health 22" in degraded and "$4.1700" in degraded, degraded
+    assert "Not recorded for this run." not in degraded.split("## Delta")[0]
+
+    # _stage_summary: runtime = deltas between consecutive rows (sub-reports attributed to the node
+    # that ran them), laps from cycles/drafts, tokens+cost summed per stage, notes = recorded facts.
+    t0 = 1_000_000.0
+    ledger = [
+        {"timestamp": t0, "stage": "scaffold", "node": "scaffold", "action": "x"},
+        {"timestamp": t0 + 60, "stage": "specification", "node": "draft", "readiness": True,
+         "token_usage": {"model": "sonnet", "input_tokens": 100, "output_tokens": 50, "cost": 0.5}},
+        {"timestamp": t0 + 70, "stage": "specification", "node": "verify", "passed": False, "cycle": 0},
+        {"timestamp": t0 + 130, "stage": "specification", "node": "draft", "readiness": True,
+         "token_usage": {"model": "sonnet", "input_tokens": 100, "output_tokens": 50, "cost": 0.5}},
+        {"timestamp": t0 + 140, "stage": "specification", "node": "verify", "passed": True, "cycle": 1},
+        {"timestamp": t0 + 200, "stage": "rebuild", "node": "stage_report", "success": False, "error": "MSB4025 boom"},
+        {"timestamp": t0 + 210, "stage": "r_ac_to_tests", "node": "rebuild", "ok": False, "cycle": 0, "verify": "discovery"},
+        {"timestamp": t0 + 300, "stage": "r_ac_to_tests", "node": "rebuild", "ok": True, "cycle": 1, "verify": "replay"},
+        {"timestamp": t0 + 360, "stage": "e2e", "node": "run", "status": "passed", "passed": 3, "total": 3, "attempt": 1},
+    ]
+    stage_rows, stage_md = _stage_summary(
+        ledger, {"plan": {"status": "approved"}, "remediation": {"status": "not_started"}}, None
+    )
+    by_stage = {r["stage"]: r for r in stage_rows}
+    spec = by_stage["specification"]
+    assert spec["runtime_seconds"] == 140.0 and spec["laps"] == 2 and spec["cost"] == 1.0, spec
+    assert spec["input_tokens"] == 200 and "verify rejected lap 0" in spec["notes"], spec
+    rb = by_stage["r_ac_to_tests"]
+    assert rb["runtime_seconds"] == 160.0 and rb["laps"] == 2, rb  # stage_report row folded in
+    assert any("tool run failed: MSB4025" in n for n in rb["notes"]) and any("replay" not in n and "discovery" in n for n in rb["notes"]), rb
+    assert by_stage["plan"]["notes"] == ["skipped (approved on resume)"], by_stage["plan"]
+    assert by_stage["remediation"]["notes"] == ["not reached (not_started)"]
+    assert "e2e passed: 3/3 passed" in by_stage["e2e"]["notes"][0]
+    assert "| specification | 2:20 | 2 | 200/100 | $1.00 |" in stage_md, stage_md
+    assert "**Total**" in stage_md
+    _, failed_md = _stage_summary(ledger, {}, {"stage": "r_ac_to_tests", "type": "rebuild_cap_exceeded"})
+    assert "TERMINAL: rebuild_cap_exceeded" in failed_md
+    assert _stage_summary([], None, None) == ([], "")
+
+    # Terminal-failure rendering: the bullet headline is the error's first line; the section carries
+    # the tail verbatim. A report without the real error sent the drafting model guessing (d16959d3).
+    rf = {
+        "stage": "r_ac_to_tests", "type": "rebuild_cap_exceeded", "failure_type": "gate_exhausted",
+        "stdout_tail": "", "feedback": "apps/api.Tests/Api.Tests.csproj(23,67): error MSB4025: bad XML comment\n\nBuild FAILED.",
+    }
+    assert _failure_headline(rf).startswith("apps/api.Tests/Api.Tests.csproj(23,67): error MSB4025"), _failure_headline(rf)
+    section = _render_terminal_failure(rf)
+    assert "## Terminal failure" in section and "MSB4025" in section and "rebuild_cap_exceeded" in section, section
+    assert _render_terminal_failure(None) == ""
+    assert _failure_headline({"stage": "x", "type": "y"}) == ""
+
+    # _divergence_ledger: deterministic dispositions from lap snapshots -- closed = absent from the
+    # final lap (matched by plan_reference), open = still reported, first_seen tracked across laps.
+    snaps = [
+        {"findings": [
+            {"severity": "minor", "plan_reference": "Plan Step 4", "description": "copy drift", "proposed_resolution": "align"},
+            {"severity": "minor", "plan_reference": "US-0002.1", "description": "missing aria label", "proposed_resolution": "add label"},
+        ]},
+        {"findings": [
+            {"severity": "minor", "plan_reference": "US-0002.1", "description": "aria label still missing", "proposed_resolution": "add the label"},
+        ]},
+    ]
+    rows, section = _divergence_ledger(snaps)
+    by_ref = {r["plan_reference"]: r for r in rows}
+    assert by_ref["Plan Step 4"]["status"] == "closed" and by_ref["US-0002.1"]["status"] == "open", rows
+    assert by_ref["US-0002.1"]["proposed_resolution"] == "add the label", rows
+    assert "CLOSED [minor] Plan Step 4" in section and "OPEN [minor] US-0002.1" in section, section
+    assert _divergence_ledger([]) == ([], "")
+    zero_rows, zero_section = _divergence_ledger([{"findings": []}])
+    assert zero_rows == [] and "No divergences" in zero_section, zero_section
 
     # _render_history_sections: "not recorded"/"no baseline" placeholders when data is absent,
     # real content when present, and a FIXED skeleton -- the screenshots section always renders,
@@ -849,6 +1438,46 @@ def _demo() -> None:
     assert "MISSING test-driven-development" in _text
     assert "CLAIMED BUT NOT INVOKED" in _text, _text
     assert "unverified (session log unreadable)" in _text
+
+    # _us_ac_rows / _undelivered_ac_ids / _render_us_ac_section: US/AC provenance in the exit
+    # report -- own-spec scope + changed entries + delivered-this-run entries, flake-ticket
+    # synthetic stories filtered, US coded/tested aggregated from children.
+    ledger = [
+        {"id": "US-0001", "kind": "user_story", "status": "active", "title": "Counter",
+         "first_seen_run_id": "r1", "last_revised_run_id": "r1"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "parent_us_id": "US-0001",
+         "status": "active", "description": "Increments", "first_seen_run_id": "r1",
+         "last_revised_run_id": "r1", "coded_run_id": "r1", "coded_at": "t1",
+         "tested_run_id": "r1", "tested_at": "t1", "test_ids": ["[US-0001.1] increments"]},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "parent_us_id": "US-0001",
+         "status": "revised", "description": "Shows doubled value", "first_seen_run_id": "r1",
+         "last_revised_run_id": "r2", "coded_run_id": "r2", "coded_at": "t2",
+         "tested_run_id": "r2", "tested_at": "t2", "test_ids": ["[US-0001.2] doubles"]},
+        {"id": "US-0002", "kind": "user_story", "status": "retired", "title": "Reset",
+         "first_seen_run_id": "r1", "last_revised_run_id": "r2"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "parent_us_id": "US-0002",
+         "status": "retired", "description": "Resets", "first_seen_run_id": "r1",
+         "last_revised_run_id": "r2", "coded_run_id": "r1", "coded_at": "t1"},
+        {"id": "US-0003", "kind": "user_story", "status": "active",
+         "title": "[Flaky test] something", "first_seen_run_id": "r2", "last_revised_run_id": "r2"},
+        {"id": "US-0004.1", "kind": "acceptance_criterion", "parent_us_id": "US-0004",
+         "status": "active", "description": "Orphaned undelivered", "first_seen_run_id": "r1",
+         "last_revised_run_id": "r1"},
+    ]
+    rows = _us_ac_rows(ledger, {"US-0001"}, {"US-0001.1", "US-0001.2"}, "r2")
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["US-0001.1"]["change"] == "unchanged" and by_id["US-0001.1"]["coded_run_id"] == "r1"
+    assert by_id["US-0001.2"]["change"] == "modified" and by_id["US-0001.2"]["tested_run_id"] == "r2"
+    assert by_id["US-0002"]["change"] == "deleted" and by_id["US-0002.1"]["change"] == "deleted"
+    assert "US-0003" not in by_id, "flake-ticket synthetic stories (no AC children) must be filtered"
+    assert "US-0004.1" not in by_id, "unchanged foreign AC outside own spec is not a row"
+    assert by_id["US-0001"]["coded_run_id"] == "r2", "US coded = latest child stamp when all live children coded"
+    assert _undelivered_ac_ids(ledger) == ["US-0004.1"], _undelivered_ac_ids(ledger)
+    section = "\n".join(_render_us_ac_section(rows, _undelivered_ac_ids(ledger), "r2"))
+    assert "## User stories & acceptance criteria this run" in section
+    assert "| US-0001.2 | modified |" in section and "r2 (this run)" in section
+    assert "Carried over -- not delivered**: US-0004.1" in section
+    assert "(none recorded" in "\n".join(_render_us_ac_section([], [], "r2"))
 
     print("exit_nodes self-check: ok")
 

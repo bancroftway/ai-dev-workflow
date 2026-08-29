@@ -21,23 +21,23 @@ flowchart TD
     
     stage1["STAGE 1: TECH STACK<br/>Detect languages, frameworks, build/test commands<br/>Agent: tech-stack-draft (read-only discovery)"]
     
-    stage2["STAGE 2: SPECIFICATION<br/>Draft user stories + acceptance criteria<br/>Agents: specification-draft → specification-audit<br/>Gate: human approval + sign to APPROVALS.md"]
+    stage2["STAGE 2: SPECIFICATION<br/>Draft user stories + acceptance criteria (delta ticket: cite existing_us_id/existing_ac_id, retire removed features)<br/>Agents: specification-draft → specification-audit<br/>Verify: spec ledger id sync — stable US-####.# ids, fail-closed citations<br/>Gate: human approval + sign to APPROVALS.md; approval applies tracking resets for genuinely reworded ACs"]
     
-    stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Gate: human approval + sign to APPROVALS.md"]
+    stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Verify: step↔AC linkage BOTH directions (every step cites live ac_ids or kind=infrastructure;<br/>every undelivered AC cited; retired-only steps dropped) + Mermaid/wireframe validation<br/>Gate: human approval + sign to APPROVALS.md; approval records plan_step_ids on the ledger"]
     
-    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red); retire tests for cut ACs via edit (no delete tool, by design)<br/>Agents: ac-to-tests-draft → ac-to-tests-audit (scaffold-only rebuild)<br/>Gate: write-scope + AC-coverage deterministic checks<br/>Post-scaffold TDD-red gate: suite must RUN with zero passing tests"]
+    stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red) for ELIGIBLE (undelivered) ACs only; delete tests naming retired ACs<br/>Agents: ac-to-tests-draft → ac-to-tests-audit (scaffold-only rebuild)<br/>Gate: write-scope + ledger-integrity + retired-residue + completed-AC protection + AC-coverage checks<br/>Post-scaffold TDD-red gate: zero passing tests (first ticket) / eligible-AC tests red (later tickets)"]
     
-    stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
+    stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests; delete code serving only retired ACs<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
     
     stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes quality+security+dedup+license findings (autopilot, write+bash)<br/>Gate: deterministic re-scan blocks any unexplained finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
     
     harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>Auth-enforcement gate (repo setting + Key Vault secrets present):<br/>probes every route + API unauthenticated; a 2xx on a protected route joins the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
     
-    stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Closes the back half: audits finished repo vs approved Plan + wireframes<br/>Agent: adversarial-compliance-draft (read-only, full-repo review)<br/>Gate: deterministic claim-verification + fix prompt. Rebuild gate after."]
+    stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Closes the back half: audits finished repo vs approved Plan + wireframes<br/>Agent: adversarial-compliance-draft (read-only, full-repo review)<br/>Gate: deterministic claim-verification + fix prompt. Rebuild gate after<br/>(scan-delta placement re-runs ledger-integrity + retired-residue + completed-AC protection)."]
     
     readme["README LEG (metrics-exit)<br/>Writes/updates README.md per standard-readme, grounded in the code<br/>Deterministic structure check between laps (3); human-authored README left untouched<br/>Committed BEFORE the final scan so metrics cover it"]
     
-    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan (health score v2, 9 weighted subscores) + coverage + traceability + outdated-packages probe<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign<br/>Blockers include: regression gate reasons, README hard problems,<br/>auth-required-but-unverified, missing UI screenshots"]
+    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan (health score v2, 9 weighted subscores) + coverage + traceability + outdated-packages probe<br/>Regression-clean runs stamp per-AC delivery provenance on the ledger (coded/tested run ids + measured test names)<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign<br/>Exit report: per-US/AC section (new/modified/deleted/unchanged + delivery stamps) + carried-over-undelivered list<br/>Blockers include: regression gate reasons, README hard problems,<br/>auth-required-but-unverified, missing UI screenshots"]
     
     done["END<br/>Repo ready for merge or run_failure recorded"]
     
@@ -56,11 +56,15 @@ flowchart TD
     stage7 -.->|gate failure, 6 tries| stage7
     stage8 -.->|regression gate failure, 1 rescan| stage8
     
-    stage4 -.->|cap| done
-    stage5 -.->|cap| done
-    stage6 -.->|cap| done
-    stage7 -.->|cap| done
+    stage4 -.->|verify cap| done
+    stage5 -.->|verify cap| done
+    stage6 -.->|verify cap| done
+    stage7 -.->|verify cap| done
     stage8 -.->|cap| done
+    stage4 -.->|rebuild cap: run_failure recorded| stage8
+    stage5 -.->|rebuild cap: run_failure recorded| stage8
+    stage6 -.->|rebuild cap: run_failure recorded| stage8
+    stage7 -.->|rebuild cap: run_failure recorded| stage8
     harden -.->|failure: run_failure recorded| stage8
 ```
 
@@ -74,7 +78,7 @@ flowchart TD
 | `.ai-dev-workflow/tech-stack.md` | tech-stack | The detected stack, rendered. **This is the file `AGENTS.md` tells every agent to read first.** |
 | `.ai-dev-workflow/tech-stack.approved.json` | tech-stack | Typed sidecar. Its presence is what makes a later run skip detection entirely. |
 | `.ai-dev-workflow/raw-requirements.md`, `specification.md`, `plan.md` | record raw requirements, specification, plan | The reviewed artifacts (raw requirements are recorded verbatim, never redrafted). |
-| `.ai-dev-workflow/spec/ledger.json` | specification verify | Permanently stable US/AC ids — the sync target for every later traceability check. |
+| `.ai-dev-workflow/spec/ledger.json` | specification verify + approval, plan approval, metrics | Permanently stable US/AC ids — the sync target for every later traceability check — plus per-AC delivery provenance: `plan_step_ids` (plan approval), `coded_run_id/at` + `tested_run_id/at` + measured `test_ids` (metrics, regression-clean runs only; cleared on spec approval when a criterion's wording genuinely changed). |
 | `.ai-dev-workflow/plan/diagrams/*.{mmd,svg}` | plan verify | Rendered Mermaid diagrams. |
 | `.ai-dev-workflow/plan/wireframes/*.html` | plan verify | Self-contained HTML wireframes (UI plans only) — open directly in a browser. |
 | `.ai-dev-workflow/coverage-commands.json` | minimal-code-to-green | The coverage contract: per-stack command + artifact + format. Written by the draft, REPLAYED by the coverage gate — the gate deletes artifacts and re-runs each command itself, so the number is always machine-derived. |
@@ -339,4 +343,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: e840922f702535649051f9ae9dba985797399b7b3edb60eee5f1e955723b93bf -->
+<!-- graph-source-sha256: 340c6eae0356a602f83277b406009f41067a62b1a0f0b32154d07730e71557e2 -->

@@ -57,7 +57,13 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
         lines.append("## Steps")
         lines.append("")
         for step in plan_steps:
-            lines.append(f"- **{step.get('id', '')}**: {step.get('description', '')}")
+            # Show the US/AC linkage the human gate is approving -- provenance must be visible in
+            # the reviewable document, not only in the JSON.
+            ac_ids = step.get("ac_ids") or []
+            suffix = f" _(ACs: {', '.join(ac_ids)})_" if ac_ids else (
+                " _(infrastructure)_" if step.get("kind") == "infrastructure" else ""
+            )
+            lines.append(f"- **{step.get('id', '')}**: {step.get('description', '')}{suffix}")
         lines.append("")
 
     risk_notes = content.get("risk_notes") or []
@@ -78,7 +84,12 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
         for wf in wireframes:
             screen = str(wf.get("screen", "")).strip()
             if screen:
-                lines.append(f"- [{screen}](plan/wireframes/{screen}.html)")
+                # GitHub renders the relative link as raw HTML source; the preview link (stamped by
+                # plan verify once the repo/branch are known, diagram_gate.wireframe_preview_url)
+                # opens the rendered page via html-preview.github.io.
+                preview = str(wf.get("preview_url") or "").strip()
+                suffix = f" -- [preview]({preview})" if preview else ""
+                lines.append(f"- [{screen}](plan/wireframes/{screen}.html){suffix}")
         lines.append("")
 
     diagrams = content.get("diagrams") or []

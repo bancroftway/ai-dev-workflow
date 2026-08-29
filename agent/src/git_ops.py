@@ -185,26 +185,29 @@ async def record_run_failure(
 ) -> dict[str, Any]:
     """Durably records a terminal run failure ({stage, type, ...detail}) and returns the payload.
 
-    Escalations no longer pause for a human -- the graph ENDs with `run_failure` set, so this is
-    the last chance to leave a trace: a ledger row and the session row closed as "failed" (SQL,
-    session_store.py -- unlike the ledger write below, this isn't a git commit, so it survives
-    even when the commit that follows fails).
-    No-ops (payload-only) when the sandbox is gone -- every `cannot_verify` failure happens
-    exactly then. Best-effort by design: a failed write must never mask the failure itself.
+    The SQL session close runs FIRST and unconditionally -- it needs no sandbox, and skipping it
+    when the sandbox was gone (as this function used to) left every `cannot_verify` failure's
+    session row open until the next deploy-drain sweep, with no persisted trace at all. The ledger
+    row and the commit still require a live sandbox and are skipped without one. Best-effort by
+    design: a failed write must never mask the failure itself.
     """
+    from . import session_store  # local: keeps git_ops's import surface flat
     from .sandbox import registry as sandbox_registry  # local: keep git_ops's import surface flat
+
+    try:
+        await session_store.close_session(thread_id, run_id=run_id, status="failed", failure=payload)
+    except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
+        logger.warning("failed to close session for run_failure thread_id=%s", thread_id, exc_info=True)
 
     if sandbox_registry.get(thread_id) is None:
         return payload
     from . import repo_files  # local import mirrors the module-level one-way dependency
-    from . import session_store  # local: keeps git_ops's import surface flat, same as sandbox_registry above
 
     provider = _get_provider()
     try:
         await repo_files.append_ledger_entry(
             provider, thread_id, {"stage": payload.get("stage"), "node": "run_failure", **payload}
         )
-        await session_store.close_session(thread_id, run_id=run_id, status="failed", failure=payload)
         await commit_ai_dev_workflow(provider, thread_id, f"ai-dev-workflow: run failed at {payload.get('stage')}")
     except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
         logger.warning("failed to durably record run_failure for thread_id=%s", thread_id, exc_info=True)

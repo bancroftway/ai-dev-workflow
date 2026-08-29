@@ -115,6 +115,11 @@ SPECIFICATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('specification', 'ap
 # re-investigating an unrelated, still-open finding from scratch on every single ticket.
 REMEDIATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('remediation', 'approved.json')}"
 
+# Same reasoning again -- exit_finalize_node hashes this into manifest.json's
+# requirements_content_hash. It read the UNNUMBERED literal for as long as the numbering existed,
+# so the hash was silently None on every run (the file it looked for was never written).
+RAW_REQUIREMENTS_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('raw-requirements', 'approved.json')}"
+
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
     return await repo_files.read_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}")
@@ -308,6 +313,7 @@ def _demo() -> None:
     assert PLAN_APPROVED_PATH == f"{WORKFLOW_DIR}/04-plan.approved.json"
     assert SPECIFICATION_APPROVED_PATH == f"{WORKFLOW_DIR}/03-specification.approved.json"
     assert REMEDIATION_APPROVED_PATH == f"{WORKFLOW_DIR}/07-remediation.approved.json"
+    assert RAW_REQUIREMENTS_APPROVED_PATH == f"{WORKFLOW_DIR}/01-raw-requirements.approved.json"
 
     # Padding must keep lexical order == execution order; a bare str(n) breaks at 10 stages.
     names = [_stage_file(k, "md") for k in _STAGE_ORDER]

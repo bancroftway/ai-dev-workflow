@@ -1342,6 +1342,11 @@ STAGES: list[StageSpec] = [
         render_markdown=render_specification_markdown,
         deterministic_verify=_verify_specification_ledger,
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ticket_mode_context,
+        # Second phase of the two-phase tracking reset (spec_ledger.PENDING_RESET_FIELD): the
+        # destructive stamp clear for genuinely-reworded ACs runs only once a human (or headless
+        # auto-approve) actually approved the Specification -- a rejected draft's markers stay
+        # inert and are swept by the next sync.
+        post_approve_hook=spec_ledger.apply_tracking_resets_hook,
         sign_approval=True,
         # The one stage that may use `brainstorming` -- exploring intent and requirements before
         # anything is built is precisely its purpose. It stays disabled for every other stage
@@ -1364,6 +1369,9 @@ STAGES: list[StageSpec] = [
         render_markdown=render_plan_markdown,
         sign_approval=True,
         deterministic_verify=verify_plan_diagrams,
+        # US/AC -> plan-step provenance: record which approved steps cite each live AC
+        # (spec_ledger entries' plan_step_ids). Overwrite semantics -- idempotent on resume.
+        post_approve_hook=spec_ledger.stamp_plan_links_hook,
         draft_prompt_context_from_repo_file=hydrate_plan_ticket_mode_context,
         # Wireframes are LLM-emitted self-contained HTML validated by verify_plan_diagrams -- no
         # MCP servers needed (Excalidraw MCP deleted: never spike-tested, fetched unpinned
@@ -1828,12 +1836,29 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     resume = os.environ.get("AIDW_RESUME") == "1" or (resume_flag_popped and not is_new_submission)
     for stage_spec in STAGES[1:] + _STANDALONE_STAGE_SPECS:
         stage = stages[stage_spec.key]
-        if not resume and stage["status"] in ("ready_for_review", "approved"):
+        # metrics-exit is NEVER skip-ahead eligible, resume or not: its whole job is to re-judge
+        # THIS run. A hydrated approved metrics-exit takes make_draft_node's short-circuit, which
+        # re-fires exit_finalize_node with the PREVIOUS run's approved content while bypassing
+        # verify_exit_readiness entirely -- so a thread whose last run escalated (merge_ready=False,
+        # "terminal pipeline failure" blocker) would stamp that stale failed verdict onto the
+        # resumed run's fresh exit report and re-close its session "failed" even when everything
+        # is now green.
+        stage_resume = resume and stage_spec.key != "metrics-exit"
+        # "drafting" (make_draft_node's start-of-turn mark) resets on a fresh submission like any
+        # other per-run status, and is deliberately KEPT on a resume: it is the proof a killed
+        # draft already touched the workspace (rebuild.py's TDD-red guard reads it).
+        if not stage_resume and stage["status"] in ("ready_for_review", "approved", "drafting"):
+            # Reset touches STATUS/mechanics only -- `approved_content` deliberately survives.
+            # Load-bearing beyond hydration: on a fresh run 2, persist_state keeps rewriting
+            # 04-plan.approved.json (and 03-specification.approved.json) from this surviving
+            # value, which is exactly what diagram_gate.check_plan_linkage reads as the PRIOR
+            # plan for its verbatim-carryover exemption until run 2's own gate approves a new
+            # one. Clearing approved_content here would break that carryover detection.
             stage["status"] = "not_started"
             stage["cycle_count"] = 0
             stage["readiness"] = False
             stage["clarifying_questions"] = []
-        elif resume and stage["status"] == "ready_for_review":
+        elif stage_resume and stage["status"] == "ready_for_review":
             # A stage caught mid-review when the previous run died still redrafts -- only
             # APPROVED work is trusted for skip-ahead.
             stage["status"] = "not_started"
@@ -1883,7 +1908,11 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
 
     return {
         "stages": stages,
-        "run_id": uuid.uuid4().hex[:8],
+        # Resume keeps the run's identity: the ledger's first_seen/last_revised/coded/tested
+        # stamps carry the ORIGINAL run_id, and change_status/exit rows derive "new/modified this
+        # run" by comparing against state["run_id"] -- a reminted id on resume made every entry
+        # the interrupted run created read as "unchanged" and split coded/tested across two ids.
+        "run_id": (state.get("run_id") if resume and state.get("run_id") else uuid.uuid4().hex[:8]),
         "raw_requirements_text": raw_requirements_text,
         "requirements_attachments": requirements_attachments,
         # Unchanged (echoes state.get("consumed_message_id")) on a textless run; set to the newly
@@ -2107,6 +2136,20 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             )
             start_event = await run_event_store.append_event(start_event)
             await run_event_stream.emit_live(start_event, config)
+            # Mark the stage "drafting" in state.json (and the session row's current_stage)
+            # BEFORE the model call, so a draft killed mid-turn (timeout, quota) leaves durable
+            # proof it began. Two consumers: rebuild.py's TDD-red guard, which must not mistake a
+            # workspace with a half-written implementation for one codegen never touched (run
+            # d16959d3: it did, and stubbed 200 passing tests back to red); and the board, whose
+            # current_stage otherwise lagged a whole stage behind during the longest turns.
+            # intake keeps "drafting" on a resume and resets it on a fresh submission.
+            drafting_stages = {key: dict(value) for key, value in state["stages"].items()}
+            drafting_stages[stage_spec.key]["status"] = "drafting"
+            try:
+                await _persist_if_sandboxed(thread_id, state, drafting_stages, f"ai-dev-workflow: {stage_spec.key} drafting")
+                await session_store.update_current_stage(thread_id, stage_spec.key)
+            except Exception:  # noqa: BLE001 -- bookkeeping must never block the draft itself
+                logger.warning("could not mark %s as drafting", stage_spec.key, exc_info=True)
 
         try:
             response = await call_with_infra_retry(
@@ -2827,15 +2870,21 @@ def make_draft_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, Run
         stage = state["stages"][stage_spec.key]
         detail = stage.get("last_infra_error") or ""
         payload = {"stage": stage_spec.key, "type": "draft_infra_exhausted", "detail": detail[-2000:]}
-        # This node is only ever reached via make_route_after_draft's infra_exhausted check --
-        # never a genuine content/gate failure -- so the default (when the exception message
-        # itself doesn't happen to contain a recognizable quota marker) is infra_transient, not
-        # classify_failure's generic gate_exhausted fallback. See record_run_failure_and_reset's
-        # own docstring for why this matters.
-        payload = await run_failure.record_run_failure_and_reset(
-            thread_id, state.get("run_id"),
-            payload=payload, detail_for_classification=detail, default_failure_type="infra_transient",
-        )
+        prior_failure = state.get("run_failure")
+        if prior_failure:
+            # Same first-cause preservation as make_escalate_node below: a run already carrying a
+            # terminal failure (rebuild/e2e escalate routed into metrics-exit) keeps that cause.
+            payload = {**prior_failure, "subsequent_failure": {"stage": stage_spec.key, "type": "draft_infra_exhausted"}}
+        else:
+            # This node is only ever reached via make_route_after_draft's infra_exhausted check --
+            # never a genuine content/gate failure -- so the default (when the exception message
+            # itself doesn't happen to contain a recognizable quota marker) is infra_transient, not
+            # classify_failure's generic gate_exhausted fallback. See record_run_failure_and_reset's
+            # own docstring for why this matters.
+            payload = await run_failure.record_run_failure_and_reset(
+                thread_id, state.get("run_id"),
+                payload=payload, detail_for_classification=detail, default_failure_type="infra_transient",
+            )
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stages[stage_spec.key]["infra_exhausted"] = False
@@ -2867,11 +2916,19 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
             "report": last.get("report"),
             "feedback": last.get("feedback"),
         }
-        payload = await run_failure.record_run_failure_and_reset(
-            thread_id, state.get("run_id"),
-            payload=payload,
-            detail_for_classification=f"{last.get('feedback') or ''} {last.get('report') or ''}",
-        )
+        prior_failure = state.get("run_failure")
+        if prior_failure:
+            # A terminal failure was already recorded this run (e.g. a rebuild escalate routed into
+            # metrics-exit, whose own gate then capped out). Keep the FIRST cause -- the DB row and
+            # ledger already carry it, and re-recording would overwrite the real killer with
+            # downstream fallout. The second failure survives as a nested note.
+            payload = {**prior_failure, "subsequent_failure": {"stage": stage_spec.key, "type": payload["type"]}}
+        else:
+            payload = await run_failure.record_run_failure_and_reset(
+                thread_id, state.get("run_id"),
+                payload=payload,
+                detail_for_classification=f"{last.get('feedback') or ''} {last.get('report') or ''}",
+            )
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stages[stage_spec.key]["verify_cycle_count"] = 0
@@ -3477,8 +3534,8 @@ def _wire_e2e(builder: StateGraph) -> None:
     playwright config/tests present? a runner resolvable?) -> route("skip" -> metrics_compute |
     "run" -> e2e_run) -> e2e_run (boots the app, runs the suite, harvests screenshots) ->
     route("pass" -> metrics_compute | "fix" [attempt < E2E_MAX_FIX_CYCLES] -> e2e_fix -> e2e_run |
-    "escalate" -> e2e_escalate -> END). Verification status: NOT exercised against a real
-    container -- see e2e_nodes.py's own module docstring for exactly what's unconfirmed."""
+    "escalate" -> e2e_escalate -> metrics-exit_draft). Verification status: NOT exercised against a
+    real container -- see e2e_nodes.py's own module docstring for exactly what's unconfirmed."""
     builder.add_node("e2e_gate_check", e2e_nodes.e2e_gate_check_node)
     builder.add_node("e2e_run", e2e_nodes.e2e_run_node)
     builder.add_node("e2e_fix", e2e_nodes.e2e_fix_node)
@@ -3521,7 +3578,16 @@ def _wire_rebuild(builder: StateGraph, spec: rebuild.RebuildSpec) -> str:
         {"next": spec.next_node, "fix": fix_name, "escalate": escalate_name},
     )
     builder.add_edge(fix_name, rebuild_name)
-    builder.add_edge(escalate_name, END)
+    # Into metrics-exit, not END -- same reasoning as e2e_escalate/test_hardening above: the node
+    # has already recorded run_failure, so the merge stays blocked; routing onward means the human
+    # also gets exit.md, the manifest and a closed session naming the failure. The one exception is
+    # cannot_verify (sandbox gone): metrics-exit executes in the sandbox, so that branch still ENDs
+    # -- git_ops.record_run_failure at least closed the DB session row.
+    builder.add_conditional_edges(
+        escalate_name,
+        rebuild.route_after_escalate,
+        {"exit": "metrics-exit_draft", "end": END},
+    )
     return rebuild_name
 
 
