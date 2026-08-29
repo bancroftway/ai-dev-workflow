@@ -40,6 +40,13 @@ E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "120
 # number a code change can't reliably move (2026-08-24 audit). Set a floor explicitly to gate it.
 LIGHTHOUSE_PERF_MIN = int(os.environ.get("LIGHTHOUSE_PERF_MIN", "0"))
 LIGHTHOUSE_A11Y_MIN = int(os.environ.get("LIGHTHOUSE_A11Y_MIN", "90"))
+# Audit ids that block the e2e gate on their own, whatever the aggregate score: an accessibility
+# score of 93 sailed past the floor while `color-contrast` scored 0 on a primary button (run
+# d16959d3) -- a WCAG AA failure on a delivered UI is a defect, not a rounding error. Comma-separated
+# Lighthouse audit ids; empty disables. Each is a concrete, selector-named fix the e2e_fix lap can make.
+LIGHTHOUSE_BLOCKING_AUDITS = frozenset(
+    a.strip() for a in os.environ.get("LIGHTHOUSE_BLOCKING_AUDITS", "color-contrast").split(",") if a.strip()
+)
 
 # Operator kill-switch for the whole application-auth enforcement chain (prompt segments + the
 # e2e auth gate). On by default; "0" disables everything auth-related without touching per-repo

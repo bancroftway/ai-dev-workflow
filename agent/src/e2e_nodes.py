@@ -1318,6 +1318,17 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             below.append(f"performance {perf} < {workflow_config.LIGHTHOUSE_PERF_MIN}")
         if a11y is not None and workflow_config.LIGHTHOUSE_A11Y_MIN and a11y < workflow_config.LIGHTHOUSE_A11Y_MIN:
             below.append(f"accessibility {a11y} < {workflow_config.LIGHTHOUSE_A11Y_MIN}")
+        # Individually blocking audits (config.LIGHTHOUSE_BLOCKING_AUDITS): a failing score on one
+        # of these is a defect regardless of the aggregate -- see the config comment.
+        blocking_hits = [
+            a for a in (lighthouse.get("failing_audits") or [])
+            if a.get("id") in workflow_config.LIGHTHOUSE_BLOCKING_AUDITS and (a.get("score") or 0) < 1
+        ]
+        if blocking_hits:
+            below.append(
+                "blocking audit(s) failed: "
+                + ", ".join(f"{a.get('id')} on {a.get('route', '/')}" for a in blocking_hits)
+            )
         if below:
             audit_lines = "; ".join(
                 f"[{a.get('route', '/')}] {a.get('id')}: {a.get('title')}"

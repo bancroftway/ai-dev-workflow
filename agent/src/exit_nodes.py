@@ -578,6 +578,35 @@ def _render_history_sections(
     lines.append(e2e_line)
     lines.append("")
 
+    # Real route names for the Screens table below (e2e_nodes._route_slug is the inverse of the
+    # filename e2e wrote); imported lazily -- e2e_nodes is a heavier module than this one needs.
+    from .e2e_nodes import _route_slug
+
+    slug_to_route = {_route_slug(r): r for r in (e2e.get("routes") or []) if isinstance(r, str)}
+
+    lighthouse = e2e.get("lighthouse") or {}
+    if lighthouse:
+        # Lighthouse lives only in report.json today; the report a human reads never showed the
+        # per-route scores or the named failing audits (the color-contrast failure in d16959d3
+        # was invisible in exit.md while sitting in the JSON).
+        lines += ["## Lighthouse (live app, worst-of-routes)", ""]
+        lines.append(
+            f"- **Performance**: {lighthouse.get('performance', '--')} (floor {workflow_config.LIGHTHOUSE_PERF_MIN or 'report-only'}), "
+            f"**Accessibility**: {lighthouse.get('accessibility', '--')} (floor {workflow_config.LIGHTHOUSE_A11Y_MIN or 'report-only'})"
+        )
+        per_route = lighthouse.get("per_route") or {}
+        if per_route:
+            lines += ["", "| Route | Performance | Accessibility |", "|---|---|---|"]
+            for route, scores in per_route.items():
+                lines.append(f"| `{route}` | {(scores or {}).get('performance', '--')} | {(scores or {}).get('accessibility', '--')} |")
+        failing = lighthouse.get("failing_audits") or []
+        if failing:
+            lines += ["", "Failing audits (worst first):", ""]
+            for a in failing:
+                selector = f" -- `{a['selector']}`" if a.get("selector") else ""
+                lines.append(f"- [{a.get('route', '/')}] {a.get('id')}: {a.get('title')} (score {a.get('score')}){selector}")
+        lines.append("")
+
     lines += ["## Delta vs baseline", ""]
     if delta_summary:
         lines += ["| Metric | Before | After | Change |", "|---|---|---|---|"]
@@ -606,6 +635,12 @@ def _render_history_sections(
         for path in screenshots:
             name = path.rsplit("/", 1)[-1]
             screen, route = _screen_label(name)
+            # Prefer the real route e2e captured over the filename heuristic: the slug is lossy
+            # ("journal-entries" read back as "/journal/entries" in run d16959d3's report).
+            stem = name.rsplit(".", 1)[0]
+            slug = stem.split("-", 1)[1] if "-" in stem else stem
+            if slug in slug_to_route:
+                route = slug_to_route[slug]
             lines.append(f"| {screen} | `{route}` | ![{screen}]({screenshot_prefix}{run_id}-screens/{name}) |")
         lines.append("")
         lines.append(f"{len(screenshots)} screenshot(s) captured from the running application.")
@@ -1286,6 +1321,23 @@ def _demo() -> None:
     assert _baseline_refresh_payload("failed", {"repo_scan": final_scan}) is None, "a failed run must never refresh the baseline"
     assert _baseline_refresh_payload("completed", {}) is None, "no recorded scan -- nothing to write"
     assert _baseline_refresh_payload("completed", {"repo_scan": None}) is None
+
+    # Screens table uses the route e2e actually captured; Lighthouse section renders scores +
+    # named failing audits (previously only in report.json).
+    routed = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,
+        screenshots=[".ai-dev-workflow/history/r1-screens/002-journal-entries.png"], run_id="r1",
+        e2e={
+            "status": "passed", "routes": ["/accounts", "/journal-entries"],
+            "lighthouse": {
+                "performance": 54, "accessibility": 93,
+                "per_route": {"/accounts": {"performance": 55, "accessibility": 93}},
+                "failing_audits": [{"id": "color-contrast", "title": "Insufficient contrast", "score": 0, "selector": "button.btn", "route": "/accounts"}],
+            },
+        },
+    )
+    assert "| Journal Entries | `/journal-entries` |" in routed, routed
+    assert "## Lighthouse" in routed and "color-contrast" in routed and "`button.btn`" in routed and "| `/accounts` | 55 | 93 |" in routed, routed
 
     # Fallback metrics on a run that never reached metrics_compute: the last background scan and
     # the token ledger, explicitly labelled as not the final measurement.
