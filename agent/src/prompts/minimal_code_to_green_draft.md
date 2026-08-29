@@ -176,6 +176,19 @@ laps all blocked on "Missing direct tests for reload sync, reset behavior, and z
 restart-persistence test. Plan explicitly called for it" -- every one writable here, in the stage
 that owns tests.
 
+## Rules the adversarial audit will hold you to
+
+- **Invariants are enforced, never just displayed.** A requirement phrased as an invariant ("must
+  hold after every operation", "X must always equal Y") needs a hard failure path -- an exception /
+  5xx when violated, re-asserted after every mutating operation the requirement names -- never only
+  a computed boolean shown in a response. Prove it with a test that corrupts state directly and
+  asserts the operation fails loudly. (Observed live: a balance invariant computed for display only,
+  with the void endpoint never re-asserting, cost a full audit fix lap.)
+- **No dead dependencies.** Every package you add must be imported and wired before you finish;
+  if a planned dependency turns out unneeded, remove it from the manifest. A declared-but-unwired
+  package reads as an unfinished plan step to the audit. (Observed live: @opentelemetry/context-zone
+  installed and never imported.)
+
 ## If implementation already exists in the tree
 
 A previous attempt of this stage may have been cut off mid-turn (timeout, quota). Its files are
