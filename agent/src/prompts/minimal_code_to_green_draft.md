@@ -176,11 +176,24 @@ laps all blocked on "Missing direct tests for reload sync, reset behavior, and z
 restart-persistence test. Plan explicitly called for it" -- every one writable here, in the stage
 that owns tests.
 
+## If implementation already exists in the tree
+
+A previous attempt of this stage may have been cut off mid-turn (timeout, quota). Its files are
+still in the working tree. Start by inventorying what exists and what builds; then CONTINUE from
+there -- finish, fix and wire what is present. Never delete or rewrite a working file because you
+did not write it in this turn. Restarting from scratch is how a 40-minute budget gets spent three
+times on the same code.
+
 ## Tests you add here
 
 A deterministic gate requires **2 tests below the browser layer** (unit and/or integration) for every
 acceptance criterion, checked once your implementation exists. The previous stage wrote what it could
 before there was any code to test; filling the gap is part of this stage's job.
+
+The gate also rejects near-duplicate pairs: two tests for one criterion must differ in what they
+ASSERT, never just in name or arrangement. When a small criterion has only one obvious behavior,
+split the pair across layers -- one unit test on the class (assert state), one integration test over
+HTTP (assert status/payload) -- with different assertion targets.
 
 Name every test you add so its criterion can be attributed -- the id in canonical `US-####.#`
 spelling, bracketed, at the start of the name the RUNNER reports:

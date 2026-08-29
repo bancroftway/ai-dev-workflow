@@ -41,6 +41,20 @@ class TurnResult:
     exit_code: int
 
 
+class TurnTimeout(TimeoutError):
+    """run_turn's timeout, carrying whatever the CLI had streamed to stdout before the kill.
+
+    The stream-json `system/init` line -- and with it the session_id -- is emitted at turn START,
+    so a killed turn's partial output still names the session a retry can `--resume`. Observed
+    live (run d16959d3): three 40-minute minimal-code-to-green turns, each killed at the ceiling,
+    each retried as a FRESH session because the id was only ever read from the final result line
+    that a killed turn never produces -- 2.4 hours of work re-derived three times."""
+
+    def __init__(self, message: str, partial_stdout: str = "") -> None:
+        super().__init__(message)
+        self.partial_stdout = partial_stdout
+
+
 # Phase E audit C-2 ("Resume-rejected is not a distinct signal ... collapsed exactly as the Spec
 # forbade"): shared tri-state vocabulary for both claude_chat_model.py and copilot_chat_model.py,
 # which each hold their own per-provider SessionCache instance (see that class below) -- the STATE
@@ -341,7 +355,13 @@ async def run_turn(
                     f"kill -KILL -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; true"
                 )
                 await provider.exec_in_sandbox(thread_id, kill_cmd)
-                raise TimeoutError(f"turn did not complete within {timeout_seconds} seconds")
+                # Head only: the init line is the first line, and a 40-minute turn's stdout can
+                # be megabytes of tool events nobody needs here.
+                partial = await provider.exec_in_sandbox(thread_id, f"head -c 65536 {shlex.quote(out_path)} 2>/dev/null || true")
+                raise TurnTimeout(
+                    f"turn did not complete within {timeout_seconds} seconds",
+                    partial_stdout=partial.stdout if partial.ok else "",
+                )
 
             # Check if exit file exists.
             check_cmd = f"test -f {shlex.quote(exit_path)} && echo DONE || echo PENDING"
@@ -453,6 +473,11 @@ def _demo() -> None:
         "no conversation found",
     )) == "unknown"
 
+    # TurnTimeout is a TimeoutError (existing `except TimeoutError` handlers keep working) that
+    # carries the killed turn's stdout head for session-id recovery.
+    timeout_exc = TurnTimeout("turn did not complete within 5 seconds", partial_stdout='{"type":"system","subtype":"init"}')
+    assert isinstance(timeout_exc, TimeoutError) and "init" in timeout_exc.partial_stdout
+    assert TurnTimeout("x").partial_stdout == ""
     print("cli_agent_exec self-check: all assertions passed")
 
 

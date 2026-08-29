@@ -33,7 +33,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .. import repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
-from .write_scope_gate import _E2E_PATH_RE
+from .write_scope_gate import _E2E_PATH_RE, _is_pipeline_owned, _is_test_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
 from ..spec_ledger import LEDGER_PATH, own_ac_ids_from_specification
@@ -366,20 +366,70 @@ def duplicate_test_bodies(ac_id: str, test_files: dict[str, str]) -> int:
     return len(duplicate_test_pairs(ac_id, test_files))
 
 
+_TOKEN_RE = re.compile(r"[A-Za-z_]\w*|\d+|\S")
+
+
+def _alpha_profile(body: str) -> tuple[list[str], frozenset[str]]:
+    """(alpha token stream, alpha-normalised assertion-target set) for one test body.
+
+    Type-2 clone normalisation with one deliberate deviation: identifiers are replaced by
+    first-occurrence indexes (i1, i2, ...) so renaming a local/method never defeats the comparison
+    -- EXCEPT tokens that immediately follow a '.', which stay literal. A member access names the
+    API surface under test: alpha-mapping it would collapse `r.Count` and `r.Total` into the same
+    stream, re-creating the tiny-test false positive this function exists to avoid (run d8b09f43,
+    US-0005.1), while keeping it literal still catches the copy-and-rename-the-local dodge
+    (`r.Count` vs `result.Count` -- receiver indexed, member identical). Numbers -> 'n', string
+    literals -> 's', punctuation kept: structure stays, spelling doesn't."""
+    stripped = re.sub(r'"[^"]*"|\'[^\']*\'', " s ", body)
+    mapping: dict[str, str] = {}
+
+    def alpha(tokens: list[str]) -> list[str]:
+        out: list[str] = []
+        prev = ""
+        for token in tokens:
+            if token.isdigit():
+                out.append("n")
+            elif re.match(r"[A-Za-z_]", token) and prev != ".":
+                out.append(mapping.setdefault(token, f"i{len(mapping) + 1}"))
+            else:
+                out.append(token.lower())
+            prev = token
+        return out
+
+    stream = alpha(_TOKEN_RE.findall(stripped))
+    asserts = frozenset(
+        " ".join(alpha(_TOKEN_RE.findall(re.sub(r'"[^"]*"|\'[^\']*\'', " s ", m.group(1)))))
+        for m in _ASSERTION_RE.finditer(body)
+    ) - {""}
+    return stream, asserts
+
+
 def duplicate_test_pairs(ac_id: str, test_files: dict[str, str]) -> list[tuple[str, str]]:
-    """(duplicate test label, original test label) per near-duplicate, so feedback names both."""
+    """(duplicate test label, original test label) per near-duplicate, so feedback names both.
+
+    A pair is a duplicate only when the alpha token streams are similar AND the alpha-normalised
+    assertion targets match (see _alpha_profile for what alpha means and why member names stay
+    literal). Raw-text similarity alone false-positives on tiny tests: bodies are ~90% shared
+    plumbing, so SequenceMatcher saturates past 0.92 for ANY two short tests -- observed live (run
+    d8b09f43, US-0005.1): six laps rejected, by lap 6 flagging a singleton-registration store test
+    against an accumulation-across-connections controller test. Different assertion targets =
+    different tests, no matter how much scaffolding they share; renamed locals = the same test, no
+    matter how thorough the rename. Two assertion-less bodies (RED-phase stubs) compare equal-empty
+    and stay governed by the stream ratio, as before."""
     pairs: list[tuple[str, str]] = []
-    kept: list[tuple[str, str]] = []
+    kept: list[tuple[str, list[str], frozenset[str]]] = []
     for decl, body in _tests_for_ac(ac_id, test_files):
+        stream, asserts = _alpha_profile(body)
         original = next(
-            (k_decl for k_decl, k_body in kept
-             if SequenceMatcher(None, body, k_body).ratio() >= MAX_TEST_BODY_SIMILARITY),
+            (k_decl for k_decl, k_stream, k_asserts in kept
+             if asserts == k_asserts
+             and SequenceMatcher(None, stream, k_stream).ratio() >= MAX_TEST_BODY_SIMILARITY),
             None,
         )
         if original is not None:
             pairs.append((decl, original))
         else:
-            kept.append((decl, body))
+            kept.append((decl, stream, asserts))
     return pairs
 
 
@@ -661,7 +711,10 @@ def depth_shortfalls(
                 problems.append(
                     f"{len(pairs)} of its test(s) are near-duplicate bodies of another test for the "
                     f"same criterion (>= {int(MAX_TEST_BODY_SIMILARITY * 100)}% similar): {named} -- "
-                    "rewrite the named duplicate to assert a different observable behavior"
+                    "make the named duplicate differ in what it ASSERTS, not how it arranges: assert "
+                    "a different observable (status code, header, store/state value, error path), or "
+                    "test the same behavior at a different layer (unit on the class + integration "
+                    "over HTTP). Rearranging the same assert is still a duplicate"
                 )
 
         if content_dict is not None and total_tests > 0:
@@ -689,6 +742,146 @@ def _ui_relevant_ac_ids(content_dict: dict[str, Any], active_ac_ids: list[str]) 
     return {ac for ac in active_ac_ids if ac in flagged}
 
 
+# One definition of "the test files in this tree" for every scan in this module. `test-?results`
+# with -i, not the old case-sensitive bare `TestResults`: that spelling is .NET's, and Playwright
+# writes its failure artifacts to `test-results/` (hyphen, lowercase) which sailed straight
+# through -- one e2e run's screenshots then crowded real sources out of the depth listing, and
+# reading a `test-failed-1.png` as source crashed the run outright. The binary-extension denylist
+# exists because artifacts can be named anything and still match (test|spec).
+_TEST_FILE_LISTING = (
+    "git ls-files -co --exclude-standard | grep -iE '(test|spec)' "
+    r"| grep -viE '(^|/)(node_modules|\.playwright-browsers|bin|obj|dist|build|\.next|\.venv|vendor|test-?results|coverage|\.ai-dev-workflow|agent-work)/' "
+    r"| grep -viE '\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|mp4|webm|woff2?|ttf|eot|dll|exe|so|dylib|pyc|class|jar)$'"
+)
+
+
+async def _grep_test_files_for_ids(
+    provider: SandboxProvider, thread_id: str, ac_ids: set[str]
+) -> dict[str, set[str]]:
+    """{test file path -> AC ids named on its lines}, for the given ids only.
+
+    Two-stage matching: `grep -F` with id_variants finds CANDIDATE lines cheaply, then
+    test_results.ac_ids_in_name re-parses each line boundary-aware -- a raw variant substring test
+    would credit US-0001.1 for a line naming only US-0001.12 (the `(?!\\d)` tail is what the
+    variants list cannot express in `grep -F`)."""
+    if not ac_ids:
+        return {}
+    patterns = " ".join(f"-e {shlex.quote(v)}" for ac in sorted(ac_ids) for v in id_variants(ac))
+    grep = await provider.exec_in_sandbox(
+        thread_id,
+        f"{_TEST_FILE_LISTING} | xargs -r -d '\\n' grep -H -n -F {patterns} -- 2>/dev/null || true",
+    )
+    hits: dict[str, set[str]] = {}
+    for line in (grep.stdout or "").splitlines():
+        path, _, rest = line.partition(":")
+        _lineno, _, text = rest.partition(":")
+        found = set(test_results.ac_ids_in_name(text)) & ac_ids
+        if found and path:
+            hits.setdefault(path, set()).update(found)
+    return hits
+
+
+async def check_retired_ac_residue(
+    provider: SandboxProvider, thread_id: str, entries: list[dict[str, Any]]
+) -> list[str]:
+    """Deletion propagation, test side: once a Specification retires an AC, no test file may still
+    reference its id. Runs at ac-to-tests verify AND again at the last rebuild gate before metrics
+    (rebuild._scan_regression_reasons) -- later stages can write tests too."""
+    retired = {
+        e["id"]
+        for e in entries
+        if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
+    }
+    hits = await _grep_test_files_for_ids(provider, thread_id, retired)
+    if not hits:
+        return []
+    detail = "; ".join(f"{path}: {', '.join(sorted(ids))}" for path, ids in sorted(hits.items()))
+    return [
+        "test files still reference retired AC ids -- these criteria were removed from the "
+        f"Specification, so delete those test cases (delete the file if it holds nothing else): {detail}"
+    ]
+
+
+async def check_completed_ac_protection(
+    provider: SandboxProvider, thread_id: str, baseline_commit: str | None, entries: list[dict[str, Any]]
+) -> list[str]:
+    """Completed criteria (coded_run_id stamped by a healthy metrics run) are settled: their
+    regression tests must survive (A), and no NEW test work may target them (B). Incidental
+    shared-code edits are deliberately NOT policed -- the regression suite guards behavior.
+
+    A is id-presence (does any test file still name the id), never runner-reported test-name
+    grepping: runner names are FQNs/joined titles that don't exist verbatim in source. An AC coded
+    but with no tests on disk at all is a deletion either way.
+    """
+    completed = {
+        e["id"]
+        for e in entries
+        if e.get("kind") == "acceptance_criterion"
+        and e.get("status") in ("active", "revised")
+        and e.get("coded_run_id")
+    }
+    if not completed:
+        return []
+    problems: list[str] = []
+
+    present = set()
+    for ids in (await _grep_test_files_for_ids(provider, thread_id, completed)).values():
+        present.update(ids)
+    for ac_id in sorted(completed - present):
+        problems.append(
+            f"no test file names completed criterion {ac_id} any more -- its regression tests were "
+            "deleted or renamed; restore them (completed criteria keep their tests)"
+        )
+
+    if baseline_commit is not None:
+        added_by_path: dict[str, list[str]] = {}
+        diff = await provider.exec_in_sandbox(
+            thread_id, f"git diff --unified=0 {shlex.quote(baseline_commit)} -- ."
+        )
+        current: str | None = None
+        for line in (diff.stdout or "").splitlines():
+            if line.startswith("+++ b/"):
+                path = line[6:].strip()
+                current = path if _is_test_path(path) and not _is_pipeline_owned(path) else None
+            elif line.startswith("+") and not line.startswith("+++") and current:
+                added_by_path.setdefault(current, []).append(line[1:])
+        untracked = await provider.exec_in_sandbox(thread_id, "git ls-files --others --exclude-standard")
+        for path in (untracked.stdout or "").splitlines():
+            path = path.strip()
+            if path and _is_test_path(path) and not _is_pipeline_owned(path):
+                contents = await repo_files.read_repo_file(provider, thread_id, path)
+                if contents is not None:
+                    added_by_path.setdefault(path, []).extend(contents.splitlines())
+        offenders: dict[str, set[str]] = {}
+        for path, lines in added_by_path.items():
+            for text in lines:
+                touched = set(test_results.ac_ids_in_name(text)) & completed
+                if touched:
+                    offenders.setdefault(path, set()).update(touched)
+        if offenders:
+            detail = "; ".join(f"{path}: {', '.join(sorted(ids))}" for path, ids in sorted(offenders.items()))
+            problems.append(
+                "new/modified test lines target criteria that are already coded and tested -- "
+                f"completed criteria are never re-worked, remove those additions: {detail}"
+            )
+    return problems
+
+
+async def check_ledger_integrity(provider: SandboxProvider, thread_id: str) -> list[str]:
+    """The spec ledger is pipeline-owned truth every gate reads, yet it sits inside the write-scope
+    whitelist (.ai-dev-workflow/) any agent can write to. Every pipeline writer commits its own
+    ledger writes, so an UNCOMMITTED diff on it at gate time is agent tampering: revert it and fail
+    the lap so the feedback says so."""
+    diff = await provider.exec_in_sandbox(thread_id, f"git diff --name-only -- {shlex.quote(LEDGER_PATH)}")
+    if not (diff.stdout or "").strip():
+        return []
+    await provider.exec_in_sandbox(thread_id, f"git checkout -- {shlex.quote(LEDGER_PATH)}")
+    return [
+        f"{LEDGER_PATH} was modified during this stage -- the spec ledger is pipeline-owned and "
+        "never writable by an agent; the change has been reverted. Do not touch it."
+    ]
+
+
 @dataclass(frozen=True)
 class AcCoverageOutcome:
     passed: bool
@@ -706,19 +899,26 @@ async def check_ac_coverage(
     threaded the same way, defaulting to "unknown" -- its caller (verify_ac_to_tests) already
     carries a real one in scope."""
     raw_ledger = await repo_files.read_repo_file(provider, thread_id, LEDGER_PATH)
+    ledger_entries: list[dict[str, Any]] = []
     active_ac_ids: list[str] = []
     all_ledger_ac_ids: list[str] = []
+    coded_by_id: dict[str, str] = {}
     if raw_ledger is not None:
         try:
-            entries = json.loads(raw_ledger).get("entries", [])
+            ledger_entries = json.loads(raw_ledger).get("entries", [])
             active_ac_ids = [
-                e["id"] for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") in ("active", "revised")
+                e["id"] for e in ledger_entries if e.get("kind") == "acceptance_criterion" and e.get("status") in ("active", "revised")
             ]
             # Every status, retired included -- see unattributed_tests's own call site below (Task
             # 10 sweep item #10): that check's question ("did a real human ever write this AC id
             # anywhere in the ledger") doesn't care whether the AC is still active, unlike every
             # other consumer of active_ac_ids in this function.
-            all_ledger_ac_ids = [e["id"] for e in entries if e.get("kind") == "acceptance_criterion"]
+            all_ledger_ac_ids = [e["id"] for e in ledger_entries if e.get("kind") == "acceptance_criterion"]
+            coded_by_id = {
+                e["id"]: e["coded_run_id"]
+                for e in ledger_entries
+                if e.get("kind") == "acceptance_criterion" and e.get("coded_run_id")
+            }
         except json.JSONDecodeError:
             pass
 
@@ -743,13 +943,45 @@ async def check_ac_coverage(
     # should not manufacture a NEW false coverage gap on top of it).
     raw_spec = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH)
     own_ac_ids: set[str] = set()
+    spec_parsed = False
+    spec_retired: list[str] = []
     if raw_spec is not None:
         try:
-            own_ac_ids = own_ac_ids_from_specification(json.loads(raw_spec))
+            spec_doc = json.loads(raw_spec)
+            own_ac_ids = own_ac_ids_from_specification(spec_doc)
+            spec_retired = list(spec_doc.get("retired_ac_ids") or []) + list(spec_doc.get("retired_us_ids") or [])
+            spec_parsed = True
         except json.JSONDecodeError:
             pass
     if own_ac_ids:
         active_ac_ids = [ac for ac in active_ac_ids if ac in own_ac_ids]
+
+    # Work-queue scoping: criteria already delivered by a healthy run (coded_run_id stamped by
+    # metrics_compute, cleared by spec approval when the requirement's wording really changed) are
+    # never re-presented for test work. Only applied when the approved Specification was actually
+    # read -- the unparseable-spec fallback keeps the old unscoped behavior rather than
+    # manufacturing a vacuous pass out of an infra hiccup.
+    if spec_parsed:
+        completed_excluded = sorted(ac for ac in active_ac_ids if ac in coded_by_id)
+        active_ac_ids = [ac for ac in active_ac_ids if ac not in coded_by_id]
+        if not active_ac_ids and (completed_excluded or spec_retired):
+            # Every own criterion is already delivered, and/or this is a deletion-only ticket
+            # (a spec with no stories, only retirements). Nothing new to cover is a PASS here --
+            # trustworthy because coded stamps exist only from regression-clean metrics runs.
+            return AcCoverageOutcome(
+                passed=True,
+                feedback=(
+                    "No acceptance criteria await test coverage: "
+                    + (
+                        f"all {len(completed_excluded)} of this ticket's criteria are already coded and tested "
+                        "(ledger stamps)"
+                        if completed_excluded
+                        else "this ticket only retires criteria"
+                    )
+                    + " -- no new coverage required."
+                ),
+                report={"eligible": [], "completed_ac_ids_excluded": completed_excluded, "spec_retired": spec_retired},
+            )
 
     if not active_ac_ids:
         return AcCoverageOutcome(
@@ -870,23 +1102,10 @@ async def check_ac_coverage(
     # test is one that stands up a real host -- see _INTEGRATION_SYMBOLS) and .NET keeps every level
     # in one project, so a path proves nothing except e2e.
     depth_report: dict[str, Any] = {}
-    listing = await provider.exec_in_sandbox(
-        thread_id,
-        "git ls-files -co --exclude-standard | grep -iE '(test|spec)' "
-        # `test-?results` with -i, not the old case-sensitive bare `TestResults`: that spelling is
-        # .NET's, and Playwright writes its failure artifacts to `test-results/` (hyphen, lowercase)
-        # which sailed straight through. One e2e run's output then dominated the whole listing --
-        # 53 of the 60 slots below were screenshots and error-context dumps, crowding the real test
-        # sources out of the depth analysis, and reading a `test-failed-1.png` as source crashed the
-        # run outright.
-        r"| grep -viE '(^|/)(node_modules|\.playwright-browsers|bin|obj|dist|build|\.next|\.venv|vendor|test-?results|coverage|\.ai-dev-workflow|agent-work)/' "
-        # Binary artifacts can be named anything and still match (test|spec); this gate reads every
-        # path it lists as text, so they must never reach it regardless of which directory they sit
-        # in. A denylist rather than a source-extension allowlist, so an unfamiliar stack's test
-        # files are never silently dropped from coverage.
-        r"| grep -viE '\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|mp4|webm|woff2?|ttf|eot|dll|exe|so|dylib|pyc|class|jar)$' "
-        "| head -60 || true",
-    )
+    # head -60 is legitimate HERE (this pass reads every listed file's contents); the grep-only
+    # residue/protection checks below use the uncapped _TEST_FILE_LISTING -- a cap there silently
+    # skipped every test file past the 60th.
+    listing = await provider.exec_in_sandbox(thread_id, f"{_TEST_FILE_LISTING} | head -60 || true")
     test_paths = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
     test_files: dict[str, str] = {}
     for path in test_paths:
@@ -1060,6 +1279,33 @@ def _demo() -> None:
     }
     pairs = duplicate_test_pairs("US-0007.1", dup_files)
     assert len(pairs) == 1 and "US_0007_1_B" in pairs[0][0] and "US_0007_1_A" in pairs[0][1], pairs
+
+    # Similar plumbing, DIFFERENT assertion targets = not duplicates. The tiny-test false positive
+    # observed live (run d8b09f43, US-0005.1): short bodies are mostly shared boilerplate, so the
+    # text ratio saturates for any two of them -- the assertion-target condition is what tells a
+    # store-state test apart from a payload test that arranges identically.
+    layered_files = {
+        "apps/api.Tests/tests/L.cs": (
+            "[Fact] public void US_0007_2_A(){ var r = svc.Add(book); Assert.Equal(1, r.Count); }\n"
+            "[Fact] public void US_0007_2_B(){ var r = svc.Add(book); Assert.Equal(1, r.Items.Length); }\n"
+        )
+    }
+    assert duplicate_test_pairs("US-0007.2", layered_files) == [], (
+        "near-identical bodies with different assertion targets must NOT be duplicates"
+    )
+
+    # The rename dodge: same test, method + local renamed wholesale. Alpha indexing makes the
+    # streams identical and the member access (.Count) stays literal on both sides -- flagged.
+    dodge_files = {
+        "apps/api.Tests/tests/R.cs": (
+            "[Fact] public void US_0007_3_A(){ var r = svc.Add(book); Assert.Equal(1, r.Count); }\n"
+            "[Fact] public void US_0007_3_B(){ var outcome = svc.Add(book); Assert.Equal(1, outcome.Count); }\n"
+        )
+    }
+    dodge_pairs = duplicate_test_pairs("US-0007.3", dodge_files)
+    assert len(dodge_pairs) == 1 and "US_0007_3_B" in dodge_pairs[0][0], (
+        "a renamed-local clone must still be flagged", dodge_pairs,
+    )
 
     # The .NET shape this pipeline actually generates: `[Fact]` on one line, the criterion id inside
     # a PascalCase method name on the next, with all punctuation stripped. Every part of this was

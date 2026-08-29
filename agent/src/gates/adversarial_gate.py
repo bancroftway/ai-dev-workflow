@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 BLOCKING_VERDICTS = frozenset({"major_gaps", "fails_to_conform"})
 BLOCKING_SEVERITIES = frozenset({"critical", "major"})
 
+# One bounded minor-sweep lap per run: the FIRST otherwise-passing verify that still carries minor
+# findings fails once, so the stage's write-capable fix pass gets one shot at closing what is
+# mechanically closeable, and the re-audit referees. Exactly once -- minors are where subjectivity
+# lives, and a fix-until-zero-minors loop never converges (an adversarial auditor can always find
+# one more). Keyed process-local per (thread_id, run_id): a process restart at worst repeats one
+# bounded lap, same tolerance as every other in-memory per-run cache in this codebase.
+_MINOR_SWEEP_DONE: set[tuple[str, str]] = set()
+MINOR_SWEEP_MARKER = "[minor sweep]"
+
 
 def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
     """(passed, reasons). Pure, so the routing logic is testable without a sandbox.
@@ -68,16 +77,40 @@ def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
 
 
 async def verify_adversarial_compliance(
-    _thread_id: str, content_dict: dict[str, Any], _run_id: str, _baseline_commit: str | None, _provider: Any,
+    thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: Any,
     _chat_provider: str,
 ) -> "VerificationResult":
     # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: this check has
     # no chat-model dispatch call of its own.
     from ..graph import VerificationResult
 
+    await _snapshot_findings(provider, thread_id, run_id, content_dict)
+
     passed, reasons = evaluate_audit(content_dict)
     if passed:
         findings = content_dict.get("divergence_findings") or []
+        minors = [f for f in findings if str(f.get("severity") or "").lower() == "minor"]
+        if minors and (thread_id, run_id) not in _MINOR_SWEEP_DONE:
+            _MINOR_SWEEP_DONE.add((thread_id, run_id))
+            logger.info("adversarial gate: minor sweep -- one fix lap for %d minor finding(s)", len(minors))
+            lines = [
+                f"- {MINOR_SWEEP_MARKER} [{f.get('severity')}] "
+                f"{f.get('plan_reference') or 'unknown plan reference'}: {f.get('description')} -- "
+                f"proposed: {f.get('proposed_resolution') or '(none)'}"
+                for f in minors
+            ]
+            return VerificationResult(
+                passed=False,
+                feedback=(
+                    "MINOR SWEEP (one lap, will not repeat): the audit passed -- nothing critical or "
+                    "major -- but the minor divergences below are still open. Fix every one that is "
+                    "mechanically closeable without risk; SKIP any that requires a judgement call or "
+                    "endangers a passing test, and state per finding why you skipped it. The suite "
+                    "you leave behind must be at least as green as the one you found:\n"
+                    + "\n".join(lines)
+                ),
+                report={"overall_verdict": content_dict.get("overall_verdict"), "minor_sweep": len(minors)},
+            )
         return VerificationResult(
             passed=True,
             feedback=(
@@ -101,6 +134,33 @@ async def verify_adversarial_compliance(
             "blocking_reasons": reasons,
         },
     )
+
+
+async def _snapshot_findings(provider: Any, thread_id: str, run_id: str, content_dict: dict[str, Any] | None) -> None:
+    """One ledger row per verify lap with this lap's full findings list -- the exit report's
+    divergence ledger diffs the first snapshot against the last to say deterministically which
+    findings the fix laps closed and which stayed open (matched by plan_reference; no model
+    self-report involved). Best-effort: a failed ledger write must never fail the gate."""
+    from .. import repo_files
+
+    try:
+        await repo_files.append_ledger_entry(provider, thread_id, {
+            "stage": "adversarial-compliance",
+            "node": "divergence_snapshot",
+            "run_id": run_id,
+            "overall_verdict": (content_dict or {}).get("overall_verdict"),
+            "findings": [
+                {
+                    "severity": f.get("severity"),
+                    "plan_reference": f.get("plan_reference"),
+                    "description": f.get("description"),
+                    "proposed_resolution": f.get("proposed_resolution"),
+                }
+                for f in ((content_dict or {}).get("divergence_findings") or [])
+            ],
+        })
+    except Exception:  # noqa: BLE001 -- advisory trail only
+        logger.warning("divergence snapshot ledger write failed for thread_id=%s", thread_id, exc_info=True)
 
 
 def _demo() -> None:
@@ -137,6 +197,40 @@ def _demo() -> None:
 
     # A missing verdict is itself a failure: the stage must commit to a judgement.
     assert not evaluate_audit({"divergence_findings": []})[0]
+
+    # Minor sweep: the first otherwise-passing verify with minors fails ONCE with sweep feedback;
+    # the second identical call passes. Stubbed provider -- the snapshot write is best-effort.
+    import asyncio
+
+    class _StubProvider:
+        async def exec_in_sandbox(self, _thread_id, _cmd):
+            class _R:
+                ok = True
+                stdout = ""
+                stderr = ""
+            return _R()
+
+    _MINOR_SWEEP_DONE.clear()
+    minor_report = {
+        "overall_verdict": "minor_gaps",
+        "divergence_findings": [{
+            "severity": "minor", "plan_reference": "Plan Step 4",
+            "description": "empty-state copy differs from wireframe", "proposed_resolution": "align the copy",
+        }],
+    }
+    first = asyncio.run(verify_adversarial_compliance("t1", minor_report, "r1", None, _StubProvider(), "claude"))
+    assert not first.passed and MINOR_SWEEP_MARKER in first.feedback and "Plan Step 4" in first.feedback, first
+    second = asyncio.run(verify_adversarial_compliance("t1", minor_report, "r1", None, _StubProvider(), "claude"))
+    assert second.passed, second
+    # A different run on the same thread gets its own sweep.
+    third = asyncio.run(verify_adversarial_compliance("t1", minor_report, "r2", None, _StubProvider(), "claude"))
+    assert not third.passed, third
+    # Blocking findings still block regardless of sweep state, and no sweep fires with zero minors.
+    _MINOR_SWEEP_DONE.clear()
+    clean = asyncio.run(verify_adversarial_compliance(
+        "t2", {"overall_verdict": "conforms", "divergence_findings": []}, "r1", None, _StubProvider(), "claude"))
+    assert clean.passed, clean
+    _MINOR_SWEEP_DONE.clear()
 
     print("adversarial_gate self-check: all assertions passed")
 

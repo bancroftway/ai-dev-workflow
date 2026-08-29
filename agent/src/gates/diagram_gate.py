@@ -20,7 +20,9 @@ import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .. import git_ops, repo_files
+import json
+
+from .. import git_ops, repo_files, spec_ledger, workflow_persistence
 from ..failure_classification import classify_failure
 from ..sandbox.provider import SandboxProvider
 
@@ -29,6 +31,15 @@ if TYPE_CHECKING:
 
 DIAGRAMS_DIR = ".ai-dev-workflow/plan/diagrams"
 WIREFRAMES_DIR = ".ai-dev-workflow/plan/wireframes"
+
+
+def wireframe_preview_url(owner: str, repo: str, branch: str, screen: str) -> str:
+    """Rendered-HTML preview link for a committed wireframe. GitHub shows an .html blob as source;
+    html-preview.github.io fetches the blob and renders it. Pure, so plan.md's link is testable."""
+    return (
+        "https://html-preview.github.io/?url="
+        f"https://github.com/{owner}/{repo}/blob/{branch}/{WIREFRAMES_DIR}/{screen}.html"
+    )
 
 MAX_WIREFRAMES = 6
 MAX_WIREFRAME_BYTES = 30 * 1024
@@ -64,6 +75,72 @@ def check_wireframe(screen: str, html_source: str) -> str | None:
         if pattern.search(html_source):
             return f"wireframe {screen!r} {reason} -- wireframes must be fully self-contained (inline CSS only)"
     return None
+
+def check_plan_linkage(
+    plan_steps: list[dict[str, Any]],
+    ledger_entries: list[dict[str, Any]],
+    own_ac_ids: set[str],
+    prior_steps_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Pure both-direction US/AC <-> plan-step provenance check (the ledger is the authority):
+
+    step side -- every step cites >=1 live AC id or is kind='infrastructure'; cited ids must
+    exist, be acceptance criteria, and not ALL be retired (a step whose every criterion this
+    Specification retires is a deleted feature's leftover and must be dropped); a NEW or CHANGED
+    step (vs the prior approved plan) citing only completed criteria is rework the pipeline
+    forbids -- verbatim carryovers are exempt because ticket mode requires restating them.
+
+    coverage side -- every ELIGIBLE AC (this ticket's own, live, never delivered by a healthy
+    run) is cited by >=1 step. Completed criteria need no step; this direction also defeats
+    marking every step 'infrastructure' to dodge the step-side rule.
+    """
+    problems: list[str] = []
+    by_id = {e.get("id"): e for e in ledger_entries}
+    cited_live: set[str] = set()
+    for step in plan_steps:
+        step_id = step.get("id") or "?"
+        ac_ids = step.get("ac_ids") or []
+        if not ac_ids:
+            if step.get("kind") != "infrastructure":
+                problems.append(
+                    f"{step_id}: cites no acceptance criteria and is not kind='infrastructure' -- "
+                    "every feature step must name the US-####.# ids it fulfils"
+                )
+            continue
+        bad = [i for i in ac_ids if by_id.get(i) is None or by_id[i].get("kind") != "acceptance_criterion"]
+        if bad:
+            problems.append(
+                f"{step_id}: cites {', '.join(bad)} which is not an acceptance criterion in the "
+                "ledger -- copy ids exactly from the approved Specification"
+            )
+            continue
+        live = [i for i in ac_ids if by_id[i].get("status") in ("active", "revised")]
+        if not live:
+            problems.append(
+                f"{step_id}: every cited criterion ({', '.join(ac_ids)}) is retired -- this step "
+                "implements a removed feature; drop it from the plan"
+            )
+            continue
+        prior = prior_steps_by_id.get(step.get("id") or "")
+        carryover = prior is not None and prior.get("description") == step.get("description")
+        if not carryover:
+            undelivered = [i for i in live if not by_id[i].get("coded_run_id")]
+            if not undelivered:
+                problems.append(
+                    f"{step_id}: is new/changed but cites only already-delivered criteria "
+                    f"({', '.join(live)}) -- completed criteria are never re-planned; carry the "
+                    "prior step over verbatim or drop it"
+                )
+                continue
+        cited_live.update(live)
+    for ac_id in spec_ledger.eligible_ac_ids(ledger_entries, own_ac_ids):
+        if ac_id not in cited_live:
+            problems.append(
+                f"{ac_id}: this ticket's undelivered criterion is cited by no plan step -- every "
+                "criterion awaiting delivery needs at least one step (ac_ids) that fulfils it"
+            )
+    return problems
+
 
 @dataclass(frozen=True)
 class DiagramRenderOutcome:
@@ -198,6 +275,50 @@ def _demo() -> None:
         'Configuration file "/opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json" doesn\'t exist'
     )
     assert not _MERMAID_SYNTAX_MARKERS.search("Failed to launch the browser process! spawn ENOENT")
+    # check_plan_linkage: one assertion per rule, plus a passing plan.
+    ledger = [
+        {"id": "US-0001", "kind": "user_story", "status": "active"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "status": "retired"},
+        {"id": "US-0001.3", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1"},
+    ]
+    own = {"US-0001.1", "US-0001.2", "US-0001.3"}
+    ok_steps = [
+        {"id": "PS-1", "description": "build it", "ac_ids": ["US-0001.1"], "kind": "feature"},
+        {"id": "PS-2", "description": "wire CI", "ac_ids": [], "kind": "infrastructure"},
+    ]
+    assert check_plan_linkage(ok_steps, ledger, own, {}) == []
+    # feature step with no citations
+    assert any("PS-1" in p for p in check_plan_linkage(
+        [{"id": "PS-1", "description": "x", "ac_ids": [], "kind": "feature"}], ledger, set(), {}))
+    # unknown / non-AC id
+    assert any("US-0009.9" in p for p in check_plan_linkage(
+        [{"id": "PS-1", "description": "x", "ac_ids": ["US-0009.9"]}], ledger, set(), {}))
+    assert any("not an acceptance criterion" in p for p in check_plan_linkage(
+        [{"id": "PS-1", "description": "x", "ac_ids": ["US-0001"]}], ledger, set(), {}))
+    # every cited AC retired => drop the step
+    assert any("retired" in p for p in check_plan_linkage(
+        [{"id": "PS-1", "description": "x", "ac_ids": ["US-0001.2"]}], ledger, set(), {}))
+    # new step citing only delivered criteria => rework refused; verbatim carryover exempt
+    rework = [{"id": "PS-9", "description": "redo it", "ac_ids": ["US-0001.3"]}]
+    assert any("never re-planned" in p for p in check_plan_linkage(rework, ledger, set(), {}))
+    assert check_plan_linkage(rework, ledger, set(), {"PS-9": {"id": "PS-9", "description": "redo it"}}) == []
+    # coverage direction: undelivered own AC with no step fails; completed AC needs none
+    assert any("US-0001.1" in p for p in check_plan_linkage(
+        [{"id": "PS-2", "description": "ci", "ac_ids": [], "kind": "infrastructure"}], ledger, own, {}))
+    # plan.md preview link: html-preview.github.io over the branch's blob URL, exact shape.
+    assert wireframe_preview_url("acme", "shop", "ai-dev-workflow/abc", "catalog") == (
+        "https://html-preview.github.io/?url=https://github.com/acme/shop/blob/ai-dev-workflow/abc/"
+        ".ai-dev-workflow/plan/wireframes/catalog.html"
+    )
+    from ..markdown_render import render_plan_markdown
+
+    rendered = render_plan_markdown({"wireframes": [
+        {"screen": "catalog", "html_source": "<html></html>", "preview_url": "https://html-preview.github.io/?url=x"},
+        {"screen": "cart", "html_source": "<html></html>"},
+    ]})
+    assert "- [catalog](plan/wireframes/catalog.html) -- [preview](https://html-preview.github.io/?url=x)" in rendered, rendered
+    assert "- [cart](plan/wireframes/cart.html)\n" in rendered, rendered
     print("diagram_gate wireframe self-check: all assertions passed")
 
 
@@ -225,6 +346,39 @@ async def verify_plan_diagrams(
             report={"plan_content": "empty"},
         )
 
+    # Provenance first: pure checks against the ledger, cheaper than any render, and a plan whose
+    # steps aren't linked to this ticket's criteria is wrong regardless of its diagrams. The spec
+    # read falls back to an empty own-set (coverage direction skipped) the same way
+    # ac_coverage_gate's identical read does -- an infra hiccup must not manufacture a false gap.
+    ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+    own_ac_ids: set[str] = set()
+    raw_spec = await repo_files.read_repo_file(
+        provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+    )
+    if raw_spec is not None:
+        try:
+            own_ac_ids = spec_ledger.own_ac_ids_from_specification(json.loads(raw_spec))
+        except json.JSONDecodeError:
+            pass
+    prior_steps_by_id: dict[str, dict[str, Any]] = {}
+    raw_prior_plan = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.PLAN_APPROVED_PATH)
+    if raw_prior_plan is not None:
+        try:
+            prior_steps_by_id = {
+                s.get("id"): s for s in (json.loads(raw_prior_plan).get("plan_steps") or []) if s.get("id")
+            }
+        except json.JSONDecodeError:
+            pass
+    linkage_problems = check_plan_linkage(
+        content_dict.get("plan_steps") or [], ledger_entries, own_ac_ids, prior_steps_by_id
+    )
+    if linkage_problems:
+        return VerificationResult(
+            passed=False,
+            feedback="; ".join(linkage_problems),
+            report={"plan_linkage_failed": linkage_problems},
+        )
+
     diagrams = content_dict.get("diagrams") or []
     wireframes = content_dict.get("wireframes") or []
 
@@ -243,6 +397,21 @@ async def verify_plan_diagrams(
         return VerificationResult(passed=False, feedback="; ".join(wireframe_errors), report={"wireframes_failed": wireframe_errors})
     for wf in wireframes:
         await repo_files.write_repo_file(provider, thread_id, f"{WIREFRAMES_DIR}/{wf['screen']}.html", wf["html_source"])
+    if wireframes:
+        # Stamp a rendered-preview link onto each wireframe entry. In-place mutation of
+        # content_dict is this verify's established contract (it already rewrites ids/fields before
+        # the gate), so the link lands in approved_content and plan.md. Repo/branch come from the
+        # session row -- the only place they are durably known; unavailable (DB down, no row) means
+        # plan.md keeps just the relative link, never a broken absolute one.
+        try:
+            from .. import session_store
+
+            row = await session_store.get_session(thread_id)
+        except Exception:  # noqa: BLE001 -- cosmetic link, never a gate failure
+            row = None
+        if row and row.get("owner") and row.get("repo") and row.get("work_branch"):
+            for wf in wireframes:
+                wf["preview_url"] = wireframe_preview_url(row["owner"], row["repo"], row["work_branch"], wf["screen"])
 
     if not diagrams and not wireframes:
         return VerificationResult(passed=True, feedback="No diagrams or wireframes in this draft -- nothing to validate.", report={})

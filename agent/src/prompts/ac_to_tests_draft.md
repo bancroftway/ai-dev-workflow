@@ -196,8 +196,10 @@ reading as requirements rather than advice:
    expressions. Numeric literals are normalised before comparison, so `Assert.Equal(1, c.Value)`
    and `Assert.Equal(2, c.Value)` count as ONE assertion target, not two. Assert a different
    property, a different method's return, or a different observable effect.
-2. **No near-duplicate bodies.** Two tests for the same AC whose bodies are >= 92% similar count as
-   one test. Renaming a test and changing a literal does not produce a second test.
+2. **No near-duplicate bodies.** Two tests for the same AC whose bodies are >= 92% similar AND
+   assert the same targets count as one test. Renaming a test and changing a literal does not
+   produce a second test; the escape route is asserting a DIFFERENT observable (status code, header,
+   state value, error path) or the same behavior at a different layer (unit + integration).
 3. **Category spread.** An AC whose `categories` contains only `happy_path` is blocked. At least one
    negative, edge, or adversarial case per criterion.
 4. **Positive anchor before absence checks.** A test that asserts ONLY absence -- `toHaveCount(0)`,

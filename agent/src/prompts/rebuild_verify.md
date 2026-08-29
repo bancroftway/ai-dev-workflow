@@ -46,9 +46,17 @@ Steps:
 3. If a build fails, capture the real compiler/tool output. That output is the whole point -- the
    fix agent that runs next can only work from what you report.
 
+Run the build IN THIS TURN, every time you are asked -- never answer from an earlier turn's
+result. The tree changes between your turns (a fix agent edits it), so a remembered error is
+worthless; only output produced by a command you ran just now counts.
+
 Then report:
 - `success`: true only if EVERY buildable project built cleanly.
 - `ok`: same as success -- the build gate reads this field.
+- `build_commands`: one `{cwd, command}` per project you built -- the repo-relative directory and
+  the exact command, e.g. `{"cwd": "apps/api.Tests", "command": "dotnet build"}`. This is a
+  contract: the pipeline REPLAYS these commands itself after each fix lap instead of asking you
+  again, so they must be complete (every buildable project) and runnable non-interactively as-is.
 - `stdout_tail` / `stderr_tail`: the last few thousand characters of real output. On failure these
   must contain the actual error text, not your summary of it.
 - `summary`: what you found and what you ran (which directories, which commands).

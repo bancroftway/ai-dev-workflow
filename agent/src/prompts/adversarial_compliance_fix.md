@@ -38,6 +38,13 @@ Rules that matter more than speed:
   wireframe got closer and the product broke. A conformance fix that breaks a passing test is a
   REGRESSION; the suite you leave behind must be at least as green as the one you found.
 
+**Minor-sweep laps.** When the findings below are marked `[minor sweep]`, the audit already passed
+-- these are below the blocking threshold and this is a single bounded cleanup lap, not a loop. The
+close-or-rebut rules above relax exactly one notch: you may SKIP a minor finding, but only for a
+stated reason (it requires a product judgement call, or closing it risks a passing test), named per
+finding in your summary. Fix everything else. Skipping without a reason, or skipping everything, is
+not a valid outcome.
+
 You have full write access to source and tests. After your changes, run the build and the affected
 tests yourself and confirm they pass for the right reason -- the audit runs again immediately after
 you, against the tree you leave behind.

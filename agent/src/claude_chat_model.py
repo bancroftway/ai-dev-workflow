@@ -289,6 +289,16 @@ async def _messages_to_prompt(
     )
 
 
+def _init_session_id(partial_stdout: str) -> str | None:
+    """session_id from the stream-json `system`/`init` line of a (possibly truncated) turn's
+    stdout -- emitted at turn start, so present even when the turn was killed long before its
+    result line. None when no such line parsed."""
+    for event in _parse_claude_jsonl(partial_stdout or ""):
+        if event.get("type") == "system" and event.get("subtype") == "init" and event.get("session_id"):
+            return str(event["session_id"])
+    return None
+
+
 def _parse_claude_jsonl(stdout: str) -> list[dict[str, Any]]:
     """Parse `claude -p --output-format stream-json --verbose`'s NDJSON stdout into a list of
     per-line event dicts, one dict per line.
@@ -700,6 +710,14 @@ class ClaudeChatModel(BaseChatModel):
             # it lets the next turn's own real --resume attempt -- and this same classification
             # logic, applied to THAT attempt's real outcome -- decide for real, which is what makes
             # this legible instead of either silently trusting or silently discarding.
+            if not session_id:
+                # First turn on this key: nothing was cached, but the killed turn's own stdout
+                # head carries the `system/init` line with the session it was running as -- cache
+                # it so the retry --resumes that transcript (40 minutes of context and tool
+                # results) instead of starting over. See cli_agent_exec.TurnTimeout.
+                session_id = _init_session_id(getattr(exc, "partial_stdout", ""))
+                if session_id:
+                    _session_cache.cache_session_id(self._session_key, session_id, None)
             if session_id:
                 _resume_states[self._session_key] = "unknown"
                 logger.warning(
@@ -1410,6 +1428,16 @@ def _demo() -> None:
     assert fake_secret not in reasoning_stored_json, f"token leaked into REASONING payload: {reasoning_stored_json}"
     assert "<redacted>" in reasoning_stored_json, "REASONING payload was not actually scrubbed"
 
+    # _init_session_id: the init line names the session at turn START, so a killed turn's
+    # truncated stdout still yields a resumable id; garbage/absent lines yield None.
+    killed_head = (
+        '{"type":"system","subtype":"init","cwd":"/workspace/repo","session_id":"abc-123","tools":[]}\n'
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
+        '{"type":"assistant","mess'  # truncated mid-line by the kill
+    )
+    assert _init_session_id(killed_head) == "abc-123"
+    assert _init_session_id('{"type":"assistant","message":{}}\n') is None
+    assert _init_session_id("") is None
     print("claude_chat_model self-check: all assertions passed")
 
 
