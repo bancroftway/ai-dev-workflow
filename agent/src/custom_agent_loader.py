@@ -8,6 +8,8 @@ from typing import Any, TypedDict
 
 import yaml
 
+from .prompt_loader import load_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,8 +51,10 @@ def load_agent(path: str) -> CustomAgentConfig:
     if not isinstance(frontmatter, dict):
         raise ValueError(f"Frontmatter in {path} is not a dict")
 
-    # Extract body (strip leading/trailing whitespace)
-    prompt = body.strip()
+    # Extract body (strip leading/trailing whitespace), with the same global writing rules
+    # prompt_loader injects into every prompts/*.md -- keeps this dormant agents/ path
+    # consistent with the live prompt path.
+    prompt = f"{load_prompt('global_system_segment')}\n\n{body.strip()}"
 
     # Ensure required fields
     required = {"name", "description", "tools", "model"}

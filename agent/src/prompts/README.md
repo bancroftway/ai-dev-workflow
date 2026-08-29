@@ -3,6 +3,11 @@
 Every LLM prompt in the pipeline lives here as a plain markdown file — edit freely, then restart
 the agent (prompts are cached at first load via `lru_cache` in `src/prompt_loader.py`).
 
+`global_system_segment.md` is the one global system prompt: `load_prompt` prepends it to every
+non-`_segment` prompt (and `custom_agent_loader` to every `agents/*.md` body), so its writing
+rules reach every LLM instruction. `_segment` files are exempt because they are concatenated
+into already-injected prompts. It must not contain a `---` line (would break `load_prompt_pair`).
+
 Naming: `<stage-id>_<purpose>.md`.
 - `draft` — writes the stage's artifact.
 - `audit` — adversarial second-opinion pass by a separately configured model (`agent/config/models.yaml`); the auditor **fixes the artifact directly** — its revised output replaces the draft. Only specification, plan, ac-to-tests, and minimal-code-to-green have one.
@@ -13,6 +18,7 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 
 | File | Stage | Role |
 |---|---|---|
+| `global_system_segment.md` | every stage | global writing rules (plain language, minimal prose), injected by `load_prompt` |
 | `brownfield_baseline_draft.md` | brownfield-baseline | pre-existing system baseline |
 | `tech_stack_draft.md` | tech-stack | detect languages/frameworks (Tech Stack tab's fresh-detection path) |
 | `tech_stack_extract.md` | tech-stack | one-shot JSON extraction from the tab's saved/approved markdown |

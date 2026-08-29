@@ -13,7 +13,15 @@ _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 @lru_cache(maxsize=None)
 def load_prompt(name: str) -> str:
-    return (_PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8").strip()
+    """Load a prompt file, with the global writing rules (global_system_segment.md) prepended.
+
+    `*_segment` files are exempt: they get concatenated into an already-injected prompt, so
+    injecting them too would duplicate the preamble -- and the global file's own `_segment`
+    suffix is what stops it from injecting into itself."""
+    text = (_PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8").strip()
+    if name.endswith("_segment"):
+        return text
+    return f"{load_prompt('global_system_segment')}\n\n{text}"
 
 
 @lru_cache(maxsize=None)

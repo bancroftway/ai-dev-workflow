@@ -3910,8 +3910,11 @@ def assert_no_stub_stages() -> None:
     # `---` line, so a paired prompt's system constant is only the top of the file and would never
     # equal the whole text. (The detector caught this about itself on first run.)
     prompt_texts: set[str] = set()
+    # Via load_prompt, not a raw read_text: the loader prepends prompts/global_system_segment.md
+    # to every non-_segment prompt, so the constants being checked carry that preamble too -- a
+    # raw disk read would flag every healthy stage as literal.
     for path in (Path(__file__).parent / "prompts").glob("*.md"):
-        text = path.read_text(encoding="utf-8").strip()
+        text = load_prompt(path.stem)
         prompt_texts.add(text)
         system_half, separator, _ = text.partition("\n---\n")
         if separator:
@@ -4535,6 +4538,27 @@ def _demo() -> None:
     _dormant_adversarial_prompt = _flat(load_agent_for_stage("adversarial-compliance", "draft")["prompt"])
     assert "for EACH wireframe, find the implemented screen" not in _dormant_adversarial_prompt
     assert "Only audit the screens the Plan above actually lists" in _dormant_adversarial_prompt
+
+    # Every audit step must carry the mandated audit sentence verbatim -- in the live prompt AND
+    # its dormant agents/ duplicate where one exists (same consistency sweep as above).
+    _audit_mandate = "perform a stringent audit, adversarial probe; find gaps, suggest improvements"
+    for _audit_prompt in (
+        SPEC_AUDIT_SYSTEM_PROMPT,
+        PLAN_AUDIT_SYSTEM_PROMPT,
+        AC_TO_TESTS_AUDIT_SYSTEM_PROMPT,
+        MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT,
+    ):
+        assert _audit_mandate in _flat(_audit_prompt)
+    for _audit_stage in ("specification", "plan", "minimal-code-to-green"):
+        assert _audit_mandate in _flat(load_agent_for_stage(_audit_stage, "audit")["prompt"])
+
+    # The global writing-rules preamble (prompts/global_system_segment.md) is injected by
+    # prompt_loader.load_prompt into every non-_segment prompt -- exactly once (a second copy
+    # would mean a segment got double-injected or the suffix rule broke).
+    _global_rules = load_prompt("global_system_segment")
+    assert SPEC_SYSTEM_PROMPT.count(_global_rules) == 1
+    assert AC_TO_TESTS_AUDIT_SYSTEM_PROMPT.count(_global_rules) == 1
+    assert MEMORY_SEGMENT.count(_global_rules) == 0
 
     # minimal-code-to-green's brownfield segment deliberately reuses tech_stack_signals.
     # is_greenfield_repo directly rather than a new StageSpec hook (see
