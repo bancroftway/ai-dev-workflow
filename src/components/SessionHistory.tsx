@@ -59,6 +59,32 @@ export function SessionHistory({
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [stoppingId, setStoppingId] = useState<string | null>(null);
+  const [supportIssueId, setSupportIssueId] = useState<string | null>(null);
+  const [supportIssueError, setSupportIssueError] = useState<string | null>(null);
+
+  async function openSupportIssue(session: Session) {
+    setSupportIssueId(session.session_id);
+    setSupportIssueError(null);
+    try {
+      const res = await fetch("/api/sessions/support-issue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: session.session_id }),
+      });
+      const body = (await res.json()) as { url?: string; detail?: string };
+      if (res.ok && body.url) {
+        window.open(body.url, "_blank", "noreferrer");
+      } else if (res.status === 409) {
+        setSupportIssueError("No support repo configured — set one in organization settings.");
+      } else {
+        setSupportIssueError(body.detail ?? `Could not open support issue (${res.status})`);
+      }
+    } catch {
+      setSupportIssueError("Could not open support issue: network error");
+    } finally {
+      setSupportIssueId(null);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -133,6 +159,7 @@ export function SessionHistory({
       <h2 className="text-sm font-medium text-neutral-700">Sessions on this branch</h2>
       {error && <p className="text-sm text-red-600">{error}</p>}
       {deleteError && <p className="text-sm text-red-600">{deleteError}</p>}
+      {supportIssueError && <p className="text-sm text-red-600">{supportIssueError}</p>}
       {!error && sessions === null && <p className="text-sm text-neutral-500">Loading sessions…</p>}
       {sessions?.length === 0 && (
         <p className="text-sm text-neutral-500">No sessions yet for this repository/branch.</p>
@@ -177,6 +204,17 @@ export function SessionHistory({
                     onClick={() => resume(s)}
                   >
                     Resume
+                  </button>
+                )}
+                {s.status === "failed" && (
+                  <button
+                    type="button"
+                    title="Files an issue in the org-configured support repo with the thread id and failure details (or opens the existing one)."
+                    className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700 disabled:opacity-40"
+                    disabled={supportIssueId === s.session_id}
+                    onClick={() => openSupportIssue(s)}
+                  >
+                    {supportIssueId === s.session_id ? "Filing…" : "Open support issue"}
                   </button>
                 )}
                 {s.status === "completed" && (

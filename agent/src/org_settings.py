@@ -42,6 +42,9 @@ class OrgSettings:
     credential_kind: str | None = None
     last_validation_ok: bool | None = None
     last_validated_at: datetime | None = None
+    # Migration 0011: "owner/repo" of the TOOL's own support repo, where failed-run issues are
+    # filed (never the customer repo). None = not configured.
+    support_repo: str | None = None
 
 
 async def get_org_settings() -> OrgSettings | None:
@@ -52,7 +55,7 @@ async def get_org_settings() -> OrgSettings | None:
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             "SELECT provider, credential_secret_name, updated_at, updated_by, credential_kind, "
-            "last_validation_ok, last_validated_at FROM dbo.org_settings WHERE id = 1"
+            "last_validation_ok, last_validated_at, support_repo FROM dbo.org_settings WHERE id = 1"
         )
         row = await cur.fetchone()
         if row is None:
@@ -60,6 +63,7 @@ async def get_org_settings() -> OrgSettings | None:
         return OrgSettings(
             provider=row[0], credential_secret_name=row[1], updated_at=row[2], updated_by=row[3],
             credential_kind=row[4], last_validation_ok=row[5], last_validated_at=row[6],
+            support_repo=row[7],
         )
 
 
@@ -82,6 +86,20 @@ async def set_org_settings(
             provider, credential_secret_name, updated_by, credential_kind,
             provider, credential_secret_name, updated_by, credential_kind,
         )
+
+
+async def set_support_repo(support_repo: str | None, updated_by: str) -> bool:
+    """Migration 0011's one writer. A plain UPDATE, not the MERGE above, for the same reason as
+    record_validation_result below: this call has no opinion on provider/credential, and a bare
+    UPDATE can't invent a row that would then imply a provider choice nobody made. Returns False
+    when no org_settings row exists yet -- the caller surfaces "save provider settings first"."""
+    pool = await session_store._get_pool()  # noqa: SLF001
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE dbo.org_settings SET support_repo = ?, updated_by = ?, updated_at = SYSUTCDATETIME() WHERE id = 1",
+            support_repo, updated_by,
+        )
+        return cur.rowcount > 0
 
 
 async def record_validation_result(ok: bool) -> None:

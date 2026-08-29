@@ -754,6 +754,9 @@ class OrgSettingsResponse(BaseModel):
     session_ready: bool
     updated_at: datetime | None
     updated_by: str | None
+    # Migration 0011: "owner/repo" of the TOOL's own support repo for failed-run issues. None =
+    # not configured; the frontend's support-issue action refuses and points at this settings page.
+    support_repo: str | None = None
 
 
 # I-1 (lazy version, whole-branch review): re-probing a saved credential on every settings-page
@@ -887,12 +890,37 @@ async def _org_settings_response() -> OrgSettingsResponse:
         session_ready=session_ready,
         updated_at=settings.updated_at,
         updated_by=settings.updated_by,
+        support_repo=settings.support_repo,
     )
 
 
 @org_settings_router.get("", response_model=OrgSettingsResponse)
 async def get_org_settings_endpoint(request: Request) -> OrgSettingsResponse:
     _check_shared_secret(request)
+    return await _org_settings_response()
+
+
+# Deliberately loose (no GitHub-exact grammar): this is a pointer the issue-filing route hands to
+# the GitHub API, which is the real validator -- the regex only blocks obvious junk and path tricks.
+_SUPPORT_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+class SupportRepoPutRequest(BaseModel):
+    support_repo: str | None = None  # None or blank clears the setting
+    updated_by: str
+
+
+@org_settings_router.put("/support-repo", response_model=OrgSettingsResponse)
+async def put_support_repo_endpoint(body: SupportRepoPutRequest, request: Request) -> OrgSettingsResponse:
+    """Own endpoint rather than a field on put_org_settings_endpoint: that PUT's contract is
+    provider+credential (with probe side effects); the support repo is an unrelated pointer and
+    must be savable without re-submitting or re-probing a credential."""
+    _check_shared_secret(request)
+    value = (body.support_repo or "").strip() or None
+    if value is not None and not _SUPPORT_REPO_RE.match(value):
+        raise HTTPException(status_code=400, detail='support_repo must be "owner/repo"')
+    if not await org_settings.set_support_repo(value, body.updated_by):
+        raise HTTPException(status_code=409, detail="No org settings saved yet -- save provider settings first")
     return await _org_settings_response()
 
 
