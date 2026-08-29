@@ -731,6 +731,59 @@ def _parse_istanbul_counts(raw: str) -> tuple[_Counts | None, str]:
     return _Counts(lc, lt, bc, bt, gaps), ""
 
 
+# Per-command ceiling for a deterministic contract replay (same knob repo_scan's own coverage
+# leg honours; a hung `dotnet test` must not stall the gate forever).
+_REPLAY_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIMEOUT_SECONDS", "600"))
+
+
+def _load_coverage_contract(raw: str | None) -> list[CoverageEntry]:
+    """Validated entries from a committed coverage-commands.json, or [] when absent/unusable.
+    Pure. Every entry must carry a non-empty command, a repo-relative artifact path and a known
+    format -- anything else means the contract is not replayable and discovery must run."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    entries: list[CoverageEntry] = []
+    for item in (parsed or {}).get("entries") or []:
+        try:
+            entry = CoverageEntry(**item)
+            validate_repo_relative_path(entry.artifact)
+        except Exception:  # noqa: BLE001 -- one bad entry invalidates the whole contract
+            return []
+        if not entry.command.strip() or entry.format not in _CONTRACT_FORMATS:
+            return []
+        entries.append(entry)
+    return entries
+
+
+async def _replay_coverage_contract(
+    provider: SandboxProvider, thread_id: str, entries: list[CoverageEntry]
+) -> list[dict[str, Any]]:
+    """Deterministic acquisition: delete each entry's prior artifact, then run its command from its
+    root. No model in the loop. Returns per-entry run summaries for the gate's feedback; the
+    freshness/parse loop in _run_coverage_via_ghcp judges the artifacts exactly as it would after a
+    model-driven run. Observed live (run d16959d3, mctg lap 3): the coverage-run session executed
+    the commands on laps 1-2, then answered lap 3 from conversation memory with zero tool calls --
+    "Replayed the contract exactly" over artifacts 25 minutes old. The gate's staleness check
+    caught it, but the lap was already burned."""
+    runs: list[dict[str, Any]] = []
+    for entry in entries:
+        root = entry.root.strip() or "."
+        command = (
+            f"rm -f {shlex.quote(entry.artifact)}; cd {shlex.quote(root)} && "
+            + _with_timeout(entry.command, _REPLAY_TIMEOUT_SECONDS)
+        )
+        result = await provider.exec_in_sandbox(thread_id, command)
+        runs.append({
+            "root": root, "command": entry.command, "exit_code": result.returncode,
+            "stdout_tail": (result.stdout or "")[-1500:], "stderr_tail": (result.stderr or "")[-1500:],
+        })
+    return runs
+
+
 def _with_timeout(command: str, timeout_seconds: int | None) -> str:
     """`sh -c` wrap keeps a single `timeout` bound to the WHOLE command even when it chains
     multiple statements (&&, if/then/else) -- a bare `timeout N cmd1 && cmd2` would only bound
@@ -764,24 +817,49 @@ async def _run_coverage_via_ghcp(
     except ValueError:
         epoch = 0
 
-    report = await stack_runner.run_and_report(
-        thread_id,
-        stage_key="coverage-run",
-        prompt_name="coverage_run",
-        schema=CoverageRunReport,
-        provider=chat_provider,
-        run_id=run_id,
-        failure_detail=(
+    # Contract replay first: once a validated coverage-commands.json exists (written below from a
+    # model run whose artifacts parsed), every later measurement re-runs THOSE commands here in
+    # Python. The model only runs discovery -- no contract yet, or a replay whose artifacts all
+    # fail (a stale contract after the tree changed shape), in which case it gets the replay's
+    # own errors as failure_detail and gets to re-discover.
+    contract = _load_coverage_contract(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH))
+    replay_runs: list[dict[str, Any]] = []
+    entries: list[CoverageEntry] = []
+    if contract:
+        replay_runs = await _replay_coverage_contract(provider, thread_id, contract)
+        entries = contract
+        failure_detail = "; ".join(
+            f"[{r['root']}] `{r['command']}` exited {r['exit_code']}: {(r['stderr_tail'] or r['stdout_tail'])[-300:]}"
+            for r in replay_runs
+        )
+    else:
+        failure_detail = (
             "No prior automatic attempt: determine how to run this repository's tests with "
             "coverage from scratch."
-        ),
-    )
-    if not report.entries:
-        return None, None, [], REASON_RUNNER_ERROR, [{"error": report.error or "no coverage entries reported"}]
+        )
+
+    async def _discover() -> list[CoverageEntry]:
+        report = await stack_runner.run_and_report(
+            thread_id,
+            stage_key="coverage-run",
+            prompt_name="coverage_run",
+            schema=CoverageRunReport,
+            provider=chat_provider,
+            run_id=run_id,
+            failure_detail=failure_detail,
+        )
+        return list(report.entries)
+
+    if not entries:
+        entries = await _discover()
+    if not entries:
+        return None, None, [], REASON_RUNNER_ERROR, [{"error": "no coverage entries reported"}]
 
     merged: list[_Counts] = []
     entry_reports: list[dict[str, Any]] = []
-    for entry in report.entries[:10]:  # bounded: dozens of entries is itself suspect
+    if replay_runs:
+        entry_reports.append({"replay": replay_runs})
+    for entry in entries[:10]:  # bounded: dozens of entries is itself suspect
         detail: dict[str, Any] = {"entry": entry.model_dump()}
         entry_reports.append(detail)
         try:
@@ -819,6 +897,43 @@ async def _run_coverage_via_ghcp(
         detail["branches"] = f"{counts.branches_covered}/{counts.branches_total}"
         merged.append(counts)
 
+    if not merged and replay_runs:
+        # The replayed contract produced nothing usable -- the tree may have changed shape since it
+        # was written. One model-driven re-discovery, handed the replay's own errors.
+        logger.warning("repo_scan coverage: contract replay produced no usable artifact -- re-discovering")
+        replay_errors = "; ".join(str(d.get("error")) for d in entry_reports if d.get("error"))
+        failure_detail = f"Contract replay failed: {failure_detail}. Artifact errors: {replay_errors}"
+        entries = await _discover()
+        replay_runs = []
+        merged, entry_reports = [], []
+        for entry in entries[:10]:
+            detail = {"entry": entry.model_dump()}
+            entry_reports.append(detail)
+            try:
+                validate_repo_relative_path(entry.artifact)
+            except ValueError as exc:
+                detail["error"] = f"invalid artifact path: {exc}"
+                continue
+            stat = await provider.exec_in_sandbox(thread_id, f"stat -c %Y {shlex.quote(entry.artifact)} 2>/dev/null")
+            try:
+                mtime = int((stat.stdout or "0").strip())
+            except ValueError:
+                mtime = 0
+            if mtime < epoch or mtime == 0:
+                detail["error"] = f"stale or missing artifact at {entry.artifact}"
+                continue
+            artifact_raw = await repo_files.read_repo_file(provider, thread_id, entry.artifact)
+            counts, parse_error = (
+                (_parse_cobertura_counts(artifact_raw) if entry.format == "cobertura" else _parse_istanbul_counts(artifact_raw))
+                if artifact_raw is not None else (None, "artifact could not be read")
+            )
+            if counts is None:
+                detail["error"] = parse_error
+                continue
+            detail["lines"] = f"{counts.lines_covered}/{counts.lines_total}"
+            detail["branches"] = f"{counts.branches_covered}/{counts.branches_total}"
+            merged.append(counts)
+
     if not merged:
         errors = "; ".join(str(d.get("error")) for d in entry_reports if d.get("error"))
         logger.warning("repo_scan coverage: no usable coverage artifact from the run: %s", errors)
@@ -830,7 +945,7 @@ async def _run_coverage_via_ghcp(
         provider,
         thread_id,
         COVERAGE_COMMANDS_PATH,
-        json.dumps({"entries": [e.model_dump() for e in report.entries]}, indent=2) + "\n",
+        json.dumps({"entries": [e.model_dump() for e in entries]}, indent=2) + "\n",
     )
 
     lines_total = sum(c.lines_total for c in merged)
@@ -1466,6 +1581,41 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert frontend_reimplements_backend(absolute) == []
     assert frontend_reimplements_backend({}) == []
 
+    # Contract replay: a validated coverage-commands.json is re-run by Python (delete artifact,
+    # cd root, command under a timeout); a malformed contract yields [] so discovery runs instead.
+    import asyncio
+
+    good = json.dumps({"entries": [
+        {"root": "", "command": "dotnet test /p:CollectCoverage=true", "artifact": "apps/api.Tests/TestResults/coverage.cobertura.xml", "format": "cobertura"},
+        {"root": "apps/web", "command": "npx vitest run --coverage", "artifact": "apps/web/coverage/coverage-summary.json", "format": "istanbul-json-summary"},
+    ]})
+    loaded = _load_coverage_contract(good)
+    assert len(loaded) == 2 and loaded[1].root == "apps/web", loaded
+    assert _load_coverage_contract(None) == [] and _load_coverage_contract("not json") == []
+    assert _load_coverage_contract(json.dumps({"entries": [{"root": "", "command": "", "artifact": "x.xml", "format": "cobertura"}]})) == []
+    assert _load_coverage_contract(json.dumps({"entries": [{"root": "", "command": "x", "artifact": "../evil", "format": "cobertura"}]})) == []
+
+    class _Res:
+        def __init__(self, rc: int) -> None:
+            self.returncode, self.stdout, self.stderr = rc, "ran", ""
+
+        @property
+        def ok(self) -> bool:
+            return self.returncode == 0
+
+    class _Prov:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        async def exec_in_sandbox(self, _t: str, command: str) -> _Res:
+            self.commands.append(command)
+            return _Res(0)
+
+    prov = _Prov()
+    runs = asyncio.run(_replay_coverage_contract(prov, "t", loaded))
+    assert len(runs) == 2 and runs[0]["exit_code"] == 0, runs
+    assert prov.commands[0].startswith("rm -f apps/api.Tests/TestResults/coverage.cobertura.xml; cd . && timeout"), prov.commands[0]
+    assert "cd apps/web && timeout" in prov.commands[1] and "npx vitest run --coverage" in prov.commands[1], prov.commands[1]
     print("test_coverage_gate self-check: all assertions passed")
 
 
