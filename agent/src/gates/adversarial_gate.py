@@ -109,7 +109,14 @@ async def verify_adversarial_compliance(
                     "you leave behind must be at least as green as the one you found:\n"
                     + "\n".join(lines)
                 ),
-                report={"overall_verdict": content_dict.get("overall_verdict"), "minor_sweep": len(minors)},
+                # blocking_reasons is what graph.make_verify_fix_node hands the write-capable fix
+                # pass; without it the sweep lap ran a no-op fix (observed live, run d16959d3 lap 2:
+                # verify_fix finished in 0.2 s and the three minors stayed open).
+                report={
+                    "overall_verdict": content_dict.get("overall_verdict"),
+                    "minor_sweep": len(minors),
+                    "blocking_reasons": [line[2:] for line in lines],
+                },
             )
         return VerificationResult(
             passed=True,
@@ -220,6 +227,8 @@ def _demo() -> None:
     }
     first = asyncio.run(verify_adversarial_compliance("t1", minor_report, "r1", None, _StubProvider(), "claude"))
     assert not first.passed and MINOR_SWEEP_MARKER in first.feedback and "Plan Step 4" in first.feedback, first
+    # The fix pass reads report["blocking_reasons"] -- the sweep must hand it the minors verbatim.
+    assert first.report["blocking_reasons"] and MINOR_SWEEP_MARKER in first.report["blocking_reasons"][0], first.report
     second = asyncio.run(verify_adversarial_compliance("t1", minor_report, "r1", None, _StubProvider(), "claude"))
     assert second.passed, second
     # A different run on the same thread gets its own sweep.
