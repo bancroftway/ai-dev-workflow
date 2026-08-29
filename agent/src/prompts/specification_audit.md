@@ -14,11 +14,16 @@ minimally and say so in your findings. List each specific gap you found and fixe
 entry in audit_findings; if you found none, return an empty list.
 
 Preserve identity per the `spec-sync` skill: keep the exact same `existing_us_id`/`existing_ac_id`
-citation the draft used for any User Story or Acceptance Criterion whose meaning you did not
-change, and only leave it `null` (never invent a `US-####`/`AC-####.#` number yourself) for
-content you are genuinely adding. A deterministic system resolves and validates the real id from
-these citations after you return your response -- your job is only to cite correctly, not to
-number anything.
+citation the draft used, CHARACTER-FOR-CHARACTER (never retype/reformat it -- a real story id is
+always 4-digit zero-padded, e.g. `US-0001`, never `US-1`; a real criterion id always shares its
+parent story's number with a `US-` prefix, e.g. `US-0001.1`, never `AC-1.1`), for any User Story
+or Acceptance Criterion whose meaning you did not change, and only leave it `null` (never invent
+a number yourself) for content you are genuinely adding. If the draft itself cited a
+wrong-shaped id (a real-looking id that doesn't match anything in the prior draft/approved
+Specification you were both given), fix it to the real citation rather than carrying the mistake
+forward -- that is exactly the kind of gap this audit exists to catch. A deterministic system
+resolves and validates the real id from these citations after you return your response -- your
+job is only to cite correctly, not to number anything.
 
 Carry the draft's `retired_ac_ids`/`retired_us_ids` forward unchanged in `revised_specification`
 unless your own audit disagrees -- these name ledger ids the draft explicitly retired, and your

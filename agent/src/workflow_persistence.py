@@ -120,6 +120,12 @@ REMEDIATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('remediation', 'approv
 # so the hash was silently None on every run (the file it looked for was never written).
 RAW_REQUIREMENTS_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('raw-requirements', 'approved.json')}"
 
+# The FULL exit report (health table, findings dispositions, scanner tools). Written ONLY by
+# exit_nodes.exit_finalize_node -- metrics-exit's StageSpec sets render_markdown=None so the
+# generic per-stage .md render above never touches it (it would revert the full report to the
+# 4-section merge-readiness stub on the next run's first persist).
+METRICS_EXIT_MD_PATH = f"{WORKFLOW_DIR}/{_stage_file('metrics-exit', 'md')}"
+
 
 async def _read_file(provider: SandboxProvider, thread_id: str, relative_path: str) -> str | None:
     return await repo_files.read_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}")
@@ -237,7 +243,7 @@ async def persist_state(
     thread_id: str,
     *,
     stages: dict[str, dict[str, Any]],
-    render_markdown: dict[str, Callable[[dict[str, Any]], str]],
+    render_markdown: dict[str, Callable[[dict[str, Any]], str] | None],
 ) -> None:
     """Writes the given stages into `.ai-dev-workflow/`.
 

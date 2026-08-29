@@ -1,6 +1,6 @@
 ---
 name: spec-sync
-description: Guides how to correctly reference stable user-story and acceptance-criteria IDs (US-#### / AC-####.#) when drafting or revising a specification, so that a downstream deterministic ledger can allocate and validate IDs correctly. Use this skill whenever drafting, revising, or updating a specification document that has (or will have) a stable-ID registry -- especially when a prior version of the spec already exists and some stories are being kept, some changed, some removed, and some added for the first time. Also trigger when asked to "keep story numbering stable," "don't renumber," or "sync the spec with the ledger."
+description: Guides how to correctly reference stable user-story and acceptance-criteria IDs (US-0001 for a story, US-0001.1 for its 1st criterion -- criterion ids ALWAYS share the US- prefix, never AC-) when drafting or revising a specification, so that a downstream deterministic ledger can allocate and validate IDs correctly. Use this skill whenever drafting, revising, or updating a specification document that has (or will have) a stable-ID registry -- especially when a prior version of the spec already exists and some stories are being kept, some changed, some removed, and some added for the first time. Also trigger when asked to "keep story numbering stable," "don't renumber," or "sync the spec with the ledger."
 ---
 
 # Spec Sync
@@ -16,14 +16,20 @@ yourself, you just say clearly enough which existing item (if any) each story co
 ## You never allocate or invent an ID number
 
 This is the one rule everything else here supports. A separate, deterministic system owns the
-actual `US-####`/`AC-####.#` numbering -- it's the only thing that can guarantee a number is never
-reused, even after a story is retired. If you write `"id": "US-0042"` for a story you consider
-new, you're guessing at a number that system hasn't allocated yet, and if you guess wrong (a
-collision, a gap, a number that's actually retired) you've corrupted the one thing this whole
-mechanism exists to protect. Instead:
+actual numbering -- it's the only thing that can guarantee a number is never reused, even after a
+story is retired. A story id is always 4-digit zero-padded, e.g. `US-0007`; a criterion id is
+always that SAME story number plus `.` plus the criterion's own number, e.g. `US-0007.2` for the
+2nd criterion of story `US-0007` -- there is no `AC-` prefix anywhere in this system, and a
+criterion's number is never zero-padded on its own (`US-0007.2`, not `US-0007.02`). If you write
+`"id": "US-0042"` for a story you consider new, or reformat an existing id when citing it
+(dropping zero-padding, swapping the prefix), you've corrupted the one thing this whole mechanism
+exists to protect -- it will not resolve and your draft is rejected. Instead:
 
-- **Revising an existing story or criterion**: cite its existing id explicitly (e.g.
-  `"existing_us_id": "US-0007"`) so the system knows to update that entry, not create a new one.
+- **Revising an existing story or criterion**: cite its existing id explicitly, COPIED
+  CHARACTER-FOR-CHARACTER from the prior draft/approved specification you were shown (e.g.
+  `"existing_us_id": "US-0007"`, `"existing_ac_id": "US-0007.2"`) so the system knows to update
+  that entry, not create a new one. If you can't point to the exact substring you're copying it
+  from, you don't actually have it -- leave the citation `null` instead of guessing its shape.
 - **A genuinely new story or criterion**: leave the existing-id field empty/`null` and say so --
   the system allocates the next number itself.
 

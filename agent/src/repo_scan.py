@@ -10,13 +10,18 @@ Callers select a subset with `profile=` (or an explicit `tools=`):
     security -> semgrep, trivy, gitleaks, osv-scanner, checkov (security-remediation)
     full     -> those plus git churn/ownership and syft (SBOM) (baseline node, metrics-report)
 
-Licence bar is permissive (MIT / Apache-2.0), with exactly one documented exception: semgrep is
-LGPL-2.1. Invoking it as a subprocess creates no derivative work, but it does not meet the bar, so
-it is recorded in the report's `tools[]` block as `permissive: false` and driven from a vendored
-rule pack rather than the network registry. SonarQube (LGPL-3.0 + server), TruffleHog (AGPL-3.0),
-Hadolint (GPL-3.0), cloc (GPL-2.0) and code-maat (GPL-3.0) were evaluated and rejected on licence;
-hercules, Dependency-Check, Grype, detect-secrets, ZAP and Nuclei were rejected as redundant or out
-of scope. Syft was originally rejected here too ("redundant with Trivy's own SBOM mode") but is now
+Licence ground rule (the sandbox image ships to SaaS AND on-prem customers, so every tool here is
+REDISTRIBUTED): tools are invoked unmodified as subprocesses and shipped as binaries inside a
+container image -- mere aggregation. Copyleft is therefore a compliance obligation (ship the licence
+text under /opt/aidw/licenses/, keep notices, point at pinned upstream source -- see
+agent/sandbox-image/THIRD-PARTY-NOTICES.md), not contamination. What DOES exclude a tool: no
+redistribution grant at all, or terms forbidding "as a service" use (the official semgrep-rules pack
+died on exactly that clause and was replaced by MIT community packs -- see the Dockerfile). semgrep's
+engine is LGPL-2.1 and recorded as `permissive: false` in `tools[]`, an honest record, not a bar.
+TruffleHog (AGPL-3.0, policy) and SonarQube (server) stay rejected; hercules, Dependency-Check,
+Grype, detect-secrets, ZAP, Nuclei, pmd, radon, scancode stay rejected as redundant or out of scope;
+hadolint/shellcheck (GPL-3.0, fine to ship with notices) are deferred on value, not licence.
+Syft was originally rejected here too ("redundant with Trivy's own SBOM mode") but is now
 included as a dedicated tool: Syft is Anchore's purpose-built SBOM cataloger with materially deeper
 per-ecosystem coverage than Trivy's SBOM-as-a-byproduct mode, and its output is large enough
 (cyclonedx-json, one entry per dependency) that it is persisted as its own artifact
@@ -34,10 +39,11 @@ image and never updated at scan time, findings are sorted before serialization, 
 covers findings + metrics only -- never `generated_at` or per-tool durations. Two runs over an
 unchanged worktree in the same image must produce the same `content_hash`.
 
-Findings deliberately carry no tool attribution in `to_dashboard_dict()`, the dashboard artifact.
-Gate callers read `ScanReport.findings` directly, where `Finding.to_dict()` still carries `tool`
-and `sources` -- security-remediation's never-suppress rule and anyone debugging a false positive need to know who
-said what.
+Dashboard findings carry `tools` (the corroborating sources) so the exit report's findings table can
+show who said what, and `actionable` (the fix-everything contract: every severity, application code
+only, quality debt only when introduced by this pipeline -- see `is_gating`'s floor="info" use in
+`to_dashboard_dict`). Gate callers still read `ScanReport.findings` directly, where
+`Finding.to_dict()` carries the richer `tool`/`sources` pair.
 
 Verification status: the pure half (parsers, dedup, severity normalization, scoring, diff) has an
 assert-based self-check, runnable with `uv run python -m src.repo_scan`. The sandbox-I/O half has
@@ -112,10 +118,36 @@ SECURITY_CATEGORIES = frozenset({"vulnerability", "secret", "sast", "misconfig",
 QUALITY_CATEGORIES = frozenset({"duplication", "maintainability"})
 
 # The tools whose findings feed SECURITY_CATEGORIES. The health score's security subscore is only
-# trustworthy when every one of these that was selected actually ran ok -- a semgrep timeout that
-# yields zero findings must read as "unmeasured", never as "clean" (at 40% weight, a tool crash
-# would otherwise INFLATE the score).
-_SECURITY_TOOL_NAMES = frozenset({"semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"})
+# trustworthy in proportion to how many of these actually ran ok -- a semgrep timeout that yields
+# zero findings must read as a coverage gap, never as "clean" (at 40% weight, a tool crash would
+# otherwise INFLATE the score). Tools whose `applies` probe said not_applicable are excluded from
+# the denominator entirely.
+_SECURITY_TOOL_NAMES = frozenset({"semgrep", "trivy", "gitleaks", "osv-scanner", "checkov", "bandit", "eslint-security"})
+
+# --- health score v3: density-aware security leg + security-tool-coverage multiplier ------------
+# Risk units per severity (research-note calibration): risk = sum(units[severity] * count) over
+# APPLICATION security findings only. The leg is 100*exp(-(risk/size_factor)/decay) where
+# size_factor = sqrt(kloc/ref) -- sublinear, so a fixed finding count scores higher in a larger
+# codebase but size can never fully mask risk. The floor EQUALS the reference on purpose: density
+# must only ever relieve above 10 kloc, never amplify below it (at the note's 0.5 kloc floor a
+# 2 kloc greenfield app with one secret scored 16.7 where v2 gave 60).
+_RISK_UNITS: dict[str, float] = {"critical": 20.0, "high": 8.0, "medium": 2.5, "low": 0.5, "info": 0.1}
+_SECURITY_REF_KLOC = 10.0
+_SECURITY_MIN_KLOC = 10.0
+_SECURITY_DECAY = 25.0
+# Below this fraction of applicable security tools completing, the whole score is multiplied by
+# sqrt(fraction) -- a smooth haircut, never a cliff, applied to the WHOLE score deliberately: a
+# partial security measurement makes the whole verdict less trustworthy. 1.0 means any failed
+# security tool costs something (at the note's 0.8, one failed tool of five cost nothing).
+MIN_SECURITY_COVERAGE = float(os.environ.get("HEALTH_MIN_SECURITY_COVERAGE", "1.0"))
+
+# scc language names that are data/markup, not authored code -- excluded from the kloc that
+# normalizes the security leg. A 20k-line package-lock.json or a YAML pipeline would otherwise
+# halve the normalised burden. HTML stays IN (Angular templates are application code).
+_NON_CODE_LANGUAGES = frozenset({
+    "JSON", "YAML", "Markdown", "XML", "Plain Text", "License", "gitignore",
+    "TOML", "INI", "CSV", "SVG", "Properties File",
+})
 
 
 def _health_weight(env_name: str, default: float) -> float:
@@ -141,7 +173,7 @@ HEALTH_WEIGHTS: dict[str, float] = {
     "duplication": _health_weight("HEALTH_WEIGHT_DUPLICATION", 0.04),
     "maintainability": _health_weight("HEALTH_WEIGHT_MAINTAINABILITY", 0.04),
 }
-HEALTH_SCORE_VERSION = 2
+HEALTH_SCORE_VERSION = 3
 # lizard findings score in the complexity subscore and interrogate's percentage is blended directly,
 # so their findings must not ALSO count in the maintainability subscore (double-counting).
 _MAINTAINABILITY_EXCLUDED_RULE_IDS = frozenset({
@@ -930,6 +962,101 @@ def parse_dotnet_docs(raw: str) -> ParseResult:
     return [], {"documentation": {"dotnet_undocumented_public_members": len(_CS1591_RE.findall(raw))}}
 
 
+def parse_bandit(raw: str) -> ParseResult:
+    """bandit -f json: {"results": [{filename, line_number, test_id, test_name, issue_severity,
+    issue_confidence, issue_text, issue_cwe: {id, link}}, ...]}. Python SAST -- the licence-clean
+    replacement for the official semgrep python pack (see the module docstring's licence rule)."""
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], {}
+    if not isinstance(doc, dict):
+        return [], {}
+    findings: list[Finding] = []
+    for result in doc.get("results") or []:
+        if not isinstance(result, dict):
+            continue
+        rule_id = str(result.get("test_id") or "bandit")
+        path = _norm_path(result.get("filename") or "unknown")
+        tier = normalize_tier(result.get("issue_severity"))
+        cwe = (result.get("issue_cwe") or {}).get("id") if isinstance(result.get("issue_cwe"), dict) else None
+        line = result.get("line_number") if isinstance(result.get("line_number"), int) else None
+        findings.append(
+            Finding(
+                finding_key=stable_id("sast", f"{rule_id}:{line}", path),
+                tool="bandit",
+                rule_id=rule_id,
+                severity=tier or "low",
+                raw_severity=str(result.get("issue_severity") or ""),
+                file=path,
+                line=line,
+                message=str(result.get("issue_text") or rule_id),
+                cwe=f"CWE-{cwe}" if cwe else None,
+                category="sast",
+                title=str(result.get("test_name") or result.get("issue_text") or rule_id),
+                severity_source="native" if tier else "defaulted",
+                sources=("bandit",),
+            )
+        )
+    return findings, {}
+
+
+# Only these rule namespaces from the pipeline-owned ESLint config become findings: the config also
+# carries style/correctness rules (typescript-eslint, react-hooks) that belong to the BUILD, not a
+# security scan -- turning them into scan findings would make remediation re-litigate lint style.
+_ESLINT_SECURITY_PREFIXES = ("security/", "sonarjs/")
+
+
+def parse_eslint(raw: str) -> ParseResult:
+    """`eslint -f json`: [{filePath, messages: [{ruleId, severity(1|2), message, line}]}].
+    Keeps only security-relevant namespaces (see _ESLINT_SECURITY_PREFIXES); `security/` rules are
+    pattern-based possible-injection/unsafe-API detections -> medium, `sonarjs/` hotspots -> low.
+    Both are `derived`: ESLint's own 1/2 severity encodes the config's opinion, not risk."""
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], {}
+    if not isinstance(entries, list):
+        return [], {}
+    findings: list[Finding] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        raw_path = str(entry.get("filePath") or "unknown")
+        # eslint -f json always emits absolute paths; the sandbox clone lives at /workspace/repo
+        # (see README "The sandbox filesystem"). Repo-relative is the vocabulary every other
+        # finding uses, and what is_non_application_path/is_gating match against.
+        for prefix in ("/workspace/repo/",):
+            if raw_path.startswith(prefix):
+                raw_path = raw_path[len(prefix):]
+                break
+        path = _norm_path(raw_path)
+        for message in entry.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            rule_id = str(message.get("ruleId") or "")
+            if not rule_id.startswith(_ESLINT_SECURITY_PREFIXES):
+                continue
+            line = message.get("line") if isinstance(message.get("line"), int) else None
+            findings.append(
+                Finding(
+                    finding_key=stable_id("sast", f"{rule_id}:{line}", path),
+                    tool="eslint-security",
+                    rule_id=rule_id,
+                    severity="medium" if rule_id.startswith("security/") else "low",
+                    raw_severity=str(message.get("severity") or ""),
+                    file=path,
+                    line=line,
+                    message=str(message.get("message") or rule_id),
+                    category="sast",
+                    title=str(message.get("message") or rule_id),
+                    severity_source="derived",
+                    sources=("eslint-security",),
+                )
+            )
+    return findings, {}
+
+
 # Fraction of SBOM components the dependency graph must actually mention before ancestry is
 # reported at all. Syft emits a near-empty graph for some ecosystems (816 components / 20 edges on
 # this pipeline's own branch), and a split derived from that describes the tool, not the project.
@@ -1323,6 +1450,27 @@ def _clamp(value: float) -> float:
     return max(0.0, min(100.0, value))
 
 
+def _density_score(risk_units: float, kloc: float | None) -> float:
+    """Research-note density model, security-leg parameters. `kloc=None` (scc absent from this
+    profile) behaves as the reference size: size_factor 1, pure exp decay."""
+    size_factor = (max(kloc or 0.0, _SECURITY_MIN_KLOC) / _SECURITY_REF_KLOC) ** 0.5
+    return _clamp(100.0 * math.exp(-(risk_units / size_factor) / _SECURITY_DECAY))
+
+
+def kloc_from_metrics(metrics: dict[str, Any]) -> float | None:
+    """Authored-code kloc: scc's non-blank non-comment `code` lines, data/markup languages
+    excluded (see _NON_CODE_LANGUAGES). None when scc didn't run in this profile."""
+    languages = (metrics.get("size") or {}).get("languages")
+    if not isinstance(languages, list):
+        return None
+    code = sum(
+        int(lang.get("code") or 0)
+        for lang in languages
+        if isinstance(lang, dict) and lang.get("name") not in _NON_CODE_LANGUAGES
+    )
+    return round(code / 1000.0, 2)
+
+
 def health_score(
     *,
     security_by_severity: dict[str, int],
@@ -1331,23 +1479,35 @@ def health_score(
     metrics: dict[str, Any],
     ac_verification: dict[str, Any] | None = None,
     ac_execution: dict[str, Any] | None = None,
+    kloc: float | None = None,
+    coverage_fraction: float = 1.0,
 ) -> dict[str, Any]:
     """One explicit formula in one place: nine 0-100 subscores, each None when its input was not
-    measured, combined by HEALTH_WEIGHTS with unmeasured weights redistributed proportionally.
-    Returns {"score": int|None, "subscores": {...}, "weights_used": {...}} -- `weights_used` is what
-    the score actually weighed and is the comparability key for the regression gate (a pre-build
-    baseline and a post-build latest legitimately measure different sets).
+    measured, combined by HEALTH_WEIGHTS with unmeasured weights redistributed proportionally,
+    then multiplied by the security-tool-coverage factor. Returns {"score": int|None, "raw": ...,
+    "coverage_multiplier": ..., "coverage_fraction": ..., "subscores": {...}, "weights_used": {...},
+    "basis": {...}} -- `weights_used` is what the score actually weighed and, with
+    `coverage_fraction` and HEALTH_SCORE_VERSION, the comparability key for the regression gate.
 
     Deliberate shapes, documented in README.md "Health score":
-      * security counts SECURITY_CATEGORIES findings only (a lizard complexity "high" is not a
-        security issue) and is None -- not 100 -- when a security tool failed to run.
+      * security counts APPLICATION security findings only (non-application paths are excluded by
+        the caller; a lizard complexity "high" is not a security issue), density-normalised:
+        100*exp(-(risk_units/sqrt(max(kloc,10)/10))/25) -- size-aware above 10 kloc, never
+        amplified below it. None -- not 100 -- when fewer than half the applicable security tools
+        completed: a number built from two of five tools is not a measurement.
+      * the coverage multiplier sqrt(fraction/MIN_SECURITY_COVERAGE) applies to the WHOLE score:
+        a partial security measurement makes the whole verdict less trustworthy. Raw and adjusted
+        are both reported; `score` is the adjusted one.
       * coverage/duplication are the raw measurements, not distance-to-the-gate: those thresholds
         are already hard gates elsewhere, and a leg that saturates at 100 on every passing run
         measures nothing.
       * dependency CVEs and licence findings score in `security`; the dependencies leg is
         staleness only (no double-counting).
-      * three criticals zero the security leg and cap the composite at 60 -- intended.
+      * `active_critical_count` (caller-side) is display/banner only -- it never caps the score.
 
+    v2 (removed): security = 100 - (40*crit + 15*high + 5*med + 1*low), absolute counts, no size
+    normalization, None on ANY security-tool failure (whose 0.40 weight then redistributed --
+    INFLATING the score exactly when measurement was weakest).
     v1 (removed): 100 - (25*crit + 10*high + 3*med + 0.5*low over ALL findings)
                   - 2*(dup% over 3) - 3*(mean_ccn over 5).
     """
@@ -1355,15 +1515,20 @@ def health_score(
     coverage = metrics.get("coverage") or {}
     lighthouse = metrics.get("lighthouse") or {}
     outdated = metrics.get("outdated") or {}
+    basis: dict[str, str] = {}
 
     security: float | None = None
-    if security_measured:
-        security = _clamp(
-            100.0
-            - 40 * security_by_severity.get("critical", 0)
-            - 15 * security_by_severity.get("high", 0)
-            - 5 * security_by_severity.get("medium", 0)
-            - 1 * security_by_severity.get("low", 0)
+    if security_measured and coverage_fraction >= 0.5:
+        risk_units = sum(_RISK_UNITS[level] * security_by_severity.get(level, 0) for level in _RISK_UNITS)
+        security = round(_density_score(risk_units, kloc), 1)
+        finding_count = sum(security_by_severity.get(level, 0) for level in _RISK_UNITS)
+        basis["security"] = (
+            f"{finding_count} finding(s), {risk_units:.1f} risk units / "
+            + (f"{kloc:.1f} kloc" if kloc is not None else "kloc unmeasured (treated as reference size)")
+        )
+    elif security_measured:
+        basis["security"] = (
+            f"unmeasured: only {coverage_fraction:.0%} of applicable security tools completed (< 50%)"
         )
 
     line, branch = coverage.get("line_rate"), coverage.get("branch_rate")
@@ -1371,12 +1536,15 @@ def health_score(
     if isinstance(line, (int, float)):
         if isinstance(branch, (int, float)):
             coverage_sub = _clamp(0.75 * line + 0.25 * branch)
+            basis["coverage"] = f"line {line:.1f}%, branch {branch:.1f}%"
         else:
             coverage_sub = _clamp(float(line))
+            basis["coverage"] = f"line {line:.1f}% (no branch rate)"
 
     dependencies: float | None = None
     if isinstance(outdated.get("total"), int):
         dependencies = _clamp(100.0 - min(100.0, 5.0 * outdated["total"]))
+        basis["dependencies"] = f"{outdated['total']} stale package(s)"
 
     ac_sub: float | None = None
     total_acs = (ac_verification or {}).get("total")
@@ -1388,11 +1556,16 @@ def health_score(
     ):
         flaky = len(execution.get("flaky") or [])
         ac_sub = _clamp(100.0 * (execution["solidly_verified"] + 0.5 * flaky) / total_acs)
+        basis["ac_verification"] = f"{execution['solidly_verified']} solid + {flaky} flaky of {total_acs} ACs"
 
     accessibility = lighthouse.get("accessibility")
     accessibility = _clamp(float(accessibility)) if isinstance(accessibility, (int, float)) else None
+    if accessibility is not None:
+        basis["accessibility"] = "Lighthouse accessibility, worst measured route"
     performance = lighthouse.get("performance")
     performance = _clamp(float(performance)) if isinstance(performance, (int, float)) else None
+    if performance is not None:
+        basis["performance"] = "Lighthouse performance, worst measured route"
 
     complexity_sub: float | None = None
     mean_ccn, max_ccn = complexity.get("mean_ccn"), complexity.get("max_ccn")
@@ -1400,17 +1573,22 @@ def health_score(
         mean_part = _clamp(100.0 - 10.0 * max(0.0, mean_ccn - 5.0))
         max_part = _clamp(100.0 - 2.0 * max(0.0, (max_ccn or 0) - 15.0))
         complexity_sub = _clamp(0.7 * mean_part + 0.3 * max_part)
+        basis["complexity"] = f"mean CCN {mean_ccn}, max {max_ccn}"
 
     duplication_pct = (metrics.get("duplication") or {}).get("percent")
     duplication_sub = (
         _clamp(100.0 - 3.0 * duplication_pct) if isinstance(duplication_pct, (int, float)) else None
     )
+    if duplication_sub is not None:
+        basis["duplication"] = f"{duplication_pct}% duplicated"
 
     # Findings-count part is always computable; the docstring percentage blends in when present.
     maintainability_sub = _clamp(100.0 - 3.0 * maintainability_count)
+    basis["maintainability"] = f"{maintainability_count} finding(s)"
     docstring_pct = (metrics.get("documentation") or {}).get("python_docstring_coverage_percent")
     if isinstance(docstring_pct, (int, float)):
         maintainability_sub = _clamp((maintainability_sub + docstring_pct) / 2.0)
+        basis["maintainability"] += f", docstring coverage {docstring_pct}%"
 
     subscores: dict[str, float | None] = {
         "security": security,
@@ -1424,16 +1602,29 @@ def health_score(
         "maintainability": maintainability_sub,
     }
 
+    multiplier = (
+        1.0
+        if coverage_fraction >= MIN_SECURITY_COVERAGE or MIN_SECURITY_COVERAGE <= 0
+        else (max(coverage_fraction, 0.0) / MIN_SECURITY_COVERAGE) ** 0.5
+    )
     present = {name: HEALTH_WEIGHTS[name] for name, sub in subscores.items() if sub is not None}
     total_weight = sum(present.values())
     if not present or total_weight <= 0:
-        return {"score": None, "subscores": subscores, "weights_used": {}}
+        return {
+            "score": None, "raw": None, "coverage_multiplier": round(multiplier, 4),
+            "coverage_fraction": round(coverage_fraction, 4), "subscores": subscores,
+            "weights_used": {}, "basis": basis,
+        }
     weights_used = {name: round(w / total_weight, 4) for name, w in present.items()}
-    score = round(sum(subscores[name] * weights_used[name] for name in weights_used))
+    raw = sum(subscores[name] * weights_used[name] for name in weights_used)
     return {
-        "score": max(0, min(100, score)),
+        "score": max(0, min(100, round(raw * multiplier))),
+        "raw": round(_clamp(raw), 1),
+        "coverage_multiplier": round(multiplier, 4),
+        "coverage_fraction": round(coverage_fraction, 4),
         "subscores": {k: (round(v, 1) if v is not None else None) for k, v in subscores.items()},
         "weights_used": weights_used,
+        "basis": basis,
     }
 
 
@@ -1575,6 +1766,12 @@ class ScanReport:
         for finding in self.findings:
             by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
             by_category[finding.category] = by_category.get(finding.category, 0) + 1
+            # SCORED tallies are application-only: agent-work/gitleaks.json's 48 "secrets" (the
+            # scanner's own report re-scanned) or a vendored bundle's CVEs must not zero the
+            # security leg -- is_gating already refuses to gate on them for the same reason.
+            # `by_severity`/`by_category` above stay FULL counts (display truthfully; score fairly).
+            if is_non_application_path(finding.file):
+                continue
             if finding.category in SECURITY_CATEGORIES:
                 security_by_severity[finding.severity] = security_by_severity.get(finding.severity, 0) + 1
             elif (
@@ -1598,15 +1795,28 @@ class ScanReport:
         worst_open_severity = next(
             (level for level in reversed(SEVERITY_ORDER) if security_by_severity.get(level, 0)), "none"
         )
-        # A security tool that was selected but failed/missing means the security subscore is
-        # unmeasured, never "clean" -- and `degraded` names every non-ok tool so consumers can see
-        # which signals this summary is missing.
-        security_runs = [t for t in self.tools if t.get("name") in _SECURITY_TOOL_NAMES]
-        security_measured = bool(security_runs) and all(t.get("status") == "ok" for t in security_runs)
+        # Security-tool coverage: `required` = selected security tools whose `applies` probe did
+        # not rule them out; the fraction of those that completed drives both the whole-score
+        # multiplier and (below 50%) an unmeasured security leg -- a failed tool now COSTS score
+        # instead of redistributing its weight (v2 inflated exactly when measurement was weakest).
+        security_runs = [
+            t for t in self.tools
+            if t.get("name") in _SECURITY_TOOL_NAMES and t.get("status") != "not_applicable"
+        ]
+        coverage_fraction = (
+            sum(1 for t in security_runs if t.get("status") == "ok") / len(security_runs)
+            if security_runs else 1.0
+        )
+        security_measured = bool(security_runs)
         # `outdated` excluded: it is fail-open-by-design and networked, so its failure already
         # reads as an unmeasured (null) subscore -- listing it here would park a permanent false
-        # "summary is partial" flag on every airgapped deployment.
-        degraded = sorted(t["name"] for t in self.tools if t.get("status") != "ok" and t.get("name") != "outdated")
+        # "summary is partial" flag on every airgapped deployment. `not_applicable` excluded too:
+        # "no Python here" is a fact about the repo, not a degraded signal.
+        degraded = sorted(
+            t["name"] for t in self.tools
+            if t.get("status") not in ("ok", "not_applicable") and t.get("name") != "outdated"
+        )
+        kloc = kloc_from_metrics(self.metrics)
         health = health_score(
             security_by_severity=security_by_severity,
             security_measured=security_measured,
@@ -1614,12 +1824,22 @@ class ScanReport:
             metrics=self.metrics,
             ac_verification=self.ac_verification,
             ac_execution=self.ac_execution,
+            kloc=kloc,
+            coverage_fraction=coverage_fraction,
         )
         return {
             "health_score": health["score"],
+            "health_raw": health["raw"],
+            "health_coverage_multiplier": health["coverage_multiplier"],
+            "health_coverage_fraction": health["coverage_fraction"],
             "health_subscores": health["subscores"],
             "health_weights_used": health["weights_used"],
+            "health_basis": health["basis"],
             "health_score_version": HEALTH_SCORE_VERSION,
+            # Display/banner only -- never caps or overrides the score. Application security
+            # criticals, same tally the security leg scores.
+            "active_critical_count": security_by_severity.get("critical", 0),
+            "kloc": kloc,
             "degraded": degraded,
             "by_severity": by_severity,
             "by_category": dict(sorted(by_category.items())),
@@ -1644,9 +1864,18 @@ class ScanReport:
         findings = [
             _dashboard_finding(
                 f,
-                is_gating(
+                gating=is_gating(
                     f,
                     severity_floor=severity_floor,
+                    introduced_ids=introduced_ids,
+                    direct_dependencies=self.direct_dependencies,
+                ),
+                # The fix-everything contract remediation's gate enforces: every severity ("info"
+                # floor), application code only, quality debt only when introduced by this
+                # pipeline, security always -- the same split is_gating already draws.
+                actionable=is_gating(
+                    f,
+                    severity_floor="info",
                     introduced_ids=introduced_ids,
                     direct_dependencies=self.direct_dependencies,
                 ),
@@ -1735,14 +1964,17 @@ def merge_measures(prior_summary: dict[str, Any] | None, new_summary: dict[str, 
     return {**new_summary, "measures": new_measures}
 
 
-def _dashboard_finding(finding: Finding, gating: bool) -> dict[str, Any]:
-    """No `tool`, no `sources`: the dashboard shows the issue, not who found it."""
+def _dashboard_finding(finding: Finding, *, gating: bool, actionable: bool = False) -> dict[str, Any]:
+    """`tools` (the corroborating sources) rides along so the exit report's findings table can show
+    who said what; the richer `tool`/`sources` pair stays on Finding.to_dict() for gate callers."""
     return {
         "id": finding.finding_key,
         "category": finding.category,
         "severity": finding.severity,
         "severity_source": finding.severity_source,
         "gating": gating,
+        "actionable": actionable,
+        "tools": sorted(finding.sources) if finding.sources else [finding.tool],
         "title": finding.title or finding.rule_id,
         "description": finding.message,
         "location": {"path": finding.file, "start_line": finding.line, "end_line": finding.end_line},
@@ -1944,7 +2176,23 @@ class ToolSpec:
     output_path: str
     parse: Callable[[str], ParseResult]
     version_command: str
+    # Applicability probe: a shell command exiting 0 when the tool has anything to look at
+    # (same find-idiom the `outdated` command uses). None = always applicable. A tool ruled out
+    # here records status="not_applicable" -- excluded from summary.degraded AND from the
+    # security-coverage denominator, so "no Python in this repo" never reads as a degraded scan.
+    applies: str | None = None
 
+
+# Applicability probes (ToolSpec.applies). `-print -quit | grep -q .` = exit 0 on first hit.
+_PYTHON_FILES_PROBE = (
+    "find . -name '*.py' -not -path '*/node_modules/*' -not -path '*/.venv/*' "
+    "-not -path '*/agent-work/*' -not -path '*/.ai-dev-workflow/*' -print -quit | grep -q ."
+)
+_DOTNET_PROJECT_PROBE = (
+    "find . -maxdepth 4 \\( -name '*.sln' -o -name '*.csproj' \\) "
+    "-not -path '*/obj/*' -not -path '*/node_modules/*' -print -quit | grep -q ."
+)
+_PACKAGE_JSON_PROBE = "find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' -print -quit | grep -q ."
 
 # Every command is offline by construction: no `--config auto`, no DB update, no registry fetch.
 # The databases are baked into the sandbox image at build time -- see agent/sandbox-image/Dockerfile.
@@ -1954,7 +2202,16 @@ class ToolSpec:
 TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         "scc", "MIT", True,
-        "scc --format json . > agent-work/scc.json",
+        # The exclude list mirrors _NON_APPLICATION_PATH_RE. scc honours .gitignore, but the
+        # ignore file is only written at the first commit_all and never lists .angular/,
+        # .playwright-browsers/ or .ai-dev-workflow/ -- and `size.code` now normalises the
+        # security score (kloc), so a browser payload or the pipeline's own artifacts inflating
+        # it would quietly RAISE the score.
+        # .git/.hg/.svn lead the list because --exclude-dir REPLACES scc's default (.git,.hg,.svn),
+        # it does not extend it -- dropping them would count the object database as code.
+        "scc --exclude-dir .git,.hg,.svn,agent-work,.ai-dev-workflow,node_modules,.playwright-browsers,bin,obj,"
+        "dist,build,out,.next,.nuxt,.angular,.venv,vendor,TestResults,coverage "
+        "--format json . > agent-work/scc.json",
         "agent-work/scc.json", parse_scc, "scc --version",
     ),
     ToolSpec(
@@ -2022,6 +2279,33 @@ TOOLS: tuple[ToolSpec, ...] = (
         # never interrogate's own exit code.
         "interrogate --fail-under 0 -v . > agent-work/interrogate.txt",
         "agent-work/interrogate.txt", parse_interrogate, "interrogate --version",
+        applies=_PYTHON_FILES_PROBE,
+    ),
+    ToolSpec(
+        # Python SAST. Carries the weight semgrep used to: the vendored permissive rule packs
+        # (see the Dockerfile) have no Python coverage, and bandit is the licence-clean
+        # (Apache-2.0) native scanner. -s B101 skips assert-used -- pytest suites are built on
+        # assert and B101 on them is a documented false-positive flood.
+        "bandit", "Apache-2.0", True,
+        "bandit -r . -f json -o agent-work/bandit.json -s B101 "
+        "-x './node_modules,./.venv,./apps/*/.venv,./agent-work,./.ai-dev-workflow' --exit-zero",
+        "agent-work/bandit.json", parse_bandit, "bandit --version",
+        applies=_PYTHON_FILES_PROBE,
+    ),
+    ToolSpec(
+        # JS/TS SAST via the image-baked, pipeline-owned ESLint toolchain (eslint-plugin-security +
+        # eslint-plugin-sonarjs, resolved against /opt/aidw/lint's OWN node_modules -- see the
+        # Dockerfile). --no-config-lookup: this is a read-only SCAN with our security config, so the
+        # "a repo that lints its own way keeps its own lint contract" defer rule (which governs the
+        # build gate) deliberately does NOT apply -- a Next.js scaffold's own eslint config is
+        # exactly why no security rule ever ran on one. `|| true`: eslint exits 1 whenever anything
+        # matched; _run_one judges on the output file, not the exit code.
+        "eslint-security", "MIT (eslint) / Apache-2.0 (plugin-security) / LGPL-3.0 (plugin-sonarjs)", True,
+        "/opt/aidw/lint/node_modules/.bin/eslint --no-config-lookup "
+        "--config /opt/aidw/lint/eslint.config.mjs --no-error-on-unmatched-pattern "
+        "-f json -o agent-work/eslint.json . || true",
+        "agent-work/eslint.json", parse_eslint, "/opt/aidw/lint/node_modules/.bin/eslint --version",
+        applies=_PACKAGE_JSON_PROBE,
     ),
     ToolSpec(
         # "n/a" license, like git-churn above: this invokes the .NET SDK's own Roslyn compiler, not
@@ -2031,6 +2315,7 @@ TOOLS: tuple[ToolSpec, ...] = (
         "/p:GenerateDocumentationFile=true /p:TreatWarningsAsErrors=false /p:WarningLevel=9999 "
         "> agent-work/dotnet-docs.txt",
         "agent-work/dotnet-docs.txt", parse_dotnet_docs, "dotnet --version",
+        applies=_DOTNET_PROJECT_PROBE,
     ),
     ToolSpec(
         "syft", "Apache-2.0", True,
@@ -2066,7 +2351,7 @@ TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 
 PROFILES: dict[str, tuple[str, ...]] = {
     "quality": ("scc", "lizard", "jscpd", "interrogate", "dotnet-docs"),
-    "security": ("semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"),
+    "security": ("semgrep", "trivy", "gitleaks", "osv-scanner", "checkov", "bandit", "eslint-security"),
     # `outdated` is deliberately NOT in "full": start_background_refresh runs "full" after every
     # commit_all, and a networked registry probe per code commit would both hammer the registry
     # and make the streamed health score flicker as the dependencies subscore blinks in and out.
@@ -2252,23 +2537,39 @@ async def run_repo_scan(
 
 async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[str, Any], list[Finding], dict[str, Any]]:
     started = time.monotonic()
-    version_result = await provider.exec_in_sandbox(thread_id, f"LC_ALL=C {spec.version_command} 2>&1")
-    version_output = (version_result.stdout or "").strip()
 
     run: dict[str, Any] = {
         "name": spec.name,
         "license": spec.license,
         "permissive": spec.permissive,
-        "version": version_output.splitlines()[0].strip() if version_output else None,
-        "db_version": _extract_db_version(version_output),
+        "version": None,
+        "db_version": None,
         "status": "ok",
         "exit_code": None,
         "duration_ms": 0,
+        # Per-tool finding count (pre-dedupe) and a short human note -- the exit report's
+        # Scanner tools table renders both.
+        "findings": 0,
+        "notes": "",
     }
+
+    if spec.applies is not None:
+        probe = await provider.exec_in_sandbox(thread_id, f"{spec.applies}")
+        if not probe.ok:
+            # A fact about the repo (no Python here), not a degraded scan -- summary() excludes
+            # this status from both `degraded` and the security-coverage denominator.
+            run.update(status="not_applicable", notes="No applicable files detected", duration_ms=_elapsed_ms(started))
+            return run, [], {}
+
+    version_result = await provider.exec_in_sandbox(thread_id, f"LC_ALL=C {spec.version_command} 2>&1")
+    version_output = (version_result.stdout or "").strip()
+    run["version"] = version_output.splitlines()[0].strip() if version_output else None
+    run["db_version"] = _extract_db_version(version_output)
 
     if not version_result.ok:
         # The binary is not on PATH -- a sandbox image problem, not a repo problem. Say so.
-        run.update(status="missing", version=None, duration_ms=_elapsed_ms(started))
+        run.update(status="missing", version=None, notes="binary not on PATH -- sandbox image problem",
+                   duration_ms=_elapsed_ms(started))
         logger.warning("repo_scan: tool %s is not available in the sandbox", spec.name)
         return run, [], {}
 
@@ -2281,18 +2582,20 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
     if raw is None or not raw.strip():
         # Non-zero exit is normal for most of these tools (findings present), so the report file --
         # not the exit code -- is what decides success.
-        run.update(status="failed", duration_ms=_elapsed_ms(started))
+        run.update(status="failed", notes=f"no readable output at {spec.output_path}",
+                   duration_ms=_elapsed_ms(started))
         logger.warning("repo_scan: tool %s produced no readable output at %s", spec.name, spec.output_path)
         return run, [], {}
 
     try:
         tool_findings, fragment = spec.parse(raw)
-    except Exception:  # noqa: BLE001 -- one malformed report must not lose the other seven tools
+    except Exception as exc:  # noqa: BLE001 -- one malformed report must not lose the other tools
         logger.warning("repo_scan: parser for %s failed", spec.name, exc_info=True)
-        run.update(status="failed", duration_ms=_elapsed_ms(started))
+        run.update(status="failed", notes=f"parser failed: {type(exc).__name__}", duration_ms=_elapsed_ms(started))
         return run, [], {}
 
     run["duration_ms"] = _elapsed_ms(started)
+    run["findings"] = len(tool_findings)
     return run, tool_findings, fragment
 
 
@@ -2583,7 +2886,8 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert "GHSA-aaaa-bbbb-cccc" in only.aliases, only
     assert only.severity == "high", "merge must keep the worst severity, not the last one seen"
     assert set(only.sources) == {"trivy", "osv-scanner"} and only.occurrences == 2
-    assert _dashboard_finding(only, True)["confidence"] == "corroborated"
+    assert _dashboard_finding(only, gating=True)["confidence"] == "corroborated"
+    assert _dashboard_finding(only, gating=True)["tools"] == ["osv-scanner", "trivy"], "corroborating sources ride the dashboard"
 
     # Two genuinely different advisories on the same package must NOT collapse.
     other = _vuln("trivy", "CVE-2024-9999", "lodash", "low")
@@ -2718,6 +3022,41 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     )
     assert dotnet_metrics["documentation"]["dotnet_undocumented_public_members"] == 2
     assert parse_dotnet_docs("MSBUILD : error MSB1003: Specify a project or solution file.") == ([], {})
+
+    # --- bandit: Python SAST, native severities, CWE carried -----------------------------------
+    bandit_findings, bandit_metrics = parse_bandit(json.dumps({
+        "results": [
+            {"filename": "./apps/api/app.py", "line_number": 12, "test_id": "B602",
+             "test_name": "subprocess_popen_with_shell_equals_true", "issue_severity": "HIGH",
+             "issue_confidence": "HIGH", "issue_text": "subprocess call with shell=True identified.",
+             "issue_cwe": {"id": 78, "link": "https://cwe.mitre.org/data/definitions/78.html"}},
+            {"filename": "./apps/api/util.py", "line_number": 3, "test_id": "B404",
+             "test_name": "blacklist", "issue_severity": "LOW", "issue_confidence": "HIGH",
+             "issue_text": "Consider possible security implications.", "issue_cwe": {"id": 78}},
+        ],
+    }))
+    assert bandit_metrics == {} and len(bandit_findings) == 2, (bandit_findings, bandit_metrics)
+    assert bandit_findings[0].category == "sast" and bandit_findings[0].severity == "high"
+    assert bandit_findings[0].cwe == "CWE-78" and bandit_findings[0].file == "apps/api/app.py"
+    assert bandit_findings[0].severity_source == "native" and bandit_findings[0].tool == "bandit"
+    assert parse_bandit("not json") == ([], {}) and parse_bandit("[]") == ([], {})
+
+    # --- eslint-security: only security/* and sonarjs/* namespaces become findings ---------------
+    eslint_findings, eslint_metrics = parse_eslint(json.dumps([
+        {"filePath": "/workspace/repo/apps/web/src/lib/query.ts", "messages": [
+            {"ruleId": "security/detect-object-injection", "severity": 2,
+             "message": "Generic Object Injection Sink", "line": 42},
+            {"ruleId": "sonarjs/no-hardcoded-passwords", "severity": 2,
+             "message": "Review this hard-coded password.", "line": 7},
+            {"ruleId": "no-console", "severity": 2, "message": "Unexpected console statement.", "line": 1},
+            {"ruleId": None, "severity": 2, "message": "Parsing error", "line": 1},
+        ]},
+    ]))
+    assert eslint_metrics == {} and len(eslint_findings) == 2, eslint_findings
+    assert eslint_findings[0].file == "apps/web/src/lib/query.ts", "absolute sandbox path must become repo-relative"
+    assert eslint_findings[0].severity == "medium" and eslint_findings[1].severity == "low"
+    assert all(f.category == "sast" and f.severity_source == "derived" for f in eslint_findings)
+    assert parse_eslint("not json") == ([], {}) and parse_eslint("{}") == ([], {})
 
     # --- syft: SBOM summarized to a handful of numbers, never expanded into `metrics` --------------
     _, syft_metrics = parse_syft(json.dumps({"components": [
@@ -2882,7 +3221,7 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     # --- report shape --------------------------------------------------------------------------
     report = ScanReport(
         findings=tuple(sort_findings(list(secrets) + list(merged) + lizard_findings)),
-        metrics=metrics, tools=({"name": "trivy", "db_version": "2026-08-01"},),
+        metrics=metrics, tools=({"name": "trivy", "db_version": "2026-08-01", "status": "ok"},),
         repo={"commit": "aaa", "branch": "main"}, deduped_count=2,
     )
     dashboard = report.to_dashboard_dict()
@@ -2890,13 +3229,17 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     for key in ("schema_version", "generated_at", "content_hash", "repo", "summary", "findings", "metrics", "tools"):
         assert key in dashboard, key
     serialized = json.dumps(dashboard["findings"])
-    assert '"tool"' not in serialized and '"sources"' not in serialized, "dashboard must not attribute tools"
+    # `tools` (plural, the corroborating sources) IS in the dashboard now -- the exit report's
+    # findings table shows who said what; the singular `tool`/`sources` pair stays gate-only.
+    assert '"tool"' not in serialized and '"sources"' not in serialized, "dashboard keeps the gate-only keys off"
+    assert all(f["tools"] for f in dashboard["findings"]), "every dashboard finding names its tools"
+    assert all("actionable" in f for f in dashboard["findings"]), "fix-everything contract flag"
     # ...but the gate path, which reads Finding.to_dict() straight off ScanReport.findings, must.
     assert '"tool"' in json.dumps([f.to_dict() for f in report.findings]), "gate payload must attribute tools"
     assert dashboard["summary"]["by_severity"]["critical"] == 1
     assert dashboard["summary"]["health_score"] < 100
 
-    # --- health score v2 -----------------------------------------------------------------------
+    # --- health score v3 -----------------------------------------------------------------------
     assert abs(sum(HEALTH_WEIGHTS.values()) - 1.0) < 1e-9, "nominal weights must sum to 1.0"
     # The README's weights table documents these defaults -- keep them in lockstep (the assert is
     # skipped when an env override is actually set, since then HEALTH_WEIGHTS is deliberately off
@@ -2907,24 +3250,53 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
             "accessibility": 0.07, "complexity": 0.06, "performance": 0.05,
             "duplication": 0.04, "maintainability": 0.04,
         }, "README.md 'The health score' documents different defaults -- update both together"
-    # This fixture's trivy entry has no status:"ok", so security is UNMEASURED -> None, and its
-    # weight redistributes over the measured legs (weights_used re-sums to 1.0).
-    summary_v2 = dashboard["summary"]
-    assert summary_v2["health_score_version"] == HEALTH_SCORE_VERSION
-    assert summary_v2["health_subscores"]["security"] is None, "failed/absent security tools must read unmeasured, not clean"
-    assert "security" not in summary_v2["health_weights_used"]
-    assert abs(sum(summary_v2["health_weights_used"].values()) - 1.0) < 1e-3, summary_v2["health_weights_used"]
-    # A clean security run scores 100; three criticals zero the leg (and cap the composite at 60).
+    # Fixture's one security tool (trivy) ran ok -> fraction 1.0, security measured and weighted.
+    summary_v3 = dashboard["summary"]
+    assert summary_v3["health_score_version"] == HEALTH_SCORE_VERSION
+    assert summary_v3["health_subscores"]["security"] is not None and summary_v3["health_subscores"]["security"] < 100
+    assert summary_v3["health_coverage_fraction"] == 1.0 and summary_v3["health_coverage_multiplier"] == 1.0
+    assert summary_v3["health_raw"] is not None and "security" in summary_v3["health_basis"], summary_v3["health_basis"]
+    assert summary_v3["active_critical_count"] == 1, "banner metadata: the one application secret"
+    assert abs(sum(summary_v3["health_weights_used"].values()) - 1.0) < 1e-3, summary_v3["health_weights_used"]
+    # A clean security run scores 100. Density model at/below the 10 kloc reference (size_factor
+    # floors at 1 -- never amplified below the reference, only relieved above it):
     clean = health_score(
         security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=True,
         maintainability_count=0, metrics={},
     )
-    assert clean["subscores"]["security"] == 100.0 and clean["score"] == 100, clean
+    assert clean["subscores"]["security"] == 100.0 and clean["score"] == 100 and clean["raw"] == 100.0, clean
     three_crit = health_score(
         security_by_severity={**{lvl: 0 for lvl in SEVERITY_ORDER}, "critical": 3},
         security_measured=True, maintainability_count=0, metrics={},
     )
-    assert three_crit["subscores"]["security"] == 0.0, three_crit
+    assert three_crit["subscores"]["security"] == 9.1, three_crit  # 100*exp(-60/25) -- low, never a hard cap
+    # The research note's own worked example: 7 highs on a 50.9 kloc repo -> ~37, not v2's 0.
+    seven_high = health_score(
+        security_by_severity={**{lvl: 0 for lvl in SEVERITY_ORDER}, "high": 7},
+        security_measured=True, maintainability_count=0, metrics={}, kloc=50.92,
+    )
+    assert 36.5 <= seven_high["subscores"]["security"] <= 37.5, seven_high["subscores"]
+    # Greenfield shapes at 2 kloc: the floor equals the reference, so these match the 10 kloc
+    # numbers instead of being density-amplified (the note's 0.5 floor gave 16.7 for one secret).
+    for by_sev, expected in ((("medium", 1), 90.5), (("high", 1), 72.6), (("critical", 1), 44.9)):
+        shaped = health_score(
+            security_by_severity={**{lvl: 0 for lvl in SEVERITY_ORDER}, by_sev[0]: by_sev[1]},
+            security_measured=True, maintainability_count=0, metrics={}, kloc=2.0,
+        )
+        assert shaped["subscores"]["security"] == expected, (by_sev, shaped["subscores"])
+    # Coverage multiplier: one failed tool of five is a sqrt haircut on the WHOLE score...
+    partial = health_score(
+        security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=True,
+        maintainability_count=0, metrics={}, coverage_fraction=0.8,
+    )
+    assert partial["coverage_multiplier"] == round(0.8 ** 0.5, 4) and partial["score"] == 89, partial
+    # ...and below half the tools, security is UNMEASURED -- two of five is not a measurement.
+    sparse = health_score(
+        security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=True,
+        maintainability_count=0, metrics={}, coverage_fraction=0.4,
+    )
+    assert sparse["subscores"]["security"] is None and "security" not in sparse["weights_used"], sparse
+    assert "unmeasured" in sparse["basis"]["security"], sparse["basis"]
     # Nothing measured at all -> score None, never a fabricated number.
     nothing = health_score(
         security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=False,
@@ -2933,6 +3305,24 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     # maintainability's count part is always computable, so at least that leg is present -- but a
     # weights table zeroed by env override must not divide by zero either.
     assert nothing["score"] is not None and nothing["subscores"]["security"] is None
+    # kloc excludes data/markup languages -- a 20k-line lockfile must not halve the burden.
+    assert kloc_from_metrics({"size": {"languages": [
+        {"name": "TypeScript", "code": 1500}, {"name": "JSON", "code": 20000},
+    ]}}) == 1.5
+    assert kloc_from_metrics({}) is None, "no scc in this profile -> unmeasured, not zero"
+    # not_applicable is a fact about the repo: out of `degraded`, out of the coverage denominator.
+    na_report = ScanReport(findings=(), metrics={}, repo={}, deduped_count=0, tools=(
+        {"name": "trivy", "status": "ok"},
+        {"name": "gitleaks", "status": "ok"},
+        {"name": "semgrep", "status": "failed"},
+        {"name": "bandit", "status": "not_applicable", "version": None, "exit_code": None},
+        {"name": "lizard", "status": "failed"},
+    ))
+    na_summary = na_report.summary()
+    assert na_summary["degraded"] == ["lizard", "semgrep"], na_summary["degraded"]
+    assert na_summary["health_coverage_fraction"] == round(2 / 3, 4), na_summary["health_coverage_fraction"]
+    assert na_summary["health_coverage_multiplier"] == round((2 / 3) ** 0.5, 4)
+    assert na_summary["health_subscores"]["security"] is not None, "2 of 3 applicable tools is still a measurement"
     # Coverage is the raw measurement, not distance-to-the-95%-gate: 95% must NOT read as 100.
     covered = health_score(
         security_by_severity={lvl: 0 for lvl in SEVERITY_ORDER}, security_measured=True,
@@ -2959,7 +3349,7 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert health_score(
         security_by_severity={**_zero, "high": 1, "medium": 1, "low": 1},
         security_measured=True, maintainability_count=0, metrics={},
-    )["subscores"]["security"] == 79.0  # 100 - 15 - 5 - 1
+    )["subscores"]["security"] == 64.4  # 100*exp(-(8+2.5+0.5)/25) at/below the 10 kloc reference
     assert _leg(metrics={"coverage": {"line_rate": 100.0, "branch_rate": 0.0}})["coverage"] == 75.0  # 0.75/0.25 blend
     assert _leg(metrics={"outdated": {"total": 4}})["dependencies"] == 80.0  # 100 - 5*4
     assert _leg(metrics={"complexity": {"mean_ccn": 7.0, "max_ccn": 25.0}})["complexity"] == 80.0  # 0.7*80 + 0.3*80
@@ -3220,7 +3610,9 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     # --- profiles ---------------------------------------------------------------------------------
     assert [t.name for t in select_tools("quality", None, True)] == ["scc", "lizard", "jscpd", "interrogate", "dotnet-docs"]
     assert "trivy" not in [t.name for t in select_tools("quality", None, True)]
-    assert [t.name for t in select_tools("security", None, True)] == ["semgrep", "trivy", "gitleaks", "osv-scanner", "checkov"]
+    assert [t.name for t in select_tools("security", None, True)] == [
+        "semgrep", "trivy", "gitleaks", "osv-scanner", "checkov", "bandit", "eslint-security"
+    ]
     assert [t.name for t in select_tools("full", ["jscpd"], True)] == ["jscpd"], "explicit tools= must win"
     assert "scc" not in [t.name for t in select_tools("full", None, False)]
     assert "git-churn" not in [t.name for t in select_tools("full", None, False)]

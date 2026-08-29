@@ -6,10 +6,12 @@
 // workspace's peer graph, forked drizzle-orm into two incompatible instances, and broke a
 // build the pipeline was supposed to protect.
 //
-// Enforced as a build failure at the pipeline's full-scope rebuild gates:
-//   eslint --config /opt/aidw/lint/eslint.config.mjs --max-warnings=0 .
-// A repo that ships its OWN eslint config keeps its own lint contract instead -- this file
-// only ever applies to repos with no lint setup of their own.
+// Two consumers:
+//   * build gates (a repo that ships its OWN eslint config keeps its own lint contract instead --
+//     for BUILDING, this file only applies to repos with no lint setup of their own);
+//   * repo_scan.py's `eslint-security` adapter, which runs this config read-only on EVERY repo
+//     with a package.json (--no-config-lookup) and keeps only security/* and sonarjs/* findings --
+//     a repo's own config governs its style, not whether it gets security-scanned.
 // ══════════════════════════════════════════════════════════════════════
 import js from '@eslint/js';
 import globals from 'globals';
@@ -55,6 +57,18 @@ export default [
       '**/coverage/**',
       '**/*.min.js',
       '**/*.d.ts', // generated declaration files (wrangler, cloudflare-env) are not authored code
+      // Non-application paths repo_scan's other tools also skip: pipeline scratch, build caches,
+      // vendored payloads, test-run artifacts (mirrors repo_scan._NON_APPLICATION_PATH_RE).
+      '**/.angular/**',
+      '**/.nuxt/**',
+      '**/agent-work/**',
+      '**/.ai-dev-workflow/**',
+      '**/.venv/**',
+      '**/TestResults/**',
+      '**/bin/**',
+      '**/obj/**',
+      '**/.playwright-browsers/**',
+      '**/vendor/**',
     ],
   },
   {

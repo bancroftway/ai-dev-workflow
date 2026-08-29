@@ -806,13 +806,22 @@ async def check_completed_ac_protection(
     provider: SandboxProvider, thread_id: str, baseline_commit: str | None, entries: list[dict[str, Any]]
 ) -> list[str]:
     """Completed criteria (coded_run_id stamped by a healthy metrics run) are settled: their
-    regression tests must survive (A), and no NEW test work may target them (B). Incidental
-    shared-code edits are deliberately NOT policed -- the regression suite guards behavior.
+    regression tests must survive. Incidental shared-code/file edits are deliberately NOT policed
+    -- the regression suite guards behavior, and this stage's own tooling (create/edit, no delete)
+    routinely rewrites a whole test file to add new cases, which a line-level diff cannot tell
+    apart from genuine rework of the untouched ones sitting in the same file. An earlier
+    line-diff-based "no added line may mention a completed AC" check was removed after it fired on
+    exactly that: a normal whole-file rewrite for NEW work reads every pre-existing line as
+    "added," false-flagging every completed AC the file happens to also cover (observed live: one
+    rewritten controller test file alone false-flagged 8 already-delivered criteria). Presence is
+    the check that actually matters and cannot be fooled by reformatting.
 
-    A is id-presence (does any test file still name the id), never runner-reported test-name
-    grepping: runner names are FQNs/joined titles that don't exist verbatim in source. An AC coded
-    but with no tests on disk at all is a deletion either way.
+    Id-presence (does any test file still name the id), never runner-reported test-name grepping:
+    runner names are FQNs/joined titles that don't exist verbatim in source. An AC coded but with
+    no tests on disk at all is a deletion either way. `baseline_commit` is unused now (kept in the
+    signature -- callers already pass it, and a future precision check may want it again).
     """
+    del baseline_commit
     completed = {
         e["id"]
         for e in entries
@@ -832,38 +841,6 @@ async def check_completed_ac_protection(
             f"no test file names completed criterion {ac_id} any more -- its regression tests were "
             "deleted or renamed; restore them (completed criteria keep their tests)"
         )
-
-    if baseline_commit is not None:
-        added_by_path: dict[str, list[str]] = {}
-        diff = await provider.exec_in_sandbox(
-            thread_id, f"git diff --unified=0 {shlex.quote(baseline_commit)} -- ."
-        )
-        current: str | None = None
-        for line in (diff.stdout or "").splitlines():
-            if line.startswith("+++ b/"):
-                path = line[6:].strip()
-                current = path if _is_test_path(path) and not _is_pipeline_owned(path) else None
-            elif line.startswith("+") and not line.startswith("+++") and current:
-                added_by_path.setdefault(current, []).append(line[1:])
-        untracked = await provider.exec_in_sandbox(thread_id, "git ls-files --others --exclude-standard")
-        for path in (untracked.stdout or "").splitlines():
-            path = path.strip()
-            if path and _is_test_path(path) and not _is_pipeline_owned(path):
-                contents = await repo_files.read_repo_file(provider, thread_id, path)
-                if contents is not None:
-                    added_by_path.setdefault(path, []).extend(contents.splitlines())
-        offenders: dict[str, set[str]] = {}
-        for path, lines in added_by_path.items():
-            for text in lines:
-                touched = set(test_results.ac_ids_in_name(text)) & completed
-                if touched:
-                    offenders.setdefault(path, set()).update(touched)
-        if offenders:
-            detail = "; ".join(f"{path}: {', '.join(sorted(ids))}" for path, ids in sorted(offenders.items()))
-            problems.append(
-                "new/modified test lines target criteria that are already coded and tested -- "
-                f"completed criteria are never re-worked, remove those additions: {detail}"
-            )
     return problems
 
 
@@ -1533,8 +1510,87 @@ def _demo() -> None:
     # _demo_ticket_scoping below (needs asyncio + hand-rolled sandbox fakes, kept out of the main
     # body above since every other assertion here is synchronous and pure).
     asyncio.run(_demo_ticket_scoping())
+    asyncio.run(_demo_provenance_checks())
 
     print("ac_coverage_gate self-check: all assertions passed")
+
+
+async def _demo_provenance_checks() -> None:
+    """check_ledger_integrity / check_retired_ac_residue / check_completed_ac_protection against
+    fake providers that mock the ACTUAL commands each issues -- not the `cat <path>`-style fake
+    _demo_ticket_scoping uses, which none of these three match.
+
+    The protection-B removal (this module's own history) is the case worth pinning permanently:
+    a completed AC's test surviving unmoved must never be flagged just because the SAME file also
+    grew new, unrelated test methods -- exactly the false positive observed live (one rewritten
+    controller test file false-flagged 8 already-delivered criteria)."""
+
+    class _FakeExecResult:
+        def __init__(self, ok: bool = True, stdout: str = "") -> None:
+            self.ok = ok
+            self.stdout = stdout
+
+    class _FakeGrepProvider:
+        """Serves the two commands these functions actually issue: `git diff --name-only -- <path>`
+        (check_ledger_integrity) and `<listing> | xargs ... grep -H -n -F ...` (the shared id-grep
+        both residue and protection use). `files` maps a test file path to its full content;
+        matching is done in Python (real grep semantics), not string substring, so line/path
+        attribution is exact."""
+
+        def __init__(self, files: dict[str, str], ledger_diff: str = "") -> None:
+            self._files = files
+            self._ledger_diff = ledger_diff
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str):  # noqa: ANN201
+            if command.startswith("git diff --name-only -- "):
+                return _FakeExecResult(True, self._ledger_diff)
+            if "grep -H -n -F" in command:
+                out_lines = []
+                for path, content in self._files.items():
+                    for lineno, text in enumerate(content.splitlines(), start=1):
+                        out_lines.append(f"{path}:{lineno}:{text}")
+                return _FakeExecResult(True, "\n".join(out_lines))
+            return _FakeExecResult(True, "")
+
+    # check_ledger_integrity: clean diff -> no problems; tampered ledger -> flagged (revert is a
+    # real `git checkout` call this fake just no-ops, only the detection is asserted here).
+    assert await check_ledger_integrity(_FakeGrepProvider({}), "t") == []
+    tampered = await check_ledger_integrity(_FakeGrepProvider({}, ledger_diff=f" M {LEDGER_PATH}\n"), "t")
+    assert tampered and LEDGER_PATH in tampered[0], tampered
+
+    entries = [
+        {"id": "US-0001", "kind": "user_story", "status": "active"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "retired"},
+    ]
+
+    # check_retired_ac_residue: a retired AC's id still present in a test file is flagged.
+    residue = await check_retired_ac_residue(
+        _FakeGrepProvider({"apps/web/x.spec.ts": "test('[US-0002.1] old feature', () => {});"}),
+        "t", entries,
+    )
+    assert residue and "US-0002.1" in residue[0], residue
+    assert await check_retired_ac_residue(_FakeGrepProvider({}), "t", entries) == []
+
+    # check_completed_ac_protection: presence-only now (protection-B removed). The completed AC's
+    # test surviving anywhere in the tree is enough, EVEN when the same file also grew unrelated
+    # new test methods around it -- the exact whole-file-rewrite shape that used to false-flag.
+    rewritten_file_with_survivor_and_new_work = (
+        "test('[US-0001.1] still here, reformatted', () => {});\n"
+        "test('[US-0003.1] brand new unrelated work', () => {});\n"
+    )
+    ok = await check_completed_ac_protection(
+        _FakeGrepProvider({"apps/web/x.spec.ts": rewritten_file_with_survivor_and_new_work}),
+        "t", "baseline-sha", entries,
+    )
+    assert ok == [], ok
+
+    # Deletion is still caught: the completed AC's id is nowhere in the tree any more.
+    deleted = await check_completed_ac_protection(
+        _FakeGrepProvider({"apps/web/x.spec.ts": "test('[US-0003.1] unrelated only', () => {});"}),
+        "t", "baseline-sha", entries,
+    )
+    assert deleted and "US-0001.1" in deleted[0], deleted
 
 
 async def _demo_ticket_scoping() -> None:

@@ -13,11 +13,15 @@ hypothetical: it is what this stage did on every run until the scan above starte
 If `repo-scan-latest.json` is genuinely missing, say so explicitly in `remediation_summary` and set
 `readiness` true anyway -- a stated inability to measure is useful; a fabricated all-clear is not.
 
-Start with `gating: true` findings. Those are what block this run; a non-gating finding is worth
-fixing only when it is genuinely trivial. Ignore anything located under `agent-work/`,
-`.ai-dev-workflow/`, `node_modules/`, `bin/`, `obj/`, `dist/`, `.next/` or a downloaded browser
-directory -- those are the pipeline's own scratch, build output, or vendored third-party payloads,
-not this application's code, and they are already excluded from gating.
+Fix EVERY finding marked `actionable: true`, regardless of severity -- `info` and `low` included.
+Work highest-severity first (`gating: true` findings block this run outright), but the gate that
+verifies you blocks on ANY actionable finding that is neither gone from a fresh scan nor explained:
+each one you leave MUST appear in `known_gaps` as `<id>: <real reason>`. A `vulnerability` whose
+scan entry lists no `fixed_version` is a known gap with exactly that reason ("no fixed version
+published"). Findings with `actionable: false` need nothing from you -- they are outside the
+application (`agent-work/`, `.ai-dev-workflow/`, `node_modules/`, `bin/`, `obj/`, `dist/`,
+`.next/`, downloaded browser directories), advisory-only rules, licences inherited through lock
+files, or pre-existing debt this pipeline did not introduce; the exit report labels them itself.
 
 ## Vulnerable dependencies
 

@@ -88,6 +88,12 @@ def _run_pipeline(branch: str, thread_id: str, requirements: str, fresh_run: boo
     ]
     if fresh_run:
         cmd.append("--fresh-run")
+    # run_headless.py writes its own outcome report as the LAST thing it does -- an unhandled
+    # exception anywhere in the astream loop propagates past that write, and the previous
+    # invocation's stale report (if any) would otherwise be silently misread as this run's
+    # result. Remove it first so a stale report can never survive a crashed subprocess.
+    report_path = Path(__file__).parent / "agent-work" / f"headless-{thread_id}.json"
+    report_path.unlink(missing_ok=True)
     logger.info("running: %s", " ".join(cmd))
     try:
         result = subprocess.run(
@@ -99,12 +105,13 @@ def _run_pipeline(branch: str, thread_id: str, requirements: str, fresh_run: boo
             os.unlink(req_file)
         except OSError:
             pass
-    report_path = Path(__file__).parent / "agent-work" / f"headless-{thread_id}.json"
     outcome: dict = {}
     if report_path.exists():
         outcome = json.loads(report_path.read_text(encoding="utf-8"))
+    else:
+        outcome["crashed_without_report"] = True
     outcome["returncode"] = result.returncode
-    outcome["tail"] = (result.stdout + "\n" + result.stderr)[-3000:]
+    outcome["tail"] = (result.stdout + "\n" + result.stderr)[-6000:]
     return outcome
 
 
@@ -313,17 +320,31 @@ def main() -> int:
 
     # Full canonical uuid4: sessions.session_id is SQL Server `uniqueidentifier` -- a prefixed or
     # truncated id fails touch_run's conversion mid-pipeline.
-    thread_id = str(uuid.uuid4())
+    # DELTA_E2E_RESUME_THREAD: continue an earlier attempt's run 1 (its sandbox/volume/work-branch
+    # already exist and carry approved stages on disk) instead of minting a fresh thread and
+    # re-paying for stages already approved -- e.g. after a quota_exhausted run_failure. Resumed
+    # exactly like run_headless.py's own --thread contract: same thread id, fresh_run=False so
+    # AIDW_RESUME=1 skips every stage already approved on disk.
+    resume_thread = os.environ.get("DELTA_E2E_RESUME_THREAD", "").strip()
+    thread_id = resume_thread or str(uuid.uuid4())
     # Source branch must EXIST in the remote -- the sandbox entrypoint does
     # `git clone --branch <source>` and dies on a missing ref. The per-session work branch
     # (ai-dev-workflow-session-<thread>) is minted by the entrypoint on top of it.
     branch = "main"
-    logger.info("thread=%s source_branch=%s stack=%s", thread_id, branch, TECH_STACK)
+    logger.info(
+        "thread=%s source_branch=%s stack=%s%s", thread_id, branch, TECH_STACK,
+        " (RESUMING prior run 1)" if resume_thread else "",
+    )
 
     outcome1 = _run_pipeline(branch, thread_id, REQUIREMENTS_RUN_1, fresh_run=False)
     run1_id = outcome1.get("run_id") or ""
     if not outcome1.get("ok"):
         logger.error("run 1 did not reach a merge-ready exit: %s", json.dumps(outcome1, indent=2)[:2000])
+        logger.error(
+            "to retry without re-paying for approved stages: "
+            "DELTA_E2E_RESUME_THREAD=%s uv run python test_requirements_delta_e2e.py",
+            thread_id,
+        )
         return 1
     logger.info("run 1 ok (run_id=%s)", run1_id)
 

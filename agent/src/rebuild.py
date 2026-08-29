@@ -183,8 +183,17 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
         return []
 
     # summary() is a METHOD with keyword args, not an attribute. Called the same way metrics_nodes
-    # calls it, so both gates see the same shape.
-    latest_summary = scan.summary()
+    # calls it, so both gates see the same shape -- INCLUDING the known-gap exemption (Ruling 8):
+    # metrics_compute passes remediation's approved `known_gaps` ids so an honestly-explained
+    # finding (a transitive CVE with no fixed_version, say) doesn't gate. This pre-gate omitted
+    # them, so exactly that finding passed remediation's own gate, would pass the terminal gate,
+    # and still re-blocked the adversarial rebuild for its full 3 laps -> escalate.
+    try:
+        known_gaps = await metrics_nodes._read_known_gaps(provider, thread_id)  # noqa: SLF001 -- same package
+    except Exception:  # noqa: BLE001 -- an unreadable remediation report just means no exemptions
+        known_gaps = []
+    known_gap_ids = metrics_nodes._known_gap_finding_keys(known_gaps, scan.findings)  # noqa: SLF001
+    latest_summary = scan.summary(known_gap_ids=known_gap_ids)
     # Prefer the contract-merged coverage minimal-code-to-green's own gate promoted onto state,
     # then FALL BACK to parsing the artifacts off disk -- exactly the order metrics_nodes uses.
     #
@@ -218,6 +227,7 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
                 severity_floor=latest_summary.get("severity_floor") or repo_scan.SECURITY_SEVERITY_FLOOR,
                 introduced_ids=None,
                 direct_dependencies=scan.direct_dependencies,
+                known_gap_ids=known_gap_ids,
             )
         ]
         for f in gating[:10]:
@@ -233,10 +243,22 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
     return reasons
 
 
-async def _eligible_ac_ids_for_run(provider: Any, thread_id: str) -> set[str]:
+async def _eligible_ac_ids_for_run(provider: Any, thread_id: str, run_id: str, *, new_or_modified_only: bool = False) -> set[str]:
     """This ticket's undelivered AC ids, from the persisted spec + ledger (this node has no
     stage content of its own). Empty set on any read/parse failure -- callers treat empty as
-    "nothing to scope to" and skip their check, the fail-open posture every rebuild check keeps."""
+    "nothing to scope to" and skip their check, the fail-open posture every rebuild check keeps.
+
+    `new_or_modified_only` narrows to ids this RUN itself introduced or reworded
+    (spec_ledger.change_status in ("new","modified")) -- for the TDD-red gate specifically, never
+    for ac-coverage's own (unfiltered) work-queue scoping. Carried-over debt (an AC an EARLIER run
+    left undelivered, untouched by this run's own citations) has no business being held to "must
+    currently fail": its wording may describe a property that is already true as an emergent
+    consequence of other, already-shipped code (observed live: 'no separate mechanism needed to
+    discard out-of-order responses' -- a criterion whose own text says nothing new is required).
+    Demanding a red proof for that is unsatisfiable without breaking correct, delivered behavior.
+    Carried-over debt still owes coverage (ac-coverage's own gate still requires it); it just does
+    not owe a fresh watch-it-fail moment on someone else's incomplete work.
+    """
     import json
 
     from . import spec_ledger
@@ -251,7 +273,14 @@ async def _eligible_ac_ids_for_run(provider: Any, thread_id: str) -> set[str]:
     except json.JSONDecodeError:
         return set()
     entries = await spec_ledger.load_ledger(provider, thread_id)
-    return set(spec_ledger.eligible_ac_ids(entries, own))
+    eligible = set(spec_ledger.eligible_ac_ids(entries, own))
+    if not new_or_modified_only:
+        return eligible
+    by_id = {e.get("id"): e for e in entries}
+    return {
+        ac_id for ac_id in eligible
+        if ac_id in by_id and spec_ledger.change_status(by_id[ac_id], run_id) in ("new", "modified")
+    }
 
 
 async def _provenance_reasons(provider: Any, thread_id: str, state: dict[str, Any]) -> list[str]:
@@ -460,10 +489,11 @@ def make_rebuild_node(spec: RebuildSpec):
             # "not_started"); any other status means a resume where implementation already exists,
             # and demanding red then would strip finished work (observed live, s04 run 7).
             mctg_status = ((state.get("stages") or {}).get("minimal-code-to-green") or {}).get("status")
-            eligible = await _eligible_ac_ids_for_run(provider, thread_id)
+            run_id = state.get("run_id", "unknown")
+            eligible = await _eligible_ac_ids_for_run(provider, thread_id, run_id, new_or_modified_only=True)
             if mctg_status == "not_started" and eligible:
                 red_ok, red_detail = await _verify_all_red(
-                    thread_id, state["provider"], run_id=state.get("run_id", "unknown"), eligible_only=eligible
+                    thread_id, state["provider"], run_id=run_id, eligible_only=eligible
                 )
                 if not red_ok:
                     build_ok = False

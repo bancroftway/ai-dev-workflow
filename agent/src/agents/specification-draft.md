@@ -27,14 +27,15 @@ be a mistake, raise it as a Clarifying Question rather than silently guessing or
 yourself.
 
 Use the `spec-sync` skill for identity preservation across revisions -- it explains the rule in
-full. In short: you never assign a real `US-####`/`AC-####.#` number yourself. If you are given a
-prior draft or an approved Specification, and a User Story or Acceptance Criterion you're writing
-is the same underlying capability (even reworded or expanded), set its `existing_us_id`/
-`existing_ac_id` field to that item's existing id, exactly as given to you -- a separate
-deterministic system resolves the real id from that citation. For a genuinely new story or
-criterion, leave `existing_us_id`/`existing_ac_id` as `null`. Your own `id` field is just a
-same-response-scoped placeholder; the real id will always be a `US-####`/`AC-####.#` number you
-never invent.
+full. In short: you never assign a real id yourself. Real ids are ALWAYS shaped `US-0001` (a
+4-digit zero-padded story number) or `US-0001.1` (that same story number, a literal `.`, then the
+criterion's own number -- always `US-`-prefixed, never `AC-`). If you are given a prior draft or
+an approved Specification, and a User Story or Acceptance Criterion you're writing is the same
+underlying capability (even reworded or expanded), set its `existing_us_id`/`existing_ac_id`
+field to that item's existing id -- COPIED CHARACTER-FOR-CHARACTER from what you were given, never
+reformatted. For a genuinely new story or criterion, leave `existing_us_id`/`existing_ac_id` as
+`null`. Your own `id` field is just a same-response-scoped placeholder -- never write something
+that merely LOOKS like a real id there unless it's an exact copy of what you're citing.
 
 State plainly what this draft adds or changes. If a User Story or Acceptance Criterion the ledger
 already has no longer belongs -- cut, descoped, superseded by something else in this same draft --
@@ -46,7 +47,7 @@ that you are also citing as `existing_ac_id`/`existing_us_id` in this same respo
 retire, never both.
 
 HARD RULE: if this prompt did NOT hand you an approved Specification or prior draft containing
-real `US-####`/`AC-####.#` ids, then no such ids exist yet -- every `existing_us_id` and
-`existing_ac_id` in your response MUST be `null`. Never cite an id you were not literally given
-in this conversation; the deterministic gate rejects invented citations and your draft will be
-bounced back to you.
+real ids, then no such ids exist yet -- every `existing_us_id` and `existing_ac_id` in your
+response MUST be `null`. Never cite an id you were not literally given in this conversation --
+the deterministic gate rejects invented citations (including a real one retyped with the wrong
+digit count or prefix) and your draft will be bounced back to you.

@@ -29,7 +29,7 @@ flowchart TD
     
     stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests; delete code serving only retired ACs<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
     
-    stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes quality+security+dedup+license findings (autopilot, write+bash)<br/>Gate: deterministic re-scan blocks any unexplained finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
+    stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes EVERY actionable finding, any severity (autopilot, write+bash);<br/>unfixable ones need a per-id reason in known_gaps<br/>Gate: deterministic re-scan blocks any unexplained actionable finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
     
     harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>Auth-enforcement gate (repo setting + Key Vault secrets present):<br/>probes every route + API unauthenticated; a 2xx on a protected route joins the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
     
@@ -37,7 +37,7 @@ flowchart TD
     
     readme["README LEG (metrics-exit)<br/>Writes/updates README.md per standard-readme, grounded in the code<br/>Deterministic structure check between laps (3); human-authored README left untouched<br/>Committed BEFORE the final scan so metrics cover it"]
     
-    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan (health score v2, 9 weighted subscores) + coverage + traceability + outdated-packages probe<br/>Regression-clean runs stamp per-AC delivery provenance on the ledger (coded/tested run ids + measured test names)<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign<br/>Exit report: per-US/AC section (new/modified/deleted/unchanged + delivery stamps) + carried-over-undelivered list<br/>Blockers include: regression gate reasons, README hard problems,<br/>auth-required-but-unverified, missing UI screenshots"]
+    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan (health score v3: 9 weighted subscores, density-aware security, × security-tool-coverage multiplier) + coverage + traceability + outdated-packages probe<br/>Regression-clean runs stamp per-AC delivery provenance on the ledger (coded/tested run ids + measured test names)<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign<br/>Exit report (09-metrics-exit.md + EXIT-REPORT.md): health-score table, every finding cluster with disposition (known-gap reason / auto-exempt / open), scanner-tools table,<br/>per-US/AC section (new/modified/deleted/unchanged + delivery stamps) + carried-over-undelivered list<br/>Blockers include: regression gate reasons, README hard problems,<br/>auth-required-but-unverified, missing UI screenshots"]
     
     done["END<br/>Repo ready for merge or run_failure recorded"]
     
@@ -93,22 +93,24 @@ flowchart TD
 
 The last two rows exist for one reason: an LLM reliably fixes what a deterministic tool *refuses to accept*, and treats everything else as advice. Each config is paired with a build command that fails on violation (see the R · REBUILD boxes above), which is what turns a lint finding into work the agent must complete.
 
-Node/TS gets the same enforcement **without any file or dependency landing in the repo**: the ESLint toolchain (config + pinned plugins) is baked into the sandbox image at `/opt/aidw/lint` and the full-scope rebuild gates run it from there. Installing lint devDependencies into a target repo is a mistake this pipeline made once — the root install re-resolved a pnpm workspace's peer graph, forked `drizzle-orm` into two incompatible peer-variant instances, and broke the repo's own build.
+Node/TS gets the same enforcement **without any file or dependency landing in the repo**: the ESLint toolchain (config + pinned plugins) is baked into the sandbox image at `/opt/aidw/lint`. Its security half (`eslint-plugin-security`, `eslint-plugin-sonarjs`) runs deterministically as `repo_scan`'s `eslint-security` adapter on every repo with a `package.json` — the findings land in the scan report and the exit report's findings table. Installing lint devDependencies into a target repo is a mistake this pipeline made once — the root install re-resolved a pnpm workspace's peer graph, forked `drizzle-orm` into two incompatible peer-variant instances, and broke the repo's own build.
 
 Two caveats worth stating rather than burying:
 
-- **Severity is not uniform across ecosystems.** .NET stays at `AnalysisLevel=latest-recommended`, the setting already in production use. Node/TS (`typescript-eslint` strict) and Python (`mypy --strict`) start stricter. The strict lint/typecheck gates therefore run only at the full-scope R placements (post-codegen), where the fixer may refactor anything — the scaffold-only placement gates on compilation alone.
-- **A repo that lints its own way keeps its own lint contract.** Any ESLint config of the repo's own (any `.eslintrc*`, any `eslint.config.*`) makes the pipeline defer entirely — the image-baked config only ever applies to repos with no lint setup at all.
+- **Severity is not uniform across ecosystems.** .NET runs `AnalysisLevel=latest-recommended` plus `AnalysisModeSecurity=All` (every Roslyn Security-category rule is a build error under `TreatWarningsAsErrors`). Node/TS (`typescript-eslint` strict) and Python (`mypy --strict`) start stricter. The strict lint/typecheck gates therefore run only at the full-scope R placements (post-codegen), where the fixer may refactor anything — the scaffold-only placement gates on compilation alone.
+- **A repo that lints its own way keeps its own lint contract — for BUILDING.** Any ESLint config of the repo's own (any `.eslintrc*`, any `eslint.config.*`) makes the build-gate lint defer entirely. The `eslint-security` scan does NOT defer: a repo's own config governs its style, not whether it gets security-scanned.
 
 A file already present and not written by this pipeline is left alone. Our own files carry a version stamp in their header and are replaced when the bundled template moves forward; a file without that header is treated as human-authored.
 
 ## The health score
 
-One number, 0–100, computed in one function ([agent/src/repo_scan.py](agent/src/repo_scan.py) `health_score()`, version 2) as a **weighted blend of nine subscores**, each itself 0–100 and each `null` when its input was not measured. Security carries the most weight by design — this is an enterprise pipeline and a leaked secret matters more than a duplicated helper.
+One number, 0–100, computed in one function ([agent/src/repo_scan.py](agent/src/repo_scan.py) `health_score()`, version 3) as a **weighted blend of nine subscores × a security-tool-coverage multiplier**. Each subscore is 0–100 and `null` when its input was not measured. Security carries the most weight by design — this is an enterprise pipeline and a leaked secret matters more than a duplicated helper.
+
+Version 3 changes (research-note lessons): the security leg is **density-aware** (a fixed finding count scores higher in a larger codebase, sub-linearly, so size relieves but can never mask risk); scored tallies count **application findings only** (`agent-work/` scratch, `node_modules/`, build output are reported but never scored); and a **failed security tool now costs score** instead of inflating it — `score = round(raw × multiplier)` where `multiplier = sqrt(fraction of applicable security tools that completed)` when below `HEALTH_MIN_SECURITY_COVERAGE` (default 1.0). Both `health_raw` and the adjusted `health_score` are reported, along with `health_basis` (a one-line derivation per leg), `active_critical_count` (display only — **never** caps the score) and `kloc`. Tools whose applicability probe found nothing to scan (`not_applicable` — bandit on a .NET repo) are excluded from both `degraded` and the coverage denominator.
 
 | Subscore | Weight | Derivation (clamped to 0–100) |
 |---|---|---|
-| Security | 0.40 | `100 − (40·critical + 15·high + 5·medium + 1·low)` counting **security findings only** (vulnerabilities, secrets, SAST, misconfig, licence). `null` — not 100 — when any security scanner failed to run: a semgrep timeout must read as "unmeasured", never "clean". Three criticals zero this leg and cap the composite at 60. That is intended. |
+| Security | 0.40 | `100·exp(−(risk/size_factor)/25)` with risk units `critical 20 / high 8 / medium 2.5 / low 0.5 / info 0.1` over **application security findings only** (vulnerabilities, secrets, SAST, misconfig, licence) and `size_factor = sqrt(max(kloc, 10)/10)` — kloc from scc's non-blank non-comment code lines, data/markup languages excluded. The floor equals the reference: density relieves above 10 kloc, never amplifies below it. Worked example: 7 highs on 50.9 kloc → 37, on 2 kloc → 73 (v2 scored both 0/85). `null` — not 100 — when fewer than half the applicable security scanners completed: two of five tools is not a measurement. |
 | Coverage | 0.12 | `0.75·line + 0.25·branch` — the raw percentages, not distance-to-the-95%-gate (the gate is enforced separately; a leg that saturates at 100 on every passing run measures nothing). |
 | Dependencies | 0.12 | `100 − min(100, 5·outdated_packages)` from the `outdated` scanner leg (`npm outdated` / `dotnet list package --outdated` / `pip list --outdated` — the pipeline's one deliberately networked probe, fail-open). Staleness only: dependency CVEs and licence findings already score in Security, and counting them twice would double-charge. |
 | AC verification | 0.10 | `100 · (solidly-verified ACs + 0.5·flaky ACs) / total ACs` from the Eval layer. |
@@ -118,13 +120,13 @@ One number, 0–100, computed in one function ([agent/src/repo_scan.py](agent/sr
 | Duplication | 0.04 | `100 − 3·duplication_percent`. |
 | Maintainability | 0.04 | `100 − 3·(maintainability findings)` — excluding complexity and docstring findings, which already score elsewhere — averaged with Python docstring coverage when measured. |
 
-**Unmeasured subscores redistribute.** A `null` leg's weight is spread proportionally over the measured ones, so a pre-e2e scan is still a 0–100 score — and `health_weights_used` on the summary records what the score *actually* weighed. That field is also the comparability key: the regression gate ([agent/src/metrics_nodes.py](agent/src/metrics_nodes.py)) only blocks on a health drop when baseline and latest used the **same** weights, and says so in the ledger when it skips. Scores whose `health_weights_used` differ are different formulas, not a regression.
+**Unmeasured subscores redistribute.** A `null` leg's weight is spread proportionally over the measured ones, so a pre-e2e scan is still a 0–100 score — and `health_weights_used` on the summary records what the score *actually* weighed. Comparability for the regression gate ([agent/src/metrics_nodes.py](agent/src/metrics_nodes.py)) requires equal `health_weights_used` **and** `health_score_version` **and** `health_coverage_fraction` — without the last, a scanner flake between baseline and latest would read as a score regression. The gate says so in the ledger when it skips. Scores that differ on any of the three are different formulas, not a regression.
 
-Weights are env-overridable (`HEALTH_WEIGHT_SECURITY`, `HEALTH_WEIGHT_COVERAGE`, `HEALTH_WEIGHT_DEPENDENCIES`, `HEALTH_WEIGHT_AC_VERIFICATION`, `HEALTH_WEIGHT_ACCESSIBILITY`, `HEALTH_WEIGHT_COMPLEXITY`, `HEALTH_WEIGHT_PERFORMANCE`, `HEALTH_WEIGHT_DUPLICATION`, `HEALTH_WEIGHT_MAINTAINABILITY`); the defaults above are asserted in `repo_scan`'s self-check so this table cannot silently drift. The `outdated` leg is excluded from the report's `content_hash` (an upstream registry publishing a release must not change the hash of an unchanged worktree) and runs only in the final metrics scan, never in the per-commit background refresh.
+Weights are env-overridable (`HEALTH_WEIGHT_SECURITY`, `HEALTH_WEIGHT_COVERAGE`, `HEALTH_WEIGHT_DEPENDENCIES`, `HEALTH_WEIGHT_AC_VERIFICATION`, `HEALTH_WEIGHT_ACCESSIBILITY`, `HEALTH_WEIGHT_COMPLEXITY`, `HEALTH_WEIGHT_PERFORMANCE`, `HEALTH_WEIGHT_DUPLICATION`, `HEALTH_WEIGHT_MAINTAINABILITY`); the defaults above and every curve constant are asserted in `repo_scan`'s self-check so this table cannot silently drift. The `outdated` leg is excluded from the report's `content_hash` (an upstream registry publishing a release must not change the hash of an unchanged worktree) and runs only in the final metrics scan, never in the per-commit background refresh. Note: the v3 upgrade itself changes `content_hash` once for every repo (findings gained `tools`/`actionable` keys) — the first post-upgrade delta is a format change, not "the repo changed".
 
-The metrics bar renders the score as an **annular ring** (sweep = score, color red→green); the Quality tab shows the full per-subscore breakdown with the weights used.
+The metrics bar renders the score as an **annular ring** (sweep = score, color red→green); the Quality tab shows the full per-subscore breakdown with the weights used. The exit report (`09-metrics-exit.md` / `EXIT-REPORT.md`) renders the same breakdown as a markdown table, plus every finding cluster with its disposition and the per-tool run table (Tool / Version / State / Duration / Findings / Notes).
 
-*Version 1, for the archaeology:* `100 − (25·crit + 10·high + 3·med + 0.5·low over all findings) − 2·(dup% over 3) − 3·(mean_ccn over 5)` — it ignored coverage, dependencies, AC verification and Lighthouse entirely, and counted quality findings at security prices.
+*Version 2, for the archaeology:* security = `100 − (40·crit + 15·high + 5·med + 1·low)` over absolute counts — size-blind (7 highs scored 0 on any repo), it counted the pipeline's own `agent-work/` scratch, and a failed security tool made the leg `null`, redistributing its 0.40 weight onto the other legs — *inflating* the score exactly when measurement was weakest. *Version 1:* `100 − (25·crit + 10·high + 3·med + 0.5·low over all findings) − 2·(dup% over 3) − 3·(mean_ccn over 5)` — it ignored coverage, dependencies, AC verification and Lighthouse entirely, and counted quality findings at security prices.
 
 ## The sandbox filesystem
 
@@ -141,6 +143,43 @@ Both `/opt/aidw` paths are created and declared in the image itself, so a contai
 [agent/sandbox-image/bootstrap.sh](agent/sandbox-image/bootstrap.sh) runs after the clone and after the git credentials are destroyed. It installs only what the repo declares for itself (`.tool-versions`, `mise.toml`, `.nvmrc`, `.node-version`, `global.json`), only from mise's own registry — a config naming an arbitrary plugin git URL is refused, since that is third-party shell that would otherwise run automatically before anything else in the container. Failure is never fatal: a missing toolchain surfaces later as a real build error, which beats a container that refuses to start. `apt-get` at runtime is impossible by construction (the container runs as non-root `vscode`); a genuine OS-package need is a `BASE_IMAGE` change.
 
 What it found is recorded three ways: `.ai-dev-workflow/manifest.json`'s `toolchain` key (durable per repo, rewritten only when the tool set actually changes, and used for a warm start next run), `.ai-dev-workflow/ledger.jsonl` (this run's install metrics), and a host-side `agent/agent-work/toolchain.jsonl` (`$AIDW_TOOLCHAIN_LOG`). The host-side log is the one that answers "what should the next image ship" — commits are pushed to the single `ai-dev-workflow` work branch at every stage end, so the in-repo copy survives the container.
+
+## Third-party components and redistribution
+
+The sandbox image ships to SaaS deployments **and** on-prem customers, so everything baked into it
+is redistributed. Ground rule: scan/build tools run **unmodified as subprocesses** inside the
+container — mere aggregation — so copyleft components are fine to ship *with their compliance
+obligations met* (licence text in the image, notices kept, pinned upstream source recorded); the
+base image already redistributes `git` (GPL-2.0) and coreutils (GPL-3.0) the same way. What actually
+excludes a component: **no redistribution grant**, or terms forbidding **"as a service"** use.
+
+The full inventory — every tool, SPDX id, version pin, licence-file location and the
+vulnerability-database attribution list — lives in
+[agent/sandbox-image/THIRD-PARTY-NOTICES.md](agent/sandbox-image/THIRD-PARTY-NOTICES.md); the
+licence texts are baked at `/opt/aidw/licenses/` (build-asserted). The judgment calls:
+
+- **Official semgrep rules are gone.** The Semgrep Rules License v1.0 permits use "only for your own
+  internal business purposes" and forbids distributing the rules or making them "available to others
+  as a service" — both of which this product does. The image vendors MIT-licensed community packs
+  instead (SHA-pinned and licence-asserted via
+  [agent/sandbox-image/semgrep-rule-packs.txt](agent/sandbox-image/semgrep-rule-packs.txt)); the
+  LGPL-2.1 semgrep *engine* stays, recorded as `permissive: false` in every scan report. Language
+  SAST is carried by bandit (Python, Apache-2.0), the `eslint-security` adapter (JS/TS) and Roslyn's
+  Security category (.NET).
+- **GitHub Copilot CLI** ships under its licence's §2 redistribution grant: unmodified, as part of an
+  application providing material functionality beyond it, never standalone, licence + notices
+  included (`/opt/aidw/licenses/copilot-cli/LICENSE.md`), this application licensed independently.
+- **Claude Code CLI has no redistribution grant** ("© Anthropic PBC. All rights reserved. Use is
+  subject to Anthropic's Commercial Terms of Service."). Kept in the image by decision (2026-08-29),
+  recorded as an open item in the notices file; on-prem distribution needs Anthropic's confirmation
+  or a customer-side install at container start. The Claude *Agent SDK* is not a workaround — its
+  MIT licence covers the wrapper only, and it bundles this same CLI under these same terms.
+- **SonarAnalyzer.CSharp** (Sonar Source-Available License 1.0, "no competing use") is referenced by
+  the .NET template and restored from NuGet by customer builds, not shipped in the image. Kept by
+  decision (2026-08-29), recorded in the notices file.
+- GPL-3.0 tools evaluated for the scanner (hadolint, shellcheck, ansible-lint) are **legally fine to
+  ship with notices** — deferred on value, not licence. grype/pmd/scancode/radon stay out as
+  redundant.
 
 ## The stage template every box shares
 
@@ -343,4 +382,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 1518ce7a667e706ae5992f66dee4b0cc81a6219a47aef2098f204c730baccf5c -->
+<!-- graph-source-sha256: df8fdced5fc655899820da654e9b86cd374023ae6c5070be69aa7e3c23edc887 -->

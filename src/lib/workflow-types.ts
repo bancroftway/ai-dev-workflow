@@ -77,6 +77,18 @@ export interface ScanMeasures {
  * even carry null there -- render nothing, never crash. */
 export interface ScanSummary {
   health_score: number | null;
+  /** v3: the weighted blend BEFORE the security-tool-coverage multiplier; health_score = round(raw * multiplier). */
+  health_raw?: number | null;
+  /** v3: sqrt(fraction) haircut applied to the whole score when security tools failed; 1.0 = full coverage. */
+  health_coverage_multiplier?: number;
+  /** v3: fraction of applicable security tools that completed (not_applicable excluded). */
+  health_coverage_fraction?: number;
+  /** v3: one-line derivation per measured subscore ("7 finding(s), 56.0 risk units / 50.9 kloc"). */
+  health_basis?: Record<string, string>;
+  /** v3: application security criticals -- display/banner only, never caps the score. */
+  active_critical_count?: number;
+  /** v3: authored-code kloc (scc, data/markup languages excluded) that normalizes the security leg. */
+  kloc?: number | null;
   /** Per-subscore 0-100 values, null = unmeasured (its weight was redistributed). */
   health_subscores?: Record<string, number | null>;
   /** The renormalized weights the score ACTUALLY used -- ground truth for comparability. */

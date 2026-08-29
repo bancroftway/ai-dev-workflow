@@ -2,6 +2,12 @@
 
 This directory builds the per-session sandbox container that runs the coding-agent CLI headless
 (Claude Code by default, GitHub Copilot CLI as the alternate provider).
+
+**This image is redistributed** (SaaS + on-prem customers). Every shipped component's licence is
+inventoried in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), with the licence texts baked at
+`/opt/aidw/licenses/` and the semgrep rule packs pinned in `semgrep-rule-packs.txt`. Adding a
+binary to the Dockerfile means adding its notices row AND its licence file to the Dockerfile's
+licence step (which asserts every licence dir is non-empty at build).
 `plugins/ai-dev-workflow/` (this project's own first-party skill pack) and `plugins/vendor/`'s
 nine third-party skill packs both end up at `/opt/ai-dev-workflow-plugins/` in the image, but they
 get there differently:

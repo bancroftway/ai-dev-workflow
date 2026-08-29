@@ -173,7 +173,19 @@ ENV AIDW_TOOLS_DIR=/opt/aidw/tools \
     DOTNET_CLI_TELEMETRY_OPTOUT=1
 # mise's shims live under MISE_DATA_DIR, not under a bare tools/shims -- getting this wrong means
 # every mise-installed toolchain is invisible at runtime.
-ENV PATH=/opt/aidw/tools/bin:/opt/aidw/tools/mise/shims:$PATH
+ENV PATH=/opt/aidw/tools/bin:/opt/aidw/tools/mise/shims:/opt/dotnet-tools:$PATH
+
+# dotnet-ef, baked read-only at /opt/dotnet-tools (--tool-path, not --global: global tools land in
+# the installing user's home, and this layer runs as root while the container runs as vscode).
+# Observed live (run 8be5b4eb, PS-4): with no dotnet-ef, the model swapped the plan's "generate and
+# apply the initial EF Core migration" for Database.EnsureCreatedAsync() and documented the
+# workaround -- delivered repos then carry no migrations at all. "10.*" tracks the SDK major this
+# image is built on; per-project Microsoft.EntityFrameworkCore.Design stays a repo-level
+# PackageReference the model adds (runtime NuGet, cached).
+RUN set -eux; \
+    dotnet tool install --tool-path /opt/dotnet-tools --version "10.*" dotnet-ef; \
+    chmod -R a+rX /opt/dotnet-tools; \
+    dotnet-ef --version
 
 RUN set -eux; \
     mkdir -p /opt/aidw/tools/bin /opt/aidw/cache; \
@@ -259,8 +271,10 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # P8's quality scan: jscpd (duplication) via npm, lizard (per-function complexity) via pip.
-# checkov (IaC misconfig) and interrogate (Python docstring coverage) ride the same pip line as
-# lizard/semgrep -- all five are pure-Python static analyzers with no other runtime dependency.
+# checkov (IaC misconfig), interrogate (Python docstring coverage) and bandit (Python SAST --
+# Apache-2.0, the licence-clean load-bearer for Python once the official semgrep rules left, see
+# the rule-pack block below) ride the same pip line as lizard/semgrep -- all six are pure-Python
+# static analyzers with no other runtime dependency.
 # ponytail: no version pin here -- neither gate reads a specific tool version, just parses
 # whatever JSON/CSV shape the latest release emits, so pinning buys nothing over always-latest.
 # azure-functions-core-tools rides along in the same layer: npm rather than the
@@ -270,13 +284,16 @@ RUN set -eux; \
 # Node-based Functions projects downstream, in R's build and P13's test runs.
 RUN set -eux; \
     npm install -g jscpd "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}" --unsafe-perm true; \
-    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep checkov interrogate
+    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep checkov interrogate bandit
 
 # Front-end and Python quality toolchain. These are the deterministic signal for non-.NET repos:
 # preflight_nodes.apply_stack_conventions writes eslint.config.mjs / ruff.toml / mypy.ini into a
-# target repo, and rebuild.py runs `eslint --max-warnings=0`, `tsc --noEmit --strict`, `ruff check`
-# and `mypy` so a violation fails the build the same way an analyzer warning does under
-# `dotnet build -warnaserror`.
+# target repo, and the rebuild verifier session runs the repo's own build/lint/typecheck commands
+# (`tsc --noEmit --strict`, `ruff check`, `mypy`, the repo's eslint where it has one) so a
+# violation fails the build the same way an analyzer warning does under `dotnet build
+# -warnaserror`. JS/TS SECURITY linting no longer rides that path at all: repo_scan.py's
+# `eslint-security` adapter runs /opt/aidw/lint's config (security + sonarjs rules only,
+# --no-config-lookup) on every repo with a package.json, own-config or not.
 #
 # Deliberately NOT installed globally: React and Vue. Neither has a global CLI worth having (they
 # are scaffolded per-project via `npm create`), and a repo's own React/Vue lint plugins are
@@ -376,34 +393,91 @@ RUN set -eux; \
             || { echo "OSV offline db missing for $ecosystem" >&2; exit 1; }; \
     done
 
-# Semgrep rules, fetched from a pinned tag at BUILD time rather than via `--config auto` at scan
+# Semgrep rule packs, fetched at SHA pins at BUILD time rather than via `--config auto` at scan
 # time. `auto` means a network fetch on every run, rules that change underneath a baseline
 # comparison, and the hosted registry's own terms attaching to what it serves.
 #
-# semgrep-rules is LGPL-2.1, and semgrep itself is LGPL-2.1 -- the one non-permissive dependency in
-# this image, kept deliberately (it is the only free multi-language SAST engine) and recorded as
-# `permissive: false` in every scan report's tools[] block. Individual rule files that declare a
-# different licence in their own metadata are deleted below, so only the LGPL-2.1 set ships.
+# NOT the official semgrep/semgrep-rules pack any more. This image is redistributed (SaaS + on-prem
+# customers), and the Semgrep Rules License v1.0 forbids exactly that: "You may use the rules only
+# for your own internal business purposes. This license does not allow you to distribute the rules,
+# or to make them available to others as a service." The packs below are MIT -- listed, SHA-pinned
+# and licence-asserted in semgrep-rule-packs.txt (the rule-pack equivalent of
+# plugins/vendor/vendor-lock.json). The semgrep ENGINE stays: LGPL-2.1, invoked as an unmodified
+# subprocess, recorded as `permissive: false` in every scan report's tools[] block.
 #
-# The resolved commit is written to REVISION so a scan report can be traced back to the exact rule
-# set that produced it. The pin is the built image, same as for every other tool here: rules only
+# Each pack's url+sha+spdx is written to MANIFEST so a scan report traces to the exact rule set
+# that produced it. The pin is the built image, same as for every other tool here: rules only
 # move when the image is rebuilt, never between two scans compared against each other.
-ARG SEMGREP_RULES_REF=develop
+COPY semgrep-rule-packs.txt /tmp/semgrep-rule-packs.txt
 RUN set -eux; \
-    git clone --depth 1 --branch "${SEMGREP_RULES_REF}" \
-        https://github.com/semgrep/semgrep-rules.git /tmp/semgrep-rules; \
     mkdir -p "$AIDW_SEMGREP_RULES_DIR"; \
-    git -C /tmp/semgrep-rules rev-parse HEAD > "$AIDW_SEMGREP_RULES_DIR/REVISION"; \
-    cp /tmp/semgrep-rules/LICENSE "$AIDW_SEMGREP_RULES_DIR/LICENSE"; \
-    for lang in c cpp csharp dockerfile generic go java javascript json kotlin php python ruby rust scala terraform typescript yaml; do \
-        if [ -d "/tmp/semgrep-rules/$lang" ]; then cp -r "/tmp/semgrep-rules/$lang" "$AIDW_SEMGREP_RULES_DIR/"; fi; \
+    : > "$AIDW_SEMGREP_RULES_DIR/MANIFEST"; \
+    grep -v '^\s*#' /tmp/semgrep-rule-packs.txt | grep -v '^\s*$' | \
+    while read -r url sha spdx license_grep subdirs; do \
+        pack="$(basename "$url" .git)"; \
+        git clone --filter=blob:none "$url" "/tmp/pack-$pack"; \
+        git -C "/tmp/pack-$pack" checkout --quiet "$sha"; \
+        head -5 "/tmp/pack-$pack/LICENSE" | grep -qi "$license_grep" \
+            || { echo "rule pack $pack LICENSE does not read as $spdx -- refusing to ship" >&2; exit 1; }; \
+        mkdir -p "$AIDW_SEMGREP_RULES_DIR/$pack"; \
+        cp "/tmp/pack-$pack/LICENSE" "$AIDW_SEMGREP_RULES_DIR/$pack/LICENSE"; \
+        echo "$subdirs" | tr ',' '\n' | while read -r subdir; do \
+            [ -d "/tmp/pack-$pack/$subdir" ] || { echo "rule pack $pack has no $subdir" >&2; exit 1; }; \
+            cp -r "/tmp/pack-$pack/$subdir" "$AIDW_SEMGREP_RULES_DIR/$pack/"; \
+        done; \
+        echo "$url $sha $spdx" >> "$AIDW_SEMGREP_RULES_DIR/MANIFEST"; \
+        rm -rf "/tmp/pack-$pack"; \
     done; \
-    find "$AIDW_SEMGREP_RULES_DIR" -name '*.yaml' -exec grep -lEi 'Semgrep Rules License|Commons Clause' {} + \
-        | xargs -r rm -f; \
     find "$AIDW_SEMGREP_RULES_DIR" -name '*.test.*' -delete; \
-    rm -rf /tmp/semgrep-rules; \
-    test -n "$(find "$AIDW_SEMGREP_RULES_DIR" -name '*.yaml' -print -quit)"; \
+    find "$AIDW_SEMGREP_RULES_DIR" \( -name '*.yaml' -o -name '*.yml' \) -exec grep -lEi 'Semgrep Rules License|Commons Clause' {} + \
+        | grep . && { echo "non-permissive rule text made it into the image" >&2; exit 1; } || true; \
+    test -n "$(find "$AIDW_SEMGREP_RULES_DIR" \( -name '*.yaml' -o -name '*.yml' \) -print -quit)"; \
+    test -s "$AIDW_SEMGREP_RULES_DIR/MANIFEST"; \
+    rm -f /tmp/semgrep-rule-packs.txt; \
     chmod -R a+rX "$AIDW_SEMGREP_RULES_DIR"
+# ── Third-party licence texts: /opt/aidw/licenses/<tool>/LICENSE* ──────────────────────────────
+# This image is REDISTRIBUTED (SaaS + on-prem customers), so every binary baked above ships with
+# its licence text -- see agent/sandbox-image/THIRD-PARTY-NOTICES.md for the full inventory,
+# SPDX ids, and source pointers (the compliance obligation for the copyleft ones: semgrep engine
+# LGPL-2.1, eslint-plugin-sonarjs LGPL-3.0). Fetched at the SAME version pins as the binaries.
+# Copilot CLI's licence §2 makes including its LICENSE.md a CONDITION of redistribution.
+# pip/npm-installed packages already carry their licence files in *.dist-info/ and
+# node_modules/<pkg>/ inside the image; the two below are the exceptions worth surfacing at a
+# stable path (the proprietary grant, and the copyleft lint plugin).
+# Global ARGs are per-stage in Docker: redeclared here or every ${*_VERSION} below is EMPTY and
+# the raw.githubusercontent URLs 404 (curl -f makes that a loud build failure, but still).
+ARG SCC_VERSION
+ARG GITLEAKS_VERSION
+ARG TRIVY_VERSION
+ARG OSV_SCANNER_VERSION
+ARG SYFT_VERSION
+ARG MISE_VERSION
+RUN set -eux; \
+    for tool_ref in \
+        "scc boyter/scc v${SCC_VERSION} LICENSE" \
+        "gitleaks gitleaks/gitleaks v${GITLEAKS_VERSION} LICENSE" \
+        "trivy aquasecurity/trivy v${TRIVY_VERSION} LICENSE" \
+        "osv-scanner google/osv-scanner v${OSV_SCANNER_VERSION} LICENSE" \
+        "syft anchore/syft v${SYFT_VERSION} LICENSE" \
+        "mise jdx/mise v${MISE_VERSION} LICENSE" \
+        "copilot-cli github/copilot-cli main LICENSE.md" \
+    ; do \
+        set -- $tool_ref; tool="$1"; repo="$2"; ref="$3"; file="$4"; \
+        mkdir -p "/opt/aidw/licenses/$tool"; \
+        curl -fsSL "https://raw.githubusercontent.com/$repo/$ref/$file" \
+            -o "/opt/aidw/licenses/$tool/$file" \
+            || { echo "licence fetch failed for $tool -- refusing to ship without it" >&2; exit 1; }; \
+    done; \
+    mkdir -p /opt/aidw/licenses/eslint-plugin-sonarjs /opt/aidw/licenses/semgrep-rules; \
+    cp /opt/aidw/lint/node_modules/eslint-plugin-sonarjs/LICENSE* /opt/aidw/licenses/eslint-plugin-sonarjs/ \
+        || { echo "eslint-plugin-sonarjs (LGPL-3.0) ships without its licence text" >&2; exit 1; }; \
+    cp "$AIDW_SEMGREP_RULES_DIR/MANIFEST" /opt/aidw/licenses/semgrep-rules/MANIFEST; \
+    for d in /opt/aidw/licenses/*/; do \
+        find "$d" -maxdepth 1 \( -name 'LICENSE*' -o -name 'MANIFEST' \) -print -quit | grep -q . \
+            || { echo "empty licence dir $d" >&2; exit 1; }; \
+    done; \
+    chmod -R a+rX /opt/aidw/licenses
+
 # ponytail: nuget-license (P11d's .NET license scan) intentionally NOT installed here -- it's a
 # `dotnet tool` pulled from NuGet at scan time in a *target* repo's own container, not something
 # this base image can usefully pre-install (no target repo/lockfile exists yet at image-build

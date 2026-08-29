@@ -8,9 +8,11 @@ pre-auth RCE while changing nothing.
 
 What is measured here, and what is not:
 
-- **Measured.** Whether each still-gating finding is either gone from a fresh scan or accounted for
-  in `known_gaps`; whether a claimed id exists in the scan at all (a fabricated id is the cheapest
-  possible way to look busy); whether the "fix" was to silence the scanner rather than the defect.
+- **Measured.** Whether each still-ACTIONABLE finding (any severity, application code only, quality
+  debt only when this pipeline introduced it -- repo_scan.to_dashboard_dict's flag) is either gone
+  from a fresh scan or accounted for in `known_gaps`; whether a claimed id exists in the scan at all
+  (a fabricated id is the cheapest possible way to look busy); whether the "fix" was to silence the
+  scanner rather than the defect.
 - **Not measured.** Whether a *reason* in `known_gaps` is a good reason. That is judgement, and this
   gate does not pretend to have it -- it forces the reason to be stated and attached to a real
   finding id, which is what makes it reviewable.
@@ -96,27 +98,43 @@ def evaluate_remediation(
         ]
 
     findings = scan.get("findings") or []
-    gating = [f for f in findings if f.get("gating")]
+    # The fix-everything contract: every `actionable` finding -- ANY severity, application code
+    # only, quality debt only when this pipeline introduced it (see repo_scan.to_dashboard_dict)
+    # -- must be gone from the post-fix scan or explained in known_gaps. Older scans (pre-v3)
+    # carry no `actionable` key; `gating` is the honest fallback there, never a silent pass.
+    actionable = [f for f in findings if f.get("actionable", f.get("gating"))]
     known_gaps = [str(g) for g in (content.get("known_gaps") or [])]
     claimed = [str(c) for c in (content.get("findings_addressed") or [])]
     all_ids = {str(f.get("id")) for f in findings}
 
     reasons: list[str] = []
 
-    # 1. Every finding still gating after this stage ran must be explained. This is the check that
-    #    actually blocks: it reads the CURRENT scan, so a claim that a finding was fixed is worth
-    #    exactly as much as the finding's absence from it.
-    for finding in gating:
+    # 1. Every actionable finding still open after this stage ran must be explained. This is the
+    #    check that actually blocks: it reads the CURRENT scan, so a claim that a finding was
+    #    fixed is worth exactly as much as the finding's absence from it.
+    unexplained: list[str] = []
+    for finding in actionable:
         finding_id = str(finding.get("id"))
         if accounted_for(finding_id, known_gaps):
             continue
         location = (finding.get("location") or {}).get("path") or "unknown path"
-        reasons.append(
+        unexplained.append(
             f"finding {finding_id} [{finding.get('severity')}/{finding.get('category')}] is still "
-            f"gating after remediation and is not in known_gaps: "
+            f"open after remediation and is not in known_gaps: "
             f"{finding.get('title')} at {location}"
             + (f" (fixed_version {finding['package'].get('fixed_version')})" if (finding.get("package") or {}).get("fixed_version") else "")
         )
+    # Cap what the feedback carries -- 60 unexplained findings would drown the fix prompt, and the
+    # model reads repo-scan-latest.json itself (its own prompt says so). Named-not-counted still
+    # holds: the first 30 are named, the remainder is a pointer to the exact file/flag to read.
+    if len(unexplained) > 30:
+        reasons.extend(unexplained[:30])
+        reasons.append(
+            f"...and {len(unexplained) - 30} more -- every `actionable: true` entry in "
+            f"repo-scan-latest.json must be fixed or explained in known_gaps"
+        )
+    else:
+        reasons.extend(unexplained)
 
     # 2. A claimed id that appears in NEITHER the scan it was handed nor the scan taken after is a
     #    fabrication, not a fix. Both sets count: a fixed finding leaves the post-fix scan, and a
@@ -157,10 +175,21 @@ async def scan_and_publish(provider: Any, thread_id: str) -> dict[str, Any]:
     writes it afterwards, and the commit-triggered background refresh deliberately never touches
     committed artifacts -- so the prompt pointed at a file that did not exist.
     """
-    from .. import repo_files, repo_scan
+    from .. import metrics_nodes, repo_files, repo_scan
 
     report = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
-    scan = report.to_dashboard_dict()
+    # `actionable` is introduced-aware for quality categories (same split is_gating draws):
+    # a brownfield repo's pre-existing lizard/jscpd debt is not this run's to explain, or the
+    # fix-everything gate would demand a known_gaps line per legacy finding and deadlock in
+    # 3 laps. Greenfield's pre-codegen baseline is empty, so there everything is introduced.
+    # Security findings stay absolute regardless. No baseline at all -> None -> the old blunt
+    # rule (everything counts), which is also is_gating's own fallback.
+    baseline = await metrics_nodes._read_baseline(provider, thread_id)  # noqa: SLF001 -- same package
+    introduced_ids: frozenset[str] | None = None
+    if baseline is not None:
+        baseline_ids = frozenset(str(f.get("id")) for f in baseline.get("findings") or [])
+        introduced_ids = frozenset(f.finding_key for f in report.findings) - baseline_ids
+    scan = report.to_dashboard_dict(introduced_ids=introduced_ids)
     await repo_files.write_repo_file(
         provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan, indent=2, default=str) + "\n"
     )
@@ -323,6 +352,28 @@ def _demo() -> None:
     reasoned = {"known_gaps": ["aaa111: no fixed version for .NET 10 yet, tracked upstream"]}
     assert evaluate_remediation(reasoned, scan)[0]
     assert not evaluate_remediation({"known_gaps": ["aaa111"]}, scan)[0]
+
+    # Fix-everything: a NON-gating finding flagged `actionable` (low severity, application code,
+    # introduced by this pipeline) blocks exactly like a gating one until fixed or explained.
+    lowball = {"findings": [
+        {"id": "ccc333", "gating": False, "actionable": True, "severity": "low",
+         "category": "sast", "title": "possible object injection", "location": {"path": "apps/web/src/q.ts"}},
+    ]}
+    passed, reasons = evaluate_remediation({"findings_addressed": [], "known_gaps": []}, lowball)
+    assert not passed and "ccc333" in reasons[0] and "still open" in reasons[0], reasons
+    assert evaluate_remediation({"known_gaps": ["ccc333: sanitized upstream, key is enum-constrained"]}, lowball)[0]
+    # ...and an auto-exempt finding (actionable False) never demands an explanation.
+    exempt = {"findings": [{"id": "ddd444", "gating": False, "actionable": False, "severity": "low",
+                            "category": "maintainability", "title": "pre-existing debt"}]}
+    assert evaluate_remediation({"findings_addressed": [], "known_gaps": []}, exempt)[0]
+    # The feedback names the first 30 and points at the file for the rest -- named, never drowned.
+    flood = {"findings": [
+        {"id": f"e{i:05x}", "gating": False, "actionable": True, "severity": "low",
+         "category": "sast", "title": f"finding {i}", "location": {"path": "apps/web/src/q.ts"}}
+        for i in range(35)
+    ]}
+    passed, reasons = evaluate_remediation({"findings_addressed": [], "known_gaps": []}, flood)
+    assert not passed and len(reasons) == 31 and "and 5 more" in reasons[30], (len(reasons), reasons[-1])
 
     # Fabricated id: in neither scan.
     passed, reasons = evaluate_remediation(

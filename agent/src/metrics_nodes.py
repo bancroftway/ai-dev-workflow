@@ -346,6 +346,20 @@ async def metrics_regression_record_node(state: dict[str, Any], config: Runnable
     return {"run_failure": payload}
 
 
+def _health_comparable(latest: dict[str, Any] | None, prior: dict[str, Any] | None) -> bool:
+    """Two health scores are the SAME formula only when they weighed the same measured subscore
+    set (weights_used), were produced by the same score version (a v2 baseline against a v3
+    latest is a formula change, not a regression), and saw the same security-tool coverage (the
+    v3 multiplier means a semgrep flake between two scans is a x0.89 drop on identical weights --
+    without this clause that flake blocks the regression gate). Pure; self-checked in _demo."""
+    latest, prior = latest or {}, prior or {}
+    return (
+        latest.get("health_weights_used") == prior.get("health_weights_used")
+        and latest.get("health_score_version") == prior.get("health_score_version")
+        and latest.get("health_coverage_fraction") == prior.get("health_coverage_fraction")
+    )
+
+
 async def collect_live_refresh(state: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
     """Non-blocking pickup of a finished background refresh scan (kicked by git_ops.commit_all
     after every code-writing commit): merges the fresher summary into repo_scan.latest_summary and
@@ -363,9 +377,7 @@ async def collect_live_refresh(state: dict[str, Any], thread_id: str) -> dict[st
     # lighthouse, no eval, no outdated), so its score is not directly comparable to what sat on
     # the strip before it. Stamp comparability against the summary being replaced so the ring can
     # caveat the delta instead of showing an uncaveated jump.
-    summary["health_score_comparable"] = (
-        summary.get("health_weights_used") == (prior_summary or {}).get("health_weights_used")
-    )
+    summary["health_score_comparable"] = _health_comparable(summary, prior_summary)
     prior_repo_scan = dict(state.get("repo_scan") or {})
     prior_repo_scan.update(
         latest_summary=summary,
@@ -402,20 +414,26 @@ def _known_gap_finding_keys(known_gaps: list[str], findings: Any) -> frozenset[s
     return frozenset(f.finding_key for f in findings if accounted_for(f.finding_key, known_gaps))
 
 
-async def _read_known_gaps(provider: Any, thread_id: str) -> list[str]:
-    """The current ticket's own approved remediation `known_gaps`, or [] when remediation hasn't
+async def read_remediation_report(provider: Any, thread_id: str) -> dict[str, Any]:
+    """The current ticket's own approved remediation report, or {} when remediation hasn't
     approved (yet, or ever, on an old thread) -- never fabricated. `REMEDIATION_APPROVED_PATH` is
     a fixed, stage-owned path that remediation's own approval overwrites, so by the time
     metrics-report runs (after remediation, same run) it already holds THIS ticket's own content,
-    not a prior ticket's (see workflow_persistence.REMEDIATION_APPROVED_PATH's own docstring)."""
+    not a prior ticket's (see workflow_persistence.REMEDIATION_APPROVED_PATH's own docstring).
+    Shared by metrics_compute (known-gap exemption), rebuild's scan-delta gate (same exemption)
+    and exit_finalize (findings dispositions in the report)."""
     raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.REMEDIATION_APPROVED_PATH)
     if raw is None:
-        return []
+        return {}
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return []
-    return [str(g) for g in ((parsed or {}).get("known_gaps") or [])]
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def _read_known_gaps(provider: Any, thread_id: str) -> list[str]:
+    return [str(g) for g in ((await read_remediation_report(provider, thread_id)).get("known_gaps") or [])]
 
 
 async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -481,13 +499,12 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     scan_report["summary"] = scan.summary(known_gap_ids=known_gap_ids)
     baseline = await _read_baseline(provider, thread_id)
     # Comparability: the health regression check only means something when baseline and latest
-    # were scored by the same formula over the same measured subscore set. health_weights_used IS
-    # that identity (it also differs between v1 baselines, which lack the key entirely, and v2).
-    # Stamped BEFORE the LATEST_PATH write so the committed file carries it too.
+    # were scored by the same formula over the same measured subscore set with the same security-
+    # tool coverage -- _health_comparable is that identity (a v1/v2 baseline lacks the newer keys
+    # and reads not-comparable). Stamped BEFORE the LATEST_PATH write so the committed file
+    # carries it too.
     baseline_summary = (baseline or {}).get("summary") or {}
-    health_comparable = (
-        baseline_summary.get("health_weights_used") == scan_report["summary"].get("health_weights_used")
-    )
+    health_comparable = _health_comparable(scan_report["summary"], baseline_summary)
     scan_report["summary"]["health_score_comparable"] = health_comparable
     await repo_files.write_repo_file(provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan_report, indent=2, default=str) + "\n")
     delta = repo_scan.diff_scans(baseline, scan_report)
@@ -527,10 +544,14 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
                 await spec_ledger.save_ledger(provider, thread_id, ledger_entries)
                 ledger_committed_paths = [spec_ledger.LEDGER_PATH]
 
+    # Key order is load-bearing for the exit prompt: _build_exit_prompt hands this dict through
+    # _bounded_json(..., 8000), which keeps the LEADING fragment when the payload doesn't fit --
+    # and `repo_scan` alone (summary + per-finding entries) blows that budget after ~a dozen
+    # findings. The small decision-relevant keys (regression_gate, coverage, e2e, readme,
+    # app_auth) therefore come FIRST and the two big scan blobs go LAST, so truncation eats
+    # finding detail the model can read from repo-scan-latest.json anyway, never the gate verdict.
     metrics = {
         "run_id": run_id,
-        "repo_scan": scan_report,
-        "repo_scan_delta": delta,
         "repo_scan_delta_reason": None if delta else "no baseline recorded for this repository",
         "coverage": coverage,
         "e2e": state.get("e2e"),
@@ -557,6 +578,9 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         # Persisted (not just channel state) so exit's deterministic verify can read the gate's
         # verdict from metrics-latest.json -- deterministic_verify doesn't receive graph state.
         "regression_gate": {"reasons": gate_reasons, "attempt": attempt},
+        # The two big blobs, deliberately last -- see the key-order comment above the dict.
+        "repo_scan_delta": delta,
+        "repo_scan": scan_report,
     }
 
     history_path = f".ai-dev-workflow/history/{run_id}-metrics.json"
@@ -777,6 +801,16 @@ def _demo() -> None:
     # No token found -> untested, never tests_only (kept in the summary shape for the frontend).
     rows = _traceability_rows([entry], set(), commit_log="")
     assert rows[0]["status"] == "untested" and rows[0]["tests_found"] is False
+
+    # _health_comparable: same weights is no longer enough -- version and security-tool coverage
+    # are part of the formula's identity (a semgrep flake is a x0.89 multiplier drop on identical
+    # weights; v2 vs v3 is a different formula outright).
+    base_id = {"health_weights_used": {"security": 1.0}, "health_score_version": 3, "health_coverage_fraction": 1.0}
+    assert _health_comparable(dict(base_id), dict(base_id))
+    assert not _health_comparable({**base_id, "health_score_version": 2}, dict(base_id))
+    assert not _health_comparable({**base_id, "health_coverage_fraction": 0.8}, dict(base_id))
+    assert not _health_comparable({**base_id, "health_weights_used": {}}, dict(base_id))
+    assert not _health_comparable(dict(base_id), {}), "a v2/v1 baseline lacking the keys reads not-comparable"
 
     # regression_reasons: the metrics gate's pure decision half.
     clean_summary = {"gating_count": 0, "severity_floor": "medium"}

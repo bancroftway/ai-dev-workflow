@@ -122,6 +122,16 @@ export function HealthBreakdown({
             </span>
           )}
         </p>
+        {summary.health_coverage_multiplier != null && summary.health_coverage_multiplier < 1 && (
+          // v3: subscores x weights no longer sum to the ring when security tools failed --
+          // name the haircut or the breakdown reads as broken arithmetic.
+          <p className="text-xs text-amber-700">
+            coverage ×{summary.health_coverage_multiplier}
+            {summary.health_coverage_fraction != null &&
+              ` (${Math.round(summary.health_coverage_fraction * 100)}% of security tools completed)`}
+            {summary.health_raw != null && ` — raw ${summary.health_raw}`}
+          </p>
+        )}
         <ul className="mt-1 grid grid-cols-1 gap-x-6 sm:grid-cols-3">
           {HEALTH_SUBSCORE_LABELS.map(([key, label]) => {
             const value = subscores[key];

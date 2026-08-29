@@ -63,32 +63,42 @@ class ClarifyingQuestion(BaseModel):
 
 class AcceptanceCriterion(BaseModel):
     id: str = Field(
-        description="Your own placeholder id for this AC in this response (e.g. AC-1.1) -- the "
+        description="Your own placeholder id for this AC in this response (e.g. 'ac-a') -- the "
         "real, stable id is assigned deterministically by the caller from existing_ac_id/None, "
-        "never by you; this field is ignored when existing_ac_id is set."
+        "never by you; this field is ignored when existing_ac_id is set. Never write a "
+        "real-looking id here (US-####.#) unless it is copied from existing_ac_id -- a "
+        "placeholder that merely LOOKS real is treated as an attempted renumbering and rejected."
     )
     description: str = Field(description="One specific, testable condition and its expected outcome.")
     existing_ac_id: str | None = Field(
         default=None,
-        description="The stable AC-####.# id (from your immediately-prior draft or the approved "
-        "Specification you were given) that this AC revises, exactly as given to you -- never "
-        "invented, never a retired id. None means this is a genuinely new Acceptance Criterion.",
+        description="The stable id of the Acceptance Criterion this revises -- copied "
+        "CHARACTER-FOR-CHARACTER from your immediately-prior draft or the approved Specification "
+        "you were given, never reformatted, never re-derived. The real format is the parent "
+        "story's own id plus '.' plus a number, e.g. 'US-0001.1' for the 1st criterion of story "
+        "US-0001 -- ALWAYS a 'US-' prefix (never 'AC-'), always the parent story's full "
+        "zero-padded number (never 'US-1.1' for 'US-0001.1'). Copy it, do not reconstruct it. "
+        "None means this is a genuinely new Acceptance Criterion.",
     )
 
 
 class UserStory(BaseModel):
     id: str = Field(
-        description="Your own placeholder id for this story in this response (e.g. US-1) -- the "
-        "real, stable id is assigned deterministically by the caller from existing_us_id/None, "
-        "never by you; this field is ignored when existing_us_id is set."
+        description="Your own placeholder id for this story in this response (e.g. 'story-a') -- "
+        "the real, stable id is assigned deterministically by the caller from existing_us_id/None, "
+        "never by you; this field is ignored when existing_us_id is set. Never write a "
+        "real-looking id here (US-####) unless it is copied from existing_us_id -- a placeholder "
+        "that merely LOOKS real is treated as an attempted renumbering and rejected."
     )
     title: str
     narrative: str = Field(description='"As a <role>, I want <capability>, so that <benefit>".')
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     existing_us_id: str | None = Field(
         default=None,
-        description="The stable US-#### id (from your immediately-prior draft or the approved "
-        "Specification you were given) that this story revises, exactly as given to you -- never "
+        description="The stable id of the User Story this revises -- copied CHARACTER-FOR-"
+        "CHARACTER from your immediately-prior draft or the approved Specification you were "
+        "given, never reformatted, never re-derived. The real format is always 4-digit "
+        "zero-padded, e.g. 'US-0001' (never 'US-1'). Copy it, do not reconstruct it -- never "
         "invented, never a retired id. None means this is a genuinely new User Story.",
     )
 
@@ -118,17 +128,19 @@ class Specification(BaseModel):
     )
     retired_ac_ids: list[str] = Field(
         default_factory=list,
-        description="Stable AC-####.# ids (from the ledger you were given) that no longer belong "
-        "in this specification -- cut, descoped, or superseded. Name them here explicitly; simply "
-        "leaving an old AC out of this draft does NOT retire it (a deterministic gate only ever "
-        "retires an id you name). Never list an id you're also revising via existing_ac_id in "
-        "this same response -- revise or retire, not both.",
+        description="Stable ids of Acceptance Criteria (from the ledger/approved Specification you "
+        "were given -- copied CHARACTER-FOR-CHARACTER, e.g. 'US-0001.1', always a 'US-' prefix, "
+        "never 'AC-') that no longer belong in this specification -- cut, descoped, or superseded. "
+        "Name them here explicitly; simply leaving an old AC out of this draft does NOT retire it "
+        "(a deterministic gate only ever retires an id you name). Never list an id you're also "
+        "revising via existing_ac_id in this same response -- revise or retire, not both.",
     )
     retired_us_ids: list[str] = Field(
         default_factory=list,
-        description="Same as retired_ac_ids, for stable US-#### ids. Retiring a story also "
-        "retires its still-active acceptance criteria automatically -- you don't need to repeat "
-        "them in retired_ac_ids too, though you may.",
+        description="Same as retired_ac_ids, for stable User Story ids (e.g. 'US-0001', copied "
+        "character-for-character). Retiring a story also retires its still-active acceptance "
+        "criteria automatically -- you don't need to repeat them in retired_ac_ids too, though "
+        "you may.",
     )
 
 

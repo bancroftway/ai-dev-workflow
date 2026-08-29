@@ -1,6 +1,6 @@
 <!-- ══════════════════════════════════════════════════════════════════════
      DO NOT MODIFY THIS FILE DURING FEATURE WORK
-     aidw-template-version: 2
+     aidw-template-version: 3
      ══════════════════════════════════════════════════════════════════════
      This file is shared across ALL projects under this directory and is intentionally
      immutable during feature development.
@@ -25,10 +25,15 @@
 
   <!-- ── Code Analysis ── -->
   <!-- AnalysisLevel=latest-recommended: balanced ruleset, avoids excessive noise on first pass. -->
+  <!-- AnalysisModeSecurity=All: latest-recommended leaves most CA2xxx/CA3xxx/CA5xxx security rules
+       OFF; this escalates the whole Security category to build-time diagnostics, which
+       TreatWarningsAsErrors then makes build errors the rebuild loop must fix. This is the .NET
+       side of the SAST story: the permissive semgrep rule packs carry no C# rules. -->
   <!-- EnforceCodeStyleInBuild: ensures .editorconfig style rules fire at build time, not just in IDE. -->
   <PropertyGroup>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <AnalysisModeSecurity>All</AnalysisModeSecurity>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>

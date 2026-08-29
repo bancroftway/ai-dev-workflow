@@ -504,6 +504,138 @@ def _stage_summary(
     return report_rows, "\n".join(lines) + "\n"
 
 
+def _md_cell(text: Any, limit: int = 90) -> str:
+    """Same |-escape + truncation idiom the US/AC table uses."""
+    cell = str(text if text is not None else "").replace("\n", " ").replace("|", "\\|")
+    return cell[: limit - 3] + "..." if len(cell) > limit else cell
+
+
+def _fmt_tool_duration(ms: Any) -> str:
+    return f"{int(ms) / 1000:.1f}s" if isinstance(ms, (int, float)) else "--"
+
+
+def _finding_disposition(finding: dict[str, Any], known_gaps: list[str]) -> str:
+    """One honest label per remaining finding -- the user-facing answer to 'why is this still
+    here'. Order matters: an explained finding is a known gap even if it would also be exempt."""
+    from .gates.remediation_gate import accounted_for  # lazy: keeps gate imports one-directional
+
+    finding_id = str(finding.get("id"))
+    if accounted_for(finding_id, known_gaps):
+        gap = next((str(g) for g in known_gaps if finding_id.lower() in str(g).lower()), "")
+        reason = gap.split(finding_id, 1)[-1].lstrip(" :--") if finding_id in gap else gap
+        return _md_cell(f"known gap: {reason}" if reason else "known gap", 110)
+    if finding.get("actionable"):
+        return "open -- introduced after remediation, no disposition recorded"
+    path = (finding.get("location") or {}).get("path")
+    if repo_scan.is_non_application_path(path):
+        return "outside application code"
+    if repo_scan.is_advisory_rule(finding.get("rule_id")):
+        return "advisory rule"
+    if finding.get("category") == "license" and repo_scan.is_transitive_dependency_file(path):
+        return "transitive lockfile licence"
+    return "pre-existing quality debt (in baseline)"
+
+
+_FINDINGS_TABLE_CAP = 60
+
+
+def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[str, Any] | None) -> list[str]:
+    """`## Health score` + `## Findings (N clusters)` + `## Scanner tools (N)`, from the dashboard
+    dict metrics_compute persisted into metrics-latest.json. Deterministic, fixed skeleton: on a
+    run that never reached metrics_compute the sections say so instead of silently missing."""
+    if not scan_report:
+        return [
+            "## Health score", "",
+            "_scan sections unavailable -- metrics_compute did not run this attempt._", "",
+        ]
+    summary = scan_report.get("summary") or {}
+    findings = scan_report.get("findings") or []
+    tools = scan_report.get("tools") or []
+    known_gaps = [str(g) for g in ((remediation or {}).get("known_gaps") or [])]
+
+    lines: list[str] = ["## Health score", ""]
+    score = summary.get("health_score")
+    fraction = summary.get("health_coverage_fraction")
+    multiplier = summary.get("health_coverage_multiplier")
+    criticals = summary.get("active_critical_count")
+    headline = f"**{score if score is not None else '--'} / 100**"
+    details = [
+        f"raw {summary.get('health_raw', '--')}",
+        f"coverage multiplier {multiplier if multiplier is not None else '--'}"
+        + (f" ({fraction:.0%} of security tools completed)" if isinstance(fraction, (int, float)) else ""),
+        # The research note's "critical override" -- always 'no' by design; the count is banner-only.
+        f"critical override: no ({criticals if criticals is not None else '--'} active critical(s))",
+    ]
+    if isinstance(summary.get("kloc"), (int, float)):
+        details.append(f"{summary['kloc']} kloc")
+    lines += [headline + " -- " + " · ".join(details), ""]
+    subscores = summary.get("health_subscores") or {}
+    weights_used = summary.get("health_weights_used") or {}
+    basis = summary.get("health_basis") or {}
+    if subscores:
+        lines += ["| Dimension | Weight used | Score | Basis |", "|---|---|---|---|"]
+        for name in repo_scan.HEALTH_WEIGHTS:
+            if name not in subscores:
+                continue
+            sub = subscores.get(name)
+            weight = weights_used.get(name)
+            lines.append(
+                f"| {name} | {f'{weight:.0%}' if isinstance(weight, (int, float)) else '--'} "
+                f"| {sub if sub is not None else '--'} "
+                f"| {_md_cell(basis.get(name) or ('unmeasured, weight redistributed' if sub is None else ''), 100)} |"
+            )
+        lines.append("")
+
+    lines += [f"## Findings ({len(findings)} clusters)", ""]
+    if findings:
+        addressed = len((remediation or {}).get("findings_addressed") or [])
+        explained = sum(1 for f in findings if _finding_disposition(f, known_gaps).startswith("known gap"))
+        open_count = sum(
+            1 for f in findings
+            if f.get("actionable") and _finding_disposition(f, known_gaps).startswith("open")
+        )
+        exempt = len(findings) - explained - open_count
+        lines += [
+            f"{addressed} fixed by remediation this run · {explained} known gap(s) · "
+            f"{exempt} auto-exempt · {open_count} open",
+            "",
+            "| Severity | Category | Tool(s) | Rule | Title | Location | Gating | Disposition |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for finding in findings[:_FINDINGS_TABLE_CAP]:
+            location = finding.get("location") or {}
+            where = location.get("path") or "?"
+            if location.get("start_line"):
+                where += f":{location['start_line']}"
+            lines.append(
+                f"| {finding.get('severity')} | {finding.get('category')} "
+                f"| {_md_cell(', '.join(finding.get('tools') or []), 40)} "
+                f"| {_md_cell(finding.get('rule_id') or finding.get('cve') or '', 40)} "
+                f"| {_md_cell(finding.get('title'), 70)} | {_md_cell(where, 60)} "
+                f"| {'yes' if finding.get('gating') else 'no'} "
+                f"| {_finding_disposition(finding, known_gaps)} |"
+            )
+        if len(findings) > _FINDINGS_TABLE_CAP:
+            lines.append(f"| ... | | | | and {len(findings) - _FINDINGS_TABLE_CAP} more | see repo-scan-latest.json | | |")
+    else:
+        lines.append("No findings in the final scan.")
+    lines.append("")
+
+    lines += [f"## Scanner tools ({len(tools)})", ""]
+    if tools:
+        lines += ["| Tool | Version | State | Duration | Findings | Notes |", "|---|---|---|---|---|---|"]
+        for tool in tools:
+            lines.append(
+                f"| {tool.get('name')} | {_md_cell(tool.get('version') or '--', 45)} "
+                f"| {str(tool.get('status') or '--').upper()} | {_fmt_tool_duration(tool.get('duration_ms'))} "
+                f"| {tool.get('findings', '--')} | {_md_cell(tool.get('notes') or '', 60)} |"
+            )
+    else:
+        lines.append("No tool run records in this scan.")
+    lines.append("")
+    return lines
+
+
 def _render_history_sections(
     *,
     files_changed_stat: str,
@@ -518,6 +650,7 @@ def _render_history_sections(
     us_ac_rows: list[dict[str, Any]] | None = None,
     carried_over: list[str] | None = None,
     fallback_metrics: dict[str, Any] | None = None,
+    remediation: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
     markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
@@ -577,6 +710,11 @@ def _render_history_sections(
         e2e_line += f" -- {e2e['skipped_reason']}"
     lines.append(e2e_line)
     lines.append("")
+
+    # The scan sections: total score + per-dimension table, every finding cluster with its
+    # disposition, and the per-tool run table. All from the dashboard dict metrics_compute
+    # persisted; on an escalated run that never reached metrics_compute they say so.
+    lines += _render_scan_sections((metrics_summary or {}).get("repo_scan"), remediation)
 
     # Real route names for the Screens table below (e2e_nodes._route_slug is the inverse of the
     # filename e2e wrote); imported lazily -- e2e_nodes is a heavier module than this one needs.
@@ -1199,6 +1337,15 @@ async def exit_finalize_node(
         [r for r in ledger_rows if r.get("node") == "divergence_snapshot" and r.get("run_id") == run_id]
     )
     stage_rows, stage_section = _stage_summary(ledger_rows, state.get("stages"), terminal_failure)
+    # Remediation's approved report: known_gaps become the findings table's "known gap: <reason>"
+    # dispositions, findings_addressed the "fixed by remediation" count. {} when remediation never
+    # approved (escalated runs) -- the renderer degrades to the deterministic disposition classes.
+    from . import metrics_nodes
+
+    try:
+        remediation_report = await metrics_nodes.read_remediation_report(provider, thread_id)
+    except Exception:  # noqa: BLE001 -- report rendering must survive an unreadable artifact
+        remediation_report = {}
     fallback_metrics: dict[str, Any] | None = None
     if not metrics_summary:
         # Escalated runs skip metrics_compute; surface what already exists instead of nothing.
@@ -1257,6 +1404,7 @@ async def exit_finalize_node(
         us_ac_rows=us_ac_rows,
         carried_over=carried_over,
         fallback_metrics=fallback_metrics,
+        remediation=remediation_report,
     ) + ("\n" + failure_section if failure_section else "") + ("\n" + divergence_section if divergence_section else "")
     await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
 
@@ -1277,10 +1425,15 @@ async def exit_finalize_node(
         us_ac_rows=us_ac_rows,
         carried_over=carried_over,
         fallback_metrics=fallback_metrics,
+        remediation=remediation_report,
     ) + ("\n" + failure_section if failure_section else "") + ("\n" + divergence_section if divergence_section else "")
     await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, latest_markdown)
+    # The numbered stage artifact carries the SAME full report. This node is its only writer --
+    # metrics-exit's StageSpec sets render_markdown=None precisely so the generic persist can't
+    # revert this file to the 4-section stub at the start of the next run.
+    await repo_files.write_repo_file(provider, thread_id, workflow_persistence.METRICS_EXIT_MD_PATH, latest_markdown)
 
-    commit_targets = [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH]
+    commit_targets = [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH, workflow_persistence.METRICS_EXIT_MD_PATH]
     if baseline_payload is not None:
         commit_targets.append(repo_scan.BASELINE_PATH)
     await git_ops.commit_paths(
@@ -1338,6 +1491,55 @@ def _demo() -> None:
     )
     assert "| Journal Entries | `/journal-entries` |" in routed, routed
     assert "## Lighthouse" in routed and "color-contrast" in routed and "`button.btn`" in routed and "| `/accounts` | 55 | 93 |" in routed, routed
+
+    # --- scan sections: score table, findings dispositions, tool table --------------------------
+    scan_fixture = {
+        "summary": {
+            "health_score": 71, "health_raw": 71.1, "health_coverage_multiplier": 1.0,
+            "health_coverage_fraction": 1.0, "active_critical_count": 0, "kloc": 50.92,
+            "health_subscores": {"security": 37.1, "coverage": 95.0, "dependencies": None},
+            "health_weights_used": {"security": 0.45, "coverage": 0.55},
+            "health_basis": {"security": "7 finding(s), 56.0 risk units / 50.9 kloc"},
+        },
+        "findings": [
+            {"id": "aaa111aaa111", "severity": "high", "category": "vulnerability",
+             "tools": ["osv-scanner", "trivy"], "rule_id": "CVE-2026-68945",
+             "title": "Angular: Cross-Request Response Reuse | pipes",  # the | must be escaped
+             "location": {"path": "src/web/package-lock.json", "start_line": None},
+             "gating": True, "actionable": True},
+            {"id": "bbb222bbb222", "severity": "low", "category": "sast",
+             "tools": ["semgrep"], "rule_id": "typescript.i18next.jsx-not-internationalized",
+             "title": "not internationalized", "location": {"path": "src/web/app/page.tsx", "start_line": 4},
+             "gating": False, "actionable": False},
+            {"id": "ccc333ccc333", "severity": "low", "category": "sast", "tools": ["eslint-security"],
+             "rule_id": "security/detect-object-injection", "title": "object injection sink",
+             "location": {"path": "src/web/lib/q.ts", "start_line": 42}, "gating": False, "actionable": True},
+        ],
+        "tools": [
+            {"name": "trivy", "version": "Version: 0.74.0", "status": "ok", "duration_ms": 69180, "findings": 7, "notes": ""},
+            {"name": "interrogate", "version": None, "status": "not_applicable", "duration_ms": 3,
+             "findings": 0, "notes": "No applicable files detected"},
+        ],
+    }
+    remediation_fixture = {
+        "findings_addressed": ["ddd444ddd444"],
+        "known_gaps": ["aaa111aaa111: no fixed version published upstream yet"],
+    }
+    scan_md = "\n".join(_render_scan_sections(scan_fixture, remediation_fixture))
+    assert "## Health score" in scan_md and "**71 / 100**" in scan_md and "raw 71.1" in scan_md, scan_md
+    assert "| security | 45% | 37.1 | 7 finding(s), 56.0 risk units / 50.9 kloc |" in scan_md, scan_md
+    assert "| dependencies | -- | -- | unmeasured, weight redistributed |" in scan_md, scan_md
+    assert "## Findings (3 clusters)" in scan_md
+    assert "known gap: no fixed version published upstream yet" in scan_md, "the recorded reason must render"
+    assert "advisory rule" in scan_md, "auto-exempt classes get deterministic reasons"
+    assert "open -- introduced after remediation" in scan_md, "an unexplained actionable finding is labeled open"
+    assert "1 fixed by remediation this run" in scan_md and "1 known gap(s)" in scan_md and "1 open" in scan_md, scan_md
+    assert "Reuse \\| pipes" in scan_md, "pipe characters must not break the table"
+    assert "osv-scanner, trivy" in scan_md, "the Tool(s) column names every corroborating source"
+    assert "## Scanner tools (2)" in scan_md and "| NOT_APPLICABLE | 0.0s | 0 | No applicable files detected |" in scan_md, scan_md
+    assert "| trivy | Version: 0.74.0 | OK | 69.2s | 7 |" in scan_md, scan_md
+    unavailable = _render_scan_sections(None, None)
+    assert unavailable[0] == "## Health score" and "unavailable" in unavailable[2], unavailable
 
     # Fallback metrics on a run that never reached metrics_compute: the last background scan and
     # the token ledger, explicitly labelled as not the final measurement.

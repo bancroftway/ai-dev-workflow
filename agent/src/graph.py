@@ -81,7 +81,6 @@ from .chat_model import ainvoke_structured, close_session, close_thread_session,
 from .markdown_render import (
     render_ac_to_tests_markdown,
     render_adversarial_audit_markdown,
-    render_exit_markdown,
     render_minimal_code_to_green_markdown,
     render_brownfield_baseline_markdown,
     render_plan_markdown,
@@ -1137,7 +1136,11 @@ class StageSpec:
     build_envelope: Callable[[dict[str, Any], list[str] | None], dict[str, Any]]
     build_prompt: Callable[[GraphState], list[BaseMessage]]
     max_cycles: int
-    render_markdown: Callable[[dict[str, Any]], str]
+    # None = persist_state writes NO per-stage .md for this stage; some other writer owns that
+    # file. Only metrics-exit uses it: exit_finalize_node writes the FULL report (score tables,
+    # findings, tools) to 09-metrics-exit.md, and the generic 4-section render here would revert
+    # it to a stub on the NEXT run's first persist (intake keeps approved_content across runs).
+    render_markdown: Callable[[dict[str, Any]], str] | None
 
     # The adversarial audit leg is OPT-IN: specification, plan, ac-to-tests, and
     # minimal-code-to-green configure it (a second model revising the artifact a human will
@@ -1585,7 +1588,12 @@ STAGES: list[StageSpec] = [
         build_envelope=build_exit_envelope,
         build_prompt=_build_metrics_exit_prompt,
         max_cycles=workflow_config.EXIT_MAX_CLARIFICATION_CYCLES,
-        render_markdown=render_exit_markdown,
+        # None, not render_exit_markdown: exit_finalize_node (the post_approve_hook below) is the
+        # ONLY writer of 09-metrics-exit.md -- it renders the full report (health table, findings
+        # dispositions, scanner tools), and a generic persist here would overwrite that file with
+        # the 4-section stub at the start of every SUBSEQUENT run (approved_content survives
+        # intake's reset on purpose; see intake_node).
+        render_markdown=None,
         requires_human_gate=False,
         sign_approval=True,
         # Read-only tools, added because this stage SIGNS THE MERGE VERDICT. Its prompt is real and
