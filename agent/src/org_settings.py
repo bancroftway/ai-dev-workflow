@@ -88,18 +88,26 @@ async def set_org_settings(
         )
 
 
-async def set_support_repo(support_repo: str | None, updated_by: str) -> bool:
-    """Migration 0011's one writer. A plain UPDATE, not the MERGE above, for the same reason as
-    record_validation_result below: this call has no opinion on provider/credential, and a bare
-    UPDATE can't invent a row that would then imply a provider choice nobody made. Returns False
-    when no org_settings row exists yet -- the caller surfaces "save provider settings first"."""
+async def set_support_repo(support_repo: str | None, updated_by: str, *, fallback_provider: str) -> None:
+    """Migration 0011's one writer. MERGE, not a bare UPDATE: requiring an existing row coupled
+    this unrelated pointer to the provider/credential save, which on a fresh deployment demands the
+    org credential vault (AZURE_ORG_VAULT_URI) -- observed live 2026-08-30: the support repo could
+    not be saved at all until an org vault existed. When the row must be invented, its provider is
+    `fallback_provider` (the caller passes the same env fallback chat_model.get_provider() would
+    use), so the DB row can never disagree with what a session would actually have run under."""
     pool = await session_store._get_pool()  # noqa: SLF001
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
-            "UPDATE dbo.org_settings SET support_repo = ?, updated_by = ?, updated_at = SYSUTCDATETIME() WHERE id = 1",
+            """
+            MERGE dbo.org_settings AS target
+            USING (SELECT 1 AS id) AS src
+              ON target.id = src.id
+            WHEN MATCHED THEN UPDATE SET support_repo = ?, updated_by = ?, updated_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN INSERT (id, provider, support_repo, updated_by) VALUES (1, ?, ?, ?);
+            """,
             support_repo, updated_by,
+            fallback_provider, support_repo, updated_by,
         )
-        return cur.rowcount > 0
 
 
 async def record_validation_result(ok: bool) -> None:

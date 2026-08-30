@@ -919,8 +919,7 @@ async def put_support_repo_endpoint(body: SupportRepoPutRequest, request: Reques
     value = (body.support_repo or "").strip() or None
     if value is not None and not _SUPPORT_REPO_RE.match(value):
         raise HTTPException(status_code=400, detail='support_repo must be "owner/repo"')
-    if not await org_settings.set_support_repo(value, body.updated_by):
-        raise HTTPException(status_code=409, detail="No org settings saved yet -- save provider settings first")
+    await org_settings.set_support_repo(value, body.updated_by, fallback_provider=chat_model.env_fallback_provider())
     return await _org_settings_response()
 
 
