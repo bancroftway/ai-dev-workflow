@@ -20,6 +20,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi>=0.65b0",
     "opentelemetry-sdk>=1.44.0",
     "pydantic>=2.7",
+    "pyjwt[crypto]>=2.10",
     "pyodbc>=5.2.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.2",

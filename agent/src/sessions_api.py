@@ -36,6 +36,7 @@ from . import (
     branch_naming,
     chat_model,
     git_ops,
+    github_link_store,
     keyvault,
     org_credential_vault,
     org_settings,
@@ -56,6 +57,7 @@ org_settings_router = APIRouter(prefix="/org-settings", tags=["org-settings"])
 catalog_router = APIRouter(tags=["tech-stack"])
 projects_router = APIRouter(prefix="/projects", tags=["projects"])
 repo_auth_settings_router = APIRouter(prefix="/repo-auth-settings", tags=["repo-auth-settings"])
+github_link_router = APIRouter(prefix="/github-link", tags=["github-link"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -734,6 +736,118 @@ async def put_repo_auth_settings(body: RepoAuthSettingsPutRequest, request: Requ
     settings = {"auth_mode": body.auth_mode, "anonymous_routes": routes}
     await repo_auth_settings.set_settings(body.owner, body.repo, settings, updated_by=body.user_login)
     return RepoAuthSettingsResponse(**repo_auth_settings.normalize(settings))
+
+
+# --- per-user GitHub link tokens (link once, stored in the org vault) --------------------------
+
+# Cached JWKS client for the tenant's v2.0 signing keys. Lazy + module-level: PyJWKClient caches
+# keys internally and is meant to be long-lived, like session_store's pool.
+_jwks_client = None
+
+
+def _verify_entra_assertion(assertion: str) -> str:
+    """Verify the caller's Entra access token and return its `oid`. This is the REAL caller-identity
+    check the github-link endpoints stand on: unlike the vault OBO path (where Azure enforces at the
+    exchange), these endpoints use the agent's standing identity, so a caller-supplied oid would be
+    forgeable. We never trust a supplied oid -- we derive it from a token whose signature, issuer,
+    audience and tenant we verify against the tenant's published JWKS.
+    """
+    import jwt
+    from jwt import PyJWKClient
+
+    global _jwks_client
+    tenant = os.environ.get("AZURE_TENANT_ID")
+    app_id = os.environ.get("AIDW_AGENT_APP_ID")
+    if not tenant or not app_id:
+        raise HTTPException(status_code=503, detail="Entra verification is not configured on the agent")
+    if _jwks_client is None:
+        _jwks_client = PyJWKClient(f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys")
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(assertion)
+        claims = jwt.decode(
+            assertion,
+            signing_key.key,
+            algorithms=["RS256"],
+            # The token was issued for this app's own API scope, so aud is the app id or its api:// URI.
+            audience=[app_id, f"api://{app_id}"],
+            issuer=f"https://login.microsoftonline.com/{tenant}/v2.0",
+        )
+    except Exception as exc:  # noqa: BLE001 -- any verification failure is a 401, never a 500
+        raise HTTPException(status_code=401, detail=f"invalid Entra assertion: {exc}") from None
+    oid = claims.get("oid")
+    if not oid:
+        raise HTTPException(status_code=401, detail="Entra assertion carries no oid claim")
+    return str(oid)
+
+
+class GithubLinkReadRequest(BaseModel):
+    entra_assertion: str
+
+
+class GithubLinkResponse(BaseModel):
+    linked: bool
+    login: str | None = None
+    github_id: int | None = None
+    # The token pair, returned ONLY to the trusted frontend BFF (which puts it on the server-side
+    # JWT, never the browser) -- the caller has already proven identity via the verified assertion.
+    access_token: str | None = None
+    refresh_token: str | None = None
+    expires_at: int | None = None
+    refresh_token_expires_at: int | None = None
+
+
+@github_link_router.post("/read", response_model=GithubLinkResponse)
+async def read_github_link(body: GithubLinkReadRequest, request: Request) -> GithubLinkResponse:
+    """POST (not GET): the assertion is a bearer credential and must not land in a URL/query log.
+    oid is derived from the verified assertion, never supplied by the caller."""
+    _check_shared_secret(request)
+    oid = _verify_entra_assertion(body.entra_assertion)
+    try:
+        link = await github_link_store.get_github_link(oid)
+    except keyvault.VaultAccessError:
+        # Vault down/unconfigured -> behave as unlinked; the frontend degrades to cookie-only.
+        logger.warning("github-link read failed (vault unavailable) for oid=%s", oid, exc_info=True)
+        return GithubLinkResponse(linked=False)
+    if not link:
+        return GithubLinkResponse(linked=False)
+    return GithubLinkResponse(linked=True, **{k: link.get(k) for k in (
+        "login", "github_id", "access_token", "refresh_token", "expires_at", "refresh_token_expires_at",
+    )})
+
+
+class GithubLinkPutRequest(BaseModel):
+    entra_assertion: str
+    access_token: str
+    refresh_token: str | None = None
+    expires_at: int | None = None
+    refresh_token_expires_at: int | None = None
+    github_id: int | None = None
+    login: str | None = None
+
+
+@github_link_router.put("", response_model=SessionActionResponse)
+async def put_github_link(body: GithubLinkPutRequest, request: Request) -> SessionActionResponse:
+    _check_shared_secret(request)
+    oid = _verify_entra_assertion(body.entra_assertion)
+    payload = {k: v for k, v in body.model_dump().items() if k != "entra_assertion"}
+    try:
+        await github_link_store.set_github_link(oid, payload)
+    except keyvault.VaultAccessError as exc:
+        raise HTTPException(status_code=502, detail=f"org vault is not accessible: {exc}") from None
+    return SessionActionResponse(secret_count=1)
+
+
+@github_link_router.post("/delete", response_model=SessionActionResponse)
+async def delete_github_link(body: GithubLinkReadRequest, request: Request) -> SessionActionResponse:
+    """Disconnect. POST so the assertion stays out of the URL. Deletes the stored link only on this
+    explicit action -- never on a refresh failure (rotation makes a stale copy normal)."""
+    _check_shared_secret(request)
+    oid = _verify_entra_assertion(body.entra_assertion)
+    try:
+        await github_link_store.delete_github_link(oid)
+    except keyvault.VaultAccessError as exc:
+        raise HTTPException(status_code=502, detail=f"org vault is not accessible: {exc}") from None
+    return SessionActionResponse(secret_count=0)
 
 
 # --- org-wide coding-agent provider settings (settings page, Part 4) --------------------------

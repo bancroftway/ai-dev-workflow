@@ -29,6 +29,7 @@ export function WorkspaceHeader() {
               Org settings
             </Link>
             <span className="text-neutral-600">{session.user.name ?? session.user.email}</span>
+            <DisconnectGithubButton />
             <button
               onClick={() => signOut({ redirectTo: "/" })}
               className="rounded-md px-2 py-1 text-neutral-500 hover:bg-neutral-100"
@@ -39,6 +40,35 @@ export function WorkspaceHeader() {
         )}
       </div>
     </div>
+  );
+}
+
+/** Disconnect GitHub: revoke + delete the stored link, then drop the JWT claims via update().
+ * Shown only when a link exists. "Signing out keeps GitHub linked for your next sign-in;
+ * Disconnect removes it" -- users can't otherwise tell signout from unlink. */
+function DisconnectGithubButton() {
+  const { data: session, update } = useSession();
+  const [busy, setBusy] = useState(false);
+  if (!session?.githubConnected) return null;
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      title="Removes the stored GitHub authorization. Signing out alone keeps it linked for next time."
+      onClick={async () => {
+        if (!window.confirm("Disconnect GitHub? You'll need to reconnect to browse repositories. (Signing out alone keeps it linked.)")) return;
+        setBusy(true);
+        try {
+          const res = await fetch("/api/github/disconnect", { method: "POST" });
+          if (res.ok) await update({ github: "disconnect" });
+        } finally {
+          setBusy(false);
+        }
+      }}
+      className="rounded-md px-2 py-1 text-neutral-500 hover:bg-neutral-100 disabled:opacity-40"
+    >
+      {busy ? "Disconnecting…" : "Disconnect GitHub"}
+    </button>
   );
 }
 

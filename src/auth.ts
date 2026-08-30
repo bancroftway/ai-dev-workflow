@@ -3,6 +3,10 @@ import GitHub from "next-auth/providers/github";
 import MicrosoftEntraID from "next-auth/providers/microsoft-entra-id";
 import { getToken, type JWT } from "next-auth/jwt";
 import { cookies } from "next/headers";
+import { agentFetch } from "@/lib/agent-client";
+
+const GITHUB_CLIENT_ID = process.env.AUTH_GITHUB_ID;
+const GITHUB_CLIENT_SECRET = process.env.AUTH_GITHUB_SECRET;
 
 declare module "next-auth" {
   interface Session {
@@ -25,6 +29,12 @@ declare module "next-auth/jwt" {
     accessToken?: string;
     githubId?: string;
     login?: string;
+    /** GitHub refresh token (present only when the OAuth app has token expiration enabled).
+     * Server-side only; persisted to the org vault so the link survives cookie loss. */
+    githubRefreshToken?: string;
+    /** Epoch seconds; 0/undefined means a non-expiring classic token (no refresh needed). */
+    githubExpiresAt?: number;
+    githubRefreshTokenExpiresAt?: number;
     /** Entra access token for the agent API (the OBO assertion). Server-side only. */
     entraAccessToken?: string;
     entraRefreshToken?: string;
@@ -136,6 +146,128 @@ async function refreshEntraIfNeeded(token: JWT): Promise<JWT> {
   return token;
 }
 
+// --- GitHub link persistence (org vault, keyed by Entra oid) ----------------------------------
+// The agent verifies the entra_assertion via tenant JWKS and derives the oid itself -- we never
+// send a bare oid. All three calls are best-effort: any failure degrades to today's cookie-only
+// link, never breaks sign-in.
+
+type StoredGithubLink = {
+  access_token?: string;
+  refresh_token?: string;
+  expires_at?: number;
+  refresh_token_expires_at?: number;
+  github_id?: number;
+  login?: string;
+};
+
+async function readGithubLink(entraAssertion: string): Promise<StoredGithubLink | null> {
+  try {
+    const res = await agentFetch("github-link/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entra_assertion: entraAssertion }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { linked?: boolean } & StoredGithubLink;
+    return data.linked ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeGithubLink(entraAssertion: string, token: JWT): Promise<void> {
+  if (!token.accessToken) return;
+  try {
+    await agentFetch("github-link", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        entra_assertion: entraAssertion,
+        access_token: token.accessToken,
+        refresh_token: token.githubRefreshToken ?? null,
+        expires_at: token.githubExpiresAt ?? null,
+        refresh_token_expires_at: token.githubRefreshTokenExpiresAt ?? null,
+        github_id: token.githubId ? Number(token.githubId) : null,
+        login: token.login ?? null,
+      }),
+    });
+  } catch {
+    // Non-fatal: the link still works for this session (JWT-only), same as before this feature.
+  }
+}
+
+function applyStoredLink(token: JWT, link: StoredGithubLink): void {
+  token.accessToken = link.access_token;
+  token.githubRefreshToken = link.refresh_token;
+  token.githubExpiresAt = link.expires_at;
+  token.githubRefreshTokenExpiresAt = link.refresh_token_expires_at;
+  token.githubId = link.github_id != null ? String(link.github_id) : undefined;
+  token.login = link.login;
+}
+
+async function refreshGithubIfNeeded(token: JWT): Promise<JWT> {
+  // Only apps with token expiration enabled hand out refresh tokens + a real expiry; a classic
+  // non-expiring token has no githubExpiresAt and needs nothing here.
+  if (!token.githubRefreshToken || !token.githubExpiresAt) return token;
+  if (token.githubExpiresAt * 1000 - Date.now() > 5 * 60_000) return token;
+
+  async function attemptRefresh(refreshToken: string) {
+    const res = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: new URLSearchParams({
+        client_id: GITHUB_CLIENT_ID!,
+        client_secret: GITHUB_CLIENT_SECRET!,
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+    });
+    return (await res.json()) as {
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      refresh_token_expires_in?: number;
+      error?: string;
+    };
+  }
+
+  const applyRefreshed = (d: Awaited<ReturnType<typeof attemptRefresh>>) => {
+    const now = Math.floor(Date.now() / 1000);
+    token.accessToken = d.access_token;
+    token.githubExpiresAt = now + Number(d.expires_in ?? 28800);
+    if (d.refresh_token) token.githubRefreshToken = d.refresh_token;
+    if (d.refresh_token_expires_in) token.githubRefreshTokenExpiresAt = now + Number(d.refresh_token_expires_in);
+  };
+
+  try {
+    let data = await attemptRefresh(token.githubRefreshToken);
+    if (data.error === "bad_refresh_token" && token.entraAccessToken) {
+      // Rotation race / another device already refreshed: NEVER delete. Re-read the vault; if it
+      // holds a different (newer) pair, adopt it and retry once. Only if it still matches the dead
+      // token do we drop the claims (unlinked); the stored copy self-heals on the next real link.
+      const stored = await readGithubLink(token.entraAccessToken);
+      if (stored?.refresh_token && stored.refresh_token !== token.githubRefreshToken) {
+        applyStoredLink(token, stored);
+        return token; // adopted a live pair; no retry needed
+      }
+      data = await attemptRefresh(token.githubRefreshToken);
+    }
+    if (!data.access_token) {
+      // Dead link: drop the GitHub claims for this session (banner offers re-link). Do NOT delete
+      // the vault secret -- that's Disconnect's job only.
+      token.accessToken = undefined;
+      token.githubRefreshToken = undefined;
+      token.githubExpiresAt = undefined;
+      return token;
+    }
+    applyRefreshed(data);
+    if (token.entraAccessToken) await writeGithubLink(token.entraAccessToken, token);
+  } catch {
+    // Network hiccup: leave the (possibly stale) token; next request retries. Don't unlink.
+  }
+  return token;
+}
+
 export const { handlers, auth, signIn, signOut } = NextAuth({
   providers: [
     MicrosoftEntraID({
@@ -169,7 +301,18 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       }
       return true;
     },
-    async jwt({ token, account, profile }) {
+    async jwt({ token, account, profile, trigger, session }) {
+      // Disconnect (client calls update({ github: "disconnect" }) after the route revokes the
+      // vault copy): drop the GitHub claims from this session's JWT.
+      if (trigger === "update" && (session as { github?: string } | undefined)?.github === "disconnect") {
+        token.accessToken = undefined;
+        token.githubRefreshToken = undefined;
+        token.githubExpiresAt = undefined;
+        token.githubRefreshTokenExpiresAt = undefined;
+        token.githubId = undefined;
+        token.login = undefined;
+        return token;
+      }
       if (account?.provider === "microsoft-entra-id") {
         // Fresh Entra sign-in. Auth.js seeded `token` from scratch, so carry an existing GitHub
         // link over from the session being replaced (re-logins must not force re-linking).
@@ -182,6 +325,14 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           token.accessToken = prev.accessToken;
           token.githubId = prev.githubId;
           token.login = prev.login;
+          token.githubRefreshToken = prev.githubRefreshToken;
+          token.githubExpiresAt = prev.githubExpiresAt;
+          token.githubRefreshTokenExpiresAt = prev.githubRefreshTokenExpiresAt;
+        } else if (token.entraAccessToken && token.oid) {
+          // No GitHub link in the cookie being replaced (sign-out, new browser, expired cookie) --
+          // recover it from the org vault so the user links only once, ever. Sign-in path only.
+          const stored = await readGithubLink(token.entraAccessToken);
+          if (stored) applyStoredLink(token, stored);
         }
         return token;
       }
@@ -198,11 +349,16 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         token.accessToken = account.access_token;
         token.githubId = account.providerAccountId;
         token.login = (profile as { login?: string } | undefined)?.login;
+        // account.expires_at/refresh_token present only when the OAuth app has token expiration on.
+        token.githubRefreshToken = account.refresh_token;
+        token.githubExpiresAt = account.expires_at;
+        token.githubRefreshTokenExpiresAt = (account as { refresh_token_expires_at?: number } | undefined)?.refresh_token_expires_at;
+        // Persist the link so it survives this cookie. Best-effort; needs a live assertion.
+        if (token.entraAccessToken) await writeGithubLink(token.entraAccessToken, token);
         return token;
       }
-      // Routine read (no sign-in event): silently refresh the Entra access token when close to
-      // expiry so provision/actions always have a live assertion to forward.
-      return refreshEntraIfNeeded(token);
+      // Routine read (no sign-in event): keep both access tokens live for provision/actions.
+      return refreshGithubIfNeeded(await refreshEntraIfNeeded(token));
     },
     async session({ session, token }) {
       // Identity/display fields only -- tokens stay on the JWT (getServerAuthToken).
