@@ -142,6 +142,11 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       clientId: ENTRA_APP_ID,
       clientSecret: ENTRA_CLIENT_SECRET,
       issuer: `${ENTRA_AUTHORITY}/v2.0`,
+      // No prompt=consent needed: the app pre-authorizes ITSELF for api://<app>/access_as_user
+      // (api.preAuthorizedApplications, set 2026-08-30), because this tenant's "recommended"
+      // user-consent policy silently blocks user consent for custom API scopes -- sign-ins never
+      // showed a consent screen and the missing grant surfaced only as AADSTS65001 at the OBO
+      // exchange. Pre-authorization needs app ownership only, not tenant admin.
       authorization: { params: { scope: ENTRA_SCOPES } },
     }),
     GitHub({
