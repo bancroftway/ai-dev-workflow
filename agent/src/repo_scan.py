@@ -206,7 +206,22 @@ def _worst(*severities: str) -> str:
 
 
 def _norm_path(path: str) -> str:
-    return (path or "unknown").replace("\\", "/").lstrip("./") or "."
+    """Normalizes a tool-reported path to repo-relative, forward-slash form.
+
+    Strips a genuine leading `./` PREFIX -- never `str.lstrip("./")`, which strips the CHARACTER
+    SET {'.', '/'} repeatedly from the left, not the two-character prefix. That silently ate the
+    leading dot off every dotfile/dotdir path a tool reported relative to the scan root --
+    `./.ai-dev-workflow/...` became `ai-dev-workflow/...`, `./.git/...` became `git/...` -- which
+    made is_non_application_path's regex (anchored on the literal dot) unable to recognize them,
+    ever. Observed live: 6 accumulated .ai-dev-workflow/quarantine/ snapshots (each a full
+    package-lock.json copy from an earlier reverted write-scope violation) were scored as if they
+    were live application dependencies, dragging the security subscore down 78.7 -> 65.7 on an
+    otherwise fully-approved, fully-delivered run.
+    """
+    normalized = (path or "unknown").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized or "."
 
 
 # --- severity normalization -------------------------------------------------------------------
@@ -3639,6 +3654,15 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert is_non_application_path("apps/api.Tests/obj/project.assets.json")
     assert is_non_application_path("apps/web/node_modules/left-pad/index.js")
     assert is_non_application_path(".ai-dev-workflow/history/x-report.json")
+    # _norm_path must preserve the leading dot on a dotdir -- a real live incident (str.lstrip's
+    # character-set trap, not a literal-prefix strip) silently stripped it, which made every
+    # downstream is_non_application_path check on a tool-reported path blind to .ai-dev-workflow/
+    # (and .git/.next/.venv/.angular/.nuxt) -- 6 accumulated quarantine snapshots then scored as
+    # live application dependencies. Assert BOTH the normalizer and the check it feeds.
+    assert _norm_path("./.ai-dev-workflow/quarantine/x/package-lock.json") == ".ai-dev-workflow/quarantine/x/package-lock.json"
+    assert _norm_path(".ai-dev-workflow/history/x.json") == ".ai-dev-workflow/history/x.json", "a path with no ./ prefix must be untouched"
+    assert _norm_path("apps/web/src/app.ts") == "apps/web/src/app.ts"
+    assert is_non_application_path(_norm_path("./.ai-dev-workflow/quarantine/x/package-lock.json"))
     # Real application code still gates -- this must not become a blanket amnesty.
     assert not is_non_application_path("apps/web/src/app/page.tsx")
     assert not is_non_application_path("apps/api/Program.cs")
