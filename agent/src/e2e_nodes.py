@@ -49,7 +49,7 @@ from pydantic import Field
 
 from . import app_discovery
 from . import config as workflow_config
-from . import git_ops, keyvault, model_config, repo_files, run_failure, session_store
+from . import git_ops, keyvault, model_config, repo_files, repo_test_config, run_failure, session_store
 from .chat_model import get_chat_model_for_thread, secret_env_names
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
@@ -930,8 +930,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
 
     test_auth_enforced = _auth_enforced(state)
     app_secrets = keyvault.get_app_secrets(thread_id)
+    # Hoisted above the vault branch: the common path (secrets cached, or no vault at all) needs the
+    # session row too, to read this repo's non-secret test config. SQL-backed, so a resumed run in a
+    # fresh process still gets it (unlike the process-local secret cache).
+    sess_row = await session_store.get_session(thread_id)
     if app_secrets is None:
-        sess_row = await session_store.get_session(thread_id)
         vault_uri_configured, _sel = (
             await keyvault.resolve_vault(sess_row["owner"], sess_row["repo"], [sess_row["user_login"]])
             if sess_row is not None else (None, None)
@@ -946,9 +949,20 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
                          "in the workspace header, then retry",
             }]
             return {"e2e": e2e}
-    use_env_file = bool(app_secrets)
-    if app_secrets:
-        await keyvault.write_env_file(provider, thread_id, app_secrets)
+    # Non-secret app config the user supplied in the settings UI, injected as env vars. Merged with
+    # vault secrets into ONE file (render_env_file sorts keys, so precedence must live in the dict):
+    # config < vault (a real secret always wins over a placeholder). idp_overrides (Phase 5) merge
+    # last, before the file is written after the IdP boots.
+    config_env: dict[str, str] = {}
+    if sess_row is not None:
+        try:
+            config_env = repo_test_config.to_env(await repo_test_config.get_config(sess_row["owner"], sess_row["repo"]))
+        except Exception:  # noqa: BLE001 -- config is best-effort; a bad row must not sink the boot
+            logger.warning("could not load repo_test_config for %s", thread_id, exc_info=True)
+    merged_env = {**config_env, **(app_secrets or {})}
+    use_env_file = bool(merged_env)
+    if merged_env:
+        await keyvault.write_env_file(provider, thread_id, merged_env)
 
     # Clear the field before booting. A fix cycle re-enters this node, and the launch-discovery agent
     # is asked to stop whatever it starts but does not reliably do so -- a survivor holding the port

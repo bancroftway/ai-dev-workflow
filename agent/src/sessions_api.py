@@ -39,6 +39,7 @@ from . import (
     github_link_store,
     keyvault,
     org_credential_vault,
+    repo_test_config,
     org_settings,
     project_store,
     repo_auth_settings,
@@ -58,6 +59,7 @@ catalog_router = APIRouter(tags=["tech-stack"])
 projects_router = APIRouter(prefix="/projects", tags=["projects"])
 repo_auth_settings_router = APIRouter(prefix="/repo-auth-settings", tags=["repo-auth-settings"])
 github_link_router = APIRouter(prefix="/github-link", tags=["github-link"])
+repo_test_config_router = APIRouter(prefix="/repo-test-config", tags=["repo-test-config"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -848,6 +850,39 @@ async def delete_github_link(body: GithubLinkReadRequest, request: Request) -> S
     except keyvault.VaultAccessError as exc:
         raise HTTPException(status_code=502, detail=f"org vault is not accessible: {exc}") from None
     return SessionActionResponse(secret_count=0)
+
+
+# --- per-repo test config values (settings page) ----------------------------------------------
+
+
+class RepoTestConfigResponse(BaseModel):
+    entries: list[dict[str, Any]]
+
+
+@repo_test_config_router.get("", response_model=RepoTestConfigResponse)
+async def get_repo_test_config(request: Request, owner: str, repo: str) -> RepoTestConfigResponse:
+    _check_shared_secret(request)
+    return RepoTestConfigResponse(entries=await repo_test_config.get_config(owner, repo))
+
+
+class RepoTestConfigPutRequest(BaseModel):
+    owner: str
+    repo: str
+    user_login: str
+    entries: list[dict[str, Any]] = []
+
+
+@repo_test_config_router.put("", response_model=RepoTestConfigResponse)
+async def put_repo_test_config(body: RepoTestConfigPutRequest, request: Request) -> RepoTestConfigResponse:
+    _check_shared_secret(request)
+    # Reject an un-mappable key loudly rather than let normalize_entries silently drop the user's
+    # value later (the security boundary is the env name; the message names the offender).
+    for entry in body.entries:
+        key = str((entry or {}).get("key") or "").strip()
+        if key and not keyvault.ENV_NAME_RE.fullmatch(keyvault.config_key_to_env(key)):
+            raise HTTPException(status_code=422, detail=f"config key {key!r} does not map to a valid env var name")
+    await repo_test_config.set_config(body.owner, body.repo, body.entries, updated_by=body.user_login)
+    return RepoTestConfigResponse(entries=await repo_test_config.get_config(body.owner, body.repo))
 
 
 # --- org-wide coding-agent provider settings (settings page, Part 4) --------------------------

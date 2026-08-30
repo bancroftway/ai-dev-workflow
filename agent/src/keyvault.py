@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # style rule: the env file is `. `-sourced by a shell inside the sandbox (e2e_nodes._boot_process),
 # so a free-form name like `X; rm -rf / #` would EXECUTE. Enforced at selection-save time in
 # sessions_api AND defensively in render_env_file below; the UI's client-side check is advisory.
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 
 # Home of the sandbox user -- outside /workspace/repo so repo tooling (gitleaks, commits, find)
 # never sees it. Constant, never interpolated from user input.
@@ -169,7 +169,7 @@ def resolve_env_names(selection: Selection) -> dict[str, str]:
     for entry in selection:
         name = entry["name"] or ""
         env_name = entry.get("env_name") or secret_name_to_env(name)
-        if not ENV_NAME_RE.match(env_name):
+        if not ENV_NAME_RE.fullmatch(env_name):
             raise ValueError(f"invalid env name {env_name!r} for secret {name!r} (must match {ENV_NAME_RE.pattern})")
         if env_name in by_env:
             raise ValueError(f"secrets {by_env[env_name]!r} and {name!r} both resolve to env name {env_name!r}")
@@ -272,6 +272,15 @@ def secret_name_to_env(name: str) -> str:
     return f"_{env}" if env[:1].isdigit() else env
 
 
+def config_key_to_env(key: str) -> str:
+    """.NET config path -> env var name: `AzureAd:TenantId` -> `AzureAd__TenantId` (the standard
+    double-underscore convention every ASP.NET config binder understands). Case is preserved (the
+    binder is case-insensitive; SPA `process.env.X` keys are already env-shaped and pass through).
+    The result is still validated against ENV_NAME_RE by every caller -- this only maps the
+    separator, it does not sanitize."""
+    return key.replace(":", "__")
+
+
 def render_env_file(secrets: dict[str, str]) -> str:
     """`KEY=<quoted>` lines consumable by `set -a; . file; set +a` -- values are shlex-quoted so
     spaces/quotes/$ in secret values survive the shell parse literally. Keys are validated against
@@ -279,7 +288,7 @@ def render_env_file(secrets: dict[str, str]) -> str:
     executed by a shell, so a malformed key is dropped with a warning, never emitted."""
     lines = []
     for key, value in sorted(secrets.items()):
-        if not ENV_NAME_RE.match(key):
+        if not ENV_NAME_RE.fullmatch(key):
             logger.warning("refusing to render env entry with invalid name %r", key)
             continue
         lines.append(f"{key}={shlex.quote(value)}\n")
@@ -348,6 +357,11 @@ def _demo() -> None:
     # render_env_file's defensive half: a malformed key is DROPPED, never emitted into a file a
     # shell will source.
     assert render_env_file({"OK_KEY": "v", "X; touch /tmp/pwned #": "v"}) == "OK_KEY=v\n"
+    # config_key_to_env: colon separator -> double underscore; result still ENV_NAME_RE-legal.
+    assert config_key_to_env("AzureAd:TenantId") == "AzureAd__TenantId"
+    assert ENV_NAME_RE.fullmatch(config_key_to_env("Nested:A:B"))
+    # Newline no longer slips through (the $-vs-\Z fix): a trailing-newline name is illegal.
+    assert not ENV_NAME_RE.fullmatch("NAME\n"), "trailing newline must be rejected"
     print("keyvault self-check: ok")
 
 

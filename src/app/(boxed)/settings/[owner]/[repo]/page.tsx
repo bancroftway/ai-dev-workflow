@@ -11,6 +11,14 @@ type SaveState =
   | { kind: "error"; detail: string };
 
 type SelectionEntry = { name: string; env_name: string | null };
+type ConfigEntry = { key: string; value: string; secret: boolean; source: string };
+
+/** Config keys managed by the test-login system (fake IdP / vault) -- shown read-only so a user
+ * can't override what the pipeline injects. Matched against the raw key AND its env-var form. */
+const MANAGED_CONFIG_PREFIXES = ["AzureAd:", "AzureAd__", "Authentication:", "Authentication__", "AUTH_", "NEXTAUTH_", "OIDC_"];
+function isManagedConfigKey(key: string): boolean {
+  return MANAGED_CONFIG_PREFIXES.some((p) => key.startsWith(p));
+}
 
 /** Advisory client-side mirror of the agent's ENV_NAME_RE -- the agent re-validates on save. */
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
@@ -48,6 +56,10 @@ export default function RepoSettingsPage() {
   const [authMode, setAuthMode] = useState<"required" | "anonymous_list" | "none">("required");
   const [anonRoutes, setAnonRoutes] = useState("");
   const [authSave, setAuthSave] = useState<SaveState>({ kind: "idle" });
+
+  // Test config values (non-secret app config injected as env vars at test boot).
+  const [configEntries, setConfigEntries] = useState<ConfigEntry[]>([]);
+  const [configSave, setConfigSave] = useState<SaveState>({ kind: "idle" });
 
   const loadSecrets = useCallback(() => {
     setSecretsError(null);
@@ -97,6 +109,12 @@ export default function RepoSettingsPage() {
           setAuthMode(data.auth_mode);
         }
         if (data?.anonymous_routes?.length) setAnonRoutes(data.anonymous_routes.join("\n"));
+      })
+      .catch(() => undefined);
+    fetch(`/api/repos/test-config?${query}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { entries?: ConfigEntry[] } | null) => {
+        if (data?.entries?.length) setConfigEntries(data.entries);
       })
       .catch(() => undefined);
   }, [owner, repo, loadSecrets]);
@@ -187,6 +205,24 @@ export default function RepoSettingsPage() {
       if (authMode !== "anonymous_list") setAnonRoutes("");
     } else {
       setAuthSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
+    }
+  }
+
+  async function saveConfig() {
+    setConfigSave({ kind: "saving" });
+    // Drop wholly-empty rows; keep managed rows untouched (they're read-only in the UI anyway).
+    const entries = configEntries.filter((e) => e.key.trim());
+    const res = await fetch("/api/repos/test-config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner, repo, entries }),
+    });
+    const body = (await res.json()) as { entries?: ConfigEntry[]; detail?: string };
+    if (res.ok) {
+      if (body.entries) setConfigEntries(body.entries);
+      setConfigSave({ kind: "saved", secretCount: 0 });
+    } else {
+      setConfigSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
     }
   }
 
@@ -391,6 +427,82 @@ export default function RepoSettingsPage() {
           {authSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
         </div>
         {authSave.kind === "error" && <p className="text-sm text-red-700">{authSave.detail}</p>}
+      </section>
+
+      <section className="flex max-w-2xl flex-col gap-3 rounded-lg border border-neutral-200 p-4">
+        <div>
+          <h2 className="font-medium">Test configuration</h2>
+          <p className="mt-1 text-sm text-neutral-500">
+            Non-secret config values your app reads (connection strings to a test DB, feature flags,
+            service URLs). Injected as environment variables when sessions boot the app for testing.
+            Keys use the app&apos;s own names — <code className="rounded bg-neutral-100 px-1">Section:Key</code> for
+            .NET. Detected keys appear here automatically; fill in values. Secrets belong in Key Vault
+            above, and auth keys are managed by the test-login system.
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          {configEntries.length === 0 && (
+            <p className="text-sm text-neutral-400">No config keys yet. Add one, or they&apos;ll appear here once detected.</p>
+          )}
+          {configEntries.map((entry, i) => {
+            const managed = isManagedConfigKey(entry.key);
+            return (
+              <div key={i} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="Section:Key"
+                  value={entry.key}
+                  disabled={managed}
+                  onChange={(e) =>
+                    setConfigEntries((prev) => prev.map((p, j) => (j === i ? { ...p, key: e.target.value } : p)))
+                  }
+                  className="w-2/5 rounded-md border border-neutral-300 px-2 py-1 text-sm disabled:bg-neutral-100 disabled:text-neutral-400"
+                />
+                <input
+                  type="text"
+                  placeholder={managed ? "managed by test login" : entry.secret ? "→ Key Vault" : "value"}
+                  value={entry.value}
+                  disabled={managed || entry.secret}
+                  onChange={(e) =>
+                    setConfigEntries((prev) => prev.map((p, j) => (j === i ? { ...p, value: e.target.value } : p)))
+                  }
+                  className="flex-1 rounded-md border border-neutral-300 px-2 py-1 text-sm disabled:bg-neutral-100 disabled:text-neutral-400"
+                />
+                {!managed && (
+                  <button
+                    type="button"
+                    onClick={() => setConfigEntries((prev) => prev.filter((_, j) => j !== i))}
+                    className="rounded-md px-2 py-1 text-sm text-neutral-400 hover:text-red-600"
+                    title="Remove"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => setConfigEntries((prev) => [...prev, { key: "", value: "", secret: false, source: "user" }])}
+            className="self-start text-sm text-neutral-600 underline hover:text-neutral-900"
+          >
+            + Add config value
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            onClick={saveConfig}
+            disabled={configSave.kind === "saving"}
+          >
+            {configSave.kind === "saving" ? "Saving…" : "Save"}
+          </button>
+          {configSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
+        </div>
+        {configSave.kind === "error" && <p className="text-sm text-red-700">{configSave.detail}</p>}
       </section>
     </div>
   );
