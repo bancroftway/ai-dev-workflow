@@ -25,8 +25,17 @@ $rg = "$prefix-rg"
 function Invoke-Az {
   # az's exit code is the only reliable failure signal for a native call in PS 5.1 -- check it
   # after every call that must have succeeded, with the args echoed so the failing step is obvious.
+  #
+  # Quoting: az on Windows is az.cmd (a batch file), and PS 5.1 only auto-quotes args containing
+  # WHITESPACE -- an arg like `length(appRoles)` or `key=value` goes through bare, and cmd's
+  # parser dies on the parens/equals with "-o was unexpected at this time". Wrap any
+  # metacharacter-bearing, whitespace-free arg in literal quotes ourselves (whitespace-bearing
+  # args are left alone: PS already quotes those, and double-wrapping would break them).
   param([Parameter(Mandatory)][string[]]$AzArgs)
-  $out = az @AzArgs
+  $escaped = $AzArgs | ForEach-Object {
+    if ($_ -notmatch '\s' -and $_ -match '[()|&^<>;,=%]') { '"' + $_ + '"' } else { $_ }
+  }
+  $out = az @escaped
   if ($LASTEXITCODE -ne 0) { throw "az $($AzArgs -join ' ') failed (exit $LASTEXITCODE)" }
   return $out
 }
