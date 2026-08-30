@@ -23,7 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, repo_scan, session_store, template_loader, workflow_persistence
+from . import config_inventory, git_ops, model_config, repo_files, repo_scan, repo_test_config, session_store, template_loader, workflow_persistence
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
@@ -428,7 +428,7 @@ async def hydrate_tech_stack_from_repo_file(
     if raw is None:
         return None
     try:
-        return json.loads(raw)
+        approved = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning(
             "tech-stack.approved.json exists but isn't valid JSON for thread_id=%s -- treating as "
@@ -437,6 +437,27 @@ async def hydrate_tech_stack_from_repo_file(
             thread_id,
         )
         return None
+    # Backfill auth_kind/config_inventory for repos onboarded before these fields existed: they
+    # otherwise never populate (hydration skips detection forever), so the deterministic scanner
+    # fills them here and the enriched sidecar is re-persisted. Best-effort -- a scan failure just
+    # leaves the fields at their defaults, read with .get(...,"none") everywhere.
+    if isinstance(approved, dict) and (approved.get("auth_kind") in (None, "none") or not approved.get("config_inventory")):
+        try:
+            auth_kind, keys = await config_inventory.inventory(provider, thread_id)
+            changed = False
+            if not approved.get("auth_kind") or (approved.get("auth_kind") == "none" and auth_kind != "none"):
+                approved["auth_kind"] = auth_kind
+                changed = True
+            if not approved.get("config_inventory") and keys:
+                approved["config_inventory"] = keys
+                changed = True
+            if changed:
+                await repo_files.write_repo_file(
+                    provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(approved, indent=2),
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning("auth_kind/config backfill failed for thread_id=%s", thread_id, exc_info=True)
+    return approved
 
 
 def _resolve_ticket_tech_stack_markdown(
@@ -780,6 +801,19 @@ async def apply_stack_conventions(
     Every ecosystem is applied inside its own try/except: one bad root or one npm failure must not
     cost the others their conventions, and must never take down the run.
     """
+    # Seed the settings-page config table with this run's detected keys (value-empty rows the user
+    # fills in). Additive-only + idempotent -- merge_detected never clobbers a user value -- so it
+    # is safe on every run, including hydration-skipped ones. Best-effort: config seeding must never
+    # fail the conventions hook.
+    detected_keys = tech_stack.get("config_inventory") or []
+    if detected_keys:
+        try:
+            sess = await session_store.get_session(thread_id)
+            if sess is not None:
+                await repo_test_config.merge_detected(sess["owner"], sess["repo"], list(detected_keys))
+        except Exception:  # noqa: BLE001
+            logger.warning("could not seed repo_test_config for thread_id=%s", thread_id, exc_info=True)
+
     written_paths: list[str] = []
     outcomes: dict[str, Any] = {}
 

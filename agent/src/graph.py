@@ -395,15 +395,29 @@ def get_app_auth(state: "GraphState") -> dict[str, Any]:
     return state.get("app_auth") or dict(_APP_AUTH_DEFAULT)
 
 
+def auth_kind(state: "GraphState") -> str:
+    """How the approved tech-stack says the app authenticates (entra/google/generic-oidc/custom/
+    none). Read from the approved tech-stack content; 'none' for old sidecars / pre-detection runs.
+    Tech-stack is always approved before any stage that reads this, so approved_content is set."""
+    content = (state.get("stages", {}).get("tech-stack") or {}).get("approved_content") or {}
+    if not isinstance(content, dict):
+        return "none"
+    return str(content.get("auth_kind") or "none")
+
+
 def auth_enforced(state: "GraphState") -> bool:
-    """True when the generated app must be locked down AND the run can actually satisfy that:
-    auth mode requires it, Key Vault auth secrets were injected, and the operator kill-switch
-    (AIDW_AUTH_GATE) is on. The same predicate guards prompt injection and the e2e auth gate, so
-    the pipeline never demands what it cannot verify (or vice versa)."""
+    """True when the generated app must be locked down AND the run can actually satisfy that. The
+    auth mode must require it, the kill-switch (AIDW_AUTH_GATE) must be on, and the run must have a
+    way to exercise auth: either Key Vault auth secrets were injected (the original path) OR the
+    operator declared test users (the fake-IdP / seeded-user path, which needs no vault). The same
+    predicate guards prompt injection and the e2e auth gate, so the pipeline never demands what it
+    cannot verify (or vice versa)."""
     if not workflow_config.AIDW_AUTH_GATE:
         return False
     app_auth = get_app_auth(state)
-    return app_auth.get("auth_mode") in ("required", "anonymous_list") and bool(app_auth.get("secrets_present"))
+    if app_auth.get("auth_mode") not in ("required", "anonymous_list"):
+        return False
+    return bool(app_auth.get("secrets_present")) or bool(state.get("test_users"))
 
 
 def _auth_segment_message(state: "GraphState") -> HumanMessage:

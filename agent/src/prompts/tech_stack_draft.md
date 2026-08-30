@@ -17,6 +17,19 @@ itself. Omit a key entirely when that ecosystem isn't present, or when the repo 
 unrelated roots and no single one is the obvious home — deterministic code writes real files at
 these paths, so a wrong root is worse than a missing one.
 
+Report `auth_kind`: how the app authenticates users — `entra` (Microsoft Entra ID /
+Microsoft.Identity.Web / MSAL / an `AzureAd` config section), `google`, `generic-oidc` (any other
+OpenID Connect: `AddOpenIdConnect`, an `Authority`/`Issuer` setting, next-auth with an OIDC
+provider), `custom` (the app checks credentials itself — ASP.NET Identity, a login form issuing its
+own cookie/JWT, a Credentials provider), or `none` (no sign-in). When unsure between OIDC flavors,
+prefer the most specific that fits the evidence.
+
+Report `config_inventory`: the config keys the app reads that a tester might need to supply values
+for — `appsettings*.json` section paths written as `Section:Key` (e.g. `ConnectionStrings:Db`,
+`AzureAd:TenantId`), and keys read in code (`Configuration["X"]`, `GetSection("Y")`,
+`process.env.Z`). List the keys, not their values. A deterministic scan runs alongside you and the
+two lists are unioned, so it's fine to miss some — but don't invent keys you saw no evidence for.
+
 Leave `conventions_applied` empty — that field is populated later, by deterministic code, not by
 you.
 

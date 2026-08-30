@@ -27,6 +27,11 @@ itself. Omit a key entirely when that ecosystem isn't present, or when the repo 
 unrelated roots and no single one is the obvious home — deterministic code writes real files at
 these paths, so a wrong root is worse than a missing one.
 
+Report `auth_kind` (how the app authenticates: `entra` / `google` / `generic-oidc` / `custom` /
+`none`) and `config_inventory` (config keys the app reads — `appsettings` `Section:Key` paths and
+`Configuration[...]`/`GetSection`/`process.env` reads; keys only, not values; a deterministic scan
+is unioned with yours, so don't invent keys).
+
 Leave `conventions_applied` empty — that field is populated later, by deterministic code, not by
 you.
 

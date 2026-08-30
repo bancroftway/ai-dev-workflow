@@ -155,6 +155,21 @@ def render_tech_stack_markdown(content: dict[str, Any]) -> str:
         lines.extend(f"- {c}" for c in conventions_applied)
         lines.append("")
 
+    # Always rendered (human reviews it at the gate): a wrong auth_kind is worth correcting.
+    lines.append("## Authentication")
+    lines.append("")
+    lines.append(f"Detected auth: **{content.get('auth_kind', 'none')}**")
+    lines.append("")
+
+    config_inventory = content.get("config_inventory") or []
+    if config_inventory:
+        lines.append("## Configuration Keys")
+        lines.append("")
+        lines.append("Config the app reads -- supply test values on the repo settings page:")
+        lines.append("")
+        lines.extend(f"- `{k}`" for k in config_inventory)
+        lines.append("")
+
     return "\n".join(lines).strip() + "\n"
 
 

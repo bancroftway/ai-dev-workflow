@@ -806,6 +806,34 @@ async def _boot_process(
     )
 
 
+# Boot-error signatures that name a missing config key in group 1. Bounded, conservative -- a
+# false negative just means the key doesn't auto-appear on the settings page (the log tail still
+# names it to the fix loop); a false positive adds a value-empty row a human can delete.
+_BOOT_CONFIG_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"""Configuration\s+key\s+['"]([^'"]+)['"]\s+.*(?:not found|missing|is not configured)""", re.IGNORECASE),
+    re.compile(r"""['"]([^'"]+)['"]\s+is\s+not\s+configured""", re.IGNORECASE),
+    re.compile(r"""Missing\s+(?:required\s+)?configuration(?:\s+value)?\s+(?:for\s+)?['"]([^'"]+)['"]""", re.IGNORECASE),
+    re.compile(r"""No\s+connection\s+string\s+named\s+['"]([^'"]+)['"]""", re.IGNORECASE),
+    re.compile(r"""ConnectionString\s+['"]?([A-Za-z0-9_:]+)['"]?\s+(?:not found|is null|was not found)""", re.IGNORECASE),
+)
+
+
+def _config_keys_from_boot_error(log_tail: str) -> list[str]:
+    """Distinct config keys named by a boot failure, in first-seen order (pure, self-checked)."""
+    found: list[str] = []
+    have: set[str] = set()
+    for pattern in _BOOT_CONFIG_ERROR_PATTERNS:
+        for m in pattern.finditer(log_tail or ""):
+            key = m.group(1).strip()
+            # A bare connection-string name maps onto ConnectionStrings:<name> in .NET config.
+            if pattern.pattern.startswith("No\\s+connection") or "ConnectionString" in pattern.pattern:
+                key = key if ":" in key else f"ConnectionStrings:{key}"
+            if key and key not in have:
+                have.add(key)
+                found.append(key)
+    return found
+
+
 async def _wait_ready(provider: Any, thread_id: str, port: int) -> bool:
     """True once the port SPEAKS HTTP -- any status code, not necessarily a successful one.
 
@@ -1099,11 +1127,23 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
 
     if not ready:
         log_tail = (await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "")[-3000:]
+        # Boot-error mop-up: a boot that died on a missing config value should surface that key on
+        # the settings page, not just in the log. Best-effort; the failure text below still reaches
+        # the fix loop either way.
+        hint = ""
+        missing = _config_keys_from_boot_error(log_tail)
+        if missing and sess_row is not None:
+            try:
+                await repo_test_config.merge_detected(sess_row["owner"], sess_row["repo"], missing, source="boot-error")
+                hint = (f"\n\nMissing config detected: {', '.join(missing)} -- supply values at "
+                        f"/settings/{sess_row['owner']}/{sess_row['repo']}, then retry.")
+            except Exception:  # noqa: BLE001
+                logger.warning("boot-error config mop-up failed for %s", thread_id, exc_info=True)
         e2e.update(
             status="failed", total=0, passed=0, screenshots=[],
             failed_tests=[{
                 "title": "app readiness",
-                "error": f"app never answered on port {port} within {workflow_config.E2E_APP_READY_TIMEOUT_SECONDS}s -- log tail:\n{log_tail}",
+                "error": f"app never answered on port {port} within {workflow_config.E2E_APP_READY_TIMEOUT_SECONDS}s -- log tail:\n{log_tail}{hint}",
             }],
         )
         return await _finalize_run(provider, thread_id, e2e)
@@ -1830,6 +1870,10 @@ def _demo() -> None:
     for _name in ("COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN"):
         assert _name in _scrub_names, (_name, _scrub_names)
 
+    # boot-error config mop-up: named keys are extracted; connection-string names get the section.
+    assert _config_keys_from_boot_error("'Stripe:Key' is not configured") == ["Stripe:Key"]
+    assert _config_keys_from_boot_error("No connection string named 'Ledger' was found") == ["ConnectionStrings:Ledger"]
+    assert _config_keys_from_boot_error("app started fine, port 3000") == []
     print("e2e_nodes self-check: ok")
 
 

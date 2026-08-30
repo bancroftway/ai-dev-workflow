@@ -302,6 +302,22 @@ class TechStack(BaseModel):
         "(e.g. ['dotnet']) -- populated by the deterministic post_audit_hook after it runs, not "
         "by the model itself, since the model never writes files.",
     )
+    auth_kind: str = Field(
+        default="none",
+        description="How the app authenticates users, one of: 'entra' (Microsoft Entra ID / "
+        "Microsoft.Identity.Web / MSAL), 'google', 'generic-oidc' (any other OpenID Connect "
+        "provider), 'custom' (the app checks credentials itself -- ASP.NET Identity, a login form "
+        "issuing its own cookie/JWT, a Credentials provider), or 'none' (no sign-in). Drives "
+        "whether e2e uses a fake OIDC identity provider (OIDC kinds) or seeded users + the real "
+        "login form (custom), and whether the auth-enforcement gate arms.",
+    )
+    config_inventory: list[str] = Field(
+        default_factory=list,
+        description="Config keys the app reads that a tester may need to supply values for -- "
+        "appsettings section paths ('Section:Key') and code-read keys "
+        "(Configuration[...], GetSection, process.env.X). Unioned with a deterministic scan; "
+        "the human reviews them and supplies test values on the repo settings page.",
+    )
 
 
 class TechStackDraftResponse(BaseModel):
