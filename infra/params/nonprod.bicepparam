@@ -5,9 +5,9 @@
 using '../main.bicep'
 
 param namePrefix = 'aidw-nonprod'
-param entraTenantId = '<home-tenant-id>' // TODO(bootstrap): set real tenant id
-param entraAppId = '<sign-in-app-id>' // TODO(bootstrap): set real app registration id
-param sqlAadAdminObjectId = '<aidw-sql-admins-object-id>' // TODO(bootstrap): Entra group object id
+param entraTenantId = 'e83eaf75-cbe6-47a2-82bd-451f13dc8b54' // TODO(bootstrap): set real tenant id
+param entraAppId = '33b4c021-6631-4d29-9906-0d675b44fa74' // TODO(bootstrap): set real app registration id
+param sqlAadAdminObjectId = '911e6eaa-2415-4bad-87ca-c69d2b41e5c5' // TODO(bootstrap): Entra group object id
 param sqlAadAdminLogin = 'aidw-sql-admins'
 param sqlAadAdminPrincipalType = 'Group'
 
