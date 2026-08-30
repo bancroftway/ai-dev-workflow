@@ -188,6 +188,14 @@ that owns tests.
   if a planned dependency turns out unneeded, remove it from the manifest. A declared-but-unwired
   package reads as an unfinished plan step to the audit. (Observed live: @opentelemetry/context-zone
   installed and never imported.)
+- **The app must boot from environment variables alone, with no live cloud dependency at startup.**
+  A cloud configuration provider that runs at boot -- `AddAzureKeyVault`, Azure App Configuration,
+  and the like -- must be guarded so it only activates in the real cloud environment (e.g.
+  `if (!builder.Environment.IsDevelopment()) builder.Configuration.AddAzureKeyVault(...)`, or gated on
+  a config flag being set), because the test sandbox has no managed identity and any such provider
+  would crash the app before it serves a page. All configuration the app needs at test time arrives
+  as environment variables; read them through the normal config binder (they override any
+  `appsettings` layer). Never require reaching a cloud service to start.
 
 ## If implementation already exists in the tree
 
