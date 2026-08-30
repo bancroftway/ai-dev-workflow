@@ -18,14 +18,24 @@ const AGENT_SHARED_SECRET = process.env.AIDW_AGENT_SHARED_SECRET;
 /** Fetches a path relative to the agent's base URL, with the shared-secret header attached when
  * configured. `path` is joined the same way for every caller -- e.g. "sessions/provision",
  * "sessions?owner=x&repo=y", "sessions/<id>". */
-export function agentFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(new URL(path, AGENT_BASE_URL), {
-    ...init,
-    headers: {
-      ...(AGENT_SHARED_SECRET ? { "x-aidw-secret": AGENT_SHARED_SECRET } : {}),
-      ...init?.headers,
-    },
-  });
+export async function agentFetch(path: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(new URL(path, AGENT_BASE_URL), {
+      ...init,
+      headers: {
+        ...(AGENT_SHARED_SECRET ? { "x-aidw-secret": AGENT_SHARED_SECRET } : {}),
+        ...init?.headers,
+      },
+    });
+  } catch (err) {
+    // Agent down/unreachable: a JSON 502 every caller already handles via `.ok`/status, instead
+    // of a rejection that Next turns into a 500 with an EMPTY body (which then blows up the
+    // browser's `res.json()`). undici wraps the real ECONNREFUSED under `cause` (an AggregateError
+    // whose message is empty but whose code is set).
+    const cause = (err as { cause?: { code?: string; message?: string } }).cause;
+    const message = cause?.code || cause?.message || (err instanceof Error ? err.message : String(err));
+    return Response.json({ detail: `agent unreachable at ${AGENT_BASE_URL}: ${message}` }, { status: 502 });
+  }
 }
 
 /** Client-side: re-reads the project list and finds this one -- no `GET /api/projects/:id`

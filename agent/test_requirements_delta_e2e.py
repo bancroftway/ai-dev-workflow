@@ -307,11 +307,11 @@ def validate_after_run_2(repo_dir: Path, run1_id: str, run2_id: str, failures: l
 
 def main() -> int:
     if not os.environ.get("E2E_GITHUB_TOKEN"):
-        # run_headless loads the root .env itself; do the same here for the clone step.
+        # run_headless loads the root .env + config vault itself; do the same here for the clone step.
         try:
-            from dotenv import find_dotenv, load_dotenv
+            from src.env_bootstrap import bootstrap_env
 
-            load_dotenv(find_dotenv())
+            bootstrap_env()
         except ImportError:
             pass
     if not os.environ.get("E2E_GITHUB_TOKEN"):
@@ -347,6 +347,14 @@ def main() -> int:
         )
         return 1
     logger.info("run 1 ok (run_id=%s)", run1_id)
+
+    if os.environ.get("DELTA_E2E_PAUSE_AFTER_RUN1") == "1":
+        logger.info(
+            "DELTA_E2E_PAUSE_AFTER_RUN1=1 -- stopping before run 2 as requested. To continue: "
+            "DELTA_E2E_RESUME_THREAD=%s uv run python test_requirements_delta_e2e.py",
+            thread_id,
+        )
+        return 0
 
     outcome2 = _run_pipeline(branch, thread_id, REQUIREMENTS_RUN_2, fresh_run=True)
     run2_id = outcome2.get("run_id") or ""

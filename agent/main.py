@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dotenv import load_dotenv
+from src.env_bootstrap import bootstrap_env
 
-load_dotenv()
+bootstrap_env()  # .env, then AZURE_CONFIG_VAULT_URI -- before any import that reads os.environ
 
 import logging
 import os

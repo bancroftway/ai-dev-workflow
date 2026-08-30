@@ -984,11 +984,19 @@ async def check_ac_coverage(
     )
     output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)
     if output is None:
+        # run_report.summary is a SEPARATE session's (ac-test-run, not this draft's own) account of
+        # what happened, and it is frequently the actual diagnosis -- observed live: a .NET build
+        # failure (an analyzer rule violation) meant no .trx/console tee was ever produced, so
+        # `output is None` correctly, but run_report.error was empty (the runner considered
+        # "I investigated and explained the failure" a success) while run_report.summary named the
+        # exact file and rule. Dropping it here left the draft session with a generic "no test
+        # output" message and nothing to act on -- it cannot fix what it was never told.
+        diagnosis = run_report.error or run_report.summary or "no test output was captured"
         return AcCoverageOutcome(
             passed=False,
             feedback=(
                 "The test suite could not be run, so AC coverage cannot be verified -- this is an "
-                f"infra failure, not a coverage gap: {run_report.error or 'no test output was captured'}"
+                f"infra failure, not a coverage gap: {diagnosis}"
             ),
             report={"infra_error": "test_run_failed", "run_summary": run_report.summary},
         )

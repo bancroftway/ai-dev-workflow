@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { RepoSummary } from "@/app/api/github/repos/route";
@@ -8,8 +8,6 @@ import type { BranchSummary } from "@/app/api/github/branches/route";
 import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
 import { SessionHistory } from "@/components/SessionHistory";
 import { SettingsBanner } from "@/components/SettingsBanner";
-
-type OnboardedStatus = "checking" | "onboarded" | "not-onboarded" | "error";
 
 /** Get-or-create a project row for (owner, repo) via the Connect-Repository route -- shared by
  * RepoBranchSection's "Connect repository" button AND its "start new session" action (Task 5):
@@ -165,7 +163,7 @@ export default function SelectPage() {
 
         <div className="flex min-w-0 flex-1 flex-col gap-4 overflow-y-auto border-l border-neutral-200 pl-6">
           {/* Keyed by repo so switching repositories always starts this section's state fresh,
-              rather than manually resetting branch/onboarding state via an effect. */}
+              rather than manually resetting branch state via an effect. */}
           {selectedRepo ? (
             <RepoBranchSection key={selectedRepo.fullName} repo={selectedRepo} projectId={selectedProjectId} />
           ) : (
@@ -356,25 +354,20 @@ function RepoBranchSection({ repo, projectId }: { repo: RepoSummary; projectId: 
         </select>
       </label>
 
-      {/* Keyed by branch so switching branches re-checks onboarding status and re-fetches the
-          session list from scratch. */}
       {selectedBranch && (
-        <OnboardingStatusSection key={`onboarding-${selectedBranch}`} owner={repo.owner} repo={repo.repo} branch={selectedBranch}>
-          {(status) => (
-            <button
-              type="button"
-              className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-              onClick={startNewSession}
-              disabled={starting}
-            >
-              {starting ? "Starting…" : status === "onboarded" ? "Start new session" : "Onboard & start new session"}
-            </button>
-          )}
-        </OnboardingStatusSection>
+        <button
+          type="button"
+          className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+          onClick={startNewSession}
+          disabled={starting}
+        >
+          {starting ? "Starting…" : "Start new session"}
+        </button>
       )}
 
       {/* Sessions are branch-scoped now (each gets its own ai-dev-workflow/<session_id> branch),
-          so the list is too -- shown once both repo and branch are chosen, keyed the same way. */}
+          so the list is too -- shown once both repo and branch are chosen, keyed by branch so
+          switching branches re-fetches the list from scratch. */}
       {selectedBranch && (
         <SessionHistory key={`history-${selectedBranch}`} owner={repo.owner} repo={repo.repo} sourceBranch={selectedBranch} />
       )}
@@ -382,65 +375,3 @@ function RepoBranchSection({ repo, projectId }: { repo: RepoSummary; projectId: 
   );
 }
 
-function OnboardingStatusSection({
-  owner,
-  repo,
-  branch,
-  children,
-}: {
-  owner: string;
-  repo: string;
-  branch: string;
-  children: (status: OnboardedStatus) => ReactNode;
-}) {
-  const [status, setStatus] = useState<OnboardedStatus>("checking");
-
-  useEffect(() => {
-    let cancelled = false;
-    const params = new URLSearchParams({ owner, repo, branch });
-    fetch(`/api/github/onboarding-status?${params}`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`status ${res.status}`);
-        return res.json();
-      })
-      .then((data: { onboarded: boolean }) => {
-        if (!cancelled) setStatus(data.onboarded ? "onboarded" : "not-onboarded");
-      })
-      .catch(() => {
-        if (!cancelled) setStatus("error");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [owner, repo, branch]);
-
-  return (
-    <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm">
-        <OnboardedBadge status={status} />
-      </div>
-      {children(status)}
-    </div>
-  );
-}
-
-function OnboardedBadge({ status }: { status: OnboardedStatus }) {
-  switch (status) {
-    case "checking":
-      return <span className="text-neutral-500">Checking onboarding status…</span>;
-    case "onboarded":
-      return (
-        <span className="rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-medium text-green-800">
-          Onboarded
-        </span>
-      );
-    case "not-onboarded":
-      return (
-        <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800">
-          Not yet onboarded
-        </span>
-      );
-    case "error":
-      return <span className="text-red-600">Couldn&apos;t check onboarding status</span>;
-  }
-}

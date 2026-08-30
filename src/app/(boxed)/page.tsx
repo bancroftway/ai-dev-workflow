@@ -1,4 +1,5 @@
-import { signIn } from "@/auth";
+import { redirect } from "next/navigation";
+import { auth, signIn } from "@/auth";
 
 const APPROVAL_STEPS = [
   {
@@ -45,7 +46,10 @@ const FEATURES = [
   },
 ];
 
-export default function Home() {
+export default async function Home() {
+  // Signed-in users never see the marketing/sign-in page -- proxy.ts only bounces the
+  // unauthenticated direction, so this is the one place that sends them to the workspace.
+  if ((await auth())?.user) redirect("/select");
   return (
     <main className="flex-1">
       {/* Hero */}

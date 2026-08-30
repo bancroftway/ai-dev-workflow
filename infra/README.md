@@ -119,9 +119,13 @@ whichever shell invokes it too).
 
 ## Known gaps
 
-- No Key Vault *for the service's own secrets* — those are Container Apps' built-in secrets, per
-  Decision 4 (small internal tool, sufficient at this scale). User-app secrets are different:
-  they come from per user-repo Key Vaults read on-behalf-of the user (section above).
+- Service configuration is in transition to Key Vault: `main.bicep` now provisions
+  `<namePrefix>-config` and both apps read every secret in it at boot (README.md "Configuration
+  from Key Vault"), but the parameter-driven Container Apps secrets (`authSecret`,
+  `entraClientSecret`, ...) are still set and win over the vault. Seed the config vault
+  (`az keyvault secret set`, one secret per env var, `_` → `-`) and then drop those parameters
+  and their `secretRef` env entries. User-app secrets are different: they come from per user-repo
+  Key Vaults read on-behalf-of the user (section above).
 - No custom domain/TLS config beyond the platform-managed `*.azurecontainerapps.io` certificate.
 - The agent's own identity is granted resource-group-scoped **Contributor** to manage ACI
   container groups — broader than strictly needed (no built-in role is narrower for

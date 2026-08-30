@@ -11,6 +11,8 @@
   "dependencies": {
     "@ag-ui/a2ui-middleware": "^0.0.10",
     "@ag-ui/langgraph": "^0.0.42",
+    "@azure/identity": "^4.13.2",
+    "@azure/keyvault-secrets": "^4.11.2",
     "@copilotkit/a2ui-renderer": "^1.66.4",
     "@copilotkit/react-core": "^1.66.4",
     "@copilotkit/runtime": "^1.66.4",

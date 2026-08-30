@@ -282,8 +282,43 @@ cd agent && uv run python run_headless.py <owner> <repo> <branch> --requirements
 ```
 
 Needs `GITHUB_TOKEN` (Copilot) and `E2E_GITHUB_TOKEN` (clone + push — must have push scope) in the
-root `.env`. Writes a JSON summary to `agent/agent-work/headless-<thread>.json`; exit code 0 only
+config vault or the root `.env`. Writes a JSON summary to `agent/agent-work/headless-<thread>.json`; exit code 0 only
 when the exit stage approved. Expect hours of wall time and real Copilot spend for a full run.
+
+---
+
+## Configuration from Key Vault
+
+Both processes read their configuration from one Azure Key Vault at boot; the only value a
+machine needs in `.env` is where that vault is:
+
+```bash
+AZURE_CONFIG_VAULT_URI=https://<vault>.vault.azure.net/
+```
+
+Every enabled secret in that vault becomes an env var (secret `AUTH-SECRET` → env
+`AUTH_SECRET`; Key Vault names allow only letters, digits and hyphens). The full variable catalog — every name the code reads, with defaults — is [docs/CONFIG.md](docs/CONFIG.md). A variable already set in
+the process environment or `.env` wins over the vault, so shell overrides such as
+`AIDW_E2E_MODE=1` and the values `infra/main.bicep` sets on the Container Apps stay
+authoritative. Unset `AZURE_CONFIG_VAULT_URI` and `.env` is the whole configuration, as before;
+set it to an unreachable vault and the process refuses to start with Azure's error text. Loaders:
+[src/instrumentation.ts](src/instrumentation.ts) (Next.js `register()`) and
+[agent/src/env_bootstrap.py](agent/src/env_bootstrap.py) (before any env-reading import). Values
+are read once at boot — restart after rotating a secret.
+
+Access is `DefaultAzureCredential`: your `az login` locally, the app's managed identity in
+Azure. Grant `Key Vault Secrets User` on the vault to whoever boots the app. Seed a vault from
+an existing `.env` (or any `NAME=value` list) with:
+
+```bash
+grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env | while IFS== read -r name value; do
+  az keyvault secret set --vault-name <vault> --name "${name//_/-}" --value "$value" --output none
+done
+```
+
+The vault is separate from `AZURE_ORG_VAULT_URI` (org credential, GitHub links — written at
+runtime, never injected as env). Dev vault: `aidw-kv-dev`; production: `<namePrefix>-config`
+from `infra/main.bicep`.
 
 ---
 
@@ -382,4 +417,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 2ae60d8ba85a8e6365561c39ee73717cba2d8beaf540a7978dd16da1aa27001f -->
+<!-- graph-source-sha256: 002151211fdc5dab400e9be8851fa196d5d782d0a2089469235f9ba600babb4d -->

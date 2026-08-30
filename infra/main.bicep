@@ -287,6 +287,10 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
             // different access pattern for a fleet-wide secret with no natural per-user owner --
             // see this file's orgVault/kvSecretsOfficerRoleAgent resources and Part 4 Ruling 1.
             { name: 'AZURE_ORG_VAULT_URI', value: orgVault.properties.vaultUri }
+            // Boot-time configuration source (agent/src/env_bootstrap.py): every secret in
+            // configVault becomes an env var unless already set above -- the explicit values
+            // in this list win, so the vault only fills what this template does not set.
+            { name: 'AZURE_CONFIG_VAULT_URI', value: configVault.properties.vaultUri }
           ]
           resources: {
             cpu: json('0.5')
@@ -351,6 +355,9 @@ resource frontendApp 'Microsoft.App/containerApps@2024-03-01' = {
             // Pure env-var change per the plan's D table -- AGENT_URL is already externalized in
             // src/app/api/copilotkit/[[...slug]]/route.ts, defaulting to http://localhost:8123/.
             { name: 'AGENT_URL', value: 'https://${agentApp.properties.configuration.ingress.fqdn}' }
+            // Boot-time configuration source (src/instrumentation.ts) -- same precedence rule as
+            // the agent: values listed here win, the vault fills the rest.
+            { name: 'AZURE_CONFIG_VAULT_URI', value: configVault.properties.vaultUri }
           ]
           resources: {
             cpu: json('0.5')
@@ -457,6 +464,46 @@ resource kvSecretsOfficerRoleAgent 'Microsoft.Authorization/roleAssignments@2022
     principalId: agentApp.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7') // Key Vault Secrets Officer
+  }
+}
+
+// Service configuration vault (docs/superpowers/specs/2026-08-30-keyvault-config-design.md):
+// every secret in it becomes an env var in BOTH apps at boot (src/instrumentation.ts,
+// agent/src/env_bootstrap.py), replacing the Container Apps secrets above over time. Separate
+// from orgVault on purpose: that one holds runtime-WRITTEN secrets (org-provider-credential,
+// GitHub links) which must never be injected as env vars. Read-only for both identities --
+// seeding is out-of-band via `az keyvault secret set` (infra/README.md), so "Key Vault Secrets
+// User" (getSecret + list) is exactly enough here.
+resource configVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  name: '${namePrefix}-config' // same 24-char global-uniqueness caveat as orgVault
+  location: location
+  properties: {
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    tenantId: subscription().tenantId
+    enableRbacAuthorization: true
+  }
+}
+
+resource kvSecretsUserRoleAgentConfig 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(configVault.id, agentApp.id, 'KeyVaultSecretsUser')
+  scope: configVault
+  properties: {
+    principalId: agentApp.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
+  }
+}
+
+resource kvSecretsUserRoleFrontendConfig 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(configVault.id, frontendApp.id, 'KeyVaultSecretsUser')
+  scope: configVault
+  properties: {
+    principalId: frontendApp.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6') // Key Vault Secrets User
   }
 }
 

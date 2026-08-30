@@ -101,7 +101,7 @@ export default function OrganizationSettingsPage() {
         credential_kind: provider === "claude" ? billingMode : null,
       }),
     });
-    const body = (await res.json()) as OrgSettings & { detail?: string };
+    const body = (await res.json().catch(() => ({}))) as OrgSettings & { detail?: string };
     if (res.ok) {
       setCredentialConfigured(body.credential_configured ?? false);
       setBillingMode(body.credential_kind === "oauth" ? "oauth" : "api_key");
@@ -275,7 +275,7 @@ export default function OrganizationSettingsPage() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ support_repo: supportRepo.trim() || null }),
               });
-              const body = (await res.json()) as OrgSettings & { detail?: string };
+              const body = (await res.json().catch(() => ({}))) as OrgSettings & { detail?: string };
               if (res.ok) {
                 setSupportRepo(body.support_repo ?? "");
                 setSupportSave({ kind: "saved" });

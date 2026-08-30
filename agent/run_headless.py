@@ -29,9 +29,9 @@ import time
 import uuid
 from pathlib import Path
 
-from dotenv import find_dotenv, load_dotenv
+from src.env_bootstrap import bootstrap_env
 
-load_dotenv(find_dotenv())  # tokens live in the repo-root .env, one level above agent/
+bootstrap_env()  # repo-root .env (one level above agent/), then the config vault
 os.environ.setdefault("AIDW_HEADLESS", "1")
 os.environ.setdefault("AIDW_SANDBOX_IDLE_TIMEOUT", "86400")  # belt-and-suspenders: _touch_sandbox() already keeps a silent turn's sandbox alive; this just widens the margin
 

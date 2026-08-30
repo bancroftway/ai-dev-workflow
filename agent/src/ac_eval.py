@@ -243,7 +243,15 @@ async def _ac_ids(provider: SandboxProvider, thread_id: str) -> list[str]:
         entry_id = str(entry.get("id") or "")
         # Criterion-level ids only (US-0001.2), not story-level ones (US-0001): a story is not a
         # testable assertion, and counting it would inflate the denominator.
-        if "." in entry_id:
+        #
+        # Live, retired excluded: a retired criterion's tests are REQUIRED to be gone (deletion
+        # propagation, gates/ac_coverage_gate.check_retired_ac_residue) -- counting it here reads
+        # a correctly-deleted feature as "unverified" and drags ac_verification/ac_execution down
+        # for every ticket that ever deletes anything, which is the opposite of what those
+        # subscores are meant to measure. Observed live: retiring one story (3 ACs) plus one
+        # already-broken carryover AC pushed health_score from 81 to 74 on an otherwise
+        # fully-approved run -- a deletion-only ticket must never look like a quality regression.
+        if "." in entry_id and entry.get("status") in ("active", "revised"):
             ids.append(entry_id)
     return sorted(set(ids))
 
@@ -474,7 +482,43 @@ def _demo() -> None:
     # A test naming no criterion is not attributed to one, and an unexercised criterion stays not_run.
     assert execution_summary(real_ids, [real_names])["per_ac"]["US-0009.9"]["status"] == "not_run"
 
+    import asyncio
+
+    asyncio.run(_demo_ac_ids_excludes_retired())
+
     print("ac_eval self-check: all assertions passed")
+
+
+async def _demo_ac_ids_excludes_retired() -> None:
+    """_ac_ids must never count a retired criterion: its tests are REQUIRED to be gone (deletion
+    propagation), so counting it as 'unverified' would read a correctly-deleted feature as a
+    quality regression -- reproduces the exact live incident (retiring one story dropped
+    health_score 81 -> 74 on an otherwise fully-approved run)."""
+
+    class _FakeResult:
+        def __init__(self, ok: bool, stdout: str = "") -> None:
+            self.ok = ok
+            self.stdout = stdout
+
+    class _FakeProvider:
+        def __init__(self, files: dict[str, str]) -> None:
+            self._files = files
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str):  # noqa: ANN201
+            for path, content in self._files.items():
+                if path in command:
+                    return _FakeResult(True, content)
+            return _FakeResult(False)
+
+    ledger = json.dumps({"entries": [
+        {"id": "US-0001", "kind": "user_story", "status": "active"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0002", "kind": "user_story", "status": "retired"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "retired"},
+        {"id": "US-0002.2", "kind": "acceptance_criterion", "status": "retired"},
+    ]})
+    ids = await _ac_ids(_FakeProvider({spec_ledger.LEDGER_PATH: ledger}), "t")
+    assert ids == ["US-0001.1"], ids
 
 
 if __name__ == "__main__":
