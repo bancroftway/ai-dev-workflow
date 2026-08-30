@@ -20,8 +20,8 @@
  *   because generated .NET APIs validate bearer JWTs; opaque tokens would 401 every SPA->API call.
  * - conformIdTokenClaims:false so roles/oid survive in the ID token that web apps read.
  * - devInteractions replaced by a one-button-per-user login page (no passwords).
- * - redirectUriAllowed overridden to any http://localhost:*/http://127.0.0.1:* -- safe in-sandbox,
- *   and the app's exact callback path is unknown ahead of time.
+ * - redirectUriAllowed overridden to any localhost / 127.0.0.1 callback -- safe in-sandbox, and
+ *   the app's exact callback path is unknown ahead of time.
  */
 
 const fs = require("fs");
