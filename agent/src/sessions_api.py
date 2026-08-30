@@ -44,6 +44,7 @@ from . import (
     project_store,
     repo_auth_settings,
     repo_scaffold,
+    repo_test_users,
     run_event_store,
     session_store,
 )
@@ -60,6 +61,7 @@ projects_router = APIRouter(prefix="/projects", tags=["projects"])
 repo_auth_settings_router = APIRouter(prefix="/repo-auth-settings", tags=["repo-auth-settings"])
 github_link_router = APIRouter(prefix="/github-link", tags=["github-link"])
 repo_test_config_router = APIRouter(prefix="/repo-test-config", tags=["repo-test-config"])
+repo_test_users_router = APIRouter(prefix="/repo-test-users", tags=["repo-test-users"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -282,6 +284,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     # per-thread store graph.py reads at record_raw_requirements. A brand-new scaffolded repo has
     # no row and gets the locked default -- which stays INERT until a vault provides auth secrets.
     repo_auth_settings.set_for_thread(body.thread_id, await repo_auth_settings.get_settings(owner, repo))
+    repo_test_users.set_for_thread(body.thread_id, await repo_test_users.get_users(owner, repo))
 
     work_branch = branch_naming.work_branch_for(body.thread_id)
     provider = get_sandbox_provider()
@@ -498,6 +501,7 @@ async def terminate_session(thread_id: str, request: Request) -> ProvisionRespon
     registry.pop(thread_id)
     keyvault.pop_app_secrets(thread_id)
     repo_auth_settings.pop_for_thread(thread_id)
+    repo_test_users.pop_for_thread(thread_id)
     return ProvisionResponse(status="terminated")
 
 
@@ -533,6 +537,7 @@ async def delete_session_full(thread_id: str, body: DeleteSessionRequest, reques
     registry.pop(thread_id)
     keyvault.pop_app_secrets(thread_id)
     repo_auth_settings.pop_for_thread(thread_id)
+    repo_test_users.pop_for_thread(thread_id)
 
     branch_deleted = False
     if body.github_token:
@@ -592,6 +597,7 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
     # posture too, or record_raw_requirements_node's next read falls back to the locked default
     # for a repo the user explicitly set to 'none'.
     repo_auth_settings.set_for_thread(thread_id, await repo_auth_settings.get_settings(row["owner"], row["repo"]))
+    repo_test_users.set_for_thread(thread_id, await repo_test_users.get_users(row["owner"], row["repo"]))
     if registry.get(thread_id) is not None:
         await keyvault.write_env_file(get_sandbox_provider(), thread_id, app_secrets)
     logger.info("refreshed %d app secret(s) for thread_id=%s", len(app_secrets), thread_id)
@@ -883,6 +889,33 @@ async def put_repo_test_config(body: RepoTestConfigPutRequest, request: Request)
             raise HTTPException(status_code=422, detail=f"config key {key!r} does not map to a valid env var name")
     await repo_test_config.set_config(body.owner, body.repo, body.entries, updated_by=body.user_login)
     return RepoTestConfigResponse(entries=await repo_test_config.get_config(body.owner, body.repo))
+
+
+# --- per-repo test users (settings page) ------------------------------------------------------
+
+
+class RepoTestUsersResponse(BaseModel):
+    users: list[dict[str, Any]]
+
+
+@repo_test_users_router.get("", response_model=RepoTestUsersResponse)
+async def get_repo_test_users(request: Request, owner: str, repo: str) -> RepoTestUsersResponse:
+    _check_shared_secret(request)
+    return RepoTestUsersResponse(users=await repo_test_users.get_users(owner, repo))
+
+
+class RepoTestUsersPutRequest(BaseModel):
+    owner: str
+    repo: str
+    user_login: str
+    users: list[dict[str, Any]] = []
+
+
+@repo_test_users_router.put("", response_model=RepoTestUsersResponse)
+async def put_repo_test_users(body: RepoTestUsersPutRequest, request: Request) -> RepoTestUsersResponse:
+    _check_shared_secret(request)
+    await repo_test_users.set_users(body.owner, body.repo, body.users, updated_by=body.user_login)
+    return RepoTestUsersResponse(users=await repo_test_users.get_users(body.owner, body.repo))
 
 
 # --- org-wide coding-agent provider settings (settings page, Part 4) --------------------------

@@ -12,6 +12,7 @@ type SaveState =
 
 type SelectionEntry = { name: string; env_name: string | null };
 type ConfigEntry = { key: string; value: string; secret: boolean; source: string };
+type TestUser = { name: string; email: string; roles: string[] };
 
 /** Config keys managed by the test-login system (fake IdP / vault) -- shown read-only so a user
  * can't override what the pipeline injects. Matched against the raw key AND its env-var form. */
@@ -60,6 +61,10 @@ export default function RepoSettingsPage() {
   // Test config values (non-secret app config injected as env vars at test boot).
   const [configEntries, setConfigEntries] = useState<ConfigEntry[]>([]);
   const [configSave, setConfigSave] = useState<SaveState>({ kind: "idle" });
+
+  // Test users (name/email/roles -- no passwords) for multi-role e2e.
+  const [testUsers, setTestUsers] = useState<TestUser[]>([]);
+  const [usersSave, setUsersSave] = useState<SaveState>({ kind: "idle" });
 
   const loadSecrets = useCallback(() => {
     setSecretsError(null);
@@ -115,6 +120,12 @@ export default function RepoSettingsPage() {
       .then((res) => (res.ok ? res.json() : null))
       .then((data: { entries?: ConfigEntry[] } | null) => {
         if (data?.entries?.length) setConfigEntries(data.entries);
+      })
+      .catch(() => undefined);
+    fetch(`/api/repos/test-users?${query}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { users?: TestUser[] } | null) => {
+        if (data?.users?.length) setTestUsers(data.users);
       })
       .catch(() => undefined);
   }, [owner, repo, loadSecrets]);
@@ -223,6 +234,25 @@ export default function RepoSettingsPage() {
       setConfigSave({ kind: "saved", secretCount: 0 });
     } else {
       setConfigSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
+    }
+  }
+
+  async function saveUsers() {
+    setUsersSave({ kind: "saving" });
+    const users = testUsers
+      .map((u) => ({ ...u, name: u.name.trim() }))
+      .filter((u) => u.name);
+    const res = await fetch("/api/repos/test-users", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner, repo, users }),
+    });
+    const body = (await res.json()) as { users?: TestUser[]; detail?: string };
+    if (res.ok) {
+      if (body.users) setTestUsers(body.users);
+      setUsersSave({ kind: "saved", secretCount: 0 });
+    } else {
+      setUsersSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
     }
   }
 
@@ -503,6 +533,83 @@ export default function RepoSettingsPage() {
           {configSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
         </div>
         {configSave.kind === "error" && <p className="text-sm text-red-700">{configSave.detail}</p>}
+      </section>
+
+      <section className="flex max-w-2xl flex-col gap-3 rounded-lg border border-neutral-200 p-4">
+        <div>
+          <h2 className="font-medium">Test users</h2>
+          <p className="mt-1 text-sm text-neutral-500">
+            Users the app is tested as, so end-to-end tests can prove each role sees only what it
+            should. <strong>No passwords</strong> — the test harness signs in for you (a fake identity
+            provider for Entra/OIDC apps, seeded accounts for custom-auth apps). Roles are your app&apos;s
+            own role names (e.g. <code className="rounded bg-neutral-100 px-1">Admin</code>).
+          </p>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          {testUsers.length === 0 && (
+            <p className="text-sm text-neutral-400">No test users yet. Add one to enable multi-role testing.</p>
+          )}
+          {testUsers.map((u, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <input
+                type="text"
+                placeholder="Name"
+                value={u.name}
+                onChange={(e) => setTestUsers((prev) => prev.map((p, j) => (j === i ? { ...p, name: e.target.value } : p)))}
+                className="w-1/4 rounded-md border border-neutral-300 px-2 py-1 text-sm"
+              />
+              <input
+                type="email"
+                placeholder="email@test.local"
+                value={u.email}
+                onChange={(e) => setTestUsers((prev) => prev.map((p, j) => (j === i ? { ...p, email: e.target.value } : p)))}
+                className="w-1/3 rounded-md border border-neutral-300 px-2 py-1 text-sm"
+              />
+              <input
+                type="text"
+                placeholder="roles (comma-separated)"
+                value={u.roles.join(", ")}
+                onChange={(e) =>
+                  setTestUsers((prev) =>
+                    prev.map((p, j) =>
+                      j === i ? { ...p, roles: e.target.value.split(",").map((r) => r.trim()).filter(Boolean) } : p,
+                    ),
+                  )
+                }
+                className="flex-1 rounded-md border border-neutral-300 px-2 py-1 text-sm"
+              />
+              <button
+                type="button"
+                onClick={() => setTestUsers((prev) => prev.filter((_, j) => j !== i))}
+                className="rounded-md px-2 py-1 text-sm text-neutral-400 hover:text-red-600"
+                title="Remove"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setTestUsers((prev) => [...prev, { name: "", email: "", roles: [] }])}
+            className="self-start text-sm text-neutral-600 underline hover:text-neutral-900"
+          >
+            + Add test user
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            onClick={saveUsers}
+            disabled={usersSave.kind === "saving"}
+          >
+            {usersSave.kind === "saving" ? "Saving…" : "Save"}
+          </button>
+          {usersSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
+        </div>
+        {usersSave.kind === "error" && <p className="text-sm text-red-700">{usersSave.detail}</p>}
       </section>
     </div>
   );

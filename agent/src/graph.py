@@ -304,6 +304,9 @@ class GraphState(TypedDict):
     # get_app_auth(state) -- NEVER a direct subscript, because every checkpoint written before
     # this field shipped lacks it, and a gate-approval resume re-enters PAST the seeding node.
     app_auth: dict[str, Any]
+    # Declared test users for THIS run: [{name, email, roles}]. Seeded beside app_auth from
+    # repo_test_users' per-thread store; read via state.get("test_users"). Empty when none declared.
+    test_users: list[dict[str, Any]]
 
 
 def default_stage_state() -> StageState:
@@ -377,6 +380,7 @@ PLAN_GREENFIELD_SEGMENT = load_prompt("plan_greenfield_segment")
 # posture requires it AND Key Vault auth secrets are actually present (an app cannot demand Entra
 # sign-in with no ClientId to sign in against -- see get_app_auth/auth_enforced below).
 AUTH_REQUIREMENT_SEGMENT = load_prompt("auth_requirement_segment")
+TEST_USERS_SEGMENT = load_prompt("test_users_segment")
 
 # W9: repo-durable memory (.ai-dev-workflow/memory.md -- the only store that outlives the
 # container, since $HOME and its .claude transcripts die on every reprovision). Appended to the
@@ -424,6 +428,13 @@ def _auth_segment_message(state: "GraphState") -> HumanMessage:
     routes = get_app_auth(state).get("anonymous_routes") or []
     rendered = "\n".join(f"  - {r}" for r in routes) if routes else "  (none -- every route requires sign-in)"
     return HumanMessage(content=AUTH_REQUIREMENT_SEGMENT.replace("<<anonymous_routes>>", rendered))
+
+
+def _test_users_segment_message(state: "GraphState") -> HumanMessage:
+    from . import repo_test_users
+
+    table = repo_test_users.render_table(state.get("test_users") or [])
+    return HumanMessage(content=TEST_USERS_SEGMENT.replace("<<test_users>>", table))
 
 # Appended only when hydrate_plan_ticket_mode_context (StageSpec.draft_prompt_context_from_repo_file)
 # finds an earlier ticket's approved Plan already on disk -- spec_ledger.hydrate_ticket_mode_context's
@@ -759,11 +770,11 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
     # through after provision): repo settings from the per-thread store sessions_api populated,
     # plus whether Key Vault actually delivered auth secrets -- auth_enforced() needs both.
     # Checkpointed like every other GraphState field; resumes re-read it from the checkpoint.
-    from . import keyvault, repo_auth_settings
+    from . import keyvault, repo_auth_settings, repo_test_users
 
     auth_settings = repo_auth_settings.get_for_thread(thread_id)
     app_auth = {**auth_settings, "secrets_present": bool(keyvault.get_app_secrets(thread_id))}
-    return {"stages": stages, "app_auth": app_auth}
+    return {"stages": stages, "app_auth": app_auth, "test_users": repo_test_users.get_for_thread(thread_id)}
 
 
 async def _verify_specification_ledger(
@@ -831,6 +842,8 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
     # then re-fails the auth gate. The segment mandates the AIDW_TEST_AUTH seam tests sign in with.
     if auth_enforced(state):
         messages.append(_auth_segment_message(state))
+    if state.get("test_users"):
+        messages.append(_test_users_segment_message(state))
     messages.append(HumanMessage(content=MEMORY_SEGMENT))
     if tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=AC_TO_TESTS_GREENFIELD_SEGMENT))
@@ -894,6 +907,8 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
     ]
     if auth_enforced(state):
         messages.append(_auth_segment_message(state))
+    if state.get("test_users"):
+        messages.append(_test_users_segment_message(state))
     messages.append(HumanMessage(content=MEMORY_SEGMENT))
     if _tech_stack_has_ui_framework(state):
         messages.append(HumanMessage(content=IMPECCABLE_CODEGEN_SEGMENT))
