@@ -125,13 +125,22 @@ async function main() {
     }
   };
 
-  // Minimal interaction: a button per test user, no password. Posts the chosen account back.
-  const interactionUrl = new RegExp(`^${ISSUER_PATH}/interaction/([^/]+)$`);
-  const submitUrl = new RegExp(`^${ISSUER_PATH}/interaction/([^/]+)/login$`);
+  // oidc-provider serves its routes at ITS OWN root (/.well-known/..., /auth, /token). The issuer
+  // carries a path (/aidw/v2.0) so Microsoft.Identity.Web composes discovery there, so this server
+  // is MOUNTED under that prefix: strip it from every request before delegating, and the provider's
+  // absolute URLs (which include the prefix) map straight back. Interaction routes are handled here.
+  const interactionUrl = /^\/interaction\/([^/]+)$/;
+  const submitUrl = /^\/interaction\/([^/]+)\/login$/;
 
   const rawHandler = provider.callback();
   const server = require("http").createServer(async (req, res) => {
-    const path = req.url.split("?")[0];
+    // Map external /aidw/v2.0/* to the provider's internal /* (default "/" for the bare prefix).
+    let internal = req.url;
+    if (internal === ISSUER_PATH) internal = "/";
+    else if (internal.startsWith(ISSUER_PATH + "/")) internal = internal.slice(ISSUER_PATH.length);
+    req.url = internal;
+
+    const path = internal.split("?")[0];
     const showMatch = path.match(interactionUrl);
     const postMatch = path.match(submitUrl);
     try {
@@ -151,7 +160,6 @@ async function main() {
         return;
       }
       if (postMatch && req.method === "POST") {
-        const uid = postMatch[1];
         let body = "";
         for await (const chunk of req) body += chunk;
         const oid = new URLSearchParams(body).get("oid");
