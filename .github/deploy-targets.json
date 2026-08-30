@@ -1,0 +1,5 @@
+{
+  "_comment": "Deploy fan-out per branch (deploy.yml). Each entry names a GitHub Environment AND a matching infra/params/<target>.bicepparam. Onboarding a customer tenant = run infra/onboard-target.ps1, create the GitHub Environment, add the slug (<=12 chars, lowercase alphanumeric) to the 'main' list. All targets on a branch deploy simultaneously.",
+  "dev": ["nonprod"],
+  "main": ["prod"]
+}

@@ -15,59 +15,33 @@
 // both tested and both failed with a reproducible connection timeout -- see the plan's Section
 // C.3 for the full writeup).
 
-@description('Short, unique-ish name prefix for all resources (e.g. "aidevworkflow-dev").')
+@description('Short, unique-ish name prefix for all resources, "aidw-<target>" by convention (e.g. "aidw-nonprod", "aidw-prod", "aidw-<customer>"). Key Vault names are the tight constraint: "<namePrefix>-config" must stay within 24 chars, so the target slug caps at 12.')
 param namePrefix string
 
 @description('Azure region for all resources.')
 param location string = resourceGroup().location
 
-@description('GitHub OAuth App client id (frontend sign-in).')
-@secure()
-param authGithubId string
+// The ~9 former @secure() params (auth secrets, provider tokens, entra client secret, shared
+// secret) are GONE on purpose: both apps boot their secret config from configVault below
+// (src/instrumentation.ts, agent/src/env_bootstrap.py) and the env-wins precedence meant any
+// template-set secretRef silently overrode the vault (the transitional conflict flagged in
+// docs/superpowers/specs/2026-08-30-keyvault-config-design.md:51). Seeding the vault is the
+// runbook's job (infra/README.md); this template only wires non-secret structural env.
 
-@description('GitHub OAuth App client secret (frontend sign-in).')
-@secure()
-param authGithubSecret string
-
-@description('NextAuth session-signing secret (openssl rand -base64 32).')
-@secure()
-param authSecret string
-
-@description('Shared GitHub Copilot PAT used by every Copilot SDK session regardless of signed-in user (see agent/README.md and the plan\'s D.3 scaling note on why this is shared, not per-user, today).')
-@secure()
-param copilotGithubToken string
-
-@description('Fallback coding-agent provider, used only until an org admin saves a setting via the Settings UI (agent/src/org_settings.py), or if that DB read ever fails. agent/src/chat_model.py\'s get_provider() checks the database first and falls back to this env var second -- it is NOT a startup-only, immutable choice: an admin can change the live provider without a redeploy (Part 4).')
-@allowed(['copilot', 'claude'])
-param agentProvider string = 'claude'
-
-@description('Anthropic API key for the Claude provider, metered billing (agent/src/claude_chat_model.py). Left blank when agentProvider is \'copilot\' -- unused in that mode. Mutually exclusive with anthropicOAuthToken -- see that param\'s own description for the precedence rule if both are somehow set.')
-@secure()
-param anthropicApiKey string = ''
-
-@description('Anthropic subscription (Pro/Max/Team) OAuth token for the Claude provider, from `claude setup-token` (agent/src/chat_model.py\'s get_runtime_auth_token() env-var fallback path; Phase E audit C-1). Left blank when agentProvider is \'copilot\', or when the deployment bills by API key instead. Sibling of anthropicApiKey, same secret/env pattern -- deploy with exactly one of the two non-empty, never both: the Claude CLI\'s own documented precedence has ANTHROPIC_API_KEY win if both are set, and this container-level env var is only the FALLBACK anyway (agent/src/org_settings.py\'s Settings-UI-saved credential, if any, always wins over both once an admin has saved one).')
-@secure()
-param anthropicOAuthToken string = ''
-
-@description('Entra tenant id (single-tenant deployment).')
+@description('Entra tenant id (single-tenant per deployment target).')
 param entraTenantId string
 
 @description('The single Entra app registration\'s client id -- covers user sign-in, the exposed api://<id>/access_as_user scope, and the agent\'s on-behalf-of Key Vault exchange (see infra/README.md).')
 param entraAppId string
 
-@description('That app registration\'s client secret (used by both the frontend sign-in and the agent\'s OBO exchange).')
-@secure()
-param entraClientSecret string
-
-@description('Shared secret between the frontend and the agent\'s session endpoints (x-aidw-secret) -- required now that those endpoints carry user Entra assertions.')
-@secure()
-param agentSharedSecret string
-
-@description('Container image for the frontend, e.g. myacr.azurecr.io/ai-dev-workflow-frontend:sha. Left as a placeholder tag on first deploy; CI (deploy-frontend.yml) updates it on every push.')
+@description('Container image for the frontend, e.g. myacr.azurecr.io/ai-dev-workflow-frontend:sha. Placeholder default keeps a first, pre-CI deploy bootable; deploy.yml passes the real :sha via the FRONTEND_IMAGE env var read by infra/params/*.bicepparam.')
 param frontendImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
-@description('Container image for the agent, e.g. myacr.azurecr.io/ai-dev-workflow-agent:sha. Left as a placeholder tag on first deploy; CI (deploy-agent.yml) updates it on every push.')
+@description('Container image for the agent, same convention as frontendImage (AGENT_IMAGE env var).')
 param agentImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
+
+@description('Tag of the sandbox image in this target\'s ACR that azure_aci.py provisions at runtime -- deploy.yml passes the git sha (SANDBOX_IMAGE_TAG env var), pinning sandboxes to the exact bytes CI scanned instead of a drifting :latest.')
+param sandboxImageTag string = 'latest'
 
 @description('VNET address space for the sandbox subnet.')
 param vnetAddressPrefix string = '10.10.0.0/16'
@@ -86,10 +60,10 @@ param sqlAadAdminLogin string
 param sqlAadAdminPrincipalType string = 'User'
 
 var acrName = replace('${namePrefix}acr', '-', '')
-// ACI's own image reference always resolves through the ACR created below, regardless of the
-// tag CI last pushed -- kept as its own var so provision() (agent/src/sandbox/azure_aci.py) and
-// this template agree on the same "latest" convention without a second parameter to keep in sync.
-var sandboxImage = '${acr.name}.azurecr.io/ai-dev-workflow-sandbox:latest'
+// ACI's own image reference always resolves through the ACR created below; the tag is pinned by
+// the sandboxImageTag param so provision() (agent/src/sandbox/azure_aci.py) runs exactly what CI
+// scanned and imported for this deploy.
+var sandboxImage = '${acr.name}.azurecr.io/ai-dev-workflow-sandbox:${sandboxImageTag}'
 
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: '${namePrefix}-logs'
@@ -148,6 +122,11 @@ resource sandboxIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-
 }
 
 resource sandboxAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  // Idempotency trap (applies to every roleAssignment in this file): guid() must seed on values
+  // known at deployment start, so principalId can't be used (ARM rejects it). If an identity-holding
+  // resource is ever deleted and recreated, its principalId changes under the same assignment name
+  // and every later deploy fails with RoleAssignmentUpdateNotPermitted -- fix by deleting the stale
+  // assignment (`az role assignment delete --ids ...`) and re-running the deploy (runbook note).
   name: guid(acr.id, sandboxIdentity.id, 'AcrPull')
   scope: acr
   properties: {
@@ -230,13 +209,6 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 8123
         transport: 'http'
       }
-      secrets: [
-        { name: 'copilot-github-token', value: copilotGithubToken }
-        { name: 'anthropic-api-key', value: anthropicApiKey }
-        { name: 'anthropic-oauth-token', value: anthropicOAuthToken }
-        { name: 'entra-client-secret', value: entraClientSecret }
-        { name: 'agent-shared-secret', value: agentSharedSecret }
-      ]
       registries: [
         { server: '${acr.name}.azurecr.io', identity: 'system' }
       ]
@@ -247,18 +219,10 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'agent'
           image: agentImage
           env: [
-            { name: 'GITHUB_TOKEN', secretRef: 'copilot-github-token' }
-            { name: 'ANTHROPIC_API_KEY', secretRef: 'anthropic-api-key' }
-            // C-1 (Phase E audit): sibling of ANTHROPIC_API_KEY above, same secret/env pattern.
-            // This is the container-level FALLBACK only -- chat_model.get_runtime_auth_token()
-            // checks ANTHROPIC_API_KEY first, then this, and an org admin's Settings-UI-saved
-            // credential (org_settings.py) wins over both once one exists. Deploy with at most one
-            // of anthropicApiKey/anthropicOAuthToken actually non-empty for a given billing mode --
-            // this template sets both env vars unconditionally (empty string is harmless, same
-            // "both always set, one real one empty" convention as GITHUB_TOKEN/ANTHROPIC_API_KEY
-            // above), it's the deploy-time PARAMETER values that must not both be real.
-            { name: 'CLAUDE_CODE_OAUTH_TOKEN', secretRef: 'anthropic-oauth-token' }
-            { name: 'AGENT_PROVIDER', value: agentProvider }
+            // Secrets (GITHUB_TOKEN, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, AGENT_PROVIDER,
+            // AIDW_AGENT_CLIENT_SECRET, AIDW_AGENT_SHARED_SECRET, ...) come from configVault at
+            // boot (agent/src/env_bootstrap.py) -- deliberately NOT set here, because template-set
+            // values win over the vault and would freeze rotation behind a redeploy.
             { name: 'SANDBOX_PROVIDER', value: 'azure' }
             // On-behalf-of Key Vault exchange (agent/src/keyvault.py): the shared Entra app
             // registration's confidential-client credentials. The agent's MANAGED identity is
@@ -266,8 +230,6 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
             // the signed-in user via their forwarded assertion.
             { name: 'AZURE_TENANT_ID', value: entraTenantId }
             { name: 'AIDW_AGENT_APP_ID', value: entraAppId }
-            { name: 'AIDW_AGENT_CLIENT_SECRET', secretRef: 'entra-client-secret' }
-            { name: 'AIDW_AGENT_SHARED_SECRET', secretRef: 'agent-shared-secret' }
             // docker-entrypoint.sh runs `az login --identity` before starting uvicorn when this
             // is set -- the agent's own system-assigned identity (below), not the sandbox
             // identity, which only ever needs AcrPull, never ACI-management permissions.
@@ -322,13 +284,6 @@ resource frontendApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 3000
         transport: 'http'
       }
-      secrets: [
-        { name: 'auth-github-id', value: authGithubId }
-        { name: 'auth-github-secret', value: authGithubSecret }
-        { name: 'auth-secret', value: authSecret }
-        { name: 'entra-client-secret', value: entraClientSecret }
-        { name: 'agent-shared-secret', value: agentSharedSecret }
-      ]
       registries: [
         { server: '${acr.name}.azurecr.io', identity: 'system' }
       ]
@@ -339,16 +294,14 @@ resource frontendApp 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'frontend'
           image: frontendImage
           env: [
-            { name: 'AUTH_GITHUB_ID', secretRef: 'auth-github-id' }
-            { name: 'AUTH_GITHUB_SECRET', secretRef: 'auth-github-secret' }
-            { name: 'AUTH_SECRET', secretRef: 'auth-secret' }
+            // Secrets (AUTH_GITHUB_ID/SECRET, AUTH_SECRET, AIDW_AGENT_CLIENT_SECRET,
+            // AIDW_AGENT_SHARED_SECRET, ...) come from configVault at boot
+            // (src/instrumentation.ts) -- deliberately NOT set here; template-set values would
+            // win over the vault (env-wins precedence).
             // Entra ID primary sign-in (src/auth.ts): the ONE shared app registration -- same
-            // three values the agent gets. GitHub above is the LINKED account (repos/push), not
-            // the sign-in.
+            // values the agent gets. GitHub is the LINKED account (repos/push), not the sign-in.
             { name: 'AZURE_TENANT_ID', value: entraTenantId }
             { name: 'AIDW_AGENT_APP_ID', value: entraAppId }
-            { name: 'AIDW_AGENT_CLIENT_SECRET', secretRef: 'entra-client-secret' }
-            { name: 'AIDW_AGENT_SHARED_SECRET', secretRef: 'agent-shared-secret' }
             // Required behind Container Apps' ingress -- confirmed locally (Dockerfile smoke
             // test) that NextAuth otherwise rejects every request with UntrustedHost.
             { name: 'AUTH_TRUST_HOST', value: 'true' }

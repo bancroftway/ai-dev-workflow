@@ -1,0 +1,212 @@
+# Build-once-deploy-everywhere (production CI/CD plan, Phase 3).
+#
+# dev  -> every target listed under "dev"  in .github/deploy-targets.json (home nonprod)
+# main -> every target listed under "main" (home prod + every customer tenant, simultaneously)
+#
+# Images are built and Trivy-gated ONCE, pushed to private GHCR as :<sha> only, then imported into
+# each target tenant's ACR -- identical bytes everywhere. The deploy itself is a single idempotent
+# `az deployment group create` per target; infra drift and app rollout are one operation, and
+# rollback is "re-run this workflow from the last good commit".
+#
+# Per-target GitHub Environment must define variables: AZURE_CLIENT_ID, AZURE_TENANT_ID,
+# AZURE_SUBSCRIPTION_ID, RESOURCE_GROUP, ACR_NAME, NAME_PREFIX -- plus a federated credential on
+# that tenant's deploy app registration with subject repo:<owner>/<repo>:environment:<target>.
+#
+# FIRST BOOTSTRAP of a new target is EXPECTED to go red at the smoke step: the apps crash-loop
+# until the target's config vault is seeded (infra/README.md runbook). Seed the vault, restart the
+# apps, re-run this workflow -- every step is idempotent.
+name: Deploy
+
+on:
+  push:
+    branches: [dev, main]
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: frontend
+            context: .
+          - name: agent
+            context: agent
+          - name: sandbox
+            context: agent/sandbox-image
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build -t "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" "${{ matrix.context }}"
+      # Gate BEFORE push: a vulnerable image never reaches any registry. Sandbox is a
+      # dev-toolchain image that chronically carries HIGHs -- CRITICAL-only there, tighten via
+      # .trivyignore as the list shrinks.
+      - name: trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}
+          severity: ${{ matrix.name == 'sandbox' && 'CRITICAL' || 'HIGH,CRITICAL' }}
+          ignore-unfixed: true
+          exit-code: 1
+      - name: push to GHCR (private)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}"
+
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.read.outputs.list }}
+      any: ${{ steps.read.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          LIST=$(jq -c --arg b "${{ github.ref_name }}" '.[$b] // []' .github/deploy-targets.json)
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+          echo "any=$([ "$LIST" != "[]" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [build, targets]
+    if: needs.targets.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write # mandatory for OIDC azure/login
+    strategy:
+      fail-fast: false # one tenant failing must not stop the rest
+      matrix:
+        target: ${{ fromJson(needs.targets.outputs.list) }}
+    environment: ${{ matrix.target }}
+    env:
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Same bytes in every tenant; --force makes re-imports (workflow re-runs) idempotent.
+      - name: import images into target ACR
+        run: |
+          for n in frontend agent sandbox; do
+            az acr import --name "$ACR_NAME" \
+              --source "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-$n:$SHA" \
+              --image "ai-dev-workflow-$n:$SHA" \
+              --username "${{ github.actor }}" --password "${{ secrets.GITHUB_TOKEN }}" \
+              --force
+          done
+
+      # The drain/grant/migrate steps below run the agent's own db helpers on the runner: they
+      # need the MS ODBC driver (not in Ubuntu's default repos -- add Microsoft's) and uv.
+      - name: prepare agent tooling
+        run: |
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc >/dev/null
+          curl -sSL "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list" | sudo tee /etc/apt/sources.list.d/mssql-release.list >/dev/null
+          sudo apt-get update -qq
+          sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18
+          pipx install uv
+          cd agent && uv sync --frozen
+
+      # Drain BEFORE the revision swap: the agent's LangGraph state is in-memory only, so the old
+      # revision's in-flight sessions die with it. Draining first marks them failed while they are
+      # still genuinely doomed; draining after the swap would wrongly kill healthy sessions started
+      # on the NEW revision. Guarded on DB existence so a first bootstrap (no DB yet) skips it.
+      - name: drain in-flight sessions
+        run: |
+          if az sql db show -g "$RESOURCE_GROUP" -s "$NAME_PREFIX-sql" -n "Ai-Dev-Workflow" >/dev/null 2>&1; then
+            cd agent
+            AZURE_SQL_SERVER="$NAME_PREFIX-sql.database.windows.net" \
+            AZURE_SQL_DATABASE="Ai-Dev-Workflow" \
+              uv run python -m src.deploy_drain --run
+          else
+            echo "no database yet (first bootstrap) -- skipping drain"
+          fi
+
+      - name: what-if (informational)
+        run: |
+          {
+            echo '## what-if: ${{ matrix.target }}'
+            echo '```'
+            FRONTEND_IMAGE="$ACR_NAME.azurecr.io/ai-dev-workflow-frontend:$SHA" \
+            AGENT_IMAGE="$ACR_NAME.azurecr.io/ai-dev-workflow-agent:$SHA" \
+            SANDBOX_IMAGE_TAG="$SHA" \
+              az deployment group what-if -g "$RESOURCE_GROUP" \
+                --template-file infra/main.bicep \
+                --parameters "infra/params/${{ matrix.target }}.bicepparam" \
+                --no-pretty-print || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: deploy (bicep, idempotent)
+        run: |
+          FRONTEND_IMAGE="$ACR_NAME.azurecr.io/ai-dev-workflow-frontend:$SHA" \
+          AGENT_IMAGE="$ACR_NAME.azurecr.io/ai-dev-workflow-agent:$SHA" \
+          SANDBOX_IMAGE_TAG="$SHA" \
+            az deployment group create -g "$RESOURCE_GROUP" \
+              --name "deploy-$SHA" \
+              --template-file infra/main.bicep \
+              --parameters "infra/params/${{ matrix.target }}.bicepparam"
+
+      # Idempotent every deploy; automates the one-time grant from infra/README.md. Runs as the
+      # deploy SP, which is a member of the aidw-sql-admins group (the server's AAD admin).
+      - name: grant agent identity on SQL
+        run: |
+          cd agent
+          AZURE_SQL_SERVER="$NAME_PREFIX-sql.database.windows.net" \
+          AZURE_SQL_DATABASE="Ai-Dev-Workflow" \
+          AGENT_PRINCIPAL="$NAME_PREFIX-agent" \
+            uv run python - <<'EOF'
+          import os
+          from src import db
+
+          agent = os.environ["AGENT_PRINCIPAL"]
+          sql = f"""
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = '{agent}')
+            CREATE USER [{agent}] FROM EXTERNAL PROVIDER;
+          IF IS_ROLEMEMBER('db_datareader', '{agent}') = 0
+            ALTER ROLE db_datareader ADD MEMBER [{agent}];
+          IF IS_ROLEMEMBER('db_datawriter', '{agent}') = 0
+            ALTER ROLE db_datawriter ADD MEMBER [{agent}];
+          """
+          conn = db.connect()
+          try:
+              conn.cursor().execute(sql)
+              conn.commit()
+          finally:
+              conn.close()
+          print(f"grants ensured for [{agent}]")
+          EOF
+
+      - name: run DB migrations
+        run: |
+          cd agent
+          AZURE_SQL_SERVER="$NAME_PREFIX-sql.database.windows.net" \
+          AZURE_SQL_DATABASE="Ai-Dev-Workflow" \
+            uv run python -m src.db_migrate
+
+      # First bootstrap of a new target fails HERE until its config vault is seeded -- expected;
+      # see the header comment and infra/README.md.
+      - name: smoke
+        run: |
+          FRONTEND_URL=$(az deployment group show -g "$RESOURCE_GROUP" --name "deploy-$SHA" \
+            --query properties.outputs.frontendUrl.value -o tsv)
+          curl -sf --max-time 30 --retry 5 --retry-delay 10 --retry-all-errors "$FRONTEND_URL" >/dev/null
+          STATUS=$(az containerapp revision list -g "$RESOURCE_GROUP" -n "$NAME_PREFIX-agent" \
+            --query '[?properties.active].properties.healthState | [0]' -o tsv)
+          echo "agent latest active revision health: $STATUS"
+          [ "$STATUS" = "Healthy" ]

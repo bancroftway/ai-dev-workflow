@@ -1,0 +1,96 @@
+# PR gate for dev and main (production CI/CD plan, Phase 2). Four required checks -- the branch
+# rulesets name these jobs verbatim: frontend, agent, bicep, security. No Azure credentials
+# anywhere in this workflow; anything needing a subscription lives in deploy.yml.
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # npm install, not npm ci: the lockfile lacks optional wasm32 fallbacks (Dockerfile:6-11's
+      # deliberate choice) -- CI matches the image build exactly.
+      - run: npm install
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm run build
+
+  agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      # Whole-tree syntax gate: covers modules the _demo loop below skips.
+      - run: uv run python -m compileall -q src
+      # The repo's test convention is _demo() __main__ self-checks, not pytest (see AGENTS/docs).
+      # SKIP = modules whose demos need a DB, network, credentials, or an LLM. Finalized from a
+      # local run; extend it when a new demo legitimately can't run offline.
+      - name: demo self-checks
+        run: |
+          SKIP="db_migrate session_store project_store org_settings repo_auth_settings \
+            repo_test_users repo_test_config run_event_store deploy_drain sessions_api \
+            keyvault org_credential_vault github_link_store repo_scaffold chat_model \
+            claude_chat_model copilot_chat_model cli_agent_exec telemetry graph \
+            e2e_nodes fake_idp rebuild"
+          fail=0
+          for f in $(git ls-files 'src/*.py' 'src/gates/*.py'); do
+            grep -q 'def _demo' "$f" || continue
+            base=$(basename "$f" .py)
+            case " $SKIP " in *" $base "*) continue ;; esac
+            mod="${f%.py}"; mod="${mod//\//.}"
+            echo "== $mod"
+            timeout 120 uv run python -m "$mod" || { echo "FAIL $mod"; fail=1; }
+          done
+          exit $fail
+
+  bicep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: az bicep build --file infra/main.bicep
+      - run: az bicep build-params --file infra/params/nonprod.bicepparam
+      - run: az bicep build-params --file infra/params/prod.bicepparam
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks scans full history
+      # Gitleaks CLI, not gitleaks-action (the action needs a paid org license). The baseline file
+      # freezes pre-existing historical findings so only NEW leaks fail; anything real captured in
+      # the baseline must be rotated, not ignored.
+      - name: gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz gitleaks
+          BASELINE=""
+          [ -f .gitleaks-baseline.json ] && BASELINE="--baseline-path .gitleaks-baseline.json"
+          ./gitleaks git --redact --exit-code 1 $BASELINE .
+      - name: semgrep
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          pipx install semgrep
+          semgrep scan --config auto --error
+      - name: trivy fs + config
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
