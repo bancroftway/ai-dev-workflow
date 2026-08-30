@@ -1,16 +1,15 @@
 # Onboard a new deployment target (home env or customer tenant) for the build-once
 # deploy-everywhere pipeline (.github/workflows/deploy.yml). Run once per target by a human with
-# admin rights IN THAT TENANT; every az call is idempotent-ish (create-if-missing) so re-running
+# admin rights IN THAT TENANT; every step is guarded by an existence pre-check, so re-running
 # after a partial failure is safe.
 #
-#   ./onboard-target.ps1 -Slug acme -TenantId <guid> -SubscriptionId <guid> `
+#   ./onboard-target.ps1 -Slug nonprod -TenantId <guid> -SubscriptionId <guid> `
 #       -GitHubRepo owner/ai-dev-workflow [-Location eastus2]
 #
 # Slug rules: <=12 chars, lowercase alphanumeric -- "aidw-<slug>-config" (Key Vault) caps at 24.
-# After this script: create the GitHub Environment "<slug>" with the printed variables, copy
-# infra/params/prod.bicepparam to infra/params/<slug>.bicepparam with the printed ids, add the
-# slug to .github/deploy-targets.json, merge -- the pipeline bootstraps the rest (first run goes
-# red at smoke until the config vault is seeded; see infra/README.md).
+# Windows PowerShell 5.1 compatible: no stderr redirection on native az calls (5.1 wraps redirected
+# native stderr into ErrorRecords, which throws under -ErrorAction Stop even on success), JSON
+# always passed to az via @file (inline JSON loses its quotes to native arg parsing on Windows).
 param(
   [Parameter(Mandatory)][ValidatePattern('^[a-z0-9]{1,12}$')][string]$Slug,
   [Parameter(Mandatory)][string]$TenantId,
@@ -19,78 +18,112 @@ param(
   [string]$Location = 'eastus2'
 )
 $ErrorActionPreference = 'Stop'
+$env:AZURE_CORE_ONLY_SHOW_ERRORS = 'true'
 $prefix = "aidw-$Slug"
 $rg = "$prefix-rg"
 
-az login --tenant $TenantId --only-show-errors | Out-Null
-az account set --subscription $SubscriptionId
+function Invoke-Az {
+  # az's exit code is the only reliable failure signal for a native call in PS 5.1 -- check it
+  # after every call that must have succeeded, with the args echoed so the failing step is obvious.
+  param([Parameter(Mandatory)][string[]]$AzArgs)
+  $out = az @AzArgs
+  if ($LASTEXITCODE -ne 0) { throw "az $($AzArgs -join ' ') failed (exit $LASTEXITCODE)" }
+  return $out
+}
+
+Write-Host "== Signing in to tenant $TenantId"
+Invoke-Az @('login', '--tenant', $TenantId) | Out-Null
+Invoke-Az @('account', 'set', '--subscription', $SubscriptionId) | Out-Null
 
 # --- 1. Deploy app registration + GitHub OIDC federated credential (no secret anywhere) ---
+Write-Host '== Deploy app registration + federated credential'
 $deployAppName = "aidw-deploy-$Slug"
-$deployAppId = az ad app list --display-name $deployAppName --query '[0].appId' -o tsv
-if (-not $deployAppId) { $deployAppId = az ad app create --display-name $deployAppName --query appId -o tsv }
-$deploySpId = az ad sp list --filter "appId eq '$deployAppId'" --query '[0].id' -o tsv
-if (-not $deploySpId) { $deploySpId = az ad sp create --id $deployAppId --query id -o tsv }
+$deployAppId = Invoke-Az @('ad', 'app', 'list', '--display-name', $deployAppName, '--query', '[0].appId', '-o', 'tsv')
+if (-not $deployAppId) { $deployAppId = Invoke-Az @('ad', 'app', 'create', '--display-name', $deployAppName, '--query', 'appId', '-o', 'tsv') }
+$deploySpId = Invoke-Az @('ad', 'sp', 'list', '--filter', "appId eq '$deployAppId'", '--query', '[0].id', '-o', 'tsv')
+if (-not $deploySpId) { $deploySpId = Invoke-Az @('ad', 'sp', 'create', '--id', $deployAppId, '--query', 'id', '-o', 'tsv') }
 
 $fedName = "aidw-deploy-$Slug-github"
-$existingFed = az ad app federated-credential list --id $deployAppId --query "[?name=='$fedName'] | [0].name" -o tsv
+$existingFed = Invoke-Az @('ad', 'app', 'federated-credential', 'list', '--id', $deployAppId, '--query', "[?name=='$fedName'] | [0].name", '-o', 'tsv')
 if (-not $existingFed) {
-  $fed = @{
+  $fedFile = Join-Path $env:TEMP "aidw-fed-$Slug.json"
+  @{
     name = $fedName
     issuer = 'https://token.actions.githubusercontent.com'
     subject = "repo:${GitHubRepo}:environment:$Slug"
     audiences = @('api://AzureADTokenExchange')
-  } | ConvertTo-Json -Compress
-  az ad app federated-credential create --id $deployAppId --parameters $fed | Out-Null
+  } | ConvertTo-Json | Out-File -Encoding ascii $fedFile
+  Invoke-Az @('ad', 'app', 'federated-credential', 'create', '--id', $deployAppId, '--parameters', "@$fedFile") | Out-Null
+  Remove-Item $fedFile
 }
 
 # --- 2. Sign-in app registration: App Roles (Admin/Member), exposed API, assignment required ---
+Write-Host '== Sign-in app registration (App Roles, exposed API, assignment-required)'
 $signinAppName = "aidw-$Slug-signin"
-$signinAppId = az ad app list --display-name $signinAppName --query '[0].appId' -o tsv
-if (-not $signinAppId) { $signinAppId = az ad app create --display-name $signinAppName --sign-in-audience AzureADMyOrg --query appId -o tsv }
-# App Roles manifest -- ids are arbitrary but must stay stable per app once assigned.
-$roles = @(
-  @{ allowedMemberTypes = @('User'); description = 'Manage org settings'; displayName = 'Admin'
-     id = [guid]::NewGuid().Guid; isEnabled = $true; value = 'Admin' },
-  @{ allowedMemberTypes = @('User'); description = 'Standard access'; displayName = 'Member'
-     id = [guid]::NewGuid().Guid; isEnabled = $true; value = 'Member' }
-)
-$haveRoles = az ad app show --id $signinAppId --query 'length(appRoles)' -o tsv
+$signinAppId = Invoke-Az @('ad', 'app', 'list', '--display-name', $signinAppName, '--query', '[0].appId', '-o', 'tsv')
+if (-not $signinAppId) { $signinAppId = Invoke-Az @('ad', 'app', 'create', '--display-name', $signinAppName, '--sign-in-audience', 'AzureADMyOrg', '--query', 'appId', '-o', 'tsv') }
+
+# App Role ids are arbitrary but must stay stable per app once assigned -- only set on first run.
+$haveRoles = Invoke-Az @('ad', 'app', 'show', '--id', $signinAppId, '--query', 'length(appRoles)', '-o', 'tsv')
 if ($haveRoles -eq '0') {
-  $rolesJson = ConvertTo-Json $roles -Depth 4 -Compress
-  az ad app update --id $signinAppId --app-roles $rolesJson
+  $rolesFile = Join-Path $env:TEMP "aidw-roles-$Slug.json"
+  ConvertTo-Json @(
+    @{ allowedMemberTypes = @('User'); description = 'Manage org settings'; displayName = 'Admin'
+       id = [guid]::NewGuid().Guid; isEnabled = $true; value = 'Admin' },
+    @{ allowedMemberTypes = @('User'); description = 'Standard access'; displayName = 'Member'
+       id = [guid]::NewGuid().Guid; isEnabled = $true; value = 'Member' }
+  ) -Depth 4 | Out-File -Encoding ascii $rolesFile
+  Invoke-Az @('ad', 'app', 'update', '--id', $signinAppId, '--app-roles', "@$rolesFile") | Out-Null
+  Remove-Item $rolesFile
 }
+
 # Expose api://<appId>/access_as_user (the OBO assertion scope src/auth.ts requests).
-az ad app update --id $signinAppId --identifier-uris "api://$signinAppId" 2>$null
-$signinSpId = az ad sp list --filter "appId eq '$signinAppId'" --query '[0].id' -o tsv
-if (-not $signinSpId) { $signinSpId = az ad sp create --id $signinAppId --query id -o tsv }
+$haveUri = Invoke-Az @('ad', 'app', 'show', '--id', $signinAppId, '--query', 'length(identifierUris)', '-o', 'tsv')
+if ($haveUri -eq '0') {
+  Invoke-Az @('ad', 'app', 'update', '--id', $signinAppId, '--identifier-uris', "api://$signinAppId") | Out-Null
+}
+$signinSpId = Invoke-Az @('ad', 'sp', 'list', '--filter', "appId eq '$signinAppId'", '--query', '[0].id', '-o', 'tsv')
+if (-not $signinSpId) { $signinSpId = Invoke-Az @('ad', 'sp', 'create', '--id', $signinAppId, '--query', 'id', '-o', 'tsv') }
 # Assignment required: unassigned users cannot sign in at all -- Member baseline, enforced by
 # Entra, zero app code. Assign users (free tier) or groups (needs Entra ID P1) to the roles in
 # the portal's Enterprise Application blade.
-az ad sp update --id $signinSpId --set appRoleAssignmentRequired=true
+Invoke-Az @('ad', 'sp', 'update', '--id', $signinSpId, '--set', 'appRoleAssignmentRequired=true') | Out-Null
 
 # --- 3. SQL AAD admin group (deploy SP is a member -> pipeline can grant/migrate/drain) ---
+Write-Host '== aidw-sql-admins group'
 $groupName = 'aidw-sql-admins'
-$groupId = az ad group list --display-name $groupName --query '[0].id' -o tsv
-if (-not $groupId) { $groupId = az ad group create --display-name $groupName --mail-nickname $groupName --query id -o tsv }
-az ad group member add --group $groupId --member-id $deploySpId 2>$null
+$groupId = Invoke-Az @('ad', 'group', 'list', '--display-name', $groupName, '--query', '[0].id', '-o', 'tsv')
+if (-not $groupId) { $groupId = Invoke-Az @('ad', 'group', 'create', '--display-name', $groupName, '--mail-nickname', 'aidwsqladmins', '--query', 'id', '-o', 'tsv') }
+$isMember = Invoke-Az @('ad', 'group', 'member', 'check', '--group', $groupId, '--member-id', $deploySpId, '--query', 'value', '-o', 'tsv')
+if ($isMember -ne 'true') {
+  Invoke-Az @('ad', 'group', 'member', 'add', '--group', $groupId, '--member-id', $deploySpId) | Out-Null
+}
 
 # --- 4. Resource group + least-priv deploy grants ---
-az group create --name $rg --location $Location | Out-Null
-az role assignment create --assignee-object-id $deploySpId --assignee-principal-type ServicePrincipal `
-  --role Contributor --scope "/subscriptions/$SubscriptionId/resourceGroups/$rg" 2>$null
+Write-Host "== Resource group $rg + deploy SP role grants"
+Invoke-Az @('group', 'create', '--name', $rg, '--location', $Location) | Out-Null
+$scope = "/subscriptions/$SubscriptionId/resourceGroups/$rg"
+
+function Grant-IfMissing {
+  param([string]$Role, [string[]]$Extra = @())
+  $existing = Invoke-Az @('role', 'assignment', 'list', '--assignee', $deploySpId, '--role', $Role, '--scope', $scope, '--query', '[0].id', '-o', 'tsv')
+  if (-not $existing) {
+    Invoke-Az (@('role', 'assignment', 'create', '--assignee-object-id', $deploySpId,
+      '--assignee-principal-type', 'ServicePrincipal', '--role', $Role, '--scope', $scope) + $Extra) | Out-Null
+  }
+}
+
+Grant-IfMissing -Role 'Contributor'
 # RBAC Administrator, conditioned to ONLY the 4 role definitions main.bicep assigns -- the
 # template's roleAssignments need this; plain Contributor cannot create them, Owner is too much.
-$cond = @(
+$roleIds = @(
   'b24988ac-6180-42a0-ab88-20f7382dd24c', # Contributor (agent -> RG, for ACI management)
   '7f951dda-4ed3-4680-a7ca-43fe172d538d', # AcrPull
   'b86a8fe4-44ce-4948-aee5-eccb2c155cd7', # Key Vault Secrets Officer
   '4633458b-17de-408a-b874-0445c86b69e6'  # Key Vault Secrets User
-) | ForEach-Object { "{$_}" }
-$condition = "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR (@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$($cond -join ', ' -replace '[{}]','')}))"
-az role assignment create --assignee-object-id $deploySpId --assignee-principal-type ServicePrincipal `
-  --role 'Role Based Access Control Administrator' --scope "/subscriptions/$SubscriptionId/resourceGroups/$rg" `
-  --condition $condition --condition-version '2.0' 2>$null
+) -join ', '
+$condition = "((!(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})) OR (@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {$roleIds}))"
+Grant-IfMissing -Role 'Role Based Access Control Administrator' -Extra @('--condition', $condition, '--condition-version', '2.0')
 
 # --- 5. What the human wires up next ---
 Write-Host @"
@@ -106,13 +139,13 @@ Target '$Slug' onboarded. Now:
      NAME_PREFIX           = $prefix
    Deployment branch policy: main only (dev for the nonprod target).
 
-2. infra/params/$Slug.bicepparam (copy prod.bicepparam):
+2. infra/params/$Slug.bicepparam (copy prod.bicepparam if new):
      namePrefix          = '$prefix'
      entraTenantId       = '$TenantId'
      entraAppId          = '$signinAppId'
      sqlAadAdminObjectId = '$groupId'
 
-3. Add "$Slug" to the right branch list in .github/deploy-targets.json, PR, merge.
+3. Ensure "$Slug" is in the right branch list in .github/deploy-targets.json.
    FIRST deploy goes red at smoke until step 4 -- expected.
 
 4. Seed the config vault $prefix-config (created by that first deploy) per infra/README.md,
