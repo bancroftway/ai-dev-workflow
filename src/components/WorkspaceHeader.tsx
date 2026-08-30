@@ -22,12 +22,16 @@ export function WorkspaceHeader() {
         <RefreshSecretsButton />
         {session?.user && (
           <>
-            <Link
-              href="/settings/organization"
-              className="rounded-md px-2 py-1 text-neutral-500 hover:bg-neutral-100"
-            >
-              Org settings
-            </Link>
+            {/* Admin-only surface (Entra App Role): hiding the link is courtesy -- the page's
+                layout 404s and the API routes 403 non-admins server-side regardless. */}
+            {session.isAdmin && (
+              <Link
+                href="/settings/organization"
+                className="rounded-md px-2 py-1 text-neutral-500 hover:bg-neutral-100"
+              >
+                Org settings
+              </Link>
+            )}
             <span className="text-neutral-600">{session.user.name ?? session.user.email}</span>
             <DisconnectGithubButton />
             <button

@@ -19,6 +19,9 @@ declare module "next-auth" {
     githubConnected: boolean;
     /** Set when the silent Entra token refresh failed -- UI should prompt a re-login. */
     entraAuthError?: string;
+    /** True when the Entra ID token carried the "Admin" App Role. Display-gating only (hide the
+     * Org settings link, 404 the page) -- the API routes re-check the JWT's roles server-side. */
+    isAdmin: boolean;
   }
 }
 
@@ -42,6 +45,10 @@ declare module "next-auth/jwt" {
     entraExpiresAt?: number;
     /** Entra object id -- the immutable user key in the tenant. */
     oid?: string;
+    /** Entra App Roles ("Admin" | "Member") from the ID token's roles claim. Captured at sign-in
+     * only -- refreshEntraIfNeeded never re-reads claims, so a role change takes effect at the
+     * next login (documented limitation, CI/CD plan Phase 6). */
+    roles?: string[];
     error?: "EntraRefreshFailed";
   }
 }
@@ -105,6 +112,16 @@ export async function getServerAuthToken(): Promise<JWT | null> {
  */
 export function auditIdentity(token: JWT | null): string | undefined {
   return token?.email ?? token?.name ?? token?.login ?? token?.oid;
+}
+
+/**
+ * Server-side Admin gate for org-level surfaces (Entra App Role "Admin", CI/CD plan Phase 6).
+ * Reads the JWT directly -- the session object's isAdmin is display-gating only. Request context
+ * only (same constraint as getServerAuthToken).
+ */
+export async function isAdminRequest(): Promise<boolean> {
+  const token = await getServerAuthToken();
+  return token?.roles?.includes("Admin") ?? false;
 }
 
 async function refreshEntraIfNeeded(token: JWT): Promise<JWT> {
@@ -321,6 +338,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         token.entraRefreshToken = account.refresh_token;
         token.entraExpiresAt = account.expires_at;
         token.oid = (profile as { oid?: string } | undefined)?.oid;
+        // App Roles arrive in the ID token once assigned in the tenant (enterprise app has
+        // assignment-required, so an unassigned user never gets this far).
+        token.roles = (profile as { roles?: string[] } | undefined)?.roles ?? [];
         if (prev?.accessToken) {
           token.accessToken = prev.accessToken;
           token.githubId = prev.githubId;
@@ -345,6 +365,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           token.entraRefreshToken = prev.entraRefreshToken;
           token.entraExpiresAt = prev.entraExpiresAt;
           token.oid = prev.oid;
+          // Same carry-over rule as oid: the GitHub link sign-in seeds a fresh JWT, and losing
+          // the roles claim here would silently demote an admin until their next Entra login.
+          token.roles = prev.roles;
         }
         token.accessToken = account.access_token;
         token.githubId = account.providerAccountId;
@@ -366,6 +389,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       session.login = token.login;
       session.githubConnected = Boolean(token.accessToken);
       session.entraAuthError = token.error;
+      session.isAdmin = token.roles?.includes("Admin") ?? false;
       return session;
     },
   },

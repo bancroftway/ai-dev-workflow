@@ -42,6 +42,10 @@ export default function SelectPage() {
   // tickets/new's fetchProject already use -- no `GET /api/projects?owner=&repo=` exists, and one
   // ticket's worth of board-link plumbing doesn't earn a new backend route.
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
+  // Per-repo container cap: lowercase "owner/repo" set of repos with a live sandbox container
+  // right now. Advisory only -- the agent's provision-time 409 is the enforcement; this just
+  // explains it before the user hits it.
+  const [activeRepos, setActiveRepos] = useState<Set<string>>(new Set());
 
   const selectedRepo = useMemo(
     () => repos?.find((r) => r.fullName === selectedFullName) ?? null,
@@ -100,6 +104,30 @@ export default function SelectPage() {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    // Live-container poll: same 15s interval + focus-refetch pattern the board page settled on
+    // (board/page.tsx) -- plain polling, deliberately no push channel. Best-effort: a failed
+    // fetch keeps the previous set (stale badge for one round beats a flickering one).
+    let cancelled = false;
+    const load = () =>
+      fetch("/api/sessions/active")
+        .then((res) => (res.ok ? (res.json() as Promise<{ active: { owner: string; repo: string }[] }>) : null))
+        .then((data) => {
+          if (data && !cancelled) {
+            setActiveRepos(new Set(data.active.map((a) => `${a.owner}/${a.repo}`.toLowerCase())));
+          }
+        })
+        .catch(() => {});
+    load();
+    const interval = setInterval(load, 15_000);
+    window.addEventListener("focus", load);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      window.removeEventListener("focus", load);
+    };
+  }, []);
+
   return (
     <div className="flex h-full w-full flex-col gap-4 p-6">
       <div className="flex items-start justify-between gap-4">
@@ -153,6 +181,7 @@ export default function SelectPage() {
                     key={r.fullName}
                     repo={r}
                     selected={r.fullName === selectedFullName}
+                    containerRunning={activeRepos.has(r.fullName.toLowerCase())}
                     onSelect={() => setSelectedFullName(r.fullName)}
                   />
                 ))}
@@ -165,7 +194,12 @@ export default function SelectPage() {
           {/* Keyed by repo so switching repositories always starts this section's state fresh,
               rather than manually resetting branch state via an effect. */}
           {selectedRepo ? (
-            <RepoBranchSection key={selectedRepo.fullName} repo={selectedRepo} projectId={selectedProjectId} />
+            <RepoBranchSection
+              key={selectedRepo.fullName}
+              repo={selectedRepo}
+              projectId={selectedProjectId}
+              containerRunning={activeRepos.has(selectedRepo.fullName.toLowerCase())}
+            />
           ) : (
             <p className="text-sm text-neutral-500">Select a repository to see its branches and sessions.</p>
           )}
@@ -178,12 +212,17 @@ export default function SelectPage() {
 function RepoRow({
   repo,
   selected,
+  containerRunning,
   onSelect,
 }: {
   repo: RepoSummary;
   selected: boolean;
+  containerRunning: boolean;
   onSelect: () => void;
 }) {
+  // Deliberately still clickable while a container runs: selecting shows the session history and
+  // the explanatory warning -- only "Start new session" is disabled (RepoBranchSection). The
+  // muted text + amber pill are the at-a-glance signal.
   return (
     <div
       className={`flex w-full cursor-pointer items-center gap-3 border-b border-neutral-100 px-3 py-2 text-left last:border-b-0 ${
@@ -200,8 +239,18 @@ function RepoRow({
         }
       }}
     >
-      <div className="min-w-0 flex-1">
-        <span className="block truncate text-sm font-medium">{repo.fullName}</span>
+      <div className={`min-w-0 flex-1 ${containerRunning && !selected ? "opacity-60" : ""}`}>
+        <span className="flex items-center gap-2 text-sm font-medium">
+          <span className="truncate">{repo.fullName}</span>
+          {containerRunning && (
+            <span
+              className="shrink-0 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-900"
+              title={`A sandbox container is already running for ${repo.fullName} -- only one per repository.`}
+            >
+              ● container running
+            </span>
+          )}
+        </span>
         <span className={`text-xs ${selected ? "text-neutral-300" : "text-neutral-500"}`}>
           {repo.private ? "private" : "public"}
           {repo.updatedAt ? ` · updated ${timeAgo(repo.updatedAt)}` : ""}
@@ -244,7 +293,15 @@ function timeAgo(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-function RepoBranchSection({ repo, projectId }: { repo: RepoSummary; projectId: string | null }) {
+function RepoBranchSection({
+  repo,
+  projectId,
+  containerRunning,
+}: {
+  repo: RepoSummary;
+  projectId: string | null;
+  containerRunning: boolean;
+}) {
   const router = useRouter();
   const [branches, setBranches] = useState<BranchSummary[] | null>(null);
   const [branchesError, setBranchesError] = useState<string | null>(null);
@@ -354,12 +411,26 @@ function RepoBranchSection({ repo, projectId }: { repo: RepoSummary; projectId: 
         </select>
       </label>
 
+      {/* Per-repo container cap: the courtesy layer. The agent's provision-time 409 is the real
+          enforcement (a resume attempt elsewhere renders that 409's message verbatim via
+          SandboxSessionBoot) -- this warning + disabled button just explain it up front. */}
+      {containerRunning && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3">
+          <p className="text-sm font-medium text-amber-900">A sandbox container is already running for this repository.</p>
+          <p className="mt-1 text-sm text-amber-800">
+            Only one container per repository is allowed. Stop the running session below, or wait
+            for it to finish, before starting a new one.
+          </p>
+        </div>
+      )}
+
       {selectedBranch && (
         <button
           type="button"
           className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           onClick={startNewSession}
-          disabled={starting}
+          disabled={starting || containerRunning}
+          title={containerRunning ? "A container is already running for this repository -- one per repo." : undefined}
         >
           {starting ? "Starting…" : "Start new session"}
         </button>

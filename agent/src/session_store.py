@@ -231,7 +231,19 @@ async def close_session(
     pr_url: str | None = None,
 ) -> None:
     """Replaces session_index.end_session / the DB half of git_ops.record_run_failure. Always
-    sets ended_at -- this is a terminal close for the current attempt."""
+    sets ended_at -- this is a terminal close for the current attempt.
+
+    Side effect (per-repo container cap, CI/CD plan Phase 5): every terminal transition also
+    fire-and-forgets the session's container teardown. This is THE choke point all ended
+    sessions pass through (exit_nodes' completed/failed paths, git_ops' push-failure close,
+    deploy_drain), so hooking here frees the repo's one-container slot in seconds instead of
+    the idle reaper's 30 minutes. Function-level import: the sandbox package transitively pulls
+    chat_model, which a module-level import here would cycle. create_task, not await: ACI
+    teardown shells `az container delete` (tens of seconds) and must not block the exit path;
+    off-process callers (deploy_drain on a CI runner) no-op instantly inside the helper."""
+    from .sandbox.factory import end_session_container
+
+    asyncio.create_task(end_session_container(session_id))
     failure_stage, failure_type, failure_message = _build_failure(failure) if failure else (None, None, None)
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
@@ -312,6 +324,24 @@ async def list_sessions(
         return [_row_to_dict(_COLUMNS, row) for row in rows]
 
 
+async def sessions_by_ids(ids: list[str]) -> list[dict[str, Any]]:
+    """(session_id, owner, repo) for the given session ids -- the reverse direction of
+    list_sessions (which requires owner/repo). Backs the per-repo container cap: callers join the
+    registry's live thread_ids to repos (provision guard + GET /sessions/active)."""
+    if not ids:
+        return []
+    cols = ["session_id", "owner", "repo"]
+    placeholders = ", ".join("?" for _ in ids)
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"SELECT {', '.join(cols)} FROM dbo.sessions WHERE session_id IN ({placeholders})",
+            *ids,
+        )
+        rows = await cur.fetchall()
+        return [_row_to_dict(cols, row) for row in rows]
+
+
 async def _demo() -> None:
     """Self-check against a real DB: `cd agent && uv run python -m src.session_store`."""
     session_id = str(uuid.uuid4())
@@ -386,6 +416,12 @@ async def _demo() -> None:
             f"set_session_provider must never overwrite an already-stamped value, got {row['provider']!r}"
         )
         await delete_session(legacy_session_id)
+
+        # sessions_by_ids: reverse lookup for the per-repo container cap -- unknown ids drop out,
+        # empty input short-circuits without touching the pool.
+        assert await sessions_by_ids([]) == []
+        by_ids = await sessions_by_ids([session_id, str(uuid.uuid4())])
+        assert by_ids == [{"session_id": session_id, "owner": owner, "repo": repo}], by_ids
 
         await touch_run(session_id, run_id="r1", title="Initial request")
         row = await get_session(session_id)

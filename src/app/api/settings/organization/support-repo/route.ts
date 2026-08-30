@@ -1,14 +1,18 @@
 import { NextResponse } from "next/server";
-import { auditIdentity, getServerAuthToken } from "@/auth";
+import { auditIdentity, getServerAuthToken, isAdminRequest } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
+import { E2E_MODE } from "@/lib/e2e";
 
 /**
  * Org-wide support-repo pointer (agent's /org-settings/support-repo) — where the support-issue
- * action files failed-run issues. Sibling of ../route.ts and under its same flagged authorization
- * gap: any signed-in user can change it (no org-admin concept exists; see that file's comment).
- * Separate from the provider/credential PUT so saving this never re-probes a credential.
+ * action files failed-run issues. Sibling of ../route.ts, gated the same way: Entra App Role
+ * "Admin" server-side (see that file's comment). Separate from the provider/credential PUT so
+ * saving this never re-probes a credential.
  */
 export async function PUT(request: Request) {
+  if (!E2E_MODE && !(await isAdminRequest())) {
+    return NextResponse.json({ detail: "Admin role required" }, { status: 403 });
+  }
   const token = await getServerAuthToken();
   const updatedBy = auditIdentity(token);
   if (!updatedBy) {

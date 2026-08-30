@@ -7,13 +7,35 @@ idle reaper task) that needs to persist across calls.
 
 from __future__ import annotations
 
+import logging
 import os
 
+from . import registry
 from .azure_aci import AzureContainerInstanceProvider
 from .local_docker import LocalDockerProvider
 from .provider import SandboxProvider
 
+logger = logging.getLogger(__name__)
+
 _provider: SandboxProvider | None = None
+
+
+async def end_session_container(thread_id: str) -> None:
+    """Best-effort immediate teardown of a session's container, if this process holds one.
+
+    Called (fire-and-forget) from session_store.close_session -- the single choke point every
+    terminal transition (failed OR completed) passes through -- so an errored/escalated/finished
+    run frees its per-repo cap slot in seconds instead of waiting on the 30-minute idle reaper.
+    No-ops harmlessly when the registry has no entry: off-process callers of close_session (the
+    CI runner's deploy_drain) and already-torn-down sessions land here with nothing to do.
+    terminate() itself routes through registry.pop, so no extra eviction is needed here."""
+    if registry.get(thread_id) is None:
+        return
+    try:
+        await get_sandbox_provider().terminate(thread_id)
+        logger.info("terminated container for ended session thread_id=%s", thread_id)
+    except Exception:  # noqa: BLE001 -- teardown is a cleanup courtesy; never fail the caller
+        logger.warning("container teardown failed for thread_id=%s", thread_id, exc_info=True)
 
 
 def get_sandbox_provider() -> SandboxProvider:

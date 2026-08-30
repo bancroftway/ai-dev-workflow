@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // The Python agent's tree (sandbox-image JS payloads, vendored plugins) is not frontend
+    // code -- linting it turned the CI `lint` gate red on files this config was never meant for.
+    "agent/**",
   ]),
 ]);
 

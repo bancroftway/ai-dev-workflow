@@ -197,6 +197,27 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     if not project_id:
         raise HTTPException(status_code=422, detail="project_id is required to provision a new session")
 
+    # Per-repo container cap (production CI/CD plan, Phase 5): at most ONE live container per
+    # (owner, repo). Sits with the other pre-side-effect 409s above, before the vault fetch and
+    # long before provider.provision(). The thread that OWNS the live container always passes
+    # (reattach/reload/resume-after-idle keep working); any OTHER thread targeting the same repo
+    # is refused until that container ends -- close_session's teardown (exit paths) and the stop
+    # button free the slot in seconds, the idle reaper is the backstop. A scaffold-new-repo
+    # provision passes vacuously (its repo doesn't exist yet, so nothing matches). Known race:
+    # two concurrent provisions can both pass before either registry.set -- accepted (single agent
+    # process, minReplicas=maxReplicas=1; the reaper bounds the damage).
+    live_others = set(registry.live_ids()) - {body.thread_id}
+    if live_others:
+        for row in await session_store.sessions_by_ids(sorted(live_others)):
+            if (row["owner"], row["repo"]) == (body.owner, body.repo):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"a sandbox container is already running for {body.owner}/{body.repo} "
+                        f"(session {row['session_id']}) -- stop it or wait for it to finish"
+                    ),
+                )
+
     # Vault fetch happens BEFORE the sandbox boots: a misconfigured/revoked vault fails the
     # provision in seconds with the provider's own AADSTS/403 detail, instead of surfacing hours
     # later as a confusing e2e boot failure. A configured vault with no assertion (E2E bypass,
@@ -309,6 +330,13 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
         )
     except Exception as exc:  # noqa: BLE001 -- surfaced to the caller as a plain 502, not swallowed
         logger.exception("sandbox provisioning failed for thread_id=%s", body.thread_id)
+        # Best-effort teardown of whatever half-created container the failure left behind --
+        # without it, a partially-provisioned container holds the per-repo cap's slot until the
+        # idle reaper notices, blocking every retry on this repo for up to 30 minutes.
+        try:
+            await provider.terminate(body.thread_id)
+        except Exception:  # noqa: BLE001 -- cleanup must never mask the original provision error
+            logger.warning("post-failure teardown itself failed for thread_id=%s", body.thread_id, exc_info=True)
         raise HTTPException(
             status_code=502, detail=f"sandbox provisioning failed: {type(exc).__name__}: {exc}"
         ) from None
@@ -414,6 +442,29 @@ async def list_sessions(
     _check_shared_secret(request)
     rows = await session_store.list_sessions(owner, repo, source_branch, project_id)
     return SessionListResponse(sessions=[_row_to_response(row) for row in rows])
+
+
+class ActiveSessionEntry(BaseModel):
+    owner: str
+    repo: str
+    session_id: str
+
+
+class ActiveSessionsResponse(BaseModel):
+    active: list[ActiveSessionEntry]
+
+
+# Registered BEFORE the /{session_id} route below on purpose: FastAPI matches in registration
+# order, so declaring it later would swallow /active as session_id="active".
+@router.get("/active", response_model=ActiveSessionsResponse)
+async def list_active_sessions(request: Request) -> ActiveSessionsResponse:
+    """Which repos have a live container right now -- one call for the whole /select repo list
+    (the per-repo cap's UI badge). Joins the in-process registry (live truth, reaper-aware)
+    against dbo.sessions for owner/repo; a registry entry with no DB row yet (mid-provision) is
+    simply absent until its row lands, which the 15s poll picks up next round."""
+    _check_shared_secret(request)
+    rows = await session_store.sessions_by_ids(sorted(registry.live_ids()))
+    return ActiveSessionsResponse(active=[ActiveSessionEntry(**row) for row in rows])
 
 
 @router.get("/{session_id}", response_model=SessionResponse)

@@ -27,6 +27,12 @@ def get(thread_id: str) -> SandboxSession | None:
     return _sessions.get(thread_id)
 
 
+def live_ids() -> list[str]:
+    """thread_ids with a live container right now -- the per-repo cap (sessions_api's provision
+    guard + GET /sessions/active) joins these against dbo.sessions for owner/repo."""
+    return list(_sessions)
+
+
 def set(thread_id: str, session: SandboxSession) -> None:
     _sessions[thread_id] = session
 
