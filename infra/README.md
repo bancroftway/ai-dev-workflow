@@ -18,41 +18,57 @@ subnet, real ACI container groups with both public and private IPs, a real pushe
 a real `AzureContainerInstanceProvider.provision()` call that connected and completed the
 JSON-RPC handshake).
 
-**Partially validated.** The underlying resource shapes above are proven; this exact
-`main.bicep` file has not been run through `az bicep build`/`what-if` verbatim (no Bicep
-compiler was available in the environment it was authored in). Before applying it:
+The template is CI-validated on every PR (`az bicep build` + `build-params` in
+`.github/workflows/ci.yml`), and **no secrets are parameters anymore**: both apps boot their
+secret config from the `<namePrefix>-config` Key Vault (see "Config vault seeding" below), so a
+deployment needs only the ids in `infra/params/<target>.bicepparam`.
 
-```bash
-az bicep build --file main.bicep         # syntax check
-az deployment group validate \
-  --resource-group <rg> \
-  --template-file main.bicep \
-  --parameters namePrefix=<prefix> authGithubId=<id> authGithubSecret=<secret> authSecret=<secret> \
-               copilotGithubToken=<token> sqlAadAdminObjectId=<your-aad-object-id> sqlAadAdminLogin=<your-upn-or-group-name> \
-               entraTenantId=<tenant-id> entraAppId=<app-client-id> entraClientSecret=<secret> \
-               agentSharedSecret=<random>
-az deployment group what-if \
-  --resource-group <rg> \
-  --template-file main.bicep \
-  --parameters @params.json   # review before creating params.json with real secrets, don't commit it
-```
+## Deployment targets and the pipeline
 
-`sqlAadAdminObjectId`/`sqlAadAdminLogin` (and `sqlAadAdminPrincipalType`, default `User`) name
-whoever should be the SQL Server's Azure AD admin — needed once, right after deploy, to run the
-one-time grant below. Get your own object id with `az ad signed-in-user show --query id -o tsv`.
+Deploys are fully pipeline-driven (`.github/workflows/deploy.yml`, see the root README's
+"Deployment pipeline" section): merge to `dev` deploys every target listed under `dev` in
+`.github/deploy-targets.json` (home `nonprod`), merge to `main` deploys every target under
+`main` (home `prod` plus every customer tenant, simultaneously). A **target** is:
 
-## First deploy
+- a GitHub Environment named `<target>` carrying `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+  `AZURE_SUBSCRIPTION_ID`, `RESOURCE_GROUP`, `ACR_NAME`, `NAME_PREFIX` as environment variables
+  (no secrets: OIDC federation replaces credentials), and
+- `infra/params/<target>.bicepparam` with that tenant's ids (`namePrefix = aidw-<target>`).
 
-The container apps need *some* image to deploy with before CI has ever pushed one — that's what
-`frontendImage`/`agentImage`'s placeholder default is for. The sandbox image has no such
-placeholder: `AzureContainerInstanceProvider` reads it from `AZURE_ACI_SANDBOX_IMAGE`
-(`main.bicep` points this at `<acr>.azurecr.io/ai-dev-workflow-sandbox:latest`), so
-`build-sandbox-image.yml` needs to have pushed at least once before the first real onboarding
-session can provision a sandbox. After the first `az deployment group create`, push real images
-(manually or by running the GitHub Actions workflows once `ACR_NAME`/`RESOURCE_GROUP`/
-`CONTAINER_APP_NAME_*` repo variables and the OIDC login secrets are configured — see the
-comments at the top of `.github/workflows/deploy-*.yml`), then subsequent pushes to `main` keep
-everything current automatically.
+### Onboarding a new target (env or customer tenant)
+
+Run `infra/onboard-target.ps1` as an admin in the target tenant — it creates the deploy app
+registration + federated credential, the sign-in app registration with the `Admin`/`Member` App
+Roles and assignment-required, the `aidw-sql-admins` group (deploy SP as member, so the pipeline
+can run the SQL grant/migrations/drain), the resource group, and the least-privilege deploy
+grants (Contributor + conditioned RBAC Administrator). It prints the GitHub Environment values
+and the bicepparam skeleton. Then follow its printed steps 1-5.
+
+**The first Deploy run for a new target is EXPECTED to fail at the smoke step**: both apps
+crash-loop until the config vault is seeded. Seed it (below), restart both container apps
+(`az containerapp revision restart`), re-run the Deploy workflow — every step is idempotent.
+
+### Config vault seeding (manual, per target)
+
+`deploy.yml` creates `<namePrefix>-config`; a human seeds it (the pipeline never holds app
+secrets): one secret per env var, `_` → `-` (`AUTH_SECRET` → `AUTH-SECRET`); the name inventory
+is `agent/src/config_inventory.py` and `docs/CONFIG.md`. For a new env, copy from an existing
+vault (`az keyvault secret show` → `set` loop). Grant yourself `Key Vault Secrets Officer` on
+the vault first. Client secrets expire (≤24 months) — calendar the rotation.
+
+### Idempotency notes
+
+- `az deployment group create` (incremental mode) is safe to re-run; a no-op deploy takes ~1-2
+  minutes. Resources *removed* from the template are NOT deleted — clean up manually.
+- Key Vault soft-delete: a deleted `<prefix>-vault`/`-config` blocks recreation under the same
+  name for 90 days (`az keyvault recover`, or purge). Purge protection is deliberately off for
+  now (documented prod-hardening option).
+- Role assignments seed `guid()` on resource ids (ARM can't use principalIds in names). If an
+  identity-holding resource is deleted and recreated, delete the stale assignment
+  (`az role assignment delete`) before the next deploy or it fails with
+  `RoleAssignmentUpdateNotPermitted`.
+- Rollback = re-run the Deploy workflow from the last good commit (images are `:sha`-pinned,
+  the bicep deployment records them).
 
 ## One-time Entra app registration (sign-in + on-behalf-of Key Vault)
 
@@ -64,7 +80,8 @@ app) is forwarded at provision time as an OBO assertion; the agent (`agent/src/k
 exchanges it on-behalf-of the user for a Key Vault token. **The service has no standing vault
 access** — Azure evaluates the *user's* RBAC on every vault read.
 
-Portal (portal.azure.com → Microsoft Entra ID → App registrations → New registration):
+`infra/onboard-target.ps1` scripts all of this (plus the App Roles below); the portal steps are
+kept for reference/repair:
 
 1. Name e.g. `<prefix>-app` · **Accounts in this organizational directory only** · Redirect URI:
    platform **Web**, `http://localhost:3000/api/auth/callback/microsoft-entra-id` (add
@@ -76,8 +93,14 @@ Portal (portal.azure.com → Microsoft Entra ID → App registrations → New re
 3. **API permissions** → Add a permission → **My APIs** → this same app → Delegated →
    `access_as_user` → Add → **Grant admin consent** (the app requests its own scope at sign-in;
    without consent every login prompts or fails with AADSTS65001).
-4. **Certificates & secrets** → New client secret → copy the Value →
-   `entraClientSecret` / `AIDW_AGENT_CLIENT_SECRET`.
+4. **Certificates & secrets** → New client secret → copy the Value → the config vault's
+   `AIDW-AGENT-CLIENT-SECRET` (no longer a bicep parameter).
+5. **App roles** → two roles, both "Users/Groups": `Admin` (value `Admin`, gates Org settings)
+   and `Member` (value `Member`, standard access). Then in the **Enterprise application** blade:
+   Properties → **Assignment required = Yes** (unassigned users can't sign in at all), and
+   Users and groups → assign people to the roles. Group-to-role assignment needs Entra ID P1;
+   direct user assignment works on the free tier. Role changes take effect at the user's next
+   sign-in (the app never re-reads claims mid-session).
 
 Per-user vault access (each vault's owner, once per user): grant `Key Vault Secrets User` —
 
@@ -94,39 +117,21 @@ injection makes `DefaultAzureCredential`'s environment path work inside the sand
 Conditional Access policies can block the OBO exchange (AADSTS530xx) — the error detail is
 surfaced verbatim in the settings page and provision failures.
 
-## One-time SQL grant (run once per environment, after the first deploy)
+## SQL grant + migrations (automated)
 
-Bicep can't run T-SQL, so the agent's managed identity needs a one-time, out-of-band grant on the
-new `Ai-Dev-Workflow` database before `session_store.py` can connect. As the AAD admin configured
-above (`sqlcmd` with AAD auth, or the Azure portal's Query Editor):
-
-```sql
-CREATE USER [<namePrefix>-agent] FROM EXTERNAL PROVIDER;
-ALTER ROLE db_datareader ADD MEMBER [<namePrefix>-agent];
-ALTER ROLE db_datawriter ADD MEMBER [<namePrefix>-agent];
-```
-
-`<namePrefix>-agent` is the Container App's own name (its system-assigned identity's display
-name matches it) -- the same `namePrefix` parameter used everywhere else in this template. Only
-`agentApp` needs this; the frontend never touches SQL directly (it calls the agent's `/sessions`
-HTTP API), so there's exactly one identity to grant and exactly one schema-aware client.
-
-Then run migrations once against the new database (from a machine with `az` AAD auth and network
-access to the server, or via Cloud Shell): `cd agent && uv run python -m src.db_migrate` with
-`AZURE_SQL_SERVER`/`AZURE_SQL_DATABASE` set to match the deployed values (`main.bicep` already
-sets these as the agent Container App's own env, but the migration runner needs them in
-whichever shell invokes it too).
+The pipeline runs both on every deploy, idempotently, as the deploy SP (a member of the
+`aidw-sql-admins` group, which is the SQL Server's AAD admin): the `IF NOT EXISTS`-guarded
+`CREATE USER [<namePrefix>-agent] FROM EXTERNAL PROVIDER` + `db_datareader`/`db_datawriter`
+grants, then `uv run python -m src.db_migrate`. Only `agentApp` gets a grant; the frontend never
+touches SQL directly (it calls the agent's `/sessions` HTTP API). Manual fallback (portal Query
+Editor as any `aidw-sql-admins` member) is the same SQL — see `deploy.yml`'s grant step.
 
 ## Known gaps
 
-- Service configuration is in transition to Key Vault: `main.bicep` now provisions
-  `<namePrefix>-config` and both apps read every secret in it at boot (README.md "Configuration
-  from Key Vault"), but the parameter-driven Container Apps secrets (`authSecret`,
-  `entraClientSecret`, ...) are still set and win over the vault. Seed the config vault
-  (`az keyvault secret set`, one secret per env var, `_` → `-`) and then drop those parameters
-  and their `secretRef` env entries. User-app secrets are different: they come from per user-repo
-  Key Vaults read on-behalf-of the user (section above).
-- No custom domain/TLS config beyond the platform-managed `*.azurecontainerapps.io` certificate.
+- New required config keys crash-loop every tenant whose vault lacks them: ship new keys with a
+  safe in-code default, or seed ALL target vaults before the introducing merge lands.
+- No custom domain/TLS config beyond the platform-managed `*.azurecontainerapps.io` certificate
+  — a likely customer-tenant ask, unaddressed today.
 - The agent's own identity is granted resource-group-scoped **Contributor** to manage ACI
   container groups — broader than strictly needed (no built-in role is narrower for
   container-instance management alone). A custom least-privilege role is the follow-up once this
