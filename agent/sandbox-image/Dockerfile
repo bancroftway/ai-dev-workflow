@@ -336,6 +336,17 @@ RUN set -eux; \
     npm install --no-audit --no-fund; \
     test -x node_modules/.bin/vitest
 
+# ── /opt/aidw/fakeidp: pipeline-owned fake OIDC identity provider, same isolation rationale ─────
+# A local oidc-provider stood up during e2e for OIDC apps (Entra/Google/generic) so sign-in can be
+# tested with declared test users -- no real tenant, secret, or consent. Resolves oidc-provider from
+# its own node_modules; agent/src/fake_idp.py boots it as `node /opt/aidw/fakeidp/server.js`.
+COPY fakeidp/ /opt/aidw/fakeidp/
+RUN set -eux; \
+    cd /opt/aidw/fakeidp; \
+    npm install --no-audit --no-fund; \
+    test -d node_modules/oidc-provider; \
+    node -e "require('/opt/aidw/fakeidp/package.json')"
+
 # mise / scc / gitleaks / trivy / osv-scanner / copilot all arrive via the fetch stage's
 # COPY --from at the top of this stage. mise usage note: driven at container start by
 # bootstrap.sh from files the repo itself declares (.tool-versions, mise.toml, .nvmrc,

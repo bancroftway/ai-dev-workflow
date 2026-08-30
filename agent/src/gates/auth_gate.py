@@ -52,17 +52,31 @@ def is_allowlisted(route: str, anonymous_routes: list[str]) -> bool:
     return any(fnmatchcase(route, pattern) for pattern in anonymous_routes)
 
 
+def _left_app(final_url: str, idp_port: int | None) -> bool:
+    """True when a redirect chain ended somewhere OTHER than the app: an external host (the real
+    IdP), or a LOCAL host on the fake IdP's port. The fake IdP runs on localhost, so a host-only
+    check would read its login page as 'the app answered 200' -- a false violation on every
+    protected route. Keyed on the port instead."""
+    if not final_url:
+        return False
+    parts = urlsplit(final_url)
+    final_host = (parts.hostname or "").lower()
+    if final_host and final_host not in _LOCAL_HOSTS:
+        return True
+    return idp_port is not None and parts.port == idp_port
+
+
 def classify_response(
     status: int,
     final_url: str,
     *,
     allowlisted: bool,
     spa_shell: bool = False,
+    idp_port: int | None = None,
 ) -> str:
     """Pure verdict for one probed route: 'protected' | 'anonymous_ok' | 'violation' |
     'inconclusive' | 'not_applicable'. `final_url` is curl's %{url_effective} after -L."""
-    final_host = (urlsplit(final_url).hostname or "").lower() if final_url else ""
-    left_app = bool(final_host) and final_host not in _LOCAL_HOSTS
+    left_app = _left_app(final_url, idp_port)
 
     if allowlisted:
         if left_app:
@@ -118,6 +132,7 @@ async def check_auth(
     api_routes: list[str],
     service_urls: list[str],
     anonymous_routes: list[str],
+    idp_port: int | None = None,
 ) -> "VerificationResult":
     """Probes every discovered page route (UI port) and API route (each booted service, falling
     back to the UI port when the stack serves both from one process). See module docstring for the
@@ -129,8 +144,9 @@ async def check_auth(
     catchall_status, catchall_final = await _probe(provider, thread_id, f"{base}{_CATCHALL_PROBE_PATH}")
     # A catch-all 200 answered locally = SPA shell. A catch-all that redirects to the IdP is
     # server-side auth over everything -- the strongest possible pass signal, not an SPA.
-    catchall_host = (urlsplit(catchall_final).hostname or "").lower() if catchall_final else ""
-    spa_shell = 200 <= catchall_status < 300 and (not catchall_host or catchall_host in _LOCAL_HOSTS)
+    # A catch-all that redirected to the IdP (external host or the fake IdP's local port) is
+    # server-side auth over everything, NOT an SPA shell -- _left_app captures both.
+    spa_shell = 200 <= catchall_status < 300 and not _left_app(catchall_final, idp_port)
 
     page_routes = [r for r in routes if isinstance(r, str) and r.startswith("/")]
     api_paths = [r for r in api_routes if isinstance(r, str) and split_method(r)[1].startswith("/")]
@@ -154,7 +170,7 @@ async def check_auth(
 
     for label, url, method, allowlisted in probes:
         status, final_url = await _probe(provider, thread_id, url, method)
-        verdict = classify_response(status, final_url, allowlisted=allowlisted, spa_shell=spa_shell)
+        verdict = classify_response(status, final_url, allowlisted=allowlisted, spa_shell=spa_shell, idp_port=idp_port)
         verdicts.append({
             "route": label, "url": url, "method": method, "status": status, "final_url": final_url,
             "allowlisted": allowlisted, "verdict": verdict,
@@ -231,6 +247,14 @@ def _demo() -> None:
     assert split_method("/api/orders") == ("GET", "/api/orders")
     assert split_method("delete /api/x") == ("DELETE", "/api/x")
     assert split_method("not a route") == ("GET", "not a route")
+
+    # Fake IdP on a local port: a redirect chain ending there is 'protected', not a local-200
+    # violation; an allowlisted route redirecting there still breaks its anonymous contract; and the
+    # catch-all landing there is server-side auth, not an SPA shell.
+    assert classify_response(200, "http://localhost:9400/aidw/v2.0/authorize?x=1", allowlisted=False, idp_port=9400) == "protected"
+    assert classify_response(200, "http://127.0.0.1:9400/aidw/v2.0/authorize", allowlisted=True, idp_port=9400) == "violation"
+    assert classify_response(200, "http://127.0.0.1:3000/expenses", allowlisted=False, idp_port=9400) == "violation"  # app's own port, still a violation
+    assert _left_app("http://localhost:9400/x", 9400) and not _left_app("http://localhost:3000/x", 9400)
     print("auth_gate self-check: ok")
 
 

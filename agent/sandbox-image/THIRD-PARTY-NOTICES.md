@@ -64,6 +64,7 @@ distribution. Shipped packs are SHA-pinned and licence-asserted at build via
 | **eslint-plugin-sonarjs** | **LGPL-3.0-only** | copyleft: licence text at `/opt/aidw/licenses/eslint-plugin-sonarjs/`; source: https://github.com/SonarSource/SonarJS |
 | eslint-plugin-react-hooks, eslint-plugin-jsx-a11y, angular-eslint, eslint-plugin-vue | MIT | |
 | lighthouse | Apache-2.0 | |
+| oidc-provider | MIT | pipeline-owned fake OIDC identity provider at `/opt/aidw/fakeidp` (e2e test-login only; never in a delivered app) |
 | azure-functions-core-tools | MIT | its npm postinstall downloads the platform binary from Microsoft's CDN at IMAGE BUILD time — the shipped binary is Microsoft's, version pinned by `FUNC_CORE_TOOLS_VERSION` |
 | Claude Code CLI (`@anthropic-ai/claude-code`, `CLAUDE_CODE_CLI_VERSION`) | "© Anthropic PBC. All rights reserved. Use is subject to Anthropic's Commercial Terms of Service." | **no redistribution grant in the package licence** — kept as-is by decision (2026-08-29); on-prem distribution pending confirmation with Anthropic. The Claude *Agent SDK* is not a way out: its MIT licence covers the SDK wrapper only, and it bundles this same CLI under these same terms |
 

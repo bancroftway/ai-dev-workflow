@@ -1,0 +1,10 @@
+{
+  "name": "aidw-fakeidp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local OpenID Connect provider for ai-dev-workflow e2e -- serves declared test users with Entra-shaped claims so generated OIDC apps can be sign-in tested without a real tenant or secrets.",
+  "type": "commonjs",
+  "dependencies": {
+    "oidc-provider": "8.5.1"
+  }
+}

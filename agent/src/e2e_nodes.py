@@ -49,7 +49,7 @@ from pydantic import Field
 
 from . import app_discovery
 from . import config as workflow_config
-from . import git_ops, keyvault, model_config, repo_files, repo_test_config, run_failure, session_store
+from . import fake_idp, git_ops, keyvault, model_config, repo_files, repo_test_config, run_failure, session_store
 from .chat_model import get_chat_model_for_thread, secret_env_names
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
@@ -954,7 +954,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # as an env file sourced only into the app's own shell. Cache empty but a vault IS configured
     # means the agent restarted since provision -- an infra/user-action gap the e2e fix LLM can't
     # patch, so escalate (cannot_verify) instead of burning fix cycles booting a secretless app.
-    from .graph import auth_enforced as _auth_enforced, get_app_auth as _get_app_auth  # lazy: graph imports this module
+    from .graph import auth_enforced as _auth_enforced, auth_kind as auth_kind_for_state, get_app_auth as _get_app_auth  # lazy: graph imports this module
 
     test_auth_enforced = _auth_enforced(state)
     app_secrets = keyvault.get_app_secrets(thread_id)
@@ -987,16 +987,35 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             config_env = repo_test_config.to_env(await repo_test_config.get_config(sess_row["owner"], sess_row["repo"]))
         except Exception:  # noqa: BLE001 -- config is best-effort; a bad row must not sink the boot
             logger.warning("could not load repo_test_config for %s", thread_id, exc_info=True)
-    merged_env = {**config_env, **(app_secrets or {})}
-    use_env_file = bool(merged_env)
-    if merged_env:
-        await keyvault.write_env_file(provider, thread_id, merged_env)
-
     # Clear the field before booting. A fix cycle re-enters this node, and the launch-discovery agent
     # is asked to stop whatever it starts but does not reliably do so -- a survivor holding the port
     # makes a dev server silently pick a DIFFERENT port ("Port 3000 is in use ... using 3002") while
     # the readiness probe watches the one we asked for, reporting a healthy app as never answering.
     await _kill_stale_app_processes(provider, thread_id)
+
+    # Fake OIDC IdP: for an OIDC app with declared test users, boot a local provider and override
+    # the app's authority to point at it -- real redirect logins, per-role, no tenant/secret/consent.
+    # Booted AFTER kill-stale (so its node process survives the sweep) and BEFORE the merged env file
+    # is written (so the AzureAd__*/OIDC_* overrides ride the same file the app + services source).
+    idp_overrides: dict[str, str] = {}
+    kind = auth_kind_for_state(state)
+    users = list(state.get("test_users") or [])
+    if fake_idp.should_run(kind, users):
+        idp_port = await _pick_free_port(provider, thread_id, reserved=reserved_ports)
+        reserved_ports.add(idp_port)
+        try:
+            idp_overrides = await fake_idp.start(provider, thread_id, users, kind, idp_port)
+            e2e["idp_port"] = idp_port
+            e2e["idp_url"] = fake_idp.issuer_url(idp_port)
+        except Exception:  # noqa: BLE001 -- IdP boot failure degrades to the seam path (segment says so)
+            logger.warning("fake IdP boot failed for %s -- falling back to the test seam", thread_id, exc_info=True)
+
+    # Non-secret config (from the settings UI) + vault secrets + IdP overrides, ONE env file
+    # (render_env_file sorts keys, so precedence must live in the dict): config < vault < IdP.
+    merged_env = {**config_env, **(app_secrets or {}), **idp_overrides}
+    use_env_file = bool(merged_env)
+    if merged_env:
+        await keyvault.write_env_file(provider, thread_id, merged_env)
 
     # Boot the SUPPORTING processes (an API/service the UI calls) before the app playwright drives.
     # Their readiness is required, not best-effort: a UI screenshotted against a dead API renders
@@ -1197,6 +1216,10 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             f"{cd_prefix}{node_path_env}PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
             f"PLAYWRIGHT_JSON_OUTPUT_NAME={shlex.quote(_report_path_for(config_dir))} "
             f"BASE_URL=http://localhost:{port} "
+            # Personas + IdP for the config template's per-persona projects / global-setup. Only
+            # channel into the suite process, so it must be exported here. JSON is shlex-quoted.
+            + (f"AIDW_TEST_USERS={shlex.quote(json.dumps(state.get('test_users') or []))} " if state.get("test_users") else "")
+            + (f"AIDW_IDP_URL={shlex.quote(str(e2e.get('idp_url')))} " if e2e.get("idp_url") else "")
             # The suite sees the seam flag too, so tests can branch on it (e.g. hit the test
             # sign-in endpoint) -- the seam itself lives in the APP, exported at boot above.
             + ("AIDW_TEST_AUTH=1 " if test_auth_enforced else "")
@@ -1415,6 +1438,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             api_routes=list(getattr(launch, "api_routes", None) or []),
             service_urls=list(e2e.get("service_urls") or []),
             anonymous_routes=list(app_auth.get("anonymous_routes") or []),
+            idp_port=e2e.get("idp_port"),
         )
         e2e["auth_check"] = {**auth_result.report, "passed": auth_result.passed, "feedback": auth_result.feedback}
         # Routes VERIFIED protected legitimately screenshot as the IdP/login page -- often a tiny
