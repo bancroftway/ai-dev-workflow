@@ -13,14 +13,22 @@ your purposes: `success` refers to whether you managed to run the suite and capt
 never to whether the tests passed.
 
 Steps:
-1. Explore the tree (view/glob/bash) and find every place that has tests. A polyglot monorepo has
+1. FIRST, before running anything, create the output file so it exists no matter what happens
+   later: `: > '<<output_path>>'` (create its parent directory if needed).
+2. Explore the tree (view/glob/bash) and find every place that has tests. A polyglot monorepo has
    more than one; run each.
-2. Run each suite with the most verbose per-test reporting the runner offers, so that every
+3. Run each suite with the most verbose per-test reporting the runner offers, so that every
    individual test name appears in the output (this matters: a later check matches acceptance-
-   criteria ids against those test names).
-3. Append ALL of that output -- every suite, complete, uncoloured if you can -- to the single file
-   `<<output_path>>`. Create it fresh; do not append to a previous run's file.
-4. **Also emit each runner's own MACHINE-READABLE report**, in addition to the console output, and
+   criteria ids against those test names). Pipe EVERY runner invocation through
+   `2>&1 | tee -a '<<output_path>>'` (tee from the repo root -- the path is repo-relative) so the
+   capture happens as a side effect of running, never as a separate step you might skip. A runner
+   that fails before producing any test output (compile error, missing dependencies) still counts:
+   its error text goes in the file too.
+4. Append ALL of that output -- every suite, complete, uncoloured if you can -- to the single file
+   `<<output_path>>`. Do not report output as captured unless the file really contains it: a
+   report that names this file while the file does not exist is treated as a fabricated run and
+   rejected outright.
+5. **Also emit each runner's own MACHINE-READABLE report**, in addition to the console output, and
    list the file paths in `result_artifacts`. Console text is a fallback; these files are the
    authoritative record of which test passed, because they have a schema instead of a layout:
 
@@ -31,7 +39,8 @@ Steps:
 
    Use whichever apply. If a runner offers no structured reporter, say so in `summary` and rely on
    the console output for that suite.
-5. Confirm the files exist and actually contain results before you finish.
+6. Confirm the files exist and actually contain results before you finish -- `<<output_path>>`
+   included. If it is empty or missing at this point, your run FAILED: set `error` accordingly.
 
 Then report:
 - `output_artifact`: `<<output_path>>`

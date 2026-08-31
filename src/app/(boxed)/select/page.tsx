@@ -362,31 +362,35 @@ function RepoBranchSection({
 
   return (
     <>
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-sm text-neutral-500">
-          Connecting registers this repo as a project so tickets can be filed against it --
-          no session starts until the first ticket does.
-        </p>
-        <button
-          type="button"
-          className="shrink-0 self-start rounded-lg border border-neutral-300 px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
-          onClick={connectRepository}
-          disabled={connecting}
-        >
-          {connecting ? "Connecting…" : "Connect repository"}
-        </button>
-      </div>
-
-      {/* Minor 15: the board's per-project entry point -- only shows once this repo already has a
-          project row (see selectedProjectId above), same "connecting is what creates a project"
-          rule the paragraph above already states. */}
-      {projectId && (
-        <Link
-          href={`/projects/${projectId}/board`}
-          className="self-start text-xs text-neutral-500 underline hover:text-neutral-800"
-        >
-          View board →
-        </Link>
+      {/* Connect-repository button + View-board link HIDDEN for now (user decision 2026-08-31):
+          "Start new session" connects the project implicitly, so the button's only remaining
+          purpose (ticket-first registration) is parked until the ticket flow is revisited.
+          connectRepository() and the projectId lookup stay wired for when these return. */}
+      {false && (
+        <>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-neutral-500">
+              Connecting registers this repo as a project so tickets can be filed against it --
+              no session starts until the first ticket does.
+            </p>
+            <button
+              type="button"
+              className="shrink-0 self-start rounded-lg border border-neutral-300 px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
+              onClick={connectRepository}
+              disabled={connecting}
+            >
+              {connecting ? "Connecting…" : "Connect repository"}
+            </button>
+          </div>
+          {projectId && (
+            <Link
+              href={`/projects/${projectId}/board`}
+              className="self-start text-xs text-neutral-500 underline hover:text-neutral-800"
+            >
+              View board →
+            </Link>
+          )}
+        </>
       )}
 
       {actionError && <p className="text-sm text-red-600">{actionError}</p>}

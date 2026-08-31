@@ -20,7 +20,8 @@ def render_specification_markdown(content: dict[str, Any]) -> str:
         lines.append("## User Stories")
         lines.append("")
         for story in user_stories:
-            lines.append(f"### {story.get('id', '')}: {story.get('title', '')}")
+            deferred_suffix = " _(deferred — later phase)_" if story.get("deferred") else ""
+            lines.append(f"### {story.get('id', '')}: {story.get('title', '')}{deferred_suffix}")
             lines.append("")
             lines.append(story.get("narrative", ""))
             lines.append("")
@@ -29,7 +30,8 @@ def render_specification_markdown(content: dict[str, Any]) -> str:
                 lines.append("**Acceptance Criteria**")
                 lines.append("")
                 for ac in criteria:
-                    lines.append(f"- **{ac.get('id', '')}**: {ac.get('description', '')}")
+                    ac_suffix = " _(deferred)_" if (ac.get("deferred") or story.get("deferred")) else ""
+                    lines.append(f"- **{ac.get('id', '')}**: {ac.get('description', '')}{ac_suffix}")
                 lines.append("")
 
     assumptions = content.get("assumptions") or []

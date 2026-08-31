@@ -61,6 +61,31 @@ class ClarifyingQuestion(BaseModel):
     )
 
 
+class SpecQuestion(BaseModel):
+    """One entry in the Specification's durable question ledger (user requirement 2026-08-31:
+    every question ever raised is tracked with its resolution, so provenance always traces back
+    to the requirements document). The FULL history is re-emitted on every draft -- answered and
+    assumed entries included, never dropped."""
+
+    id: str = Field(
+        description="Stable question id you assign once (e.g. 'q-empty-title') and copy "
+        "character-for-character on every later draft -- never renumber or re-slug a question "
+        "that already exists in the ledger."
+    )
+    question: str
+    status: Literal["open", "answered", "assumed"] = Field(
+        description="'open' = only the human can decide (forces the clarification pause); "
+        "'answered' = the requirements document now answers it; 'assumed' = you chose an "
+        "explicit assumption instead (also recorded in `assumptions`)."
+    )
+    answer: str = Field(
+        default="",
+        description="For 'answered': the answer, citing the requirements wording that settles "
+        "it. For 'assumed': the assumption taken. Empty only while 'open'.",
+    )
+    suggested_choices: list[str] = Field(default_factory=list)
+
+
 class AcceptanceCriterion(BaseModel):
     id: str = Field(
         description="Your own placeholder id for this AC in this response (e.g. 'ac-a') -- the "
@@ -79,6 +104,13 @@ class AcceptanceCriterion(BaseModel):
         "US-0001 -- ALWAYS a 'US-' prefix (never 'AC-'), always the parent story's full "
         "zero-padded number (never 'US-1.1' for 'US-0001.1'). Copy it, do not reconstruct it. "
         "None means this is a genuinely new Acceptance Criterion.",
+    )
+    deferred: bool = Field(
+        default=False,
+        description="True when the requirements mark this criterion for a LATER phase ('deferred', "
+        "'later', 'do not build yet'): specified and reviewed now, but excluded from this ticket's "
+        "build/test scope. Deferral is NOT retirement -- the item stays in the document, parked. "
+        "A criterion inside a deferred story is deferred automatically.",
     )
 
 
@@ -99,7 +131,19 @@ class UserStory(BaseModel):
         "CHARACTER from your immediately-prior draft or the approved Specification you were "
         "given, never reformatted, never re-derived. The real format is always 4-digit "
         "zero-padded, e.g. 'US-0001' (never 'US-1'). Copy it, do not reconstruct it -- never "
-        "invented, never a retired id. None means this is a genuinely new User Story.",
+        "invented, never a retired id. None means this is a genuinely new User Story. Citing a "
+        "currently-DEFERRED story id is how you promote it when the requirements move it into "
+        "the build-now scope.",
+    )
+    deferred: bool = Field(
+        default=False,
+        description="True when the requirements mark this story for a LATER phase ('deferred', "
+        "'later', 'do not build yet', a 'Later' section): still fully specified -- title, "
+        "narrative, acceptance criteria -- and shown to the reviewer, but parked: no tests or "
+        "code are demanded for it in this ticket, and all of its criteria defer with it. "
+        "Deferral is NOT retirement: never put a merely-deferred item in retired_us_ids. When a "
+        "later revision moves it into the build-now scope, re-emit it citing its existing id "
+        "with deferred=false.",
     )
 
 
@@ -119,6 +163,13 @@ class Specification(BaseModel):
     user_stories: list[UserStory] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     out_of_scope: list[str] = Field(default_factory=list)
+    questions: list[SpecQuestion] = Field(
+        default_factory=list,
+        description="The COMPLETE question ledger -- every question ever raised across all "
+        "drafts of this ticket with its current status, answered and assumed entries included. "
+        "Any 'open' entry routes the draft to the clarification pause instead of the human "
+        "gate.",
+    )
     attachment_notes: list[str] = Field(
         default_factory=list,
         description="Your own distillation of what each provided attachment (screenshot, "

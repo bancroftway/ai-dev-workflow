@@ -61,3 +61,4 @@ agent/sandbox-image/plugins/vendor/anthropics-claude-plugins-official/
 agent/sandbox-image/plugins/vendor/mattpocock-skills/
 
 .superpowers/
+agent/data/

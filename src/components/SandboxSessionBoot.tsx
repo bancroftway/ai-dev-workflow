@@ -78,7 +78,7 @@ export function SandboxSessionBoot({
     >
       {status === "error"
         ? (errorMessage ??
-          "Couldn't prepare a dev-tool sandbox for this session — chat still works, but Copilot won't have repo/tool access yet.")
+          "Couldn't prepare a dev-tool sandbox for this session — chat still works, but the agent won't have repo/tool access yet.")
         : "Preparing dev-tool sandbox…"}
     </div>
   );

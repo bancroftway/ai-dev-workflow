@@ -1,8 +1,9 @@
 "use client";
 
-import { useAgent } from "@copilotkit/react-core/v2";
+import { useAgent, useAttachments } from "@copilotkit/react-core/v2";
 import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
+import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
@@ -22,7 +23,7 @@ import type { CannedTechStack, TechStackCatalogResponse, WorkflowState } from "@
  */
 export function TechStackView() {
   // agentId only -- AppShell already registered this proxied agent (see RequirementsView.tsx).
-  const { localAgentId } = useWorkflowThread();
+  const { localAgentId, threadId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const { interrupt } = useOpenInterrupt();
   const [sandboxStatus] = useSandboxStatus();
@@ -31,12 +32,22 @@ export function TechStackView() {
   const showDropdown = isOpen && interrupt.fileExisted === false;
 
   const [text, setText] = useState("");
-  const [mode, setMode] = useState<"edit" | "preview">("edit");
   const [catalog, setCatalog] = useState<CannedTechStack[]>([]);
   const [selectedStackId, setSelectedStackId] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [feedback, setFeedback] = useState("");
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const syncedRef = useRef(false);
+
+  // Same editor stack as RequirementsView (user requirement 2026-08-31: identical look & feel,
+  // paste-inline-screenshots everywhere). Note: tech-stack Submit resolves with markdown only,
+  // so pasted images preview here but are not carried into the committed tech-stack.md.
+  const attachmentsApi = useAttachments({
+    config: {
+      enabled: true,
+      ...SHARED_ATTACHMENTS_CONFIG,
+      onUploadFailed: ({ file, message }) => setUploadError(`${file.name}: ${message}`),
+    },
+  });
 
   useEffect(() => {
     if (!showDropdown) return;
@@ -56,41 +67,60 @@ export function TechStackView() {
   }, [isOpen]);
 
   // Prefill exactly once per gate occurrence from whatever the gate is showing -- never clobber
-  // an active edit.
+  // an active edit. A per-session draft copy (saved on every change below) takes precedence over
+  // the gate's own markdown: any remount (tab switch, hot reload) resets this component's state,
+  // and prefilling back to the gate's stub silently REPLACED a picked/edited stack -- observed
+  // live 2026-08-31: the greenfield stub got submitted and approved instead of the user's
+  // Angular+.NET pick. Same sessionStorage-degrades-silently rules as RequirementsView.
   useEffect(() => {
     if (syncedRef.current || !isOpen || typeof interrupt.draftMarkdown !== "string") return;
-    setText(interrupt.draftMarkdown);
+    let saved: string | null = null;
+    try {
+      saved = sessionStorage.getItem(`aidw:techstack-draft:${threadId}`);
+    } catch {
+      saved = null;
+    }
+    setText(saved || interrupt.draftMarkdown);
     syncedRef.current = true;
-  }, [isOpen, interrupt.draftMarkdown]);
+  }, [isOpen, interrupt.draftMarkdown, threadId]);
+
+  function updateText(value: string) {
+    setText(value);
+    try {
+      sessionStorage.setItem(`aidw:techstack-draft:${threadId}`, value);
+    } catch {
+      // Storage blocked -- the remount safety net is lost, editing still works.
+    }
+  }
 
   function pickStack(id: string) {
     setSelectedStackId(id);
     const found = catalog.find((s) => s.id === id);
-    if (found) setText(found.markdown); // overwrites the editor; still hand-editable after
+    if (found) updateText(found.markdown); // overwrites the editor; still hand-editable after
   }
 
   async function handleSubmit() {
     setSubmitting(true);
     try {
       interrupt.resolve?.({ markdown: text });
+      // The submitted text is the stack of record now -- a stale draft copy must not resurrect
+      // on the next session/gate against this thread.
+      try {
+        sessionStorage.removeItem(`aidw:techstack-draft:${threadId}`);
+      } catch {
+        // ignore
+      }
     } finally {
       setSubmitting(false);
     }
   }
 
-  // Same {decision, feedback} contract as the generic InterruptCard's Reject button
-  // (graph.py make_gate_node) -- consistency across every gated stage's UI, per the plan's text.
-  async function handleReject() {
-    setSubmitting(true);
-    try {
-      interrupt.resolve?.({ decision: "rejected", feedback: feedback.trim() });
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
+  // Reject + feedback REMOVED (user decision 2026-08-31): unlike spec/plan, this stage's whole
+  // artifact sits in the editable textarea below -- "reject with feedback so the LLM redrafts"
+  // is strictly worse than the user just editing the text and submitting. The gate's server-side
+  // {decision, feedback} contract (graph.py make_gate_node) is untouched; this tab simply never
+  // sends it.
   const disabled = !isOpen || text.trim().length === 0 || submitting || sandboxStatus !== "ready";
-  const rejectDisabled = !isOpen || feedback.trim().length === 0 || submitting || sandboxStatus !== "ready";
 
   const state = (agent.state ?? {}) as WorkflowState;
   const stage = state.stages?.["tech-stack"];
@@ -101,13 +131,22 @@ export function TechStackView() {
         <h1 className="text-lg font-semibold">Tech Stack</h1>
         <p className="text-sm text-neutral-500">
           {isOpen
-            ? "Review the detected tech stack below. Edit it directly, or pick a starting stack, then submit."
+            ? "Pick a starting stack or review what was detected — the text below is fully editable either way, and whatever you submit becomes the stack of record."
             : "The technology stack this session builds against."}
         </p>
       </div>
 
+      {/* Two different waits share this slot: before the gate the pipeline is detecting; after
+          Submit it is saving (structured extraction + commit) -- calling the second one
+          "Detecting" read as the app having lost the submission (user, 2026-08-31). ready_for_review
+          with no open interrupt can only be the post-submit phase. */}
       {!isOpen && stage?.status !== "approved" && (
-        <p className="text-sm text-neutral-500">Detecting your tech stack…</p>
+        <p className="flex items-center gap-2 text-sm text-neutral-500">
+          <Spinner />
+          {stage?.status === "ready_for_review"
+            ? "Saving your tech stack — extracting the structured details every later stage builds on…"
+            : "Detecting your tech stack…"}
+        </p>
       )}
 
       {!isOpen && stage?.status === "approved" && (
@@ -137,51 +176,19 @@ export function TechStackView() {
             </label>
           )}
 
-          <div className="flex min-h-0 flex-1 flex-col rounded-lg border border-neutral-300 focus-within:ring-1 focus-within:ring-neutral-400">
-            <div className="flex items-center gap-1 border-b border-neutral-200 px-2 py-1">
-              <ModeButton label="Edit" active={mode === "edit"} onClick={() => setMode("edit")} />
-              <ModeButton label="Preview" active={mode === "preview"} onClick={() => setMode("preview")} />
-            </div>
-
-            {mode === "edit" ? (
-              <textarea
-                className="min-h-[240px] w-full flex-1 resize-none p-3 font-mono text-xs outline-none"
-                value={text}
-                onChange={(event) => setText(event.target.value)}
-                disabled={submitting}
-              />
-            ) : (
-              // Default sanitizer, no urlTransform override: this text may carry arbitrary human
-              // edits (or came from a canned catalog file), so raw HTML/script must never render.
-              <div className="prose prose-sm min-h-[240px] max-w-none flex-1 overflow-y-auto p-3">
-                <ReactMarkdown>{text}</ReactMarkdown>
-              </div>
-            )}
-          </div>
-
-          <label className="flex flex-col gap-1">
-            <span className="text-sm font-medium text-neutral-700">Feedback (required to reject)</span>
-            <textarea
-              className="min-h-[60px] w-full resize-none rounded-md border border-neutral-300 p-2 text-sm outline-none"
-              rows={2}
-              placeholder="What should change before this is approved?"
-              value={feedback}
-              onChange={(event) => setFeedback(event.target.value)}
-              disabled={submitting}
-            />
-          </label>
+          <AttachmentEditor
+            value={text}
+            onChange={updateText}
+            attachmentsApi={attachmentsApi}
+            disabled={submitting}
+            minHeightClassName="h-[63vh]"
+            uploadError={uploadError}
+          />
 
           <div className="flex items-center justify-end gap-3">
             {sandboxStatus !== "ready" && (
               <span className="text-xs text-neutral-500">Waiting for the dev-tool sandbox to finish starting…</span>
             )}
-            <button
-              className="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={rejectDisabled}
-              onClick={handleReject}
-            >
-              Reject
-            </button>
             <button
               className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
               disabled={disabled}
@@ -210,7 +217,7 @@ function ConfirmedTechStackSummary({ content }: { content: unknown }) {
         </span>
       </div>
       {c.summary && <p className="text-sm text-neutral-700">{c.summary}</p>}
-      {(c.languages?.length || c.frameworks?.length) && (
+      {((c.languages?.length ?? 0) > 0 || (c.frameworks?.length ?? 0) > 0) && (
         <p className="text-xs text-neutral-500">
           {[...(c.languages ?? []), ...(c.frameworks ?? [])].join(" · ")}
         </p>
@@ -219,17 +226,3 @@ function ConfirmedTechStackSummary({ content }: { content: unknown }) {
   );
 }
 
-function ModeButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      className={[
-        "rounded px-2 py-0.5 text-xs font-medium",
-        active ? "bg-neutral-900 text-white" : "text-neutral-500 hover:bg-neutral-100",
-      ].join(" ")}
-      onClick={onClick}
-    >
-      {label}
-    </button>
-  );
-}

@@ -47,6 +47,7 @@ flowchart TD
     
     scaffold -.->|suitable path| scaffold_fin --> stage1
     stage1 -.->|not ready, or rejected| stage1
+    stage1 -.->|"tech-stack-first: no requirements typed yet — run ends after the stack is approved; the Requirements tab unlocks and its submit re-enters at intake"| done
     stage2 -.->|not ready, or rejected| stage2
     stage3 -.->|not ready, or rejected| stage3
     stage4 -.->|gate failure, 3 tries| stage4
@@ -194,7 +195,7 @@ flowchart LR
     v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage."]
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves<br/>or rejects with feedback.<br/>tech-stack, specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
     aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>skips the audit and the human gate —<br/>never the deterministic verify. Approval is<br/>persisted only after verify passes."]
-    e["ESCALATE<br/>Verify cap exhausted. The run ENDs with<br/>run_failure recorded (ledger + commit + push).<br/>Never auto-approved past a failed<br/>deterministic gate. Counters reset for resubmit."]
+    e["ESCALATE<br/>Verify cap exhausted. The run ENDs with<br/>run_failure recorded (ledger + commit + push).<br/>Never auto-approved past a failed<br/>deterministic gate. Counters reset for resubmit.<br/>Verify verdicts tagged infra_error (the platform<br/>could not measure, e.g. the coverage gate's test-run<br/>evidence missing) spend a separate small budget<br/>(VERIFY_INFRA_RETRY_CAP, default 2) instead of the<br/>stage's verify laps, and escalate as<br/>failure_type=infra_transient — resumable."]
     ie["DRAFT-ESCALATE<br/>Copilot session failure survived infra_retry's<br/>own backoff attempts (quota/timeout/429) — never<br/>charged against cycle_count. run_failure tagged<br/>failure_type=infra_transient/quota_exhausted,<br/>not gate_exhausted. Wired for every stage,<br/>including tech-stack, the one with no verify."]
     q(["Not ready: emit clarifying questions, end the run"])
 
@@ -480,4 +481,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 5af2814e3822af5b6e934c083d1c661df35cf6fac6f4935a62ba1887c811ec45 -->
+<!-- graph-source-sha256: 16fabf11efc151e8d02ecfc9ef2d98f2bcb2695ab63ef5d6b99ec9f4e9d02758 -->

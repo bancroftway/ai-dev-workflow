@@ -972,7 +972,18 @@ async def check_ac_coverage(
     # -- that guess kept running the wrong tool from the wrong directory on generated monorepos,
     # producing an MSB1003-style error instead of any test output, which read here as "no AC is
     # covered" and deadlocked the stage at its verify cap.
-    await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(AC_TEST_OUTPUT_PATH)}")
+    #
+    # Fresh-lap evidence guard: the write-scope gate treats runner artifacts (ac-run-*.json,
+    # test-results/, *.trx) as pipeline-owned, so a PREVIOUS lap's reports survive on disk.
+    # Delete them along with the tee before this lap's run -- stale evidence must never pass a lap.
+    await provider.exec_in_sandbox(
+        thread_id,
+        f"rm -f {shlex.quote(AC_TEST_OUTPUT_PATH)}; "
+        "find . \\( -name node_modules -o -name .git -o -name .playwright-browsers \\) -prune -o "
+        "-type f \\( -name 'ac-run-*.json' -o -name '*.trx' \\) -print0 | xargs -0 -r rm -f; "
+        "find . \\( -name node_modules -o -name .git \\) -prune -o "
+        "-type d \\( -name test-results -o -name TestResults \\) -print0 | xargs -0 -r rm -rf",
+    )
     run_report = await stack_runner.run_and_report(
         thread_id,
         stage_key="ac-test-run",
@@ -983,7 +994,23 @@ async def check_ac_coverage(
         output_path=AC_TEST_OUTPUT_PATH,
     )
     output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)
-    if output is None:
+
+    # PREFERRED evidence: the runners' own structured reports (.trx / vitest-json /
+    # playwright-json). Read them BEFORE deciding anything about the console tee -- observed live
+    # (2026-08-30, greenfield angular-dotnet): the run agent produced a complete Playwright JSON
+    # every lap while (falsely) claiming it had also written the tee; the old missing-tee
+    # short-circuit below threw that real evidence away and burned identical infra laps to halt.
+    structured_reports: dict[str, str] = {}
+    for artifact in run_report.result_artifacts or []:
+        rel = test_results.repo_relative(artifact)
+        if not rel:
+            continue
+        contents = await repo_files.read_repo_file(provider, thread_id, rel)
+        if contents:
+            structured_reports[rel] = contents
+
+    tee_missing = output is None
+    if tee_missing and not structured_reports:
         # run_report.summary is a SEPARATE session's (ac-test-run, not this draft's own) account of
         # what happened, and it is frequently the actual diagnosis -- observed live: a .NET build
         # failure (an analyzer rule violation) meant no .trx/console tee was ever produced, so
@@ -992,14 +1019,28 @@ async def check_ac_coverage(
         # exact file and rule. Dropping it here left the draft session with a generic "no test
         # output" message and nothing to act on -- it cannot fix what it was never told.
         diagnosis = run_report.error or run_report.summary or "no test output was captured"
+        claimed = AC_TEST_OUTPUT_PATH in (run_report.summary or "") or bool(run_report.output_artifact)
         return AcCoverageOutcome(
             passed=False,
             feedback=(
                 "The test suite could not be run, so AC coverage cannot be verified -- this is an "
                 f"infra failure, not a coverage gap: {diagnosis}"
+                + (
+                    f" NOTE: the run report claimed console output was captured to {AC_TEST_OUTPUT_PATH}, "
+                    "but no such file exists and no structured runner report was found either -- "
+                    "that claim was false; the output file MUST actually be written."
+                    if claimed else ""
+                )
             ),
             report={"infra_error": "test_run_failed", "run_summary": run_report.summary},
         )
+    if tee_missing:
+        logger.warning(
+            "ac coverage: console tee %s missing but %d structured runner report(s) exist -- "
+            "proceeding on runner reports (the run agent's tee claim was not honored)",
+            AC_TEST_OUTPUT_PATH, len(structured_reports),
+        )
+        output = ""
     # The suite is expected RED at this stage; exit_ok is the runner's own exit status, which the
     # tree-grep fallback below keys off exactly as the old exec's returncode did.
     result_ok = run_report.exit_ok
@@ -1011,17 +1052,8 @@ async def check_ac_coverage(
     # Matched by substring against the ledger's OWN ids, never a hardcoded id-format regex --
     # observed live (headless run 3): the ledger mints US-0001.1-style ids while an AC-\d{4}
     # regex found nothing, so every AC read as uncovered and the stage deadlocked at the cap.
-    # PREFERRED: the runners' own structured reports. Console scraping below is the fallback for a
-    # suite whose runner offered no machine-readable reporter.
-    structured_reports: dict[str, str] = {}
-    for artifact in run_report.result_artifacts or []:
-        rel = test_results.repo_relative(artifact)
-        if not rel:
-            continue
-        contents = await repo_files.read_repo_file(provider, thread_id, rel)
-        if contents:
-            structured_reports[rel] = contents
-
+    # `structured_reports` (loaded above, before the missing-tee decision) is PREFERRED; console
+    # scraping below is the fallback for a suite whose runner offered no machine-readable reporter.
     ac_line_status: dict[str, str] = {}
     attribution_tally: dict[str, int] = {}
     if structured_reports:
@@ -1059,7 +1091,12 @@ async def check_ac_coverage(
     # matters, "the test exists and nothing is green", is checkable from the tree + exit code
     # without trusting reporter formatting at all. Tautological (green) ids can't hide here:
     # a green test printed its ✓ line and was classified "pass" above.
-    if missing and not result_ok:
+    # `not result_ok` is the honest case; `all red so far` covers a runner whose self-reported
+    # exit_ok is wrong (it is an LLM-reported field) while every classified test is failing --
+    # in the RED phase that is exactly the state tree-grep evidence is valid for. A single green
+    # test disables the widening, so a tautological suite still cannot hide behind it.
+    all_red_so_far = "pass" not in ac_line_status.values()
+    if missing and (not result_ok or all_red_so_far):
         # Piped into xargs, not interpolated: `git ls-files -co` lists UNTRACKED files too, so a
         # vendored directory (a browser npm downloaded into apps/web, say) can contribute thousands
         # of /test|spec/ matches and push a single command line past the OS argv limit -- which

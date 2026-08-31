@@ -6,5 +6,7 @@
  * already owns scrolling, so this never adds a second scroll container.
  */
 export function ViewContainer({ children }: { children: React.ReactNode }) {
-  return <div className="flex h-full w-full flex-col gap-4 p-6">{children}</div>;
+  // px-4 aligns content with the tab row above; py-3/gap-3 over the old p-6/gap-4 -- the fat
+  // top gap between the tabs and each view's heading read as wasted space (user, 2026-08-31).
+  return <div className="flex h-full w-full flex-col gap-3 px-4 py-3">{children}</div>;
 }

@@ -60,6 +60,13 @@ AIDW_AUTH_GATE = os.environ.get("AIDW_AUTH_GATE", "1").strip().lower() not in ("
 # misfires -- see infra_retry.py's own env vars for the matching draft/audit-side knob.
 VERIFY_STALL_LAPS = int(os.environ.get("AIDW_VERIFY_STALL_LAPS", "2"))
 
+# Deterministic-verify verdicts that carry report["infra_error"] (the harness could not produce
+# evidence -- e.g. ac_coverage_gate's test-run tee/artifacts missing) burn THIS budget instead of
+# the stage's max_verify_cycles: the draft didn't fail a check, the platform failed to check.
+# Observed live (2026-08-30, greenfield angular-dotnet): identical infra verdicts consumed real
+# verify laps until halt. On exhaustion the run escalates as failure_type="infra_transient".
+VERIFY_INFRA_RETRY_CAP = int(os.environ.get("AIDW_VERIFY_INFRA_RETRY_CAP", "2"))
+
 # Bounded retry when a sandbox container starts but its CLI tool (whichever provider's --
 # `claude --version`/`copilot --version`, per sandbox/provider.py's wait_for_cli_ready) never
 # responds within that function's own readiness deadline -- distinguishes "the container is slow"
@@ -127,7 +134,10 @@ CLI_AGENT_TURN_TIMEOUT_SECONDS = int(os.environ.get("CLI_AGENT_TURN_TIMEOUT_SECO
 # skill_gate.py's own module docstring. Self-report (StageReport.skills_invoked) is telemetry, not
 # evidence regardless -- a model that skipped a skill will happily claim it used one.
 REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
-    "specification": ["brainstorming"],
+    # grill-me (mattpocock pack, vendored in the sandbox image): the spec prompt has always asked
+    # for it; required here after a live run (2026-08-31) shipped a spec with zero Skill calls --
+    # the gate is what closes the prompt-says/agent-skips gap.
+    "specification": ["brainstorming", "grill-me"],
     "plan": ["writing-plans"],
     "ac-to-tests": ["test-driven-development"],
     # ponytail: minimal_code_to_green_draft.md has mandated it for as long as the prompt existed --

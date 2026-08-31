@@ -225,17 +225,16 @@ class GraphState(TypedDict):
     # the identical "captured once, persists via checkpoint" reliance for a plain StageState field.
     # Nothing about a fresh top-level GraphState key makes this field any less durable than those.
     #
-    # The one real wrinkle, independently documented in three other places in this codebase
-    # (run_headless.py's own module docstring, repo_scan.py, sandbox/registry.py): InMemorySaver is
-    # process-local. It holds nothing across a process restart, for ANY field -- provider included,
-    # but also stages, run_id, everything. The only cross-restart durability this pipeline has is
-    # workflow_persistence.hydrate_state(), and intake_node calls it to restore just `stages`
-    # (never a bare top-level field -- manifest_exists/app_scan/run_baseline_commit are all simply
-    # recomputed fresh every run instead of hydrated, same as this one will be). So
-    # `state.get("provider")` comes back empty not only for a checkpoint that predates this field,
-    # but for EVERY thread's first intake call after EVERY future restart, forever -- the `or await
-    # chat_model.get_provider()` fallback is this field's ordinary, permanent steady-state behavior,
-    # not a one-time migration shim that stops mattering once every pre-migration checkpoint is gone.
+    # Checkpoint durability (updated 2026-08-31): the graph COMPILES with InMemorySaver, but at
+    # process startup src/checkpoint.py attaches a durable AsyncSqliteSaver (main.py lifespan /
+    # run_headless), so thread state and open interrupts now survive restarts on the ordinary
+    # path. The in-memory saver remains only as the fail-soft boot fallback, and
+    # workflow_persistence.hydrate_state() remains the recovery path for a lost/deleted
+    # checkpoint DB -- intake restores just `stages` from it (never a bare top-level field --
+    # manifest_exists/app_scan/run_baseline_commit are recomputed fresh every run instead of
+    # hydrated, same as this one). So `state.get("provider")` can still come back empty (fresh
+    # thread, fallback boot, lost DB) and the `or await chat_model.get_provider()` fallback stays
+    # this field's ordinary defensive behavior, not a migration shim.
     provider: Literal["copilot", "claude"]
     # Set by scaffold_node (preflight_nodes.py) -- manifest.json absence is the canonical
     # "never onboarded before" signal, routing into brownfield-baseline's brownfield sub-flow. Read once at
@@ -321,6 +320,12 @@ def default_stage_state() -> StageState:
         "used_ids": [],
         "audit_findings": [],
         "verify_cycle_count": 0,
+        # Separate budget for report["infra_error"] verdicts (config.VERIFY_INFRA_RETRY_CAP) --
+        # a lap the platform failed to measure must not spend the draft's own verify laps.
+        "infra_retry_count": 0,
+        # The stage's own verify-lap cap, mirrored from StageSpec by make_verify_node so the
+        # frontend can render "lap N of M" honestly instead of hardcoding the constant.
+        "max_verify_cycles": 0,
         "last_verification": None,
         "reviewer_feedback": None,
         "baseline_commit": None,
@@ -724,7 +729,10 @@ def _build_tech_stack_interrupt_extra(state: GraphState) -> dict[str, Any]:
     the LLM draft path's raw TechStack dict does not."""
     draft = state["stages"]["tech-stack"].get("draft") or {}
     if isinstance(draft, dict) and "markdown" in draft:
-        return {"file_existed": True, "markdown": draft.get("markdown") or ""}
+        # greenfield_stub (preflight_nodes.prefill_tech_stack_from_repo_file): the markdown is a
+        # placeholder for an EMPTY repo, not a real pre-existing file -- the canned-stack dropdown
+        # must still show, which file_existed=True would hide.
+        return {"file_existed": not draft.get("greenfield_stub"), "markdown": draft.get("markdown") or ""}
     return {"file_existed": False, "markdown": render_tech_stack_markdown(draft)}
 
 
@@ -791,6 +799,25 @@ async def _verify_specification_ledger(
     them here. `_chat_provider` is unused -- a pure ledger sync has no dispatch call of its own
     (StageSpec.deterministic_verify's own docstring).
     """
+    # Question-ledger backstop (user requirement 2026-08-31): make_draft_node's routing coercion
+    # keeps open questions away from the gate on the DRAFT path, but the audit revises content
+    # after that and could reintroduce one -- verify is the last deterministic word before the
+    # gate, so an open question here fails the check outright.
+    open_questions = [
+        q for q in (content_dict.get("questions") or []) if isinstance(q, dict) and q.get("status") == "open"
+    ]
+    if open_questions:
+        listed = "; ".join(f"{q.get('id')}: {q.get('question')}" for q in open_questions)
+        return VerificationResult(
+            passed=False,
+            feedback=(
+                "Open clarifying questions can never reach the human gate -- either the revised "
+                "requirements answer them (mark status=answered, citing the wording) or take an "
+                f"explicit assumption (status=assumed, mirrored in `assumptions`): {listed}"
+            ),
+            report={"open_questions": [q.get("id") for q in open_questions]},
+        )
+
     entries = await spec_ledger.load_ledger(provider, thread_id)
     user_stories = content_dict.get("user_stories") or []
     retired_ac_ids = content_dict.get("retired_ac_ids") or []
@@ -799,9 +826,93 @@ async def _verify_specification_ledger(
         entries, user_stories, run_id, retired_ac_ids=retired_ac_ids, retired_us_ids=retired_us_ids
     )
     if result.passed:
+        # Completeness gate (2026-08-31, observed live TWICE): a redraft that emits only the
+        # stories it touched silently shrinks the specification -- the ledger keeps the dropped
+        # entries live, but the document (what the human approves and every later stage reads)
+        # loses them. Prompt-level instructions failed to prevent it, so it is deterministic now:
+        # every still-live ledger entry must appear in the draft (sync above already resolved
+        # draft ids) or be explicitly retired this round. Runs only on a PASSING sync so the
+        # feedback names real ids.
+        draft_ids: set[str] = set()
+        for story in content_dict.get("user_stories") or []:
+            if story.get("id"):
+                draft_ids.add(str(story["id"]))
+            for ac in story.get("acceptance_criteria") or []:
+                if ac.get("id"):
+                    draft_ids.add(str(ac["id"]))
+        missing_live = [
+            e["id"]
+            for e in result.updated_entries
+            if e.get("kind") in ("user_story", "acceptance_criterion")
+            # "deferred" included on purpose: parked scope must stay VISIBLE in every draft
+            # (re-emitted with deferred=true), or the document silently loses it exactly like
+            # the delta-shrink this gate exists to prevent.
+            and e.get("status") in ("active", "revised", "deferred")
+            and e["id"] not in draft_ids
+        ]
+        if missing_live:
+            # Feedback carries each missing entry's FULL text, not just its id (observed live
+            # 2026-08-31, thread 47f1be95: three laps burned to verification_cap_exceeded on two
+            # audit-added ACs the draft session had never itself emitted -- bare ids gave the
+            # redraft nothing to re-emit, and it never went to read ledger.json).
+            by_id_live = {e["id"]: e for e in result.updated_entries}
+            detail_lines = []
+            for mid in sorted(missing_live):
+                e = by_id_live[mid]
+                text = e.get("title") if e.get("kind") == "user_story" else e.get("description", "")
+                parent = f" (criterion of {e['parent_us_id']})" if e.get("parent_us_id") else ""
+                flag = " [status=deferred: re-emit with deferred=true]" if e.get("status") == "deferred" else ""
+                detail_lines.append(f"- {mid}{parent}{flag}: {text}")
+            return VerificationResult(
+                passed=False,
+                feedback=(
+                    "The specification draft is INCOMPLETE -- every draft must be the WHOLE "
+                    "specification, never a delta. These still-live ledger entries are absent; "
+                    "re-emit each one VERBATIM below, citing its id via existing_us_id/"
+                    "existing_ac_id (a criterion nests under its parent story's block), or "
+                    "explicitly retire it via retired_us_ids/retired_ac_ids if the requirements "
+                    "no longer call for it:\n" + "\n".join(detail_lines)
+                ),
+                report={"missing_live_entries": sorted(missing_live)},
+            )
+
+        # Durable question provenance: every question ever raised (answered/assumed included)
+        # upserts into the same committed ledger the US/AC ids live in, keyed by the model's
+        # stable question id -- the requirements document plus this ledger together explain how
+        # every ambiguity was resolved.
+        updated_entries = spec_ledger.upsert_questions(
+            result.updated_entries, content_dict.get("questions") or [], run_id
+        )
         # No explicit commit: the ledger lives under .ai-dev-workflow/, which the verify-pass
         # persistence commit sweeps up.
-        await spec_ledger.save_ledger(provider, thread_id, result.updated_entries)
+        await spec_ledger.save_ledger(provider, thread_id, updated_entries)
+        # Scope-lifecycle stamps for the review UI (user requirement 2026-08-31): every live
+        # story/AC carries its change classification versus the LAST GATED draft (`entries`, the
+        # ledger as loaded before this sync -- spec_ledger.gate_change_status explains why that
+        # is exactly the last thing the human saw), and everything retired is appended so the
+        # tab can render removed scope crossed out instead of silently vanishing it. The exit
+        # report keeps using change_status (per-RUN semantics are right there). Stamped onto the
+        # draft dict in place, exactly like sync_ledger's own id resolution above.
+        old_by_id = {e.get("id"): e for e in entries}
+        by_id = {e.get("id"): e for e in updated_entries}
+        for story in content_dict.get("user_stories") or []:
+            entry = by_id.get(story.get("id"))
+            if entry:
+                story["change"] = spec_ledger.gate_change_status(old_by_id.get(story.get("id")), entry)
+            for ac in story.get("acceptance_criteria") or []:
+                ac_entry = by_id.get(ac.get("id"))
+                if ac_entry:
+                    ac["change"] = spec_ledger.gate_change_status(old_by_id.get(ac.get("id")), ac_entry)
+        content_dict["retired_user_stories"] = [
+            {"id": e["id"], "title": e.get("title", "")}
+            for e in updated_entries
+            if e.get("kind") == "user_story" and e.get("status") == "retired"
+        ]
+        content_dict["retired_acceptance_criteria"] = [
+            {"id": e["id"], "description": e.get("description", ""), "parent_us_id": e.get("parent_us_id", "")}
+            for e in updated_entries
+            if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
+        ]
     return VerificationResult(
         passed=result.passed,
         feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
@@ -2230,10 +2341,51 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         stage["readiness"] = response.readiness
         stage["used_ids"] = sorted(used_ids)
 
+        # Question-ledger gate (user requirement 2026-08-31): a draft carrying OPEN questions can
+        # never reach the human gate -- open means "only the human can decide", so the only
+        # honest route is the clarification pause, whatever readiness the model claimed. At the
+        # clarification-cycle cap the remaining opens convert to explicit 'assumed' entries
+        # instead (same forced-progress rule the cap has always applied), so the run cannot loop
+        # forever. Generic: only the Specification schema emits `questions`, every other stage's
+        # content lacks the key and this is a no-op.
+        if isinstance(content_dict, dict) and isinstance(content_dict.get("questions"), list):
+            open_questions = [
+                q for q in content_dict["questions"] if isinstance(q, dict) and q.get("status") == "open"
+            ]
+            if open_questions and stage["cycle_count"] >= stage_spec.max_cycles:
+                for q in open_questions:
+                    q["status"] = "assumed"
+                    q["answer"] = q.get("answer") or (
+                        "Clarification budget exhausted -- proceeding on best judgment; revisit "
+                        "by revising the requirements document."
+                    )
+                logger.warning(
+                    "%s: clarification cap reached -- converted %d open question(s) to explicit assumptions",
+                    stage_spec.key, len(open_questions),
+                )
+                open_questions = []
+            if open_questions and stage["readiness"]:
+                logger.info(
+                    "%s: %d open question(s) override readiness=true -- routing to the clarification pause",
+                    stage_spec.key, len(open_questions),
+                )
+                stage["readiness"] = False
+            if open_questions and not stage["clarifying_questions"]:
+                # Mirror opens into the legacy clarifying_questions channel so the Requirements
+                # tab's answer-and-resubmit hint lists them.
+                stage["clarifying_questions"] = [
+                    {
+                        "id": str(q.get("id") or ""),
+                        "question": str(q.get("question") or ""),
+                        "suggested_choices": list(q.get("suggested_choices") or []),
+                    }
+                    for q in open_questions
+                ]
+
         # Note: no A2UI envelope is built here even when readiness=true. That happens once, in
         # make_audit_node, against the *audited* (revised) content -- building it here too would
         # double-emit the surface (once pre-audit, once post-audit) for every ready draft.
-        if response.readiness:
+        if stage["readiness"]:
             stage["status"] = "ready_for_review"
             stage["ever_ready_for_review"] = True
         else:
@@ -2628,23 +2780,35 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             state["provider"],
         )
         stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
+        stage["max_verify_cycles"] = stage_spec.max_verify_cycles
         if not result.passed:
-            stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
-            # A redraft is otherwise invisible in the log: the run just shows <stage>_verify
-            # followed by <stage>_draft again, with no reason. Diagnosing a thrashing stage then
-            # means reconstructing it from whatever the failing sub-system happened to log, which
-            # is exactly how an audit outage masqueraded as "the plan keeps getting rejected".
-            # 1200, not 300: a single-line gate verdict fits in 300, but an adversarial-compliance
-            # rejection is a LIST of findings and 300 characters stops inside the first one --
-            # observed live, the log preserved only "[major] PS-1 (scaffol" and the rest of the
-            # audit was unrecoverable from disk, since state.json holds the hydration snapshot
-            # rather than in-flight state. A truncated reason is barely better than no reason: the
-            # whole point of this line is that a thrash explains itself without a container autopsy.
-            logger.warning(
-                "%s: REDRAFT %d/%d -- %s",
-                stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles,
-                " ".join((result.feedback or "no feedback").split())[:1200],
-            )
+            # report["infra_error"]: the platform failed to produce evidence (e.g. the coverage
+            # gate's test-run tee/artifacts missing) -- the draft didn't fail a check, so this lap
+            # spends the separate infra budget, never the stage's own verify laps.
+            if (result.report or {}).get("infra_error"):
+                stage["infra_retry_count"] = stage.get("infra_retry_count", 0) + 1
+                logger.warning(
+                    "%s: INFRA RETRY %d/%d -- %s",
+                    stage_spec.key, stage["infra_retry_count"], workflow_config.VERIFY_INFRA_RETRY_CAP,
+                    " ".join((result.feedback or "no feedback").split())[:1200],
+                )
+            else:
+                stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
+                # A redraft is otherwise invisible in the log: the run just shows <stage>_verify
+                # followed by <stage>_draft again, with no reason. Diagnosing a thrashing stage then
+                # means reconstructing it from whatever the failing sub-system happened to log, which
+                # is exactly how an audit outage masqueraded as "the plan keeps getting rejected".
+                # 1200, not 300: a single-line gate verdict fits in 300, but an adversarial-compliance
+                # rejection is a LIST of findings and 300 characters stops inside the first one --
+                # observed live, the log preserved only "[major] PS-1 (scaffol" and the rest of the
+                # audit was unrecoverable from disk, since state.json holds the hydration snapshot
+                # rather than in-flight state. A truncated reason is barely better than no reason: the
+                # whole point of this line is that a thrash explains itself without a container autopsy.
+                logger.warning(
+                    "%s: REDRAFT %d/%d -- %s",
+                    stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles,
+                    " ".join((result.feedback or "no feedback").split())[:1200],
+                )
             # Reset the session ONLY when the stage fabricated -- i.e. claimed work while writing
             # nothing but pipeline artifacts. That specific failure is self-reinforcing: the false
             # claim sits in the session's own history and the model re-reads and repeats it (six
@@ -2793,6 +2957,11 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
             return "escalate"  # no sandbox -- never loop or pass, a human must see it
         if last.get("passed"):
             return "gate"
+        # Infra verdicts spend their own budget (see make_verify_node's counter split).
+        if (last.get("report") or {}).get("infra_error"):
+            if stage.get("infra_retry_count", 0) < workflow_config.VERIFY_INFRA_RETRY_CAP:
+                return "retry"
+            return "escalate"
         if stage.get("verify_cycle_count", 0) < stage_spec.max_verify_cycles:
             return "retry"
         return "escalate"
@@ -2947,9 +3116,14 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
         thread_id = config["configurable"]["thread_id"]
         stage = state["stages"][stage_spec.key]
         last = stage.get("last_verification") or {}
+        infra = bool((last.get("report") or {}).get("infra_error"))
         payload = {
             "stage": stage_spec.key,
-            "type": "cannot_verify" if last.get("cannot_verify") else "verification_cap_exceeded",
+            "type": (
+                "cannot_verify" if last.get("cannot_verify")
+                else "infra_retry_cap_exceeded" if infra
+                else "verification_cap_exceeded"
+            ),
             "report": last.get("report"),
             "feedback": last.get("feedback"),
         }
@@ -2965,10 +3139,14 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
                 thread_id, state.get("run_id"),
                 payload=payload,
                 detail_for_classification=f"{last.get('feedback') or ''} {last.get('report') or ''}",
+                # An exhausted infra budget is a platform failure, not a verified defect in the
+                # draft -- resumable, so the UI offers "Resume retries from the last checkpoint".
+                **({"default_failure_type": "infra_transient"} if infra else {}),
             )
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stages[stage_spec.key]["verify_cycle_count"] = 0
+        stages[stage_spec.key]["infra_retry_count"] = 0
         # The approval is REVOKED, and persisted revoked. A stage that exhausted its deterministic
         # gate did not pass, so leaving status=approved on the branch is simply false -- and it has
         # a concrete consequence: `intake` clears `last_verification` on every run, so the next
@@ -3045,8 +3223,9 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
             # docs/superpowers/plans/part-3-tickets-tasks.md) -- current_stage alone can't tell
             # "still drafting stage_spec.key" apart from "paused at its gate", since
             # update_current_stage only ever fires post-approval (_run_post_approve_hook below),
-            # and LangGraph's own InMemorySaver interrupt bookkeeping is in-process only, invisible
-            # to the board's separate GET /sessions DB read and lost on a restart. Best-effort and
+            # and LangGraph's interrupt bookkeeping (durable via src/checkpoint.py's sqlite saver,
+            # in-process on the fail-soft fallback) is in either case invisible
+            # to the board's separate GET /sessions DB read. Best-effort and
             # swallowed like every other sandbox-adjacent write in this function: no sandbox
             # registered means no row worth updating (mirrors _run_post_approve_hook's own guard).
             # This line re-runs harmlessly on resume too -- LangGraph re-executes the node from the
@@ -3123,6 +3302,27 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
             rejected["status"] = "needs_clarification"
             rejected["reviewer_feedback"] = feedback or "(rejected with no feedback provided)"
             stages[stage_spec.key] = rejected
+            # Requirements-as-single-source-of-truth (user requirement 2026-08-31): the
+            # Requirements tab's Submit, while this gate is open, resolves the interrupt with the
+            # FULL revised requirements document instead of making the human smuggle their real
+            # intent into a feedback box. Land it in state BEFORE the redraft loop re-enters this
+            # stage's draft node, so the redraft prompt (built from raw_requirements_text) and
+            # the persisted raw-requirements doc both reflect the revision -- provenance stays in
+            # the one document.
+            revised = resume_value.get("revised_requirements")
+            revised_update: dict[str, Any] = {}
+            if isinstance(revised, str) and revised.strip():
+                revised_update["raw_requirements_text"] = revised
+                raw_req = dict(stages.get("raw-requirements") or default_stage_state())
+                raw_req["draft"] = {"content": revised}
+                raw_req["approved_content"] = {"content": revised}
+                raw_req["status"] = "approved"
+                stages["raw-requirements"] = raw_req
+                logger.info(
+                    "%s gate rejection carried revised requirements (%d chars) -- redraft will "
+                    "use the updated document",
+                    stage_spec.key, len(revised),
+                )
             # Mirrors the True-setting call above: this session is no longer sitting at a gate --
             # it is about to redraft. Never routes through _run_post_approve_hook/
             # update_current_stage (that would fire post_approve_hook, which is only correct for
@@ -3153,6 +3353,8 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
             await _persist_if_sandboxed(
                 thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} rejected by reviewer"
             )
+            if revised_update:
+                return {"stages": stages, **revised_update}
             # No approvals.record_approval call here, deliberately: that ledger's whole purpose
             # (approvals.py's own docstring) is a tamper-evident record of content a human
             # APPROVED -- a rejection has no approved content to hash, and logging it there would
@@ -3408,17 +3610,36 @@ def _route_after_tech_stack(state: GraphState) -> str:
 
 
 def _route_after_intake(state: GraphState) -> str:
-    """END for a blank run with nothing to do; scaffold otherwise.
+    """Scaffold when there is work to do; END only for a blank run on a thread whose tech stack
+    is already settled.
 
-    "Nothing to do" = no requirements text this run (typed or carried in the latest
-    HumanMessage) AND nothing hydrated back out of the repo (a returning thread whose clone
-    holds an approved raw-requirements doc proceeds so downstream stages can hydrate/resume).
+    Tech-stack-first (product requirement, 2026-08-31): a blank run on a FRESH thread -- no
+    requirements typed yet, tech-stack not approved -- now drives scaffold -> app discovery ->
+    the Tech Stack tab's gate, then ends at repo_scan_baseline's own router below. The user
+    settles the stack before writing requirements; the ordinary reload/reattach no-op is
+    preserved by the approved-tech-stack END branch.
     """
     if (state.get("raw_requirements_text") or "").strip():
         return "scaffold"
     raw_req = (state.get("stages") or {}).get("raw-requirements") or {}
     if raw_req.get("approved_content") or raw_req.get("draft"):
         return "scaffold"
+    tech_stack = (state.get("stages") or {}).get("tech-stack") or {}
+    if tech_stack.get("status") != "approved":
+        return "scaffold"
+    return END
+
+
+def _route_after_repo_scan_baseline(state: GraphState) -> str:
+    """Tech-stack-first stopper: with the stack settled but no requirements anywhere (none typed
+    this run, none recorded on the thread), the run ends here and waits for the Requirements tab
+    -- record_raw_requirements on empty input would draft noise. The next submit re-enters at
+    intake and flows straight through (the approved tech-stack sidecar short-circuits its gate)."""
+    if (state.get("raw_requirements_text") or "").strip():
+        return "record_raw_requirements"
+    raw_req = (state.get("stages") or {}).get("raw-requirements") or {}
+    if raw_req.get("approved_content") or raw_req.get("draft"):
+        return "record_raw_requirements"
     return END
 
 
@@ -3468,7 +3689,13 @@ def _wire_tech_stack_intake(builder: StateGraph) -> None:
     )
     builder.add_edge("app_check_record", "repo_scan_baseline")
     builder.add_node("record_raw_requirements", record_raw_requirements_node)
-    builder.add_edge("repo_scan_baseline", "record_raw_requirements")
+    # Tech-stack-first: a run that exists only to settle the stack ends here (see
+    # _route_after_repo_scan_baseline) instead of drafting requirements from nothing.
+    builder.add_conditional_edges(
+        "repo_scan_baseline",
+        _route_after_repo_scan_baseline,
+        {"record_raw_requirements": "record_raw_requirements", END: END},
+    )
     builder.add_edge("record_raw_requirements", f"{STAGES[1].key}_draft")
 
 
@@ -3988,6 +4215,10 @@ def compile_graph():
     assert_pipeline_nodes_registered(builder)
     assert_no_dead_clusters(builder)
     assert_no_stub_stages()
+    # Boot-time saver only: src/checkpoint.py swaps in the durable AsyncSqliteSaver at process
+    # startup (main.py lifespan / run_headless) -- safe as a post-compile attribute assignment
+    # because Pregel resolves self.checkpointer per invoke (verified on langgraph 1.2.10). The
+    # InMemorySaver here is the fail-soft fallback when that attach fails.
     checkpointer = InMemorySaver()
     store = InMemoryStore()
     # Async checkpoint durability (Section 3.5): "async" is the documented

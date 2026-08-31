@@ -352,7 +352,7 @@ def _demo() -> None:
         "requesting-code-review", "receiving-code-review", "verification-before-completion",
         "finishing-a-development-branch", "systematic-debugging", "dispatching-parallel-agents",
         "subagent-driven-development", "ponytail", "code-review", "security-review", "simplify",
-        "agent:code-simplifier", "frontend-design",
+        "agent:code-simplifier", "frontend-design", "grill-me", "grill-with-docs",
     }
     for stage, skills in workflow_config.REQUIRED_SKILLS_BY_STAGE.items():
         for skill in skills:

@@ -7,8 +7,10 @@ Clarifying questions are disallowed via the AIDW_HEADLESS draft-prompt injection
 make_draft_node); an exhausted deterministic gate ENDs the run with `run_failure` set, which lands
 in the report.
 
-Runs IN-PROCESS on purpose: the sandbox registry, push-token map, and the graph's InMemorySaver
-checkpointer are all process-local, so provisioning and the graph must share one process.
+Runs IN-PROCESS on purpose: the sandbox registry and push-token map are process-local, so
+provisioning and the graph must share one process. Checkpoints are durable (src/checkpoint.py's
+AsyncSqliteSaver, attached at the top of run()), so a crashed run's thread state survives into
+the next process.
 
     cd agent && uv run python run_headless.py <owner> <repo> <branch> \
         --requirements-file req.md [--discard-sandbox]
@@ -132,6 +134,12 @@ def _stage_statuses(values: dict) -> dict[str, str]:
 
 
 async def run(args: argparse.Namespace) -> int:
+    # Same durable checkpointing the server process gets (src/checkpoint.py) -- a crashed
+    # headless run's thread can then be resumed instead of redrafting its gated stage.
+    from src import checkpoint
+
+    await checkpoint.attach_sqlite_checkpointer(graph)
+
     requirements = Path(args.requirements_file).read_text(encoding="utf-8")
     if not requirements.strip():
         logger.error("requirements file is empty")

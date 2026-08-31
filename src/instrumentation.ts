@@ -17,6 +17,12 @@ export const envName = (secretName: string) => secretName.toUpperCase().replace(
 
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  // Dynamic import keeps `process.on` out of the Edge bundle -- inlined here it was a hard
+  // Edge-compile error that also poisoned Turbopack HMR (see instrumentation-node.ts).
+  const { registerUnhandledRejectionGuard } = await import("./instrumentation-node");
+  registerUnhandledRejectionGuard();
+
   const vaultUri = process.env.AZURE_CONFIG_VAULT_URI;
   if (!vaultUri) return;
 

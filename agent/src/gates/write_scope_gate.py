@@ -51,6 +51,10 @@ _TS_TEST_PATTERNS = [
     # explicitly told to write must never be deleted over their extension.
     r"(^|/)playwright\.config\.[cm]?[jt]sx?$",
     r"(^|/)vitest\.config\.[cm]?[jt]sx?$",
+    # The vitest/Angular setup file its config points at (setupFiles: ["src/test-setup.ts"]) --
+    # observed live (2026-08-30): quarantined every lap because the hyphenated name matches none
+    # of the patterns above, and the model (never told) rewrote it every lap.
+    r"(^|/)test-setup\.[cm]?[jt]s$",
 ]
 _PY_TEST_PATTERNS = [
     r"(^|/)test_[A-Za-z0-9_]+\.py$",
@@ -74,8 +78,16 @@ def _is_test_path(path: str) -> bool:
 _PIPELINE_OWNED_PREFIXES = (".ai-dev-workflow/", "APPROVALS.md", "AGENTS.md")
 
 
+# Artifacts the coverage gate's own test run produces (runner reports and Playwright's failure
+# dumps) at whatever depth the test roots live. They are the GATE's requested evidence, not model
+# writes -- quarantining them each lap deleted the very reports ac_coverage_gate prefers (observed
+# live 2026-08-30: apps/web/ac-run-playwright.json + test-results/ reverted every lap). The
+# coverage gate deletes them itself before each fresh run, so staleness is handled there.
+_RUNNER_ARTIFACT_RE = re.compile(r"(^|/)(ac-run-[^/]*\.json$|test-results/|TestResults/)|\.trx$")
+
+
 def _is_pipeline_owned(path: str) -> bool:
-    return path.startswith(_PIPELINE_OWNED_PREFIXES)
+    return path.startswith(_PIPELINE_OWNED_PREFIXES) or bool(_RUNNER_ARTIFACT_RE.search(path))
 
 
 # A Playwright end-to-end spec: either it sits in an e2e directory, or it's the playwright config
@@ -368,10 +380,20 @@ async def verify_ac_to_tests(
 
     coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
+    feedback = coverage.feedback
     if write_scope.reverted_paths:
         report["reverted_out_of_scope_paths"] = write_scope.reverted_paths
         report["quarantine_dir"] = write_scope.quarantine_dir
-    return VerificationResult(passed=coverage.passed, feedback=coverage.feedback, report=report)
+        # Tell the MODEL, not just the report: a silent revert made the draft rewrite the same
+        # out-of-scope files every lap (observed live 2026-08-30, test-setup.ts x2), because
+        # nothing it could read ever said they were being deleted.
+        feedback = (
+            (feedback + " " if feedback else "")
+            + "NOTE: these paths were out of this stage's write scope and were reverted/removed "
+            f"({', '.join(write_scope.reverted_paths)}) -- do NOT write them again; only test "
+            "files, test configs, and their setup files are in scope here."
+        )
+    return VerificationResult(passed=coverage.passed, feedback=feedback, report=report)
 
 
 def _demo() -> None:
@@ -394,6 +416,15 @@ def _demo() -> None:
     assert _has_non_e2e_test(["apps/web/src/app/calc.test.ts"])
     assert _has_non_e2e_test(["apps/api.Tests/Api.Tests.csproj", "apps/api.Tests/TaskTests.cs"])
     assert _has_non_e2e_test(["tests/test_tasks.py"])
+    # vitest/Angular setup file is in scope (was quarantined every lap, live 2026-08-30)
+    assert _is_test_path("apps/web/src/test-setup.ts")
+    assert _is_test_path("apps/web/src/test-setup.mjs")
+    # the coverage gate's own runner artifacts are pipeline-owned, never model violations
+    assert _is_pipeline_owned("apps/web/ac-run-playwright.json")
+    assert _is_pipeline_owned("apps/web/test-results/foo/error-context.md")
+    assert _is_pipeline_owned("apps/api.Tests/TestResults/run.trx")
+    assert _is_pipeline_owned("apps/api.Tests/results.trx")
+    assert not _is_pipeline_owned("apps/web/src/app/app.ts")
     # non-test and pipeline-owned files never count as tests
     assert not _has_non_e2e_test(["apps/web/src/app/page.tsx"])
     assert not _has_non_e2e_test([".ai-dev-workflow/ledger.jsonl"])

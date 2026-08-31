@@ -29,9 +29,15 @@ export function ContainerStatusButton({
   const meta = CONTAINER_STATUS_META[status];
   const dot = <span className={`h-2 w-2 shrink-0 rounded-full ${meta.dot} ${meta.pulse ? "animate-pulse" : ""}`} />;
 
+  // Identical footprint in every state (backlog item 2, 2026-08-31): the provisioning->ready
+  // span->button swap (and the hover label swap) changed the pill's width and reflowed the whole
+  // tab row -- a visible flicker on every session load. min-w fits the widest label
+  // ("Stop container"); both variants share border width and padding.
+  const pillClass = "flex min-w-[7.5rem] items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-xs";
+
   if (status !== "ready" || !onStop) {
     return (
-      <span className="flex items-center gap-1.5 rounded-md border border-neutral-200 px-2 py-1 text-xs text-neutral-500">
+      <span className={`${pillClass} border-neutral-200 text-neutral-500`}>
         {dot}
         {meta.label}
       </span>
@@ -44,7 +50,7 @@ export function ContainerStatusButton({
       onClick={onStop}
       disabled={stopping}
       title="Click to stop this session's dev-tool container"
-      className="group flex items-center gap-1.5 rounded-md border border-neutral-300 px-2 py-1 text-xs text-neutral-600 hover:border-red-300 hover:bg-red-50 hover:text-red-700 disabled:opacity-40"
+      className={`${pillClass} group border-neutral-200 text-neutral-600 hover:border-red-300 hover:bg-red-50 hover:text-red-700 disabled:opacity-40`}
     >
       {dot}
       <span className="group-hover:hidden">{stopping ? "Stopping…" : "Connected"}</span>

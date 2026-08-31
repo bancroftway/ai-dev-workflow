@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json"
 SCHEMA_VERSION = 1
 
-EntryStatus = Literal["active", "retired", "revised"]
+EntryStatus = Literal["active", "retired", "revised", "deferred"]
 EntryKind = Literal["user_story", "acceptance_criterion"]
 
 # Per-AC execution provenance, written by exactly three pipeline-owned sites (never the model):
@@ -201,6 +201,14 @@ def sync_ledger(
     reused), an AC cited under the wrong parent user story, or the draft's own `id` field
     disagreeing with what it cited as `existing_*_id` (an attempted renumbering).
 
+    Deferred scope (user requirement 2026-08-31): a draft story/AC carrying `deferred: true`
+    (schemas.UserStory/AcceptanceCriterion) is fully specified but parked -- ledger status
+    "deferred", excluded from eligible_ac_ids and every live-status gate filter, NOT crossed out.
+    A story-level flag defers all of its criteria (including still-live children not re-emitted in
+    this draft -- same cascade rationale as retirement). Re-citing a deferred entry without the
+    flag promotes it back to "revised" and stamps `activated_run_id`, which change_status reports
+    as "activated". Deferral is reversible parking; retirement stays the only terminal state.
+
     `retired_ac_ids`/`retired_us_ids` (schemas.Specification's own fields of the same name) name
     ledger entries this draft explicitly declares no longer belong -- the ONLY way an entry's
     status ever becomes `"retired"`. There is deliberately no "anything not re-cited this round
@@ -237,6 +245,7 @@ def sync_ledger(
     updated = [dict(e) for e in entries]
     reasons: list[str] = []
     touched_ids: set[str] = set()
+    deferred_story_ids: set[str] = set()
 
     # Drop reset markers left by runs that never reached spec approval (rejected/abandoned drafts)
     # -- their stamp clears must never execute. This run's own markers are re-derived below.
@@ -271,7 +280,13 @@ def sync_ledger(
                     f"{existing_us_id!r} -- do not renumber an existing story"
                 )
                 continue
-            entry["status"] = "revised"
+            # Deferred scope (user requirement 2026-08-31): a story marked deferred in the draft is
+            # specified but parked -- not in the work queue, not crossed out. Citing a deferred
+            # entry WITHOUT the flag promotes it back to live ("activated"), the delta flow that
+            # builds just that slice.
+            was_deferred = entry.get("status") == "deferred"
+            story_deferred = bool(story.get("deferred"))
+            entry["status"] = "deferred" if story_deferred else "revised"
             # last_revised_run_id bumps ONLY on a real title change: an identical re-cite is not a
             # revision, and stamping it polluted _diff_ledger/CHANGELOG with phantom "Revised"
             # rows and would misreport change_status as "modified".
@@ -279,14 +294,19 @@ def sync_ledger(
             if new_title != entry.get("title"):
                 entry["title"] = new_title
                 entry["last_revised_run_id"] = run_id
+            if story_deferred != was_deferred:
+                entry["last_revised_run_id"] = run_id
+                if was_deferred:
+                    entry["activated_run_id"] = run_id
             resolved_us_id = existing_us_id
         else:
+            story_deferred = bool(story.get("deferred"))
             resolved_us_id = allocate_next_id(updated, "user_story")
             updated.append(
                 {
                     "id": resolved_us_id,
                     "kind": "user_story",
-                    "status": "active",
+                    "status": "deferred" if story_deferred else "active",
                     "title": story.get("title", ""),
                     "first_seen_run_id": run_id,
                     "last_revised_run_id": run_id,
@@ -295,8 +315,12 @@ def sync_ledger(
 
         story["id"] = resolved_us_id
         touched_ids.add(resolved_us_id)
+        if story_deferred:
+            deferred_story_ids.add(resolved_us_id)
 
         for ac in story.get("acceptance_criteria") or []:
+            # A deferred story defers all of its criteria; an individual AC may also defer alone.
+            ac_deferred = bool(ac.get("deferred")) or story_deferred
             existing_ac_id = ac.get("existing_ac_id")
             if existing_ac_id is not None:
                 ac_entry = _find(updated, existing_ac_id)
@@ -320,7 +344,12 @@ def sync_ledger(
                         f"{existing_ac_id!r} -- do not renumber an existing AC"
                     )
                     continue
-                ac_entry["status"] = "revised"
+                ac_was_deferred = ac_entry.get("status") == "deferred"
+                ac_entry["status"] = "deferred" if ac_deferred else "revised"
+                if ac_deferred != ac_was_deferred:
+                    ac_entry["last_revised_run_id"] = run_id
+                    if ac_was_deferred:
+                        ac_entry["activated_run_id"] = run_id
                 new_description = ac.get("description", ac_entry.get("description", ""))
                 if new_description != ac_entry.get("description"):
                     # The requirement genuinely changed: mark it for a tracking-field reset at
@@ -342,7 +371,7 @@ def sync_ledger(
                         "id": resolved_ac_id,
                         "kind": "acceptance_criterion",
                         "parent_us_id": resolved_us_id,
-                        "status": "active",
+                        "status": "deferred" if ac_deferred else "active",
                         "description": ac.get("description", ""),
                         "first_seen_run_id": run_id,
                         "last_revised_run_id": run_id,
@@ -351,6 +380,18 @@ def sync_ledger(
 
             ac["id"] = resolved_ac_id
             touched_ids.add(resolved_ac_id)
+
+    # Deferral cascades like retirement (same structural invariant: ac_coverage_gate/eligible_ac_ids
+    # filter by an AC's OWN status): a deferred story's still-live children not re-emitted in this
+    # draft park along with it, or the completeness/coverage machinery would keep demanding them.
+    for child in updated:
+        if (
+            child.get("kind") == "acceptance_criterion"
+            and child.get("parent_us_id") in deferred_story_ids
+            and child.get("status") in ("active", "revised")
+        ):
+            child["status"] = "deferred"
+            child["last_revised_run_id"] = run_id
 
     for us_id in retired_us_ids or []:
         entry = _find(updated, us_id)
@@ -366,7 +407,7 @@ def sync_ledger(
                 "existing_us_id -- a story cannot be both revised and retired in the same draft"
             )
             continue
-        if entry.get("status") in ("active", "revised"):
+        if entry.get("status") in ("active", "revised", "deferred"):
             entry["status"] = "retired"
             entry["last_revised_run_id"] = run_id
             # Cascade: see this function's own docstring -- ac_coverage_gate only looks at an
@@ -388,7 +429,7 @@ def sync_ledger(
                 if (
                     child.get("kind") == "acceptance_criterion"
                     and child.get("parent_us_id") == us_id
-                    and child.get("status") in ("active", "revised")
+                    and child.get("status") in ("active", "revised", "deferred")
                 ):
                     child["status"] = "retired"
                     child["last_revised_run_id"] = run_id
@@ -407,7 +448,7 @@ def sync_ledger(
                 "existing_ac_id -- an AC cannot be both revised and retired in the same draft"
             )
             continue
-        if entry.get("status") in ("active", "revised"):
+        if entry.get("status") in ("active", "revised", "deferred"):
             entry["status"] = "retired"
             entry["last_revised_run_id"] = run_id
 
@@ -417,17 +458,80 @@ def sync_ledger(
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
 
 
-def change_status(entry: dict[str, Any], run_id: str) -> Literal["new", "modified", "deleted", "unchanged"]:
+def upsert_questions(
+    entries: list[dict[str, Any]], questions: list[dict[str, Any]], run_id: str
+) -> list[dict[str, Any]]:
+    """Durable question provenance (user requirement 2026-08-31): merge the draft's FULL question
+    ledger (schemas.SpecQuestion rows, .model_dump()'d) into the entries list as
+    kind="clarifying_question" rows keyed by the model's stable question id. The draft's latest
+    word wins on question text/status/answer; rows are never deleted -- answered and assumed
+    history alongside the US/AC ids is exactly what lets every resolution trace back to the
+    requirements document. Pure; mutates and returns `entries` for save_ledger."""
+    by_id = {e.get("id"): e for e in entries if e.get("kind") == "clarifying_question"}
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        qid = str(q.get("id") or "").strip()
+        if not qid:
+            continue
+        row = by_id.get(qid)
+        if row is None:
+            row = {"kind": "clarifying_question", "id": qid, "raised_run_id": run_id}
+            entries.append(row)
+            by_id[qid] = row
+        if q.get("question"):
+            row["question"] = str(q["question"])
+        row["status"] = q.get("status") or row.get("status") or "open"
+        if q.get("answer"):
+            row["answer"] = str(q["answer"])
+        row["updated_run_id"] = run_id
+    return entries
+
+
+def change_status(
+    entry: dict[str, Any], run_id: str
+) -> Literal["new", "modified", "deleted", "unchanged", "deferred", "activated"]:
     """Derived per-run change classification -- deliberately computed, never stored: sync_ledger
-    already stamps first_seen/last_revised (and retire paths stamp last_revised), so a stored copy
-    could only ever drift from these. "deleted" wins over "new" for an entry created and retired
-    inside the same run's draft laps.
+    already stamps first_seen/last_revised (and retire/defer paths stamp last_revised), so a stored
+    copy could only ever drift from these. "deleted" wins over "new" for an entry created and
+    retired inside the same run's draft laps; "deferred" likewise wins for one created straight
+    into the parked state, and "activated" (a deferred entry promoted back to live this run) wins
+    over plain "modified".
     """
     if entry.get("status") == "retired" and entry.get("last_revised_run_id") == run_id:
         return "deleted"
+    if entry.get("status") == "deferred" and entry.get("last_revised_run_id") == run_id:
+        return "deferred"
+    if entry.get("activated_run_id") == run_id:
+        return "activated"
     if entry.get("first_seen_run_id") == run_id:
         return "new"
     if entry.get("last_revised_run_id") == run_id:
+        return "modified"
+    return "unchanged"
+
+
+def gate_change_status(
+    old_entry: dict[str, Any] | None, new_entry: dict[str, Any]
+) -> Literal["new", "modified", "unchanged", "deferred", "activated"]:
+    """Per-GATE change classification for the review UI: what changed versus the last draft the
+    human actually saw. change_status (above) classifies per RUN, and every gate-rejection
+    redraft shares one run_id -- so an in-session rewording badged "new" forever (observed live
+    2026-08-31, S3 soft-delete revision). The ledger is only persisted on a PASSING verify, and a
+    passing verify is exactly what reaches the gate -- so the ledger state loaded BEFORE this
+    sync IS the last gated draft, and a plain content diff against it gives gate-relative
+    semantics with no extra stamps to keep consistent. Pure.
+
+    old_entry is the entry as it stood in the pre-sync ledger (None = allocated this cycle)."""
+    if old_entry is None:
+        return "new"
+    old_status, new_status = old_entry.get("status"), new_entry.get("status")
+    if old_status == "deferred" and new_status in ("active", "revised"):
+        return "activated"
+    if new_status == "deferred" and old_status != "deferred":
+        return "deferred"
+    text_key = "title" if new_entry.get("kind") == "user_story" else "description"
+    if old_entry.get(text_key) != new_entry.get(text_key):
         return "modified"
     return "unchanged"
 
@@ -768,6 +872,86 @@ def _demo() -> None:
     assert "coded_run_id" not in delivery_pool[2], "retired entries never stamped"
     assert "coded_run_id" not in delivery_pool[3], "other tickets' entries never stamped"
     assert not stamp_delivery(delivery_pool, {"US-0001.1", "US-0001.2"}, execution, "r2", "t2"), "idempotent"
+
+    # --- Deferred scope lifecycle ---
+    # New story emitted deferred: parked from birth, cascades to its own new AC, out of the queue.
+    deferred_draft = [
+        {
+            "id": "d-1",
+            "existing_us_id": None,
+            "title": "Delete a task",
+            "deferred": True,
+            "acceptance_criteria": [{"id": "d-1.1", "existing_ac_id": None, "description": "Deletes."}],
+        }
+    ]
+    rd = sync_ledger([dict(e) for e in seed], deferred_draft, "run-7")
+    assert rd.passed, rd.reasons
+    dus = next(e for e in rd.updated_entries if e["kind"] == "user_story" and e["title"] == "Delete a task")
+    dac = next(e for e in rd.updated_entries if e.get("parent_us_id") == dus["id"])
+    assert dus["status"] == "deferred" and dac["status"] == "deferred"
+    assert change_status(dus, "run-7") == "deferred", "born-deferred reports 'deferred', not 'new'"
+    assert eligible_ac_ids(rd.updated_entries, {dac["id"]}) == [], "deferred ACs never enter the work queue"
+
+    # Deferring an existing live story parks its non-re-emitted live children too (cascade).
+    rd2 = sync_ledger(
+        [dict(e) for e in seed],
+        [{"id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in", "deferred": True,
+          "acceptance_criteria": []}],
+        "run-8",
+    )
+    assert rd2.passed, rd2.reasons
+    assert next(e for e in rd2.updated_entries if e["id"] == "US-0001")["status"] == "deferred"
+    assert next(e for e in rd2.updated_entries if e["id"] == "US-0001.1")["status"] == "deferred", "defer cascades"
+
+    # Promotion: re-citing a deferred entry WITHOUT the flag revives it as 'activated'.
+    parked = rd2.updated_entries
+    rp = sync_ledger(
+        [dict(e) for e in parked],
+        [{"id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in", "acceptance_criteria": [
+            {"id": "US-0001.1", "existing_ac_id": "US-0001.1", "description": "Shows an error on a wrong password."}
+        ]}],
+        "run-9",
+    )
+    assert rp.passed, rp.reasons
+    pus = next(e for e in rp.updated_entries if e["id"] == "US-0001")
+    pac = next(e for e in rp.updated_entries if e["id"] == "US-0001.1")
+    assert pus["status"] == "revised" and pac["status"] == "revised"
+    assert change_status(pus, "run-9") == "activated" and change_status(pac, "run-9") == "activated"
+    assert eligible_ac_ids(rp.updated_entries, {"US-0001.1"}) == ["US-0001.1"], "promotion re-enters the queue"
+
+    # A deferred entry can still be retired outright (feature cancelled from the PRD).
+    rr = sync_ledger([dict(e) for e in parked], [], "run-10", retired_us_ids=["US-0001"])
+    assert rr.passed, rr.reasons
+    assert next(e for e in rr.updated_entries if e["id"] == "US-0001")["status"] == "retired"
+    assert next(e for e in rr.updated_entries if e["id"] == "US-0001.1")["status"] == "retired"
+
+    # gate_change_status: gate-relative badges -- an in-session rewording is 'modified' even
+    # though run stamps say 'new' (the run-id bug this function exists to fix), and status
+    # transitions win over text diffs.
+    old_us = {"id": "US-0001", "kind": "user_story", "status": "revised", "title": "Delete a task"}
+    assert gate_change_status(None, {"kind": "user_story", "status": "active", "title": "X"}) == "new"
+    assert gate_change_status(old_us, {**old_us, "title": "Soft-delete a task"}) == "modified"
+    assert gate_change_status(old_us, dict(old_us)) == "unchanged"
+    assert gate_change_status(old_us, {**old_us, "status": "deferred"}) == "deferred"
+    assert gate_change_status({**old_us, "status": "deferred"}, {**old_us, "status": "revised"}) == "activated"
+    old_ac = {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "description": "a"}
+    assert gate_change_status(old_ac, {**old_ac, "description": "b"}) == "modified"
+
+    # Question ledger: upsert keeps history, latest draft wins, no deletes.
+    q_entries: list[dict[str, Any]] = [{"kind": "user_story", "id": "US-0001", "status": "active"}]
+    upsert_questions(q_entries, [{"id": "q-a", "question": "A?", "status": "open"}], "r1")
+    assert any(e["kind"] == "clarifying_question" and e["id"] == "q-a" and e["status"] == "open" for e in q_entries)
+    upsert_questions(
+        q_entries,
+        [{"id": "q-a", "question": "A?", "status": "answered", "answer": "per requirements: yes"},
+         {"id": "q-b", "question": "B?", "status": "assumed", "answer": "assumed default"}],
+        "r2",
+    )
+    q_rows = {e["id"]: e for e in q_entries if e["kind"] == "clarifying_question"}
+    assert q_rows["q-a"]["status"] == "answered" and q_rows["q-a"]["answer"].startswith("per requirements")
+    assert q_rows["q-a"]["raised_run_id"] == "r1" and q_rows["q-a"]["updated_run_id"] == "r2"
+    assert q_rows["q-b"]["status"] == "assumed"
+    assert len(q_rows) == 2 and any(e["kind"] == "user_story" for e in q_entries), "no deletes, other kinds intact"
 
     print("spec_ledger self-check: ok")
 

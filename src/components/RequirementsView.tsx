@@ -9,7 +9,7 @@ import { ViewContainer } from "@/components/ViewContainer";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { takeHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import type { WorkflowState } from "@/lib/workflow-types";
+import { anyStageDrafting, buildStarted, runEnded, type WorkflowState } from "@/lib/workflow-types";
 
 export function RequirementsView() {
   // agentId only, not the full {agentId, runtimeAgentId, threadId} triple: AppShell (always
@@ -94,16 +94,80 @@ export function RequirementsView() {
     }
   }, [rawRequirementsContent]);
 
+  // Last-resort rehydrate from this tab's own draft copy (saved on every keystroke below).
+  // Mid-run, agent state doesn't reach a reloaded client until the run next pauses (the
+  // reattach gap) -- so a reload right after Submit showed an EMPTY editor ("my requirements
+  // vanished", observed live 2026-08-31). Same sessionStorage-degrades-silently rules as the
+  // new-ticket handoff above. syncedRef is set so late-arriving server state never clobbers.
+  useEffect(() => {
+    if (syncedRef.current) return;
+    let saved: string | null = null;
+    try {
+      saved = sessionStorage.getItem(`aidw:req-draft:${threadId}`);
+    } catch {
+      return;
+    }
+    if (saved) {
+      // One-time seed from an external store on mount, same shape as the handoff effect above.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setText(saved);
+      syncedRef.current = true;
+    }
+  }, [threadId]);
+
+  function updateText(value: string) {
+    setText(value);
+    try {
+      sessionStorage.setItem(`aidw:req-draft:${threadId}`, value);
+    } catch {
+      // Storage blocked -- the reload safety net is lost, typing still works.
+    }
+  }
+
   // A run submitted while an interrupt is pending is silently dropped server-side (the endpoint
   // re-emits the stored interrupt and never starts the graph), so Submit must go down while a
   // review is open -- an enabled button there is a lie.
   const { interrupt: openInterrupt } = useOpenInterrupt();
-  const disabled = text.trim().length === 0 || agent.isRunning || submitting || openInterrupt.open;
+  // State-derived run lock: agent.isRunning is stream attachment, which resets to false on a
+  // page reload while the run keeps going server-side -- observed live: Submit sat enabled all
+  // through ac-to-tests. Locked from build-start until the run ends (failure recorded or exit
+  // approved -- resubmitting after THAT is the supported requirements-delta flow), and while any
+  // stage is actively drafting pre-build.
+  const runLocked = (buildStarted(state) && !runEnded(state)) || anyStageDrafting(state);
+  // Requirements-as-single-source-of-truth (user requirement 2026-08-31): while the
+  // SPECIFICATION gate is open, this tab stays live -- submitting resolves that gate with the
+  // full revised document (graph.py make_gate_node's revised_requirements contract), so answers
+  // to the spec's questions live in the requirements doc, not in a feedback box. Scoped to the
+  // spec gate only: a plan-gate revision would redraft the plan against a stale approved spec.
+  const specGateOpen = openInterrupt.open && openInterrupt.stage === "specification";
+  const disabled =
+    text.trim().length === 0 ||
+    agent.isRunning ||
+    submitting ||
+    (openInterrupt.open && !specGateOpen) ||
+    runLocked;
 
   async function handleSubmit() {
     const trimmed = text.trim();
     if (!trimmed) return;
     setSubmitting(true);
+    if (specGateOpen) {
+      try {
+        openInterrupt.resolve?.({
+          decision: "rejected",
+          feedback:
+            "Requirements revised by the reviewer — redraft the Specification strictly from the updated requirements document. " +
+            "Emit the COMPLETE specification: every still-applicable user story and acceptance criterion re-appears citing its existing id — never just the changed ones. " +
+            "Features REMOVED from the document must be explicitly retired via retired_us_ids/retired_ac_ids (citing their existing ids), never silently dropped. " +
+            "Features the document marks for a LATER phase are specified with deferred=true, never retired; features moved INTO the build-now scope re-appear with deferred=false. " +
+            "A previously deferred feature that no longer appears ANYWHERE in the document has been removed — retire it; the current document alone decides what exists.",
+          revised_requirements: trimmed,
+        });
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     try {
       const ready = consumeAttachments();
       const content: string | InputContent[] =
@@ -129,12 +193,28 @@ export function RequirementsView() {
 
   return (
     <ViewContainer>
-      <div>
-        <h1 className="text-lg font-semibold">Requirements</h1>
-        <p className="text-sm text-neutral-500">
-          Describe what you want built. Edit and resubmit at any time — including to answer
-          clarifying questions below. Paste screenshots directly into the text.
-        </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-lg font-semibold">Requirements</h1>
+          <p className="text-sm text-neutral-500">
+            Describe what you want built. Edit and resubmit at any time — including to answer
+            clarifying questions below. Paste screenshots directly into the text.
+          </p>
+        </div>
+        {/* Teaches the scoping convention by example (user, 2026-08-31): a full PRD with explicit
+            "Build now" vs "Later (deferred)" sections -- deferred items are specified and shown,
+            never built until moved up. */}
+        <button
+          type="button"
+          className="shrink-0 rounded-md border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 disabled:opacity-40"
+          disabled={agent.isRunning || submitting || runLocked}
+          onClick={() => {
+            if (text.trim() && !window.confirm("Replace the current requirements text with the PRD template?")) return;
+            updateText(PRD_TEMPLATE);
+          }}
+        >
+          Start from PRD template
+        </button>
       </div>
 
       <ClarifyingQuestions
@@ -145,19 +225,27 @@ export function RequirementsView() {
 
       <AttachmentEditor
         value={text}
-        onChange={setText}
+        onChange={updateText}
         attachmentsApi={attachmentsApi}
         disabled={agent.isRunning || submitting}
+        minHeightClassName="h-[63vh]"
         placeholder="Describe your software idea... (markdown supported; paste or drag screenshots in)"
         uploadError={uploadError}
       />
 
       <div className="flex items-center justify-end gap-3">
+        {runLocked && !openInterrupt.open && (
+          <span className="text-xs text-neutral-500">
+            A run is in progress — requirements are locked until it ends (resubmit afterwards for a delta).
+          </span>
+        )}
         {openInterrupt.open && (
           <span className="text-xs text-neutral-500">
             {openInterrupt.stage === "tech-stack"
               ? "Finish the Tech Stack tab first, then resubmit."
-              : "A review is waiting in the chat sidebar — approve or acknowledge it first, then edit and resubmit."}
+              : specGateOpen
+                ? "The Specification is awaiting review — submitting here revises the requirements and redrafts it from the updated document."
+                : "A review is waiting — approve or reject it first, then edit and resubmit."}
           </span>
         )}
         <button
@@ -165,12 +253,44 @@ export function RequirementsView() {
           disabled={disabled}
           onClick={handleSubmit}
         >
-          {agent.isRunning || submitting ? "Submitting…" : "Submit"}
+          {/* "Submitting…" only during the actual submit POST -- it used to stay up for the
+              whole multi-minute run (isRunning), which made the Requirements green dot (that
+              stage IS done seconds in) look contradictory. The global spinner in the tab row
+              now owns "the pipeline is working". */}
+          {submitting ? "Submitting…" : "Submit"}
         </button>
       </div>
     </ViewContainer>
   );
 }
+
+/** The Requirements document is the single source of truth; this skeleton teaches the full-PRD
+ * convention: keep EVERYTHING the product needs in one document, scope with "Build now" vs
+ * "Later (deferred)" sections, and promote work by moving items up and resubmitting. */
+const PRD_TEMPLATE = `# <Product name>
+
+## Goal
+One or two sentences: what this product does and for whom.
+
+## Build now
+List the features to build in this pass. Be concrete — each becomes user stories with testable
+acceptance criteria.
+- Feature A — what the user can do and what they see
+- Feature B — ...
+
+## Later (deferred)
+Features that belong to the product but NOT this pass. They are specified and reviewed now, shown
+as "deferred", and no code or tests are written for them until you move them into "Build now" and
+resubmit.
+- Feature C (deferred: planned for a later phase — do not build yet)
+
+## Tech stack
+Confirmed on the Tech Stack tab; note anything extra here (libraries, hosting, integrations).
+
+## Constraints & non-goals
+- Keep it as simple as possible.
+- No auth / no persistence / no ... (delete what doesn't apply)
+`;
 
 /** Parses the New Ticket form's sessionStorage handoff payload (see the rehydrate effect above)
  * into the combined requirements text, or null for a missing/malformed/empty payload -- kept

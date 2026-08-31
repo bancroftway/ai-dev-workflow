@@ -31,8 +31,32 @@ export function PlanView() {
     parseImplementationPlan(plan?.approved_content) ??
     (interrupt.stage === "plan" ? parseImplementationPlan(interrupt.draft) : null);
 
+  // Same shell as Tech Stack / Requirements / Specification (user requirement 2026-08-31):
+  // header block on top, content in one bounded 63vh box scrolling internally. Read-only here;
+  // approve/reject lives in the gate card above the tabs.
   return (
     <ViewContainer>
+      <div>
+        <h1 className="text-lg font-semibold">Plan</h1>
+        <p className="text-sm text-neutral-500">
+          Ordered implementation steps, diagrams, and wireframes drafted from the approved
+          specification and adversarially audited by a second model. Review here; approve or reject
+          with feedback in the review card above.
+        </p>
+      </div>
+
+      {(plan?.audit_findings?.length ?? 0) > 0 && (
+        <details className="rounded-lg border border-neutral-200 px-3 py-2 text-sm">
+          <summary className="cursor-pointer text-neutral-700">
+            Adversarial audit revised this draft — {plan!.audit_findings.length} finding(s) addressed
+          </summary>
+          <ul className="mt-1 list-inside list-disc text-xs text-neutral-600">
+            {plan!.audit_findings.map((finding, index) => (
+              <li key={index}>{finding}</li>
+            ))}
+          </ul>
+        </details>
+      )}
       <ClarifyingQuestions
         stageKey="plan"
         questions={plan?.clarifying_questions ?? []}
@@ -44,16 +68,18 @@ export function PlanView() {
           be generated once the Specification is re-approved.
         </div>
       )}
-      <A2UISurfaceView
-        surfaceId={PLAN_SURFACE_ID}
-        fallback={
-          draft ? (
-            <PlanSurfaceRenderer plan={draft} />
-          ) : (
-            <p className="text-sm text-neutral-500">No Plan draft yet.</p>
-          )
-        }
-      />
+      <div className="h-[75vh] overflow-y-auto rounded-lg border border-neutral-300 p-3">
+        <A2UISurfaceView
+          surfaceId={PLAN_SURFACE_ID}
+          fallback={
+            draft ? (
+              <PlanSurfaceRenderer plan={draft} />
+            ) : (
+              <p className="text-sm text-neutral-500">No Plan draft yet.</p>
+            )
+          }
+        />
+      </div>
     </ViewContainer>
   );
 }

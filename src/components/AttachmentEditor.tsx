@@ -113,11 +113,16 @@ export function AttachmentEditor({
         <ModeButton label="Preview" active={mode === "preview"} onClick={() => setMode("preview")} />
       </div>
 
+      {/* Both panes take EXACTLY the height class the caller passes (`h-[..]` locks Edit and
+          Preview to the identical box -- user requirement 2026-08-31: toggling Preview must not
+          change the page height; long content scrolls inside the pane). No flex-1 on the panes:
+          the class prop owns sizing alone, so a `min-h-[..]` caller gets a fixed floor, not
+          content-driven growth. */}
       {mode === "edit" ? (
         <textarea
           ref={textareaRef}
           id={textareaId}
-          className={`${minHeightClassName} w-full flex-1 resize-none p-3 text-sm outline-none`}
+          className={`${minHeightClassName} w-full resize-none p-3 text-sm outline-none`}
           placeholder={placeholder}
           value={value}
           onChange={(event) => onChange(event.target.value)}
@@ -126,7 +131,7 @@ export function AttachmentEditor({
         />
       ) : (
         <div
-          className={`prose prose-sm ${minHeightClassName} max-w-none flex-1 overflow-y-auto p-3 [&_img]:max-h-80 [&_img]:rounded-md [&_img]:border`}
+          className={`prose prose-sm ${minHeightClassName} max-w-none overflow-y-auto p-3 [&_img]:max-h-80 [&_img]:rounded-md [&_img]:border`}
         >
           {value.trim() ? (
             <ReactMarkdown urlTransform={resolveUrl}>{value}</ReactMarkdown>

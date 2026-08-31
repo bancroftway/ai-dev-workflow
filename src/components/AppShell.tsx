@@ -7,7 +7,9 @@ import {
   useInterrupt,
 } from "@copilotkit/react-core/v2";
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { BuildView } from "@/components/BuildView";
+import { ContainerStatusButton } from "@/components/ContainerStatus";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
 import { QualityView } from "@/components/QualityView";
@@ -16,11 +18,14 @@ import { RequirementsView } from "@/components/RequirementsView";
 import { SessionOverview } from "@/components/SessionOverview";
 import { SpecificationView } from "@/components/SpecificationView";
 import { TechStackView } from "@/components/TechStackView";
+import { Spinner } from "@/components/Spinner";
+import { terminateSession } from "@/lib/agent-client";
 import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
+  buildStarted,
   type EscalationPayload,
   type MergeReadinessReport,
   PIPELINE_STAGE_ORDER,
@@ -84,11 +89,104 @@ export function AppShell({
   });
   const [activeView, setActiveView] = useState<ViewId>("tech-stack");
   const { copilotkit } = useCopilotKit();
-  const [sandboxStatus] = useSandboxStatus();
+  const [sandboxStatus, setSandboxStatus] = useSandboxStatus();
+  const router = useRouter();
+  const [stoppingContainer, setStoppingContainer] = useState(false);
 
   const state = (agent.state ?? {}) as WorkflowState;
   const specification = state.stages?.specification;
   const plan = state.stages?.plan;
+
+  // Focus follows the pipeline (user ask 2026-08-31): when a stage starts needing the user (a
+  // gate opens) or a new phase begins, switch to its tab instead of making the user chase the
+  // amber dot. Two modes:
+  //  - TRANSITION: a stage's status changed this mount -> jump to the mapped tab.
+  //  - FIRST LOAD (no previous statuses seen): land on the most relevant tab for the state as
+  //    hydrated -- a returning user opens where the action is, not on the Tech Stack default.
+  // Manual clicks always win afterwards: auto-switches only ever fire on fresh transitions.
+  const stagesForFocus = state.stages;
+  const prevStageStatusRef = useRef<Record<string, string> | null>(null);
+  useEffect(() => {
+    if (stagesForFocus == null || Object.keys(stagesForFocus).length === 0) return;
+    const stages = stagesForFocus as Record<string, { status?: string } | undefined>;
+    const status = (key: string) => stages[key]?.status;
+    const prev = prevStageStatusRef.current;
+    const current: Record<string, string> = {};
+    for (const [key, stage] of Object.entries(stages)) if (stage?.status) current[key] = stage.status;
+    prevStageStatusRef.current = current;
+
+    // Ordered latest-phase-first: the furthest stage that newly needs attention wins.
+    const RULES: { key: string; at: string; to: ViewId; also?: () => boolean }[] = [
+      { key: "metrics-exit", at: "approved", to: "report" },
+      { key: "exit", at: "approved", to: "report" },
+      { key: "ac-to-tests", at: "drafting", to: "build" },
+      { key: "plan", at: "ready_for_review", to: "plan" },
+      { key: "specification", at: "ready_for_review", to: "specification" },
+      // Tech stack confirmed -> the only next action is typing requirements. Skip for
+      // resumed/delta threads that already carry them -- checked by STATUS, not key presence:
+      // intake pre-creates every stage entry at not_started, so `== null` never fired (observed
+      // live 2026-08-31, the jump silently skipped).
+      {
+        key: "tech-stack",
+        at: "approved",
+        to: "requirements",
+        also: () => (stages["raw-requirements"]?.status ?? "not_started") === "not_started",
+      },
+    ];
+    // setState-in-effect is the point here: activeView reacts to SERVER stage transitions (an
+    // external store), not to derivable render-time data -- same exemption shape as the
+    // one-time seeds in RequirementsView.
+    if (prev == null) {
+      const landing = RULES.find((r) => status(r.key) === r.at && (r.also?.() ?? true));
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (landing) setActiveView(landing.to);
+      return;
+    }
+    const fired = RULES.find((r) => status(r.key) === r.at && prev[r.key] !== r.at && (r.also?.() ?? true));
+     
+    if (fired) setActiveView(fired.to);
+  }, [stagesForFocus]);
+
+  // Container-pill liveness poll (found live 2026-08-31: the pill said "Connected" while a
+  // restarted agent had NO sandbox registered -- SandboxSessionBoot sets "ready" once after the
+  // provision POST and nothing ever re-checked, so an agent restart or a dead container left the
+  // pill green until the next run failed). The agent side is real-time (a docker-events watcher
+  // evicts a dead container's registry entry within milliseconds, and reads verify against
+  // `docker inspect`); GET /api/sessions/{id} surfaces that as `container_alive`, and this poll
+  // is just the delivery hop -- every 10s and on window focus, so the pill lags the daemon by at
+  // most one tick. Never interferes with an in-flight provision ("provisioning" is skipped);
+  // recovers to "ready" on its own if the sandbox comes back.
+  const sandboxStatusRef = useRef(sandboxStatus);
+  useEffect(() => {
+    sandboxStatusRef.current = sandboxStatus;
+  }, [sandboxStatus]);
+  useEffect(() => {
+    let stopped = false;
+    async function reconcile() {
+      if (stopped || sandboxStatusRef.current === "provisioning") return;
+      try {
+        const res = await fetch(`/api/sessions/${threadId}`);
+        if (stopped) return;
+        if (res.status === 404) {
+          setSandboxStatus("terminated"); // session deleted elsewhere
+          return;
+        }
+        if (!res.ok) return; // agent unreachable/transient -- keep the last known state
+        const row = (await res.json()) as { container_alive?: boolean };
+        setSandboxStatus(row.container_alive ? "ready" : "error");
+      } catch {
+        // transient network failure -- next tick retries
+      }
+    }
+    const id = setInterval(() => void reconcile(), 10_000);
+    const onFocus = () => void reconcile();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [threadId, setSandboxStatus]);
 
   // Auto-trigger the run once, as soon as the sandbox is ready, on a thread that's never run
   // before -- scaffold_node hard-fails with no local-working-tree fallback if run before the
@@ -109,7 +207,12 @@ export function AppShell({
       return;
     }
     if (Object.keys(state.stages ?? {}).length > 0) return;
-    if (agent.messages.length > 0) return;
+    // No messages-guard anymore (2026-08-31): after a reload the thread's messages rehydrate
+    // client-side, so `messages.length > 0` permanently blocked the blank reattach run on any
+    // thread the user had ever submitted requirements on -- the page sat unhydrated ("Detecting
+    // your tech stack…", no gate card) forever. The blank run is safe to fire: the server drops
+    // it while an interrupt is pending (re-emitting the stored gate) and no-ops at intake on an
+    // idle thread (tech-stack-first routing), so stages-empty is the only guard needed.
     autoTriggeredRef.current = true;
     void copilotkit.runAgent({ agent });
   }, [sandboxStatus, state.stages, agent, copilotkit, resume]);
@@ -139,7 +242,7 @@ export function AppShell({
     },
   });
 
-  const buildStarted = state.stages?.["ac-to-tests"]?.status !== undefined && state.stages["ac-to-tests"]!.status !== "not_started";
+  const buildTabEnabled = buildStarted(state);
   const qualityStarted = Boolean(
     state.quality_remediation ?? state.security_remediation ?? state.test_hardening ?? state.metrics_report,
   );
@@ -180,7 +283,10 @@ export function AppShell({
             Sandbox provisioning failed — the workflow can’t run. Reload the page to retry.
           </div>
         )}
-        <MetricsBar thresholds={metricThresholds} />
+        {/* Pre-build the bar only shows the empty-repo baseline scan (a meaningless 89/A/Pass on
+            zero code) -- misleading, per user feedback 2026-08-31. Metrics appear once Build
+            starts producing code; a recorded run failure always surfaces its chip. */}
+        {(buildTabEnabled || state.run_failure != null) && <MetricsBar thresholds={metricThresholds} />}
         <nav className="flex items-center gap-1 border-b border-neutral-200 px-4 py-2">
           <TabButton
             label="Tech Stack"
@@ -191,6 +297,10 @@ export function AppShell({
           <TabButton
             label="Requirements"
             active={activeView === "requirements"}
+            // Tech-stack-first (product requirement 2026-08-31): requirements wait until the
+            // stack is determined/selected. Legacy threads that already carry requirements
+            // (raw-requirements stage exists) stay reachable regardless.
+            disabled={state.stages?.["tech-stack"]?.status !== "approved" && state.stages?.["raw-requirements"] == null}
             dot={dots.requirements}
             onClick={() => setActiveView("requirements")}
           />
@@ -211,7 +321,7 @@ export function AppShell({
           <TabButton
             label="Build"
             active={activeView === "build"}
-            disabled={!buildStarted}
+            disabled={!buildTabEnabled}
             dot={dots.build}
             onClick={() => setActiveView("build")}
           />
@@ -234,22 +344,92 @@ export function AppShell({
             active={activeView === "overview"}
             onClick={() => setActiveView("overview")}
           />
+          {/* Session chrome lives HERE, not in WorkspaceHeader: that header mounts in root
+              layout, OUTSIDE this page's SandboxStatusProvider, so a status pill there reads
+              null context and renders nothing (found dead 2026-08-30). */}
+          <div className="ml-auto flex items-center gap-2">
+            {/* Global run indicator (user requirement 2026-08-31): visible on EVERY tab while
+                the pipeline works. isRunning ONLY -- the spinner spins exactly while a run call
+                to the agent is in flight (the attached stream). anyStageDrafting was removed
+                (user, 2026-08-31): it reads server-state status flags, and a run that died
+                mid-draft (agent restart, quota) leaves a stage stuck on "drafting" forever -- the
+                spinner then claimed work that wasn't happening. The trade: a reloaded client
+                whose stream detached mid-run shows no spinner until it reattaches (the known
+                mid-run reattach gap, backlog item 4). Suppressed while a review gate is open:
+                the stream stays attached during a LangGraph interrupt, but the pipeline is
+                waiting on the HUMAN then. */}
+            {interruptElement == null && agent.isRunning && (
+              <span className="flex items-center gap-1.5 text-xs text-neutral-500">
+                <Spinner />
+                {(() => {
+                  const drafting = Object.entries(state.stages ?? {}).find(([, s]) => s?.status === "drafting")?.[0];
+                  return drafting ? `${drafting} running…` : "working…";
+                })()}
+              </span>
+            )}
+            {/* Gated on a real push, not just the session row: the remote branch is created by
+                the run's FIRST push, so linking earlier 404s (observed live at the tech-stack
+                gate, 2026-08-31). last_push alone was too fragile -- it only lands in state when
+                a gate node RETURNS, so mid-gate/reloaded clients hid the icon on branches that
+                verifiably existed (backlog item 8). Any approved stage implies its approval
+                commit was pushed, so that is the durable co-signal.
+                ponytail: a failed push behind an approved stage still shows the icon (404 on
+                click); upgrade path = persist branch-exists on dbo.sessions. */}
+            {workBranch !== "" &&
+              (state.last_push?.ok === true ||
+                Object.values(state.stages ?? {}).some((s) => s?.status === "approved")) && (
+              <a
+                href={`https://github.com/${owner}/${repo}/tree/${workBranch.split("/").map(encodeURIComponent).join("/")}`}
+                target="_blank"
+                rel="noreferrer"
+                title={`Open ${workBranch} on GitHub`}
+                className="flex items-center rounded-md border border-neutral-200 p-1.5 text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900"
+              >
+                <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-label="GitHub branch">
+                  <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+                </svg>
+              </a>
+            )}
+            <ContainerStatusButton
+              status={sandboxStatus}
+              stopping={stoppingContainer}
+              onStop={async () => {
+                if (!window.confirm("Stop this session's container? Its workspace volume is discarded — a later Resume re-provisions from the pushed branch.")) return;
+                setStoppingContainer(true);
+                try {
+                  if (await terminateSession(threadId)) {
+                    setSandboxStatus("terminated");
+                    router.push("/select");
+                  }
+                } finally {
+                  setStoppingContainer(false);
+                }
+              }}
+            />
+          </div>
         </nav>
 
         {/* The Gate UI's new home (Task 10) -- rendered here so it's visible above whichever tab
             is open, matching the comment on useInterrupt above. null for tech-stack's own gate
             (InterruptCard returns null there; TechStackView renders its own controls instead) and
             for the ordinary "nothing is paused right now" case, so this adds no dead space then. */}
-        {interruptElement != null && <div className="px-4 pt-3">{interruptElement}</div>}
+        {/* No wrapper div: InterruptCard renders null for tech-stack's own gate, and a padded
+            wrapper around that null was a 12px phantom gap above every view while that gate was
+            open (user, 2026-08-31). The card's non-null returns carry their own mx-4 mt-3. */}
+        {interruptElement}
 
+        {/* Views stay MOUNTED and hide via [hidden] (backlog item 3, 2026-08-31): unmounting on
+            tab switch reset unsaved editor text, dropdown picks, and scroll -- observed live.
+            Every view already tolerates empty state (tabs enable mid-run), so mounting them all
+            up front only costs idle renders. */}
         <main className="flex-1 overflow-y-auto">
-          {activeView === "tech-stack" && <TechStackView />}
-          {activeView === "requirements" && <RequirementsView />}
-          {activeView === "specification" && <SpecificationView />}
-          {activeView === "plan" && <PlanView />}
-          {activeView === "build" && <BuildView />}
-          {activeView === "quality" && <QualityView />}
-          {activeView === "report" && (
+          <div hidden={activeView !== "tech-stack"}><TechStackView /></div>
+          <div hidden={activeView !== "requirements"}><RequirementsView /></div>
+          <div hidden={activeView !== "specification"}><SpecificationView /></div>
+          <div hidden={activeView !== "plan"}><PlanView /></div>
+          <div hidden={activeView !== "build"}><BuildView /></div>
+          <div hidden={activeView !== "quality"}><QualityView /></div>
+          <div hidden={activeView !== "report"}>
             <ReportView
               report={exitStage?.approved_content as MergeReadinessReport | null | undefined}
               metrics={state.metrics_report?.metrics}
@@ -257,8 +437,8 @@ export function AppShell({
               screenshotUrls={state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path, workBranch))}
               thresholds={metricThresholds}
             />
-          )}
-          {activeView === "overview" && <SessionOverview />}
+          </div>
+          <div hidden={activeView !== "overview"}><SessionOverview /></div>
         </main>
       </div>
     </InterruptProvider>
@@ -319,7 +499,7 @@ function InterruptCard({
     delete rest.feedback;
     delete rest.reason;
     return (
-      <div className="space-y-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
+      <div className="mx-4 mt-3 space-y-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
         <p className="text-sm font-medium text-red-900">
           {stageLabel}: {String(payload.type).replaceAll("_", " ")}
         </p>
@@ -341,8 +521,35 @@ function InterruptCard({
     );
   }
 
+  // Requirements-as-single-source-of-truth (user ruling 2026-08-31): the SPECIFICATION gate has
+  // no Reject/feedback box -- change requests belong in the requirements document, and the
+  // Requirements tab's Submit (live while this gate is open) resolves the gate with the revised
+  // doc. The plan gate keeps Reject-with-feedback for now: its input is the approved spec, not
+  // the raw requirements, so the revise-requirements path doesn't apply cleanly there yet.
+  if (stageKey === "specification") {
+    return (
+      <div className="mx-4 mt-3 flex items-center justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+        <span className="text-sm text-amber-900">
+          The <strong>{stageLabel}</strong> is ready for your review. Your{" "}
+          <strong>Requirements document is the single source of truth</strong>: this specification —
+          and every plan, test, and line of code after it — is derived from that document alone.
+          Nothing you want will make it into the product unless it&apos;s written there. To change
+          anything here, don&apos;t comment — edit the document on the Requirements tab and
+          resubmit; the specification is redrafted from it, and every question it answers is
+          traced back to your wording.
+        </span>
+        <button
+          className="shrink-0 rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
+          onClick={() => done({ decision: "approved" })}
+        >
+          Approve
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+    <div className="mx-4 mt-3 space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
       <div className="flex items-center justify-between gap-4">
         <span className="text-sm text-amber-900">
           The <strong>{stageLabel}</strong> is ready for your review.

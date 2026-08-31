@@ -27,6 +27,9 @@ Plan-step provenance is a HARD, gate-checked contract, both directions:
   step may cite a retired id, and any prior step whose every cited criterion is retired is simply
   dropped from this draft. Add a step for the removal work itself only if there is concrete code
   to delete, citing no retired ids (`kind: "infrastructure"` if it fulfils no live criterion).
+- Stories/criteria marked `deferred: true` in the Specification are parked for a LATER phase: plan
+  NOTHING for them and never cite a deferred criterion's id -- the same gate rejects steps whose
+  cited criteria are not live. They are not removed; a future ticket plans them when promoted.
 
 The Specification JSON may include `attachment_notes`: the Specification author's own
 distillation of what any screenshots or documents attached to the original request actually

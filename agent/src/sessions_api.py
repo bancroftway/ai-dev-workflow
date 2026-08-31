@@ -35,6 +35,7 @@ from . import (
     app_discovery,
     branch_naming,
     chat_model,
+    checkpoint,
     git_ops,
     github_link_store,
     keyvault,
@@ -419,8 +420,31 @@ class SessionResponse(BaseModel):
     project_id: str | None = None
 
 
-def _row_to_response(row: dict[str, Any]) -> "SessionResponse":
-    return SessionResponse(**row, container_alive=registry.get(row["session_id"]) is not None)
+async def _verified_container_alive(session_id: str) -> bool:
+    """Registry presence VERIFIED against the actual container (found live 2026-08-31: `docker
+    kill` left a phantom registry entry, so the UI pill said Connected until the next exec
+    failed). The docker-events watcher (local_docker._watch_docker_events) evicts phantoms in
+    real time; this read-side check is the belt for events missed while that stream was down.
+    A dead check evicts the phantom so execs, the per-repo cap, and /active all agree. Providers
+    without is_session_alive (duck-typed optional) keep the plain registry answer; a probe
+    failure fails OPEN -- a docker hiccup must not flap the UI or evict a live sandbox."""
+    if registry.get(session_id) is None:
+        return False
+    probe = getattr(get_sandbox_provider(), "is_session_alive", None)
+    if probe is None:
+        return True
+    try:
+        alive = bool(await probe(session_id))
+    except Exception:  # noqa: BLE001
+        return True
+    if not alive:
+        logger.warning("phantom sandbox evicted for session_id=%s (container not running)", session_id)
+        registry.pop(session_id)
+    return alive
+
+
+async def _row_to_response(row: dict[str, Any]) -> "SessionResponse":
+    return SessionResponse(**row, container_alive=await _verified_container_alive(row["session_id"]))
 
 
 class SessionListResponse(BaseModel):
@@ -441,7 +465,7 @@ async def list_sessions(
     longer exists."""
     _check_shared_secret(request)
     rows = await session_store.list_sessions(owner, repo, source_branch, project_id)
-    return SessionListResponse(sessions=[_row_to_response(row) for row in rows])
+    return SessionListResponse(sessions=[await _row_to_response(row) for row in rows])
 
 
 class ActiveSessionEntry(BaseModel):
@@ -475,7 +499,7 @@ async def get_session_row(session_id: str, request: Request) -> SessionResponse:
     row = await session_store.get_session(session_id)
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
-    return _row_to_response(row)
+    return await _row_to_response(row)
 
 
 class RunEventResponse(BaseModel):
@@ -603,6 +627,9 @@ async def delete_session_full(thread_id: str, body: DeleteSessionRequest, reques
     # sessions row delete, same order run_event_store._demo()'s own cleanup already uses.
     await run_event_store.delete_events_by_session(thread_id)
     await session_store.delete_session(thread_id)
+    # Durable checkpoints (src/checkpoint.py): drop this thread's rows so the sqlite file tracks
+    # the session list instead of growing forever. Fail-soft inside, like every teardown step.
+    await checkpoint.delete_thread_checkpoints(thread_id)
     return DeleteSessionResponse(status="deleted", branch_deleted=branch_deleted)
 
 
@@ -1617,9 +1644,10 @@ def _demo() -> None:
         "failure_stage": None, "failure_type": None, "failure_message": None,
         "project_id": "22222222-2222-2222-2222-222222222222", "awaiting_gate": True,
     }
-    resp = _row_to_response(fake_row)
+    resp = asyncio.run(_row_to_response(fake_row))
     assert resp.awaiting_gate is True, resp
     assert resp.project_id == "22222222-2222-2222-2222-222222222222", resp
+    assert resp.container_alive is False, "no registry entry must read as not alive"
 
     global _fetch_default_branch  # reassigned further down; must precede every use in this function
 

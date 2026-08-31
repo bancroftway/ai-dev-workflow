@@ -7,9 +7,17 @@ export { CATALOG_ID };
 
 // Mirrors agent/src/schemas.py field-for-field (SPECIFICATION.md Section 4).
 // Field names are snake_case to match the Pydantic JSON dump verbatim.
+// Per-run scope lifecycle, stamped by the spec verify (graph.py) from the id ledger. Optional so
+// pre-stamp envelopes still parse.
+const ChangeSchema = z.enum(["new", "modified", "deleted", "unchanged", "deferred", "activated"]).optional();
+
 const AcceptanceCriterionSchema = z.object({
   id: z.string(),
   description: z.string(),
+  change: ChangeSchema,
+  // Parked for a later phase (specified, reviewed, not built this ticket) -- optional so
+  // envelopes from before deferred scope existed still parse.
+  deferred: z.boolean().optional().default(false),
 });
 
 const UserStorySchema = z.object({
@@ -17,6 +25,19 @@ const UserStorySchema = z.object({
   title: z.string(),
   narrative: z.string(),
   acceptance_criteria: z.array(AcceptanceCriterionSchema),
+  change: ChangeSchema,
+  deferred: z.boolean().optional().default(false),
+});
+
+const RetiredStorySchema = z.object({ id: z.string(), title: z.string() });
+const RetiredCriterionSchema = z.object({ id: z.string(), description: z.string(), parent_us_id: z.string() });
+
+const SpecQuestionSchema = z.object({
+  id: z.string(),
+  question: z.string(),
+  status: z.enum(["open", "answered", "assumed"]),
+  answer: z.string().optional().default(""),
+  suggested_choices: z.array(z.string()).optional().default([]),
 });
 
 const SpecificationSchema = z.object({
@@ -25,6 +46,10 @@ const SpecificationSchema = z.object({
   user_stories: z.array(UserStorySchema),
   assumptions: z.array(z.string()),
   out_of_scope: z.array(z.string()),
+  // Optional so envelopes from before the question ledger existed still parse.
+  questions: z.array(SpecQuestionSchema).optional().default([]),
+  retired_user_stories: z.array(RetiredStorySchema).optional().default([]),
+  retired_acceptance_criteria: z.array(RetiredCriterionSchema).optional().default([]),
 });
 
 const PlanStepSchema = z.object({
@@ -66,35 +91,175 @@ export function parseImplementationPlan(data: unknown): ImplementationPlan | nul
 // audit pass found and fixed (see the plan's "Audit findings hidden from the user" requirement).
 // Still accepted in props below (the backend still sends it in every envelope), just unused here.
 
+/** Real ledger ids only (user, 2026-08-31): a draft mid-verify still carries the model's own
+ * placeholder ids ("n-us7", "story-a") -- rendering those read as a labeling scheme. The ledger
+ * overwrites them with US-#### ids at verify; until then the id chip is simply omitted. */
+function realIdOrNull(id: string): string | null {
+  return /^US-\d{4}(\.\d+)?$/.test(id) ? id : null;
+}
+
+/** Scope-lifecycle chip (user requirement 2026-08-31): 'new' and 'updated' get loud colors,
+ * 'unchanged' stays silent (the common case must not add noise), 'deleted' items render
+ * crossed-out via the retired lists instead of a chip. 'deferred'/'activated' (2026-08-31):
+ * parked scope shows a quiet slate chip whether or not it changed this run (its parked-ness is
+ * the fact the reviewer needs); a promotion this run gets a loud 'activated'. */
+function ChangeBadge({
+  change,
+  deferred,
+}: {
+  change?: "new" | "modified" | "deleted" | "unchanged" | "deferred" | "activated";
+  deferred?: boolean;
+}) {
+  if (deferred || change === "deferred") {
+    return <span className="ml-1.5 rounded-full bg-slate-200 px-1.5 text-xs font-normal text-slate-700">deferred</span>;
+  }
+  if (change === "activated") {
+    return (
+      <span className="ml-1.5 rounded-full bg-emerald-100 px-1.5 text-xs font-normal text-emerald-800">activated</span>
+    );
+  }
+  if (change === "new") {
+    return <span className="ml-1.5 rounded-full bg-emerald-100 px-1.5 text-xs font-normal text-emerald-800">new</span>;
+  }
+  if (change === "modified") {
+    return <span className="ml-1.5 rounded-full bg-amber-100 px-1.5 text-xs font-normal text-amber-800">updated</span>;
+  }
+  return null;
+}
+
 export function SpecificationSurfaceRenderer({
   specification: spec,
 }: {
   specification: Specification;
   auditFindings?: string[];
 }) {
+  const openQuestions = (spec.questions ?? []).filter((q) => q.status === "open");
+  // Split by WHO resolved them (user, 2026-08-31): "Resolved questions" read as if a person had
+  // answered -- 'answered' means the requirements document settled it, 'assumed' means the agent
+  // picked a default itself (overridable by editing the requirements).
+  const answeredQuestions = (spec.questions ?? []).filter((q) => q.status === "answered");
+  const assumedQuestions = (spec.questions ?? []).filter((q) => q.status === "assumed");
+
+  // Compact layout (user, 2026-08-31): id + title share one line, halved paddings/gaps -- the
+  // airy original spent half the review box on whitespace.
   return (
-    <div className="space-y-6">
+    <div className="space-y-3">
       <div>
         <h2 className="text-xl font-semibold">{spec.title}</h2>
-        <p className="mt-1 text-neutral-600">{spec.summary}</p>
+        <p className="text-neutral-600">{spec.summary}</p>
       </div>
 
-      <div className="space-y-4">
-        {spec.user_stories.map((story) => (
-          <div key={story.id} className="rounded-lg border border-neutral-200 p-4">
-            <div className="font-mono text-xs text-neutral-500">{story.id}</div>
-            <h3 className="font-medium">{story.title}</h3>
-            <p className="mt-1 text-sm text-neutral-700">{story.narrative}</p>
-            {story.acceptance_criteria.length > 0 && (
-              <ul className="mt-2 space-y-1">
-                {story.acceptance_criteria.map((ac) => (
-                  <li key={ac.id} className="text-sm">
-                    <span className="mr-1 font-mono text-xs text-neutral-500">{ac.id}</span>
-                    {ac.description}
-                  </li>
-                ))}
-              </ul>
-            )}
+      {/* Question ledger (user requirement 2026-08-31): open questions on top in amber -- these
+          pause the pipeline until answered in the requirements document; resolved history stays
+          reviewable underneath, each answer tracing back to the doc or an explicit assumption. */}
+      {openQuestions.length > 0 && (
+        <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2">
+          <p className="text-sm font-medium text-amber-900">
+            Open questions — answer these in the Requirements document, then resubmit:
+          </p>
+          <ul className="mt-1 space-y-1">
+            {openQuestions.map((q) => (
+              <li key={q.id} className="text-sm text-amber-900">
+                <span className="mr-1 font-mono text-xs text-amber-700">{q.id}</span>
+                {q.question}
+                {q.suggested_choices.length > 0 && (
+                  <span className="text-xs text-amber-700"> (e.g. {q.suggested_choices.join(" / ")})</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {answeredQuestions.length > 0 && (
+        <details className="rounded-lg border border-neutral-200 px-3 py-2 text-sm">
+          <summary className="cursor-pointer text-neutral-700">
+            Answered from your requirements ({answeredQuestions.length})
+          </summary>
+          <ul className="mt-1 space-y-1">
+            {answeredQuestions.map((q) => (
+              <li key={q.id} className="text-sm text-neutral-700">
+                <span className="mr-1 font-mono text-xs text-neutral-500">{q.id}</span>
+                {q.question}
+                {q.answer && <span className="block pl-4 text-xs text-neutral-500">↳ {q.answer}</span>}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {assumedQuestions.length > 0 && (
+        <details className="rounded-lg border border-neutral-200 px-3 py-2 text-sm">
+          <summary className="cursor-pointer text-neutral-700">
+            Assumed by the agent ({assumedQuestions.length}) — override any by stating your choice in the
+            Requirements document and resubmitting
+          </summary>
+          <ul className="mt-1 space-y-1">
+            {assumedQuestions.map((q) => (
+              <li key={q.id} className="text-sm text-neutral-700">
+                <span className="mr-1 font-mono text-xs text-neutral-500">{q.id}</span>
+                {q.question}
+                {q.answer && <span className="block pl-4 text-xs text-neutral-500">↳ {q.answer}</span>}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      <div className="space-y-2">
+        {spec.user_stories.map((story) => {
+          const retiredAcsHere = (spec.retired_acceptance_criteria ?? []).filter(
+            (ac) => ac.parent_us_id === story.id,
+          );
+          return (
+            // Deferred stories (parked, NOT removed): muted but fully readable -- deliberately
+            // distinct from the retired cards' dashed cross-out below (user, 2026-08-31: a
+            // deferred feature rendering as deleted read as data loss).
+            <div
+              key={story.id}
+              className={`rounded-lg border px-3 py-2 ${story.deferred ? "border-slate-200 bg-slate-50" : "border-neutral-200"}`}
+            >
+              <h3 className={`font-medium ${story.deferred ? "text-neutral-500" : ""}`}>
+                {realIdOrNull(story.id) && (
+                  <span className="mr-2 font-mono text-xs font-normal text-neutral-500">{story.id}</span>
+                )}
+                {story.title}
+                <ChangeBadge change={story.change} deferred={story.deferred} />
+              </h3>
+              <p className={`text-sm ${story.deferred ? "text-neutral-500" : "text-neutral-700"}`}>{story.narrative}</p>
+              {story.deferred && (
+                <p className="text-xs text-slate-500">
+                  Deferred — specified now, built in a later phase. To build it, move it into the
+                  build-now scope in the Requirements document and resubmit.
+                </p>
+              )}
+              {(story.acceptance_criteria.length > 0 || retiredAcsHere.length > 0) && (
+                <ul className="mt-1">
+                  {story.acceptance_criteria.map((ac) => (
+                    <li key={ac.id} className={`text-sm ${ac.deferred || story.deferred ? "text-neutral-500" : ""}`}>
+                      {realIdOrNull(ac.id) && (
+                        <span className="mr-1 font-mono text-xs text-neutral-500">{ac.id}</span>
+                      )}
+                      {ac.description}
+                      <ChangeBadge change={ac.change} deferred={ac.deferred && !story.deferred} />
+                    </li>
+                  ))}
+                  {retiredAcsHere.map((ac) => (
+                    <li key={ac.id} className="text-sm text-neutral-400 line-through">
+                      <span className="mr-1 font-mono text-xs">{ac.id}</span>
+                      {ac.description}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+        {(spec.retired_user_stories ?? []).map((story) => (
+          <div key={story.id} className="rounded-lg border border-dashed border-neutral-300 px-3 py-2 opacity-70">
+            <h3 className="font-medium text-neutral-400 line-through">
+              <span className="mr-2 font-mono text-xs font-normal">{story.id}</span>
+              {story.title}
+            </h3>
+            <p className="text-xs text-neutral-400">Removed from scope — retired in the requirements revision.</p>
           </div>
         ))}
       </div>

@@ -2,14 +2,13 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { useParams } from "next/navigation";
 import { useSession, signOut } from "next-auth/react";
-import { ContainerStatusButton } from "@/components/ContainerStatus";
-import { terminateSession } from "@/lib/agent-client";
-import { useOptionalSandboxStatus } from "@/lib/sandbox-status-context";
 
-/** Minimal app-wide header: brand (doubles as "back to repositories" nav), the live sandbox
- * connection indicator (workflow pages only), and account controls. Mounted on every page. */
+/** Minimal app-wide header: brand (doubles as "back to repositories" nav) and account controls.
+ * Mounted on every page. The sandbox connection indicator moved into AppShell's tab row: this
+ * header mounts in root layout, OUTSIDE the workflow page's SandboxStatusProvider, so a pill
+ * here always read null context and rendered nothing. */
 export function WorkspaceHeader() {
   const { data: session } = useSession();
   return (
@@ -18,7 +17,6 @@ export function WorkspaceHeader() {
         AI-Assisted Specification &amp; Planning
       </Link>
       <div className="flex flex-wrap items-center justify-end gap-3">
-        <SandboxConnectionIndicator />
         <RefreshSecretsButton />
         {session?.user && (
           <>
@@ -74,37 +72,6 @@ function DisconnectGithubButton() {
       {busy ? "Disconnecting…" : "Disconnect GitHub"}
     </button>
   );
-}
-
-/** Live status for the session's dev-tool container -- workflow pages only
- * (useOptionalSandboxStatus is null anywhere else, e.g. /select, /settings/*, and this renders
- * nothing there). Stopping tears down the sandbox AND its persistent workspace volume (agent's
- * DELETE /sessions/{id} -- same as terminate_session's explicit-close path), so it's gated
- * behind a confirm and only offered while actually connected. */
-function SandboxConnectionIndicator() {
-  const ctx = useOptionalSandboxStatus();
-  const params = useParams<{ sessionId?: string }>();
-  const router = useRouter();
-  const [stopping, setStopping] = useState(false);
-
-  if (!ctx) return null;
-  const [status, setStatus] = ctx;
-  const sessionId = params?.sessionId;
-
-  async function stopContainer() {
-    if (!sessionId) return;
-    setStopping(true);
-    try {
-      if (await terminateSession(sessionId)) {
-        setStatus("terminated");
-        router.push("/select");
-      }
-    } finally {
-      setStopping(false);
-    }
-  }
-
-  return <ContainerStatusButton status={status} onStop={stopContainer} stopping={stopping} />;
 }
 
 type RefreshState =

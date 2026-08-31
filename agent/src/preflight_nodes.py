@@ -23,7 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
 from . import config as workflow_config
-from . import config_inventory, git_ops, model_config, repo_files, repo_scan, repo_test_config, session_store, template_loader, workflow_persistence
+from . import config_inventory, git_ops, model_config, repo_files, repo_scan, repo_test_config, session_store, tech_stack_signals, template_loader, workflow_persistence
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
@@ -526,7 +526,7 @@ async def _prefill_from_ticket_tech_stack_selection(thread_id: str) -> dict[str,
 
 
 async def prefill_tech_stack_from_repo_file(
-    thread_id: str, _state: "GraphState", provider: SandboxProvider
+    thread_id: str, state: "GraphState", provider: SandboxProvider
 ) -> dict[str, Any] | None:
     """StageSpec.prefill_from_repo_file for the tech-stack stage: tech-stack.md exists but
     approved.json doesn't (else hydrate_tech_stack_from_repo_file already short-circuited to
@@ -547,10 +547,66 @@ async def prefill_tech_stack_from_repo_file(
     raw = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_MD_PATH)
     if raw is not None:
         return {"markdown": raw}
-    return await _prefill_from_ticket_tech_stack_selection(thread_id)
+    ticket_prefill = await _prefill_from_ticket_tech_stack_selection(thread_id)
+    if ticket_prefill is not None:
+        return ticket_prefill
+    # Greenfield short-circuit (2026-08-31): the deterministic app_discovery_pre scan already
+    # proved there is no application code, so the LLM explore-and-draft pass has nothing to
+    # discover -- its live output on an empty repo was literally "No application code found
+    # yet" after ~60s of haiku. Serve that stub directly: the gate opens as soon as the sandbox
+    # is ready. `greenfield_stub` keeps the canned-stack dropdown visible
+    # (graph._build_tech_stack_interrupt_extra reads it -- a plain {"markdown": ...} draft would
+    # otherwise read as "file existed, hide the dropdown").
+    if tech_stack_signals.is_greenfield_repo(state):
+        return {
+            "markdown": (
+                "# Tech Stack\n\n"
+                "No application code found yet -- this is a greenfield repository.\n\n"
+                "Pick a starting stack from the dropdown above, or describe your own stack here, "
+                "then submit.\n"
+            ),
+            "greenfield_stub": True,
+        }
+    return None
 
 
 _TECH_STACK_EXTRACT_PROMPT = load_prompt("tech_stack_extract")
+
+
+# Content-hash cache for _extract_tech_stack results, one json file on the agent host (same
+# disposable-run-plumbing lifecycle as agent/data/checkpoints.sqlite -- losing it just costs one
+# LLM call per distinct markdown). Validated through TechStack on read so a stale/corrupt row can
+# never feed downstream gates a wrong shape.
+_EXTRACT_CACHE_PATH = Path(
+    os.environ.get("AIDW_TECH_STACK_EXTRACT_CACHE", Path(__file__).parents[1] / "data" / "tech_stack_extract_cache.json")
+)
+
+
+def _extract_cache_key(markdown: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(markdown.strip().encode("utf-8")).hexdigest()
+
+
+def _extract_cache_get(markdown: str) -> dict[str, Any] | None:
+    try:
+        rows = json.loads(_EXTRACT_CACHE_PATH.read_text(encoding="utf-8"))
+        raw = rows.get(_extract_cache_key(markdown))
+        return None if raw is None else TechStack.model_validate(raw).model_dump(mode="json")
+    except Exception:  # noqa: BLE001 -- cache is best-effort; any failure means "miss"
+        return None
+
+
+def _extract_cache_put(markdown: str, tech_stack: dict[str, Any]) -> None:
+    try:
+        rows: dict[str, Any] = {}
+        if _EXTRACT_CACHE_PATH.exists():
+            rows = json.loads(_EXTRACT_CACHE_PATH.read_text(encoding="utf-8"))
+        rows[_extract_cache_key(markdown)] = tech_stack
+        _EXTRACT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _EXTRACT_CACHE_PATH.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001 -- never let cache bookkeeping break an approval
+        logger.warning("tech-stack extract cache write failed", exc_info=True)
 
 
 async def _extract_tech_stack(
@@ -619,10 +675,26 @@ async def resolve_tech_stack_submission(
     await repo_files.write_repo_file(provider, thread_id, TECH_STACK_MD_PATH, markdown)
     await git_ops.commit_paths(provider, thread_id, [TECH_STACK_MD_PATH], "ai-dev-workflow: tech stack saved")
 
+    # Extraction cache (backlog item 1, 2026-08-31): an UNEDITED canned catalog pick is the same
+    # markdown bytes every session, and its structured extraction is deterministic -- one agent-host
+    # json file keyed by content hash skips the LLM call for every repeat. Edited text misses and
+    # extracts normally; every cache failure falls through to the real call.
+    cached = _extract_cache_get(markdown)
+    if cached is not None:
+        logger.info("tech-stack extraction served from cache for thread_id=%s", thread_id)
+        await repo_files.write_repo_file(
+            provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(cached, indent=2) + "\n"
+        )
+        await git_ops.commit_paths(
+            provider, thread_id, [TECH_STACK_APPROVED_JSON_PATH], "ai-dev-workflow: tech stack extracted"
+        )
+        return cached
+
     try:
         tech_stack = await _extract_tech_stack(
             thread_id, markdown, provider, state["provider"], state.get("run_id", "unknown")
         )
+        _extract_cache_put(markdown, tech_stack)
     except Exception:
         logger.exception(
             "tech-stack extraction failed for thread_id=%s; approving with a bare summary instead "

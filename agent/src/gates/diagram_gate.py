@@ -117,8 +117,8 @@ def check_plan_linkage(
         live = [i for i in ac_ids if by_id[i].get("status") in ("active", "revised")]
         if not live:
             problems.append(
-                f"{step_id}: every cited criterion ({', '.join(ac_ids)}) is retired -- this step "
-                "implements a removed feature; drop it from the plan"
+                f"{step_id}: every cited criterion ({', '.join(ac_ids)}) is retired or deferred -- "
+                "this step implements scope that is out of this ticket; drop it from the plan"
             )
             continue
         prior = prior_steps_by_id.get(step.get("id") or "")

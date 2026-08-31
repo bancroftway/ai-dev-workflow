@@ -165,6 +165,7 @@ class LocalDockerProvider(SandboxProvider):
         self._sandboxes: dict[str, _RunningSandbox] = {}
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
+        self._events_task: asyncio.Task[None] | None = None
 
     async def provision(
         self,
@@ -470,9 +471,62 @@ class LocalDockerProvider(SandboxProvider):
         )
         return ExecResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
+    async def is_session_alive(self, session_id: str) -> bool:
+        """Whether this session's container is ACTUALLY running right now -- `docker inspect`
+        ground truth, not the in-memory map (found live 2026-08-31: `docker kill` left a phantom
+        entry and the UI pill said Connected until the next exec failed). Duck-typed optional on
+        SandboxProvider: sessions_api probes it with getattr and falls back to registry presence
+        for providers that don't implement it."""
+        async with self._lock:
+            sandbox = self._sandboxes.get(session_id)
+        if sandbox is None:
+            return False
+        returncode, out, _ = await _run_docker("inspect", "--format", "{{.State.Running}}", sandbox.container_id)
+        return returncode == 0 and out.strip() == "true"
+
     def _ensure_reaper_running(self) -> None:
         if self._reaper_task is None or self._reaper_task.done():
             self._reaper_task = asyncio.create_task(self._reap_idle_sandboxes())
+        if self._events_task is None or self._events_task.done():
+            self._events_task = asyncio.create_task(self._watch_docker_events())
+
+    async def _watch_docker_events(self) -> None:
+        """Real-time phantom eviction: subscribes to the docker daemon's own event stream and
+        evicts a session the moment its container dies (external `docker kill`, OOM, daemon
+        restart) -- the registry then answers `container_alive` truthfully within milliseconds
+        instead of lying until the next exec fails. Restarts itself with a backoff if the docker
+        CLI stream ends (e.g. Docker Desktop restart)."""
+        while True:
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "events",
+                    "--filter", "type=container",
+                    "--filter", "event=die",
+                    "--format", "{{.Actor.Attributes.name}}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                assert proc.stdout is not None
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    name = line.decode("utf-8", "replace").strip()
+                    if not name.startswith(_CONTAINER_NAME_PREFIX):
+                        continue
+                    session_id = name[len(_CONTAINER_NAME_PREFIX):]
+                    async with self._lock:
+                        known = session_id in self._sandboxes
+                    if known:
+                        logger.warning("container died for session_id=%s -- evicting sandbox", session_id)
+                        await self.terminate(session_id)  # container already dead; stop is a no-op
+            except Exception:  # noqa: BLE001 -- watcher must never die silently mid-loop
+                logger.warning("docker events watcher failed; retrying", exc_info=True)
+            finally:
+                if proc is not None and proc.returncode is None:
+                    proc.kill()
+            await asyncio.sleep(5.0)
 
     async def _reap_idle_sandboxes(self) -> None:
         """Docker Desktop has no idle-session GC of its own (plan Section E) -- this replicates

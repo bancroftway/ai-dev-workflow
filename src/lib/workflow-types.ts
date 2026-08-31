@@ -32,8 +32,37 @@ export interface StageState {
   used_ids: string[];
   audit_findings: string[];
   verify_cycle_count: number;
+  /** Laps burned on report["infra_error"] verdicts (platform failed to measure) -- separate
+   * budget from verify_cycle_count, capped by the agent's VERIFY_INFRA_RETRY_CAP (default 2). */
+  infra_retry_count?: number;
+  /** The stage's verify-lap cap, mirrored from its StageSpec by the agent's verify node so the
+   * UI can say "lap N of M" without hardcoding the constant. 0/absent = not yet verified. */
+  max_verify_cycles?: number;
   last_verification: StageVerification | null;
   baseline_commit: string | null;
+}
+
+/** Build phase has begun (shared by AppShell's tab gating and RequirementsView's submit lock) --
+ * ac-to-tests is the first Build stage, so any status past not_started means implementation work
+ * exists that a casual requirements resubmit would race. */
+export function buildStarted(state: WorkflowState): boolean {
+  const status = state.stages?.["ac-to-tests"]?.status;
+  return status !== undefined && status !== "not_started";
+}
+
+/** The current run reached a terminal state: a recorded failure, or the exit stage approved.
+ * Requirements resubmits are welcome again after either (the requirements-delta flow).
+ * Both exit-stage spellings checked: the agent's live key is "metrics-exit" (stage-stable-id
+ * rename), while this file's typed stages map still carries the older "exit". */
+export function runEnded(state: WorkflowState): boolean {
+  const stages = (state.stages ?? {}) as Record<string, StageState | undefined>;
+  return state.run_failure != null || stages["metrics-exit"]?.status === "approved" || stages["exit"]?.status === "approved";
+}
+
+/** Some stage is actively drafting server-side. Unlike agent.isRunning this survives a reload
+ * (it is state, not stream attachment), which is exactly when the submit lock needs it. */
+export function anyStageDrafting(state: WorkflowState): boolean {
+  return Object.values(state.stages ?? {}).some((stage) => stage.status === "drafting");
 }
 
 /** A canned monorepo stack the Tech Stack tab's dropdown offers, loaded from
