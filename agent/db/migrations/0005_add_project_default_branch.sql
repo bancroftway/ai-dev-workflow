@@ -1,0 +1,11 @@
+-- dbo.projects.default_branch (Task 5, part-3-tickets-tasks) -- New-ticket provisioning
+-- (src/app/(boxed)/tickets/new/page.tsx) used to hardcode branch "main", correct only for a
+-- freshly-scaffolded repo (repo_scaffold.create_repo always lands on "main"). A Connect-Repository
+-- project (sessions_api.connect_project_route) can point at a repo whose real default branch is
+-- anything else, and dbo.projects had nowhere to record it.
+--
+-- NULL is a valid, permanent state for two cases, not just a migration transient: a "+ New
+-- Project" row that hasn't been scaffolded yet, and a scaffolded-but-not-yet-connected project
+-- (repo_scaffold's own repos are never round-tripped through connect_project_route, so they never
+-- populate this column -- callers fall back to the literal "main" for those, which is correct).
+ALTER TABLE dbo.projects ADD default_branch NVARCHAR(500) NULL;

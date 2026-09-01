@@ -1,0 +1,239 @@
+# Per-stage, per-role model selection for both agent providers (SPECIFICATION.md Section 3.4).
+#
+# Every stage nests a full model config per AGENT_PROVIDER value -- {stage}: {copilot: {draft_model,
+# audit_model}, claude: {draft_model, audit_model}}. model_config.get_model_name looks up
+# stage -> provider -> role, so only the active provider's block is ever read at runtime; editing
+# (or leaving stale) the other provider's block cannot affect a live run on the active one.
+#
+# `null` (or an absent key) lets the active CLI pick its own default model for that call.
+# `audit_model` applies ONLY to the four stages with an adversarial audit pass
+# (specification, plan, ac-to-tests, minimal-code-to-green) and should differ from draft_model --
+# the audit exists to get a second opinion from a *different* model. Other stages have no audit leg.
+# ac-to-tests joined this list 2026-08-24 (user decision): it writes the failing TDD-RED tests every
+# downstream stage builds against, so a bad suite here is a bad foundation for everything after it.
+#
+# COPILOT roster: valid model ids depend on your GitHub Copilot account/plan -- list what's
+# actually available with `CopilotClient.list_models()` (agent/.venv, `uv run python -c "..."`),
+# not this comment, since the roster changes over time. As of this writing, this account has
+# access to:
+#   auto, claude-sonnet-5, claude-sonnet-4.6, claude-sonnet-4.5, claude-haiku-4.5,
+#   claude-opus-5, gpt-5.6-terra, gpt-5.6-luna, gpt-5.4, gpt-5.3-codex, gpt-5.4-mini,
+#   gpt-5-mini, mai-code-1-flash-picker, gemini-3.1-pro-preview, gemini-3.6-flash,
+#   gemini-3.5-flash, kimi-k2.7-code
+# Headless-test roster (2026-08-15, user directive): cheaper/faster models only, no
+# claude-sonnet-5. Audits stay on a different vendor than their draft for a real second opinion.
+#
+# CLAUDE roster: every claude: block below is a PLACEHOLDER an operator should tune, not a
+# measured choice -- added by Task 10 (part-1-provider-unification) purely to give
+# AGENT_PROVIDER=claude a config shape to read. Defaults mirror each stage's existing Copilot
+# tier (mini -> haiku, full -> sonnet) with any audit bumped one tier up (haiku -> sonnet,
+# sonnet -> opus) so the "audit differs from draft" property above still holds. `sonnet`/`opus`/
+# `haiku` are Claude Code CLI's own published model aliases -- claude_chat_model.py passes
+# get_model_name's return straight through as `--model <value>`, no separate id-mapping table --
+# but verify them against Anthropic's currently published model list (`claude --help` or
+# Anthropic's docs) before relying on this section for a real Claude-backed run, same
+# "verify before you trust this comment" caveat as the Copilot roster above.
+#
+# TEMPORARY DEV OVERRIDE (2026-09-01): every claude: block below is forced to haiku for local dev
+# iteration speed, replacing whatever tier each stage's own comment still documents/justifies
+# (sonnet, in most cases -- those comments describe the real steady-state choice and the failure
+# modes that motivated it, e.g. mini-tier models not calling write tools or truncating output).
+# EXCEPTIONS (2026-09-01): ac-to-tests, minimal-code-to-green, remediation, and
+# adversarial-compliance are all back on sonnet (see each block) after live haiku failures --
+# minimal-code-to-green hit the 2400s turn timeout on its 70k+-token drafting turn (the same
+# capability floor its copilot mini-tier comment already documented); ac-to-tests' haiku-drafted
+# suite hit REBUILD_AFTER_AC_TO_TESTS's scaffold-only rebuild cap (tautological tests passing
+# against pure stubs). remediation/adversarial-compliance restored preemptively, same class of
+# codegen/fix work. Revert everything else by restoring each block's own commented-out reasoning,
+# not by guessing a tier.
+tech-stack:
+  # Also used for the "extract" role (Tech Stack tab's Submit-time JSON extraction) -- shares
+  # draft_model, see model_config.get_model_name's own comment on why that's not a config gap.
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
+specification:
+  copilot:
+    draft_model: gpt-5.4-mini
+    audit_model: gemini-3.6-flash
+  claude:
+    draft_model: haiku
+    audit_model: haiku
+plan:
+  copilot:
+    # gpt-5.4 (not -mini): the plan draft is one large structured reply (steps + inline mermaid +
+    # wireframe HTML). Observed live (s04 lending-library, 2026-08-20): mini's output cap truncated
+    # the JSON at the same column on every attempt -- column 18354, ~4k tokens -- so all 3
+    # ainvoke_structured retries failed identically and the run died. Small scenarios fit under the
+    # cap; any moderate UI scenario does not.
+    draft_model: gpt-5.4
+    audit_model: gemini-3.6-flash
+  claude:
+    draft_model: haiku
+    # sonnet, not opus (2026-08-26, user directive: cheaper models -- two runs died on the 5h
+    # subscription window). Costs the "audit differs from draft" property on this provider
+    # (Claude has no second full-tier vendor); the audit still runs in a FRESH session with an
+    # adversarial prompt, which is where most of its value observably comes from. Restore opus
+    # here first if plan-audit quality regresses.
+    audit_model: haiku
+ac-to-tests:
+  copilot:
+    # gpt-5.3-codex: mini and plain gpt-5.4 both drafted structured metadata describing test files
+    # without ever calling a file-write tool. Used via plain session_options (graph.py's StageSpec.
+    # use_custom_agent=False for this stage) -- custom_agents was empirically confirmed to silently
+    # drop part of its own declared tools:, so there is no agents/ac-to-tests-draft.md.
+    draft_model: gpt-5.3-codex
+    # Same different-vendor-than-draft convention as every other audited stage below.
+    audit_model: gemini-3.6-flash
+  claude:
+    # EXCEPTION to the 2026-09-01 blanket haiku dev override (see file header): restored to
+    # sonnet (2026-09-01) after a live haiku-drafted suite hit REBUILD_AFTER_AC_TO_TESTS's
+    # scaffold-only rebuild cap -- many tests passed trivially against pure stubs (tautological
+    # assertions, no positive anchor), exactly the weak-test class ac_to_tests_draft.md's own
+    # prompt warns against. Two rebuild+fix cycles couldn't recover it; escalated.
+    draft_model: sonnet
+    # Was opus per the 2026-08-24 "top tier regardless" decision; downshifted 2026-08-26 by the
+    # newer user directive (cheaper models -- the 5h usage window killed two runs, and this audit
+    # fires on EVERY draft lap, 3-6 per run). Same same-model caveat as plan's audit above;
+    # restore opus here first if suite-quality rejections stop being caught before the gate. Also
+    # restored to sonnet alongside draft_model above, same 2026-09-01 exception.
+    audit_model: sonnet
+minimal-code-to-green:
+  copilot:
+    # gpt-5.4 (not -mini) on purpose: the codegen stage's 70k+-token drafting turn is above the
+    # mini tier's capability floor -- observed live twice, mini replied readiness=false in ~96
+    # tokens rather than implement. Everything else stays on the cheap roster.
+    draft_model: gpt-5.4
+    audit_model: gemini-3.6-flash
+  claude:
+    # EXCEPTION to the 2026-09-01 blanket haiku dev override above: restored to sonnet
+    # (2026-09-01) after a live haiku attempt hit the 2400s turn timeout on this stage's own
+    # 70k+-token drafting turn -- same capability floor the copilot mini-tier comment above
+    # already documents, haiku is in that same weak class. Every other stage stays on haiku.
+    draft_model: sonnet
+    # sonnet, not opus (2026-08-26 cheaper-models directive): this stage runs up to 12 verify
+    # cycles, each with an audit pass -- the single largest opus burn in the pipeline. Same
+    # same-model caveat and restore-first rule as the plan/ac-to-tests audits above. Also
+    # restored alongside draft_model above -- a weak model auditing a strong draft's 70k+ tokens
+    # loses the "second opinion" value the audit exists for.
+    audit_model: sonnet
+brownfield-baseline:
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
+# Remediation FIX nodes are codegen-tier work -- mini fixed nothing across full cycles
+# (observed live: 44-token replies leaving a complexity finding standing). Triage shares the
+# stage model; acceptable, triage quality also improved.
+test-hardening-flake-triage:
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
+metrics-report:
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
+readme:
+  # readme_write_node (metrics_nodes.py): reads the repo and WRITES README.md with file tools.
+  # Not mini-tier: mini models have twice failed to actually call file-write tools in this
+  # pipeline's write-capable passes (see the rebuild/e2e comments in this file).
+  copilot:
+    draft_model: gpt-5.4
+  claude:
+    draft_model: haiku
+rebuild:
+  copilot:
+    # Shared by every R placement (rebuild.py): both the GHCP build-VERIFICATION session and the
+    # fix node. gpt-5.4 (not -mini): observed live, mini left trivial lint errors standing.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: haiku
+e2e:
+  copilot:
+    # e2e_fix_node (e2e_nodes.py) -- same codegen-tier reasoning as quality/security/rebuild's fix
+    # nodes above: fixing a failing app or test is not mini-tier work.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: haiku
+# Phase E audit M-5: model_config.Stage declares "e2e-run" (e2e_nodes.py's stack_runner.
+# run_and_report call, stage_key="e2e-run") and it genuinely DOES call get_model_name -- via
+# run_and_report's own model_name-or-get_model_name(stage_key,...)-or-get_model_name("stack-run",...)
+# fallback chain (stack_runner.py), since e2e_nodes.py never passes an explicit model_name. Explicit
+# `null` here (rather than leaving the key absent) documents that on purpose: this stage has no
+# draft-tier choice of its own and is meant to fall through to stack-run's config below, same as
+# "let the CLI choose" elsewhere in this file -- an absent key looked identical to "nobody noticed
+# this stage exists," which is what M-5 flagged.
+e2e-run:
+  copilot:
+    draft_model: null
+  claude:
+    draft_model: null
+# src/stack_runner.py sessions: a GHCP agent explores the repo, works out how to run a real
+# toolchain command there, runs it, and reports through a schema-validated terminal tool. Exploring
+# a generated monorepo and getting a build/test/coverage invocation right is the same class of work
+# as the fix nodes above, not draft-tier -- mini-tier models guessed roots wrong.
+stack-run:
+  copilot:
+    # Fallback for any stack_runner stage_key without its own entry below.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: haiku
+coverage-run:
+  copilot:
+    # gates/test_coverage_gate.py -- runs the tests with coverage, reports artifact paths.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: haiku
+ac-test-run:
+  copilot:
+    # gates/ac_coverage_gate.py -- runs the (expected-RED) suite and tees output for the AC-id scan.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: haiku
+# Phase E audit M-5: same shape as e2e-run above -- test_hardening_nodes.py's stack_runner.
+# run_and_report call (stage_key="test-hardening-run") never passes an explicit model_name either,
+# so it too falls through run_and_report's own fallback chain to stack-run's config below. Explicit
+# `null` documents that this stage deliberately has no draft-tier choice of its own, rather than
+# leaving the key silently absent from the declared stage set.
+test-hardening-run:
+  copilot:
+    draft_model: null
+  claude:
+    draft_model: null
+remediation:
+  copilot:
+    # Previously carried by agents/remediation-draft.md's own `model:`; custom_agents is now off by
+    # default (graph.py StageSpec.use_custom_agent), so every stage's roster lives here instead.
+    draft_model: gpt-5.4
+  claude:
+    # EXCEPTION to the 2026-09-01 blanket haiku dev override (see file header) -- restored to
+    # sonnet alongside ac-to-tests/minimal-code-to-green/adversarial-compliance below.
+    draft_model: sonnet
+adversarial-compliance:
+  copilot:
+    # The write-capable pass that closes audit divergences -- real code edits, so not a mini tier.
+    fix_model: gpt-5.4
+    draft_model: gpt-5.4
+  claude:
+    # EXCEPTION to the 2026-09-01 blanket haiku dev override (see file header) -- restored to
+    # sonnet alongside ac-to-tests/minimal-code-to-green/remediation above.
+    fix_model: sonnet
+    draft_model: sonnet
+metrics-exit:
+  copilot:
+    # Not mini: this turn reads the run's metrics, ledger and diff and writes the whole merge-readiness
+    # report + PR description, and it has a required skill to invoke first. Observed live (thread
+    # 70bbfc95, otherwise-complete run, every earlier stage approved): the mini session went silent and
+    # the run died with `TimeoutError: Copilot session silent for 300s (stage=metrics-exit role=draft)`.
+    draft_model: gpt-5.4
+  claude:
+    draft_model: haiku
+session-title:
+  copilot:
+    # One short sentence in, one short phrase out -- the cheapest tier is plenty.
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku

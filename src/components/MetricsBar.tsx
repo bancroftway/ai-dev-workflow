@@ -1,0 +1,360 @@
+"use client";
+
+import { useAgent } from "@copilotkit/react-core/v2";
+import { HealthRing } from "@/components/HealthRing";
+import { useWorkflowThread } from "@/lib/workflow-thread-context";
+import { PIPELINE_STAGE_ORDER, type E2EState, type ScanMeasures, type WorkflowState } from "@/lib/workflow-types";
+import {
+  GRADE_TONE,
+  computeDelta,
+  gradeHigherIsBetter,
+  gradeLowerIsBetter,
+  securityGrade,
+  securityOpenCount,
+  type Delta,
+  type Grade,
+  type Thresholds4,
+  type Tone,
+} from "@/lib/metric-grades";
+
+/** Threshold bands read server-side from env (see page.tsx) so they're runtime-configurable --
+ * NEXT_PUBLIC_* would be baked in at build time and unchangeable in a deployed image. Each is
+ * [t0,t1,t2,t3]: A/B/C/D band edges (ascending for ccn/dup where lower is better, descending for
+ * coverage where higher is better); band E is whatever's left past t3. */
+export interface MetricThresholds {
+  ccn: Thresholds4;
+  coverage: Thresholds4;
+  dup: Thresholds4;
+  /** Lighthouse performance score bands (higher is better, 0-100). */
+  lhPerf: Thresholds4;
+  /** Lighthouse accessibility score bands (higher is better, 0-100). */
+  a11y: Thresholds4;
+}
+
+const CHIP_CLASS: Record<Tone, string> = {
+  green: "border-emerald-300 bg-emerald-50 text-emerald-800",
+  amber: "border-amber-300 bg-amber-50 text-amber-800",
+  red: "border-red-300 bg-red-50 text-red-800",
+  gray: "border-neutral-300 bg-neutral-100 text-neutral-500",
+};
+
+export function Chip({ label, value, tone, title }: { label: string; value: string; tone: Tone; title?: string }) {
+  return (
+    <span title={title} className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS[tone]}`}>
+      <span className="font-medium">{label}</span>
+      {value}
+    </span>
+  );
+}
+
+const STATUS_LABEL: Record<string, string> = {
+  drafting: "drafting",
+  needs_clarification: "needs clarification",
+  ready_for_review: "ready for review",
+};
+
+/** Appends the delta arrow + signed numeric change (when non-zero) to a chip's base value. */
+function withDelta(base: string, delta: Delta | null): string {
+  if (!delta) return base;
+  return `${base} ${delta.arrow}${delta.text ? ` ${delta.text}` : ""}`;
+}
+
+/** Shared shape for the three banded metrics (Maintainability/Coverage/Duplication): grade a
+ * value against thresholds, diff it against the baseline, render "--" gray when the value itself
+ * is missing (old data pre-dating Task 4's `measures` block, or an unmeasured metric). */
+function bandedChip(opts: {
+  metricKey: string;
+  label: string;
+  value: number | null | undefined;
+  baseValue: number | null | undefined;
+  thresholds: Thresholds4;
+  higherIsBetter: boolean;
+  decimals: number;
+  unit: string;
+  hasBaseline: boolean;
+  title: (value: number, grade: Grade) => string;
+  placeholderTitle: string;
+}): React.ReactNode {
+  const { metricKey, label, value, baseValue, thresholds, higherIsBetter, decimals, unit, hasBaseline, title, placeholderTitle } = opts;
+  if (value == null) return <Chip key={metricKey} label={label} value="—" tone="gray" title={placeholderTitle} />;
+  const g = higherIsBetter ? gradeHigherIsBetter(value, thresholds) : gradeLowerIsBetter(value, thresholds);
+  const delta = hasBaseline ? computeDelta(baseValue, value, higherIsBetter, decimals) : null;
+  return (
+    <Chip
+      key={metricKey}
+      label={label}
+      value={withDelta(`${g} · ${value.toFixed(decimals)}${unit}`, delta)}
+      tone={GRADE_TONE[g]}
+      title={title(value, g)}
+    />
+  );
+}
+
+/** Security is categorical (worst_open_severity), not banded against numeric thresholds like the
+ * other three, so it gets its own small chip builder rather than fitting bandedChip's shape. */
+function securityChip(measures: ScanMeasures | undefined, baseMeasures: ScanMeasures | undefined, hasBaseline: boolean): React.ReactNode {
+  if (!measures) return <Chip key="sec" label="Security" value="—" tone="gray" title="No scan data yet." />;
+  const worst = measures.security.worst_open_severity;
+  const openCount = securityOpenCount(measures.security.by_severity);
+  const g = securityGrade(worst);
+  const delta = hasBaseline ? computeDelta(baseMeasures && securityOpenCount(baseMeasures.security.by_severity), openCount, false) : null;
+  return (
+    <Chip
+      key="sec"
+      label="Security"
+      value={withDelta(`${g} · ${openCount}`, delta)}
+      tone={GRADE_TONE[g]}
+      title={`Open security findings (vulnerabilities, leaked secrets, insecure code). Grade = worst open severity; fewer and less severe is better. ${openCount} open, worst: ${worst}.`}
+    />
+  );
+}
+
+/** e2e is a bespoke node cluster with no StageState of its own (see workflow-types.ts's E2EState
+ * comment), so `activeStage` below never picks it up -- rendered as its own pill instead, styled
+ * like the push-failing/run_failure pills. Silent once it settles into passed/skipped, the same
+ * way a StageState pill goes quiet once approved. */
+function e2ePill(e2e: E2EState | null | undefined): React.ReactNode {
+  if (!e2e || e2e.status == null || e2e.status === "passed" || e2e.status === "skipped") return null;
+  if (e2e.status === "running") {
+    return (
+      <span className={`rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS.gray}`}>
+        e2e: running (attempt {e2e.attempt ?? 1})
+      </span>
+    );
+  }
+  const failed = e2e.failed_tests?.length ?? 0;
+  const tone: Tone = (e2e.passed ?? 0) > 0 ? "amber" : "red";
+  return (
+    <span className={`rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS[tone]}`}>
+      e2e: {failed}/{e2e.total ?? 0} failed
+    </span>
+  );
+}
+
+/** TurboTax-style always-visible metrics strip: five fixed chips (Security, Maintainability,
+ * Coverage, Duplication, Gate) once any scan summary exists, "--" gray placeholders for whatever
+ * a given summary doesn't carry. The whole bar stays hidden until there's a summary, an active
+ * stage, or a push/run failure to show. */
+export function MetricsBar({
+  thresholds,
+  trailing,
+}: {
+  thresholds: MetricThresholds;
+  // Composed in rather than computed here (LiveCostChip, AppShell.tsx) -- same row as this bar's
+  // own chips, but a separate, independent component: it must keep showing even on the pre-build
+  // stages this bar's own scan chips are deliberately suppressed on (user feedback 2026-09-01:
+  // "same row as Metrics bar, but separate from the Metrics bar"). Counted in the early-return
+  // guard below so the row doesn't hide itself out from under it.
+  trailing?: React.ReactNode;
+}) {
+  // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
+  const { localAgentId } = useWorkflowThread();
+  const { agent } = useAgent({ agentId: localAgentId });
+  const state = (agent.state ?? {}) as WorkflowState;
+  const scan = state.repo_scan;
+
+  const summary = scan?.latest_summary ?? scan?.baseline_summary ?? null;
+  const measures = summary?.measures;
+  const baseMeasures = scan?.baseline_summary?.measures;
+  const hasBaseline = scan?.baseline_summary != null && scan?.latest_summary != null;
+  // Coverage's failure `reason` lives on the coverage state key parallel to whichever summary is
+  // in play (RepoScanState.coverage for latest, .baseline_coverage before a latest scan exists),
+  // not on `measures` -- see repo_scan.py's `{line_rate: null, reason}` shape.
+  const coverageState = scan?.latest_summary ? scan?.coverage : scan?.baseline_coverage;
+
+  const activeStage = PIPELINE_STAGE_ORDER.find((s) => {
+    const status = state.stages?.[s.key]?.status;
+    return status != null && status !== "not_started" && status !== "approved";
+  });
+  const e2ePillNode = e2ePill(state.e2e);
+
+  // Live running total (re-summed each time a background refresh scan lands), falling back to
+  // metrics-report's end-of-run summary for finished runs that predate the live channel.
+  const runningUsage = state.token_usage_running;
+  const finalUsage = state.metrics_report?.metrics?.token_usage_summary;
+  const costChip = (() => {
+    const cost = runningUsage?.cost ?? finalUsage?.total_cost;
+    if (cost == null) return null;
+    const inTokens = runningUsage?.input_tokens ?? finalUsage?.total_input_tokens ?? 0;
+    const outTokens = runningUsage?.output_tokens ?? finalUsage?.total_output_tokens ?? 0;
+    return (
+      <Chip
+        key="cost"
+        label="Cost"
+        value={`$${cost.toFixed(2)}`}
+        tone="gray"
+        title={`LLM spend this run: ${inTokens.toLocaleString()} tokens in / ${outTokens.toLocaleString()} out. Updates as the run progresses; final total comes from the metrics stage.`}
+      />
+    );
+  })();
+
+  let chips: React.ReactNode = null;
+  if (summary) {
+    const security = securityChip(measures, baseMeasures, hasBaseline);
+
+    const maintainability = bandedChip({
+      metricKey: "maint",
+      label: "Maintainability",
+      value: measures?.mean_ccn,
+      baseValue: baseMeasures?.mean_ccn,
+      thresholds: thresholds.ccn,
+      higherIsBetter: false,
+      decimals: 1,
+      unit: "",
+      hasBaseline,
+      placeholderTitle: "No scan data yet.",
+      title: (ccn) => {
+        const [a, b, c, d] = thresholds.ccn;
+        return `Average cyclomatic complexity per function — how tangled the code's control flow is; lower is easier to change safely. Mean CCN ${ccn.toFixed(1)} (A≤${a}, B≤${b}, C≤${c}, D≤${d}).`;
+      },
+    });
+
+    const coverage = bandedChip({
+      metricKey: "cov",
+      label: "Coverage",
+      value: measures?.coverage_line_rate,
+      baseValue: scan?.baseline_coverage?.line_rate ?? baseMeasures?.coverage_line_rate,
+      thresholds: thresholds.coverage,
+      higherIsBetter: true,
+      decimals: 0,
+      unit: "%",
+      hasBaseline,
+      placeholderTitle: `Percentage of code lines executed by the test suite; higher means changes are safer to make. Unavailable: ${coverageState?.reason ?? "not measured"}.`,
+      title: (rate) => {
+        const branch = coverageState?.branch_rate;
+        return `Percentage of code lines executed by the test suite; higher means changes are safer to make. Line rate ${rate.toFixed(0)}%, branch ${branch != null ? `${branch.toFixed(0)}%` : "—"}.`;
+      },
+    });
+
+    const duplication = bandedChip({
+      metricKey: "dup",
+      label: "Duplication",
+      value: measures?.duplication_percent,
+      baseValue: baseMeasures?.duplication_percent,
+      thresholds: thresholds.dup,
+      higherIsBetter: false,
+      decimals: 1,
+      unit: "%",
+      hasBaseline,
+      placeholderTitle: "No scan data yet.",
+      title: (dup) =>
+        `Percentage of code duplicated across files; lower means fixes don't need repeating in copies. ${dup.toFixed(1)}% duplicated.`,
+    });
+
+    // Lighthouse chips HIDE entirely when unmeasured (non-UI repo, e2e skipped, pre-lighthouse
+    // data) instead of showing a permanent "—" placeholder -- unlike coverage/dup, absence here
+    // usually means "not applicable", not "not yet".
+    const perfValue = measures?.lighthouse_performance;
+    const performance = perfValue == null ? null : bandedChip({
+      metricKey: "lhperf",
+      label: "Performance",
+      value: perfValue,
+      baseValue: baseMeasures?.lighthouse_performance,
+      thresholds: thresholds.lhPerf,
+      higherIsBetter: true,
+      decimals: 0,
+      unit: "",
+      hasBaseline,
+      placeholderTitle: "Not measured.",
+      title: (score) =>
+        `Lighthouse performance score for the slowest measured route (0-100); higher means faster loads. Worst route: ${score.toFixed(0)}.`,
+    });
+
+    const a11yValue = measures?.accessibility_score;
+    const accessibility = a11yValue == null ? null : bandedChip({
+      metricKey: "a11y",
+      label: "A11y",
+      value: a11yValue,
+      baseValue: baseMeasures?.accessibility_score,
+      thresholds: thresholds.a11y,
+      higherIsBetter: true,
+      decimals: 0,
+      unit: "",
+      hasBaseline,
+      placeholderTitle: "Not measured.",
+      title: (score) =>
+        `Lighthouse accessibility score (axe-based) for the worst measured route (0-100); higher means more usable with assistive tech. Worst route: ${score.toFixed(0)}.`,
+    });
+
+    const gatingCount = summary.gating_count;
+    const gate = (
+      <Chip
+        key="gate"
+        // "Gate" alone reads ambiguous here -- this pipeline has many gates (spec/plan approval,
+        // ac-to-tests verify, ...); this chip is specifically the scan-based merge-readiness gate
+        // (user feedback 2026-09-01: "what is meant by Gate Pass?").
+        label="Quality Gate"
+        value={gatingCount === 0 ? "Pass" : `Fail · ${gatingCount}`}
+        tone={gatingCount === 0 ? "green" : "red"}
+        title={`Quality gate: fails when any finding at/above the severity floor (or newly introduced quality issue) is open. ${gatingCount} gating findings.`}
+      />
+    );
+
+    // The annular health ring leads the strip. Guarded on the SCORE (not just the summary):
+    // pre-v2 stored baselines can rehydrate with health_score null when nothing was measurable.
+    const healthRing = summary.health_score == null ? null : (
+      <HealthRing
+        key="health"
+        score={summary.health_score}
+        baseline={hasBaseline ? scan?.baseline_summary?.health_score : null}
+        comparable={summary.health_score_comparable}
+      />
+    );
+
+    chips = (
+      <>
+        {healthRing}
+        {security}
+        {maintainability}
+        {coverage}
+        {duplication}
+        {performance}
+        {accessibility}
+        {gate}
+      </>
+    );
+  }
+
+  // The status/push lines matter before any scan has streamed (a needs_clarification stage was
+  // previously invisible exactly when no scan had streamed) -- only hide a truly empty strip.
+  if (!summary && !costChip && !activeStage && !e2ePillNode && !trailing && state.last_push?.ok !== false && state.run_failure == null) return null;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-1.5">
+      {chips}
+      {costChip}
+      {activeStage && (
+        <span className="text-xs text-neutral-500">
+          {activeStage.label} — {STATUS_LABEL[state.stages?.[activeStage.key]?.status ?? ""] ?? state.stages?.[activeStage.key]?.status}
+        </span>
+      )}
+      {e2ePillNode}
+      {state.last_push && state.last_push.ok === false && (
+        <span className="rounded-full border border-red-300 bg-red-50 px-2.5 py-0.5 text-xs text-red-800">
+          push failing — GitHub persistence off
+        </span>
+      )}
+      {state.run_failure && (() => {
+        // failure_type distinguishes a real gate-verified defect (red -- your code needs a fix)
+        // from a quota/timeout/infra failure (amber -- resubmitting may just work, nothing about
+        // the generated code was actually wrong). Older payloads predate this field and fall back
+        // to the pre-existing red/"run ended" treatment.
+        const isInfra = state.run_failure.failure_type === "infra_transient" || state.run_failure.failure_type === "quota_exhausted";
+        const toneClass = isInfra ? CHIP_CLASS.amber : CHIP_CLASS.red;
+        const reason = isInfra
+          ? state.run_failure.failure_type === "quota_exhausted"
+            ? "quota/rate limit — resubmit once it resets"
+            : "infrastructure failure — resubmit to retry"
+          : null;
+        return (
+          <span className={`rounded-full border px-2.5 py-0.5 text-xs ${toneClass}`}>
+            {state.run_failure.stage}: {state.run_failure.type} — run ended
+            {reason ? ` (${reason})` : ""}
+            {state.run_failure.type === "cannot_verify" ? " (sandbox lost — resubmit to restart)" : ""}
+          </span>
+        );
+      })()}
+      {trailing && <div className="ml-auto flex items-center gap-2">{trailing}</div>}
+    </div>
+  );
+}

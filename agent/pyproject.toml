@@ -1,0 +1,29 @@
+[project]
+name = "ai-dev-workflow-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ag-ui-langgraph>=0.0.42",
+    "aiohttp>=3.14.3",
+    "aioodbc>=0.5.0",
+    "azure-identity>=1.19.0",
+    "azure-keyvault-secrets>=4.8.0",
+    "copilotkit>=0.1.94",
+    "defusedxml>=0.7.1",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "langchain-core>=1.5.3",
+    "langgraph>=1.2.10",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-sdk>=1.44.0",
+    "pydantic>=2.7",
+    "pyjwt[crypto]>=2.10",
+    "pyodbc>=5.2.0",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.2",
+    "uvicorn[standard]>=0.52.1",
+]

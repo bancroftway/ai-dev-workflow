@@ -1,0 +1,32 @@
+{
+  "env": {
+    "PONYTAIL_DEFAULT_MODE": "ultra"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/graph-diagram-check.mjs",
+            "timeout": 15,
+            "statusMessage": "Checking workflow graph diagram"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/graph-diagram-check.mjs --stop",
+            "timeout": 15,
+            "statusMessage": "Checking workflow graph diagram"
+          }
+        ]
+      }
+    ]
+  }
+}

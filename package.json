@@ -1,0 +1,43 @@
+{
+  "name": "ai-dev-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@ag-ui/a2ui-middleware": "^0.0.10",
+    "@ag-ui/langgraph": "^0.0.42",
+    "@azure/identity": "^4.13.2",
+    "@azure/keyvault-secrets": "^4.11.2",
+    "@copilotkit/a2ui-renderer": "^1.66.4",
+    "@copilotkit/react-core": "^1.66.4",
+    "@copilotkit/runtime": "^1.66.4",
+    "mermaid": "^11.17.2",
+    "next": "16.3.0",
+    "next-auth": "^5.0.0-beta.32",
+    "octokit": "^5.0.5",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
+    "server-only": "^0.0.1",
+    "shiki": "^3.23.0",
+    "zod": "^3.25.76"
+  },
+  "overrides": {
+    "undici": "^8.5.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

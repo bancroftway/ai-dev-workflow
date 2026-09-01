@@ -1,0 +1,58 @@
+{
+  "name": "ai-dev-workflow-local",
+  "owner": {
+    "name": "AI Dev Workflow"
+  },
+  "plugins": [
+    {
+      "name": "ai-dev-workflow",
+      "source": "./ai-dev-workflow",
+      "description": "First-party skill pack for the AI Dev Workflow SDLC pipeline."
+    },
+    {
+      "name": "superpowers",
+      "source": "./vendor/obra-superpowers/superpowers",
+      "description": "Vendored from obra/superpowers -- process-spine skills (TDD, debugging, code review, planning)."
+    },
+    {
+      "name": "ponytail",
+      "source": "./vendor/dietrichgebert-ponytail/ponytail",
+      "description": "Vendored from dietrichgebert/ponytail -- code/doc minimization."
+    },
+    {
+      "name": "caveman",
+      "source": "./vendor/juliusbrussee-caveman/caveman",
+      "description": "Vendored from JuliusBrussee/caveman (skill only) -- output-token reduction."
+    },
+    {
+      "name": "security-review",
+      "source": "./vendor/github-awesome-copilot/security-review",
+      "description": "Vendored from github/awesome-copilot -- reasoning-based vulnerability analysis."
+    },
+    {
+      "name": "impeccable",
+      "source": "./vendor/pbakaus-impeccable/impeccable",
+      "description": "Vendored from pbakaus/impeccable -- UI design rules, critique, and audit skills (hooks/agents/live stripped)."
+    },
+    {
+      "name": "frontend-design",
+      "source": "./vendor/anthropics-claude-plugins-official/frontend-design",
+      "description": "Vendored from anthropics/claude-plugins-official -- distinctive, intentional visual design guidance."
+    },
+    {
+      "name": "code-review",
+      "source": "./vendor/anthropics-claude-plugins-official/code-review",
+      "description": "Vendored from anthropics/claude-plugins-official -- multi-agent PR review command (gh-PR-centric; built-in code-review preferred in-pipeline)."
+    },
+    {
+      "name": "code-simplifier",
+      "source": "./vendor/anthropics-claude-plugins-official/code-simplifier",
+      "description": "Vendored from anthropics/claude-plugins-official -- agent that simplifies code while preserving functionality (model: opus)."
+    },
+    {
+      "name": "mattpocock-skills",
+      "source": "./vendor/mattpocock-skills/mattpocock-skills",
+      "description": "Vendored subset of mattpocock/skills -- grill-me, grill-with-docs, diagnosing-bugs, improve-codebase-architecture + their grilling/domain-modeling/codebase-design support skills."
+    }
+  ]
+}

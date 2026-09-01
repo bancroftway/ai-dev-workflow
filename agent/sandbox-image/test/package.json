@@ -1,0 +1,10 @@
+{
+  "name": "aidw-test-toolchain",
+  "private": true,
+  "description": "Pipeline-owned vitest + coverage provider, baked into the sandbox image at /opt/aidw/test. vitest resolves @vitest/coverage-v8 from its OWN node_modules here, so measuring a target repo's coverage never requires installing anything into that repo. jsdom included for DOM-environment tests.",
+  "dependencies": {
+    "vitest": "^4.0.7",
+    "@vitest/coverage-v8": "^4.0.7",
+    "jsdom": "^28.0.0"
+  }
+}

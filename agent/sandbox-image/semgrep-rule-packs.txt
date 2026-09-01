@@ -1,0 +1,20 @@
+# Semgrep rule packs vendored into /opt/aidw/semgrep-rules at image build time.
+# Format: <git-url> <commit-sha> <spdx> <license-grep> <subdir>[,<subdir>...]
+#   (<license-grep> is a SINGLE whitespace-free token -- the fields are split by `read`.)
+#   - SHA-pinned (never a branch): the rules baked into an image must be reproducible, same
+#     discipline as plugins/vendor/vendor-lock.json.
+#   - <spdx> must be a permissive licence. This image ships to SaaS AND on-prem customers, so the
+#     official semgrep/semgrep-rules pack is unusable: its Semgrep Rules License v1.0 says "You may
+#     use the rules only for your own internal business purposes. This license does not allow you
+#     to distribute the rules, or to make them available to others as a service."
+#   - <license-grep> is asserted against the pack's LICENSE file at build time, so a silent
+#     upstream relicense fails the build instead of shipping.
+#   - Rejected candidates, for the record: trailofbits/semgrep-rules (AGPL-3.0),
+#     hashicorp-forge/semgrep-rules (MPL-2.0, not permissive), kondukto-io/semgrep-rules (no
+#     licence = no grant), 0xdea/semgrep-rules (MIT but C/C++ only),
+#     federicodotta/semgrep-rules (MIT but java/kotlin/php only).
+# Coverage note: these packs are generic/yaml/JS-malware focused. Language SAST is carried by
+# bandit (Python), the eslint-security adapter (JS/TS) and Roslyn's Security category (.NET) --
+# see repo_scan.py's module docstring.
+https://github.com/elttam/semgrep-rules.git 244268562cc92d33f54b8a60a187df5520f91b26 MIT MIT rules/generic,rules/yaml
+https://github.com/apiiro/malicious-code-ruleset.git a21246b666f34db899f0e33add7237ed70fab790 MIT MIT dynamic_execution,obfuscation

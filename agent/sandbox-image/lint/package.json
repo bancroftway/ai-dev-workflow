@@ -1,0 +1,17 @@
+{
+  "name": "aidw-lint-toolchain",
+  "private": true,
+  "description": "Pipeline-owned ESLint toolchain, baked into the sandbox image at /opt/aidw/lint. Never installed into a target repo -- the repo's dependency graph is NEVER touched for linting (a root devDependency install once re-resolved a workspace's peer graph and broke its build).",
+  "dependencies": {
+    "eslint": "^9.39.4",
+    "@eslint/js": "^9.39.4",
+    "globals": "^17.11.0",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.67.0",
+    "eslint-plugin-security": "^4.0.1",
+    "eslint-plugin-sonarjs": "^4.2.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-jsx-a11y": "^6.10.2"
+  },
+  "//": "angular-eslint and eslint-plugin-vue are deliberately absent: both peer-depend on their framework's own packages and cannot install standalone. Angular/Vue repos ship their own lint config in practice, so the gate's defer-to-repo rule covers them; the config's optional() import returns null for the missing plugins."
+}
