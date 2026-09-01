@@ -1971,9 +1971,38 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     requirements_attachments: list[dict[str, Any]] = []
     if is_new_submission:
         assert latest_human_message is not None  # narrows for the type checker
-        raw_requirements_text, requirements_attachments = _split_text_and_attachments(
-            latest_human_message.content
+        candidate_text, candidate_attachments = _split_text_and_attachments(latest_human_message.content)
+
+        # Two backstops against a submission that reaches here without really being a fresh,
+        # intentional edit (found live 2026-09-01: a stale tab -- one that missed Build's live
+        # state through the mid-run reattach gap, AppShell.tsx -- had RequirementsView's own
+        # client-side runLocked stuck disabled=false, so an automated retry against it pushed a
+        # brand-new HumanMessage straight through the moment this thread's astream happened to be
+        # between turns with no interrupt pending; the reset loop below then wiped a
+        # minimal-code-to-green draft that had already landed on the branch). Either backstop
+        # keeps this a no-op resume instead of a fresh submission:
+        #   1. the text is byte-identical to what's already recorded -- a duplicate, not an edit.
+        #   2. Build has genuinely started and this run hasn't ended -- the one place the client's
+        #      runLocked rule can be enforced for real, since a stale/compromised client can't
+        #      spoof server-side stage state the way it can spoof its own React state.
+        previous_stages = state.get("stages") or {}
+        build_started = (previous_stages.get("ac-to-tests") or {}).get("status") not in (None, "not_started")
+        run_ended = (
+            state.get("run_failure") is not None
+            or (previous_stages.get("metrics-exit") or {}).get("status") == "approved"
+            or (previous_stages.get("exit") or {}).get("status") == "approved"
         )
+        is_duplicate_text = candidate_text.strip() == (state.get("raw_requirements_text") or "").strip()
+        if is_duplicate_text or (build_started and not run_ended):
+            logger.warning(
+                "intake_node: ignoring resubmission for thread_id=%s as a no-op "
+                "(duplicate_text=%s, build_started=%s, run_ended=%s)",
+                thread_id, is_duplicate_text, build_started, run_ended,
+            )
+            is_new_submission = False
+            raw_requirements_text = state.get("raw_requirements_text", "")
+        else:
+            raw_requirements_text, requirements_attachments = candidate_text, candidate_attachments
         consumed_message_id = latest_human_message.id
 
     # Hydration (architecture plan Section B.2): only when this thread has never had any stage
