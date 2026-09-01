@@ -4,6 +4,14 @@
 // `az deployment group create` bootable without CI.
 using '../main.bicep'
 
+// Override main.bicep's default (resourceGroup().location, i.e. East US 2 -- the rg itself is a
+// pure metadata container, resources don't have to share its region): this subscription is a
+// sponsored one (quotaId Sponsored_2016-01-01) and Azure is currently refusing new SQL Database
+// server creation for it in East US 2 AND South Central US ("RegionDoesNotAllowProvisioning",
+// confirmed against both). West US 3 verified available for SQL server creation in the Azure
+// portal; revisit if the sponsored quota opens up elsewhere or a support request lifts it.
+param location = 'westus3'
+
 param namePrefix = 'aidw-nonprod'
 param entraTenantId = 'e83eaf75-cbe6-47a2-82bd-451f13dc8b54' // TODO(bootstrap): set real tenant id
 param entraAppId = '33b4c021-6631-4d29-9906-0d675b44fa74' // TODO(bootstrap): set real app registration id
