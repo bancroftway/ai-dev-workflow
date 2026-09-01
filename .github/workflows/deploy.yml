@@ -42,6 +42,12 @@ jobs:
             context: agent/sandbox-image
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # sandbox is a multi-toolchain dev image (node, python, gh cli, claude code, ...) big enough
+      # that the runner's ~14GB free disk runs out mid-build/scan; the rest of the preinstalled
+      # toolcache (dotnet, android, ghc) is dead weight for a docker-build-only job.
+      - name: free disk space (sandbox only)
+        if: matrix.name == 'sandbox'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
       - name: build image
         run: docker build -t "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" "${{ matrix.context }}"
       # Gate BEFORE push: a vulnerable image never reaches any registry. Sandbox is a
