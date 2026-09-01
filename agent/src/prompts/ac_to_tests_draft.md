@@ -164,12 +164,14 @@ down with them; a test id is a contract. The stage that writes the UI is instruc
 `coverage_plan` entry -- that is the handshake between the two stages.
 
 **If the screen an AC touches has a wireframe, assert against what it shows, not just that the page
-loads.** Wireframes approved with the Plan live at `.ai-dev-workflow/plan/wireframes/<screen>.html`;
-when one exists, your e2e spec for that screen should exercise the fields, actions, and states it
-depicts (a form's fields, a button's action, an empty/error state it shows) -- "the page renders" is
-not a proving test for a screen the Plan already specified in detail. This also lets adversarial-
-compliance (which checks implementation against these same wireframes later) find fewer real
-divergences, since your suite is what will have caught a missing element first.
+loads.** The Implementation Plan JSON above lists each wireframe's `ac_ids` -- any AC named there is
+exactly the criteria that wireframe is evidence for. When one covers the AC you're testing, its
+HTML lives at `.ai-dev-workflow/plan/wireframes/<screen>.html`; your e2e spec for that screen should
+exercise the fields, actions, and states it depicts (a form's fields, a button's action, an
+empty/error state it shows) -- "the page renders" is not a proving test for a screen the Plan
+already specified in detail. This also lets adversarial-compliance (which checks implementation
+against these same wireframes later) find fewer real divergences, since your suite is what will
+have caught a missing element first.
 
 Besides that proving (happy-path) test, for every AC write further tests where meaningful, each
 following the same AC-id-in-test-name rule above unchanged: negative tests covering invalid input,
@@ -233,6 +235,12 @@ making it pass). For the same reason, NEVER write a body that fails by fiat -- `
 by a Python check: they prove nothing about the criterion, and a file of them collapses into
 near-duplicate bodies. Write the real arrange-act-assert calling the API the plan promises; the
 compile or module-resolution failure it causes IS the RED signal this stage exists to produce.
+
+Stories/criteria the Specification marks `deferred: true` are PARKED for a later phase: write NO
+tests for them -- a failing test naming a deferred id would force the build stage to implement the
+parked feature, and a deterministic gate rejects any test file that references a deferred
+criterion that has never been delivered. (A criterion that was delivered by an earlier ticket and
+only later deferred keeps its existing regression tests -- its code stays in the tree.)
 
 When a ticket retires an Acceptance Criterion, its now-orphaned test(s) must stop running. Check the
 Approved Specification above for `retired_ac_ids`/`retired_us_ids` -- ids the ledger sync already

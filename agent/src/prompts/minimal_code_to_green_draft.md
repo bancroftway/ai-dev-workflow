@@ -156,15 +156,16 @@ previous stage locate elements with `page.getByTestId(...)`; check that stage's 
 they expect and honour those exact names. Selecting by CSS class or visible text breaks the suite on
 any cosmetic change, which is why the id is the contract.
 
-**If a screen has a wireframe, read it before you build the screen.** Wireframes approved with the
-Plan live at `.ai-dev-workflow/plan/wireframes/<screen>.html`; when one exists for a screen you are
-implementing, match its fields, actions, sections, and states before considering that screen done --
-same intent, cosmetic labels/roles may differ, but no whole element, state, or section it shows may
-be missing. This is not a new requirement invented here: the adversarial-compliance stage already
-checks every implemented screen against its wireframe and blocks the run on a mismatch. Checking it
-now, while the code is still yours to write, is the cheap version of that fix -- catching it after
-the fact is the expensive one (that stage's own fix-lap cap is 6, specifically because wireframe
-rework is heavy). No wireframe for a screen means nothing to check here.
+**If a screen has a wireframe, read it before you build the screen.** The Implementation Plan JSON
+above lists each wireframe's `ac_ids` -- check it for the AC you're implementing. When one covers
+your AC, its HTML lives at `.ai-dev-workflow/plan/wireframes/<screen>.html`; match its fields,
+actions, sections, and states before considering that screen done -- same intent, cosmetic
+labels/roles may differ, but no whole element, state, or section it shows may be missing. This is
+not a new requirement invented here: the adversarial-compliance stage already checks every
+implemented screen against its wireframe and blocks the run on a mismatch. Checking it now, while
+the code is still yours to write, is the cheap version of that fix -- catching it after the fact is
+the expensive one (that stage's own fix-lap cap is 6, specifically because wireframe rework is
+heavy). No wireframe for a screen means nothing to check here.
 
 **If the Plan names a test, write that test -- by that name.** Plan steps routinely spell out
 coverage in prose ("API integration tests cover restart persistence", "verify US-0001.1-3"). Each
@@ -203,7 +204,14 @@ A previous attempt of this stage may have been cut off mid-turn (timeout, quota)
 still in the working tree. Start by inventorying what exists and what builds; then CONTINUE from
 there -- finish, fix and wire what is present. Never delete or rewrite a working file because you
 did not write it in this turn. Restarting from scratch is how a 40-minute budget gets spent three
-times on the same code.
+times on the same code. The ONE exception: a Plan step whose `removes_ids` names retired scope is
+an explicit order to DELETE that feature's delivered artifacts -- implementation code, UI screens,
+navigation links/routes, config -- and executing it is required work, not restart thrash.
+
+Stories/criteria the Specification marks `deferred: true` are PARKED: build NOTHING for them --
+no endpoints, no UI, no placeholder buttons -- even if a stray test seems to demand it (report
+such a test as factually wrong about the Specification instead of implementing the parked
+feature).
 
 ## Tests you add here
 

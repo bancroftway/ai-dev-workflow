@@ -65,6 +65,9 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
             suffix = f" _(ACs: {', '.join(ac_ids)})_" if ac_ids else (
                 " _(infrastructure)_" if step.get("kind") == "infrastructure" else ""
             )
+            removes = step.get("removes_ids") or []
+            if removes:
+                suffix += f" **_(removes: {', '.join(removes)})_**"
             lines.append(f"- **{step.get('id', '')}**: {step.get('description', '')}{suffix}")
         lines.append("")
 
@@ -91,6 +94,14 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
                 # opens the rendered page via html-preview.github.io.
                 preview = str(wf.get("preview_url") or "").strip()
                 suffix = f" -- [preview]({preview})" if preview else ""
+                # Same "provenance must be visible in the reviewable document" reasoning as plan
+                # steps' own _(ACs: ...)_ suffix above -- without it, a stage that reads this
+                # rendered .md (ac-to-tests, minimal-code-to-green: both told to "read the approved
+                # Implementation Plan", never pointed at the raw JSON specifically) has no way to
+                # tell which AC a wireframe is evidence for, only that the screen exists.
+                ac_ids = wf.get("ac_ids") or []
+                if ac_ids:
+                    suffix += f" _(ACs: {', '.join(ac_ids)})_"
                 lines.append(f"- [{screen}](plan/wireframes/{screen}.html){suffix}")
         lines.append("")
 
@@ -294,3 +305,29 @@ def render_raw_requirements_markdown(content: dict[str, Any]) -> str:
     structured fields) -- this renderer is a passthrough, kept only so raw-requirements fits the
     same render_markdown-per-stage convention every other stage uses."""
     return (content.get("content") or "").strip() + "\n"
+
+
+def _demo() -> None:
+    # A wireframe's ac_ids must render (2026-09-01 fix): ac-to-tests/minimal-code-to-green are
+    # only ever told to "read the approved Implementation Plan", never pointed at the raw JSON
+    # specifically, so this rendered .md is the one place that link is guaranteed visible to them.
+    md = render_plan_markdown(
+        {
+            "overview": "x",
+            "plan_steps": [{"id": "PS-1", "description": "d", "ac_ids": ["US-0001.1"]}],
+            "wireframes": [{"screen": "task-list", "ac_ids": ["US-0001.1", "US-0001.2"]}],
+        }
+    )
+    assert "_(ACs: US-0001.1)_" in md, md  # plan step's own suffix, unchanged
+    assert "_(ACs: US-0001.1, US-0001.2)_" in md, md  # wireframe's new suffix
+    assert "[task-list](plan/wireframes/task-list.html)" in md, md
+
+    # No ac_ids on a wireframe (schema default is an empty list) -> no suffix, no crash.
+    md_no_ac_ids = render_plan_markdown({"overview": "x", "wireframes": [{"screen": "task-list"}]})
+    assert "_(ACs:" not in md_no_ac_ids, md_no_ac_ids
+
+    print("markdown_render self-check: ok")
+
+
+if __name__ == "__main__":
+    _demo()

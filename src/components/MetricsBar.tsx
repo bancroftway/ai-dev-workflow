@@ -135,7 +135,18 @@ function e2ePill(e2e: E2EState | null | undefined): React.ReactNode {
  * Coverage, Duplication, Gate) once any scan summary exists, "--" gray placeholders for whatever
  * a given summary doesn't carry. The whole bar stays hidden until there's a summary, an active
  * stage, or a push/run failure to show. */
-export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
+export function MetricsBar({
+  thresholds,
+  trailing,
+}: {
+  thresholds: MetricThresholds;
+  // Composed in rather than computed here (LiveCostChip, AppShell.tsx) -- same row as this bar's
+  // own chips, but a separate, independent component: it must keep showing even on the pre-build
+  // stages this bar's own scan chips are deliberately suppressed on (user feedback 2026-09-01:
+  // "same row as Metrics bar, but separate from the Metrics bar"). Counted in the early-return
+  // guard below so the row doesn't hide itself out from under it.
+  trailing?: React.ReactNode;
+}) {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
@@ -269,7 +280,10 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
     const gate = (
       <Chip
         key="gate"
-        label="Gate"
+        // "Gate" alone reads ambiguous here -- this pipeline has many gates (spec/plan approval,
+        // ac-to-tests verify, ...); this chip is specifically the scan-based merge-readiness gate
+        // (user feedback 2026-09-01: "what is meant by Gate Pass?").
+        label="Quality Gate"
         value={gatingCount === 0 ? "Pass" : `Fail · ${gatingCount}`}
         tone={gatingCount === 0 ? "green" : "red"}
         title={`Quality gate: fails when any finding at/above the severity floor (or newly introduced quality issue) is open. ${gatingCount} gating findings.`}
@@ -303,14 +317,14 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
 
   // The status/push lines matter before any scan has streamed (a needs_clarification stage was
   // previously invisible exactly when no scan had streamed) -- only hide a truly empty strip.
-  if (!summary && !costChip && !activeStage && !e2ePillNode && state.last_push?.ok !== false && state.run_failure == null) return null;
+  if (!summary && !costChip && !activeStage && !e2ePillNode && !trailing && state.last_push?.ok !== false && state.run_failure == null) return null;
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-1.5">
       {chips}
       {costChip}
       {activeStage && (
-        <span className="ml-auto text-xs text-neutral-500">
+        <span className="text-xs text-neutral-500">
           {activeStage.label} — {STATUS_LABEL[state.stages?.[activeStage.key]?.status ?? ""] ?? state.stages?.[activeStage.key]?.status}
         </span>
       )}
@@ -340,6 +354,7 @@ export function MetricsBar({ thresholds }: { thresholds: MetricThresholds }) {
           </span>
         );
       })()}
+      {trailing && <div className="ml-auto flex items-center gap-2">{trailing}</div>}
     </div>
   );
 }

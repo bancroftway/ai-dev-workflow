@@ -134,35 +134,41 @@ export function RequirementsView() {
   // approved -- resubmitting after THAT is the supported requirements-delta flow), and while any
   // stage is actively drafting pre-build.
   const runLocked = (buildStarted(state) && !runEnded(state)) || anyStageDrafting(state);
-  // Requirements-as-single-source-of-truth (user requirement 2026-08-31): while the
-  // SPECIFICATION gate is open, this tab stays live -- submitting resolves that gate with the
-  // full revised document (graph.py make_gate_node's revised_requirements contract), so answers
-  // to the spec's questions live in the requirements doc, not in a feedback box. Scoped to the
-  // spec gate only: a plan-gate revision would redraft the plan against a stale approved spec.
-  const specGateOpen = openInterrupt.open && openInterrupt.stage === "specification";
+  // Requirements-as-single-source-of-truth (user requirement 2026-08-31, extended to Plan
+  // 2026-08-31): while the SPECIFICATION or PLAN gate is open, this tab stays live -- submitting
+  // resolves whichever gate is open with the full revised document (graph.py make_gate_node's
+  // revised_requirements contract). For Plan, the SAME resolve shape also trips
+  // GraphState.restart_from_specification server-side (make_gate_node detects stage_spec.key ==
+  // "plan" on its own -- no extra field needed here) so the redraft cascades through
+  // Specification first rather than redrafting Plan against its now-stale approved spec.
+  const sourceOfTruthGateOpen =
+    openInterrupt.open && (openInterrupt.stage === "specification" || openInterrupt.stage === "plan");
   const disabled =
     text.trim().length === 0 ||
     agent.isRunning ||
     submitting ||
-    (openInterrupt.open && !specGateOpen) ||
+    (openInterrupt.open && !sourceOfTruthGateOpen) ||
     runLocked;
 
   async function handleSubmit() {
     const trimmed = text.trim();
     if (!trimmed) return;
     setSubmitting(true);
-    if (specGateOpen) {
+    if (sourceOfTruthGateOpen) {
       try {
-        openInterrupt.resolve?.({
-          decision: "rejected",
-          feedback:
-            "Requirements revised by the reviewer — redraft the Specification strictly from the updated requirements document. " +
-            "Emit the COMPLETE specification: every still-applicable user story and acceptance criterion re-appears citing its existing id — never just the changed ones. " +
-            "Features REMOVED from the document must be explicitly retired via retired_us_ids/retired_ac_ids (citing their existing ids), never silently dropped. " +
-            "Features the document marks for a LATER phase are specified with deferred=true, never retired; features moved INTO the build-now scope re-appear with deferred=false. " +
-            "A previously deferred feature that no longer appears ANYWHERE in the document has been removed — retire it; the current document alone decides what exists.",
-          revised_requirements: trimmed,
-        });
+        const feedback =
+          openInterrupt.stage === "plan"
+            ? "Requirements revised by the reviewer while reviewing the Plan — the Specification redrafts first, strictly from the updated requirements document; once it is re-approved, the Plan will redraft from it. " +
+              "Emit the COMPLETE specification: every still-applicable user story and acceptance criterion re-appears citing its existing id — never just the changed ones. " +
+              "Features REMOVED from the document must be explicitly retired via retired_us_ids/retired_ac_ids (citing their existing ids), never silently dropped. " +
+              "Features the document marks for a LATER phase are specified with deferred=true, never retired; features moved INTO the build-now scope re-appear with deferred=false. " +
+              "A previously deferred feature that no longer appears ANYWHERE in the document has been removed — retire it; the current document alone decides what exists."
+            : "Requirements revised by the reviewer — redraft the Specification strictly from the updated requirements document. " +
+              "Emit the COMPLETE specification: every still-applicable user story and acceptance criterion re-appears citing its existing id — never just the changed ones. " +
+              "Features REMOVED from the document must be explicitly retired via retired_us_ids/retired_ac_ids (citing their existing ids), never silently dropped. " +
+              "Features the document marks for a LATER phase are specified with deferred=true, never retired; features moved INTO the build-now scope re-appear with deferred=false. " +
+              "A previously deferred feature that no longer appears ANYWHERE in the document has been removed — retire it; the current document alone decides what exists.";
+        openInterrupt.resolve?.({ decision: "rejected", feedback, revised_requirements: trimmed });
       } finally {
         setSubmitting(false);
       }
@@ -243,9 +249,11 @@ export function RequirementsView() {
           <span className="text-xs text-neutral-500">
             {openInterrupt.stage === "tech-stack"
               ? "Finish the Tech Stack tab first, then resubmit."
-              : specGateOpen
+              : openInterrupt.stage === "specification"
                 ? "The Specification is awaiting review — submitting here revises the requirements and redrafts it from the updated document."
-                : "A review is waiting — approve or reject it first, then edit and resubmit."}
+                : openInterrupt.stage === "plan"
+                  ? "The Plan is awaiting review — submitting here revises the requirements and redrafts the Specification first, then the Plan."
+                  : "A review is waiting — approve or reject it first, then edit and resubmit."}
           </span>
         )}
         <button

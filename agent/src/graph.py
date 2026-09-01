@@ -306,6 +306,19 @@ class GraphState(TypedDict):
     # Declared test users for THIS run: [{name, email, roles}]. Seeded beside app_auth from
     # repo_test_users' per-thread store; read via state.get("test_users"). Empty when none declared.
     test_users: list[dict[str, Any]]
+    # One-shot signal (user requirement 2026-08-31): the Plan gate carries no reject/feedback box
+    # -- like Specification, "Requirements is the sole source of truth" means a Plan change also
+    # flows through the Requirements tab, never a Plan-specific feedback string. Its own draft is
+    # built from the APPROVED SPECIFICATION though, not raw requirements directly, so simply
+    # looping Plan's rejection back to Plan's own draft node (Ruling 3's normal "rejected" edge)
+    # would redraft Plan against the UNCHANGED old spec -- the revised requirements would sit
+    # inert in raw-requirements text, never actually reflected in what Plan reads. Set True by
+    # make_gate_node's Plan-specific rejection branch, read by make_route_after_gate(plan_spec) to
+    # route to "specification_draft" instead of "plan_draft" so the full cascade (spec redrafts,
+    # human re-approves the new spec, THEN plan redrafts from it) actually happens. Cleared by
+    # every draft node's own return (see make_draft_node) the instant it's consumed. Read only via
+    # state.get() -- checkpoints written before this field shipped lack it.
+    restart_from_specification: bool
 
 
 def default_stage_state() -> StageState:
@@ -887,22 +900,41 @@ async def _verify_specification_ledger(
         # persistence commit sweeps up.
         await spec_ledger.save_ledger(provider, thread_id, updated_entries)
         # Scope-lifecycle stamps for the review UI (user requirement 2026-08-31): every live
-        # story/AC carries its change classification versus the LAST GATED draft (`entries`, the
-        # ledger as loaded before this sync -- spec_ledger.gate_change_status explains why that
-        # is exactly the last thing the human saw), and everything retired is appended so the
-        # tab can render removed scope crossed out instead of silently vanishing it. The exit
-        # report keeps using change_status (per-RUN semantics are right there). Stamped onto the
-        # draft dict in place, exactly like sync_ledger's own id resolution above.
-        old_by_id = {e.get("id"): e for e in entries}
-        by_id = {e.get("id"): e for e in updated_entries}
+        # story/AC carries its change classification versus the specification the human last
+        # APPROVED -- read fresh from disk here rather than from the ledger's own pre-sync state,
+        # which mutates on every verify pass and so falsely reports "unchanged" for a story
+        # re-cited identically from an earlier draft the human never actually approved (spec_
+        # ledger.gate_change_status's own docstring has the full story; observed live 2026-08-31:
+        # a reject-and-redraft cycle before approval silently dropped the "new" badge from every
+        # story except the one genuinely added in the redraft). Absent entirely before this
+        # ticket's first-ever approval, in which case every story/AC correctly reports "new".
+        raw_prior_spec = await repo_files.read_repo_file(
+            provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+        )
+        prior_by_id: dict[str, dict[str, Any]] = {}
+        if raw_prior_spec is not None:
+            try:
+                prior_spec = json.loads(raw_prior_spec)
+                for prior_story in prior_spec.get("user_stories") or []:
+                    prior_by_id[prior_story.get("id")] = {
+                        "text": prior_story.get("title", ""), "deferred": bool(prior_story.get("deferred")),
+                    }
+                    for prior_ac in prior_story.get("acceptance_criteria") or []:
+                        prior_by_id[prior_ac.get("id")] = {
+                            "text": prior_ac.get("description", ""), "deferred": bool(prior_ac.get("deferred")),
+                        }
+            except json.JSONDecodeError:
+                pass
         for story in content_dict.get("user_stories") or []:
-            entry = by_id.get(story.get("id"))
-            if entry:
-                story["change"] = spec_ledger.gate_change_status(old_by_id.get(story.get("id")), entry)
+            story["change"] = spec_ledger.gate_change_status(
+                prior_by_id.get(story.get("id")),
+                {"text": story.get("title", ""), "deferred": bool(story.get("deferred"))},
+            )
             for ac in story.get("acceptance_criteria") or []:
-                ac_entry = by_id.get(ac.get("id"))
-                if ac_entry:
-                    ac["change"] = spec_ledger.gate_change_status(old_by_id.get(ac.get("id")), ac_entry)
+                ac["change"] = spec_ledger.gate_change_status(
+                    prior_by_id.get(ac.get("id")),
+                    {"text": ac.get("description", ""), "deferred": bool(ac.get("deferred"))},
+                )
         content_dict["retired_user_stories"] = [
             {"id": e["id"], "title": e.get("title", "")}
             for e in updated_entries
@@ -1800,19 +1832,21 @@ async def _run_post_approve_hook(
     a convention file that couldn't be written must not take down a run whose approval already
     happened. The hook itself is expected to record its own partial failures where they matter.
 
-    Known limitation (Task 10 sweep item #2, mirrors a pre-existing current_stage gap): a session
-    whose sandbox is evicted while paused at a gate, then approved anyway, skips this whole
-    function -- including the update_current_stage call below that clears awaiting_gate -- and can
-    leave that column stuck True until the next touch_run. Only affects the Board's cosmetic ⏸
-    marker; not fixed here since the real fix (decoupling awaiting_gate's clear from this sandbox
-    guard) would touch this hot, already-reviewed choke point for a cosmetic-only edge case.
+    update_current_stage runs unconditionally, ahead of the sandbox_registry guard below: it is a
+    DB-only write (session-list progress indicator + awaiting_gate), not sandbox-dependent, so a
+    session whose sandbox was evicted while paused at a gate -- then approved anyway -- must still
+    advance it. Previously this whole function short-circuited on a dead sandbox, freezing
+    current_stage/awaiting_gate at whatever they were during the outage even after the run kept
+    going (observed live 2026-09-01: session-list card stuck reporting "stage 2 of 8" a day into a
+    run that had long since moved past it). post_approve_hook stays behind the guard -- it writes
+    convention files into the sandboxed repo and genuinely needs one.
     """
-    if sandbox_registry.get(thread_id) is None:
-        return
     try:
         await session_store.update_current_stage(thread_id, stage_spec.key)
     except Exception:
         logger.warning("update_current_stage failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True)
+    if sandbox_registry.get(thread_id) is None:
+        return
     if stage_spec.post_approve_hook is None or not content:
         return
     try:
@@ -2273,6 +2307,16 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         # a legitimate "started, never finished" span, not a bug; the swimlane renders that as
         # open-ended rather than silently dropping it. Same fail-soft two-call pattern (append_event
         # then emit_live, rebind before the live call) as every other RunEvent site in this file.
+        #
+        # update_current_stage runs unconditionally, outside the sandbox_registry guard below: it's
+        # a DB-only write, not sandbox-dependent, so a session whose sandbox is down (or not yet
+        # provisioned) still reports the right stage on the session list instead of freezing on
+        # whatever stage was current the last time a sandbox happened to be registered (observed
+        # live 2026-09-01: a session's card was stuck reporting a stage from a day earlier).
+        try:
+            await session_store.update_current_stage(thread_id, stage_spec.key)
+        except Exception:  # noqa: BLE001 -- bookkeeping must never block the draft itself
+            logger.warning("could not mark %s as drafting", stage_spec.key, exc_info=True)
         if sandbox_registry.get(thread_id) is not None:
             start_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
@@ -2284,20 +2328,17 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             )
             start_event = await run_event_store.append_event(start_event)
             await run_event_stream.emit_live(start_event, config)
-            # Mark the stage "drafting" in state.json (and the session row's current_stage)
-            # BEFORE the model call, so a draft killed mid-turn (timeout, quota) leaves durable
-            # proof it began. Two consumers: rebuild.py's TDD-red guard, which must not mistake a
-            # workspace with a half-written implementation for one codegen never touched (run
-            # d16959d3: it did, and stubbed 200 passing tests back to red); and the board, whose
-            # current_stage otherwise lagged a whole stage behind during the longest turns.
-            # intake keeps "drafting" on a resume and resets it on a fresh submission.
+            # Mark the stage "drafting" in state.json BEFORE the model call, so a draft killed
+            # mid-turn (timeout, quota) leaves durable proof it began -- rebuild.py's TDD-red guard
+            # must not mistake a workspace with a half-written implementation for one codegen never
+            # touched (run d16959d3: it did, and stubbed 200 passing tests back to red). intake
+            # keeps "drafting" on a resume and resets it on a fresh submission.
             drafting_stages = {key: dict(value) for key, value in state["stages"].items()}
             drafting_stages[stage_spec.key]["status"] = "drafting"
             try:
                 await _persist_if_sandboxed(thread_id, state, drafting_stages, f"ai-dev-workflow: {stage_spec.key} drafting")
-                await session_store.update_current_stage(thread_id, stage_spec.key)
             except Exception:  # noqa: BLE001 -- bookkeeping must never block the draft itself
-                logger.warning("could not mark %s as drafting", stage_spec.key, exc_info=True)
+                logger.warning("could not persist %s drafting status", stage_spec.key, exc_info=True)
 
         try:
             response = await call_with_infra_retry(
@@ -3323,6 +3364,25 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     "use the updated document",
                     stage_spec.key, len(revised),
                 )
+                # Plan's own draft is built from the approved SPECIFICATION, not raw requirements
+                # directly (see GraphState.restart_from_specification's own docstring) -- looping
+                # back to Plan's own draft node here would redraft Plan against the UNCHANGED old
+                # spec, leaving the revised requirements inert. Force the real cascade instead:
+                # reset the (currently "approved") specification stage so should_skip_draft can't
+                # short-circuit it, and signal the router to send control there.
+                if stage_spec.key == "plan":
+                    spec_stage = dict(stages.get("specification") or default_stage_state())
+                    spec_stage["status"] = "drafting"
+                    stages["specification"] = spec_stage
+                    # `rejected["status"]` was just set to "needs_clarification" above, which the
+                    # tab-pill dot (AppShell.tsx's stageGroupDot) renders identically to
+                    # "ready_for_review" -- amber, "awaiting a human". Wrong here: the human
+                    # already resubmitted: Plan isn't waiting on anyone, it's stale and about to
+                    # be redrafted once Specification re-approves. "not_started" is what
+                    # PlanView's own isStale banner already keys off for this exact cascade.
+                    rejected["status"] = "not_started"
+                    stages[stage_spec.key] = rejected
+                    revised_update["restart_from_specification"] = True
             # Mirrors the True-setting call above: this session is no longer sitting at a gate --
             # it is about to redraft. Never routes through _run_post_approve_hook/
             # update_current_stage (that would fire post_approve_hook, which is only correct for
@@ -3408,7 +3468,15 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
             )
 
         await _run_post_approve_hook(stage_spec, thread_id, approved["approved_content"], state)
-        return {"stages": stages, "last_push": git_ops.get_last_push(thread_id)}
+        # Clears GraphState.restart_from_specification the moment ANY stage is genuinely
+        # approved -- most relevantly Specification's own approval, the one place guaranteed to
+        # run before Plan's gate is ever reached again after a Plan-triggered restart (see the
+        # flag's own docstring and make_route_after_gate). Without this, the flag stays True
+        # forever (un-annotated GraphState keys are last-write-wins across the whole run) and a
+        # LATER, completely unrelated plain Approve on Plan's gate would incorrectly route back
+        # to specification_draft again. Harmless to clear unconditionally on every stage's
+        # approval; only Specification's clearing is ever load-bearing.
+        return {"stages": stages, "last_push": git_ops.get_last_push(thread_id), "restart_from_specification": False}
 
     return gate_node
 
@@ -3419,6 +3487,13 @@ def make_route_after_gate(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     reach "approved" -- proceeds to the next stage's draft, unchanged from the unconditional edge
     this replaced. "rejected" (Ruling 3) loops back to THIS stage's own draft node instead.
 
+    "restart" is Plan-only (GraphState.restart_from_specification's own docstring): a Plan
+    rejection carrying revised requirements needs the full upstream cascade (specification
+    redrafts and is re-approved before Plan ever drafts again), not a loop back to Plan's own
+    draft node against its now-stale approved specification. _wire_stage only wires this outcome
+    into Plan's own conditional-edges map, so it is unreachable (and would KeyError if it somehow
+    fired) for every other stage -- exactly why the flag is set only in that one branch.
+
     Reads state AFTER gate_node has already run: LangGraph evaluates a conditional edge's routing
     function against the state its source node just returned (the same reliance
     make_route_after_draft/make_route_after_verify already have on make_draft_node/
@@ -3426,6 +3501,8 @@ def make_route_after_gate(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     gate_node took."""
 
     def route(state: GraphState) -> str:
+        if stage_spec.key == "plan" and state.get("restart_from_specification"):
+            return "restart"
         stage = state["stages"][stage_spec.key]
         return "approved" if stage["status"] == "approved" else "rejected"
 
@@ -3925,11 +4002,16 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
     # fires for the 3 requires_human_gate=True stages (make_route_after_gate); every non-gated
     # stage's gate_node always reaches "approved", so this is a no-op change for those 5 stages,
     # not a behavior change -- see make_route_after_gate's own docstring.
-    builder.add_conditional_edges(
-        gate_name,
-        make_route_after_gate(stage_spec),
-        {"approved": next_draft_name, "rejected": draft_name},
-    )
+    #
+    # "restart" (user requirement 2026-08-31, Plan only): wired ONLY for Plan's own gate, always
+    # targeting "specification_draft" -- make_route_after_gate(plan_spec) is the only route
+    # function that can ever produce this outcome (guarded there on stage_spec.key == "plan"), so
+    # no other stage's map needs it and none is given it; that guard is what makes it safe to hard-
+    # code the target name here rather than threading it through as a parameter.
+    gate_edges = {"approved": next_draft_name, "rejected": draft_name}
+    if stage_spec.key == "plan":
+        gate_edges["restart"] = "specification_draft"
+    builder.add_conditional_edges(gate_name, make_route_after_gate(stage_spec), gate_edges)
     # auto_approve (clarification cap) skips the AUDIT and the HUMAN gate -- never the
     # deterministic verify. Observed live (run 14): a stage auto-approved with NO draft content
     # sailed past the coverage gate entirely and the pipeline "progressed" with zero feature

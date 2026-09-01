@@ -28,8 +28,15 @@ _EXEC_CMD_BUDGET = 16000
 # Scratch-file directory for all provider execs (shared, not provider-specific).
 _SCRATCH_DIR = "/tmp/aidw-agent"
 
-# Poll interval for backgrounded process completion.
-_POLL_INTERVAL_SECONDS = 5.0
+# A single completion-wait exec blocks (via the remote `timeout`/`tail --pid` below) for up to
+# this long before returning to let the host loop re-check its own deadline and re-touch
+# last_active (see local_docker.py's DEFAULT_IDLE_TIMEOUT_SECONDS=1800 -- this is comfortably
+# under that with margin to spare). Replaces a fixed-interval host-side poll (2026-09-01: a
+# runaway stack of those, each issuing its own `docker exec` every few seconds, hammered Docker
+# Desktop's API into a VM reset). One exec call per chunk instead of one every few seconds cuts
+# call volume ~60x on a long turn while still noticing completion within a second or two, since
+# the remote wait itself is event-driven (`tail --pid`), not a sleep loop.
+_ACTIVITY_CHUNK_SECONDS = 300.0
 
 
 @dataclass
@@ -348,7 +355,8 @@ async def run_turn(
         start_time = time.time()
         while True:
             elapsed = time.time() - start_time
-            if elapsed > timeout_seconds:
+            remaining = timeout_seconds - elapsed
+            if remaining <= 0:
                 # Timeout: kill the process group, then raise.
                 kill_cmd = (
                     f"kill -TERM -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; "
@@ -363,14 +371,32 @@ async def run_turn(
                     partial_stdout=partial.stdout if partial.ok else "",
                 )
 
-            # Check if exit file exists.
-            check_cmd = f"test -f {shlex.quote(exit_path)} && echo DONE || echo PENDING"
-            check_result = await provider.exec_in_sandbox(thread_id, check_cmd)
+            # Block inside the sandbox until the exit file appears or this chunk elapses,
+            # whichever first -- `timeout` bounds the remote wait so this exec always returns on
+            # its own (no host-side cancellation, so nothing is left running in the sandbox).
+            #
+            # NOT `tail --pid=<turn pid>` (what this used to be): this sandbox's PID 1 is a bare
+            # `sleep infinity` (no init/reaper), so every backgrounded turn's process becomes an
+            # unreaped ZOMBIE the instant it exits rather than disappearing -- confirmed live
+            # 2026-09-01, `ps aux` showed dozens of `[sh] <defunct>` entries, one per chunk, going
+            # back to session start. `kill -0`/`tail --pid` both see a zombie's PID as still
+            # "alive" (the /proc entry persists until something reaps it, which never happens
+            # here), so `tail --pid` never returned early -- it silently degraded into "always
+            # block the full chunk," turning a turn that finished in under a minute (confirmed:
+            # .exit file timestamped ~60s after start) into a 5-minute wait before the host loop
+            # ever rechecked. Polling the exit file directly has no such failure mode -- a file's
+            # existence doesn't depend on process-reaping semantics -- and the 2s remote sleep
+            # interval is still all inside one exec call, so it costs nothing extra host-side.
+            chunk = min(remaining, _ACTIVITY_CHUNK_SECONDS)
+            wait_cmd = (
+                f"timeout {int(chunk) + 1} sh -c 'while [ ! -f {exit_path} ]; do sleep 2; done' 2>/dev/null; "
+                f"test -f {shlex.quote(exit_path)} && echo DONE || echo PENDING"
+            )
+            check_result = await asyncio.wait_for(
+                provider.exec_in_sandbox(thread_id, wait_cmd), timeout=chunk + 30.0
+            )
             if check_result.ok and "DONE" in check_result.stdout:
                 break
-
-            # Sleep before next poll.
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
         # Read results.
         stdout_result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(out_path)} 2>/dev/null || true")

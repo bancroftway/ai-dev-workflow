@@ -91,9 +91,20 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
         return prepared
 
 
+# LangGraph's own default recursion_limit (25 super-steps) is far below what this pipeline's own
+# documented retry design needs -- ac-to-tests alone allows up to 6 verify cycles (draft+audit+
+# verify per cycle), minimal-code-to-green up to 12, and EVERY resume replays ~8-9 super-steps
+# from intake through whichever stage is already approved (should_skip_draft short-circuits, but
+# each still counts as a step) before reaching the stage actually retrying. Observed live
+# 2026-09-01: langgraph.errors.GraphRecursionError killed an otherwise-healthy run mid-stream, no
+# run_failure recorded (the error propagated out of the AG-UI stream unhandled). The real
+# runaway-loop protection is each stage's own max_verify_cycles/max_cycles (workflow_config.py);
+# this is just a generous ceiling against a genuine infinite loop, not a cost control.
+_RECURSION_LIMIT = 1000
+
 add_langgraph_fastapi_endpoint(
     app=app,
-    agent=_ReattachStateAgent(name="workflow", graph=graph),
+    agent=_ReattachStateAgent(name="workflow", graph=graph, config={"recursion_limit": _RECURSION_LIMIT}),
     path="/",
 )
 

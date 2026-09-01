@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
+import { RunningSpinner } from "@/components/Spinner";
 import { terminateSession } from "@/lib/agent-client";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 
@@ -110,8 +111,21 @@ export function SessionHistory({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [owner, repo, sourceBranch]);
 
+  // "Resume" restarts a run that has genuinely stopped (failed) -- it fires ?resume=1, which
+  // AppShell.tsx turns into a blank runAgent() call re-entering the graph from intake (a real,
+  // if self-healing, cost: confirmed live 2026-09-01 to replay ~5 min of already-approved early
+  // stages before reaching the one that actually needs re-running). An in_progress session's
+  // agent process and container are typically still alive and streaming on their own -- opening
+  // it needs no such call at all, just the plain URL, which reattaches for free (confirmed live
+  // the same day: zero new graph activity, correct live state). Calling that "Resume" too read as
+  // "something might restart / work could be lost" for a session that was never stopped -- these
+  // are deliberately two different actions now, not one function with two labels.
   function resume(session: Session) {
     router.push(`/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}?resume=1`);
+  }
+
+  function openLive(session: Session) {
+    router.push(`/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}`);
   }
 
   async function stopContainer(session: Session) {
@@ -180,8 +194,9 @@ export function SessionHistory({
                     stopping={stoppingId === s.session_id}
                   />
                   <span
-                    className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[s.status]}`}
+                    className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[s.status]}`}
                   >
+                    {s.status === "in_progress" && <RunningSpinner className="h-3 w-3" />}
                     {s.status.replace("_", " ")}
                   </span>
                 </div>
@@ -196,7 +211,7 @@ export function SessionHistory({
                 </p>
               )}
               <div className="flex gap-2">
-                {(s.status === "failed" || s.status === "in_progress") && (
+                {s.status === "failed" && (
                   <button
                     type="button"
                     title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
@@ -204,6 +219,16 @@ export function SessionHistory({
                     onClick={() => resume(s)}
                   >
                     Resume
+                  </button>
+                )}
+                {s.status === "in_progress" && (
+                  <button
+                    type="button"
+                    title="Reattaches to the run already in progress -- nothing restarts, nothing is lost."
+                    className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
+                    onClick={() => openLive(s)}
+                  >
+                    Open
                   </button>
                 )}
                 {s.status === "failed" && (

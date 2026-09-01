@@ -41,6 +41,14 @@ fixed in the suite's own files:
 
 Everything else here is a real defect: fix the app.
 
+**When a failing test's JSON entry below includes a `screenshot` path, view that file with your
+read tool before forming your fix hypothesis.** It is what the browser actually rendered at the
+moment of failure -- a blank page, a stuck spinner, an unstyled layout, an error banner the
+assertion never checked for -- and it often shows the real defect directly, faster and more
+reliably than reasoning from a stack trace alone. Not every entry has one (a setup/config failure
+that never got a page to screenshot has nothing to view); skip silently when the key is absent
+rather than treating it as a missing artifact.
+
 The backend is instrumented with OpenTelemetry, and its console exporter writes spans to the same
 stdout/stderr stream captured below -- if a failing test corresponds to a request that reached the
 backend, look for its trace/span output first: it names the actual handler and any downstream call

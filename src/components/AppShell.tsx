@@ -6,10 +6,11 @@ import {
   useCopilotKit,
   useInterrupt,
 } from "@copilotkit/react-core/v2";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
+import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
 import { QualityView } from "@/components/QualityView";
@@ -18,11 +19,12 @@ import { RequirementsView } from "@/components/RequirementsView";
 import { SessionOverview } from "@/components/SessionOverview";
 import { SpecificationView } from "@/components/SpecificationView";
 import { TechStackView } from "@/components/TechStackView";
-import { Spinner } from "@/components/Spinner";
+import { RunningSpinner, Spinner } from "@/components/Spinner";
 import { terminateSession } from "@/lib/agent-client";
 import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
+import { computeRunningStages, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   buildStarted,
@@ -46,8 +48,19 @@ const DOT_CLASS: Record<DotState, string> = {
 
 /** Dot for a tab whose status derives from ordinary StageStates (TAB_STAGE_GROUPS). Green dots
  * intentionally clear on resubmission: intake resets later stages to not_started on each fresh
- * run, and the dots simply reflect that. */
-function stageGroupDot(state: WorkflowState, keys: StageKey[]): DotState | undefined {
+ * run, and the dots simply reflect that.
+ *
+ * `runningStages` (computeRunningStages, use-run-events.ts) backstops `status === "drafting"`:
+ * a non-gated stage (ac-to-tests, minimal-code-to-green, ...) cycles through "ready_for_review"
+ * between verify attempts -- a generic status name the backend reuses for "draft phase done"
+ * regardless of whether a human is involved -- so relying on `status` alone showed a stage that
+ * was actively retrying as "awaiting" almost the entire time (user feedback 2026-09-01). Checked
+ * FIRST: the live event stream is more current than state, which only pushes on a gate pause. */
+function stageGroupDot(state: WorkflowState, keys: StageKey[], runningStages: Set<string>): DotState | undefined {
+  // Checked before the stages.length guard below: mid-run reattach (user feedback 2026-09-01)
+  // means `state.stages` can be completely empty for a while even though the run is genuinely
+  // active -- the event stream still knows, so this must not wait on stage state existing at all.
+  if (keys.some((k) => runningStages.has(k))) return "running";
   const stages = keys.map((k) => state.stages?.[k]).filter((s) => s != null);
   if (stages.length === 0) return undefined;
   if (stages.some((s) => s.status === "drafting")) return "running";
@@ -96,6 +109,14 @@ export function AppShell({
   const state = (agent.state ?? {}) as WorkflowState;
   const specification = state.stages?.specification;
   const plan = state.stages?.plan;
+  const runEvents = useRunEvents();
+  const runningStages = useMemo(() => computeRunningStages(runEvents), [runEvents]);
+  // Always-fresh handle for effects below whose own deps intentionally exclude `state` (recreating
+  // a poll's setInterval on every state tick would be wasteful) but still need this render's value.
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = (agent.state ?? {}) as WorkflowState;
+  }, [agent.state]);
 
   // Focus follows the pipeline (user ask 2026-08-31): when a stage starts needing the user (a
   // gate opens) or a new phase begins, switch to its tab instead of making the user chase the
@@ -143,9 +164,23 @@ export function AppShell({
       return;
     }
     const fired = RULES.find((r) => status(r.key) === r.at && prev[r.key] !== r.at && (r.also?.() ?? true));
-     
+
     if (fired) setActiveView(fired.to);
   }, [stagesForFocus]);
+
+  // Build tab wins the landing race against a same-tick stale gate (e.g. a requirements-delta
+  // reopening Plan's "ready_for_review" while minimal-code-to-green is genuinely running): RULES
+  // above only catches ac-to-tests's "drafting" for the Build jump, but a non-gated build stage
+  // spends most of its active time in "ready_for_review" between verify attempts, not "drafting"
+  // (same status-cycling flaw stageGroupDot backstops with runningStages for the tab dots, above).
+  // Fires only on the false->true edge so it never fights a manual tab click made while build
+  // keeps running (found live 2026-09-01: landed on Plan while Build was active).
+  const wasBuildRunningRef = useRef(false);
+  useEffect(() => {
+    const buildRunning = TAB_STAGE_GROUPS.build.some((k) => runningStages.has(k));
+    if (buildRunning && !wasBuildRunningRef.current) setActiveView("build");
+    wasBuildRunningRef.current = buildRunning;
+  }, [runningStages]);
 
   // Container-pill liveness poll (found live 2026-08-31: the pill said "Connected" while a
   // restarted agent had NO sandbox registered -- SandboxSessionBoot sets "ready" once after the
@@ -160,6 +195,20 @@ export function AppShell({
   useEffect(() => {
     sandboxStatusRef.current = sandboxStatus;
   }, [sandboxStatus]);
+  // Durable session row (dbo.sessions, via the same poll) -- current_stage/status survive an agent
+  // restart and a client reload alike, unlike the live AG-UI state stream below. Used only to
+  // detect the mid-run reattach gap (see isReattaching below); never a substitute for `state`.
+  const [durableRow, setDurableRow] = useState<{
+    current_stage: string | null;
+    status: string;
+    awaiting_gate: boolean | null;
+  } | null>(null);
+  // One-shot, separate from the fresh-session auto-trigger's own ref below: that effect fires (or
+  // doesn't) once at mount and never retries, so a reattach whose gate wasn't open YET at mount
+  // never got a second chance -- found live 2026-08-31, right after Plan's gate genuinely opened,
+  // on a tab that had been sitting on the "Reconnecting…" banner since before that: the banner
+  // does not clear on its own, contradicting its own copy ("this page updates automatically").
+  const reattachTriggeredRef = useRef(false);
   useEffect(() => {
     let stopped = false;
     async function reconcile() {
@@ -172,12 +221,34 @@ export function AppShell({
           return;
         }
         if (!res.ok) return; // agent unreachable/transient -- keep the last known state
-        const row = (await res.json()) as { container_alive?: boolean };
+        const row = (await res.json()) as {
+          container_alive?: boolean;
+          current_stage: string | null;
+          status: string;
+          awaiting_gate: boolean | null;
+        };
         setSandboxStatus(row.container_alive ? "ready" : "error");
+        setDurableRow({ current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate });
+        // The moment the durable row reports the run PAUSED at its own gate, a blank run request
+        // hits ag_ui_langgraph's pending-interrupt short-circuit and main.py's
+        // _ReattachStateAgent injects a full STATE_SNAPSHOT into it -- exactly the mechanism a
+        // manual reload was relying on. Firing it here means this tab recovers on its own, no
+        // reload needed. Guarded so it only ever fires once per mount; a stages-non-empty client
+        // (the ordinary case) never reaches this branch at all.
+        if (
+          row.awaiting_gate &&
+          Object.keys(stateRef.current.stages ?? {}).length === 0 &&
+          !reattachTriggeredRef.current
+        ) {
+          reattachTriggeredRef.current = true;
+          void copilotkit.runAgent({ agent });
+        }
       } catch {
         // transient network failure -- next tick retries
       }
     }
+    void reconcile(); // immediately on mount too -- isReattaching below needs this before the
+    // first 10s tick, or a reattached reload sits on the misleading default tab that much longer.
     const id = setInterval(() => void reconcile(), 10_000);
     const onFocus = () => void reconcile();
     window.addEventListener("focus", onFocus);
@@ -186,7 +257,22 @@ export function AppShell({
       clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
-  }, [threadId, setSandboxStatus]);
+  }, [threadId, setSandboxStatus, agent, copilotkit]);
+
+  // Mid-run reattach gap (backlog item 4; user found confusing live 2026-08-31): a client that
+  // (re)connects while the graph is actively drafting/auditing -- no gate open, nothing to pause
+  // on -- gets no state snapshot until the run next pauses; today's architecture only delivers one
+  // at a gate interrupt. Meanwhile this component's local `activeView` still defaults to its
+  // initial "tech-stack", so the user saw the Tech Stack tab's own "Detecting your tech stack…"
+  // copy on a session that was actually several stages further along -- read as the app having
+  // lost its place. The durable session row (dbo.sessions, unaffected by the gap) is the signal
+  // that this is a stale reattach, not a genuine fresh start: `current_stage` past "tech-stack"
+  // with the run still `in_progress` while the live stream has delivered nothing at all.
+  const isReattaching =
+    Object.keys(state.stages ?? {}).length === 0 &&
+    durableRow?.status === "in_progress" &&
+    durableRow.current_stage != null &&
+    durableRow.current_stage !== "tech-stack";
 
   // Auto-trigger the run once, as soon as the sandbox is ready, on a thread that's never run
   // before -- scaffold_node hard-fails with no local-working-tree fallback if run before the
@@ -265,11 +351,11 @@ export function AppShell({
   const reportDot: DotState | undefined = exitStage?.approved_content != null ? "done" : undefined;
 
   const dots: Record<ViewId, DotState | undefined> = {
-    "tech-stack": stageGroupDot(state, TAB_STAGE_GROUPS["tech-stack"]),
-    requirements: stageGroupDot(state, TAB_STAGE_GROUPS.requirements),
-    specification: stageGroupDot(state, TAB_STAGE_GROUPS.specification),
-    plan: stageGroupDot(state, TAB_STAGE_GROUPS.plan),
-    build: stageGroupDot(state, TAB_STAGE_GROUPS.build),
+    "tech-stack": stageGroupDot(state, TAB_STAGE_GROUPS["tech-stack"], runningStages),
+    requirements: stageGroupDot(state, TAB_STAGE_GROUPS.requirements, runningStages),
+    specification: stageGroupDot(state, TAB_STAGE_GROUPS.specification, runningStages),
+    plan: stageGroupDot(state, TAB_STAGE_GROUPS.plan, runningStages),
+    build: stageGroupDot(state, TAB_STAGE_GROUPS.build, runningStages),
     quality: qualityDot,
     report: reportDot,
     overview: undefined,
@@ -283,10 +369,15 @@ export function AppShell({
             Sandbox provisioning failed — the workflow can’t run. Reload the page to retry.
           </div>
         )}
-        {/* Pre-build the bar only shows the empty-repo baseline scan (a meaningless 89/A/Pass on
-            zero code) -- misleading, per user feedback 2026-08-31. Metrics appear once Build
-            starts producing code; a recorded run failure always surfaces its chip. */}
-        {(buildTabEnabled || state.run_failure != null) && <MetricsBar thresholds={metricThresholds} />}
+        {/* Pre-build the bar's own scan chips only show the empty-repo baseline scan (a
+            meaningless 89/A/Pass on zero code) -- misleading, per user feedback 2026-08-31 --
+            MetricsBar's own summary-gated `chips` still suppress those regardless of this
+            condition. This mount gate now also opens as soon as there's live cost to show
+            (spec/plan already spend real tokens before Build starts), per the same 2026-09-01
+            feedback that put `trailing` on its own always-eligible footing. */}
+        {(buildTabEnabled || state.run_failure != null || runEvents.some((e) => e.token_usage != null)) && (
+          <MetricsBar thresholds={metricThresholds} trailing={<LiveCostChip />} />
+        )}
         <nav className="flex items-center gap-1 border-b border-neutral-200 px-4 py-2">
           <TabButton
             label="Tech Stack"
@@ -421,8 +512,30 @@ export function AppShell({
         {/* Views stay MOUNTED and hide via [hidden] (backlog item 3, 2026-08-31): unmounting on
             tab switch reset unsaved editor text, dropdown picks, and scroll -- observed live.
             Every view already tolerates empty state (tabs enable mid-run), so mounting them all
-            up front only costs idle renders. */}
-        <main className="flex-1 overflow-y-auto">
+            up front only costs idle renders. Reattach gap (backlog item 4, user found confusing
+            live 2026-08-31): while isReattaching, every tab's own empty-state copy is WRONG (the
+            Tech Stack tab said "Detecting your tech stack…" on a session already several stages
+            past it) -- show one honest, stage-aware message instead of any tab's guess. Views
+            stay mounted underneath (hidden, not unmounted) so they pick up state the instant a
+            snapshot arrives, same as the tab-switch fix above. */}
+        <main className="relative flex-1 overflow-y-auto">
+          {isReattaching && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/95">
+              <div className="flex max-w-sm flex-col items-center gap-2 text-center">
+                <Spinner className="h-6 w-6" />
+                <p className="text-sm font-medium text-neutral-700">Reconnecting to your session…</p>
+                <p className="text-xs text-neutral-500">
+                  Currently at:{" "}
+                  <strong>
+                    {PIPELINE_STAGE_ORDER.find((s) => s.key === durableRow?.current_stage)?.label ??
+                      durableRow?.current_stage}
+                  </strong>
+                  . The pipeline keeps running in the background — this page updates automatically once that
+                  stage pauses for your review.
+                </p>
+              </div>
+            </div>
+          )}
           <div hidden={activeView !== "tech-stack"}><TechStackView /></div>
           <div hidden={activeView !== "requirements"}><RequirementsView /></div>
           <div hidden={activeView !== "specification"}><SpecificationView /></div>
@@ -521,22 +634,27 @@ function InterruptCard({
     );
   }
 
-  // Requirements-as-single-source-of-truth (user ruling 2026-08-31): the SPECIFICATION gate has
-  // no Reject/feedback box -- change requests belong in the requirements document, and the
-  // Requirements tab's Submit (live while this gate is open) resolves the gate with the revised
-  // doc. The plan gate keeps Reject-with-feedback for now: its input is the approved spec, not
-  // the raw requirements, so the revise-requirements path doesn't apply cleanly there yet.
-  if (stageKey === "specification") {
+  // Requirements-as-single-source-of-truth (user ruling 2026-08-31, extended to Plan 2026-08-31):
+  // neither the Specification nor the Plan gate has a Reject/feedback box -- change requests
+  // belong in the requirements document, and the Requirements tab's Submit (live while either
+  // gate is open) resolves the OPEN gate with the revised doc. For Plan specifically, that
+  // resolve also carries graph.py's GraphState.restart_from_specification signal so the redraft
+  // cascades through Specification first (Plan's own draft is built from the approved spec, not
+  // raw requirements directly -- a plain loop-back-to-Plan's-own-draft would leave the revision
+  // unreflected in what Plan actually reads); see make_route_after_gate's own docstring.
+  if (stageKey === "specification" || stageKey === "plan") {
+    const derivationCopy =
+      stageKey === "specification"
+        ? "this specification — and every plan, test, and line of code after it — is derived from that document alone"
+        : "this plan is derived from the approved Specification, which is itself derived from that document alone";
     return (
       <div className="mx-4 mt-3 flex items-center justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
         <span className="text-sm text-amber-900">
           The <strong>{stageLabel}</strong> is ready for your review. Your{" "}
-          <strong>Requirements document is the single source of truth</strong>: this specification —
-          and every plan, test, and line of code after it — is derived from that document alone.
-          Nothing you want will make it into the product unless it&apos;s written there. To change
-          anything here, don&apos;t comment — edit the document on the Requirements tab and
-          resubmit; the specification is redrafted from it, and every question it answers is
-          traced back to your wording.
+          <strong>Requirements document is the single source of truth</strong>: {derivationCopy}. Nothing
+          you want will make it into the product unless it&apos;s written there. To change anything here,
+          don&apos;t comment — edit the document on the Requirements tab and resubmit; {stageKey === "plan" ? "the specification and this plan are" : "the specification is"}{" "}
+          redrafted from it, and every question it answers is traced back to your wording.
         </span>
         <button
           className="shrink-0 rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
@@ -608,7 +726,14 @@ function TabButton({
       onClick={onClick}
     >
       {label}
-      {dot && <span aria-hidden className={`ml-1.5 inline-block h-2 w-2 rounded-full ${DOT_CLASS[dot]}`} />}
+      {dot === "running" ? (
+        // A spinning icon, not just another colored dot -- an amber "awaiting" dot and a blue
+        // "running" dot are too close in a quick glance at 8px (user feedback 2026-09-01: "unclear
+        // which stage is running"). Shape + motion reads unambiguously where hue alone didn't.
+        <RunningSpinner className="ml-1.5 h-2.5 w-2.5" />
+      ) : (
+        dot && <span aria-hidden className={`ml-1.5 inline-block h-2 w-2 rounded-full ${DOT_CLASS[dot]}`} />
+      )}
     </button>
   );
 }

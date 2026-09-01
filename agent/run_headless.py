@@ -188,7 +188,10 @@ async def run(args: argparse.Namespace) -> int:
             return 2
         greenfield_stack_markdown = match["markdown"]
         logger.info("greenfield auto-select armed: stack_id=%s", args.greenfield_stack)
-    cfg = {"configurable": {"thread_id": thread_id}}
+    # Same generous ceiling as main.py's AG-UI endpoint (see its own comment): LangGraph's default
+    # recursion_limit=25 is far below what this pipeline's per-stage retry loops need across a
+    # full run, and this call site builds its own config independent of that one.
+    cfg = {"configurable": {"thread_id": thread_id}, "recursion_limit": 1000}
     started = time.monotonic()
 
     await _ensure_session_row(thread_id, args, active_provider)

@@ -512,26 +512,43 @@ def change_status(
 
 
 def gate_change_status(
-    old_entry: dict[str, Any] | None, new_entry: dict[str, Any]
+    old: dict[str, Any] | None, new: dict[str, Any]
 ) -> Literal["new", "modified", "unchanged", "deferred", "activated"]:
-    """Per-GATE change classification for the review UI: what changed versus the last draft the
-    human actually saw. change_status (above) classifies per RUN, and every gate-rejection
-    redraft shares one run_id -- so an in-session rewording badged "new" forever (observed live
-    2026-08-31, S3 soft-delete revision). The ledger is only persisted on a PASSING verify, and a
-    passing verify is exactly what reaches the gate -- so the ledger state loaded BEFORE this
-    sync IS the last gated draft, and a plain content diff against it gives gate-relative
-    semantics with no extra stamps to keep consistent. Pure.
+    """Per-GATE change classification for the review UI: what changed versus the specification
+    the human last actually APPROVED -- not the ledger's own rolling pre-sync state, and not
+    change_status's per-RUN classification (both wrong here, for different reasons):
 
-    old_entry is the entry as it stood in the pre-sync ledger (None = allocated this cycle)."""
-    if old_entry is None:
+    - change_status (above) is per-RUN: every gate-rejection redraft shares one run_id, so an
+      in-session rewording badged "new" forever (observed live 2026-08-31, S3 soft-delete
+      revision).
+    - An EARLIER version of this function compared against the ledger's pre-sync state instead,
+      reasoning that the ledger only persists on a passing verify and a passing verify is what
+      reaches the gate. That reasoning breaks across a reject-and-redraft cycle that happens
+      BEFORE the human ever approves anything: sync_ledger (and the ledger save) already ran
+      during the FIRST draft's verify, so the ledger enters the SECOND draft's verify already
+      populated -- a story re-cited unchanged from that never-approved first draft then compared
+      "unchanged" against it, even though the human had never seen it as anything but a fresh
+      "new" story (observed live 2026-08-31: a 6-story spec redrafted once before approval badged
+      only the ONE genuinely-added story "new" and silently dropped the badge from the other
+      five).
+
+    The specification a human last approved is the only content guaranteed NOT to change across
+    any number of reject-before-approval redraft cycles (nothing is written there until a real
+    approval), so it is the correct, stable baseline. `old`/`new` are `{"text": str, "deferred":
+    bool}` shapes lifted straight from Specification content (previously-approved vs current
+    draft) -- never ledger entries, which have no comparable "was this deferred before" signal of
+    their own beyond the ledger's independent bookkeeping. Pure.
+
+    old=None means this id did not exist in the previously-approved specification at all (a
+    genuinely new ticket, or a first-ever approval where nothing has been approved yet)."""
+    if old is None:
         return "new"
-    old_status, new_status = old_entry.get("status"), new_entry.get("status")
-    if old_status == "deferred" and new_status in ("active", "revised"):
+    old_deferred, new_deferred = bool(old.get("deferred")), bool(new.get("deferred"))
+    if old_deferred and not new_deferred:
         return "activated"
-    if new_status == "deferred" and old_status != "deferred":
+    if new_deferred:
         return "deferred"
-    text_key = "title" if new_entry.get("kind") == "user_story" else "description"
-    if old_entry.get(text_key) != new_entry.get(text_key):
+    if old.get("text") != new.get("text"):
         return "modified"
     return "unchanged"
 
@@ -925,17 +942,25 @@ def _demo() -> None:
     assert next(e for e in rr.updated_entries if e["id"] == "US-0001")["status"] == "retired"
     assert next(e for e in rr.updated_entries if e["id"] == "US-0001.1")["status"] == "retired"
 
-    # gate_change_status: gate-relative badges -- an in-session rewording is 'modified' even
-    # though run stamps say 'new' (the run-id bug this function exists to fix), and status
-    # transitions win over text diffs.
-    old_us = {"id": "US-0001", "kind": "user_story", "status": "revised", "title": "Delete a task"}
-    assert gate_change_status(None, {"kind": "user_story", "status": "active", "title": "X"}) == "new"
-    assert gate_change_status(old_us, {**old_us, "title": "Soft-delete a task"}) == "modified"
-    assert gate_change_status(old_us, dict(old_us)) == "unchanged"
-    assert gate_change_status(old_us, {**old_us, "status": "deferred"}) == "deferred"
-    assert gate_change_status({**old_us, "status": "deferred"}, {**old_us, "status": "revised"}) == "activated"
-    old_ac = {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "description": "a"}
-    assert gate_change_status(old_ac, {**old_ac, "description": "b"}) == "modified"
+    # gate_change_status: compares against the PREVIOUSLY APPROVED specification, never the
+    # ledger's rolling pre-sync state -- the whole point is staying "new" across any number of
+    # reject-before-approval redraft cycles, since nothing is written to the approved spec until
+    # a real approval happens.
+    old_story = {"text": "As a user, I want to delete a task.", "deferred": False}
+    assert gate_change_status(None, {"text": "X", "deferred": False}) == "new"
+    # Re-cited unchanged across a REJECTED, never-approved redraft: still "new", not "unchanged"
+    # (the exact bug this rewrite fixes -- old_story stands in for "nothing has been approved
+    # yet", so a second, third, Nth pre-approval redraft of the same never-approved content must
+    # keep reporting "new" every time).
+    assert gate_change_status(None, dict(old_story)) == "new"
+    # Once something IS actually approved, re-citing it unchanged next time is "unchanged".
+    assert gate_change_status(old_story, dict(old_story)) == "unchanged"
+    assert gate_change_status(old_story, {**old_story, "text": "As a user, I want to soft-delete a task."}) == "modified"
+    assert gate_change_status(old_story, {**old_story, "deferred": True}) == "deferred"
+    assert gate_change_status({**old_story, "deferred": True}, {**old_story, "deferred": False}) == "activated"
+    # Stays deferred both times: still reported "deferred" (the UI's own `deferred` prop already
+    # forces the chip regardless, but the change classification should agree, not silently None).
+    assert gate_change_status({**old_story, "deferred": True}, {**old_story, "deferred": True}) == "deferred"
 
     # Question ledger: upsert keeps history, latest draft wins, no deletes.
     q_entries: list[dict[str, Any]] = [{"kind": "user_story", "id": "US-0001", "status": "active"}]

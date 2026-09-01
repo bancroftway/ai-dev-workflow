@@ -91,6 +91,27 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 }
 
+/** Which stages have a node genuinely executing right now, straight from the live event stream --
+ * NOT from `state.stages[key].status`, which only updates when the run pauses at a human gate
+ * (user feedback 2026-09-01: a non-gated stage like ac-to-tests cycles through "ready_for_review"
+ * between verify attempts -- a generic status name the backend reuses for "draft phase done"
+ * regardless of whether a human is involved -- so a status-only check reads a stage that is
+ * actively retrying as "awaiting", not "running", almost the entire time). Scoped to the latest
+ * `run_id` so a node_started left open by a hard-killed agent process (several observed live) can
+ * never read as "still running" forever -- that run is over, whether or not it got a matching
+ * node_finished. First consumer: SessionOverview's per-stage table; second: AppShell's tab pills. */
+export function computeRunningStages(events: RunLogEvent[]): Set<string> {
+  const latestRunId = events.length > 0 ? events[events.length - 1].run_id : null;
+  const openNodeStage = new Map<string, string>(); // "run_id|node" -> stage, while still unfinished
+  for (const e of events) {
+    if (!e.stage || !e.node || e.run_id !== latestRunId) continue;
+    const key = `${e.run_id}|${e.node}`;
+    if (e.type === "node_started") openNodeStage.set(key, e.stage);
+    else if (e.type === "node_finished") openNodeStage.delete(key);
+  }
+  return new Set(openNodeStage.values());
+}
+
 /** This session's full event history, oldest first, live-updating for as long as the caller stays
  * mounted. Reads threadId/localAgentId from useWorkflowThread() internally -- same assumption
  * EventLogView's original effect made: a session switch is a full Next.js route navigation, which
@@ -103,17 +124,29 @@ export function useRunEvents(): RunLogEvent[] {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/sessions/${encodeURIComponent(threadId)}/events`)
-      .then((r) => (r.ok ? (r.json() as Promise<{ events: RunLogEvent[] }>) : null))
-      .then((data) => {
-        if (!cancelled && data) setEvents((prev) => mergeEvents(prev, data.events));
-      })
-      .catch(() => {
-        // History fetch is a best-effort fallback -- the live subscription below still works even
-        // if this request fails (offline history, transient 5xx, ...).
-      });
+    const fetchOnce = () =>
+      fetch(`/api/sessions/${encodeURIComponent(threadId)}/events`)
+        .then((r) => (r.ok ? (r.json() as Promise<{ events: RunLogEvent[] }>) : null))
+        .then((data) => {
+          if (!cancelled && data) setEvents((prev) => mergeEvents(prev, data.events));
+        })
+        .catch(() => {
+          // Best-effort -- the live subscription below still works even if one poll fails
+          // (transient 5xx), and the next tick tries again.
+        });
+    fetchOnce();
+    // Re-poll, not just the one mount-time fetch: `agent.subscribe` below only delivers events
+    // for a run THIS tab's own agent instance is actively streaming -- a tab that reattaches to a
+    // run already started elsewhere (Resume clicked from a different tab/reload, same known
+    // mid-run reattach gap as state snapshots) never gets attached to that stream's custom events,
+    // so its data would otherwise freeze at whatever existed at mount forever (user feedback
+    // 2026-09-01: a stage's tab-pill spinner stayed on the wrong stage because of exactly this --
+    // a direct fetch of this same endpoint had fresher data than the hook's own state). Same 10s
+    // cadence AppShell.tsx already polls the durable session row at.
+    const interval = setInterval(fetchOnce, 10000);
     return () => {
       cancelled = true;
+      clearInterval(interval);
     };
   }, [threadId]);
 

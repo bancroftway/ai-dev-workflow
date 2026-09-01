@@ -195,7 +195,19 @@ def parse_playwright_json(raw_json: str) -> dict[str, Any]:
                         frame = str((extra or {}).get("message") or "")
                         if frame and frame not in error:
                             error = f"{error}\n{frame}"
-                    failed_tests.append({"title": title, "error": str(error)})
+                    entry = {"title": title, "error": str(error)}
+                    # `screenshot: 'on'` (mandated in every playwright.config this pipeline writes,
+                    # ac_to_tests_draft.md) means Playwright attaches one to every result, pass or
+                    # fail -- surfacing it here is what lets e2e_fix_node hand the fix loop a path
+                    # to actually LOOK at instead of reasoning from the stack trace alone (user
+                    # requirement 2026-09-01: "make sure the agent is looking at the screenshots").
+                    shot = next(
+                        (a.get("path") for a in (outcome.get("attachments") or []) if a.get("name") == "screenshot" and a.get("path")),
+                        None,
+                    )
+                    if shot:
+                        entry["screenshot"] = shot
+                    failed_tests.append(entry)
 
     if total == 0:
         top_errors = doc.get("errors") or []
@@ -298,6 +310,24 @@ def _demo() -> None:
     retried = json.dumps({"suites": [{"specs": [
         {"title": "flaky", "tests": [{"results": [{"status": "failed"}, {"status": "passed"}]}]}]}]})
     assert parse_playwright_json(retried)["passed"] == 1
+
+    # A failure's own screenshot attachment surfaces onto its failed_tests entry (user requirement
+    # 2026-09-01: the e2e fix loop must be able to actually look at what the browser rendered, not
+    # just read the stack trace) -- a non-screenshot attachment (e.g. a trace.zip) or no attachments
+    # at all must never add a `screenshot` key.
+    with_shot = json.dumps({"suites": [{"specs": [{"title": "t", "tests": [{"results": [{
+        "status": "failed", "error": {"message": "boom"},
+        "attachments": [
+            {"name": "trace", "path": "/x/trace.zip"},
+            {"name": "screenshot", "path": "/x/test-results/t/test-failed-1.png"},
+        ],
+    }]}]}]}]})
+    assert parse_playwright_json(with_shot)["failed_tests"][0]["screenshot"] == "/x/test-results/t/test-failed-1.png"
+    without_shot = json.dumps({"suites": [{"specs": [{"title": "t", "tests": [{"results": [
+        {"status": "failed", "error": {"message": "boom"}, "attachments": [{"name": "trace", "path": "/x/trace.zip"}]}
+    ]}]}]}]})
+    assert "screenshot" not in parse_playwright_json(without_shot)["failed_tests"][0]
+
     empty = parse_playwright_json(json.dumps({"suites": []}))
     assert empty["total"] == 0 and empty["failed_tests"], empty
 

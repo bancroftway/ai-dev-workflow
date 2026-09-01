@@ -802,6 +802,32 @@ async def check_retired_ac_residue(
     ]
 
 
+async def check_deferred_ac_residue(
+    provider: SandboxProvider, thread_id: str, entries: list[dict[str, Any]]
+) -> list[str]:
+    """Deferral containment, test side (user requirement 2026-08-31): a NEVER-DELIVERED deferred
+    criterion must have no test naming it -- a red test citing a deferred id would drag the whole
+    parked feature into the build, because minimal-code-to-green's job is 'make every failing
+    test pass'. Delivered-then-deferred criteria (coded_run_id set) keep their tests on purpose:
+    the code stays in the tree, parked, and its regression tests with it. Runs at the same two
+    call sites as check_retired_ac_residue (ac-to-tests verify, last rebuild gate)."""
+    parked_unbuilt = {
+        e["id"]
+        for e in entries
+        if e.get("kind") == "acceptance_criterion"
+        and e.get("status") == "deferred"
+        and not e.get("coded_run_id")
+    }
+    hits = await _grep_test_files_for_ids(provider, thread_id, parked_unbuilt)
+    if not hits:
+        return []
+    detail = "; ".join(f"{path}: {', '.join(sorted(ids))}" for path, ids in sorted(hits.items()))
+    return [
+        "test files reference DEFERRED criteria that were never built -- deferred scope is parked, "
+        f"not in this ticket: delete those test cases (no code may be demanded for them): {detail}"
+    ]
+
+
 async def check_completed_ac_protection(
     provider: SandboxProvider, thread_id: str, baseline_commit: str | None, entries: list[dict[str, Any]]
 ) -> list[str]:
@@ -1616,6 +1642,23 @@ async def _demo_provenance_checks() -> None:
     )
     assert residue and "US-0002.1" in residue[0], residue
     assert await check_retired_ac_residue(_FakeGrepProvider({}), "t", entries) == []
+
+    # check_deferred_ac_residue (2026-08-31): a NEVER-BUILT deferred AC named by a test is flagged
+    # (a red test would drag parked scope into the build); a delivered-then-deferred AC keeps its
+    # tests (the code stays in the tree, parked, its regression tests with it).
+    deferred_entries = entries + [
+        {"id": "US-0004.1", "kind": "acceptance_criterion", "status": "deferred"},
+        {"id": "US-0004.2", "kind": "acceptance_criterion", "status": "deferred", "coded_run_id": "r1"},
+    ]
+    parked = await check_deferred_ac_residue(
+        _FakeGrepProvider({"apps/web/y.spec.ts": "test('[US-0004.1] deferred thing', () => {});"}),
+        "t", deferred_entries,
+    )
+    assert parked and "US-0004.1" in parked[0], parked
+    assert await check_deferred_ac_residue(
+        _FakeGrepProvider({"apps/web/y.spec.ts": "test('[US-0004.2] built then parked', () => {});"}),
+        "t", deferred_entries,
+    ) == [], "delivered-then-deferred tests must survive"
 
     # check_completed_ac_protection: presence-only now (protection-B removed). The completed AC's
     # test surviving anywhere in the tree is enough, EVEN when the same file also grew unrelated

@@ -27,14 +27,26 @@ logger = logging.getLogger(__name__)
 _DEFAULT_LIST_LIMIT = 20
 
 _pool: aioodbc.Pool | None = None
+_pool_lock = asyncio.Lock()
 
 
 async def _get_pool() -> aioodbc.Pool:
+    """The `is None` check below is not atomic with the assignment -- without the lock, several
+    early concurrent callers (observed live 2026-09-01: a burst of GET /sessions/{id} polls right
+    after a restart) each see None, each call create_pool(), and only the last assignment
+    survives -- the other pool(s), maxsize connections apiece, are instantly unreferenced and
+    surface as "Unclosed connection" asyncio errors when GC'd. Standard double-checked lock:
+    still no lock taken on the fast path once _pool is set."""
     global _pool
     if _pool is None:
-        # to_thread: db.connection_kwargs() does synchronous HTTP (an AAD token fetch) in Azure
-        # mode -- run it off the event loop rather than blocking every other coroutine on it.
-        _pool = await aioodbc.create_pool(autocommit=True, **(await asyncio.to_thread(db.connection_kwargs)))
+        async with _pool_lock:
+            if _pool is None:
+                # to_thread: db.connection_kwargs() does synchronous HTTP (an AAD token fetch) in
+                # Azure mode -- run it off the event loop rather than blocking every other
+                # coroutine on it.
+                _pool = await aioodbc.create_pool(
+                    autocommit=True, **(await asyncio.to_thread(db.connection_kwargs))
+                )
     return _pool
 
 

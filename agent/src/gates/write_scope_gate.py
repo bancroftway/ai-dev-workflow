@@ -265,6 +265,7 @@ async def verify_ac_to_tests(
     from .ac_coverage_gate import (
         check_ac_coverage,
         check_completed_ac_protection,
+        check_deferred_ac_residue,
         check_ledger_integrity,
         check_retired_ac_residue,
     )
@@ -291,6 +292,7 @@ async def verify_ac_to_tests(
     protection_problems = (
         await check_ledger_integrity(provider, thread_id)
         + await check_retired_ac_residue(provider, thread_id, ledger_entries)
+        + await check_deferred_ac_residue(provider, thread_id, ledger_entries)
         + await check_completed_ac_protection(provider, thread_id, baseline_commit, ledger_entries)
     )
     if protection_problems:

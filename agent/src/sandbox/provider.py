@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import abc
 import asyncio
-import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -203,24 +202,34 @@ async def wait_for_cli_ready(
     caller-supplied version-check command for whichever CLI is actually active (e.g. "claude
     --version" or "copilot --version") -- no default here, deliberately: a fallback would silently
     check the wrong binary for any caller that forgot to pass one, exactly the bug this parameter
-    replaces. This function polls exec_fn(version_command) every 0.5s up to _READY_TIMEOUT_SECONDS.
-    Once the command succeeds (returncode == 0), returns; otherwise raises RuntimeError on timeout
-    with the last error observed.
+    replaces.
+
+    The retry loop itself now runs INSIDE the sandbox as a single blocking exec (a `until ...;
+    sleep 1; done` shell loop, self-bounded by the same deadline), not as repeated host-side
+    exec_fn calls every 0.5s -- provisioning retries used to each start their own 0.5s poll loop
+    with nothing cancelling a prior attempt's, and a stack of those hammering `docker exec` is
+    what drove Docker Desktop's backend into a VM reset (2026-09-01). One exec call per
+    provisioning attempt instead of up to 120 removes that failure mode outright. The outer
+    asyncio.wait_for is a safety margin in case exec_fn itself hangs (e.g. an unresponsive
+    daemon), not the normal exit path.
     """
-    deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
-    last_error: str | None = None
-
-    while time.monotonic() < deadline:
-        try:
-            returncode, _, stderr = await exec_fn(version_command)
-            if returncode == 0:
-                return
-            last_error = f"returncode {returncode}: {stderr}"
-        except Exception as exc:
-            last_error = str(exc)
-        await asyncio.sleep(0.5)
-
-    raise RuntimeError(
-        f"CLI tool in sandbox did not become ready within {_READY_TIMEOUT_SECONDS}s "
-        f"(last error: {last_error})"
+    wait_command = (
+        f"deadline=$(( $(date +%s) + {int(_READY_TIMEOUT_SECONDS)} )); "
+        f"until {version_command} >/dev/null 2>&1; do "
+        f"[ \"$(date +%s)\" -ge \"$deadline\" ] && exit 1; sleep 1; done"
     )
+    try:
+        returncode, _, stderr = await asyncio.wait_for(
+            exec_fn(wait_command), timeout=_READY_TIMEOUT_SECONDS + 10.0
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"CLI tool in sandbox did not become ready within {_READY_TIMEOUT_SECONDS}s "
+            f"(last error: {exc})"
+        ) from exc
+
+    if returncode != 0:
+        raise RuntimeError(
+            f"CLI tool in sandbox did not become ready within {_READY_TIMEOUT_SECONDS}s "
+            f"(last error: returncode {returncode}: {stderr})"
+        )

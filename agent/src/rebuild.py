@@ -293,6 +293,7 @@ async def _provenance_reasons(provider: Any, thread_id: str, state: dict[str, An
     from . import spec_ledger
     from .gates.ac_coverage_gate import (
         check_completed_ac_protection,
+        check_deferred_ac_residue,
         check_ledger_integrity,
         check_retired_ac_residue,
     )
@@ -303,6 +304,7 @@ async def _provenance_reasons(provider: Any, thread_id: str, state: dict[str, An
         return (
             await check_ledger_integrity(provider, thread_id)
             + await check_retired_ac_residue(provider, thread_id, entries)
+            + await check_deferred_ac_residue(provider, thread_id, entries)
             + await check_completed_ac_protection(provider, thread_id, baseline, entries)
         )
     except Exception:  # noqa: BLE001 -- fail-open, mirrors _scan_regression_reasons

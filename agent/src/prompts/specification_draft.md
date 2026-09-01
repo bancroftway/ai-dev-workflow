@@ -27,6 +27,15 @@ ONLY way scope leaves the specification is an explicit entry in `retired_us_ids`
 Removing one feature from the requirements changes THAT feature's stories; every other story must
 reappear unchanged, id intact.
 
+Set `ui_related: true` on every Acceptance Criterion whose satisfaction involves something the
+user sees or interacts with (a screen, a component, layout, client-side behavior); leave it
+`false` (the default) for pure backend/API/data logic with no visible surface. Judge each
+criterion honestly and independently -- sibling criteria under the same User Story often differ
+(e.g. "the list renders correctly" is UI; "the list is sorted server-side" may not be). The Plan
+stage's wireframe coverage is gated on this field: marking a backend-only criterion `ui_related`
+forces an unneeded wireframe later, and marking a real UI criterion `false` lets it through
+unreviewed.
+
 DEFERRED SCOPE -- the requirements document may mark features for a LATER phase ("deferred",
 "later", "do not build yet", a "Later" section). These are scoped OUT of this ticket's build but
 NOT removed from the product:
@@ -119,8 +128,11 @@ field to that item's existing id -- COPIED CHARACTER-FOR-CHARACTER from what you
 retyped from memory, never reformatted, never re-derived. `US-0001` is not the same string as
 `US-1`, and a criterion of story `US-0005` is `US-0005.2`, never `AC-5.2` -- if you find yourself
 typing a number you don't see verbatim in the prior draft/approved Specification/ledger text in
-front of you, stop and re-read it rather than guessing the shape. For a genuinely new story or
-criterion, leave `existing_us_id`/`existing_ac_id` as `null`. Your own `id` field is just a
+front of you, stop and re-read it rather than guessing the shape. The next sequential number is
+NOT a citation: if story `US-0001` currently has criteria `.1`-`.4` and you are adding a new one,
+it is not `.5` -- a real id only ever comes from being copied out of text you were actually given,
+never computed by counting. For a genuinely new story or criterion, leave
+`existing_us_id`/`existing_ac_id` as `null`. Your own `id` field is just a
 same-response-scoped placeholder (e.g. `story-a`, `ac-a`) -- never write something that merely
 LOOKS like a real id there unless it's an exact copy of what you're citing.
 

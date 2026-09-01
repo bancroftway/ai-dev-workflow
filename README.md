@@ -21,9 +21,9 @@ flowchart TD
     
     stage1["STAGE 1: TECH STACK<br/>Detect languages, frameworks, build/test commands<br/>Agent: tech-stack-draft (read-only discovery)"]
     
-    stage2["STAGE 2: SPECIFICATION<br/>Draft user stories + acceptance criteria (delta ticket: cite existing_us_id/existing_ac_id, retire removed features)<br/>Agents: specification-draft → specification-audit<br/>Verify: spec ledger id sync — stable US-####.# ids, fail-closed citations<br/>Gate: human approval + sign to APPROVALS.md; approval applies tracking resets for genuinely reworded ACs"]
+    stage2["STAGE 2: SPECIFICATION<br/>Draft user stories + acceptance criteria (delta ticket: cite existing_us_id/existing_ac_id, retire removed features; deferred=true parks a story/criterion without retiring it)<br/>Agents: specification-draft → specification-audit<br/>Verify: spec ledger id sync — stable US-####.# ids, fail-closed citations; change badges (new/modified/deferred/activated) diffed against the last APPROVED spec, never the ledger's own rolling pre-sync state<br/>Gate: human approval + sign to APPROVALS.md; approval applies tracking resets for genuinely reworded ACs. No reject box — Requirements is the sole source of truth; submitting there resolves this gate with the revised document"]
     
-    stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Verify: step↔AC linkage BOTH directions (every step cites live ac_ids or kind=infrastructure;<br/>every undelivered AC cited; retired-only steps dropped) + Mermaid/wireframe validation<br/>Gate: human approval + sign to APPROVALS.md; approval records plan_step_ids on the ledger"]
+    stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Verify: step↔AC linkage BOTH directions (every step cites live ac_ids or kind=infrastructure — a step may cite ONLY live ids, never a retired/deferred one alongside a live one;<br/>every eligible (new/modified/promoted) AC cited; retired-only steps dropped; a criterion DELIVERED by an earlier run and retired this round must be named in some step's removes_ids, never demanded if it was never built; every criterion the Specification marks ui_related must be cited in some wireframe's ac_ids) + Mermaid/wireframe validation<br/>Gate: human approval + sign to APPROVALS.md; approval records plan_step_ids on the ledger. No reject box either — submitting revised Requirements here restarts the cascade at Specification (GraphState.restart_from_specification), never redrafts Plan alone against a stale spec"]
     
     stage4["STAGE 4: AC-TO-TESTS<br/>Write failing tests (TDD red) for ELIGIBLE (undelivered) ACs only; delete tests naming retired ACs<br/>Agents: ac-to-tests-draft → ac-to-tests-audit (scaffold-only rebuild)<br/>Gate: write-scope + ledger-integrity + retired-residue + completed-AC protection + AC-coverage checks<br/>Post-scaffold TDD-red gate: zero passing tests (first ticket) / eligible-AC tests red (later tickets)"]
     
@@ -49,7 +49,8 @@ flowchart TD
     stage1 -.->|not ready, or rejected| stage1
     stage1 -.->|"tech-stack-first: no requirements typed yet — run ends after the stack is approved; the Requirements tab unlocks and its submit re-enters at intake"| done
     stage2 -.->|not ready, or rejected| stage2
-    stage3 -.->|not ready, or rejected| stage3
+    stage3 -.->|not ready, or rejected with PLAN-only feedback -- unreachable, no reject box| stage3
+    stage3 -.->|"rejected via revised Requirements (the only path): restarts at Specification, not Plan's own draft"| stage2
     stage4 -.->|gate failure, 3 tries| stage4
     stage5 -.->|gate failure, 3 tries| stage5
     stage6 -.->|gate failure, 3 cycles| stage6
@@ -214,6 +215,8 @@ flowchart LR
     aa -->|stage has a verify| v
     aa -->|no verify| next
 ```
+
+Two of the three human-gated stages carry a documented exception to `g -.->|rejected, with feedback| d`: **specification** and **plan** have no reject/feedback box at all (Requirements is the sole source of truth) — Approve is the gate's only button, and the Requirements tab's Submit resolves whichever of the two is open instead. For specification this still lands on `d` (its own draft, rebuilt from the revised requirements). For **plan** it does not: plan's draft reads the *approved specification*, not raw requirements, so redrafting plan alone against a stale spec would leave the revision unreflected. Submitting Requirements while Plan's gate is open instead sets `GraphState.restart_from_specification` and routes `g` straight to **specification's own draft node** — the cascade (spec redrafts, a human re-approves it, only then does plan draft again) is what actually applies the change. The flag is cleared the next time any stage's gate reaches genuine approval, so a later plain Approve on Plan's gate is unaffected. Plan's own stage status is forced to `not_started` here too (not left at the rejection's default `needs_clarification`, which the tab-pill dot renders identically to "awaiting review") -- it isn't waiting on anyone, it's stale and will redraft once Specification is re-approved; this is also what PlanView's `isStale` banner keys off.
 
 Cross-cutting behavior that is not drawn above, because it happens in nearly every node: state is persisted to the sandbox repo and committed after each audit, verify and gate — and every successful commit is pushed to the single, repo-shared `ai-dev-workflow` work branch on origin (`--force-with-lease`, not plain `--force` — WS0's single-branch migration means every session/user on a repo shares this one branch, so a losing race is rejected instead of silently overwriting another session's already-pushed commits; a failed push is logged, surfaced in the UI via streamed `last_push` state, and never blocks the run). Generated source code is committed separately (`git add -A`) at every green rebuild and after each quality/security/dependency fix round, so the pushed branch always carries the code, not just the artifacts. Every LLM node appends a ledger entry with its token usage; a fresh run always re-enters at `intake`, abandoning any interrupt a previous run left open. Each of those code commits also kicks a display-only background full-profile scan, collected non-blocking at the next node boundary, so the metrics bar (including its running $ Cost chip, re-summed from the ledger) tracks the code as it churns instead of going stale between the gate scans — the gates' own scans stay authoritative.
 
@@ -481,4 +484,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 16fabf11efc151e8d02ecfc9ef2d98f2bcb2695ab63ef5d6b99ec9f4e9d02758 -->
+<!-- graph-source-sha256: 388ccaf2a5a773dd07997710e2b6df71a91e334dc5addf899b80e494288ba2e8 -->

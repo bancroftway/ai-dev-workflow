@@ -41,6 +41,14 @@ same project -- those already passed their own conformance audit when they were 
 the screens the Plan above actually lists; a screen this ticket's Plan does not mention is not
 yours to re-check.
 
+The end-to-end run outcome above includes a `screenshots` list -- real captures of what the app
+actually rendered (both were also taken of every test's own screen). View the ones for screens
+you're checking wireframe conformance on WITH YOUR READ TOOL, alongside the implementing source:
+source review alone catches a missing element but not a runtime-only defect (a stylesheet that
+didn't apply, a script error leaving the page blank, a layout that only breaks at the viewport size
+Playwright actually used) -- exactly the kind of divergence a screenshot shows directly and source
+code doesn't. A path in that list you don't have a use for is fine to skip.
+
 You are read-only in this session. Report a `plan_conformance_summary`, every `divergence_finding`
 (with severity, the specific Plan/AC reference, evidence, and a proposed resolution),
 `unresolved_risk_notes` for anything you're not confident about either way, and an

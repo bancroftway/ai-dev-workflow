@@ -63,6 +63,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import shlex
 import uuid
 from typing import Any, Literal
@@ -657,6 +658,13 @@ class ClaudeChatModel(BaseChatModel):
 
         if self.model_name:
             argv += ["--model", self.model_name]
+        # Dev-speed knob, not a per-stage config (unlike model_name/models.yaml): --effort
+        # (low/medium/high/xhigh/max, `claude --help`) trades reasoning depth for latency on
+        # whatever model is already chosen. Blanket env var, not threaded through StageSpec --
+        # meant to be flipped for a local dev run, not tuned per stage.
+        cli_effort = os.environ.get("AIDW_CLI_EFFORT")
+        if cli_effort:
+            argv += ["--effort", cli_effort]
         if self.custom_agents:
             argv += ["--agents", json.dumps(self.custom_agents)]
         if self.agent:

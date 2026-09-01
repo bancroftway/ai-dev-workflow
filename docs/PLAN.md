@@ -675,6 +675,7 @@ Four sub-stages, not collapsed, exactly as planned: `p11a-adversarial-audit (Sta
 | Changelog generation | ⬜ Not yet built (P15 doesn't exist). |
 | Traceability matrix | ⬜ Not yet built (P14 doesn't exist). |
 | License classifier accuracy | ⬜ Not yet built (P11 doesn't exist). |
+| ac-to-tests per-AC sub-agent parallelism (dispatch one sub-agent per AC to write its own test file, instead of one draft session covering all ACs) | ⬜ Not started — investigate only once ac-to-tests is the measured pipeline bottleneck, not preemptively (2026-09-01: raised during a dev-speed session where minimal-code-to-green was the actual bottleneck instead, a model-capability problem sub-agents wouldn't have fixed). |
 
 ## Recommended build order (adopted from the user's guide, unchanged, annotated)
 

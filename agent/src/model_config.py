@@ -100,14 +100,20 @@ def _demo() -> None:
     """
     # "specification" has an explicit audit_model on both providers -- values must resolve
     # correctly AND differ per provider, or a stage would silently run the wrong vendor's model.
+    # Claude's draft/audit values are EQUAL right now (TEMPORARY DEV OVERRIDE, models.yaml header,
+    # 2026-09-01: every claude: block forced to haiku) -- the "audit differs from draft" property
+    # models.yaml's own header comment normally requires is genuinely suspended on this provider
+    # until that override is reverted, not a bug in this lookup.
     assert get_model_name("specification", "draft", "copilot") == "gpt-5.4-mini"
     assert get_model_name("specification", "draft", "claude") == "haiku"
     assert get_model_name("specification", "audit", "copilot") == "gemini-3.6-flash"
-    assert get_model_name("specification", "audit", "claude") == "sonnet"
+    assert get_model_name("specification", "audit", "claude") == "haiku"
 
     # "ac-to-tests" joined the audited stages 2026-08-24 -- same shape as "specification" above.
-    # Claude audit was opus (2026-08-24 user default) until the 2026-08-26 cheaper-models
-    # directive dropped every opus leg to sonnet (two runs died on the 5h usage window).
+    # Claude audit was opus (2026-08-24 user default), downshifted to sonnet by the 2026-08-26
+    # cheaper-models directive; briefly haiku under the 2026-09-01 dev-speed override, then back
+    # to sonnet (same file, same date) after a live haiku-drafted suite hit the scaffold-only
+    # rebuild cap -- one of the four stages exempted from that override.
     assert get_model_name("ac-to-tests", "draft", "copilot") == "gpt-5.3-codex"
     assert get_model_name("ac-to-tests", "draft", "claude") == "sonnet"
     assert get_model_name("ac-to-tests", "audit", "copilot") == "gemini-3.6-flash"

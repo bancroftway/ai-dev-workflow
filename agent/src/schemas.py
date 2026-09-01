@@ -112,6 +112,15 @@ class AcceptanceCriterion(BaseModel):
         "build/test scope. Deferral is NOT retirement -- the item stays in the document, parked. "
         "A criterion inside a deferred story is deferred automatically.",
     )
+    ui_related: bool = Field(
+        default=False,
+        description="True when satisfying this criterion involves something the user sees or "
+        "interacts with (a screen, a component, layout, client-side behavior) -- False for pure "
+        "backend/API/data logic with no visible surface. A deterministic Plan gate demands at "
+        "least one wireframe (Wireframe.ac_ids) cite every live ui_related criterion -- set this "
+        "honestly, not defensively; marking a backend-only criterion true forces an unneeded "
+        "wireframe, and marking a real UI criterion false lets it slip through unreviewed.",
+    )
 
 
 class UserStory(BaseModel):
@@ -211,6 +220,25 @@ class PlanStep(BaseModel):
         description="'infrastructure' marks scaffolding/tooling/config steps that fulfil no "
         "single criterion; every other step is 'feature' and must cite ac_ids.",
     )
+    ui_related: bool = Field(
+        default=False,
+        description="True when this step changes what the user sees or interacts with (a screen, "
+        "a component, layout, styling, client-side behavior) -- False for pure backend/API/data/"
+        "infrastructure work with no visible surface. Lets the review UI separate UI-facing work "
+        "from the rest at a glance; not gate-enforced against wireframe coverage.",
+    )
+    removes_ids: list[str] = Field(
+        default_factory=list,
+        description="Stable ids of RETIRED stories/criteria (from the approved Specification's "
+        "retired lists -- copied exactly, never invented, never a live id) whose already-delivered "
+        "artifacts this step removes: implementation code, UI screens, navigation links, config. "
+        "Only for features that were actually BUILT before being removed -- a feature retired "
+        "before any code existed needs no removal step at all. A pure-removal step is "
+        "kind='infrastructure' with empty ac_ids; a step may also both fulfil live criteria and "
+        "remove retired ones. A deterministic gate rejects a live id here, and demands that every "
+        "criterion delivered by an earlier run and retired this round is named by some step's "
+        "removes_ids.",
+    )
 
 
 class PlanDiagram(BaseModel):
@@ -240,6 +268,13 @@ class Wireframe(BaseModel):
         description="One complete self-contained HTML page: inline CSS only, system font stack, "
         "CSS shapes/gradients for imagery. NO <script>, no external URLs (no CDN css/js, no web "
         "fonts, no remote images). Keep it under 30 KB."
+    )
+    ac_ids: list[str] = Field(
+        default_factory=list,
+        description="The ledger Acceptance Criterion ids (US-####.#) this screen fulfils, copied "
+        "exactly from the approved Specification -- same convention as PlanStep.ac_ids, never "
+        "invented, never a retired or deferred id. A reviewer must be able to tell which "
+        "requirements this wireframe is evidence for at a glance.",
     )
 
 

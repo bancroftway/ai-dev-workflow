@@ -23,13 +23,30 @@ Plan-step provenance is a HARD, gate-checked contract, both directions:
 - Every Acceptance Criterion in the Specification that still awaits delivery must be cited by at
   least one step. Marking steps "infrastructure" to dodge citation fails the other direction of
   the same gate.
-- If the Specification lists `retired_us_ids`/`retired_ac_ids`, those features are REMOVED: no
-  step may cite a retired id, and any prior step whose every cited criterion is retired is simply
-  dropped from this draft. Add a step for the removal work itself only if there is concrete code
-  to delete, citing no retired ids (`kind: "infrastructure"` if it fulfils no live criterion).
+- If the Specification lists `retired_us_ids`/`retired_ac_ids` (or shows retired items), those
+  features are REMOVED: no step may cite a retired id in `ac_ids`, and any prior step whose every
+  cited criterion is retired is simply dropped from this draft. Whether removal WORK is needed
+  depends on what was ever built -- the gate enforces this split deterministically:
+  - Retired but never delivered (a greenfield spec revision before any code existed): no removal
+    step at all -- there is nothing to remove.
+  - Retired after being DELIVERED by an earlier run (a brownfield feature removal): plan the
+    removal explicitly -- delete the implementation code, UI screens, navigation links/routes,
+    and config that feature owns (its tests are removed by the test stage). Name the retired
+    ids that step cleans up in the step's `removes_ids` field (the retired story id covers all
+    of its criteria); `removes_ids` never contains a live id, and a pure-removal step is
+    `kind: "infrastructure"` with empty `ac_ids`. The gate rejects a plan that leaves a
+    delivered-then-retired criterion with no removal step.
+- A criterion the Specification marks as updated/changed re-enters the work queue automatically
+  (its delivery stamps were reset at spec approval) -- plan it like new work, and include
+  reworking whatever the earlier implementation did that no longer matches.
 - Stories/criteria marked `deferred: true` in the Specification are parked for a LATER phase: plan
   NOTHING for them and never cite a deferred criterion's id -- the same gate rejects steps whose
   cited criteria are not live. They are not removed; a future ticket plans them when promoted.
+
+Set `ui_related: true` on any step that changes what the user sees or interacts with -- a screen,
+a component, layout, styling, client-side behavior -- and leave it `false` (the default) for
+backend/API/data/infrastructure work with no visible surface. This is a display tag for the
+review UI, not gate-enforced.
 
 The Specification JSON may include `attachment_notes`: the Specification author's own
 distillation of what any screenshots or documents attached to the original request actually
@@ -72,7 +89,10 @@ Wireframes: when (and only when) this repository has a UI framework and the plan
 user-facing screens, include one Wireframe per new/changed screen (at most 6). Each is a single
 complete, self-contained, high-fidelity HTML page: ALL styling inline in one `<style>` block, a
 system font stack (`-apple-system, Segoe UI, Roboto, sans-serif`), CSS shapes/gradients for any
-imagery. Absolutely no `<script>` tags, no inline event handlers, no external URLs of any kind
+imagery. Name the Acceptance Criteria this screen is evidence for in `ac_ids` (US-####.# ids,
+copied exactly from the approved Specification -- same convention as a plan step's own `ac_ids`)
+so a reviewer can tell at a glance which requirements this wireframe demonstrates.
+Absolutely no `<script>` tags, no inline event handlers, no external URLs of any kind
 (no CDN css/js, no web fonts, no remote images), and no `data:`/`javascript:`/`file:` URIs
 anywhere -- an inline base64 `data:image/...` placeholder icon is rejected exactly like a remote
 one, so draw imagery with CSS shapes/gradients or omit it -- and no `<iframe>`/`<object>`/
@@ -81,6 +101,11 @@ one, so draw imagery with CSS shapes/gradients or omit it -- and no `<iframe>`/`
 sent back. Keep each under 30 KB; these ride along in every review prompt,
 so spend the bytes on layout fidelity, not boilerplate. Show realistic example content, not
 lorem ipsum. Skip wireframes entirely for non-UI plans.
+
+Coverage, also gate-checked: every criterion the Specification marks `ui_related: true` (and is
+not deferred) must be cited in some wireframe's `ac_ids` -- a UI-facing requirement with no
+wireframe evidence is rejected. If several such criteria share one screen, one wireframe citing
+all of them satisfies the requirement; you do not need a separate wireframe per criterion.
 
 Naming, also gate-checked: each wireframe's `screen` name and each diagram's `name` must match
 `^[A-Za-z0-9_-]{1,64}$` -- letters, digits, `_`, `-` only. `login-form` and `ER_model` pass;
