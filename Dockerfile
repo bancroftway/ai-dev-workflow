@@ -20,6 +20,11 @@ FROM node:22-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 RUN groupadd --system --gid 1001 nodejs && useradd --system --uid 1001 --gid nodejs nextjs
+# npm/npx/corepack are never invoked at runtime (CMD is `node server.js` only) -- standalone
+# output has no need for them, and their bundled deps (tar, pacote, sigstore, ...) are what trivy
+# keeps flagging in every node:*-slim image.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./

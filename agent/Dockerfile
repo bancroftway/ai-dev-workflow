@@ -22,6 +22,14 @@ RUN curl -sSL -o /tmp/packages-microsoft-prod.deb \
 # this image) rather than a credential shipped in the image.
 RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 
+# az CLI's bundled venv pins an old cryptography (2 HIGH CVEs); bump it directly, it's a stable
+# leaf dependency. pip itself (both az CLI's copy and the base image's, neither ever invoked --
+# this app only runs through uv's own .venv, and the az commands actually used (login, container,
+# containerapp) don't touch pip) vendors its own old setuptools/msgpack that we can't patch
+# in place, so remove pip entirely instead of carrying findings for code that's never reachable.
+RUN /opt/az/bin/python3 -m pip install --no-cache-dir --upgrade "cryptography>=50.0.0" \
+    && rm -rf /usr/local/lib/python*/site-packages/pip* /opt/az/lib/python*/site-packages/pip*
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
