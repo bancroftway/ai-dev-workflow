@@ -185,16 +185,24 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      # Same bytes in every tenant; --force makes re-imports (workflow re-runs) idempotent.
+      # --force makes re-imports (workflow re-runs) idempotent. Guarded on the ACR already
+      # existing: on a target's first-ever deploy the registry doesn't exist yet (only the bicep
+      # step below creates it), so there's nothing to import into. That's expected -- see this
+      # workflow's header comment on first-bootstrap -- and resolves itself once bicep has run
+      # once; a later re-run of this same workflow imports normally. Same bytes in every tenant.
       - name: import images into target ACR
         run: |
-          for n in frontend agent sandbox; do
-            az acr import --name "$ACR_NAME" \
-              --source "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-$n:$SHA" \
-              --image "ai-dev-workflow-$n:$SHA" \
-              --username "${{ github.actor }}" --password "${{ secrets.GITHUB_TOKEN }}" \
-              --force
-          done
+          if az acr show --name "$ACR_NAME" >/dev/null 2>&1; then
+            for n in frontend agent sandbox; do
+              az acr import --name "$ACR_NAME" \
+                --source "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-$n:$SHA" \
+                --image "ai-dev-workflow-$n:$SHA" \
+                --username "${{ github.actor }}" --password "${{ secrets.GITHUB_TOKEN }}" \
+                --force
+            done
+          else
+            echo "ACR $ACR_NAME does not exist yet (first bootstrap) -- skipping import, bicep will create it below; re-run this workflow afterward to import images"
+          fi
 
       # The drain/grant/migrate steps below run the agent's own db helpers on the runner: they
       # need the MS ODBC driver (not in Ubuntu's default repos -- add Microsoft's) and uv.
