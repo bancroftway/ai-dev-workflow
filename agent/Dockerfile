@@ -4,6 +4,17 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# session_store.py imports aioodbc/pyodbc at module load time (agent/pyproject.toml), which link
+# against the ODBC driver manager -- without it the app crashes on every boot, not just before the
+# first-bootstrap vault seed. Mirrors the MS driver install deploy.yml does on the runner.
+RUN curl -sSL -o /tmp/packages-microsoft-prod.deb \
+        "https://packages.microsoft.com/config/debian/$(. /etc/os-release && echo "$VERSION_ID")/packages-microsoft-prod.deb" \
+    && dpkg -i /tmp/packages-microsoft-prod.deb \
+    && rm -f /tmp/packages-microsoft-prod.deb \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+    && rm -rf /var/lib/apt/lists/*
+
 # AzureContainerInstanceProvider (agent/src/sandbox/azure_aci.py, SANDBOX_PROVIDER=azure) shells
 # out to `az container ...` to provision/tear down per-session ACI sandboxes -- required in any
 # real deployment, not just for local testing against this provider. Authenticates via the
@@ -19,6 +30,12 @@ RUN uv sync --frozen --no-dev
 
 COPY . .
 RUN chmod +x docker-entrypoint.sh
+
+# Non-root: az CLI's managed-identity login (docker-entrypoint.sh) writes its cache under $HOME,
+# so the user needs a real home dir, not just a UID.
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 # SANDBOX_PROVIDER=local (agent/src/sandbox/factory.py) needs Docker itself to provision
 # sandboxes -- meaningless inside this container; local-only, for a developer's own machine.
