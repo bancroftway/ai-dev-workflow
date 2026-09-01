@@ -10,6 +10,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd ../.. && pwd)"
+source ./versions.sh # TRIVY_SEVERITY / TRIVY_TIMEOUT per image -- same values deploy.yml reads.
 
 fail=0
 run() { echo "== $* =="; "$@" || { echo "FAILED: $*"; fail=1; }; }
@@ -21,16 +22,6 @@ declare -A CONTEXTS=(
   [agent]="$REPO_ROOT/agent"
   [sandbox]="$REPO_ROOT/agent/sandbox-image"
 )
-declare -A SEVERITIES=(
-  [frontend]="LOW,MEDIUM,HIGH,CRITICAL"
-  [agent]="LOW,MEDIUM,HIGH,CRITICAL"
-  [sandbox]="HIGH,CRITICAL"
-)
-declare -A TRIVY_TIMEOUTS=(
-  [frontend]="5m0s"
-  [agent]="5m0s"
-  [sandbox]="20m0s"
-)
 
 for name in frontend agent sandbox; do
   context="${CONTEXTS[$name]}"
@@ -38,7 +29,7 @@ for name in frontend agent sandbox; do
   run ./hadolint.sh "$context/Dockerfile"
   run ./build-image.sh "$tag" "$context"
   run ./dockle.sh "$tag"
-  run ./trivy-image.sh "$tag" "${SEVERITIES[$name]}" "${TRIVY_TIMEOUTS[$name]}"
+  run ./trivy-image.sh "$tag" "${TRIVY_SEVERITY[$name]}" "${TRIVY_TIMEOUT[$name]}"
 done
 
 exit $fail

@@ -103,7 +103,7 @@ jobs:
             /usr/local/share/chromium /usr/lib/jvm
           df -h /
       - name: build image
-        run: docker build -t "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" "${{ matrix.context }}"
+        run: scripts/security-checks/build-image.sh "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" "${{ matrix.context }}"
       # The 30-step Dockerfile's buildkit cache is the other big consumer -- drop everything except
       # the final tagged image trivy/push actually need.
       - name: prune docker build cache (sandbox only)
@@ -124,12 +124,15 @@ jobs:
       # everywhere: blocking on a CVE with no available patch anywhere upstream is a gate nobody
       # can ever satisfy, not a security improvement.
       - name: trivy image scan
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
         run: |
+          source scripts/security-checks/versions.sh
           scripts/security-checks/trivy-image.sh \
-            "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" \
-            "${{ matrix.name == 'sandbox' && 'HIGH,CRITICAL' || 'LOW,MEDIUM,HIGH,CRITICAL' }}" \
-            "${{ matrix.name == 'sandbox' && '20m0s' || '5m0s' }}"
-          if [ "${{ matrix.name }}" = "sandbox" ]; then df -h /; fi
+            "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${IMAGE_NAME}:${{ github.sha }}" \
+            "${TRIVY_SEVERITY[$IMAGE_NAME]}" \
+            "${TRIVY_TIMEOUT[$IMAGE_NAME]}"
+          if [ "$IMAGE_NAME" = "sandbox" ]; then df -h /; fi
       - name: push to GHCR (private)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
