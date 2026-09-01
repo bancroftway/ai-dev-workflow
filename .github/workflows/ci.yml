@@ -85,7 +85,7 @@ jobs:
           SEMGREP_SEND_METRICS: "off"
         run: |
           pipx install semgrep
-          semgrep scan --config auto --error
+          semgrep scan --config p/ci --error
       - name: trivy fs + config
         uses: aquasecurity/trivy-action@v0.36.0
         with:
