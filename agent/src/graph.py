@@ -2058,7 +2058,17 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # "drafting" (make_draft_node's start-of-turn mark) resets on a fresh submission like any
         # other per-run status, and is deliberately KEPT on a resume: it is the proof a killed
         # draft already touched the workspace (rebuild.py's TDD-red guard reads it).
-        if not stage_resume and stage["status"] in ("ready_for_review", "approved", "drafting"):
+        #
+        # is_new_submission is REQUIRED here, not just "not stage_resume" (found live 2026-09-01):
+        # intake_node runs on every plain graph re-entry that isn't a Command-resume of a pending
+        # interrupt, including a routine reattach carrying no new message at all -- a thread that's
+        # merely stuck mid-pipeline with no interrupt open (a crash, a dropped connection, or a
+        # hand-edited checkpoint confusing the interrupt bookkeeping) re-enters exactly this way.
+        # Without this clause, that ordinary reattach wiped a fully-approved Plan and ac-to-tests
+        # back to not_started -- no new message, no resume flag, nothing to justify a reset. A
+        # reset must be earned by an actual new human submission; a bare re-entry with nothing new
+        # to say should leave every stage exactly as it found it.
+        if is_new_submission and not stage_resume and stage["status"] in ("ready_for_review", "approved", "drafting"):
             # Reset touches STATUS/mechanics only -- `approved_content` deliberately survives.
             # Load-bearing beyond hydration: on a fresh run 2, persist_state keeps rewriting
             # 04-plan.approved.json (and 03-specification.approved.json) from this surviving
