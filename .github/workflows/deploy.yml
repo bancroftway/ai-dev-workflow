@@ -71,6 +71,17 @@ jobs:
             timeout 120 uv run python -m "$mod" || { echo "FAIL $mod"; fail=1; }
           done
           exit $fail
+      # Lints the Dockerfile source itself (before any build) -- best-practice/correctness issues
+      # like uncached apt-get, missing pinned versions, ADD vs COPY. CLI binary, not a marketplace
+      # action, same reasoning as gitleaks above. Removed right after use: sandbox is already
+      # tight on disk (see below) and every tool's footprint counts by the time trivy needs room.
+      - name: hadolint
+        run: |
+          curl -sSL -o /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+          hadolint --failure-threshold warning "${{ matrix.context }}/Dockerfile"
+          rm -f /usr/local/bin/hadolint
       # sandbox is a multi-toolchain dev image (node, python, gh cli, claude code, ...) big enough
       # that the runner's ~14GB free disk runs out mid-build/scan even after this; the rest of the
       # preinstalled toolcache (dotnet, android, ghc, codeql, powershell, various JVMs) is dead
@@ -92,6 +103,17 @@ jobs:
           docker builder prune -af
           docker image prune -f
           df -h /
+      # Lints the BUILT image against CIS/best-practice checks (non-root user, no baked secrets,
+      # unnecessary setuid bits, ...) -- complements trivy's CVE scan with configuration hygiene.
+      # Removed right after use, same reasoning as hadolint above.
+      - name: dockle
+        run: |
+          curl -sSL https://github.com/goodwithtech/dockle/releases/download/v0.4.15/dockle_0.4.15_Linux-64bit.tar.gz \
+            | tar xz -C /usr/local/bin dockle
+          dockle --exit-code 1 --exit-level warn \
+            "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}"
+          rm -f /usr/local/bin/dockle
+          if [ "${{ matrix.name }}" = "sandbox" ]; then df -h /; fi
       # Gate BEFORE push: a vulnerable image never reaches any registry. Sandbox is a
       # dev-toolchain image that chronically carries HIGHs -- CRITICAL-only there, tighten via
       # .trivyignore as the list shrinks.
