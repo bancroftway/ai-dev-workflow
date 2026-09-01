@@ -69,3 +69,18 @@ CVE-2026-53488
 CVE-2026-56854
 CVE-2026-71556
 GHSA-hrxh-6v49-42gf
+
+# npm itself, bumped to 12.0.2 (latest) -- these are npm's OWN vendored deps (brace-expansion,
+# ip-address, tar), still on slightly-behind sub-versions in npm's latest release. Same shape as
+# the frontend image's original finding, but npm can't be removed here (a target repo's own
+# `npm install`/`npm run` genuinely needs it at runtime).
+CVE-2026-14257
+CVE-2026-69152
+CVE-2026-69192
+CVE-2026-73566
+
+# BASE_IMAGE's own bundled .NET runtime (Microsoft.NETCore.App 10.0.10, fixed in 10.0.11) --
+# different shape from everything above: not a tool we pin, the floating `dotnet/sdk:10.0` base
+# tag just hasn't picked up Microsoft's own latest patch yet at build time. Self-resolves on the
+# next image rebuild once MCR republishes; drop this line once it does.
+CVE-2026-62901
