@@ -71,15 +71,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # gitleaks scans full history
-      # Gitleaks CLI, not gitleaks-action (the action needs a paid org license). The baseline file
-      # freezes pre-existing historical findings so only NEW leaks fail; anything real captured in
-      # the baseline must be rotated, not ignored.
+      # scripts/security-checks/gitleaks.sh is the single source of truth for this check (same
+      # script deploy.yml and the local pre-commit hook run) -- not gitleaks-action (needs a paid
+      # org license). The baseline file freezes pre-existing historical findings so only NEW leaks
+      # fail; anything real captured in the baseline must be rotated, not ignored.
       - name: gitleaks
-        run: |
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz gitleaks
-          BASELINE=""
-          [ -f .gitleaks-baseline.json ] && BASELINE="--baseline-path .gitleaks-baseline.json"
-          ./gitleaks git --redact --exit-code 1 $BASELINE .
+        run: scripts/security-checks/gitleaks.sh .
       - name: semgrep
         env:
           SEMGREP_SEND_METRICS: "off"

@@ -26,7 +26,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Redundant with ci.yml's own gitleaks pass on every PR -- kept here too, same defense-in-depth
+  # reasoning as the demo self-checks below: a commit that reached dev/main some other way than
+  # the normal PR gate still gets full git-history secret scanning before any image is built.
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # scripts/security-checks/*.sh are the single source of truth for every tool invocation here
+      # -- a dev runs the identical script (identical docker image, identical flags) via
+      # scripts/hooks/pre-commit before ever pushing, so nothing in this workflow can surprise them.
+      - name: gitleaks
+        run: scripts/security-checks/gitleaks.sh .
+
   build:
+    needs: [secrets-scan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -72,16 +88,9 @@ jobs:
           done
           exit $fail
       # Lints the Dockerfile source itself (before any build) -- best-practice/correctness issues
-      # like uncached apt-get, missing pinned versions, ADD vs COPY. CLI binary, not a marketplace
-      # action, same reasoning as gitleaks above. Removed right after use: sandbox is already
-      # tight on disk (see below) and every tool's footprint counts by the time trivy needs room.
+      # like uncached apt-get, missing pinned versions, ADD vs COPY.
       - name: hadolint
-        run: |
-          curl -sSL -o /usr/local/bin/hadolint \
-            https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64
-          chmod +x /usr/local/bin/hadolint
-          hadolint --failure-threshold warning "${{ matrix.context }}/Dockerfile"
-          rm -f /usr/local/bin/hadolint
+        run: scripts/security-checks/hadolint.sh "${{ matrix.context }}/Dockerfile"
       # sandbox is a multi-toolchain dev image (node, python, gh cli, claude code, ...) big enough
       # that the runner's ~14GB free disk runs out mid-build/scan even after this; the rest of the
       # preinstalled toolcache (dotnet, android, ghc, codeql, powershell, various JVMs) is dead
@@ -105,28 +114,22 @@ jobs:
           df -h /
       # Lints the BUILT image against CIS/best-practice checks (non-root user, no baked secrets,
       # unnecessary setuid bits, ...) -- complements trivy's CVE scan with configuration hygiene.
-      # Removed right after use, same reasoning as hadolint above.
       - name: dockle
-        run: |
-          curl -sSL https://github.com/goodwithtech/dockle/releases/download/v0.4.15/dockle_0.4.15_Linux-64bit.tar.gz \
-            | tar xz -C /usr/local/bin dockle
-          dockle --exit-code 1 --exit-level warn \
-            "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}"
-          rm -f /usr/local/bin/dockle
-          if [ "${{ matrix.name }}" = "sandbox" ]; then df -h /; fi
-      # Gate BEFORE push: a vulnerable image never reaches any registry. Sandbox is a
-      # dev-toolchain image that chronically carries HIGHs -- CRITICAL-only there, tighten via
-      # .trivyignore as the list shrinks.
+        run: scripts/security-checks/dockle.sh "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}"
+      # Gate BEFORE push: a vulnerable or secret-carrying image never reaches any registry.
+      # frontend/agent (what's actually exposed) block on LOW+ -- every fixable finding, no floor.
+      # sandbox is a multi-toolchain dev image that chronically carries LOW/MEDIUM noise in some
+      # transitive dependency; HIGH+ there is the agreed compromise, tighten via pinning findings
+      # away rather than relaxing this further. ignore-unfixed (baked into the script) stays true
+      # everywhere: blocking on a CVE with no available patch anywhere upstream is a gate nobody
+      # can ever satisfy, not a security improvement.
       - name: trivy image scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: image
-          image-ref: ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}
-          severity: ${{ matrix.name == 'sandbox' && 'CRITICAL' || 'HIGH,CRITICAL' }}
-          ignore-unfixed: true
-          exit-code: 1
-          # sandbox's package count blows past trivy's 5m default (context deadline exceeded).
-          timeout: ${{ matrix.name == 'sandbox' && '20m0s' || '5m0s' }}
+        run: |
+          scripts/security-checks/trivy-image.sh \
+            "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" \
+            "${{ matrix.name == 'sandbox' && 'HIGH,CRITICAL' || 'LOW,MEDIUM,HIGH,CRITICAL' }}" \
+            "${{ matrix.name == 'sandbox' && '20m0s' || '5m0s' }}"
+          if [ "${{ matrix.name }}" = "sandbox" ]; then df -h /; fi
       - name: push to GHCR (private)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Runs the full docker-based security-check suite (hadolint, gitleaks, dockle, trivy -- the exact
+# same scripts and tool versions deploy.yml runs) before every commit. Slow by design when a
+# commit touches a Dockerfile: see scripts/security-checks/run-all.sh for why.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+exec scripts/security-checks/run-all.sh
