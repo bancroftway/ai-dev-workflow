@@ -72,13 +72,26 @@ jobs:
           done
           exit $fail
       # sandbox is a multi-toolchain dev image (node, python, gh cli, claude code, ...) big enough
-      # that the runner's ~14GB free disk runs out mid-build/scan; the rest of the preinstalled
-      # toolcache (dotnet, android, ghc) is dead weight for a docker-build-only job.
+      # that the runner's ~14GB free disk runs out mid-build/scan even after this; the rest of the
+      # preinstalled toolcache (dotnet, android, ghc, codeql, powershell, various JVMs) is dead
+      # weight for a docker-build-only job.
       - name: free disk space (sandbox only)
         if: matrix.name == 'sandbox'
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/lib/jvm
+          df -h /
       - name: build image
         run: docker build -t "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" "${{ matrix.context }}"
+      # The 30-step Dockerfile's buildkit cache is the other big consumer -- drop everything except
+      # the final tagged image trivy/push actually need.
+      - name: prune docker build cache (sandbox only)
+        if: matrix.name == 'sandbox'
+        run: |
+          docker builder prune -af
+          docker image prune -f
+          df -h /
       # Gate BEFORE push: a vulnerable image never reaches any registry. Sandbox is a
       # dev-toolchain image that chronically carries HIGHs -- CRITICAL-only there, tighten via
       # .trivyignore as the list shrinks.
