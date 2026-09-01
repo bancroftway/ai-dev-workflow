@@ -61,6 +61,8 @@ jobs:
           severity: ${{ matrix.name == 'sandbox' && 'CRITICAL' || 'HIGH,CRITICAL' }}
           ignore-unfixed: true
           exit-code: 1
+          # sandbox's package count blows past trivy's 5m default (context deadline exceeded).
+          timeout: ${{ matrix.name == 'sandbox' && '20m0s' || '5m0s' }}
       - name: push to GHCR (private)
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
