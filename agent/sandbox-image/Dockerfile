@@ -105,6 +105,10 @@ RUN set -eux; \
 # ── final stage ────────────────────────────────────────────────────────────────────────────────
 FROM ${BASE_IMAGE}
 
+# Piped RUN commands below (curl | bash, the nodesource setup script) need pipefail or a failing
+# curl can silently pass.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 ARG NODE_MAJOR=22
 # Redeclared here (default lives with COPILOT_CLI_VERSION above) so the npm install in the
 # Node/npm/gh layer below can see it -- same cross-stage pattern as COPILOT_CLI_VERSION's own
@@ -136,6 +140,26 @@ ARG PLAYWRIGHT_VERSION=1.63.0-alpha-2026-08-05
 # image before any run trusts the numbers; if the headless shell proves insufficient, bake full
 # chromium here instead of ever fetching at session time.
 ARG LIGHTHOUSE_VERSION=13.4.1
+# Everything below was unpinned ("neither gate reads a specific tool version, just parses
+# whatever JSON/CSV shape the latest release emits") until 2026-09-01, when the deploy pipeline's
+# security gate was tightened to block on hadolint's DL3008/13/16 (pin every apt/pip/npm install)
+# with no exceptions -- pinned like every other tool in this file now, same reproducibility
+# reasoning, even for the ones whose own output format is version-agnostic.
+ARG MERMAID_CLI_VERSION=11.16.0
+ARG JSCPD_VERSION=5.1.1
+ARG LIZARD_VERSION=1.24.0
+ARG SEMGREP_VERSION=1.175.0
+ARG CHECKOV_VERSION=3.3.16
+ARG INTERROGATE_VERSION=1.7.0
+ARG BANDIT_VERSION=1.9.4
+ARG PNPM_VERSION=11.25.0
+ARG YARN_VERSION=1.22.22
+ARG TYPESCRIPT_VERSION=7.0.2
+ARG ESLINT_GLOBAL_VERSION=10.9.1
+ARG PRETTIER_VERSION=3.9.6
+ARG ANGULAR_CLI_VERSION=22.1.6
+ARG RUFF_VERSION=0.16.5
+ARG MYPY_VERSION=2.3.1
 
 USER root
 
@@ -205,9 +229,13 @@ RUN set -eux; \
 # actually picks which CLI runs, one turn at a time.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates gnupg python3 python3-pip; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates=20260601~24.04.1 \
+        gnupg=2.4.4-2ubuntu17.4 \
+        python3=3.12.3-0ubuntu2.1 \
+        python3-pip=24.0+dfsg-1ubuntu1.3; \
     curl -fsSL --retry 5 --retry-all-errors "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
-    apt-get install -y --no-install-recommends nodejs; \
+    apt-get install -y --no-install-recommends nodejs=22.23.2-1nodesource1; \
     npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}"; \
     curl -fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
@@ -215,7 +243,7 @@ RUN set -eux; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list; \
     apt-get update; \
-    apt-get install -y --no-install-recommends gh; \
+    apt-get install -y --no-install-recommends gh=2.98.0; \
     rm -rf /var/lib/apt/lists/*
 
 # Playwright MCP + its exact-matching browser build, baked at BUILD time into
@@ -260,14 +288,27 @@ ENV CHROME_PATH=/usr/local/bin/aidw-headless-shell
 # Puppeteer at the Playwright headless shell baked above (PUPPETEER_EXECUTABLE_PATH env +
 # "headless": "shell" in mermaid-puppeteer-config.json). Both skip-download spellings are set:
 # PUPPETEER_SKIP_DOWNLOAD is current, PUPPETEER_SKIP_CHROMIUM_DOWNLOAD covers older bundled
-# puppeteers -- mermaid-cli is installed unpinned.
+# puppeteers. libatk1.0-0/libatk-bridge2.0-0/libcups2 pin under their real Ubuntu 24.04 t64-transition
+# names (apt resolves the old names to these transitively; pinning the old name has no candidate).
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
-        libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
-        libcairo2; \
-    PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1 npm install -g @mermaid-js/mermaid-cli; \
+        libnss3=2:3.98-1ubuntu0.2 \
+        libatk1.0-0t64=2.52.0-1build1 \
+        libatk-bridge2.0-0t64=2.52.0-1build1 \
+        libcups2t64=2.4.7-1.2ubuntu7.14 \
+        libdrm2=2.4.125-1ubuntu0.1~24.04.2 \
+        libxkbcommon0=1.6.0-1build1 \
+        libxcomposite1=1:0.4.5-1build3 \
+        libxdamage1=1:1.1.6-1build1 \
+        libxfixes3=1:6.0.0-2build1 \
+        libxrandr2=2:1.5.2-2build1 \
+        libgbm1=25.2.8-0ubuntu0.24.04.2 \
+        libasound2t64=1.2.11-1ubuntu0.3 \
+        libpango-1.0-0=1.52.1+ds-1build1 \
+        libcairo2=1.18.0-3build1; \
+    PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1 \
+        npm install -g "@mermaid-js/mermaid-cli@${MERMAID_CLI_VERSION}"; \
     rm -rf /var/lib/apt/lists/*
 
 # P8's quality scan: jscpd (duplication) via npm, lizard (per-function complexity) via pip.
@@ -275,16 +316,16 @@ RUN set -eux; \
 # Apache-2.0, the licence-clean load-bearer for Python once the official semgrep rules left, see
 # the rule-pack block below) ride the same pip line as lizard/semgrep -- all six are pure-Python
 # static analyzers with no other runtime dependency.
-# ponytail: no version pin here -- neither gate reads a specific tool version, just parses
-# whatever JSON/CSV shape the latest release emits, so pinning buys nothing over always-latest.
 # azure-functions-core-tools rides along in the same layer: npm rather than the
 # packages.microsoft.com apt feed, since the package resolves its own linux-x64/linux-arm64
 # payload (no new arch case block, no third apt keyring). --unsafe-perm because its postinstall
 # runs as root here. Nothing in the pipeline invokes `func` yet -- it earns its size for
 # Node-based Functions projects downstream, in R's build and P13's test runs.
 RUN set -eux; \
-    npm install -g jscpd "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}" --unsafe-perm true; \
-    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 lizard semgrep checkov interrogate bandit
+    npm install -g "jscpd@${JSCPD_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}" --unsafe-perm=true; \
+    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \
+        "lizard==${LIZARD_VERSION}" "semgrep==${SEMGREP_VERSION}" "checkov==${CHECKOV_VERSION}" \
+        "interrogate==${INTERROGATE_VERSION}" "bandit==${BANDIT_VERSION}"
 
 # Front-end and Python quality toolchain. These are the deterministic signal for non-.NET repos:
 # preflight_nodes.apply_stack_conventions writes eslint.config.mjs / ruff.toml / mypy.ini into a
@@ -308,8 +349,11 @@ RUN set -eux; \
 # npm packages at runtime, and keeping the two separate means an untrusted repo cannot shadow a
 # tool a gate depends on.
 RUN set -eux; \
-    npm install -g pnpm yarn typescript eslint prettier @angular/cli --unsafe-perm true; \
-    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries 5 ruff mypy
+    npm install -g "pnpm@${PNPM_VERSION}" "yarn@${YARN_VERSION}" "typescript@${TYPESCRIPT_VERSION}" \
+        "eslint@${ESLINT_GLOBAL_VERSION}" "prettier@${PRETTIER_VERSION}" "@angular/cli@${ANGULAR_CLI_VERSION}" \
+        --unsafe-perm=true; \
+    pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \
+        "ruff==${RUFF_VERSION}" "mypy==${MYPY_VERSION}"
 
 # ── /opt/aidw/lint: the pipeline-owned ESLint toolchain, resolved AGAINST ITS OWN node_modules ─
 # Linting a target repo must never mutate that repo's dependency graph: installing our lint
@@ -319,6 +363,10 @@ RUN set -eux; \
 #   /opt/aidw/lint/node_modules/.bin/eslint --config /opt/aidw/lint/eslint.config.mjs .
 # Root-owned and immutable at runtime for the same reason as the global npm tools above.
 COPY lint/ /opt/aidw/lint/
+# WORKDIR persists for every later Dockerfile instruction; this cd is scoped to just this RUN's
+# shell, deliberately, so it can't shift where a later COPY/RUN in this 550+ line file resolves
+# relative paths -- not worth the risk for a pure layer-caching nicety.
+# hadolint ignore=DL3003
 RUN set -eux; \
     cd /opt/aidw/lint; \
     npm install --no-audit --no-fund; \
@@ -331,6 +379,7 @@ RUN set -eux; \
 # alternative: vitest's pool workers never inherit the wrapper's V8 coverage collection
 # (observed live: a real suite measured a hard 0.0%).
 COPY test/ /opt/aidw/test/
+# hadolint ignore=DL3003
 RUN set -eux; \
     cd /opt/aidw/test; \
     npm install --no-audit --no-fund; \
@@ -341,6 +390,7 @@ RUN set -eux; \
 # tested with declared test users -- no real tenant, secret, or consent. Resolves oidc-provider from
 # its own node_modules; agent/src/fake_idp.py boots it as `node /opt/aidw/fakeidp/server.js`.
 COPY fakeidp/ /opt/aidw/fakeidp/
+# hadolint ignore=DL3003
 RUN set -eux; \
     cd /opt/aidw/fakeidp; \
     npm install --no-audit --no-fund; \
@@ -382,6 +432,9 @@ ENV AIDW_OSV_DB_DIR=/opt/aidw/osv-db \
 # live, blazor-dotnet: osv-scanner exit 127, dependency-CVE coverage silently single-sourced to
 # trivy for the whole run). One seed lockfile per ecosystem in scope -- npm, NuGet, PyPI, matching
 # the dotnet/node/python scope named in the BASE_IMAGE header.
+# The one `cd` below is already subshell-scoped ( cd X && ... ) specifically so it can't leak into
+# the rest of this RUN -- a WORKDIR here would be the regression, not the fix.
+# hadolint ignore=DL3003
 RUN set -eux; \
     mkdir -p "$TRIVY_CACHE_DIR" "$AIDW_OSV_DB_DIR" /tmp/osv-seed; \
     trivy image --download-db-only --cache-dir "$TRIVY_CACHE_DIR"; \
