@@ -1,0 +1,71 @@
+# Genuinely blocked upstream, not a "didn't get to it yet" list. Every CVE below is in a
+# statically-linked Go binary already at its latest available release (or, for osv-scanner,
+# pinned one version below latest for a real, documented, unrelated reason -- see
+# OSV_SCANNER_VERSION's own comment in the Dockerfile). ignore-unfixed doesn't catch these because
+# trivy considers the underlying Go MODULE fixed, even though the consuming binary hasn't picked
+# up that fix (or, for osv-scanner, can't be bumped to the version that would without breaking
+# repo_scan.py's real --local-db-path usage). Re-check whenever bumping gh/TYPESCRIPT_VERSION, or
+# when repo_scan.py's osv-scanner invocation gets migrated off --local-db-path -- drop whichever
+# lines a new release/migration actually fixes. Many CVEs below recur across gh, tsc, and
+# osv-scanner: same underlying Go stdlib/module issue, several statically-linked binaries.
+
+# gh CLI 2.99.0 -- unverified whether this release actually still carries these two (its
+# changelog doesn't call out the fix); left in defensively rather than assumed fixed. If the next
+# scan shows them clean, drop these two lines.
+CVE-2026-56864
+CVE-2026-56865
+
+# typescript's native tsc binary (@typescript/typescript-linux-x64, TYPESCRIPT_VERSION=7.0.2,
+# latest stable -- 7.1.0 dev/nightly builds have newer deps, but pinning a nightly for a security
+# fix trades a cataloged CVE for an uncataloged stability risk, worse trade)
+CVE-2026-33818
+CVE-2026-39821
+CVE-2026-39822
+CVE-2026-46600
+CVE-2026-56852
+CVE-2026-56853
+CVE-2026-56858
+CVE-2026-56859
+CVE-2026-56860
+CVE-2026-56862
+
+# osv-scanner (pinned to 2.0.2, see OSV_SCANNER_VERSION comment -- these are the binary's own
+# compiled-in Go deps, unrelated to the --local-db-path reason for the pin itself)
+CVE-2024-25621
+CVE-2025-15558
+CVE-2025-22874
+CVE-2025-47913
+CVE-2025-52881
+CVE-2025-61726
+CVE-2025-61729
+CVE-2025-68121
+CVE-2026-25679
+CVE-2026-25681
+CVE-2026-27136
+CVE-2026-27145
+CVE-2026-32280
+CVE-2026-32281
+CVE-2026-32283
+CVE-2026-33186
+CVE-2026-33811
+CVE-2026-33814
+CVE-2026-39820
+CVE-2026-39828
+CVE-2026-39829
+CVE-2026-39830
+CVE-2026-39831
+CVE-2026-39832
+CVE-2026-39835
+CVE-2026-39836
+CVE-2026-42499
+CVE-2026-42504
+CVE-2026-42508
+CVE-2026-44973
+CVE-2026-45022
+CVE-2026-46595
+CVE-2026-46597
+CVE-2026-46680
+CVE-2026-53488
+CVE-2026-56854
+CVE-2026-71556
+GHSA-hrxh-6v49-42gf

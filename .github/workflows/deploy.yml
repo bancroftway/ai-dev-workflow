@@ -130,10 +130,13 @@ jobs:
           IMAGE_NAME: ${{ matrix.name }}
         run: |
           source scripts/security-checks/versions.sh
+          IGNOREFILE=""
+          [ -f "${{ matrix.context }}/.trivyignore" ] && IGNOREFILE="${{ matrix.context }}/.trivyignore"
           scripts/security-checks/trivy-image.sh \
             "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${IMAGE_NAME}:${{ github.sha }}" \
             "${TRIVY_SEVERITY[$IMAGE_NAME]}" \
-            "${TRIVY_TIMEOUT[$IMAGE_NAME]}"
+            "${TRIVY_TIMEOUT[$IMAGE_NAME]}" \
+            "$IGNOREFILE"
           if [ "$IMAGE_NAME" = "sandbox" ]; then df -h /; fi
       - name: push to GHCR (private)
         run: |

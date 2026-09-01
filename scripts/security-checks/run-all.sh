@@ -29,7 +29,9 @@ for name in frontend agent sandbox; do
   run ./hadolint.sh "$context/Dockerfile"
   run ./build-image.sh "$tag" "$context"
   run ./dockle.sh "$tag" "${DOCKLE_TIMEOUT[$name]}"
-  run ./trivy-image.sh "$tag" "${TRIVY_SEVERITY[$name]}" "${TRIVY_TIMEOUT[$name]}"
+  ignorefile=""
+  [ -f "$context/.trivyignore" ] && ignorefile="$context/.trivyignore"
+  run ./trivy-image.sh "$tag" "${TRIVY_SEVERITY[$name]}" "${TRIVY_TIMEOUT[$name]}" "$ignorefile"
 done
 
 exit $fail

@@ -35,19 +35,30 @@ ARG CLAUDE_CODE_CLI_VERSION=2.1.241
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end
 # against a rebuilt image -- see each gate module's own docstring.
-ARG SCC_VERSION=3.5.0
-ARG GITLEAKS_VERSION=8.21.2
-ARG TRIVY_VERSION=0.73.0
+# 2026-09-01: bumped scc/gitleaks/trivy/osv-scanner/syft to their latest releases -- the deploy
+# pipeline's tightened trivy gate found real CVEs in each one's own compiled-in Go dependencies
+# (these are static Go binaries; a vulnerable transitive dep only gets fixed by a newer release of
+# the binary itself, there's no separate package to bump).
+ARG SCC_VERSION=4.0.0
+ARG GITLEAKS_VERSION=8.30.1
+ARG TRIVY_VERSION=0.74.0
 # osv-scanner: a second vulnerability database (OSV.dev) alongside Trivy's. Deliberately both --
 # they disagree at the edges, and src/repo_scan.py reconciles their advisory ids via OSV's alias
 # lists so the overlap collapses to one finding rather than two. Pinned to a v2 release because
 # repo_scan.py's command uses the v2 `scan source --offline-vulnerabilities` subcommand form;
 # v1's flags differ and would silently produce no output.
+# STAYING at 2.0.2 deliberately, unlike scc/gitleaks/trivy/syft above: `--local-db-path` (which
+# repo_scan.py:2270 depends on for its whole offline-scan contract) was removed from osv-scanner
+# almost immediately after this release -- verified empirically against v2.0.3 through v2.5.1,
+# none of them have it. The binary's own CVEs (52 findings, all HIGH/CRITICAL, its own compiled-in
+# Go deps) are real and unfixed, tracked in this dir's .trivyignore -- fixing them for real means
+# migrating repo_scan.py's osv-scanner invocation to whatever v2.5+'s fixed-location cache
+# (~/.cache/osv-scalibr/) replaced --local-db-path with, a real app-level change, not a version bump.
 ARG OSV_SCANNER_VERSION=2.0.2
 # Anchore's dedicated SBOM cataloger -- repo_scan.py's own docstring explains why this replaced the
 # earlier "redundant with Trivy" call. Same goreleaser asset-naming convention as scc/gitleaks/trivy
 # above (no "v" prefix in the filename, unlike the release tag).
-ARG SYFT_VERSION=1.51.0
+ARG SYFT_VERSION=1.51.1
 # mise (multi-language version manager) is what lets this immutable image serve a repo needing a
 # toolchain it doesn't ship -- Node 18, a second JDK, a Go version. See the /opt/aidw layout below
 # and bootstrap.sh for how it's driven. Pinned like every other tool here.
@@ -108,6 +119,12 @@ FROM ${BASE_IMAGE}
 # Piped RUN commands below (curl | bash, the nodesource setup script) need pipefail or a failing
 # curl can silently pass.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# PowerShell 7.6.2 ships baked into BASE_IMAGE itself (mcr.microsoft.com/dotnet/sdk:10.0's own
+# Dockerfile) and bundles System.Security.Cryptography.Xml 10.0.6 -- 5 HIGH CVEs, fixed in
+# 10.0.10. Nothing in this codebase invokes pwsh/powershell (grepped agent/src and
+# agent/sandbox-image, zero hits); dead weight carrying real CVEs, not a tool this image needs.
+RUN rm -rf /usr/share/powershell /usr/bin/pwsh
 
 ARG NODE_MAJOR=22
 # Redeclared here (default lives with COPILOT_CLI_VERSION above) so the npm install in the
@@ -236,6 +253,11 @@ RUN set -eux; \
         python3-pip=24.0+dfsg-1ubuntu1.3; \
     curl -fsSL --retry 5 --retry-all-errors "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
     apt-get install -y --no-install-recommends nodejs=22.23.2-1nodesource1; \
+    # NodeSource's bundled npm carries its own vendored deps (tar, pacote, brace-expansion, ...)
+    # with real HIGH/CRITICAL CVEs, same root cause as the frontend image's -- there npm is unused
+    # at runtime and gets removed entirely; here a target repo's own npm install/run genuinely
+    # needs it, so upgrade instead.
+    npm install -g npm@12.0.2; \
     npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}"; \
     curl -fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
@@ -243,7 +265,7 @@ RUN set -eux; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list; \
     apt-get update; \
-    apt-get install -y --no-install-recommends gh=2.98.0; \
+    apt-get install -y --no-install-recommends gh=2.99.0; \
     rm -rf /var/lib/apt/lists/*
 
 # Playwright MCP + its exact-matching browser build, baked at BUILD time into
@@ -318,11 +340,19 @@ RUN set -eux; \
 # static analyzers with no other runtime dependency.
 # azure-functions-core-tools rides along in the same layer: npm rather than the
 # packages.microsoft.com apt feed, since the package resolves its own linux-x64/linux-arm64
-# payload (no new arch case block, no third apt keyring). --unsafe-perm because its postinstall
-# runs as root here. Nothing in the pipeline invokes `func` yet -- it earns its size for
-# Node-based Functions projects downstream, in R's build and P13's test runs.
+# payload (no new arch case block, no third apt keyring). Its postinstall runs fine as root here
+# without --unsafe-perm -- npm 12 (bumped above) dropped that flag entirely; running as actual
+# root already gets postinstall scripts run without npm's non-root privilege-drop dance. Nothing
+# in the pipeline invokes `func` yet -- it earns its size for Node-based Functions projects
+# downstream, in R's build and P13's test runs. Its bundled PowerShell-language worker is real
+# dead weight, not just unused-for-now: this pipeline is scoped to Node-based Functions projects
+# only (see above), never PowerShell ones, and that worker's own bundled
+# System.Security.Cryptography.Xml carries real HIGH CVEs with no upstream fix in any 4.x release
+# yet -- removed outright, `func` and its Node worker are untouched.
 RUN set -eux; \
-    npm install -g "jscpd@${JSCPD_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}" --unsafe-perm=true; \
+    npm install -g "jscpd@${JSCPD_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}"; \
+    rm -rf /usr/lib/node_modules/azure-functions-core-tools/bin/workers/powershell \
+           /usr/lib/node_modules/azure-functions-core-tools/bin/*/workers/powershell; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \
         "lizard==${LIZARD_VERSION}" "semgrep==${SEMGREP_VERSION}" "checkov==${CHECKOV_VERSION}" \
         "interrogate==${INTERROGATE_VERSION}" "bandit==${BANDIT_VERSION}"
@@ -350,8 +380,7 @@ RUN set -eux; \
 # tool a gate depends on.
 RUN set -eux; \
     npm install -g "pnpm@${PNPM_VERSION}" "yarn@${YARN_VERSION}" "typescript@${TYPESCRIPT_VERSION}" \
-        "eslint@${ESLINT_GLOBAL_VERSION}" "prettier@${PRETTIER_VERSION}" "@angular/cli@${ANGULAR_CLI_VERSION}" \
-        --unsafe-perm=true; \
+        "eslint@${ESLINT_GLOBAL_VERSION}" "prettier@${PRETTIER_VERSION}" "@angular/cli@${ANGULAR_CLI_VERSION}"; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \
         "ruff==${RUFF_VERSION}" "mypy==${MYPY_VERSION}"
 
