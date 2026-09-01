@@ -14,8 +14,8 @@ jobs:
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       # npm install, not npm ci: the lockfile lacks optional wasm32 fallbacks (Dockerfile:6-11's
@@ -31,8 +31,8 @@ jobs:
       run:
         working-directory: agent
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv sync --frozen
       # Whole-tree syntax gate: covers modules the _demo loop below skips.
       - run: uv run python -m compileall -q src
@@ -60,7 +60,7 @@ jobs:
   bicep:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: az bicep build --file infra/main.bicep
       - run: az bicep build-params --file infra/params/nonprod.bicepparam
       - run: az bicep build-params --file infra/params/prod.bicepparam
@@ -68,7 +68,7 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # gitleaks scans full history
       # Gitleaks CLI, not gitleaks-action (the action needs a paid org license). The baseline file
@@ -87,7 +87,7 @@ jobs:
           pipx install semgrep
           semgrep scan --config p/ci --error
       - name: trivy fs + config
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scanners: vuln,misconfig

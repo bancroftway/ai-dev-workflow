@@ -41,14 +41,14 @@ jobs:
           - name: sandbox
             context: agent/sandbox-image
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: build image
         run: docker build -t "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" "${{ matrix.context }}"
       # Gate BEFORE push: a vulnerable image never reaches any registry. Sandbox is a
       # dev-toolchain image that chronically carries HIGHs -- CRITICAL-only there, tighten via
       # .trivyignore as the list shrinks.
       - name: trivy image scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           image-ref: ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}
@@ -66,10 +66,12 @@ jobs:
       list: ${{ steps.read.outputs.list }}
       any: ${{ steps.read.outputs.any }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: read
+        env:
+          BRANCH: ${{ github.ref_name }}
         run: |
-          LIST=$(jq -c --arg b "${{ github.ref_name }}" '.[$b] // []' .github/deploy-targets.json)
+          LIST=$(jq -c --arg b "$BRANCH" '.[$b] // []' .github/deploy-targets.json)
           echo "list=$LIST" >> "$GITHUB_OUTPUT"
           echo "any=$([ "$LIST" != "[]" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
@@ -92,9 +94,9 @@ jobs:
       NAME_PREFIX: ${{ vars.NAME_PREFIX }}
       SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: azure/login@v2
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
