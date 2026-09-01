@@ -57,12 +57,15 @@ name inventory is docs/CONFIG.md's "Secrets / identity (required for a real depl
 **Automated (creates only what's missing, never overwrites a real value):** run the
 `Seed Config Vault` workflow (`workflow_dispatch`, target = the GitHub Environment name). It
 self-grants `Key Vault Secrets Officer` on the vault (the deploy SP's RBAC-Administrator role is
-already conditioned to allow exactly this, see onboard-target.ps1), then for each required secret:
-uses that environment's `CONFIG_<NAME>` GitHub secret if you've set one (e.g. `CONFIG_AUTH_SECRET`
-for `AUTH_SECRET`), otherwise writes an obvious `REPLACE-ME` placeholder so
-`az keyvault secret list` shows you exactly what still needs a real value. `AZURE_TENANT_ID` is
-filled from the environment's own `vars.AZURE_TENANT_ID` (already configured for azure/login) --
-no separate secret needed for that one.
+already conditioned to allow exactly this, see onboard-target.ps1), then seeds two kinds of value:
+
+- Non-secret, already known from this repo's own IaC -- `AZURE_TENANT_ID` (from the environment's
+  own `vars.AZURE_TENANT_ID`) and `AIDW_AGENT_APP_ID` (parsed straight out of
+  `infra/params/<target>.bicepparam`'s `entraAppId`). No GitHub secret needed for either.
+- Everything else, a real credential: uses that environment's `CONFIG_<NAME>` GitHub secret if
+  you've set one (e.g. `CONFIG_AUTH_SECRET` for `AUTH_SECRET`), otherwise writes an obvious
+  `REPLACE-ME` placeholder so `az keyvault secret list` shows you exactly what still needs a real
+  value.
 
 **Manual (copying from an existing environment, or fixing up one secret):**
 `az keyvault secret show` → `set` loop, same `_`→`-` naming. Grant yourself

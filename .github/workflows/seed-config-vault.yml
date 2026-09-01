@@ -53,19 +53,40 @@ jobs:
             done
           fi
 
-      # Only creates secrets that don't already exist in the vault -- never overwrites a real
-      # value with a placeholder or a stale GitHub secret. Each name maps 1:1 to docs/CONFIG.md's
-      # "required for a real deployment" section; add a line here AND there, not just one place,
-      # if that list ever changes. GitHub secret names are CONFIG_<the same underscore name> --
-      # set the ones you have real values for (repo or this environment's own secrets, either
-      # works); anything left unset gets an obvious placeholder instead of being silently skipped,
-      # so `az keyvault secret list` always shows you exactly what's real vs. still needs a value.
+      # Values that AREN'T credentials and already have a known-good answer sitting in this
+      # repo's own IaC -- no placeholder, no GitHub secret, just copied straight from the source
+      # of truth so it can't drift out of sync with what bicep actually deployed.
+      - name: seed non-secret config values (idempotent, additive only)
+        run: |
+          set -eu
+          ENTRA_APP_ID=$(grep -oP "param entraAppId = '\K[^']+" "infra/params/${{ inputs.target }}.bicepparam")
+          declare -A KNOWN=(
+            [AZURE-TENANT-ID]="${{ vars.AZURE_TENANT_ID }}"
+            [AIDW-AGENT-APP-ID]="$ENTRA_APP_ID"
+          )
+          for name in "${!KNOWN[@]}"; do
+            if az keyvault secret show --vault-name "$NAME_PREFIX-config" --name "$name" >/dev/null 2>&1; then
+              echo "skip $name (already set)"
+              continue
+            fi
+            az keyvault secret set --vault-name "$NAME_PREFIX-config" --name "$name" --value "${KNOWN[$name]}" >/dev/null
+            echo "seeded $name"
+          done
+
+      # Everything below is a real credential -- never derivable from this repo, always from a
+      # CONFIG_<NAME> GitHub secret you set yourself (or left blank on purpose). Only creates
+      # secrets that don't already exist in the vault -- never overwrites a real value with a
+      # placeholder or a stale GitHub secret. Each name maps 1:1 to docs/CONFIG.md's "required for
+      # a real deployment" section, minus the two non-secret ones seeded above; add a line here
+      # AND there, not just one place, if that list ever changes. Anything left unset gets an
+      # obvious placeholder instead of being silently skipped, so
+      # `az keyvault secret list --vault-name <name>-config` always shows you exactly what's real
+      # vs. still needs a value.
       - name: seed required secrets (idempotent, additive only)
         env:
           AUTH_SECRET: ${{ secrets.CONFIG_AUTH_SECRET }}
           AUTH_GITHUB_ID: ${{ secrets.CONFIG_AUTH_GITHUB_ID }}
           AUTH_GITHUB_SECRET: ${{ secrets.CONFIG_AUTH_GITHUB_SECRET }}
-          AIDW_AGENT_APP_ID: ${{ secrets.CONFIG_AIDW_AGENT_APP_ID }}
           AIDW_AGENT_CLIENT_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_CLIENT_SECRET }}
           AIDW_AGENT_SHARED_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_SHARED_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.CONFIG_ANTHROPIC_API_KEY }}
@@ -77,8 +98,6 @@ jobs:
             [AUTH-SECRET]="$AUTH_SECRET"
             [AUTH-GITHUB-ID]="$AUTH_GITHUB_ID"
             [AUTH-GITHUB-SECRET]="$AUTH_GITHUB_SECRET"
-            [AZURE-TENANT-ID]="${{ vars.AZURE_TENANT_ID }}"
-            [AIDW-AGENT-APP-ID]="$AIDW_AGENT_APP_ID"
             [AIDW-AGENT-CLIENT-SECRET]="$AIDW_AGENT_CLIENT_SECRET"
             [AIDW-AGENT-SHARED-SECRET]="$AIDW_AGENT_SHARED_SECRET"
             [ANTHROPIC-API-KEY]="$ANTHROPIC_API_KEY"
