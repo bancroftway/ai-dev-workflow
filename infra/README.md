@@ -48,13 +48,27 @@ and the bicepparam skeleton. Then follow its printed steps 1-5.
 crash-loop until the config vault is seeded. Seed it (below), restart both container apps
 (`az containerapp revision restart`), re-run the Deploy workflow — every step is idempotent.
 
-### Config vault seeding (manual, per target)
+### Config vault seeding
 
-`deploy.yml` creates `<namePrefix>-config`; a human seeds it (the pipeline never holds app
-secrets): one secret per env var, `_` → `-` (`AUTH_SECRET` → `AUTH-SECRET`); the name inventory
-is `agent/src/config_inventory.py` and `docs/CONFIG.md`. For a new env, copy from an existing
-vault (`az keyvault secret show` → `set` loop). Grant yourself `Key Vault Secrets Officer` on
-the vault first. Client secrets expire (≤24 months) — calendar the rotation.
+`deploy.yml` creates `<namePrefix>-config`; the pipeline never holds app secrets, so something
+else has to write into it: one secret per env var, `_` → `-` (`AUTH_SECRET` → `AUTH-SECRET`); the
+name inventory is docs/CONFIG.md's "Secrets / identity (required for a real deployment)" section.
+
+**Automated (creates only what's missing, never overwrites a real value):** run the
+`Seed Config Vault` workflow (`workflow_dispatch`, target = the GitHub Environment name). It
+self-grants `Key Vault Secrets Officer` on the vault (the deploy SP's RBAC-Administrator role is
+already conditioned to allow exactly this, see onboard-target.ps1), then for each required secret:
+uses that environment's `CONFIG_<NAME>` GitHub secret if you've set one (e.g. `CONFIG_AUTH_SECRET`
+for `AUTH_SECRET`), otherwise writes an obvious `REPLACE-ME` placeholder so
+`az keyvault secret list` shows you exactly what still needs a real value. `AZURE_TENANT_ID` is
+filled from the environment's own `vars.AZURE_TENANT_ID` (already configured for azure/login) --
+no separate secret needed for that one.
+
+**Manual (copying from an existing environment, or fixing up one secret):**
+`az keyvault secret show` → `set` loop, same `_`→`-` naming. Grant yourself
+`Key Vault Secrets Officer` on the vault first.
+
+Either way: client secrets expire (≤24 months) — calendar the rotation.
 
 ### Idempotency notes
 
