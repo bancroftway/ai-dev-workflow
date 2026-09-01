@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd ../.. && pwd)"
-source ./versions.sh # TRIVY_SEVERITY / TRIVY_TIMEOUT per image -- same values deploy.yml reads.
+source ./versions.sh # TRIVY_SEVERITY/TRIVY_TIMEOUT/DOCKLE_TIMEOUT per image -- deploy.yml reads the same.
 
 fail=0
 run() { echo "== $* =="; "$@" || { echo "FAILED: $*"; fail=1; }; }
@@ -28,7 +28,7 @@ for name in frontend agent sandbox; do
   tag="ai-dev-workflow-$name:local-check"
   run ./hadolint.sh "$context/Dockerfile"
   run ./build-image.sh "$tag" "$context"
-  run ./dockle.sh "$tag"
+  run ./dockle.sh "$tag" "${DOCKLE_TIMEOUT[$name]}"
   run ./trivy-image.sh "$tag" "${TRIVY_SEVERITY[$name]}" "${TRIVY_TIMEOUT[$name]}"
 done
 

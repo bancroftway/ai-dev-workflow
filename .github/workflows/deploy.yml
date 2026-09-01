@@ -92,9 +92,11 @@ jobs:
       - name: hadolint
         run: scripts/security-checks/hadolint.sh "${{ matrix.context }}/Dockerfile"
       # sandbox is a multi-toolchain dev image (node, python, gh cli, claude code, ...) big enough
-      # that the runner's ~14GB free disk runs out mid-build/scan even after this; the rest of the
-      # preinstalled toolcache (dotnet, android, ghc, codeql, powershell, various JVMs) is dead
-      # weight for a docker-build-only job.
+      # that the runner's ~14GB free disk runs out mid-build/scan without this; the preinstalled
+      # toolcache (dotnet, android, ghc, codeql, powershell, various JVMs) is dead weight for a
+      # docker-build-only job. This is the actual fix -- a `docker builder prune` after the build
+      # was tried too, but a fresh runner has nothing stale to reclaim: every byte of that cache
+      # still backs the one image we just built and haven't scanned/pushed yet, so it reclaimed 0B.
       - name: free disk space (sandbox only)
         if: matrix.name == 'sandbox'
         run: |
@@ -104,18 +106,18 @@ jobs:
           df -h /
       - name: build image
         run: scripts/security-checks/build-image.sh "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}" "${{ matrix.context }}"
-      # The 30-step Dockerfile's buildkit cache is the other big consumer -- drop everything except
-      # the final tagged image trivy/push actually need.
-      - name: prune docker build cache (sandbox only)
-        if: matrix.name == 'sandbox'
-        run: |
-          docker builder prune -af
-          docker image prune -f
-          df -h /
       # Lints the BUILT image against CIS/best-practice checks (non-root user, no baked secrets,
       # unnecessary setuid bits, ...) -- complements trivy's CVE scan with configuration hygiene.
+      # dockle's own default timeout (1m30s) isn't enough for sandbox either -- same cause as
+      # trivy's below, same TRIVY_TIMEOUT-style lookup for consistency.
       - name: dockle
-        run: scripts/security-checks/dockle.sh "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${{ matrix.name }}:${{ github.sha }}"
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+        run: |
+          source scripts/security-checks/versions.sh
+          scripts/security-checks/dockle.sh \
+            "ghcr.io/${{ github.repository_owner }}/ai-dev-workflow-${IMAGE_NAME}:${{ github.sha }}" \
+            "${DOCKLE_TIMEOUT[$IMAGE_NAME]}"
       # Gate BEFORE push: a vulnerable or secret-carrying image never reaches any registry.
       # frontend/agent (what's actually exposed) block on LOW+ -- every fixable finding, no floor.
       # sandbox is a multi-toolchain dev image that chronically carries LOW/MEDIUM noise in some

@@ -19,3 +19,8 @@ declare -A TRIVY_TIMEOUT=(
   [agent]="5m0s"
   [sandbox]="20m0s"
 )
+declare -A DOCKLE_TIMEOUT=(
+  [frontend]="1m30s"
+  [agent]="1m30s"
+  [sandbox]="10m0s"
+)
