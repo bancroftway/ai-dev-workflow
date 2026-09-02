@@ -6,9 +6,9 @@ target for the drafting nodes' model calls.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, ValidationError, model_validator
 
 
 class StageReport(BaseModel):
@@ -352,6 +352,119 @@ class PlanAuditResponse(BaseModel):
     )
 
 
+NonBlankStr = Annotated[str, StringConstraints(min_length=1, strip_whitespace=True)]
+"""A str that Pydantic rejects if empty or all-whitespace after stripping. Use in place of a bare
+`str` field anywhere blank is a silent way to mean "I have nothing to say" -- reasons, roots,
+anything meant to be read by a human or another gate."""
+
+
+class PresenceList(BaseModel):
+    """Typed replacement for a bare `list[str]` field whenever an empty list is ambiguous: did the
+    detector look and find nothing, or did it never look? `status` makes that explicit instead of
+    forcing every reader to guess from an empty list alone.
+    """
+
+    status: Literal["present", "absent"]
+    values: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_bare_list(cls, data: Any) -> Any:
+        """Older sidecars/model output stored this as a bare `list[str]` (or `None` for "nothing
+        found"). Coerce that shape into the typed one so existing producers aren't broken by this
+        field going from a list to an object."""
+        if isinstance(data, list):
+            if data:
+                return {"status": "present", "values": list(data)}
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        if data is None:
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        return data
+
+    @model_validator(mode="after")
+    def _validate_presence(self) -> "PresenceList":
+        if self.status == "present":
+            if not self.values:
+                raise ValueError("status='present' requires a non-empty values list.")
+        else:  # absent
+            if self.values:
+                raise ValueError("status='absent' requires an empty values list.")
+            if not self.reason.strip():
+                raise ValueError("status='absent' requires a non-blank reason.")
+        return self
+
+
+class DotnetStatus(BaseModel):
+    """Typed replacement for the `dotnet_detected: bool` / `dotnet_solution_root: str | None` field
+    pair. Folds in the low-confidence case `tech_stack_draft.md:9-11` already describes in prose --
+    detected but the solution root couldn't be confidently located -- as a first-class state
+    instead of an unexplained `None`.
+    """
+
+    status: Literal["detected", "not_detected"]
+    solution_root: str | None = None
+    reason: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_dotnet_pair(cls, data: Any) -> Any:
+        """Older sidecars/model output stored this as the separate `dotnet_detected` /
+        `dotnet_solution_root` fields. Coerce that pair into the typed shape."""
+        if isinstance(data, dict) and "dotnet_detected" in data and "status" not in data:
+            if data.get("dotnet_detected"):
+                return {
+                    "status": "detected",
+                    "solution_root": data.get("dotnet_solution_root"),
+                    "reason": "",
+                }
+            return {
+                "status": "not_detected",
+                "solution_root": None,
+                "reason": "legacy sidecar, pre-typed-absence",
+            }
+        return data
+
+    @model_validator(mode="after")
+    def _validate_dotnet_status(self) -> "DotnetStatus":
+        if self.status == "detected":
+            if not (self.solution_root or "").strip() and not self.reason.strip():
+                raise ValueError(
+                    "status='detected' requires either a non-blank solution_root or a non-blank "
+                    "reason explaining why the root couldn't be confidently located."
+                )
+        else:  # not_detected
+            if not self.reason.strip():
+                raise ValueError("status='not_detected' requires a non-blank reason.")
+            if self.solution_root is not None:
+                raise ValueError("status='not_detected' requires solution_root=None.")
+        return self
+
+
+class EcosystemRoot(BaseModel):
+    """Typed replacement for one entry of the `convention_roots: dict[str, str]` map -- makes
+    "this ecosystem isn't present" a first-class state instead of an omitted dict key that every
+    reader has to know to check for.
+    """
+
+    ecosystem: Literal["node", "python"]
+    status: Literal["present", "absent"]
+    root: str = ""
+    reason: str = ""
+
+    @model_validator(mode="after")
+    def _validate_ecosystem_root(self) -> "EcosystemRoot":
+        if self.status == "present":
+            if not self.root.strip():
+                raise ValueError("status='present' requires a non-blank root.")
+        else:  # absent
+            if self.root.strip():
+                raise ValueError("status='absent' requires a blank root.")
+            if not self.reason.strip():
+                raise ValueError("status='absent' requires a non-blank reason.")
+        return self
+
+
 class TechStack(BaseModel):
     """brownfield-baseline tech-stack detection content model. Deliberately full and typed, never a thin summary --
     this is what render_tech_stack_markdown writes tech-stack.md from (the sole writer, exactly
@@ -420,3 +533,109 @@ class TechStackDraftResponse(BaseModel):
 
 # Raw requirements have no schemas: the human's text is recorded verbatim by the deterministic
 # record_raw_requirements_node in graph.py -- no draft, no audit, no structured output.
+
+
+if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.schemas`
+    # NonBlankStr: rejects blank/whitespace-only, strips what it keeps.
+    class _NonBlankStrProbe(BaseModel):
+        value: NonBlankStr
+
+    assert _NonBlankStrProbe(value="  hi  ").value == "hi"
+    try:
+        _NonBlankStrProbe(value="   ")
+        raise AssertionError("expected ValidationError for a blank NonBlankStr")
+    except ValidationError:
+        pass
+
+    # PresenceList: new shape round-trips as given.
+    present = PresenceList(status="present", values=["a", "b"])
+    assert present.model_dump() == {"status": "present", "values": ["a", "b"], "reason": ""}
+    absent = PresenceList(status="absent", reason="checked, none found")
+    assert absent.values == []
+
+    # PresenceList: legacy bare-list/None coercion.
+    assert PresenceList.model_validate(["x", "y"]).model_dump() == {
+        "status": "present",
+        "values": ["x", "y"],
+        "reason": "",
+    }
+    for legacy_absent in ([], None):
+        coerced = PresenceList.model_validate(legacy_absent)
+        assert coerced.status == "absent"
+        assert coerced.values == []
+        assert coerced.reason == "legacy sidecar, pre-typed-absence"
+
+    try:
+        PresenceList(status="present", values=[])
+        raise AssertionError("expected ValidationError for present with empty values")
+    except ValidationError:
+        pass
+    try:
+        PresenceList(status="absent", values=["x"])
+        raise AssertionError("expected ValidationError for absent with non-empty values")
+    except ValidationError:
+        pass
+    try:
+        PresenceList(status="absent")
+        raise AssertionError("expected ValidationError for absent with blank reason")
+    except ValidationError:
+        pass
+
+    # DotnetStatus: legacy dotnet_detected/dotnet_solution_root pair coercion, both directions.
+    legacy_not_detected = DotnetStatus.model_validate(
+        {"dotnet_detected": False, "dotnet_solution_root": None}
+    )
+    assert legacy_not_detected.status == "not_detected"
+    assert legacy_not_detected.solution_root is None
+    assert legacy_not_detected.reason == "legacy sidecar, pre-typed-absence"
+
+    legacy_detected = DotnetStatus.model_validate(
+        {"dotnet_detected": True, "dotnet_solution_root": "src/Api"}
+    )
+    assert legacy_detected.status == "detected"
+    assert legacy_detected.solution_root == "src/Api"
+    assert legacy_detected.reason == ""
+
+    # DotnetStatus: new shape covers the low-confidence case (detected, no root, but a reason).
+    low_confidence = DotnetStatus(status="detected", reason="two unrelated .csproj roots found")
+    assert low_confidence.solution_root is None
+
+    try:
+        DotnetStatus(status="detected")
+        raise AssertionError("expected ValidationError for detected with no root and no reason")
+    except ValidationError:
+        pass
+    try:
+        DotnetStatus(status="not_detected")
+        raise AssertionError("expected ValidationError for not_detected with a blank reason")
+    except ValidationError:
+        pass
+    try:
+        DotnetStatus(status="not_detected", solution_root="src", reason="stray root")
+        raise AssertionError("expected ValidationError for not_detected with a solution_root")
+    except ValidationError:
+        pass
+
+    # EcosystemRoot: same present/absent pattern, no legacy coercion (nothing to migrate yet).
+    node_present = EcosystemRoot(ecosystem="node", status="present", root="apps/web")
+    assert node_present.root == "apps/web"
+    python_absent = EcosystemRoot(ecosystem="python", status="absent", reason="no pyproject.toml")
+    assert python_absent.root == ""
+
+    try:
+        EcosystemRoot(ecosystem="node", status="present", root="")
+        raise AssertionError("expected ValidationError for present with a blank root")
+    except ValidationError:
+        pass
+    try:
+        EcosystemRoot(ecosystem="python", status="absent", root="apps/api")
+        raise AssertionError("expected ValidationError for absent with a non-blank root")
+    except ValidationError:
+        pass
+    try:
+        EcosystemRoot(ecosystem="python", status="absent")
+        raise AssertionError("expected ValidationError for absent with a blank reason")
+    except ValidationError:
+        pass
+
+    print("schemas self-check: all assertions passed")
