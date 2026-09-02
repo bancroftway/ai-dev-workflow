@@ -248,6 +248,32 @@ async def check_write_scope(
     )
 
 
+# Task 8: one line per real rejection branch inside verify_ac_to_tests below, in plain English a
+# model can act on -- not a restatement of the Python. Eight distinct reasons, not five: the four
+# `check_*` provenance calls folded into one `protection_problems` list (~lines 292-297) are each
+# an independent rejection reason in their own right, not one "retired-AC" umbrella.
+AC_TO_TESTS_HARD_RULES: tuple[str, ...] = (
+    "Only create or edit test files, test configs, and test setup files here -- anything else you "
+    "write is out of this stage's scope; it will be detected against the pre-stage baseline and "
+    "reverted, and the stage fails outright on the rare case that revert itself cannot succeed.",
+    "Never modify the spec ledger -- it is pipeline-owned truth, not yours to write; any change you "
+    "make to it is treated as tampering, gets reverted, and fails this stage.",
+    "Delete the test cases for any acceptance criterion id that has been retired from the "
+    "Specification -- a retired criterion may not still be named by a test file.",
+    "Delete the test cases for any acceptance criterion id that is deferred and was never actually "
+    "built -- parked, undelivered scope may not be dragged in by a failing test that names it.",
+    "Never delete or rename the tests for an acceptance criterion that is already completed (has a "
+    "coded_run_id) -- its regression tests must keep being named by some test file on disk.",
+    "You must actually create/edit the test files with your file tools before you answer -- a "
+    "structured response that only describes tests, with no matching write call, fails this stage.",
+    "Do not write only Playwright end-to-end specs -- a suite made of e2e alone proves nothing below "
+    "the UI and is rejected; add unit and/or integration/subcutaneous tests for the same criteria too.",
+    "If this stack has a UI framework, you must also write at least one real Playwright end-to-end "
+    "spec under tests/e2e/ (with a working playwright.config.ts) -- a UI stack with zero browser "
+    "tests is rejected.",
+)
+
+
 async def verify_ac_to_tests(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: SandboxProvider,
     chat_provider: str,
@@ -443,6 +469,13 @@ def _demo() -> None:
     # just makes that fact a standing check instead of a one-time reading of the source.
     assert _is_test_path("apps/api.Tests/TaskTests.cs")  # true whether this path was added, edited, or deleted
     assert not _is_test_path("apps/api/Startup.cs")  # same regardless of operation -- always reverted if changed
+
+    # AC_TO_TESTS_HARD_RULES: one line per real rejection branch in verify_ac_to_tests -- write-scope,
+    # ledger-integrity, retired-residue, deferred-residue, completed-AC protection, no-files-written,
+    # e2e-only, and missing-e2e. Eight, not five: the four check_* provenance calls folded into one
+    # protection_problems list are each counted separately here, same as they are for the model.
+    assert len(AC_TO_TESTS_HARD_RULES) == 8
+    assert all(isinstance(r, str) and r.strip() for r in AC_TO_TESTS_HARD_RULES)
     print("write_scope_gate self-check: all assertions passed")
 
 

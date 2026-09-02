@@ -63,7 +63,7 @@ from .gates import adversarial_gate, remediation_gate, skill_gate
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
 from .gates.diagram_gate import verify_plan_diagrams
 from .gates.test_coverage_gate import verify_coverage
-from .gates.write_scope_gate import verify_ac_to_tests
+from .gates.write_scope_gate import AC_TO_TESTS_HARD_RULES, verify_ac_to_tests
 from .infra_retry import call_with_infra_retry
 from .a2ui_tools import (
     build_ac_to_tests_envelope,
@@ -1631,6 +1631,11 @@ STAGES: list[StageSpec] = [
         requires_human_gate=False,
         capture_baseline_commit=True,
         deterministic_verify=verify_ac_to_tests,
+        # Task 8: the same hard gates verify_ac_to_tests enforces, spelled out up front so the model
+        # can avoid a rejection instead of only learning the rule from one. Threaded automatically
+        # into the draft's ainvoke_structured call by make_draft_node's generic rules=stage_spec.
+        # draft_rules -- ac-to-tests has no custom draft node to wire separately.
+        draft_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ac_to_tests_ticket_mode_context,
         # Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block --
         # the model returns a fully-detailed coverage_plan claiming it "created failing RED-phase
