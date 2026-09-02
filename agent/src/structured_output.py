@@ -40,12 +40,40 @@ def _resolve_ref(prop: dict, defs: dict) -> dict | None:
     return defs.get(_ref_name(ref)) if ref else None
 
 
+def _first_enum_field(model_def: dict, defs: dict) -> tuple[str, list] | None:
+    """One level into an ordinary object $defs entry's OWN properties: the first one that is
+    itself enum-shaped (a direct Literal, or a $ref to a named Enum) -- e.g. PresenceList's
+    `status`, DotnetStatus's `status`, EcosystemRoot's `status` (schemas.py). Not hardcoded to the
+    name "status": whichever field is enum-shaped first wins. Deliberately not recursive beyond
+    this one level -- this codebase's wrapper types are all exactly one level deep."""
+    for field_name, field_prop in model_def.get("properties", {}).items():
+        if "enum" in field_prop:
+            return field_name, field_prop["enum"]
+        ref_target = _resolve_ref(field_prop, defs)
+        if ref_target and "enum" in ref_target:
+            return field_name, ref_target["enum"]
+    return None
+
+
 def _type_label(prop: dict, defs: dict) -> str:
     """Compact type label for one schema property -- resolves `$ref`/`anyOf`/`array` one level
     deep so a reader sees e.g. `TechStack | null` or `array[ClarifyingQuestion]` instead of a bare
-    "object"/"array"."""
+    "object"/"array".
+
+    A `$ref` to an ordinary nested BaseModel (not itself a named Enum -- that case is `_enum_values`'s
+    job, via its own `[allowed: ...]` suffix) additionally surfaces THAT model's own wrapper enum,
+    e.g. `PresenceList — status: present|absent` -- without this, build_schema_contract's "cannot
+    drift from the schema by construction" claim would be hollow for PresenceList/DotnetStatus/
+    EcosystemRoot, whose entire reason for existing is exactly that one status-shaped field."""
     if "$ref" in prop:
-        return _ref_name(prop["$ref"])
+        ref_name = _ref_name(prop["$ref"])
+        target = defs.get(ref_name)
+        if target is not None and "enum" not in target:
+            nested = _first_enum_field(target, defs)
+            if nested:
+                field_name, values = nested
+                return f"{ref_name} — {field_name}: {'|'.join(str(v) for v in values)}"
+        return ref_name
     prop_type = prop.get("type")
     if prop_type == "array":
         item_label = _type_label(prop["items"], defs) if "items" in prop else "any"
@@ -59,15 +87,17 @@ def _type_label(prop: dict, defs: dict) -> str:
 
 
 def _enum_values(prop: dict, defs: dict) -> list | None:
-    """The allowed values for one schema property, or None if it isn't enum-shaped.
+    """The allowed values for one schema property ITSELF, or None if the property isn't
+    enum-shaped.
 
     Checked directly on the property (how Pydantic renders a `Literal[...]` field -- inline
     `"enum": [...]` with no `$ref`, confirmed against this codebase's own `auth_kind` field) and,
     one level deep, on a `$ref` target (how a named Enum type alias would render: the enum lives
     on the $defs entry itself, not the property). A `$ref` to an ordinary nested BaseModel (e.g.
-    `PresenceList`) has no top-level `enum` on its $defs entry, so it correctly yields nothing here
-    -- its own sub-fields' enums stay out of this summary by design (compact, not a re-dump of the
-    entire schema)."""
+    `PresenceList`) has no top-level `enum` on its own $defs entry, so it correctly yields nothing
+    here -- that model's own enum-shaped sub-field (`PresenceList.status`) is a DIFFERENT case,
+    surfaced by `_type_label` instead (see its docstring), not duplicated into this `[allowed: ...]`
+    suffix."""
     if "enum" in prop:
         return prop["enum"]
     target = _resolve_ref(prop, defs)
@@ -230,12 +260,13 @@ def _demo() -> None:
     expected = '{\n  "key": "value",\n  "nested": {"a": 1}\n}'
     assert stripped == expected, f"multiline JSON mangled: {stripped!r}"
 
-    # build_schema_contract: field/enum summary, covering every shape _type_label/_enum_values
-    # need to tell apart -- a direct Literal (inline enum, confirmed against this codebase's real
-    # `auth_kind` field), a named Enum type ($ref to a $defs entry that itself carries the enum),
-    # a plain nested object ($ref with no enum of its own -- must NOT show "[allowed:" from its
-    # sub-fields, this summary is compact by design, not a recursive re-dump), an Optional nested
-    # object (anyOf + null), and an array of nested objects.
+    # build_schema_contract: field/enum summary, covering every shape _type_label/_enum_values/
+    # _first_enum_field need to tell apart -- a direct Literal (inline enum, confirmed against this
+    # codebase's real `auth_kind` field), a named Enum type ($ref to a $defs entry that itself
+    # carries the enum), a plain nested object with NO enum of its own (must NOT show "[allowed:"),
+    # a nested object whose OWN sub-field is enum-shaped under a name OTHER than "status" (proves
+    # _first_enum_field isn't hardcoded to that one field name), an Optional nested object (anyOf +
+    # null), and an array of nested objects.
     from enum import Enum
     from typing import Literal as _Literal
 
@@ -248,16 +279,23 @@ def _demo() -> None:
     class _DemoNested(BaseModel):
         x: int = 0
 
+    class _DemoWrapper(BaseModel):
+        # Deliberately NOT named "status" -- _first_enum_field must find whichever field is
+        # enum-shaped, not just one hardcoded name.
+        mode: _Literal["alpha", "beta"] = "alpha"
+
     class _DemoSchema(BaseModel):
         name: str = Field(description="a name")
         kind: _Literal["one", "two"] = Field(description="a literal kind")
         tag: _DemoEnum = Field(description="a named enum")
         nested: _DemoNested = Field(description="a nested object")
+        wrapped: _DemoWrapper = Field(description="a nested object with its own enum field")
         maybe_nested: _DemoNested | None = Field(default=None, description="optional nested")
         items: list[_DemoNested] = Field(default_factory=list, description="a list")
 
     demo_example = _DemoSchema(
-        name="n", kind="one", tag=_DemoEnum.A, nested=_DemoNested(x=1), items=[_DemoNested(x=2)]
+        name="n", kind="one", tag=_DemoEnum.A, nested=_DemoNested(x=1),
+        wrapped=_DemoWrapper(), items=[_DemoNested(x=2)],
     )
     contract = build_schema_contract(
         _DemoSchema.model_json_schema(), example=demo_example, rules="Rule: always do X."
@@ -271,12 +309,27 @@ def _demo() -> None:
         line.startswith("- tag (") and "a named enum" in line and "[allowed: a, b]" in line for line in lines
     ), contract
     assert any(
-        line.startswith("- nested (") and "a nested object" in line and "[allowed:" not in line for line in lines
-    ), "a plain nested object's OWN sub-field enums must not leak into this compact summary"
+        line.startswith("- nested (") and "a nested object" in line and "[allowed:" not in line and "—" not in line
+        for line in lines
+    ), "a plain nested object with no enum of its own must show neither [allowed:] nor a — hint"
+    assert any(
+        line.startswith("- wrapped (_DemoWrapper — mode: alpha|beta)") for line in lines
+    ), "a nested object's OWN non-'status'-named enum field must surface in the type label"
     assert any(line.startswith("- maybe_nested (") and " | null" in line for line in lines), contract
     assert any(line.startswith("- items (array[") for line in lines), contract
     assert "Worked example:" in contract and '"name": "n"' in contract, contract
     assert contract.endswith("Rule: always do X."), contract
+
+    # Same nested-wrapper-enum case, against a REAL schema from this codebase (not just the
+    # synthetic one above) -- TechStack's `languages` field is a PresenceList (schemas.py), whose
+    # own `status` field is the enum a model most needs to see right the first time.
+    from .schemas import TechStack
+
+    real_contract = build_schema_contract(TechStack.model_json_schema())
+    assert (
+        "- languages (PresenceList — status: present|absent): Programming languages found evidence for."
+        in real_contract
+    ), real_contract
 
     # No example/rules given -> build_schema_contract renders no worked example/rules section
     # (still just the field summary) -- exercised directly since ainvoke_structured only calls it
@@ -292,7 +345,9 @@ def _demo() -> None:
 
     assert_example_matches_schema(TECH_STACK_DRAFT_EXAMPLE, TechStackDraftResponse)
     rejected = False
-    wrong_type_example = _DemoSchema(kind="one", tag=_DemoEnum.A, nested=_DemoNested(), name="n")
+    wrong_type_example = _DemoSchema(
+        kind="one", tag=_DemoEnum.A, nested=_DemoNested(), wrapped=_DemoWrapper(), name="n"
+    )
     try:
         assert_example_matches_schema(wrong_type_example, TechStackDraftResponse)  # type: ignore[arg-type]
     except AssertionError:
