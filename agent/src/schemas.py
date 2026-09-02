@@ -6,6 +6,7 @@ target for the drafting nodes' model calls.
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, StringConstraints, ValidationError, model_validator
@@ -478,46 +479,45 @@ class TechStack(BaseModel):
     by name from the draft prompt, itself never writing files) is reported into."""
 
     summary: str = Field(description="One or two sentences describing the stack at a glance.")
-    languages: list[str] = Field(default_factory=list)
-    frameworks: list[str] = Field(default_factory=list)
-    package_managers: list[str] = Field(default_factory=list)
-    testing_frameworks: list[str] = Field(default_factory=list)
-    conventions: list[str] = Field(
-        default_factory=list, description="Observed conventions, each with a short reason."
+    languages: PresenceList = Field(description="Programming languages found evidence for.")
+    frameworks: PresenceList = Field(description="Frameworks found evidence for.")
+    package_managers: PresenceList = Field(description="Package managers found evidence for.")
+    testing_frameworks: PresenceList = Field(description="Testing frameworks found evidence for.")
+    conventions: PresenceList = Field(
+        description="Observed conventions, each with a short reason."
     )
-    dotnet_detected: bool = Field(default=False, description="Any .csproj/.sln files found.")
-    dotnet_solution_root: str | None = Field(
-        default=None,
-        description="Repo-relative path to the common ancestor of all .csproj files (where "
-        "Directory.Build.props belongs), or None if not confidently determined.",
+    dotnet: DotnetStatus = Field(
+        description="Whether any .csproj/.sln files were found and, if so, the repo-relative "
+        "solution root (where Directory.Build.props belongs), or a reason it couldn't be "
+        "confidently determined."
     )
-    convention_roots: dict[str, str] = Field(
-        default_factory=dict,
-        description="Repo-relative directory where each non-.NET ecosystem's shared config file "
-        "belongs, keyed by ecosystem: 'node' (the workspace root holding package.json) and "
-        "'python' (the project root holding pyproject.toml/setup.cfg/requirements.txt). Use \"\" "
-        "for the repository root itself. Omit a key entirely when the ecosystem isn't present or "
-        "no confident common root exists -- a wrong root is worse than a missing one. .NET keeps "
-        "its own dotnet_solution_root field above rather than a key here, because several "
-        "pipeline stages already read that field by name.",
+    convention_roots: list[EcosystemRoot] = Field(
+        default_factory=list,
+        description="One entry per non-.NET ecosystem actually checked -- 'node' (the workspace "
+        "root holding package.json) and 'python' (the project root holding "
+        "pyproject.toml/setup.cfg/requirements.txt). root is the repo-relative directory where "
+        "that ecosystem's shared config file belongs (\".\" for the repository root itself -- "
+        "root can't be blank when status='present') when status='present'; a reason when "
+        "status='absent' (not present, or no single confident common root). .NET keeps its own "
+        "top-level `dotnet` field rather than an entry here, because several pipeline stages "
+        "already read that field by name.",
     )
     conventions_applied: list[str] = Field(
         default_factory=list,
         description="Which language-specific convention files were actually written this run "
-        "(e.g. ['dotnet']) -- populated by the deterministic post_audit_hook after it runs, not "
+        "(e.g. ['dotnet']) -- populated by the deterministic post_approve_hook after it runs, not "
         "by the model itself, since the model never writes files.",
     )
-    auth_kind: str = Field(
+    auth_kind: Literal["entra", "google", "generic-oidc", "custom", "none"] = Field(
         default="none",
-        description="How the app authenticates users, one of: 'entra' (Microsoft Entra ID / "
+        description="How the app authenticates users: 'entra' (Microsoft Entra ID / "
         "Microsoft.Identity.Web / MSAL), 'google', 'generic-oidc' (any other OpenID Connect "
         "provider), 'custom' (the app checks credentials itself -- ASP.NET Identity, a login form "
         "issuing its own cookie/JWT, a Credentials provider), or 'none' (no sign-in). Drives "
         "whether e2e uses a fake OIDC identity provider (OIDC kinds) or seeded users + the real "
         "login form (custom), and whether the auth-enforcement gate arms.",
     )
-    config_inventory: list[str] = Field(
-        default_factory=list,
+    config_inventory: PresenceList = Field(
         description="Config keys the app reads that a tester may need to supply values for -- "
         "appsettings section paths ('Section:Key') and code-read keys "
         "(Configuration[...], GetSection, process.env.X). Unioned with a deterministic scan; "
@@ -535,6 +535,77 @@ class TechStackDraftResponse(BaseModel):
     tech_stack: TechStack | None = Field(
         default=None, description="Present whenever a draft was produced, ready or not."
     )
+
+
+TECH_STACK_DRAFT_EXAMPLE: TechStackDraftResponse = TechStackDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    tech_stack=TechStack(
+        summary="Small Node/TypeScript API service using Express, tested with Jest; no .NET or "
+        "Python components detected.",
+        languages=PresenceList(status="present", values=["TypeScript", "JavaScript"]),
+        frameworks=PresenceList(status="present", values=["Express"]),
+        package_managers=PresenceList(status="present", values=["npm"]),
+        testing_frameworks=PresenceList(status="present", values=["Jest"]),
+        conventions=PresenceList(
+            status="present",
+            values=[
+                "ESLint + Prettier enforced via a pre-commit hook",
+                "Path aliases configured in tsconfig.json",
+            ],
+        ),
+        dotnet=DotnetStatus(
+            status="not_detected", reason="No .csproj or .sln files found in the repository."
+        ),
+        convention_roots=[
+            EcosystemRoot(ecosystem="node", status="present", root="."),
+            EcosystemRoot(
+                ecosystem="python",
+                status="absent",
+                reason="No pyproject.toml, setup.cfg, or requirements.txt found.",
+            ),
+        ],
+        conventions_applied=[],
+        auth_kind="none",
+        config_inventory=PresenceList(status="present", values=["PORT", "DATABASE_URL"]),
+    ),
+)
+"""Fully-populated example of the tech-stack drafting node's structured output, echoed into the
+draft prompt (Task 7) so the model sees a realistic instance of the current canonical shape."""
+
+
+TECH_STACK_EXTRACT_EXAMPLE: TechStack = TechStack(
+    summary="ASP.NET Core web API secured with Microsoft Entra ID, with a small set of Python "
+    "data-migration scripts alongside the .NET solution.",
+    languages=PresenceList(status="present", values=["C#", "Python"]),
+    frameworks=PresenceList(status="present", values=["ASP.NET Core", "Entity Framework Core"]),
+    package_managers=PresenceList(status="present", values=["NuGet", "pip"]),
+    testing_frameworks=PresenceList(status="present", values=["xUnit"]),
+    conventions=PresenceList(
+        status="present",
+        values=[
+            "Repository pattern for data access",
+            "Feature-folder organization under src/Api",
+        ],
+    ),
+    dotnet=DotnetStatus(status="detected", solution_root="src"),
+    convention_roots=[
+        EcosystemRoot(
+            ecosystem="node",
+            status="absent",
+            reason="No package.json found anywhere in the repository.",
+        ),
+        EcosystemRoot(ecosystem="python", status="present", root="scripts"),
+    ],
+    conventions_applied=[],
+    auth_kind="entra",
+    config_inventory=PresenceList(
+        status="present",
+        values=["AzureAd:TenantId", "AzureAd:ClientId", "ConnectionStrings:Db"],
+    ),
+)
+"""Fully-populated example of the plain TechStack shape (no draft wrapper), for the
+extraction-only prompt path that reads approved markdown back into this same schema."""
 
 
 # Raw requirements have no schemas: the human's text is recorded verbatim by the deterministic
@@ -652,5 +723,45 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
         raise AssertionError("expected ValidationError for absent with a blank reason")
     except ValidationError:
         pass
+
+    # TechStack examples: validate, AND actually use the current canonical (typed) shape --
+    # "validates" alone doesn't prove this, since PresenceList's own before-validator would
+    # silently coerce a stale bare-list/dict example back into the typed shape.
+    _presence_fields = (
+        "languages",
+        "frameworks",
+        "package_managers",
+        "testing_frameworks",
+        "conventions",
+        "config_inventory",
+    )
+    for _label, _stack in (
+        ("TECH_STACK_DRAFT_EXAMPLE.tech_stack", TECH_STACK_DRAFT_EXAMPLE.tech_stack),
+        ("TECH_STACK_EXTRACT_EXAMPLE", TECH_STACK_EXTRACT_EXAMPLE),
+    ):
+        assert _stack is not None, f"{_label} is missing a tech_stack"
+        # Round-trip through JSON to prove the example is really a validated instance of the
+        # CURRENT schema, not just a Python object built to look like one.
+        _reloaded = TechStack.model_validate_json(_stack.model_dump_json())
+        assert _reloaded == _stack, f"{_label} did not round-trip through model_validate_json"
+
+        _dumped = json.loads(_stack.model_dump_json())
+        for _field in _presence_fields:
+            assert "status" in _dumped[_field], f"{_label}.{_field} missing 'status' key"
+        assert "status" in _dumped["dotnet"], f"{_label}.dotnet missing 'status' key"
+        assert _dumped["convention_roots"], f"{_label}.convention_roots is empty"
+        for _root in _dumped["convention_roots"]:
+            assert "status" in _root, f"{_label}.convention_roots entry missing 'status' key"
+
+    assert TechStackDraftResponse.model_validate_json(
+        TECH_STACK_DRAFT_EXAMPLE.model_dump_json()
+    ) == TECH_STACK_DRAFT_EXAMPLE
+
+    # Nested $defs/$refs: TechStack's schema now nests PresenceList/DotnetStatus/EcosystemRoot
+    # instead of flat arrays -- confirm the schema actually reflects that (a regression guard,
+    # not a live end-to-end check of the CLI/model consumers -- see task-2-report.md).
+    _ts_schema = TechStack.model_json_schema()
+    assert "$defs" in _ts_schema, "TechStack.model_json_schema() lost its nested $defs"
+    assert json.dumps(_ts_schema), "TechStack.model_json_schema() failed to json.dumps"
 
     print("schemas self-check: all assertions passed")
