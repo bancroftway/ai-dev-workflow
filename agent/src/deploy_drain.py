@@ -77,6 +77,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable
 
+import pyodbc
+
 from . import session_store
 
 logger = logging.getLogger(__name__)
@@ -98,10 +100,19 @@ async def _list_drainable_sessions() -> list[dict[str, Any]]:
         # UNKNOWN, never TRUE). Treat NULL the same as 0/not-awaiting, matching every other reader
         # in this codebase (session_store._row_to_response, gate_node's own
         # `bool(existing_session and existing_session.get("awaiting_gate"))`).
-        await cur.execute(
-            "SELECT session_id, run_id, current_stage FROM dbo.sessions "
-            "WHERE status = 'in_progress' AND (awaiting_gate = 0 OR awaiting_gate IS NULL)"
-        )
+        try:
+            await cur.execute(
+                "SELECT session_id, run_id, current_stage FROM dbo.sessions "
+                "WHERE status = 'in_progress' AND (awaiting_gate = 0 OR awaiting_gate IS NULL)"
+            )
+        except pyodbc.ProgrammingError as e:
+            # SQLSTATE 42S02 = invalid object name: deploy.yml's drain step only guards on the
+            # *database* existing, not on migrations having run yet -- reachable for real on a
+            # bootstrap retry (SQL server/database created by a previous, later-failed attempt,
+            # migrations still pending). Nothing to drain if the table itself doesn't exist yet.
+            if "42S02" in str(e):
+                return []
+            raise
         rows = await cur.fetchall()
         # SQL Server hands UNIQUEIDENTIFIER back uppercase -- normalize to lowercase, same
         # convention session_store._row_to_dict already applies for every other reader.
