@@ -128,8 +128,8 @@ def _extract_failed_files(lines: list[str]) -> list[str]:
 
 def resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
     """Public: exit's manifest completion records this as the manifest's test_command."""
-    languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
-    if tech_stack.get("dotnet_detected"):
+    languages = [str(l).lower() for l in tech_stack_signals.presence_values(tech_stack, "languages")]
+    if tech_stack_signals.dotnet_detected(tech_stack):
         return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet test --logger 'console;verbosity=normal'"
     if "typescript" in languages or "javascript" in languages:
         return "npx --yes vitest run --reporter=verbose || npx --yes jest --verbose"
@@ -1232,6 +1232,20 @@ async def check_ac_coverage(
 def _demo() -> None:
     """`cd agent && uv run python -m src.gates.ac_coverage_gate`."""
     import asyncio
+
+    # resolve_test_command: TechStack's languages/dotnet fields are PresenceList/DotnetStatus
+    # objects now, not a bare list/bool -- must read ["values"]/["status"] instead of truthiness.
+    assert resolve_test_command({"dotnet": {"status": "detected", "solution_root": "src"}}) == (
+        "cd src && dotnet test --logger 'console;verbosity=normal'"
+    )
+    assert resolve_test_command(
+        {"dotnet": {"status": "not_detected", "reason": "no .csproj"}, "languages": {"status": "present", "values": ["TypeScript"]}}
+    ) == "npx --yes vitest run --reporter=verbose || npx --yes jest --verbose"
+    assert resolve_test_command(
+        {"dotnet": {"status": "not_detected", "reason": "no .csproj"}, "languages": {"status": "present", "values": ["Python"]}}
+    ) == "python -m pytest -v"
+    assert resolve_test_command({}) is None
+    assert resolve_test_command({"languages": {"status": "absent", "values": [], "reason": "none found"}}) is None
 
     # Level classification: e2e by PATH (the only level a path proves), integration by SYMBOL,
     # because .NET keeps unit and integration tests in one project and often one file.

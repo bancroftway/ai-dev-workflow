@@ -117,18 +117,19 @@ async def _stack_has_ui(provider: SandboxProvider, thread_id: str) -> bool:
     requirement, so all three agree on what "has a UI" means. Fails OPEN (False) when the record is
     unreadable -- an unreadable artifact must not be reported as a missing browser test.
     """
-    from ..tech_stack_signals import frameworks_have_ui
+    from ..tech_stack_signals import frameworks_have_ui, presence_values
 
     for path in (workflow_persistence.TECH_STACK_APPROVED_PATH, workflow_persistence.TECH_STACK_DRAFT_PATH):
         raw = await repo_files.read_repo_file(provider, thread_id, path)
         if raw is None:
             continue
         try:
-            frameworks = json.loads(raw).get("frameworks") or []
+            tech_stack = json.loads(raw)
         except json.JSONDecodeError:
             continue
+        frameworks = presence_values(tech_stack, "frameworks")
         if frameworks:
-            return frameworks_have_ui([str(f) for f in frameworks])
+            return frameworks_have_ui(frameworks)
     return False
 
 

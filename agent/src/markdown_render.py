@@ -120,6 +120,20 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def _render_presence_section(lines: list[str], content: dict[str, Any], field: str, heading: str) -> None:
+    """One PresenceList-shaped field (languages/frameworks/package_managers/testing_frameworks/
+    conventions/config_inventory): its values when status="present", else its `reason` -- a human
+    reviewing this document should SEE why a category came back empty, not just an absent section."""
+    entry = content.get(field) or {}
+    lines.append(f"## {heading}")
+    lines.append("")
+    if entry.get("status") == "present":
+        lines.extend(f"- {v}" for v in (entry.get("values") or []))
+    else:
+        lines.append(entry.get("reason") or "(not checked)")
+    lines.append("")
+
+
 def render_tech_stack_markdown(content: dict[str, Any]) -> str:
     lines: list[str] = ["# Tech Stack", "", content.get("summary", ""), ""]
 
@@ -128,37 +142,30 @@ def render_tech_stack_markdown(content: dict[str, Any]) -> str:
         ("frameworks", "Frameworks"),
         ("package_managers", "Package Managers"),
         ("testing_frameworks", "Testing Frameworks"),
+        ("conventions", "Conventions"),
     ):
-        values = content.get(field) or []
-        if values:
-            lines.append(f"## {heading}")
-            lines.append("")
-            lines.extend(f"- {v}" for v in values)
-            lines.append("")
-
-    conventions = content.get("conventions") or []
-    if conventions:
-        lines.append("## Conventions")
-        lines.append("")
-        lines.extend(f"- {c}" for c in conventions)
-        lines.append("")
+        _render_presence_section(lines, content, field, heading)
 
     lines.append("## .NET")
     lines.append("")
-    if content.get("dotnet_detected"):
-        root = content.get("dotnet_solution_root")
+    dotnet = content.get("dotnet") or {}
+    if dotnet.get("status") == "detected":
+        root = dotnet.get("solution_root")
         lines.append(f"Detected. Solution root: `{root}`" if root else "Detected, but no confident solution root.")
     else:
-        lines.append("Not detected.")
+        lines.append(dotnet.get("reason") or "Not detected.")
     lines.append("")
 
-    convention_roots = content.get("convention_roots") or {}
+    convention_roots = content.get("convention_roots") or []
     if convention_roots:
         lines.append("## Shared Config Roots")
         lines.append("")
-        lines.extend(
-            f"- `{key}`: `{value or '(repository root)'}`" for key, value in sorted(convention_roots.items())
-        )
+        for entry in sorted(convention_roots, key=lambda e: e.get("ecosystem", "")):
+            eco = entry.get("ecosystem", "")
+            if entry.get("status") == "present":
+                lines.append(f"- `{eco}`: `{entry.get('root') or '(repository root)'}`")
+            else:
+                lines.append(f"- `{eco}`: {entry.get('reason') or '(not present)'}")
         lines.append("")
 
     conventions_applied = content.get("conventions_applied") or []
@@ -174,14 +181,16 @@ def render_tech_stack_markdown(content: dict[str, Any]) -> str:
     lines.append(f"Detected auth: **{content.get('auth_kind', 'none')}**")
     lines.append("")
 
-    config_inventory = content.get("config_inventory") or []
-    if config_inventory:
-        lines.append("## Configuration Keys")
-        lines.append("")
+    lines.append("## Configuration Keys")
+    lines.append("")
+    config_inventory = content.get("config_inventory") or {}
+    if config_inventory.get("status") == "present":
         lines.append("Config the app reads -- supply test values on the repo settings page:")
         lines.append("")
-        lines.extend(f"- `{k}`" for k in config_inventory)
-        lines.append("")
+        lines.extend(f"- `{k}`" for k in (config_inventory.get("values") or []))
+    else:
+        lines.append(config_inventory.get("reason") or "(not checked)")
+    lines.append("")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -325,6 +334,38 @@ def _demo() -> None:
     # No ac_ids on a wireframe (schema default is an empty list) -> no suffix, no crash.
     md_no_ac_ids = render_plan_markdown({"overview": "x", "wireframes": [{"screen": "task-list"}]})
     assert "_(ACs:" not in md_no_ac_ids, md_no_ac_ids
+
+    # render_tech_stack_markdown: TechStack's PresenceList/DotnetStatus/EcosystemRoot fields are
+    # nested objects now, not bare lists/dicts -- present renders values, absent renders the
+    # `reason` instead of silently rendering nothing for that section.
+    ts_md = render_tech_stack_markdown(
+        {
+            "summary": "S",
+            "languages": {"status": "present", "values": ["Python"]},
+            "frameworks": {"status": "absent", "values": [], "reason": "no framework markers found"},
+            "package_managers": {"status": "present", "values": ["pip"]},
+            "testing_frameworks": {"status": "absent", "values": [], "reason": "no test files found"},
+            "conventions": {"status": "present", "values": ["Repository pattern"]},
+            "dotnet": {"status": "not_detected", "solution_root": None, "reason": "no .csproj/.sln found"},
+            "convention_roots": [
+                {"ecosystem": "node", "status": "absent", "root": "", "reason": "no package.json found"},
+                {"ecosystem": "python", "status": "present", "root": "", "reason": ""},
+            ],
+            "auth_kind": "none",
+            "config_inventory": {"status": "absent", "values": [], "reason": "no config keys found"},
+        }
+    )
+    assert "- Python" in ts_md, ts_md
+    assert "no framework markers found" in ts_md, "absent field must render its reason, not nothing"
+    assert "no .csproj/.sln found" in ts_md, "not_detected dotnet must render its reason"
+    assert "`node`: no package.json found" in ts_md, ts_md
+    assert "`python`: `(repository root)`" in ts_md, ts_md
+    assert "no config keys found" in ts_md, "absent config_inventory must render its reason"
+
+    # A minimal/legacy-shaped dict (fields missing entirely) must not crash -- every reader falls
+    # back to "not checked" rather than KeyError/AttributeError.
+    assert render_tech_stack_markdown({"summary": "S"})
+    assert render_tech_stack_markdown({})
 
     print("markdown_render self-check: ok")
 

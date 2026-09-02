@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 import defusedxml.ElementTree as ET
 from pydantic import BaseModel, Field
 
-from .. import repo_files, stack_runner, workflow_persistence
+from .. import repo_files, stack_runner, tech_stack_signals, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
@@ -359,9 +359,10 @@ async def _declared_frameworks(provider: SandboxProvider, thread_id: str) -> lis
         if raw is None:
             continue
         try:
-            frameworks = json.loads(raw).get("frameworks") or []
+            tech_stack = json.loads(raw)
         except json.JSONDecodeError:
             continue
+        frameworks = tech_stack_signals.presence_values(tech_stack, "frameworks")
         if frameworks:
             return [str(f) for f in frameworks]
     return []
@@ -528,9 +529,10 @@ async def _missing_declared_frontend(
         if raw is None:
             continue
         try:
-            frameworks = json.loads(raw).get("frameworks") or []
+            tech_stack = json.loads(raw)
         except json.JSONDecodeError:
             continue
+        frameworks = tech_stack_signals.presence_values(tech_stack, "frameworks")
         if not frameworks:
             continue
         names = [str(f) for f in frameworks]
@@ -1009,8 +1011,8 @@ async def measure_coverage(
     # measure, so don't spend a GHCP session discovering that.
     raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.TECH_STACK_APPROVED_PATH)
     tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
-    languages = [str(l).lower() for l in (tech_stack.get("languages") or [])]
-    if not languages and not tech_stack.get("dotnet_detected"):
+    languages = [str(l).lower() for l in tech_stack_signals.presence_values(tech_stack, "languages")]
+    if not languages and not tech_stack_signals.dotnet_detected(tech_stack):
         logger.info("repo_scan coverage: no tooling mapping for detected languages %s", languages)
         return None, None, [], REASON_NO_TOOLING_MAPPING, []
 

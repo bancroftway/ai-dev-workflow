@@ -813,15 +813,15 @@ def _applicable_ecosystems(tech_stack: dict[str, Any]) -> list[tuple[_Ecosystem,
 
     Pure function on the audited TechStack dict, which is what makes it the one thing in this
     module with a runnable self-check (see __main__ at the bottom). Roots come from the model's
-    `convention_roots` map where present, falling back to the repo root -- except .NET, which
-    keeps its own two long-standing fields because eight other modules read them.
+    `convention_roots` list where an ecosystem entry is status="present", falling back to the repo
+    root -- except .NET, which keeps its own top-level `dotnet` field because eight other modules
+    read it.
     """
-    roots = tech_stack.get("convention_roots") or {}
-    languages = [str(item).lower() for item in (tech_stack.get("languages") or [])]
+    languages = [str(item).lower() for item in tech_stack_signals.presence_values(tech_stack, "languages")]
     applicable: list[tuple[_Ecosystem, str]] = []
 
-    if tech_stack.get("dotnet_detected"):
-        solution_root = tech_stack.get("dotnet_solution_root")
+    if tech_stack_signals.dotnet_detected(tech_stack):
+        solution_root = (tech_stack.get("dotnet") or {}).get("solution_root")
         # None means the detector had low confidence. Skipping beats guessing: MSBuild discovers
         # props by walking *up* from each project, so a wrongly-placed file silently misses
         # projects or pulls in unrelated directories.
@@ -829,10 +829,10 @@ def _applicable_ecosystems(tech_stack: dict[str, Any]) -> list[tuple[_Ecosystem,
             applicable.append((_DOTNET, str(solution_root)))
 
     if any(language in languages for language in ("typescript", "javascript")):
-        applicable.append((_NODE, str(roots.get("node", ""))))
+        applicable.append((_NODE, str(tech_stack_signals.convention_root(tech_stack, "node") or "")))
 
     if "python" in languages:
-        applicable.append((_PYTHON, str(roots.get("python", ""))))
+        applicable.append((_PYTHON, str(tech_stack_signals.convention_root(tech_stack, "python") or "")))
 
     return [(eco, root) for eco, root in applicable if _root_is_safe(root)]
 
@@ -877,7 +877,7 @@ async def apply_stack_conventions(
     # fills in). Additive-only + idempotent -- merge_detected never clobbers a user value -- so it
     # is safe on every run, including hydration-skipped ones. Best-effort: config seeding must never
     # fail the conventions hook.
-    detected_keys = tech_stack.get("config_inventory") or []
+    detected_keys = tech_stack_signals.presence_values(tech_stack, "config_inventory")
     if detected_keys:
         try:
             sess = await session_store.get_session(thread_id)
@@ -944,27 +944,38 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     # The one runnable check this module earns: _applicable_ecosystems is the only non-trivial
     # pure logic here, and every failure mode it has is a real bug (a wrong path silently misses
     # projects; an unsafe root used to be able to kill the run).
-    assert _applicable_ecosystems({}) == []
-    assert _applicable_ecosystems({"languages": ["Rust"]}) == []
+    def _langs(*values: str) -> dict[str, Any]:
+        return {"status": "present", "values": list(values)} if values else {"status": "absent", "reason": "test fixture"}
 
-    dotnet_only = _applicable_ecosystems({"dotnet_detected": True, "dotnet_solution_root": "src"})
+    def _dotnet(solution_root: str | None) -> dict[str, Any]:
+        # solution_root=None is the "detected, low confidence" case; "" is a legitimate
+        # repo-root-itself value. DotnetStatus requires a reason whenever root is blank.
+        return {"status": "detected", "solution_root": solution_root, "reason": "" if solution_root else "test fixture"}
+
+    def _roots(**by_ecosystem: str) -> list[dict[str, Any]]:
+        return [{"ecosystem": eco, "status": "present", "root": root, "reason": ""} for eco, root in by_ecosystem.items()]
+
+    assert _applicable_ecosystems({}) == []
+    assert _applicable_ecosystems({"languages": _langs("Rust")}) == []
+
+    dotnet_only = _applicable_ecosystems({"dotnet": _dotnet("src")})
     assert [(e.key, r) for e, r in dotnet_only] == [("dotnet", "src")], dotnet_only
     assert _join_root("src", "Directory.Build.props") == "src/Directory.Build.props"
 
     # Repo root: "" is a legal solution root but an illegal repo-relative path -- the join, not
     # the validator, is what has to special-case it.
-    root_level = _applicable_ecosystems({"dotnet_detected": True, "dotnet_solution_root": ""})
+    root_level = _applicable_ecosystems({"dotnet": _dotnet("")})
     assert [(e.key, r) for e, r in root_level] == [("dotnet", "")], root_level
     assert _join_root("", "Directory.Build.props") == "Directory.Build.props"
 
     # Low confidence (None) is not the same as the repo root ("").
-    assert _applicable_ecosystems({"dotnet_detected": True, "dotnet_solution_root": None}) == []
+    assert _applicable_ecosystems({"dotnet": _dotnet(None)}) == []
 
     # A root the path allowlist rejects is dropped, not raised on. Traversal, absolute paths and
     # shell metacharacters are all rejected -- the cases that actually matter, since these roots are
     # model-reported and end up inside container shell commands.
     def _py_roots(root: str) -> list[tuple[str, str]]:
-        applicable = _applicable_ecosystems({"languages": ["Python"], "convention_roots": {"python": root}})
+        applicable = _applicable_ecosystems({"languages": _langs("Python"), "convention_roots": _roots(python=root)})
         return [(eco.key, resolved) for eco, resolved in applicable]
 
     assert _py_roots("../etc") == []
@@ -978,13 +989,20 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
 
     polyglot = _applicable_ecosystems(
         {
-            "languages": ["TypeScript", "Python", "C#"],
-            "dotnet_detected": True,
-            "dotnet_solution_root": "src",
-            "convention_roots": {"node": "web", "python": "api"},
+            "languages": _langs("TypeScript", "Python", "C#"),
+            "dotnet": _dotnet("src"),
+            "convention_roots": _roots(node="web", python="api"),
         }
     )
     assert [(e.key, r) for e, r in polyglot] == [("dotnet", "src"), ("node", "web"), ("python", "api")], polyglot
+
+    # An ecosystem recorded status="absent" must fall back to the repo root, same as no entry at
+    # all -- a real repo whose convention_roots audit found no node.js work still needs "" (root
+    # level) if the languages heuristic alone flags it (defensive: the two should agree in practice).
+    absent_only = _applicable_ecosystems(
+        {"languages": _langs("TypeScript"), "convention_roots": [{"ecosystem": "node", "status": "absent", "root": "", "reason": "no package.json"}]}
+    )
+    assert [(e.key, r) for e, r in absent_only] == [("node", "")], absent_only
 
     # Node writes nothing into the repo: no template files, only the AGENTS.md paragraph.
     assert _NODE.files == ()

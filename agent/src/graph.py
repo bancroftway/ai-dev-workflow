@@ -98,6 +98,8 @@ from .schemas import (
     PlanDraftResponse,
     SpecificationAuditResponse,
     SpecificationDraftResponse,
+    DotnetStatus,
+    PresenceList,
     TechStack,
     TechStackDraftResponse,
 )
@@ -419,7 +421,11 @@ def get_app_auth(state: "GraphState") -> dict[str, Any]:
 
 def auth_kind(state: "GraphState") -> str:
     """How the approved tech-stack says the app authenticates (entra/google/generic-oidc/custom/
-    none). Read from the approved tech-stack content; 'none' for old sidecars / pre-detection runs.
+    none). Read from the approved tech-stack content -- 'none' is now a first-class detected value
+    (the app was checked and genuinely has no sign-in), not merely a legacy placeholder, though it
+    still doubles as the fallback for old sidecars / pre-detection runs that never populated the
+    field at all; this helper (unlike the six PresenceList-wrapped fields, which carry their own
+    status="absent" vs "never checked" distinction) has no way to tell those two "none"s apart.
     Tech-stack is always approved before any stage that reads this, so approved_content is set."""
     content = (state.get("stages", {}).get("tech-stack") or {}).get("approved_content") or {}
     if not isinstance(content, dict):
@@ -4668,11 +4674,23 @@ def _demo() -> None:
     async def _fake_append_ledger_entry(_provider, _thread_id, _entry):  # noqa: ANN001
         return None
 
+    def _absent(reason: str) -> PresenceList:
+        return PresenceList(status="absent", reason=reason)
+
     async def _fake_ainvoke_structured(_model, _messages, _schema):  # noqa: ANN001
         draft_call_count["n"] += 1
         return TechStackDraftResponse(
             readiness=True, clarifying_questions=[],
-            tech_stack=TechStack(summary=f"real draft call #{draft_call_count['n']}"),
+            tech_stack=TechStack(
+                summary=f"real draft call #{draft_call_count['n']}",
+                languages=_absent("demo fixture"),
+                frameworks=_absent("demo fixture"),
+                package_managers=_absent("demo fixture"),
+                testing_frameworks=_absent("demo fixture"),
+                conventions=_absent("demo fixture"),
+                dotnet=DotnetStatus(status="not_detected", reason="demo fixture"),
+                config_inventory=_absent("demo fixture"),
+            ),
         )
 
     globals()["ainvoke_structured"] = _fake_ainvoke_structured

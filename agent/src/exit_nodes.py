@@ -982,7 +982,7 @@ async def verify_exit_readiness(
     from .gates.ac_coverage_gate import resolve_test_command
     from .gates.test_coverage_gate import COVERAGE_COMMANDS_PATH
     from .graph import VerificationResult  # local: graph imports exit_nodes (same pattern as audit_gates)
-    from .tech_stack_signals import frameworks_have_ui
+    from .tech_stack_signals import frameworks_have_ui, presence_values
 
     def _parse(raw: str | None) -> dict[str, Any]:
         if raw is None:
@@ -1030,7 +1030,7 @@ async def verify_exit_readiness(
 
     # --- screenshots: mandatory visual evidence for UI apps, whatever path e2e took (covers all
     # of its skip paths with one check) ---
-    is_ui = frameworks_have_ui(tech_stack.get("frameworks") or [])
+    is_ui = frameworks_have_ui(presence_values(tech_stack, "frameworks"))
     screenshots = await _list_screenshots(provider, thread_id, run_id)
     if is_ui and not screenshots:
         problems.append("UI application but no e2e screenshots were captured")

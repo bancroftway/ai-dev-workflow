@@ -1764,8 +1764,12 @@ def _demo() -> None:
     # tech_stack_has_ui_framework: same UI-framework-marker check graph.py's stage gates use --
     # this module's own self-check is a light re-confirmation, the real one lives in
     # tech_stack_signals.py now.
-    assert tech_stack_has_ui_framework({"stages": {"tech-stack": {"approved_content": {"frameworks": ["Next.js"]}}}})
-    assert not tech_stack_has_ui_framework({"stages": {"tech-stack": {"approved_content": {"frameworks": ["FastAPI"]}}}})
+    assert tech_stack_has_ui_framework(
+        {"stages": {"tech-stack": {"approved_content": {"frameworks": {"status": "present", "values": ["Next.js"]}}}}}
+    )
+    assert not tech_stack_has_ui_framework(
+        {"stages": {"tech-stack": {"approved_content": {"frameworks": {"status": "present", "values": ["FastAPI"]}}}}}
+    )
     assert not tech_stack_has_ui_framework({})
 
     # Route -> filename slug. These names are what let exit.md label each screenshot with the
