@@ -413,10 +413,16 @@ class DotnetStatus(BaseModel):
         `dotnet_solution_root` fields. Coerce that pair into the typed shape."""
         if isinstance(data, dict) and "dotnet_detected" in data and "status" not in data:
             if data.get("dotnet_detected"):
+                root = data.get("dotnet_solution_root")
                 return {
                     "status": "detected",
-                    "solution_root": data.get("dotnet_solution_root"),
-                    "reason": "",
+                    "solution_root": root,
+                    # A blank root on old data IS the legacy low-confidence case
+                    # (TechStack.dotnet_solution_root's own docstring: None means "not confidently
+                    # determined") -- no reason was ever recorded for it, so synthesize the same
+                    # legacy marker used everywhere else, rather than leaving reason="" and letting
+                    # the after-validator reject data that used to load fine.
+                    "reason": "" if (root or "").strip() else "legacy sidecar, pre-typed-absence",
                 }
             return {
                 "status": "not_detected",
@@ -595,6 +601,15 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert legacy_detected.status == "detected"
     assert legacy_detected.solution_root == "src/Api"
     assert legacy_detected.reason == ""
+
+    # Real legacy shape: detected=True but root=None (TechStack.dotnet_solution_root's own
+    # docstring says None means "not confidently determined") -- must coerce, not crash.
+    legacy_detected_no_root = DotnetStatus.model_validate(
+        {"dotnet_detected": True, "dotnet_solution_root": None}
+    )
+    assert legacy_detected_no_root.status == "detected"
+    assert legacy_detected_no_root.solution_root is None
+    assert legacy_detected_no_root.reason == "legacy sidecar, pre-typed-absence"
 
     # DotnetStatus: new shape covers the low-confidence case (detected, no root, but a reason).
     low_confidence = DotnetStatus(status="detected", reason="two unrelated .csproj roots found")
