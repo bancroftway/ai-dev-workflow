@@ -452,6 +452,12 @@ class EcosystemRoot(BaseModel):
     """Typed replacement for one entry of the `convention_roots: dict[str, str]` map -- makes
     "this ecosystem isn't present" a first-class state instead of an omitted dict key that every
     reader has to know to check for.
+
+    root="" is a legitimate `status="present"` value -- it means the repo root itself (same
+    convention as the old dict shape and as `_join_root` in preflight_nodes.py, which special-
+    cases a falsy root as "join nothing, just use the bare filename"). Unambiguous here in a way
+    an omitted dict key never was: `status` itself already says "checked, found present" -- this
+    is not "never checked" wearing a blank string.
     """
 
     ecosystem: Literal["node", "python"]
@@ -461,10 +467,7 @@ class EcosystemRoot(BaseModel):
 
     @model_validator(mode="after")
     def _validate_ecosystem_root(self) -> "EcosystemRoot":
-        if self.status == "present":
-            if not self.root.strip():
-                raise ValueError("status='present' requires a non-blank root.")
-        else:  # absent
+        if self.status == "absent":
             if self.root.strip():
                 raise ValueError("status='absent' requires a blank root.")
             if not self.reason.strip():
@@ -477,6 +480,45 @@ class TechStack(BaseModel):
     this is what render_tech_stack_markdown writes tech-stack.md from (the sole writer, exactly
     like specification.md/plan.md), and what the tech-stack-conventions skill's analysis (invoked
     by name from the draft prompt, itself never writing files) is reported into."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_shape(cls, data: Any) -> Any:
+        """Older on-disk sidecars/model output predate this task's field changes and crash without
+        this: `dotnet_detected`/`dotnet_solution_root` (no `dotnet` key existed at all) and
+        `convention_roots` as a bare `dict[str, str]` (not `list[EcosystemRoot]`).
+
+        Unlike the six `PresenceList` fields -- whose key NAME never changed, so `PresenceList`'s
+        own before-validator fires automatically on old bare-list data under that same key --
+        `dotnet` and `convention_roots` have a different key name/container shape in old data, so
+        nothing bridges the gap on its own. Reshape here, before Pydantic construction, then let
+        `DotnetStatus`'s own before-validator (below) do the actual legacy-pair coercion so the
+        mapping isn't duplicated.
+        """
+        if not isinstance(data, dict):
+            return data
+        if "dotnet" not in data and (
+            "dotnet_detected" in data or "dotnet_solution_root" in data
+        ):
+            data = {
+                **data,
+                "dotnet": {
+                    "dotnet_detected": data.get("dotnet_detected", False),
+                    "dotnet_solution_root": data.get("dotnet_solution_root"),
+                },
+            }
+        roots = data.get("convention_roots")
+        if isinstance(roots, dict):
+            # Old dict shape never recorded an "absent" ecosystem at all -- it just omitted the
+            # key -- so there's nothing to backfill an absent entry from. Only emit what's there.
+            data = {
+                **data,
+                "convention_roots": [
+                    {"ecosystem": eco, "status": "present", "root": root, "reason": ""}
+                    for eco, root in roots.items()
+                ],
+            }
+        return data
 
     summary: str = Field(description="One or two sentences describing the stack at a glance.")
     languages: PresenceList = Field(description="Programming languages found evidence for.")
@@ -496,11 +538,10 @@ class TechStack(BaseModel):
         description="One entry per non-.NET ecosystem actually checked -- 'node' (the workspace "
         "root holding package.json) and 'python' (the project root holding "
         "pyproject.toml/setup.cfg/requirements.txt). root is the repo-relative directory where "
-        "that ecosystem's shared config file belongs (\".\" for the repository root itself -- "
-        "root can't be blank when status='present') when status='present'; a reason when "
-        "status='absent' (not present, or no single confident common root). .NET keeps its own "
-        "top-level `dotnet` field rather than an entry here, because several pipeline stages "
-        "already read that field by name.",
+        "that ecosystem's shared config file belongs (\"\" for the repository root itself) when "
+        "status='present'; a reason when status='absent' (not present, or no single confident "
+        "common root). .NET keeps its own top-level `dotnet` field rather than an entry here, "
+        "because several pipeline stages already read that field by name.",
     )
     conventions_applied: list[str] = Field(
         default_factory=list,
@@ -558,7 +599,7 @@ TECH_STACK_DRAFT_EXAMPLE: TechStackDraftResponse = TechStackDraftResponse(
             status="not_detected", reason="No .csproj or .sln files found in the repository."
         ),
         convention_roots=[
-            EcosystemRoot(ecosystem="node", status="present", root="."),
+            EcosystemRoot(ecosystem="node", status="present", root=""),
             EcosystemRoot(
                 ecosystem="python",
                 status="absent",
@@ -708,11 +749,16 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     python_absent = EcosystemRoot(ecosystem="python", status="absent", reason="no pyproject.toml")
     assert python_absent.root == ""
 
-    try:
-        EcosystemRoot(ecosystem="node", status="present", root="")
-        raise AssertionError("expected ValidationError for present with a blank root")
-    except ValidationError:
-        pass
+    # present + root="" is the repo-root-itself case (same convention as the old dict shape and
+    # _join_root in preflight_nodes.py) -- unambiguous once status itself says "checked, present",
+    # so this must validate, not raise.
+    root_level_present = EcosystemRoot(ecosystem="node", status="present", root="")
+    assert root_level_present.root == ""
+    root_level_present_with_reason = EcosystemRoot(
+        ecosystem="node", status="present", root="", reason="workspace root is the repo root"
+    )
+    assert root_level_present_with_reason.root == ""
+
     try:
         EcosystemRoot(ecosystem="python", status="absent", root="apps/api")
         raise AssertionError("expected ValidationError for absent with a non-blank root")
@@ -763,5 +809,51 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     _ts_schema = TechStack.model_json_schema()
     assert "$defs" in _ts_schema, "TechStack.model_json_schema() lost its nested $defs"
     assert json.dumps(_ts_schema), "TechStack.model_json_schema() failed to json.dumps"
+
+    # Full legacy on-disk TechStack shape (both the old dotnet_detected/dotnet_solution_root pair
+    # AND a dict-shaped convention_roots, together) must not crash -- preflight_nodes.py:595 loads
+    # exactly this shape from real cached JSON today. The six PresenceList-wrapped fields already
+    # coerce for free (key name unchanged), so only those two fields are exercised here.
+    _legacy_stack = TechStack.model_validate(
+        {
+            "summary": "legacy sidecar",
+            "languages": ["Python"],
+            "frameworks": [],
+            "package_managers": ["pip"],
+            "testing_frameworks": [],
+            "conventions": [],
+            "dotnet_detected": False,
+            "dotnet_solution_root": None,
+            "convention_roots": {"python": "src"},
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": [],
+        }
+    )
+    assert _legacy_stack.dotnet.status == "not_detected"
+    assert _legacy_stack.dotnet.solution_root is None
+    assert [r.model_dump() for r in _legacy_stack.convention_roots] == [
+        {"ecosystem": "python", "status": "present", "root": "src", "reason": ""}
+    ]
+
+    _legacy_stack_dotnet_detected = TechStack.model_validate(
+        {
+            "summary": "legacy sidecar, dotnet detected",
+            "languages": [],
+            "frameworks": [],
+            "package_managers": [],
+            "testing_frameworks": [],
+            "conventions": [],
+            "dotnet_detected": True,
+            "dotnet_solution_root": "src/Api",
+            "convention_roots": {},
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": [],
+        }
+    )
+    assert _legacy_stack_dotnet_detected.dotnet.status == "detected"
+    assert _legacy_stack_dotnet_detected.dotnet.solution_root == "src/Api"
+    assert _legacy_stack_dotnet_detected.convention_roots == []
 
     print("schemas self-check: all assertions passed")
