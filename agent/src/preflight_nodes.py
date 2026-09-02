@@ -27,7 +27,7 @@ from . import config_inventory, git_ops, model_config, repo_files, repo_scan, re
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
-from .schemas import TechStack
+from .schemas import DotnetStatus, PresenceList, TechStack
 from .schemas_app_discovery import DiscoveredApp
 from .schemas_session import SessionTitleResponse
 from .sandbox import registry as sandbox_registry
@@ -413,6 +413,72 @@ async def brownfield_write_manifest_node(state: "GraphState", config: RunnableCo
     return {"manifest_exists": True}
 
 
+def _merge_config_signals(
+    tech_stack: dict[str, Any], scanned_auth: str, scanned_keys: list[str]
+) -> tuple[dict[str, Any], bool]:
+    """Task 5 fix #1's shared core: unions a config_inventory.inventory() scan into an
+    already-produced TechStack dict's auth_kind/config_inventory fields via config_inventory.merge()
+    (Task 4). Both resolve_tech_stack_submission's settle tail (_settle_tech_stack, below -- every
+    settle-and-persist path: cache hit, fresh extraction, and the extraction-failure fallback) and
+    hydrate_tech_stack_from_repo_file's backfill route through this one function, so there is
+    structurally no path that can ship a TechStack without the union.
+
+    `config_inventory` is PresenceList-shaped (Task 2), not a bare list -- unwrapped to its plain
+    `values` via tech_stack_signals.presence_values for merge(), then rewrapped following
+    PresenceList's own validation rules (non-empty values -> status="present"; empty ->
+    status="absent" with a reason). Returns (possibly-unchanged tech_stack, changed) so a caller
+    that only wants to backfill on real change (hydrate, to avoid rewriting an already-complete
+    sidecar on every hydration) can skip its own write when nothing moved; a caller that always
+    persists regardless (_settle_tech_stack) can just ignore the flag.
+    """
+    existing_auth = tech_stack.get("auth_kind") if isinstance(tech_stack.get("auth_kind"), str) else None
+    existing_keys = tech_stack_signals.presence_values(tech_stack, "config_inventory")
+    auth_kind, keys = config_inventory.merge(existing_auth or "none", existing_keys, scanned_auth, scanned_keys)
+    if auth_kind == (existing_auth or "none") and keys == existing_keys:
+        return tech_stack, False
+    merged = dict(tech_stack)
+    merged["auth_kind"] = auth_kind
+    merged["config_inventory"] = (
+        {"status": "present", "values": keys, "reason": ""}
+        if keys
+        else {"status": "absent", "values": [], "reason": "no config keys detected"}
+    )
+    return merged, True
+
+
+_EXTRACTION_FAILURE_REASONS = frozenset({"extraction failed", "legacy sidecar, pre-typed-absence"})
+
+
+def _looks_like_extraction_failure(tech_stack: dict[str, Any]) -> bool:
+    """Task 5 fix #4's pure predicate: does this (already tech_stack_signals.load_tech_stack-
+    normalized) TechStack dict carry the signature _extraction_failed_tech_stack's output leaves
+    behind -- `summary` is raw (possibly truncated) markdown rather than an LLM-written sentence,
+    AND every LLM-derived field sits at its bare absent/not-detected default with a generic reason
+    (this fix's own "extraction failed" marker, or a genuinely ancient pre-typed-absence sidecar
+    that coerces to the same shape).
+
+    Deliberately distinguishes that from a genuinely EMPTY repo an LLM looked at and correctly
+    reported nothing for: a real "nothing found" verdict carries its own specific reason text
+    (e.g. "no framework found in package.json"), never the generic sentinel every field shares in
+    a failed extraction. Also deliberately does not look at auth_kind/config_inventory -- those
+    are populated by the deterministic config_inventory scan (fix #1), not the LLM, and
+    legitimately vary independent of whether extraction itself succeeded.
+    """
+    summary = str(tech_stack.get("summary") or "")
+    if not (summary.startswith("#") or len(summary) == 500):
+        return False
+    for field in ("languages", "frameworks", "package_managers", "testing_frameworks", "conventions"):
+        entry = tech_stack.get(field) or {}
+        if entry.get("status") != "absent" or entry.get("reason") not in _EXTRACTION_FAILURE_REASONS:
+            return False
+    dotnet = tech_stack.get("dotnet") or {}
+    if dotnet.get("status") != "not_detected" or dotnet.get("reason") not in _EXTRACTION_FAILURE_REASONS:
+        return False
+    if tech_stack.get("convention_roots") or tech_stack.get("conventions_applied"):
+        return False
+    return True
+
+
 async def hydrate_tech_stack_from_repo_file(
     thread_id: str, state: "GraphState", provider: SandboxProvider
 ) -> dict[str, Any] | None:
@@ -437,21 +503,46 @@ async def hydrate_tech_stack_from_repo_file(
             thread_id,
         )
         return None
+    if not isinstance(approved, dict):
+        return approved
+
+    # Fix #4 (Task 5): repair a sidecar carrying the extraction-failure signature (fix #2's
+    # typed-absence fallback, or an ancient sidecar that coerces the same way) by retrying
+    # extraction once against tech-stack.md, which is still on disk. Self-limiting -- a renewed
+    # failure (the retry itself raising) just leaves the existing sidecar as-is rather than
+    # looping; no separate migration script for dead threads that will never hydrate again.
+    if _looks_like_extraction_failure(tech_stack_signals.load_tech_stack(approved)):
+        try:
+            markdown = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_MD_PATH)
+            if markdown:
+                repaired = await _extract_tech_stack(
+                    thread_id, markdown, provider, state["provider"], state.get("run_id", "unknown")
+                )
+                approved = repaired
+                await repo_files.write_repo_file(
+                    provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(approved, indent=2) + "\n",
+                )
+        except Exception:  # noqa: BLE001 -- one retry only; a renewed failure just keeps the old sidecar
+            logger.warning(
+                "tech-stack sidecar repair retry failed for thread_id=%s; leaving existing sidecar as-is",
+                thread_id, exc_info=True,
+            )
+
     # Backfill auth_kind/config_inventory for repos onboarded before these fields existed: they
     # otherwise never populate (hydration skips detection forever), so the deterministic scanner
-    # fills them here and the enriched sidecar is re-persisted. Best-effort -- a scan failure just
-    # leaves the fields at their defaults, read with .get(...,"none") everywhere.
-    if isinstance(approved, dict) and (approved.get("auth_kind") in (None, "none") or not approved.get("config_inventory")):
+    # fills them here (via the same config_inventory.merge() core resolve_tech_stack_submission's
+    # own settle tail uses, fix #1) and the enriched sidecar is re-persisted. Best-effort -- a scan
+    # failure just leaves the fields at their existing values. Gated on "something's actually
+    # missing" (not unconditional, unlike the settle tail) so an already-complete sidecar isn't
+    # rescanned on every hydration of an onboarded repo.
+    existing_auth = approved.get("auth_kind") if isinstance(approved.get("auth_kind"), str) else None
+    existing_keys = tech_stack_signals.presence_values(approved, "config_inventory")
+    if existing_auth in (None, "none") or not existing_keys:
         try:
-            auth_kind, keys = await config_inventory.inventory(provider, thread_id)
-            changed = False
-            if not approved.get("auth_kind") or (approved.get("auth_kind") == "none" and auth_kind != "none"):
-                approved["auth_kind"] = auth_kind
-                changed = True
-            if not approved.get("config_inventory") and keys:
-                approved["config_inventory"] = keys
-                changed = True
+            scanned_auth, scanned_keys = await config_inventory.inventory(provider, thread_id)
+            merged, changed = _merge_config_signals(approved, scanned_auth, scanned_keys)
             if changed:
+                approved = merged
                 await repo_files.write_repo_file(
                     provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(approved, indent=2),
                 )
@@ -635,9 +726,73 @@ async def _extract_tech_stack(
         available_tools=workflow_config.READ_ONLY_AVAILABLE_TOOLS,
     )
     response = await ainvoke_structured(
-        model, [SystemMessage(content=_TECH_STACK_EXTRACT_PROMPT), HumanMessage(content=markdown)], TechStack
+        model, [SystemMessage(content=_TECH_STACK_EXTRACT_PROMPT), HumanMessage(content=markdown)], TechStack,
+        # Task 5 fix #2: cheap insurance against a transient failure taking this one-shot, no-retry-
+        # loop extraction all the way down to the typed-absent fallback -- bumped from
+        # ainvoke_structured's own default of 3, both for the normal extraction call and for
+        # hydrate_tech_stack_from_repo_file's fix #4 repair retry (this is their only shared call).
+        max_attempts=5,
     )
     return response.model_dump(mode="json")
+
+
+def _extraction_failed_tech_stack(markdown: str) -> dict[str, Any]:
+    """Task 5 fix #2: the extract-except fallback, factored out of resolve_tech_stack_submission so
+    every LLM-derived field becomes an explicit typed-absence marker (Task 2's PresenceList/
+    DotnetStatus shape) instead of the old bare `TechStack(summary=...)` -- which, now that those
+    fields are required with no default, would itself raise ValidationError right here in the
+    except block instead of degrading gracefully.
+
+    Constructed via the actual TechStack class (not a hand-built dict) so Pydantic's own validators
+    catch a shape mistake immediately, matching _extract_tech_stack's own model_dump(mode="json")
+    pattern. auth_kind has no "extraction failed" option in its Literal -- "none" is the safe,
+    conservative default, and fix #1's merge (which runs unconditionally afterward on every settle
+    path, see _settle_tech_stack) still correctly overrides it with the deterministically-scanned
+    value, so nothing is actually lost here beyond the LLM-only fields this function truly cannot
+    know.
+    """
+    absent = PresenceList(status="absent", reason="extraction failed")
+    return TechStack(
+        summary=markdown.strip()[:500] or "(not extracted)",
+        languages=absent,
+        frameworks=absent,
+        package_managers=absent,
+        testing_frameworks=absent,
+        conventions=absent,
+        dotnet=DotnetStatus(status="not_detected", reason="extraction failed"),
+        convention_roots=[],
+        conventions_applied=[],
+        auth_kind="none",
+        config_inventory=absent,
+    ).model_dump(mode="json")
+
+
+async def _settle_tech_stack(
+    thread_id: str, tech_stack: dict[str, Any], provider: SandboxProvider
+) -> dict[str, Any]:
+    """Task 5 fix #1's shared merge-then-persist tail for resolve_tech_stack_submission's TWO
+    settle-and-persist points (a cache hit, and fresh-extraction/extraction-failure-fallback):
+    scans this repo's own config_inventory deterministically and unions it into `tech_stack` (via
+    _merge_config_signals) BEFORE either path writes tech-stack.approved.json.
+
+    Putting this merge in only one of the two callers would leave the cache-hit path -- precisely
+    the "unedited canned catalog pick" case the extraction cache exists for -- silently shipping
+    without the auth/config union, reintroducing the exact bug this fix targets on that path; both
+    of resolve_tech_stack_submission's return statements now go through this one function instead.
+    """
+    try:
+        scanned_auth, scanned_keys = await config_inventory.inventory(provider, thread_id)
+    except Exception:  # noqa: BLE001 -- the scan is best-effort, never a reason to lose the approval
+        logger.warning("config inventory scan failed for thread_id=%s", thread_id, exc_info=True)
+        scanned_auth, scanned_keys = "none", []
+    merged, _changed = _merge_config_signals(tech_stack, scanned_auth, scanned_keys)
+    await repo_files.write_repo_file(
+        provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(merged, indent=2) + "\n"
+    )
+    await git_ops.commit_paths(
+        provider, thread_id, [TECH_STACK_APPROVED_JSON_PATH], "ai-dev-workflow: tech stack extracted"
+    )
+    return merged
 
 
 def _select_tech_stack_markdown(resume_value: Any, draft: dict[str, Any] | None) -> str:
@@ -669,7 +824,7 @@ async def resolve_tech_stack_submission(
     markdown = _select_tech_stack_markdown(resume_value, stage.get("draft"))
 
     # Written FIRST, unconditionally: the human's approved text must never be lost even if the
-    # extraction pass below fails outright -- ainvoke_structured raises after exhausting its own 3
+    # extraction pass below fails outright -- ainvoke_structured raises after exhausting its own
     # retries, and an uncaught exception here would otherwise crash the whole graph run through
     # make_gate_node, losing this write along with it.
     await repo_files.write_repo_file(provider, thread_id, TECH_STACK_MD_PATH, markdown)
@@ -678,17 +833,14 @@ async def resolve_tech_stack_submission(
     # Extraction cache (backlog item 1, 2026-08-31): an UNEDITED canned catalog pick is the same
     # markdown bytes every session, and its structured extraction is deterministic -- one agent-host
     # json file keyed by content hash skips the LLM call for every repeat. Edited text misses and
-    # extracts normally; every cache failure falls through to the real call.
+    # extracts normally; every cache failure falls through to the real call. Note the cache stores
+    # the PURE extraction result only (before _settle_tech_stack's config_inventory union below) --
+    # it's shared across every thread that produces this same markdown, so a merge keyed to one
+    # thread's own repo scan must never be written back into it.
     cached = _extract_cache_get(markdown)
     if cached is not None:
         logger.info("tech-stack extraction served from cache for thread_id=%s", thread_id)
-        await repo_files.write_repo_file(
-            provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(cached, indent=2) + "\n"
-        )
-        await git_ops.commit_paths(
-            provider, thread_id, [TECH_STACK_APPROVED_JSON_PATH], "ai-dev-workflow: tech stack extracted"
-        )
-        return cached
+        return await _settle_tech_stack(thread_id, cached, provider)
 
     try:
         tech_stack = await _extract_tech_stack(
@@ -697,22 +849,28 @@ async def resolve_tech_stack_submission(
         _extract_cache_put(markdown, tech_stack)
     except Exception:
         logger.exception(
-            "tech-stack extraction failed for thread_id=%s; approving with a bare summary instead "
-            "of failing the run -- a human already reviewed and approved the markdown, which is "
-            "what matters; a failed best-effort JSON extraction is a quality loss, not a reason to "
-            "crash. Every downstream consumer tolerates a sparse TechStack (only `summary` is "
-            "required).",
+            "tech-stack extraction failed for thread_id=%s; approving with typed-absent LLM fields "
+            "instead of failing the run -- a human already reviewed and approved the markdown, "
+            "which is what matters; a failed best-effort JSON extraction is a quality loss, not a "
+            "reason to crash. Every downstream consumer tolerates a sparse TechStack.",
             thread_id,
         )
-        tech_stack = TechStack(summary=markdown.strip()[:500] or "(not extracted)").model_dump(mode="json")
+        try:
+            await repo_files.append_ledger_entry(
+                provider, thread_id,
+                {
+                    "stage": "tech-stack", "node": "extract",
+                    "error": "extraction failed; approved with typed-absent fallback",
+                },
+            )
+        except Exception:  # noqa: BLE001 -- ledger bookkeeping must never break the approval either
+            logger.warning(
+                "failed to append tech-stack extraction-failure ledger entry for thread_id=%s",
+                thread_id, exc_info=True,
+            )
+        tech_stack = _extraction_failed_tech_stack(markdown)
 
-    await repo_files.write_repo_file(
-        provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(tech_stack, indent=2) + "\n"
-    )
-    await git_ops.commit_paths(
-        provider, thread_id, [TECH_STACK_APPROVED_JSON_PATH], "ai-dev-workflow: tech stack extracted"
-    )
-    return tech_stack
+    return await _settle_tech_stack(thread_id, tech_stack, provider)
 
 
 # ── Ecosystem convention table ────────────────────────────────────────────────────────────────
@@ -921,6 +1079,28 @@ async def apply_stack_conventions(
             )
             outcomes[ecosystem.key] = {"error": str(exc)[:500]}
 
+    # Task 5 fix #3: persist which ecosystems' conventions actually applied. This hook already
+    # fires on every hydration short-circuit AND on the resume path (graph.py's two
+    # `_run_post_approve_hook` call sites for an "already approved" tech-stack stage), so this
+    # self-heals every already-onboarded repo's permanently-`[]` conventions_applied the next time
+    # its pipeline runs -- no separate migration script needed. Read-modify-write against the
+    # sidecar ON DISK (not the `tech_stack` argument this hook was handed), same pattern
+    # hydrate_tech_stack_from_repo_file's own backfill uses -- `tech_stack` can be a checkpointed
+    # value from a prior lap on the resume path, so writing through it directly would risk
+    # persisting stale content over whatever's actually on disk.
+    applied = sorted(key for key, outcome in outcomes.items() if "error" not in outcome)
+    try:
+        current_raw = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_APPROVED_JSON_PATH)
+        if current_raw is not None:
+            current = json.loads(current_raw)
+            if isinstance(current, dict) and current.get("conventions_applied") != applied:
+                current["conventions_applied"] = applied
+                await repo_files.write_repo_file(
+                    provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(current, indent=2) + "\n",
+                )
+    except Exception:  # noqa: BLE001 -- best-effort bookkeeping, never a reason to skip the ledger/commit below
+        logger.warning("failed to persist conventions_applied for thread_id=%s", thread_id, exc_info=True)
+
     if not written_paths:
         # Recorded even when nothing was written: "we looked and everything was current" is a
         # different fact from "this hook never ran," and only the ledger can tell them apart.
@@ -1118,5 +1298,307 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     # neither) -- nothing to prefill, the caller falls through to fresh detection unchanged.
     assert _resolve_ticket_tech_stack_markdown(None, None, fake_catalog) is None
     assert _resolve_ticket_tech_stack_markdown("", "", fake_catalog) is None
+
+    # --- Task 5 fixes -------------------------------------------------------------------------
+    # _merge_config_signals / _extraction_failed_tech_stack / _looks_like_extraction_failure are
+    # pure and checked directly; resolve_tech_stack_submission / hydrate_tech_stack_from_repo_file
+    # / apply_stack_conventions are exercised for real against a minimal in-memory fake
+    # SandboxProvider (config_inventory.inventory and _extract_tech_stack -- the two genuinely
+    # I/O-bound/LLM-bound calls -- are monkeypatched around their own real work, same convention
+    # graph.py's own self-check uses for _persist_if_sandboxed/_run_post_approve_hook).
+    import asyncio
+
+    unchanged, changed = _merge_config_signals(
+        _full(auth_kind="entra", config_inventory={"status": "present", "values": ["AzureAd:TenantId"], "reason": ""}),
+        "entra", ["AzureAd:TenantId"],
+    )
+    assert changed is False and unchanged["auth_kind"] == "entra"
+    merged, changed = _merge_config_signals(
+        _full(auth_kind="none", config_inventory={"status": "absent", "values": [], "reason": "test fixture"}),
+        "google", ["GOOG_CLIENT_ID"],
+    )
+    assert changed is True and merged["auth_kind"] == "google"
+    assert merged["config_inventory"] == {"status": "present", "values": ["GOOG_CLIENT_ID"], "reason": ""}
+    # Existing wins over scanned once it's already something specific; keys still union.
+    kept, changed = _merge_config_signals(
+        _full(auth_kind="custom", config_inventory={"status": "present", "values": ["A"], "reason": ""}),
+        "google", ["A", "B"],
+    )
+    assert kept["auth_kind"] == "custom" and kept["config_inventory"]["values"] == ["A", "B"] and changed is True
+
+    # _extraction_failed_tech_stack (fix #2): must itself be schema-valid -- Task 2's typed fields
+    # are all required, so the OLD bare `TechStack(summary=...)` fallback would now raise
+    # ValidationError right here instead of degrading gracefully.
+    failed = _extraction_failed_tech_stack("# Tech Stack\n\nSome markdown that never got extracted.")
+    TechStack.model_validate(failed)
+    assert failed["auth_kind"] == "none"
+    assert failed["languages"] == {"status": "absent", "values": [], "reason": "extraction failed"}
+    assert failed["dotnet"] == {"status": "not_detected", "solution_root": None, "reason": "extraction failed"}
+    assert failed["convention_roots"] == [] and failed["conventions_applied"] == []
+
+    # _looks_like_extraction_failure (fix #4): the fallback's own signature is caught...
+    assert _looks_like_extraction_failure(tech_stack_signals.load_tech_stack(failed)) is True
+    # ...a genuine LLM verdict of "empty repo" -- same all-absent shape, but its OWN specific
+    # reasons, not the generic sentinel -- must NOT be flagged for repair.
+    genuinely_empty = _full(
+        summary="An empty repository with no application code yet.",
+        languages={"status": "absent", "values": [], "reason": "no source files found in the repository"},
+        frameworks={"status": "absent", "values": [], "reason": "no source files found in the repository"},
+        package_managers={"status": "absent", "values": [], "reason": "no source files found in the repository"},
+        testing_frameworks={"status": "absent", "values": [], "reason": "no source files found in the repository"},
+        conventions={"status": "absent", "values": [], "reason": "no source files found in the repository"},
+        dotnet={"status": "not_detected", "reason": "no .csproj or .sln files found"},
+    )
+    assert _looks_like_extraction_failure(tech_stack_signals.load_tech_stack(genuinely_empty)) is False
+    # A well-formed summary alone must not be flagged, even if fields happen to share the generic
+    # reason text -- the summary check is the primary signal.
+    well_formed_summary = {**failed, "summary": "A small Node/Express API with no auth."}
+    assert _looks_like_extraction_failure(tech_stack_signals.load_tech_stack(well_formed_summary)) is False
+    # A genuinely ancient pre-typed-absence sidecar coerces to the same reason text via
+    # PresenceList/DotnetStatus's own legacy coercion -- also caught.
+    legacy_failure_shape = {
+        "summary": "#" * 500,
+        "languages": [], "frameworks": [], "package_managers": [], "testing_frameworks": [], "conventions": [],
+        "dotnet_detected": False, "dotnet_solution_root": None,
+        "convention_roots": {}, "conventions_applied": [], "auth_kind": "none", "config_inventory": [],
+    }
+    assert _looks_like_extraction_failure(tech_stack_signals.load_tech_stack(legacy_failure_shape)) is True
+
+    class _FakeExecResult:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+        @property
+        def ok(self) -> bool:
+            return self.returncode == 0
+
+    class _FakeSandboxProvider:
+        """Minimal in-memory SandboxProvider stand-in, self-check only: implements just enough of
+        exec_in_sandbox's shell surface for repo_files.read/write_repo_file and
+        append_ledger_entry to run against a dict instead of a real container (same duck-typing
+        convention chat_model.py's own self-check _FakeSandboxProvider uses). Anything else
+        (git add/commit, mkdir) is accepted as a no-op success -- only reads/writes are tracked."""
+
+        def __init__(self, files: dict[str, str] | None = None):
+            self.files: dict[str, str] = dict(files or {})
+
+        async def exec_in_sandbox(self, thread_id: str, command: str):  # noqa: ARG002
+            import base64 as _b64
+
+            cat_match = re.search(r"cat (\S+) 2>/dev/null", command)
+            if cat_match:
+                path = cat_match.group(1)
+                if path in self.files:
+                    return _FakeExecResult(0, self.files[path])
+                return _FakeExecResult(1, "", "no such file")
+            write_match = re.search(r"echo (\S+) \| base64 -d (>>?) (\S+)$", command)
+            if write_match:
+                encoded, mode, path = write_match.groups()
+                decoded = _b64.b64decode(encoded).decode("utf-8")
+                self.files[path] = (self.files.get(path, "") + decoded) if mode == ">>" else decoded
+            return _FakeExecResult(0)
+
+    # resolve_tech_stack_submission, scenario A: the CACHE-HIT path must ALSO merge (fix #1) --
+    # this is exactly the "unedited canned catalog pick" case the extraction cache exists for, and
+    # the bug this fix targets was this path silently shipping without the auth/config union.
+    cached_stack = _full(
+        summary="A small Node/Express API.",
+        languages={"status": "present", "values": ["TypeScript"], "reason": ""},
+        auth_kind="none",
+        config_inventory={"status": "absent", "values": [], "reason": "test fixture"},
+    )
+    real_extract_cache_get = _extract_cache_get
+    real_inventory = config_inventory.inventory
+
+    async def _fake_inventory_entra(provider, thread_id):  # noqa: ANN001, ARG001
+        return "entra", ["AzureAd:TenantId"]
+
+    globals()["_extract_cache_get"] = lambda markdown: dict(cached_stack)
+    config_inventory.inventory = _fake_inventory_entra
+    try:
+        fake_provider_a = _FakeSandboxProvider()
+        result_a = asyncio.run(
+            resolve_tech_stack_submission(
+                "demo-thread-a", {"markdown": "# Tech Stack\n\nUnedited canned catalog pick."},
+                {"stages": {"tech-stack": {"draft": {}}}, "provider": "claude", "run_id": "demo-run-a"},
+                fake_provider_a,
+            )
+        )
+    finally:
+        globals()["_extract_cache_get"] = real_extract_cache_get
+        config_inventory.inventory = real_inventory
+
+    assert result_a is not None
+    assert result_a["auth_kind"] == "entra", "cache-hit path must merge the deterministic scan (fix #1)"
+    assert result_a["config_inventory"] == {"status": "present", "values": ["AzureAd:TenantId"], "reason": ""}
+    assert json.loads(fake_provider_a.files[TECH_STACK_APPROVED_JSON_PATH]) == result_a
+
+    # resolve_tech_stack_submission, scenario B: the fresh-extraction path also merges, AND the
+    # extraction cache stores the PURE extraction result (before the scan is unioned in) --
+    # otherwise a later cache hit for a DIFFERENT repo/thread would ship THIS repo's own scan.
+    fresh_extracted = _full(
+        summary="A small Python service.",
+        languages={"status": "present", "values": ["Python"], "reason": ""},
+        auth_kind="none",
+        config_inventory={"status": "present", "values": ["FOO_KEY"], "reason": ""},
+    )
+    cache_put_calls: list[tuple[str, dict[str, Any]]] = []
+    real_extract_cache_get = _extract_cache_get
+    real_extract_cache_put = _extract_cache_put
+    real_extract_tech_stack = globals()["_extract_tech_stack"]
+    real_inventory = config_inventory.inventory
+
+    async def _fake_extract_b(thread_id, markdown, provider, chat_provider, run_id):  # noqa: ANN001, ARG001
+        return dict(fresh_extracted)
+
+    async def _fake_inventory_custom(provider, thread_id):  # noqa: ANN001, ARG001
+        return "custom", ["BAR_KEY"]
+
+    globals()["_extract_cache_get"] = lambda markdown: None
+    globals()["_extract_cache_put"] = lambda markdown, tech_stack: cache_put_calls.append((markdown, dict(tech_stack)))
+    globals()["_extract_tech_stack"] = _fake_extract_b
+    config_inventory.inventory = _fake_inventory_custom
+    try:
+        fake_provider_b = _FakeSandboxProvider()
+        result_b = asyncio.run(
+            resolve_tech_stack_submission(
+                "demo-thread-b", {"markdown": "# Tech Stack\n\nFreshly typed description."},
+                {"stages": {"tech-stack": {"draft": {}}}, "provider": "claude", "run_id": "demo-run-b"},
+                fake_provider_b,
+            )
+        )
+    finally:
+        globals()["_extract_cache_get"] = real_extract_cache_get
+        globals()["_extract_cache_put"] = real_extract_cache_put
+        globals()["_extract_tech_stack"] = real_extract_tech_stack
+        config_inventory.inventory = real_inventory
+
+    assert result_b is not None
+    assert result_b["auth_kind"] == "custom", "extraction path must merge the deterministic scan too (fix #1)"
+    assert result_b["config_inventory"]["values"] == ["FOO_KEY", "BAR_KEY"], "union, existing keys first"
+    assert len(cache_put_calls) == 1 and cache_put_calls[0][1] == fresh_extracted, (
+        "the cache must store the PURE extraction, not the per-thread merged result"
+    )
+
+    # resolve_tech_stack_submission, scenario C: total extraction failure -> typed-absent fallback
+    # (fix #2) still merges (fix #1) and records a ledger entry, and the human's approved markdown
+    # is never lost.
+    real_extract_cache_get = _extract_cache_get
+    real_extract_tech_stack = globals()["_extract_tech_stack"]
+    real_inventory = config_inventory.inventory
+
+    async def _raising_extract(thread_id, markdown, provider, chat_provider, run_id):  # noqa: ANN001, ARG001
+        raise RuntimeError("simulated extraction failure")
+
+    async def _fake_inventory_google(provider, thread_id):  # noqa: ANN001, ARG001
+        return "google", ["GOOG_KEY"]
+
+    globals()["_extract_cache_get"] = lambda markdown: None
+    globals()["_extract_tech_stack"] = _raising_extract
+    config_inventory.inventory = _fake_inventory_google
+    try:
+        fake_provider_c = _FakeSandboxProvider()
+        markdown_c = "# Tech Stack\n\nWill fail to extract."
+        result_c = asyncio.run(
+            resolve_tech_stack_submission(
+                "demo-thread-c", {"markdown": markdown_c},
+                {"stages": {"tech-stack": {"draft": {}}}, "provider": "claude", "run_id": "demo-run-c"},
+                fake_provider_c,
+            )
+        )
+    finally:
+        globals()["_extract_cache_get"] = real_extract_cache_get
+        globals()["_extract_tech_stack"] = real_extract_tech_stack
+        config_inventory.inventory = real_inventory
+
+    assert fake_provider_c.files[TECH_STACK_MD_PATH] == markdown_c, "the human's approved text must never be lost"
+    TechStack.model_validate(result_c)
+    assert result_c["summary"].startswith("#"), "fallback summary is raw markdown -- fix #4's repair signature"
+    assert result_c["auth_kind"] == "google", "fix #1's merge still runs on the extraction-failure path"
+    assert result_c["config_inventory"]["values"] == ["GOOG_KEY"]
+    assert "extraction failed" in fake_provider_c.files.get(repo_files.LEDGER_PATH, ""), (
+        "the extraction failure must be recorded in the ledger (fix #2)"
+    )
+
+    # hydrate_tech_stack_from_repo_file, scenario D: a sidecar carrying the extraction-failure
+    # signature gets repaired via one retry against the markdown still on disk (fix #4), and the
+    # repair result is itself persisted.
+    markdown_d = "# Tech Stack\n\nOriginal human-approved markdown."
+    bad_sidecar = _extraction_failed_tech_stack(markdown_d)
+    repaired_stack = _full(
+        summary="A Go microservice with no auth.",
+        languages={"status": "present", "values": ["Go"], "reason": ""},
+    )
+    real_extract_tech_stack = globals()["_extract_tech_stack"]
+    real_inventory = config_inventory.inventory
+
+    async def _fake_extract_repair(thread_id, markdown, provider, chat_provider, run_id):  # noqa: ANN001, ARG001
+        assert markdown == markdown_d, "the repair retry must read the CURRENT tech-stack.md"
+        return dict(repaired_stack)
+
+    async def _fake_inventory_none(provider, thread_id):  # noqa: ANN001, ARG001
+        return "none", []
+
+    globals()["_extract_tech_stack"] = _fake_extract_repair
+    config_inventory.inventory = _fake_inventory_none
+    try:
+        fake_provider_d = _FakeSandboxProvider(files={
+            TECH_STACK_APPROVED_JSON_PATH: json.dumps(bad_sidecar),
+            TECH_STACK_MD_PATH: markdown_d,
+        })
+        hydrated_d = asyncio.run(
+            hydrate_tech_stack_from_repo_file(
+                "demo-thread-d", {"provider": "claude", "run_id": "demo-run-d"}, fake_provider_d
+            )
+        )
+    finally:
+        globals()["_extract_tech_stack"] = real_extract_tech_stack
+        config_inventory.inventory = real_inventory
+
+    assert hydrated_d is not None and hydrated_d["summary"] == repaired_stack["summary"]
+    assert json.loads(fake_provider_d.files[TECH_STACK_APPROVED_JSON_PATH])["summary"] == repaired_stack["summary"]
+
+    # hydrate_tech_stack_from_repo_file, scenario E: a genuinely empty repo's sidecar must NOT be
+    # repaired -- too loose a signature would fire a needless retry and could silently overwrite a
+    # real "nothing found" verdict with a fabricated one.
+    real_extract_tech_stack = globals()["_extract_tech_stack"]
+    real_inventory = config_inventory.inventory
+
+    async def _fail_if_called(thread_id, markdown, provider, chat_provider, run_id):  # noqa: ANN001, ARG001
+        raise AssertionError("hydrate must not retry extraction for a genuinely empty repo")
+
+    async def _fake_inventory_none2(provider, thread_id):  # noqa: ANN001, ARG001
+        return "none", []
+
+    globals()["_extract_tech_stack"] = _fail_if_called
+    config_inventory.inventory = _fake_inventory_none2
+    try:
+        fake_provider_e = _FakeSandboxProvider(files={
+            TECH_STACK_APPROVED_JSON_PATH: json.dumps(genuinely_empty),
+            TECH_STACK_MD_PATH: "# Tech Stack\n\n(never read -- no repair should trigger)",
+        })
+        hydrated_e = asyncio.run(
+            hydrate_tech_stack_from_repo_file(
+                "demo-thread-e", {"provider": "claude", "run_id": "demo-run-e"}, fake_provider_e
+            )
+        )
+    finally:
+        globals()["_extract_tech_stack"] = real_extract_tech_stack
+        config_inventory.inventory = real_inventory
+
+    assert hydrated_e is not None and hydrated_e["summary"] == genuinely_empty["summary"]
+
+    # apply_stack_conventions, scenario F: conventions_applied self-heals on every run (fix #3),
+    # including a hydration/resume short-circuit that hands this hook a checkpointed `tech_stack`
+    # -- the fix reads/writes TECH_STACK_APPROVED_JSON_PATH on disk, not that argument, precisely
+    # so it can't persist stale content over whatever's actually there.
+    tech_stack_f = _full(languages=_langs("Python"), convention_roots=_roots(python=""))
+    fake_provider_f = _FakeSandboxProvider(files={TECH_STACK_APPROVED_JSON_PATH: json.dumps(tech_stack_f)})
+    asyncio.run(apply_stack_conventions("demo-thread-f", tech_stack_f, {}, fake_provider_f))
+    on_disk_f = json.loads(fake_provider_f.files[TECH_STACK_APPROVED_JSON_PATH])
+    assert on_disk_f["conventions_applied"] == ["python"], "fix #3: conventions_applied must self-heal"
+    assert "ruff.toml" in fake_provider_f.files and "mypy.ini" in fake_provider_f.files
 
     print("preflight_nodes self-check: ok")
