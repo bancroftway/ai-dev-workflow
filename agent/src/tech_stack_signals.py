@@ -13,6 +13,7 @@ import shlex
 from typing import Any
 
 from . import repo_files
+from .schemas import TechStack
 
 logger = logging.getLogger(__name__)
 
@@ -26,20 +27,51 @@ def frameworks_have_ui(frameworks: list[Any]) -> bool:
     return any(marker in fw for fw in lowered for marker in UI_FRAMEWORK_MARKERS)
 
 
+def load_tech_stack(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalizes a tech-stack dict to TechStack's CURRENT shape before anything below reads it --
+    whether `raw` is already that shape, a genuinely LEGACY on-disk shape (bare-list PresenceList
+    fields, the old separate dotnet_detected/dotnet_solution_root keys, dict-shaped
+    convention_roots -- what every already-onboarded repo's tech-stack.approved.json/draft.json
+    actually contains until the migration ships), or missing/malformed.
+
+    Routes through TechStack's own model_validator(mode="before") coercion chain (schemas.py,
+    Tasks 1-2) instead of re-implementing that legacy-shape knowledge here a second time -- same
+    "validate through the schema, don't hand-roll it" pattern preflight_nodes._extract_cache_get
+    already uses. Never raises: a validation failure (including a bare `{}`, since every field
+    below is required) falls back to `{}`, which every reader in this module already treats as
+    "nothing to report" -- the fail-open convention every call site here already relies on for a
+    missing file.
+    """
+    try:
+        return TechStack.model_validate(raw or {}).model_dump(mode="json")
+    except Exception:  # noqa: BLE001 -- malformed/legacy-but-uncoercible input is "nothing to read"
+        return {}
+
+
 def presence_values(tech_stack: dict[str, Any], field: str) -> list[str]:
     """The `values` list of a PresenceList-shaped TechStack field (languages/frameworks/
-    package_managers/testing_frameworks/conventions/config_inventory), tolerating a missing field
-    or a bare dict the same way the old `tech_stack.get(field) or []` shape used to tolerate a
-    missing key. Empty both when the field is absent from `tech_stack` entirely AND when it's
-    present with status="absent" -- callers that need to tell "not checked" from "checked, found
-    none" apart should read `tech_stack[field]["status"]` themselves instead."""
-    return (tech_stack.get(field) or {}).get("values") or []
+    package_managers/testing_frameworks/conventions/config_inventory), tolerating a missing field,
+    a bare dict, or a genuinely legacy bare-list value (normalized by load_tech_stack first) the
+    same way the old `tech_stack.get(field) or []` shape used to tolerate a missing key. Empty both
+    when the field is absent from `tech_stack` entirely AND when it's present with status="absent"
+    -- callers that need to tell "not checked" from "checked, found none" apart should read
+    `tech_stack[field]["status"]` themselves instead (on the normalized dict, not the raw one)."""
+    return (load_tech_stack(tech_stack).get(field) or {}).get("values") or []
 
 
 def dotnet_detected(tech_stack: dict[str, Any]) -> bool:
     """True when TechStack.dotnet reports status="detected" -- the bool the old top-level
-    `dotnet_detected` field used to carry directly, before it was folded into the `dotnet` object."""
-    return (tech_stack.get("dotnet") or {}).get("status") == "detected"
+    `dotnet_detected` field used to carry directly, before it was folded into the `dotnet` object.
+    Normalizes legacy shape first (load_tech_stack), so this is also correct for a repo whose
+    on-disk sidecar still has the old dotnet_detected/dotnet_solution_root pair instead of `dotnet`."""
+    return (load_tech_stack(tech_stack).get("dotnet") or {}).get("status") == "detected"
+
+
+def dotnet_solution_root(tech_stack: dict[str, Any]) -> str | None:
+    """TechStack.dotnet.solution_root, normalizing legacy shape first (same as dotnet_detected).
+    None means either not-detected or detected-but-low-confidence -- the "skip rather than guess"
+    contract every existing caller already relies on."""
+    return (load_tech_stack(tech_stack).get("dotnet") or {}).get("solution_root")
 
 
 def tech_stack_has_ui_framework(state: dict[str, Any]) -> bool:
@@ -62,8 +94,9 @@ def convention_root(tech_stack: dict[str, Any], ecosystem: str) -> str | None:
     """The repo-relative root recorded for a non-.NET ecosystem's `convention_roots` entry, or
     None when that ecosystem has no entry at all or is recorded status="absent". "" is a
     legitimate present-at-repo-root value, distinct from None ("nothing to join, fall back to
-    whatever the caller treats as its own default")."""
-    for entry in tech_stack.get("convention_roots") or []:
+    whatever the caller treats as its own default"). Normalizes legacy shape first (load_tech_stack)
+    -- a genuinely legacy sidecar has convention_roots as a bare dict[str, str], not this list."""
+    for entry in load_tech_stack(tech_stack).get("convention_roots") or []:
         if entry.get("ecosystem") == ecosystem:
             return entry.get("root") if entry.get("status") == "present" else None
     return None
@@ -82,7 +115,7 @@ def dotnet_root_prefix(tech_stack: dict[str, Any]) -> str:
     model-reported (TechStack.dotnet's own field) and must not be trusted to shell out unchecked,
     same as any other repo-relative path from that source.
     """
-    return _cd_prefix((tech_stack.get("dotnet") or {}).get("solution_root"), "dotnet.solution_root")
+    return _cd_prefix(dotnet_solution_root(tech_stack), "dotnet.solution_root")
 
 
 def ecosystem_root_prefix(tech_stack: dict[str, Any], ecosystem: str) -> str:
@@ -119,31 +152,98 @@ def _demo() -> None:
     def _roots(**by_ecosystem: str) -> list[dict[str, Any]]:
         return [{"ecosystem": eco, "status": "present", "root": root, "reason": ""} for eco, root in by_ecosystem.items()]
 
-    assert dotnet_root_prefix({"dotnet": _dotnet("apps")}) == "cd apps && "
-    assert dotnet_root_prefix({"dotnet": _dotnet("apps/backend")}) == "cd apps/backend && "
-    assert dotnet_root_prefix({"dotnet": _dotnet("")}) == ""
+    def _full(**overrides: Any) -> dict[str, Any]:
+        # A full, valid new-shape TechStack dict -- every field below is REQUIRED (Task 2 dropped
+        # their defaults), and load_tech_stack now validates the WHOLE object before any read, so
+        # a partial dict (e.g. just {"dotnet": ...}) fails validation and falls back to {} instead
+        # of exercising the field under test. Every real caller already hands these functions a
+        # full TechStack dump (a sidecar file's whole contents, or approved_content), never a
+        # hand-picked subset -- this fixture matches that, overriding only what each test cares about.
+        base: dict[str, Any] = {
+            "summary": "s",
+            "languages": {"status": "absent", "reason": "test fixture"},
+            "frameworks": {"status": "absent", "reason": "test fixture"},
+            "package_managers": {"status": "absent", "reason": "test fixture"},
+            "testing_frameworks": {"status": "absent", "reason": "test fixture"},
+            "conventions": {"status": "absent", "reason": "test fixture"},
+            "dotnet": {"status": "not_detected", "reason": "test fixture"},
+            "convention_roots": [],
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": {"status": "absent", "reason": "test fixture"},
+        }
+        return {**base, **overrides}
+
+    assert dotnet_root_prefix(_full(dotnet=_dotnet("apps"))) == "cd apps && "
+    assert dotnet_root_prefix(_full(dotnet=_dotnet("apps/backend"))) == "cd apps/backend && "
+    assert dotnet_root_prefix(_full(dotnet=_dotnet(""))) == ""
     assert dotnet_root_prefix({}) == ""
-    assert dotnet_root_prefix({"dotnet": _dotnet(None)}) == ""
-    assert dotnet_root_prefix({"dotnet": _dotnet("../evil")}) == ""
-    assert dotnet_root_prefix({"dotnet": _dotnet("/abs")}) == ""
-    assert ecosystem_root_prefix({"convention_roots": _roots(node="apps/web")}, "node") == "cd apps/web && "
-    assert ecosystem_root_prefix({"convention_roots": _roots(node="apps/web")}, "python") == ""
-    assert ecosystem_root_prefix({"convention_roots": _roots(python="../evil")}, "python") == ""
+    assert dotnet_root_prefix(_full(dotnet=_dotnet(None))) == ""
+    assert dotnet_root_prefix(_full(dotnet=_dotnet("../evil"))) == ""
+    assert dotnet_root_prefix(_full(dotnet=_dotnet("/abs"))) == ""
+    assert ecosystem_root_prefix(_full(convention_roots=_roots(node="apps/web")), "node") == "cd apps/web && "
+    assert ecosystem_root_prefix(_full(convention_roots=_roots(node="apps/web")), "python") == ""
+    assert ecosystem_root_prefix(_full(convention_roots=_roots(python="../evil")), "python") == ""
     assert ecosystem_root_prefix({}, "node") == ""
 
     # convention_root: status="absent" and "no entry at all" both mean None, not "".
     absent_roots = [{"ecosystem": "node", "status": "absent", "root": "", "reason": "no package.json"}]
-    assert convention_root({"convention_roots": absent_roots}, "node") is None
-    assert convention_root({"convention_roots": absent_roots}, "python") is None
-    assert convention_root({"convention_roots": _roots(node="")}, "node") == ""
+    assert convention_root(_full(convention_roots=absent_roots), "node") is None
+    assert convention_root(_full(convention_roots=absent_roots), "python") is None
+    assert convention_root(_full(convention_roots=_roots(node="")), "node") == ""
 
     # presence_values/dotnet_detected: the two other shape-reads every consumer shares.
-    assert presence_values({"frameworks": {"status": "present", "values": ["Express"]}}, "frameworks") == ["Express"]
-    assert presence_values({"frameworks": {"status": "absent", "values": [], "reason": "none found"}}, "frameworks") == []
+    assert presence_values(_full(frameworks={"status": "present", "values": ["Express"]}), "frameworks") == ["Express"]
+    assert presence_values(_full(frameworks={"status": "absent", "values": [], "reason": "none found"}), "frameworks") == []
     assert presence_values({}, "frameworks") == []
-    assert dotnet_detected({"dotnet": {"status": "detected", "solution_root": "src"}}) is True
-    assert dotnet_detected({"dotnet": {"status": "not_detected", "reason": "no .csproj"}}) is False
+    assert dotnet_detected(_full(dotnet={"status": "detected", "solution_root": "src"})) is True
+    assert dotnet_detected(_full(dotnet={"status": "not_detected", "reason": "no .csproj"})) is False
     assert dotnet_detected({}) is False
+
+    # --- Genuinely LEGACY on-disk shape: every already-onboarded repo's tech-stack.approved.json
+    # looks like this today (bare-list PresenceList fields, the old dotnet_detected/
+    # dotnet_solution_root pair, dict-shaped convention_roots) until the migration ships. Every
+    # reader above must normalize it via load_tech_stack (TechStack's own before-validator coercion
+    # chain), not crash (AttributeError: 'list'/'str' object has no attribute 'get') or silently
+    # under-report (dotnet_detected() returning False for a repo that IS dotnet).
+    legacy = {
+        "summary": "legacy sidecar",
+        "languages": ["Python", "TypeScript"],
+        "frameworks": ["Express"],
+        "package_managers": ["npm"],
+        "testing_frameworks": [],
+        "conventions": [],
+        "dotnet_detected": True,
+        "dotnet_solution_root": "src/Api",
+        "convention_roots": {"node": "apps/web", "python": "apps/api"},
+        "conventions_applied": [],
+        "auth_kind": "none",
+        "config_inventory": ["DATABASE_URL"],
+    }
+    assert presence_values(legacy, "languages") == ["Python", "TypeScript"]
+    assert presence_values(legacy, "frameworks") == ["Express"]
+    assert presence_values(legacy, "testing_frameworks") == [], "legacy empty list -> absent -> []"
+    assert presence_values(legacy, "config_inventory") == ["DATABASE_URL"]
+    assert dotnet_detected(legacy) is True, "legacy dotnet_detected=True must not silently read as False"
+    assert dotnet_solution_root(legacy) == "src/Api"
+    assert dotnet_root_prefix(legacy) == "cd src/Api && "
+    assert convention_root(legacy, "node") == "apps/web"
+    assert convention_root(legacy, "python") == "apps/api"
+    assert ecosystem_root_prefix(legacy, "node") == "cd apps/web && "
+
+    # A legacy repo with dotnet NOT detected -- the other half of the old bool/pair.
+    legacy_no_dotnet = {**legacy, "dotnet_detected": False, "dotnet_solution_root": None, "convention_roots": {}}
+    assert dotnet_detected(legacy_no_dotnet) is False
+    assert dotnet_solution_root(legacy_no_dotnet) is None
+    assert dotnet_root_prefix(legacy_no_dotnet) == ""
+    assert convention_root(legacy_no_dotnet, "node") is None
+
+    # Malformed/uncoercible input must fail open (empty), never raise.
+    assert load_tech_stack(None) == {}
+    assert load_tech_stack({"not": "a tech stack at all"}) == {}
+    assert presence_values({"not": "a tech stack at all"}, "languages") == []
+    assert dotnet_detected({"not": "a tech stack at all"}) is False
+    assert convention_root({"not": "a tech stack at all"}, "node") is None
 
     print("tech_stack_signals self-check: ok")
 

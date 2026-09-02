@@ -1235,17 +1235,53 @@ def _demo() -> None:
 
     # resolve_test_command: TechStack's languages/dotnet fields are PresenceList/DotnetStatus
     # objects now, not a bare list/bool -- must read ["values"]/["status"] instead of truthiness.
-    assert resolve_test_command({"dotnet": {"status": "detected", "solution_root": "src"}}) == (
+    # tech_stack_signals' helpers now validate the WHOLE dict (to normalize legacy shape too), so a
+    # fixture needs every required TechStack field, not just the one under test.
+    def _ts(**overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "summary": "s",
+            "languages": {"status": "absent", "reason": "test fixture"},
+            "frameworks": {"status": "absent", "reason": "test fixture"},
+            "package_managers": {"status": "absent", "reason": "test fixture"},
+            "testing_frameworks": {"status": "absent", "reason": "test fixture"},
+            "conventions": {"status": "absent", "reason": "test fixture"},
+            "dotnet": {"status": "not_detected", "reason": "test fixture"},
+            "convention_roots": [],
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": {"status": "absent", "reason": "test fixture"},
+        }
+        return {**base, **overrides}
+
+    assert resolve_test_command(_ts(dotnet={"status": "detected", "solution_root": "src"})) == (
         "cd src && dotnet test --logger 'console;verbosity=normal'"
     )
     assert resolve_test_command(
-        {"dotnet": {"status": "not_detected", "reason": "no .csproj"}, "languages": {"status": "present", "values": ["TypeScript"]}}
+        _ts(languages={"status": "present", "values": ["TypeScript"]})
     ) == "npx --yes vitest run --reporter=verbose || npx --yes jest --verbose"
     assert resolve_test_command(
-        {"dotnet": {"status": "not_detected", "reason": "no .csproj"}, "languages": {"status": "present", "values": ["Python"]}}
+        _ts(languages={"status": "present", "values": ["Python"]})
     ) == "python -m pytest -v"
     assert resolve_test_command({}) is None
-    assert resolve_test_command({"languages": {"status": "absent", "values": [], "reason": "none found"}}) is None
+    assert resolve_test_command(_ts()) is None
+
+    # Genuinely legacy on-disk shape (old dotnet_detected/dotnet_solution_root pair) must resolve
+    # correctly too, not silently fall through to "no command" for an already-onboarded .NET repo.
+    legacy = {
+        "summary": "legacy",
+        "languages": [],
+        "frameworks": [],
+        "package_managers": [],
+        "testing_frameworks": [],
+        "conventions": [],
+        "dotnet_detected": True,
+        "dotnet_solution_root": "src/Api",
+        "convention_roots": {},
+        "conventions_applied": [],
+        "auth_kind": "none",
+        "config_inventory": [],
+    }
+    assert resolve_test_command(legacy) == "cd src/Api && dotnet test --logger 'console;verbosity=normal'"
 
     # Level classification: e2e by PATH (the only level a path proves), integration by SYMBOL,
     # because .NET keeps unit and integration tests in one project and often one file.

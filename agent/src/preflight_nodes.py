@@ -821,7 +821,7 @@ def _applicable_ecosystems(tech_stack: dict[str, Any]) -> list[tuple[_Ecosystem,
     applicable: list[tuple[_Ecosystem, str]] = []
 
     if tech_stack_signals.dotnet_detected(tech_stack):
-        solution_root = (tech_stack.get("dotnet") or {}).get("solution_root")
+        solution_root = tech_stack_signals.dotnet_solution_root(tech_stack)
         # None means the detector had low confidence. Skipping beats guessing: MSBuild discovers
         # props by walking *up* from each project, so a wrongly-placed file silently misses
         # projects or pulls in unrelated directories.
@@ -955,27 +955,49 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     def _roots(**by_ecosystem: str) -> list[dict[str, Any]]:
         return [{"ecosystem": eco, "status": "present", "root": root, "reason": ""} for eco, root in by_ecosystem.items()]
 
-    assert _applicable_ecosystems({}) == []
-    assert _applicable_ecosystems({"languages": _langs("Rust")}) == []
+    def _full(**overrides: Any) -> dict[str, Any]:
+        # A full, valid new-shape TechStack dict. _applicable_ecosystems now routes every read
+        # through tech_stack_signals' shared helpers, which normalize legacy shape via
+        # TechStack.model_validate -- that validates the WHOLE object, so a partial dict (e.g. just
+        # {"dotnet": ...}) fails validation and silently falls back to "nothing detected" instead of
+        # exercising the field under test. Every real caller already hands these helpers a full
+        # TechStack dump, never a hand-picked subset -- this fixture matches that.
+        base: dict[str, Any] = {
+            "summary": "s",
+            "languages": {"status": "absent", "reason": "test fixture"},
+            "frameworks": {"status": "absent", "reason": "test fixture"},
+            "package_managers": {"status": "absent", "reason": "test fixture"},
+            "testing_frameworks": {"status": "absent", "reason": "test fixture"},
+            "conventions": {"status": "absent", "reason": "test fixture"},
+            "dotnet": {"status": "not_detected", "reason": "test fixture"},
+            "convention_roots": [],
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": {"status": "absent", "reason": "test fixture"},
+        }
+        return {**base, **overrides}
 
-    dotnet_only = _applicable_ecosystems({"dotnet": _dotnet("src")})
+    assert _applicable_ecosystems({}) == []
+    assert _applicable_ecosystems(_full(languages=_langs("Rust"))) == []
+
+    dotnet_only = _applicable_ecosystems(_full(dotnet=_dotnet("src")))
     assert [(e.key, r) for e, r in dotnet_only] == [("dotnet", "src")], dotnet_only
     assert _join_root("src", "Directory.Build.props") == "src/Directory.Build.props"
 
     # Repo root: "" is a legal solution root but an illegal repo-relative path -- the join, not
     # the validator, is what has to special-case it.
-    root_level = _applicable_ecosystems({"dotnet": _dotnet("")})
+    root_level = _applicable_ecosystems(_full(dotnet=_dotnet("")))
     assert [(e.key, r) for e, r in root_level] == [("dotnet", "")], root_level
     assert _join_root("", "Directory.Build.props") == "Directory.Build.props"
 
     # Low confidence (None) is not the same as the repo root ("").
-    assert _applicable_ecosystems({"dotnet": _dotnet(None)}) == []
+    assert _applicable_ecosystems(_full(dotnet=_dotnet(None))) == []
 
     # A root the path allowlist rejects is dropped, not raised on. Traversal, absolute paths and
     # shell metacharacters are all rejected -- the cases that actually matter, since these roots are
     # model-reported and end up inside container shell commands.
     def _py_roots(root: str) -> list[tuple[str, str]]:
-        applicable = _applicable_ecosystems({"languages": _langs("Python"), "convention_roots": _roots(python=root)})
+        applicable = _applicable_ecosystems(_full(languages=_langs("Python"), convention_roots=_roots(python=root)))
         return [(eco.key, resolved) for eco, resolved in applicable]
 
     assert _py_roots("../etc") == []
@@ -988,11 +1010,11 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     assert _py_roots("My App") == [("python", "My App")]
 
     polyglot = _applicable_ecosystems(
-        {
-            "languages": _langs("TypeScript", "Python", "C#"),
-            "dotnet": _dotnet("src"),
-            "convention_roots": _roots(node="web", python="api"),
-        }
+        _full(
+            languages=_langs("TypeScript", "Python", "C#"),
+            dotnet=_dotnet("src"),
+            convention_roots=_roots(node="web", python="api"),
+        )
     )
     assert [(e.key, r) for e, r in polyglot] == [("dotnet", "src"), ("node", "web"), ("python", "api")], polyglot
 
@@ -1000,9 +1022,33 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     # all -- a real repo whose convention_roots audit found no node.js work still needs "" (root
     # level) if the languages heuristic alone flags it (defensive: the two should agree in practice).
     absent_only = _applicable_ecosystems(
-        {"languages": _langs("TypeScript"), "convention_roots": [{"ecosystem": "node", "status": "absent", "root": "", "reason": "no package.json"}]}
+        _full(
+            languages=_langs("TypeScript"),
+            convention_roots=[{"ecosystem": "node", "status": "absent", "root": "", "reason": "no package.json"}],
+        )
     )
     assert [(e.key, r) for e, r in absent_only] == [("node", "")], absent_only
+
+    # Genuinely LEGACY on-disk shape (old dotnet_detected/dotnet_solution_root pair, dict-shaped
+    # convention_roots) -- what every already-onboarded repo's tech-stack.approved.json actually
+    # contains until the migration ships. Must normalize via load_tech_stack, not silently drop
+    # the ecosystems this repo actually has.
+    legacy = {
+        "summary": "legacy sidecar",
+        "languages": ["TypeScript", "Python"],
+        "frameworks": [],
+        "package_managers": [],
+        "testing_frameworks": [],
+        "conventions": [],
+        "dotnet_detected": False,
+        "dotnet_solution_root": None,
+        "convention_roots": {"node": "web", "python": "api"},
+        "conventions_applied": [],
+        "auth_kind": "none",
+        "config_inventory": [],
+    }
+    legacy_applicable = _applicable_ecosystems(legacy)
+    assert [(e.key, r) for e, r in legacy_applicable] == [("node", "web"), ("python", "api")], legacy_applicable
 
     # Node writes nothing into the repo: no template files, only the AGENTS.md paragraph.
     assert _NODE.files == ()

@@ -1763,12 +1763,29 @@ def _demo() -> None:
 
     # tech_stack_has_ui_framework: same UI-framework-marker check graph.py's stage gates use --
     # this module's own self-check is a light re-confirmation, the real one lives in
-    # tech_stack_signals.py now.
+    # tech_stack_signals.py now. approved_content must be a FULL TechStack dict -- presence_values
+    # normalizes legacy shape by validating the WHOLE object, so a hand-picked partial dict fails
+    # validation and silently reads as "no frameworks" instead of exercising the field under test.
+    def _approved_content(frameworks: list[str]) -> dict[str, Any]:
+        return {
+            "summary": "s",
+            "languages": {"status": "absent", "reason": "test fixture"},
+            "frameworks": {"status": "present", "values": frameworks},
+            "package_managers": {"status": "absent", "reason": "test fixture"},
+            "testing_frameworks": {"status": "absent", "reason": "test fixture"},
+            "conventions": {"status": "absent", "reason": "test fixture"},
+            "dotnet": {"status": "not_detected", "reason": "test fixture"},
+            "convention_roots": [],
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": {"status": "absent", "reason": "test fixture"},
+        }
+
     assert tech_stack_has_ui_framework(
-        {"stages": {"tech-stack": {"approved_content": {"frameworks": {"status": "present", "values": ["Next.js"]}}}}}
+        {"stages": {"tech-stack": {"approved_content": _approved_content(["Next.js"])}}}
     )
     assert not tech_stack_has_ui_framework(
-        {"stages": {"tech-stack": {"approved_content": {"frameworks": {"status": "present", "values": ["FastAPI"]}}}}}
+        {"stages": {"tech-stack": {"approved_content": _approved_content(["FastAPI"])}}}
     )
     assert not tech_stack_has_ui_framework({})
 
