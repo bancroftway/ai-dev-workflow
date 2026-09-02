@@ -1485,6 +1485,42 @@ class StageSpec:
     raw-requirements) -- set for specification/plan, whose approved content other stages build on
     and whose approval is worth being able to detect tampering/accidental edits against later."""
 
+    draft_example: BaseModel | None = None
+    audit_example: BaseModel | None = None
+    """A worked example of a valid response, forwarded to ainvoke_structured's own `example` kwarg
+    (structured_output.build_schema_contract) for the draft/audit call respectively. None (the
+    default) is zero behavior change -- no stage sets either yet; Tasks 7/8/13 wire real per-stage
+    examples in."""
+
+    draft_rules: str | None = None
+    audit_rules: str | None = None
+    """Pre-joined gate-rule text, forwarded to ainvoke_structured's own `rules` kwarg for the
+    draft/audit call respectively -- the WORK rules a stage's deterministic_verify actually
+    enforces, spelled out for the model up front instead of only discovered after a rejection.
+    None (the default) is zero behavior change; Tasks 7/8/13 wire real per-stage rules in."""
+
+
+def stages_missing_rules(stages: list[StageSpec]) -> list[str]:
+    """Stage keys that have a deterministic_verify but no rules text arming the pass(es) that feed
+    it -- draft_rules always required (every stage drafts), audit_rules required too only when the
+    stage actually has an audit pass (audit_response_schema set).
+
+    NOT asserted against the real STAGES registry below: at this point in the plan no StageSpec
+    has draft_rules/audit_rules populated yet (Tasks 7/8/13 add that), so asserting here would fail
+    today for reasons that have nothing to do with this task's own mechanism. Self-tested against
+    synthetic StageSpecs in _demo() instead -- callable directly against STAGES once later tasks
+    have wired real rules in.
+    """
+    missing = []
+    for stage in stages:
+        if stage.deterministic_verify is None:
+            continue
+        has_draft_rules = bool(stage.draft_rules)
+        has_audit_rules = stage.audit_response_schema is None or bool(stage.audit_rules)
+        if not (has_draft_rules and has_audit_rules):
+            missing.append(stage.key)
+    return missing
+
 
 STAGES: list[StageSpec] = [
     StageSpec(
@@ -2387,7 +2423,13 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         try:
             response = await call_with_infra_retry(
-                lambda: ainvoke_structured(model, prompt_messages, stage_spec.response_schema),
+                lambda: ainvoke_structured(
+                    model,
+                    prompt_messages,
+                    stage_spec.response_schema,
+                    example=stage_spec.draft_example,
+                    rules=stage_spec.draft_rules,
+                ),
                 label=f"{stage_spec.key}:draft",
             )
         except (TimeoutError, RuntimeError) as exc:
@@ -2597,7 +2639,13 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         try:
             response = await call_with_infra_retry(
-                lambda: ainvoke_structured(model, prompt_messages, stage_spec.audit_response_schema),
+                lambda: ainvoke_structured(
+                    model,
+                    prompt_messages,
+                    stage_spec.audit_response_schema,
+                    example=stage_spec.audit_example,
+                    rules=stage_spec.audit_rules,
+                ),
                 label=f"{stage_spec.key}:audit",
             )
             content_dict = getattr(response, stage_spec.audit_content_field).model_dump(mode="json")
@@ -4677,7 +4725,9 @@ def _demo() -> None:
     def _absent(reason: str) -> PresenceList:
         return PresenceList(status="absent", reason=reason)
 
-    async def _fake_ainvoke_structured(_model, _messages, _schema):  # noqa: ANN001
+    async def _fake_ainvoke_structured(_model, _messages, _schema, **_kwargs):  # noqa: ANN001
+        # **_kwargs swallows the draft call site's now-real example=/rules= (Task 6) -- both None
+        # for tech-stack today, but the fake must tolerate any kwargs the real call site passes.
         draft_call_count["n"] += 1
         return TechStackDraftResponse(
             readiness=True, clarifying_questions=[],
@@ -5008,6 +5058,53 @@ def _demo() -> None:
     # unchanged -- same "wired, not just correct in isolation" proof already used above for the
     # wireframe-scoping and ticket-mode segments.
     assert "retired_ac_ids" in AC_TO_TESTS_SYSTEM_PROMPT and "retired_us_ids" in AC_TO_TESTS_SYSTEM_PROMPT
+
+    # Task 6: stages_missing_rules's own checking logic, against synthetic StageSpecs -- not the
+    # real STAGES registry, since no real StageSpec has draft_rules/audit_rules populated yet
+    # (Tasks 7/8/13 wire those in). Same minimal-fields pattern as demo_gate_spec above.
+    def _synthetic_stage(  # noqa: ANN001
+        key: str, *, has_verify: bool = True, audited: bool = False, draft_rules=None, audit_rules=None
+    ) -> StageSpec:
+        return StageSpec(
+            key=key,
+            response_schema=object,  # unused by stages_missing_rules
+            content_field=None,
+            surface_tool_name="synthetic",
+            build_envelope=lambda *a: {},
+            build_prompt=lambda *a: [],
+            max_cycles=1,
+            render_markdown=lambda *a: "",
+            audit_response_schema=object if audited else None,
+            deterministic_verify=(lambda *a: None) if has_verify else None,  # never called -- key is just "is it set"
+            draft_rules=draft_rules,
+            audit_rules=audit_rules,
+        )
+
+    missing = stages_missing_rules(
+        [
+            _synthetic_stage("no-gate", has_verify=False),  # no deterministic_verify at all -- exempt
+            _synthetic_stage("draft-only-ok", draft_rules="be terse"),
+            _synthetic_stage("draft-only-missing"),
+            _synthetic_stage("audited-ok", audited=True, draft_rules="be terse", audit_rules="stay terse"),
+            _synthetic_stage("audited-missing-audit-rules", audited=True, draft_rules="be terse"),
+        ]
+    )
+    assert missing == ["draft-only-missing", "audited-missing-audit-rules"], missing
+
+    # Task 6: draft_example/draft_rules/audit_example/audit_rules actually reach the two
+    # ainvoke_structured call sites (not just sit unused on StageSpec). Driving make_draft_node/
+    # make_audit_node for real needs a live sandbox+model setup unrelated to this task (session
+    # options, model_config, get_chat_model_for_thread...); source-inspecting the actual call sites
+    # is the same "wired, not just correct in isolation" proof already used above for the
+    # retirement-cleanup/wireframe-scoping prompt segments, just aimed at code instead of a prompt.
+    draft_node_src = inspect.getsource(make_draft_node)
+    assert "example=stage_spec.draft_example" in draft_node_src and "rules=stage_spec.draft_rules" in draft_node_src, (
+        "make_draft_node no longer threads draft_example/draft_rules into ainvoke_structured"
+    )
+    audit_node_src = inspect.getsource(make_audit_node)
+    assert "example=stage_spec.audit_example" in audit_node_src and "rules=stage_spec.audit_rules" in audit_node_src, (
+        "make_audit_node no longer threads audit_example/audit_rules into ainvoke_structured"
+    )
 
     print("graph self-check: all assertions passed")
 
