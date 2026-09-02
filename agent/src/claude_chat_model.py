@@ -767,6 +767,28 @@ class ClaudeChatModel(BaseChatModel):
                 f"stderr={result.stderr!r}"
             )
 
+        if result.exit_code != 0:
+            # The backgrounded shell wrapper's own `echo $? > exit_path`
+            # (cli_agent_exec._build_startup_command) captured the CLI PROCESS's real exit
+            # status -- nonzero here means it crashed/was killed partway through (OOM, signal,
+            # uncaught exception), NOT that it cleanly reported an application-level error via its
+            # own JSON (that path exits 0; is_error is read from the terminal line below). events
+            # can still be non-empty (some JSONL emitted before the crash) -- events[-1] would
+            # then be an INTERMEDIATE event, not the terminal result, which is exactly why this
+            # check must run before "final = events[-1]" treats it as one. Classified the same
+            # defensive way as the empty-events guard above: a resume-rejection marker match is
+            # recorded, but a mid-turn crash is never itself assumed to BE a resume rejection.
+            if session_id:
+                combined_text = f"{result.stdout} {result.stderr}"
+                rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
+                _session_cache.record_resume_state(self._session_key, "rejected" if rejected else "unknown")
+            raise RuntimeError(
+                f"Claude CLI process for {self._session_key!r} exited with code {result.exit_code} "
+                f"before completing (resume_state={_resume_states.get(self._session_key)!r}); "
+                f"last parsed event={events[-1] if events else None!r} stdout={result.stdout!r}\n"
+                f"stderr={result.stderr!r}"
+            )
+
         # Best-effort guess, confirmed real for this pipeline's own pinned CLI version
         # (task-4-report.md): the LAST line is the result-shaped summary event, exactly the same
         # is_error/result/session_id/usage/total_cost_usd/stop_reason keys the old single-object

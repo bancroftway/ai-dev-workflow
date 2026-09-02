@@ -18,6 +18,7 @@ from typing import Literal
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
+from . import config
 from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,18 @@ class TurnTimeout(TimeoutError):
     def __init__(self, message: str, partial_stdout: str = "") -> None:
         super().__init__(message)
         self.partial_stdout = partial_stdout
+
+
+class TurnCrashed(TurnTimeout):
+    """The backgrounded CLI process died (crash/OOM/signal) WITHOUT ever writing exit_path,
+    detected via /proc/$PID/stat's zombie state instead of exhausting the full timeout_seconds
+    budget waiting on a file that will never appear. Subclasses TurnTimeout (not a bare
+    RuntimeError): both chat models' `except TimeoutError` handlers already do exactly the right
+    thing for "the turn didn't finish" -- cache the partial stdout's session id for --resume,
+    mark resume continuity unknown (never dropped), re-raise with a clearer message -- so this
+    needs ZERO call-site changes in claude_chat_model.py/copilot_chat_model.py; only the message
+    text (and how fast this fires vs. a real timeout) tells the two apart.
+    """
 
 
 # Phase E audit C-2 ("Resume-rejected is not a distinct signal ... collapsed exactly as the Spec
@@ -304,6 +317,30 @@ def _build_startup_command(
     return f"setsid nohup sh -c {shlex.quote(sh_script)} >/dev/null 2>&1 & echo $! > {shlex.quote(pid_path)}"
 
 
+def _pid_state_probe_script(pid_path: str) -> str:
+    """POSIX sh expression: echoes DEAD if the pid in pid_path is confirmed dead
+    (/proc/$pid/stat unreadable, or its 3rd field is Z -- zombie, since this sandbox's PID 1 has
+    no reaper). ALIVE otherwise, including when pid_path is empty/unreadable (nothing recorded
+    yet -- an instant-early race, deliberately not treated as dead).
+
+    Naive whitespace field-splitting of /proc/pid/stat is generally unsafe (its 2nd field, comm,
+    is parenthesized and can itself contain spaces or `)`, shifting field indices) but safe here
+    specifically: the pid in pid_path is the setsid'd `sh` process ITSELF (setsid execve's in
+    place rather than forking when already a process-group leader, so the pid never changes
+    through setsid -> nohup -> sh -c -- see _build_startup_command's own comment on why `;` not
+    `&&` precedes the backgrounded setsid, for the same "this pid is the kill target" reasoning),
+    never the arbitrary user command running as ITS child. comm is therefore always the literal
+    2-byte string "sh", which can't contain a space or `)`.
+    """
+    quoted = shlex.quote(pid_path)
+    return (
+        f"p=$(cat {quoted} 2>/dev/null); "
+        f'if [ -z "$p" ]; then echo ALIVE; else '
+        f's=$(cut -d" " -f3 /proc/"$p"/stat 2>/dev/null); '
+        f'if [ -z "$s" ] || [ "$s" = Z ]; then echo DEAD; else echo ALIVE; fi; fi'
+    )
+
+
 async def run_turn(
     provider: SandboxProvider,
     thread_id: str,
@@ -388,25 +425,54 @@ async def run_turn(
             # existence doesn't depend on process-reaping semantics -- and the 2s remote sleep
             # interval is still all inside one exec call, so it costs nothing extra host-side.
             chunk = min(remaining, _ACTIVITY_CHUNK_SECONDS)
+            probe = _pid_state_probe_script(pid_path)
+            # The nested `timeout N sh -c '...'` is a separate process -- shell functions don't
+            # cross that boundary -- so the probe body is inlined both places rather than defined
+            # once as a function; it's four lines, not worth the indirection.
+            inner_script = (
+                f"while [ ! -f {shlex.quote(exit_path)} ]; do "
+                f'state=$({probe}); [ "$state" = DEAD ] && break; sleep 2; done'
+            )
             wait_cmd = (
-                f"timeout {int(chunk) + 1} sh -c 'while [ ! -f {exit_path} ]; do sleep 2; done' 2>/dev/null; "
-                f"test -f {shlex.quote(exit_path)} && echo DONE || echo PENDING"
+                f"timeout {int(chunk) + 1} sh -c {shlex.quote(inner_script)} 2>/dev/null; "
+                f"if [ -f {shlex.quote(exit_path)} ]; then echo DONE; "
+                f'else state=$({probe}); if [ "$state" = DEAD ]; then echo DEAD; else echo PENDING; fi; fi'
             )
             check_result = await asyncio.wait_for(
-                provider.exec_in_sandbox(thread_id, wait_cmd), timeout=chunk + 30.0
+                provider.exec_in_sandbox(thread_id, wait_cmd, timeout_seconds=chunk + 20.0),
+                timeout=chunk + 30.0,
             )
             if check_result.ok and "DONE" in check_result.stdout:
                 break
+            if check_result.ok and "DEAD" in check_result.stdout:
+                partial = await provider.exec_in_sandbox(
+                    thread_id, f"head -c 65536 {shlex.quote(out_path)} 2>/dev/null || true"
+                )
+                raise TurnCrashed(
+                    f"backgrounded turn process (pid file {pid_path}) died without writing "
+                    f"{exit_path} -- zombie/gone in /proc, exit code never captured "
+                    f"(elapsed={elapsed:.0f}s of {timeout_seconds}s budget)",
+                    partial_stdout=partial.stdout if partial.ok else "",
+                )
 
-        # Read results.
-        stdout_result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(out_path)} 2>/dev/null || true")
+        # Read results. Long timeout, not the fast-admin default: a 40-minute turn's stdout can
+        # be megabytes of tool events (see the head -c 65536 comment above) and this reads it back
+        # unbounded/untruncated.
+        stdout_result = await provider.exec_in_sandbox(
+            thread_id, f"cat {shlex.quote(out_path)} 2>/dev/null || true",
+            timeout_seconds=config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
+        )
         stdout = stdout_result.stdout if stdout_result.ok else ""
 
-        stderr_result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(err_path)} 2>/dev/null || true")
+        stderr_result = await provider.exec_in_sandbox(
+            thread_id, f"cat {shlex.quote(err_path)} 2>/dev/null || true",
+            timeout_seconds=config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
+        )
         stderr = stderr_result.stdout if stderr_result.ok else ""
 
         exit_code_result = await provider.exec_in_sandbox(
-            thread_id, f"cat {shlex.quote(exit_path)} 2>/dev/null || echo 1"
+            thread_id, f"cat {shlex.quote(exit_path)} 2>/dev/null || echo 1",
+            timeout_seconds=config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
         )
         try:
             exit_code = int(exit_code_result.stdout.strip()) if exit_code_result.ok else 1
@@ -504,6 +570,20 @@ def _demo() -> None:
     timeout_exc = TurnTimeout("turn did not complete within 5 seconds", partial_stdout='{"type":"system","subtype":"init"}')
     assert isinstance(timeout_exc, TimeoutError) and "init" in timeout_exc.partial_stdout
     assert TurnTimeout("x").partial_stdout == ""
+
+    # TurnCrashed subclasses TurnTimeout (itself a TimeoutError) -- both chat models' existing
+    # `except TimeoutError` handlers must catch it with zero call-site changes.
+    crashed_exc = TurnCrashed("died without writing exit_path", partial_stdout='{"type":"system"}')
+    assert isinstance(crashed_exc, TurnTimeout) and isinstance(crashed_exc, TimeoutError)
+    assert crashed_exc.partial_stdout == '{"type":"system"}'
+
+    # _pid_state_probe_script: pure string construction, no live /proc reads here -- checks the
+    # shell expression shape (echoes ALIVE for an empty pid file, DEAD for a Z state or a missing
+    # /proc entry), not real process state.
+    probe = _pid_state_probe_script("/tmp/aidw-agent/test.pid")
+    assert "/tmp/aidw-agent/test.pid" in probe
+    assert 'echo ALIVE' in probe and 'echo DEAD' in probe
+    assert '"$s" = Z' in probe, "must check the zombie state character"
     print("cli_agent_exec self-check: all assertions passed")
 
 

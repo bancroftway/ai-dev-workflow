@@ -77,6 +77,22 @@ VERIFY_INFRA_RETRY_CAP = int(os.environ.get("AIDW_VERIFY_INFRA_RETRY_CAP", "2"))
 # sandbox/local_docker.py's provision().
 SANDBOX_PROVISION_RETRY_ATTEMPTS = int(os.environ.get("AIDW_SANDBOX_PROVISION_RETRY_ATTEMPTS", "2"))
 
+# How long a single `docker <args>` call (sandbox/local_docker.py's _run_docker) may run before
+# it's treated as wedged and killed. Covers routine admin commands (inspect/rm/stop/start/cp/
+# exec) that only talk to the local daemon. Matters more than an ordinary timeout would suggest:
+# provision()/_try_reattach() hold LocalDockerProvider's one shared, non-reentrant self._lock
+# while calling this, so a wedged call there freezes every OTHER session's provisioning/touch/
+# liveness too, not just the stuck one.
+SANDBOX_DOCKER_TIMEOUT_SECONDS = int(os.environ.get("AIDW_SANDBOX_DOCKER_TIMEOUT_SECONDS", "30"))
+
+# For docker operations that are legitimately allowed to run long and shouldn't share the
+# fast-admin default above: `docker create` can trigger a first-time image pull over the network,
+# and reading a finished turn's full stdout/stderr back (cli_agent_exec.py's post-completion
+# `cat` calls) can plausibly be megabytes (see TurnTimeout's own comment on turn output size).
+SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS = int(
+    os.environ.get("AIDW_SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS", "600")
+)
+
 # In-container path the sandbox image bakes the Agent Plugin content to (agent/sandbox-image/
 # Dockerfile's COPY plugins/ -> this path). Overridable for local spikes without a code change.
 COPILOT_PLUGIN_ROOT_IN_CONTAINER = os.environ.get(

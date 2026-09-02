@@ -112,23 +112,34 @@ export function computeRunningStages(events: RunLogEvent[]): Set<string> {
   return new Set(openNodeStage.values());
 }
 
-/** This session's full event history, oldest first, live-updating for as long as the caller stays
- * mounted. Reads threadId/localAgentId from useWorkflowThread() internally -- same assumption
- * EventLogView's original effect made: a session switch is a full Next.js route navigation, which
- * remounts the caller, not an in-place threadId prop change, so no reset-on-change handling is
- * needed here. */
-export function useRunEvents(): RunLogEvent[] {
-  const { threadId, localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
-  const [events, setEvents] = useState<RunLogEvent[]>([]);
+const POLL_MS = 15000;
 
-  useEffect(() => {
-    let cancelled = false;
+interface PollState {
+  events: RunLogEvent[];
+  listeners: Set<(events: RunLogEvent[]) => void>;
+  timer?: ReturnType<typeof setInterval>;
+}
+
+// Keyed by threadId, module-level (outside React) so every useRunEvents() caller mounted for the
+// same session shares one fetch+timer loop instead of each running its own -- AppShell, BuildView,
+// LiveCostChip and SessionOverview all call this hook independently, and until this were four
+// unsynchronized 10s timers overlapping in phase, averaging a real request every 2-3s for one
+// person looking at one session (2026-09-02 investigation). First subscriber for a threadId starts
+// the loop; each additional one just registers and gets the current + all future events for free;
+// last one to unmount tears it down.
+const pollStates = new Map<string, PollState>();
+
+function subscribeToPoll(threadId: string, onEvents: (events: RunLogEvent[]) => void): () => void {
+  let state = pollStates.get(threadId);
+  if (!state) {
+    const s: PollState = { events: [], listeners: new Set() };
     const fetchOnce = () =>
       fetch(`/api/sessions/${encodeURIComponent(threadId)}/events`)
         .then((r) => (r.ok ? (r.json() as Promise<{ events: RunLogEvent[] }>) : null))
         .then((data) => {
-          if (!cancelled && data) setEvents((prev) => mergeEvents(prev, data.events));
+          if (!data) return;
+          s.events = mergeEvents(s.events, data.events);
+          s.listeners.forEach((l) => l(s.events));
         })
         .catch(() => {
           // Best-effort -- the live subscription below still works even if one poll fails
@@ -141,14 +152,37 @@ export function useRunEvents(): RunLogEvent[] {
     // mid-run reattach gap as state snapshots) never gets attached to that stream's custom events,
     // so its data would otherwise freeze at whatever existed at mount forever (user feedback
     // 2026-09-01: a stage's tab-pill spinner stayed on the wrong stage because of exactly this --
-    // a direct fetch of this same endpoint had fresher data than the hook's own state). Same 10s
-    // cadence AppShell.tsx already polls the durable session row at.
-    const interval = setInterval(fetchOnce, 10000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [threadId]);
+    // a direct fetch of this same endpoint had fresher data than the hook's own state). Separate
+    // from, and slower than, AppShell.tsx's own 10s poll of the durable session row.
+    s.timer = setInterval(fetchOnce, POLL_MS);
+    pollStates.set(threadId, s);
+    state = s;
+  }
+  state.listeners.add(onEvents);
+  onEvents(state.events);
+  return () => {
+    state!.listeners.delete(onEvents);
+    if (state!.listeners.size === 0) {
+      clearInterval(state!.timer);
+      pollStates.delete(threadId);
+    }
+  };
+}
+
+/** This session's full event history, oldest first, live-updating for as long as the caller stays
+ * mounted. Reads threadId/localAgentId from useWorkflowThread() internally -- same assumption
+ * EventLogView's original effect made: a session switch is a full Next.js route navigation, which
+ * remounts the caller, not an in-place threadId prop change, so no reset-on-change handling is
+ * needed here. */
+export function useRunEvents(): RunLogEvent[] {
+  const { threadId, localAgentId } = useWorkflowThread();
+  const { agent } = useAgent({ agentId: localAgentId });
+  const [events, setEvents] = useState<RunLogEvent[]>([]);
+
+  useEffect(
+    () => subscribeToPoll(threadId, (polled) => setEvents((prev) => mergeEvents(prev, polled))),
+    [threadId],
+  );
 
   useEffect(() => {
     const { unsubscribe } = agent.subscribe({

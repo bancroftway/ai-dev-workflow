@@ -20,7 +20,14 @@ from dataclasses import dataclass, field
 from . import registry
 from .. import config as workflow_config
 from ..telemetry import traced_exec
-from .provider import ExecResult, SandboxProvider, SandboxSession, runtime_auth_env, wait_for_cli_ready
+from .provider import (
+    ExecResult,
+    READY_TIMEOUT_SECONDS,
+    SandboxProvider,
+    SandboxSession,
+    runtime_auth_env,
+    wait_for_cli_ready,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +68,13 @@ _WS_VOLUME_PREFIX = "aidw-ws-"
 _GIT_TOKEN_DIR_IN_CONTAINER = "/home/vscode"
 _GIT_TOKEN_FILENAME = ".aidw-git-token"
 
+# The two wait_for_cli_ready _exec closures below each run ONE docker exec that legitimately
+# blocks for up to provider.READY_TIMEOUT_SECONDS + 10.0 (wait_for_cli_ready's own outer
+# asyncio.wait_for). This exec's OWN _run_docker timeout must stay comfortably above that so the
+# outer wait_for -- described in its own docstring as "a safety margin ... not the normal exit
+# path" -- is what actually fires on a genuine hang, never this module's fast-admin default.
+_READINESS_EXEC_TIMEOUT_SECONDS = READY_TIMEOUT_SECONDS + 30.0
+
 
 def _cache_volume_name(repo_clone_url: str) -> str:
     """Docker volume name for this repo's owner, derived from the clone URL.
@@ -75,7 +89,14 @@ def _cache_volume_name(repo_clone_url: str) -> str:
     return f"{_CACHE_VOLUME_PREFIX}{slug or 'shared'}"
 
 
-async def _run_docker(*args: str, input_bytes: bytes | None = None) -> tuple[int, str, str]:
+async def _run_docker(
+    *args: str,
+    input_bytes: bytes | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[int, str, str]:
+    resolved_timeout = (
+        timeout_seconds if timeout_seconds is not None else workflow_config.SANDBOX_DOCKER_TIMEOUT_SECONDS
+    )
     proc = await asyncio.create_subprocess_exec(
         "docker",
         *args,
@@ -83,7 +104,28 @@ async def _run_docker(*args: str, input_bytes: bytes | None = None) -> tuple[int
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate(input=input_bytes)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(input=input_bytes), timeout=resolved_timeout)
+    except TimeoutError:
+        # OUR OWN deadline fired -- docker itself is wedged. Every call here is a plain
+        # `docker <argv...>` (no shell=True, no pipeline), so proc.kill() alone reaps the right
+        # thing. Return a failure tuple in the SAME shape every existing caller already inspects
+        # via `if returncode != 0` -- never raise: a timeout is just one more kind of
+        # docker-command failure to every caller in this file.
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        return (-1, "", f"docker {' '.join(args)} timed out after {resolved_timeout}s")
+    except asyncio.CancelledError:
+        # An OUTER asyncio.wait_for (wait_for_cli_ready, or run_turn's poll loop) hit its own
+        # deadline first and is cancelling us. Kill + reap so the docker client process doesn't
+        # leak, then re-raise -- swallowing CancelledError here would break asyncio's
+        # cancellation contract. The returncode-is-None guard covers the narrow race where the
+        # process already exited in the instant before this handler ran.
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        raise
     # errors="replace", not strict: a sandbox command's output is arbitrary bytes, and a strict
     # decode turns any of them into an unhandled UnicodeDecodeError that propagates out of the
     # calling node and kills the whole graph invocation. Observed live: ac_coverage_gate's test-file
@@ -326,7 +368,9 @@ class LocalDockerProvider(SandboxProvider):
                     create_args += ["-e", "SCAFFOLD_NEW_REPO=1", "-e", f"PROJECT_NAME={project_name}"]
                 create_args.append(image or self._image)
 
-                returncode, container_id, stderr = await _run_docker(*create_args)
+                returncode, container_id, stderr = await _run_docker(
+                    *create_args, timeout_seconds=workflow_config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS
+                )
                 if returncode != 0:
                     raise RuntimeError(f"docker create failed for session {session_id!r}: {stderr}")
 
@@ -338,7 +382,8 @@ class LocalDockerProvider(SandboxProvider):
 
                     async def _exec(cmd: str) -> tuple[int, str, str]:
                         return await _run_docker(
-                            "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd
+                            "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd,
+                            timeout_seconds=_READINESS_EXEC_TIMEOUT_SECONDS,
                         )
 
                     await wait_for_cli_ready(_exec, version_command=f"{provider} --version")
@@ -398,7 +443,10 @@ class LocalDockerProvider(SandboxProvider):
             return None
 
         async def _exec(cmd: str) -> tuple[int, str, str]:
-            return await _run_docker("exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd)
+            return await _run_docker(
+                "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, container_id, "sh", "-c", cmd,
+                timeout_seconds=_READINESS_EXEC_TIMEOUT_SECONDS,
+            )
 
         # The container's OWN baked-in AGENT_PROVIDER (already parsed into `env` above, from
         # provision()'s own `docker create -e AGENT_PROVIDER={provider}`) -- NOT a live
@@ -457,7 +505,9 @@ class LocalDockerProvider(SandboxProvider):
             return list(self._sandboxes.keys())
 
     @traced_exec
-    async def exec_in_sandbox(self, session_id: str, command: str) -> ExecResult:
+    async def exec_in_sandbox(
+        self, session_id: str, command: str, *, timeout_seconds: float | None = None
+    ) -> ExecResult:
         async with self._lock:
             sandbox = self._sandboxes.get(session_id)
             if sandbox is not None:
@@ -467,7 +517,8 @@ class LocalDockerProvider(SandboxProvider):
             raise RuntimeError(f"no active sandbox for session_id={session_id!r}")
 
         returncode, stdout, stderr = await _run_docker(
-            "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, sandbox.container_id, "sh", "-c", command
+            "exec", "-w", WORKSPACE_DIR_IN_CONTAINER, sandbox.container_id, "sh", "-c", command,
+            timeout_seconds=timeout_seconds,
         )
         return ExecResult(returncode=returncode, stdout=stdout, stderr=stderr)
 

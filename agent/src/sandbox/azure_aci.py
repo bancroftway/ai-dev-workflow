@@ -392,7 +392,13 @@ class AzureContainerInstanceProvider(SandboxProvider):
             return list(self._sandboxes.keys())
 
     @traced_exec
-    async def exec_in_sandbox(self, session_id: str, command: str) -> ExecResult:
+    async def exec_in_sandbox(
+        self, session_id: str, command: str, *, timeout_seconds: float | None = None
+    ) -> ExecResult:
+        # ponytail: timeout_seconds accepted-but-unused -- interface parity with
+        # LocalDockerProvider so cli_agent_exec.py's shared poll-loop call site doesn't break this
+        # provider at runtime. _run_az has the identical no-timeout bug shape as
+        # local_docker.py's pre-fix _run_docker; fixing that is an explicit follow-up.
         async with self._lock:
             sandbox = self._sandboxes.get(session_id)
             if sandbox is not None:

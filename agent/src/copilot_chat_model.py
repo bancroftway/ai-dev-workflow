@@ -792,6 +792,25 @@ class CopilotChatModel(BaseChatModel):
             for translated_event in translated_events:
                 await run_event_stream.emit_live(translated_event)
 
+        if result.exit_code != 0:
+            # Same reasoning as claude_chat_model's identical check: the backgrounded shell
+            # wrapper's own `echo $? > exit_path` captured the CLI PROCESS's real exit status --
+            # nonzero means it crashed/was killed partway through, not that it cleanly reported an
+            # application-level error (that path exits 0). events can still be non-empty (partial
+            # output before the crash), so events[-1] below would be an INTERMEDIATE event, not
+            # the terminal result -- this must run first. Intermediate events were already
+            # persisted above so a crash mid-turn doesn't lose that visibility.
+            if session_id:
+                combined_text = f"{result.stdout} {result.stderr}"
+                rejected = any(marker in combined_text.lower() for marker in _RESUME_REJECTED_MARKERS)
+                _session_cache.record_resume_state(self._session_key, "rejected" if rejected else "unknown")
+            raise RuntimeError(
+                f"Copilot CLI process for {self._session_key!r} exited with code {result.exit_code} "
+                f"before completing (resume_state={_resume_states.get(self._session_key)!r}); "
+                f"last parsed event={events[-1] if events else None!r} stdout={result.stdout!r}\n"
+                f"stderr={result.stderr!r}"
+            )
+
         # Best-effort guess, NOT confirmed against real output (module docstring): the LAST line is
         # the result-shaped summary event, by analogy with Claude's single terminal JSON object
         # carrying result/is_error/usage/total_cost_usd together. Every element of `events` is

@@ -154,7 +154,7 @@ def traced_exec(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[An
     flagging them would paint every healthy run red. traced_node owns ERROR status.
     """
 
-    async def wrapper(self: Any, session_id: str, command: str) -> Any:
+    async def wrapper(self: Any, session_id: str, command: str, **kwargs: Any) -> Any:
         with tracer.start_as_current_span(
             "sandbox/exec",
             attributes={
@@ -162,7 +162,7 @@ def traced_exec(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[An
                 "command": redact_text(command)[:_COMMAND_ATTR_MAX],
             },
         ) as span:
-            result = await fn(self, session_id, command)
+            result = await fn(self, session_id, command, **kwargs)
             span.set_attribute("rc", result.returncode)
             return result
 

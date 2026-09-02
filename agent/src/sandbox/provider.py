@@ -19,7 +19,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-_READY_TIMEOUT_SECONDS = 60.0
+# Not underscore-prefixed: local_docker.py imports this to size its own _run_docker timeout for
+# the exec calls that back wait_for_cli_ready (must stay comfortably above this + the 10.0s
+# margin below, or a fast-admin default timeout would cut off a perfectly healthy readiness poll).
+READY_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -155,7 +158,9 @@ class SandboxProvider(abc.ABC):
         """Return the session_ids of currently-running sandboxes."""
 
     @abc.abstractmethod
-    async def exec_in_sandbox(self, session_id: str, command: str) -> ExecResult:
+    async def exec_in_sandbox(
+        self, session_id: str, command: str, *, timeout_seconds: float | None = None
+    ) -> ExecResult:
         """Run a shell command inside session_id's sandbox and return its result.
 
         This is the persistence layer's (workflow_persistence.py, git_ops.py) only channel to the
@@ -163,6 +168,11 @@ class SandboxProvider(abc.ABC):
         happen wherever the clone actually lives (inside the sandbox), not in the agent's own
         process. `command` is run via `sh -c`, so the caller is responsible for shell-safe
         quoting (workflow_persistence.py base64-encodes file content for exactly this reason).
+
+        timeout_seconds bounds this ONE call -- None (the default) uses the provider's own
+        fast-admin default, sized for routine commands against a healthy daemon. Overridable for
+        a caller that already knows its command may legitimately run long (cli_agent_exec.py's
+        run_turn poll loop, and its post-completion reads of a turn's full stdout/stderr).
         """
 
 
@@ -214,22 +224,22 @@ async def wait_for_cli_ready(
     daemon), not the normal exit path.
     """
     wait_command = (
-        f"deadline=$(( $(date +%s) + {int(_READY_TIMEOUT_SECONDS)} )); "
+        f"deadline=$(( $(date +%s) + {int(READY_TIMEOUT_SECONDS)} )); "
         f"until {version_command} >/dev/null 2>&1; do "
         f"[ \"$(date +%s)\" -ge \"$deadline\" ] && exit 1; sleep 1; done"
     )
     try:
         returncode, _, stderr = await asyncio.wait_for(
-            exec_fn(wait_command), timeout=_READY_TIMEOUT_SECONDS + 10.0
+            exec_fn(wait_command), timeout=READY_TIMEOUT_SECONDS + 10.0
         )
     except Exception as exc:
         raise RuntimeError(
-            f"CLI tool in sandbox did not become ready within {_READY_TIMEOUT_SECONDS}s "
+            f"CLI tool in sandbox did not become ready within {READY_TIMEOUT_SECONDS}s "
             f"(last error: {exc})"
         ) from exc
 
     if returncode != 0:
         raise RuntimeError(
-            f"CLI tool in sandbox did not become ready within {_READY_TIMEOUT_SECONDS}s "
+            f"CLI tool in sandbox did not become ready within {READY_TIMEOUT_SECONDS}s "
             f"(last error: returncode {returncode}: {stderr})"
         )
