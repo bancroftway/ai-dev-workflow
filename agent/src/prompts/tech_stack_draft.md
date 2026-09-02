@@ -6,16 +6,19 @@ job is to explore the repository and report back.
 
 Report your findings as the required structured JSON object: a one-or-two-sentence summary, every
 language/framework/package-manager/testing-framework you found evidence for, the conventions you
-observed (each with a short reason), whether any `.csproj`/`.sln` files exist (`dotnet_detected`),
-and — if so — the repo-relative path to the common ancestor of all `.csproj` files
-(`dotnet_solution_root`), or an explicit statement that you couldn't determine one confidently.
+observed (each with a short reason), and `dotnet`: one object reporting whether any `.csproj`/
+`.sln` files exist (`status: "detected"`/`"not_detected"`) and, when detected, the repo-relative
+path to the common ancestor of all `.csproj` files (`solution_root`) — or, if detected but you
+couldn't determine a confident root, leave `solution_root` null and explain why in `reason`. When
+not detected, explain why in `reason` too.
 
-Also report `convention_roots`: the repo-relative directory where each non-.NET ecosystem's shared
-config file belongs — `node` (the workspace root holding `package.json`) and `python` (the project
-root holding `pyproject.toml`/`setup.cfg`/`requirements.txt`). Use `""` for the repository root
-itself. Omit a key entirely when that ecosystem isn't present, or when the repo has several
-unrelated roots and no single one is the obvious home — deterministic code writes real files at
-these paths, so a wrong root is worse than a missing one.
+Also report `convention_roots`: one entry per non-.NET ecosystem (`node`, `python`), each reporting
+the repo-relative directory where that ecosystem's shared config file belongs — `node` (the
+workspace root holding `package.json`) and `python` (the project root holding
+`pyproject.toml`/`setup.cfg`/`requirements.txt`). Use `status: "present"`, `root: ""` for the
+repository root itself. Report `status: "absent"` with a reason when that ecosystem isn't present,
+or when the repo has several unrelated roots and no single one is the obvious home — deterministic
+code writes real files at these paths, so a wrong root is worse than a missing one.
 
 Report `auth_kind`: how the app authenticates users — `entra` (Microsoft Entra ID /
 Microsoft.Identity.Web / MSAL / an `AzureAd` config section), `google`, `generic-oidc` (any other
@@ -35,8 +38,9 @@ you.
 
 Always set readiness to true and ask no clarifying questions, even for a repository with no
 application code yet (a blank/empty repo, or one containing only docs/config). "No application
-code found yet" is a complete, honest report — write it as the `summary`, leave the other lists
-empty, and report `dotnet_detected: false`. There is no human available to answer a clarifying
+code found yet" is a complete, honest report — write it as the `summary`, report every category
+`status: "absent"` with that same reason, and report `dotnet: {status: "not_detected", reason:
+"no application code found yet"}`. There is no human available to answer a clarifying
 question at this point in the run: a human reviews and can freely edit this draft immediately
 afterward (including picking a starting stack from a canned catalog), so an incomplete-looking
 draft here is not a dead end -- withholding readiness or asking a question would be.

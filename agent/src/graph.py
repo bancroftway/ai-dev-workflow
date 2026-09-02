@@ -100,6 +100,7 @@ from .schemas import (
     SpecificationDraftResponse,
     DotnetStatus,
     PresenceList,
+    TECH_STACK_DRAFT_EXAMPLE,
     TechStack,
     TechStackDraftResponse,
 )
@@ -1533,6 +1534,9 @@ STAGES: list[StageSpec] = [
         max_cycles=workflow_config.TECH_STACK_MAX_CLARIFICATION_CYCLES,
         render_markdown=render_tech_stack_markdown,
         requires_human_gate=True,
+        # No deterministic_verify/audit for this stage (see stages_missing_rules) -- draft_rules/
+        # audit_rules stay None; only the summary+example half of Task 6's mechanism applies here.
+        draft_example=TECH_STACK_DRAFT_EXAMPLE,
         post_approve_hook=preflight_nodes.apply_stack_conventions,
         hydrate_from_repo_file=preflight_nodes.hydrate_tech_stack_from_repo_file,
         prefill_from_repo_file=preflight_nodes.prefill_tech_stack_from_repo_file,

@@ -27,7 +27,7 @@ from . import config_inventory, git_ops, model_config, repo_files, repo_scan, re
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
-from .schemas import DotnetStatus, PresenceList, TechStack
+from .schemas import TECH_STACK_EXTRACT_EXAMPLE, DotnetStatus, PresenceList, TechStack
 from .schemas_app_discovery import DiscoveredApp
 from .schemas_session import SessionTitleResponse
 from .sandbox import registry as sandbox_registry
@@ -732,6 +732,10 @@ async def _extract_tech_stack(
         # ainvoke_structured's own default of 3, both for the normal extraction call and for
         # hydrate_tech_stack_from_repo_file's fix #4 repair retry (this is their only shared call).
         max_attempts=5,
+        # Task 7: a worked example of the current TechStack shape (dotnet as one object,
+        # convention_roots as a list, auth_kind/config_inventory included) -- this call has no
+        # StageSpec of its own to carry draft_example, so the example is passed directly.
+        example=TECH_STACK_EXTRACT_EXAMPLE,
     )
     return response.model_dump(mode="json")
 
