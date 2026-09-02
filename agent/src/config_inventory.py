@@ -130,6 +130,22 @@ async def inventory(provider: SandboxProvider, thread_id: str) -> tuple[str, lis
     return auth_kind, keys
 
 
+def merge(existing_auth: str, existing_keys: list[str], scanned_auth: str,
+          scanned_keys: list[str]) -> tuple[str, list[str]]:
+    """Combine a human-edited (existing) inventory with a fresh scan. `auth_kind` prefers the more
+    specific side: existing wins outright unless it's `"none"`/empty, in which case scanned fills
+    it (even with `"none"`). Key lists are a true union: existing keys keep their order, then any
+    new scanned keys are appended in scanned order -- deduplicated overall."""
+    auth_kind = existing_auth if existing_auth and existing_auth != "none" else scanned_auth
+    keys: list[str] = []
+    have: set[str] = set()
+    for key in existing_keys + scanned_keys:
+        if key not in have:
+            have.add(key)
+            keys.append(key)
+    return auth_kind, keys
+
+
 def _demo() -> None:
     """`cd agent && uv run python -m src.config_inventory`."""
     flat = flatten_appsettings({
@@ -154,6 +170,18 @@ def _demo() -> None:
         "api.ts": "const u = process.env.API_BASE_URL; const k = process.env['STRIPE_KEY'];",
     })
     assert keys == ["Stripe:Key", "Smtp", "API_BASE_URL", "STRIPE_KEY"], keys
+
+    # merge(): existing wins over scanned-none.
+    assert merge("entra", ["AzureAd:TenantId"], "none", ["Stripe:Key"]) == (
+        "entra", ["AzureAd:TenantId", "Stripe:Key"])
+    # merge(): scanned fills existing-none, with a concrete value (not just none -> none).
+    assert merge("none", ["Stripe:Key"], "entra", ["AzureAd:TenantId"]) == (
+        "entra", ["Stripe:Key", "AzureAd:TenantId"])
+    # merge(): both-none stays none.
+    assert merge("none", [], "none", []) == ("none", [])
+    # merge(): key lists union -- order-preserving, deduplicated.
+    assert merge("entra", ["A", "B"], "entra", ["B", "C", "A"]) == ("entra", ["A", "B", "C"])
+
     print("config_inventory self-check: ok")
 
 

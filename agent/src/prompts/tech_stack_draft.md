@@ -27,8 +27,8 @@ prefer the most specific that fits the evidence.
 Report `config_inventory`: the config keys the app reads that a tester might need to supply values
 for — `appsettings*.json` section paths written as `Section:Key` (e.g. `ConnectionStrings:Db`,
 `AzureAd:TenantId`), and keys read in code (`Configuration["X"]`, `GetSection("Y")`,
-`process.env.Z`). List the keys, not their values. A deterministic scan runs alongside you and the
-two lists are unioned, so it's fine to miss some — but don't invent keys you saw no evidence for.
+`process.env.Z`). List the keys, not their values. A deterministic scan is unioned in separately
+after you draft, so it's fine to miss some — but don't invent keys you saw no evidence for.
 
 Leave `conventions_applied` empty — that field is populated later, by deterministic code, not by
 you.
