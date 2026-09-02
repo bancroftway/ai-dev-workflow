@@ -84,3 +84,13 @@ CVE-2026-73566
 # tag just hasn't picked up Microsoft's own latest patch yet at build time. Self-resolves on the
 # next image rebuild once MCR republishes; drop this line once it does.
 CVE-2026-62901
+
+# google.golang.org/grpc CVE-2026-84304 (fixed upstream at grpc 1.83.1), found in three
+# statically-linked Go binaries: syft (SYFT_VERSION=1.51.1) and trivy (TRIVY_VERSION=0.74.0) --
+# both verified via GitHub's releases/latest API to already be each project's newest release, so
+# neither has re-vendored the fixed grpc yet -- and osv-scanner (pinned to 2.0.2, same
+# --local-db-path reason as above -- confirmed 2.5.1, the current latest, still doesn't restore
+# that flag: only re-added OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY, a different mechanism, per its
+# own release notes and cmd/osv-scanner/scan/source/command.go). Re-check next time any of the
+# three's pinned version is bumped.
+CVE-2026-84304
