@@ -736,21 +736,29 @@ PLAN_AUDIT_SYSTEM_PROMPT = load_prompt("plan_audit")
 
 def _build_specification_audit_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
-    return [
+    messages: list[BaseMessage] = [
         SystemMessage(content=SPEC_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"),
         HumanMessage(content=f"Draft Specification to audit (JSON):\n{stage['draft']}"),
     ]
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
+    return messages
 
 
 def _build_plan_audit_prompt(state: GraphState) -> list[BaseMessage]:
     spec_stage = state["stages"]["specification"]
     plan_stage = state["stages"]["plan"]
-    return [
+    messages: list[BaseMessage] = [
         SystemMessage(content=PLAN_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
         HumanMessage(content=f"Draft Plan to audit (JSON):\n{plan_stage['draft']}"),
     ]
+    verify_feedback_message = _verification_feedback_message(plan_stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
+    return messages
 
 
 TECH_STACK_SYSTEM_PROMPT = load_prompt("tech_stack_draft")
@@ -1166,11 +1174,15 @@ def _build_ac_to_tests_audit_prompt(state: GraphState) -> list[BaseMessage]:
     files on disk, same as every other tool-writing stage's audit."""
     spec_stage = state["stages"]["specification"]
     stage = state["stages"]["ac-to-tests"]
-    return [
+    messages: list[BaseMessage] = [
         SystemMessage(content=AC_TO_TESTS_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
         HumanMessage(content=f"Draft test suite to audit (JSON):\n{stage['draft']}"),
     ]
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
+    return messages
 
 
 MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_draft")
@@ -1221,10 +1233,14 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
 
 def _build_minimal_code_to_green_audit_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["minimal-code-to-green"]
-    return [
+    messages: list[BaseMessage] = [
         SystemMessage(content=MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Draft code-change iteration to audit (JSON):\n{stage['draft']}"),
     ]
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
+    return messages
 
 
 ADVERSARIAL_AUDIT_SYSTEM_PROMPT = load_prompt("adversarial_audit_draft")
