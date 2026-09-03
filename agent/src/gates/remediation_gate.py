@@ -56,6 +56,21 @@ def _mentions_id(text: str, finding_id: str) -> bool:
     return finding_id.lower() in text.lower()
 
 
+def _presence_values(entry: Any) -> list[str]:
+    """Read a PresenceList-shaped dict's `values` (schemas.py: `{"status": ..., "values": [...],
+    "reason": ...}`) -- `findings_addressed`/`dependencies_upgraded`/`known_gaps` as of Task 11 --
+    tolerating a legacy/degenerate bare list or a missing field. `content`/`content_dict` here are
+    plain dicts off the wire, never re-validated through the Pydantic wrapper after initial parse,
+    so this reads defensively rather than assuming the typed shape (mirrors
+    gates/adversarial_gate.py's `_findings_from` and exit_nodes.py's `_presence_values`; duplicated
+    rather than shared, same as every other PresenceList reader in this codebase)."""
+    if isinstance(entry, dict):
+        return list(entry.get("values") or [])
+    if isinstance(entry, list):
+        return list(entry)
+    return []
+
+
 def accounted_for(finding_id: str, known_gaps: list[str]) -> bool:
     """A gap entry counts only if it names the finding id AND says something beyond the id.
 
@@ -103,8 +118,8 @@ def evaluate_remediation(
     # -- must be gone from the post-fix scan or explained in known_gaps. Older scans (pre-v3)
     # carry no `actionable` key; `gating` is the honest fallback there, never a silent pass.
     actionable = [f for f in findings if f.get("actionable", f.get("gating"))]
-    known_gaps = [str(g) for g in (content.get("known_gaps") or [])]
-    claimed = [str(c) for c in (content.get("findings_addressed") or [])]
+    known_gaps = [str(g) for g in _presence_values(content.get("known_gaps"))]
+    claimed = [str(c) for c in _presence_values(content.get("findings_addressed"))]
     all_ids = {str(f.get("id")) for f in findings}
 
     reasons: list[str] = []
@@ -290,12 +305,12 @@ async def verify_remediation(
             passed=True,
             feedback=(
                 f"remediation verified: no gating findings remain unexplained "
-                f"({len(content_dict.get('findings_addressed') or [])} addressed, "
-                f"{len(content_dict.get('known_gaps') or [])} documented gap(s))"
+                f"({len(_presence_values(content_dict.get('findings_addressed')))} addressed, "
+                f"{len(_presence_values(content_dict.get('known_gaps')))} documented gap(s))"
             ),
             report={
-                "findings_addressed": content_dict.get("findings_addressed") or [],
-                "known_gaps": content_dict.get("known_gaps") or [],
+                "findings_addressed": _presence_values(content_dict.get("findings_addressed")),
+                "known_gaps": _presence_values(content_dict.get("known_gaps")),
             },
         )
 
@@ -406,6 +421,26 @@ def _demo() -> None:
     # No scan = cannot verify = blocks. An unrunnable check is not a clean one.
     assert not evaluate_remediation(clean, None)[0]
     assert not evaluate_remediation(None, scan)[0]
+
+    # Task 11: known_gaps/findings_addressed are now PresenceList-shaped ({"status", "values",
+    # "reason"}), not a bare list[str] -- _presence_values must unwrap the REAL shape, not just
+    # the legacy bare list every other assertion above uses.
+    typed_gap = {
+        "findings_addressed": {"status": "absent", "values": [], "reason": "nothing fixed"},
+        "known_gaps": {
+            "status": "present",
+            "values": ["aaa111: no fixed version for .NET 10 yet, tracked upstream"],
+            "reason": "",
+        },
+    }
+    assert evaluate_remediation(typed_gap, scan)[0]
+    assert not evaluate_remediation(
+        {
+            "findings_addressed": {"status": "absent", "values": [], "reason": "nothing fixed"},
+            "known_gaps": {"status": "absent", "values": [], "reason": "nothing left open"},
+        },
+        scan,
+    )[0]
 
     print("remediation_gate self-check: all assertions passed")
 

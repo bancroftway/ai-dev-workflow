@@ -551,7 +551,10 @@ def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[
     summary = scan_report.get("summary") or {}
     findings = scan_report.get("findings") or []
     tools = scan_report.get("tools") or []
-    known_gaps = [str(g) for g in ((remediation or {}).get("known_gaps") or [])]
+    # known_gaps is PresenceList-shaped as of Task 11 ({"status", "values", "reason"}), not a bare
+    # list[str] -- _presence_values (below) unwraps it, same tolerant read as blocking_reasons/
+    # risk_notes elsewhere in this module.
+    known_gaps = [str(g) for g in _presence_values((remediation or {}).get("known_gaps"))]
 
     lines: list[str] = ["## Health score", ""]
     score = summary.get("health_score")
@@ -588,7 +591,7 @@ def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[
 
     lines += [f"## Findings ({len(findings)} clusters)", ""]
     if findings:
-        addressed = len((remediation or {}).get("findings_addressed") or [])
+        addressed = len(_presence_values((remediation or {}).get("findings_addressed")))
         explained = sum(1 for f in findings if _finding_disposition(f, known_gaps).startswith("known gap"))
         open_count = sum(
             1 for f in findings
@@ -1571,9 +1574,16 @@ def _demo() -> None:
              "findings": 0, "notes": "No applicable files detected"},
         ],
     }
+    # Task 11: findings_addressed/known_gaps are real PresenceList-shaped dicts here, not a bare
+    # list[str] -- proves _render_scan_sections/_finding_disposition read the ACTUAL production
+    # shape correctly, not just the legacy bare list _presence_values also tolerates.
     remediation_fixture = {
-        "findings_addressed": ["ddd444ddd444"],
-        "known_gaps": ["aaa111aaa111: no fixed version published upstream yet"],
+        "findings_addressed": {"status": "present", "values": ["ddd444ddd444"], "reason": ""},
+        "known_gaps": {
+            "status": "present",
+            "values": ["aaa111aaa111: no fixed version published upstream yet"],
+            "reason": "",
+        },
     }
     scan_md = "\n".join(_render_scan_sections(scan_fixture, remediation_fixture))
     assert "## Health score" in scan_md and "**71 / 100**" in scan_md and "raw 71.1" in scan_md, scan_md

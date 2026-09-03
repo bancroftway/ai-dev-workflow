@@ -1272,6 +1272,21 @@ def build_remediation_envelope(content: dict[str, Any], audit_findings: list[str
     return {"stage": "remediation", "content": content}
 
 
+def _remediation_presence_values(entry: Any) -> list[str]:
+    """`dependencies_upgraded`/`findings_addressed`/`known_gaps`'s values -- PresenceList-shaped
+    (`{"status": ..., "values": [...], "reason": ...}`) as of Task 11, not a bare list[str].
+    `content` here is `stage["draft"]`, a plain dict never re-validated through the Pydantic
+    wrapper after initial parse (a thread whose remediation stage drafted before this migration
+    may still carry the old bare-list shape on resume), so this reads defensively rather than
+    assuming the typed shape -- mirrors gates/remediation_gate.py's own `_presence_values`;
+    duplicated rather than shared, same as every other PresenceList reader in this codebase."""
+    if isinstance(entry, dict):
+        return list(entry.get("values") or [])
+    if isinstance(entry, list):
+        return list(entry)
+    return []
+
+
 def render_remediation_markdown(content: dict[str, Any]) -> str:
     """Human-readable remediation summary.
 
@@ -1285,7 +1300,7 @@ def render_remediation_markdown(content: dict[str, Any]) -> str:
         ("Findings addressed", "findings_addressed"),
         ("Known gaps (deliberately not fixed)", "known_gaps"),
     ):
-        items = content.get(key) or []
+        items = _remediation_presence_values(content.get(key))
         if items:
             lines += [f"## {heading}", ""] + [f"- {item}" for item in items] + [""]
     return "\n".join(lines).strip() + "\n"

@@ -29,7 +29,7 @@ from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, workflow_persistence
 from .gates import readme_gate
 from .gates.ac_coverage_gate import id_variants
-from .gates.remediation_gate import accounted_for
+from .gates.remediation_gate import _presence_values, accounted_for  # noqa: SLF001 -- same package
 from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
 from .chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry
@@ -433,7 +433,12 @@ async def read_remediation_report(provider: Any, thread_id: str) -> dict[str, An
 
 
 async def _read_known_gaps(provider: Any, thread_id: str) -> list[str]:
-    return [str(g) for g in ((await read_remediation_report(provider, thread_id)).get("known_gaps") or [])]
+    # known_gaps is PresenceList-shaped as of Task 11 ({"status", "values", "reason"}), not a bare
+    # list[str] -- _presence_values unwraps it (and still tolerates an older thread's pre-Task-11
+    # bare-list/None report, since this reads the raw persisted dict, never re-validated through
+    # RemediationDraftResponse).
+    report = await read_remediation_report(provider, thread_id)
+    return [str(g) for g in _presence_values(report.get("known_gaps"))]
 
 
 async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
