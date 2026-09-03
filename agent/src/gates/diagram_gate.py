@@ -492,11 +492,69 @@ def _demo() -> None:
     assert _presence_values({"status": "present", "values": [{"screen": "x"}], "reason": ""}) == [{"screen": "x"}]
     assert _presence_values({"status": "absent", "values": [], "reason": "no UI work"}) == []
     assert _presence_values(None) == []
+
+    # Task 13b: PLAN_HARD_RULES -- one line per real rejection branch in verify_plan_diagrams
+    # (see the constant's own comment for the count breakdown).
+    assert len(PLAN_HARD_RULES) == 19, len(PLAN_HARD_RULES)
+    assert all(isinstance(r, str) and r.strip() for r in PLAN_HARD_RULES)
     print("diagram_gate wireframe self-check: all assertions passed")
 
 
-if __name__ == "__main__":
-    _demo()
+# Task 13b: one line per DISTINCT rejection reason inside verify_plan_diagrams below, including
+# every reason folded into check_plan_linkage/check_wireframe_ac_ids/check_ui_wireframe_coverage/
+# check_wireframe/_render_one -- all defined in THIS file, so (unlike write_scope_gate.py's
+# delegation to ac_coverage_gate.py) none of it is out-of-scope delegation. The 8
+# _WIREFRAME_FORBIDDEN patterns are one rule ("must be self-contained/safe"), not eight -- same
+# granularity write_scope_gate.py's _is_test_path regex family gets. A render failure classified
+# as infrastructure (mmdc/Chromium broken, not a genuine Mermaid syntax error) is deliberately
+# NOT a rule here -- the model cannot fix its own sandbox's browser install, and the gate itself
+# never blames it for one (see _looks_like_infra_failure).
+PLAN_HARD_RULES: tuple[str, ...] = (
+    "Never submit empty plan content -- a draft that never produced a real plan (e.g. stuck on "
+    "clarifying questions) is rejected outright.",
+    "Every id you name in a step's removes_ids must actually exist in the spec ledger -- an "
+    "invented or mistyped id is rejected.",
+    "Every id you name in a step's removes_ids must be RETIRED, not live -- live/active scope "
+    "belongs in ac_ids, never in removes_ids.",
+    "If this ticket retires a criterion an earlier run already delivered (its code, tests, and "
+    "UI already exist), some plan step must name it (or its parent story) in removes_ids and "
+    "describe the removal work -- a delivered-then-retired criterion cannot just be dropped.",
+    "Every feature step must cite at least one live US-####.# acceptance-criterion id in "
+    "ac_ids, unless it is kind='infrastructure' -- a step with no citations and no "
+    "infrastructure kind is rejected.",
+    "Every acceptance-criterion id a step cites in ac_ids must be a real id copied verbatim "
+    "from the approved Specification's ledger -- an invented or mistyped id is rejected.",
+    "A step whose every cited criterion is retired or deferred implements out-of-ticket scope "
+    "and must be dropped from the plan entirely.",
+    "A step may not mix live and non-live (retired/deferred) criteria in ac_ids -- ac_ids may "
+    "only name LIVE criteria; move a retired criterion's citation to removes_ids and drop "
+    "deferred scope from the plan altogether.",
+    "A new or materially changed step may not cite only already-delivered (completed) criteria "
+    "-- completed criteria are never re-planned; either carry the prior step over verbatim "
+    "(identical description) or drop it.",
+    "Every one of this ticket's own undelivered, live criteria must be cited by ac_ids in at "
+    "least one plan step -- an eligible criterion with no covering step is rejected.",
+    "Every acceptance-criterion id a wireframe cites in its ac_ids must be a real id from the "
+    "approved Specification's ledger, copied verbatim -- an invented or mistyped id is "
+    "rejected.",
+    "Every criterion the approved Specification marks ui_related must be cited by at least one "
+    "wireframe's ac_ids -- a UI-facing requirement with zero wireframe evidence is rejected.",
+    "Include at most 6 wireframes -- keep only the screens this plan actually changes.",
+    "Every wireframe's screen name must be a plain filename (letters, digits, underscore, "
+    "hyphen only).",
+    "Every wireframe's HTML must stay under 30 KB -- simplify an oversized wireframe rather "
+    "than submit it.",
+    "Every wireframe must actually be an HTML page (contain an <html>, <body>, or <div> tag) "
+    "-- prose with no markup is rejected.",
+    "Every wireframe must be fully self-contained, inline-styled HTML with no <script> tags, "
+    "inline on*= event handlers, external URLs or stylesheets, javascript:/vbscript:/data:/"
+    "file: URLs, embedding/navigation elements (iframe/object/embed/base/form), or "
+    "<meta http-equiv> overrides.",
+    "Every diagram's name must be a plain filename (letters, digits, underscore, hyphen only).",
+    "Every diagram's Mermaid source must actually render -- a real parse/syntax error must be "
+    "fixed before this stage can pass (an infrastructure failure in the renderer itself is not "
+    "held against you).",
+)
 
 
 async def verify_plan_diagrams(
@@ -656,3 +714,7 @@ async def verify_plan_diagrams(
         feedback=feedback,
         report={"failed": [o.name for o in failures], "infra_failure": bool(infra_failures)},
     )
+
+
+if __name__ == "__main__":
+    _demo()

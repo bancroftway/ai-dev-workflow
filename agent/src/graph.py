@@ -61,8 +61,8 @@ from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
 from .gates import adversarial_gate, remediation_gate, skill_gate
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
-from .gates.diagram_gate import verify_plan_diagrams
-from .gates.test_coverage_gate import verify_coverage
+from .gates.diagram_gate import PLAN_HARD_RULES, verify_plan_diagrams
+from .gates.test_coverage_gate import MINIMAL_CODE_TO_GREEN_HARD_RULES, verify_coverage
 from .gates.write_scope_gate import AC_TO_TESTS_HARD_RULES, verify_ac_to_tests
 from .infra_retry import call_with_infra_retry
 from .a2ui_tools import (
@@ -810,6 +810,25 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
     auth_settings = repo_auth_settings.get_for_thread(thread_id)
     app_auth = {**auth_settings, "secrets_present": bool(keyvault.get_app_secrets(thread_id))}
     return {"stages": stages, "app_auth": app_auth, "test_users": repo_test_users.get_for_thread(thread_id)}
+
+
+# Task 13b: one line per DISTINCT rejection reason inside _verify_specification_ledger below --
+# only the two reasons THIS function's own code decides on. spec_ledger.sync_ledger's own
+# id-resolution/status-transition validation (an unknown existing_us_id/existing_ac_id, retiring
+# a non-existent or wrong-kind id, etc.) is a WHOLLY SEPARATE module's logic (spec_ledger.py, a
+# different file) delegated to wholesale -- the same "check_ac_coverage lives in a different
+# file" exclusion Task 8 drew for write_scope_gate.py's verify_ac_to_tests, left out here for a
+# future task to add as its own rules constant if warranted.
+SPECIFICATION_HARD_RULES: tuple[str, ...] = (
+    "Never leave a clarifying question open -- every question you raised must be answered "
+    "(status=answered, citing the wording that answers it) or explicitly assumed "
+    "(status=assumed, mirrored in assumptions) before this stage can pass.",
+    "Every draft must be the WHOLE specification, never a delta -- every still-live (active, "
+    "revised, or deferred) story/criterion already in the persistent ledger must be re-emitted "
+    "verbatim (citing its id via existing_us_id/existing_ac_id) or explicitly retired via "
+    "retired_us_ids/retired_ac_ids; silently dropping one because this redraft didn't touch it "
+    "is rejected.",
+)
 
 
 async def _verify_specification_ledger(
@@ -1586,6 +1605,12 @@ STAGES: list[StageSpec] = [
         draft_example=SPECIFICATION_DRAFT_EXAMPLE,
         audit_example=SPECIFICATION_AUDIT_EXAMPLE,
         deterministic_verify=_verify_specification_ledger,
+        # Task 13b: same rules text for both passes -- the audit overwrites stage["draft"] with
+        # its revised_specification BEFORE this gate runs (graph.py's audit-then-verify
+        # ordering), so one gate checks whichever pass produced the content, same mechanism
+        # Task 8 confirmed for ac-to-tests.
+        draft_rules="\n".join(f"- {r}" for r in SPECIFICATION_HARD_RULES),
+        audit_rules="\n".join(f"- {r}" for r in SPECIFICATION_HARD_RULES),
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ticket_mode_context,
         # Second phase of the two-phase tracking reset (spec_ledger.PENDING_RESET_FIELD): the
         # destructive stamp clear for genuinely-reworded ACs runs only once a human (or headless
@@ -1616,6 +1641,10 @@ STAGES: list[StageSpec] = [
         audit_example=PLAN_AUDIT_EXAMPLE,
         sign_approval=True,
         deterministic_verify=verify_plan_diagrams,
+        # Task 13b: same rules text for both passes -- the audit overwrites stage["draft"] with
+        # its revised_plan BEFORE this gate runs, same mechanism Task 8 confirmed for ac-to-tests.
+        draft_rules="\n".join(f"- {r}" for r in PLAN_HARD_RULES),
+        audit_rules="\n".join(f"- {r}" for r in PLAN_HARD_RULES),
         # US/AC -> plan-step provenance: record which approved steps cite each live AC
         # (spec_ledger entries' plan_step_ids). Overwrite semantics -- idempotent on resume.
         post_approve_hook=spec_ledger.stamp_plan_links_hook,
@@ -1737,6 +1766,11 @@ STAGES: list[StageSpec] = [
         draft_example=MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE,
         audit_example=MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE,
         deterministic_verify=verify_coverage,
+        # Task 13b: same rules text for both passes -- the audit overwrites stage["draft"] with
+        # its revised_iteration BEFORE this gate runs, same mechanism Task 8 confirmed for
+        # ac-to-tests.
+        draft_rules="\n".join(f"- {r}" for r in MINIMAL_CODE_TO_GREEN_HARD_RULES),
+        audit_rules="\n".join(f"- {r}" for r in MINIMAL_CODE_TO_GREEN_HARD_RULES),
         # Coverage verification (the deterministic gate) is the real check; the human checkpoints
         # are specification and plan only.
         requires_human_gate=False,
@@ -1794,6 +1828,8 @@ STAGES: list[StageSpec] = [
         # catch a scanner being silenced instead of a defect being fixed.
         capture_baseline_commit=True,
         deterministic_verify=remediation_gate.verify_remediation,
+        # Task 13b: no audit_rules -- remediation has no audit pass (see StageSpec above).
+        draft_rules="\n".join(f"- {r}" for r in remediation_gate.REMEDIATION_HARD_RULES),
         draft_prompt_context_from_repo_file=hydrate_remediation_ticket_mode_context,
         max_verify_cycles=3,
         # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
@@ -1829,6 +1865,8 @@ STAGES: list[StageSpec] = [
             "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
         },
         deterministic_verify=adversarial_gate.verify_adversarial_compliance,
+        # Task 13b: no audit_rules -- adversarial-compliance has no audit pass of its own.
+        draft_rules="\n".join(f"- {r}" for r in adversarial_gate.ADVERSARIAL_COMPLIANCE_HARD_RULES),
         # 6, not 3: this stage's fix laps carry the whole back-half workload (wireframe
         # conformance, negative-path e2e specs, frontend unit tests) and each lap is ~8 minutes of
         # real multi-file work. Observed live (s04 run 6): 3 laps all made measurable progress --
@@ -1863,6 +1901,8 @@ STAGES: list[StageSpec] = [
             "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
         },
         deterministic_verify=exit_nodes.verify_exit_readiness,
+        # Task 13b: no audit_rules -- metrics-exit has no audit pass of its own.
+        draft_rules="\n".join(f"- {r}" for r in exit_nodes.METRICS_EXIT_HARD_RULES),
         # Was 0, on the (then-true) reasoning that verify_exit_readiness always returns passed=True
         # so no retry could ever be needed. The skill gate now runs BEFORE deterministic_verify and
         # CAN fail, which turned any missed skill here into an instant, unrecoverable run failure --
@@ -5147,6 +5187,19 @@ def _demo() -> None:
         ]
     )
     assert missing == ["draft-only-missing", "audited-missing-audit-rules"], missing
+
+    # Task 13b: now that every StageSpec with a deterministic_verify has been wired with real
+    # draft_rules/audit_rules (Tasks 7/8/13 combined), the real registry must satisfy its own
+    # check cleanly -- not just the synthetic fixtures above. _ALL_STAGE_SPECS (not just STAGES)
+    # so brownfield-baseline's real StageSpec proves "no deterministic_verify -> exempt" against
+    # actual production wiring, not only the synthetic "no-gate" fixture above; tech-stack (in
+    # STAGES, also no deterministic_verify) is exempt the same way.
+    assert stages_missing_rules(_ALL_STAGE_SPECS) == [], stages_missing_rules(_ALL_STAGE_SPECS)
+
+    # Task 13b: SPECIFICATION_HARD_RULES -- one line per real rejection branch this function's
+    # OWN code decides on (see the constant's own comment for what's excluded and why).
+    assert len(SPECIFICATION_HARD_RULES) == 2, len(SPECIFICATION_HARD_RULES)
+    assert all(isinstance(r, str) and r.strip() for r in SPECIFICATION_HARD_RULES)
 
     # Task 6: draft_example/draft_rules/audit_example/audit_rules actually reach the two
     # ainvoke_structured call sites (not just sit unused on StageSpec). Driving make_draft_node/

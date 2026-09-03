@@ -89,6 +89,28 @@ def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
     return not reasons, reasons
 
 
+# Task 13b: one line per DISTINCT rejection reason inside evaluate_audit/verify_adversarial_
+# compliance below. Five: the empty-report guard, the missing-verdict and blocking-verdict
+# branches of evaluate_audit's own if/elif (two independently-triggered reasons on the same
+# field), the per-finding critical/major check, and the one-time minor-sweep bounce that
+# verify_adversarial_compliance itself adds on top of evaluate_audit's verdict.
+ADVERSARIAL_COMPLIANCE_HARD_RULES: tuple[str, ...] = (
+    "You must produce a real report naming a plan_conformance_summary and an overall_verdict "
+    "-- an empty or missing report cannot be told apart from an audit that never ran and is "
+    "rejected outright.",
+    "You must state an overall_verdict -- leaving it blank is itself a failure; this stage "
+    "exists to render a judgement, not describe one.",
+    "An overall_verdict of major_gaps or fails_to_conform blocks the run -- fix the code, or "
+    "argue with evidence that the audit is wrong, rather than downgrading the verdict to pass.",
+    "Any single divergence finding whose severity is critical or major blocks the run "
+    "regardless of the overall_verdict you assign -- a per-finding critical/major cannot be "
+    "waved off by an optimistic summary verdict.",
+    "Even once the audit is otherwise clean (no critical/major finding, overall_verdict not "
+    "blocking), any remaining minor divergence finding gets exactly one required fix pass -- "
+    "close what is mechanically fixable then, not indefinitely later.",
+)
+
+
 async def verify_adversarial_compliance(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: Any,
     _chat_provider: str,
@@ -273,6 +295,12 @@ def _demo() -> None:
     ))
     assert clean.passed, clean
     _MINOR_SWEEP_DONE.clear()
+
+    # Task 13b: ADVERSARIAL_COMPLIANCE_HARD_RULES -- one line per real rejection branch in
+    # evaluate_audit/verify_adversarial_compliance (see the constant's own comment for the count
+    # breakdown).
+    assert len(ADVERSARIAL_COMPLIANCE_HARD_RULES) == 5, len(ADVERSARIAL_COMPLIANCE_HARD_RULES)
+    assert all(isinstance(r, str) and r.strip() for r in ADVERSARIAL_COMPLIANCE_HARD_RULES)
 
     print("adversarial_gate self-check: all assertions passed")
 

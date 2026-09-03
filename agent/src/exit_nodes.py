@@ -991,6 +991,36 @@ def _presence_from_values(values: list[str], *, empty_reason: str) -> dict[str, 
     return {"status": "absent", "values": [], "reason": empty_reason}
 
 
+# Task 13b: one line per DISTINCT condition inside verify_exit_readiness below that forces
+# merge_ready=False (this gate always returns passed=True to the graph -- an LLM redraft cannot
+# fix a code regression or a missing screenshot, so the downgrade IS the outcome -- but each
+# condition below is still a real, distinct reason the merge gets blocked, and the model's own
+# blocking_reasons/merge_ready should agree with it). Eight: four independent manifest/evidence
+# presence checks, the metrics-not-recorded-for-this-run guard, the regression gate's own
+# recorded reasons (its granular thresholds live in a different module and are not enumerated
+# here), the README-ownership-scoped check, and the auth-verification requirement.
+METRICS_EXIT_HARD_RULES: tuple[str, ...] = (
+    "manifest.json must record at least one runnable app via app_check.apps (unless "
+    "app_check explicitly marked the repo unsuitable) -- an empty app list after the re-scan "
+    "blocks the merge.",
+    "manifest.json must record a test_command for this stack -- a missing one blocks the "
+    "merge.",
+    "manifest.json must record coverage_commands (the replayable coverage contract) -- "
+    "without it coverage cannot be replayed and the merge is blocked.",
+    "A UI application must have captured at least one e2e screenshot -- zero screenshots "
+    "blocks the merge.",
+    "Code metrics must actually have been recorded for THIS run (a matching run_id) -- "
+    "unrecorded metrics block the merge on their own.",
+    "Whatever reasons the metrics regression gate recorded for this run (coverage, "
+    "duplication, security thresholds, etc.) must be empty -- any recorded reason blocks the "
+    "merge.",
+    "When this leg owns the README (not a human-authored brownfield README), any README "
+    "problem still open after its own retry laps blocks the merge.",
+    "If authentication enforcement was required for this run, the e2e auth probe must "
+    "actually have run and passed -- required auth that was never verified blocks the merge.",
+)
+
+
 async def verify_exit_readiness(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any,
     _chat_provider: str,
@@ -1792,6 +1822,11 @@ def _demo() -> None:
     assert "| US-0001.2 | modified |" in section and "r2 (this run)" in section
     assert "Carried over -- not delivered**: US-0004.1" in section
     assert "(none recorded" in "\n".join(_render_us_ac_section([], [], "r2"))
+
+    # Task 13b: METRICS_EXIT_HARD_RULES -- one line per real merge-blocking condition in
+    # verify_exit_readiness (see the constant's own comment for the count breakdown).
+    assert len(METRICS_EXIT_HARD_RULES) == 8, len(METRICS_EXIT_HARD_RULES)
+    assert all(isinstance(r, str) and r.strip() for r in METRICS_EXIT_HARD_RULES)
 
     print("exit_nodes self-check: ok")
 

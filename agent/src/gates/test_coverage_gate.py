@@ -1118,6 +1118,47 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
     )
 
 
+# Task 13b: one line per DISTINCT rejection reason inside verify_coverage below, including every
+# reason folded into _missing_declared_frontend (2: signature absent, dependency absent) and
+# _check_integration_fidelity (4: unhosted backend, missing OTel, frontend-local-storage-only,
+# frontend-reimplements-its-own-backend) -- all defined in THIS file, so none of it is
+# out-of-scope delegation. check_ac_depth reuses two PURE counting helpers imported from
+# ac_coverage_gate.py, but the check itself (threshold, call site, feedback) is native here, not
+# delegated wholesale the way write_scope_gate.py's check_ac_coverage call was -- counted as one
+# rule of this gate's own.
+MINIMAL_CODE_TO_GREEN_HARD_RULES: tuple[str, ...] = (
+    "You must write real application code -- a repository containing only test files and "
+    "pipeline artifacts, with no project manifest and no source files, is rejected outright.",
+    "If the approved Tech Stack declares a frontend framework, its source-file signature must "
+    "actually exist in the tree -- a framework with no matching source file is rejected.",
+    "If the approved Tech Stack declares a frontend framework, some package.json in the repo "
+    "must really depend on it -- a signature file with no matching manifest dependency is "
+    "rejected.",
+    "If the approved Tech Stack declares a backend framework, it must be a real hosted HTTP "
+    "service (a web-SDK project plus an entry point that builds a running app and maps "
+    "endpoints) -- a plain class library with no host is rejected.",
+    "Every declared framework, frontend and backend alike, must show real OpenTelemetry "
+    "instrumentation somewhere in its project or entry files -- total absence is rejected.",
+    "If a backend is declared, the frontend must actually call it over HTTP -- persisting "
+    "state only to localStorage/sessionStorage/IndexedDB with no backend call at all is "
+    "rejected.",
+    "If the frontend has its own API route handlers, they must forward (proxy) to the "
+    "declared backend, not reimplement its state themselves with no outbound call -- a "
+    "same-origin fetch to your own route handler does not count as calling the backend.",
+    "You must actually produce a real, parseable coverage report (Cobertura XML or istanbul "
+    "json-summary) from a real run using this stack's correct tooling -- an unreadable or "
+    "missing artifact is treated as an infrastructure failure, not a coverage gap, and blocks "
+    "just the same.",
+    "Never broaden a coverage-exclusion config (coverage.runsettings, .c8rc.json, etc.) beyond "
+    "the known-safe generated-code patterns to dodge the threshold -- that is gaming the gate, "
+    "not legitimate exclusion.",
+    "Coverage must meet the 95% threshold for BOTH line rate and branch rate.",
+    "Once coverage clears the threshold, every eligible acceptance criterion still needs "
+    "enough tests below the browser layer (unit/integration) -- a high aggregate percentage "
+    "does not excuse a criterion proven only through Playwright.",
+)
+
+
 async def verify_coverage(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
     chat_provider: str,
@@ -1618,6 +1659,11 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert len(runs) == 2 and runs[0]["exit_code"] == 0, runs
     assert prov.commands[0].startswith("rm -f apps/api.Tests/TestResults/coverage.cobertura.xml; cd . && timeout"), prov.commands[0]
     assert "cd apps/web && timeout" in prov.commands[1] and "npx vitest run --coverage" in prov.commands[1], prov.commands[1]
+
+    # Task 13b: MINIMAL_CODE_TO_GREEN_HARD_RULES -- one line per real rejection branch in
+    # verify_coverage (see the constant's own comment for the count breakdown).
+    assert len(MINIMAL_CODE_TO_GREEN_HARD_RULES) == 11, len(MINIMAL_CODE_TO_GREEN_HARD_RULES)
+    assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_HARD_RULES)
     print("test_coverage_gate self-check: all assertions passed")
 
 

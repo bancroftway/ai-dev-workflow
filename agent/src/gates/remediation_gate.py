@@ -275,6 +275,30 @@ async def _prior_finding_ids(provider: Any, thread_id: str, baseline_commit: str
     return frozenset(str(f.get("id")) for f in (prior.get("findings") or []))
 
 
+# Task 13b: one line per DISTINCT rejection reason inside evaluate_remediation/verify_remediation
+# below. Six, not two: content-missing and no-scan-available are each their own reason, same as
+# the three concrete checks (unexplained actionable finding, fabricated claimed id, and the two
+# suppression checks -- by file and by inline comment -- counted separately since they are two
+# independently-triggered branches).
+REMEDIATION_HARD_RULES: tuple[str, ...] = (
+    "You must actually produce a report -- an absent report cannot be distinguished from a "
+    "stage that never ran and is rejected outright.",
+    "A repo scan must be available to verify your claims against -- if none could be taken, "
+    "your claims about what you fixed cannot be checked and the stage is rejected.",
+    "Every still-ACTIONABLE finding (any severity, application code, and quality debt this "
+    "pipeline itself introduced) left open after you ran must be gone from a fresh scan or "
+    "named in known_gaps with a REAL reason beyond the bare id -- an unexplained open finding "
+    "blocks.",
+    "Every id you list in findings_addressed must be a real finding id copied verbatim from "
+    "the scan -- a fabricated or mistyped id is rejected.",
+    "Never touch a scanner ignore/config file (.trivyignore, .gitleaksignore, gitleaks.toml, "
+    "etc.) -- remediation must fix findings, never silence the scanner.",
+    "Never add an inline scanner-suppression comment (nosec, noqa, trivy:ignore, "
+    "gitleaks:allow, semgrep-disable, eslint-disable, type: ignore, etc.) -- fix the finding "
+    "instead of hiding it from the scanner.",
+)
+
+
 async def verify_remediation(
     thread_id: str, content_dict: dict[str, Any], _run_id: str, baseline_commit: str | None, provider: Any,
     _chat_provider: str,
@@ -441,6 +465,12 @@ def _demo() -> None:
         },
         scan,
     )[0]
+
+    # Task 13b: REMEDIATION_HARD_RULES -- one line per real rejection branch in
+    # evaluate_remediation/verify_remediation (see the constant's own comment for the count
+    # breakdown).
+    assert len(REMEDIATION_HARD_RULES) == 6, len(REMEDIATION_HARD_RULES)
+    assert all(isinstance(r, str) and r.strip() for r in REMEDIATION_HARD_RULES)
 
     print("remediation_gate self-check: all assertions passed")
 
