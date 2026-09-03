@@ -1636,6 +1636,11 @@ STAGES: list[StageSpec] = [
         # into the draft's ainvoke_structured call by make_draft_node's generic rules=stage_spec.
         # draft_rules -- ac-to-tests has no custom draft node to wire separately.
         draft_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
+        # Same constant, not a separate set: make_audit_node overwrites stage["draft"] with the
+        # audit's revised_test_suite BEFORE make_verify_node runs verify_ac_to_tests against it
+        # (graph.py's audit-then-verify ordering), so the audit pass needs the identical rules --
+        # one gate checks both draft and audit-revised content.
+        audit_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ac_to_tests_ticket_mode_context,
         # Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block --
         # the model returns a fully-detailed coverage_plan claiming it "created failing RED-phase
