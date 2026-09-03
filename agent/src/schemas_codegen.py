@@ -101,7 +101,9 @@ class AcToTestsAuditResponse(BaseModel):
     here)."""
 
     revised_test_suite: AcceptanceCriteriaTestSuite
-    audit_findings: list[str] = Field(default_factory=list)
+    audit_findings: PresenceList = Field(
+        description="Gaps found and fixed, or an explicit absent+reason when none were found."
+    )
 
 
 class ChangedFile(BaseModel):
@@ -173,7 +175,9 @@ class MinimalCodeToGreenDraftResponse(BaseModel):
 
 class MinimalCodeToGreenAuditResponse(BaseModel):
     revised_iteration: CodegenIterationResult
-    audit_findings: list[str] = Field(default_factory=list)
+    audit_findings: PresenceList = Field(
+        description="Gaps found and fixed, or an explicit absent+reason when none were found."
+    )
 
 
 _MINIMAL_CODE_TO_GREEN_ITERATION_EXAMPLE = CodegenIterationResult(
@@ -223,14 +227,16 @@ echoed into the draft prompt so the model sees a realistic instance of the curre
 
 MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE: MinimalCodeToGreenAuditResponse = MinimalCodeToGreenAuditResponse(
     revised_iteration=_MINIMAL_CODE_TO_GREEN_ITERATION_EXAMPLE,
-    audit_findings=[
-        "Confirmed the reset-request endpoint matches PS-1 and both cited criteria; no "
-        "divergences found."
-    ],
+    audit_findings=PresenceList(
+        status="absent",
+        reason="Confirmed the reset-request endpoint matches PS-1 and both cited criteria; no "
+        "divergences found.",
+    ),
 )
 """Fully-populated example of the minimal-code-to-green adversarial-audit node's structured
-output. audit_findings is a bare list[str] here (not a PresenceList) -- this schema was not
-tightened by an earlier task, so the example matches its actual current shape."""
+output. audit_findings is a real PresenceList (Task 14), matching SpecificationAuditResponse/
+PlanAuditResponse/AcToTestsAuditResponse's audit_findings -- all four audit schemas now share the
+same typed-absence shape."""
 
 
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.schemas_codegen`
@@ -290,10 +296,53 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert_example_matches_schema(MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE, MinimalCodeToGreenDraftResponse)
     assert_example_matches_schema(MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE, MinimalCodeToGreenAuditResponse)
 
-    # known_gaps is the one PresenceList-wrapped field on this schema -- confirm it dumps a real
-    # "status" key, not a stale bare-list shape PresenceList's own before-validator would silently
-    # coerce.
+    # known_gaps is one of three PresenceList-wrapped fields on this module's schemas -- confirm
+    # it dumps a real "status" key, not a stale bare-list shape PresenceList's own before-validator
+    # would silently coerce.
     _iteration_dumped = json.loads(MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE.iteration.model_dump_json())
     assert "status" in _iteration_dumped["known_gaps"], "iteration.known_gaps missing 'status'"
+
+    # Task 14: AcToTestsAuditResponse.audit_findings / MinimalCodeToGreenAuditResponse.
+    # audit_findings -- both were bare list[str] until now, same fix already applied to
+    # SpecificationAuditResponse/PlanAuditResponse.audit_findings (schemas.py). Same three-part
+    # proof as every other PresenceList field in this codebase: present/absent both validate,
+    # a bare list still legacy-coerces, and the wired example round-trips to the real typed shape.
+    _revised_suite = AcceptanceCriteriaTestSuite(summary="all ACs covered")
+    ac_to_tests_audit_present = AcToTestsAuditResponse(
+        revised_test_suite=_revised_suite,
+        audit_findings=PresenceList(status="present", values=["AC-0001.1 test was missing an edge case"]),
+    )
+    assert ac_to_tests_audit_present.audit_findings.values == ["AC-0001.1 test was missing an edge case"]
+    ac_to_tests_audit_legacy = AcToTestsAuditResponse.model_validate(
+        {"revised_test_suite": _revised_suite.model_dump(), "audit_findings": ["legacy bare finding"]}
+    )
+    assert ac_to_tests_audit_legacy.audit_findings.status == "present"
+    assert ac_to_tests_audit_legacy.audit_findings.values == ["legacy bare finding"]
+    ac_to_tests_audit_legacy_empty = AcToTestsAuditResponse.model_validate(
+        {"revised_test_suite": _revised_suite.model_dump(), "audit_findings": []}
+    )
+    assert ac_to_tests_audit_legacy_empty.audit_findings.status == "absent"
+    assert ac_to_tests_audit_legacy_empty.audit_findings.reason == "legacy sidecar, pre-typed-absence"
+
+    minimal_audit_present = MinimalCodeToGreenAuditResponse(
+        revised_iteration=_iteration(),
+        audit_findings=PresenceList(status="present", values=["missed the second ChangedFile's related_ac_ids"]),
+    )
+    assert minimal_audit_present.audit_findings.values == ["missed the second ChangedFile's related_ac_ids"]
+    minimal_audit_legacy = MinimalCodeToGreenAuditResponse.model_validate(
+        {"revised_iteration": _iteration().model_dump(), "audit_findings": None}
+    )
+    assert minimal_audit_legacy.audit_findings.status == "absent"
+    assert minimal_audit_legacy.audit_findings.reason == "legacy sidecar, pre-typed-absence"
+
+    _ac_to_tests_dummy_example = AcToTestsAuditResponse(
+        revised_test_suite=_revised_suite,
+        audit_findings=PresenceList(status="absent", reason="no findings for this self-check instance"),
+    )
+    assert_example_matches_schema(_ac_to_tests_dummy_example, AcToTestsAuditResponse)
+    _minimal_audit_dumped = json.loads(MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE.model_dump_json())
+    assert "status" in _minimal_audit_dumped["audit_findings"], (
+        "MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE.audit_findings missing 'status'"
+    )
 
     print("schemas_codegen self-check: all assertions passed")

@@ -476,6 +476,45 @@ def _demo() -> None:
     # protection_problems list are each counted separately here, same as they are for the model.
     assert len(AC_TO_TESTS_HARD_RULES) == 8
     assert all(isinstance(r, str) and r.strip() for r in AC_TO_TESTS_HARD_RULES)
+
+    # Task 14 item 4: don't just confirm the constant exists -- trace it through the SAME
+    # build_schema_contract/ainvoke_structured machinery graph.py's make_draft_node/make_audit_node
+    # actually call for ac-to-tests (draft_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
+    # graph.py), and confirm every one of the 8 rule strings really lands in the message the model
+    # is sent, byte-for-byte, not just "the joined string is non-empty."
+    import asyncio
+
+    from langchain_core.messages import AIMessage
+
+    from ..schemas_codegen import AcceptanceCriteriaTestsDraftResponse
+    from ..structured_output import ainvoke_structured, build_schema_contract
+
+    joined_rules = "\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES)
+    contract = build_schema_contract(AcceptanceCriteriaTestsDraftResponse.model_json_schema(), rules=joined_rules)
+    for rule in AC_TO_TESTS_HARD_RULES:
+        assert rule in contract, f"rule missing from build_schema_contract's output: {rule!r}"
+
+    class _FakeRuleCheckModel:
+        def __init__(self) -> None:
+            self.calls: list[list[Any]] = []
+
+        async def ainvoke(self, messages: list[Any], config: dict | None = None) -> AIMessage:  # noqa: ARG002
+            self.calls.append(list(messages))
+            return AIMessage(
+                content=json.dumps(
+                    {"readiness": False, "clarifying_questions": [], "test_suite": None, "skills_invoked": []}
+                )
+            )
+
+    fake_model = _FakeRuleCheckModel()
+    asyncio.run(
+        ainvoke_structured(fake_model, [], AcceptanceCriteriaTestsDraftResponse, rules=joined_rules)  # type: ignore[arg-type]
+    )
+    assert len(fake_model.calls) == 1, "readiness=false is a valid first-attempt answer -- must not retry"
+    sent_text = "\n".join(str(m.content) for m in fake_model.calls[0])
+    for rule in AC_TO_TESTS_HARD_RULES:
+        assert rule in sent_text, f"rule never reached the actual message sent to the model: {rule!r}"
+
     print("write_scope_gate self-check: all assertions passed")
 
 

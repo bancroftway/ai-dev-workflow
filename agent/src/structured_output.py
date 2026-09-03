@@ -399,6 +399,25 @@ def _demo() -> None:
     assert second_call_text.count("Worked example:") == 1, "retry re-sent the worked example -- token-cost bug"
     assert "Re-check against the worked example above" in second_call_text
 
+    # Task 14 item 3(c): the REAL retry-exhaustion failure path, against the real TechStack schema
+    # -- a model that NEVER produces valid JSON must genuinely burn every attempt and raise the
+    # last real ValidationError, not the degenerate max_attempts=0 case (which skips the loop body
+    # entirely and hits this function's own `assert last_error is not None` guard, raising a bare
+    # AssertionError instead of ever exercising a real parse failure). This is the failure shape
+    # preflight_nodes._extract_tech_stack's caller (resolve_tech_stack_submission) actually catches
+    # in production when extraction never converges.
+    always_malformed = _FakeModel(replies=["not json at all"] * 3)
+    raised: Exception | None = None
+    try:
+        asyncio.run(ainvoke_structured(always_malformed, [], TechStack, max_attempts=3))  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001 -- capturing whatever the loop actually raised
+        raised = exc
+    assert raised is not None, "expected the exhausted retry loop to raise"
+    assert not isinstance(raised, AssertionError), (
+        f"got the degenerate max_attempts=0-shaped AssertionError, not a real parse failure: {raised!r}"
+    )
+    assert len(always_malformed.calls) == 3, "must burn every attempt, not short-circuit"
+
     print("structured_output self-check: all assertions passed")
 
 
