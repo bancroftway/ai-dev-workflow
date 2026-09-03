@@ -229,12 +229,10 @@ def render_minimal_code_to_green_markdown(content: dict[str, Any]) -> str:
             lines.append(f"- **{cf.get('change_kind', '')}** `{cf.get('path', '')}` -- {cf.get('summary', '')}")
         lines.append("")
 
-    known_gaps = content.get("known_gaps") or []
-    if known_gaps:
-        lines.append("## Known Gaps")
-        lines.append("")
-        lines.extend(f"- {gap}" for gap in known_gaps)
-        lines.append("")
+    # known_gaps is PresenceList-shaped (schemas_codegen.py, Task 12) as of this task -- always
+    # render, reason when absent, same convention as every other PresenceList field this module
+    # renders. Was a bare `content.get("known_gaps") or []` read before the schema changed.
+    _render_presence_section(lines, content, "known_gaps", "Known Gaps")
 
     ponytail_rejected = content.get("ponytail_rejected") or []
     if ponytail_rejected:
@@ -395,6 +393,21 @@ def _demo() -> None:
     # back to "not checked" rather than KeyError/AttributeError.
     assert render_tech_stack_markdown({"summary": "S"})
     assert render_tech_stack_markdown({})
+
+    # render_minimal_code_to_green_markdown: known_gaps is PresenceList-shaped (schemas_codegen.py,
+    # Task 12) -- present renders values, absent renders the reason (was a bare
+    # `content.get("known_gaps") or []` read before the schema changed).
+    green_present = render_minimal_code_to_green_markdown({
+        "approach_summary": "x",
+        "known_gaps": {"status": "present", "values": ["needs a follow-up migration"]},
+    })
+    assert "- needs a follow-up migration" in green_present, green_present
+    green_absent = render_minimal_code_to_green_markdown({
+        "approach_summary": "x",
+        "known_gaps": {"status": "absent", "values": [], "reason": "nothing left open"},
+    })
+    assert "nothing left open" in green_absent, "absent known_gaps must render its reason"
+    assert render_minimal_code_to_green_markdown({"approach_summary": "x"})
 
     # render_adversarial_audit_markdown: divergence_findings is DivergenceFindingPresence-shaped
     # (structured findings, not a bare PresenceList), unresolved_risk_notes is PresenceList-shaped --

@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .schemas import ClarifyingQuestion
+from .schemas import ClarifyingQuestion, PresenceList
 
 TestKind = Literal["unit", "integration", "e2e_playwright_skeleton"]
 TestFramework = Literal["xunit", "nunit", "vitest", "jest", "playwright", "pytest"]
@@ -122,7 +122,10 @@ class CodegenIterationResult(BaseModel):
     approach_summary: str
     changed_files: list[ChangedFile] = Field(default_factory=list)
     subagent_tasks: list[SubagentTaskRecord] = Field(default_factory=list)
-    known_gaps: list[str] = Field(default_factory=list)
+    known_gaps: PresenceList = Field(
+        description="Gaps deliberately left unfixed this iteration, or an explicit absent+reason "
+        "when there are none."
+    )
     ponytail_rejected: list[str] = Field(
         default_factory=list,
         description="Ponytail suggestions evaluated and rejected (including by subagents), each with a one-line reason.",
@@ -142,7 +145,82 @@ class MinimalCodeToGreenDraftResponse(BaseModel):
         "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
     )
 
+    @model_validator(mode="after")
+    def _ready_means_files_were_changed(self) -> "MinimalCodeToGreenDraftResponse":
+        """Structural twin of AcceptanceCriteriaTestsDraftResponse._ready_means_files_were_written
+        (schemas_codegen.py's sibling stage schema for AC-to-tests): readiness=True with no
+        changed_files is the same dominant failure mode, just for the codegen stage -- the model
+        reports metadata about a fix instead of actually writing it.
+
+        Raising it here feeds the correction straight back into the same turn: ainvoke_structured
+        re-sends this message to the same session, which still has its file tools and can write the
+        change and answer again, before a whole graph cycle is spent on an empty iteration.
+        """
+        if not self.readiness:
+            return self  # not claiming done; clarifying_questions is the honest path
+        if self.iteration is None or not self.iteration.changed_files:
+            raise ValueError(
+                "readiness=true but changed_files is empty. This response is metadata ABOUT "
+                "changed files -- it is not the files themselves. Nothing has been written to the "
+                "repo yet. Use your file tools (create/edit/apply_patch) to write/edit the actual "
+                "files to disk NOW, then reply with this JSON listing the files you really "
+                "changed. If something genuinely blocks you from making the change, set "
+                "readiness=false and put the blocker in clarifying_questions instead of reporting "
+                "an empty iteration as done."
+            )
+        return self
+
 
 class MinimalCodeToGreenAuditResponse(BaseModel):
     revised_iteration: CodegenIterationResult
     audit_findings: list[str] = Field(default_factory=list)
+
+
+if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.schemas_codegen`
+    from pydantic import ValidationError
+
+    _changed_file = ChangedFile(path="src/foo.py", change_kind="modified", summary="fixed the bug")
+
+    def _iteration(**kwargs: object) -> CodegenIterationResult:
+        base = dict(
+            approach_summary="fixed it",
+            changed_files=[_changed_file],
+            known_gaps=PresenceList(status="absent", reason="nothing left open"),
+        )
+        base.update(kwargs)
+        return CodegenIterationResult(**base)  # type: ignore[arg-type]
+
+    # CodegenIterationResult.known_gaps: real PresenceList now, present/absent both validate, and
+    # a bare list still legacy-coerces (older sidecars/model output).
+    present_gaps = _iteration(known_gaps=PresenceList(status="present", values=["needs a follow-up migration"]))
+    assert present_gaps.known_gaps.values == ["needs a follow-up migration"]
+    legacy_gaps = CodegenIterationResult.model_validate(
+        {
+            "approach_summary": "x",
+            "changed_files": [_changed_file.model_dump()],
+            "known_gaps": ["legacy bare gap"],
+        }
+    )
+    assert legacy_gaps.known_gaps.status == "present"
+    assert legacy_gaps.known_gaps.values == ["legacy bare gap"]
+
+    # MinimalCodeToGreenDraftResponse._ready_means_files_were_changed: mirrors
+    # AcceptanceCriteriaTestsDraftResponse._ready_means_files_were_written -- both directions.
+    not_ready = MinimalCodeToGreenDraftResponse(readiness=False, iteration=None)
+    assert not_ready.iteration is None  # honest "not done yet" path, never raises
+
+    ready_with_changes = MinimalCodeToGreenDraftResponse(readiness=True, iteration=_iteration())
+    assert ready_with_changes.iteration is not None and ready_with_changes.iteration.changed_files
+
+    try:
+        MinimalCodeToGreenDraftResponse(readiness=True, iteration=None)
+        raise AssertionError("expected ValidationError for readiness=true with iteration=None")
+    except ValidationError:
+        pass
+    try:
+        MinimalCodeToGreenDraftResponse(readiness=True, iteration=_iteration(changed_files=[]))
+        raise AssertionError("expected ValidationError for readiness=true with empty changed_files")
+    except ValidationError:
+        pass
+
+    print("schemas_codegen self-check: all assertions passed")
