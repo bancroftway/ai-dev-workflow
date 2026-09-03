@@ -24,6 +24,7 @@ import { terminateSession } from "@/lib/agent-client";
 import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { computeRunningStages, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
@@ -70,6 +71,14 @@ function stageGroupDot(state: WorkflowState, keys: StageKey[], runningStages: Se
   return undefined;
 }
 
+/** Reverse of TAB_STAGE_GROUPS: which tab a durable `current_stage` value belongs to. Returns
+ * undefined for a stage TAB_STAGE_GROUPS doesn't cover (quality/report's own stages aren't
+ * listed there either) -- callers must treat that as "nothing to correct", not an error. */
+function tabForStage(stageKey: string): ViewId | undefined {
+  const found = Object.entries(TAB_STAGE_GROUPS).find(([, keys]) => (keys as string[]).includes(stageKey));
+  return found?.[0] as ViewId | undefined;
+}
+
 export function AppShell({
   owner,
   repo,
@@ -103,6 +112,9 @@ export function AppShell({
   const [activeView, setActiveView] = useState<ViewId>("tech-stack");
   const { copilotkit } = useCopilotKit();
   const [sandboxStatus, setSandboxStatus] = useSandboxStatus();
+  // Declared early (not down by the poll that populates it) so runningStages below can read it --
+  // `null` until that poll's first response arrives; see computeRunningStages' own tri-state note.
+  const [runActivity, setRunActivity] = useRunActivity();
   const router = useRouter();
   const [stoppingContainer, setStoppingContainer] = useState(false);
 
@@ -110,7 +122,10 @@ export function AppShell({
   const specification = state.stages?.specification;
   const plan = state.stages?.plan;
   const runEvents = useRunEvents();
-  const runningStages = useMemo(() => computeRunningStages(runEvents), [runEvents]);
+  const runningStages = useMemo(
+    () => computeRunningStages(runEvents, runActivity?.runActive ?? null),
+    [runEvents, runActivity?.runActive],
+  );
   // Always-fresh handle for effects below whose own deps intentionally exclude `state` (recreating
   // a poll's setInterval on every state tick would be wasteful) but still need this render's value.
   const stateRef = useRef(state);
@@ -182,6 +197,31 @@ export function AppShell({
     wasBuildRunningRef.current = buildRunning;
   }, [runningStages]);
 
+  // Third, narrower backstop (Workflow Liveness Fix; user-reported: landed on Tech Stack with a
+  // session already at ac-to-tests): the two mechanisms above already cover most of this --
+  // RULES' own first-load branch below reacts once `state.stages` hydrates, and the effect just
+  // above reacts to the live event stream -- but a non-gated build stage spends most of its real
+  // running time at persisted status "ready_for_review" (RULES misses it) between verify attempts
+  // rather than "drafting", and the event stream can lag on first paint. The durable row's plain
+  // `current_stage` string is the cheapest, fastest-arriving signal (no dependency on state.stages
+  // or the events poll) -- fires once, only while still sitting on the initial default, so it
+  // never fights a tab the user already clicked.
+  const durableTabLandedRef = useRef(false);
+  useEffect(() => {
+    if (durableTabLandedRef.current) return;
+    if (runActivity?.currentStage == null) return;
+    durableTabLandedRef.current = true;
+    if (activeView !== "tech-stack") return; // already navigated (manually or by a sibling effect)
+    const tab = tabForStage(runActivity.currentStage);
+    // setState-in-effect is the point here, same exemption as the RULES effect above: reacting to
+    // a durable SERVER value (current_stage), not to derivable render-time data.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (tab && tab !== "tech-stack") setActiveView(tab);
+    // activeView intentionally excluded -- read once at fire time (one-shot, ref-guarded), not a
+    // reactive dependency; listing it would re-run this effect on every later tab switch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runActivity?.currentStage]);
+
   // Container-pill liveness poll (found live 2026-08-31: the pill said "Connected" while a
   // restarted agent had NO sandbox registered -- SandboxSessionBoot sets "ready" once after the
   // provision POST and nothing ever re-checked, so an agent restart or a dead container left the
@@ -226,9 +266,20 @@ export function AppShell({
           current_stage: string | null;
           status: string;
           awaiting_gate: boolean | null;
+          run_active?: boolean;
+          interrupted?: boolean;
         };
         setSandboxStatus(row.container_alive ? "ready" : "error");
         setDurableRow({ current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate });
+        // Same response, lifted into context so BuildView/SessionOverview/SpecificationView/
+        // PlanView/RequirementsView can read run_active/interrupted without a second fetch.
+        setRunActivity({
+          runActive: row.run_active ?? false,
+          interrupted: row.interrupted ?? false,
+          awaitingGate: row.awaiting_gate,
+          currentStage: row.current_stage,
+          status: row.status,
+        });
         // The moment the durable row reports the run PAUSED at its own gate, a blank run request
         // hits ag_ui_langgraph's pending-interrupt short-circuit and main.py's
         // _ReattachStateAgent injects a full STATE_SNAPSHOT into it -- exactly the mechanism a
@@ -257,7 +308,7 @@ export function AppShell({
       clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
-  }, [threadId, setSandboxStatus, agent, copilotkit]);
+  }, [threadId, setSandboxStatus, setRunActivity, agent, copilotkit]);
 
   // Mid-run reattach gap (backlog item 4; user found confusing live 2026-08-31): a client that
   // (re)connects while the graph is actively drafting/auditing -- no gate open, nothing to pause
@@ -268,11 +319,17 @@ export function AppShell({
   // lost its place. The durable session row (dbo.sessions, unaffected by the gap) is the signal
   // that this is a stale reattach, not a genuine fresh start: `current_stage` past "tech-stack"
   // with the run still `in_progress` while the live stream has delivered nothing at all.
+  // Workflow Liveness Fix: must NOT fire once we positively know the run has stopped -- otherwise
+  // this banner's own "pipeline keeps running in the background" copy is a lie next to the
+  // Interrupted banner's "this run appears to have stopped" a few pixels below it. `interrupted`
+  // is a definitive signal (server-computed from run_active + awaiting_gate); `runActivity == null`
+  // (not yet loaded) still allows this branch, same tri-state caution as computeRunningStages.
   const isReattaching =
     Object.keys(state.stages ?? {}).length === 0 &&
     durableRow?.status === "in_progress" &&
     durableRow.current_stage != null &&
-    durableRow.current_stage !== "tech-stack";
+    durableRow.current_stage !== "tech-stack" &&
+    !runActivity?.interrupted;
 
   // Auto-trigger the run once, as soon as the sandbox is ready, on a thread that's never run
   // before -- scaffold_node hard-fails with no local-working-tree fallback if run before the
@@ -444,12 +501,15 @@ export function AppShell({
                 to the agent is in flight (the attached stream). anyStageDrafting was removed
                 (user, 2026-08-31): it reads server-state status flags, and a run that died
                 mid-draft (agent restart, quota) leaves a stage stuck on "drafting" forever -- the
-                spinner then claimed work that wasn't happening. The trade: a reloaded client
-                whose stream detached mid-run shows no spinner until it reattaches (the known
-                mid-run reattach gap, backlog item 4). Suppressed while a review gate is open:
-                the stream stays attached during a LangGraph interrupt, but the pipeline is
-                waiting on the HUMAN then. */}
-            {interruptElement == null && agent.isRunning && (
+                spinner then claimed work that wasn't happening. Workflow Liveness Fix: OR'd with
+                the durable run_active signal (agent/src/run_activity.py, via GET /sessions/{id})
+                to close the "known mid-run reattach gap" this comment used to accept as a
+                trade-off -- a reloaded client whose stream hasn't reattached yet, but whose
+                server-side run genuinely is still active, now shows the spinner immediately
+                instead of waiting for the stream. Suppressed while a review gate is open: the
+                stream stays attached during a LangGraph interrupt, but the pipeline is waiting on
+                the HUMAN then. */}
+            {interruptElement == null && (agent.isRunning || runActivity?.runActive) && (
               <span className="flex items-center gap-1.5 text-xs text-neutral-500">
                 <Spinner />
                 {(() => {
@@ -499,6 +559,32 @@ export function AppShell({
             />
           </div>
         </nav>
+
+        {/* Workflow Liveness Fix: a session can be `in_progress` (not yet a terminal DB status)
+            with nothing actually executing it (process died, container killed, agent restarted --
+            durable node events/persisted stage status all outlive the process, so nothing else in
+            this file could tell). `interrupted` is server-computed and definitive; `status ===
+            "failed"` is the other stopped-and-recoverable case, whose only Resume button used to
+            live buried in the Overview tab (SessionOverview.tsx) -- this one is visible from
+            every tab. */}
+        {(runActivity?.interrupted || durableRow?.status === "failed") && (
+          <div className="flex items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
+            <span>
+              {durableRow?.status === "failed"
+                ? "This run failed and stopped."
+                : "This run appears to have stopped (no process is currently attached)."}{" "}
+              Resume picks up from the last checkpoint.
+            </span>
+            <button
+              type="button"
+              className="shrink-0 rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40"
+              disabled={agent.isRunning}
+              onClick={() => void copilotkit.runAgent({ agent })}
+            >
+              {agent.isRunning ? "Resuming…" : "Resume"}
+            </button>
+          </div>
+        )}
 
         {/* The Gate UI's new home (Task 10) -- rendered here so it's visible above whichever tab
             is open, matching the comment on useInterrupt above. null for tech-stack's own gate

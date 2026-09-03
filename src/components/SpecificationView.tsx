@@ -8,6 +8,7 @@ import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { SPECIFICATION_SURFACE_ID } from "@/lib/a2ui-surface-ids";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -16,6 +17,7 @@ export function SpecificationView() {
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const { interrupt } = useOpenInterrupt();
+  const [runActivity] = useRunActivity();
   const state = (agent.state ?? {}) as WorkflowState;
   const stage = state.stages?.specification;
 
@@ -46,7 +48,11 @@ export function SpecificationView() {
   // with the interrupt closing). Once this stage's own status is "approved" its content is
   // settled regardless of what the rest of the pipeline is doing.
   const isFinal = interrupt.open && interrupt.stage === "specification";
-  const isProvisional = agent.isRunning && stage?.status !== "approved" && !isFinal;
+  // agent.isRunning OR'd with the durable run_active signal (Workflow Liveness Fix): isRunning is
+  // stream-attachment only and resets to false on reload while the server may still genuinely be
+  // auditing/redrafting this stage -- without runActive, that reload briefly rendered mid-audit
+  // content as if it were the final, settled version.
+  const isProvisional = (agent.isRunning || runActivity?.runActive === true) && stage?.status !== "approved" && !isFinal;
 
   // Same shell as the Tech Stack / Requirements tabs (user requirement 2026-08-31): header block
   // on top, content in one bounded 65vh box that scrolls internally -- the document itself is

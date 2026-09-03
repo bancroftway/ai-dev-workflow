@@ -5,6 +5,7 @@ import { useMemo } from "react";
 import { LiveCostChip } from "@/components/LiveCostChip";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { computeRunningStages, formatDuration, parseEventTs, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { StageState, WorkflowState } from "@/lib/workflow-types";
@@ -55,6 +56,7 @@ export function SessionOverview() {
   // sent the stage back to its own draft node (make_gate_node, graph.py) -- a count Overview never
   // surfaced before (user feedback 2026-09-01).
   const events = useRunEvents();
+  const [runActivity] = useRunActivity();
   const perStage = useMemo(() => {
     const byStage = new Map<
       string,
@@ -79,10 +81,10 @@ export function SessionOverview() {
     }
     // See computeRunningStages' own docstring for why this can't just be `stage.status ===
     // "drafting"`: a non-gated stage's status is stale/misleading between verify attempts.
-    const runningStages = computeRunningStages(events);
+    const runningStages = computeRunningStages(events, runActivity?.runActive ?? null);
     for (const [stageKey, entry] of byStage) entry.running = runningStages.has(stageKey);
     return byStage;
-  }, [events]);
+  }, [events, runActivity?.runActive]);
 
   const failureIsInfra = failure?.failure_type === "infra_transient" || failure?.failure_type === "quota_exhausted";
 
@@ -130,9 +132,11 @@ export function SessionOverview() {
           is underway. */}
       {stages.length === 0 && (
         <p className="text-sm text-neutral-500">
-          {events.length > 0
-            ? "Run in progress — stages appear here as they start reporting."
-            : "No stages have run yet."}
+          {runActivity?.interrupted
+            ? "This run appears to have stopped before any stage reported in. Resume to pick it back up."
+            : events.length > 0 && runActivity?.runActive !== false
+              ? "Run in progress — stages appear here as they start reporting."
+              : "No stages have run yet."}
         </p>
       )}
 
@@ -154,8 +158,11 @@ export function SessionOverview() {
               // remediation, ...): it only updates when the run pauses at a gate, so a stage with
               // no gate can sit at "not_started" for its entire real drafting time. `timing.running`
               // (perStage, above) is derived from the live event stream instead, which has no such
-              // lag -- OR'd together since state is never wrong when it does say "drafting".
-              const running = stage.status === "drafting" || timing?.running === true;
+              // lag -- OR'd together since state is never wrong when it does say "drafting". Gated
+              // on runActive !== false too (Workflow Liveness Fix): a killed process left mid-draft
+              // leaves `status === "drafting"` forever, which used to read as running with no other
+              // signal to contradict it.
+              const running = (stage.status === "drafting" && runActivity?.runActive !== false) || timing?.running === true;
               return (
                 <li
                   key={key}

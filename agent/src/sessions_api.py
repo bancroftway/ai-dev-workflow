@@ -46,6 +46,7 @@ from . import (
     repo_auth_settings,
     repo_scaffold,
     repo_test_users,
+    run_activity,
     run_event_store,
     session_store,
 )
@@ -412,6 +413,16 @@ class SessionResponse(BaseModel):
     # actually leave this process now: True while `current_stage` is paused at its own human gate
     # awaiting approval, False/None otherwise.
     awaiting_gate: bool | None = None
+    # Live, not persisted: this session's process-local run_activity refcount (run_activity.py)
+    # is > 0 right now -- i.e. an AG-UI stream is actually attached and executing THIS instance,
+    # as opposed to `status == "in_progress"`, which only ever means "not yet terminal" and
+    # survives a crash/restart unchanged (Workflow Liveness Fix).
+    run_active: bool = False
+    # Derived, not a new DB status (no migration): `status == "in_progress"` but neither actively
+    # running nor paused at a human gate -- the durable row says the workflow isn't finished, but
+    # nothing is actually executing it. Computed server-side, once, here -- not left to the ~5
+    # frontend surfaces that would otherwise each re-derive the same three-flag expression.
+    interrupted: bool = False
     # Part 2 Ruling 8: the same silent-drop bug awaiting_gate had above -- `row` (session_store's
     # _COLUMNS) has carried project_id all along, Pydantic v2's `extra="ignore"` just never let it
     # through because nothing declared it here. A run-detail page needs its own project_id for
@@ -444,7 +455,14 @@ async def _verified_container_alive(session_id: str) -> bool:
 
 
 async def _row_to_response(row: dict[str, Any]) -> "SessionResponse":
-    return SessionResponse(**row, container_alive=await _verified_container_alive(row["session_id"]))
+    active = run_activity.is_active(row["session_id"])
+    interrupted = row["status"] == "in_progress" and not active and not bool(row.get("awaiting_gate"))
+    return SessionResponse(
+        **row,
+        container_alive=await _verified_container_alive(row["session_id"]),
+        run_active=active,
+        interrupted=interrupted,
+    )
 
 
 class SessionListResponse(BaseModel):
@@ -1648,6 +1666,23 @@ def _demo() -> None:
     assert resp.awaiting_gate is True, resp
     assert resp.project_id == "22222222-2222-2222-2222-222222222222", resp
     assert resp.container_alive is False, "no registry entry must read as not alive"
+
+    # Workflow Liveness Fix: run_active/interrupted round-trip through _row_to_response. A gate
+    # open (awaiting_gate=True, as fake_row already is) must never read as interrupted, whether or
+    # not run_activity happens to have an entry for it.
+    assert resp.run_active is False, "no run_activity entry must read as not active"
+    assert resp.interrupted is False, "awaiting_gate=True must never read as interrupted"
+
+    dead_row = dict(fake_row, awaiting_gate=False, session_id="33333333-3333-3333-3333-333333333333")
+    dead_resp = asyncio.run(_row_to_response(dead_row))
+    assert dead_resp.run_active is False and dead_resp.interrupted is True, dead_resp
+
+    run_activity.incr(dead_row["session_id"])
+    try:
+        live_resp = asyncio.run(_row_to_response(dead_row))
+        assert live_resp.run_active is True and live_resp.interrupted is False, live_resp
+    finally:
+        run_activity.decr(dead_row["session_id"])
 
     global _fetch_default_branch  # reassigned further down; must precede every use in this function
 

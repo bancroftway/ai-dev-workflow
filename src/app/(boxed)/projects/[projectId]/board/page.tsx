@@ -6,7 +6,8 @@ import { useParams } from "next/navigation";
 import type { ProjectSummary } from "@/app/api/projects/route";
 import { fetchProject } from "@/lib/agent-client";
 import { SettingsBanner } from "@/components/SettingsBanner";
-import { STATUS_BADGE } from "@/components/SessionHistory";
+import { inProgressLabel, STATUS_BADGE } from "@/components/SessionHistory";
+import { RunningSpinner } from "@/components/Spinner";
 import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
 import { providerLabel, useOrgProvider } from "@/lib/use-org-provider";
 
@@ -268,10 +269,15 @@ function SessionCard({ session, owner, repo }: { session: Session; owner: string
   // report" button, same route/param shape copied verbatim) -- no side effects, matches what
   // "Done" actually implies. Every other status is unaffected: still the workflow route,
   // unchanged, still deliberately without ?resume=1 (same reasoning, now only relevant to them).
-  const href =
-    session.status === "completed"
-      ? `/sessions/${owner}/${repo}/${session.session_id}/${session.run_id}/report`
-      : `/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}`;
+  // Workflow Liveness Fix: an interrupted in_progress session's process is dead -- a plain
+  // reattach reconnects to nothing, same reasoning as SessionHistory's Open-vs-Resume split.
+  // ?resume=1 is the same query param AppShell already reads to fire a blank runAgent() on mount.
+  const workflowHref = `/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}${
+    session.status === "in_progress" && session.interrupted ? "?resume=1" : ""
+  }`;
+  const href = session.status === "completed"
+    ? `/sessions/${owner}/${repo}/${session.session_id}/${session.run_id}/report`
+    : workflowHref;
   return (
     <Link
       href={href}
@@ -285,8 +291,9 @@ function SessionCard({ session, owner, repo }: { session: Session; owner: string
           </span>
         )}
       </div>
-      <span className={`self-start rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_BADGE[session.status]}`}>
-        {session.status.replace("_", " ")}
+      <span className={`flex items-center gap-1.5 self-start rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_BADGE[session.status]}`}>
+        {session.status === "in_progress" && session.run_active && <RunningSpinner className="h-3 w-3" />}
+        {session.status === "in_progress" ? inProgressLabel(session) : session.status.replace("_", " ")}
       </span>
       {(session.status === "failed" || session.status === "rejected") && session.failure_message && (
         <p className="truncate text-xs text-red-700" title={session.failure_message}>

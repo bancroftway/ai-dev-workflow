@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 # actually visible -- Python's root logger defaults to WARNING, which silently drops them.
 logging.basicConfig(level=logging.INFO)
 
-from src import checkpoint
+from src import checkpoint, run_activity
 from src.graph import graph
 from src.sessions_api import catalog_router as tech_stack_catalog_router
 from src.sessions_api import config_router as vault_config_router
@@ -89,6 +89,23 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
         except Exception:  # noqa: BLE001 - never let hydration sugar break the gate re-emit
             logging.getLogger(__name__).warning("reattach state-snapshot injection failed", exc_info=True)
         return prepared
+
+    async def run(self, input):  # noqa: A002 - library signature
+        """Marks this session's run_active signal (run_activity.py) for the lifetime of the
+        stream -- endpoint.py clones the registered agent per request (`agent.clone()`), so this
+        override runs once per HTTP call, not once per process; the `finally` is what makes it
+        cover normal completion, a mid-stream exception (see _RECURSION_LIMIT below), AND a client
+        disconnect (StreamingResponse cancels the streaming task on disconnect, which propagates
+        into this generator's current await point same as any other exception)."""
+        thread_id = input.thread_id
+        if thread_id:
+            run_activity.incr(thread_id)
+        try:
+            async for event in super().run(input):
+                yield event
+        finally:
+            if thread_id:
+                run_activity.decr(thread_id)
 
 
 # LangGraph's own default recursion_limit (25 super-steps) is far below what this pipeline's own

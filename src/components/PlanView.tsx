@@ -8,6 +8,7 @@ import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { PLAN_SURFACE_ID } from "@/lib/a2ui-surface-ids";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -17,6 +18,7 @@ export function PlanView() {
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const { interrupt } = useOpenInterrupt();
+  const [runActivity] = useRunActivity();
   const state = (agent.state ?? {}) as WorkflowState;
   const plan = state.stages?.plan;
 
@@ -40,7 +42,9 @@ export function PlanView() {
   // itself gets approved and Build starts running, agent.isRunning stays true and isFinal goes
   // false with the interrupt closed -- without this check the now-approved plan would blur again).
   const isFinal = interrupt.open && interrupt.stage === "plan";
-  const isProvisional = agent.isRunning && plan?.status !== "approved" && !isFinal;
+  // Same reasoning as SpecificationView's own copy of this comment: agent.isRunning alone misses a
+  // reload mid-redraft (Workflow Liveness Fix's durable run_active backstops it).
+  const isProvisional = (agent.isRunning || runActivity?.runActive === true) && plan?.status !== "approved" && !isFinal;
 
   // Same shell as Tech Stack / Requirements / Specification (user requirement 2026-08-31):
   // header block on top, content in one bounded 63vh box scrolling internally. Read-only here;

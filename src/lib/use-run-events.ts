@@ -99,8 +99,19 @@ export function formatDuration(ms: number): string {
  * actively retrying as "awaiting", not "running", almost the entire time). Scoped to the latest
  * `run_id` so a node_started left open by a hard-killed agent process (several observed live) can
  * never read as "still running" forever -- that run is over, whether or not it got a matching
- * node_finished. First consumer: SessionOverview's per-stage table; second: AppShell's tab pills. */
-export function computeRunningStages(events: RunLogEvent[]): Set<string> {
+ * node_finished. First consumer: SessionOverview's per-stage table; second: AppShell's tab pills.
+ *
+ * `runActive` (Workflow Liveness Fix) is a tri-state backstop, not a plain boolean: an explicit
+ * `false` (the backend's run_activity refcount says nothing is attached to this session right
+ * now) always wins and returns an empty set -- this is what actually fixes a hard-killed run's
+ * dangling node_started, which the latest-run-id scoping above can still misread as running (the
+ * old run IS the latest run_id until a new one emits its first event). `null`/`undefined` (the
+ * caller's run-activity context hasn't loaded yet -- always true on first render) must NOT be
+ * treated as `false`: that would hide a genuinely-running session's spinner for a tick on every
+ * page load, a regression this fix must not introduce. Only omit the argument (or pass `true`) to
+ * keep the old, ungated behavior. */
+export function computeRunningStages(events: RunLogEvent[], runActive?: boolean | null): Set<string> {
+  if (runActive === false) return new Set();
   const latestRunId = events.length > 0 ? events[events.length - 1].run_id : null;
   const openNodeStage = new Map<string, string>(); // "run_id|node" -> stage, while still unfinished
   for (const e of events) {

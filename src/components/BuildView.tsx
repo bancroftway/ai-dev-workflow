@@ -4,6 +4,7 @@ import { useAgent } from "@copilotkit/react-core/v2";
 import { useMemo } from "react";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { computeRunningStages, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { StageState, WorkflowState } from "@/lib/workflow-types";
@@ -93,7 +94,11 @@ export function BuildView() {
   const { agent } = useAgent({ agentId: localAgentId });
   const state = (agent.state ?? {}) as WorkflowState;
   const runEvents = useRunEvents();
-  const runningStages = useMemo(() => computeRunningStages(runEvents), [runEvents]);
+  const [runActivity] = useRunActivity();
+  const runningStages = useMemo(
+    () => computeRunningStages(runEvents, runActivity?.runActive ?? null),
+    [runEvents, runActivity?.runActive],
+  );
 
   return (
     <ViewContainer>

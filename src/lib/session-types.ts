@@ -31,6 +31,13 @@ export type Session = {
    * agent's memory right now. False after an agent restart until the session is reprovisioned,
    * regardless of `status`. */
   container_alive: boolean;
+  /** Live, not persisted -- this session's process-local run_activity refcount is > 0 right now,
+   * i.e. an AG-UI stream is actually attached and executing (Workflow Liveness Fix). Unlike
+   * `status`, this does not survive a crash/restart -- which is the point. */
+  run_active: boolean;
+  /** Derived server-side (not a DB status): `status === "in_progress"` but neither `run_active`
+   * nor `awaiting_gate` -- the workflow isn't finished, but nothing is currently executing it. */
+  interrupted: boolean;
 };
 
 /** agent/src/graph.py's STAGES list, key order -- used only to render "stage N of M" in the

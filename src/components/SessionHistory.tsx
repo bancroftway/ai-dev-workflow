@@ -17,6 +17,17 @@ export const STATUS_BADGE: Record<Session["status"], string> = {
   in_progress: "bg-blue-100 text-blue-800",
 };
 
+/** Differentiated label for an `in_progress` row -- the DB status itself doesn't distinguish
+ * genuinely-executing from paused-at-a-gate from crashed-and-abandoned (Workflow Liveness Fix);
+ * `run_active`/`interrupted` are live/derived signals from the session API, not new DB values, so
+ * STATUS_BADGE's own 4-key color map stays untouched -- only this label differentiates further. */
+export function inProgressLabel(s: Session): string {
+  if (s.run_active) return "Active";
+  if (s.awaiting_gate) return "Awaiting review";
+  if (s.interrupted) return "Interrupted";
+  return "In progress";
+}
+
 function ProgressIndicator({ currentStage }: { currentStage: string | null }) {
   if (!currentStage) return <span className="text-xs text-neutral-500">Starting…</span>;
   const index = STAGE_KEYS_IN_ORDER.indexOf(currentStage as (typeof STAGE_KEYS_IN_ORDER)[number]);
@@ -90,21 +101,33 @@ export function SessionHistory({
   useEffect(() => {
     let cancelled = false;
     const params = new URLSearchParams({ owner, repo, source_branch: sourceBranch });
-    fetch(`/api/sessions/list?${params}`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`Failed to load session history (${res.status})`);
-        return res.json();
-      })
-      .then((data: { sessions: Session[] }) => {
-        if (cancelled) return;
-        setSessions(data.sessions);
-        onInProgressChange?.(data.sessions.some((s) => s.status === "in_progress"));
-      })
-      .catch((err: Error) => {
-        if (!cancelled) setError(err.message);
-      });
+    function load() {
+      fetch(`/api/sessions/list?${params}`)
+        .then((res) => {
+          if (!res.ok) throw new Error(`Failed to load session history (${res.status})`);
+          return res.json();
+        })
+        .then((data: { sessions: Session[] }) => {
+          if (cancelled) return;
+          setSessions(data.sessions);
+          onInProgressChange?.(data.sessions.some((s) => s.status === "in_progress"));
+        })
+        .catch((err: Error) => {
+          if (!cancelled) setError(err.message);
+        });
+    }
+    load();
+    // Workflow Liveness Fix: this used to be mount-only, unlike AppShell's durable-row poll (10s+
+    // focus) and the Board's session-list poll (15s+focus) -- without a repoll, a badge could
+    // never transition from its initial "in progress" load into "Interrupted" once the run
+    // actually died, since run_active/interrupted only ever update via a fresh GET. Same interval
+    // and pattern as the Board (page.tsx, same directory tree) uses for the same list shape.
+    const interval = setInterval(load, 15_000);
+    window.addEventListener("focus", load);
     return () => {
       cancelled = true;
+      clearInterval(interval);
+      window.removeEventListener("focus", load);
     };
     // onInProgressChange intentionally excluded -- a parent-supplied setState function's identity
     // must not re-trigger this fetch.
@@ -196,8 +219,8 @@ export function SessionHistory({
                   <span
                     className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[s.status]}`}
                   >
-                    {s.status === "in_progress" && <RunningSpinner className="h-3 w-3" />}
-                    {s.status.replace("_", " ")}
+                    {s.status === "in_progress" && s.run_active && <RunningSpinner className="h-3 w-3" />}
+                    {s.status === "in_progress" ? inProgressLabel(s) : s.status.replace("_", " ")}
                   </span>
                 </div>
               </div>
@@ -211,7 +234,7 @@ export function SessionHistory({
                 </p>
               )}
               <div className="flex gap-2">
-                {s.status === "failed" && (
+                {(s.status === "failed" || (s.status === "in_progress" && s.interrupted)) && (
                   <button
                     type="button"
                     title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
@@ -221,7 +244,10 @@ export function SessionHistory({
                     Resume
                   </button>
                 )}
-                {s.status === "in_progress" && (
+                {/* Workflow Liveness Fix: an "in_progress" session whose process has actually died
+                    (interrupted) routes to Resume above instead -- a plain-URL reattach here would
+                    open the workflow page and reconnect to nothing. */}
+                {s.status === "in_progress" && !s.interrupted && (
                   <button
                     type="button"
                     title="Reattaches to the run already in progress -- nothing restarts, nothing is lost."

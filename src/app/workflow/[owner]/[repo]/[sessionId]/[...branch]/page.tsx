@@ -5,6 +5,7 @@ import { AppShell } from "@/components/AppShell";
 import { SandboxSessionBoot } from "@/components/SandboxSessionBoot";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
 import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
+import { RunActivityProvider } from "@/lib/run-activity-context";
 import { parseThresholds } from "@/lib/metric-grades";
 import { lookupSessionWithAuthorization } from "@/lib/session-access";
 import { WorkflowProviders } from "../../../../providers";
@@ -72,34 +73,36 @@ export default async function WorkflowPage({
     <WorkflowThreadProvider threadId={sessionId}>
       <WorkflowProviders>
         <SandboxStatusProvider>
-          {/* The page shell (header, frozen/scroll split) lives once in root layout now -- this
-              is just this route's own content, filling whatever height that shell hands it. */}
-          <div className="flex h-full w-full flex-col">
-            <div className="shrink-0">
-              <SandboxSessionBoot
-                sessionId={sessionId}
-                owner={owner}
-                repo={repo}
-                branch={branch}
-                resume={resume}
-                projectId={projectId}
-              />
+          <RunActivityProvider>
+            {/* The page shell (header, frozen/scroll split) lives once in root layout now -- this
+                is just this route's own content, filling whatever height that shell hands it. */}
+            <div className="flex h-full w-full flex-col">
+              <div className="shrink-0">
+                <SandboxSessionBoot
+                  sessionId={sessionId}
+                  owner={owner}
+                  repo={repo}
+                  branch={branch}
+                  resume={resume}
+                  projectId={projectId}
+                />
+              </div>
+              {/* min-h-0 is required here, not decorative: without it a flex child's default
+                  min-height:auto lets it grow past this row's share of the column instead of
+                  bounding to it, which is what AppShell's own internal scroll region depends on. */}
+              <div className="min-h-0 flex-1">
+                <AppShell
+                  owner={owner}
+                  repo={repo}
+                  // Not yet provisioned (sessionRow is null): no artifacts exist to read yet either,
+                  // so an empty string is never actually dereferenced against GitHub.
+                  workBranch={sessionRow?.work_branch ?? ""}
+                  metricThresholds={metricThresholds}
+                  resume={resume}
+                />
+              </div>
             </div>
-            {/* min-h-0 is required here, not decorative: without it a flex child's default
-                min-height:auto lets it grow past this row's share of the column instead of
-                bounding to it, which is what AppShell's own internal scroll region depends on. */}
-            <div className="min-h-0 flex-1">
-              <AppShell
-                owner={owner}
-                repo={repo}
-                // Not yet provisioned (sessionRow is null): no artifacts exist to read yet either,
-                // so an empty string is never actually dereferenced against GitHub.
-                workBranch={sessionRow?.work_branch ?? ""}
-                metricThresholds={metricThresholds}
-                resume={resume}
-              />
-            </div>
-          </div>
+          </RunActivityProvider>
         </SandboxStatusProvider>
       </WorkflowProviders>
     </WorkflowThreadProvider>

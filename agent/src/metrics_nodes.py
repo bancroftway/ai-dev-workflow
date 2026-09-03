@@ -748,7 +748,7 @@ async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> di
             sandbox=sandbox_registry.get(thread_id),
             agent_mode="autopilot",
             # A README writer needs to read the repo and write ONE file -- no bash, no skills.
-            available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:edit", "builtin:create"],
+            available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:edit", "builtin:create", "builtin:apply_patch"],
         )
         try:
             await model.ainvoke(

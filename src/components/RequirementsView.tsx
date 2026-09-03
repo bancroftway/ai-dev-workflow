@@ -8,6 +8,7 @@ import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { takeHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import { anyStageDrafting, buildStarted, runEnded, type WorkflowState } from "@/lib/workflow-types";
 
@@ -19,6 +20,7 @@ export function RequirementsView() {
   const { localAgentId, threadId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
+  const [runActivity] = useRunActivity();
   const [text, setText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -240,7 +242,23 @@ export function RequirementsView() {
       />
 
       <div className="flex items-center justify-end gap-3">
-        {runLocked && !openInterrupt.open && (
+        {/* Workflow Liveness Fix: `runLocked` is pure persisted state (anyStageDrafting survives a
+            reload on purpose) -- it stays a lock either way, but a genuinely dead run needs
+            different copy and an actual way out, not an indefinite "in progress". */}
+        {runLocked && !openInterrupt.open && runActivity?.interrupted && (
+          <span className="flex items-center gap-2 text-xs text-amber-700">
+            This run appears to have stopped — Resume before submitting new requirements.
+            <button
+              type="button"
+              className="rounded-md bg-neutral-900 px-2 py-1 text-xs font-medium text-white disabled:opacity-40"
+              disabled={agent.isRunning}
+              onClick={() => void copilotkit.runAgent({ agent })}
+            >
+              {agent.isRunning ? "Resuming…" : "Resume"}
+            </button>
+          </span>
+        )}
+        {runLocked && !openInterrupt.open && !runActivity?.interrupted && (
           <span className="text-xs text-neutral-500">
             A run is in progress — requirements are locked until it ends (resubmit afterwards for a delta).
           </span>
