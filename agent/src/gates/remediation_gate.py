@@ -25,6 +25,8 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from ..schemas import presence_values as _presence_values
+
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
@@ -54,21 +56,6 @@ _SUPPRESSION_COMMENT_RE = re.compile(
 
 def _mentions_id(text: str, finding_id: str) -> bool:
     return finding_id.lower() in text.lower()
-
-
-def _presence_values(entry: Any) -> list[str]:
-    """Read a PresenceList-shaped dict's `values` (schemas.py: `{"status": ..., "values": [...],
-    "reason": ...}`) -- `findings_addressed`/`dependencies_upgraded`/`known_gaps` as of Task 11 --
-    tolerating a legacy/degenerate bare list or a missing field. `content`/`content_dict` here are
-    plain dicts off the wire, never re-validated through the Pydantic wrapper after initial parse,
-    so this reads defensively rather than assuming the typed shape (mirrors
-    gates/adversarial_gate.py's `_findings_from` and exit_nodes.py's `_presence_values`; duplicated
-    rather than shared, same as every other PresenceList reader in this codebase)."""
-    if isinstance(entry, dict):
-        return list(entry.get("values") or [])
-    if isinstance(entry, list):
-        return list(entry)
-    return []
 
 
 def accounted_for(finding_id: str, known_gaps: list[str]) -> bool:

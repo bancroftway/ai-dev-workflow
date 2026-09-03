@@ -44,7 +44,21 @@ def load_tech_stack(raw: dict[str, Any] | None) -> dict[str, Any]:
     """
     try:
         return TechStack.model_validate(raw or {}).model_dump(mode="json")
-    except Exception:  # noqa: BLE001 -- malformed/legacy-but-uncoercible input is "nothing to read"
+    except Exception as exc:  # noqa: BLE001 -- malformed/legacy-but-uncoercible input is "nothing to read"
+        if raw:
+            # `raw` being non-empty means there WAS something to read -- unlike a missing file
+            # (raw=None) or a genuinely blank sidecar (raw={}), this is a real tech-stack dict
+            # that failed whole-model validation for a reason _coerce_legacy_shape didn't
+            # anticipate. Silently returning {} here previously made every downstream reader
+            # (frameworks_have_ui, dotnet_detected, both coverage gates, wireframe/Playwright
+            # provisioning) see "nothing detected at all" with zero trace of why -- log it loudly
+            # so an uncoercible shape this fix didn't foresee is at least diagnosable.
+            logger.warning(
+                "load_tech_stack: tech-stack dict failed validation, falling back to {} "
+                "(downstream readers will see NOTHING detected for this repo) -- keys=%s error=%s",
+                sorted(raw.keys()) if isinstance(raw, dict) else type(raw).__name__,
+                exc,
+            )
         return {}
 
 
@@ -238,11 +252,45 @@ def _demo() -> None:
     assert dotnet_root_prefix(legacy_no_dotnet) == ""
     assert convention_root(legacy_no_dotnet, "node") is None
 
+    # Important 2 (final review fix wave): an off-enum legacy auth_kind must no longer fail-open
+    # the WHOLE tech stack to {} -- schemas.py's TechStack._coerce_legacy_shape now bridges it to
+    # "none" before whole-model validation runs, so every unrelated field (frameworks, dotnet, ...)
+    # still reads correctly instead of every downstream reader seeing "nothing detected at all"
+    # over one bad field.
+    legacy_bad_auth_kind = {**legacy, "auth_kind": "azure-ad"}
+    coerced = load_tech_stack(legacy_bad_auth_kind)
+    assert coerced, "an off-enum legacy auth_kind must no longer fail-open the whole tech stack"
+    assert coerced["auth_kind"] == "none"
+    assert presence_values(legacy_bad_auth_kind, "frameworks") == ["Express"], (
+        "an unrelated field must still read correctly once auth_kind coerces instead of failing"
+    )
+
     # Malformed/uncoercible input must fail open (empty), never raise.
     assert load_tech_stack(None) == {}
     assert load_tech_stack({"not": "a tech stack at all"}) == {}
     assert presence_values({"not": "a tech stack at all"}, "languages") == []
     assert dotnet_detected({"not": "a tech stack at all"}) is False
+
+    # ...and now LOUD about it: a genuinely non-empty, uncoercible shape must log a warning naming
+    # the failure (the whole point of this fix -- silence is what let the regression go unnoticed),
+    # while a missing/blank input (nothing to report to begin with) logs nothing.
+    _warn_calls: list[tuple[Any, ...]] = []
+    _orig_warning = logger.warning
+    logger.warning = lambda *a, **k: _warn_calls.append(a)  # type: ignore[method-assign]
+    try:
+        assert load_tech_stack({"not": "a tech stack at all"}) == {}
+    finally:
+        logger.warning = _orig_warning  # type: ignore[method-assign]
+    assert _warn_calls, "a genuinely uncoercible non-empty input must log a warning, not fail silently"
+
+    _warn_calls_blank: list[tuple[Any, ...]] = []
+    logger.warning = lambda *a, **k: _warn_calls_blank.append(a)  # type: ignore[method-assign]
+    try:
+        assert load_tech_stack(None) == {}
+        assert load_tech_stack({}) == {}
+    finally:
+        logger.warning = _orig_warning  # type: ignore[method-assign]
+    assert not _warn_calls_blank, "a missing/blank tech stack is 'nothing to report' -- must not warn"
     assert convention_root({"not": "a tech stack at all"}, "node") is None
 
     print("tech_stack_signals self-check: ok")

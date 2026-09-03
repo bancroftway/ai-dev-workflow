@@ -29,7 +29,8 @@ from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, workflow_persistence
 from .gates import readme_gate
 from .gates.ac_coverage_gate import id_variants
-from .gates.remediation_gate import _presence_values, accounted_for  # noqa: SLF001 -- same package
+from .gates.remediation_gate import accounted_for
+from .schemas import presence_values as _presence_values
 from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
 from .chat_model import get_chat_model_for_thread
 from .sandbox import registry as sandbox_registry

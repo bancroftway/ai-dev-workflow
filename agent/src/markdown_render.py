@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .schemas import presence_values
+
 
 def render_specification_markdown(content: dict[str, Any]) -> str:
     lines: list[str] = [f"# {content.get('title', 'Specification')}", "", content.get("summary", ""), ""]
@@ -75,11 +77,15 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
     # plan/wireframes/<screen>.html (relative to this file's own .ai-dev-workflow/ home). Without
     # this section they were invisible from the plan document -- present on the branch, referenced
     # by the adversarial audit, and unfindable by a human reading 04-plan.md.
+    # presence_values (schemas.py, final review fix wave) tolerates wireframes_entry/diagrams_entry
+    # still being a genuinely legacy bare list -- a plain `.get("status")` on a list raises
+    # AttributeError, one of this fix wave's two real reachable crash paths.
     wireframes_entry = content.get("wireframes") or {}
+    wireframe_values = presence_values(wireframes_entry)
     lines.append("## Wireframes")
     lines.append("")
-    if wireframes_entry.get("status") == "present":
-        for wf in wireframes_entry.get("values") or []:
+    if wireframe_values:
+        for wf in wireframe_values:
             screen = str(wf.get("screen", "")).strip()
             if screen:
                 # GitHub renders the relative link as raw HTML source; the preview link (stamped by
@@ -97,14 +103,16 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
                     suffix += f" _(ACs: {', '.join(ac_ids)})_"
                 lines.append(f"- [{screen}](plan/wireframes/{screen}.html){suffix}")
     else:
-        lines.append(wireframes_entry.get("reason") or "(not checked)")
+        reason = wireframes_entry.get("reason") if isinstance(wireframes_entry, dict) else None
+        lines.append(reason or "(not checked)")
     lines.append("")
 
     diagrams_entry = content.get("diagrams") or {}
+    diagram_values = presence_values(diagrams_entry)
     lines.append("## Diagrams")
     lines.append("")
-    if diagrams_entry.get("status") == "present":
-        for diagram in diagrams_entry.get("values") or []:
+    if diagram_values:
+        for diagram in diagram_values:
             lines.append(f"### {diagram.get('name', '')} ({diagram.get('kind', '')})")
             lines.append("")
             lines.append("```mermaid")
@@ -112,7 +120,8 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
             lines.append("```")
             lines.append("")
     else:
-        lines.append(diagrams_entry.get("reason") or "(not checked)")
+        reason = diagrams_entry.get("reason") if isinstance(diagrams_entry, dict) else None
+        lines.append(reason or "(not checked)")
         lines.append("")
 
     return "\n".join(lines).strip() + "\n"
@@ -124,14 +133,24 @@ def _render_presence_section(lines: list[str], content: dict[str, Any], field: s
     unresolved_risk_notes, MergeReadinessReport's blocking_reasons/risk_notes, Specification's
     assumptions/out_of_scope, ImplementationPlan's risk_notes): its values when status="present",
     else its `reason` -- a human reviewing this document should SEE why a category came back
-    empty, not just an absent section."""
+    empty, not just an absent section.
+
+    Routed through schemas.presence_values (final review fix wave) rather than a bare
+    `entry.get("status")`/`entry.get("values")` read: a legacy on-disk sidecar/checkpoint (or
+    `stage["draft"]` resumed from before PresenceList existed) can still have `content[field]` as a
+    genuinely bare list, and `entry.get(...)` on a list raises AttributeError -- presence_values
+    tolerates that shape the same way every other reader of a plain off-the-wire dict in this
+    codebase already does.
+    """
     entry = content.get(field) or {}
+    values = presence_values(entry)
     lines.append(f"## {heading}")
     lines.append("")
-    if entry.get("status") == "present":
-        lines.extend(f"- {v}" for v in (entry.get("values") or []))
+    if values:
+        lines.extend(f"- {v}" for v in values)
     else:
-        lines.append(entry.get("reason") or "(not checked)")
+        reason = entry.get("reason") if isinstance(entry, dict) else None
+        lines.append(reason or "(not checked)")
     lines.append("")
 
 
@@ -184,13 +203,18 @@ def render_tech_stack_markdown(content: dict[str, Any]) -> str:
 
     lines.append("## Configuration Keys")
     lines.append("")
+    # presence_values (schemas.py) tolerates config_inventory still being a genuinely legacy bare
+    # list -- `.get("status")` on a list raises AttributeError, the same crash this fix wave found
+    # in _render_presence_section and the wireframes/diagrams block above.
     config_inventory = content.get("config_inventory") or {}
-    if config_inventory.get("status") == "present":
+    config_values = presence_values(config_inventory)
+    if config_values:
         lines.append("Config the app reads -- supply test values on the repo settings page:")
         lines.append("")
-        lines.extend(f"- `{k}`" for k in (config_inventory.get("values") or []))
+        lines.extend(f"- `{k}`" for k in config_values)
     else:
-        lines.append(config_inventory.get("reason") or "(not checked)")
+        reason = config_inventory.get("reason") if isinstance(config_inventory, dict) else None
+        lines.append(reason or "(not checked)")
     lines.append("")
 
     return "\n".join(lines).strip() + "\n"
@@ -348,6 +372,25 @@ def _demo() -> None:
     assert render_plan_markdown({"overview": "x"})
     assert render_plan_markdown({})
 
+    # Final review fix wave (Important 1): risk_notes/wireframes/diagrams as a genuinely LEGACY
+    # bare list (pre-migration on-disk sidecar/checkpoint, or stage["draft"] resumed from before
+    # this plan's schema tightening) used to crash with AttributeError: 'list' object has no
+    # attribute 'get' -- `.get("status")` on a bare list. Must render the values it has instead.
+    md_legacy_bare_list = render_plan_markdown(
+        {
+            "overview": "x",
+            "risk_notes": ["a bare legacy risk note"],
+            "wireframes": [{"screen": "task-list"}],
+            "diagrams": [{"name": "flow", "kind": "flowchart", "mermaid_source": "graph TD; A-->B;"}],
+        }
+    )
+    assert "- a bare legacy risk note" in md_legacy_bare_list, md_legacy_bare_list
+    assert "[task-list](plan/wireframes/task-list.html)" in md_legacy_bare_list, md_legacy_bare_list
+    assert "### flow (flowchart)" in md_legacy_bare_list, md_legacy_bare_list
+    # An EMPTY legacy bare list (nothing detected, but still not the typed absent+reason shape)
+    # must fall back to "(not checked)" rather than crash on a missing `reason`.
+    assert render_plan_markdown({"overview": "x", "risk_notes": [], "wireframes": [], "diagrams": []})
+
     # render_specification_markdown: assumptions/out_of_scope are PresenceList-shaped -- present
     # renders values, absent renders the reason.
     spec_md = render_specification_markdown(
@@ -361,6 +404,14 @@ def _demo() -> None:
     assert "- users have a verified email" in spec_md, spec_md
     assert "nothing was excluded" in spec_md, "absent out_of_scope must render its reason"
     assert render_specification_markdown({"title": "T", "summary": "S"})
+
+    # Final review fix wave (Important 1): assumptions/out_of_scope as a genuinely legacy bare list
+    # must not crash render_specification_markdown either (same _render_presence_section bug).
+    spec_md_legacy = render_specification_markdown(
+        {"title": "T", "summary": "S", "assumptions": ["a bare legacy assumption"], "out_of_scope": []}
+    )
+    assert "- a bare legacy assumption" in spec_md_legacy, spec_md_legacy
+    assert "(not checked)" in spec_md_legacy, "empty legacy bare list must fall back, not crash"
 
     # render_tech_stack_markdown: TechStack's PresenceList/DotnetStatus/EcosystemRoot fields are
     # nested objects now, not bare lists/dicts -- present renders values, absent renders the
@@ -388,6 +439,14 @@ def _demo() -> None:
     assert "`node`: no package.json found" in ts_md, ts_md
     assert "`python`: `(repository root)`" in ts_md, ts_md
     assert "no config keys found" in ts_md, "absent config_inventory must render its reason"
+
+    # Final review fix wave (Important 1): config_inventory as a genuinely legacy bare list (the
+    # exact shape preflight_nodes.resolve_tech_stack_submission and graph.persist_state can hand
+    # this renderer for an on-disk sidecar/checkpoint predating PresenceList) must not crash either.
+    ts_md_legacy = render_tech_stack_markdown({"summary": "S", "config_inventory": ["DATABASE_URL"]})
+    assert "- `DATABASE_URL`" in ts_md_legacy, ts_md_legacy
+    ts_md_legacy_empty = render_tech_stack_markdown({"summary": "S", "config_inventory": []})
+    assert "(not checked)" in ts_md_legacy_empty, "empty legacy bare list must fall back, not crash"
 
     # A minimal/legacy-shaped dict (fields missing entirely) must not crash -- every reader falls
     # back to "not checked" rather than KeyError/AttributeError.

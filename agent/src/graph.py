@@ -107,8 +107,11 @@ from .schemas import (
     TECH_STACK_DRAFT_EXAMPLE,
     TechStack,
     TechStackDraftResponse,
+    presence_values as _remediation_presence_values,
 )
 from .schemas_codegen import (
+    AC_TO_TESTS_AUDIT_EXAMPLE,
+    AC_TO_TESTS_DRAFT_EXAMPLE,
     MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE,
     MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE,
     AcceptanceCriteriaTestsDraftResponse,
@@ -1330,21 +1333,6 @@ def build_remediation_envelope(content: dict[str, Any], audit_findings: list[str
     return {"stage": "remediation", "content": content}
 
 
-def _remediation_presence_values(entry: Any) -> list[str]:
-    """`dependencies_upgraded`/`findings_addressed`/`known_gaps`'s values -- PresenceList-shaped
-    (`{"status": ..., "values": [...], "reason": ...}`) as of Task 11, not a bare list[str].
-    `content` here is `stage["draft"]`, a plain dict never re-validated through the Pydantic
-    wrapper after initial parse (a thread whose remediation stage drafted before this migration
-    may still carry the old bare-list shape on resume), so this reads defensively rather than
-    assuming the typed shape -- mirrors gates/remediation_gate.py's own `_presence_values`;
-    duplicated rather than shared, same as every other PresenceList reader in this codebase."""
-    if isinstance(entry, dict):
-        return list(entry.get("values") or [])
-    if isinstance(entry, list):
-        return list(entry)
-    return []
-
-
 def render_remediation_markdown(content: dict[str, Any]) -> str:
     """Human-readable remediation summary.
 
@@ -1579,11 +1567,9 @@ def stages_missing_rules(stages: list[StageSpec]) -> list[str]:
     it -- draft_rules always required (every stage drafts), audit_rules required too only when the
     stage actually has an audit pass (audit_response_schema set).
 
-    NOT asserted against the real STAGES registry below: at this point in the plan no StageSpec
-    has draft_rules/audit_rules populated yet (Tasks 7/8/13 add that), so asserting here would fail
-    today for reasons that have nothing to do with this task's own mechanism. Self-tested against
-    synthetic StageSpecs in _demo() instead -- callable directly against STAGES once later tasks
-    have wired real rules in.
+    Self-tested against synthetic StageSpecs in _demo() first, then (Task 13b, once every StageSpec
+    with a deterministic_verify was actually wired with real draft_rules/audit_rules) asserted for
+    real: `assert stages_missing_rules(_ALL_STAGE_SPECS) == []` further down in this same _demo().
     """
     missing = []
     for stage in stages:
@@ -1728,6 +1714,13 @@ STAGES: list[StageSpec] = [
         # (graph.py's audit-then-verify ordering), so the audit pass needs the identical rules --
         # one gate checks both draft and audit-revised content.
         audit_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
+        # Final whole-branch review fix wave: every OTHER wired stage already paired its draft_rules/
+        # audit_rules with a worked draft_example/audit_example -- this stage had the rules half but
+        # not the example half, despite being the one AcceptanceCriteriaTestsDraftResponse's own
+        # docstring documents a live "dominant failure" history for (observed across 3 consecutive
+        # sessions), and the reason it alone carries max_verify_cycles=6 below.
+        draft_example=AC_TO_TESTS_DRAFT_EXAMPLE,
+        audit_example=AC_TO_TESTS_AUDIT_EXAMPLE,
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ac_to_tests_ticket_mode_context,
         # Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block --
         # the model returns a fully-detailed coverage_plan claiming it "created failing RED-phase
@@ -2766,12 +2759,14 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 label=f"{stage_spec.key}:audit",
             )
             content_dict = getattr(response, stage_spec.audit_content_field).model_dump(mode="json")
-            # response.audit_findings is a bare list[str] for some audit schemas (ac-to-tests,
-            # minimal-code-to-green) but a real PresenceList for others (Specification/Plan, since
-            # Task 10) -- this node is generic across every stage's audit_response_schema, so it
-            # must read whichever shape the model actually has rather than assuming one. A plain
-            # `list(...)` on a PresenceList instance would iterate its Pydantic field tuples
-            # (status/values/reason), not the finding strings.
+            # As of Task 14, every audit_response_schema this node is actually wired to
+            # (Specification/Plan since Task 10, AcToTests/MinimalCodeToGreen since Task 14) types
+            # audit_findings as a real PresenceList -- the shape asymmetry this comment used to
+            # describe (some bare list[str], some PresenceList) no longer exists. The isinstance
+            # check below is still correct and kept anyway: this node is generic across whatever
+            # audit_response_schema a future stage wires in, and a plain `list(...)` on a
+            # PresenceList instance would iterate its Pydantic field tuples (status/values/reason),
+            # not the finding strings, if that ever stopped being true.
             _raw_audit_findings = response.audit_findings
             audit_findings = (
                 list(_raw_audit_findings.values)

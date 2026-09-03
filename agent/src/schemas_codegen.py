@@ -106,6 +106,87 @@ class AcToTestsAuditResponse(BaseModel):
     )
 
 
+_AC_TO_TESTS_SUITE_EXAMPLE = AcceptanceCriteriaTestSuite(
+    coverage_plan=[
+        AcceptanceCriteriaTestPlanEntry(
+            ac_id="US-0001.1",
+            us_id="US-0001",
+            test_kind="unit",
+            ui_relevant=False,
+            categories=["happy_path", "negative"],
+            rationale="Covers reset-token issuance and rejection of an expired token.",
+        ),
+        AcceptanceCriteriaTestPlanEntry(
+            ac_id="US-0001.2",
+            us_id="US-0001",
+            test_kind="e2e_playwright_skeleton",
+            ui_relevant=True,
+            categories=["happy_path"],
+            rationale="Covers the reset-request form's user-visible confirmation state.",
+        ),
+    ],
+    test_files=[
+        GeneratedTestFile(
+            path="tests/auth/test_reset_controller.py",
+            test_framework="pytest",
+            ac_ids=["US-0001.1"],
+            test_names=[
+                "test_reset_request_issues_token_US_0001_1",
+                "test_reset_request_rejects_expired_token_US_0001_1",
+            ],
+            kind="unit",
+            summary="Unit tests for reset-token issuance and expiry rejection.",
+        ),
+        GeneratedTestFile(
+            path="tests/e2e/reset-request.spec.ts",
+            test_framework="playwright",
+            ac_ids=["US-0001.2"],
+            test_names=["reset request form shows a confirmation message US-0001.2"],
+            kind="e2e_playwright_skeleton",
+            summary="Playwright skeleton for the reset-request form's success state.",
+        ),
+    ],
+    skipped_ac_ids=[
+        SkippedAcceptanceCriterion(
+            ac_id="US-0001.3",
+            reason="Deferred to a later phase per the approved Specification.",
+        ),
+    ],
+    summary="Covers both non-deferred criteria for US-0001 (unit + Playwright skeleton); "
+    "US-0001.3 is deferred, not skipped for any other reason.",
+)
+
+AC_TO_TESTS_DRAFT_EXAMPLE: AcceptanceCriteriaTestsDraftResponse = AcceptanceCriteriaTestsDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    test_suite=_AC_TO_TESTS_SUITE_EXAMPLE,
+    skills_invoked=["test-driven-development"],
+)
+"""Fully-populated example of the ac-to-tests drafting node's structured output, echoed into the
+draft prompt so the model sees a realistic instance of the current canonical shape -- same
+purpose and pattern as this stage's sibling, MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE below. Added in
+the final whole-branch review's fix wave: every OTHER wired stage already had a draft_example, and
+this is the stage (AcceptanceCriteriaTestsDraftResponse's own docstring documents a live
+dominant-failure history, and it alone carries max_verify_cycles=6) that most needed the missing
+half of the mechanism."""
+
+AC_TO_TESTS_AUDIT_EXAMPLE: AcToTestsAuditResponse = AcToTestsAuditResponse(
+    revised_test_suite=_AC_TO_TESTS_SUITE_EXAMPLE,
+    audit_findings=PresenceList(
+        status="present",
+        values=[
+            "US-0001.1's expiry test only checked a token 1 second past expiry; added a "
+            "well-past-expiry case too."
+        ],
+    ),
+)
+"""Fully-populated example of the ac-to-tests adversarial-audit node's structured output.
+audit_findings is a real PresenceList (Task 14), matching every other audit schema's
+audit_findings. Deliberately the non-empty 'present' branch, where MINIMAL_CODE_TO_GREEN_AUDIT_
+EXAMPLE below demonstrates 'absent' -- between the two wired examples, both directions of the
+typed-absence shape are exercised with real status keys, not just validated by coercion."""
+
+
 class ChangedFile(BaseModel):
     path: str
     change_kind: Literal["created", "modified", "deleted"]
@@ -296,6 +377,27 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert_example_matches_schema(MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE, MinimalCodeToGreenDraftResponse)
     assert_example_matches_schema(MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE, MinimalCodeToGreenAuditResponse)
 
+    # Final whole-branch review fix wave: ac-to-tests was the one wired stage with draft_rules/
+    # audit_rules but no draft_example/audit_example -- same round-trip proof as every other
+    # example in this plan, both "validates" AND "round-trips to canonical shape with real status
+    # keys", not just silent-coercion-validates.
+    assert_example_matches_schema(AC_TO_TESTS_DRAFT_EXAMPLE, AcceptanceCriteriaTestsDraftResponse)
+    assert_example_matches_schema(AC_TO_TESTS_AUDIT_EXAMPLE, AcToTestsAuditResponse)
+    _ac_to_tests_draft_dumped = json.loads(AC_TO_TESTS_DRAFT_EXAMPLE.model_dump_json())
+    assert _ac_to_tests_draft_dumped["test_suite"]["test_files"], (
+        "AC_TO_TESTS_DRAFT_EXAMPLE must have real test_files -- readiness=true with none is this "
+        "stage's own documented dominant failure mode"
+    )
+    _ac_to_tests_audit_dumped = json.loads(AC_TO_TESTS_AUDIT_EXAMPLE.model_dump_json())
+    assert _ac_to_tests_audit_dumped["audit_findings"] == {
+        "status": "present",
+        "values": [
+            "US-0001.1's expiry test only checked a token 1 second past expiry; added a "
+            "well-past-expiry case too."
+        ],
+        "reason": "",
+    }, "AC_TO_TESTS_AUDIT_EXAMPLE.audit_findings must round-trip with real status/values keys"
+
     # known_gaps is one of three PresenceList-wrapped fields on this module's schemas -- confirm
     # it dumps a real "status" key, not a stale bare-list shape PresenceList's own before-validator
     # would silently coerce.
@@ -335,11 +437,8 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert minimal_audit_legacy.audit_findings.status == "absent"
     assert minimal_audit_legacy.audit_findings.reason == "legacy sidecar, pre-typed-absence"
 
-    _ac_to_tests_dummy_example = AcToTestsAuditResponse(
-        revised_test_suite=_revised_suite,
-        audit_findings=PresenceList(status="absent", reason="no findings for this self-check instance"),
-    )
-    assert_example_matches_schema(_ac_to_tests_dummy_example, AcToTestsAuditResponse)
+    # (AcToTestsAuditResponse's own round-trip is now proven directly against the REAL wired
+    # AC_TO_TESTS_AUDIT_EXAMPLE above, not a throwaway dummy instance.)
     _minimal_audit_dumped = json.loads(MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE.model_dump_json())
     assert "status" in _minimal_audit_dumped["audit_findings"], (
         "MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE.audit_findings missing 'status'"

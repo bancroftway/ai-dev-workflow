@@ -200,6 +200,31 @@ class PresenceList(BaseModel):
         return self
 
 
+def presence_values(entry: Any) -> list[Any]:
+    """The `values` list of a PresenceList-shaped dict (`{"status": ..., "values": [...],
+    "reason": ...}`) -- also correct for the structurally-identical DiagramPresence/
+    WireframePresence (schemas.py) and DivergenceFindingPresence (schemas_audit.py) wrappers,
+    whose `values` hold objects rather than strings. Tolerates a legacy/degenerate bare list or a
+    missing/None field the same way PresenceList's own `_coerce_legacy_bare_list` does for a
+    freshly-validated model -- this is for the OTHER half of this codebase's readers, the ones
+    holding a plain dict straight off the wire (`stage["draft"]`, a JSON sidecar, a gate's
+    `content_dict`) that was never re-validated through the Pydantic wrapper after initial parse,
+    so it has to read defensively rather than assume the typed shape.
+
+    The single shared implementation behind what used to be six near-identical private copies:
+    exit_nodes._presence_values, gates/remediation_gate._presence_values,
+    gates/diagram_gate._presence_values, gates/adversarial_gate._findings_from,
+    graph._remediation_presence_values, and metrics_nodes's cross-imported copy of
+    remediation_gate's. markdown_render.py's renderers route through this too (same shape, same
+    fix), rather than being a 7th one-off.
+    """
+    if isinstance(entry, dict):
+        return list(entry.get("values") or [])
+    if isinstance(entry, list):
+        return list(entry)
+    return []
+
+
 class Specification(BaseModel):
     title: NonBlankStr
     summary: NonBlankStr
@@ -755,6 +780,26 @@ class TechStack(BaseModel):
                     for eco, root in roots.items()
                 ],
             }
+        elif roots is None and "convention_roots" in data:
+            # An explicit None (not just an absent key, which default_factory=list already
+            # handles) -- some legacy sidecar/model output recorded this field as null instead of
+            # omitting it. list[EcosystemRoot] rejects None outright, so bridge it to [] here, same
+            # "reshape before construction" spirit as the dotnet/dict-shaped cases above.
+            data = {**data, "convention_roots": []}
+
+        # Kept as a literal tuple, not a cross-reference to the `auth_kind` field's own Literal
+        # below -- Pydantic's class body hasn't finished executing when this classmethod runs
+        # (it fires during construction, not after), so there is no live Literal object to
+        # introspect here yet.
+        valid_auth_kinds = ("entra", "google", "generic-oidc", "custom", "none")
+        auth_kind = data.get("auth_kind")
+        if "auth_kind" in data and auth_kind not in valid_auth_kinds:
+            # A legacy free-text value (e.g. "azure-ad", "oidc") or a blank string that predates
+            # this field becoming a 5-member Literal -- whole-model validation would otherwise
+            # reject the ENTIRE TechStack over this one field, and load_tech_stack's caller then
+            # fail-opens to {} (nothing detected at all, not just no auth). "none" is the safe
+            # coercion: it disarms the auth-enforcement gate rather than guessing a specific kind.
+            data = {**data, "auth_kind": "none"}
         return data
 
     summary: str = Field(description="One or two sentences describing the stack at a glance.")
@@ -1092,6 +1137,49 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert _legacy_stack_dotnet_detected.dotnet.status == "detected"
     assert _legacy_stack_dotnet_detected.dotnet.solution_root == "src/Api"
     assert _legacy_stack_dotnet_detected.convention_roots == []
+
+    # Final review fix wave: auth_kind tightened to a 5-member Literal (Task 2) means a legacy
+    # sidecar's off-enum free-text value (or a blank string) would otherwise fail WHOLE-MODEL
+    # validation -- _coerce_legacy_shape now bridges it to "none" instead, same spirit as the
+    # dotnet/convention_roots bridging just above.
+    def _stack_kwargs(**overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "summary": "s",
+            "languages": [], "frameworks": [], "package_managers": [],
+            "testing_frameworks": [], "conventions": [],
+            "dotnet_detected": False, "dotnet_solution_root": None,
+            "convention_roots": {}, "conventions_applied": [],
+            "auth_kind": "none", "config_inventory": [],
+        }
+        return {**base, **overrides}
+
+    assert TechStack.model_validate(_stack_kwargs(auth_kind="azure-ad")).auth_kind == "none", (
+        "an off-enum legacy auth_kind must coerce to 'none', not fail whole-model validation"
+    )
+    assert TechStack.model_validate(_stack_kwargs(auth_kind="")).auth_kind == "none", (
+        "a blank auth_kind must coerce to 'none'"
+    )
+    assert TechStack.model_validate(_stack_kwargs(auth_kind="entra")).auth_kind == "entra", (
+        "a genuinely valid auth_kind must pass through unchanged"
+    )
+
+    # convention_roots explicitly None (not just an absent key) must coerce to [] rather than fail
+    # list[EcosystemRoot] validation -- a real legacy shape data.get(...) previously let through
+    # unhandled.
+    assert TechStack.model_validate(_stack_kwargs(convention_roots=None)).convention_roots == [], (
+        "convention_roots=None must coerce to [], not raise"
+    )
+
+    # presence_values: the shared reader now used by 6 former near-duplicates plus 3 markdown
+    # renderers -- dict-shaped (typed), bare-list (legacy), and missing/None all tolerated.
+    assert presence_values({"status": "present", "values": ["a", "b"], "reason": ""}) == ["a", "b"]
+    assert presence_values({"status": "absent", "values": [], "reason": "none found"}) == []
+    assert presence_values(["legacy", "bare", "list"]) == ["legacy", "bare", "list"]
+    assert presence_values(None) == []
+    assert presence_values({}) == []
+    # Values may be dicts too (DiagramPresence/WireframePresence/DivergenceFindingPresence) --
+    # confirm this isn't accidentally string-only.
+    assert presence_values({"status": "present", "values": [{"screen": "x"}], "reason": ""}) == [{"screen": "x"}]
 
     # NonBlankStr on Specification.title/summary: rejects blank/whitespace-only.
     _ok_spec_kwargs: dict[str, Any] = dict(

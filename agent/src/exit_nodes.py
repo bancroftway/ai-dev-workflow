@@ -22,6 +22,12 @@ from . import config as workflow_config
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
+# Imported under this module's existing private name, not renamed at every call site: a LOCAL
+# `from .tech_stack_signals import ... presence_values` inside verify_exit_readiness (a completely
+# different, 2-arg function) shadows a bare module-level `presence_values` for that whole function
+# body, so keeping the `_`-prefixed alias here is what avoids a same-named-but-wrong-arity
+# collision, not just habit.
+from .schemas import presence_values as _presence_values
 
 logger = logging.getLogger(__name__)
 
@@ -967,21 +973,9 @@ def _diff_ledger(prior: list[dict[str, Any]] | None, current: list[dict[str, Any
     return {"added": added, "revised": revised, "retired": retired}
 
 
-def _presence_values(entry: Any) -> list[str]:
-    """Read a PresenceList-shaped dict's `values` (schemas.py: `{"status": ..., "values": [...],
-    "reason": ...}`), tolerating a legacy/degenerate bare list or a missing field. `content_dict`
-    here is a plain dict off the wire, never re-validated through the Pydantic wrapper after
-    initial parse, so this reads defensively rather than assuming the typed shape."""
-    if isinstance(entry, dict):
-        return list(entry.get("values") or [])
-    if isinstance(entry, list):
-        return list(entry)
-    return []
-
-
 def _presence_from_values(values: list[str], *, empty_reason: str) -> dict[str, Any]:
     """Build a PresenceList-shaped dict from a plain list -- the read-modify-rewrite counterpart to
-    `_presence_values`, for the two fields this stage mutates in place after the model's initial
+    schemas.presence_values, for the two fields this stage mutates in place after the model's initial
     (already-typed) output: `status='present'` for a non-empty list, `status='absent'` with
     `empty_reason` otherwise. Never leaves `values` populated while `status='absent'`, and never
     reports `status='present'` with nothing in `values` -- the shape PresenceList.model_validator

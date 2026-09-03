@@ -25,6 +25,7 @@ import json
 from .. import git_ops, repo_files, spec_ledger, workflow_persistence
 from ..failure_classification import classify_failure
 from ..sandbox.provider import SandboxProvider
+from ..schemas import presence_values as _presence_values
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
@@ -59,16 +60,6 @@ _WIREFRAME_FORBIDDEN = (
     (re.compile(r"<\s*(?:iframe|object|embed|base|form)\b", re.IGNORECASE), "contains an embedding/navigation element (iframe/object/embed/base/form)"),
     (re.compile(r"""<\s*meta\b[^>]*http-equiv""", re.IGNORECASE), "contains <meta http-equiv> (refresh/CSP override)"),
 )
-
-
-def _presence_values(entry: Any) -> list[dict[str, Any]]:
-    """DiagramPresence/WireframePresence-shaped dict (schemas.py, Task 10) -> its `values` list.
-    `content_dict` here is always freshly produced this run (stage["draft"] built from the current
-    ImplementationPlan schema), so it always carries the wrapped shape -- the bare-list fallback is
-    only for this module's own self-check fixtures and defense against a missing/None field."""
-    if isinstance(entry, dict):
-        return list(entry.get("values") or [])
-    return list(entry or [])
 
 
 def check_wireframe(screen: str, html_source: str) -> str | None:
@@ -488,7 +479,12 @@ def _demo() -> None:
     assert "- [cart](plan/wireframes/cart.html)\n" in rendered, rendered
 
     # _presence_values: the DiagramPresence/WireframePresence -> plain-list extraction this gate
-    # relies on throughout verify_plan_diagrams.
+    # relies on throughout verify_plan_diagrams. Now schemas.presence_values under this module's
+    # own alias (final review fix wave consolidated 6 near-identical private copies into one) --
+    # this module's own former version used `list(entry or [])` for the non-dict fallback rather
+    # than an isinstance check; confirmed here that the shared isinstance-checked version still
+    # returns the identical [] for both None and a missing field, the only two shapes this gate's
+    # real callers (a freshly-produced ImplementationPlan dump) ever hand it.
     assert _presence_values({"status": "present", "values": [{"screen": "x"}], "reason": ""}) == [{"screen": "x"}]
     assert _presence_values({"status": "absent", "values": [], "reason": "no UI work"}) == []
     assert _presence_values(None) == []

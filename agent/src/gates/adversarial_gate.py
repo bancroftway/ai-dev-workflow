@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ..schemas import presence_values as _findings_from
+
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
@@ -36,19 +38,6 @@ BLOCKING_SEVERITIES = frozenset({"critical", "major"})
 # bounded lap, same tolerance as every other in-memory per-run cache in this codebase.
 _MINOR_SWEEP_DONE: set[tuple[str, str]] = set()
 MINOR_SWEEP_MARKER = "[minor sweep]"
-
-
-def _findings_from(entry: Any) -> list[dict[str, Any]]:
-    """`divergence_findings`'s values, tolerating the DivergenceFindingPresence-wrapped shape
-    (schemas_audit.py: `{"status": ..., "values": [...], "reason": ...}`), a legacy/degenerate bare
-    list, or a missing/None field. `content_dict` here is a plain dict off the wire, never
-    re-validated through the Pydantic wrapper after initial parse, so this reads defensively rather
-    than assuming the typed shape."""
-    if isinstance(entry, dict):
-        return list(entry.get("values") or [])
-    if isinstance(entry, list):
-        return list(entry)
-    return []
 
 
 def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
