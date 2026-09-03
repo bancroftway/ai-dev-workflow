@@ -484,4 +484,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 2db1685136dd04b5d02139fb5d3468868b6f7d4222d036664ded48212429cf34 -->
+<!-- graph-source-sha256: ca27bb5b00452643a6ab1eeb3791561cc5c10f54885023a3d349a8dacd17684b -->

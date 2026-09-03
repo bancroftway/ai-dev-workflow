@@ -964,6 +964,30 @@ def _diff_ledger(prior: list[dict[str, Any]] | None, current: list[dict[str, Any
     return {"added": added, "revised": revised, "retired": retired}
 
 
+def _presence_values(entry: Any) -> list[str]:
+    """Read a PresenceList-shaped dict's `values` (schemas.py: `{"status": ..., "values": [...],
+    "reason": ...}`), tolerating a legacy/degenerate bare list or a missing field. `content_dict`
+    here is a plain dict off the wire, never re-validated through the Pydantic wrapper after
+    initial parse, so this reads defensively rather than assuming the typed shape."""
+    if isinstance(entry, dict):
+        return list(entry.get("values") or [])
+    if isinstance(entry, list):
+        return list(entry)
+    return []
+
+
+def _presence_from_values(values: list[str], *, empty_reason: str) -> dict[str, Any]:
+    """Build a PresenceList-shaped dict from a plain list -- the read-modify-rewrite counterpart to
+    `_presence_values`, for the two fields this stage mutates in place after the model's initial
+    (already-typed) output: `status='present'` for a non-empty list, `status='absent'` with
+    `empty_reason` otherwise. Never leaves `values` populated while `status='absent'`, and never
+    reports `status='present'` with nothing in `values` -- the shape PresenceList.model_validator
+    itself would reject."""
+    if values:
+        return {"status": "present", "values": values, "reason": ""}
+    return {"status": "absent", "values": [], "reason": empty_reason}
+
+
 async def verify_exit_readiness(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any,
     _chat_provider: str,
@@ -1075,9 +1099,11 @@ async def verify_exit_readiness(
             # report's own risk-notes section) -- the "reported, not blocking" inconclusives
             # otherwise live only in metrics-latest.json.
             auth_note = f"Authentication enforcement verified: {(e2e_snapshot.get('auth_check') or {}).get('feedback')}"
-            notes = list(content_dict.get("risk_notes") or [])
+            notes = _presence_values(content_dict.get("risk_notes"))
             if auth_note not in notes:
-                content_dict["risk_notes"] = notes + [auth_note]
+                content_dict["risk_notes"] = _presence_from_values(
+                    notes + [auth_note], empty_reason="no risk notes recorded"
+                )
 
     # Drop STALE deterministic blockers the model carried over from a previous run's report.
     #
@@ -1094,7 +1120,7 @@ async def verify_exit_readiness(
     # out-of-scope dependency, a broken replay contract) is exactly what this stage is for and is
     # never touched here.
     gate_reasons = set(problems)
-    model_reasons = list(content_dict.get("blocking_reasons") or [])
+    model_reasons = _presence_values(content_dict.get("blocking_reasons"))
     kept_reasons, stale_reasons = [], []
     for reason in model_reasons:
         owned = any(marker in reason for marker in _GATE_OWNED_REASON_MARKERS)
@@ -1105,12 +1131,19 @@ async def verify_exit_readiness(
             "(carried over from an earlier report): %s",
             len(stale_reasons), "; ".join(r[:120] for r in stale_reasons),
         )
-        content_dict["blocking_reasons"] = kept_reasons
+        content_dict["blocking_reasons"] = _presence_from_values(
+            kept_reasons,
+            empty_reason="deterministic exit checks passed; all model-supplied blocking reasons "
+            "were stale gate reasons carried over from an earlier run and have been cleared",
+        )
 
     if problems:
         content_dict["merge_ready"] = False
-        existing = list(content_dict.get("blocking_reasons") or [])
-        content_dict["blocking_reasons"] = existing + [p for p in problems if p not in existing]
+        existing = _presence_values(content_dict.get("blocking_reasons"))
+        content_dict["blocking_reasons"] = _presence_from_values(
+            existing + [p for p in problems if p not in existing],
+            empty_reason="unreachable: problems is non-empty in this branch",
+        )
         feedback = f"merge_ready forced False: {len(problems)} deterministic blocker(s)"
     elif stale_reasons and not kept_reasons and content_dict.get("merge_ready") is False:
         # Every deterministic check passed AND every blocker the model listed was a stale copy of a
@@ -1191,9 +1224,12 @@ async def exit_finalize_node(
         detail_line = _failure_headline(terminal_failure)
         if detail_line:
             reason = f"{reason} -- {detail_line}"
-        existing_reasons = list(merge_readiness.get("blocking_reasons") or [])
+        existing_reasons = _presence_values(merge_readiness.get("blocking_reasons"))
         if reason not in existing_reasons:
-            merge_readiness["blocking_reasons"] = [reason, *existing_reasons]
+            merge_readiness["blocking_reasons"] = _presence_from_values(
+                [reason, *existing_reasons],
+                empty_reason="unreachable: reason is always appended in this branch",
+            )
         merge_readiness["merge_ready"] = False
 
     spec_approval = await approvals.latest_approval(provider, thread_id, "specification")
@@ -1284,7 +1320,7 @@ async def exit_finalize_node(
         failure_payload = {
             "stage": "exit",
             "type": "gates_not_passed",
-            "feedback": "; ".join((merge_readiness or {}).get("blocking_reasons") or []) or "exit gates did not pass",
+            "feedback": "; ".join(_presence_values((merge_readiness or {}).get("blocking_reasons"))) or "exit gates did not pass",
         }
 
     # Ruling 8, Part B: refresh the regression baseline from this run's own final scan -- only on
@@ -1456,6 +1492,20 @@ async def exit_finalize_node(
 
 def _demo() -> None:
     """Self-check for this module's pure halves: `cd agent && uv run python -m src.exit_nodes`."""
+    # _presence_values/_presence_from_values: the read-modify-rewrite helpers verify_exit_readiness
+    # and exit_finalize_node use to keep blocking_reasons/risk_notes PresenceList-shaped after the
+    # model's initial (already-typed) output -- never leave values populated while status='absent'.
+    assert _presence_values({"status": "present", "values": ["a", "b"], "reason": ""}) == ["a", "b"]
+    assert _presence_values({"status": "absent", "values": [], "reason": "none found"}) == []
+    assert _presence_values(["legacy", "bare", "list"]) == ["legacy", "bare", "list"]
+    assert _presence_values(None) == []
+    assert _presence_from_values(["x"], empty_reason="unused") == {
+        "status": "present", "values": ["x"], "reason": "",
+    }
+    assert _presence_from_values([], empty_reason="nothing to report") == {
+        "status": "absent", "values": [], "reason": "nothing to report",
+    }
+
     # _diff_ledger: added/revised/retired classification against a prior snapshot.
     prior = [{"id": "US-0001", "status": "active", "last_revised_run_id": "r1"}]
     current = [

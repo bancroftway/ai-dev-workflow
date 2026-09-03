@@ -38,6 +38,19 @@ _MINOR_SWEEP_DONE: set[tuple[str, str]] = set()
 MINOR_SWEEP_MARKER = "[minor sweep]"
 
 
+def _findings_from(entry: Any) -> list[dict[str, Any]]:
+    """`divergence_findings`'s values, tolerating the DivergenceFindingPresence-wrapped shape
+    (schemas_audit.py: `{"status": ..., "values": [...], "reason": ...}`), a legacy/degenerate bare
+    list, or a missing/None field. `content_dict` here is a plain dict off the wire, never
+    re-validated through the Pydantic wrapper after initial parse, so this reads defensively rather
+    than assuming the typed shape."""
+    if isinstance(entry, dict):
+        return list(entry.get("values") or [])
+    if isinstance(entry, list):
+        return list(entry)
+    return []
+
+
 def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
     """(passed, reasons). Pure, so the routing logic is testable without a sandbox.
 
@@ -61,7 +74,7 @@ def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
 
     blocking = [
         finding
-        for finding in (report.get("divergence_findings") or [])
+        for finding in _findings_from(report.get("divergence_findings"))
         if str(finding.get("severity") or "").lower() in BLOCKING_SEVERITIES
     ]
     for finding in blocking:
@@ -88,7 +101,7 @@ async def verify_adversarial_compliance(
 
     passed, reasons = evaluate_audit(content_dict)
     if passed:
-        findings = content_dict.get("divergence_findings") or []
+        findings = _findings_from(content_dict.get("divergence_findings"))
         minors = [f for f in findings if str(f.get("severity") or "").lower() == "minor"]
         if minors and (thread_id, run_id) not in _MINOR_SWEEP_DONE:
             _MINOR_SWEEP_DONE.add((thread_id, run_id))
@@ -163,7 +176,7 @@ async def _snapshot_findings(provider: Any, thread_id: str, run_id: str, content
                     "description": f.get("description"),
                     "proposed_resolution": f.get("proposed_resolution"),
                 }
-                for f in ((content_dict or {}).get("divergence_findings") or [])
+                for f in _findings_from((content_dict or {}).get("divergence_findings"))
             ],
         })
     except Exception:  # noqa: BLE001 -- advisory trail only
@@ -177,33 +190,47 @@ def _demo() -> None:
         passed, reasons = evaluate_audit(empty)
         assert not passed and "no report at all" in reasons[0], empty
 
-    conforms = {"overall_verdict": "conforms", "divergence_findings": []}
+    # divergence_findings is DivergenceFindingPresence-wrapped (schemas_audit.py) -- a bare list is
+    # only the legacy shape _findings_from tolerates, not what a current content_dict carries.
+    absent_findings = {"status": "absent", "values": [], "reason": "no divergences found"}
+    conforms = {"overall_verdict": "conforms", "divergence_findings": absent_findings}
     assert evaluate_audit(conforms) == (True, [])
 
     # minor_gaps passes on purpose -- see BLOCKING_VERDICTS.
-    minor = {"overall_verdict": "minor_gaps", "divergence_findings": [{"severity": "minor"}]}
+    minor = {
+        "overall_verdict": "minor_gaps",
+        "divergence_findings": {"status": "present", "values": [{"severity": "minor"}]},
+    }
     assert evaluate_audit(minor)[0]
 
     # A blocking verdict blocks.
     for verdict in ("major_gaps", "fails_to_conform"):
-        passed, reasons = evaluate_audit({"overall_verdict": verdict, "divergence_findings": []})
+        passed, reasons = evaluate_audit({"overall_verdict": verdict, "divergence_findings": absent_findings})
         assert not passed and verdict in reasons[0]
 
     # A critical/major finding blocks even when the model calls the whole thing "conforms" -- the
     # per-finding severity is not allowed to be contradicted by an optimistic summary verdict.
     contradictory = {
         "overall_verdict": "conforms",
-        "divergence_findings": [{
-            "severity": "critical", "plan_reference": "AC US-0003.2",
-            "description": "reset endpoint missing", "evidence": ["apps/api/Program.cs has no /reset route"],
-        }],
+        "divergence_findings": {
+            "status": "present",
+            "values": [{
+                "severity": "critical", "plan_reference": "AC US-0003.2",
+                "description": "reset endpoint missing", "evidence": ["apps/api/Program.cs has no /reset route"],
+            }],
+        },
     }
     passed, reasons = evaluate_audit(contradictory)
     assert not passed
     assert "US-0003.2" in reasons[0] and "Program.cs" in reasons[0], reasons
 
     # A missing verdict is itself a failure: the stage must commit to a judgement.
-    assert not evaluate_audit({"divergence_findings": []})[0]
+    assert not evaluate_audit({"divergence_findings": absent_findings})[0]
+
+    # _findings_from also tolerates a legacy bare list (pre-wrapper on-disk content), never crashes.
+    assert _findings_from([{"severity": "minor"}]) == [{"severity": "minor"}]
+    assert _findings_from(None) == []
+    assert _findings_from({"status": "absent", "values": [], "reason": "x"}) == []
 
     # Minor sweep: the first otherwise-passing verify with minors fails ONCE with sweep feedback;
     # the second identical call passes. Stubbed provider -- the snapshot write is best-effort.
@@ -220,10 +247,13 @@ def _demo() -> None:
     _MINOR_SWEEP_DONE.clear()
     minor_report = {
         "overall_verdict": "minor_gaps",
-        "divergence_findings": [{
-            "severity": "minor", "plan_reference": "Plan Step 4",
-            "description": "empty-state copy differs from wireframe", "proposed_resolution": "align the copy",
-        }],
+        "divergence_findings": {
+            "status": "present",
+            "values": [{
+                "severity": "minor", "plan_reference": "Plan Step 4",
+                "description": "empty-state copy differs from wireframe", "proposed_resolution": "align the copy",
+            }],
+        },
     }
     first = asyncio.run(verify_adversarial_compliance("t1", minor_report, "r1", None, _StubProvider(), "claude"))
     assert not first.passed and MINOR_SWEEP_MARKER in first.feedback and "Plan Step 4" in first.feedback, first
@@ -237,7 +267,10 @@ def _demo() -> None:
     # Blocking findings still block regardless of sweep state, and no sweep fires with zero minors.
     _MINOR_SWEEP_DONE.clear()
     clean = asyncio.run(verify_adversarial_compliance(
-        "t2", {"overall_verdict": "conforms", "divergence_findings": []}, "r1", None, _StubProvider(), "claude"))
+        "t2",
+        {"overall_verdict": "conforms", "divergence_findings": absent_findings},
+        "r1", None, _StubProvider(), "claude",
+    ))
     assert clean.passed, clean
     _MINOR_SWEEP_DONE.clear()
 

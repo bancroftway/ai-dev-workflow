@@ -121,9 +121,11 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
 
 
 def _render_presence_section(lines: list[str], content: dict[str, Any], field: str, heading: str) -> None:
-    """One PresenceList-shaped field (languages/frameworks/package_managers/testing_frameworks/
-    conventions/config_inventory): its values when status="present", else its `reason` -- a human
-    reviewing this document should SEE why a category came back empty, not just an absent section."""
+    """One PresenceList-shaped field (TechStack's languages/frameworks/package_managers/
+    testing_frameworks/conventions/config_inventory, AdversarialAuditReport's
+    unresolved_risk_notes, MergeReadinessReport's blocking_reasons/risk_notes): its values when
+    status="present", else its `reason` -- a human reviewing this document should SEE why a
+    category came back empty, not just an absent section."""
     entry = content.get(field) or {}
     lines.append(f"## {heading}")
     lines.append("")
@@ -247,19 +249,20 @@ def render_minimal_code_to_green_markdown(content: dict[str, Any]) -> str:
 
 def render_adversarial_audit_markdown(content: dict[str, Any]) -> str:
     lines: list[str] = ["# Adversarial Audit", "", content.get("plan_conformance_summary", ""), "", f"**Overall verdict:** {content.get('overall_verdict', '')}", ""]
-    findings = content.get("divergence_findings") or []
-    if findings:
-        lines.append("## Divergence Findings")
-        lines.append("")
-        for f in findings:
+    # divergence_findings is DivergenceFindingPresence-shaped (schemas_audit.py), not a bare
+    # PresenceList -- its `values` are structured findings, not strings, so it gets its own
+    # rendering rather than _render_presence_section, but the same "always show why, present or
+    # absent" convention.
+    findings_entry = content.get("divergence_findings") or {}
+    lines.append("## Divergence Findings")
+    lines.append("")
+    if findings_entry.get("status") == "present":
+        for f in findings_entry.get("values") or []:
             lines.append(f"- **[{f.get('severity', '')}] {f.get('id', '')}** ({f.get('plan_reference', '')}): {f.get('description', '')} -- {f.get('proposed_resolution', '')}")
-        lines.append("")
-    risk_notes = content.get("unresolved_risk_notes") or []
-    if risk_notes:
-        lines.append("## Unresolved Risk Notes")
-        lines.append("")
-        lines.extend(f"- {n}" for n in risk_notes)
-        lines.append("")
+    else:
+        lines.append(findings_entry.get("reason") or "(not checked)")
+    lines.append("")
+    _render_presence_section(lines, content, "unresolved_risk_notes", "Unresolved Risk Notes")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -290,22 +293,12 @@ def render_brownfield_baseline_markdown(content: dict[str, Any]) -> str:
 
 def render_exit_markdown(content: dict[str, Any]) -> str:
     lines: list[str] = ["# Merge Readiness", "", f"**Ready to merge:** {content.get('merge_ready', False)}", ""]
-    blocking = content.get("blocking_reasons") or []
-    if blocking:
-        lines.append("## Blocking Reasons")
-        lines.append("")
-        lines.extend(f"- {r}" for r in blocking)
-        lines.append("")
+    _render_presence_section(lines, content, "blocking_reasons", "Blocking Reasons")
     lines.append(f"## {content.get('pr_title', '')}")
     lines.append("")
     lines.append(content.get("pr_description_markdown", ""))
     lines.append("")
-    risk_notes = content.get("risk_notes") or []
-    if risk_notes:
-        lines.append("## Risk Notes")
-        lines.append("")
-        lines.extend(f"- {n}" for n in risk_notes)
-        lines.append("")
+    _render_presence_section(lines, content, "risk_notes", "Risk Notes")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -366,6 +359,53 @@ def _demo() -> None:
     # back to "not checked" rather than KeyError/AttributeError.
     assert render_tech_stack_markdown({"summary": "S"})
     assert render_tech_stack_markdown({})
+
+    # render_adversarial_audit_markdown: divergence_findings is DivergenceFindingPresence-shaped
+    # (structured findings, not a bare PresenceList), unresolved_risk_notes is PresenceList-shaped --
+    # both must render their `reason` when absent, not silently omit the section.
+    audit_present = render_adversarial_audit_markdown({
+        "plan_conformance_summary": "Mostly conforms.",
+        "overall_verdict": "minor_gaps",
+        "divergence_findings": {
+            "status": "present",
+            "values": [{"id": "DIV-1", "severity": "minor", "plan_reference": "Plan Step 4",
+                        "description": "copy drift", "proposed_resolution": "align the copy"}],
+        },
+        "unresolved_risk_notes": {"status": "absent", "values": [], "reason": "no open risks"},
+    })
+    assert "**[minor] DIV-1** (Plan Step 4): copy drift -- align the copy" in audit_present, audit_present
+    assert "no open risks" in audit_present, "absent unresolved_risk_notes must render its reason"
+
+    audit_absent = render_adversarial_audit_markdown({
+        "plan_conformance_summary": "Fully conforms.",
+        "overall_verdict": "conforms",
+        "divergence_findings": {"status": "absent", "values": [], "reason": "no divergences found"},
+        "unresolved_risk_notes": {"status": "present", "values": ["flaky third-party API"]},
+    })
+    assert "no divergences found" in audit_absent, "absent divergence_findings must render its reason"
+    assert "- flaky third-party API" in audit_absent, audit_absent
+
+    # render_exit_markdown: blocking_reasons/risk_notes are PresenceList-shaped -- reuse of
+    # _render_presence_section covers both directions the same way tech-stack fields do.
+    exit_blocked = render_exit_markdown({
+        "merge_ready": False,
+        "blocking_reasons": {"status": "present", "values": ["coverage regressed"]},
+        "pr_title": "Add the thing",
+        "pr_description_markdown": "Adds the thing.",
+        "risk_notes": {"status": "absent", "values": [], "reason": "no open risks"},
+    })
+    assert "- coverage regressed" in exit_blocked, exit_blocked
+    assert "no open risks" in exit_blocked, "absent risk_notes must render its reason"
+
+    exit_ready = render_exit_markdown({
+        "merge_ready": True,
+        "blocking_reasons": {"status": "absent", "values": [], "reason": "no blockers"},
+        "pr_title": "Add the thing",
+        "pr_description_markdown": "Adds the thing.",
+        "risk_notes": {"status": "present", "values": ["depends on an unreleased upstream fix"]},
+    })
+    assert "no blockers" in exit_ready, "absent blocking_reasons must render its reason"
+    assert "- depends on an unreleased upstream fix" in exit_ready, exit_ready
 
     print("markdown_render self-check: ok")
 
