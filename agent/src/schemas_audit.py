@@ -94,6 +94,43 @@ class AdversarialAuditDraftResponse(BaseModel):
     )
 
 
+ADVERSARIAL_AUDIT_DRAFT_EXAMPLE: AdversarialAuditDraftResponse = AdversarialAuditDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    report=AdversarialAuditReport(
+        plan_conformance_summary="Implementation matches Plan Steps PS-1 and PS-2; the "
+        "reset-request and reset-confirm screens match their wireframes.",
+        divergence_findings=DivergenceFindingPresence(
+            status="present",
+            values=[
+                DivergenceFinding(
+                    id="DIV-1",
+                    severity="minor",
+                    plan_reference="PS-2",
+                    description="The reset-confirm screen omits the password-strength meter shown "
+                    "in the wireframe.",
+                    evidence=[
+                        "src/auth/ResetConfirm.tsx:42 renders a plain <input> with no meter "
+                        "component"
+                    ],
+                    proposed_resolution="Reuse the shared PasswordStrengthMeter component already "
+                    "used by the signup flow.",
+                )
+            ],
+        ),
+        unresolved_risk_notes=PresenceList(
+            status="absent", reason="No open risks beyond the noted minor divergence."
+        ),
+        overall_verdict="minor_gaps",
+    ),
+    skills_invoked=[],
+)
+"""Fully-populated example of the adversarial-compliance drafting node's structured output,
+echoed into the draft prompt so the model sees a realistic instance of the current canonical
+(typed-absence) shape. No separate audit pass for this stage -- it IS the audit leg for the
+plan/code, and has no StageSpec.audit_response_schema of its own."""
+
+
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m src.schemas_audit`
     _finding = DivergenceFinding(
         id="DIV-1", severity="critical", plan_reference="US-0001.1",
@@ -154,5 +191,16 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m 
         raise AssertionError("expected ValidationError for blank plan_conformance_summary")
     except ValidationError:
         pass
+
+    # Task 13a: ADVERSARIAL_AUDIT_DRAFT_EXAMPLE -- same generic round-trip proof schemas.py's
+    # TECH_STACK_DRAFT_EXAMPLE uses, via structured_output.assert_example_matches_schema.
+    import json
+
+    from .structured_output import assert_example_matches_schema
+
+    assert_example_matches_schema(ADVERSARIAL_AUDIT_DRAFT_EXAMPLE, AdversarialAuditDraftResponse)
+    _report_dumped = json.loads(ADVERSARIAL_AUDIT_DRAFT_EXAMPLE.report.model_dump_json())
+    assert "status" in _report_dumped["divergence_findings"], "report.divergence_findings missing 'status'"
+    assert "status" in _report_dumped["unresolved_risk_notes"], "report.unresolved_risk_notes missing 'status'"
 
     print("schemas_audit self-check: all assertions passed")

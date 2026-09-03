@@ -450,6 +450,68 @@ class SpecificationDraftResponse(BaseModel):
     )
 
 
+SPECIFICATION_DRAFT_EXAMPLE: SpecificationDraftResponse = SpecificationDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    specification=Specification(
+        title="Password reset via email",
+        summary="Let a user who forgot their password request a time-limited emailed reset link "
+        "and set a new password with it.",
+        work_kind="feature",
+        user_stories=[
+            UserStory(
+                id="story-a",
+                title="Request a password reset",
+                narrative="As a user who forgot my password, I want to request a reset email, "
+                "so that I can regain access to my account.",
+                existing_us_id="US-0001",
+                deferred=False,
+                acceptance_criteria=[
+                    AcceptanceCriterion(
+                        id="ac-a",
+                        description="Submitting a registered email sends a reset link that "
+                        "expires after 1 hour.",
+                        existing_ac_id="US-0001.1",
+                        deferred=False,
+                        ui_related=True,
+                    ),
+                    AcceptanceCriterion(
+                        id="ac-b",
+                        description="Submitting an unregistered email shows the same "
+                        "confirmation message, without revealing whether the account exists.",
+                        existing_ac_id="US-0001.2",
+                        deferred=False,
+                        ui_related=True,
+                    ),
+                ],
+            )
+        ],
+        assumptions=PresenceList(
+            status="present", values=["Reset links expire after 1 hour, per the security policy."]
+        ),
+        out_of_scope=PresenceList(
+            status="absent", reason="Nothing was explicitly excluded for this ticket."
+        ),
+        questions=[
+            SpecQuestion(
+                id="q-token-ttl",
+                question="How long should the reset token remain valid?",
+                status="answered",
+                answer="1 hour, per the security policy doc referenced in the requirements.",
+                suggested_choices=[],
+            )
+        ],
+        attachment_notes=[],
+        retired_ac_ids=[],
+        retired_us_ids=[],
+    ),
+    skills_invoked=["test-driven-development"],
+)
+"""Fully-populated example of the specification drafting node's structured output, echoed into
+the draft prompt so the model sees a realistic instance of the current canonical (typed-absence)
+shape."""
+
+
 class PlanDraftResponse(BaseModel):
     """Structured output contract for the Plan drafting node."""
 
@@ -470,6 +532,67 @@ class PlanDraftResponse(BaseModel):
     )
 
 
+PLAN_DRAFT_EXAMPLE: PlanDraftResponse = PlanDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    plan=ImplementationPlan(
+        overview="Implements password reset via a time-limited emailed token, reusing the "
+        "existing auth module's email-sending and session conventions.",
+        plan_steps=[
+            PlanStep(
+                id="PS-1",
+                description="Add POST /auth/reset-request: looks up the email, issues a "
+                "1-hour token, and sends the reset email.",
+                ac_ids=["US-0001.1", "US-0001.2"],
+                kind="feature",
+                ui_related=True,
+                removes_ids=[],
+            ),
+            PlanStep(
+                id="PS-2",
+                description="Add the reset-request page shown by the wireframe below.",
+                ac_ids=["US-0001.1"],
+                kind="feature",
+                ui_related=True,
+                removes_ids=[],
+            ),
+        ],
+        risk_notes=PresenceList(
+            status="present",
+            values=["Email deliverability depends on the third-party SMTP provider's uptime."],
+        ),
+        diagrams=DiagramPresence(
+            status="present",
+            values=[
+                PlanDiagram(
+                    name="password-reset-flow",
+                    kind="user_flow",
+                    mermaid_source="flowchart TD\n"
+                    "  A[Request reset] --> B[Send email]\n"
+                    "  B --> C[User clicks link]\n"
+                    "  C --> D[Set new password]",
+                )
+            ],
+        ),
+        wireframes=WireframePresence(
+            status="present",
+            values=[
+                Wireframe(
+                    screen="reset-request",
+                    html_source="<html><body><h1>Reset your password</h1>"
+                    '<input type="email" placeholder="you@example.com">'
+                    "<button>Send reset link</button></body></html>",
+                    ac_ids=["US-0001.1"],
+                )
+            ],
+        ),
+    ),
+    skills_invoked=["writing-plans"],
+)
+"""Fully-populated example of the plan drafting node's structured output, echoed into the draft
+prompt so the model sees a realistic instance of the current canonical (typed-absence) shape."""
+
+
 class SpecificationAuditResponse(BaseModel):
     """Structured output contract for the Specification adversarial-audit node."""
 
@@ -479,6 +602,19 @@ class SpecificationAuditResponse(BaseModel):
     )
 
 
+SPECIFICATION_AUDIT_EXAMPLE: SpecificationAuditResponse = SpecificationAuditResponse(
+    revised_specification=SPECIFICATION_DRAFT_EXAMPLE.specification,
+    audit_findings=PresenceList(
+        status="present",
+        values=[
+            "Added the 'unregistered email gives the same confirmation' criterion (ac-b) -- the "
+            "original draft only covered the happy path and would have leaked account existence."
+        ],
+    ),
+)
+"""Fully-populated example of the specification adversarial-audit node's structured output."""
+
+
 class PlanAuditResponse(BaseModel):
     """Structured output contract for the Plan adversarial-audit node."""
 
@@ -486,6 +622,15 @@ class PlanAuditResponse(BaseModel):
     audit_findings: PresenceList = Field(
         description="Gaps found and fixed, or an explicit absent+reason when none were found."
     )
+
+
+PLAN_AUDIT_EXAMPLE: PlanAuditResponse = PlanAuditResponse(
+    revised_plan=PLAN_DRAFT_EXAMPLE.plan,
+    audit_findings=PresenceList(
+        status="absent", reason="Plan steps and wireframes already cover every live criterion."
+    ),
+)
+"""Fully-populated example of the plan adversarial-audit node's structured output."""
 
 
 class DotnetStatus(BaseModel):
@@ -1111,5 +1256,32 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     )
     assert plan_audit_legacy.audit_findings.status == "present"
     assert plan_audit_legacy.audit_findings.values == ["fixed a missing AC citation"]
+
+    # Task 13a: SPECIFICATION_DRAFT_EXAMPLE/SPECIFICATION_AUDIT_EXAMPLE/PLAN_DRAFT_EXAMPLE/
+    # PLAN_AUDIT_EXAMPLE -- same generic round-trip proof TECH_STACK_DRAFT_EXAMPLE already uses
+    # above, via structured_output.assert_example_matches_schema (the reusable version Task 6
+    # built for exactly this).
+    from .structured_output import assert_example_matches_schema
+
+    assert_example_matches_schema(SPECIFICATION_DRAFT_EXAMPLE, SpecificationDraftResponse)
+    assert_example_matches_schema(SPECIFICATION_AUDIT_EXAMPLE, SpecificationAuditResponse)
+    assert_example_matches_schema(PLAN_DRAFT_EXAMPLE, PlanDraftResponse)
+    assert_example_matches_schema(PLAN_AUDIT_EXAMPLE, PlanAuditResponse)
+
+    # "Validates" alone doesn't prove the CURRENT typed shape -- PresenceList's own before-
+    # validator would silently coerce a stale bare-list example back into today's shape. Confirm
+    # every PresenceList-wrapped field actually dumps a real "status" key, same proof already used
+    # for TechStack above.
+    _spec_dumped = json.loads(SPECIFICATION_DRAFT_EXAMPLE.specification.model_dump_json())
+    assert "status" in _spec_dumped["assumptions"], "SPECIFICATION_DRAFT_EXAMPLE.assumptions missing 'status'"
+    assert "status" in _spec_dumped["out_of_scope"], "SPECIFICATION_DRAFT_EXAMPLE.out_of_scope missing 'status'"
+    _spec_audit_dumped = json.loads(SPECIFICATION_AUDIT_EXAMPLE.model_dump_json())
+    assert "status" in _spec_audit_dumped["audit_findings"], "SPECIFICATION_AUDIT_EXAMPLE.audit_findings missing 'status'"
+
+    _plan_dumped = json.loads(PLAN_DRAFT_EXAMPLE.plan.model_dump_json())
+    for _plan_field in ("risk_notes", "diagrams", "wireframes"):
+        assert "status" in _plan_dumped[_plan_field], f"PLAN_DRAFT_EXAMPLE.plan.{_plan_field} missing 'status'"
+    _plan_audit_dumped = json.loads(PLAN_AUDIT_EXAMPLE.model_dump_json())
+    assert "status" in _plan_audit_dumped["audit_findings"], "PLAN_AUDIT_EXAMPLE.audit_findings missing 'status'"
 
     print("schemas self-check: all assertions passed")

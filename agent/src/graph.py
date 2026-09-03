@@ -94,6 +94,10 @@ from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider, SandboxSession
 from .schemas import (
+    PLAN_AUDIT_EXAMPLE,
+    PLAN_DRAFT_EXAMPLE,
+    SPECIFICATION_AUDIT_EXAMPLE,
+    SPECIFICATION_DRAFT_EXAMPLE,
     PlanAuditResponse,
     PlanDraftResponse,
     SpecificationAuditResponse,
@@ -105,17 +109,20 @@ from .schemas import (
     TechStackDraftResponse,
 )
 from .schemas_codegen import (
+    MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE,
+    MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE,
     AcceptanceCriteriaTestsDraftResponse,
     AcToTestsAuditResponse,
     MinimalCodeToGreenAuditResponse,
     MinimalCodeToGreenDraftResponse,
 )
 from .schemas_audit import (
+    ADVERSARIAL_AUDIT_DRAFT_EXAMPLE,
     AdversarialAuditDraftResponse,
 )
-from .schemas_brownfield import BrownfieldBaselineDraftResponse
-from .schemas_exit import ExitDraftResponse
-from .schemas_remediation import RemediationDraftResponse
+from .schemas_brownfield import BROWNFIELD_BASELINE_DRAFT_EXAMPLE, BrownfieldBaselineDraftResponse
+from .schemas_exit import EXIT_DRAFT_EXAMPLE, ExitDraftResponse
+from .schemas_remediation import REMEDIATION_DRAFT_EXAMPLE, RemediationDraftResponse
 
 logger = logging.getLogger(__name__)
 
@@ -1576,6 +1583,8 @@ STAGES: list[StageSpec] = [
         audit_content_field="revised_specification",
         build_audit_prompt=_build_specification_audit_prompt,
         render_markdown=render_specification_markdown,
+        draft_example=SPECIFICATION_DRAFT_EXAMPLE,
+        audit_example=SPECIFICATION_AUDIT_EXAMPLE,
         deterministic_verify=_verify_specification_ledger,
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ticket_mode_context,
         # Second phase of the two-phase tracking reset (spec_ledger.PENDING_RESET_FIELD): the
@@ -1603,6 +1612,8 @@ STAGES: list[StageSpec] = [
         audit_content_field="revised_plan",
         build_audit_prompt=_build_plan_audit_prompt,
         render_markdown=render_plan_markdown,
+        draft_example=PLAN_DRAFT_EXAMPLE,
+        audit_example=PLAN_AUDIT_EXAMPLE,
         sign_approval=True,
         deterministic_verify=verify_plan_diagrams,
         # US/AC -> plan-step provenance: record which approved steps cite each live AC
@@ -1723,6 +1734,8 @@ STAGES: list[StageSpec] = [
         audit_content_field="revised_iteration",
         build_audit_prompt=_build_minimal_code_to_green_audit_prompt,
         render_markdown=render_minimal_code_to_green_markdown,
+        draft_example=MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE,
+        audit_example=MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE,
         deterministic_verify=verify_coverage,
         # Coverage verification (the deterministic gate) is the real check; the human checkpoints
         # are specification and plan only.
@@ -1773,6 +1786,7 @@ STAGES: list[StageSpec] = [
         build_prompt=_build_remediation_prompt,
         max_cycles=2,
         render_markdown=render_remediation_markdown,
+        draft_example=REMEDIATION_DRAFT_EXAMPLE,
         requires_human_gate=False,
         # Nothing read this stage's output until now: it could report "fixed the pre-auth RCE" and
         # be believed. The gate re-scans and blocks on any finding still gating that the report does
@@ -1805,6 +1819,7 @@ STAGES: list[StageSpec] = [
         build_prompt=_build_adversarial_compliance_prompt,
         max_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES,
         render_markdown=render_adversarial_audit_markdown,
+        draft_example=ADVERSARIAL_AUDIT_DRAFT_EXAMPLE,
         requires_human_gate=False,
         # Read-only, but it MUST have tools: the prompt says "you are read-only in this session" and
         # asks it to verify every Plan step and AC against the actual code and wireframes. It
@@ -1837,6 +1852,7 @@ STAGES: list[StageSpec] = [
         # the 4-section stub at the start of every SUBSEQUENT run (approved_content survives
         # intake's reset on purpose; see intake_node).
         render_markdown=None,
+        draft_example=EXIT_DRAFT_EXAMPLE,
         requires_human_gate=False,
         sign_approval=True,
         # Read-only tools, added because this stage SIGNS THE MERGE VERDICT. Its prompt is real and
@@ -3918,6 +3934,7 @@ BROWNFIELD_BASELINE_SPEC = StageSpec(
     build_prompt=_build_brownfield_baseline_prompt,
     max_cycles=2,
     render_markdown=render_brownfield_baseline_markdown,
+    draft_example=BROWNFIELD_BASELINE_DRAFT_EXAMPLE,
     # Ratification (brownfield_write_manifest_node, this stage's next_draft_name below) now runs
     # automatically after the audit -- the human checkpoints are specification and plan only.
     requires_human_gate=False,

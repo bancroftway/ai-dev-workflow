@@ -52,6 +52,36 @@ class ExitDraftResponse(BaseModel):
     )
 
 
+EXIT_DRAFT_EXAMPLE: ExitDraftResponse = ExitDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    report=MergeReadinessReport(
+        merge_ready=True,
+        blocking_reasons=PresenceList(
+            status="absent",
+            reason="Coverage, adversarial audit, and remediation all passed with no open findings.",
+        ),
+        pr_title="Add password reset via email",
+        pr_description_markdown="Implements US-0001 (password reset via emailed token).\n\n"
+        "- Adds POST /auth/reset-request and /auth/reset-confirm\n"
+        "- 96% branch coverage on new code\n"
+        "- Adversarial audit: minor_gaps (missing password-strength meter), fixed",
+        risk_notes=PresenceList(
+            status="present",
+            values=[
+                "Email deliverability depends on the third-party SMTP provider staying within "
+                "its rate limit."
+            ],
+        ),
+        suggested_reviewers_note="Auth module owner recommended.",
+    ),
+    skills_invoked=[],
+)
+"""Fully-populated example of the metrics-exit drafting node's structured output, echoed into
+the draft prompt so the model sees a realistic instance of the current canonical (typed-absence)
+shape. No separate audit pass for this stage -- draft-only, per StageSpec.audit_response_schema."""
+
+
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m src.schemas_exit`
     # merge_ready=True requires blocking_reasons absent.
     ready = MergeReadinessReport(
@@ -126,5 +156,16 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m 
             raise AssertionError(f"expected ValidationError for blank {blank_field}")
         except ValidationError:
             pass
+
+    # Task 13a: EXIT_DRAFT_EXAMPLE -- same generic round-trip proof schemas.py's
+    # TECH_STACK_DRAFT_EXAMPLE uses, via structured_output.assert_example_matches_schema.
+    import json
+
+    from .structured_output import assert_example_matches_schema
+
+    assert_example_matches_schema(EXIT_DRAFT_EXAMPLE, ExitDraftResponse)
+    _report_dumped = json.loads(EXIT_DRAFT_EXAMPLE.report.model_dump_json())
+    assert "status" in _report_dumped["blocking_reasons"], "report.blocking_reasons missing 'status'"
+    assert "status" in _report_dumped["risk_notes"], "report.risk_notes missing 'status'"
 
     print("schemas_exit self-check: all assertions passed")

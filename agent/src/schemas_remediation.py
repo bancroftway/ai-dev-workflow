@@ -51,6 +51,25 @@ class RemediationDraftResponse(BaseModel):
     )
 
 
+REMEDIATION_DRAFT_EXAMPLE: RemediationDraftResponse = RemediationDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    remediation_summary="Upgraded next.js to patch the pinned version's pre-auth RCE and fixed 2 "
+    "SAST findings flagging unsanitized template output; left 1 low-severity dependency finding "
+    "open pending an upstream fix.",
+    findings_addressed=PresenceList(status="present", values=["CVE-2026-31337", "SAST-042"]),
+    dependencies_upgraded=PresenceList(status="present", values=["next: 15.4.6 -> 15.4.9"]),
+    known_gaps=PresenceList(
+        status="present",
+        values=["lodash: ReDoS finding has no fixed version published yet upstream."],
+    ),
+    skills_invoked=["code-review"],
+)
+"""Fully-populated example of the remediation drafting node's structured output, echoed into the
+draft prompt so the model sees a realistic instance of the current canonical (typed-absence)
+shape. No audit pass for this stage -- draft-only, per StageSpec.audit_response_schema."""
+
+
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m src.schemas_remediation`
     _base_kwargs: dict[str, Any] = dict(
         readiness=True,
@@ -108,5 +127,14 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m 
     assert legacy_resp.findings_addressed.values == ["ccc333"]
     assert legacy_resp.dependencies_upgraded.status == "absent"
     assert legacy_resp.known_gaps.status == "absent"
+
+    # Task 13a: REMEDIATION_DRAFT_EXAMPLE -- same generic round-trip proof schemas.py's
+    # TECH_STACK_DRAFT_EXAMPLE uses, via structured_output.assert_example_matches_schema.
+    from .structured_output import assert_example_matches_schema
+
+    assert_example_matches_schema(REMEDIATION_DRAFT_EXAMPLE, RemediationDraftResponse)
+    _remediation_dumped = json.loads(REMEDIATION_DRAFT_EXAMPLE.model_dump_json())
+    for _field in ("findings_addressed", "dependencies_upgraded", "known_gaps"):
+        assert "status" in _remediation_dumped[_field], f"REMEDIATION_DRAFT_EXAMPLE.{_field} missing 'status'"
 
     print("schemas_remediation self-check: all assertions passed")

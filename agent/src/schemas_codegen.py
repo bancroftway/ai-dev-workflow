@@ -176,6 +176,63 @@ class MinimalCodeToGreenAuditResponse(BaseModel):
     audit_findings: list[str] = Field(default_factory=list)
 
 
+_MINIMAL_CODE_TO_GREEN_ITERATION_EXAMPLE = CodegenIterationResult(
+    approach_summary="Implemented plan step PS-1: added the password-reset-request endpoint and "
+    "wired it to the existing email-sending module.",
+    changed_files=[
+        ChangedFile(
+            path="src/auth/reset_controller.py",
+            change_kind="created",
+            summary="New POST /auth/reset-request handler: looks up the email, issues a 1-hour "
+            "token, sends the reset email.",
+            related_ac_ids=["US-0001.1", "US-0001.2"],
+        ),
+        ChangedFile(
+            path="src/auth/routes.py",
+            change_kind="modified",
+            summary="Registered the reset-request route.",
+            related_ac_ids=["US-0001.1"],
+        ),
+    ],
+    subagent_tasks=[
+        SubagentTaskRecord(
+            task_id="task-1",
+            description="Write the reset-token email template.",
+            status="completed",
+            reviewer_notes="Matches the reset-request wireframe's copy.",
+        )
+    ],
+    known_gaps=PresenceList(
+        status="absent", reason="Both criteria for this plan step are fully implemented."
+    ),
+    ponytail_rejected=[
+        "Considered a generic notification-service abstraction; rejected as premature for a "
+        "single email type."
+    ],
+)
+
+MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE: MinimalCodeToGreenDraftResponse = MinimalCodeToGreenDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    iteration=_MINIMAL_CODE_TO_GREEN_ITERATION_EXAMPLE,
+    skills_invoked=["test-driven-development"],
+)
+"""Fully-populated example of the minimal-code-to-green drafting node's structured output,
+echoed into the draft prompt so the model sees a realistic instance of the current canonical
+(typed-absence) shape."""
+
+MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE: MinimalCodeToGreenAuditResponse = MinimalCodeToGreenAuditResponse(
+    revised_iteration=_MINIMAL_CODE_TO_GREEN_ITERATION_EXAMPLE,
+    audit_findings=[
+        "Confirmed the reset-request endpoint matches PS-1 and both cited criteria; no "
+        "divergences found."
+    ],
+)
+"""Fully-populated example of the minimal-code-to-green adversarial-audit node's structured
+output. audit_findings is a bare list[str] here (not a PresenceList) -- this schema was not
+tightened by an earlier task, so the example matches its actual current shape."""
+
+
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.schemas_codegen`
     from pydantic import ValidationError
 
@@ -222,5 +279,21 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
         raise AssertionError("expected ValidationError for readiness=true with empty changed_files")
     except ValidationError:
         pass
+
+    # Task 13a: MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE/MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE -- same
+    # generic round-trip proof schemas.py's TECH_STACK_DRAFT_EXAMPLE uses, via
+    # structured_output.assert_example_matches_schema.
+    import json
+
+    from .structured_output import assert_example_matches_schema
+
+    assert_example_matches_schema(MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE, MinimalCodeToGreenDraftResponse)
+    assert_example_matches_schema(MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE, MinimalCodeToGreenAuditResponse)
+
+    # known_gaps is the one PresenceList-wrapped field on this schema -- confirm it dumps a real
+    # "status" key, not a stale bare-list shape PresenceList's own before-validator would silently
+    # coerce.
+    _iteration_dumped = json.loads(MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE.iteration.model_dump_json())
+    assert "status" in _iteration_dumped["known_gaps"], "iteration.known_gaps missing 'status'"
 
     print("schemas_codegen self-check: all assertions passed")

@@ -72,6 +72,63 @@ class BrownfieldBaselineDraftResponse(BaseModel):
     baseline: BrownfieldBaselineCombined | None = Field(default=None)
 
 
+BROWNFIELD_BASELINE_DRAFT_EXAMPLE: BrownfieldBaselineDraftResponse = BrownfieldBaselineDraftResponse(
+    readiness=True,
+    clarifying_questions=[],
+    baseline=BrownfieldBaselineCombined(
+        as_built_spec=AsBuiltSpec(
+            user_stories=[
+                InferredUserStory(
+                    us_id="US-1",
+                    title="User login",
+                    narrative="As a returning user, I want to log in with email and password, "
+                    "so that I can access my account.",
+                    source_evidence=[
+                        "src/auth/login_controller.py implements POST /auth/login",
+                        "tests/auth/test_login.py covers valid and invalid credentials",
+                    ],
+                    confidence="high",
+                )
+            ],
+            acceptance_criteria=[
+                InferredAcceptanceCriterion(
+                    ac_id="AC-1",
+                    us_id="US-1",
+                    description="A valid email/password pair returns a session token.",
+                    confidence="high",
+                    backing_test="tests/auth/test_login.py::test_valid_login_returns_token",
+                )
+            ],
+            er_diagram_mermaid="erDiagram\n"
+            "  USER ||--o{ SESSION : has\n"
+            "  USER {\n"
+            "    string id\n"
+            "    string email\n"
+            "    string password_hash\n"
+            "  }",
+            notes=[
+                "No existing requirements doc found; stories inferred entirely from route "
+                "handlers and their tests."
+            ],
+        ),
+        as_built_plan=AsBuiltPlan(
+            architecture_diagram_mermaid="flowchart TD\n"
+            "  Client --> API[Express API]\n"
+            "  API --> DB[(Postgres)]",
+            file_inventory=[
+                "src/auth/login_controller.py",
+                "src/auth/session.py",
+                "tests/auth/test_login.py",
+            ],
+            notes=["Single Express service; no separate frontend repo found."],
+        ),
+    ),
+)
+"""Fully-populated example of the brownfield-baseline drafting node's structured output, echoed
+into the draft prompt so the model sees a realistic instance of the current canonical shape. No
+audit pass for this stage -- draft-only, per StageSpec.audit_response_schema."""
+
+
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.schemas_brownfield`
     from pydantic import ValidationError
 
@@ -122,6 +179,12 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
         raise AssertionError("expected ValidationError for whitespace-only architecture_diagram_mermaid")
     except ValidationError:
         pass
+
+    # Task 13a: BROWNFIELD_BASELINE_DRAFT_EXAMPLE -- same generic round-trip proof schemas.py's
+    # TECH_STACK_DRAFT_EXAMPLE uses, via structured_output.assert_example_matches_schema.
+    from .structured_output import assert_example_matches_schema
+
+    assert_example_matches_schema(BROWNFIELD_BASELINE_DRAFT_EXAMPLE, BrownfieldBaselineDraftResponse)
 
     print("schemas_brownfield self-check: all assertions passed")
 
