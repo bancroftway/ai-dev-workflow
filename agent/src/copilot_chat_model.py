@@ -84,6 +84,7 @@ from .cli_agent_exec import (
     SessionCache,
     classify_resume,
     flatten_messages_to_prompt,
+    parse_jsonl_line,
     run_turn,
     write_scratch_file,
 )
@@ -151,16 +152,15 @@ def _parse_copilot_jsonl(stdout: str) -> tuple[list[dict[str, Any]], str | None]
     later event is at least as authoritative as an earlier one if more than one line happens to
     carry it.
     """
+    # Line parsing itself is now the shared cli_agent_exec.parse_jsonl_line (Agent Narration
+    # Drawer feature) -- the incremental streaming path in run_turn applies the exact same rule,
+    # so TurnResult.streamed_line_count (a plain index into this function's own `events` list)
+    # stays meaningful for both. Session-id scanning below is unchanged, still specific to this
+    # provider's own unconfirmed-key-name guess.
     events: list[dict[str, Any]] = []
     for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            parsed_line = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed_line, dict):
+        parsed_line = parse_jsonl_line(line)
+        if parsed_line is not None:
             events.append(parsed_line)
 
     session_id: str | None = None
@@ -203,6 +203,83 @@ def _extract_usage(final: dict[str, Any], model_name: str | None) -> dict[str, A
         "cost": final.get("total_cost_usd"),
         "premium_requests": usage.get("premiumRequests"),
     }
+
+
+def _classify_one_event(
+    raw_event: dict[str, Any],
+    *,
+    run_id: str,
+    session_id: str,
+    stage: str,
+    node: str,
+) -> list[RunEvent]:
+    """Classify ONE already-parsed Copilot JSONL line into zero or more RunEvents.
+
+    Extracted from _translate_intermediate_events' own per-line loop body (Agent Narration Drawer
+    feature) so cli_agent_exec.run_turn's incremental streaming path can classify a single line the
+    instant it arrives, while _translate_intermediate_events itself stays a thin batch wrapper --
+    see that function's own docstring for the full behavioral contract this preserves unchanged.
+    Returns a list (not Optional) for shape parity with claude_chat_model._classify_one_event,
+    even though this provider's own per-line classification never yields more than one event.
+    """
+    event_type = raw_event.get("type")
+    if not isinstance(event_type, str):
+        return []
+    namespace, _, verb = event_type.partition(".")
+    raw_data = raw_event.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
+    ts = raw_event.get("timestamp")
+
+    if namespace == "tool":
+        # Defensive key-name scan (same spirit as _parse_copilot_jsonl's own session_id scan
+        # just above): which key actually carries the tool's name is exactly as unconfirmed as
+        # the "tool.*" namespace guess itself, so try the plausible spellings rather than
+        # committing to one -- `verb` (e.g. "call_start" in "tool.call_start") is the
+        # last-resort fallback so a tool call with no recognizable name field still yields a
+        # non-empty summary.
+        tool_name = data.get("name") or data.get("toolName") or data.get("tool_name") or verb or "unknown"
+        payload = dict(data)  # copy -- never mutate the caller's own parsed event in place
+        if ts is not None:
+            payload["envelope_ts"] = ts
+        return [
+            RunEvent(
+                run_id=run_id,
+                session_id=session_id,
+                type=RunEventType.TOOL_CALL,
+                stage=stage,
+                node=node,
+                # Task 5 (Part 2 run-visibility): this is real captured tool-call content
+                # reaching a human-facing event log for the first time -- redact_text/
+                # redact_value (redaction.py, shared with telemetry.py's own long-standing
+                # command scrub) scrub it here, before this RunEvent ever reaches
+                # run_event_store.append_event/run_event_stream.emit_live.
+                summary=redact_text(f"tool call: {tool_name}"),
+                payload=redact_value(payload),
+            )
+        ]
+
+    if event_type == "assistant.message_delta":
+        text = data.get("text") or data.get("content")
+        if not isinstance(text, str) or not text:
+            return []  # surprise shape, or genuinely nothing to narrate -- never fabricate
+        head = text[:160]
+        if len(text) > 160:
+            head += "..."
+        payload = {"text": text}
+        if ts is not None:
+            payload["envelope_ts"] = ts
+        return [
+            RunEvent(
+                run_id=run_id,
+                session_id=session_id,
+                type=RunEventType.REASONING,
+                stage=stage,
+                node=node,
+                summary=redact_text(head),
+                payload=redact_value(payload),
+            )
+        ]
+    return []
 
 
 def _translate_intermediate_events(
@@ -260,64 +337,9 @@ def _translate_intermediate_events(
     """
     translated: list[RunEvent] = []
     for raw_event in intermediate_events:
-        event_type = raw_event.get("type")
-        if not isinstance(event_type, str):
-            continue
-        namespace, _, verb = event_type.partition(".")
-        raw_data = raw_event.get("data")
-        data = raw_data if isinstance(raw_data, dict) else {}
-        ts = raw_event.get("timestamp")
-
-        if namespace == "tool":
-            # Defensive key-name scan (same spirit as _parse_copilot_jsonl's own session_id scan
-            # just above): which key actually carries the tool's name is exactly as unconfirmed as
-            # the "tool.*" namespace guess itself, so try the plausible spellings rather than
-            # committing to one -- `verb` (e.g. "call_start" in "tool.call_start") is the
-            # last-resort fallback so a tool call with no recognizable name field still yields a
-            # non-empty summary.
-            tool_name = data.get("name") or data.get("toolName") or data.get("tool_name") or verb or "unknown"
-            payload = dict(data)  # copy -- never mutate the caller's own parsed event in place
-            if ts is not None:
-                payload["envelope_ts"] = ts
-            translated.append(
-                RunEvent(
-                    run_id=run_id,
-                    session_id=session_id,
-                    type=RunEventType.TOOL_CALL,
-                    stage=stage,
-                    node=node,
-                    # Task 5 (Part 2 run-visibility): this is real captured tool-call content
-                    # reaching a human-facing event log for the first time -- redact_text/
-                    # redact_value (redaction.py, shared with telemetry.py's own long-standing
-                    # command scrub) scrub it here, before this RunEvent ever reaches
-                    # run_event_store.append_event/run_event_stream.emit_live.
-                    summary=redact_text(f"tool call: {tool_name}"),
-                    payload=redact_value(payload),
-                )
-            )
-            continue
-
-        if event_type == "assistant.message_delta":
-            text = data.get("text") or data.get("content")
-            if not isinstance(text, str) or not text:
-                continue  # surprise shape, or genuinely nothing to narrate -- never fabricate
-            head = text[:160]
-            if len(text) > 160:
-                head += "..."
-            payload = {"text": text}
-            if ts is not None:
-                payload["envelope_ts"] = ts
-            translated.append(
-                RunEvent(
-                    run_id=run_id,
-                    session_id=session_id,
-                    type=RunEventType.REASONING,
-                    stage=stage,
-                    node=node,
-                    summary=redact_text(head),
-                    payload=redact_value(payload),
-                )
-            )
+        translated.extend(
+            _classify_one_event(raw_event, run_id=run_id, session_id=session_id, stage=stage, node=node)
+        )
     return translated
 
 
@@ -712,6 +734,17 @@ class CopilotChatModel(BaseChatModel):
         wrapper_script = _build_copilot_wrapper_script(argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS)
         await write_scratch_file(provider, self.thread_id, wrapper_path, wrapper_script)
         command = f"sh {shlex.quote(wrapper_path)}"
+
+        # Agent Narration Drawer feature: classify each JSONL line the instant run_turn's own
+        # incremental poll loop sees it complete -- the exact same per-line classifier the
+        # post-turn batch path below uses (_classify_one_event), just invoked one line at a time
+        # instead of over the whole parsed list at once.
+        def _classify_line(parsed: dict[str, Any]) -> list[RunEvent]:
+            return _classify_one_event(
+                parsed, run_id=self.run_id or "unknown", session_id=self.thread_id,
+                stage=self.stage, node=self.role,
+            )
+
         try:
             result = await run_turn(
                 provider,
@@ -720,6 +753,7 @@ class CopilotChatModel(BaseChatModel):
                 prompt,
                 scratch_prefix,
                 timeout_seconds=config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
+                classify_line=_classify_line,
             )
         except TimeoutError as exc:
             # Phase E audit C-2: same shape as claude_chat_model's identical guard -- see this
@@ -780,8 +814,14 @@ class CopilotChatModel(BaseChatModel):
         # second one. Previously always "unknown" unconditionally (task-3-report.md); see that
         # report for the concrete cost this left: events not retrievable via
         # run_event_store.list_events(run_id) for a specific run.
+        # Agent Narration Drawer feature: streamed_line_count checkpoints how many of these lines
+        # run_turn's own incremental poll loop already classified+persisted+emitted live during
+        # the turn (via _classify_line above) -- slicing from that index instead of from 0 avoids
+        # double-persisting/double-emitting anything streaming already handled. A no-op slice
+        # (events[:-1], same as before this feature) whenever streaming covered everything except
+        # the always-excluded terminal line, which is the normal case.
         translated_events = _translate_intermediate_events(
-            events[:-1],
+            events[result.streamed_line_count:-1],
             run_id=self.run_id or "unknown",
             session_id=self.thread_id,
             stage=self.stage,

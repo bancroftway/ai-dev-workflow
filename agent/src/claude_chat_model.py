@@ -85,6 +85,7 @@ from .cli_agent_exec import (
     SessionCache,
     classify_resume,
     flatten_messages_to_prompt,
+    parse_jsonl_line,
     run_turn,
     write_scratch_file,
 )
@@ -314,17 +315,113 @@ def _parse_claude_jsonl(stdout: str) -> list[dict[str, Any]]:
     total_cost_usd. The caller (_agenerate_inner) is what decides `events[-1]` is that line; this
     function only parses.
     """
+    # Line parsing itself is now the shared cli_agent_exec.parse_jsonl_line (Agent Narration
+    # Drawer feature) -- the incremental streaming path in run_turn applies the exact same rule,
+    # so TurnResult.streamed_line_count (a plain index into this function's own returned list)
+    # stays meaningful for both.
     events: list[dict[str, Any]] = []
     for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            parsed_line = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed_line, dict):
+        parsed_line = parse_jsonl_line(line)
+        if parsed_line is not None:
             events.append(parsed_line)
+    return events
+
+
+_REASONING_HEAD_CHARS = 160
+
+
+def _classify_one_event(
+    raw_event: dict[str, Any],
+    *,
+    run_id: str,
+    session_id: str,
+    stage: str,
+    node: str,
+    results_by_tool_use_id: dict[str, dict[str, Any]] | None = None,
+) -> list[RunEvent]:
+    """Classify ONE already-parsed Claude JSONL line into zero or more RunEvents.
+
+    Extracted from _translate_intermediate_events' own per-line loop body (Agent Narration Drawer
+    feature) so cli_agent_exec.run_turn's incremental streaming path can classify a single line the
+    instant it arrives, while _translate_intermediate_events itself stays a two-pass batch wrapper
+    (build the full tool_use/tool_result correlation lookup first, THEN classify every line against
+    it) -- see that function's own docstring below for the full behavioral contract this preserves
+    unchanged for the batch/legacy path.
+
+    results_by_tool_use_id is the SAME correlation lookup _translate_intermediate_events builds
+    from the WHOLE batch before ever calling this function -- passed through unchanged there. None
+    (the live/incremental call site's own choice, cli_agent_exec.claude_chat_model's classify_line
+    closure) means no lookup exists yet: a tool_use streamed before its matching tool_result line
+    has arrived simply gets no result/is_error in its payload, PERMANENTLY (persistence here is a
+    one-shot insert, never updated later once a result does arrive) -- an accepted, documented
+    trade-off (Agent Narration Drawer design), invisible to a drawer that never renders raw tool
+    results/arguments in the first place. A future consumer of dbo.run_events that DOES need this
+    field on live-streamed rows would need a tool_use_id -> seq backfill mechanism this deliberately
+    does not build, since nothing today needs it.
+    """
+    lookup = results_by_tool_use_id or {}
+    message = raw_event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+
+    events: list[RunEvent] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+
+        if block_type in ("thinking", "text"):
+            text = block.get("thinking") if block_type == "thinking" else block.get("text")
+            text = text if isinstance(text, str) else ""
+            if not text:
+                continue  # nothing to narrate (e.g. an empty text block) -- no event for it
+            head = text[:_REASONING_HEAD_CHARS]
+            if len(text) > _REASONING_HEAD_CHARS:
+                head += "..."
+            events.append(
+                RunEvent(
+                    run_id=run_id,
+                    session_id=session_id,
+                    type=RunEventType.REASONING,
+                    stage=stage,
+                    node=node,
+                    summary=redact_text(head),
+                    payload=redact_value({"kind": block_type, "text": text}),
+                )
+            )
+            continue
+
+        if block_type != "tool_use":
+            continue
+        name = block.get("name") or "unknown"
+        payload: dict[str, Any] = {"name": name, "input": block.get("input")}
+        tool_use_id = block.get("id")
+        result_block = lookup.get(tool_use_id) if isinstance(tool_use_id, str) else None
+        if result_block is not None:
+            payload["result"] = result_block["content"]
+            payload["is_error"] = result_block["is_error"]
+            if result_block["timestamp"] is not None:
+                payload["result_ts"] = result_block["timestamp"]
+        events.append(
+            RunEvent(
+                run_id=run_id,
+                session_id=session_id,
+                type=RunEventType.TOOL_CALL,
+                stage=stage,
+                node=node,
+                # Task 5 (Part 2 run-visibility): real captured tool-call content (a Bash
+                # command, its output, ...) reaching a human-facing event log for the first
+                # time -- scrub it here, before this RunEvent reaches run_event_store.
+                # append_event/run_event_stream.emit_live. Same shared helper as
+                # copilot_chat_model.py's identical call site and telemetry.py's own
+                # long-standing command scrub (redaction.py).
+                summary=redact_text(f"tool call: {name}"),
+                payload=redact_value(payload),
+            )
+        )
     return events
 
 
@@ -386,7 +483,6 @@ def _translate_intermediate_events(
     duration -- this makes a real per-call span derivable later (once a real start time is ALSO
     captured) without inventing one now.
     """
-    _REASONING_HEAD_CHARS = 160
     results_by_tool_use_id: dict[str, dict[str, Any]] = {}
     for raw_event in intermediate_events:
         message = raw_event.get("message")
@@ -408,66 +504,12 @@ def _translate_intermediate_events(
 
     translated: list[RunEvent] = []
     for raw_event in intermediate_events:
-        message = raw_event.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get("type")
-
-            if block_type in ("thinking", "text"):
-                text = block.get("thinking") if block_type == "thinking" else block.get("text")
-                text = text if isinstance(text, str) else ""
-                if not text:
-                    continue  # nothing to narrate (e.g. an empty text block) -- no event for it
-                head = text[:_REASONING_HEAD_CHARS]
-                if len(text) > _REASONING_HEAD_CHARS:
-                    head += "..."
-                translated.append(
-                    RunEvent(
-                        run_id=run_id,
-                        session_id=session_id,
-                        type=RunEventType.REASONING,
-                        stage=stage,
-                        node=node,
-                        summary=redact_text(head),
-                        payload=redact_value({"kind": block_type, "text": text}),
-                    )
-                )
-                continue
-
-            if block_type != "tool_use":
-                continue
-            name = block.get("name") or "unknown"
-            payload: dict[str, Any] = {"name": name, "input": block.get("input")}
-            tool_use_id = block.get("id")
-            result_block = results_by_tool_use_id.get(tool_use_id) if isinstance(tool_use_id, str) else None
-            if result_block is not None:
-                payload["result"] = result_block["content"]
-                payload["is_error"] = result_block["is_error"]
-                if result_block["timestamp"] is not None:
-                    payload["result_ts"] = result_block["timestamp"]
-            translated.append(
-                RunEvent(
-                    run_id=run_id,
-                    session_id=session_id,
-                    type=RunEventType.TOOL_CALL,
-                    stage=stage,
-                    node=node,
-                    # Task 5 (Part 2 run-visibility): real captured tool-call content (a Bash
-                    # command, its output, ...) reaching a human-facing event log for the first
-                    # time -- scrub it here, before this RunEvent reaches run_event_store.
-                    # append_event/run_event_stream.emit_live. Same shared helper as
-                    # copilot_chat_model.py's identical call site and telemetry.py's own
-                    # long-standing command scrub (redaction.py).
-                    summary=redact_text(f"tool call: {name}"),
-                    payload=redact_value(payload),
-                )
+        translated.extend(
+            _classify_one_event(
+                raw_event, run_id=run_id, session_id=session_id, stage=stage, node=node,
+                results_by_tool_use_id=results_by_tool_use_id,
             )
+        )
     return translated
 
 
@@ -697,6 +739,19 @@ class ClaudeChatModel(BaseChatModel):
             argv += ["--json-schema", json.dumps(self.response_schema.model_json_schema())]
 
         command = shlex.join(argv)
+
+        # Agent Narration Drawer feature: classify each JSONL line the instant run_turn's own
+        # incremental poll loop sees it complete -- the exact same per-line classifier the
+        # post-turn batch path below uses (_classify_one_event), just invoked one line at a time.
+        # results_by_tool_use_id=None (the default): a tool_use streamed before its tool_result
+        # line arrives gets no result/is_error, permanently -- see _classify_one_event's own
+        # docstring for why this is an accepted trade-off, not an oversight.
+        def _classify_line(parsed: dict[str, Any]) -> list[RunEvent]:
+            return _classify_one_event(
+                parsed, run_id=self.run_id or "unknown", session_id=self.thread_id,
+                stage=self.stage, node=self.role,
+            )
+
         try:
             result = await run_turn(
                 provider,
@@ -705,6 +760,7 @@ class ClaudeChatModel(BaseChatModel):
                 prompt,
                 scratch_prefix,
                 timeout_seconds=config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
+                classify_line=_classify_line,
             )
         except TimeoutError as exc:
             # Phase E audit C-2: cli_agent_exec.run_turn's own SIGKILL-the-process-group path just
@@ -837,8 +893,14 @@ class ClaudeChatModel(BaseChatModel):
         # real per-run id (Task 3b) for every caller that has one; the "unknown" fallback is only
         # for a caller that hasn't been wired up to pass one yet, same sentinel convention as
         # copilot_chat_model's identical call site.
+        # Agent Narration Drawer feature: streamed_line_count checkpoints how many of these lines
+        # run_turn's own incremental poll loop already classified+persisted+emitted live during
+        # the turn (via _classify_line above) -- slicing from that index instead of from 0 avoids
+        # double-persisting/double-emitting anything streaming already handled. A no-op slice
+        # (events[:-1], same as before this feature) whenever streaming covered everything except
+        # the always-excluded terminal line, which is the normal case.
         translated_events = _translate_intermediate_events(
-            events[:-1],
+            events[result.streamed_line_count:-1],
             run_id=self.run_id or "unknown",
             session_id=self.thread_id,
             stage=self.stage,

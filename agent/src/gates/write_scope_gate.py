@@ -97,16 +97,94 @@ def _is_pipeline_owned(path: str) -> bool:
 _E2E_PATH_RE = re.compile(r"(^|/)e2e(/|$)|(^|/)playwright\.config\.[jt]sx?$|\.e2e\.[jt]sx?$", re.IGNORECASE)
 
 
-def _has_e2e_test(changed_paths: list[str]) -> bool:
-    """True when a real browser-level spec was written (a playwright config alone doesn't count --
-    a config with no spec runs zero tests and still yields no screenshots)."""
-    return any(
-        _is_test_path(p)
+def _classify_e2e_paths(changed_paths: list[str], resolved_root: str | None) -> tuple[bool, str]:
+    """(has_e2e, diagnosis) -- diagnosis is "present" exactly when has_e2e is True, else one of
+    "missing" (nothing e2e-ish changed at all) or "misplaced" (something e2e-ish changed but not
+    under `{resolved_root}/tests/e2e/`).
+
+    `resolved_root` is None for the genuinely-ambiguous case (see `_resolve_web_root`): with no
+    confidently known directory to be strict against, this falls back to the old location-only
+    regex a bare boolean used to return -- deliberately no stricter than before for that one case.
+    Otherwise (`resolved_root` is `""` for repo-root-is-web-app, or a real subdirectory) checks
+    membership under the exact directory the pipeline's own byte-for-byte-fixed
+    `playwright.config.ts` template hardcodes as `testDir` -- a config alone never counts (it runs
+    zero tests and yields no screenshots), and neither does an e2e-shaped file sitting anywhere
+    else: Playwright's `testDir` would never discover it, so crediting it as "present" would
+    silently under-report a UI story with zero real browser coverage."""
+    e2e_ish = [
+        p
+        for p in changed_paths
+        if _is_test_path(p)
         and _E2E_PATH_RE.search(p)
         and not _is_pipeline_owned(p)
         and not p.endswith(("playwright.config.ts", "playwright.config.js"))
-        for p in changed_paths
+    ]
+    if resolved_root is None:
+        return bool(e2e_ish), ("present" if e2e_ish else "missing")
+    expected_prefix = f"{resolved_root}/tests/e2e/" if resolved_root else "tests/e2e/"
+    if any(p.startswith(expected_prefix) for p in e2e_ish):
+        return True, "present"
+    return False, ("misplaced" if e2e_ish else "missing")
+
+
+async def _looks_greenfield_for_node(provider: SandboxProvider, thread_id: str) -> bool:
+    """Cheap disk-only proxy for tech_stack_signals.is_greenfield_repo's in-memory `app_scan`
+    signal, which this module has no access to -- `deterministic_verify`'s signature (thread_id,
+    content_dict, run_id, baseline_commit, provider, chat_provider) carries no `state`. No
+    package.json anywhere outside node_modules means there is no existing node app to misplace the
+    Playwright suite relative to -- the same "nothing scaffolded yet" case the ac-to-tests prompt's
+    web-root segment answers with "use the repo root". A package.json that DOES exist somewhere,
+    with tech-stack still reporting no confident root, is the genuinely ambiguous case instead
+    (several real candidates, none obvious) -- this proxy tells the two apart without re-deriving
+    app_discovery's own richer candidate/framework classification."""
+    result = await provider.exec_in_sandbox(
+        thread_id,
+        "find . -maxdepth 4 -name package.json -not -path '*/node_modules/*' -not -path './.git/*' | head -1",
     )
+    return not (result.stdout or "").strip()
+
+
+async def _resolve_web_root(provider: SandboxProvider, thread_id: str) -> tuple[str | None, bool]:
+    """(resolved_root, strict) -- the SAME tech-stack `convention_root` the ac-to-tests prompt's
+    web-root segment resolves (graph.py's `_web_root_segment_message`), read here from the repo's
+    own approved/draft tech-stack record on disk (same "no state access, read from disk instead"
+    workaround `_stack_has_ui` above already uses, for the same reason).
+
+    `strict` is True when there is a single confidently-known root to check membership against
+    (tech-stack resolved one, or nothing is scaffolded yet so the repo root is the only correct
+    answer) and False for the ambiguous-multi-root case, where this gate falls back to the old
+    loose heuristic rather than guessing which of several real roots is the intended one."""
+    from ..tech_stack_signals import convention_root
+
+    tech_stack: dict[str, Any] = {}
+    for path in (workflow_persistence.TECH_STACK_APPROVED_PATH, workflow_persistence.TECH_STACK_DRAFT_PATH):
+        raw = await repo_files.read_repo_file(provider, thread_id, path)
+        if raw is None:
+            continue
+        try:
+            tech_stack = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        break
+
+    root = convention_root(tech_stack, "node")
+    if root is not None:
+        return root, True
+    if await _looks_greenfield_for_node(provider, thread_id):
+        return "", True
+    return None, False
+
+
+async def _e2e_dir_is_gitignored(provider: SandboxProvider, thread_id: str, resolved_root: str) -> bool:
+    """Best-effort "ignored" diagnosis (the note's fourth case, distinct from a genuine miss): does
+    a `.gitignore` rule swallow anything written at the expected e2e directory, so a real write
+    would never show up in `changed_paths` (git diff/ls-files both exclude ignored paths) at all.
+    Probes a synthetic filename rather than the bare directory -- `git check-ignore` on a directory
+    path alone does not reliably match a rule anchored to files within it."""
+    expected_dir = f"{resolved_root}/tests/e2e" if resolved_root else "tests/e2e"
+    probe_path = f"{expected_dir}/__aidw_e2e_ignore_probe__.spec.ts"
+    result = await provider.exec_in_sandbox(thread_id, f"git check-ignore -q {shlex.quote(probe_path)}")
+    return result.ok
 
 
 async def _stack_has_ui(provider: SandboxProvider, thread_id: str) -> bool:
@@ -385,27 +463,49 @@ async def verify_ac_to_tests(
     # outermost layer, and no-e2e leaves the running app unproven and (just as concretely) leaves the
     # e2e stage with nothing to run, which is how every delivered branch ended up with zero
     # screenshots and a blocked merge.
-    if not no_eligible_work and await _stack_has_ui(provider, thread_id) and not _has_e2e_test(real_changes):
-        return VerificationResult(
-            passed=False,
-            feedback=(
-                "You did NOT write a Playwright spec. Check the working tree before you answer "
-                "again: previous attempts reported \"Added required Playwright e2e skeleton files "
-                "beside the web app (config + spec)\" four times in a row while making no write "
-                "call for either file, so the claim was false each time and this gate caught it "
-                "each time. Your response is metadata about files that must already exist.\n\n"
-                "This stack has a UI framework but you wrote no Playwright end-to-end spec. The "
-                "running app is never exercised through a browser, and the e2e stage has nothing to "
-                "run -- so the merge is blocked for missing visual evidence no matter how good the "
-                "unit tests are. Add a playwright.config.ts beside the web app plus at least one "
-                "spec under its tests/e2e/ covering the primary user journeys. Import from "
-                "'@playwright/test' in BOTH the config and the specs (mixing that with "
-                "'playwright/test' loads two runner copies and playwright refuses to run), set "
-                "screenshot: 'on', take baseURL from process.env.BASE_URL, and locate elements with "
-                "getByTestId. Keep the tests below the UI that you already wrote."
-            ),
-            report={"changed_paths": write_scope.changed_paths, "missing_e2e": True},
-        )
+    if not no_eligible_work and await _stack_has_ui(provider, thread_id):
+        resolved_root, strict = await _resolve_web_root(provider, thread_id)
+        has_e2e, diagnosis = _classify_e2e_paths(real_changes, resolved_root if strict else None)
+        if not has_e2e:
+            if strict and diagnosis == "missing" and await _e2e_dir_is_gitignored(provider, thread_id, resolved_root or ""):
+                diagnosis = "ignored"
+            where = (
+                f"under `{resolved_root}/tests/e2e/`" if resolved_root else "under the repo root's `tests/e2e/`"
+            )
+            diagnosis_line = {
+                "missing": "Check the working tree before you answer again: no Playwright spec exists yet.",
+                "misplaced": (
+                    f"A file that looks like an e2e spec exists, but not {where} -- Playwright's "
+                    "`testDir: './tests/e2e'` will never discover or run it from wherever it actually "
+                    "landed, so it does not count."
+                ),
+                "ignored": (
+                    f"A `.gitignore` rule swallows anything written {where}, so even a real write "
+                    "there would never be tracked -- fix the ignore rule (or write elsewhere it "
+                    "isn't ignored) rather than rewriting the same spec again."
+                ),
+            }[diagnosis]
+            return VerificationResult(
+                passed=False,
+                feedback=(
+                    "You did NOT write a Playwright spec that this gate can see. Previous attempts "
+                    "reported \"Added required Playwright e2e skeleton files beside the web app "
+                    "(config + spec)\" four times in a row while making no write call for either "
+                    "file, so a claim like that is not evidence -- only a real file at the exact "
+                    "expected path is.\n\n"
+                    f"{diagnosis_line}\n\n"
+                    f"This stack has a UI framework but has no working Playwright end-to-end spec "
+                    f"{where}. The running app is never exercised through a browser, and the e2e "
+                    "stage has nothing to run -- so the merge is blocked for missing visual evidence "
+                    "no matter how good the unit tests are. Add a playwright.config.ts beside the "
+                    f"web app plus at least one spec {where} covering the primary user journeys. "
+                    "Import from '@playwright/test' in BOTH the config and the specs (mixing that "
+                    "with 'playwright/test' loads two runner copies and playwright refuses to run), "
+                    "set screenshot: 'on', take baseURL from process.env.BASE_URL, and locate "
+                    "elements with getByTestId. Keep the tests below the UI that you already wrote."
+                ),
+                report={"changed_paths": write_scope.changed_paths, "missing_e2e": True, "e2e_diagnosis": diagnosis},
+            )
 
     coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
@@ -430,13 +530,29 @@ def _demo() -> None:
     # e2e-only suites are what this stage produced live, and must be rejected
     # A UI stack must ALSO write a browser spec -- the mirror of the e2e-only rejection. A config
     # with no spec does not count: it runs zero tests and yields no screenshots.
-    assert _has_e2e_test(["apps/web/tests/e2e/a.spec.ts"])
-    assert not _has_e2e_test(["apps/web/playwright.config.ts"])
-    assert not _has_e2e_test(["apps/api.Tests/TaskTests.cs", "apps/web/src/app/calc.test.ts"])
-    assert not _has_e2e_test([".ai-dev-workflow/ledger.jsonl"])
+    # Ambiguous case (resolved_root=None): falls back to the old location-only regex, unchanged.
+    assert _classify_e2e_paths(["apps/web/tests/e2e/a.spec.ts"], None) == (True, "present")
+    assert _classify_e2e_paths(["apps/web/playwright.config.ts"], None) == (False, "missing")
+    assert _classify_e2e_paths(["apps/api.Tests/TaskTests.cs", "apps/web/src/app/calc.test.ts"], None) == (False, "missing")
+    assert _classify_e2e_paths([".ai-dev-workflow/ledger.jsonl"], None) == (False, "missing")
     # Both directions together: a full, healthy suite satisfies each check.
     _full = ["apps/web/tests/e2e/a.spec.ts", "apps/api.Tests/TaskTests.cs"]
-    assert _has_e2e_test(_full) and _has_non_e2e_test(_full)
+    assert _classify_e2e_paths(_full, None)[0] and _has_non_e2e_test(_full)
+
+    # Confidently-resolved root ("apps/web"): strict membership. Correctly placed passes...
+    assert _classify_e2e_paths(["apps/web/tests/e2e/a.spec.ts"], "apps/web") == (True, "present")
+    # ...but the flattening bug this whole gate exists for -- a bare `e2e/` directory at the repo
+    # root instead of nested under the resolved root's `tests/e2e/` -- must now be caught as
+    # "misplaced". The old bare boolean credited this: `_is_test_path` matches `.spec.ts$` and
+    # `_E2E_PATH_RE`'s `(^|/)e2e(/|$)` branch matches the directory segment with no requirement
+    # that it live under the actual web app root at all -- confirmed live false positive.
+    assert _classify_e2e_paths(["e2e/login.spec.ts"], "apps/web") == (False, "misplaced")
+    # Same file, but the resolved root IS the repo root (""): still not under tests/e2e/, so still
+    # misplaced, not present, just because no subdirectory prefix applies.
+    assert _classify_e2e_paths(["e2e/login.spec.ts"], "") == (False, "misplaced")
+    assert _classify_e2e_paths(["tests/e2e/a.spec.ts"], "") == (True, "present")
+    # Nothing e2e-ish at all is "missing", never "misplaced".
+    assert _classify_e2e_paths(["apps/web/src/app/calc.test.ts"], "apps/web") == (False, "missing")
 
     assert not _has_non_e2e_test(["apps/web/tests/e2e/task-tracker.ac.spec.ts"])
     assert not _has_non_e2e_test(["apps/web/tests/e2e/a.spec.ts", "apps/web/playwright.config.ts"])

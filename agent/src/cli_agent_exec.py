@@ -10,15 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import json
 import logging
+import os
 import shlex
 import time
 from dataclasses import dataclass
-from typing import Literal
+from pathlib import Path
+from typing import Any, Callable, Literal
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
 from . import config
+from . import run_event_store
+from . import run_event_stream
+from .run_events import RunEvent, RunEventType
 from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
@@ -28,6 +35,14 @@ _EXEC_CMD_BUDGET = 16000
 
 # Scratch-file directory for all provider execs (shared, not provider-specific).
 _SCRATCH_DIR = "/tmp/aidw-agent"
+
+def _llm_io_log_path() -> Path:
+    """Host-side sink for AIDW_LOG_LLM_IO: raw per-turn stdout (both providers' stream-json/JSONL
+    already carries every tool call, including the literal path argument of every file write), so
+    a Phase 0-style spike can grep what path the model actually asked to write to, without a
+    per-tool-call parser this shared runner has no reason to own otherwise."""
+    return Path(os.environ.get("AIDW_LOG_LLM_IO_PATH") or (Path(__file__).parent.parent / "agent-work" / "llm-io.jsonl"))
+
 
 # A single completion-wait exec blocks (via the remote `timeout`/`tail --pid` below) for up to
 # this long before returning to let the host loop re-check its own deadline and re-touch
@@ -39,6 +54,74 @@ _SCRATCH_DIR = "/tmp/aidw-agent"
 # the remote wait itself is event-driven (`tail --pid`), not a sleep loop.
 _ACTIVITY_CHUNK_SECONDS = 300.0
 
+# Agent Narration Drawer feature: a MUCH shorter per-iteration chunk than the plain-completion-wait
+# loop above uses, ONLY for a caller that passes classify_line to run_turn (both provider chat
+# models, as of this feature). classify_line=None skips this branch and the exec-call cadence
+# entirely, keeping _ACTIVITY_CHUNK_SECONDS's original ~8-calls-per-turn shape for anything that
+# doesn't need live narration. Env-overridable so an operator can dial this down without a code
+# change -- same override convention as AIDW_SANDBOX_IDLE_TIMEOUT (local_docker.py/azure_aci.py).
+#
+# ponytail: ~40x more host-side exec calls than the 300s cadence for a full-length turn (2400s/7s
+# ~= 343 vs 2400s/300s ~= 8) -- a real, accepted trade-off (deliberately NOT the same failure shape
+# as the 2026-09-01 Docker Desktop incident above, which was many OVERLAPPING independent pollers;
+# this is one well-behaved loop at a fixed cadence), not a free lunch. If a real deployment's exec
+# volume ever becomes a problem, raise AIDW_NARRATION_POLL_SECONDS first before touching this code.
+_NARRATION_POLL_SECONDS = float(os.environ.get("AIDW_NARRATION_POLL_SECONDS", "7.0"))
+
+# Per-poll tail-read cap: bounds one exec call's response size regardless of how much a turn wrote
+# since the last poll. A burst bigger than this is simply consumed across more than one iteration
+# (byte_offset only advances by what was actually read) -- see run_turn's DONE-but-hit-cap handling.
+_MAX_TAIL_BYTES = 2 * 1024 * 1024
+
+# Delimiter lines wrapping the base64 tail payload in a streaming poll's combined stdout, so the
+# host can locate it by structure (index of these exact lines) rather than by substring-searching
+# for DONE/DEAD/PENDING -- a base64 blob can coincidentally contain any of those three words.
+_TAIL_MARKER_START = "===TAIL-B64-START==="
+_TAIL_MARKER_END = "===TAIL-B64-END==="
+
+
+def parse_jsonl_line(line: str) -> dict[str, Any] | None:
+    """Parse one JSONL line into a dict, or None if it's blank, malformed, or not object-shaped.
+
+    Extracted from copilot_chat_model._parse_copilot_jsonl/claude_chat_model._parse_claude_jsonl's
+    near-identical per-line bodies (Agent Narration Drawer feature) so run_turn's own incremental
+    streaming below and both providers' whole-buffer batch parsers apply the EXACT SAME
+    line-acceptance rule -- TurnResult.streamed_line_count is a plain index into the batch parsers'
+    own `events` list, and that index is only meaningful if both paths agree on which lines count.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _split_tail_poll_output(stdout_text: str) -> tuple[str, str]:
+    """Split one streaming poll iteration's combined stdout into (base64_tail_payload, status).
+
+    status is DONE/DEAD/PENDING -- the LAST non-empty line, matched exactly, never a substring
+    search (see _TAIL_MARKER_START/_TAIL_MARKER_END's own comment for why). base64_tail_payload is
+    whatever sits between the two marker lines (normally a single line -- tr -d '\\n' guarantees
+    the base64 command's own output carries no embedded newlines), joined defensively in case a
+    future change ever splits it further. Missing markers entirely (e.g. the tail-read commands
+    themselves failed) falls back to treating the whole output as status text -- the same leniency
+    the original substring-search had, so a transient shell hiccup degrades to "no new bytes this
+    poll," never a crash.
+    """
+    lines = stdout_text.split("\n")
+    try:
+        start_idx = lines.index(_TAIL_MARKER_START)
+        end_idx = lines.index(_TAIL_MARKER_END, start_idx + 1)
+    except ValueError:
+        status = next((line.strip() for line in reversed(lines) if line.strip()), "")
+        return "", status
+    payload = "".join(lines[start_idx + 1 : end_idx])
+    status = next((line.strip() for line in reversed(lines[end_idx + 1 :]) if line.strip()), "")
+    return payload, status
+
 
 @dataclass
 class TurnResult:
@@ -47,6 +130,11 @@ class TurnResult:
     stdout: str
     stderr: str
     exit_code: int
+    # Agent Narration Drawer feature: number of complete JSONL lines already streamed live during
+    # the turn (0 when run_turn was called with classify_line=None). Callers slice their own
+    # post-hoc parsed `events` list from this index (events[streamed_line_count:-1]) instead of
+    # re-translating everything the streaming path already handled -- see run_turn's docstring.
+    streamed_line_count: int = 0
 
 
 class TurnTimeout(TimeoutError):
@@ -341,6 +429,67 @@ def _pid_state_probe_script(pid_path: str) -> str:
     )
 
 
+class _NarrationStreamer:
+    """Incremental JSONL-line consumer backing run_turn's Agent Narration Drawer streaming.
+
+    Extracted as its own class (rather than closures inline inside run_turn) specifically so
+    _demo() can drive the one-line-lag flush contract directly with a fake classify_line and
+    monkeypatched run_event_store/run_event_stream, without a live sandbox -- see that function's
+    own docstring for the full contract this implements.
+    """
+
+    def __init__(self, classify_line: Callable[[dict[str, Any]], list[RunEvent]]) -> None:
+        self._classify_line = classify_line
+        self.byte_offset = 0
+        self.streamed_line_count = 0
+        self._line_buffer = ""
+        self._pending_events: list[RunEvent] = []
+
+    async def flush_pending(self) -> None:
+        if not self._pending_events:
+            return
+        # append_events/emit_live are already fail-soft internally (their own docstrings) -- this
+        # try/except is belt-and-suspenders against something else going wrong in this call, not a
+        # second copy of their own error handling.
+        try:
+            appended = await run_event_store.append_events(self._pending_events)
+            for appended_event in appended:
+                await run_event_stream.emit_live(appended_event)
+        except Exception:  # noqa: BLE001 -- narration streaming must never abort the real turn
+            logger.warning("failed to flush streamed narration events -- continuing turn", exc_info=True)
+        self._pending_events = []
+
+    async def consume_tail(self, new_bytes: bytes) -> None:
+        if not new_bytes:
+            return
+        self.byte_offset += len(new_bytes)
+        # ponytail: errors="replace" can mangle a multi-byte UTF-8 character that straddles the
+        # _MAX_TAIL_BYTES cap exactly on an incomplete trailing line -- extremely rare (requires
+        # hitting that boundary mid-character AND mid-line) and cosmetic (one possibly-garbled
+        # display character in narration text, nothing functional -- the unconditional final `cat`
+        # of out_path in run_turn is still byte-exact). Upgrade path: track the line buffer as raw
+        # bytes instead of decoded text if this ever actually bites.
+        text = self._line_buffer + new_bytes.decode("utf-8", errors="replace")
+        text_lines = text.split("\n")
+        self._line_buffer = text_lines.pop()
+        for raw_line in text_lines:
+            parsed = parse_jsonl_line(raw_line)
+            if parsed is None:
+                continue
+            self.streamed_line_count += 1
+            # One-line-lag: only flush the PREVIOUS line's classified events once a next line has
+            # actually arrived, proving the held-back one wasn't the turn's terminal result line.
+            await self.flush_pending()
+            try:
+                self._pending_events = self._classify_line(parsed) or []
+            except Exception:  # noqa: BLE001 -- a bad line must never abort the real turn
+                logger.warning(
+                    "classify_line raised for a streamed JSONL line -- dropping narration for it",
+                    exc_info=True,
+                )
+                self._pending_events = []
+
+
 async def run_turn(
     provider: SandboxProvider,
     thread_id: str,
@@ -348,12 +497,14 @@ async def run_turn(
     prompt: str,
     scratch_prefix: str,
     timeout_seconds: float,
+    *,
+    classify_line: Callable[[dict[str, Any]], list[RunEvent]] | None = None,
 ) -> TurnResult:
     """Executes a backgrounded provider CLI turn in the sandbox.
 
     The provider's CLI invocation (argv already built by the caller as a single shell-safe
-    string via shlex.join) is launched backgrounded and polled every 5 seconds to keep the
-    sandbox idle-reaper's clock ticking -- multi-minute turns would otherwise time out.
+    string via shlex.join) is launched backgrounded and polled to keep the sandbox idle-reaper's
+    clock ticking -- multi-minute turns would otherwise time out.
 
     Args:
         provider: Sandbox provider.
@@ -362,9 +513,24 @@ async def run_turn(
         prompt: Prompt text to write to scratch file.
         scratch_prefix: Absolute prefix for scratch files (prompt_path = f"{scratch_prefix}").
         timeout_seconds: Timeout for the entire turn.
+        classify_line: Agent Narration Drawer feature. When given, turns on incremental narration
+            streaming: every complete JSONL line the CLI writes to its output file during the turn
+            is parsed (parse_jsonl_line) and handed to this callback, which classifies it into zero
+            or more already-persistence-ready RunEvents (each provider chat model supplies its own
+            per-line classifier -- see copilot_chat_model._classify_one_event/
+            claude_chat_model._classify_one_event). This function owns WHEN a classified event
+            reaches run_event_store/run_event_stream (a one-line-lag flush: a line's events are
+            held until the NEXT line arrives, proving the held-back one wasn't the turn's terminal
+            result line, which is never a narration event); classify_line itself stays pure. None
+            (the default) skips the tail-read entirely -- zero exec-call-cadence cost for a caller
+            that doesn't want live narration, and the completion-wait loop is byte-for-byte the
+            original _ACTIVITY_CHUNK_SECONDS-chunked behavior in that case.
 
     Returns:
-        TurnResult with stdout, stderr, exit_code.
+        TurnResult with stdout, stderr, exit_code, and streamed_line_count (0 when classify_line is
+        None) -- the number of complete JSONL lines already streamed live, so callers can slice
+        their own post-hoc parsed `events` list from that index instead of re-processing everything
+        the streaming path already handled.
 
     Raises:
         TimeoutError: If the turn does not complete within timeout_seconds.
@@ -375,6 +541,11 @@ async def run_turn(
     out_path = f"{scratch_prefix}.out"
     err_path = f"{scratch_prefix}.err"
     exit_path = f"{scratch_prefix}.exit"
+
+    streaming = classify_line is not None
+    # Scoped to this one run_turn() call only -- nothing here survives past this function
+    # returning or raising, and nothing needs to.
+    streamer = _NarrationStreamer(classify_line) if classify_line is not None else None
 
     try:
         # Write prompt to scratch file.
@@ -400,6 +571,13 @@ async def run_turn(
                     f"kill -KILL -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; true"
                 )
                 await provider.exec_in_sandbox(thread_id, kill_cmd)
+                if streamer is not None:
+                    # A killed turn has no terminal result line -- whatever's pending is genuine,
+                    # real, in-progress narration, not a presumed-terminal line to discard. Without
+                    # this, a killed/timed-out turn's in-flight narration was silently lost entirely
+                    # (the flip side of the same TurnTimeout.partial_stdout comment above, applied
+                    # to narration instead of session-id recovery).
+                    await streamer.flush_pending()
                 # Head only: the init line is the first line, and a 40-minute turn's stdout can
                 # be megabytes of tool events nobody needs here.
                 partial = await provider.exec_in_sandbox(thread_id, f"head -c 65536 {shlex.quote(out_path)} 2>/dev/null || true")
@@ -424,7 +602,7 @@ async def run_turn(
             # ever rechecked. Polling the exit file directly has no such failure mode -- a file's
             # existence doesn't depend on process-reaping semantics -- and the 2s remote sleep
             # interval is still all inside one exec call, so it costs nothing extra host-side.
-            chunk = min(remaining, _ACTIVITY_CHUNK_SECONDS)
+            chunk = min(remaining, _NARRATION_POLL_SECONDS if streaming else _ACTIVITY_CHUNK_SECONDS)
             probe = _pid_state_probe_script(pid_path)
             # The nested `timeout N sh -c '...'` is a separate process -- shell functions don't
             # cross that boundary -- so the probe body is inlined both places rather than defined
@@ -433,15 +611,67 @@ async def run_turn(
                 f"while [ ! -f {shlex.quote(exit_path)} ]; do "
                 f'state=$({probe}); [ "$state" = DEAD ] && break; sleep 2; done'
             )
-            wait_cmd = (
-                f"timeout {int(chunk) + 1} sh -c {shlex.quote(inner_script)} 2>/dev/null; "
+            status_check = (
                 f"if [ -f {shlex.quote(exit_path)} ]; then echo DONE; "
                 f'else state=$({probe}); if [ "$state" = DEAD ]; then echo DEAD; else echo PENDING; fi; fi'
             )
+            if streaming:
+                # Folded into the SAME per-iteration exec call as the completion check above --
+                # not a second exec call every poll, which would double an already ~40x call-volume
+                # increase (_NARRATION_POLL_SECONDS' own comment). The tailed bytes are base64'd
+                # BEFORE they cross exec_in_sandbox's own `.strip()` (local_docker._run_docker /
+                # azure_aci._run_az): splicing raw bytes into that same `.strip()`-ed stdout would
+                # silently corrupt trailing whitespace/newlines and drift byte_offset. `tr -d '\n'`
+                # strips base64's own line-wrapping so the payload is exactly one line between the
+                # two markers (_split_tail_poll_output's own docstring).
+                assert streamer is not None  # streaming implies classify_line was given
+                wait_cmd = (
+                    f"timeout {int(chunk) + 1} sh -c {shlex.quote(inner_script)} 2>/dev/null; "
+                    f"echo {shlex.quote(_TAIL_MARKER_START)}; "
+                    f"tail -c +{streamer.byte_offset + 1} {shlex.quote(out_path)} 2>/dev/null "
+                    f"| head -c {_MAX_TAIL_BYTES} | base64 | tr -d '\\n'; "
+                    f"echo ''; "
+                    f"echo {shlex.quote(_TAIL_MARKER_END)}; "
+                    f"{status_check}"
+                )
+            else:
+                wait_cmd = f"timeout {int(chunk) + 1} sh -c {shlex.quote(inner_script)} 2>/dev/null; {status_check}"
             check_result = await asyncio.wait_for(
                 provider.exec_in_sandbox(thread_id, wait_cmd, timeout_seconds=chunk + 20.0),
                 timeout=chunk + 30.0,
             )
+            if streaming:
+                assert streamer is not None
+                stdout_text = check_result.stdout if check_result.ok else ""
+                b64_payload, status = _split_tail_poll_output(stdout_text)
+                new_bytes = b""
+                if b64_payload:
+                    try:
+                        new_bytes = base64.b64decode(b64_payload)
+                    except (binascii.Error, ValueError):
+                        new_bytes = b""
+                # A read that hit the cap may not have reached the current end of out_path yet --
+                # if DONE also fired this same iteration, don't break (and don't discard pending as
+                # "presumed terminal") until a follow-up, uncapped read actually catches up. Once
+                # exit_path exists, the wrapped `timeout N sh -c '...'` above returns near-instantly
+                # on every subsequent iteration (its `while` condition is false immediately), so
+                # this costs a few fast extra round trips, never a real wait.
+                hit_cap = len(new_bytes) >= _MAX_TAIL_BYTES
+                await streamer.consume_tail(new_bytes)
+                if status == "DONE" and not hit_cap:
+                    break
+                if status == "DEAD":
+                    await streamer.flush_pending()
+                    partial = await provider.exec_in_sandbox(
+                        thread_id, f"head -c 65536 {shlex.quote(out_path)} 2>/dev/null || true"
+                    )
+                    raise TurnCrashed(
+                        f"backgrounded turn process (pid file {pid_path}) died without writing "
+                        f"{exit_path} -- zombie/gone in /proc, exit code never captured "
+                        f"(elapsed={elapsed:.0f}s of {timeout_seconds}s budget)",
+                        partial_stdout=partial.stdout if partial.ok else "",
+                    )
+                continue
             if check_result.ok and "DONE" in check_result.stdout:
                 break
             if check_result.ok and "DEAD" in check_result.stdout:
@@ -479,7 +709,31 @@ async def run_turn(
         except (ValueError, AttributeError):
             exit_code = 1
 
-        return TurnResult(stdout=stdout, stderr=stderr, exit_code=exit_code)
+        if os.environ.get("AIDW_LOG_LLM_IO"):
+            # Best-effort, never the reason a turn fails -- same contract as record_toolchain's
+            # host-side sink (preflight_nodes.py).
+            try:
+                log_path = _llm_io_log_path()
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "thread_id": thread_id,
+                                "command": command[:200],
+                                "exit_code": exit_code,
+                                "stdout": stdout,
+                            }
+                        )
+                        + "\n"
+                    )
+            except OSError:
+                logger.warning("could not append to the host-side LLM I/O log", exc_info=True)
+
+        return TurnResult(
+            stdout=stdout, stderr=stderr, exit_code=exit_code,
+            streamed_line_count=streamer.streamed_line_count if streamer is not None else 0,
+        )
     finally:
         # Cleanup (rm -f with glob removes the prefix and all siblings sharing it) now runs on
         # EVERY exit path, not just success -- previously a TimeoutError or a launch RuntimeError
@@ -584,6 +838,109 @@ def _demo() -> None:
     assert "/tmp/aidw-agent/test.pid" in probe
     assert 'echo ALIVE' in probe and 'echo DEAD' in probe
     assert '"$s" = Z' in probe, "must check the zombie state character"
+
+    # --- Agent Narration Drawer feature: parse_jsonl_line ---
+    assert parse_jsonl_line("") is None
+    assert parse_jsonl_line("   ") is None
+    assert parse_jsonl_line("not json") is None
+    assert parse_jsonl_line("[1, 2, 3]") is None, "a JSON array is not object-shaped"
+    assert parse_jsonl_line('{"a": 1}') == {"a": 1}
+    assert parse_jsonl_line('  {"a": 1}  ') == {"a": 1}, "surrounding whitespace must be stripped"
+
+    # --- _split_tail_poll_output: marker-delimited payload/status extraction ---
+    combined = f"{_TAIL_MARKER_START}\nSGVsbG8=\n{_TAIL_MARKER_END}\nDONE"
+    payload, status = _split_tail_poll_output(combined)
+    assert payload == "SGVsbG8=" and status == "DONE", (payload, status)
+
+    empty_payload_combined = f"{_TAIL_MARKER_START}\n\n{_TAIL_MARKER_END}\nPENDING"
+    payload, status = _split_tail_poll_output(empty_payload_combined)
+    assert payload == "" and status == "PENDING", (payload, status)
+
+    # A base64 blob that happens to spell DONE/DEAD must never be mistaken for the status line --
+    # only the LAST non-empty line (past the END marker) counts.
+    tricky_combined = f"{_TAIL_MARKER_START}\nDEADBEEFDONE==\n{_TAIL_MARKER_END}\nPENDING"
+    payload, status = _split_tail_poll_output(tricky_combined)
+    assert payload == "DEADBEEFDONE==" and status == "PENDING", (
+        f"a payload containing DONE/DEAD as substrings must not be mistaken for the status: {(payload, status)}"
+    )
+
+    # Missing markers entirely (e.g. the tail-read commands themselves failed) falls back to
+    # treating the whole output as status text -- same leniency the old substring search had.
+    payload, status = _split_tail_poll_output("DONE")
+    assert payload == "" and status == "DONE"
+
+    # --- _NarrationStreamer: the one-line-lag flush contract ---
+    #
+    # Fake persistence: records what was "persisted"/"emitted" without a real DB or graph run, same
+    # monkeypatching technique run_event_store._demo()/copilot_chat_model._demo() already use
+    # ("plain global reassignment").
+    flushed_batches: list[list[RunEvent]] = []
+    emitted: list[RunEvent] = []
+
+    async def _fake_append_events(events: list[RunEvent]) -> list[RunEvent]:
+        flushed_batches.append(list(events))
+        return events
+
+    async def _fake_emit_live(event: RunEvent) -> None:
+        emitted.append(event)
+
+    real_append_events = run_event_store.append_events
+    real_emit_live = run_event_stream.emit_live
+    run_event_store.append_events = _fake_append_events
+    run_event_stream.emit_live = _fake_emit_live
+
+    def _fake_classify(parsed: dict[str, Any]) -> list[RunEvent]:
+        return [RunEvent(run_id="r", session_id="s", type=RunEventType.REASONING, summary=parsed["marker"])]
+
+    try:
+        streamer = _NarrationStreamer(_fake_classify)
+
+        async def _drive() -> None:
+            # Two complete lines arrive in the SAME tail read: line1 flushes the instant line2 is
+            # recognized (a next line arriving is what proves the held-back one wasn't terminal --
+            # batch boundaries don't matter, only line-arrival order does), leaving line2 pending.
+            await streamer.consume_tail(b'{"marker": "line1"}\n{"marker": "line2"}\n')
+            assert [e.summary for e in emitted] == ["line1"], (
+                f"line1 should flush as soon as line2 proved it wasn't terminal, got {[e.summary for e in emitted]}"
+            )
+            assert streamer.streamed_line_count == 2
+
+            # A third line, in a LATER tail read, flushes line2 (the previously held-back line).
+            await streamer.consume_tail(b'{"marker": "line3"}\n')
+            assert [e.summary for e in emitted] == ["line1", "line2"], (
+                f"expected line1 and line2 flushed, line3 still pending, got {[e.summary for e in emitted]}"
+            )
+
+        asyncio.run(_drive())
+
+        # Simulated DONE: run_turn simply never calls flush_pending again on this path -- line3
+        # stays pending forever, discarded as the presumed terminal line (nothing new appears).
+        assert [e.summary for e in emitted] == ["line1", "line2"], (
+            "DONE must discard the final pending line, not flush it"
+        )
+
+        # Simulated DEAD/timeout instead: flush_pending IS called explicitly (run_turn's own
+        # timeout/DEAD branches) -- the pending line3 must flush, not be discarded, since a killed
+        # turn has no terminal result line at all.
+        asyncio.run(streamer.flush_pending())
+        assert [e.summary for e in emitted] == ["line1", "line2", "line3"], (
+            f"DEAD/timeout must flush the pending line too, got {[e.summary for e in emitted]}"
+        )
+        assert len(flushed_batches) == 3 and all(len(batch) == 1 for batch in flushed_batches)
+
+        # A classify_line that raises must not crash the streamer -- the bad line's narration is
+        # dropped, but streamed_line_count still advances (matches the legacy parser's own
+        # per-line-independent skip contract) and the turn keeps going.
+        def _raising_classify(parsed: dict[str, Any]) -> list[RunEvent]:
+            raise ValueError("boom")
+
+        raising_streamer = _NarrationStreamer(_raising_classify)
+        asyncio.run(raising_streamer.consume_tail(b'{"marker": "x"}\n{"marker": "y"}\n'))
+        assert raising_streamer.streamed_line_count == 2, "a raising classify_line must not stop line counting"
+    finally:
+        run_event_store.append_events = real_append_events
+        run_event_stream.emit_live = real_emit_live
+
     print("cli_agent_exec self-check: all assertions passed")
 
 

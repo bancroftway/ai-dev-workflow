@@ -8,6 +8,7 @@ import {
 } from "@copilotkit/react-core/v2";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { AgentNarrationDrawer } from "@/components/AgentNarrationDrawer";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
 import { LiveCostChip } from "@/components/LiveCostChip";
@@ -117,6 +118,12 @@ export function AppShell({
   const [runActivity, setRunActivity] = useRunActivity();
   const router = useRouter();
   const [stoppingContainer, setStoppingContainer] = useState(false);
+  // Agent Narration Drawer: plain local state, no new context -- AppShell already persists across
+  // tab switches (views are hidden, not unmounted), so this survives tab changes for free. Manual
+  // toggle only (no auto-open on a new turn starting): the pipeline advances through many turns
+  // without direct user action per turn, and auto-popping this over whatever tab someone's working
+  // in every time a turn starts would fight their navigation constantly.
+  const [narrationOpen, setNarrationOpen] = useState(false);
 
   const state = (agent.state ?? {}) as WorkflowState;
   const specification = state.stages?.specification;
@@ -541,6 +548,20 @@ export function AppShell({
                 </svg>
               </a>
             )}
+            {/* Agent Narration Drawer trigger -- reuses the exact same "is a turn running" OR the
+                global spinner above already computes, no new liveness signal invented. */}
+            <button
+              type="button"
+              onClick={() => setNarrationOpen((v) => !v)}
+              aria-label="Toggle agent activity drawer"
+              aria-pressed={narrationOpen}
+              className="relative flex items-center gap-1.5 rounded-md border border-neutral-200 px-2 py-1.5 text-xs text-neutral-600 hover:bg-neutral-100"
+            >
+              Activity
+              {interruptElement == null && (agent.isRunning || runActivity?.runActive) && (
+                <span aria-hidden className="h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+              )}
+            </button>
             <ContainerStatusButton
               status={sandboxStatus}
               stopping={stoppingContainer}
@@ -639,6 +660,7 @@ export function AppShell({
           </div>
           <div hidden={activeView !== "overview"}><SessionOverview /></div>
         </main>
+        <AgentNarrationDrawer open={narrationOpen} onClose={() => setNarrationOpen(false)} />
       </div>
     </InterruptProvider>
   );

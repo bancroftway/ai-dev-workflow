@@ -33,11 +33,19 @@ import os
 import shutil
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from . import registry
 from .. import config as workflow_config
 from ..telemetry import traced_exec
-from .provider import ExecResult, SandboxProvider, SandboxSession, runtime_auth_env, wait_for_cli_ready
+from .provider import (
+    READY_TIMEOUT_SECONDS,
+    ExecResult,
+    SandboxProvider,
+    SandboxSession,
+    runtime_auth_env,
+    wait_for_cli_ready,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +55,15 @@ _REAP_POLL_SECONDS = 60.0
 WORKSPACE_DIR_IN_CONTAINER = "/workspace/repo"
 # Matches the image's own AIDW_CACHE_DIR and LocalDockerProvider's mount point.
 _CACHE_DIR_IN_CONTAINER = "/opt/aidw/cache"
+
+# Mirrors local_docker.py's identical constant/reasoning: the readiness `_exec` closure below runs
+# ONE `az container exec` that legitimately blocks for up to provider.READY_TIMEOUT_SECONDS + 10.0
+# (wait_for_cli_ready's own outer asyncio.wait_for). This exec's OWN _run_az timeout must stay
+# comfortably above that so the outer wait_for -- "a safety margin ... not the normal exit path" --
+# is what actually fires on a genuine hang, never _run_az's own fast-admin default (added alongside
+# _run_az's timeout fix below; before that fix _run_az had no timeout at all, so this had nothing
+# to conflict with).
+_READINESS_EXEC_TIMEOUT_SECONDS = READY_TIMEOUT_SECONDS + 30.0
 
 
 def _container_group_name(session_id: str) -> str:
@@ -74,12 +91,48 @@ def _resolve_az_executable() -> str:
     return resolved
 
 
-async def _run_az(*args: str) -> tuple[int, str, str]:
+async def _run_az(*args: str, timeout_seconds: float | None = None) -> tuple[int, str, str]:
+    """Mirrors local_docker.py's _run_docker exactly (same timeout/cancellation/decode shape) --
+    this function used to have none of that: no timeout at all (a real, previously-flagged bug --
+    see exec_in_sandbox's own former "ponytail: timeout_seconds accepted-but-unused" comment,
+    removed now that this fixes it), no asyncio.CancelledError handling (an outer wait_for hitting
+    its own deadline first would leave this `az` client process running rather than reaped), and a
+    strict stdout/stderr decode (the identical latent crash local_docker.py's own module docstring
+    already documents fixing for arbitrary sandboxed output -- a screenshot's raw PNG bytes, say --
+    fixed here the same way: errors="replace")."""
+    resolved_timeout = (
+        timeout_seconds if timeout_seconds is not None else workflow_config.SANDBOX_DOCKER_TIMEOUT_SECONDS
+    )
     proc = await asyncio.create_subprocess_exec(
         _resolve_az_executable(), *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    stdout, stderr = await proc.communicate()
-    return proc.returncode or 0, stdout.decode().strip(), stderr.decode().strip()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=resolved_timeout)
+    except TimeoutError:
+        # OUR OWN deadline fired -- az itself is wedged. Every call here is a plain
+        # `az <argv...>` (no shell=True, no pipeline), so proc.kill() alone reaps the right thing.
+        # Return a failure tuple in the SAME shape every existing caller already inspects via
+        # `if returncode != 0` -- never raise: a timeout is just one more kind of az-command
+        # failure to every caller in this file.
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        return (-1, "", f"az {' '.join(args)} timed out after {resolved_timeout}s")
+    except asyncio.CancelledError:
+        # An OUTER asyncio.wait_for (wait_for_cli_ready, or run_turn's poll loop) hit its own
+        # deadline first and is cancelling us. Kill + reap so the az client process doesn't leak,
+        # then re-raise -- swallowing CancelledError here would break asyncio's cancellation
+        # contract. The returncode-is-None guard covers the narrow race where the process already
+        # exited in the instant before this handler ran.
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        raise
+    return (
+        proc.returncode or 0,
+        stdout.decode(errors="replace").strip(),
+        stderr.decode(errors="replace").strip(),
+    )
 
 
 @dataclass
@@ -217,7 +270,10 @@ class AzureContainerInstanceProvider(SandboxProvider):
             # Best-effort cleanup of a stale container group from a previous, uncleanly-terminated
             # run under the same session_id -- `az container create --name` fails outright if a
             # group with that name still exists.
-            await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
+            await _run_az(
+                "container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes",
+                timeout_seconds=workflow_config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
+            )
 
             args = [
                 "container", "create",
@@ -305,8 +361,14 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 if attempt > 0:
                     # This loop's own previous attempt's group, named identically -- `az container
                     # create --name` fails outright if it's still around.
-                    await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
-                returncode, stdout, stderr = await _run_az(*args)
+                    await _run_az(
+                        "container", "delete", "--resource-group", self._resource_group,
+                        "--name", name, "--yes",
+                        timeout_seconds=workflow_config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
+                    )
+                returncode, stdout, stderr = await _run_az(
+                    *args, timeout_seconds=workflow_config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS
+                )
                 if returncode != 0:
                     raise RuntimeError(f"az container create failed for session {session_id!r}: {stderr}")
                 try:
@@ -318,13 +380,18 @@ class AzureContainerInstanceProvider(SandboxProvider):
                             "--resource-group", self._resource_group,
                             "--name", name,
                             "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {cmd}\"",
+                            timeout_seconds=_READINESS_EXEC_TIMEOUT_SECONDS,
                         )
 
                     await wait_for_cli_ready(_exec, version_command=f"{provider} --version")
                     last_exc = None
                     break
                 except Exception as exc:
-                    await _run_az("container", "delete", "--resource-group", self._resource_group, "--name", name, "--yes")
+                    await _run_az(
+                        "container", "delete", "--resource-group", self._resource_group,
+                        "--name", name, "--yes",
+                        timeout_seconds=workflow_config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
+                    )
                     last_exc = exc
                     if attempt < attempts - 1:
                         logger.warning(
@@ -385,6 +452,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
             "--resource-group", self._resource_group,
             "--name", sandbox.container_name,
             "--yes",
+            timeout_seconds=workflow_config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
         )
 
     async def list_active(self) -> list[str]:
@@ -395,10 +463,6 @@ class AzureContainerInstanceProvider(SandboxProvider):
     async def exec_in_sandbox(
         self, session_id: str, command: str, *, timeout_seconds: float | None = None
     ) -> ExecResult:
-        # ponytail: timeout_seconds accepted-but-unused -- interface parity with
-        # LocalDockerProvider so cli_agent_exec.py's shared poll-loop call site doesn't break this
-        # provider at runtime. _run_az has the identical no-timeout bug shape as
-        # local_docker.py's pre-fix _run_docker; fixing that is an explicit follow-up.
         async with self._lock:
             sandbox = self._sandboxes.get(session_id)
             if sandbox is not None:
@@ -412,6 +476,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
             "--resource-group", self._resource_group,
             "--name", sandbox.container_name,
             "--exec-command", f"/bin/sh -c \"cd {WORKSPACE_DIR_IN_CONTAINER} && {command}\"",
+            timeout_seconds=timeout_seconds,
         )
         return ExecResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -432,3 +497,67 @@ class AzureContainerInstanceProvider(SandboxProvider):
             for session_id in idle_session_ids:
                 logger.info("Reaping idle ACI sandbox session_id=%s", session_id)
                 await self.terminate(session_id)
+
+
+async def _run_az_timeout_check() -> None:
+    """The one thing worth self-checking without a real, authenticated `az`/subscription (this
+    module otherwise has none -- provision/exec_in_sandbox all need a live Azure environment): the
+    `_run_az` timeout fix itself. Monkeypatches `_resolve_az_executable` to point at the current
+    Python interpreter (always available, no `az` CLI or credentials needed) running a deliberately
+    slow script, and wraps `asyncio.create_subprocess_exec` to capture the spawned Process object so
+    this can assert it was actually reaped (`.wait()`ed on), not merely killed-and-abandoned.
+    """
+    import sys
+
+    global _resolve_az_executable
+    real_resolve = _resolve_az_executable
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+    captured_procs: list[asyncio.subprocess.Process] = []
+
+    async def _capturing_create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        proc = await real_create_subprocess_exec(*args, **kwargs)
+        captured_procs.append(proc)
+        return proc
+
+    _resolve_az_executable = lambda: sys.executable  # noqa: E731 -- self-check monkeypatch only
+    asyncio.create_subprocess_exec = _capturing_create_subprocess_exec
+    try:
+        returncode, stdout, stderr = await _run_az(
+            "-c", "import time; time.sleep(5)", timeout_seconds=0.3
+        )
+        assert returncode == -1, f"expected -1 on timeout, got {returncode}"
+        assert stdout == "", f"expected empty stdout on timeout, got {stdout!r}"
+        assert "timed out" in stderr, f"expected a 'timed out' message in stderr, got {stderr!r}"
+        assert len(captured_procs) == 1, captured_procs
+        assert captured_procs[0].returncode is not None, (
+            "the slow subprocess must be killed AND reaped (awaited), not merely fired-and-forgotten"
+        )
+
+        # A call that finishes well within its timeout must behave normally -- the fix must not
+        # regress the ordinary, non-timing-out case.
+        returncode, stdout, stderr = await _run_az("-c", "print('hello')", timeout_seconds=10.0)
+        assert returncode == 0 and stdout == "hello" and stderr == "", (returncode, stdout, stderr)
+    finally:
+        _resolve_az_executable = real_resolve
+        asyncio.create_subprocess_exec = real_create_subprocess_exec
+
+
+def _demo() -> None:
+    """Self-check for the `_run_az` timeout/cancellation/decode fix -- see
+    _run_az_timeout_check's own docstring for why this is the one thing checkable without a real
+    Azure environment. Everything else in this module (provision, exec_in_sandbox against a real
+    container group, the idle reaper) needs a live, authenticated `az` CLI and a provisioned
+    resource group/sandbox image -- neither exists in this environment (confirmed: `az account
+    show` succeeds, but AZURE_RESOURCE_GROUP/AZURE_ACI_SANDBOX_IMAGE are unset) -- so those stay
+    unverified here, same as before this fix, and are tracked as a follow-up once ACI is actually
+    provisioned.
+    """
+    asyncio.run(_run_az_timeout_check())
+    print("azure_aci self-check: all assertions passed")
+
+
+if __name__ == "__main__":  # pragma: no cover -- cd agent && .venv/Scripts/python.exe -m src.sandbox.azure_aci
+    # Unlike cli_agent_exec.py/copilot_chat_model.py/claude_chat_model.py, no module-level mutable
+    # state here (no session-id cache) -- a double-import via the package name buys nothing, so no
+    # re-dispatch needed.
+    _demo()

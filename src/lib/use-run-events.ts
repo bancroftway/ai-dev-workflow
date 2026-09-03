@@ -82,6 +82,30 @@ export function toolNameOf(e: RunLogEvent): string | null {
   return m ? m[1] : "tool";
 }
 
+function truncateOneLine(s: string, max: number): string {
+  const oneLine = s.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
+}
+
+/** One-line arg preview for a dense tool-call row (Agent Narration Drawer feature; recovered from
+ * the deleted EventLogView.tsx's identical helper, git show 7a37340^:src/components/
+ * EventLogView.tsx). Claude's shape wraps args in `payload.input`; Copilot's uncorrelated shape (no
+ * confirmed real example yet -- copilot_chat_model.py's own docstring) has no such wrapper, so this
+ * also tries a couple of plausible top-level keys directly on `payload` before giving up and
+ * showing no arg summary at all -- never throws, never assumes either shape. */
+export function argSummary(payload: Record<string, unknown> | null): string | null {
+  if (!payload) return null;
+  const input = payload.input;
+  if (input && typeof input === "object") {
+    const obj = input as Record<string, unknown>;
+    const preferred = obj.command ?? obj.file_path ?? obj.path ?? obj.pattern;
+    if (typeof preferred === "string") return truncateOneLine(preferred, 80);
+  }
+  if (typeof input === "string") return truncateOneLine(input, 80);
+  const direct = payload.path ?? payload.command ?? payload.file;
+  return typeof direct === "string" ? truncateOneLine(direct, 80) : null;
+}
+
 /** Human-readable duration, shared so a span reads identically in EventLogView's row detail and
  * Swimlane's bars/tooltips. */
 export function formatDuration(ms: number): string {

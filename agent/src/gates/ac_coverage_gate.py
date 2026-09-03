@@ -180,16 +180,31 @@ MIN_NON_E2E_TESTS_PER_AC_RED = int(os.environ.get("MIN_NON_E2E_TESTS_PER_AC_RED"
 _INTEGRATION_SYMBOLS = ("WebApplicationFactory", "TestServer", "HttpClient", "createServer", "supertest", "TestClient")
 
 
-def classify_test_level(path: str, contents: str) -> str:
-    """'e2e' | 'integration' | 'unit'. Pure."""
+def classify_test_level(path: str, contents: str, resolved_root: str | None = None) -> str:
+    """'e2e' | 'integration' | 'unit'. Pure.
+
+    `resolved_root` is the same tech-stack root `write_scope_gate._resolve_web_root` resolves.
+    Optional and defaulting to None (the old location-only-regex behavior, unchanged) so every
+    existing call site keeps working; passed explicitly (today, only ac-to-tests' own RED-phase
+    depth check), an e2e-shaped path outside `{resolved_root}/tests/e2e/` no longer counts as "e2e"
+    -- the exact flattening bug this pipeline exists to catch, where crediting it here would let a
+    UI story pass depth thresholds on a browser test that Playwright's own `testDir` will never
+    actually run.
+    """
     if _E2E_PATH_RE.search(path):
-        return "e2e"
+        if resolved_root is None:
+            return "e2e"
+        expected_prefix = f"{resolved_root}/tests/e2e/" if resolved_root else "tests/e2e/"
+        if path.startswith(expected_prefix):
+            return "e2e"
     if any(symbol in contents for symbol in _INTEGRATION_SYMBOLS):
         return "integration"
     return "unit"
 
 
-def count_tests_per_ac(ac_ids: list[str], test_files: dict[str, str]) -> dict[str, dict[str, int]]:
+def count_tests_per_ac(
+    ac_ids: list[str], test_files: dict[str, str], resolved_root: str | None = None
+) -> dict[str, dict[str, int]]:
     """Per AC: how many tests name it, split by level.
 
     A "test" is counted per test-declaring line mentioning the id, not per file: one file commonly
@@ -198,7 +213,7 @@ def count_tests_per_ac(ac_ids: list[str], test_files: dict[str, str]) -> dict[st
     """
     counts = {ac: {"unit": 0, "integration": 0, "e2e": 0} for ac in ac_ids}
     for path, contents in test_files.items():
-        level = classify_test_level(path, contents)
+        level = classify_test_level(path, contents, resolved_root)
         for line in contents.splitlines():
             # Shared with the anti-padding checks below, so "what is a test" is defined once.
             if not _TEST_DECL_RE.search(line):
@@ -1162,7 +1177,15 @@ async def check_ac_coverage(
             test_files[path] = contents
     depth_shortfall: dict[str, list[str]] = {}
     if test_files:
-        counts = count_tests_per_ac(active_ac_ids, test_files)
+        # Same tech-stack root the ac-to-tests prompt's web-root segment and write_scope_gate's
+        # own boolean e2e check resolve (write_scope_gate._resolve_web_root) -- keeps a misplaced
+        # e2e-shaped file from padding the "e2e" bucket here too, the same flattening bug this
+        # whole gate exists to catch. Lazy import: write_scope_gate imports THIS module at call
+        # time (verify_ac_to_tests), so a module-level import here would be circular.
+        from .write_scope_gate import _resolve_web_root
+
+        resolved_root, strict = await _resolve_web_root(provider, thread_id)
+        counts = count_tests_per_ac(active_ac_ids, test_files, resolved_root if strict else None)
         ui_relevant = _ui_relevant_ac_ids(content_dict, active_ac_ids)
         # RED-phase threshold: this gate runs at ac-to-tests, before any implementation exists.
         # See MIN_NON_E2E_TESTS_PER_AC_RED for why it is not the full requirement.
@@ -1288,6 +1311,15 @@ def _demo() -> None:
     assert classify_test_level("apps/web/tests/e2e/a.spec.ts", "x") == "e2e"
     assert classify_test_level("apps/api.Tests/T.cs", "new WebApplicationFactory<Program>();") == "integration"
     assert classify_test_level("apps/api.Tests/T.cs", "Assert.Equal(1, s.Value);") == "unit"
+    # resolved_root defaults to None (unchanged, location-only regex) -- every call site above and
+    # every existing count_tests_per_ac self-test below stays correct without passing it.
+    assert classify_test_level("e2e/login.spec.ts", "x") == "e2e"
+    # Passed explicitly (ac-to-tests' own RED-phase depth check does this), the SAME path is a
+    # misplaced spec relative to the resolved web-app root -- Playwright's testDir would never run
+    # it from there, so it no longer counts as "e2e", falling through to unit/integration-by-symbol
+    # like any other file instead of padding the e2e bucket on a browser test that can't run.
+    assert classify_test_level("e2e/login.spec.ts", "x", "apps/web") == "unit"
+    assert classify_test_level("apps/web/tests/e2e/a.spec.ts", "x", "apps/web") == "e2e"
 
     # Counting is per TEST, not per file: one file routinely holds several tests for one criterion.
     files = {
@@ -1300,6 +1332,14 @@ def _demo() -> None:
     counts = count_tests_per_ac(["US-0001.1", "US-0002.1"], files)
     assert counts["US-0001.1"] == {"unit": 2, "integration": 0, "e2e": 1}, counts
     assert counts["US-0002.1"] == {"unit": 0, "integration": 1, "e2e": 0}, counts
+
+    # Same files, but the e2e spec is at a misplaced path relative to a confidently-resolved root:
+    # with resolved_root passed explicitly, it drops out of the "e2e" bucket (unchanged default
+    # behavior above still counts it, proving the parameter is additive, not a breaking change).
+    misplaced_files = dict(files)
+    misplaced_files["e2e/a.spec.ts"] = misplaced_files.pop("apps/web/tests/e2e/a.spec.ts")
+    misplaced_counts = count_tests_per_ac(["US-0001.1", "US-0002.1"], misplaced_files, "apps/web")
+    assert misplaced_counts["US-0001.1"] == {"unit": 3, "integration": 0, "e2e": 0}, misplaced_counts
 
     # US-0001.1 satisfies both thresholds; US-0002.1 fails depth AND has no browser test.
     short = depth_shortfalls(counts, ui_relevant={"US-0001.1", "US-0002.1"})
