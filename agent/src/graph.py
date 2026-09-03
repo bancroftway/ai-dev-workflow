@@ -516,6 +516,25 @@ def _reviewer_feedback_message(stage: StageState) -> HumanMessage | None:
     return HumanMessage(content=f"A human reviewer rejected your previous draft and left this feedback: {feedback}")
 
 
+def _verification_feedback_message(stage: StageState) -> HumanMessage | None:
+    """Shared by every build_prompt whose stage carries a StageSpec.deterministic_verify gate --
+    folds the gate's own rejection reason (VerificationResult.feedback, stashed on
+    stage["last_verification"]) into the next draft or audit call. Mirrors
+    _reviewer_feedback_message's shape, but reads a deliberately separate field (see
+    StageState.reviewer_feedback's own comment on why the two never merge): a script's verdict,
+    not a human's opinion. Guards on passed is False specifically, not mere presence -- a stray
+    last_verification left over from an earlier PASS must never be misread as a rejection."""
+    last = stage.get("last_verification")
+    if not last or last.get("passed") is not False:
+        return None
+    feedback = last.get("feedback")
+    if not feedback:
+        return None
+    return HumanMessage(
+        content=f"The previous attempt was rejected by the deterministic verification gate:\n\n{feedback}"
+    )
+
+
 def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
     requirements_text = f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"
@@ -560,6 +579,9 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     feedback_message = _reviewer_feedback_message(stage)
     if feedback_message is not None:
         messages.append(feedback_message)
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -593,6 +615,9 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
     feedback_message = _reviewer_feedback_message(plan_stage)
     if feedback_message is not None:
         messages.append(feedback_message)
+    verify_feedback_message = _verification_feedback_message(plan_stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -1031,12 +1056,60 @@ AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft").replace(
 
 AC_TO_TESTS_GREENFIELD_SEGMENT = load_prompt("ac_to_tests_greenfield_segment")
 
+# Resolves the model an exact web-app root instead of the system prompt's illustrative "e.g.
+# apps/web/" -- observed live: generated Playwright specs flattened to the repo root instead of
+# the intended tests/e2e/ subdirectory. Uses tech_stack_signals.convention_root, the SAME signal
+# Phase 3's deterministic gate (write_scope_gate._resolve_web_root/_classify_e2e_paths) checks the
+# result against, so the prompt and the gate can never resolve two different roots for the same run.
+AC_TO_TESTS_WEB_ROOT_SEGMENT = load_prompt("ac_to_tests_web_root_segment")
+
 # Appended only when spec_ledger.hydrate_ac_to_tests_ticket_mode_context (StageSpec.
 # draft_prompt_context_from_repo_file) finds ledger ACs beyond this ticket's own approved
 # Specification -- a genuine multi-ticket project, not merely "the ledger has entries" (which is
 # trivially true by ac-to-tests time even on a project's first-ever ticket, since specification's
 # own sync_ledger run just populated it moments before).
 AC_TO_TESTS_TICKET_MODE_SEGMENT = load_prompt("ac_to_tests_ticket_mode_segment")
+
+
+def _web_root_segment_message(state: "GraphState") -> HumanMessage:
+    """Resolves the model an exact web-app root instead of the system prompt's illustrative "e.g.
+    apps/web/" -- observed live (provider=copilot): generated Playwright specs flattened to the
+    repo root instead of the intended tests/e2e/ subdirectory. Uses
+    tech_stack_signals.convention_root, the SAME signal write_scope_gate._resolve_web_root checks
+    the result against (that gate re-derives it independently from disk, since deterministic_verify
+    has no `state` access -- see its own docstring), so the prompt and the gate can never resolve
+    two different roots for the same run.
+
+    Three branches, not two: a None root is not always "nothing exists yet" -- TechStack's own
+    prompt (tech_stack_draft.md) deliberately reports status="absent" both for genuine greenfield
+    AND for an ambiguous multi-root monorepo, and those two need different advice. Defaulting an
+    ambiguous real repo to the repo root would be a confidently wrong answer, not a safe fallback.
+    """
+    tech_stack = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
+    root = tech_stack_signals.convention_root(tech_stack, "node")
+    if root is not None:
+        where = "the repo root itself" if root == "" else f"`{root}`"
+        test_dir = f"{root}/tests/e2e" if root else "tests/e2e"
+        instruction = (
+            f"This repo's web app root is {where}. Write `playwright.config.ts` and every spec "
+            f"under `{test_dir}/*.spec.ts` -- not at the repo root (unless that IS the resolved "
+            "root above), and not anywhere else."
+        )
+    elif tech_stack_signals.is_greenfield_repo(state):
+        instruction = (
+            "No web-app root exists yet (this is a greenfield repository). Use the repo root "
+            "itself: write `playwright.config.ts` and `tests/e2e/*.spec.ts` directly under the "
+            "repo root."
+        )
+    else:
+        instruction = (
+            "This repo's web-app root could not be automatically determined (more than one "
+            "plausible location, or none confidently detected). Inspect the repo yourself to find "
+            "the real web app directory (e.g. `apps/web/`, `client/`, `frontend/` -- whatever this "
+            "repo actually uses) and write `playwright.config.ts` and `tests/e2e/*.spec.ts` there. "
+            "Do not default to the repo root without checking."
+        )
+    return HumanMessage(content=AC_TO_TESTS_WEB_ROOT_SEGMENT.replace("<<web_root_instruction>>", instruction))
 
 
 def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
@@ -1056,18 +1129,28 @@ def _build_ac_to_tests_prompt(state: GraphState) -> list[BaseMessage]:
     if state.get("test_users"):
         messages.append(_test_users_segment_message(state))
     messages.append(HumanMessage(content=MEMORY_SEGMENT))
+    if _tech_stack_has_ui_framework(state):
+        messages.append(_web_root_segment_message(state))
     if tech_stack_signals.is_greenfield_repo(state):
         messages.append(HumanMessage(content=AC_TO_TESTS_GREENFIELD_SEGMENT))
     # Not a StageState field -- see hydrate_plan_ticket_mode_context's docstring for the general
     # shape (this stage's own copy lives in spec_ledger.hydrate_ac_to_tests_ticket_mode_context).
     if stage.get("ticket_mode_baseline"):
         messages.append(HumanMessage(content=AC_TO_TESTS_TICKET_MODE_SEGMENT))
-    if stage["draft"] is not None:
+    # Omitted (not the usual "re-show the immediately-prior draft") specifically when the last
+    # verify failure was a missing/misplaced/ignored e2e spec (write_scope_gate.py's
+    # "missing_e2e" report key): the draft's own self-reported test_files metadata already claimed
+    # a Playwright spec that this gate could not find on disk, so re-feeding that same fabricated
+    # claim just re-seeds it next attempt. The failure feedback message below still says what went
+    # wrong. Only has teeth once the underlying CLI session has actually been reset
+    # (_detect_verify_stall) -- a `--resume`d session still carries the prior turn in the vendor
+    # CLI's own conversation regardless of what this reconstructed message list includes.
+    last_report = (stage.get("last_verification") or {}).get("report") or {}
+    if stage["draft"] is not None and not last_report.get("missing_e2e"):
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
-    if stage.get("last_verification"):
-        messages.append(
-            HumanMessage(content=f"The last verification attempt failed with: {stage['last_verification'].get('feedback')}")
-        )
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -1130,10 +1213,9 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
         messages.append(HumanMessage(content=MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior iteration (JSON):\n{stage['draft']}"))
-    if stage.get("last_verification"):
-        messages.append(
-            HumanMessage(content=f"The last coverage verification failed with: {stage['last_verification'].get('feedback')}")
-        )
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -1168,6 +1250,9 @@ def _build_exit_prompt(state: GraphState, stage_key: str = "metrics-exit") -> li
     ]
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior report (JSON):\n{stage['draft']}"))
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -1233,13 +1318,9 @@ def _build_remediation_prompt(state: GraphState) -> list[BaseMessage]:
     # code-simplifier agent, each shorter than the last, because the model was never told. The
     # docstring above rules out echoing a prior DRAFT (the scan is re-read live each attempt) --
     # that reasoning never applied to the gate's own verdict, which exists nowhere else.
-    if state["stages"]["remediation"].get("last_verification"):
-        messages.append(
-            HumanMessage(
-                content="Your previous attempt was rejected by the deterministic gate:\n\n"
-                f"{state['stages']['remediation']['last_verification'].get('feedback')}"
-            )
-        )
+    verify_feedback_message = _verification_feedback_message(state["stages"]["remediation"])
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -1297,13 +1378,9 @@ def _build_adversarial_compliance_prompt(state: GraphState) -> list[BaseMessage]
         HumanMessage(content=f"End-to-end run outcome (JSON):\n\n{_bounded_json(e2e_summary, 4000)}"),
     ]
     stage = state["stages"]["adversarial-compliance"]
-    if stage.get("draft") is not None and stage.get("last_verification"):
-        messages.append(
-            HumanMessage(
-                content="Your previous audit was rejected by the deterministic gate:\n\n"
-                f"{stage['last_verification'].get('feedback')}"
-            )
-        )
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -5062,6 +5139,89 @@ def _demo() -> None:
     assert any(
         AC_TO_TESTS_TICKET_MODE_SEGMENT in str(m.content)
         for m in _build_ac_to_tests_prompt(ac_demo_state)  # type: ignore[arg-type]
+    )
+
+    # _web_root_segment_message's three branches (Phase 1 of the ac-to-tests placement fix): a
+    # UI-framework tech-stack record is required to even see the segment (no UI, no Playwright
+    # requirement, no reason to tell the model a web-app root). TechStack.model_validate requires
+    # every field (tech_stack_signals.load_tech_stack fails closed to {} otherwise), so this fixture
+    # fills every required field like tech_stack_signals.py's own `_full` self-test fixture does.
+    def _tech_stack(frameworks_present: bool, convention_roots: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "summary": "s",
+            "languages": {"status": "absent", "reason": "test fixture"},
+            "frameworks": (
+                {"status": "present", "values": ["react"]}
+                if frameworks_present
+                else {"status": "absent", "reason": "test fixture"}
+            ),
+            "package_managers": {"status": "absent", "reason": "test fixture"},
+            "testing_frameworks": {"status": "absent", "reason": "test fixture"},
+            "conventions": {"status": "absent", "reason": "test fixture"},
+            "dotnet": {"status": "not_detected", "reason": "test fixture"},
+            "convention_roots": convention_roots,
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": {"status": "absent", "reason": "test fixture"},
+        }
+
+    def _ac_state(convention_roots: list[dict[str, Any]], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "stages": {
+                "specification": {"approved_content": own_spec},
+                "plan": {"approved_content": {}},
+                "tech-stack": {"approved_content": _tech_stack(True, convention_roots)},
+                "ac-to-tests": {**default_stage_state()},
+            },
+            "app_scan": {"candidates": candidates},
+        }
+
+    def _web_root_text(state: dict[str, Any]) -> str:
+        matches = [
+            str(m.content) for m in _build_ac_to_tests_prompt(state) if "WEB APP ROOT" in str(m.content)  # type: ignore[arg-type]
+        ]
+        assert len(matches) == 1, "expected exactly one web-root segment message"
+        return matches[0]
+
+    # Root present ("apps/web"): the model gets the exact resolved path, no "e.g.".
+    present_text = _web_root_text(_ac_state([{"ecosystem": "node", "status": "present", "root": "apps/web"}], [{"path": "."}]))
+    assert "apps/web" in present_text and "e.g." not in present_text, present_text
+
+    # Root absent + genuinely greenfield (no app_scan candidates): definite repo-root fallback.
+    greenfield_text = _web_root_text(_ac_state([{"ecosystem": "node", "status": "absent", "root": "", "reason": "test fixture"}], []))
+    assert "use the repo root" in greenfield_text.lower(), greenfield_text
+
+    # Root absent but NOT greenfield (a real, ambiguous multi-root repo): must NOT default to the
+    # repo root -- that would be a confidently wrong answer, not a safe fallback (Audit item 4).
+    ambiguous_text = _web_root_text(_ac_state([{"ecosystem": "node", "status": "absent", "root": "", "reason": "test fixture"}], [{"path": "."}]))
+    assert "use the repo root" not in ambiguous_text.lower(), ambiguous_text
+    assert "could not be automatically determined" in ambiguous_text, ambiguous_text
+
+    # No UI framework at all: the segment is skipped entirely, not just empty.
+    no_ui_state = _ac_state([{"ecosystem": "node", "status": "present", "root": "apps/web"}], [{"path": "."}])
+    no_ui_state["stages"]["tech-stack"]["approved_content"] = _tech_stack(
+        False, [{"ecosystem": "node", "status": "present", "root": "apps/web"}]
+    )
+    assert not any(
+        "WEB APP ROOT" in str(m.content) for m in _build_ac_to_tests_prompt(no_ui_state)  # type: ignore[arg-type]
+    )
+
+    # Phase 4 retry hygiene: the immediately-prior draft is omitted on retry specifically when the
+    # last verify failure was write_scope_gate's missing/misplaced/ignored e2e diagnosis
+    # ("missing_e2e" in its report) -- re-showing it would just re-seed the same fabricated
+    # test_files claim. Any OTHER failure reason still re-shows the draft as before.
+    retry_state = _ac_state([{"ecosystem": "node", "status": "present", "root": "apps/web"}], [{"path": "."}])
+    retry_state["stages"]["ac-to-tests"]["draft"] = {"test_files": {"foo.spec.ts": "..."}}
+    retry_state["stages"]["ac-to-tests"]["last_verification"] = {
+        "feedback": "You did NOT write a Playwright spec.",
+        "report": {"missing_e2e": True, "e2e_diagnosis": "misplaced"},
+    }
+    assert not any(
+        "immediately-prior draft" in str(m.content) for m in _build_ac_to_tests_prompt(retry_state)  # type: ignore[arg-type]
+    )
+    retry_state["stages"]["ac-to-tests"]["last_verification"]["report"] = {"e2e_only": True}
+    assert any(
+        "immediately-prior draft" in str(m.content) for m in _build_ac_to_tests_prompt(retry_state)  # type: ignore[arg-type]
     )
 
     # Task 7b: remediation's own ticket-mode reframe hook -- an earlier ticket's own accepted
