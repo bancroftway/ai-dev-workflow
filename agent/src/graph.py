@@ -812,13 +812,17 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
     return {"stages": stages, "app_auth": app_auth, "test_users": repo_test_users.get_for_thread(thread_id)}
 
 
-# Task 13b: one line per DISTINCT rejection reason inside _verify_specification_ledger below --
-# only the two reasons THIS function's own code decides on. spec_ledger.sync_ledger's own
-# id-resolution/status-transition validation (an unknown existing_us_id/existing_ac_id, retiring
-# a non-existent or wrong-kind id, etc.) is a WHOLLY SEPARATE module's logic (spec_ledger.py, a
-# different file) delegated to wholesale -- the same "check_ac_coverage lives in a different
-# file" exclusion Task 8 drew for write_scope_gate.py's verify_ac_to_tests, left out here for a
-# future task to add as its own rules constant if warranted.
+# Task 13b (revised on review): one line per DISTINCT rejection reason inside
+# _verify_specification_ledger AND spec_ledger.sync_ledger (agent/src/spec_ledger.py:183-458),
+# whose real logic this function's own docstring calls itself "just the SandboxProvider-I/O
+# wrapper" around. Unlike write_scope_gate.py's delegation to ac_coverage_gate.py's
+# check_ac_coverage (one peripheral check out of eight, correctly excluded by Task 8), sync_ledger
+# IS this gate's dominant rejection mode -- excluding it left the model warned about only ~13% of
+# how this stage actually rejects a draft. 13 distinct reasons.append(...) branches in
+# sync_ledger, one rule each: existing_us_id unknown/retired (2), story renumbering (1),
+# existing_ac_id unknown/wrong-parent/retired (3), AC renumbering (1), retired_us_ids
+# unknown-id/wrong-kind/revise-and-retire-contradiction (3), retired_ac_ids
+# unknown-id/wrong-kind/revise-and-retire-contradiction (3).
 SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "Never leave a clarifying question open -- every question you raised must be answered "
     "(status=answered, citing the wording that answers it) or explicitly assumed "
@@ -828,6 +832,34 @@ SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "verbatim (citing its id via existing_us_id/existing_ac_id) or explicitly retired via "
     "retired_us_ids/retired_ac_ids; silently dropping one because this redraft didn't touch it "
     "is rejected.",
+    "If you cite an existing_us_id when revising a story, that id must actually exist in the "
+    "ledger -- citing an id that was never allocated is rejected.",
+    "You may never cite a retired story's id via existing_us_id -- ids are never reused once "
+    "retired.",
+    "Never renumber an existing story -- if your own id field for a story disagrees with the "
+    "existing_us_id you cited for it, that is rejected as an attempted renumbering.",
+    "If you cite an existing_ac_id when revising a criterion, that id must actually exist in "
+    "the ledger -- citing an id that was never allocated is rejected.",
+    "An existing_ac_id you cite must belong to the SAME parent story you nest it under -- "
+    "citing a criterion under the wrong user story is rejected.",
+    "You may never cite a retired criterion's id via existing_ac_id -- ids are never reused "
+    "once retired.",
+    "Never renumber an existing criterion -- if your own id field for a criterion disagrees "
+    "with the existing_ac_id you cited for it, that is rejected as an attempted renumbering.",
+    "Every id you list in retired_us_ids must actually exist in the ledger -- an invented or "
+    "mistyped id is rejected.",
+    "Every id you list in retired_us_ids must actually be a user-story id, not an "
+    "acceptance-criterion id -- the wrong kind of id is rejected.",
+    "Never both revise and retire the same story in one draft -- citing a story's id in both "
+    "existing_us_id and retired_us_ids in the same response is a contradiction and is rejected.",
+    "Every id you list in retired_ac_ids must actually exist in the ledger -- an invented or "
+    "mistyped id is rejected.",
+    "Every id you list in retired_ac_ids must actually be an acceptance-criterion id, not a "
+    "user-story id -- the wrong kind of id is rejected (almost always the two retirement "
+    "fields swapped).",
+    "Never both revise and retire the same criterion in one draft -- citing a criterion's id "
+    "in both existing_ac_id and retired_ac_ids in the same response is a contradiction and is "
+    "rejected.",
 )
 
 
@@ -5196,9 +5228,10 @@ def _demo() -> None:
     # STAGES, also no deterministic_verify) is exempt the same way.
     assert stages_missing_rules(_ALL_STAGE_SPECS) == [], stages_missing_rules(_ALL_STAGE_SPECS)
 
-    # Task 13b: SPECIFICATION_HARD_RULES -- one line per real rejection branch this function's
-    # OWN code decides on (see the constant's own comment for what's excluded and why).
-    assert len(SPECIFICATION_HARD_RULES) == 2, len(SPECIFICATION_HARD_RULES)
+    # Task 13b: SPECIFICATION_HARD_RULES -- 2 rules from _verify_specification_ledger's own code
+    # plus 13 from spec_ledger.sync_ledger's reasons.append(...) branches (see the constant's own
+    # comment for the count breakdown).
+    assert len(SPECIFICATION_HARD_RULES) == 15, len(SPECIFICATION_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in SPECIFICATION_HARD_RULES)
 
     # Task 6: draft_example/draft_rules/audit_example/audit_rules actually reach the two

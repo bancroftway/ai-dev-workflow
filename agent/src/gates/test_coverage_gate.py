@@ -1118,14 +1118,21 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
     )
 
 
-# Task 13b: one line per DISTINCT rejection reason inside verify_coverage below, including every
-# reason folded into _missing_declared_frontend (2: signature absent, dependency absent) and
-# _check_integration_fidelity (4: unhosted backend, missing OTel, frontend-local-storage-only,
-# frontend-reimplements-its-own-backend) -- all defined in THIS file, so none of it is
-# out-of-scope delegation. check_ac_depth reuses two PURE counting helpers imported from
-# ac_coverage_gate.py, but the check itself (threshold, call site, feedback) is native here, not
-# delegated wholesale the way write_scope_gate.py's check_ac_coverage call was -- counted as one
-# rule of this gate's own.
+# Task 13b (revised on review): one line per DISTINCT rejection reason inside verify_coverage
+# below, including every reason folded into _missing_declared_frontend (2: signature absent,
+# dependency absent) and _check_integration_fidelity (4: unhosted backend, missing OTel,
+# frontend-local-storage-only, frontend-reimplements-its-own-backend) -- all defined in THIS
+# file, so none of it is out-of-scope delegation. check_ac_depth calls
+# ac_coverage_gate.depth_shortfalls with test_files populated (not just the two PURE counting
+# helpers, count_tests_per_ac/MIN_NON_E2E_TESTS_PER_AC) -- depth_shortfalls is itself a real
+# multi-branch decision function, same shape as check_plan_linkage/_check_integration_fidelity,
+# and gets the same unfolding: with test_files set (and content_dict NOT passed -- check_ac_depth
+# never passes it, so category_spread's happy-path-only branch never fires here) it activates 5
+# independent reject conditions, not 1: the min-non-e2e threshold, fiat-stub-test detection,
+# absence-only-test detection, distinct-assertion-target padding, and near-duplicate-test-body
+# detection. (ui_relevant is passed as an empty set by check_ac_depth on purpose -- see its own
+# docstring -- so depth_shortfalls' e2e/ui_relevant branch can never fire here and is correctly
+# NOT one of the 5.)
 MINIMAL_CODE_TO_GREEN_HARD_RULES: tuple[str, ...] = (
     "You must write real application code -- a repository containing only test files and "
     "pipeline artifacts, with no project manifest and no source files, is rejected outright.",
@@ -1153,9 +1160,25 @@ MINIMAL_CODE_TO_GREEN_HARD_RULES: tuple[str, ...] = (
     "the known-safe generated-code patterns to dodge the threshold -- that is gaming the gate, "
     "not legitimate exclusion.",
     "Coverage must meet the 95% threshold for BOTH line rate and branch rate.",
-    "Once coverage clears the threshold, every eligible acceptance criterion still needs "
-    "enough tests below the browser layer (unit/integration) -- a high aggregate percentage "
-    "does not excuse a criterion proven only through Playwright.",
+    "Once coverage clears the threshold, every eligible acceptance criterion still needs at "
+    "least 2 real tests below the browser layer (unit and/or integration) -- a high aggregate "
+    "percentage does not excuse a criterion proven only through Playwright.",
+    "None of an acceptance criterion's tests below the browser layer may fail by fiat "
+    "(Assert.True(false), Assert.Fail, expect(true).toBe(false), or similar placeholder "
+    "bodies) -- write the real arrange-act-assert against the not-yet-existing API; a "
+    "compile/module-resolution failure is the expected RED signal here, not a hardcoded "
+    "failure.",
+    "None of an acceptance criterion's tests may assert ONLY absence (toHaveCount(0), .not.*, "
+    "resolves.toBeUndefined(), Assert.Null/False, and similar) with no assertion that anything "
+    "is present -- add a positive anchor first, or the test passes just as well against a "
+    "blank screen or a function that does nothing.",
+    "Once an acceptance criterion has enough asserting tests to be checked, they must cover "
+    "at least 2 distinct assertion targets -- multiple tests that assert the same expression "
+    "with only a different literal count as one test, not several.",
+    "None of an acceptance criterion's tests may be a near-duplicate body of another test for "
+    "the same criterion (very high body similarity) -- a near-duplicate must differ in what it "
+    "ASSERTS (a different observable, or the same behavior tested at a different layer), not "
+    "just how it is arranged.",
 )
 
 
@@ -1661,8 +1684,9 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert "cd apps/web && timeout" in prov.commands[1] and "npx vitest run --coverage" in prov.commands[1], prov.commands[1]
 
     # Task 13b: MINIMAL_CODE_TO_GREEN_HARD_RULES -- one line per real rejection branch in
-    # verify_coverage (see the constant's own comment for the count breakdown).
-    assert len(MINIMAL_CODE_TO_GREEN_HARD_RULES) == 11, len(MINIMAL_CODE_TO_GREEN_HARD_RULES)
+    # verify_coverage, with depth_shortfalls' 5 independently-triggered conditions unfolded (see
+    # the constant's own comment for the full count breakdown).
+    assert len(MINIMAL_CODE_TO_GREEN_HARD_RULES) == 15, len(MINIMAL_CODE_TO_GREEN_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_HARD_RULES)
     print("test_coverage_gate self-check: all assertions passed")
 
