@@ -5420,6 +5420,79 @@ def _demo() -> None:
         "make_audit_node no longer threads audit_example/audit_rules into ainvoke_structured"
     )
 
+    # Verifier-feedback wiring proof (research-note fix): every draft/audit builder for a stage
+    # with a deterministic_verify gate must surface stage["last_verification"]["feedback"] when
+    # passed is False, and must inject nothing when passed is True or last_verification is absent
+    # -- the "presence-only" guard bug the note flagged. One shared base state covers all 11 call
+    # sites; each case only overrides its own stage's last_verification.
+    import copy
+
+    _VERIFY_FEEDBACK_MARKER = "verify-feedback-demo-marker-9f3a"
+    verify_feedback_base_state = {
+        "raw_requirements_text": "demo requirements",
+        "requirements_attachments": [],
+        "app_scan": {"candidates": [{"path": "."}]},
+        "test_users": [],
+        "e2e": {},
+        "metrics_report": {},
+        "stages": {
+            "specification": {**default_stage_state(), "approved_content": {}},
+            "plan": {**default_stage_state(), "approved_content": {}},
+            "ac-to-tests": {**default_stage_state(), "approved_content": {}},
+            "minimal-code-to-green": {**default_stage_state()},
+            "remediation": {**default_stage_state()},
+            "adversarial-compliance": {**default_stage_state()},
+            "metrics-exit": {**default_stage_state()},
+        },
+    }
+    _verify_feedback_cases = [
+        ("specification draft", _build_specification_prompt, "specification"),
+        ("specification audit", _build_specification_audit_prompt, "specification"),
+        ("plan draft", _build_plan_prompt, "plan"),
+        ("plan audit", _build_plan_audit_prompt, "plan"),
+        ("ac-to-tests draft", _build_ac_to_tests_prompt, "ac-to-tests"),
+        ("ac-to-tests audit", _build_ac_to_tests_audit_prompt, "ac-to-tests"),
+        ("minimal-code-to-green draft", _build_minimal_code_to_green_prompt, "minimal-code-to-green"),
+        ("minimal-code-to-green audit", _build_minimal_code_to_green_audit_prompt, "minimal-code-to-green"),
+        ("remediation draft", _build_remediation_prompt, "remediation"),
+        ("adversarial-compliance draft", _build_adversarial_compliance_prompt, "adversarial-compliance"),
+        ("metrics-exit draft", _build_exit_prompt, "metrics-exit"),
+    ]
+    for _label, _build_fn, _stage_key in _verify_feedback_cases:
+        rejected = copy.deepcopy(verify_feedback_base_state)
+        rejected["stages"][_stage_key]["last_verification"] = {
+            "passed": False, "feedback": _VERIFY_FEEDBACK_MARKER, "report": {},
+        }
+        assert any(_VERIFY_FEEDBACK_MARKER in str(m.content) for m in _build_fn(rejected)), (
+            f"{_label}: last_verification.feedback (passed=False) must reach the prompt"
+        )
+
+        passed = copy.deepcopy(verify_feedback_base_state)
+        passed["stages"][_stage_key]["last_verification"] = {
+            "passed": True, "feedback": _VERIFY_FEEDBACK_MARKER, "report": {},
+        }
+        assert not any(_VERIFY_FEEDBACK_MARKER in str(m.content) for m in _build_fn(passed)), (
+            f"{_label}: a passed=True last_verification must never be read as a rejection"
+        )
+
+        absent = copy.deepcopy(verify_feedback_base_state)
+        assert not any(_VERIFY_FEEDBACK_MARKER in str(m.content) for m in _build_fn(absent)), (
+            f"{_label}: no last_verification present must inject nothing"
+        )
+
+    # reviewer_feedback (human gate rejection) and last_verification (deterministic gate
+    # rejection) are independent channels (StageState.reviewer_feedback's own comment,
+    # graph.py:152-161) -- setting one must never surface, or suppress, the other's message.
+    independence_state = copy.deepcopy(verify_feedback_base_state)
+    independence_state["stages"]["specification"]["reviewer_feedback"] = "human-marker-only"
+    spec_messages = _build_specification_prompt(independence_state)
+    assert any("human-marker-only" in str(m.content) for m in spec_messages), (
+        "reviewer_feedback must still reach the prompt on its own"
+    )
+    assert not any(_VERIFY_FEEDBACK_MARKER in str(m.content) for m in spec_messages), (
+        "reviewer_feedback alone must not fabricate a verification-feedback message"
+    )
+
     print("graph self-check: all assertions passed")
 
 
