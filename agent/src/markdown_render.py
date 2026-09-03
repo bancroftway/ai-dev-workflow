@@ -34,19 +34,11 @@ def render_specification_markdown(content: dict[str, Any]) -> str:
                     lines.append(f"- **{ac.get('id', '')}**: {ac.get('description', '')}{ac_suffix}")
                 lines.append("")
 
-    assumptions = content.get("assumptions") or []
-    if assumptions:
-        lines.append("## Assumptions")
-        lines.append("")
-        lines.extend(f"- {a}" for a in assumptions)
-        lines.append("")
-
-    out_of_scope = content.get("out_of_scope") or []
-    if out_of_scope:
-        lines.append("## Out of Scope")
-        lines.append("")
-        lines.extend(f"- {item}" for item in out_of_scope)
-        lines.append("")
+    # assumptions/out_of_scope are PresenceList-shaped (schemas.py, Task 10) -- always render, so
+    # an absent section shows WHY (its reason) rather than silently vanishing like the old
+    # if-non-empty bare-list rendering did.
+    _render_presence_section(lines, content, "assumptions", "Assumptions")
+    _render_presence_section(lines, content, "out_of_scope", "Out of Scope")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -71,22 +63,23 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
             lines.append(f"- **{step.get('id', '')}**: {step.get('description', '')}{suffix}")
         lines.append("")
 
-    risk_notes = content.get("risk_notes") or []
-    if risk_notes:
-        lines.append("## Risk Notes")
-        lines.append("")
-        lines.extend(f"- {note}" for note in risk_notes)
-        lines.append("")
+    # risk_notes is PresenceList-shaped (schemas.py, Task 10) -- always render, reason when absent.
+    _render_presence_section(lines, content, "risk_notes", "Risk Notes")
 
+    # wireframes/diagrams are WireframePresence/DiagramPresence-shaped (schemas.py, Task 10), not a
+    # bare PresenceList -- their `values` are structured objects (Wireframe/PlanDiagram), not
+    # strings, so they get custom rendering, same "always show why, present or absent" convention
+    # as render_adversarial_audit_markdown's divergence_findings below.
+    #
     # Link, don't inline: the wireframes are self-contained HTML files written by plan verify to
     # plan/wireframes/<screen>.html (relative to this file's own .ai-dev-workflow/ home). Without
     # this section they were invisible from the plan document -- present on the branch, referenced
     # by the adversarial audit, and unfindable by a human reading 04-plan.md.
-    wireframes = content.get("wireframes") or []
-    if wireframes:
-        lines.append("## Wireframes")
-        lines.append("")
-        for wf in wireframes:
+    wireframes_entry = content.get("wireframes") or {}
+    lines.append("## Wireframes")
+    lines.append("")
+    if wireframes_entry.get("status") == "present":
+        for wf in wireframes_entry.get("values") or []:
             screen = str(wf.get("screen", "")).strip()
             if screen:
                 # GitHub renders the relative link as raw HTML source; the preview link (stamped by
@@ -103,19 +96,24 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
                 if ac_ids:
                     suffix += f" _(ACs: {', '.join(ac_ids)})_"
                 lines.append(f"- [{screen}](plan/wireframes/{screen}.html){suffix}")
-        lines.append("")
+    else:
+        lines.append(wireframes_entry.get("reason") or "(not checked)")
+    lines.append("")
 
-    diagrams = content.get("diagrams") or []
-    if diagrams:
-        lines.append("## Diagrams")
-        lines.append("")
-        for diagram in diagrams:
+    diagrams_entry = content.get("diagrams") or {}
+    lines.append("## Diagrams")
+    lines.append("")
+    if diagrams_entry.get("status") == "present":
+        for diagram in diagrams_entry.get("values") or []:
             lines.append(f"### {diagram.get('name', '')} ({diagram.get('kind', '')})")
             lines.append("")
             lines.append("```mermaid")
             lines.append((diagram.get("mermaid_source") or "").strip())
             lines.append("```")
             lines.append("")
+    else:
+        lines.append(diagrams_entry.get("reason") or "(not checked)")
+        lines.append("")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -123,9 +121,10 @@ def render_plan_markdown(content: dict[str, Any]) -> str:
 def _render_presence_section(lines: list[str], content: dict[str, Any], field: str, heading: str) -> None:
     """One PresenceList-shaped field (TechStack's languages/frameworks/package_managers/
     testing_frameworks/conventions/config_inventory, AdversarialAuditReport's
-    unresolved_risk_notes, MergeReadinessReport's blocking_reasons/risk_notes): its values when
-    status="present", else its `reason` -- a human reviewing this document should SEE why a
-    category came back empty, not just an absent section."""
+    unresolved_risk_notes, MergeReadinessReport's blocking_reasons/risk_notes, Specification's
+    assumptions/out_of_scope, ImplementationPlan's risk_notes): its values when status="present",
+    else its `reason` -- a human reviewing this document should SEE why a category came back
+    empty, not just an absent section."""
     entry = content.get(field) or {}
     lines.append(f"## {heading}")
     lines.append("")
@@ -317,7 +316,11 @@ def _demo() -> None:
         {
             "overview": "x",
             "plan_steps": [{"id": "PS-1", "description": "d", "ac_ids": ["US-0001.1"]}],
-            "wireframes": [{"screen": "task-list", "ac_ids": ["US-0001.1", "US-0001.2"]}],
+            # wireframes is WireframePresence-shaped (schemas.py, Task 10), not a bare list.
+            "wireframes": {
+                "status": "present",
+                "values": [{"screen": "task-list", "ac_ids": ["US-0001.1", "US-0001.2"]}],
+            },
         }
     )
     assert "_(ACs: US-0001.1)_" in md, md  # plan step's own suffix, unchanged
@@ -325,8 +328,41 @@ def _demo() -> None:
     assert "[task-list](plan/wireframes/task-list.html)" in md, md
 
     # No ac_ids on a wireframe (schema default is an empty list) -> no suffix, no crash.
-    md_no_ac_ids = render_plan_markdown({"overview": "x", "wireframes": [{"screen": "task-list"}]})
+    md_no_ac_ids = render_plan_markdown(
+        {"overview": "x", "wireframes": {"status": "present", "values": [{"screen": "task-list"}]}}
+    )
     assert "_(ACs:" not in md_no_ac_ids, md_no_ac_ids
+
+    # risk_notes/diagrams/wireframes absent -> each section renders its reason, not nothing.
+    md_absent = render_plan_markdown(
+        {
+            "overview": "x",
+            "risk_notes": {"status": "absent", "values": [], "reason": "no risks identified"},
+            "diagrams": {"status": "absent", "values": [], "reason": "trivial change, no diagram needed"},
+            "wireframes": {"status": "absent", "values": [], "reason": "no UI work in this plan"},
+        }
+    )
+    assert "no risks identified" in md_absent, "absent risk_notes must render its reason"
+    assert "trivial change, no diagram needed" in md_absent, "absent diagrams must render its reason"
+    assert "no UI work in this plan" in md_absent, "absent wireframes must render its reason"
+
+    # A minimal/legacy-shaped dict (fields missing entirely) must not crash.
+    assert render_plan_markdown({"overview": "x"})
+    assert render_plan_markdown({})
+
+    # render_specification_markdown: assumptions/out_of_scope are PresenceList-shaped -- present
+    # renders values, absent renders the reason.
+    spec_md = render_specification_markdown(
+        {
+            "title": "T",
+            "summary": "S",
+            "assumptions": {"status": "present", "values": ["users have a verified email"]},
+            "out_of_scope": {"status": "absent", "values": [], "reason": "nothing was excluded"},
+        }
+    )
+    assert "- users have a verified email" in spec_md, spec_md
+    assert "nothing was excluded" in spec_md, "absent out_of_scope must render its reason"
+    assert render_specification_markdown({"title": "T", "summary": "S"})
 
     # render_tech_stack_markdown: TechStack's PresenceList/DotnetStatus/EcosystemRoot fields are
     # nested objects now, not bare lists/dicts -- present renders values, absent renders the

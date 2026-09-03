@@ -2663,7 +2663,18 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 label=f"{stage_spec.key}:audit",
             )
             content_dict = getattr(response, stage_spec.audit_content_field).model_dump(mode="json")
-            audit_findings = list(response.audit_findings)
+            # response.audit_findings is a bare list[str] for some audit schemas (ac-to-tests,
+            # minimal-code-to-green) but a real PresenceList for others (Specification/Plan, since
+            # Task 10) -- this node is generic across every stage's audit_response_schema, so it
+            # must read whichever shape the model actually has rather than assuming one. A plain
+            # `list(...)` on a PresenceList instance would iterate its Pydantic field tuples
+            # (status/values/reason), not the finding strings.
+            _raw_audit_findings = response.audit_findings
+            audit_findings = (
+                list(_raw_audit_findings.values)
+                if isinstance(_raw_audit_findings, PresenceList)
+                else list(_raw_audit_findings)
+            )
         except (ValidationError, ValueError) as exc:
             # An adversarial second opinion that never actually parses (observed live: 3
             # consecutive attempts all truncated mid-JSON, same root output-length issue every

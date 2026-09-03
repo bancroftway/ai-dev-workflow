@@ -61,6 +61,16 @@ _WIREFRAME_FORBIDDEN = (
 )
 
 
+def _presence_values(entry: Any) -> list[dict[str, Any]]:
+    """DiagramPresence/WireframePresence-shaped dict (schemas.py, Task 10) -> its `values` list.
+    `content_dict` here is always freshly produced this run (stage["draft"] built from the current
+    ImplementationPlan schema), so it always carries the wrapped shape -- the bare-list fallback is
+    only for this module's own self-check fixtures and defense against a missing/None field."""
+    if isinstance(entry, dict):
+        return list(entry.get("values") or [])
+    return list(entry or [])
+
+
 def check_wireframe(screen: str, html_source: str) -> str | None:
     """Returns a rejection reason, or None if the wireframe is acceptable. Pure -- self-checkable
     without a sandbox."""
@@ -469,12 +479,19 @@ def _demo() -> None:
     assert check_ui_wireframe_coverage({"US-0001.1"}, [{"screen": "task-list", "ac_ids": ["US-0001.1"]}]) == []
     assert check_ui_wireframe_coverage(set(), [{"screen": "task-list", "ac_ids": []}]) == []
 
-    rendered = render_plan_markdown({"wireframes": [
+    # wireframes is WireframePresence-shaped (schemas.py, Task 10), not a bare list.
+    rendered = render_plan_markdown({"wireframes": {"status": "present", "values": [
         {"screen": "catalog", "html_source": "<html></html>", "preview_url": "https://html-preview.github.io/?url=x"},
         {"screen": "cart", "html_source": "<html></html>"},
-    ]})
+    ]}})
     assert "- [catalog](plan/wireframes/catalog.html) -- [preview](https://html-preview.github.io/?url=x)" in rendered, rendered
     assert "- [cart](plan/wireframes/cart.html)\n" in rendered, rendered
+
+    # _presence_values: the DiagramPresence/WireframePresence -> plain-list extraction this gate
+    # relies on throughout verify_plan_diagrams.
+    assert _presence_values({"status": "present", "values": [{"screen": "x"}], "reason": ""}) == [{"screen": "x"}]
+    assert _presence_values({"status": "absent", "values": [], "reason": "no UI work"}) == []
+    assert _presence_values(None) == []
     print("diagram_gate wireframe self-check: all assertions passed")
 
 
@@ -540,10 +557,13 @@ async def verify_plan_diagrams(
         for ac in (story.get("acceptance_criteria") or [])
         if ac.get("ui_related") and not ac.get("deferred")
     }
+    # wireframes is WireframePresence-shaped (schemas.py, Task 10): `{"status", "values", "reason"}`
+    # rather than a bare list -- extract its values once, reused by every check below.
+    wireframes = _presence_values(content_dict.get("wireframes"))
     linkage_problems = (
         check_plan_linkage(content_dict.get("plan_steps") or [], ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
-        + check_wireframe_ac_ids(content_dict.get("wireframes") or [], ledger_entries)
-        + check_ui_wireframe_coverage(ui_related_ac_ids, content_dict.get("wireframes") or [])
+        + check_wireframe_ac_ids(wireframes, ledger_entries)
+        + check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
     )
     if linkage_problems:
         return VerificationResult(
@@ -569,8 +589,9 @@ async def verify_plan_diagrams(
         changes = {ac_change_by_id.get(i) for i in (step.get("ac_ids") or [])}
         step["change"] = next((c for c in _CHANGE_PRIORITY if c in changes), None)
 
-    diagrams = content_dict.get("diagrams") or []
-    wireframes = content_dict.get("wireframes") or []
+    # diagrams is DiagramPresence-shaped (schemas.py, Task 10) -- same extraction as wireframes
+    # above (already computed; re-used here, not re-fetched from content_dict).
+    diagrams = _presence_values(content_dict.get("diagrams"))
 
     # Wireframes first: pure checks, no Chromium involved -- a broken wireframe should be cheap
     # feedback, not a render cycle. Same retry loop as diagram syntax failures.

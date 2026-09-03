@@ -157,9 +157,52 @@ class UserStory(BaseModel):
     )
 
 
+NonBlankStr = Annotated[str, StringConstraints(min_length=1, strip_whitespace=True)]
+"""A str that Pydantic rejects if empty or all-whitespace after stripping. Use in place of a bare
+`str` field anywhere blank is a silent way to mean "I have nothing to say" -- reasons, roots,
+anything meant to be read by a human or another gate."""
+
+
+class PresenceList(BaseModel):
+    """Typed replacement for a bare `list[str]` field whenever an empty list is ambiguous: did the
+    detector look and find nothing, or did it never look? `status` makes that explicit instead of
+    forcing every reader to guess from an empty list alone.
+    """
+
+    status: Literal["present", "absent"]
+    values: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_bare_list(cls, data: Any) -> Any:
+        """Older sidecars/model output stored this as a bare `list[str]` (or `None` for "nothing
+        found"). Coerce that shape into the typed one so existing producers aren't broken by this
+        field going from a list to an object."""
+        if isinstance(data, list):
+            if data:
+                return {"status": "present", "values": list(data)}
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        if data is None:
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        return data
+
+    @model_validator(mode="after")
+    def _validate_presence(self) -> "PresenceList":
+        if self.status == "present":
+            if not self.values:
+                raise ValueError("status='present' requires a non-empty values list.")
+        else:  # absent
+            if self.values:
+                raise ValueError("status='absent' requires an empty values list.")
+            if not self.reason.strip():
+                raise ValueError("status='absent' requires a non-blank reason.")
+        return self
+
+
 class Specification(BaseModel):
-    title: str
-    summary: str
+    title: NonBlankStr
+    summary: NonBlankStr
     work_kind: Literal["bug", "feature"] = Field(
         default="feature",
         description="What this ticket's raw requirements actually ask for: 'bug' when the text "
@@ -171,8 +214,15 @@ class Specification(BaseModel):
         "the fix depends on.",
     )
     user_stories: list[UserStory] = Field(default_factory=list)
-    assumptions: list[str] = Field(default_factory=list)
-    out_of_scope: list[str] = Field(default_factory=list)
+    assumptions: PresenceList = Field(
+        description="Explicit assumptions taken during drafting -- mirrors any question answered "
+        "with status='assumed' (see SpecQuestion.status) -- or an explicit absent+reason when "
+        "none were needed."
+    )
+    out_of_scope: PresenceList = Field(
+        description="Things explicitly decided NOT to build for this ticket, or an explicit "
+        "absent+reason when nothing was excluded."
+    )
     questions: list[SpecQuestion] = Field(
         default_factory=list,
         description="The COMPLETE question ledger -- every question ever raised across all "
@@ -241,6 +291,18 @@ class PlanStep(BaseModel):
         "removes_ids.",
     )
 
+    @model_validator(mode="after")
+    def _validate_ac_ids(self) -> "PlanStep":
+        """Enforces ac_ids' own docstring rule: empty is only valid for kind='infrastructure' --
+        every other step must cite at least one criterion. Infrastructure steps MAY still cite
+        ac_ids (this only permits empty for them, never requires it)."""
+        if self.kind != "infrastructure" and not self.ac_ids:
+            raise ValueError(
+                "ac_ids must be non-empty unless kind='infrastructure' -- see ac_ids' own "
+                "docstring."
+            )
+        return self
+
 
 class PlanDiagram(BaseModel):
     """A diagram authored as Mermaid source text, not driven interactively -- a deterministic
@@ -279,19 +341,92 @@ class Wireframe(BaseModel):
     )
 
 
+class DiagramPresence(BaseModel):
+    """Typed-absence wrapper for `ImplementationPlan.diagrams`, same shape/rules as `PresenceList`
+    (this module) but with `values: list[PlanDiagram]` -- PresenceList's own `values` is fixed to
+    `list[str]` (Task 1 deliberately avoided a `Generic[T]` wrapper), and a diagram is a structured
+    object, not a string. A trivial change with no diagrams states an explicit reason instead of an
+    empty list that could equally mean "never considered"."""
+
+    status: Literal["present", "absent"]
+    values: list[PlanDiagram] = Field(default_factory=list)
+    reason: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_bare_list(cls, data: Any) -> Any:
+        """Older sidecars/model output stored this as a bare `list[...]` (or `None` for "nothing
+        found"). Mirrors PresenceList._coerce_legacy_bare_list exactly -- duplicated here rather
+        than shared because the two wrappers' `values` element type differs."""
+        if isinstance(data, list):
+            if data:
+                return {"status": "present", "values": list(data)}
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        if data is None:
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        return data
+
+    @model_validator(mode="after")
+    def _validate_presence(self) -> "DiagramPresence":
+        if self.status == "present":
+            if not self.values:
+                raise ValueError("status='present' requires a non-empty values list.")
+        else:  # absent
+            if self.values:
+                raise ValueError("status='absent' requires an empty values list.")
+            if not self.reason.strip():
+                raise ValueError("status='absent' requires a non-blank reason.")
+        return self
+
+
+class WireframePresence(BaseModel):
+    """Typed-absence wrapper for `ImplementationPlan.wireframes` -- same rationale/shape as
+    `DiagramPresence` above, `values: list[Wireframe]`."""
+
+    status: Literal["present", "absent"]
+    values: list[Wireframe] = Field(default_factory=list)
+    reason: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_bare_list(cls, data: Any) -> Any:
+        """Mirrors PresenceList._coerce_legacy_bare_list exactly -- duplicated here rather than
+        shared because this wrapper's `values` element type differs."""
+        if isinstance(data, list):
+            if data:
+                return {"status": "present", "values": list(data)}
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        if data is None:
+            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
+        return data
+
+    @model_validator(mode="after")
+    def _validate_presence(self) -> "WireframePresence":
+        if self.status == "present":
+            if not self.values:
+                raise ValueError("status='present' requires a non-empty values list.")
+        else:  # absent
+            if self.values:
+                raise ValueError("status='absent' requires an empty values list.")
+            if not self.reason.strip():
+                raise ValueError("status='absent' requires a non-blank reason.")
+        return self
+
+
 class ImplementationPlan(BaseModel):
     overview: str
     plan_steps: list[PlanStep] = Field(default_factory=list)
-    risk_notes: list[str] = Field(default_factory=list)
-    diagrams: list[PlanDiagram] = Field(
-        default_factory=list,
-        description="ER/architecture/user-flow diagrams as needed to make the plan reviewable. "
-        "Empty is acceptable for a trivial change.",
+    risk_notes: PresenceList = Field(
+        description="Risks/tradeoffs called out during planning, or an explicit absent+reason "
+        "when none apply."
     )
-    wireframes: list[Wireframe] = Field(
-        default_factory=list,
-        description="One self-contained high-fidelity HTML wireframe per new or changed screen. "
-        "Empty for plans with no user-interface work. At most 6 screens.",
+    diagrams: DiagramPresence = Field(
+        description="ER/architecture/user-flow diagrams as needed to make the plan reviewable, "
+        "or an explicit absent+reason for a trivial change where one wouldn't add value."
+    )
+    wireframes: WireframePresence = Field(
+        description="One self-contained high-fidelity HTML wireframe per new or changed screen "
+        "(at most 6 screens), or an explicit absent+reason for a plan with no user-interface work."
     )
 
 
@@ -339,8 +474,8 @@ class SpecificationAuditResponse(BaseModel):
     """Structured output contract for the Specification adversarial-audit node."""
 
     revised_specification: Specification
-    audit_findings: list[str] = Field(
-        default_factory=list, description="Gaps found and fixed. Empty if none were found."
+    audit_findings: PresenceList = Field(
+        description="Gaps found and fixed, or an explicit absent+reason when none were found."
     )
 
 
@@ -348,52 +483,9 @@ class PlanAuditResponse(BaseModel):
     """Structured output contract for the Plan adversarial-audit node."""
 
     revised_plan: ImplementationPlan
-    audit_findings: list[str] = Field(
-        default_factory=list, description="Gaps found and fixed. Empty if none were found."
+    audit_findings: PresenceList = Field(
+        description="Gaps found and fixed, or an explicit absent+reason when none were found."
     )
-
-
-NonBlankStr = Annotated[str, StringConstraints(min_length=1, strip_whitespace=True)]
-"""A str that Pydantic rejects if empty or all-whitespace after stripping. Use in place of a bare
-`str` field anywhere blank is a silent way to mean "I have nothing to say" -- reasons, roots,
-anything meant to be read by a human or another gate."""
-
-
-class PresenceList(BaseModel):
-    """Typed replacement for a bare `list[str]` field whenever an empty list is ambiguous: did the
-    detector look and find nothing, or did it never look? `status` makes that explicit instead of
-    forcing every reader to guess from an empty list alone.
-    """
-
-    status: Literal["present", "absent"]
-    values: list[str] = Field(default_factory=list)
-    reason: str = ""
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_legacy_bare_list(cls, data: Any) -> Any:
-        """Older sidecars/model output stored this as a bare `list[str]` (or `None` for "nothing
-        found"). Coerce that shape into the typed one so existing producers aren't broken by this
-        field going from a list to an object."""
-        if isinstance(data, list):
-            if data:
-                return {"status": "present", "values": list(data)}
-            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
-        if data is None:
-            return {"status": "absent", "reason": "legacy sidecar, pre-typed-absence"}
-        return data
-
-    @model_validator(mode="after")
-    def _validate_presence(self) -> "PresenceList":
-        if self.status == "present":
-            if not self.values:
-                raise ValueError("status='present' requires a non-empty values list.")
-        else:  # absent
-            if self.values:
-                raise ValueError("status='absent' requires an empty values list.")
-            if not self.reason.strip():
-                raise ValueError("status='absent' requires a non-blank reason.")
-        return self
 
 
 class DotnetStatus(BaseModel):
@@ -855,5 +947,169 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert _legacy_stack_dotnet_detected.dotnet.status == "detected"
     assert _legacy_stack_dotnet_detected.dotnet.solution_root == "src/Api"
     assert _legacy_stack_dotnet_detected.convention_roots == []
+
+    # NonBlankStr on Specification.title/summary: rejects blank/whitespace-only.
+    _ok_spec_kwargs: dict[str, Any] = dict(
+        title="A title",
+        summary="A summary",
+        assumptions=PresenceList(status="absent", reason="no assumptions were needed"),
+        out_of_scope=PresenceList(status="absent", reason="nothing was excluded"),
+    )
+    assert Specification(**_ok_spec_kwargs).title == "A title"
+    for _blank_field in ("title", "summary"):
+        try:
+            Specification(**{**_ok_spec_kwargs, _blank_field: "   "})
+            raise AssertionError(f"expected ValidationError for blank Specification.{_blank_field}")
+        except ValidationError:
+            pass
+
+    # Specification.assumptions/out_of_scope: real PresenceList fields -- present/absent both
+    # validate, and a bare list still coerces (legacy sidecars/model output).
+    _spec_present = Specification(
+        title="T", summary="S",
+        assumptions=PresenceList(status="present", values=["assume X"]),
+        out_of_scope=["Y is out of scope"],  # legacy bare-list coercion
+    )
+    assert _spec_present.assumptions.values == ["assume X"]
+    assert _spec_present.out_of_scope.status == "present"
+    assert _spec_present.out_of_scope.values == ["Y is out of scope"]
+    try:
+        Specification(title="T", summary="S", assumptions=[], out_of_scope=[])
+        # A bare empty list legacy-coerces to status="absent" with a synthesized reason -- this
+        # must NOT raise, unlike an explicit PresenceList(status="absent") with no reason.
+    except ValidationError:
+        raise AssertionError("expected a bare empty list to legacy-coerce, not raise")
+
+    # PlanStep.ac_ids: the model_validator(mode="after") enforcing "empty only valid when
+    # kind='infrastructure'" -- both branches.
+    assert PlanStep(id="PS-1", description="wire CI", ac_ids=[], kind="infrastructure").ac_ids == []
+    # infrastructure steps MAY still cite ac_ids (permitted, never required).
+    assert PlanStep(id="PS-1", description="x", ac_ids=["US-0001.1"], kind="infrastructure").ac_ids == ["US-0001.1"]
+    try:
+        PlanStep(id="PS-1", description="build it", ac_ids=[], kind="feature")
+        raise AssertionError("expected ValidationError for empty ac_ids on a non-infrastructure step")
+    except ValidationError:
+        pass
+    # kind defaults to 'feature' -- the default-kind path must reject empty ac_ids too.
+    try:
+        PlanStep(id="PS-1", description="build it", ac_ids=[])
+        raise AssertionError("expected ValidationError for empty ac_ids with default kind")
+    except ValidationError:
+        pass
+
+    # DiagramPresence/WireframePresence: same present/absent/legacy-coercion contract as
+    # PresenceList, but values are structured PlanDiagram/Wireframe objects.
+    _diagram = PlanDiagram(name="core-er", kind="er", mermaid_source="erDiagram\n  A ||--o{ B : has")
+    _wireframe = Wireframe(screen="login", html_source="<html><body><div>Login</div></body></html>")
+
+    present_diagrams = DiagramPresence(status="present", values=[_diagram])
+    assert present_diagrams.values == [_diagram]
+    absent_diagrams = DiagramPresence(status="absent", reason="trivial change, no diagram needed")
+    assert absent_diagrams.values == []
+
+    coerced_diagrams = DiagramPresence.model_validate([_diagram.model_dump()])
+    assert coerced_diagrams.status == "present" and coerced_diagrams.values == [_diagram]
+    for _legacy_absent in ([], None):
+        _coerced = DiagramPresence.model_validate(_legacy_absent)
+        assert _coerced.status == "absent"
+        assert _coerced.values == []
+        assert _coerced.reason == "legacy sidecar, pre-typed-absence"
+    try:
+        DiagramPresence(status="present", values=[])
+        raise AssertionError("expected ValidationError for present with empty values")
+    except ValidationError:
+        pass
+    try:
+        DiagramPresence(status="absent", values=[_diagram])
+        raise AssertionError("expected ValidationError for absent with non-empty values")
+    except ValidationError:
+        pass
+    try:
+        DiagramPresence(status="absent")
+        raise AssertionError("expected ValidationError for absent with blank reason")
+    except ValidationError:
+        pass
+
+    present_wireframes = WireframePresence(status="present", values=[_wireframe])
+    assert present_wireframes.values == [_wireframe]
+    absent_wireframes = WireframePresence(status="absent", reason="no UI work in this plan")
+    assert absent_wireframes.values == []
+
+    coerced_wireframes = WireframePresence.model_validate([_wireframe.model_dump()])
+    assert coerced_wireframes.status == "present" and coerced_wireframes.values == [_wireframe]
+    for _legacy_absent in ([], None):
+        _coerced = WireframePresence.model_validate(_legacy_absent)
+        assert _coerced.status == "absent"
+        assert _coerced.values == []
+        assert _coerced.reason == "legacy sidecar, pre-typed-absence"
+    try:
+        WireframePresence(status="present", values=[])
+        raise AssertionError("expected ValidationError for present with empty values")
+    except ValidationError:
+        pass
+    try:
+        WireframePresence(status="absent", values=[_wireframe])
+        raise AssertionError("expected ValidationError for absent with non-empty values")
+    except ValidationError:
+        pass
+    try:
+        WireframePresence(status="absent")
+        raise AssertionError("expected ValidationError for absent with blank reason")
+    except ValidationError:
+        pass
+
+    # ImplementationPlan.risk_notes/diagrams/wireframes: a fully-populated, present-everywhere
+    # instance round-trips, and an empty-everywhere (absent+reason) instance validates too.
+    _plan_present = ImplementationPlan(
+        overview="Add password reset.",
+        plan_steps=[PlanStep(id="PS-1", description="build it", ac_ids=["US-0001.1"])],
+        risk_notes=PresenceList(status="present", values=["email deliverability is unverified"]),
+        diagrams=DiagramPresence(status="present", values=[_diagram]),
+        wireframes=WireframePresence(status="present", values=[_wireframe]),
+    )
+    assert _plan_present.risk_notes.values == ["email deliverability is unverified"]
+    assert _plan_present.diagrams.values == [_diagram]
+    assert _plan_present.wireframes.values == [_wireframe]
+    _reloaded_plan = ImplementationPlan.model_validate_json(_plan_present.model_dump_json())
+    assert _reloaded_plan == _plan_present
+
+    _plan_absent = ImplementationPlan(
+        overview="Trivial copy fix.",
+        plan_steps=[PlanStep(id="PS-1", description="fix copy", ac_ids=[], kind="infrastructure")],
+        risk_notes=PresenceList(status="absent", reason="no risks identified"),
+        diagrams=DiagramPresence(status="absent", reason="trivial change, no diagram needed"),
+        wireframes=WireframePresence(status="absent", reason="no UI work in this plan"),
+    )
+    assert _plan_absent.diagrams.status == "absent"
+
+    # SpecificationAuditResponse/PlanAuditResponse.audit_findings: now a real PresenceList, not a
+    # bare list[str] -- present/absent both validate.
+    _spec_for_audit = Specification(
+        title="T", summary="S",
+        assumptions=PresenceList(status="absent", reason="none needed"),
+        out_of_scope=PresenceList(status="absent", reason="none"),
+    )
+    spec_audit_clean = SpecificationAuditResponse(
+        revised_specification=_spec_for_audit,
+        audit_findings=PresenceList(status="absent", reason="no gaps found"),
+    )
+    assert spec_audit_clean.audit_findings.values == []
+    spec_audit_findings = SpecificationAuditResponse(
+        revised_specification=_spec_for_audit,
+        audit_findings=PresenceList(status="present", values=["AC US-0001.1 was untestable as written"]),
+    )
+    assert spec_audit_findings.audit_findings.status == "present"
+
+    plan_audit_clean = PlanAuditResponse(
+        revised_plan=_plan_absent,
+        audit_findings=PresenceList(status="absent", reason="no gaps found"),
+    )
+    assert plan_audit_clean.audit_findings.values == []
+    # Legacy bare-list audit_findings must still coerce (older sidecars/model output).
+    plan_audit_legacy = PlanAuditResponse.model_validate(
+        {"revised_plan": _plan_absent.model_dump(), "audit_findings": ["fixed a missing AC citation"]}
+    )
+    assert plan_audit_legacy.audit_findings.status == "present"
+    assert plan_audit_legacy.audit_findings.values == ["fixed a missing AC citation"]
 
     print("schemas self-check: all assertions passed")
