@@ -12,9 +12,10 @@
 # AZURE_SUBSCRIPTION_ID, RESOURCE_GROUP, ACR_NAME, NAME_PREFIX -- plus a federated credential on
 # that tenant's deploy app registration with subject repo:<owner>/<repo>:environment:<target>.
 #
-# FIRST BOOTSTRAP of a new target is EXPECTED to go red at the smoke step: the apps crash-loop
-# until the target's config vault is seeded (infra/README.md runbook). Seed the vault, restart the
-# apps, re-run this workflow -- every step is idempotent.
+# FIRST BOOTSTRAP of a new target is EXPECTED to go red at the smoke step: the deploy job seeds
+# the config vault with REPLACE-ME placeholders (see "seed config vault" step below), but the apps
+# still crash-loop until a human pastes real values over them (infra/README.md runbook). Fill in
+# the vault, restart the apps, re-run this workflow -- every step is idempotent.
 name: Deploy
 
 on:
@@ -245,6 +246,30 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # First-ever deploy of a target is a chicken-and-egg: agentApp/frontendApp's SystemAssigned
+      # identities don't exist until ARM creates them, but each container app can't finish
+      # provisioning without already being able to pull its own image from the private ACR (its
+      # AcrPull role assignment below is keyed off that same not-yet-existing identity) -- so the
+      # real deploy just times out ("Operation expired") on a brand-new target, forever, and
+      # AcrPull never gets the chance to be granted. Bootstrap once, deliberately NOT passing
+      # FRONTEND_IMAGE/AGENT_IMAGE, so each bicepparam falls back to its own already-documented
+      # `mcr.microsoft.com/k8se/quickstart` default (infra/params/*.bicepparam's own
+      # "bootable without CI" fallback) -- a public, always-pullable image that lets both container
+      # apps (and their AcrPull grants) succeed. The unconditional real deploy right below then
+      # swaps in the private-ACR images, which now pull fine. Skipped once the agent app exists --
+      # from then on AcrPull is already granted and the deadlock can't recur.
+      - name: bootstrap container apps (first deploy only)
+        run: |
+          if az containerapp show -g "$RESOURCE_GROUP" -n "$NAME_PREFIX-agent" >/dev/null 2>&1; then
+            echo "agent app already exists -- not a first deploy, nothing to bootstrap"
+          else
+            SANDBOX_IMAGE_TAG="$SHA" \
+              az deployment group create -g "$RESOURCE_GROUP" \
+                --name "bootstrap-$SHA" \
+                --template-file infra/main.bicep \
+                --parameters "infra/params/${{ matrix.target }}.bicepparam"
+          fi
+
       - name: deploy (bicep, idempotent)
         run: |
           FRONTEND_IMAGE="$ACR_NAME.azurecr.io/ai-dev-workflow-frontend:$SHA" \
@@ -254,6 +279,25 @@ jobs:
               --name "deploy-$SHA" \
               --template-file infra/main.bicep \
               --parameters "infra/params/${{ matrix.target }}.bicepparam"
+
+      # Idempotent every deploy; same script .github/workflows/seed-config-vault.yml runs manually. Creates
+      # a REPLACE-ME placeholder for any required secret (docs/CONFIG.md) with no CONFIG_<NAME>
+      # GitHub secret set, so the config vault always has every expected name present -- open the
+      # vault in the portal and paste real values over the placeholders. Never overwrites a value
+      # (real or placeholder) already there.
+      - name: seed config vault (placeholders)
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          CONFIG_AUTH_SECRET: ${{ secrets.CONFIG_AUTH_SECRET }}
+          CONFIG_AUTH_GITHUB_ID: ${{ secrets.CONFIG_AUTH_GITHUB_ID }}
+          CONFIG_AUTH_GITHUB_SECRET: ${{ secrets.CONFIG_AUTH_GITHUB_SECRET }}
+          CONFIG_AIDW_AGENT_CLIENT_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_CLIENT_SECRET }}
+          CONFIG_AIDW_AGENT_SHARED_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_SHARED_SECRET }}
+          CONFIG_ANTHROPIC_API_KEY: ${{ secrets.CONFIG_ANTHROPIC_API_KEY }}
+          CONFIG_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CONFIG_CLAUDE_CODE_OAUTH_TOKEN }}
+          CONFIG_GITHUB_TOKEN: ${{ secrets.CONFIG_GITHUB_TOKEN }}
+        run: scripts/seed-config-vault.sh "${{ matrix.target }}"
 
       # Idempotent every deploy; automates the one-time grant from infra/README.md. Runs as the
       # deploy SP, which is a member of the aidw-sql-admins group (the server's AAD admin).
@@ -292,8 +336,9 @@ jobs:
           AZURE_SQL_DATABASE="Ai-Dev-Workflow" \
             uv run python -m src.db_migrate
 
-      # First bootstrap of a new target fails HERE until its config vault is seeded -- expected;
-      # see the header comment and infra/README.md.
+      # First bootstrap of a new target fails HERE until a human replaces the config vault's
+      # REPLACE-ME placeholders with real values -- expected; see the header comment and
+      # infra/README.md.
       - name: smoke
         run: |
           FRONTEND_URL=$(az deployment group show -g "$RESOURCE_GROUP" --name "deploy-$SHA" \

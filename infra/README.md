@@ -44,9 +44,10 @@ can run the SQL grant/migrations/drain), the resource group, and the least-privi
 grants (Contributor + conditioned RBAC Administrator). It prints the GitHub Environment values
 and the bicepparam skeleton. Then follow its printed steps 1-5.
 
-**The first Deploy run for a new target is EXPECTED to fail at the smoke step**: both apps
-crash-loop until the config vault is seeded. Seed it (below), restart both container apps
-(`az containerapp revision restart`), re-run the Deploy workflow — every step is idempotent.
+**The first Deploy run for a new target is EXPECTED to fail at the smoke step**: the deploy job
+itself seeds `<namePrefix>-config` with `REPLACE-ME` placeholders (below), but both apps still
+crash-loop until a human pastes real values over them. Fill in the vault, restart both container
+apps (`az containerapp revision restart`), re-run the Deploy workflow — every step is idempotent.
 
 ### Config vault seeding
 
@@ -54,10 +55,11 @@ crash-loop until the config vault is seeded. Seed it (below), restart both conta
 else has to write into it: one secret per env var, `_` → `-` (`AUTH_SECRET` → `AUTH-SECRET`); the
 name inventory is docs/CONFIG.md's "Secrets / identity (required for a real deployment)" section.
 
-**Automated (creates only what's missing, never overwrites a real value):** run the
-`Seed Config Vault` workflow (`workflow_dispatch`, target = the GitHub Environment name). It
-self-grants `Key Vault Secrets Officer` on the vault (the deploy SP's RBAC-Administrator role is
-already conditioned to allow exactly this, see onboard-target.ps1), then seeds two kinds of value:
+**Automatic, every deploy (creates only what's missing, never overwrites a real value):**
+`deploy.yml`'s "seed config vault (placeholders)" step runs `scripts/seed-config-vault.sh` right
+after the bicep step, on every push. It self-grants `Key Vault Secrets Officer` on the vault (the
+deploy SP's RBAC-Administrator role is already conditioned to allow exactly this, see
+onboard-target.ps1), then seeds two kinds of value:
 
 - Non-secret, already known from this repo's own IaC -- `AZURE_TENANT_ID` (from the environment's
   own `vars.AZURE_TENANT_ID`) and `AIDW_AGENT_APP_ID` (parsed straight out of
@@ -67,7 +69,11 @@ already conditioned to allow exactly this, see onboard-target.ps1), then seeds t
   `REPLACE-ME` placeholder so `az keyvault secret list` shows you exactly what still needs a real
   value.
 
-**Manual (copying from an existing environment, or fixing up one secret):**
+**Manual re-run (adding a newly-required secret to an already-deployed target without waiting for
+the next push):** the same script via the `Seed Config Vault` workflow (`workflow_dispatch`,
+target = the GitHub Environment name).
+
+**Fully manual (copying from an existing environment, or fixing up one secret):**
 `az keyvault secret show` → `set` loop, same `_`→`-` naming. Grant yourself
 `Key Vault Secrets Officer` on the vault first.
 

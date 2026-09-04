@@ -1,8 +1,8 @@
-# Manually-triggered, NOT part of deploy.yml on purpose: seeding must never run unattended on
-# every push, since it would mean re-evaluating (even if additively) real per-environment secrets
-# on every merge. A human runs this once per environment after its first successful Deploy, and
-# again only when adding a newly-required secret -- see docs/CONFIG.md's "required for a real
-# deployment" section, which is this workflow's own source of truth for what "required" means.
+# Manually-triggered wrapper around scripts/seed-config-vault.sh, the same script deploy.yml runs
+# on every push. Use this one to seed a target out-of-band -- e.g. adding a newly-required secret
+# to an environment that already deployed, without waiting for the next push -- see docs/CONFIG.md's
+# "required for a real deployment" section, which is this script's own source of truth for what
+# "required" means.
 name: Seed Config Vault
 
 on:
@@ -32,89 +32,16 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      # The config vault (infra/main.bicep's configVault) only grants the running apps
-      # read-only "Key Vault Secrets User" by design (its own comment: "seeding is out-of-band").
-      # The deploy SP's existing RBAC-Administrator role is conditioned (infra/onboard-target.ps1)
-      # to allow assigning exactly 4 roles, "Key Vault Secrets Officer" among them -- this
-      # self-grant exercises authority the SP already holds, it doesn't broaden anything.
-      # Idempotent: skips if already granted (e.g. a prior run of this workflow).
-      - name: grant self Key Vault Secrets Officer on config vault
-        run: |
-          VAULT_ID=$(az keyvault show --name "$NAME_PREFIX-config" --resource-group "$RESOURCE_GROUP" --query id -o tsv)
-          SP_ID=$(az ad sp show --id "${{ vars.AZURE_CLIENT_ID }}" --query id -o tsv)
-          EXISTING=$(az role assignment list --assignee "$SP_ID" --role "Key Vault Secrets Officer" --scope "$VAULT_ID" --query '[0].id' -o tsv)
-          if [ -z "$EXISTING" ]; then
-            az role assignment create --assignee-object-id "$SP_ID" --assignee-principal-type ServicePrincipal \
-              --role "Key Vault Secrets Officer" --scope "$VAULT_ID"
-            echo "waiting for the grant to propagate..."
-            for i in $(seq 1 12); do
-              az keyvault secret list --vault-name "$NAME_PREFIX-config" >/dev/null 2>&1 && break
-              sleep 10
-            done
-          fi
-
-      # Values that AREN'T credentials and already have a known-good answer sitting in this
-      # repo's own IaC -- no placeholder, no GitHub secret, just copied straight from the source
-      # of truth so it can't drift out of sync with what bicep actually deployed.
-      - name: seed non-secret config values (idempotent, additive only)
-        run: |
-          set -eu
-          ENTRA_APP_ID=$(grep -oP "param entraAppId = '\K[^']+" "infra/params/${{ inputs.target }}.bicepparam")
-          declare -A KNOWN=(
-            [AZURE-TENANT-ID]="${{ vars.AZURE_TENANT_ID }}"
-            [AIDW-AGENT-APP-ID]="$ENTRA_APP_ID"
-          )
-          for name in "${!KNOWN[@]}"; do
-            if az keyvault secret show --vault-name "$NAME_PREFIX-config" --name "$name" >/dev/null 2>&1; then
-              echo "skip $name (already set)"
-              continue
-            fi
-            az keyvault secret set --vault-name "$NAME_PREFIX-config" --name "$name" --value "${KNOWN[$name]}" >/dev/null
-            echo "seeded $name"
-          done
-
-      # Everything below is a real credential -- never derivable from this repo, always from a
-      # CONFIG_<NAME> GitHub secret you set yourself (or left blank on purpose). Only creates
-      # secrets that don't already exist in the vault -- never overwrites a real value with a
-      # placeholder or a stale GitHub secret. Each name maps 1:1 to docs/CONFIG.md's "required for
-      # a real deployment" section, minus the two non-secret ones seeded above; add a line here
-      # AND there, not just one place, if that list ever changes. Anything left unset gets an
-      # obvious placeholder instead of being silently skipped, so
-      # `az keyvault secret list --vault-name <name>-config` always shows you exactly what's real
-      # vs. still needs a value.
-      - name: seed required secrets (idempotent, additive only)
+      - name: seed config vault (idempotent, additive only)
         env:
-          AUTH_SECRET: ${{ secrets.CONFIG_AUTH_SECRET }}
-          AUTH_GITHUB_ID: ${{ secrets.CONFIG_AUTH_GITHUB_ID }}
-          AUTH_GITHUB_SECRET: ${{ secrets.CONFIG_AUTH_GITHUB_SECRET }}
-          AIDW_AGENT_CLIENT_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_CLIENT_SECRET }}
-          AIDW_AGENT_SHARED_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_SHARED_SECRET }}
-          ANTHROPIC_API_KEY: ${{ secrets.CONFIG_ANTHROPIC_API_KEY }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CONFIG_CLAUDE_CODE_OAUTH_TOKEN }}
-          GITHUB_TOKEN_SECRET: ${{ secrets.CONFIG_GITHUB_TOKEN }}
-        run: |
-          set -eu
-          declare -A REQUIRED=(
-            [AUTH-SECRET]="$AUTH_SECRET"
-            [AUTH-GITHUB-ID]="$AUTH_GITHUB_ID"
-            [AUTH-GITHUB-SECRET]="$AUTH_GITHUB_SECRET"
-            [AIDW-AGENT-CLIENT-SECRET]="$AIDW_AGENT_CLIENT_SECRET"
-            [AIDW-AGENT-SHARED-SECRET]="$AIDW_AGENT_SHARED_SECRET"
-            [ANTHROPIC-API-KEY]="$ANTHROPIC_API_KEY"
-            [CLAUDE-CODE-OAUTH-TOKEN]="$CLAUDE_CODE_OAUTH_TOKEN"
-            [GITHUB-TOKEN]="$GITHUB_TOKEN_SECRET"
-          )
-          for name in "${!REQUIRED[@]}"; do
-            if az keyvault secret show --vault-name "$NAME_PREFIX-config" --name "$name" >/dev/null 2>&1; then
-              echo "skip $name (already set)"
-              continue
-            fi
-            value="${REQUIRED[$name]}"
-            if [ -z "$value" ]; then
-              echo "seeding $name with a placeholder -- no CONFIG_${name//-/_} secret was configured"
-              value="REPLACE-ME"
-            else
-              echo "seeding $name from its GitHub secret"
-            fi
-            az keyvault secret set --vault-name "$NAME_PREFIX-config" --name "$name" --value "$value" >/dev/null
-          done
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          CONFIG_AUTH_SECRET: ${{ secrets.CONFIG_AUTH_SECRET }}
+          CONFIG_AUTH_GITHUB_ID: ${{ secrets.CONFIG_AUTH_GITHUB_ID }}
+          CONFIG_AUTH_GITHUB_SECRET: ${{ secrets.CONFIG_AUTH_GITHUB_SECRET }}
+          CONFIG_AIDW_AGENT_CLIENT_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_CLIENT_SECRET }}
+          CONFIG_AIDW_AGENT_SHARED_SECRET: ${{ secrets.CONFIG_AIDW_AGENT_SHARED_SECRET }}
+          CONFIG_ANTHROPIC_API_KEY: ${{ secrets.CONFIG_ANTHROPIC_API_KEY }}
+          CONFIG_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CONFIG_CLAUDE_CODE_OAUTH_TOKEN }}
+          CONFIG_GITHUB_TOKEN: ${{ secrets.CONFIG_GITHUB_TOKEN }}
+        run: scripts/seed-config-vault.sh "${{ inputs.target }}"
