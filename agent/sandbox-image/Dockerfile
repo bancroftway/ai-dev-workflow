@@ -248,7 +248,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates=20260601~24.04.1 \
-        gnupg=2.4.4-2ubuntu17.4 \
+        gnupg=2.4.4-2ubuntu17.6 \
         python3=3.12.3-0ubuntu2.1 \
         python3-pip=24.0+dfsg-1ubuntu1.3; \
     curl -fsSL --retry 5 --retry-all-errors "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
@@ -265,7 +265,7 @@ RUN set -eux; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list; \
     apt-get update; \
-    apt-get install -y --no-install-recommends gh=2.99.0; \
+    apt-get install -y --no-install-recommends gh=2.100.0; \
     rm -rf /var/lib/apt/lists/*
 
 # Playwright MCP + its exact-matching browser build, baked at BUILD time into
