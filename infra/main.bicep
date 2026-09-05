@@ -43,6 +43,12 @@ param agentImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 @description('Tag of the sandbox image in this target\'s ACR that azure_aci.py provisions at runtime -- deploy.yml passes the git sha (SANDBOX_IMAGE_TAG env var), pinning sandboxes to the exact bytes CI scanned instead of a drifting :latest.')
 param sandboxImageTag string = 'latest'
 
+@description('Ingress targetPort for the agent app. 8123 always, except deploy.yml\'s bootstrap pass (AGENT_TARGET_PORT env var), which sets 80 to match frontendImage/agentImage\'s placeholder default -- Container Apps\' default TCP startup probe checks this exact port, and mcr.microsoft.com/k8se/quickstart listens on 80, not 8123. A probe that can never succeed times out exactly like the AcrPull deadlock this whole bootstrap pass exists to break, so the placeholder image and the port it actually listens on have to change together.')
+param agentTargetPort int = 8123
+
+@description('Ingress targetPort for the frontend app, same convention as agentTargetPort (FRONTEND_TARGET_PORT env var, 80 during bootstrap).')
+param frontendTargetPort int = 3000
+
 @description('Whether agentApp/frontendApp are wired to pull from the private ACR at all. false ONLY for deploy.yml\'s one-time "bootstrap container apps" pass (USE_ACR_REGISTRY env var), which exists to break an AcrPull chicken-and-egg: Container Apps tries to resolve every registry listed in `configuration.registries` whenever the resource is touched, regardless of which image the current revision actually requests -- so even switching to a public placeholder image (frontendImage/agentImage above) still hits the same 401 if the ACR is listed there before its AcrPull role assignment (below, itself keyed off this same not-yet-existing identity) has ever been granted. Omitting the ACR from `registries` entirely for that one bootstrap pass lets the container apps -- and their AcrPull grants -- finally succeed; the very next (unconditional, real-image) deploy defaults this back to true and pulls from ACR fine.')
 param useAcrRegistry bool = true
 
@@ -209,7 +215,7 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
       // Section D) -- never exposed publicly.
       ingress: {
         external: false
-        targetPort: 8123
+        targetPort: agentTargetPort
         transport: 'http'
       }
       registries: useAcrRegistry ? [
@@ -284,7 +290,7 @@ resource frontendApp 'Microsoft.App/containerApps@2024-03-01' = {
     configuration: {
       ingress: {
         external: true
-        targetPort: 3000
+        targetPort: frontendTargetPort
         transport: 'http'
       }
       registries: useAcrRegistry ? [

@@ -266,6 +266,13 @@ jobs:
       # deadlock has a resource (provisioningState Failed) with latestRevisionName permanently
       # null, since it has never once pulled its image successfully -- an existence check alone
       # would see that stuck resource and wrongly skip bootstrapping forever.
+      #
+      # A second, independent trap once the pull itself succeeds: Container Apps' default startup
+      # probe is a plain TCP check against ingress.targetPort (8123/3000), and the placeholder image
+      # (mcr.microsoft.com/k8se/quickstart) listens on 80 -- verified live, confirmed by pulling it
+      # locally. A probe that can never succeed times out exactly like the AcrPull deadlock, just
+      # one layer further in, so AGENT_TARGET_PORT/FRONTEND_TARGET_PORT have to move to 80 in
+      # lockstep with the placeholder image for this one pass too.
       - name: bootstrap container apps (first deploy only)
         run: |
           LATEST_REVISION=$(az containerapp show -g "$RESOURCE_GROUP" -n "$NAME_PREFIX-agent" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
@@ -273,6 +280,8 @@ jobs:
             echo "agent app already has a revision -- not a first deploy, nothing to bootstrap"
           else
             USE_ACR_REGISTRY=false \
+            AGENT_TARGET_PORT=80 \
+            FRONTEND_TARGET_PORT=80 \
             SANDBOX_IMAGE_TAG="$SHA" \
               az deployment group create -g "$RESOURCE_GROUP" \
                 --name "bootstrap-$SHA" \

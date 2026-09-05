@@ -16,3 +16,5 @@ param frontendImage = readEnvironmentVariable('FRONTEND_IMAGE', 'mcr.microsoft.c
 param agentImage = readEnvironmentVariable('AGENT_IMAGE', 'mcr.microsoft.com/k8se/quickstart:latest')
 param sandboxImageTag = readEnvironmentVariable('SANDBOX_IMAGE_TAG', 'latest')
 param useAcrRegistry = bool(readEnvironmentVariable('USE_ACR_REGISTRY', 'true'))
+param agentTargetPort = int(readEnvironmentVariable('AGENT_TARGET_PORT', '8123'))
+param frontendTargetPort = int(readEnvironmentVariable('FRONTEND_TARGET_PORT', '3000'))
