@@ -44,6 +44,25 @@ can run the SQL grant/migrations/drain), the resource group, and the least-privi
 grants (Contributor + conditioned RBAC Administrator). It prints the GitHub Environment values
 and the bicepparam skeleton. Then follow its printed steps 1-5.
 
+**One-time, before the first Deploy run: grant the SQL server's identity Directory Readers.**
+`main.bicep`'s `sqlServer` has a `SystemAssigned` identity (required for the "grant agent identity
+on SQL" step's `CREATE USER ... FROM EXTERNAL PROVIDER`, which resolves an Azure AD principal by
+name via Microsoft Graph) -- but an Azure RBAC role can't grant that identity the Entra **directory**
+role it needs to actually query Graph. After the first Deploy run creates the SQL server (or any
+`az deployment group create` against this template), grant it yourself (Global Admin / Privileged
+Role Admin in the target tenant):
+```bash
+SQL_IDENTITY=$(az sql server show -g <rg> -n <namePrefix>-sql --query identity.principalId -o tsv)
+az rest --method POST --url "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments" --body "{
+  \"principalId\": \"$SQL_IDENTITY\",
+  \"roleDefinitionId\": \"88d8e3e3-8f55-4a1e-953a-9b9898b8876b\",
+  \"directoryScopeId\": \"/\"
+}"
+```
+Skipped, the "grant agent identity on SQL" deploy step fails with pyodbc 33134 ("Server identity is
+not configured") -- verified live against nonprod. Propagation is usually fast but give it a few
+minutes before re-running.
+
 **The first Deploy run for a new target is EXPECTED to fail at the smoke step**: the deploy job
 itself seeds `<namePrefix>-config` with `REPLACE-ME` placeholders (below), but both apps still
 crash-loop until a human pastes real values over them. Fill in the vault, restart both container
