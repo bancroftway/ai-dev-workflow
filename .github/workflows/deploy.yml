@@ -256,12 +256,17 @@ jobs:
       # `mcr.microsoft.com/k8se/quickstart` default (infra/params/*.bicepparam's own
       # "bootable without CI" fallback) -- a public, always-pullable image that lets both container
       # apps (and their AcrPull grants) succeed. The unconditional real deploy right below then
-      # swaps in the private-ACR images, which now pull fine. Skipped once the agent app exists --
-      # from then on AcrPull is already granted and the deadlock can't recur.
+      # swaps in the private-ACR images, which now pull fine. Skipped once the agent app has ever
+      # produced a revision -- from then on AcrPull is already granted and the deadlock can't
+      # recur. Deliberately NOT just "does the container app resource exist": a target stuck in
+      # this exact deadlock has a resource (provisioningState Failed) with latestRevisionName
+      # permanently null, since it has never once pulled its image successfully -- an existence
+      # check alone would see that stuck resource and wrongly skip bootstrapping forever.
       - name: bootstrap container apps (first deploy only)
         run: |
-          if az containerapp show -g "$RESOURCE_GROUP" -n "$NAME_PREFIX-agent" >/dev/null 2>&1; then
-            echo "agent app already exists -- not a first deploy, nothing to bootstrap"
+          LATEST_REVISION=$(az containerapp show -g "$RESOURCE_GROUP" -n "$NAME_PREFIX-agent" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
+          if [ -n "$LATEST_REVISION" ]; then
+            echo "agent app already has a revision -- not a first deploy, nothing to bootstrap"
           else
             SANDBOX_IMAGE_TAG="$SHA" \
               az deployment group create -g "$RESOURCE_GROUP" \
