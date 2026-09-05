@@ -154,6 +154,15 @@ resource sandboxAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource sqlServer 'Microsoft.Sql/servers@2023-08-01-preview' = {
   name: '${namePrefix}-sql'
   location: location
+  // Required for deploy.yml's "grant agent identity on SQL" step: CREATE USER ... FROM EXTERNAL
+  // PROVIDER resolves an Azure AD principal by NAME, which needs the server's own AAD identity to
+  // query Microsoft Graph -- without one, that statement fails with pyodbc error 33134 ("Server
+  // identity is not configured"), verified live against nonprod. The identity also needs the
+  // Entra "Directory Readers" role -- an Entra directory role, not Azure RBAC, so it can't be
+  // granted here; see infra/README.md's runbook (one-time, Global Admin/Privileged Role Admin).
+  identity: {
+    type: 'SystemAssigned'
+  }
   properties: {
     administrators: {
       administratorType: 'ActiveDirectory'
