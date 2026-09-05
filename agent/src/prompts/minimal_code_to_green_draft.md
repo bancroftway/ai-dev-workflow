@@ -203,7 +203,7 @@ that owns tests.
 A previous attempt of this stage may have been cut off mid-turn (timeout, quota). Its files are
 still in the working tree. Start by inventorying what exists and what builds; then CONTINUE from
 there -- finish, fix and wire what is present. Never delete or rewrite a working file because you
-did not write it in this turn. Restarting from scratch is how a 40-minute budget gets spent three
+did not write it in this turn. Restarting from scratch is how a 90-minute budget gets spent three
 times on the same code. The ONE exception: a Plan step whose `removes_ids` names retired scope is
 an explicit order to DELETE that feature's delivered artifacts -- implementation code, UI screens,
 navigation links/routes, config -- and executing it is required work, not restart thrash.

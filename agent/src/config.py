@@ -139,7 +139,7 @@ COPILOT_DISABLED_SKILLS_SPECIFICATION = ["using-superpowers"]
 # exec inside the sandbox). Generous default since the agent's turn may involve multiple tool
 # calls, waiting for user input/approval, or complex reasoning -- the timeout is a runaway
 # backstop, not an expected exit.
-CLI_AGENT_TURN_TIMEOUT_SECONDS = int(os.environ.get("CLI_AGENT_TURN_TIMEOUT_SECONDS", "2400"))
+CLI_AGENT_TURN_TIMEOUT_SECONDS = int(os.environ.get("CLI_AGENT_TURN_TIMEOUT_SECONDS", "5400"))
 
 # Skills each stage is REQUIRED to invoke, enforced deterministically rather than trusted: the
 # stage's prompt names them, and gates/skill_gate.py verifies via chat_model's provider dispatch

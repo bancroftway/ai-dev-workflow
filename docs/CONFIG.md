@@ -138,7 +138,7 @@ E2E_SUITE_TIMEOUT_SECONDS=1200    # playwright suite ceiling
 TEST_HARDENING_MAX_FIX_CYCLES=4   # stable-regression fix laps before the gate ends the run
 TEST_HARDENING_TOTAL_ATTEMPTS=3   # suite runs (Nx) for flake triage
 AIDW_VERIFY_STALL_LAPS=2          # identical verify feedback this many laps in a row = stall
-CLI_AGENT_TURN_TIMEOUT_SECONDS=2400  # one Claude CLI turn's wall ceiling inside the sandbox
+CLI_AGENT_TURN_TIMEOUT_SECONDS=5400  # one Claude CLI turn's wall ceiling inside the sandbox
 AIDW_LLM_INFRA_RETRY_ATTEMPTS=3
 AIDW_LLM_INFRA_RETRY_BACKOFF_SECONDS=5,20,60
 EVAL_ATTEMPTS=3                   # skill-eval harness only

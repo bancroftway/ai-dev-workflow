@@ -777,7 +777,7 @@ class ClaudeChatModel(BaseChatModel):
             if not session_id:
                 # First turn on this key: nothing was cached, but the killed turn's own stdout
                 # head carries the `system/init` line with the session it was running as -- cache
-                # it so the retry --resumes that transcript (40 minutes of context and tool
+                # it so the retry --resumes that transcript (90 minutes of context and tool
                 # results) instead of starting over. See cli_agent_exec.TurnTimeout.
                 session_id = _init_session_id(getattr(exc, "partial_stdout", ""))
                 if session_id:

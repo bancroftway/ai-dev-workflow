@@ -57,12 +57,12 @@ _ACTIVITY_CHUNK_SECONDS = 300.0
 # Agent Narration Drawer feature: a MUCH shorter per-iteration chunk than the plain-completion-wait
 # loop above uses, ONLY for a caller that passes classify_line to run_turn (both provider chat
 # models, as of this feature). classify_line=None skips this branch and the exec-call cadence
-# entirely, keeping _ACTIVITY_CHUNK_SECONDS's original ~8-calls-per-turn shape for anything that
+# entirely, keeping _ACTIVITY_CHUNK_SECONDS's original ~18-calls-per-turn shape for anything that
 # doesn't need live narration. Env-overridable so an operator can dial this down without a code
 # change -- same override convention as AIDW_SANDBOX_IDLE_TIMEOUT (local_docker.py/azure_aci.py).
 #
-# ponytail: ~40x more host-side exec calls than the 300s cadence for a full-length turn (2400s/7s
-# ~= 343 vs 2400s/300s ~= 8) -- a real, accepted trade-off (deliberately NOT the same failure shape
+# ponytail: ~40x more host-side exec calls than the 300s cadence for a full-length turn (5400s/7s
+# ~= 771 vs 5400s/300s ~= 18) -- a real, accepted trade-off (deliberately NOT the same failure shape
 # as the 2026-09-01 Docker Desktop incident above, which was many OVERLAPPING independent pollers;
 # this is one well-behaved loop at a fixed cadence), not a free lunch. If a real deployment's exec
 # volume ever becomes a problem, raise AIDW_NARRATION_POLL_SECONDS first before touching this code.
@@ -578,7 +578,7 @@ async def run_turn(
                     # (the flip side of the same TurnTimeout.partial_stdout comment above, applied
                     # to narration instead of session-id recovery).
                     await streamer.flush_pending()
-                # Head only: the init line is the first line, and a 40-minute turn's stdout can
+                # Head only: the init line is the first line, and a 90-minute turn's stdout can
                 # be megabytes of tool events nobody needs here.
                 partial = await provider.exec_in_sandbox(thread_id, f"head -c 65536 {shlex.quote(out_path)} 2>/dev/null || true")
                 raise TurnTimeout(
@@ -685,7 +685,7 @@ async def run_turn(
                     partial_stdout=partial.stdout if partial.ok else "",
                 )
 
-        # Read results. Long timeout, not the fast-admin default: a 40-minute turn's stdout can
+        # Read results. Long timeout, not the fast-admin default: a 90-minute turn's stdout can
         # be megabytes of tool events (see the head -c 65536 comment above) and this reads it back
         # unbounded/untruncated.
         stdout_result = await provider.exec_in_sandbox(
