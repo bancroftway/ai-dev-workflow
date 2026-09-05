@@ -19,7 +19,18 @@ ARG BASE_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0
 # --mode/--no-ask-user/--secret-env-vars/--additional-mcp-config flags and the --output-format
 # json fields (result/is_error/usage/session_id/total_cost_usd) that module depends on, confirmed
 # against this one version rather than whatever an unpinned `@latest` ships next.
-ARG COPILOT_CLI_VERSION=1.0.79
+# 2026-09-04: bumped 1.0.79 -> 1.0.83-5 (a pre-release track, not the 1.0.82 stable release) for
+# v1.0.83-4's fix: "Host-provided plugin customizations can be read without redundant path
+# permission prompts" -- plugin skill/reference files under /opt/ai-dev-workflow-plugins were
+# silently unreadable under headless --no-ask-user before this, since that flag suppresses the
+# interactive approval prompt a file-read outside /workspace/repo would otherwise need. 1.0.83-5
+# (latest pre-release as of this bump) still carries -4's fix -- pre-release changelogs are
+# cumulative, confirmed by reading both release pages. No CLI flag changed alongside this bump;
+# the fix is entirely CLI-side. This is a real compatibility surface, not just the one plugin-read
+# fix -- re-verify the flags/JSONL-fields list above against a rebuilt image before trusting a
+# run (see agent/sandbox-image/README.md's spike procedure). Rollback: 1.0.79, the prior pin, if
+# 1.0.83-5 shows a compatibility blocker.
+ARG COPILOT_CLI_VERSION=1.0.83-5
 # Claude Code CLI -- npm-installed (final stage's Node/npm layer), not curl+tar like Copilot
 # above. Same reasoning as COPILOT_CLI_VERSION now: claude_chat_model.py drives this CLI by
 # per-turn exec, not an SDK, so the pin here IS the compatibility contract for the flags
@@ -624,7 +635,13 @@ RUN printf '%s\n' \
       > /opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json
 
 RUN chmod +x /usr/local/bin/ai-dev-workflow-entrypoint.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh && \
-    mkdir -p /workspace && chown -R vscode:vscode /workspace /opt/ai-dev-workflow-plugins /opt/aidw && \
+    mkdir -p /workspace && chown -R vscode:vscode /workspace /opt/aidw && \
+    # Plugin content is root-owned and read-only, not vscode-writable like /workspace/aidw above:
+    # the sandboxed session runs as vscode and should be able to READ curated skills/commands (via
+    # --plugin-dir, and since the 1.0.83-5 bump, direct file reads of a skill's own reference files
+    # too) but never write or tamper with them -- a self-modifying plugin mid-run is a supply-chain
+    # risk this doesn't need to accept just because the directory happened to be group-writable.
+    chown -R root:root /opt/ai-dev-workflow-plugins && chmod -R a+rX /opt/ai-dev-workflow-plugins && \
     # /opt/aidw/tools/bin is first on PATH (see the ENV PATH above) but nothing installs into it --
     # at build or at runtime (runtime toolchains land in /opt/aidw/tools/dotnet and mise's own shims
     # dir). Left vscode-writable it is a free shadowing slot: an autopilot session could drop

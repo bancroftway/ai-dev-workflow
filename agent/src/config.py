@@ -198,7 +198,13 @@ READ_ONLY_AVAILABLE_TOOLS = [
     "builtin:view",
     "builtin:grep",
     "builtin:glob",
-    "builtin:task_complete",
+    # builtin:task_complete deliberately excluded (2026-09-04): every one of this list's 10 call
+    # sites is a structured-output turn (ainvoke_structured, directly or via StageSpec.
+    # response_schema), and offering this tool let the model end the turn with plain
+    # "Task complete: ..." prose instead of the required JSON -- structured_output.py's
+    # model_validate_json then rejected it, burned all 3 retries on a generic parse error, and
+    # killed the stage. ac-to-tests' own draft tool list never included it and works fine, proving
+    # it's optional, not required, for a Copilot CLI turn to terminate cleanly.
     "builtin:ask_user",
     "builtin:skill",
 ]

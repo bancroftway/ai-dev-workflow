@@ -27,7 +27,10 @@ has been scaffolded before this stage runs), read `.ai-dev-workflow/tech-stack.m
 section for the intended framework, then hand-author the minimal test project files yourself with
 your edit tool (a test project/csproj file, a package.json's test-related fields, a
 vitest/playwright config) -- you have no shell/bash tool in this stage, so write these files
-directly rather than running a scaffolding CLI command.
+directly rather than running a scaffolding CLI command. If the directory a file belongs in does
+not exist yet, use `apply_patch` (a new-file patch creates its own containing directories) rather
+than `create`, which requires the directory to already exist and fails with a "parent directory
+does not exist" error otherwise.
 
 When such a project file pins a runtime/language version, pin the version this sandbox actually
 has installed -- do NOT write the version you happen to be most familiar with. Getting this wrong
@@ -221,7 +224,9 @@ above: anything under a `tests/`, `test/`, `__tests__/`, or `e2e/` directory; an
 or `*.spec.ts(x)`; `vitest.config.ts` and `playwright.config.ts`; any `*.Tests/` directory,
 `*Tests.csproj`, or `*Tests.cs`; and Python `test_*.py`, `*_test.py`, `conftest.py`. Editing
 `package.json` (or any other dependency manifest) is NOT permitted and will be reverted -- use
-the sandbox's baked test runners instead of adding dependencies. Do not RUN the suite you are
+the sandbox's baked test runners instead of adding dependencies. `create` only writes into a
+directory that already exists; for a file's first entry into a new directory, write it with
+`apply_patch` instead so the directory gets created along with the file. Do not RUN the suite you are
 writing: this stage produces a RED suite by design, and executing it only litters the tree with
 generated output -- `test-results/`, `coverage/`, `.coverage`, `coverage.cobertura.xml`,
 `__pycache__/`, `*.tsbuildinfo`, `next-env.d.ts` -- none of which is a test file, all of which

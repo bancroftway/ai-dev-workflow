@@ -24,6 +24,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .. import config as workflow_config
 from .. import repo_files, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
@@ -630,6 +631,14 @@ def _demo() -> None:
     sent_text = "\n".join(str(m.content) for m in fake_model.calls[0])
     for rule in AC_TO_TESTS_HARD_RULES:
         assert rule in sent_text, f"rule never reached the actual message sent to the model: {rule!r}"
+
+    # 2026-09-04: task_complete offered on a structured-output turn let the model end with plain
+    # "Task complete: ..." prose instead of the required JSON -- config.py excludes it from this
+    # allowlist now (every call site here is structured output); guard against it coming back.
+    assert "builtin:task_complete" not in workflow_config.READ_ONLY_AVAILABLE_TOOLS, (
+        "READ_ONLY_AVAILABLE_TOOLS must not offer builtin:task_complete -- it lets a "
+        "structured-output turn end with prose instead of the required JSON"
+    )
 
     print("write_scope_gate self-check: all assertions passed")
 

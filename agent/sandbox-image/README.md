@@ -98,6 +98,33 @@ The in-container path (`/opt/ai-dev-workflow-plugins`) must stay in sync with
    inspect the output, or run it in place and confirm `git status` shows no unexpected changes to
    the other plugins. Then re-verify via the spike technique below before merging.
 
+## Copilot CLI version pin (`COPILOT_CLI_VERSION`)
+
+Pinned in the Dockerfile, not left at `@latest` -- `copilot_chat_model.py` drives this CLI by
+per-turn exec (no SDK), so the pin is the whole compatibility contract for the flags
+(`--mode`/`--no-ask-user`/`--secret-env-vars`/`--additional-mcp-config`) and JSONL fields
+(`result`/`is_error`/`usage`/`session_id`/`total_cost_usd`) that module depends on.
+
+- **Current pin: `1.0.83-5`** (a pre-release, bumped from `1.0.79` on 2026-09-04). `1.0.82` is the
+  current stable release; the `1.0.83` series (`-0` through at least `-5` as of the bump) is a
+  pre-release track ahead of it. Picked over `1.0.82` specifically for `v1.0.83-4`'s changelog fix:
+  "Host-provided plugin customizations can be read without redundant path permission prompts" --
+  without it, a plugin's own reference files (anything beyond the top-level `SKILL.md` a
+  `--plugin-dir` loads directly) were silently unreadable under headless `--no-ask-user`, since
+  that flag suppresses the interactive approval prompt a file read outside `/workspace/repo` would
+  otherwise trigger, and there's no CLI flag to grant that trust explicitly instead (checked: no
+  `--add-dir` or equivalent exists in this CLI as of `1.0.83-5`). `1.0.83-5` still carries `-4`'s
+  fix -- pre-release changelogs are cumulative.
+- **Compatibility results**: not yet re-verified end-to-end against a rebuilt image (this bump is
+  a 4-pre-release-version plus one full patch-version jump from the prior `1.0.79` pin) -- re-run
+  the spike technique below and confirm the flags/JSONL-fields list above still holds, and
+  specifically exercise a plugin reference-file read (not just the top-level `SKILL.md`) before
+  trusting a headless run against this pin.
+- **Path trust**: `/opt/ai-dev-workflow-plugins` is root-owned and read-only in the image (the
+  sandboxed session runs as `vscode`) -- it can read curated plugin content but never write or
+  tamper with it, independent of whichever CLI version is pinned.
+- **Rollback**: `1.0.79`, the prior pin, if `1.0.83-5` shows a compatibility blocker.
+
 ## Confirming a plugin change actually reaches the sandbox (the "spike" smoke test)
 
 Doc rot fix (Phase E audit M-8): this section used to describe connecting to a persistent
