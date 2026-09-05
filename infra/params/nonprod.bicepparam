@@ -22,3 +22,4 @@ param sqlAadAdminPrincipalType = 'Group'
 param frontendImage = readEnvironmentVariable('FRONTEND_IMAGE', 'mcr.microsoft.com/k8se/quickstart:latest')
 param agentImage = readEnvironmentVariable('AGENT_IMAGE', 'mcr.microsoft.com/k8se/quickstart:latest')
 param sandboxImageTag = readEnvironmentVariable('SANDBOX_IMAGE_TAG', 'latest')
+param useAcrRegistry = bool(readEnvironmentVariable('USE_ACR_REGISTRY', 'true'))

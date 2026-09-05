@@ -43,6 +43,9 @@ param agentImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 @description('Tag of the sandbox image in this target\'s ACR that azure_aci.py provisions at runtime -- deploy.yml passes the git sha (SANDBOX_IMAGE_TAG env var), pinning sandboxes to the exact bytes CI scanned instead of a drifting :latest.')
 param sandboxImageTag string = 'latest'
 
+@description('Whether agentApp/frontendApp are wired to pull from the private ACR at all. false ONLY for deploy.yml\'s one-time "bootstrap container apps" pass (USE_ACR_REGISTRY env var), which exists to break an AcrPull chicken-and-egg: Container Apps tries to resolve every registry listed in `configuration.registries` whenever the resource is touched, regardless of which image the current revision actually requests -- so even switching to a public placeholder image (frontendImage/agentImage above) still hits the same 401 if the ACR is listed there before its AcrPull role assignment (below, itself keyed off this same not-yet-existing identity) has ever been granted. Omitting the ACR from `registries` entirely for that one bootstrap pass lets the container apps -- and their AcrPull grants -- finally succeed; the very next (unconditional, real-image) deploy defaults this back to true and pulls from ACR fine.')
+param useAcrRegistry bool = true
+
 @description('VNET address space for the sandbox subnet.')
 param vnetAddressPrefix string = '10.10.0.0/16'
 
@@ -209,9 +212,9 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 8123
         transport: 'http'
       }
-      registries: [
+      registries: useAcrRegistry ? [
         { server: '${acr.name}.azurecr.io', identity: 'system' }
-      ]
+      ] : []
     }
     template: {
       containers: [
@@ -284,9 +287,9 @@ resource frontendApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 3000
         transport: 'http'
       }
-      registries: [
+      registries: useAcrRegistry ? [
         { server: '${acr.name}.azurecr.io', identity: 'system' }
-      ]
+      ] : []
     }
     template: {
       containers: [

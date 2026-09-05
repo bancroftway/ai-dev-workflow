@@ -251,23 +251,28 @@ jobs:
       # provisioning without already being able to pull its own image from the private ACR (its
       # AcrPull role assignment below is keyed off that same not-yet-existing identity) -- so the
       # real deploy just times out ("Operation expired") on a brand-new target, forever, and
-      # AcrPull never gets the chance to be granted. Bootstrap once, deliberately NOT passing
-      # FRONTEND_IMAGE/AGENT_IMAGE, so each bicepparam falls back to its own already-documented
-      # `mcr.microsoft.com/k8se/quickstart` default (infra/params/*.bicepparam's own
-      # "bootable without CI" fallback) -- a public, always-pullable image that lets both container
-      # apps (and their AcrPull grants) succeed. The unconditional real deploy right below then
-      # swaps in the private-ACR images, which now pull fine. Skipped once the agent app has ever
-      # produced a revision -- from then on AcrPull is already granted and the deadlock can't
-      # recur. Deliberately NOT just "does the container app resource exist": a target stuck in
-      # this exact deadlock has a resource (provisioningState Failed) with latestRevisionName
-      # permanently null, since it has never once pulled its image successfully -- an existence
-      # check alone would see that stuck resource and wrongly skip bootstrapping forever.
+      # AcrPull never gets the chance to be granted. A placeholder IMAGE alone doesn't dodge this:
+      # verified live that Container Apps tries to resolve every registry listed in
+      # `configuration.registries` whenever the resource is touched, regardless of which image the
+      # current revision actually requests -- so the ACR 401 still fires even pulling a public
+      # mcr.microsoft.com image, as long as the ACR is listed there at all. USE_ACR_REGISTRY=false
+      # makes main.bicep omit the ACR from `registries` entirely for this one pass (see its own
+      # useAcrRegistry param doc), which is what actually lets both container apps -- and their
+      # AcrPull grants, unconditional below -- succeed. The unconditional real deploy right below
+      # then defaults USE_ACR_REGISTRY back to true and pulls the private-ACR images, which now
+      # succeed since AcrPull is already granted. Skipped once the agent app has ever produced a
+      # revision -- from then on AcrPull is already granted and the deadlock can't recur.
+      # Deliberately NOT just "does the container app resource exist": a target stuck in this exact
+      # deadlock has a resource (provisioningState Failed) with latestRevisionName permanently
+      # null, since it has never once pulled its image successfully -- an existence check alone
+      # would see that stuck resource and wrongly skip bootstrapping forever.
       - name: bootstrap container apps (first deploy only)
         run: |
           LATEST_REVISION=$(az containerapp show -g "$RESOURCE_GROUP" -n "$NAME_PREFIX-agent" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
           if [ -n "$LATEST_REVISION" ]; then
             echo "agent app already has a revision -- not a first deploy, nothing to bootstrap"
           else
+            USE_ACR_REGISTRY=false \
             SANDBOX_IMAGE_TAG="$SHA" \
               az deployment group create -g "$RESOURCE_GROUP" \
                 --name "bootstrap-$SHA" \
