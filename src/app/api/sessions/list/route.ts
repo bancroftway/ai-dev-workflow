@@ -1,9 +1,7 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_MODE } from "@/lib/e2e";
 import type { Session } from "@/lib/session-types";
-import { hasRepoAccess } from "@/lib/session-access";
+import { hasRepoAccess, isAuthenticated } from "@/lib/session-access";
 
 const NO_STORE = { "Cache-Control": "no-store" };
 
@@ -20,8 +18,7 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * show" shape for the "never run here" case -- doesn't reveal whether the repo exists either way.
  */
 export async function GET(request: Request) {
-  const session = await auth();
-  if (!session && !E2E_MODE) {
+  if (!(await isAuthenticated())) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

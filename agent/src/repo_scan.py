@@ -1,7 +1,7 @@
 """Deterministic repository health scan: one engine, several callers.
 
 Runs a licence-vetted, offline tool set inside the sandbox, normalizes every result into the one
-`Finding` vocabulary defined by quality_security/sarif.py, **deduplicates across tools**, and
+`Finding` vocabulary defined by sarif.py, **deduplicates across tools**, and
 assembles a single structured report suitable for a repo metrics/health dashboard.
 
 Callers select a subset with `profile=` (or an explicit `tools=`):
@@ -70,8 +70,8 @@ from typing import Any, Callable, Iterable, Sequence
 
 from langchain_core.runnables import RunnableConfig
 
-from .quality_security.sarif import Finding, parse_sarif
-from .quality_security.severity import SEMGREP_SEVERITY_MAP, SEVERITY_ORDER, meets_or_exceeds
+from .sarif import Finding, parse_sarif
+from .severity import SEMGREP_SEVERITY_MAP, SEVERITY_ORDER, meets_or_exceeds
 
 logger = logging.getLogger(__name__)
 

@@ -3,12 +3,14 @@
 import { useAgent } from "@copilotkit/react-core/v2";
 import { parseImplementationPlan, PlanSurfaceRenderer } from "@/a2ui/catalog";
 import { A2UISurfaceView } from "@/components/A2UISurfaceView";
+import { AuditFindingsDetails } from "@/components/AuditFindingsDetails";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { PLAN_SURFACE_ID } from "@/lib/a2ui-surface-ids";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
+import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -34,17 +36,17 @@ export function PlanView() {
     parseImplementationPlan(plan?.approved_content) ??
     (interrupt.stage === "plan" ? parseImplementationPlan(interrupt.draft) : null);
 
-  // Provisional-content indicator -- same rationale as SpecificationView's own copy of this
-  // comment: stage.status flips to "ready_for_review" the instant the draft node returns,
-  // before audit/verify run, so this view was rendering pre-audit content indistinguishably
-  // from the final reviewable plan. The gate interrupt being open for THIS stage is the only
-  // authoritative "final" signal. status !== "approved" is required too (found live: once Plan
-  // itself gets approved and Build starts running, agent.isRunning stays true and isFinal goes
-  // false with the interrupt closed -- without this check the now-approved plan would blur again).
-  const isFinal = interrupt.open && interrupt.stage === "plan";
-  // Same reasoning as SpecificationView's own copy of this comment: agent.isRunning alone misses a
-  // reload mid-redraft (Workflow Liveness Fix's durable run_active backstops it).
-  const isProvisional = (agent.isRunning || runActivity?.runActive === true) && plan?.status !== "approved" && !isFinal;
+  // See stage-review-flags.ts for the isFinal/isProvisional rationale (shared with
+  // SpecificationView -- the subtlety here has already caused two live bugs from hand-duplicating
+  // this logic).
+  const { isProvisional } = deriveStageReviewFlags({
+    stageKey: "plan",
+    stageStatus: plan?.status,
+    interruptOpen: interrupt.open,
+    interruptStage: interrupt.stage,
+    agentIsRunning: agent.isRunning,
+    runActive: runActivity?.runActive,
+  });
 
   // Same shell as Tech Stack / Requirements / Specification (user requirement 2026-08-31):
   // header block on top, content in one bounded 63vh box scrolling internally. Read-only here;
@@ -61,18 +63,7 @@ export function PlanView() {
         </p>
       </div>
 
-      {(plan?.audit_findings?.length ?? 0) > 0 && (
-        <details className="rounded-lg border border-neutral-200 px-3 py-2 text-sm">
-          <summary className="cursor-pointer text-neutral-700">
-            Adversarial audit revised this draft — {plan!.audit_findings.length} finding(s) addressed
-          </summary>
-          <ul className="mt-1 list-inside list-disc text-xs text-neutral-600">
-            {plan!.audit_findings.map((finding, index) => (
-              <li key={index}>{finding}</li>
-            ))}
-          </ul>
-        </details>
-      )}
+      <AuditFindingsDetails findings={plan?.audit_findings ?? []} />
       <ClarifyingQuestions
         stageKey="plan"
         questions={plan?.clarifying_questions ?? []}

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { hasRepoAccess } from "@/lib/session-access";
+import { requireRepoAccess } from "@/lib/session-access";
 import { E2E_GITHUB_ID, E2E_MODE } from "@/lib/e2e";
 
 /**
@@ -22,9 +22,8 @@ export async function GET(request: Request) {
   }
   // Unlike the per-user vault row, this table is (owner, repo)-keyed -- without this check any
   // signed-in user could read another team's auth posture and anonymous-route list.
-  if (!(await hasRepoAccess(owner, repo))) {
-    return NextResponse.json({ detail: "You do not have access to this repository" }, { status: 403 });
-  }
+  const accessError = await requireRepoAccess(owner, repo);
+  if (accessError) return accessError;
   const params = new URLSearchParams({ owner, repo });
   const response = await agentFetch(`repo-auth-settings?${params}`);
   return NextResponse.json(await response.json(), { status: response.status });
@@ -44,9 +43,8 @@ export async function PUT(request: Request) {
   if (!owner || !repo || !authMode) {
     return NextResponse.json({ detail: "owner, repo, and authMode are required" }, { status: 400 });
   }
-  if (!(await hasRepoAccess(owner, repo))) {
-    return NextResponse.json({ detail: "You do not have access to this repository" }, { status: 403 });
-  }
+  const accessError = await requireRepoAccess(owner, repo);
+  if (accessError) return accessError;
   const response = await agentFetch("repo-auth-settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

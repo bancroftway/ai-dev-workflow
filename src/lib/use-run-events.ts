@@ -106,6 +106,22 @@ export function argSummary(payload: Record<string, unknown> | null): string | nu
   return typeof direct === "string" ? truncateOneLine(direct, 80) : null;
 }
 
+/** Absolute clock label for one event row (Agent Narration Drawer, user request 2026-09-06: tell
+ * apart same-looking reasoning/tool-call lines from different stages/times at a glance). Includes
+ * the date, not just time-of-day -- a run can genuinely span days (SessionOverview's own "stage 2
+ * of 8 a day into a run" case), so a bare HH:MM:SS would misleadingly collide across days. Goes
+ * through parseEventTs, not a bare `new Date(e.ts)`, for the same UTC-suffix reason that function's
+ * own docstring documents. */
+export function formatEventTimestamp(ts: string): string {
+  return new Date(parseEventTs(ts)).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 /** Human-readable duration, shared so a span reads identically in EventLogView's row detail and
  * Swimlane's bars/tooltips. */
 export function formatDuration(ms: number): string {

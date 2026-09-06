@@ -338,6 +338,20 @@ export function AppShell({
     durableRow.current_stage !== "tech-stack" &&
     !runActivity?.interrupted;
 
+  // Workflow Liveness Fix false positive (found live 2026-09-06): graph.py's
+  // _route_after_repo_scan_baseline deliberately ends the run at END -- not a gate, no
+  // interrupt() -- once tech-stack is approved but no requirements have been typed yet ("waits
+  // for the Requirements tab", per that router's own docstring). That leaves status=in_progress,
+  // run_active=false, awaiting_gate=false: textbook `interrupted` by sessions_api.py's
+  // definition, even though nothing crashed -- every fresh session sits in exactly this state
+  // right after approving its tech stack. The RULES table above (tech-stack/approved/also:
+  // raw-requirements still not_started) already trusts this same pair of stage statuses to mean
+  // "waiting on the human to type requirements, not broken" for the auto-navigate jump; reused
+  // here to silence the same false alarm for the banner below.
+  const isAwaitingFirstRequirements =
+    state.stages?.["tech-stack"]?.status === "approved" &&
+    (state.stages?.["raw-requirements"]?.status ?? "not_started") === "not_started";
+
   // Auto-trigger the run once, as soon as the sandbox is ready, on a thread that's never run
   // before -- scaffold_node hard-fails with no local-working-tree fallback if run before the
   // sandbox exists, so this waits on sandboxStatus rather than firing on mount.
@@ -588,7 +602,7 @@ export function AppShell({
             "failed"` is the other stopped-and-recoverable case, whose only Resume button used to
             live buried in the Overview tab (SessionOverview.tsx) -- this one is visible from
             every tab. */}
-        {(runActivity?.interrupted || durableRow?.status === "failed") && (
+        {((runActivity?.interrupted && !isAwaitingFirstRequirements) || durableRow?.status === "failed") && (
           <div className="flex items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
             <span>
               {durableRow?.status === "failed"

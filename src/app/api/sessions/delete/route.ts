@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
 import { githubAccessToken } from "@/lib/e2e";
-import { lookupSessionWithAuthorization } from "@/lib/session-access";
+import { requireAuthorizedSession } from "@/lib/session-access";
 
 /**
  * Full purge (SessionHistory's "Delete" button): stops the container if one is running, deletes
@@ -17,10 +17,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ detail: "sessionId is required" }, { status: 400 });
   }
 
-  const lookup = await lookupSessionWithAuthorization(sessionId);
-  if (lookup.kind !== "authorized") {
-    return NextResponse.json({ detail: "session not found" }, { status: 404 });
-  }
+  const lookup = await requireAuthorizedSession(sessionId);
+  if (lookup instanceof NextResponse) return lookup;
 
   const token = await getServerAuthToken();
   const githubToken = githubAccessToken(token);

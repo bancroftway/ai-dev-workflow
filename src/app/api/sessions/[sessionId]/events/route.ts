@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_MODE } from "@/lib/e2e";
-import { getAuthorizedSession } from "@/lib/session-access";
+import { getAuthorizedSession, isAuthenticated } from "@/lib/session-access";
 
 /**
  * This session's durable event history (Part 2 Task 8's EventLogView) -- the fetch-based fallback
@@ -17,8 +15,7 @@ import { getAuthorizedSession } from "@/lib/session-access";
  * to its repo" (getAuthorizedSession collapses those on purpose -- see session-access.ts).
  */
 export async function GET(_request: Request, { params }: { params: Promise<{ sessionId: string }> }) {
-  const session = await auth();
-  if (!session && !E2E_MODE) {
+  if (!(await isAuthenticated())) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

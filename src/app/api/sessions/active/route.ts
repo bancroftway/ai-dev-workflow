@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_MODE } from "@/lib/e2e";
+import { isAuthenticated } from "@/lib/session-access";
 
 const NO_STORE = { "Cache-Control": "no-store" };
 
@@ -18,8 +17,7 @@ export type ActiveSessionEntry = { owner: string; repo: string; session_id: stri
  * for an internal single-org tool; the session data itself stays behind list/route.ts's check.
  */
 export async function GET() {
-  const session = await auth();
-  if (!session && !E2E_MODE) {
+  if (!(await isAuthenticated())) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

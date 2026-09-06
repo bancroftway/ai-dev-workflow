@@ -1,5 +1,8 @@
 import "server-only";
+import { NextResponse } from "next/server";
+import { auth } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
+import { E2E_MODE } from "@/lib/e2e";
 import { getOctokit } from "@/lib/github";
 import type { Session } from "@/lib/session-types";
 
@@ -20,6 +23,25 @@ export async function hasRepoAccess(owner: string, repo: string): Promise<boolea
     if ((error as { status?: number }).status === 404) return false;
     throw error;
   }
+}
+
+/**
+ * Shared 403 gate for the repo-scoped settings routes (auth-settings, test-config, test-users,
+ * vault, vault/selection) -- returns a ready response when access fails, null when it passes.
+ */
+export async function requireRepoAccess(owner: string, repo: string): Promise<NextResponse | null> {
+  if (await hasRepoAccess(owner, repo)) return null;
+  return NextResponse.json({ detail: "You do not have access to this repository" }, { status: 403 });
+}
+
+/**
+ * True iff the caller is signed in (or E2E_MODE's bypass applies). Deliberately returns a bare
+ * boolean, not a response -- callers' 401 bodies differ (tech-stack-catalog's typed empty payload
+ * vs. everyone else's `{ error: "Unauthorized" }`), so only the repeated condition is shared here.
+ */
+export async function isAuthenticated(): Promise<boolean> {
+  const session = await auth();
+  return session != null || E2E_MODE;
 }
 
 type SessionLookupResult =
@@ -60,4 +82,15 @@ export async function lookupSessionWithAuthorization(sessionId: string): Promise
 export async function getAuthorizedSession(sessionId: string): Promise<Session | null> {
   const result = await lookupSessionWithAuthorization(sessionId);
   return result.kind === "authorized" ? result.session : null;
+}
+
+/**
+ * Same collapse as getAuthorizedSession, but returns a ready 404 instead of null -- for the
+ * action-style routes (session actions/delete/terminate) that only ever act on success and
+ * don't need the not_found/denied distinction lookupSessionWithAuthorization preserves.
+ */
+export async function requireAuthorizedSession(sessionId: string): Promise<{ session: Session } | NextResponse> {
+  const session = await getAuthorizedSession(sessionId);
+  if (!session) return NextResponse.json({ detail: "session not found" }, { status: 404 });
+  return { session };
 }

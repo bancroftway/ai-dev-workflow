@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { lookupSessionWithAuthorization } from "@/lib/session-access";
+import { requireAuthorizedSession } from "@/lib/session-access";
 
 /**
  * On-demand session actions ("Refresh Key Vault secrets" in the workspace header;
@@ -19,12 +19,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ detail: "sessionId and a known action are required" }, { status: 400 });
   }
 
-  const lookup = await lookupSessionWithAuthorization(sessionId);
-  if (lookup.kind !== "authorized") {
-    // Same shape for not_found and denied -- never confirm a session's existence to a caller
-    // who can't see it (mirrors session-access.ts's own contract).
-    return NextResponse.json({ detail: "session not found" }, { status: 404 });
-  }
+  const lookup = await requireAuthorizedSession(sessionId);
+  if (lookup instanceof NextResponse) return lookup;
   // Only refresh-secrets needs a fresh Entra assertion to read the vault -- confirm-reopen is a
   // plain in-process flag set on the agent, nothing to authenticate against Azure with.
   if (action === "refresh-secrets" && !token?.entraAccessToken) {

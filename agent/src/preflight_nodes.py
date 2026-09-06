@@ -29,7 +29,6 @@ from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .schemas import TECH_STACK_EXTRACT_EXAMPLE, DotnetStatus, PresenceList, TechStack
 from .schemas_app_discovery import DiscoveredApp
-from .schemas_session import SessionTitleResponse
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
@@ -89,6 +88,10 @@ def _session_title(raw_requirements_text: str, run_id: str) -> str:
         if stripped:
             return stripped[:80]
     return f"(untitled run {run_id})"
+
+
+class SessionTitleResponse(BaseModel):
+    title: str
 
 
 async def _generate_session_title(thread_id: str, raw_requirements_text: str, run_id: str, provider: str) -> str:

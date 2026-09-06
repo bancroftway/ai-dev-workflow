@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { hasRepoAccess } from "@/lib/session-access";
+import { requireRepoAccess } from "@/lib/session-access";
 import { E2E_GITHUB_ID, E2E_MODE } from "@/lib/e2e";
 
 /**
@@ -54,9 +54,8 @@ export async function PUT(request: Request) {
       { status: 422 },
     );
   }
-  if (!(await hasRepoAccess(owner, repo))) {
-    return NextResponse.json({ detail: "You do not have access to this repository" }, { status: 403 });
-  }
+  const accessError = await requireRepoAccess(owner, repo);
+  if (accessError) return accessError;
 
   const response = await agentFetch("vault-config", {
     method: "PUT",

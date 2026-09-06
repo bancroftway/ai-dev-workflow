@@ -65,6 +65,49 @@ export function anyStageDrafting(state: WorkflowState): boolean {
   return Object.values(state.stages ?? {}).some((stage) => stage.status === "drafting");
 }
 
+/** Mirrors agent/src/rebuild.py's RebuildState -- one placement's clean-build (+ TDD-red, for the
+ * scaffold placement) loop between two real stages. Only the fields a client actually reads;
+ * last_stdout_tail/last_stderr_tail/build_commands have no UI consumer. */
+export interface RebuildState {
+  status: "not_started" | "clean" | "failed" | "fixing";
+  fix_cycle_count: number;
+  last_exit_ok: boolean;
+  cannot_verify: boolean;
+}
+
+/** User-reported gap (2026-09-06): ac-to-tests approves, then Build/Overview go quiet for several
+ * minutes with no row/card for it -- reads as stalled. That gap is real work: graph.py's
+ * POST_STAGE_REBUILD wires a clean-build + "are the new tests genuinely red yet" check
+ * (agent/src/rebuild.py's rebuild_node, spec key "r_ac_to_tests") between ac-to-tests' gate and
+ * minimal-code-to-green's own draft. Scoped to only this ONE of the pipeline's four rebuild
+ * placements (the other three -- after minimal-code-to-green, remediation, adversarial-compliance
+ * -- have no equivalent "silence right after a stage approves" complaint yet, and rebuild.py
+ * doesn't tag their events as distinctly as this placement's "red-gate" stage label); extend by
+ * generalizing this and its two callers (SessionOverview.tsx, BuildView.tsx) if that changes.
+ *
+ * rebuild.py's own state (rb.status) only updates when the node FUNCTION RETURNS -- same lag every
+ * other non-gated stage has (see BuildView.tsx's StageCard comment) -- so "running" here is
+ * best-effort: this placement has been entered (state.rebuild has an entry) but
+ * minimal-code-to-green hasn't started, AND the run isn't known to be idle. `runActive` is the
+ * same tri-state signal computeRunningStages/isProvisional already trust: `undefined`/`null` (not
+ * loaded yet) must NOT read as "stopped", only an explicit `false` does. */
+export const REBUILD_STATUS_LABEL: Record<RebuildState["status"], string> = {
+  not_started: "Not started",
+  clean: "Passed",
+  failed: "Failed",
+  fixing: "Fixing",
+};
+
+export function redGatePhase(
+  state: WorkflowState,
+  runActive: boolean | null | undefined,
+): { status: RebuildState["status"]; running: boolean } | null {
+  const rb = state.rebuild?.["r_ac_to_tests"];
+  if (!rb) return null;
+  const mctgStarted = (state.stages?.["minimal-code-to-green"]?.status ?? "not_started") !== "not_started";
+  return { status: rb.status, running: !mctgStarted && runActive !== false };
+}
+
 /** A canned monorepo stack the Tech Stack tab's dropdown offers, loaded from
  * agent/src/templates/tech_stacks/*.md via GET /api/tech-stack-catalog (agent/src/app_discovery.py's
  * load_stack_catalog). `markdown` is the full catalog file content -- picking one overwrites the
@@ -283,6 +326,9 @@ export interface WorkflowState {
   token_usage_running?: { input_tokens: number; output_tokens: number; cost: number } | null;
   // Terminal failure: escalations no longer pause for a human -- the graph ENDs with this set.
   run_failure?: EscalationPayload | null;
+  // Keyed by RebuildSpec.key (agent/src/rebuild.py) -- one entry per R placement this thread has
+  // actually entered. See redGatePhase's own docstring for the one placement the UI reads today.
+  rebuild?: Record<string, RebuildState>;
   stages?: {
     "brownfield-baseline"?: StageState;
     "tech-stack"?: StageState;
@@ -330,21 +376,6 @@ export const TAB_STAGE_GROUPS: Record<string, StageKey[]> = {
   overview: [],
   quality: [],
 };
-
-export interface GatePayload {
-  stage:
-    | "brownfield-baseline"
-    | "tech-stack"
-    | "specification"
-    | "plan"
-    | "ac-to-tests"
-    | "minimal-code-to-green"
-    | "adversarial-audit"
-    | "dedup-simplify"
-    | "license-audit"
-    | "exit";
-  draft: unknown;
-}
 
 /** Escalation interrupt payloads (graph.py make_escalate_node, security gate, audit exit gate).
  * Distinct from the plain approval gate interrupt, which has no `type`. */

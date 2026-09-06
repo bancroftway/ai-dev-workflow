@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { agentFetch } from "@/lib/agent-client";
-import { lookupSessionWithAuthorization } from "@/lib/session-access";
+import { requireAuthorizedSession } from "@/lib/session-access";
 
 /**
  * Manual "stop container" proxy (WorkspaceHeader's connection indicator). Forwards to the agent's
@@ -15,10 +15,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ detail: "sessionId is required" }, { status: 400 });
   }
 
-  const lookup = await lookupSessionWithAuthorization(sessionId);
-  if (lookup.kind !== "authorized") {
-    return NextResponse.json({ detail: "session not found" }, { status: 404 });
-  }
+  const lookup = await requireAuthorizedSession(sessionId);
+  if (lookup instanceof NextResponse) return lookup;
 
   const response = await agentFetch(`sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
   const body = await response.json().catch(() => ({}));

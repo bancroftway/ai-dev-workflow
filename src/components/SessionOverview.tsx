@@ -1,14 +1,14 @@
 "use client";
 
 import { useAgent, useCopilotKit } from "@copilotkit/react-core/v2";
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import { LiveCostChip } from "@/components/LiveCostChip";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { computeRunningPhases, NODE_PHASE_LABEL, formatDuration, parseEventTs, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import type { StageState, WorkflowState } from "@/lib/workflow-types";
+import { REBUILD_STATUS_LABEL, redGatePhase, type StageState, type WorkflowState } from "@/lib/workflow-types";
 
 const STATUS_LABEL: Record<string, string> = {
   not_started: "Not started",
@@ -57,6 +57,8 @@ export function SessionOverview() {
   // surfaced before (user feedback 2026-09-01).
   const events = useRunEvents();
   const [runActivity] = useRunActivity();
+  const redGate = redGatePhase(state, runActivity?.runActive);
+  const redGateFailedHere = failure?.stage === "r_ac_to_tests";
   const perStage = useMemo(() => {
     const byStage = new Map<
       string,
@@ -163,9 +165,47 @@ export function SessionOverview() {
               // leaves `status === "drafting"` forever, which used to read as running with no other
               // signal to contradict it.
               const running = (stage.status === "drafting" && runActivity?.runActive !== false) || timing?.node !== undefined;
+              // Red-gate row (redGatePhase's own docstring): inserted right after ac-to-tests,
+              // the one real stage it sits between and the pipeline's only rebuild placement
+              // with a user-reported "looks stalled" gap so far.
+              const redGateRow = key === "ac-to-tests" && redGate && (() => {
+                const rebuildTiming = perStage.get("rebuild");
+                const redGateTiming = perStage.get("red-gate");
+                const first = [rebuildTiming?.first, redGateTiming?.first].filter((n): n is number => n != null);
+                const last = [rebuildTiming?.last, redGateTiming?.last].filter((n): n is number => n != null);
+                const cost = (rebuildTiming?.cost ?? 0) + (redGateTiming?.cost ?? 0);
+                const sawCost = Boolean(rebuildTiming?.sawCost || redGateTiming?.sawCost);
+                return (
+                  <li
+                    key="red-gate"
+                    className={`rounded-lg border px-4 py-2 text-sm ${
+                      redGateFailedHere ? "border-red-300 bg-red-50" : "border-neutral-200"
+                    }`}
+                  >
+                    <div className={ROW_GRID}>
+                      <span className="font-medium">red-gate</span>
+                      <span className="text-right text-xs text-neutral-500">
+                        {first.length > 0 && last.length > 0 ? formatDuration(Math.max(...last) - Math.min(...first)) : ""}
+                      </span>
+                      <span className="text-right text-xs text-neutral-500">{sawCost ? `$${cost.toFixed(2)}` : ""}</span>
+                      <span className="text-right text-xs text-neutral-500" />
+                      <span
+                        className={`flex items-center justify-end gap-1.5 ${redGateFailedHere ? "text-red-700" : "text-neutral-500"}`}
+                      >
+                        {redGate.running && <RunningSpinner />}
+                        {redGateFailedHere ? "Failed" : redGate.running ? "Verifying" : REBUILD_STATUS_LABEL[redGate.status]}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-neutral-500">
+                      Confirms the new tests actually fail before minimal-code-to-green starts writing an
+                      implementation against them.
+                    </p>
+                  </li>
+                );
+              })();
               return (
+                <Fragment key={key}>
                 <li
-                  key={key}
                   className={`rounded-lg border px-4 py-2 text-sm ${
                     failedHere ? "border-red-300 bg-red-50" : "border-neutral-200"
                   }`}
@@ -194,6 +234,8 @@ export function SessionOverview() {
                   </div>
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
                 </li>
+                {redGateRow}
+                </Fragment>
               );
             })}
           </ol>

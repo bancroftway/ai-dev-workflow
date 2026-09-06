@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { hasRepoAccess } from "@/lib/session-access";
+import { requireRepoAccess } from "@/lib/session-access";
 
 /**
  * Saves which vault secrets are exposed to the sandbox and under which env names. The agent
@@ -21,9 +21,8 @@ export async function PUT(request: Request) {
   if (!owner || !repo || !Array.isArray(selection)) {
     return NextResponse.json({ detail: "owner, repo, and selection are required" }, { status: 400 });
   }
-  if (!(await hasRepoAccess(owner, repo))) {
-    return NextResponse.json({ detail: "You do not have access to this repository" }, { status: 403 });
-  }
+  const accessError = await requireRepoAccess(owner, repo);
+  if (accessError) return accessError;
   const response = await agentFetch("vault-config/selection", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

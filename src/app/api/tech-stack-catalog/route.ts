@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_MODE } from "@/lib/e2e";
+import { isAuthenticated } from "@/lib/session-access";
 import type { TechStackCatalogResponse } from "@/lib/workflow-types";
 
 const NO_STORE = { "Cache-Control": "no-store" };
@@ -12,8 +11,7 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * Still gated behind a real session: this is workflow-internal data, not public marketing content.
  */
 export async function GET() {
-  const session = await auth();
-  if (!session && !E2E_MODE) {
+  if (!(await isAuthenticated())) {
     return NextResponse.json({ stacks: [] } satisfies TechStackCatalogResponse, { status: 401, headers: NO_STORE });
   }
 

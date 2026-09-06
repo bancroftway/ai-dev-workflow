@@ -3,12 +3,14 @@
 import { useAgent } from "@copilotkit/react-core/v2";
 import { parseSpecification, SpecificationSurfaceRenderer } from "@/a2ui/catalog";
 import { A2UISurfaceView } from "@/components/A2UISurfaceView";
+import { AuditFindingsDetails } from "@/components/AuditFindingsDetails";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { SPECIFICATION_SURFACE_ID } from "@/lib/a2ui-surface-ids";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
+import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { WorkflowState } from "@/lib/workflow-types";
 
@@ -31,28 +33,16 @@ export function SpecificationView() {
     parseSpecification(stage?.approved_content) ??
     (interrupt.stage === "specification" ? parseSpecification(interrupt.draft) : null);
 
-  // Provisional-content indicator (user, 2026-08-31, found confusing live): make_draft_node
-  // flips stage.status to "ready_for_review" the INSTANT the draft LLM call returns readiness --
-  // before the audit or verify passes even run. This view was rendering that draft content
-  // exactly like a finished, reviewable spec (real-looking layout, no signal anything was still
-  // happening beyond the global spinner), so a user landing here mid-audit saw content with no
-  // way to tell a further-revised version was still coming and no Approve button yet -- read as
-  // a bug. The ONLY authoritative "this is final and actionable" signal is THIS stage's own gate
-  // interrupt being open; anything shown before that (draft mid-audit, mid-verify, or a redraft
-  // in flight after a rejection) is provisional and gets a blurred, spinner-labeled treatment
-  // instead of looking identical to the real thing.
-  //
-  // stage.status !== "approved" is required too, not just isFinal (found live immediately after
-  // approving: agent.isRunning stayed true because the NEXT stage, Plan, started drafting, and
-  // this view kept blurring the now-APPROVED specification because isFinal had gone false along
-  // with the interrupt closing). Once this stage's own status is "approved" its content is
-  // settled regardless of what the rest of the pipeline is doing.
-  const isFinal = interrupt.open && interrupt.stage === "specification";
-  // agent.isRunning OR'd with the durable run_active signal (Workflow Liveness Fix): isRunning is
-  // stream-attachment only and resets to false on reload while the server may still genuinely be
-  // auditing/redrafting this stage -- without runActive, that reload briefly rendered mid-audit
-  // content as if it were the final, settled version.
-  const isProvisional = (agent.isRunning || runActivity?.runActive === true) && stage?.status !== "approved" && !isFinal;
+  // See stage-review-flags.ts for the isFinal/isProvisional rationale (shared with PlanView --
+  // the subtlety here has already caused two live bugs from hand-duplicating this logic).
+  const { isProvisional } = deriveStageReviewFlags({
+    stageKey: "specification",
+    stageStatus: stage?.status,
+    interruptOpen: interrupt.open,
+    interruptStage: interrupt.stage,
+    agentIsRunning: agent.isRunning,
+    runActive: runActivity?.runActive,
+  });
 
   // Same shell as the Tech Stack / Requirements tabs (user requirement 2026-08-31): header block
   // on top, content in one bounded 65vh box that scrolls internally -- the document itself is
@@ -69,18 +59,7 @@ export function SpecificationView() {
         </p>
       </div>
 
-      {(stage?.audit_findings?.length ?? 0) > 0 && (
-        <details className="rounded-lg border border-neutral-200 px-3 py-2 text-sm">
-          <summary className="cursor-pointer text-neutral-700">
-            Adversarial audit revised this draft — {stage!.audit_findings.length} finding(s) addressed
-          </summary>
-          <ul className="mt-1 list-inside list-disc text-xs text-neutral-600">
-            {stage!.audit_findings.map((finding, index) => (
-              <li key={index}>{finding}</li>
-            ))}
-          </ul>
-        </details>
-      )}
+      <AuditFindingsDetails findings={stage?.audit_findings ?? []} />
       <ClarifyingQuestions
         stageKey="specification"
         questions={stage?.clarifying_questions ?? []}

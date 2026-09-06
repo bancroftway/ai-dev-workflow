@@ -552,11 +552,7 @@ Also caught while wiring this: standalone `StageSpec`s (P11a/b/d, P15, and now P
 
 ## P8 — Code quality
 
-**Status: ✅ DONE (not e2e-verified, structural only — read this section's caveats before relying on it).**
-
-Not a `StageSpec` entry — a bespoke node cluster wired directly into `build_graph()` (`agent/src/quality_security/p8_nodes.py` + `_wire_p8` in `graph.py`): `p8_scan → p8_triage → p8_ledger_write → p8_fix → R(p8) → p8_gate_check → (loop to p8_scan | p8_human_gate)`.
-
-**What's real and shared with P10**: `agent/src/quality_security/sarif.py` is a genuine, generic SARIF 2.1.0 parser (`Finding` dataclass, `finding_key = sha256(f"{tool}:{rule_id}:{normalized_path}")[:12]`, deliberately excluding line number so drift doesn't false-trigger re-triage — exactly as the plan specified). `agent/src/quality_security/suppressions.py` is a genuine, working suppression-ledger primitive (`append_suppression`/`check_no_silent_suppression`) shared by both P8 and P10 — the no-silent-suppression gate for real: scans the diff since a captured baseline commit for known marker-prefix patterns (`nosemgrep`, `nosec`, `#pragma warning disable`, `jscpd:ignore`, etc.), requires a `ref:<hex>` token on every one, and cross-checks that token against a real ledger row.
+**Status: SUPERSEDED.** This bespoke node-cluster design (`p8_nodes.py`, `_wire_p8`, the `suppressions.py` ledger) was removed from the codebase — `p8_nodes.py` no longer exists and `graph.py` has no `_wire_p8`/`p8_*` wiring. Replaced by `repo_scan.py`'s unified deterministic scan plus `remediation_gate.py`'s stricter blanket no-suppression policy (no ledger, no suppression path at all). The rest of this section is kept only as historical record of the earlier design's caveats — nothing below describes code that currently runs.
 
 **Stated plainly, what's NOT verified or is simplified**:
 - **Never run against a real sandbox.** Unlike P0/P1/P2/P4/(the fixed part of) P1, this cluster's exact tool invocations (`dotnet build`'s SARIF `ErrorLog` MSBuild property syntax, `dotnet format --report`'s JSON shape, jscpd's CLI flags and output path) are written from documentation, not confirmed live.
@@ -570,9 +566,7 @@ Not a `StageSpec` entry — a bespoke node cluster wired directly into `build_gr
 
 ## P10 — Code security
 
-**Status: ✅ DONE (not e2e-verified, structural only — same caveats as P8, read before relying on it).**
-
-Same bespoke-cluster shape as P8 (`agent/src/quality_security/p10_nodes.py` + `_wire_p10` in `graph.py`): `p10_scan → p10_triage → p10_ledger_write → p10_fix → R(p10) → p10_gate_check → (loop | p10_human_gate)`. Reuses P8's shared `sarif.py`/`suppressions.py` modules directly — no duplicated parsing logic.
+**Status: SUPERSEDED.** Same bespoke-cluster design as P8, and removed the same way — `p10_nodes.py` no longer exists and `graph.py` has no `_wire_p10`/`p10_*` wiring. Replaced by `repo_scan.py` + `remediation_gate.py`, same as P8. The rest of this section is kept only as historical record — nothing below describes code that currently runs.
 
 `p10_scan_node` runs Semgrep (`--config auto --config p/security-audit --sarif`), Trivy (`--scanners vuln,misconfig,license --format sarif`, plus a separate `--format cyclonedx` call writing `.ai-dev-workflow/sbom.cyclonedx.json`, committed each cycle), and gitleaks (`--no-git`, working-tree-only — a one-time full-history scan is a separate, explicitly out-of-scope item per the plan, not silently dropped). gitleaks' native JSON report is parsed directly (not SARIF, since gitleaks doesn't emit it) into the same `Finding` shape via a small dedicated parser.
 

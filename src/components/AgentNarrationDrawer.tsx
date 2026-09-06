@@ -1,7 +1,14 @@
 "use client";
 
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { argSummary, toolNameOf, useRunEvents, type RunLogEvent } from "@/lib/use-run-events";
+import {
+  argSummary,
+  formatEventTimestamp,
+  NODE_PHASE_LABEL,
+  toolNameOf,
+  useRunEvents,
+  type RunLogEvent,
+} from "@/lib/use-run-events";
 
 /**
  * Agent Narration Drawer: a right-side, non-modal panel showing the agent's live reasoning
@@ -63,6 +70,17 @@ function useStickToBottom(events: RunLogEvent[]) {
  * row. */
 const REASONING_COLLAPSE_CHARS = 480;
 
+/** "ac-to-tests · Auditing" -- which stage AND which phase of it (draft/audit/verify/fix,
+ * NODE_PHASE_LABEL, already used elsewhere for the tab-pill spinners) a line belongs to. User
+ * request 2026-09-06: a run of consecutive rows all labelled just "ac-to-tests" gave no way to
+ * tell a draft-phase tool call apart from an audit-phase one re-reading the same files. Falls back
+ * to the raw node key for a phase NODE_PHASE_LABEL hasn't named (never silently drops it). */
+function stageLabel(event: RunLogEvent): string | null {
+  if (!event.stage) return null;
+  const phase = event.node ? (NODE_PHASE_LABEL[event.node] ?? event.node) : null;
+  return phase ? `${event.stage} · ${phase}` : event.stage;
+}
+
 /** Full-width prose, never folded to a one-liner -- the research note's own label for this row
  * ("model-emitted narration, labelled Reasoning summary"). Reads `payload.text` directly (`summary`
  * is only a truncated head, per both providers' own translate functions), falling back to
@@ -79,7 +97,8 @@ function ReasoningRow({ event }: { event: RunLogEvent }) {
     <div className="bg-neutral-50/70 px-4 py-3">
       <div className="mb-1 flex items-center gap-2 text-[10px] font-medium uppercase tracking-wide text-neutral-400">
         <span>Reasoning summary</span>
-        {event.stage && <span>· {event.stage}</span>}
+        {stageLabel(event) && <span>· {stageLabel(event)}</span>}
+        <span className="ml-auto shrink-0 normal-case tracking-normal">{formatEventTimestamp(event.ts)}</span>
       </div>
       <p className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-800">{visible}</p>
       {isLong && (
@@ -107,7 +126,8 @@ function CompactToolRow({ event }: { event: RunLogEvent }) {
       <span aria-hidden className="h-2 w-2 shrink-0 rounded-full bg-neutral-400" />
       <span className="truncate text-neutral-700">{event.summary ?? tool ?? "tool"}</span>
       {arg && <span className="truncate font-mono text-xs text-neutral-400">{arg}</span>}
-      {event.stage && <span className="ml-auto shrink-0 text-xs text-neutral-400">{event.stage}</span>}
+      {stageLabel(event) && <span className="ml-auto shrink-0 text-xs text-neutral-400">{stageLabel(event)}</span>}
+      <span className="shrink-0 text-xs text-neutral-400">{formatEventTimestamp(event.ts)}</span>
     </div>
   );
 }
