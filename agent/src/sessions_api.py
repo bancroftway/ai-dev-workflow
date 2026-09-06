@@ -339,6 +339,40 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             await provider.terminate(body.thread_id)
         except Exception:  # noqa: BLE001 -- cleanup must never mask the original provision error
             logger.warning("post-failure teardown itself failed for thread_id=%s", body.thread_id, exc_info=True)
+
+        # A provisioning failure used to leave NO dbo.sessions row for a brand-new session --
+        # create_session only ever ran after this whole try succeeded -- so GET /sessions/{id}
+        # 404'd forever. AppShell's reconcile poll reads that 404 as "session deleted elsewhere"
+        # and clobbers the "error" status SandboxSessionBoot already set with "terminated" on its
+        # very next tick, silently swallowing the error banner. Create the row (skip if one
+        # already exists) then close it the same way every other terminal failure in this
+        # codebase does, so this session gets a real, visible "failed" status and a Resume path.
+        # Guarded on existing being None/in_progress: a reprovision failure on an already-terminal
+        # row (completed/failed/rejected) must not stomp that row's original status/failure detail.
+        if existing is None or existing["status"] == "in_progress":
+            if existing is None:
+                try:
+                    await session_store.create_session(
+                        body.thread_id,
+                        owner=owner,
+                        repo=repo,
+                        user_login=body.user_login,
+                        source_branch=body.branch,
+                        work_branch=work_branch,
+                        title="(untitled session)",
+                        project_id=project_id,
+                        provider=chat_provider,
+                    )
+                except Exception:  # noqa: BLE001 -- best-effort; must not mask the original 502
+                    logger.warning(
+                        "failed to create session row after provisioning failure thread_id=%s",
+                        body.thread_id, exc_info=True,
+                    )
+            await git_ops.record_run_failure(
+                body.thread_id,
+                {"stage": "provisioning", "type": "provisioning_failed", "feedback": f"{type(exc).__name__}: {exc}"},
+            )
+
         raise HTTPException(
             status_code=502, detail=f"sandbox provisioning failed: {type(exc).__name__}: {exc}"
         ) from None
@@ -655,28 +689,41 @@ class SessionActionRequest(BaseModel):
     """Named actions only -- the frontend never sends shell. Adding an action = a new Literal
     member plus a handler branch below; anything else is rejected by validation before it runs."""
 
-    action: Literal["refresh-secrets"]
+    action: Literal["refresh-secrets", "confirm-reopen"]
     entra_assertion: str = ""
 
 
 class SessionActionResponse(BaseModel):
     ok: bool = True
-    secret_count: int
+    # Only "refresh-secrets" reports a count; None for every other action (confirm-reopen included).
+    secret_count: int | None = None
 
 
 @router.post("/{thread_id}/actions", response_model=SessionActionResponse)
 async def run_session_action(thread_id: str, body: SessionActionRequest, request: Request) -> SessionActionResponse:
-    """On-demand, frontend-initiated work against a live session. v1: "refresh-secrets" -- the
-    user added/rotated a vault secret mid-session and wants it picked up without starting over.
-    Re-fetches on-behalf-of the user with the fresh assertion the frontend just minted, updates
-    the in-process cache (also the recovery path when an agent restart dropped it), and re-writes
-    the env file inside the sandbox if one is running."""
+    """On-demand, frontend-initiated work against a live session.
+
+    "refresh-secrets": the user added/rotated a vault secret mid-session and wants it picked up
+    without starting over. Re-fetches on-behalf-of the user with the fresh assertion the frontend
+    just minted, updates the in-process cache (also the recovery path when an agent restart
+    dropped it), and re-writes the env file inside the sandbox if one is running.
+
+    "confirm-reopen": the one-shot signal that graph.py's intake_node requires before it will let
+    a fresh submission reopen an already-completed (merge_ready=true) thread -- set here, popped
+    exactly once by intake_node (sandbox_registry.pop_meta_flag, same one-shot pattern as the
+    existing `resume` flag). The frontend calls this immediately after the user explicitly
+    confirms a "this session already merged, continue anyway?" prompt (RequirementsView.tsx), never
+    automatically -- see graph.py's own `reopen_blocked` routing for why this must never fire from
+    a stale tab's own reattach/resubmit logic."""
     _check_shared_secret(request)
+    if body.action == "confirm-reopen":
+        registry.set_meta(thread_id, confirm_reopen=True)
+        return SessionActionResponse(ok=True)
+
     row = await session_store.get_session(thread_id)
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
 
-    # Only "refresh-secrets" exists; a second action turns this into a match on body.action.
     # Same resolver as provision (they previously disagreed about whose row to read).
     vault_uri, vault_selection = await keyvault.resolve_vault(row["owner"], row["repo"], [row["user_login"]])
     if not vault_uri:

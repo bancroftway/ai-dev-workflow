@@ -332,6 +332,14 @@ class GraphState(TypedDict):
     # every draft node's own return (see make_draft_node) the instant it's consumed. Read only via
     # state.get() -- checkpoints written before this field shipped lack it.
     restart_from_specification: bool
+    # One-shot signal (multi-tab/completed-session hardening): set True by intake_node when this
+    # thread's dbo.sessions row is already status=="completed" (merge_ready=true) and no
+    # confirm_reopen meta flag was popped for this invocation -- i.e. this run must NOT reopen a
+    # merged session, whether it's a genuine new chat message or a plain automatic reattach.
+    # _route_after_intake reads this FIRST and routes straight to END, skipping scaffold/touch_run
+    # entirely so status/merge_ready/pr_url are never touched. Read only via state.get() --
+    # checkpoints written before this field shipped lack it.
+    reopen_blocked: bool
 
 
 def default_stage_state() -> StageState:
@@ -2177,6 +2185,25 @@ async def _resolve_thread_provider(thread_id: str, state: GraphState) -> Literal
 
 async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
+
+    # Multi-tab/completed-session hardening, checked FIRST, before anything else below: a thread
+    # already merge_ready==true (dbo.sessions.status=="completed") must never reopen silently --
+    # not via a stray message from a stale tab that was open before the session completed
+    # elsewhere, and not via a plain automatic reattach/resume call either (this check does not
+    # depend on is_new_submission, computed further down, precisely so it also covers a blank
+    # run). Only the frontend's own explicit "confirm-reopen" action (RequirementsView.tsx, after
+    # a user-facing confirm prompt) sets the one-shot meta flag this pops. _route_after_intake
+    # reads GraphState.reopen_blocked and routes straight to END, so scaffold/touch_run (which
+    # would otherwise reset status to in_progress and wipe merge_ready/pr_url) never runs.
+    existing_row = await session_store.get_session(thread_id)
+    if existing_row is not None and existing_row["status"] == "completed":
+        if not sandbox_registry.pop_meta_flag(thread_id, "confirm_reopen"):
+            logger.warning(
+                "intake_node: refusing to reopen completed thread_id=%s (no confirm_reopen flag)",
+                thread_id,
+            )
+            return {"reopen_blocked": True}
+
     stages = {key: dict(value) for key, value in state.get("stages", {}).items()}
 
     provider: Literal["copilot", "claude"] = await _resolve_thread_provider(thread_id, state)
@@ -4005,6 +4032,13 @@ def _route_after_intake(state: GraphState) -> str:
     settles the stack before writing requirements; the ordinary reload/reattach no-op is
     preserved by the approved-tech-stack END branch.
     """
+    # Checked first, ahead of every other branch below: intake_node sets this when the thread is
+    # already completed (merge_ready=true) and no confirm-reopen was given -- must route straight
+    # to END regardless of raw_requirements_text/approved_content being non-empty (true for any
+    # session that ever got past requirements), or scaffold would still run and touch_run would
+    # still wipe status/merge_ready/pr_url right back.
+    if state.get("reopen_blocked"):
+        return END
     if (state.get("raw_requirements_text") or "").strip():
         return "scaffold"
     raw_req = (state.get("stages") or {}).get("raw-requirements") or {}
@@ -4723,6 +4757,15 @@ def _demo() -> None:
     # only ever reads status, which gate_node always sets to "approved" for those stages.
     route_after_gate_nongated = make_route_after_gate(by_key["ac-to-tests"])
     assert route_after_gate_nongated({"stages": {"ac-to-tests": {**default_stage_state(), "status": "approved"}}}) == "approved"
+
+    # Multi-tab/completed-session hardening: reopen_blocked must win over EVERY other branch in
+    # _route_after_intake, including one that would otherwise obviously route to "scaffold" (non-
+    # empty raw_requirements_text) -- this is exactly the case that used to let a completed
+    # session's status/merge_ready get silently wiped by scaffold_node's touch_run.
+    assert _route_after_intake({"reopen_blocked": True, "raw_requirements_text": "build me a widget"}) == END
+    # Unset (the ordinary case for every non-completed thread): falls through to the pre-existing
+    # routing untouched.
+    assert _route_after_intake({"raw_requirements_text": "build me a widget"}) == "scaffold"
 
     # Phase E review (Important 2): GATE_PAUSED must fire once per GENUINE pause, not once per
     # replay -- LangGraph re-executes gate_node from the top on every resume, and the naive

@@ -9,7 +9,7 @@ bootstrap_env()  # .env, then AZURE_CONFIG_VAULT_URI -- before any import that r
 import logging
 import os
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 from ag_ui.core import EventType, StateSnapshotEvent
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
@@ -96,13 +96,26 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
         override runs once per HTTP call, not once per process; the `finally` is what makes it
         cover normal completion, a mid-stream exception (see _RECURSION_LIMIT below), AND a client
         disconnect (StreamingResponse cancels the streaming task on disconnect, which propagates
-        into this generator's current await point same as any other exception)."""
+        into this generator's current await point same as any other exception).
+
+        The actual graph execution (super().run(), which internally calls prepare_stream() too) is
+        serialized per thread_id via run_activity.get_lock(): multiple browser tabs on the same
+        session each independently trigger a reattach/resume call, and without this a second tab's
+        call used to drive graph.astream concurrently with the first's -- a real risk of doubled
+        side effects (duplicate git ops, duplicate PR opens) and checkpoint-write races. incr/decr
+        stay OUTSIDE the lock so the run_active display flag still flips true immediately for
+        every attaching tab, not only whichever currently holds the lock. Safe to have a tab wait
+        here a long time: this exact shape (a turn running silent for 5-10+ minutes) is why
+        route.ts already disabled the proxy's idle timeouts, and a waiting tab still sees live
+        progress via the separate run-events poll in the meantime."""
         thread_id = input.thread_id
         if thread_id:
             run_activity.incr(thread_id)
         try:
-            async for event in super().run(input):
-                yield event
+            lock = run_activity.get_lock(thread_id) if thread_id else nullcontext()
+            async with lock:
+                async for event in super().run(input):
+                    yield event
         finally:
             if thread_id:
                 run_activity.decr(thread_id)

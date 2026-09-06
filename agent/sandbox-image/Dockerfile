@@ -269,7 +269,12 @@ RUN set -eux; \
     # at runtime and gets removed entirely; here a target repo's own npm install/run genuinely
     # needs it, so upgrade instead.
     npm install -g npm@12.0.2; \
-    npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}"; \
+    # npm@12's lifecycle-script allowlist gate silently blocks this package's postinstall (exit 0,
+    # just an "npm warn install-scripts ... not covered by allowScripts") -- postinstall is what
+    # downloads claude-code's platform-native binary, so a blocked-but-"successful" install leaves
+    # `claude` unable to run at all ("Error: claude native binary not installed"), verified live
+    # against a real rebuilt image. --allow-scripts is npm's own suggested fix for exactly this.
+    npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}"; \
     curl -fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
     chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg; \
@@ -351,17 +356,20 @@ RUN set -eux; \
 # static analyzers with no other runtime dependency.
 # azure-functions-core-tools rides along in the same layer: npm rather than the
 # packages.microsoft.com apt feed, since the package resolves its own linux-x64/linux-arm64
-# payload (no new arch case block, no third apt keyring). Its postinstall runs fine as root here
-# without --unsafe-perm -- npm 12 (bumped above) dropped that flag entirely; running as actual
-# root already gets postinstall scripts run without npm's non-root privilege-drop dance. Nothing
-# in the pipeline invokes `func` yet -- it earns its size for Node-based Functions projects
-# downstream, in R's build and P13's test runs. Its bundled PowerShell-language worker is real
-# dead weight, not just unused-for-now: this pipeline is scoped to Node-based Functions projects
-# only (see above), never PowerShell ones, and that worker's own bundled
+# payload (no new arch case block, no third apt keyring). Running as root here sidesteps the OLD
+# --unsafe-perm/privilege-drop problem npm 12 (bumped above) made moot -- but npm 12 ALSO added a
+# separate lifecycle-script allowlist gate that silently blocks this package's postinstall (its
+# platform-binary fetch from Microsoft's CDN, see THIRD-PARTY-NOTICES.md) regardless of root:
+# same shape of bug as claude-code's above, --allow-scripts is the same fix. Nothing in the
+# pipeline invokes `func` yet -- it earns its size for Node-based Functions projects downstream,
+# in R's build and P13's test runs. Its bundled PowerShell-language worker is real dead weight,
+# not just unused-for-now: this pipeline is scoped to Node-based Functions projects only (see
+# above), never PowerShell ones, and that worker's own bundled
 # System.Security.Cryptography.Xml carries real HIGH CVEs with no upstream fix in any 4.x release
 # yet -- removed outright, `func` and its Node worker are untouched.
 RUN set -eux; \
-    npm install -g "jscpd@${JSCPD_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}"; \
+    npm install -g --allow-scripts=azure-functions-core-tools \
+        "jscpd@${JSCPD_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}"; \
     rm -rf /usr/lib/node_modules/azure-functions-core-tools/bin/workers/powershell \
            /usr/lib/node_modules/azure-functions-core-tools/bin/*/workers/powershell; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \

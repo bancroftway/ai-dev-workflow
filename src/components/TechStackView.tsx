@@ -140,7 +140,10 @@ export function TechStackView() {
           Submit it is saving (structured extraction + commit) -- calling the second one
           "Detecting" read as the app having lost the submission (user, 2026-08-31). ready_for_review
           with no open interrupt can only be the post-submit phase. */}
-      {!isOpen && stage?.status !== "approved" && (
+      {/* sandboxStatus check: a spinner with no failure signal of its own spun forever on a
+          provisioning failure (AppShell's "Sandbox provisioning failed" banner is the actual
+          error surface) or a stale reload of a terminated session -- neither is "detecting". */}
+      {!isOpen && stage?.status !== "approved" && (sandboxStatus === "provisioning" || sandboxStatus === "ready") && (
         <p className="flex items-center gap-2 text-sm text-neutral-500">
           <Spinner />
           {stage?.status === "ready_for_review"

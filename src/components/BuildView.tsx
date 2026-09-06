@@ -5,7 +5,7 @@ import { useMemo } from "react";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningStages, useRunEvents } from "@/lib/use-run-events";
+import { computeRunningPhases, NODE_PHASE_LABEL, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { StageState, WorkflowState } from "@/lib/workflow-types";
 
@@ -34,20 +34,21 @@ function StageCard({
   blurb,
   stage,
   runFailure,
-  running,
+  runningLabel,
 }: {
   stageKey: string;
   label: string;
   blurb: string;
   stage?: StageState;
   runFailure?: WorkflowState["run_failure"];
-  // Live from the event stream (computeRunningStages), not `stage.status` alone: this view's two
+  // Live from the event stream (computeRunningPhases), not `stage.status` alone: this view's two
   // stages are both non-gated, so `status` sits stuck at whatever it was before the current draft
   // (often "not_started", or a stale "ready_for_review" from the last verify attempt) for the
   // entire time a turn is actually running server-side -- confirmed live 2026-09-01,
   // minimal-code-to-green's .out file was actively growing while this card still said "Not
-  // started". Same fix as AppShell's tab pills and SessionOverview's table.
-  running: boolean;
+  // started". Same fix as AppShell's tab pills and SessionOverview's table. The resolved phase
+  // label (e.g. "Auditing"), or null when this stage isn't currently running.
+  runningLabel: string | null;
 }) {
   const verification = stage?.last_verification;
   // Same guard as AppShell's tab dot: an approved stage's stale failed verification is history,
@@ -60,8 +61,8 @@ function StageCard({
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold">{label}</h2>
         <span className="flex items-center gap-1.5 text-sm text-neutral-500">
-          {running && <RunningSpinner />}
-          {running ? "Drafting" : (STATUS_LABEL[stage?.status ?? "not_started"] ?? stage?.status)}
+          {runningLabel && <RunningSpinner />}
+          {runningLabel ?? (STATUS_LABEL[stage?.status ?? "not_started"] ?? stage?.status)}
         </span>
       </div>
       <p className="text-xs text-neutral-500">{blurb}</p>
@@ -95,8 +96,8 @@ export function BuildView() {
   const state = (agent.state ?? {}) as WorkflowState;
   const runEvents = useRunEvents();
   const [runActivity] = useRunActivity();
-  const runningStages = useMemo(
-    () => computeRunningStages(runEvents, runActivity?.runActive ?? null),
+  const runningPhases = useMemo(
+    () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),
     [runEvents, runActivity?.runActive],
   );
 
@@ -114,7 +115,7 @@ export function BuildView() {
           blurb={blurb}
           stage={state.stages?.[key]}
           runFailure={state.run_failure}
-          running={runningStages.has(key)}
+          runningLabel={runningPhases.has(key) ? (NODE_PHASE_LABEL[runningPhases.get(key)!] ?? "Running") : null}
         />
       ))}
     </ViewContainer>

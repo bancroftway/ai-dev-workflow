@@ -134,17 +134,31 @@ export function formatDuration(ms: number): string {
  * treated as `false`: that would hide a genuinely-running session's spinner for a tick on every
  * page load, a regression this fix must not introduce. Only omit the argument (or pass `true`) to
  * keep the old, ungated behavior. */
-export function computeRunningStages(events: RunLogEvent[], runActive?: boolean | null): Set<string> {
-  if (runActive === false) return new Set();
+export const NODE_PHASE_LABEL: Record<string, string> = {
+  draft: "Drafting",
+  audit: "Auditing",
+  verify: "Verifying",
+  fix: "Fixing",
+};
+
+// Stage -> currently-open node (or none). Newest node_started per stage wins if a retry leaves an
+// earlier node's span dangling (no matching node_finished, e.g. an infra-exhausted attempt); a
+// node_finished only closes the entry if it matches the currently-open node, so a late/stale
+// finished event for an already-superseded node can't wrongly clear the real one.
+export function computeRunningPhases(events: RunLogEvent[], runActive?: boolean | null): Map<string, string> {
+  if (runActive === false) return new Map();
   const latestRunId = events.length > 0 ? events[events.length - 1].run_id : null;
-  const openNodeStage = new Map<string, string>(); // "run_id|node" -> stage, while still unfinished
+  const openByStage = new Map<string, string>();
   for (const e of events) {
     if (!e.stage || !e.node || e.run_id !== latestRunId) continue;
-    const key = `${e.run_id}|${e.node}`;
-    if (e.type === "node_started") openNodeStage.set(key, e.stage);
-    else if (e.type === "node_finished") openNodeStage.delete(key);
+    if (e.type === "node_started") openByStage.set(e.stage, e.node);
+    else if (e.type === "node_finished" && openByStage.get(e.stage) === e.node) openByStage.delete(e.stage);
   }
-  return new Set(openNodeStage.values());
+  return openByStage;
+}
+
+export function computeRunningStages(events: RunLogEvent[], runActive?: boolean | null): Set<string> {
+  return new Set(computeRunningPhases(events, runActive).keys());
 }
 
 const POLL_MS = 15000;

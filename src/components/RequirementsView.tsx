@@ -145,6 +145,14 @@ export function RequirementsView() {
   // Specification first rather than redrafting Plan against its now-stale approved spec.
   const sourceOfTruthGateOpen =
     openInterrupt.open && (openInterrupt.stage === "specification" || openInterrupt.stage === "plan");
+  // Requirements-delta into an already-merged session is a supported flow (see runLocked's own
+  // comment above) but must never fire silently from a stale tab that doesn't know the session
+  // already completed elsewhere -- handleSubmit below confirms with the user first and tells the
+  // agent via POST /api/sessions/actions {action: "confirm-reopen"} before submitting, which
+  // graph.py's intake_node requires (GraphState.reopen_blocked) before it will let this thread
+  // reopen. Deliberately does NOT feed into `disabled`: the action must stay available, just
+  // confirmed.
+  const isCompleted = runActivity?.status === "completed";
   const disabled =
     text.trim().length === 0 ||
     agent.isRunning ||
@@ -175,6 +183,23 @@ export function RequirementsView() {
         setSubmitting(false);
       }
       return;
+    }
+    if (isCompleted) {
+      if (!window.confirm("This session already completed and merged. Continue working on it anyway?")) {
+        setSubmitting(false);
+        return;
+      }
+      try {
+        await fetch("/api/sessions/actions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: threadId, action: "confirm-reopen" }),
+        });
+      } catch {
+        // Best-effort: if this fails, intake_node's own confirm_reopen check just refuses the
+        // submission server-side (fails safe, never silently reopens) -- the run below still
+        // fires, it'll just no-op with a clear server-side log instead of a client error here.
+      }
     }
     try {
       const ready = consumeAttachments();

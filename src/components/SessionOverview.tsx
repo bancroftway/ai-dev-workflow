@@ -6,7 +6,7 @@ import { LiveCostChip } from "@/components/LiveCostChip";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningStages, formatDuration, parseEventTs, useRunEvents } from "@/lib/use-run-events";
+import { computeRunningPhases, NODE_PHASE_LABEL, formatDuration, parseEventTs, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { StageState, WorkflowState } from "@/lib/workflow-types";
 
@@ -60,13 +60,13 @@ export function SessionOverview() {
   const perStage = useMemo(() => {
     const byStage = new Map<
       string,
-      { first: number; last: number; cost: number; sawCost: boolean; rejections: number; running: boolean }
+      { first: number; last: number; cost: number; sawCost: boolean; rejections: number; node: string | undefined }
     >();
     for (const e of events) {
       if (!e.stage) continue;
       const ts = parseEventTs(e.ts);
       const entry =
-        byStage.get(e.stage) ?? { first: ts, last: ts, cost: 0, sawCost: false, rejections: 0, running: false };
+        byStage.get(e.stage) ?? { first: ts, last: ts, cost: 0, sawCost: false, rejections: 0, node: undefined };
       entry.first = Math.min(entry.first, ts);
       entry.last = Math.max(entry.last, ts);
       const cost = Number((e.token_usage as { cost?: unknown } | null)?.cost);
@@ -79,10 +79,10 @@ export function SessionOverview() {
       }
       byStage.set(e.stage, entry);
     }
-    // See computeRunningStages' own docstring for why this can't just be `stage.status ===
+    // See computeRunningPhases' own docstring for why this can't just be `stage.status ===
     // "drafting"`: a non-gated stage's status is stale/misleading between verify attempts.
-    const runningStages = computeRunningStages(events, runActivity?.runActive ?? null);
-    for (const [stageKey, entry] of byStage) entry.running = runningStages.has(stageKey);
+    const runningPhases = computeRunningPhases(events, runActivity?.runActive ?? null);
+    for (const [stageKey, entry] of byStage) entry.node = runningPhases.get(stageKey);
     return byStage;
   }, [events, runActivity?.runActive]);
 
@@ -162,7 +162,7 @@ export function SessionOverview() {
               // on runActive !== false too (Workflow Liveness Fix): a killed process left mid-draft
               // leaves `status === "drafting"` forever, which used to read as running with no other
               // signal to contradict it.
-              const running = (stage.status === "drafting" && runActivity?.runActive !== false) || timing?.running === true;
+              const running = (stage.status === "drafting" && runActivity?.runActive !== false) || timing?.node !== undefined;
               return (
                 <li
                   key={key}
@@ -185,7 +185,11 @@ export function SessionOverview() {
                       className={`flex items-center justify-end gap-1.5 ${failedHere ? "text-red-700" : "text-neutral-500"}`}
                     >
                       {running && <RunningSpinner />}
-                      {failedHere ? "Failed" : running ? "Drafting" : (STATUS_LABEL[stage.status] ?? stage.status)}
+                      {failedHere
+                        ? "Failed"
+                        : running
+                          ? (timing?.node ? (NODE_PHASE_LABEL[timing.node] ?? "Running") : "Drafting")
+                          : (STATUS_LABEL[stage.status] ?? stage.status)}
                     </span>
                   </div>
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
