@@ -2195,7 +2195,20 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # a user-facing confirm prompt) sets the one-shot meta flag this pops. _route_after_intake
     # reads GraphState.reopen_blocked and routes straight to END, so scaffold/touch_run (which
     # would otherwise reset status to in_progress and wipe merge_ready/pr_url) never runs.
-    existing_row = await session_store.get_session(thread_id)
+    #
+    # try/excepted the same way _resolve_thread_provider's own get_session call is (see that
+    # function's docstring, Phase E audit I-3): this runs unconditionally on EVERY intake, so a
+    # transient DB blip here must degrade to "skip the reopen check" (pre-hardening behavior),
+    # not hard-fail the run.
+    existing_row = None
+    try:
+        existing_row = await session_store.get_session(thread_id)
+    except Exception:
+        logger.warning(
+            "session_store.get_session failed while checking for a completed session; "
+            "falling through to normal intake for thread_id=%s",
+            thread_id, exc_info=True,
+        )
     if existing_row is not None and existing_row["status"] == "completed":
         if not sandbox_registry.pop_meta_flag(thread_id, "confirm_reopen"):
             logger.warning(

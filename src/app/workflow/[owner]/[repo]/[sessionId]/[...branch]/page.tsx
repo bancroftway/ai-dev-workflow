@@ -99,21 +99,23 @@ export default async function WorkflowPage({
                 is just this route's own content, filling whatever height that shell hands it. */}
             <div className="flex h-full w-full flex-col">
               <div className="shrink-0">
-                {/* Skipped for a terminal (completed/failed/rejected) session unless the user
-                    explicitly hit Resume: this used to POST /api/sessions/provision unconditionally
-                    for EVERY session, including one whose container/branch may be long gone (the
-                    reason completed sessions used to route to the now-deleted standalone /report
-                    page instead of here in the first place). */}
-                {(!sessionRow || sessionRow.status === "in_progress" || resume) && (
-                  <SandboxSessionBoot
-                    sessionId={sessionId}
-                    owner={owner}
-                    repo={repo}
-                    branch={branch}
-                    resume={resume}
-                    projectId={projectId}
-                  />
-                )}
+                {/* Always mounted (it's the one writer of sandboxStatus -- see its own `skip` prop
+                    doc for why skipping the mount too would strand the header's pill on
+                    "Connecting…" forever). `skip` is true for a terminal (completed/failed/
+                    rejected) session opened WITHOUT ?resume=1: this used to POST
+                    /api/sessions/provision unconditionally for EVERY session, including one whose
+                    container/branch may be long gone (the reason completed sessions used to route
+                    to the now-deleted standalone /report page instead of here in the first
+                    place). */}
+                <SandboxSessionBoot
+                  sessionId={sessionId}
+                  owner={owner}
+                  repo={repo}
+                  branch={branch}
+                  resume={resume}
+                  projectId={projectId}
+                  skip={Boolean(sessionRow) && sessionRow?.status !== "in_progress" && !resume}
+                />
               </div>
               {/* min-h-0 is required here, not decorative: without it a flex child's default
                   min-height:auto lets it grow past this row's share of the column instead of

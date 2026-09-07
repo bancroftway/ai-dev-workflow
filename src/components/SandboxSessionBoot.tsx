@@ -19,6 +19,7 @@ export function SandboxSessionBoot({
   branch,
   resume,
   projectId,
+  skip,
 }: {
   /** This session's own id -- a UUID minted client-side for a new session, or the historical
    * session being resumed. Forwarded as-is to the provision route/agent; never derived here. */
@@ -34,6 +35,15 @@ export function SandboxSessionBoot({
    * already-existing session's own stored project_id otherwise (resume, or a plain reload of this
    * page), so this is undefined in every other case and simply omitted from the POST body. */
   projectId?: string;
+  /** True for a terminal (completed/failed/rejected) session opened WITHOUT ?resume=1 -- there is
+   * nothing to provision (the container/branch may not even exist anymore) and nothing here should
+   * try. Still the one place that resolves sandboxStatus out of its "provisioning" default --
+   * skipping the POST but leaving status unset would strand the header's pill on "Connecting…"
+   * forever (observed live: reopening a completed session via its Report link). Set to
+   * "terminated" instead: truthful (no live container), and every sandboxStatus-gated check
+   * elsewhere (`!== "ready"`, `=== "provisioning"`) already treats it the same as never having
+   * provisioned. */
+  skip?: boolean;
 }) {
   const [status, setStatus] = useSandboxStatus();
   // Provision can fail with an explanatory message worth showing verbatim (e.g. the agent's
@@ -42,6 +52,10 @@ export function SandboxSessionBoot({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
+    if (skip) {
+      setStatus("terminated");
+      return;
+    }
     let cancelled = false;
     fetch("/api/sessions/provision", {
       method: "POST",
@@ -64,9 +78,9 @@ export function SandboxSessionBoot({
     return () => {
       cancelled = true;
     };
-  }, [sessionId, owner, repo, branch, resume, projectId, setStatus]);
+  }, [skip, sessionId, owner, repo, branch, resume, projectId, setStatus]);
 
-  if (status === "ready") return null;
+  if (skip || status === "ready") return null;
 
   return (
     <div

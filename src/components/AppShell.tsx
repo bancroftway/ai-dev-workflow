@@ -282,7 +282,12 @@ export function AppShell({
           run_active?: boolean;
           interrupted?: boolean;
         };
-        setSandboxStatus(row.container_alive ? "ready" : "error");
+        // A terminal session (completed/failed/rejected) has no container to be alive in the
+        // first place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
+        // "error"/Disconnected here would overwrite its correct "terminated" a few seconds after
+        // load with a status implying something failed, when nothing did. Still "ready"/"error" as
+        // before for an in_progress session (the one case a live container is actually expected).
+        setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "error" : "terminated");
         setDurableRow({ current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate });
         // Same response, lifted into context so BuildView/SessionOverview/SpecificationView/
         // PlanView/RequirementsView can read run_active/interrupted without a second fetch.
