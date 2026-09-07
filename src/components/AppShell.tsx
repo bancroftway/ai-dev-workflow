@@ -15,7 +15,7 @@ import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
 import { QualityView } from "@/components/QualityView";
-import { ReportView } from "@/components/ReportView";
+import { ReportView, type FilesChangedSummary } from "@/components/ReportView";
 import { RequirementsView } from "@/components/RequirementsView";
 import { SessionOverview } from "@/components/SessionOverview";
 import { SpecificationView } from "@/components/SpecificationView";
@@ -86,6 +86,7 @@ export function AppShell({
   workBranch,
   metricThresholds,
   resume,
+  filesChanged,
 }: {
   /** Repo coordinates for the Report tab's raw-content proxy URLs (screenshots) -- not needed by
    * anything else here, since every other view scopes itself through useWorkflowThread's
@@ -102,6 +103,11 @@ export function AppShell({
    * suppressed in that case (ordinary reloads must not re-run automatically; a Resume click
    * should). */
   resume?: boolean;
+  /** The git diff-stat/commit-log block for the Report tab, resolved server-side (workflow page)
+   * from this run's committed report.json -- the one piece of a completed session's exit report
+   * that lives only in that committed artifact, never in live LangGraph state. Undefined for an
+   * in-progress session (nothing committed yet); ReportView already renders nothing for that. */
+  filesChanged?: FilesChangedSummary | null;
 }) {
   const { threadId, runtimeAgentId, localAgentId } = useWorkflowThread();
   const { agent } = useAgent({
@@ -668,6 +674,7 @@ export function AppShell({
               report={exitStage?.approved_content as MergeReadinessReport | null | undefined}
               metrics={state.metrics_report?.metrics}
               deltaSummary={state.repo_scan?.delta_summary}
+              filesChanged={filesChanged}
               screenshotUrls={state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path, workBranch))}
               thresholds={metricThresholds}
             />

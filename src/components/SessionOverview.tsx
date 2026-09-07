@@ -8,7 +8,14 @@ import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { computeRunningPhases, NODE_PHASE_LABEL, formatDuration, parseEventTs, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import { REBUILD_STATUS_LABEL, redGatePhase, type StageState, type WorkflowState } from "@/lib/workflow-types";
+import {
+  REBUILD_PLACEMENTS,
+  REBUILD_STATUS_LABEL,
+  rebuildPhase,
+  type RebuildPlacement,
+  type StageState,
+  type WorkflowState,
+} from "@/lib/workflow-types";
 
 const STATUS_LABEL: Record<string, string> = {
   not_started: "Not started",
@@ -42,6 +49,43 @@ function truncate(text: string, max: number): string {
 // (user feedback 2026-09-01) instead of each row's flex layout drifting with its own content width.
 const ROW_GRID = "grid grid-cols-[1fr_4.5rem_4rem_5rem_9rem] items-center gap-3";
 
+/** One REBUILD_PLACEMENTS row, inserted right after its `afterStageKey`'s own row (rebuildPhase's
+ * own docstring: real, unattributed-to-a-single-placement work happening between two stages).
+ * `timing` is windowed between the two REAL stages either side of this placement (rebuildTimings,
+ * below) rather than read off the ambiguous shared "rebuild" event tag directly -- that sidesteps
+ * the tag collision across placements (workflow-types.ts's REBUILD_PLACEMENTS docstring) since the
+ * window itself is placement-specific even when the tag inside it isn't. Only set once the next
+ * real stage has started (window closed); still-running placements show status only, same as
+ * before. */
+function RebuildRow({
+  placement,
+  phase,
+  timing,
+  failedHere,
+}: {
+  placement: RebuildPlacement;
+  phase: { status: "not_started" | "clean" | "failed" | "fixing"; running: boolean };
+  timing: { first: number; last: number; cost: number } | undefined;
+  failedHere: boolean;
+}) {
+  return (
+    <li className={`rounded-lg border px-4 py-2 text-sm ${failedHere ? "border-red-300 bg-red-50" : "border-neutral-200"}`}>
+      <div className={ROW_GRID}>
+        <span className="font-medium">{placement.label}</span>
+        <span className="text-right text-xs text-neutral-500">
+          {timing ? formatDuration(timing.last - timing.first) : ""}
+        </span>
+        <span className="text-right text-xs text-neutral-500">{timing ? `$${timing.cost.toFixed(2)}` : ""}</span>
+        <span className="text-right text-xs text-neutral-500" />
+        <span className={`flex items-center justify-end gap-1.5 ${failedHere ? "text-red-700" : "text-neutral-500"}`}>
+          {phase.running && <RunningSpinner />}
+          {failedHere ? "Failed" : phase.running ? "Verifying" : REBUILD_STATUS_LABEL[phase.status]}
+        </span>
+      </div>
+    </li>
+  );
+}
+
 
 export function SessionOverview() {
   const { localAgentId } = useWorkflowThread();
@@ -57,8 +101,6 @@ export function SessionOverview() {
   // surfaced before (user feedback 2026-09-01).
   const events = useRunEvents();
   const [runActivity] = useRunActivity();
-  const redGate = redGatePhase(state, runActivity?.runActive);
-  const redGateFailedHere = failure?.stage === "r_ac_to_tests";
   const perStage = useMemo(() => {
     const byStage = new Map<
       string,
@@ -87,6 +129,31 @@ export function SessionOverview() {
     for (const [stageKey, entry] of byStage) entry.node = runningPhases.get(stageKey);
     return byStage;
   }, [events, runActivity?.runActive]);
+
+  // Per-placement duration/cost, windowed between the two real stages either side (see RebuildRow's
+  // docstring) rather than trusting the shared "rebuild"/"red-gate" event tag alone. Requires the
+  // next real stage to have started (window closed) -- an in-flight placement has no `next` entry
+  // yet and is left out, same as before this existed.
+  const rebuildTimings = useMemo(() => {
+    const timings = new Map<string, { first: number; last: number; cost: number }>();
+    for (const placement of REBUILD_PLACEMENTS) {
+      const after = perStage.get(placement.afterStageKey);
+      const next = perStage.get(placement.nextStageKey);
+      if (!after || !next) continue;
+      const start = after.last;
+      const end = next.first;
+      let cost = 0;
+      for (const e of events) {
+        if (e.stage !== "rebuild" && e.stage !== "red-gate") continue;
+        const ts = parseEventTs(e.ts);
+        if (ts < start || ts > end) continue;
+        const c = Number((e.token_usage as { cost?: unknown } | null)?.cost);
+        if (Number.isFinite(c)) cost += c;
+      }
+      timings.set(placement.rebuildKey, { first: start, last: end, cost });
+    }
+    return timings;
+  }, [events, perStage]);
 
   const failureIsInfra = failure?.failure_type === "infra_transient" || failure?.failure_type === "quota_exhausted";
 
@@ -165,44 +232,19 @@ export function SessionOverview() {
               // leaves `status === "drafting"` forever, which used to read as running with no other
               // signal to contradict it.
               const running = (stage.status === "drafting" && runActivity?.runActive !== false) || timing?.node !== undefined;
-              // Red-gate row (redGatePhase's own docstring): inserted right after ac-to-tests,
-              // the one real stage it sits between and the pipeline's only rebuild placement
-              // with a user-reported "looks stalled" gap so far.
-              const redGateRow = key === "ac-to-tests" && redGate && (() => {
-                const rebuildTiming = perStage.get("rebuild");
-                const redGateTiming = perStage.get("red-gate");
-                const first = [rebuildTiming?.first, redGateTiming?.first].filter((n): n is number => n != null);
-                const last = [rebuildTiming?.last, redGateTiming?.last].filter((n): n is number => n != null);
-                const cost = (rebuildTiming?.cost ?? 0) + (redGateTiming?.cost ?? 0);
-                const sawCost = Boolean(rebuildTiming?.sawCost || redGateTiming?.sawCost);
-                return (
-                  <li
-                    key="red-gate"
-                    className={`rounded-lg border px-4 py-2 text-sm ${
-                      redGateFailedHere ? "border-red-300 bg-red-50" : "border-neutral-200"
-                    }`}
-                  >
-                    <div className={ROW_GRID}>
-                      <span className="font-medium">red-gate</span>
-                      <span className="text-right text-xs text-neutral-500">
-                        {first.length > 0 && last.length > 0 ? formatDuration(Math.max(...last) - Math.min(...first)) : ""}
-                      </span>
-                      <span className="text-right text-xs text-neutral-500">{sawCost ? `$${cost.toFixed(2)}` : ""}</span>
-                      <span className="text-right text-xs text-neutral-500" />
-                      <span
-                        className={`flex items-center justify-end gap-1.5 ${redGateFailedHere ? "text-red-700" : "text-neutral-500"}`}
-                      >
-                        {redGate.running && <RunningSpinner />}
-                        {redGateFailedHere ? "Failed" : redGate.running ? "Verifying" : REBUILD_STATUS_LABEL[redGate.status]}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs text-neutral-500">
-                      Confirms the new tests actually fail before minimal-code-to-green starts writing an
-                      implementation against them.
-                    </p>
-                  </li>
-                );
-              })();
+              // At most one placement follows any given real stage today (REBUILD_PLACEMENTS has
+              // no two entries sharing an afterStageKey) -- find(), not filter().
+              const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
+              const phase = placement && rebuildPhase(state, placement, runActivity?.runActive);
+              const rebuildRow = placement && phase && (
+                <RebuildRow
+                  key={placement.rebuildKey}
+                  placement={placement}
+                  phase={phase}
+                  timing={rebuildTimings.get(placement.rebuildKey)}
+                  failedHere={failure?.stage === placement.rebuildKey}
+                />
+              );
               return (
                 <Fragment key={key}>
                 <li
@@ -234,7 +276,7 @@ export function SessionOverview() {
                   </div>
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
                 </li>
-                {redGateRow}
+                {rebuildRow}
                 </Fragment>
               );
             })}

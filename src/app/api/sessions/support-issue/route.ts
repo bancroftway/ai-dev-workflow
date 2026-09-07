@@ -49,9 +49,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ url: match.html_url, existing: true });
     }
 
-    const reportPath = session.run_id
-      ? `/sessions/${session.owner}/${session.repo}/${session.session_id}/${session.run_id}/report`
-      : null;
+    const workflowPath = `/workflow/${session.owner}/${session.repo}/${session.session_id}/${session.source_branch}`;
     const body = [
       `Automated context for a failed ai-dev-workflow run. Resume this thread to continue.`,
       ``,
@@ -61,7 +59,7 @@ export async function POST(request: Request) {
       `- Work branch: ${session.work_branch}`,
       `- Failed at: ${session.failure_stage ?? "unknown"} (${session.failure_type ?? "unknown"})`,
       `- Message: ${session.failure_message || "(none recorded)"}`,
-      reportPath ? `- Report page: ${reportPath}` : null,
+      `- Session page: ${workflowPath}`,
       `- Exit report (if the run reached exit finalize): \`.ai-dev-workflow/EXIT-REPORT.md\` on the work branch`,
     ]
       .filter((line): line is string => line !== null)

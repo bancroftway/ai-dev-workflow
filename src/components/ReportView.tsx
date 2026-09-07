@@ -27,9 +27,10 @@ export interface ReportViewProps {
 }
 
 /**
- * Presentational exit-report view, shared by AppShell's live Report tab and the past-session
- * report page (src/app/sessions/[owner]/[repo]/[runId]/report/page.tsx) -- identical rendering
- * whether the data came from live agent state or a committed history/<run_id>-report.json.
+ * Presentational exit-report view -- AppShell's Report tab, the one place this renders (the
+ * standalone past-session route this used to also serve is gone; a completed session's own
+ * committed report.json now only supplies the one field live state can't, filesChanged, which the
+ * workflow page reads server-side and passes through AppShell).
  *
  * SECURITY: `pr_description_markdown` is repo-controlled (an LLM's own PR description, ultimately
  * derived from an approved Specification/Plan a human already reviewed) but still untrusted HTML

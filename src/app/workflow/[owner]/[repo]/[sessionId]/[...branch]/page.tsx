@@ -2,10 +2,12 @@ import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { E2E_GITHUB_ID, E2E_MODE } from "@/lib/e2e";
 import { AppShell } from "@/components/AppShell";
+import type { FilesChangedSummary } from "@/components/ReportView";
 import { SandboxSessionBoot } from "@/components/SandboxSessionBoot";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
 import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
 import { RunActivityProvider } from "@/lib/run-activity-context";
+import { getOctokit, readRepoFile } from "@/lib/github";
 import { parseThresholds } from "@/lib/metric-grades";
 import { lookupSessionWithAuthorization } from "@/lib/session-access";
 import { WorkflowProviders } from "../../../../providers";
@@ -69,6 +71,25 @@ export default async function WorkflowPage({
     a11y: parseThresholds(process.env.METRIC_A11Y_GRADES, [95, 90, 80, 60], "METRIC_A11Y_GRADES", false),
   };
 
+  // The one piece of a completed session's exit report that lives only in the committed
+  // report.json, never in live LangGraph state (every other Report-tab field reads live state).
+  // Same source/shape the now-deleted standalone /report route used to read.
+  let filesChanged: FilesChangedSummary | null = null;
+  if (sessionRow?.status === "completed" && sessionRow.run_id) {
+    const octokit = await getOctokit();
+    const reportRaw = await readRepoFile(
+      octokit, owner, repo, `.ai-dev-workflow/history/${sessionRow.run_id}-report.json`, sessionRow.work_branch,
+    );
+    if (reportRaw) {
+      try {
+        const parsed = JSON.parse(reportRaw) as { files_changed?: string; commits?: string };
+        filesChanged = { stat: parsed.files_changed, commits: parsed.commits };
+      } catch {
+        filesChanged = null;
+      }
+    }
+  }
+
   return (
     <WorkflowThreadProvider threadId={sessionId}>
       <WorkflowProviders>
@@ -78,14 +99,21 @@ export default async function WorkflowPage({
                 is just this route's own content, filling whatever height that shell hands it. */}
             <div className="flex h-full w-full flex-col">
               <div className="shrink-0">
-                <SandboxSessionBoot
-                  sessionId={sessionId}
-                  owner={owner}
-                  repo={repo}
-                  branch={branch}
-                  resume={resume}
-                  projectId={projectId}
-                />
+                {/* Skipped for a terminal (completed/failed/rejected) session unless the user
+                    explicitly hit Resume: this used to POST /api/sessions/provision unconditionally
+                    for EVERY session, including one whose container/branch may be long gone (the
+                    reason completed sessions used to route to the now-deleted standalone /report
+                    page instead of here in the first place). */}
+                {(!sessionRow || sessionRow.status === "in_progress" || resume) && (
+                  <SandboxSessionBoot
+                    sessionId={sessionId}
+                    owner={owner}
+                    repo={repo}
+                    branch={branch}
+                    resume={resume}
+                    projectId={projectId}
+                  />
+                )}
               </div>
               {/* min-h-0 is required here, not decorative: without it a flex child's default
                   min-height:auto lets it grow past this row's share of the column instead of
@@ -99,6 +127,7 @@ export default async function WorkflowPage({
                   workBranch={sessionRow?.work_branch ?? ""}
                   metricThresholds={metricThresholds}
                   resume={resume}
+                  filesChanged={filesChanged}
                 />
               </div>
             </div>

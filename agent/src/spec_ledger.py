@@ -363,6 +363,9 @@ def sync_ledger(
                     # A later verify lap reverted the wording back to what the ledger already
                     # holds -- the pending reset no longer applies.
                     ac_entry.pop(PENDING_RESET_FIELD, None)
+                # Metadata, not a requirement-wording change -- synced independently of the
+                # description/PENDING_RESET_FIELD dance above, never bumps last_revised_run_id.
+                ac_entry["ui_related"] = ac.get("ui_related", ac_entry.get("ui_related", False))
                 resolved_ac_id = existing_ac_id
             else:
                 resolved_ac_id = allocate_next_id(updated, "acceptance_criterion", resolved_us_id)
@@ -373,6 +376,7 @@ def sync_ledger(
                         "parent_us_id": resolved_us_id,
                         "status": "deferred" if ac_deferred else "active",
                         "description": ac.get("description", ""),
+                        "ui_related": ac.get("ui_related", False),
                         "first_seen_run_id": run_id,
                         "last_revised_run_id": run_id,
                     }
@@ -717,7 +721,7 @@ def _demo() -> None:
             "id": "draft-1",
             "existing_us_id": None,
             "title": "Export CSV",
-            "acceptance_criteria": [{"id": "draft-1.1", "existing_ac_id": None, "description": "Produces a .csv file."}],
+            "acceptance_criteria": [{"id": "draft-1.1", "existing_ac_id": None, "description": "Produces a .csv file.", "ui_related": True}],
         }
     ]
     result = sync_ledger([dict(e) for e in seed], other_ticket_draft, "run-2")
@@ -726,6 +730,8 @@ def _demo() -> None:
     ac1 = next(e for e in result.updated_entries if e["id"] == "US-0001.1")
     assert us1["status"] == "active", "an untouched, unnamed story must not be silently retired"
     assert ac1["status"] == "active", "an untouched, unnamed AC must not be silently retired"
+    ac_new = next(e for e in result.updated_entries if e.get("description") == "Produces a .csv file.")
+    assert ac_new["ui_related"] is True, "ui_related from the draft must persist on a new AC entry"
 
     # THE FIX: naming a story in retired_us_ids DOES retire it, and cascades to its own AC.
     result2 = sync_ledger([dict(e) for e in seed], [], "run-3", retired_us_ids=["US-0001"])
@@ -805,7 +811,7 @@ def _demo() -> None:
             "existing_us_id": "US-0001",
             "title": "Sign in",
             "acceptance_criteria": [
-                {"id": "US-0001.1", "existing_ac_id": "US-0001.1", "description": "Locks the account after 5 wrong passwords."}
+                {"id": "US-0001.1", "existing_ac_id": "US-0001.1", "description": "Locks the account after 5 wrong passwords.", "ui_related": True}
             ],
         }
     ]
@@ -816,6 +822,7 @@ def _demo() -> None:
     assert ac[PENDING_RESET_FIELD] == "run-5"
     assert ac["coded_run_id"] == "run-1", "stamps must survive until spec approval"
     assert ac["last_revised_run_id"] == "run-5"
+    assert ac["ui_related"] is True, "ui_related syncs onto an existing AC entry independently of description tracking"
     us = next(e for e in r.updated_entries if e["id"] == "US-0001")
     assert us["last_revised_run_id"] == "run-1", "identical title re-cite must not bump last_revised"
 

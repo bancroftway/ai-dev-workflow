@@ -26,3 +26,19 @@ export async function getOctokit(): Promise<Octokit> {
   }
   return new Octokit({ auth: token.accessToken });
 }
+
+/** One repo-relative file's raw content at `ref`, or null if it doesn't exist -- covers both "this
+ * file was never written" and "this session's work branch doesn't exist (anymore)", neither of
+ * which is an error worth throwing. */
+export async function readRepoFile(
+  octokit: Octokit, owner: string, repo: string, path: string, ref: string,
+): Promise<string | null> {
+  try {
+    const res = await octokit.rest.repos.getContent({ owner, repo, path, ref });
+    if (Array.isArray(res.data) || res.data.type !== "file" || !res.data.content) return null;
+    return Buffer.from(res.data.content, "base64").toString("utf-8");
+  } catch (error) {
+    if ((error as { status?: number }).status === 404) return null;
+    throw error;
+  }
+}

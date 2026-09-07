@@ -37,7 +37,7 @@ flowchart TD
     
     readme["README LEG (metrics-exit)<br/>Writes/updates README.md per standard-readme, grounded in the code<br/>Deterministic structure check between laps (3); human-authored README left untouched<br/>Committed BEFORE the final scan so metrics cover it"]
     
-    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan (health score v3: 9 weighted subscores, density-aware security, × security-tool-coverage multiplier) + coverage + traceability + outdated-packages probe<br/>Regression-clean runs stamp per-AC delivery provenance on the ledger (coded/tested run ids + measured test names)<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign<br/>Exit report (09-metrics-exit.md + EXIT-REPORT.md): health-score table, every finding cluster with disposition (known-gap reason / auto-exempt / open), scanner-tools table,<br/>per-US/AC section (new/modified/deleted/unchanged + delivery stamps) + carried-over-undelivered list<br/>Blockers include: regression gate reasons, README hard problems,<br/>auth-required-but-unverified, missing UI screenshots"]
+    stage8["STAGE 8: METRICS + EXIT<br/>Measure delta vs baseline + merge-readiness decision<br/>Metrics: repo-scan (health score v3: 9 weighted subscores, density-aware security, × security-tool-coverage multiplier) + coverage + traceability + outdated-packages probe<br/>Regression-clean runs stamp per-AC delivery provenance on the ledger (coded/tested run ids + measured test names)<br/>Exit: deterministic merge-ready verdict + APPROVALS.md sign<br/>Exit report (09-metrics-exit.md + EXIT-REPORT.md): stage-summary table (status/runtime/laps/cost/notes), health-score table, every finding cluster with disposition (known-gap reason / auto-exempt / open), scanner-tools table,<br/>per-US/AC section (new/modified/deleted/unchanged + delivery stamps + ui_related flag) + carried-over-undelivered list<br/>Blockers include: regression gate reasons, README hard problems,<br/>auth-required-but-unverified, missing UI screenshots<br/>PR opened (or updated, on a re-finalized thread) with this SAME report content, screenshots re-based to raw.githubusercontent.com URLs<br/>Report generation is crash-guaranteed: any failure writing it still force-commits a degraded report (merge_ready=false + reason) before the session closes, never nothing at all"]
     
     done["END<br/>Repo ready for merge or run_failure recorded"]
     
@@ -484,4 +484,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 1f5df92ec11837a31ff651e6473dc49b400ff0dfc924d18578e38312cc55d994 -->
+<!-- graph-source-sha256: b44c7c30c97fd460cd6659807291ce21879002204f247d3dd10a09ce9f523acc -->

@@ -106,6 +106,41 @@ async def open_pull_request(
         return None
 
 
+async def update_pull_request(*, owner: str, repo: str, pr_url: str, body: str, token: str) -> bool:
+    """PATCHes an existing PR's body -- used when exit_finalize_node's hydrate-short-circuit path
+    re-fires for a thread that already has an open PR (a resumed session), so the enriched report
+    content replaces whatever was there from the PR's first open instead of staying frozen on it.
+    `pr_url` is the html_url already stored on the session row; a GitHub PR's number is always its
+    trailing path segment. Same log-and-continue contract as open_pull_request: a failure here must
+    never flip an otherwise gate-passing session to failed."""
+    try:
+        number = int(pr_url.rstrip("/").rsplit("/", 1)[-1])
+    except (ValueError, AttributeError):
+        logger.warning("update_pull_request: could not parse a PR number from %r", pr_url)
+        return False
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.patch(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}",
+                headers=headers,
+                json={"body": body},
+            )
+        except httpx.HTTPError:
+            logger.warning("update_pull_request request failed for %s/%s#%d", owner, repo, number, exc_info=True)
+            return False
+        if resp.status_code == 200:
+            return True
+        logger.warning(
+            "update_pull_request failed for %s/%s#%d: %s %s", owner, repo, number, resp.status_code, resp.text[:300],
+        )
+        return False
+
+
 async def delete_remote_branch(*, owner: str, repo: str, branch: str, token: str) -> bool:
     """Deletes a branch ref via a plain REST call -- no sandbox/clone needed, so this works even
     for a long-idle session whose container was already reaped. Uses the CURRENT caller's live

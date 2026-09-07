@@ -75,22 +75,6 @@ export interface RebuildState {
   cannot_verify: boolean;
 }
 
-/** User-reported gap (2026-09-06): ac-to-tests approves, then Build/Overview go quiet for several
- * minutes with no row/card for it -- reads as stalled. That gap is real work: graph.py's
- * POST_STAGE_REBUILD wires a clean-build + "are the new tests genuinely red yet" check
- * (agent/src/rebuild.py's rebuild_node, spec key "r_ac_to_tests") between ac-to-tests' gate and
- * minimal-code-to-green's own draft. Scoped to only this ONE of the pipeline's four rebuild
- * placements (the other three -- after minimal-code-to-green, remediation, adversarial-compliance
- * -- have no equivalent "silence right after a stage approves" complaint yet, and rebuild.py
- * doesn't tag their events as distinctly as this placement's "red-gate" stage label); extend by
- * generalizing this and its two callers (SessionOverview.tsx, BuildView.tsx) if that changes.
- *
- * rebuild.py's own state (rb.status) only updates when the node FUNCTION RETURNS -- same lag every
- * other non-gated stage has (see BuildView.tsx's StageCard comment) -- so "running" here is
- * best-effort: this placement has been entered (state.rebuild has an entry) but
- * minimal-code-to-green hasn't started, AND the run isn't known to be idle. `runActive` is the
- * same tri-state signal computeRunningStages/isProvisional already trust: `undefined`/`null` (not
- * loaded yet) must NOT read as "stopped", only an explicit `false` does. */
 export const REBUILD_STATUS_LABEL: Record<RebuildState["status"], string> = {
   not_started: "Not started",
   clean: "Passed",
@@ -98,14 +82,53 @@ export const REBUILD_STATUS_LABEL: Record<RebuildState["status"], string> = {
   fixing: "Fixing",
 };
 
-export function redGatePhase(
+/** One entry per agent/src/graph.py POST_STAGE_REBUILD placement: which real STAGES entry hands
+ * off into it (row/connector goes right after that stage's own), state.rebuild's own key for it
+ * (RebuildSpec.key), and the next real stage whose start means this placement is done. Covers all
+ * four placements (2026-09-06 follow-up to the original ac-to-tests-only version) -- kept in one
+ * list so SessionOverview.tsx/BuildView.tsx each loop over it once instead of hand-wiring four
+ * near-identical call sites. */
+export interface RebuildPlacement {
+  afterStageKey: string;
+  rebuildKey: string;
+  nextStageKey: string;
+  label: string;
+}
+
+export const REBUILD_PLACEMENTS: RebuildPlacement[] = [
+  { afterStageKey: "ac-to-tests", rebuildKey: "r_ac_to_tests", nextStageKey: "minimal-code-to-green", label: "red-gate" },
+  { afterStageKey: "minimal-code-to-green", rebuildKey: "r_minimal_code_to_green", nextStageKey: "remediation", label: "rebuild" },
+  { afterStageKey: "remediation", rebuildKey: "r_remediation", nextStageKey: "adversarial-compliance", label: "rebuild" },
+  { afterStageKey: "adversarial-compliance", rebuildKey: "r_adversarial_compliance", nextStageKey: "metrics-exit", label: "rebuild" },
+];
+
+/** User-reported gap (2026-09-06): a real stage approves, then Build/Overview go quiet for several
+ * minutes with no row/card for it -- reads as stalled. That gap is real work: graph.py's
+ * POST_STAGE_REBUILD wires a clean-build (+ TDD-red, ac-to-tests' placement only) check between
+ * one stage's gate and the next one's draft (agent/src/rebuild.py's rebuild_node). The other three
+ * placements' initial build-check calls all share ONE literal event stage tag ("rebuild",
+ * stack_runner.run_and_report's stage_key) with each other -- SessionOverview.tsx's rebuildTimings
+ * resolves that by time-windowing each placement between the two REAL stages either side of it
+ * (afterStageKey's last event, nextStageKey's first) instead of trusting the shared tag alone.
+ *
+ * rebuild.py's own state (rb.status) only updates when the node FUNCTION RETURNS -- same lag every
+ * other non-gated stage has (see BuildView.tsx's StageCard comment) -- so "running" here is
+ * best-effort: this placement has been entered (state.rebuild has an entry) but the next real stage
+ * hasn't started, AND the run isn't known to be idle. `runActive` is the same tri-state signal
+ * computeRunningStages/isProvisional already trust: `undefined`/`null` (not loaded yet) must NOT
+ * read as "stopped", only an explicit `false` does. */
+export function rebuildPhase(
   state: WorkflowState,
+  placement: RebuildPlacement,
   runActive: boolean | null | undefined,
 ): { status: RebuildState["status"]; running: boolean } | null {
-  const rb = state.rebuild?.["r_ac_to_tests"];
+  const rb = state.rebuild?.[placement.rebuildKey];
   if (!rb) return null;
-  const mctgStarted = (state.stages?.["minimal-code-to-green"]?.status ?? "not_started") !== "not_started";
-  return { status: rb.status, running: !mctgStarted && runActive !== false };
+  // Same cast runEnded() above already uses: `stages` carries real backend keys (remediation,
+  // adversarial-compliance, metrics-exit) this file's own typed StageState map hasn't caught up to.
+  const stages = (state.stages ?? {}) as Record<string, StageState | undefined>;
+  const nextStarted = (stages[placement.nextStageKey]?.status ?? "not_started") !== "not_started";
+  return { status: rb.status, running: !nextStarted && runActive !== false };
 }
 
 /** A canned monorepo stack the Tech Stack tab's dropdown offers, loaded from

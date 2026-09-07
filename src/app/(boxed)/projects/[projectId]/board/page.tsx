@@ -257,27 +257,18 @@ export default function ProjectBoardPage() {
 }
 
 function SessionCard({ session, owner, repo }: { session: Session; owner: string; repo: string }) {
-  // Done cards go to the existing read-only report route instead of the workflow route -- fix
-  // round 1 (review finding): the workflow route's SandboxSessionBoot unconditionally POSTs
-  // /sessions/provision on mount, no ?resume=1 needed to trigger it. provision_session's own 409
-  // guard against resuming a completed session only fires `if body.resume`, so a plain card link
-  // sails past it into `provider.provision(...)`, which only short-circuits cheaply while this
-  // exact agent process still has the container warm in its in-memory registry -- gone after a
-  // restart/manual stop/enough time, a "Done" click would silently re-clone a work branch that
-  // may not even exist anymore post-merge. `/sessions/{owner}/{repo}/{sessionId}/{runId}/report`
-  // is this codebase's own existing target for exactly this case (SessionHistory.tsx's "View
-  // report" button, same route/param shape copied verbatim) -- no side effects, matches what
-  // "Done" actually implies. Every other status is unaffected: still the workflow route,
-  // unchanged, still deliberately without ?resume=1 (same reasoning, now only relevant to them).
+  // Every status routes to the workflow URL now -- the standalone /report route this used to
+  // special-case "Done" cards onto is gone; its content lives in the workflow page's own Report
+  // tab instead. The provisioning risk that split used to dodge (SandboxSessionBoot unconditionally
+  // POSTing /sessions/provision for a terminal session whose container/branch may be long gone) is
+  // fixed at its actual source now: the workflow page itself skips mounting SandboxSessionBoot for
+  // a non-in_progress session unless ?resume=1 is present.
   // Workflow Liveness Fix: an interrupted in_progress session's process is dead -- a plain
   // reattach reconnects to nothing, same reasoning as SessionHistory's Open-vs-Resume split.
   // ?resume=1 is the same query param AppShell already reads to fire a blank runAgent() on mount.
-  const workflowHref = `/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}${
+  const href = `/workflow/${owner}/${repo}/${session.session_id}/${session.source_branch}${
     session.status === "in_progress" && session.interrupted ? "?resume=1" : ""
   }`;
-  const href = session.status === "completed"
-    ? `/sessions/${owner}/${repo}/${session.session_id}/${session.run_id}/report`
-    : workflowHref;
   return (
     <Link
       href={href}

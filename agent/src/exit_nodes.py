@@ -477,6 +477,9 @@ def _stage_summary(
         laps = max(entry["_drafts"], entry["_cycle_max"] + 1, entry["_runs"])
         report_rows.append({
             "stage": entry["stage"],
+            # Real stage status when this row's "stage" is one (specification, remediation, ...);
+            # "-" for a ledger-only tag with no real-stage counterpart (red-gate, rebuild, unknown).
+            "status": (stages or {}).get(entry["stage"], {}).get("status") or "-",
             "runtime_seconds": round(entry["runtime_seconds"], 1),
             "laps": laps,
             "input_tokens": entry["input_tokens"],
@@ -491,8 +494,8 @@ def _stage_summary(
         "recorded facts only. The ledger resets on every attempt, so a resumed thread's earlier "
         "attempts are not included.",
         "",
-        "| Stage | Runtime | Laps | Tokens in/out | Cost | Notes |",
-        "|---|---|---|---|---|---|",
+        "| Stage | Status | Runtime | Laps | Tokens in/out | Cost | Notes |",
+        "|---|---|---|---|---|---|---|",
     ]
     total_seconds = 0.0
     total_cost = 0.0
@@ -505,8 +508,8 @@ def _stage_summary(
         cost = f"${r['cost']:.2f}" if r["cost"] is not None else ("n/a" if (r["input_tokens"] or r["output_tokens"]) else "-")
         tokens = f"{r['input_tokens']:,}/{r['output_tokens']:,}" if (r["input_tokens"] or r["output_tokens"]) else "-"
         notes = "; ".join(r["notes"]).replace("|", "\\|") if r["notes"] else "-"
-        lines.append(f"| {r['stage']} | {_fmt_duration(r['runtime_seconds'])} | {r['laps'] or '-'} | {tokens} | {cost} | {notes} |")
-    lines.append(f"| **Total** | **{_fmt_duration(total_seconds)}** | | | **{'$' + format(total_cost, '.2f') if any_cost else 'n/a'}** | |")
+        lines.append(f"| {r['stage']} | {r['status']} | {_fmt_duration(r['runtime_seconds'])} | {r['laps'] or '-'} | {tokens} | {cost} | {notes} |")
+    lines.append(f"| **Total** | | **{_fmt_duration(total_seconds)}** | | | **{'$' + format(total_cost, '.2f') if any_cost else 'n/a'}** | |")
     return report_rows, "\n".join(lines) + "\n"
 
 
@@ -890,6 +893,9 @@ def _us_ac_rows(
                     "coded_run_id": e.get("coded_run_id"), "coded_at": e.get("coded_at"),
                     "tested_run_id": e.get("tested_run_id"), "tested_at": e.get("tested_at"),
                     "test_ids": e.get("test_ids") or [],
+                    # None (renders "-") for a ledger entry that predates this field, never a
+                    # fabricated guess -- see spec_ledger.py's sync/construction sites.
+                    "ui_related": e.get("ui_related"),
                 }
             )
     rows.sort(key=lambda r: r["id"])
@@ -920,13 +926,15 @@ def _render_us_ac_section(
     if not rows:
         lines += ["(none recorded -- the specification stage did not run or the ledger is empty)", ""]
     else:
-        lines += ["| Id | Change | Title / Description | Coded (run) | Tested (run) | Tests |", "|---|---|---|---|---|---|"]
+        lines += ["| Id | Change | Title / Description | UI | Coded (run) | Tested (run) | Tests |", "|---|---|---|---|---|---|---|"]
         for r in rows:
             desc = (r.get("title_or_description") or "").replace("|", "\\|")
             if len(desc) > 90:
                 desc = desc[:87] + "..."
             if r.get("kind") == "user_story":
                 desc = f"**{desc}**"
+            ui_related = r.get("ui_related")
+            ui = "Yes" if ui_related is True else "No" if ui_related is False else "--"
             coded = r.get("coded_run_id") or "--"
             if coded != "--" and r.get("coded_run_id") == run_id:
                 coded = f"{coded} (this run)"
@@ -938,7 +946,7 @@ def _render_us_ac_section(
             if extra > 0:
                 tests += f", +{extra} more"
             lines.append(
-                f"| {r['id']} | {r.get('change')} | {desc} | {coded} | {tested} | {tests or '--'} |"
+                f"| {r['id']} | {r.get('change')} | {desc} | {ui} | {coded} | {tested} | {tests or '--'} |"
             )
         lines.append("")
         coded_not_tested = [
@@ -1226,7 +1234,20 @@ async def exit_finalize_node(
 
     A metrics-regression failure is deliberately routed INTO this stage rather than straight to
     git_ops.record_run_failure, specifically so the exit report/changelog/session-close below still
-    happen for it -- see the status logic at the bottom, which checks state["run_failure"] first."""
+    happen for it -- see the status logic below, which checks state["run_failure"] first.
+
+    session_store.close_session is called EXACTLY ONCE, unconditionally, as the very last thing
+    this function does -- never earlier. It used to run immediately after the PR was opened, before
+    any of the report/changelog/commit work below it, which raced its own fire-and-forget container
+    teardown (close_session -> end_session_container -> provider.terminate) against every
+    still-in-flight sandbox call after it in this same function: the teardown task only gets a
+    chance to run at this coroutine's next `await`, and this function has a dozen more of them
+    (writes, then the final commit) before it actually finishes. That is the most likely mechanism
+    behind a real incident where the DB/PR said "completed" but nothing landed on the branch --
+    every write between the old close_session call and the final commit was racing a container that
+    could vanish out from under it. Structurally impossible now: nothing here can call close_session
+    before every sandbox-dependent write and the final commit have already resolved one way or the
+    other (success in the try, or the degraded fallback in the except)."""
     run_id = state.get("run_id", "unknown")
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     merge_readiness = content
@@ -1259,86 +1280,17 @@ async def exit_finalize_node(
             )
         merge_readiness["merge_ready"] = False
 
-    spec_approval = await approvals.latest_approval(provider, thread_id, "specification")
-    plan_approval = await approvals.latest_approval(provider, thread_id, "plan")
-    raw_requirements = await repo_files.read_repo_file(
-        provider, thread_id, workflow_persistence.RAW_REQUIREMENTS_APPROVED_PATH
-    )
-    raw_metrics = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json")
-    metrics_summary = json.loads(raw_metrics) if raw_metrics else {}
-    if metrics_summary.get("run_id") != run_id:
-        # Stale file from a previous run (metrics_compute short-circuited this run) -- rendering
-        # it as this run's numbers was the "traceability from a stale manifest" bug. Say "not
-        # recorded" instead, and persist nothing stale.
-        metrics_summary = {}
-
-    # Read-modify-write, never a wholesale overwrite: manifest.json is co-owned. brownfield-baseline owns
-    # `onboarded`, app discovery owns `app_check`, and this node owns the keys below. Overwriting
-    # the file (as this node used to) deleted `onboarded` at the end of every run, silently
-    # re-triggering brownfield onboarding on the next one.
-    await preflight_nodes.update_manifest(
-        provider,
-        thread_id,
-        {
-            "run_id": run_id,
-            "timestamp": timestamp,
-            "requirements_content_hash": _hash_content(raw_requirements),
-            "approval_hashes": {
-                "specification": spec_approval.content_sha256 if spec_approval else None,
-                "plan": plan_approval.content_sha256 if plan_approval else None,
-            },
-            "metrics_summary": metrics_summary.get("traceability_summary"),
-            "merge_readiness": merge_readiness,
-        },
-    )
-
-    ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
-    # US/AC provenance rows: this run's own spec scope from STATE (already in hand -- no sandbox
-    # read; the approved file equals it byte-for-byte), row set + carried-over from the ledger.
-    own_spec = ((state.get("stages") or {}).get("specification") or {}).get("approved_content") or {}
-    own_us_ids = {s.get("id") for s in (own_spec.get("user_stories") or []) if s.get("id")}
-    own_ac_ids = spec_ledger.own_ac_ids_from_specification(own_spec)
-    us_ac_rows = _us_ac_rows(ledger_entries, own_us_ids, own_ac_ids, run_id)
-    carried_over = _undelivered_ac_ids(ledger_entries)
-    snapshot_path = f"{HISTORY_DIR}/{run_id}-ledger-snapshot.json"
-    prior_snapshot = await _find_prior_ledger_snapshot(provider, thread_id, run_id)
-    diff = _diff_ledger(prior_snapshot, ledger_entries)
-    await repo_files.write_repo_file(provider, thread_id, snapshot_path, json.dumps(ledger_entries, indent=2) + "\n")
-
-    changelog_section = [f"## {timestamp} (run {run_id})", ""]
-    if diff["added"]:
-        changelog_section.append(f"- Added: {', '.join(diff['added'])}")
-    if diff["revised"]:
-        changelog_section.append(f"- Revised: {', '.join(diff['revised'])}")
-    if diff["retired"]:
-        changelog_section.append(f"- Retired: {', '.join(diff['retired'])}")
-    if not any(diff.values()):
-        changelog_section.append("- No user-story-level changes since the prior run.")
-    changelog_section.append("")
-
-    existing_changelog = await repo_files.read_repo_file(provider, thread_id, CHANGELOG_PATH)
-    header = "# Changelog\n\nAuto-generated by ai-dev-workflow's exit exit stage.\n\n"
-    body = "\n".join(changelog_section) + "\n"
-    if existing_changelog is None:
-        new_changelog = header + body
-    else:
-        # Prepend after the header line(s) -- newest entries first, but keep whatever the
-        # existing file's own header/preamble looked like rather than assuming this format wrote
-        # it originally.
-        new_changelog = existing_changelog.rstrip() + "\n\n" + body
-
-    await repo_files.write_repo_file(provider, thread_id, CHANGELOG_PATH, new_changelog)
-
     # Status logic: merge_ready-aware, not just run_failure-aware -- a run that reaches exit but
     # fails a DETERMINISTIC gate (verify_exit_readiness forcing merge_ready=False: missing
     # screenshots, no test command, a metrics regression) must be recorded "failed" and stay
     # resumable, exactly like a hard crash. Getting this wrong would make an actually-unsuccessful
     # session permanently unresumable once resume is server-enforced against status=="completed".
-    run_failure = state.get("run_failure")
+    # Computed early (only depends on merge_readiness/terminal_failure, both already resolved above)
+    # so the except branch below can downgrade it without duplicating this logic.
     merge_ready = bool(merge_readiness.get("merge_ready")) if merge_readiness else False
-    if run_failure:
+    if terminal_failure:
         status = "failed"
-        failure_payload = run_failure
+        failure_payload = terminal_failure
     elif merge_ready:
         status = "completed"
         failure_payload = None
@@ -1350,34 +1302,289 @@ async def exit_finalize_node(
             "feedback": "; ".join(_presence_values((merge_readiness or {}).get("blocking_reasons"))) or "exit gates did not pass",
         }
 
-    # Ruling 8, Part B: refresh the regression baseline from this run's own final scan -- only on
-    # the completed branch above, see _baseline_refresh_payload's own docstring for why.
-    baseline_payload = _baseline_refresh_payload(status, metrics_summary)
-    if baseline_payload is not None:
-        await repo_files.write_repo_file(provider, thread_id, repo_scan.BASELINE_PATH, baseline_payload)
+    # Fetched unconditionally (not just on the completed branch, as before) so an existing PR url
+    # survives being carried through to close_session even when this attempt's tail fails below --
+    # pr_url is a direct SET in that UPDATE, never a COALESCE, so passing None there would silently
+    # erase a real PR from a previous, successful finalize of this same (resumed) thread.
+    session_row = await session_store.get_session(thread_id)
+    pr_url = (session_row or {}).get("pr_url")
 
-    pr_url = None
-    if status == "completed":
-        session_row = await session_store.get_session(thread_id)
-        if session_row and session_row.get("pr_url"):
-            # Idempotency: the hydrate-short-circuit path can re-fire this hook for an already-
-            # approved exit stage (e.g. a resumed thread) -- never open a second PR for one session.
-            pr_url = session_row["pr_url"]
-        elif session_row:
+    try:
+        spec_approval = await approvals.latest_approval(provider, thread_id, "specification")
+        plan_approval = await approvals.latest_approval(provider, thread_id, "plan")
+        raw_requirements = await repo_files.read_repo_file(
+            provider, thread_id, workflow_persistence.RAW_REQUIREMENTS_APPROVED_PATH
+        )
+        raw_metrics = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json")
+        metrics_summary = json.loads(raw_metrics) if raw_metrics else {}
+        if metrics_summary.get("run_id") != run_id:
+            # Stale file from a previous run (metrics_compute short-circuited this run) -- rendering
+            # it as this run's numbers was the "traceability from a stale manifest" bug. Say "not
+            # recorded" instead, and persist nothing stale.
+            metrics_summary = {}
+
+        # Read-modify-write, never a wholesale overwrite: manifest.json is co-owned. brownfield-baseline owns
+        # `onboarded`, app discovery owns `app_check`, and this node owns the keys below. Overwriting
+        # the file (as this node used to) deleted `onboarded` at the end of every run, silently
+        # re-triggering brownfield onboarding on the next one.
+        await preflight_nodes.update_manifest(
+            provider,
+            thread_id,
+            {
+                "run_id": run_id,
+                "timestamp": timestamp,
+                "requirements_content_hash": _hash_content(raw_requirements),
+                "approval_hashes": {
+                    "specification": spec_approval.content_sha256 if spec_approval else None,
+                    "plan": plan_approval.content_sha256 if plan_approval else None,
+                },
+                "metrics_summary": metrics_summary.get("traceability_summary"),
+                "merge_readiness": merge_readiness,
+            },
+        )
+
+        ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+        # US/AC provenance rows: this run's own spec scope from STATE (already in hand -- no sandbox
+        # read; the approved file equals it byte-for-byte), row set + carried-over from the ledger.
+        own_spec = ((state.get("stages") or {}).get("specification") or {}).get("approved_content") or {}
+        own_us_ids = {s.get("id") for s in (own_spec.get("user_stories") or []) if s.get("id")}
+        own_ac_ids = spec_ledger.own_ac_ids_from_specification(own_spec)
+        us_ac_rows = _us_ac_rows(ledger_entries, own_us_ids, own_ac_ids, run_id)
+        carried_over = _undelivered_ac_ids(ledger_entries)
+        snapshot_path = f"{HISTORY_DIR}/{run_id}-ledger-snapshot.json"
+        prior_snapshot = await _find_prior_ledger_snapshot(provider, thread_id, run_id)
+        diff = _diff_ledger(prior_snapshot, ledger_entries)
+        await repo_files.write_repo_file(provider, thread_id, snapshot_path, json.dumps(ledger_entries, indent=2) + "\n")
+
+        changelog_section = [f"## {timestamp} (run {run_id})", ""]
+        if diff["added"]:
+            changelog_section.append(f"- Added: {', '.join(diff['added'])}")
+        if diff["revised"]:
+            changelog_section.append(f"- Revised: {', '.join(diff['revised'])}")
+        if diff["retired"]:
+            changelog_section.append(f"- Retired: {', '.join(diff['retired'])}")
+        if not any(diff.values()):
+            changelog_section.append("- No user-story-level changes since the prior run.")
+        changelog_section.append("")
+
+        existing_changelog = await repo_files.read_repo_file(provider, thread_id, CHANGELOG_PATH)
+        header = "# Changelog\n\nAuto-generated by ai-dev-workflow's exit exit stage.\n\n"
+        body = "\n".join(changelog_section) + "\n"
+        if existing_changelog is None:
+            new_changelog = header + body
+        else:
+            # Prepend after the header line(s) -- newest entries first, but keep whatever the
+            # existing file's own header/preamble looked like rather than assuming this format wrote
+            # it originally.
+            new_changelog = existing_changelog.rstrip() + "\n\n" + body
+
+        await repo_files.write_repo_file(provider, thread_id, CHANGELOG_PATH, new_changelog)
+
+        # Ruling 8, Part B: refresh the regression baseline from this run's own final scan -- only on
+        # the completed branch above, see _baseline_refresh_payload's own docstring for why.
+        baseline_payload = _baseline_refresh_payload(status, metrics_summary)
+        if baseline_payload is not None:
+            await repo_files.write_repo_file(provider, thread_id, repo_scan.BASELINE_PATH, baseline_payload)
+
+        # Per-run exit report artifacts (durable even once the session ages out of the UI's recent
+        # list): the raw diff/log this run actually produced, plus the same metrics/delta numbers
+        # the frontend Report tab shows live, frozen at exit time so a past session's report page
+        # can render identically. Each of these three reads is best-effort: a sandbox hiccup on any
+        # ONE of them must degrade that section, not abort the whole report (same fail-open contract
+        # as _scan_regression_reasons, agent/src/rebuild.py).
+        try:
+            files_changed_stat, commits_log = await _files_changed(provider, thread_id, state.get("run_baseline_commit"))
+        except Exception:  # noqa: BLE001 -- degrade this section, never abort the report
+            logger.warning("exit finalize: _files_changed failed for thread_id=%s", thread_id, exc_info=True)
+            files_changed_stat, commits_log = "", ""
+        try:
+            screenshots = await _list_screenshots(provider, thread_id, run_id)
+        except Exception:  # noqa: BLE001 -- degrade this section, never abort the report
+            logger.warning("exit finalize: _list_screenshots failed for thread_id=%s", thread_id, exc_info=True)
+            screenshots = []
+        delta_summary = repo_scan.delta_summary(metrics_summary.get("repo_scan_delta"))
+        try:
+            ledger_rows = await _load_ledger_rows(provider, thread_id)
+        except Exception:  # noqa: BLE001 -- degrade this section, never abort the report
+            logger.warning("exit finalize: _load_ledger_rows failed for thread_id=%s", thread_id, exc_info=True)
+            ledger_rows = []
+        divergence_rows, divergence_section = _divergence_ledger(
+            [r for r in ledger_rows if r.get("node") == "divergence_snapshot" and r.get("run_id") == run_id]
+        )
+        stage_rows, stage_section = _stage_summary(ledger_rows, state.get("stages"), terminal_failure)
+        # Remediation's approved report: known_gaps become the findings table's "known gap: <reason>"
+        # dispositions, findings_addressed the "fixed by remediation" count. {} when remediation never
+        # approved (escalated runs) -- the renderer degrades to the deterministic disposition classes.
+        from . import metrics_nodes
+
+        try:
+            remediation_report = await metrics_nodes.read_remediation_report(provider, thread_id)
+        except Exception:  # noqa: BLE001 -- report rendering must survive an unreadable artifact
+            remediation_report = {}
+        fallback_metrics: dict[str, Any] | None = None
+        if not metrics_summary:
+            # Escalated runs skip metrics_compute; surface what already exists instead of nothing.
+            latest_scan = (state.get("repo_scan") or {}).get("latest_summary") or (state.get("repo_scan") or {}).get("baseline_summary")
+            try:
+                token_totals = await metrics_nodes._sum_token_usage(provider, thread_id)  # noqa: SLF001 -- same package
+            except Exception:  # noqa: BLE001 -- ledger read is best-effort here
+                token_totals = None
+            if latest_scan or token_totals:
+                fallback_metrics = {"latest_scan": latest_scan, "token_usage_summary": token_totals}
+
+        report_path = f"{HISTORY_DIR}/{run_id}-report.json"
+        exit_md_path = f"{HISTORY_DIR}/{run_id}-exit.md"
+
+        report_payload = {
+            "run_id": run_id,
+            "timestamp": timestamp,
+            "merge_readiness": merge_readiness,
+            "metrics": metrics_summary,
+            # Not in the plan's literal artifact shape, but required to render "Delta vs baseline" on
+            # a past-session report page without re-deriving it from metrics_summary's raw repo_scan_delta
+            # diff (that transform, repo_scan.delta_summary, is Python-only) -- cheap to persist since
+            # it's already computed for the exit.md section below.
+            "delta_summary": delta_summary,
+            "files_changed": files_changed_stat,
+            "commits": commits_log,
+            "e2e": state.get("e2e"),
+            "screenshots": screenshots,
+            # Machine-readable US/AC provenance for this run -- same rows the markdown section renders.
+            "us_ac": us_ac_rows,
+            "carried_over_ac_ids": carried_over,
+            # Machine-readable divergence dispositions -- same rows the Divergence Ledger section renders.
+            "divergence_ledger": divergence_rows,
+            # The terminal failure verbatim (None on a run that reached exit normally) -- the report
+            # page and the support-issue body read this, not the prose blockers.
+            "run_failure": terminal_failure,
+            # Per-stage runtime/laps/tokens/cost/notes -- same rows the Stage summary section renders.
+            "stage_summary": stage_rows,
+        }
+        failure_section = _render_terminal_failure(terminal_failure)
+        if stage_section:
+            failure_section = stage_section + ("\n" + failure_section if failure_section else "")
+        await repo_files.write_repo_file(provider, thread_id, report_path, json.dumps(report_payload, indent=2, default=str) + "\n")
+
+        # One render, three destinations (the two committed exit-markdown copies below, plus the PR
+        # body further down) -- they differ only in how a screenshot path resolves to an image, so
+        # screenshot_prefix is the only thing that varies per call.
+        def _full_markdown(screenshot_prefix: str) -> str:
+            return (
+                render_exit_markdown(merge_readiness or {}) + "\n" + _render_history_sections(
+                    files_changed_stat=files_changed_stat,
+                    commits_log=commits_log,
+                    metrics_summary=metrics_summary,
+                    delta_summary=delta_summary,
+                    screenshots=screenshots,
+                    run_id=run_id,
+                    e2e=state.get("e2e"),
+                    screenshot_prefix=screenshot_prefix,
+                    stages=state.get("stages"),
+                    us_ac_rows=us_ac_rows,
+                    carried_over=carried_over,
+                    fallback_metrics=fallback_metrics,
+                    remediation=remediation_report,
+                )
+                + ("\n" + failure_section if failure_section else "")
+                + ("\n" + divergence_section if divergence_section else "")
+            )
+
+        exit_markdown = _full_markdown("./")
+        await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
+
+        # A second copy at a FIXED, obvious path. The per-run file above is the archive, but its name
+        # carries a run id and sits a directory deep, so on a delivered branch nobody finds it -- the
+        # report was reviewed as "missing" for five consecutive runs while being committed every time.
+        # Screenshot links are re-based to history/... because this copy lives one level up from them.
+        latest_markdown = _full_markdown("history/")
+        await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, latest_markdown)
+        # The numbered stage artifact carries the SAME full report. This node is its only writer --
+        # metrics-exit's StageSpec sets render_markdown=None precisely so the generic persist can't
+        # revert this file to the 4-section stub at the start of the next run.
+        await repo_files.write_repo_file(provider, thread_id, workflow_persistence.METRICS_EXIT_MD_PATH, latest_markdown)
+
+        commit_targets = [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH, workflow_persistence.METRICS_EXIT_MD_PATH]
+        if baseline_payload is not None:
+            commit_targets.append(repo_scan.BASELINE_PATH)
+        await git_ops.commit_paths(
+            provider,
+            thread_id,
+            commit_targets,
+            "ai-dev-workflow: exit finalize (manifest, changelog, exit report)",
+        )
+
+        # PR create/update, moved to AFTER the commit above (it used to fire before any of this run's
+        # own artifacts were written, so its body was always the model's bare freeform prose) -- the
+        # body now carries the same full report exit.md does, screenshot links re-based to absolute
+        # raw.githubusercontent.com URLs since a PR description isn't a committed file GitHub can
+        # resolve a relative image path against.
+        if status == "completed" and session_row:
             token = git_ops.get_push_token(thread_id)
             if token:
-                pr_url = await git_ops.open_pull_request(
-                    owner=session_row["owner"],
-                    repo=session_row["repo"],
-                    source_branch=session_row["source_branch"],
-                    work_branch=session_row["work_branch"],
-                    title=merge_readiness.get("pr_title") or f"ai-dev-workflow: {run_id}",
-                    body=merge_readiness.get("pr_description_markdown") or "",
-                    token=token,
+                pr_screenshot_prefix = (
+                    f"https://raw.githubusercontent.com/{session_row['owner']}/{session_row['repo']}/"
+                    f"{session_row['work_branch']}/{HISTORY_DIR}/"
                 )
+                pr_body = _full_markdown(pr_screenshot_prefix)
+                if pr_url:
+                    # Idempotent re-finalize (hydrate-short-circuit path, e.g. a resumed thread whose
+                    # exit stage was already approved): never open a second PR, but DO refresh the
+                    # existing one's body so it reflects this attempt's content instead of staying
+                    # frozen at whatever the first finalize wrote.
+                    await git_ops.update_pull_request(
+                        owner=session_row["owner"], repo=session_row["repo"], pr_url=pr_url, body=pr_body, token=token,
+                    )
+                else:
+                    pr_url = await git_ops.open_pull_request(
+                        owner=session_row["owner"],
+                        repo=session_row["repo"],
+                        source_branch=session_row["source_branch"],
+                        work_branch=session_row["work_branch"],
+                        title=merge_readiness.get("pr_title") or f"ai-dev-workflow: {run_id}",
+                        body=pr_body,
+                        token=token,
+                    )
             else:
-                logger.warning("no push token retained for thread_id=%s -- skipping PR creation", thread_id)
+                logger.warning("no push token retained for thread_id=%s -- skipping PR create/update", thread_id)
+    except Exception as exc:  # noqa: BLE001 -- this is the guarantee: exit.md must exist either way
+        # Something got through every inner guard above (most likely the final commit_paths itself).
+        # Downgrade in place and best-effort write a MINIMAL report instead of leaving nothing at all
+        # -- a human reading a degraded "generation failed" exit.md is the whole point of this stage;
+        # silence is the one outcome that must never happen.
+        logger.error("exit finalize: report generation failed for thread_id=%s -- writing degraded report", thread_id, exc_info=True)
+        reason = f"exit report generation failed: {exc}"
+        existing_reasons = _presence_values(merge_readiness.get("blocking_reasons"))
+        merge_readiness["blocking_reasons"] = _presence_from_values(
+            [reason, *existing_reasons] if reason not in existing_reasons else existing_reasons,
+            empty_reason="unreachable: reason is always appended in this branch",
+        )
+        merge_readiness["merge_ready"] = False
+        merge_ready = False
+        status = "failed"
+        failure_payload = {"stage": "exit", "type": "exit_report_failed", "feedback": reason}
+        try:
+            await preflight_nodes.update_manifest(provider, thread_id, {"merge_readiness": merge_readiness})
+            degraded_md = render_exit_markdown(merge_readiness)
+            await repo_files.write_repo_file(provider, thread_id, f"{HISTORY_DIR}/{run_id}-exit.md", degraded_md)
+            await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, degraded_md)
+            await repo_files.write_repo_file(provider, thread_id, workflow_persistence.METRICS_EXIT_MD_PATH, degraded_md)
+            await repo_files.write_repo_file(
+                provider, thread_id, f"{HISTORY_DIR}/{run_id}-report.json",
+                json.dumps(
+                    {"run_id": run_id, "timestamp": timestamp, "merge_readiness": merge_readiness, "run_failure": terminal_failure},
+                    indent=2, default=str,
+                ) + "\n",
+            )
+            await git_ops.commit_paths(
+                provider,
+                thread_id,
+                [MANIFEST_PATH, HISTORY_DIR, EXIT_REPORT_PATH, workflow_persistence.METRICS_EXIT_MD_PATH],
+                "ai-dev-workflow: exit finalize (degraded -- report generation failed)",
+            )
+        except Exception:  # noqa: BLE001 -- sandbox is truly unreachable; nothing more to do locally
+            logger.error("exit finalize: degraded fallback write ALSO failed for thread_id=%s", thread_id, exc_info=True)
 
+    # Unconditional, exactly once, last -- see this function's own docstring for why.
     await session_store.close_session(
         thread_id,
         run_id=run_id,
@@ -1386,124 +1593,6 @@ async def exit_finalize_node(
         merge_ready=merge_ready if merge_readiness else None,
         pr_title=(merge_readiness or {}).get("pr_title"),
         pr_url=pr_url,
-    )
-
-    # Per-run exit report artifacts (durable even once the session ages out of the UI's recent
-    # list): the raw
-    # diff/log this run actually produced, plus the same metrics/delta numbers the frontend Report
-    # tab shows live, frozen at exit time so a past session's report page can render identically.
-    files_changed_stat, commits_log = await _files_changed(provider, thread_id, state.get("run_baseline_commit"))
-    screenshots = await _list_screenshots(provider, thread_id, run_id)
-    delta_summary = repo_scan.delta_summary(metrics_summary.get("repo_scan_delta"))
-    ledger_rows = await _load_ledger_rows(provider, thread_id)
-    divergence_rows, divergence_section = _divergence_ledger(
-        [r for r in ledger_rows if r.get("node") == "divergence_snapshot" and r.get("run_id") == run_id]
-    )
-    stage_rows, stage_section = _stage_summary(ledger_rows, state.get("stages"), terminal_failure)
-    # Remediation's approved report: known_gaps become the findings table's "known gap: <reason>"
-    # dispositions, findings_addressed the "fixed by remediation" count. {} when remediation never
-    # approved (escalated runs) -- the renderer degrades to the deterministic disposition classes.
-    from . import metrics_nodes
-
-    try:
-        remediation_report = await metrics_nodes.read_remediation_report(provider, thread_id)
-    except Exception:  # noqa: BLE001 -- report rendering must survive an unreadable artifact
-        remediation_report = {}
-    fallback_metrics: dict[str, Any] | None = None
-    if not metrics_summary:
-        # Escalated runs skip metrics_compute; surface what already exists instead of nothing.
-        from . import metrics_nodes
-
-        latest_scan = (state.get("repo_scan") or {}).get("latest_summary") or (state.get("repo_scan") or {}).get("baseline_summary")
-        try:
-            token_totals = await metrics_nodes._sum_token_usage(provider, thread_id)  # noqa: SLF001 -- same package
-        except Exception:  # noqa: BLE001 -- ledger read is best-effort here
-            token_totals = None
-        if latest_scan or token_totals:
-            fallback_metrics = {"latest_scan": latest_scan, "token_usage_summary": token_totals}
-
-    report_path = f"{HISTORY_DIR}/{run_id}-report.json"
-    exit_md_path = f"{HISTORY_DIR}/{run_id}-exit.md"
-
-    report_payload = {
-        "run_id": run_id,
-        "timestamp": timestamp,
-        "merge_readiness": merge_readiness,
-        "metrics": metrics_summary,
-        # Not in the plan's literal artifact shape, but required to render "Delta vs baseline" on
-        # a past-session report page without re-deriving it from metrics_summary's raw repo_scan_delta
-        # diff (that transform, repo_scan.delta_summary, is Python-only) -- cheap to persist since
-        # it's already computed for the exit.md section below.
-        "delta_summary": delta_summary,
-        "files_changed": files_changed_stat,
-        "commits": commits_log,
-        "e2e": state.get("e2e"),
-        "screenshots": screenshots,
-        # Machine-readable US/AC provenance for this run -- same rows the markdown section renders.
-        "us_ac": us_ac_rows,
-        "carried_over_ac_ids": carried_over,
-        # Machine-readable divergence dispositions -- same rows the Divergence Ledger section renders.
-        "divergence_ledger": divergence_rows,
-        # The terminal failure verbatim (None on a run that reached exit normally) -- the report
-        # page and the support-issue body read this, not the prose blockers.
-        "run_failure": terminal_failure,
-        # Per-stage runtime/laps/tokens/cost/notes -- same rows the Stage summary section renders.
-        "stage_summary": stage_rows,
-    }
-    failure_section = _render_terminal_failure(terminal_failure)
-    if stage_section:
-        failure_section = stage_section + ("\n" + failure_section if failure_section else "")
-    await repo_files.write_repo_file(provider, thread_id, report_path, json.dumps(report_payload, indent=2, default=str) + "\n")
-
-    exit_markdown = render_exit_markdown(merge_readiness or {}) + "\n" + _render_history_sections(
-        files_changed_stat=files_changed_stat,
-        commits_log=commits_log,
-        metrics_summary=metrics_summary,
-        delta_summary=delta_summary,
-        screenshots=screenshots,
-        run_id=run_id,
-        e2e=state.get("e2e"),
-        stages=state.get("stages"),
-        us_ac_rows=us_ac_rows,
-        carried_over=carried_over,
-        fallback_metrics=fallback_metrics,
-        remediation=remediation_report,
-    ) + ("\n" + failure_section if failure_section else "") + ("\n" + divergence_section if divergence_section else "")
-    await repo_files.write_repo_file(provider, thread_id, exit_md_path, exit_markdown)
-
-    # A second copy at a FIXED, obvious path. The per-run file above is the archive, but its name
-    # carries a run id and sits a directory deep, so on a delivered branch nobody finds it -- the
-    # report was reviewed as "missing" for five consecutive runs while being committed every time.
-    # Screenshot links are re-based to history/... because this copy lives one level up from them.
-    latest_markdown = render_exit_markdown(merge_readiness or {}) + "\n" + _render_history_sections(
-        files_changed_stat=files_changed_stat,
-        commits_log=commits_log,
-        metrics_summary=metrics_summary,
-        delta_summary=delta_summary,
-        screenshots=screenshots,
-        run_id=run_id,
-        e2e=state.get("e2e"),
-        screenshot_prefix="history/",
-        stages=state.get("stages"),
-        us_ac_rows=us_ac_rows,
-        carried_over=carried_over,
-        fallback_metrics=fallback_metrics,
-        remediation=remediation_report,
-    ) + ("\n" + failure_section if failure_section else "") + ("\n" + divergence_section if divergence_section else "")
-    await repo_files.write_repo_file(provider, thread_id, EXIT_REPORT_PATH, latest_markdown)
-    # The numbered stage artifact carries the SAME full report. This node is its only writer --
-    # metrics-exit's StageSpec sets render_markdown=None precisely so the generic persist can't
-    # revert this file to the 4-section stub at the start of the next run.
-    await repo_files.write_repo_file(provider, thread_id, workflow_persistence.METRICS_EXIT_MD_PATH, latest_markdown)
-
-    commit_targets = [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH, workflow_persistence.METRICS_EXIT_MD_PATH]
-    if baseline_payload is not None:
-        commit_targets.append(repo_scan.BASELINE_PATH)
-    await git_ops.commit_paths(
-        provider,
-        thread_id,
-        commit_targets,
-        "ai-dev-workflow: exit finalize (manifest, changelog, exit report)",
     )
 
     # Graceful end-of-run release of this thread's ~20 Copilot sessions. metrics-exit is genuinely
@@ -1667,7 +1756,12 @@ def _demo() -> None:
     assert by_stage["plan"]["notes"] == ["skipped (approved on resume)"], by_stage["plan"]
     assert by_stage["remediation"]["notes"] == ["not reached (not_started)"]
     assert "e2e passed: 3/3 passed" in by_stage["e2e"]["notes"][0]
-    assert "| specification | 2:20 | 2 | 200/100 | $1.00 |" in stage_md, stage_md
+    # Status column: real stage status for a row the caller's `stages` dict knows about ("plan" was
+    # passed in as "approved"), "-" for a ledger-only tag with no real-stage counterpart ("e2e" here
+    # since the fixture's `stages` dict never mentions it).
+    assert by_stage["plan"]["status"] == "approved", by_stage["plan"]
+    assert by_stage["e2e"]["status"] == "-", by_stage["e2e"]
+    assert "| specification | - | 2:20 | 2 | 200/100 | $1.00 |" in stage_md, stage_md
     assert "**Total**" in stage_md
     _, failed_md = _stage_summary(ledger, {}, {"stage": "r_ac_to_tests", "type": "rebuild_cap_exceeded"})
     assert "TERMINAL: rebuild_cap_exceeded" in failed_md
@@ -1786,11 +1880,13 @@ def _demo() -> None:
         {"id": "US-0001.1", "kind": "acceptance_criterion", "parent_us_id": "US-0001",
          "status": "active", "description": "Increments", "first_seen_run_id": "r1",
          "last_revised_run_id": "r1", "coded_run_id": "r1", "coded_at": "t1",
-         "tested_run_id": "r1", "tested_at": "t1", "test_ids": ["[US-0001.1] increments"]},
+         "tested_run_id": "r1", "tested_at": "t1", "test_ids": ["[US-0001.1] increments"],
+         "ui_related": True},
         {"id": "US-0001.2", "kind": "acceptance_criterion", "parent_us_id": "US-0001",
          "status": "revised", "description": "Shows doubled value", "first_seen_run_id": "r1",
          "last_revised_run_id": "r2", "coded_run_id": "r2", "coded_at": "t2",
-         "tested_run_id": "r2", "tested_at": "t2", "test_ids": ["[US-0001.2] doubles"]},
+         "tested_run_id": "r2", "tested_at": "t2", "test_ids": ["[US-0001.2] doubles"],
+         "ui_related": False},
         {"id": "US-0002", "kind": "user_story", "status": "retired", "title": "Reset",
          "first_seen_run_id": "r1", "last_revised_run_id": "r2"},
         {"id": "US-0002.1", "kind": "acceptance_criterion", "parent_us_id": "US-0002",
@@ -1810,10 +1906,14 @@ def _demo() -> None:
     assert "US-0003" not in by_id, "flake-ticket synthetic stories (no AC children) must be filtered"
     assert "US-0004.1" not in by_id, "unchanged foreign AC outside own spec is not a row"
     assert by_id["US-0001"]["coded_run_id"] == "r2", "US coded = latest child stamp when all live children coded"
+    assert by_id["US-0001.1"]["ui_related"] is True and by_id["US-0001.2"]["ui_related"] is False, by_id
+    assert by_id["US-0002.1"]["ui_related"] is None, "a ledger entry that predates ui_related must not fabricate a value"
     assert _undelivered_ac_ids(ledger) == ["US-0004.1"], _undelivered_ac_ids(ledger)
     section = "\n".join(_render_us_ac_section(rows, _undelivered_ac_ids(ledger), "r2"))
     assert "## User stories & acceptance criteria this run" in section
-    assert "| US-0001.2 | modified |" in section and "r2 (this run)" in section
+    assert "| US-0001.1 | unchanged | Increments | Yes |" in section, section
+    assert "| US-0001.2 | modified | Shows doubled value | No |" in section and "r2 (this run)" in section, section
+    assert "| US-0002.1 | deleted | Resets | -- |" in section, section
     assert "Carried over -- not delivered**: US-0004.1" in section
     assert "(none recorded" in "\n".join(_render_us_ac_section([], [], "r2"))
 

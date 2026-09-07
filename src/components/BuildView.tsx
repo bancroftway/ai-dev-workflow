@@ -1,13 +1,19 @@
 "use client";
 
 import { useAgent } from "@copilotkit/react-core/v2";
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { computeRunningPhases, NODE_PHASE_LABEL, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import type { StageState, WorkflowState } from "@/lib/workflow-types";
+import {
+  REBUILD_PLACEMENTS,
+  REBUILD_STATUS_LABEL,
+  rebuildPhase,
+  type StageState,
+  type WorkflowState,
+} from "@/lib/workflow-types";
 
 // Both stages this view renders (BUILD_STAGES below) are non-gated -- no human ever reviews them
 // (README: only tech-stack/specification/plan pause for a person). "Ready for review" is the
@@ -89,6 +95,44 @@ function StageCard({
   );
 }
 
+/** User-reported gap (2026-09-06): several minutes of real work (a clean-build check,
+ * agent/src/rebuild.py's rebuild_node -- plus a TDD-red check, ac-to-tests' placement only) happen
+ * between a Build stage approving and the next one showing any activity, with nothing on-screen in
+ * between -- read as stalled. See rebuildPhase's own docstring (workflow-types.ts) for the
+ * derivation. A slim connector row, not a full StageCard: this step is infrastructure the pipeline
+ * always runs, never something a human reviews the way the two real Build stages are. `isRedGate`
+ * picks the one placement (ac-to-tests') with a TDD-red check worth naming specifically; the other
+ * (after minimal-code-to-green, only reachable here if that stage's OWN rebuild is still running
+ * when a user checks this tab before moving to Quality) gets the same generic copy
+ * REBUILD_STATUS_LABEL already gives it elsewhere. */
+function RebuildConnector({
+  running,
+  status,
+  failedHere,
+  isRedGate,
+}: {
+  running: boolean;
+  status: "not_started" | "clean" | "failed" | "fixing";
+  failedHere: boolean;
+  isRedGate: boolean;
+}) {
+  const label = failedHere
+    ? `${isRedGate ? "Red-gate" : "Rebuild"} check failed — see the Overview tab for details and Resume.`
+    : running
+      ? isRedGate
+        ? "Confirming the new tests actually fail before implementation starts…"
+        : "Running a clean-build check before the next stage starts…"
+      : status === "clean" && isRedGate
+        ? "Red-gate check passed — tests confirmed red before implementation began."
+        : REBUILD_STATUS_LABEL[status];
+  return (
+    <div className={`flex items-center gap-2 px-1 text-xs ${failedHere ? "text-red-700" : "text-neutral-500"}`}>
+      {running && <RunningSpinner />}
+      <span>{label}</span>
+    </div>
+  );
+}
+
 export function BuildView() {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
@@ -100,24 +144,36 @@ export function BuildView() {
     () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),
     [runEvents, runActivity?.runActive],
   );
-
   return (
     <ViewContainer>
       <div>
         <h1 className="text-lg font-semibold">Build</h1>
         <p className="text-sm text-neutral-500">Tests-first implementation progress after the approved plan.</p>
       </div>
-      {BUILD_STAGES.map(({ key, label, blurb }) => (
-        <StageCard
-          key={key}
-          stageKey={key}
-          label={label}
-          blurb={blurb}
-          stage={state.stages?.[key]}
-          runFailure={state.run_failure}
-          runningLabel={runningPhases.has(key) ? (NODE_PHASE_LABEL[runningPhases.get(key)!] ?? "Running") : null}
-        />
-      ))}
+      {BUILD_STAGES.map(({ key, label, blurb }) => {
+        const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
+        const phase = placement && rebuildPhase(state, placement, runActivity?.runActive);
+        return (
+          <Fragment key={key}>
+            <StageCard
+              stageKey={key}
+              label={label}
+              blurb={blurb}
+              stage={state.stages?.[key]}
+              runFailure={state.run_failure}
+              runningLabel={runningPhases.has(key) ? (NODE_PHASE_LABEL[runningPhases.get(key)!] ?? "Running") : null}
+            />
+            {placement && phase && (
+              <RebuildConnector
+                running={phase.running}
+                status={phase.status}
+                failedHere={state.run_failure?.stage === placement.rebuildKey}
+                isRedGate={placement.rebuildKey === "r_ac_to_tests"}
+              />
+            )}
+          </Fragment>
+        );
+      })}
     </ViewContainer>
   );
 }

@@ -273,7 +273,7 @@ export function SessionHistory({
                     <button
                       type="button"
                       className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
-                      onClick={() => router.push(`/sessions/${owner}/${repo}/${s.session_id}/${s.run_id}/report`)}
+                      onClick={() => openLive(s)}
                     >
                       View report
                     </button>
