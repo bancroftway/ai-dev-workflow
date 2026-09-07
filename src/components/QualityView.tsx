@@ -16,7 +16,7 @@ const SEVERITY_CLASS: Record<string, string> = {
   info: "text-neutral-400",
 };
 
-function FindingsTable({ findings, decisions }: { findings: RemediationFinding[]; decisions?: Record<string, { decision: string }> }) {
+export function FindingsTable({ findings, decisions }: { findings: RemediationFinding[]; decisions?: Record<string, { decision: string }> }) {
   if (findings.length === 0) return <p className="text-xs text-neutral-500">No findings.</p>;
   return (
     <div className="overflow-x-auto">

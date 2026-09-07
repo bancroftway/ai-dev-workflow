@@ -26,7 +26,7 @@ from .prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, workflow_persistence
+from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, tech_stack_signals, workflow_persistence
 from .gates import readme_gate
 from .gates.ac_coverage_gate import id_variants
 from .gates.remediation_gate import accounted_for
@@ -267,6 +267,9 @@ def regression_reasons(
     min_coverage: float | None = None,
     tolerance: float | None = None,
     health_tolerance: float | None = None,
+    ac_verification: dict[str, Any] | None = None,
+    ac_execution: dict[str, Any] | None = None,
+    is_ui_app: bool = False,
 ) -> list[str]:
     """Pure decision half of the metrics regression gate (self-checked in _demo). Blocks on:
     open gating findings (severity-floored, introduced-aware -- greenfield's empty-repo baseline
@@ -274,7 +277,14 @@ def regression_reasons(
     below-threshold coverage, coverage regressing beyond tolerance, and health-score regressing
     beyond tolerance. The health delta is skipped when the baseline has zero findings: greenfield's
     baseline is scanned pre-codegen against an empty repo, and comparing real app code against an
-    empty directory is not a regression signal (gating_count covers that case absolutely)."""
+    empty directory is not a regression signal (gating_count covers that case absolutely).
+
+    `ac_verification`/`ac_execution`/`is_ui_app` are OPTIONAL and default to a no-op: rebuild.py's
+    post-remediation rescan calls this same function mid-pipeline, before AC execution or Lighthouse
+    have ever run (both are only computed by metrics_compute_node's own final scan) -- passing real
+    values there would misreport "too early to have run yet" as "silently unmeasured". Only the
+    final scan's own call site threads real values through.
+    """
     min_cov = MIN_COVERAGE_PERCENT if min_coverage is None else min_coverage
     tol = METRIC_REGRESSION_TOLERANCE if tolerance is None else tolerance
     health_tol = HEALTH_REGRESSION_TOLERANCE if health_tolerance is None else health_tolerance
@@ -316,6 +326,36 @@ def regression_reasons(
         and health.get("direction") == "regressed" and abs(health.get("delta") or 0) > health_tol
     ):
         reasons.append(f"health_score regressed {health.get('from')} -> {health.get('to')} (beyond {health_tol}pt tolerance)")
+
+    # This ticket has live acceptance criteria (ac_verification.total > 0) but no suite ever ran
+    # (or ran and produced nothing usable) to verify them -- same "must never silently pass as
+    # unmeasured" rule coverage already gets above. Not gated on the AC COUNT reaching solidly
+    # verified (that's the health_score subscore's job, and a genuinely failing AC already gates
+    # elsewhere via test-hardening) -- only on the eval layer having run AT ALL.
+    total_acs = (ac_verification or {}).get("total")
+    if isinstance(total_acs, int) and total_acs > 0:
+        exec_status = (ac_execution or {}).get("status")
+        if exec_status in (None, "not_evaluated"):
+            reason = (ac_execution or {}).get("reason")
+            reasons.append(
+                "AC verification unmeasured -- "
+                f"{total_acs} live acceptance criterion(-ia) but no suite execution recorded"
+                + (f" ({reason})" if reason else "")
+            )
+
+    # A genuine UI app (tech-stack detected a UI framework) whose Lighthouse scores never landed:
+    # e2e's own gate check uses this SAME is_ui_app signal to decide whether to run at all, so if
+    # we're here with is_ui_app=True, a missing score is an e2e/Lighthouse INFRA failure, never the
+    # legitimate "not a UI app" skip (that case never reaches this branch, since the caller only
+    # passes is_ui_app=True when tech-stack found a UI framework in the first place).
+    if is_ui_app:
+        measures = latest_summary.get("measures") or {}
+        if measures.get("lighthouse_performance") is None and measures.get("accessibility_score") is None:
+            reasons.append(
+                "accessibility/performance unmeasured -- tech-stack detected a UI framework but "
+                "no Lighthouse score was recorded (e2e likely failed before reaching it)"
+            )
+
     return reasons
 
 
@@ -524,6 +564,11 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         scan_report["summary"], delta_summ, coverage,
         baseline_has_findings=bool((baseline or {}).get("findings")),
         health_comparable=health_comparable,
+        # Real values only from THIS call site -- the final scan, where both are expected to have
+        # actually run. rebuild.py's post-remediation rescan leaves these at their no-op defaults.
+        ac_verification=scan_report.get("ac_verification"),
+        ac_execution=scan_report.get("ac_execution"),
+        is_ui_app=tech_stack_signals.tech_stack_has_ui_framework(state),
     )
 
     # Delivery stamps -- the ONLY writer of coded_*/tested_*/test_ids, and only on a healthy run
@@ -842,6 +887,34 @@ def _demo() -> None:
     # Sub-tolerance wiggle -> passes (scan noise, not a regression).
     wiggle = {"metrics": {"coverage_line_rate": {"from": 96.5, "to": 96.0, "delta": -0.5, "direction": "regressed"}}}
     assert regression_reasons(clean_summary, wiggle, good_cov, baseline_has_findings=True, **kw) == []
+    # AC verification unmeasured -> blocks when this ticket has live ACs but no suite execution
+    # ever ran; passes when execution genuinely ran (whatever its verdict) or there are no ACs at
+    # all to verify (a docs-only/deletion-only ticket must not be forced through eval).
+    assert any(
+        "AC verification unmeasured" in r
+        for r in regression_reasons(
+            clean_summary, None, good_cov, baseline_has_findings=True,
+            ac_verification={"total": 3}, ac_execution={"status": "not_evaluated"}, **kw,
+        )
+    )
+    assert regression_reasons(
+        clean_summary, None, good_cov, baseline_has_findings=True,
+        ac_verification={"total": 3}, ac_execution={"status": "evaluated"}, **kw,
+    ) == []
+    assert regression_reasons(
+        clean_summary, None, good_cov, baseline_has_findings=True,
+        ac_verification={"total": 0}, ac_execution=None, **kw,
+    ) == []
+    # Accessibility/performance unmeasured -> blocks only for a UI app whose Lighthouse score never
+    # landed; a non-UI app (is_ui_app defaults False) is never held to a UI-only measurement.
+    no_lighthouse = {**clean_summary, "measures": {}}
+    assert any(
+        "accessibility/performance unmeasured" in r
+        for r in regression_reasons(no_lighthouse, None, good_cov, baseline_has_findings=True, is_ui_app=True, **kw)
+    )
+    assert regression_reasons(no_lighthouse, None, good_cov, baseline_has_findings=True, is_ui_app=False, **kw) == []
+    with_lighthouse = {**clean_summary, "measures": {"lighthouse_performance": 48.0, "accessibility_score": 92.0}}
+    assert regression_reasons(with_lighthouse, None, good_cov, baseline_has_findings=True, is_ui_app=True, **kw) == []
 
     # known_gaps end-to-end (Ruling 8): a finding remediation's OWN approved report already
     # explained must stop blocking the regression gate, while a genuinely new, uncovered gating

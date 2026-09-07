@@ -135,6 +135,35 @@ def parse_trx(raw_xml: str) -> dict[str, str]:
     return results
 
 
+def parse_junit_xml(raw_xml: str) -> dict[str, str]:
+    """testName -> 'pass'|'fail', from a JUnit XML report -- pytest's own built-in `--junitxml`
+    (stdlib-adjacent, no plugin needed), also the format go test/gotestsum and JVM's
+    surefire/gradle emit, so this one parser covers every runner not already handled above.
+
+    name = "<classname>::<name>" when classname is present (pytest's own convention) so an AC id
+    embedded in either half (a parametrize id in `name`, a module path in `classname`) survives
+    for test_results.attributed_ac_ids/ac_ids_in_name to find -- no new attribution logic needed,
+    the existing tolerant matcher is already stack-agnostic.
+    """
+    try:
+        root = ET.fromstring(raw_xml)
+    except ET.ParseError:
+        return {}
+    results: dict[str, str] = {}
+    # findall(".//testcase") matches both a bare <testsuite> root (go test/gotestsum) and a
+    # <testsuites> wrapper (pytest, surefire) at any depth.
+    for case in root.findall(".//testcase"):
+        classname = case.get("classname") or ""
+        name = case.get("name") or "unknown"
+        full_name = f"{classname}::{name}" if classname else name
+        # <failure>/<error>/<skipped> all count as not-pass -- same strict "only a literal pass
+        # counts" rule parse_trx already applies to non-"Passed" outcomes, so a quarantined-flaky
+        # test doesn't silently credit a criterion no attempt actually verified this run.
+        not_passed = any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+        results[full_name] = "fail" if not_passed else "pass"
+    return results
+
+
 def parse_vitest_json(raw_json: str) -> dict[str, str]:
     """testName -> 'pass'|'fail', from vitest/jest `--reporter=json`."""
     try:
@@ -293,6 +322,32 @@ def _demo() -> None:
     assert ac_ids_in_name("no ids here") == []
     # A bare story id with no criterion number is NOT an AC id and must not be invented into one.
     assert ac_ids_in_name("US-0001 general behaviour") == []
+
+    junit = """<?xml version="1.0"?>
+    <testsuites>
+      <testsuite name="tests.test_counter">
+        <testcase classname="tests.test_counter" name="test_increment_US-0001_1_returns_one" />
+        <testcase classname="tests.test_counter" name="test_reset_US-0003_2_clears_value">
+          <failure message="assert 1 == 0" />
+        </testcase>
+        <testcase classname="tests.test_counter" name="test_quarantined_flaky">
+          <skipped message="flaky" />
+        </testcase>
+      </testsuite>
+    </testsuites>"""
+    parsed_junit = parse_junit_xml(junit)
+    assert parsed_junit == {
+        "tests.test_counter::test_increment_US-0001_1_returns_one": "pass",
+        "tests.test_counter::test_reset_US-0003_2_clears_value": "fail",
+        "tests.test_counter::test_quarantined_flaky": "fail",
+    }, parsed_junit
+    # A bare <testsuite> root (no <testsuites> wrapper, e.g. go test/gotestsum) parses the same way.
+    bare_root = """<testsuite name="pkg">
+      <testcase classname="pkg" name="TestOk" />
+      <testcase classname="pkg" name="TestBad"><error message="boom" /></testcase>
+    </testsuite>"""
+    assert parse_junit_xml(bare_root) == {"pkg::TestOk": "pass", "pkg::TestBad": "fail"}
+    assert parse_junit_xml("not xml") == {}
 
     vitest = json.dumps({"testResults": [{"assertionResults": [
         {"fullName": "counter US-0002.1 increments", "status": "passed"},

@@ -15,7 +15,7 @@ import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
 import { QualityView } from "@/components/QualityView";
-import { ReportView, type FilesChangedSummary } from "@/components/ReportView";
+import { ReportView, type FilesChangedSummary, type ReportExtras } from "@/components/ReportView";
 import { RequirementsView } from "@/components/RequirementsView";
 import { SessionOverview } from "@/components/SessionOverview";
 import { SpecificationView } from "@/components/SpecificationView";
@@ -33,6 +33,7 @@ import {
   type EscalationPayload,
   type MergeReadinessReport,
   PIPELINE_STAGE_ORDER,
+  type StageState,
   TAB_STAGE_GROUPS,
   type StageKey,
   type WorkflowState,
@@ -87,6 +88,7 @@ export function AppShell({
   metricThresholds,
   resume,
   filesChanged,
+  reportExtras,
 }: {
   /** Repo coordinates for the Report tab's raw-content proxy URLs (screenshots) -- not needed by
    * anything else here, since every other view scopes itself through useWorkflowThread's
@@ -108,6 +110,9 @@ export function AppShell({
    * that lives only in that committed artifact, never in live LangGraph state. Undefined for an
    * in-progress session (nothing committed yet); ReportView already renders nothing for that. */
   filesChanged?: FilesChangedSummary | null;
+  /** Findings/AC-execution/stage-summary detail from the same committed report.json, resolved
+   * server-side alongside filesChanged -- same completed-session-only availability. */
+  reportExtras?: ReportExtras | null;
 }) {
   const { threadId, runtimeAgentId, localAgentId } = useWorkflowThread();
   const { agent } = useAgent({
@@ -435,7 +440,11 @@ export function AppShell({
         ? "running"
         : undefined;
 
-  const exitStage = state.stages?.exit;
+  // "metrics-exit" is the agent's real (post stage-stable-ids rename) key; "exit" is stale and
+  // never populated (see runEnded()/workflow-types.ts's same dual-key check) -- reading only
+  // `.exit` here left this tab's report/enabled/dot state permanently blind to every real run.
+  const stagesForExit = (state.stages ?? {}) as Record<string, StageState | undefined>;
+  const exitStage = stagesForExit["metrics-exit"] ?? stagesForExit["exit"];
   const reportEnabled = exitStage?.approved_content != null || state.metrics_report?.metrics != null;
   const reportDot: DotState | undefined = exitStage?.approved_content != null ? "done" : undefined;
 
@@ -677,11 +686,11 @@ export function AppShell({
           <div hidden={activeView !== "report"}>
             <ReportView
               report={exitStage?.approved_content as MergeReadinessReport | null | undefined}
-              metrics={state.metrics_report?.metrics}
+              metricsExitStatus={exitStage?.status}
               deltaSummary={state.repo_scan?.delta_summary}
               filesChanged={filesChanged}
               screenshotUrls={state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path, workBranch))}
-              thresholds={metricThresholds}
+              reportExtras={reportExtras}
             />
           </div>
           <div hidden={activeView !== "overview"}><SessionOverview /></div>

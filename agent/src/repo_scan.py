@@ -2354,10 +2354,19 @@ TOOLS: tuple[ToolSpec, ...] = (
         # The leading comment line keeps the file non-empty on a repo with NO ecosystems at all:
         # _run_one reads an empty output file as status=failed, which would park `outdated` in
         # summary.degraded forever on such repos (fail-open means null subscore, not a red flag).
+        # npm discovery: `find -maxdepth 3` (same depth as the dotnet guard below), not just `.`
+        # and `apps/*` -- a `package.json` nested one level deeper (`apps/web/packages/x`,
+        # `services/*/api`) used to be structurally invisible to this probe regardless of network
+        # reachability.
         "mkdir -p agent-work && echo '# aidw outdated probe' > agent-work/outdated.txt && "
-        "{ for d in . apps/*; do [ -f \"$d/package.json\" ] && { echo \"### npm $d\"; (cd \"$d\" && npm outdated --json 2>/dev/null); echo; } >> agent-work/outdated.txt || true; done; } ; "
+        "{ find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' 2>/dev/null | while read -r pj; do d=$(dirname \"$pj\"); echo \"### npm $d\"; (cd \"$d\" && npm outdated --json 2>/dev/null); echo; done >> agent-work/outdated.txt || true; } ; "
         "{ find . -maxdepth 3 \\( -name '*.sln' -o -name '*.csproj' \\) -not -path '*/obj/*' -not -path '*/node_modules/*' 2>/dev/null | grep -q . && { dotnet restore >/dev/null 2>&1 || true; echo '### dotnet' >> agent-work/outdated.txt; dotnet list package --outdated >> agent-work/outdated.txt 2>/dev/null || true; } || true; } ; "
-        "{ for v in .venv apps/*/.venv; do [ -x \"$v/bin/pip\" ] && { echo \"### pypi $v\"; \"$v/bin/pip\" list --outdated --format=json 2>/dev/null; echo; } >> agent-work/outdated.txt || true; done; } ; true",
+        "{ for v in .venv apps/*/.venv; do [ -x \"$v/bin/pip\" ] && { echo \"### pypi $v\"; \"$v/bin/pip\" list --outdated --format=json 2>/dev/null; echo; } >> agent-work/outdated.txt || true; done; } ; "
+        # poetry manages its own venv outside the repo (not discoverable as a `.venv` directory --
+        # `virtualenvs.in-project=true` is the one case already covered by the pip loop above), so
+        # this invokes `poetry` directly wherever a poetry.lock exists rather than hunting for its
+        # venv; `poetry show --outdated` reads its own environment regardless of where that lives.
+        "{ find . -maxdepth 3 -name poetry.lock -not -path '*/node_modules/*' 2>/dev/null | while read -r lock; do d=$(dirname \"$lock\"); command -v poetry >/dev/null 2>&1 && { echo \"### pypi $d (poetry)\"; (cd \"$d\" && poetry show --outdated --no-ansi 2>/dev/null); echo; } >> agent-work/outdated.txt || true; done ; } ; true",
         "agent-work/outdated.txt", parse_outdated, "sh -c 'echo probe-ok'",
     ),
 )

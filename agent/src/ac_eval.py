@@ -207,6 +207,16 @@ def result_command(root: str, command: str) -> tuple[str, str, str] | None:
             artifact,
             "vitest",
         )
+    if "pytest" in lowered:
+        # --junitxml is pytest's own built-in flag (no plugin dependency, unlike pytest-json-report
+        # which may not be preinstalled in the sandbox image) -- emits the same JUnit XML format
+        # go test/gotestsum and JVM's surefire/gradle also use, so one parser covers all of them.
+        artifact = f"{root.rstrip('/')}/ac-eval-junit.xml" if root not in ("", ".", "./") else "ac-eval-junit.xml"
+        return (
+            f"{prefix}pytest --junitxml=ac-eval-junit.xml || true",
+            artifact,
+            "junit",
+        )
     return None
 
 
@@ -217,6 +227,8 @@ def parse_artifact(fmt: str, raw: str) -> dict[str, str]:
         return test_results.parse_vitest_json(raw)
     if fmt == "playwright":
         return test_results.playwright_outcomes(raw)
+    if fmt == "junit":
+        return test_results.parse_junit_xml(raw)
     return {}
 
 
@@ -452,6 +464,10 @@ def _demo() -> None:
     assert spaced[0].startswith("cd 'apps/my tests' && "), spaced[0]
     assert result_command("apps/web", "npx playwright test")[2] == "playwright"
     assert result_command("apps/web", "npm run test:unit")[2] == "vitest"
+    pytest_cmd = result_command("services/api", "pytest")
+    assert pytest_cmd is not None and pytest_cmd[2] == "junit"
+    assert pytest_cmd[1] == "services/api/ac-eval-junit.xml", pytest_cmd
+    assert pytest_cmd[0].startswith("cd services/api && pytest --junitxml="), pytest_cmd[0]
     # An unrecognised runner yields None -- NOT an invented command.
     assert result_command("svc", "bazel test //...") is None
     assert result_command("svc", "make check") is None
@@ -464,6 +480,8 @@ def _demo() -> None:
     )
     assert parse_artifact("trx", trx) == {"Increment_US-0001.1_Works": "pass"}
     assert parse_artifact("unknown-format", trx) == {}
+    junit = '<testsuite><testcase name="test_US-0002_1_ok" /></testsuite>'
+    assert parse_artifact("junit", junit) == {"test_US-0002_1_ok": "pass"}
 
     # classify_test_level is imported rather than reimplemented -- assert the contract we rely on.
     assert classify_test_level("apps/web/e2e/x.spec.ts", "") == "e2e"

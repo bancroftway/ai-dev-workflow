@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { E2E_GITHUB_ID, E2E_MODE } from "@/lib/e2e";
 import { AppShell } from "@/components/AppShell";
-import type { FilesChangedSummary } from "@/components/ReportView";
+import type { FilesChangedSummary, ReportExtras } from "@/components/ReportView";
 import { SandboxSessionBoot } from "@/components/SandboxSessionBoot";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
 import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
@@ -71,10 +71,11 @@ export default async function WorkflowPage({
     a11y: parseThresholds(process.env.METRIC_A11Y_GRADES, [95, 90, 80, 60], "METRIC_A11Y_GRADES", false),
   };
 
-  // The one piece of a completed session's exit report that lives only in the committed
-  // report.json, never in live LangGraph state (every other Report-tab field reads live state).
-  // Same source/shape the now-deleted standalone /report route used to read.
+  // The pieces of a completed session's exit report that live only in the committed report.json,
+  // never in live LangGraph state (every other Report-tab field reads live state). Same
+  // source/shape the now-deleted standalone /report route used to read.
   let filesChanged: FilesChangedSummary | null = null;
+  let reportExtras: ReportExtras | null = null;
   if (sessionRow?.status === "completed" && sessionRow.run_id) {
     const octokit = await getOctokit();
     const reportRaw = await readRepoFile(
@@ -82,10 +83,26 @@ export default async function WorkflowPage({
     );
     if (reportRaw) {
       try {
-        const parsed = JSON.parse(reportRaw) as { files_changed?: string; commits?: string };
+        const parsed = JSON.parse(reportRaw) as {
+          files_changed?: string;
+          commits?: string;
+          stage_summary?: ReportExtras["stageSummary"];
+          us_ac?: ReportExtras["usAc"];
+          metrics?: {
+            repo_scan?: { findings?: ReportExtras["findings"] };
+            ac_execution?: { per_ac?: ReportExtras["acExecutionPerAc"] };
+          };
+        };
         filesChanged = { stat: parsed.files_changed, commits: parsed.commits };
+        reportExtras = {
+          stageSummary: parsed.stage_summary,
+          usAc: parsed.us_ac,
+          findings: parsed.metrics?.repo_scan?.findings,
+          acExecutionPerAc: parsed.metrics?.ac_execution?.per_ac,
+        };
       } catch {
         filesChanged = null;
+        reportExtras = null;
       }
     }
   }
@@ -130,6 +147,7 @@ export default async function WorkflowPage({
                   metricThresholds={metricThresholds}
                   resume={resume}
                   filesChanged={filesChanged}
+                  reportExtras={reportExtras}
                 />
               </div>
             </div>
