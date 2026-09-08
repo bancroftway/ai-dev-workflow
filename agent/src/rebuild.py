@@ -15,6 +15,7 @@ after quality-remediation, after security-remediation, after audit-cluster), eac
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, TypedDict
@@ -61,13 +62,29 @@ class RebuildState(TypedDict):
     cannot_verify: bool  # sandbox missing at run time -- the build never ran, escalate not pass
     build_commands: list[dict[str, str]]  # discovery turn's contract, replayed on fix laps
     last_red_detail: str  # previous lap's TDD-red-gate finding, to detect a stuck fix session
+    last_scan_fingerprint: frozenset[str]  # previous lap's scan-delta gating findings (line-number-free)
 
 
 def default_rebuild_state() -> RebuildState:
     return {
         "status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "",
         "last_exit_ok": False, "cannot_verify": False, "build_commands": [], "last_red_detail": "",
+        "last_scan_fingerprint": frozenset(),
     }
+
+
+# Matches one gating line _scan_regression_reasons appends: "  gating: [severity] category/rule_id
+# @ file[:line] -- title". Captures (category/rule_id, file) WITHOUT the line number, so a fix that
+# only shuffles the vulnerable code to a different line in the same file still reads as the same
+# finding -- exact-text comparison would miss that (observed live: detect-non-literal-fs-filename
+# on apps/web/serve-dist.js recurring at lines 19/30 -> 29/31 -> 32/36/40/44 -> 34/39/44/49 across
+# four fix laps, four different-looking strings for what was never actually fixed).
+_GATING_LINE_RE = re.compile(r"gating: \[\w+\] (\S+) @ (\S+?)(?::\d+)? --")
+
+
+def _scan_finding_fingerprint(scan_reasons: list[str]) -> frozenset[str]:
+    """Which (rule, file) pairs a scan-delta lap's gating findings name, line-number-free. Pure."""
+    return frozenset(f"{rule}@{file}" for rule, file in _GATING_LINE_RE.findall("\n".join(scan_reasons)))
 
 
 async def _replay_build(provider: Any, thread_id: str, commands: list[dict[str, str]]) -> BuildVerifyReport:
@@ -539,6 +556,17 @@ def make_rebuild_node(spec: RebuildSpec):
                     "unmeasured' means the coverage command itself no longer runs, which is a "
                     "broken build/test configuration, not a missing test."
                 )
+                scan_fingerprint = _scan_finding_fingerprint(scan_reasons)
+                if scan_fingerprint and scan_fingerprint == rb.get("last_scan_fingerprint"):
+                    logger.warning(
+                        "rebuild %s: scan-delta gate repeated the identical finding(s) %s -- "
+                        "resetting the stuck fix session",
+                        spec.key, sorted(scan_fingerprint),
+                    )
+                    await close_session(thread_id, f"rebuild-{spec.key}", "draft", provider=state["provider"])
+                rb["last_scan_fingerprint"] = scan_fingerprint
+            else:
+                rb["last_scan_fingerprint"] = frozenset()
 
         rb["status"] = "clean" if build_ok else "failed"
         rb["last_exit_ok"] = build_ok
@@ -759,6 +787,23 @@ def _demo() -> None:
     rep = asyncio.run(_replay_build(red, "t", contract))
     assert not rep.ok and "CS0001" in rep.stderr_tail and "exit 1" in rep.stderr_tail, rep.stderr_tail
     assert default_rebuild_state()["build_commands"] == []
+
+    # Scan-delta stall fingerprint: line numbers must not defeat the same-finding comparison
+    # (observed live: detect-non-literal-fs-filename on apps/web/serve-dist.js recurring at four
+    # different line numbers across four fix laps -- byte-identical text never matched, so the
+    # stuck fix session was never reset until the placement's cap was exhausted).
+    lap_a = [
+        "  gating: [medium] sast/security/detect-non-literal-fs-filename @ apps/web/serve-dist.js:19 -- Found existsSync",
+        "  gating: [medium] sast/security/detect-object-injection @ apps/web/serve-dist.js:30 -- Generic Object Injection Sink",
+    ]
+    lap_b = [
+        "  gating: [medium] sast/security/detect-non-literal-fs-filename @ apps/web/serve-dist.js:34 -- Found existsSync",
+        "  gating: [medium] sast/security/detect-object-injection @ apps/web/serve-dist.js:36 -- Generic Object Injection Sink",
+    ]
+    assert _scan_finding_fingerprint(lap_a) == _scan_finding_fingerprint(lap_b), "same (rule, file) at a different line must still count as the same finding"
+    lap_c = ["  gating: [medium] sast/security/detect-non-literal-fs-filename @ apps/web/serve-dist.js:34 -- Found existsSync"]
+    assert _scan_finding_fingerprint(lap_a) != _scan_finding_fingerprint(lap_c), "a finding that actually disappeared must change the fingerprint"
+    assert _scan_finding_fingerprint([]) == frozenset()
     print("rebuild red-gate self-check: all assertions passed")
 
 

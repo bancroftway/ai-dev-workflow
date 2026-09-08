@@ -17,6 +17,28 @@ broken test/coverage configuration, not missing tests. Run that command yourself
 and fix the configuration. Do not write more tests for it, and never satisfy any of these by
 lowering a threshold.
 
+A `detect-non-literal-fs-filename` (or equivalent path-traversal-shaped) finding on an
+`existsSync`/`readFileSync`/`statSync`/`createReadStream` call means the path argument is a
+variable, not a hardcoded string -- normal and often unavoidable for a static-file-serving script.
+Moving the same unchecked call to a different line, or renaming the variable, does not close it and
+will report as the identical finding next scan. First add a containment check immediately before
+the call: resolve the requested path (`path.resolve`/`path.normalize`), then verify the resolved
+path still starts with the intended base directory before touching the filesystem, rejecting it
+(404/400) if it doesn't. That is the actual vulnerability the rule exists to catch (a caller
+escaping the served directory via `../`), and it is the real security fix -- but it is NOT what
+makes the finding disappear on its own: `eslint-plugin-security`'s rules (this pipeline's SAST
+source for these two ids) are purely syntactic -- they flag the CALL SHAPE (a variable reaching an
+fs function / bracket property access) and have no dataflow analysis, so they cannot see that a
+containment check now guards the call, and will keep reporting it EVEN THOUGH THE CODE IS NOW
+CORRECT. This is the tool's own documented limitation, not a bug in your fix: after adding the
+containment check (never before -- a suppression on genuinely unvalidated input is the actual
+vulnerability, not a false positive), silence the specific line with the rule's own escape hatch:
+`// eslint-disable-next-line security/detect-non-literal-fs-filename -- path resolved and verified
+to stay within <base dir> immediately above`. Do this per finding, on the exact flagged line, never
+a blanket file- or config-level disable (that would also hide a REAL future finding elsewhere in
+the file). `detect-object-injection` on a bracket-notation lookup gets the identical treatment once
+the key itself is validated/allowlisted: contain first, then disable-with-reason on that line only.
+
 If the failure is a MISSING TOOLCHAIN (SDK/runtime not found), do not patch around it in code:
 install the exact version with mise into the sandbox's tool dir (`mise use <tool>@<version>`,
 which also records it in the repo's mise.toml so the next container start replays it), then

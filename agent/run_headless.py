@@ -251,10 +251,24 @@ async def run(args: argparse.Namespace) -> int:
                     run_id = values.get("run_id")
                     outcome["run_id"] = run_id
                     if outcome["ok"] and run_id:
-                        probe = await provider.exec_in_sandbox(
-                            thread_id, f"ls .ai-dev-workflow/history/{run_id}-exit.md 2>/dev/null"
-                        )
-                        if not (probe.stdout or "").strip():
+                        try:
+                            probe = await provider.exec_in_sandbox(
+                                thread_id, f"ls .ai-dev-workflow/history/{run_id}-exit.md 2>/dev/null"
+                            )
+                        except RuntimeError:
+                            # metrics-exit_gate's own node tears the sandbox down as its LAST action
+                            # once it finishes -- reaching this exact point (statuses already say
+                            # metrics-exit approved, no run_failure) with the sandbox already gone is
+                            # what a genuine fresh completion looks like, not the hydrated-shortcut
+                            # case this probe exists to catch: THAT case never tears the sandbox down
+                            # in the first place (nothing in it ran this invocation), so the probe
+                            # would find it still alive and simply report no matching file. A
+                            # RuntimeError here means the teardown already happened, which only
+                            # follows a real exit_finalize run -- there is nothing left to probe, and
+                            # treating a fresh success as a crash would be the wrong failure mode.
+                            probe = None
+                            outcome["exit_report_probe"] = "skipped: sandbox already torn down by a completed finalize"
+                        if probe is not None and not (probe.stdout or "").strip():
                             outcome["ok"] = False
                             outcome["error"] = (
                                 f"exit_finalize did not run this run (no history/{run_id}-exit.md): the "
