@@ -335,6 +335,13 @@ async def commit_ai_dev_workflow(provider: SandboxProvider, thread_id: str, mess
 _GITIGNORE_ENTRIES = (
     "node_modules/",
     ".next/",
+    # Angular's and Nuxt's own local dev-server/build caches -- same category as `.next/` above,
+    # just missing until a lizard/jscpd scan on an angular-dotnet/vue-dotnet repo reported "high"
+    # complexity findings inside vendored `.angular/cache/.../vite/deps/*.js` framework bundles.
+    # Angular's own generated `apps/web/.gitignore` already ignores `/.angular/cache`, but that's a
+    # NESTED gitignore a root-invoked scan doesn't see -- this root .gitignore needs its own entry.
+    ".angular/",
+    ".nuxt/",
     "out/",
     "dist/",
     "build/",

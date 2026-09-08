@@ -678,9 +678,21 @@ IMPECCABLE_CODEGEN_SEGMENT = (
 # IMPECCABLE_CRITIQUE_SEGMENT and IMPECCABLE_DEDUP_SEGMENT were deleted 2026-08-24: both lost
 # their only consumers when the standalone critique/dedup-simplify stages consolidated into
 # adversarial-compliance/remediation, and dead prompt segments read as wired when they aren't.
-# KNOWN REGRESSION (flagged, not fixed here): adversarial-compliance no longer receives any
-# impeccable-critique framing on UI repos -- re-adding it means a new segment appended in that
-# stage's build_prompt, not resurrecting the old constant unwired.
+# Re-added below, wired into adversarial-compliance's own build_prompt (see
+# _build_adversarial_compliance_prompt) instead of resurrecting the old unwired constant: that
+# stage's draft node IS its own audit (no separate audit pass), so it was the only UI-conformance
+# review before e2e, and without this segment contrast/craft-floor regressions went unflagged
+# until Lighthouse's color-contrast gate caught them live during e2e -- burning a full
+# browser+Playwright+Lighthouse attempt per fix instead of a critique-time prompt observation.
+IMPECCABLE_CRITIQUE_SEGMENT = (
+    "This repository has a UI framework. While auditing the implemented UI against the approved"
+    " Plan, also load the `impeccable` skill and apply its craft-floor critique to every screen"
+    " you review: contrast, typography, layout, motion, and its absolute bans. Raise anything that"
+    " fails the craft floor as a divergence finding (severity per its actual impact -- a failed"
+    " WCAG contrast check is at least minor) rather than leaving it for a later stage to discover."
+    f" The impeccable skill lives at {_IMPECCABLE_SKILL_DIR} -- its scripts run with plain `node`,"
+    " but do not run them in this read-only session; the methodology is what matters here."
+)
 
 FRONTEND_DESIGN_SEGMENT = (
     "This repository has a UI framework. Before writing any new UI surface, invoke the"

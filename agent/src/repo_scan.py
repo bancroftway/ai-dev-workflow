@@ -2231,7 +2231,12 @@ TOOLS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "lizard", "MIT", True,
-        "lizard --csv . > agent-work/lizard.csv",
+        # -x is repeatable and its own "*" matches everything including path separators (per
+        # `lizard --help`: `"./folder/*"` excludes a folder recursively) -- excluding Angular's and
+        # Nuxt's local build caches here, same as scc's --exclude-dir two ToolSpecs up, instead of
+        # relying solely on the post-hoc is_non_application_path filter below (belt-and-suspenders:
+        # that filter still has to stay, as the backstop for every OTHER unlisted vendor path).
+        'lizard --csv -x "*/.angular/*" -x "*/.nuxt/*" . > agent-work/lizard.csv',
         "agent-work/lizard.csv", parse_lizard, "lizard --version",
     ),
     ToolSpec(
@@ -2247,6 +2252,7 @@ TOOLS: tuple[ToolSpec, ...] = (
         f"jscpd . --threshold {MAX_DUPLICATION_PERCENT} --reporters json --output agent-work/jscpd --silent "
         "--format 'typescript,tsx,javascript,jsx,c-sharp,python' "
         '--ignore "**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/out/**,**/.next/**,'
+        '**/.angular/**,**/.nuxt/**,'
         '**/coverage/**,**/*.min.js,**/*.d.ts,**/migrations/**,'
         '**/*.test.*,**/*.spec.*,**/tests/**,**/__tests__/**,**/*Tests.cs,**/*.Tests/**,'
         '**/.ai-dev-workflow/**,**/agent-work/**,**/drizzle/meta/**,**/.wrangler/**,**/*.snap"',
