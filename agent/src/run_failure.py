@@ -24,6 +24,7 @@ async def record_run_failure_and_reset(
     payload: dict[str, Any],
     detail_for_classification: str,
     default_failure_type: str = "gate_exhausted",
+    keep_sandbox: bool = False,
 ) -> dict[str, Any]:
     """Records `payload` as the run's terminal failure, after adding a `failure_type` field
     alongside whatever `type` the call site already set. `type` keeps its existing meaning at every
@@ -44,7 +45,7 @@ async def record_run_failure_and_reset(
     classified = classify_failure(detail_for_classification)
     failure_type = classified if classified != "gate_exhausted" else default_failure_type
     full_payload = {**payload, "failure_type": failure_type}
-    await git_ops.record_run_failure(thread_id, full_payload, run_id)
+    await git_ops.record_run_failure(thread_id, full_payload, run_id, keep_sandbox=keep_sandbox)
     return full_payload
 
 

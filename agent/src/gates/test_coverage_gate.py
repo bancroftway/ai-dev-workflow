@@ -536,11 +536,18 @@ async def _missing_declared_frontend(
         if not frameworks:
             continue
         names = [str(f) for f in frameworks]
-        if (missing := missing_declared_frontend(names, source_files)) is not None:
-            return missing
-        # A signature file exists; now check the framework is genuinely installed. Search the
-        # manifests the tree actually has rather than assuming a location -- a monorepo keeps the
-        # web app's package.json under apps/web/, not at the repo root.
+        by_signature = missing_declared_frontend(names, source_files)
+        if by_signature is None:
+            return None  # a real signature file settles it
+        # The signature file didn't match -- before concluding the frontend is missing, fall back
+        # to the repo's own manifests: a framework's schematics can drop the filename convention
+        # _FRONTEND_SIGNATURES assumes (observed live, angular-dotnet: Angular's modern generator
+        # no longer suffixes component files with ".component", e.g. `poll-list.ts` instead of
+        # `poll-list.component.ts` -- a complete, real Angular app with 57 tracked files and a
+        # genuine `@angular/core` dependency was reported as "does not actually contain that
+        # frontend" and redrafted). Search the manifests the tree actually has rather than
+        # assuming a location -- a monorepo keeps the web app's package.json under apps/web/, not
+        # at the repo root.
         listing = await provider.exec_in_sandbox(
             thread_id,
             "git ls-files && git ls-files --others --exclude-standard",
@@ -552,17 +559,14 @@ async def _missing_declared_frontend(
             and "node_modules/" not in stripped
         ]
         if not manifests:
-            return None  # nothing to check against; fail open
-        # Satisfied if ANY manifest declares it -- which package.json owns the frontend is the
-        # repo's own layout decision, not this gate's to dictate.
-        unsatisfied: str | None = None
+            return by_signature  # nothing to check against; trust the signature verdict
+        # Satisfied if ANY manifest actually depends on the framework -- which package.json owns
+        # the frontend is the repo's own layout decision, not this gate's to dictate.
         for manifest_path in manifests[:10]:
             raw_manifest = await repo_files.read_repo_file(provider, thread_id, manifest_path)
-            result = missing_frontend_dependency(names, raw_manifest)
-            if result is None:
+            if missing_frontend_dependency(names, raw_manifest) is None:
                 return None
-            unsatisfied = result
-        return unsatisfied
+        return by_signature
     return None
 
 

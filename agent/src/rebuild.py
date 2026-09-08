@@ -725,6 +725,9 @@ def make_escalate_node(spec: RebuildSpec):
             thread_id, state.get("run_id"),
             payload=payload,
             detail_for_classification=f"{rb['last_stdout_tail']} {rb['last_stderr_tail']}",
+            # route_after_escalate sends every non-cannot_verify type on into metrics-exit_draft
+            # in this SAME sandbox -- tearing the container down here raced that node and lost.
+            keep_sandbox=not rb.get("cannot_verify"),
         )
         rebuild = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
         rebuild.setdefault(spec.key, default_rebuild_state())

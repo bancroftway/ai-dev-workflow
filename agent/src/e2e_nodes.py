@@ -1695,6 +1695,9 @@ async def e2e_escalate_node(state: dict[str, Any], config: RunnableConfig) -> di
         thread_id, state.get("run_id"),
         payload=payload,
         detail_for_classification=payload["feedback"] or "",
+        # e2e_escalate always routes on into metrics-exit_draft in this SAME sandbox (see graph.py
+        # _wire_e2e) -- only tear it down here when there genuinely is none (cannot_verify).
+        keep_sandbox=not e2e.get("cannot_verify"),
     )
     e2e["attempt"] = 0
     e2e["cannot_verify"] = False

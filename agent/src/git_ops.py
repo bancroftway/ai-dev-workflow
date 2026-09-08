@@ -216,7 +216,7 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
 
 
 async def record_run_failure(
-    thread_id: str, payload: dict[str, Any], run_id: str | None = None
+    thread_id: str, payload: dict[str, Any], run_id: str | None = None, *, keep_sandbox: bool = False
 ) -> dict[str, Any]:
     """Durably records a terminal run failure ({stage, type, ...detail}) and returns the payload.
 
@@ -225,12 +225,18 @@ async def record_run_failure(
     session row open until the next deploy-drain sweep, with no persisted trace at all. The ledger
     row and the commit still require a live sandbox and are skipped without one. Best-effort by
     design: a failed write must never mask the failure itself.
+
+    keep_sandbox=True (see session_store.close_session) is for a call site whose escalation still
+    routes into metrics-exit_draft in the same sandbox -- only `cannot_verify` (sandbox already
+    gone) should ever leave this False.
     """
     from . import session_store  # local: keeps git_ops's import surface flat
     from .sandbox import registry as sandbox_registry  # local: keep git_ops's import surface flat
 
     try:
-        await session_store.close_session(thread_id, run_id=run_id, status="failed", failure=payload)
+        await session_store.close_session(
+            thread_id, run_id=run_id, status="failed", failure=payload, keep_sandbox=keep_sandbox
+        )
     except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
         logger.warning("failed to close session for run_failure thread_id=%s", thread_id, exc_info=True)
 

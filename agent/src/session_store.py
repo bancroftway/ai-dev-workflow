@@ -241,6 +241,7 @@ async def close_session(
     merge_ready: bool | None = None,
     pr_title: str | None = None,
     pr_url: str | None = None,
+    keep_sandbox: bool = False,
 ) -> None:
     """Replaces session_index.end_session / the DB half of git_ops.record_run_failure. Always
     sets ended_at -- this is a terminal close for the current attempt.
@@ -252,10 +253,18 @@ async def close_session(
     the idle reaper's 30 minutes. Function-level import: the sandbox package transitively pulls
     chat_model, which a module-level import here would cycle. create_task, not await: ACI
     teardown shells `az container delete` (tens of seconds) and must not block the exit path;
-    off-process callers (deploy_drain on a CI runner) no-op instantly inside the helper."""
+    off-process callers (deploy_drain on a CI runner) no-op instantly inside the helper.
+
+    keep_sandbox=True skips that teardown: a rebuild/e2e/test-hardening escalate records this
+    DB row as `failed` but routes the graph onward into metrics-exit_draft in the SAME sandbox
+    (see rebuild.route_after_escalate) -- tearing the container down here raced the very next
+    node's exec_in_sandbox call and lost every time (observed: metrics-exit_draft crashing with
+    "no active sandbox" seconds after a rebuild_cap_exceeded escalate). The real close happens
+    later, in exit_nodes.py, once metrics-exit/exit actually finish."""
     from .sandbox.factory import end_session_container
 
-    asyncio.create_task(end_session_container(session_id))
+    if not keep_sandbox:
+        asyncio.create_task(end_session_container(session_id))
     failure_stage, failure_type, failure_message = _build_failure(failure) if failure else (None, None, None)
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:

@@ -230,6 +230,9 @@ async def test_hardening_regression_gate_node(state: dict[str, Any], config: Run
         detail = json.dumps(payload["stable_fail"])
     payload = await run_failure.record_run_failure_and_reset(
         thread_id, state.get("run_id"), payload=payload, detail_for_classification=detail,
+        # This node's edge always continues into metrics-exit_draft in this SAME sandbox (see
+        # graph.py _wire_test_hardening) -- only tear it down here when there genuinely is none.
+        keep_sandbox=not test_hardening.get("cannot_verify"),
     )
     reset = dict(test_hardening)
     reset["cannot_verify"] = False
@@ -336,5 +339,8 @@ async def test_hardening_exit_escalate_node(state: dict[str, Any], config: Runna
         thread_id, state.get("run_id"),
         payload=payload,
         detail_for_classification=json.dumps(test_hardening["flake_quarantine"]),
+        # Always routes into metrics-exit_draft in this SAME sandbox (see graph.py
+        # _wire_test_hardening) -- there is no cannot_verify case at this node.
+        keep_sandbox=True,
     )
     return {"run_failure": payload}
