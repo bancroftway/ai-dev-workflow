@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 
-from .. import repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
+from .. import chat_model, repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from .write_scope_gate import _E2E_PATH_RE, _is_pipeline_owned, _is_test_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
@@ -1061,6 +1061,15 @@ async def check_ac_coverage(
         # output" message and nothing to act on -- it cannot fix what it was never told.
         diagnosis = run_report.error or run_report.summary or "no test output was captured"
         claimed = AC_TEST_OUTPUT_PATH in (run_report.summary or "") or bool(run_report.output_artifact)
+        # The "ac-test-run" sub-agent session is keyed by (thread_id, "ac-test-run", "draft") and,
+        # unlike the stage's own draft session, nothing ever resets it on a bad turn -- so a session
+        # that once fails to produce the tee/structured reports stays stuck replaying that same
+        # failure on every later ac-to-tests lap (observed live: two INFRA RETRY attempts with
+        # byte-identical diagnosis and unchanged paths, tripping the stall detector at the same
+        # moment the infra-retry cap was reached). Close it here so the NEXT invocation -- this
+        # verify's own retry, or a future lap's -- gets a fresh attempt instead of resuming the
+        # same broken transcript.
+        await chat_model.close_session(thread_id, "ac-test-run", "draft", provider=chat_provider)
         return AcCoverageOutcome(
             passed=False,
             feedback=(

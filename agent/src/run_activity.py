@@ -1,4 +1,5 @@
-"""Process-local, in-memory, reference-counted "is a run actually executing right now" signal.
+"""Process-local, in-memory, reference-counted "is a run actually executing right now" signal,
+plus a cross-process heartbeat file for the one caller that lives in a different OS process.
 
 Mirrors sandbox/registry.py's module-level-dict pattern (SPECIFICATION.md Decision 4: small
 internal tool, don't over-engineer). Refcounted, not boolean: an overlapping reattach/duplicate
@@ -7,11 +8,25 @@ run on the same session id must not have one finishing clear the other's active 
 # ponytail: process-local refcount, single-instance only -- needs a shared store (Redis/DB row)
 if this ever runs multi-worker; not needed today (docker-entrypoint.sh runs uvicorn with no
 --workers flag), same caveat registry.py and checkpoint.py's AsyncSqliteSaver already carry.
+
+run_headless.py drives the identical graph.py code in a wholly separate OS process, so the
+in-memory _counts dict above is invisible to it -- incr()/decr() from that process would just
+update a dict nobody else ever reads. is_active() therefore also checks a heartbeat FILE
+(_HEARTBEAT_DIR), touched periodically by whichever external process is working a session via
+heartbeat(). Deliberately not a PID-liveness check (contrast run_lock.py's _pid_alive): a killed
+process never runs its cleanup, and a later-reused PID would then read as "still active" forever
+-- worse than the bug being fixed, since it would permanently hide a real crash. A periodic touch
+that goes stale after a few missed beats has no such failure mode.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import time
+from pathlib import Path
+from typing import AsyncIterator
 
 _counts: dict[str, int] = {}
 
@@ -22,6 +37,10 @@ _counts: dict[str, int] = {}
 # races. setdefault, not a plain dict literal per thread_id: multiple concurrent first-callers for
 # a never-before-seen thread_id must all resolve to the SAME Lock instance, not one each.
 _locks: dict[str, asyncio.Lock] = {}
+
+_HEARTBEAT_DIR = Path(__file__).resolve().parents[1] / "data" / "run_active"
+_BEAT_INTERVAL = 8  # seconds between touches
+_STALE_AFTER = 25  # seconds -- ~3 missed beats of margin before a marker reads as dead
 
 
 def incr(session_id: str) -> None:
@@ -39,15 +58,59 @@ def decr(session_id: str) -> None:
 
 
 def is_active(session_id: str) -> bool:
-    return _counts.get(session_id.lower(), 0) > 0
+    key = session_id.lower()
+    if _counts.get(key, 0) > 0:
+        return True
+    marker = _HEARTBEAT_DIR / f"{key}.beat"
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    if age <= _STALE_AFTER:
+        return True
+    # Stale: whatever process was beating this is gone (or wedged). Clean up in passing rather
+    # than waiting for that process to do it -- it never will, if it crashed.
+    with contextlib.suppress(FileNotFoundError):
+        marker.unlink()
+    return False
 
 
 def get_lock(session_id: str) -> asyncio.Lock:
     return _locks.setdefault(session_id.lower(), asyncio.Lock())
 
 
+@contextlib.asynccontextmanager
+async def heartbeat(session_id: str) -> AsyncIterator[None]:
+    """Keeps `is_active(session_id)` true for as long as the `async with` block runs, from any
+    process. For same-process callers (main.py), incr()/decr() already do this with zero latency
+    and zero disk I/O -- this is for a caller (run_headless.py) whose in-memory refcount nobody
+    else can see.
+    """
+    key = session_id.lower()
+    _HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+    marker = _HEARTBEAT_DIR / f"{key}.beat"
+
+    async def _beat() -> None:
+        while True:
+            marker.touch()
+            await asyncio.sleep(_BEAT_INTERVAL)
+
+    marker.touch()
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        with contextlib.suppress(FileNotFoundError):
+            marker.unlink()
+
+
 def _demo() -> None:
     """Self-check: `cd agent && uv run python -m src.run_activity`."""
+    import tempfile
+
     # Case-insensitive keys: the frontend mints lowercase UUIDs (crypto.randomUUID()) but SQL
     # Server round-trips UNIQUEIDENTIFIER uppercase (same reason session_store/run_event_store
     # normalize to lowercase on read) -- normalize here too so neither caller has to remember to.
@@ -93,6 +156,36 @@ def _demo() -> None:
         assert order == ["holder-acquired", "holder-released", "waiter-acquired"], order
 
     asyncio.run(_lock_serializes())
+
+    # Cross-process heartbeat: is_active must reflect a fresh beat file with no local refcount,
+    # then flip false once the beat goes stale -- and clean the stale file up in passing.
+    global _HEARTBEAT_DIR, _BEAT_INTERVAL
+    real_dir, real_interval = _HEARTBEAT_DIR, _BEAT_INTERVAL
+    with tempfile.TemporaryDirectory() as tmp:
+        _HEARTBEAT_DIR = Path(tmp)
+        try:
+            marker = _HEARTBEAT_DIR / "heartbeat-check.beat"
+            marker.touch()
+            assert is_active("heartbeat-check") is True, "fresh beat file must count as active"
+
+            stale = time.time() - _STALE_AFTER - 5
+            os.utime(marker, (stale, stale))
+            assert is_active("heartbeat-check") is False, "beat older than _STALE_AFTER must be stale"
+            assert not marker.exists(), "is_active must remove a stale marker it encounters"
+
+            # heartbeat(): actually keeps beating for the life of the `async with` block, and
+            # cleans its file up on exit -- checked with a fast interval so this stays instant.
+            _BEAT_INTERVAL = 0.05
+
+            async def _uses_heartbeat() -> None:
+                async with heartbeat("live-check"):
+                    await asyncio.sleep(0.2)
+                    assert is_active("live-check") is True, "heartbeat() must keep the marker fresh"
+
+            asyncio.run(_uses_heartbeat())
+            assert is_active("live-check") is False, "heartbeat() must remove its marker on exit"
+        finally:
+            _HEARTBEAT_DIR, _BEAT_INTERVAL = real_dir, real_interval
 
     print("run_activity self-check passed")
 

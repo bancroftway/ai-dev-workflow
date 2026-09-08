@@ -43,7 +43,7 @@ logger = logging.getLogger("run_headless")
 from langchain_core.messages import HumanMessage  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
-from src import app_discovery, branch_naming, chat_model, git_ops, project_store, session_store  # noqa: E402
+from src import app_discovery, branch_naming, chat_model, git_ops, project_store, run_activity, session_store  # noqa: E402
 from src.graph import graph  # noqa: E402
 from src.sandbox import get_sandbox_provider, registry  # noqa: E402
 
@@ -212,76 +212,82 @@ async def run(args: argparse.Namespace) -> int:
     git_ops.set_push_token(thread_id, git_token)
 
     outcome: dict = {"thread_id": thread_id, "ok": False}
-    try:
-        stream_input: object = {"messages": [HumanMessage(content=requirements)]}
-        while True:
-            async for chunk in graph.astream(stream_input, config=cfg, stream_mode="updates"):
-                for node_name in chunk:
-                    if node_name != "__interrupt__":
-                        logger.info("node done: %s", node_name)
-
-            snap = await graph.aget_state(cfg)
-            if not snap.next:
-                values = snap.values
-                statuses = _stage_statuses(values)
-                stuck = [k for k, s in statuses.items() if s == "needs_clarification"]
-                outcome.update(
-                    stage_statuses=statuses,
-                    run_failure=values.get("run_failure"),
-                    needs_clarification=stuck,
-                    # "metrics-exit", not "exit": the pipeline consolidated its final stage and
-                    # this success check kept reading the old key, so a fully-approved run with
-                    # no run_failure still reported ok=false. Guard on run_failure too -- a stage
-                    # can be approved while the run recorded a terminal problem elsewhere.
-                    ok=statuses.get("metrics-exit") == "approved" and values.get("run_failure") is None,
-                )
-                # A stage status can be APPROVED purely from hydration -- restored from a previous
-                # run's metrics-exit.approved.json in the repo. When that happens the stage
-                # short-circuits, exit_finalize never runs, and the exit report left on the branch
-                # belongs to an earlier run: observed live, a run that had just re-run e2e and
-                # metrics reported ok=true while the committed report still read "no e2e
-                # screenshots were captured" from 40 minutes earlier. Proof of THIS run finishing is
-                # its own exit report, which only exit_finalize writes.
-                run_id = values.get("run_id")
-                outcome["run_id"] = run_id
-                if outcome["ok"] and run_id:
-                    probe = await provider.exec_in_sandbox(
-                        thread_id, f"ls .ai-dev-workflow/history/{run_id}-exit.md 2>/dev/null"
-                    )
-                    if not (probe.stdout or "").strip():
-                        outcome["ok"] = False
-                        outcome["error"] = (
-                            f"exit_finalize did not run this run (no history/{run_id}-exit.md): the "
-                            "final stage was approved from hydrated state, so the exit report, "
-                            "manifest and screenshots on the branch are a previous run's."
-                        )
-                break
-
-            interrupts = snap.interrupts or tuple(i for task in snap.tasks for i in task.interrupts)
-            if not interrupts:
-                logger.error("graph paused with no interrupt -- aborting")
-                outcome.update(stage_statuses=_stage_statuses(snap.values), error="paused_without_interrupt")
-                break
-            payload = interrupts[0].value if isinstance(interrupts[0].value, dict) else {}
-            # Every gate auto-approves. The Tech Stack tab's gate is the one exception: with
-            # --greenfield-stack set, resume it with that canned stack's markdown (matching
-            # preflight_nodes.resolve_tech_stack_submission's expected {"markdown": ...} shape) --
-            # without it, a bare resume=True falls through to the detect pass's own draft, same as
-            # every other gate. There is no more hard-rejection path to guard against here.
-            if payload.get("stage") == "tech-stack" and greenfield_stack_markdown is not None:
-                logger.info("resuming tech-stack gate with canned stack %s", args.greenfield_stack)
-                stream_input = Command(resume={"markdown": greenfield_stack_markdown})
-            else:
-                logger.info("auto-approving gate: %s", payload.get("stage"))
-                stream_input = Command(resume=True)
-    finally:
+    # Cross-process counterpart of main.py's run_activity.incr/decr: this process's graph
+    # execution is invisible to the FastAPI server's in-memory refcount, so the UI's
+    # run_active/interrupted badge would otherwise read this run as dead the whole time it's
+    # actually working. See run_activity.heartbeat's own docstring for why this is a periodic
+    # touch and not a PID-liveness check.
+    async with run_activity.heartbeat(thread_id):
         try:
-            await chat_model.close_thread_session(thread_id, provider=active_provider)
-        except Exception:  # noqa: BLE001 -- teardown must not mask the run outcome
-            logger.warning("close_thread_session failed", exc_info=True)
-        if args.discard_sandbox:
-            await provider.terminate(thread_id)
-            await provider.discard_workspace(thread_id)
+            stream_input: object = {"messages": [HumanMessage(content=requirements)]}
+            while True:
+                async for chunk in graph.astream(stream_input, config=cfg, stream_mode="updates"):
+                    for node_name in chunk:
+                        if node_name != "__interrupt__":
+                            logger.info("node done: %s", node_name)
+
+                snap = await graph.aget_state(cfg)
+                if not snap.next:
+                    values = snap.values
+                    statuses = _stage_statuses(values)
+                    stuck = [k for k, s in statuses.items() if s == "needs_clarification"]
+                    outcome.update(
+                        stage_statuses=statuses,
+                        run_failure=values.get("run_failure"),
+                        needs_clarification=stuck,
+                        # "metrics-exit", not "exit": the pipeline consolidated its final stage and
+                        # this success check kept reading the old key, so a fully-approved run with
+                        # no run_failure still reported ok=false. Guard on run_failure too -- a stage
+                        # can be approved while the run recorded a terminal problem elsewhere.
+                        ok=statuses.get("metrics-exit") == "approved" and values.get("run_failure") is None,
+                    )
+                    # A stage status can be APPROVED purely from hydration -- restored from a previous
+                    # run's metrics-exit.approved.json in the repo. When that happens the stage
+                    # short-circuits, exit_finalize never runs, and the exit report left on the branch
+                    # belongs to an earlier run: observed live, a run that had just re-run e2e and
+                    # metrics reported ok=true while the committed report still read "no e2e
+                    # screenshots were captured" from 40 minutes earlier. Proof of THIS run finishing is
+                    # its own exit report, which only exit_finalize writes.
+                    run_id = values.get("run_id")
+                    outcome["run_id"] = run_id
+                    if outcome["ok"] and run_id:
+                        probe = await provider.exec_in_sandbox(
+                            thread_id, f"ls .ai-dev-workflow/history/{run_id}-exit.md 2>/dev/null"
+                        )
+                        if not (probe.stdout or "").strip():
+                            outcome["ok"] = False
+                            outcome["error"] = (
+                                f"exit_finalize did not run this run (no history/{run_id}-exit.md): the "
+                                "final stage was approved from hydrated state, so the exit report, "
+                                "manifest and screenshots on the branch are a previous run's."
+                            )
+                    break
+
+                interrupts = snap.interrupts or tuple(i for task in snap.tasks for i in task.interrupts)
+                if not interrupts:
+                    logger.error("graph paused with no interrupt -- aborting")
+                    outcome.update(stage_statuses=_stage_statuses(snap.values), error="paused_without_interrupt")
+                    break
+                payload = interrupts[0].value if isinstance(interrupts[0].value, dict) else {}
+                # Every gate auto-approves. The Tech Stack tab's gate is the one exception: with
+                # --greenfield-stack set, resume it with that canned stack's markdown (matching
+                # preflight_nodes.resolve_tech_stack_submission's expected {"markdown": ...} shape) --
+                # without it, a bare resume=True falls through to the detect pass's own draft, same as
+                # every other gate. There is no more hard-rejection path to guard against here.
+                if payload.get("stage") == "tech-stack" and greenfield_stack_markdown is not None:
+                    logger.info("resuming tech-stack gate with canned stack %s", args.greenfield_stack)
+                    stream_input = Command(resume={"markdown": greenfield_stack_markdown})
+                else:
+                    logger.info("auto-approving gate: %s", payload.get("stage"))
+                    stream_input = Command(resume=True)
+        finally:
+            try:
+                await chat_model.close_thread_session(thread_id, provider=active_provider)
+            except Exception:  # noqa: BLE001 -- teardown must not mask the run outcome
+                logger.warning("close_thread_session failed", exc_info=True)
+            if args.discard_sandbox:
+                await provider.terminate(thread_id)
+                await provider.discard_workspace(thread_id)
 
     outcome["wall_seconds"] = round(time.monotonic() - started, 1)
     report_dir = Path(__file__).parent / "agent-work"
@@ -294,4 +300,20 @@ async def run(args: argparse.Namespace) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(run(_parse_args())))
+    _args = _parse_args()
+    if _args.thread:
+        # A fresh run (no --thread) mints its own brand-new uuid4 inside run() and can never
+        # collide with anything, so only a --thread resume needs the lock: that is the one case
+        # where a second invocation can reattach the SAME sandbox/checkpoint/branch another live
+        # process already owns (observed live, 2026-09-07: two resumes of one thread interleaved
+        # their output byte-for-byte against the same Docker container).
+        from src.run_lock import RunAlreadyActive, acquire_run_lock
+
+        try:
+            with acquire_run_lock(_args.thread):
+                sys.exit(asyncio.run(run(_args)))
+        except RunAlreadyActive as exc:
+            logger.error(str(exc))
+            sys.exit(2)
+    else:
+        sys.exit(asyncio.run(run(_args)))

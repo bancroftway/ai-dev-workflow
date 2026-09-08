@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import git_ops, model_config, repo_files, run_failure, stack_runner, test_results, workflow_persistence
-from .chat_model import get_chat_model_for_thread
+from .chat_model import close_session, get_chat_model_for_thread
 from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -60,12 +60,13 @@ class RebuildState(TypedDict):
     last_exit_ok: bool
     cannot_verify: bool  # sandbox missing at run time -- the build never ran, escalate not pass
     build_commands: list[dict[str, str]]  # discovery turn's contract, replayed on fix laps
+    last_red_detail: str  # previous lap's TDD-red-gate finding, to detect a stuck fix session
 
 
 def default_rebuild_state() -> RebuildState:
     return {
         "status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "",
-        "last_exit_ok": False, "cannot_verify": False, "build_commands": [],
+        "last_exit_ok": False, "cannot_verify": False, "build_commands": [], "last_red_detail": "",
     }
 
 
@@ -500,6 +501,24 @@ def make_rebuild_node(spec: RebuildSpec):
                 if not red_ok:
                     build_ok = False
                     red_failed = True
+
+        # Stuck-fixer detection: the fix session (f"rebuild-{spec.key}"/"draft") is resumed
+        # across every fix cycle in this placement (its own conversation history), never reset by
+        # anything below -- so a fixer that keeps making the SAME red-gate mistake (e.g. writing a
+        # real not-found guard clause instead of a NotImplementedException stub) just repeats it
+        # every lap, byte for byte, until the cycle cap is exhausted (the same pathology already
+        # fixed for the ac-test-run sub-agent in gates/ac_coverage_gate.py). The prompt re-supplies
+        # `stderr_tail` fresh each lap regardless of session continuity, so nothing genuinely useful
+        # is lost by starting over -- only the model's own unproductive history is. Reset ONLY on a
+        # confirmed repeat (identical finding twice running), not on every red-gate failure: a
+        # DIFFERENT finding each lap means the fixer is converging and its context should stay.
+        if red_failed and red_detail and red_detail == rb.get("last_red_detail"):
+            logger.warning(
+                "rebuild %s: TDD-red gate repeated the identical finding -- resetting the stuck fix session",
+                spec.key,
+            )
+            await close_session(thread_id, f"rebuild-{spec.key}", "draft", provider=state["provider"])
+        rb["last_red_detail"] = red_detail if red_failed else ""
 
         # Scan-delta gate: same question the terminal metrics gate asks, asked here where it is
         # still actionable. See RebuildSpec.scan_delta_gate for why this placement exists.

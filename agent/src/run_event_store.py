@@ -206,7 +206,7 @@ async def list_events(run_id: str) -> list[RunEvent]:
         return [_row_to_event(row) for row in rows]
 
 
-async def list_events_by_session(session_id: str) -> list[RunEvent]:
+async def list_events_by_session(session_id: str, since_seq: int = 0) -> list[RunEvent]:
     """Oldest-first, across EVERY run_id this session has ever had -- not just its current one.
 
     Part 2 Task 8 (the new `GET /sessions/{session_id}/events` route, sessions_api.py) needs "this
@@ -226,13 +226,24 @@ async def list_events_by_session(session_id: str) -> list[RunEvent]:
     seq is one monotonic, table-wide IDENTITY counter, so "oldest first" holds across a session's
     several run_ids exactly as it does within a single one -- no separate per-run_id merge/sort
     needed.
+
+    `since_seq`: the SSE tail loop (sessions_api.stream_session_events) calls this every couple of
+    seconds for the lifetime of an open connection -- passing the last seq it already sent turns
+    each tick into "only the new rows" instead of re-fetching and re-serializing the whole history
+    every time. Default 0 keeps the original "everything" behavior for the plain REST endpoint.
     """
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
-        await cur.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM dbo.run_events WHERE session_id = ? ORDER BY seq ASC",
-            session_id,
-        )
+        if since_seq:
+            await cur.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM dbo.run_events WHERE session_id = ? AND seq > ? ORDER BY seq ASC",
+                session_id, since_seq,
+            )
+        else:
+            await cur.execute(
+                f"SELECT {', '.join(_COLUMNS)} FROM dbo.run_events WHERE session_id = ? ORDER BY seq ASC",
+                session_id,
+            )
         rows = await cur.fetchall()
         return [_row_to_event(row) for row in rows]
 
@@ -331,6 +342,11 @@ async def _demo() -> None:
         by_session = await list_events_by_session(session_id)
         assert [e.seq for e in by_session] == [appended.seq, second.seq, other_event.seq], by_session
         assert {e.run_id for e in by_session} == {run_id, other_run_id}, by_session
+
+        # since_seq (SSE tail support): passing the middle event's seq must return only what came
+        # strictly after it, same order; default (0) must be unaffected -- already proven above.
+        since_middle = await list_events_by_session(session_id, since_seq=second.seq)
+        assert [e.seq for e in since_middle] == [other_event.seq], since_middle
 
         # Fail-soft contract (coordinator review fix): a DB failure inside append_event must never
         # raise into the caller -- it logs a warning and hands back the original event unchanged, so

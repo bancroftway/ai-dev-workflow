@@ -20,13 +20,16 @@ Known gaps, flagged rather than glossed over:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.sse import EventSourceResponse, ServerSentEvent
 import httpx
 import pyodbc
 from pydantic import BaseModel
@@ -488,12 +491,17 @@ async def _verified_container_alive(session_id: str) -> bool:
     return alive
 
 
-async def _row_to_response(row: dict[str, Any]) -> "SessionResponse":
+async def _row_to_response(row: dict[str, Any], *, container_alive: bool | None = None) -> "SessionResponse":
+    """`container_alive`: pass a recently-probed value to skip the live sandbox check below --
+    used by stream_session_row's SSE loop, which calls this every few seconds and can't afford to
+    hit the sandbox provider that often (see that function's own comment)."""
     active = run_activity.is_active(row["session_id"])
     interrupted = row["status"] == "in_progress" and not active and not bool(row.get("awaiting_gate"))
+    if container_alive is None:
+        container_alive = await _verified_container_alive(row["session_id"])
     return SessionResponse(
         **row,
-        container_alive=await _verified_container_alive(row["session_id"]),
+        container_alive=container_alive,
         run_active=active,
         interrupted=interrupted,
     )
@@ -578,6 +586,20 @@ class SessionEventsResponse(BaseModel):
     events: list[RunEventResponse]
 
 
+def _event_to_response(e: RunEvent) -> RunEventResponse:
+    # Explicit field-by-field construction, NOT dataclasses.asdict(e) -- run_event_stream.py's own
+    # _json_safe_payload docstring flags exactly this gotcha: asdict() leaves a dataclass's Enum
+    # field as the enum MEMBER, not its string value, so `type=e.type.value` here mirrors that
+    # same already-established fix rather than relying on RunEventType's StrEnum-is-a-str behavior
+    # to happen to serialize correctly. Shared by get_session_events and stream_session_events so
+    # the polled and pushed shapes can't drift apart.
+    return RunEventResponse(
+        seq=e.seq, run_id=e.run_id, session_id=e.session_id, ts=e.ts,
+        stage=e.stage, node=e.node, type=e.type.value, summary=e.summary,
+        payload=e.payload, token_usage=e.token_usage,
+    )
+
+
 @router.get("/{session_id}/events", response_model=SessionEventsResponse)
 async def get_session_events(session_id: str, request: Request) -> SessionEventsResponse:
     """Backs Part 2 Task 8's EventLogView: the durable-history half of run visibility (Task 2's
@@ -599,19 +621,107 @@ async def get_session_events(session_id: str, request: Request) -> SessionEvents
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
     events = await run_event_store.list_events_by_session(session_id)
-    # Explicit field-by-field construction, NOT dataclasses.asdict(e) -- run_event_stream.py's own
-    # _json_safe_payload docstring flags exactly this gotcha: asdict() leaves a dataclass's Enum
-    # field as the enum MEMBER, not its string value, so `type=e.type.value` here mirrors that
-    # same already-established fix rather than relying on RunEventType's StrEnum-is-a-str behavior
-    # to happen to serialize correctly.
-    return SessionEventsResponse(events=[
-        RunEventResponse(
-            seq=e.seq, run_id=e.run_id, session_id=e.session_id, ts=e.ts,
-            stage=e.stage, node=e.node, type=e.type.value, summary=e.summary,
-            payload=e.payload, token_usage=e.token_usage,
-        )
-        for e in events
-    ])
+    return SessionEventsResponse(events=[_event_to_response(e) for e in events])
+
+
+# 30 min: forces the client's EventSource to reconnect periodically. Not just cleanup insurance --
+# the Next.js proxy only checks auth once, at connect, so this also bounds how long a stream can
+# keep serving a since-revoked authorization decision, and caps a leaked generator's lifetime if
+# client-disconnect propagation ever fails to fire through the Next.js proxy hop.
+_SSE_MAX_CONNECTION_SECONDS = 1800
+_SSE_EVENTS_POLL_SECONDS = 2
+_SSE_SESSION_POLL_SECONDS = 3
+# Ticks, not seconds -- every _SSE_CONTAINER_CHECK_EVERY-th session-row tick actually calls
+# _verified_container_alive (a live sandbox probe), the rest reuse the last result. At
+# _SSE_SESSION_POLL_SECONDS=3 this is ~12s, close to the old 10s client-poll cadence -- every
+# connected tab hitting the sandbox provider every 3s instead would be several times more often
+# than that poll ever did, for no benefit.
+_SSE_CONTAINER_CHECK_EVERY = 4
+
+
+async def _existing_session_for_stream(session_id: str, request: Request) -> dict[str, Any]:
+    """Dependency, not inline generator code -- deliberately. Starlette's StreamingResponse sends
+    the 200 status (stream_response's own `await send({"type": "http.response.start", ...})`)
+    BEFORE ever pulling the generator's first item, so an HTTPException raised from inside a
+    generator's body can never become a real error status -- by the time it fires, the client
+    already got 200. A dependency's exceptions, by contrast, are handled by FastAPI's normal
+    exception middleware before any of the SSE routing machinery is even constructed (same
+    solve_dependencies() call every ordinary endpoint goes through) -- verified with a TestClient
+    against a nonexistent session_id, not just reasoned about, given how easy this is to get wrong.
+    """
+    _check_shared_secret(request)
+    row = await session_store.get_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return row
+
+
+@router.get("/{session_id}/events/stream", response_class=EventSourceResponse)
+async def stream_session_events(session_id: str, _row: dict[str, Any] = Depends(_existing_session_for_stream)):
+    """Server-Sent Events tail of get_session_events above -- same durable dbo.run_events rows
+    (graph.py writes them from inside its own node functions regardless of which process drives
+    the graph, so this reflects a run_headless.py-driven session exactly as well as a
+    browser-driven one), pushed at a ~2s cadence instead of the frontend's previous 15s client
+    poll. FastAPI's own SSE routing (fastapi/routing.py) already handles client-disconnect
+    cancellation and idle keep-alive pings for a generator route -- neither is hand-rolled here.
+    """
+    started = time.monotonic()
+    last_seq = 0
+    while True:
+        for event in await run_event_store.list_events_by_session(session_id, since_seq=last_seq):
+            last_seq = max(last_seq, event.seq)
+            yield ServerSentEvent(event="run_event", data=_event_to_response(event))
+
+        current = await session_store.get_session(session_id)
+        if current is None:
+            yield ServerSentEvent(event="not_found", data={})
+            return
+        if current["status"] != "in_progress":
+            yield ServerSentEvent(event="done", data={})
+            return
+        if time.monotonic() - started > _SSE_MAX_CONNECTION_SECONDS:
+            # Distinct from 'done' above on purpose: this is a transport-lifecycle signal only
+            # ("your connection's time is up, open a new one"), NOT "this session is finished" --
+            # the session is still in_progress right here. A client that treated this the same as
+            # 'done' (stop, don't reconnect) would silently go quiet on every still-running session
+            # past _SSE_MAX_CONNECTION_SECONDS, exactly the bug this cap must not reintroduce.
+            yield ServerSentEvent(event="reconnect", data={})
+            return
+        await asyncio.sleep(_SSE_EVENTS_POLL_SECONDS)
+
+
+@router.get("/{session_id}/stream", response_class=EventSourceResponse)
+async def stream_session_row(session_id: str, _row: dict[str, Any] = Depends(_existing_session_for_stream)):
+    """SSE tail of get_session_row above -- this is where run_activity.heartbeat's cross-process
+    fix actually reaches the frontend fast: run_active/interrupted are recomputed every tick from
+    the same _row_to_response logic the plain REST endpoint uses, just pushed instead of polled.
+    """
+    started = time.monotonic()
+    last_payload: str | None = None
+    container_alive = False
+    tick = 0
+    while True:
+        row = await session_store.get_session(session_id)
+        if row is None:
+            yield ServerSentEvent(event="not_found", data={})
+            return
+        if tick % _SSE_CONTAINER_CHECK_EVERY == 0:
+            container_alive = await _verified_container_alive(row["session_id"])
+        response = await _row_to_response(row, container_alive=container_alive)
+        payload = response.model_dump_json()
+        if payload != last_payload:
+            last_payload = payload
+            yield ServerSentEvent(event="session", data=response)
+        if row["status"] != "in_progress":
+            yield ServerSentEvent(event="done", data={})
+            return
+        if time.monotonic() - started > _SSE_MAX_CONNECTION_SECONDS:
+            # See stream_session_events' identical branch for why this is NOT 'done' -- the row
+            # above is still in_progress; this only means the connection itself needs replacing.
+            yield ServerSentEvent(event="reconnect", data={})
+            return
+        tick += 1
+        await asyncio.sleep(_SSE_SESSION_POLL_SECONDS)
 
 
 @router.delete("/{thread_id}")
@@ -1730,6 +1840,160 @@ def _demo() -> None:
         assert live_resp.run_active is True and live_resp.interrupted is False, live_resp
     finally:
         run_activity.decr(dead_row["session_id"])
+
+    # SSE tail (Part B): stream_session_events must yield only events newer than the last seq it
+    # already sent each tick, and end the generator once the session reaches a terminal status.
+    # Monkeypatches session_store.get_session/run_event_store.list_events_by_session -- same
+    # module-attribute-reassignment technique as project_store above -- so this drives the REAL
+    # generator function with no real DB. Poll interval dropped to near-zero for the duration so
+    # the check stays instant. Called with no second argument -- _existing_session_for_stream's
+    # existence/auth check is a FastAPI dependency now (see that function's own docstring for why),
+    # so the generator itself no longer takes a request and has nothing left to fake here.
+    sse_events_session_id = "44444444-4444-4444-4444-444444444444"
+    sse_events = [
+        RunEvent(run_id="r1", session_id=sse_events_session_id, type=RunEventType.NODE_STARTED,
+                 stage="draft", node="draft", seq=1, ts=datetime(2026, 1, 1)),
+        RunEvent(run_id="r1", session_id=sse_events_session_id, type=RunEventType.NODE_FINISHED,
+                 stage="draft", node="draft", seq=2, ts=datetime(2026, 1, 1)),
+    ]
+    sse_events_get_calls = {"n": 0}
+
+    async def fake_get_session_for_events(session_id: str) -> dict[str, Any] | None:
+        sse_events_get_calls["n"] += 1
+        # The first two status re-checks (both happen inside the SAME __anext__ call, once all
+        # seeded events are drained) stay in_progress; the third goes terminal.
+        status = "in_progress" if sse_events_get_calls["n"] <= 2 else "completed"
+        return {"session_id": session_id, "status": status}
+
+    async def fake_list_events_by_session(session_id: str, since_seq: int = 0) -> list[RunEvent]:
+        return [e for e in sse_events if e.seq > since_seq]
+
+    original_get_session = session_store.get_session
+    original_list_events_by_session = run_event_store.list_events_by_session
+    session_store.get_session = fake_get_session_for_events  # type: ignore[assignment]
+    run_event_store.list_events_by_session = fake_list_events_by_session  # type: ignore[assignment]
+    global _SSE_EVENTS_POLL_SECONDS
+    real_events_poll_seconds = _SSE_EVENTS_POLL_SECONDS
+    _SSE_EVENTS_POLL_SECONDS = 0.01
+    try:
+        async def _drive_events_stream() -> None:
+            gen = stream_session_events(sse_events_session_id)
+            first = await gen.__anext__()
+            assert first.event == "run_event" and first.data.seq == 1, first
+            second = await gen.__anext__()
+            assert second.event == "run_event" and second.data.seq == 2, second
+            third = await gen.__anext__()
+            assert third.event == "done", third
+            try:
+                await gen.__anext__()
+                raise AssertionError("stream_session_events must stop iterating once it emits 'done'")
+            except StopAsyncIteration:
+                pass
+
+        asyncio.run(_drive_events_stream())
+    finally:
+        session_store.get_session = original_get_session  # type: ignore[assignment]
+        run_event_store.list_events_by_session = original_list_events_by_session  # type: ignore[assignment]
+        _SSE_EVENTS_POLL_SECONDS = real_events_poll_seconds
+
+    # SSE tail (Part B): stream_session_row must skip re-sending an unchanged payload, throttle
+    # the live container-alive probe to every _SSE_CONTAINER_CHECK_EVERY-th tick (not every tick --
+    # see that constant's own comment), and emit both a final 'session' update and 'done' on the
+    # tick a session goes terminal.
+    sse_row_session_id = "55555555-5555-5555-5555-555555555555"
+    sse_row_get_calls = {"n": 0}
+
+    def _fake_row(stage: str, status: str) -> dict[str, Any]:
+        return {
+            "session_id": sse_row_session_id, "owner": "octocat", "repo": "demo",
+            "user_login": "octocat", "title": "t", "source_branch": "main", "work_branch": "wb",
+            "run_id": None, "current_stage": stage, "status": status,
+            "started_at": datetime(2026, 1, 1), "ended_at": None,
+            "merge_ready": None, "pr_title": None, "pr_url": None,
+            "failure_stage": None, "failure_type": None, "failure_message": None,
+            "project_id": None, "awaiting_gate": False,
+        }
+
+    async def fake_get_session_for_row(session_id: str) -> dict[str, Any] | None:
+        sse_row_get_calls["n"] += 1
+        n = sse_row_get_calls["n"]
+        # The first 3 loop ticks read the SAME unchanged row; the 4th changes stage and goes terminal.
+        return _fake_row("draft", "in_progress") if n <= 3 else _fake_row("audit", "completed")
+
+    container_alive_calls = {"n": 0}
+
+    async def fake_verified_container_alive(session_id: str) -> bool:
+        container_alive_calls["n"] += 1
+        return False
+
+    original_get_session_row = session_store.get_session
+    session_store.get_session = fake_get_session_for_row  # type: ignore[assignment]
+    global _verified_container_alive, _SSE_SESSION_POLL_SECONDS
+    original_verified_container_alive = _verified_container_alive
+    _verified_container_alive = fake_verified_container_alive
+    real_session_poll_seconds = _SSE_SESSION_POLL_SECONDS
+    _SSE_SESSION_POLL_SECONDS = 0.01
+    try:
+        async def _drive_row_stream() -> None:
+            gen = stream_session_row(sse_row_session_id)
+            first = await gen.__anext__()
+            assert first.event == "session" and first.data.current_stage == "draft", first
+            # The second loop tick's row is byte-for-byte identical to the first -- no re-send.
+            second = await gen.__anext__()
+            assert second.event == "session" and second.data.current_stage == "audit", (
+                "an unchanged tick in between must have been skipped -- got", second
+            )
+            third = await gen.__anext__()
+            assert third.event == "done", third
+            try:
+                await gen.__anext__()
+                raise AssertionError("stream_session_row must stop iterating once it emits 'done'")
+            except StopAsyncIteration:
+                pass
+
+        asyncio.run(_drive_row_stream())
+        assert container_alive_calls["n"] == 1, (
+            f"container-alive probe should fire once (tick 0 only) across 3 ticks, "
+            f"got {container_alive_calls['n']} -- throttle regression"
+        )
+    finally:
+        session_store.get_session = original_get_session_row  # type: ignore[assignment]
+        _verified_container_alive = original_verified_container_alive
+        _SSE_SESSION_POLL_SECONDS = real_session_poll_seconds
+
+    # The bug the two direct-generator checks above CANNOT catch: Starlette's StreamingResponse
+    # sends the 200 status (stream_response's own `await send({"type": "http.response.start",
+    # ...})`) BEFORE ever pulling the generator's first item -- so an HTTPException raised from
+    # inside a generator's body (the first, wrong version of this fix) can never become a real
+    # error status; it just breaks the stream after the client already got 200. Calling the
+    # generator function directly, as the two checks above do, never exercises this at all --
+    # only a real ASGI round-trip (TestClient, against the actual FastAPI app) can prove
+    # _existing_session_for_stream's dependency-based fix actually produces a real 404.
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    real_shared_secret_env = os.environ.get("AIDW_AGENT_SHARED_SECRET")
+    os.environ["AIDW_AGENT_SHARED_SECRET"] = ""  # keep the shared-secret check a no-op here
+    test_app = FastAPI()
+    test_app.include_router(router)
+    test_client = TestClient(test_app)
+
+    async def fake_missing_session(session_id: str) -> dict[str, Any] | None:
+        return None
+
+    original_get_session_404 = session_store.get_session
+    session_store.get_session = fake_missing_session  # type: ignore[assignment]
+    try:
+        row_resp = test_client.get("/sessions/nonexistent-id/stream")
+        assert row_resp.status_code == 404, (row_resp.status_code, row_resp.text)
+        events_resp = test_client.get("/sessions/nonexistent-id/events/stream")
+        assert events_resp.status_code == 404, (events_resp.status_code, events_resp.text)
+    finally:
+        session_store.get_session = original_get_session_404  # type: ignore[assignment]
+        if real_shared_secret_env is None:
+            os.environ.pop("AIDW_AGENT_SHARED_SECRET", None)
+        else:
+            os.environ["AIDW_AGENT_SHARED_SECRET"] = real_shared_secret_env
 
     global _fetch_default_branch  # reassigned further down; must precede every use in this function
 

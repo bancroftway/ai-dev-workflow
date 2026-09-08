@@ -267,68 +267,89 @@ export function AppShell({
   // on a tab that had been sitting on the "Reconnecting…" banner since before that: the banner
   // does not clear on its own, contradicting its own copy ("this page updates automatically").
   const reattachTriggeredRef = useRef(false);
+  // SSE tail of the durable session row, replacing what used to be a 10s `setInterval` fetch loop
+  // (both here: `/api/sessions/{id}/stream`, backed by the agent's stream_session_row -- see that
+  // function's own docstring). Pushes updates within a few seconds instead of up to 10s late, and
+  // -- the actual bug this was built to fix -- reflects a run_headless.py-driven session's
+  // run_active/interrupted correctly, since stream_session_row recomputes those from
+  // run_activity.heartbeat's cross-process signal every tick, not this browser tab's own
+  // in-memory state.
   useEffect(() => {
-    let stopped = false;
-    async function reconcile() {
-      if (stopped || sandboxStatusRef.current === "provisioning") return;
-      try {
-        const res = await fetch(`/api/sessions/${threadId}`);
-        if (stopped) return;
-        if (res.status === 404) {
-          setSandboxStatus("terminated"); // session deleted elsewhere
-          return;
-        }
-        if (!res.ok) return; // agent unreachable/transient -- keep the last known state
-        const row = (await res.json()) as {
-          container_alive?: boolean;
-          current_stage: string | null;
-          status: string;
-          awaiting_gate: boolean | null;
-          run_active?: boolean;
-          interrupted?: boolean;
-        };
-        // A terminal session (completed/failed/rejected) has no container to be alive in the
-        // first place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
-        // "error"/Disconnected here would overwrite its correct "terminated" a few seconds after
-        // load with a status implying something failed, when nothing did. Still "ready"/"error" as
-        // before for an in_progress session (the one case a live container is actually expected).
-        setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "error" : "terminated");
-        setDurableRow({ current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate });
-        // Same response, lifted into context so BuildView/SessionOverview/SpecificationView/
-        // PlanView/RequirementsView can read run_active/interrupted without a second fetch.
-        setRunActivity({
-          runActive: row.run_active ?? false,
-          interrupted: row.interrupted ?? false,
-          awaitingGate: row.awaiting_gate,
-          currentStage: row.current_stage,
-          status: row.status,
-        });
-        // The moment the durable row reports the run PAUSED at its own gate, a blank run request
-        // hits ag_ui_langgraph's pending-interrupt short-circuit and main.py's
-        // _ReattachStateAgent injects a full STATE_SNAPSHOT into it -- exactly the mechanism a
-        // manual reload was relying on. Firing it here means this tab recovers on its own, no
-        // reload needed. Guarded so it only ever fires once per mount; a stages-non-empty client
-        // (the ordinary case) never reaches this branch at all.
-        if (
-          row.awaiting_gate &&
-          Object.keys(stateRef.current.stages ?? {}).length === 0 &&
-          !reattachTriggeredRef.current
-        ) {
-          reattachTriggeredRef.current = true;
-          void copilotkit.runAgent({ agent });
-        }
-      } catch {
-        // transient network failure -- next tick retries
+    function applyRow(row: {
+      container_alive?: boolean;
+      current_stage: string | null;
+      status: string;
+      awaiting_gate: boolean | null;
+      run_active?: boolean;
+      interrupted?: boolean;
+    }) {
+      if (sandboxStatusRef.current === "provisioning") return;
+      // A terminal session (completed/failed/rejected) has no container to be alive in the first
+      // place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
+      // "error"/Disconnected here would overwrite its correct "terminated" a few seconds after
+      // load with a status implying something failed, when nothing did. Still "ready"/"error" as
+      // before for an in_progress session (the one case a live container is actually expected).
+      setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "error" : "terminated");
+      setDurableRow({ current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate });
+      // Same payload, lifted into context so BuildView/SessionOverview/SpecificationView/
+      // PlanView/RequirementsView can read run_active/interrupted without a second fetch.
+      setRunActivity({
+        runActive: row.run_active ?? false,
+        interrupted: row.interrupted ?? false,
+        awaitingGate: row.awaiting_gate,
+        currentStage: row.current_stage,
+        status: row.status,
+      });
+      // The moment the durable row reports the run PAUSED at its own gate, a blank run request
+      // hits ag_ui_langgraph's pending-interrupt short-circuit and main.py's
+      // _ReattachStateAgent injects a full STATE_SNAPSHOT into it -- exactly the mechanism a
+      // manual reload was relying on. Firing it here means this tab recovers on its own, no
+      // reload needed. Guarded so it only ever fires once per mount; a stages-non-empty client
+      // (the ordinary case) never reaches this branch at all.
+      if (
+        row.awaiting_gate &&
+        Object.keys(stateRef.current.stages ?? {}).length === 0 &&
+        !reattachTriggeredRef.current
+      ) {
+        reattachTriggeredRef.current = true;
+        void copilotkit.runAgent({ agent });
       }
     }
-    void reconcile(); // immediately on mount too -- isReattaching below needs this before the
-    // first 10s tick, or a reattached reload sits on the misleading default tab that much longer.
-    const id = setInterval(() => void reconcile(), 10_000);
-    const onFocus = () => void reconcile();
+
+    let source: EventSource | null = null;
+    function open() {
+      source = new EventSource(`/api/sessions/${encodeURIComponent(threadId)}/stream`);
+      source.addEventListener("session", (ev) => {
+        try {
+          applyRow(JSON.parse((ev as MessageEvent).data));
+        } catch {
+          // Malformed payload -- ignore; the next tick/reconnect carries the real data.
+        }
+      });
+      source.addEventListener("not_found", () => {
+        setSandboxStatus("terminated"); // session deleted elsewhere
+        source?.close();
+      });
+      // 'done' (real terminal status) closes for good; 'reconnect' (the agent's own
+      // _SSE_MAX_CONNECTION_SECONDS cap -- see stream_session_row's own comment) means the session
+      // can still be in_progress, so it opens a fresh connection instead of going quiet.
+      source.addEventListener("done", () => source?.close());
+      source.addEventListener("reconnect", () => {
+        source?.close();
+        open();
+      });
+    }
+    open();
+
+    // Some browsers close an idle EventSource under background/power-saving throttling -- this is
+    // the recovery path if that happened while the tab wasn't visible. A healthy open connection
+    // needs no action; only force a reconnect if it's actually dead.
+    const onFocus = () => {
+      if (source && source.readyState === EventSource.CLOSED) open();
+    };
     window.addEventListener("focus", onFocus);
     return () => {
-      stopped = true;
-      clearInterval(id);
+      source?.close();
       window.removeEventListener("focus", onFocus);
     };
   }, [threadId, setSandboxStatus, setRunActivity, agent, copilotkit]);

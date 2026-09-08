@@ -8,12 +8,16 @@ import { useWorkflowThread } from "@/lib/workflow-thread-context";
  * Shared real-event-stream plumbing for every run-visibility view (EventLogView.tsx's Task 8,
  * Swimlane.tsx's Task 9, ...). Factored out of EventLogView.tsx when Task 9 needed the identical
  * data for a second component -- per that task's own explicit instruction, this is reused rather
- * than stood up a second time: a mount-time fetch of `GET /sessions/{id}/events` (history-so-far,
- * covers a finished run and a fresh page load/reconnect) merged with the live AG-UI CUSTOM
- * `run_event` channel (Task 2, only fires while this tab is actively watching a run) for the rest
- * of this component's mounted lifetime, deduped by `seq` (the durable store's own dedup key -- an
- * event is only ever live-dispatched AFTER run_event_store.append_event has already assigned it
- * one, see run_event_stream.py's docstring). No polling -- those two sources cover every real case.
+ * than stood up a second time: an SSE connection to `GET /sessions/{id}/events/stream` (sends
+ * this session's full history on connect, then pushes new rows as they land -- covers a finished
+ * run, a fresh page load/reconnect, AND a session a different process/tab is driving, e.g.
+ * run_headless.py) merged with the live AG-UI CUSTOM `run_event` channel (Task 2, only fires while
+ * THIS tab is itself the one actively streaming a run, but delivers with near-zero latency when it
+ * applies), deduped by `seq` (the durable store's own dedup key -- an event is only ever
+ * live-dispatched AFTER run_event_store.append_event has already assigned it one, see
+ * run_event_stream.py's docstring). Both sources converge on the same seq-keyed store, so keeping
+ * both is free -- the SSE stream is the one that actually covers every case, the AG-UI channel is
+ * just a latency shortcut for the common one.
  */
 
 export interface RunLogEvent {
@@ -177,50 +181,56 @@ export function computeRunningStages(events: RunLogEvent[], runActive?: boolean 
   return new Set(computeRunningPhases(events, runActive).keys());
 }
 
-const POLL_MS = 15000;
-
-interface PollState {
+interface StreamState {
   events: RunLogEvent[];
   listeners: Set<(events: RunLogEvent[]) => void>;
-  timer?: ReturnType<typeof setInterval>;
+  source?: EventSource;
 }
 
 // Keyed by threadId, module-level (outside React) so every useRunEvents() caller mounted for the
-// same session shares one fetch+timer loop instead of each running its own -- AppShell, BuildView,
-// LiveCostChip and SessionOverview all call this hook independently, and until this were four
-// unsynchronized 10s timers overlapping in phase, averaging a real request every 2-3s for one
-// person looking at one session (2026-09-02 investigation). First subscriber for a threadId starts
-// the loop; each additional one just registers and gets the current + all future events for free;
-// last one to unmount tears it down.
-const pollStates = new Map<string, PollState>();
+// same session shares one EventSource instead of each opening its own -- AppShell, BuildView,
+// LiveCostChip and SessionOverview all call this hook independently, and one connection per tab
+// (not per component) is what actually matters here (same sharing reasoning as the old poll timer
+// this replaced, from a 2026-09-02 investigation that found 4 unsynchronized timers per tab).
+// First subscriber for a threadId opens the connection; each additional one just registers and
+// gets the current + all future events for free; last one to unmount closes it.
+const streamStates = new Map<string, StreamState>();
 
-function subscribeToPoll(threadId: string, onEvents: (events: RunLogEvent[]) => void): () => void {
-  let state = pollStates.get(threadId);
+function openEventStream(threadId: string, s: StreamState): void {
+  const source = new EventSource(`/api/sessions/${encodeURIComponent(threadId)}/events/stream`);
+  source.addEventListener("run_event", (ev) => {
+    try {
+      const value = JSON.parse((ev as MessageEvent).data) as RunLogEvent;
+      s.events = mergeEvents(s.events, [value]);
+      s.listeners.forEach((l) => l(s.events));
+    } catch {
+      // Malformed live payload -- ignore; the durable store already has the real row and a
+      // future event/reconnect will pick it up.
+    }
+  });
+  // 'done'/'not_found' mean the session has reached a real terminal state (or is gone) -- close
+  // explicitly so the browser's default auto-reconnect-on-close behavior doesn't keep re-opening
+  // it forever. 'reconnect' is different: the agent's own _SSE_MAX_CONNECTION_SECONDS cap
+  // (stream_session_events' own comment) -- the session can still be very much in_progress when
+  // THAT fires, so it means "open a fresh connection," not "stop." Treating it like 'done' would
+  // silently go quiet on every run that outlives one connection's lifetime. Plain network blips
+  // get no special handling here: that's exactly the case EventSource's own built-in
+  // reconnect-on-error already covers.
+  source.addEventListener("done", () => source.close());
+  source.addEventListener("not_found", () => source.close());
+  source.addEventListener("reconnect", () => {
+    source.close();
+    openEventStream(threadId, s);
+  });
+  s.source = source;
+}
+
+function subscribeToEventStream(threadId: string, onEvents: (events: RunLogEvent[]) => void): () => void {
+  let state = streamStates.get(threadId);
   if (!state) {
-    const s: PollState = { events: [], listeners: new Set() };
-    const fetchOnce = () =>
-      fetch(`/api/sessions/${encodeURIComponent(threadId)}/events`)
-        .then((r) => (r.ok ? (r.json() as Promise<{ events: RunLogEvent[] }>) : null))
-        .then((data) => {
-          if (!data) return;
-          s.events = mergeEvents(s.events, data.events);
-          s.listeners.forEach((l) => l(s.events));
-        })
-        .catch(() => {
-          // Best-effort -- the live subscription below still works even if one poll fails
-          // (transient 5xx), and the next tick tries again.
-        });
-    fetchOnce();
-    // Re-poll, not just the one mount-time fetch: `agent.subscribe` below only delivers events
-    // for a run THIS tab's own agent instance is actively streaming -- a tab that reattaches to a
-    // run already started elsewhere (Resume clicked from a different tab/reload, same known
-    // mid-run reattach gap as state snapshots) never gets attached to that stream's custom events,
-    // so its data would otherwise freeze at whatever existed at mount forever (user feedback
-    // 2026-09-01: a stage's tab-pill spinner stayed on the wrong stage because of exactly this --
-    // a direct fetch of this same endpoint had fresher data than the hook's own state). Separate
-    // from, and slower than, AppShell.tsx's own 10s poll of the durable session row.
-    s.timer = setInterval(fetchOnce, POLL_MS);
-    pollStates.set(threadId, s);
+    const s: StreamState = { events: [] as RunLogEvent[], listeners: new Set() };
+    openEventStream(threadId, s);
+    streamStates.set(threadId, s);
     state = s;
   }
   state.listeners.add(onEvents);
@@ -228,8 +238,8 @@ function subscribeToPoll(threadId: string, onEvents: (events: RunLogEvent[]) => 
   return () => {
     state!.listeners.delete(onEvents);
     if (state!.listeners.size === 0) {
-      clearInterval(state!.timer);
-      pollStates.delete(threadId);
+      state!.source?.close();
+      streamStates.delete(threadId);
     }
   };
 }
@@ -245,7 +255,7 @@ export function useRunEvents(): RunLogEvent[] {
   const [events, setEvents] = useState<RunLogEvent[]>([]);
 
   useEffect(
-    () => subscribeToPoll(threadId, (polled) => setEvents((prev) => mergeEvents(prev, polled))),
+    () => subscribeToEventStream(threadId, (streamed) => setEvents((prev) => mergeEvents(prev, streamed))),
     [threadId],
   );
 
