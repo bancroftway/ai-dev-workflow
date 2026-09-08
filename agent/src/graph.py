@@ -3115,31 +3115,11 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 "verified": True,
             }
             stages[stage_spec.key] = stage
-        if not skill_check.passed:
-            stage["last_verification"] = {
-                "passed": False,
-                "feedback": skill_gate.feedback_for(skill_check),
-                "report": {
-                    "missing_skills": skill_check.missing,
-                    "invoked_skills": skill_check.invoked,
-                    "required_skills": skill_check.required,
-                },
-            }
-            stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
-            logger.warning(
-                "%s: REDRAFT %d/%d (skill gate) -- missing %s",
-                stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles,
-                skill_check.missing,
-            )
-            stages[stage_spec.key] = stage
-            # Restart the draft session, for the reason spelled out in the deterministic_verify
-            # branch below: a skill shapes HOW a turn is done, so it must be invoked before the
-            # work, and a session that has already answered will only revise its own text. This
-            # branch returns early, so it needs its own reset -- putting it only below meant three
-            # identical `invoked: []` turns with no restart between them (observed live at
-            # metrics-exit, which then exhausted its budget and failed an otherwise-complete run).
-            await close_session(thread_id, stage_spec.key, "draft", provider=state["provider"])
-            return {"stages": stages}
+        # A failing skill check no longer returns early here -- see the merge with `result` below,
+        # right after stage_spec.deterministic_verify runs. The two checks are independent (whether
+        # a skill was invoked has no bearing on whether the resulting artifact is itself correct),
+        # so running both and reporting every failure together saves a whole redraft lap versus
+        # discovering them one at a time (2026-09-07 audit).
 
         # Durable + live NODE_STARTED (Part 2 Task 9 run-visibility) -- same pattern as
         # make_draft_node/make_audit_node's identical blocks. Placed here rather than at this
@@ -3165,10 +3145,47 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         # verdict -- observed live (diagram_gate crashed two whole runs before ITS local guard
         # was added; _verify_specification_ledger had the identical latent crash). Guarded once
         # here so no individual gate has to remember to.
-        result = await stage_spec.deterministic_verify(
-            thread_id, stage["draft"] or {}, state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
-            state["provider"],
-        )
+        #
+        # Also try/excepted (2026-09-07 audit): the skill-gate merge below means this now runs on
+        # draft/ordering combinations it never ran against before (a draft missing its required
+        # skill; a gate's later checks now running even though an earlier one already failed) --
+        # input shapes no gate's existing guards were ever proven against. Every other
+        # external/LLM call in this file (draft, audit) is already wrapped and routed as a graceful
+        # failure rather than crashing the node; this call was the one outlier, only safe before
+        # because the skill-gate early return kept it from ever seeing a malformed draft.
+        try:
+            result = await stage_spec.deterministic_verify(
+                thread_id, stage["draft"] or {}, state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
+                state["provider"],
+            )
+        except Exception as exc:  # noqa: BLE001 -- convert to a routed infra verdict, never crash the node
+            logger.exception("%s: deterministic_verify crashed", stage_spec.key)
+            result = VerificationResult(
+                passed=False,
+                feedback=f"deterministic verification crashed unexpectedly: {exc}",
+                report={"infra_error": "verify_crashed"},
+            )
+        if not skill_check.passed:
+            # Merge the skill-gate's own verdict into the content gate's, instead of reporting
+            # only whichever failed first (2026-09-07 audit, "review all stages/gates" anecdote):
+            # a stage whose skill was skipped AND whose content is independently wrong used to cost
+            # two redraft laps, one per failure, when both were already knowable on lap one.
+            combined_feedback = skill_gate.feedback_for(skill_check)
+            if not result.passed:
+                combined_feedback += "\n\n" + result.feedback
+            merged_report = {**result.report}
+            # A missing skill is a draft-process failure, never a "platform failed to check" one --
+            # never let it borrow the small infra-retry budget (config.VERIFY_INFRA_RETRY_CAP).
+            # Exception: a report["infra_error"] this except-block just synthesized from a genuine
+            # crash stays -- that really is a platform fault, regardless of skill status.
+            if merged_report.get("infra_error") != "verify_crashed":
+                merged_report.pop("infra_error", None)
+            merged_report.update({
+                "missing_skills": skill_check.missing,
+                "invoked_skills": skill_check.invoked,
+                "required_skills": skill_check.required,
+            })
+            result = VerificationResult(passed=False, feedback=combined_feedback, report=merged_report)
         stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
         stage["max_verify_cycles"] = stage_spec.max_verify_cycles
         if not result.passed:
@@ -4743,6 +4760,72 @@ def _demo() -> None:
     build_graph()  # runs assert_pipeline_nodes_registered + assert_no_dead_clusters
     assert_no_stub_stages()
     assert_gates_have_self_checks()
+
+    # make_verify_node's skill-gate + content-gate merge (2026-09-07 audit): a failing skill check
+    # no longer short-circuits before stage_spec.deterministic_verify runs -- both verdicts must
+    # show up in the SAME lap's feedback, or this regresses right back to the anecdote it fixed
+    # (one redraft lap per failure instead of one lap for both). Same globals()/module-attribute
+    # patching technique as the fixtures above; StageSpec is frozen, so `replace()` swaps only
+    # deterministic_verify onto a real spec rather than hand-building one from scratch.
+    from dataclasses import replace
+
+    async def _fake_check_required_skills(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        return skill_gate.SkillCheckOutcome(
+            passed=False, required=["writing-plans"], invoked=[], missing=["writing-plans"], verified=True
+        )
+
+    async def _fake_verify_fails(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        return VerificationResult(passed=False, feedback="coverage is at 40%, needs 95%", report={"line_rate": 0.4})
+
+    async def _fake_verify_crashes(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise RuntimeError("boom")
+
+    async def _fake_append_ledger_entry(_provider, _thread_id, _entry):  # noqa: ANN001
+        return None
+
+    async def _fake_close_session(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        return None
+
+    demo_verify_thread_id = "demo-verify-merge-thread"
+    sandbox_registry.set(
+        demo_verify_thread_id,
+        SandboxSession(session_id=demo_verify_thread_id, host="localhost", port=0, connection_token=""),
+    )
+    real_check_required_skills = skill_gate.check_required_skills
+    real_append_ledger_entry_2 = repo_files.append_ledger_entry
+    real_close_session = close_session
+    skill_gate.check_required_skills = _fake_check_required_skills
+    repo_files.append_ledger_entry = _fake_append_ledger_entry
+    globals()["close_session"] = _fake_close_session
+    try:
+        demo_verify_state = {
+            "stages": {"minimal-code-to-green": {**default_stage_state(), "draft": {"x": 1}}},
+            "provider": "claude", "run_id": "demo",
+        }
+        demo_verify_cfg = {"configurable": {"thread_id": demo_verify_thread_id}}
+
+        verify_fn = make_verify_node(replace(by_key["minimal-code-to-green"], deterministic_verify=_fake_verify_fails))
+        out = asyncio.run(verify_fn(demo_verify_state, demo_verify_cfg))
+        last = out["stages"]["minimal-code-to-green"]["last_verification"]
+        assert not last["passed"]
+        assert "writing-plans" in last["feedback"] and "40%" in last["feedback"], (
+            "merged feedback must name BOTH the missing skill and the real content failure -- "
+            f"reporting only one is the exact anecdote this merge exists to fix: {last['feedback']!r}"
+        )
+        assert last["report"]["missing_skills"] == ["writing-plans"]
+        assert not last["report"].get("infra_error"), "a plain content failure must not smuggle an infra_error in"
+
+        # Crash-safety: deterministic_verify raising must not crash the node, and the resulting
+        # infra_error must survive the skill-gate merge (a genuine platform fault, not a draft one).
+        verify_crash_fn = make_verify_node(replace(by_key["minimal-code-to-green"], deterministic_verify=_fake_verify_crashes))
+        out2 = asyncio.run(verify_crash_fn(demo_verify_state, demo_verify_cfg))
+        last2 = out2["stages"]["minimal-code-to-green"]["last_verification"]
+        assert not last2["passed"]
+        assert last2["report"]["infra_error"] == "verify_crashed", last2["report"]
+    finally:
+        skill_gate.check_required_skills = real_check_required_skills
+        repo_files.append_ledger_entry = real_append_ledger_entry_2
+        globals()["close_session"] = real_close_session
 
     # make_route_after_gate (Part 2 Task 10): pure predicate, same convention as
     # should_skip_draft/_detect_verify_stall in this same function -- the real interrupt()/resume

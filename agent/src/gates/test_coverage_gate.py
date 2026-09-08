@@ -1221,6 +1221,10 @@ async def verify_coverage(
         and _is_application_source(stripped)
     ]
     if not source_files:
+        # No app at all makes every other structural check moot (nothing to check a frontend or
+        # integration fidelity against) -- this one stays a lone precondition guard, same as
+        # before. Once real app code exists, though, frontend-missing and integration-fidelity are
+        # independent problems and get aggregated below instead of hiding one behind the other.
         return VerificationResult(
             passed=False,
             feedback=(
@@ -1233,32 +1237,42 @@ async def verify_coverage(
             report={"infra_error": "no_application_code", "source_files": 0},
         )
 
+    # Both structural preconditions for a meaningful coverage measurement (2026-09-07 audit): each
+    # already shared the same infra_error budget classification one-at-a-time, so union their
+    # reasons into one verdict instead of reporting only whichever hit first -- a lap that fixes
+    # only the one named would otherwise still burn a second lap discovering the other.
+    structural_codes: list[str] = []
+    structural_reasons: list[str] = []
+    structural_report: dict[str, Any] = {}
+
     missing_ui = await _missing_declared_frontend(provider, thread_id, source_files)
     if missing_ui:
-        return VerificationResult(
-            passed=False,
-            feedback=(
-                f"The approved Tech Stack declares {missing_ui} as this app's frontend, but the "
-                "repository does not actually contain that frontend -- either it has no source "
-                f"file for {missing_ui}, or its package.json never declares {missing_ui} as a "
-                "dependency. Only the backend was really built, so the delivered app cannot be "
-                "the app that was approved.\n\n"
-                "Build the frontend described in the approved Plan: a package.json that really "
-                "depends on the framework, real components/pages, and real build/test scripts, "
-                "wired to the API you already wrote. A file that merely has the right extension, "
-                "or a script that echoes a placeholder string, does not count -- that leaves the "
-                "app non-functional while looking complete, which is the exact outcome every gate "
-                "here exists to prevent."
-            ),
-            report={"infra_error": "declared_frontend_missing", "framework": missing_ui},
+        structural_codes.append("declared_frontend_missing")
+        structural_reasons.append(
+            f"The approved Tech Stack declares {missing_ui} as this app's frontend, but the "
+            "repository does not actually contain that frontend -- either it has no source "
+            f"file for {missing_ui}, or its package.json never declares {missing_ui} as a "
+            "dependency. Only the backend was really built, so the delivered app cannot be "
+            "the app that was approved.\n\n"
+            "Build the frontend described in the approved Plan: a package.json that really "
+            "depends on the framework, real components/pages, and real build/test scripts, "
+            "wired to the API you already wrote. A file that merely has the right extension, "
+            "or a script that echoes a placeholder string, does not count -- that leaves the "
+            "app non-functional while looking complete, which is the exact outcome every gate "
+            "here exists to prevent."
         )
+        structural_report["framework"] = missing_ui
 
     integration_problem = await _check_integration_fidelity(provider, thread_id, source_files)
     if integration_problem:
+        structural_codes.append("integration_fidelity")
+        structural_reasons.append(integration_problem)
+
+    if structural_reasons:
         return VerificationResult(
             passed=False,
-            feedback=integration_problem,
-            report={"infra_error": "integration_fidelity"},
+            feedback="\n\n".join(structural_reasons),
+            report={"infra_error": "+".join(structural_codes), **structural_report},
         )
 
     line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id, chat_provider=chat_provider, run_id=run_id)

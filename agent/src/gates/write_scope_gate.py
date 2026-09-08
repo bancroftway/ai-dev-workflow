@@ -391,9 +391,11 @@ async def verify_ac_to_tests(
             report={"violating_paths": write_scope.violating_paths, "changed_paths": write_scope.changed_paths},
         )
 
-    # Provenance protections, before any content checks: the ledger must be untampered (it is the
-    # truth every check below reads), retired criteria's tests must be gone, and completed
-    # criteria's tests must be untouched.
+    # Provenance protections: the ledger must be untampered (it is the truth every check below
+    # reads), retired criteria's tests must be gone, and completed criteria's tests must be
+    # untouched. Independent of whether THIS lap wrote anything, so computed and reported
+    # alongside the content checks below rather than gating them (2026-09-07 audit) -- but still
+    # gates check_ac_coverage's real test-suite spawn at the bottom, same as before.
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
     protection_problems = (
         await check_ledger_integrity(provider, thread_id)
@@ -401,12 +403,6 @@ async def verify_ac_to_tests(
         + await check_deferred_ac_residue(provider, thread_id, ledger_entries)
         + await check_completed_ac_protection(provider, thread_id, baseline_commit, ledger_entries)
     )
-    if protection_problems:
-        return VerificationResult(
-            passed=False,
-            feedback="; ".join(protection_problems),
-            report={"changed_paths": write_scope.changed_paths, "protection_problems": protection_problems},
-        )
 
     # Work-queue scoping: when every one of this ticket's own criteria is already delivered (or the
     # ticket only retires criteria), writing no new tests is CORRECT -- the wrote-nothing and
@@ -425,28 +421,32 @@ async def verify_ac_to_tests(
     # writes). Name that failure exactly -- "no test found covering US-xxxx" reads to the model
     # like a naming problem, not a you-never-wrote-files problem.
     real_changes = [p for p in write_scope.changed_paths if not p.startswith((".ai-dev-workflow/", "APPROVALS.md", "AGENTS.md"))]
-    if not real_changes and not no_eligible_work:
-        return VerificationResult(
-            passed=False,
-            feedback=(
-                "You created NO test files -- the working tree has no changes beyond pipeline "
-                "artifacts. Your structured response is metadata ABOUT files; the files "
-                "themselves must be written to disk with your file tools (create/edit) BEFORE "
-                "you respond. Write the actual test files now."
-            ),
-            report={"changed_paths": write_scope.changed_paths},
-        )
+    wrote_nothing_real = not real_changes and not no_eligible_work
 
-    # Test-pyramid check: a suite made only of Playwright e2e specs means the stage stopped at the
-    # outermost layer. Observed live -- one `apps/web/tests/e2e/*.spec.ts` and nothing else, for
-    # every AC, because a user-facing criterion always "needs a browser" under the skill's own
-    # heuristic. That suite is slow, brittle, and proves no rule below the UI; it also leaves the
-    # coverage gate with nothing instrumentable, since a unit runner cannot execute Playwright
-    # specs. Enforced here rather than left to the prompt, which the model can silently ignore.
-    if not _has_non_e2e_test(real_changes) and not no_eligible_work:
-        return VerificationResult(
-            passed=False,
-            feedback=(
+    content_problems: list[str] = []
+    content_report: dict[str, Any] = {}
+
+    if wrote_nothing_real:
+        # A precondition, not an independent content check (2026-09-07 audit): with no real test
+        # file to look at, the pyramid-shape and missing-e2e checks below are meaningless -- both
+        # would misfire against an empty change set (an empty list has no non-e2e test AND no e2e
+        # spec), so they only run in the `else` branch, matching the original early-return order.
+        content_problems.append(
+            "You created NO test files -- the working tree has no changes beyond pipeline "
+            "artifacts. Your structured response is metadata ABOUT files; the files "
+            "themselves must be written to disk with your file tools (create/edit) BEFORE "
+            "you respond. Write the actual test files now."
+        )
+    else:
+        # Test-pyramid check: a suite made only of Playwright e2e specs means the stage stopped at
+        # the outermost layer. Observed live -- one `apps/web/tests/e2e/*.spec.ts` and nothing
+        # else, for every AC, because a user-facing criterion always "needs a browser" under the
+        # skill's own heuristic. That suite is slow, brittle, and proves no rule below the UI; it
+        # also leaves the coverage gate with nothing instrumentable, since a unit runner cannot
+        # execute Playwright specs. Enforced here rather than left to the prompt, which the model
+        # can silently ignore.
+        if not _has_non_e2e_test(real_changes) and not no_eligible_work:
+            content_problems.append(
                 "Every test you wrote is a Playwright end-to-end spec. A browser test cannot prove "
                 "the rules beneath the UI, and a unit runner cannot execute it, so this suite is "
                 "not acceptable on its own. Add tests BELOW the UI for the same criteria and keep "
@@ -455,40 +455,39 @@ async def verify_ac_to_tests(
                 "You may create these without touching any dependency manifest -- a .NET test "
                 "project (e.g. apps/api.Tests/Api.Tests.csproj plus *Tests.cs) and/or JS/TS "
                 "*.test.ts files with a vitest.config.ts run on the sandbox's baked runners."
-            ),
-            report={"changed_paths": write_scope.changed_paths, "e2e_only": True},
-        )
-
-    # The mirror of the check above: a UI stack that wrote NO browser test at all. Both directions
-    # are enforced because each alone is satisfiable while dodging the other -- e2e-only stops at the
-    # outermost layer, and no-e2e leaves the running app unproven and (just as concretely) leaves the
-    # e2e stage with nothing to run, which is how every delivered branch ended up with zero
-    # screenshots and a blocked merge.
-    if not no_eligible_work and await _stack_has_ui(provider, thread_id):
-        resolved_root, strict = await _resolve_web_root(provider, thread_id)
-        has_e2e, diagnosis = _classify_e2e_paths(real_changes, resolved_root if strict else None)
-        if not has_e2e:
-            if strict and diagnosis == "missing" and await _e2e_dir_is_gitignored(provider, thread_id, resolved_root or ""):
-                diagnosis = "ignored"
-            where = (
-                f"under `{resolved_root}/tests/e2e/`" if resolved_root else "under the repo root's `tests/e2e/`"
             )
-            diagnosis_line = {
-                "missing": "Check the working tree before you answer again: no Playwright spec exists yet.",
-                "misplaced": (
-                    f"A file that looks like an e2e spec exists, but not {where} -- Playwright's "
-                    "`testDir: './tests/e2e'` will never discover or run it from wherever it actually "
-                    "landed, so it does not count."
-                ),
-                "ignored": (
-                    f"A `.gitignore` rule swallows anything written {where}, so even a real write "
-                    "there would never be tracked -- fix the ignore rule (or write elsewhere it "
-                    "isn't ignored) rather than rewriting the same spec again."
-                ),
-            }[diagnosis]
-            return VerificationResult(
-                passed=False,
-                feedback=(
+            content_report["e2e_only"] = True
+
+        # The mirror of the check above: a UI stack that wrote NO browser test at all. Both
+        # directions are enforced because each alone is satisfiable while dodging the other --
+        # e2e-only stops at the outermost layer, and no-e2e leaves the running app unproven and
+        # (just as concretely) leaves the e2e stage with nothing to run, which is how every
+        # delivered branch ended up with zero screenshots and a blocked merge. Independent of the
+        # pyramid check above (a different aspect of the same test set), so both are reported
+        # together when they both fire instead of costing two laps.
+        if not no_eligible_work and await _stack_has_ui(provider, thread_id):
+            resolved_root, strict = await _resolve_web_root(provider, thread_id)
+            has_e2e, diagnosis = _classify_e2e_paths(real_changes, resolved_root if strict else None)
+            if not has_e2e:
+                if strict and diagnosis == "missing" and await _e2e_dir_is_gitignored(provider, thread_id, resolved_root or ""):
+                    diagnosis = "ignored"
+                where = (
+                    f"under `{resolved_root}/tests/e2e/`" if resolved_root else "under the repo root's `tests/e2e/`"
+                )
+                diagnosis_line = {
+                    "missing": "Check the working tree before you answer again: no Playwright spec exists yet.",
+                    "misplaced": (
+                        f"A file that looks like an e2e spec exists, but not {where} -- Playwright's "
+                        "`testDir: './tests/e2e'` will never discover or run it from wherever it actually "
+                        "landed, so it does not count."
+                    ),
+                    "ignored": (
+                        f"A `.gitignore` rule swallows anything written {where}, so even a real write "
+                        "there would never be tracked -- fix the ignore rule (or write elsewhere it "
+                        "isn't ignored) rather than rewriting the same spec again."
+                    ),
+                }[diagnosis]
+                content_problems.append(
                     "You did NOT write a Playwright spec that this gate can see. Previous attempts "
                     "reported \"Added required Playwright e2e skeleton files beside the web app "
                     "(config + spec)\" four times in a row while making no write call for either "
@@ -504,9 +503,16 @@ async def verify_ac_to_tests(
                     "with 'playwright/test' loads two runner copies and playwright refuses to run), "
                     "set screenshot: 'on', take baseURL from process.env.BASE_URL, and locate "
                     "elements with getByTestId. Keep the tests below the UI that you already wrote."
-                ),
-                report={"changed_paths": write_scope.changed_paths, "missing_e2e": True, "e2e_diagnosis": diagnosis},
-            )
+                )
+                content_report["missing_e2e"] = True
+                content_report["e2e_diagnosis"] = diagnosis
+
+    all_problems = protection_problems + content_problems
+    if all_problems:
+        report: dict[str, Any] = {"changed_paths": write_scope.changed_paths, **content_report}
+        if protection_problems:
+            report["protection_problems"] = protection_problems
+        return VerificationResult(passed=False, feedback="\n\n".join(all_problems), report=report)
 
     coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}

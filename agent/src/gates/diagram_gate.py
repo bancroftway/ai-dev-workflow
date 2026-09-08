@@ -614,17 +614,15 @@ async def verify_plan_diagrams(
     # wireframes is WireframePresence-shaped (schemas.py, Task 10): `{"status", "values", "reason"}`
     # rather than a bare list -- extract its values once, reused by every check below.
     wireframes = _presence_values(content_dict.get("wireframes"))
+    # Aggregated, not early-returned (2026-09-07 audit): these three check independent aspects of
+    # the same content -- ledger/AC linkage, wireframe count, and per-wireframe HTML validity --
+    # with no ordering dependency between them, so union them into one lap's feedback instead of
+    # reporting only whichever hit first.
     linkage_problems = (
         check_plan_linkage(content_dict.get("plan_steps") or [], ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
         + check_wireframe_ac_ids(wireframes, ledger_entries)
         + check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
     )
-    if linkage_problems:
-        return VerificationResult(
-            passed=False,
-            feedback="; ".join(linkage_problems),
-            report={"plan_linkage_failed": linkage_problems},
-        )
 
     # Scope-lifecycle stamps for the Plan review UI (user requirement 2026-08-31, mirroring the
     # spec view's badges): each step inherits the strongest change classification of the criteria
@@ -632,7 +630,9 @@ async def verify_plan_diagrams(
     # reviewer sees which steps exist because of NEW scope, an UPDATE, or a promotion
     # ("activated"), and removal steps are recognizable by their removes_ids. Deterministic,
     # stamped in place (this verify's established contract -- see the wireframe preview_url
-    # stamping below).
+    # stamping below). Unconditional: harmless on a failing lap (the envelope this feeds is only
+    # ever built on a PASS, graph.py's make_verify_node), so it doesn't need to wait on
+    # linkage_problems.
     ac_change_by_id = {
         ac.get("id"): ac.get("change")
         for story in (spec_doc.get("user_stories") or [])
@@ -647,22 +647,24 @@ async def verify_plan_diagrams(
     # above (already computed; re-used here, not re-fetched from content_dict).
     diagrams = _presence_values(content_dict.get("diagrams"))
 
-    # Wireframes first: pure checks, no Chromium involved -- a broken wireframe should be cheap
-    # feedback, not a render cycle. Same retry loop as diagram syntax failures.
-    if len(wireframes) > MAX_WIREFRAMES:
-        return VerificationResult(
-            passed=False,
-            feedback=f"{len(wireframes)} wireframes exceeds the cap of {MAX_WIREFRAMES} -- keep only the screens this plan actually changes.",
-            report={"wireframes_rejected": "too_many"},
+    structural_problems = list(linkage_problems)
+    wireframes_too_many = len(wireframes) > MAX_WIREFRAMES
+    if wireframes_too_many:
+        structural_problems.append(
+            f"{len(wireframes)} wireframes exceeds the cap of {MAX_WIREFRAMES} -- keep only the screens this plan actually changes."
         )
     wireframe_errors = [
         err for wf in wireframes if (err := check_wireframe(wf.get("screen") or "", wf.get("html_source") or "")) is not None
     ]
-    if wireframe_errors:
-        return VerificationResult(passed=False, feedback="; ".join(wireframe_errors), report={"wireframes_failed": wireframe_errors})
-    for wf in wireframes:
-        await repo_files.write_repo_file(provider, thread_id, f"{WIREFRAMES_DIR}/{wf['screen']}.html", wf["html_source"])
-    if wireframes:
+    structural_problems.extend(wireframe_errors)
+
+    # Wireframes are only written to the sandbox once individually valid and within the cap
+    # (unchanged invariant) -- gated on wireframe_errors/count specifically, not on linkage
+    # problems elsewhere in the same content, since a bad AC citation has nothing to do with
+    # whether a given wireframe's own HTML is safe to persist.
+    if wireframes and not wireframe_errors and not wireframes_too_many:
+        for wf in wireframes:
+            await repo_files.write_repo_file(provider, thread_id, f"{WIREFRAMES_DIR}/{wf['screen']}.html", wf["html_source"])
         # Stamp a rendered-preview link onto each wireframe entry. In-place mutation of
         # content_dict is this verify's established contract (it already rewrites ids/fields before
         # the gate), so the link lands in approved_content and plan.md. Repo/branch come from the
@@ -678,37 +680,51 @@ async def verify_plan_diagrams(
             for wf in wireframes:
                 wf["preview_url"] = wireframe_preview_url(row["owner"], row["repo"], row["work_branch"], wf["screen"])
 
+    # Diagrams and wireframes are independent artifacts (2026-09-07 audit, confirmed by reading
+    # _render_one: it only ever touches diagram["name"]/["mermaid_source"], nothing wireframe-
+    # related) -- render regardless of any structural problem found above, so a broken wireframe
+    # and a failing diagram can both be reported in the same lap instead of costing two.
+    outcomes = [await _render_one(provider, thread_id, diagram) for diagram in diagrams] if diagrams else []
+    failures = [o for o in outcomes if not o.ok]
+    infra_failures = [o for o in failures if o.is_infra_failure]
+
+    if structural_problems or failures:
+        feedback_parts = list(structural_problems)
+        if failures:
+            if infra_failures:
+                # Distinct from a real syntax problem -- the draft node retrying with "fix your
+                # Mermaid syntax" feedback would be nonsensical here since the syntax was never
+                # actually checked.
+                feedback_parts.append(
+                    f"Diagram rendering infrastructure failure (mermaid-cli/Chromium), not a diagram syntax "
+                    f"problem -- affected: {[o.name for o in infra_failures]}. First error: "
+                    f"{infra_failures[0].stderr_tail}"
+                )
+            else:
+                feedback_parts.append(
+                    "; ".join(f"{o.name}: {_mermaid_error_summary(o.stderr_tail)}" for o in failures)
+                )
+        report: dict[str, Any] = {}
+        if linkage_problems:
+            report["plan_linkage_failed"] = linkage_problems
+        if wireframes_too_many:
+            report["wireframes_rejected"] = "too_many"
+        if wireframe_errors:
+            report["wireframes_failed"] = wireframe_errors
+        if failures:
+            report["failed"] = [o.name for o in failures]
+            report["infra_failure"] = bool(infra_failures)
+        return VerificationResult(passed=False, feedback="\n\n".join(feedback_parts), report=report)
+
     if not diagrams and not wireframes:
         return VerificationResult(passed=True, feedback="No diagrams or wireframes in this draft -- nothing to validate.", report={})
 
-    outcomes = [await _render_one(provider, thread_id, diagram) for diagram in diagrams]
-    failures = [o for o in outcomes if not o.ok]
-
-    if not failures:
-        commit_dirs = ([DIAGRAMS_DIR] if diagrams else []) + ([WIREFRAMES_DIR] if wireframes else [])
-        await git_ops.commit_paths(provider, thread_id, commit_dirs, "ai-dev-workflow: render plan diagrams + wireframes")
-        return VerificationResult(
-            passed=True,
-            feedback=f"All {len(diagrams)} diagram(s) rendered and {len(wireframes)} wireframe(s) validated.",
-            report={"rendered": [o.name for o in outcomes], "wireframes": [wf["screen"] for wf in wireframes]},
-        )
-
-    infra_failures = [o for o in failures if o.is_infra_failure]
-    if infra_failures:
-        # Distinct from a real syntax problem -- the draft node retrying with "fix your Mermaid
-        # syntax" feedback would be nonsensical here since the syntax was never actually checked.
-        feedback = (
-            f"Diagram rendering infrastructure failure (mermaid-cli/Chromium), not a diagram syntax "
-            f"problem -- affected: {[o.name for o in infra_failures]}. First error: "
-            f"{infra_failures[0].stderr_tail}"
-        )
-    else:
-        feedback = "; ".join(f"{o.name}: {_mermaid_error_summary(o.stderr_tail)}" for o in failures)
-
+    commit_dirs = ([DIAGRAMS_DIR] if diagrams else []) + ([WIREFRAMES_DIR] if wireframes else [])
+    await git_ops.commit_paths(provider, thread_id, commit_dirs, "ai-dev-workflow: render plan diagrams + wireframes")
     return VerificationResult(
-        passed=False,
-        feedback=feedback,
-        report={"failed": [o.name for o in failures], "infra_failure": bool(infra_failures)},
+        passed=True,
+        feedback=f"All {len(diagrams)} diagram(s) rendered and {len(wireframes)} wireframe(s) validated.",
+        report={"rendered": [o.name for o in outcomes], "wireframes": [wf["screen"] for wf in wireframes]},
     )
 
 
