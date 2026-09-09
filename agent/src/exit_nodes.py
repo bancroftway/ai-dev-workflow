@@ -334,6 +334,28 @@ def _divergence_ledger(snapshots: list[dict[str, Any]]) -> tuple[list[dict[str, 
     return rows, "\n".join(lines) + "\n"
 
 
+def _reconcile_divergence_risk_notes(divergence_rows: list[dict[str, Any]], existing_risk_notes: list[str]) -> list[str]:
+    """Deterministic reconciliation for exit_finalize_node: the drafting model writes its
+    merge_readiness prose WITHOUT ever seeing divergence_rows (computed later, from the ledger,
+    by a separate code path) -- observed live, it claimed divergence findings were "fixed and
+    re-verified" while this exact computation still showed them open, and nothing caught the
+    contradiction because nothing compared the two. Pure so the reconciliation itself is
+    self-checkable without a sandbox.
+
+    Every open row lands in risk_notes, never blocking_reasons: by construction it is always
+    severity minor (adversarial_gate blocks the stage from ever approving while a critical/major
+    finding remains open -- see BLOCKING_SEVERITIES), the same non-gating bucket the exit prompt
+    already uses for a scanner finding marked gating: false. This must never flip merge_ready.
+    """
+    notes = [
+        f"adversarial-compliance divergence still OPEN: {row['plan_reference']}: {row['description']} "
+        f"-- {row['proposed_resolution'] or '(no proposed resolution given)'}"
+        for row in divergence_rows
+        if row.get("status") == "open"
+    ]
+    return existing_risk_notes + [n for n in notes if n not in existing_risk_notes]
+
+
 async def _load_ledger_rows(provider: Any, thread_id: str) -> list[dict[str, Any]]:
     """Every parseable row of this attempt's workflow ledger, in write order (the ledger is reset
     at scaffold on every attempt, resumes included -- so this is one attempt, not the thread)."""
@@ -1411,6 +1433,15 @@ async def exit_finalize_node(
         divergence_rows, divergence_section = _divergence_ledger(
             [r for r in ledger_rows if r.get("node") == "divergence_snapshot" and r.get("run_id") == run_id]
         )
+        # Deterministic reconciliation -- see _reconcile_divergence_risk_notes's own docstring.
+        reconciled_risk_notes = _reconcile_divergence_risk_notes(
+            divergence_rows, _presence_values(merge_readiness.get("risk_notes"))
+        )
+        if reconciled_risk_notes != _presence_values(merge_readiness.get("risk_notes")):
+            merge_readiness["risk_notes"] = _presence_from_values(
+                reconciled_risk_notes,
+                empty_reason="unreachable: at least one note is always appended in this branch",
+            )
         stage_rows, stage_section = _stage_summary(ledger_rows, state.get("stages"), terminal_failure)
         # Remediation's approved report: known_gaps become the findings table's "known gap: <reason>"
         # dispositions, findings_addressed the "fixed by remediation" count. {} when remediation never
@@ -1798,6 +1829,17 @@ def _demo() -> None:
     assert _divergence_ledger([]) == ([], "")
     zero_rows, zero_section = _divergence_ledger([{"findings": []}])
     assert zero_rows == [] and "No divergences" in zero_section, zero_section
+
+    # _reconcile_divergence_risk_notes: an open row is force-included in risk_notes regardless of
+    # what the model already wrote there -- this is the fix for the exact contradiction above
+    # (report claims "fixed", ledger says open). A closed-only ledger changes nothing.
+    reconciled = _reconcile_divergence_risk_notes(rows, ["unrelated pre-existing note"])
+    assert "unrelated pre-existing note" in reconciled, reconciled
+    assert any("US-0002.1" in n and "still OPEN" in n for n in reconciled), reconciled
+    assert not any("Plan Step 4" in n for n in reconciled), reconciled  # closed rows are not notes
+    # Idempotent: reconciling again against its own output must not duplicate the note.
+    assert _reconcile_divergence_risk_notes(rows, reconciled) == reconciled, reconciled
+    assert _reconcile_divergence_risk_notes([], ["kept"]) == ["kept"]
 
     # _render_history_sections: "not recorded"/"no baseline" placeholders when data is absent,
     # real content when present, and a FIXED skeleton -- the screenshots section always renders,

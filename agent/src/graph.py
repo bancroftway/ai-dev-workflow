@@ -678,18 +678,19 @@ IMPECCABLE_CODEGEN_SEGMENT = (
 # IMPECCABLE_CRITIQUE_SEGMENT and IMPECCABLE_DEDUP_SEGMENT were deleted 2026-08-24: both lost
 # their only consumers when the standalone critique/dedup-simplify stages consolidated into
 # adversarial-compliance/remediation, and dead prompt segments read as wired when they aren't.
-# Re-added below, wired into adversarial-compliance's own build_prompt (see
-# _build_adversarial_compliance_prompt) instead of resurrecting the old unwired constant: that
-# stage's draft node IS its own audit (no separate audit pass), so it was the only UI-conformance
-# review before e2e, and without this segment contrast/craft-floor regressions went unflagged
-# until Lighthouse's color-contrast gate caught them live during e2e -- burning a full
-# browser+Playwright+Lighthouse attempt per fix instead of a critique-time prompt observation.
+# Re-added below, wired into minimal-code-to-green's AUDIT pass (see
+# _build_minimal_code_to_green_audit_prompt), which today gets no UI/craft-floor framing at all
+# even though the draft pass right before it does (IMPECCABLE_CODEGEN_SEGMENT above). Low
+# confidence this closes the gap on its own -- IMPECCABLE_CODEGEN_SEGMENT already tells the draft
+# pass to follow the same craft-floor rules and contrast regressions still shipped, only caught
+# later by Lighthouse's color-contrast gate during e2e -- but it's a genuinely unfilled hole in
+# this one pass, and cheap enough to add regardless.
 IMPECCABLE_CRITIQUE_SEGMENT = (
-    "This repository has a UI framework. While auditing the implemented UI against the approved"
-    " Plan, also load the `impeccable` skill and apply its craft-floor critique to every screen"
-    " you review: contrast, typography, layout, motion, and its absolute bans. Raise anything that"
-    " fails the craft floor as a divergence finding (severity per its actual impact -- a failed"
-    " WCAG contrast check is at least minor) rather than leaving it for a later stage to discover."
+    "This repository has a UI framework. While auditing this draft's implemented UI, also load the"
+    " `impeccable` skill and apply its craft-floor critique to every screen touched: contrast,"
+    " typography, layout, motion, and its absolute bans. Note anything that fails the craft floor"
+    " in `audit_findings` and include the correction in `revised_iteration` rather than leaving it"
+    " for a later stage to discover -- a failed WCAG contrast check is a gap like any other."
     f" The impeccable skill lives at {_IMPECCABLE_SKILL_DIR} -- its scripts run with plain `node`,"
     " but do not run them in this read-only session; the methodology is what matters here."
 )
@@ -1257,6 +1258,8 @@ def _build_minimal_code_to_green_audit_prompt(state: GraphState) -> list[BaseMes
         SystemMessage(content=MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Draft code-change iteration to audit (JSON):\n{stage['draft']}"),
     ]
+    if _tech_stack_has_ui_framework(state):
+        messages.append(HumanMessage(content=IMPECCABLE_CRITIQUE_SEGMENT))
     verify_feedback_message = _verification_feedback_message(stage)
     if verify_feedback_message is not None:
         messages.append(verify_feedback_message)
@@ -5643,6 +5646,27 @@ def _demo() -> None:
     assert not any(_VERIFY_FEEDBACK_MARKER in str(m.content) for m in spec_messages), (
         "reviewer_feedback alone must not fabricate a verification-feedback message"
     )
+
+    # IMPECCABLE_CRITIQUE_SEGMENT: appended to minimal-code-to-green's AUDIT prompt only for a
+    # UI-framework repo, same gate as the draft prompt's own UI segments. Monkeypatches the
+    # module-level gate function directly rather than hand-building a valid TechStack fixture
+    # (tech_stack_signals.presence_values routes through full TechStack validation) -- this test
+    # is about the gating call site, not tech-stack detection itself, which has its own coverage.
+    global _tech_stack_has_ui_framework
+    _original_ui_gate = _tech_stack_has_ui_framework
+    try:
+        _tech_stack_has_ui_framework = lambda _state: True  # noqa: E731
+        assert any(
+            IMPECCABLE_CRITIQUE_SEGMENT in str(m.content)
+            for m in _build_minimal_code_to_green_audit_prompt(verify_feedback_base_state)
+        ), "a UI-framework repo must get the craft-floor critique in the audit pass"
+        _tech_stack_has_ui_framework = lambda _state: False  # noqa: E731
+        assert not any(
+            IMPECCABLE_CRITIQUE_SEGMENT in str(m.content)
+            for m in _build_minimal_code_to_green_audit_prompt(verify_feedback_base_state)
+        ), "a non-UI repo must not get UI critique framing"
+    finally:
+        _tech_stack_has_ui_framework = _original_ui_gate
 
     print("graph self-check: all assertions passed")
 

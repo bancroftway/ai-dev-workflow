@@ -31,7 +31,7 @@ flowchart TD
     
     stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes EVERY actionable finding, any severity (autopilot, write+bash);<br/>unfixable ones need a per-id reason in known_gaps<br/>Gate: deterministic re-scan blocks any unexplained actionable finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
     
-    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>Auth-enforcement gate (repo setting + Key Vault secrets present):<br/>probes every route + API unauthenticated; a 2xx on a protected route joins the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
+    harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Connectivity preflight: page probe for a broken frontend&lt;-&gt;API proxy/CORS<br/>pinning (a live app that 404s or fetch-fails is caught before the suite's<br/>own pass count would hide it) -- failure joins the fix loop<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>Auth-enforcement gate (repo setting + Key Vault secrets present):<br/>probes every route + API unauthenticated; a 2xx on a protected route joins the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
     
     stage7["STAGE 7: ADVERSARIAL COMPLIANCE<br/>Closes the back half: audits finished repo vs approved Plan + wireframes<br/>Agent: adversarial-compliance-draft (read-only, full-repo review)<br/>Gate: deterministic claim-verification + fix prompt. Rebuild gate after<br/>(scan-delta placement re-runs ledger-integrity + retired-residue + completed-AC protection)."]
     
@@ -484,4 +484,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 1ce3386638011b2dda61b0ec03030451f764f3c6213d643008926f499ae9453c -->
+<!-- graph-source-sha256: dd2e3667ea504349201c1140e10d9b6891fa6cf639fc3d1145de8d9a071bf75d -->

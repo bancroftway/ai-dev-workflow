@@ -592,6 +592,33 @@ async def _capture_page_state(provider: Any, thread_id: str, port: int, route: s
         return {"status": None, "title": "", "errors": [f"page probe produced no JSON: {raw[:300]}"], "text": ""}
 
 
+_CONNECTIVITY_FAILURE_SIGNATURES = (
+    "econnrefused", "failed to fetch", "network error", "err_connection",
+    "upstream-unavailable", "connection refused",
+)
+
+
+def connectivity_preflight_error(route: str, port: int, state: dict[str, Any]) -> str | None:
+    """None when the probed page looks reachable, else a failed_tests-ready error string.
+
+    Pure (given an already-captured page state) so it's self-checkable without a sandbox. A
+    broken frontend<->API wiring (proxy target or CORS pinned to a port this attempt didn't get --
+    see _pick_free_port's own relocation-warning comment, and _api_env_names' Next.js incident)
+    often still serves a 200 shell page while every data-fetch inside it fails, so Playwright's
+    own pass/fail count alone won't name it -- the suite just reports "element never mounted" and
+    the fix loop guesses blind. Checked against the specific fetch-failure signatures already
+    observed live in this file's own history, not just a bare HTTP status.
+    """
+    haystack = (" ".join(str(e) for e in (state.get("errors") or [])) + " " + (state.get("text") or "")).lower()
+    status = state.get("status")
+    if status is not None and status < 400 and not any(sig in haystack for sig in _CONNECTIVITY_FAILURE_SIGNATURES):
+        return None
+    return (
+        f"base route {route} on port {port}: {summarise_page_state(route, state)} -- likely cause: the "
+        "frontend's own proxy/CORS target is pinned to a different port than this attempt's assigned port."
+    )
+
+
 def summarise_page_state(route: str, state: dict[str, Any]) -> str:
     """One human/model-readable line-set for a probed route. Pure, so it is self-checkable."""
     parts = [f"route {route} -> HTTP {state.get('status')}"]
@@ -950,6 +977,10 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             _scanned_launch_command(app), port, str(app.get("runtime") or "")
         )
 
+    # Hoisted from the screenshot section below (this is its only other consumer): needed earlier
+    # now that the connectivity preflight probes the same base route before the suite runs.
+    routes = [r for r in (launch.routes or []) if str(r).startswith("/")] or ["/"]
+
     # App secrets (keyvault.py): fetched on-behalf-of the user at provision time, injected here
     # as an env file sourced only into the app's own shell. Cache empty but a vault IS configured
     # means the agent restarted since provision -- an infra/user-action gap the e2e fix LLM can't
@@ -1274,7 +1305,6 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # wants a plain picture of each screen the app serves. Named after the route so the report can
     # label them, which is what makes "list of screens created" possible at all.
     shot_cmd = "npx playwright screenshot" if runner == "local" else "playwright screenshot"
-    routes = [r for r in (launch.routes or []) if str(r).startswith("/")] or ["/"]
     for index, route in enumerate(routes[:12], start=1):
         dest = f"{screens_dir}/{index:03d}-{_route_slug(route)}.png"
         # Escalating waits rather than one fixed pause: hydration time is genuinely variable, so no
@@ -1382,6 +1412,16 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             "failed_tests": [{"title": "e2e report", "error": f"{E2E_REPORT_PATH} was not written (suite exit code {suite_result.returncode})"}],
         }
     e2e.update(status="passed" if not parsed["failed_tests"] else "failed", **parsed)
+
+    # Connectivity preflight -- see connectivity_preflight_error's own docstring. Reuses the same
+    # page-probe helper the reactive diagnostic below uses, just run unconditionally.
+    probe_state = await _capture_page_state(provider, thread_id, port, routes[0])
+    preflight_error = connectivity_preflight_error(routes[0], port, probe_state)
+    if preflight_error is not None:
+        failures = list(e2e.get("failed_tests") or [])
+        failures.append({"title": "connectivity preflight", "error": preflight_error})
+        e2e["failed_tests"] = failures
+        e2e["status"] = "failed"
 
     # Lighthouse thresholds gate the same fix loop the suite does: a measured score below the floor
     # is a fixable defect with named audits, exactly the shape e2e_fix consumes. Fail-open when
@@ -1922,6 +1962,18 @@ def _demo() -> None:
     assert _config_keys_from_boot_error("'Stripe:Key' is not configured") == ["Stripe:Key"]
     assert _config_keys_from_boot_error("No connection string named 'Ledger' was found") == ["ConnectionStrings:Ledger"]
     assert _config_keys_from_boot_error("app started fine, port 3000") == []
+
+    # connectivity_preflight_error: a healthy 200 page with no fetch-failure signature passes;
+    # a broken proxy target (the exact live incident this check targets) is named specifically.
+    healthy = {"status": 200, "title": "Home", "errors": [], "text": "Welcome"}
+    assert connectivity_preflight_error("/", 5080, healthy) is None, healthy
+    unreachable_api = {
+        "status": 200, "title": "Home", "errors": ["fetch failed: ECONNREFUSED 127.0.0.1:5150"], "text": "",
+    }
+    err = connectivity_preflight_error("/", 5080, unreachable_api)
+    assert err is not None and "/" in err and "5080" in err, err
+    broken_shell = {"status": 404, "title": "", "errors": [], "text": ""}
+    assert connectivity_preflight_error("/", 5080, broken_shell) is not None
     print("e2e_nodes self-check: ok")
 
 
