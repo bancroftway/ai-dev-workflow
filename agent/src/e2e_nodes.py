@@ -53,6 +53,7 @@ from . import fake_idp, git_ops, keyvault, model_config, repo_files, repo_test_c
 from .chat_model import get_chat_model_for_thread, secret_env_names
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
+from .text_truncate import truncate_middle
 
 logger = logging.getLogger(__name__)
 from . import stack_runner, test_results
@@ -61,8 +62,8 @@ from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .tech_stack_signals import tech_stack_has_ui_framework
 
-E2E_APP_LOG_PATH = "agent-work/e2e-app.log"
-E2E_APP_PID_PATH = "agent-work/e2e-app.pid"
+E2E_APP_LOG_PATH = workflow_config.E2E_APP_LOG_PATH
+E2E_APP_PID_PATH = workflow_config.E2E_APP_PID_PATH
 E2E_REPORT_PATH = "agent-work/e2e-report.json"
 
 E2E_FIX_SYSTEM_PROMPT, E2E_FIX_HUMAN_TEMPLATE = load_prompt_pair("e2e_fix")
@@ -589,7 +590,11 @@ async def _capture_page_state(provider: Any, thread_id: str, port: int, route: s
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        return {"status": None, "title": "", "errors": [f"page probe produced no JSON: {raw[:300]}"], "text": ""}
+        return {
+            "status": None, "title": "",
+            "errors": [f"page probe produced no JSON: {raw[:workflow_config.E2E_PROBE_PREVIEW_CHARS]}"],
+            "text": "",
+        }
 
 
 _CONNECTIVITY_FAILURE_SIGNATURES = (
@@ -626,11 +631,11 @@ def summarise_page_state(route: str, state: dict[str, Any]) -> str:
         parts.append(f"title: {state['title']!r}")
     errors = state.get("errors") or []
     if errors:
-        parts.append("browser errors: " + " | ".join(str(e) for e in errors[:5]))
+        parts.append("browser errors: " + " | ".join(str(e) for e in errors[:workflow_config.E2E_CONSOLE_ERRORS_MAX]))
     text = (state.get("text") or "").strip()
     if text:
         # The rendered text IS the diagnosis when a framework paints its error overlay into the page.
-        parts.append(f"rendered text: {text[:600]!r}")
+        parts.append(f"rendered text: {text[:workflow_config.E2E_PAGE_TEXT_PREVIEW_CHARS]!r}")
     else:
         parts.append("rendered text: (empty -- the page painted nothing)")
     return "; ".join(parts)
@@ -639,7 +644,7 @@ def summarise_page_state(route: str, state: dict[str, Any]) -> str:
 # A screenshot of a page that rendered nothing is honest but carries no information, and five of them
 # look like evidence. Observed live: a failed run produced five PNGs of IDENTICAL 4254 bytes. Flagged
 # rather than deleted -- and never fatal, since two genuinely identical pages are possible.
-_DEGENERATE_PNG_MAX_BYTES = 8192
+_DEGENERATE_PNG_MAX_BYTES = workflow_config.E2E_DEGENERATE_PNG_MAX_BYTES
 
 
 # `playwright screenshot` shoots as soon as navigation resolves, which is BEFORE a client-rendered
@@ -659,7 +664,7 @@ _DEGENERATE_PNG_MAX_BYTES = 8192
 # slightly-early one. Escalating rather than fixed, because hydration time is variable (see the
 # capture loop's own comment): a fast stack pays only the first rung, a cold Blazor boot climbs.
 # Total worst case per route is ~28s, bounded by the 12-route cap on captures.
-_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS = (3000, 10000, 15000)
+_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS = workflow_config.E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS
 
 
 def degenerate_screenshots(sizes: dict[str, int]) -> list[str]:
@@ -1132,7 +1137,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             )
             booted_services.append((other, f"http://127.0.0.1:{other_port}"))
             continue
-        log_tail = (await repo_files.read_repo_file(provider, thread_id, other_log) or "")[-3000:]
+        log_tail = truncate_middle(
+            await repo_files.read_repo_file(provider, thread_id, other_log) or "",
+            workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
+            workflow_config.E2E_BOOT_FAILURE_LOG_TAIL_CHARS,
+        )
         e2e.update(
             status="failed", total=0, passed=0, screenshots=[],
             failed_tests=[{
@@ -1176,7 +1185,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     ready = await _wait_ready(provider, thread_id, port)
 
     if not ready:
-        log_tail = (await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "")[-3000:]
+        log_tail = truncate_middle(
+            await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
+            workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
+            workflow_config.E2E_BOOT_FAILURE_LOG_TAIL_CHARS,
+        )
         # Boot-error mop-up: a boot that died on a missing config value should surface that key on
         # the settings page, not just in the log. Best-effort; the failure text below still reaches
         # the fix loop either way.
@@ -1305,7 +1318,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # wants a plain picture of each screen the app serves. Named after the route so the report can
     # label them, which is what makes "list of screens created" possible at all.
     shot_cmd = "npx playwright screenshot" if runner == "local" else "playwright screenshot"
-    for index, route in enumerate(routes[:12], start=1):
+    for index, route in enumerate(routes[:workflow_config.E2E_ROUTES_MAX], start=1):
         dest = f"{screens_dir}/{index:03d}-{_route_slug(route)}.png"
         # Escalating waits rather than one fixed pause: hydration time is genuinely variable, so no
         # single number is right. Measured on the SAME app minutes apart -- 3s produced a fully
@@ -1351,7 +1364,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             # only chromium-headless-shell is baked and a full-chromium code path fails on it.
             logger.warning(
                 "e2e route screenshot failed for thread_id=%s route=%s: %s",
-                thread_id, route, (shot.stdout or "")[-500:],
+                thread_id, route, (shot.stdout or "")[-workflow_config.E2E_SCREENSHOT_STDOUT_TAIL_CHARS:],
             )
     e2e["screenshots"] = screenshots
     e2e["routes"] = routes
@@ -1492,7 +1505,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         }
         exempt_names = {
             f"{index:03d}-{_route_slug(route)}.png"
-            for index, route in enumerate(routes[:12], start=1)
+            for index, route in enumerate(routes[:workflow_config.E2E_ROUTES_MAX], start=1)
             if route in protected_routes
         }
         if exempt_names and e2e.get("degenerate_screenshots"):
@@ -1531,8 +1544,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         # app. So the guidance is the fix, not a description of the symptom.
         blank = e2e.get("degenerate_screenshots") or []
         if blank:
-            named = ", ".join(str(p).rsplit("/", 1)[-1] for p in blank[:5]) + (
-                f", and {len(blank) - 5} more" if len(blank) > 5 else ""
+            named = ", ".join(
+                str(p).rsplit("/", 1)[-1] for p in blank[:workflow_config.E2E_BLANK_SCREENSHOTS_PREVIEW_MAX]
+            ) + (
+                f", and {len(blank) - workflow_config.E2E_BLANK_SCREENSHOTS_PREVIEW_MAX} more"
+                if len(blank) > workflow_config.E2E_BLANK_SCREENSHOTS_PREVIEW_MAX else ""
             )
             failures.append({
                 "title": "blank screenshots",
@@ -1574,13 +1590,15 @@ _LH_EXTRACT_PY = (
     "    for item in ((v.get('details') or {}).get('items') or [])[:1]:\n"
     "        node=item.get('node') if isinstance(item,dict) else None\n"
     "        if isinstance(node,dict) and node.get('selector'):\n"
-    "            return str(node['selector'])[:120]\n"
+    f"            return str(node['selector'])[:{workflow_config.E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS}]\n"
     "    return None\n"
-    "f=[{'id':k,'title':(v.get('title') or '')[:120],'score':v.get('score'),'selector':sel(v)}\n"
+    f"f=[{{'id':k,'title':(v.get('title') or '')[:{workflow_config.E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS}],"
+    "'score':v.get('score'),'selector':sel(v)}\n"
     "   for k,v in (d.get('audits') or {}).items()\n"
     "   if isinstance(v.get('score'),(int,float)) and v['score']<0.9]\n"
     "f.sort(key=lambda a:a['score'])\n"
-    "print(json.dumps({'performance':s('performance'),'accessibility':s('accessibility'),'failing':f[:12]}))\n"
+    "print(json.dumps({'performance':s('performance'),'accessibility':s('accessibility'),"
+    f"'failing':f[:{workflow_config.E2E_LIGHTHOUSE_FAILING_AUDITS_MAX}]}}))\n"
 )
 # base64-piped rather than shlex-quoted inline: the script is full of single quotes, and
 # shlex.quote would embed '"'"' sequences that survive LocalDocker's argv-passed sh -c but break
@@ -1602,12 +1620,12 @@ async def _run_lighthouse(provider: Any, thread_id: str, port: int, routes: list
     per_route: dict[str, dict[str, Any]] = {}
     failing: list[dict[str, Any]] = []
     seen_audits: set[str] = set()
-    for index, route in enumerate(routes[:12], start=1):
+    for index, route in enumerate(routes[:workflow_config.E2E_ROUTES_MAX], start=1):
         report_file = f"/tmp/aidw-lighthouse-{index}.json"
         url = f"http://localhost:{port}{route}"
         run = await provider.exec_in_sandbox(
             thread_id,
-            f"timeout 150 lighthouse {shlex.quote(url)} --output=json "
+            f"timeout {workflow_config.E2E_LIGHTHOUSE_TIMEOUT_SECONDS} lighthouse {shlex.quote(url)} --output=json "
             f"--output-path={shlex.quote(report_file)} "
             "--only-categories=performance,accessibility "
             "--chrome-flags='--headless --no-sandbox --disable-gpu' --quiet 2>&1",
@@ -1621,7 +1639,8 @@ async def _run_lighthouse(provider: Any, thread_id: str, port: int, routes: list
             summary = json.loads((extract.stdout or "").strip())
         except json.JSONDecodeError:
             logger.warning(
-                "lighthouse produced no readable report for %s (tail: %s)", url, (run.stdout or "")[-300:]
+                "lighthouse produced no readable report for %s (tail: %s)",
+                url, (run.stdout or "")[-workflow_config.E2E_LIGHTHOUSE_STDOUT_TAIL_CHARS:],
             )
             continue
         if summary.get("performance") is None and summary.get("accessibility") is None:
@@ -1640,7 +1659,9 @@ async def _run_lighthouse(provider: Any, thread_id: str, port: int, routes: list
         "performance": min(perf_scores) if perf_scores else None,
         "accessibility": min(a11y_scores) if a11y_scores else None,
         "per_route": per_route,
-        "failing_audits": sorted(failing, key=lambda a: a.get("score") or 0)[:12],
+        "failing_audits": sorted(failing, key=lambda a: a.get("score") or 0)[
+            :workflow_config.E2E_LIGHTHOUSE_FAILING_AUDITS_MAX
+        ],
     }
 
 
@@ -1665,7 +1686,11 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         return {"e2e": e2e}
 
     provider = get_sandbox_provider()
-    log_tail = (await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "")[-4000:]
+    log_tail = truncate_middle(
+        await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
+        workflow_config.E2E_FIX_APP_LOG_HEAD_CHARS,
+        workflow_config.E2E_FIX_APP_LOG_TAIL_CHARS,
+    )
     prompt = render_prompt(
         E2E_FIX_HUMAN_TEMPLATE,
         failed_tests_json=json.dumps(e2e.get("failed_tests") or [], indent=2),

@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import git_ops, model_config, repo_files, run_failure, stack_runner, test_results, workflow_persistence
+from . import config, git_ops, model_config, repo_files, run_failure, stack_runner, test_results, workflow_persistence
 from .chat_model import close_session, get_chat_model_for_thread
 from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
@@ -100,12 +100,19 @@ async def _replay_build(provider: Any, thread_id: str, commands: list[dict[str, 
         result = await provider.exec_in_sandbox(thread_id, f"cd {shlex.quote(cwd)} && {command}")
         ok = ok and result.ok
         label = f"[{cwd}] $ {command} (exit {result.returncode})"
-        stdout_parts.append(f"{label}\n{(result.stdout or '')[-2000:]}")
-        stderr_parts.append(f"{label}\n{(result.stderr or '')[-2000:]}")
+        # 2000/4000 (pre-2026-09-09) truncated a multi-error compiler log to its last ~6-12 lines --
+        # observed live on a 126-error `dotnet build` (angular-dotnet, apps/api.Tests, CA1859/CA1861
+        # analyzer-as-error violations repeated near-identically across 9 test files): the fix agent
+        # only ever saw the last handful of errors each lap, so 3 fix cycles kept whack-a-moling the
+        # same trailing subset while the rest -- invisible every single lap -- never got touched.
+        # 8000/16000 is still bounded (not every log gets forwarded verbatim), just wide enough for a
+        # realistic multi-dozen-error build to actually reach the model that has to fix it.
+        stdout_parts.append(f"{label}\n{(result.stdout or '')[-config.REBUILD_OUTPUT_TAIL_CHARS:]}")
+        stderr_parts.append(f"{label}\n{(result.stderr or '')[-config.REBUILD_OUTPUT_TAIL_CHARS:]}")
     return BuildVerifyReport(
         success=ok, ok=ok,
-        stdout_tail="\n".join(stdout_parts)[-4000:],
-        stderr_tail="\n".join(stderr_parts)[-4000:],
+        stdout_tail="\n".join(stdout_parts)[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:],
+        stderr_tail="\n".join(stderr_parts)[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:],
         error=None if ok else "replayed build command(s) failed -- see stderr_tail",
         build_commands=[BuildCommand(**c) for c in commands if c.get("command")],
     )
@@ -248,14 +255,14 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
                 known_gap_ids=known_gap_ids,
             )
         ]
-        for f in gating[:10]:
+        for f in gating[:config.REBUILD_GATING_FINDINGS_MAX]:
             reasons.append(
                 f"  gating: [{f.severity}] {f.category}/{f.rule_id} @ {f.file or '?'}"
                 + (f":{f.line}" if f.line else "")
-                + f" -- {(f.title or f.message or '')[:110]}"
+                + f" -- {(f.title or f.message or '')[:config.REBUILD_FINDING_MESSAGE_CHARS]}"
             )
-        if len(gating) > 10:
-            reasons.append(f"  ...and {len(gating) - 10} more gating finding(s)")
+        if len(gating) > config.REBUILD_GATING_FINDINGS_MAX:
+            reasons.append(f"  ...and {len(gating) - config.REBUILD_GATING_FINDINGS_MAX} more gating finding(s)")
     if reasons:
         logger.warning("scan-delta gate: blocking on %d reason(s): %s", len(reasons), "; ".join(reasons))
     return reasons
@@ -394,7 +401,10 @@ async def _verify_all_red(
                 f"undelivered criteria ({', '.join(sorted(eligible_only))}) -- the RED tests for "
                 "them either were not written or do not name their criterion ids."
             )
-        names = ", ".join(passed[:10]) + (f", and {len(passed) - 10} more" if len(passed) > 10 else "")
+        names = ", ".join(passed[:config.REBUILD_PASSED_TESTS_PREVIEW_MAX]) + (
+            f", and {len(passed) - config.REBUILD_PASSED_TESTS_PREVIEW_MAX} more"
+            if len(passed) > config.REBUILD_PASSED_TESTS_PREVIEW_MAX else ""
+        )
         return False, (
             f"TDD-red gate (ticket scope): {len(passed)} test(s) for this ticket's undelivered "
             f"criteria PASSED after scaffolding ({failed} failed): {names}. Strip only THOSE code "
@@ -403,7 +413,10 @@ async def _verify_all_red(
         )
     all_red, passed, failed = red_gate_verdict(outcomes)
     if not all_red:
-        names = ", ".join(passed[:10]) + (f", and {len(passed) - 10} more" if len(passed) > 10 else "")
+        names = ", ".join(passed[:config.REBUILD_PASSED_TESTS_PREVIEW_MAX]) + (
+            f", and {len(passed) - config.REBUILD_PASSED_TESTS_PREVIEW_MAX} more"
+            if len(passed) > config.REBUILD_PASSED_TESTS_PREVIEW_MAX else ""
+        )
         return False, (
             f"TDD-red gate: {len(passed)} test(s) PASSED after scaffolding ({failed} failed): "
             f"{names}. Scaffolding must not implement behavior -- strip those code paths back to "
@@ -570,14 +583,18 @@ def make_rebuild_node(spec: RebuildSpec):
 
         rb["status"] = "clean" if build_ok else "failed"
         rb["last_exit_ok"] = build_ok
-        rb["last_stdout_tail"] = (report.stdout_tail or "")[-4000:]
+        # -16000, matching _replay_build's own cap above -- this used to re-truncate to -4000 on
+        # top of that, which quietly threw away most of what the wider cap just preserved (the
+        # fix prompt below reads exactly these two fields, so THIS slice, not _replay_build's, is
+        # what actually reaches the model).
+        rb["last_stdout_tail"] = (report.stdout_tail or "")[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:]
         # A red-gate violation replaces the (green) build's stderr as the fix node's feedback --
         # the passing test names are the actionable part, not a clean compiler log.
         rb["last_stderr_tail"] = (
             red_detail if red_failed
             else scan_detail if scan_detail
             else (report.stderr_tail or report.error or "")
-        )[-4000:]
+        )[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:]
         rebuild[spec.key] = rb
 
         ledger_entry: dict[str, Any] = {
@@ -585,13 +602,7 @@ def make_rebuild_node(spec: RebuildSpec):
             "verify": "replay" if replayed else "discovery",
         }
         if red_detail:
-            # 1500, not 300: this is the DURABLE record of why the red gate blocked, and the detail
-            # is a LIST of the tests that wrongly passed. 300 characters stopped inside the first
-            # entry ("41 test(s) PASSED after scaffolding (16 failed): [US-0001.1] displays the
-            # value..."), so the ledger recorded that the gate fired without recording what it
-            # found -- the same truncation that made an adversarial-compliance rejection
-            # unreadable in the run log.
-            ledger_entry["red_gate"] = red_detail[:1500]
+            ledger_entry["red_gate"] = red_detail[:config.REBUILD_LEDGER_DETAIL_CHARS]
         await repo_files.append_ledger_entry(provider, thread_id, ledger_entry)
         if build_ok:
             # A green build is the checkpoint where the code-writing sessions' source changes
@@ -693,7 +704,9 @@ def make_fix_node(spec: RebuildSpec):
             # report infra_transient/quota_exhausted if this stage does eventually escalate,
             # instead of looking like a genuine build defect.
             logger.warning("rebuild fix infra-exhausted for %s -- counting the lap: %s", spec.key, exc)
-            rb["last_stderr_tail"] = f"[infra failure, fix lap not attempted] {exc}"[-4000:]
+            rb["last_stderr_tail"] = (
+                f"[infra failure, fix lap not attempted] {exc}"
+            )[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:]
 
         rb["fix_cycle_count"] = rb["fix_cycle_count"] + 1
         rb["status"] = "fixing"
@@ -719,7 +732,7 @@ def make_escalate_node(spec: RebuildSpec):
             "stderr_tail": rb["last_stderr_tail"],
             # session_store._build_failure reads only feedback/report for failure_message -- without
             # this the DB row's message is empty and the support/UI surfaces show a bare type.
-            "feedback": (rb["last_stderr_tail"] or rb["last_stdout_tail"] or "")[-1000:],
+            "feedback": (rb["last_stderr_tail"] or rb["last_stdout_tail"] or "")[-config.REBUILD_ESCALATE_FEEDBACK_CHARS:],
         }
         payload = await run_failure.record_run_failure_and_reset(
             thread_id, state.get("run_id"),

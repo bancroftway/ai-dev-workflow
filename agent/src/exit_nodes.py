@@ -22,6 +22,7 @@ from . import config as workflow_config
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
+from .text_truncate import truncate_middle
 # Imported under this module's existing private name, not renamed at every call site: a LOCAL
 # `from .tech_stack_signals import ... presence_values` inside verify_exit_readiness (a completely
 # different, 2-arg function) shadows a bare module-level `presence_values` for that whole function
@@ -232,8 +233,11 @@ def _render_supply_chain_section(metrics_summary: dict[str, Any] | None) -> list
     for label, key in (("Added", "added"), ("Removed", "removed"), ("Version changed", "version_changed")):
         items = chain.get(key) or []
         if items:
-            shown = ", ".join(f"`{i}`" for i in items[:15])
-            more = f" ... and {len(items) - 15} more" if len(items) > 15 else ""
+            shown = ", ".join(f"`{i}`" for i in items[:workflow_config.EXIT_SBOM_DIFF_PREVIEW_MAX])
+            more = (
+                f" ... and {len(items) - workflow_config.EXIT_SBOM_DIFF_PREVIEW_MAX} more"
+                if len(items) > workflow_config.EXIT_SBOM_DIFF_PREVIEW_MAX else ""
+            )
             lines.append(f"- **{label}** ({len(items)}): {shown}{more}")
     return lines + [""]
 
@@ -252,7 +256,7 @@ def _failure_headline(run_failure: dict[str, Any]) -> str:
     """First non-empty line of the failure detail, single-line, bounded -- for the blocking bullet."""
     detail = _failure_detail(run_failure)
     first = next((line.strip() for line in detail.splitlines() if line.strip()), "")
-    return first[:300]
+    return first[:workflow_config.EXIT_FAILURE_HEADLINE_CHARS]
 
 
 def _render_terminal_failure(run_failure: dict[str, Any] | None) -> str:
@@ -271,7 +275,10 @@ def _render_terminal_failure(run_failure: dict[str, Any] | None) -> str:
         lines.append(f"- **Followed by**: {subsequent.get('stage')}: {subsequent.get('type')}")
     detail = _failure_detail(run_failure)
     if detail:
-        lines += ["", "```", detail[-2500:], "```"]
+        truncated = truncate_middle(
+            detail, workflow_config.EXIT_FAILURE_DETAIL_HEAD_CHARS, workflow_config.EXIT_FAILURE_DETAIL_TAIL_CHARS
+        )
+        lines += ["", "```", truncated, "```"]
     return "\n".join(lines) + "\n"
 
 
@@ -462,7 +469,10 @@ def _stage_summary(
             if row.get("red_gate") and str(row["red_gate"]).startswith("TDD-red gate"):
                 notes.append("TDD-red gate blocked")
         if node == "stage_report" and row.get("success") is False:
-            notes.append(f"tool run failed: {str(row.get('error') or row.get('summary') or '')[:80]}")
+            notes.append(
+                f"tool run failed: "
+                f"{str(row.get('error') or row.get('summary') or '')[:workflow_config.EXIT_TOOL_ERROR_SNIPPET_CHARS]}"
+            )
         if node == "run":
             notes.append(f"e2e {row.get('status')}: {row.get('passed')}/{row.get('total')} passed (attempt {row.get('attempt')})")
         if node == "run_tests":
@@ -535,7 +545,7 @@ def _stage_summary(
     return report_rows, "\n".join(lines) + "\n"
 
 
-def _md_cell(text: Any, limit: int = 90) -> str:
+def _md_cell(text: Any, limit: int = workflow_config.EXIT_MD_CELL_DEFAULT_CHARS) -> str:
     """Same |-escape + truncation idiom the US/AC table uses."""
     cell = str(text if text is not None else "").replace("\n", " ").replace("|", "\\|")
     return cell[: limit - 3] + "..." if len(cell) > limit else cell
@@ -554,7 +564,7 @@ def _finding_disposition(finding: dict[str, Any], known_gaps: list[str]) -> str:
     if accounted_for(finding_id, known_gaps):
         gap = next((str(g) for g in known_gaps if finding_id.lower() in str(g).lower()), "")
         reason = gap.split(finding_id, 1)[-1].lstrip(" :--") if finding_id in gap else gap
-        return _md_cell(f"known gap: {reason}" if reason else "known gap", 110)
+        return _md_cell(f"known gap: {reason}" if reason else "known gap", workflow_config.EXIT_KNOWN_GAP_CELL_CHARS)
     if finding.get("actionable"):
         return "open -- introduced after remediation, no disposition recorded"
     path = (finding.get("location") or {}).get("path")
@@ -567,7 +577,7 @@ def _finding_disposition(finding: dict[str, Any], known_gaps: list[str]) -> str:
     return "pre-existing quality debt (in baseline)"
 
 
-_FINDINGS_TABLE_CAP = 60
+_FINDINGS_TABLE_CAP = workflow_config.EXIT_FINDINGS_TABLE_CAP
 
 
 def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[str, Any] | None) -> list[str]:
@@ -616,7 +626,7 @@ def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[
             lines.append(
                 f"| {name} | {f'{weight:.0%}' if isinstance(weight, (int, float)) else '--'} "
                 f"| {sub if sub is not None else '--'} "
-                f"| {_md_cell(basis.get(name) or ('unmeasured, weight redistributed' if sub is None else ''), 100)} |"
+                f"| {_md_cell(basis.get(name) or ('unmeasured, weight redistributed' if sub is None else ''), workflow_config.EXIT_HEALTH_BASIS_CELL_CHARS)} |"
             )
         lines.append("")
 
@@ -643,9 +653,10 @@ def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[
                 where += f":{location['start_line']}"
             lines.append(
                 f"| {finding.get('severity')} | {finding.get('category')} "
-                f"| {_md_cell(', '.join(finding.get('tools') or []), 40)} "
-                f"| {_md_cell(finding.get('rule_id') or finding.get('cve') or '', 40)} "
-                f"| {_md_cell(finding.get('title'), 70)} | {_md_cell(where, 60)} "
+                f"| {_md_cell(', '.join(finding.get('tools') or []), workflow_config.EXIT_FINDING_TOOLS_CELL_CHARS)} "
+                f"| {_md_cell(finding.get('rule_id') or finding.get('cve') or '', workflow_config.EXIT_FINDING_RULE_ID_CELL_CHARS)} "
+                f"| {_md_cell(finding.get('title'), workflow_config.EXIT_FINDING_TITLE_CELL_CHARS)} "
+                f"| {_md_cell(where, workflow_config.EXIT_FINDING_WHERE_CELL_CHARS)} "
                 f"| {'yes' if finding.get('gating') else 'no'} "
                 f"| {_finding_disposition(finding, known_gaps)} |"
             )
@@ -660,9 +671,9 @@ def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[
         lines += ["| Tool | Version | State | Duration | Findings | Notes |", "|---|---|---|---|---|---|"]
         for tool in tools:
             lines.append(
-                f"| {tool.get('name')} | {_md_cell(tool.get('version') or '--', 45)} "
+                f"| {tool.get('name')} | {_md_cell(tool.get('version') or '--', workflow_config.EXIT_TOOL_VERSION_CELL_CHARS)} "
                 f"| {str(tool.get('status') or '--').upper()} | {_fmt_tool_duration(tool.get('duration_ms'))} "
-                f"| {tool.get('findings', '--')} | {_md_cell(tool.get('notes') or '', 60)} |"
+                f"| {tool.get('findings', '--')} | {_md_cell(tool.get('notes') or '', workflow_config.EXIT_TOOL_NOTES_CELL_CHARS)} |"
             )
     else:
         lines.append("No tool run records in this scan.")
@@ -950,9 +961,7 @@ def _render_us_ac_section(
     else:
         lines += ["| Id | Change | Title / Description | UI | Coded (run) | Tested (run) | Tests |", "|---|---|---|---|---|---|---|"]
         for r in rows:
-            desc = (r.get("title_or_description") or "").replace("|", "\\|")
-            if len(desc) > 90:
-                desc = desc[:87] + "..."
+            desc = _md_cell(r.get("title_or_description") or "", 90)
             if r.get("kind") == "user_story":
                 desc = f"**{desc}**"
             ui_related = r.get("ui_related")
@@ -963,8 +972,8 @@ def _render_us_ac_section(
             tested = r.get("tested_run_id") or "--"
             if tested != "--" and r.get("tested_run_id") == run_id:
                 tested = f"{tested} (this run)"
-            tests = ", ".join((r.get("test_ids") or [])[:3])
-            extra = len(r.get("test_ids") or []) - 3
+            tests = ", ".join((r.get("test_ids") or [])[:workflow_config.EXIT_TEST_IDS_PREVIEW_MAX])
+            extra = len(r.get("test_ids") or []) - workflow_config.EXIT_TEST_IDS_PREVIEW_MAX
             if extra > 0:
                 tests += f", +{extra} more"
             lines.append(
@@ -1186,7 +1195,8 @@ async def verify_exit_readiness(
         logger.warning(
             "exit verify: dropping %d blocking reason(s) this run's regression gate did not raise "
             "(carried over from an earlier report): %s",
-            len(stale_reasons), "; ".join(r[:120] for r in stale_reasons),
+            len(stale_reasons),
+            "; ".join(r[:workflow_config.EXIT_STALE_REASON_LOG_CHARS] for r in stale_reasons),
         )
         content_dict["blocking_reasons"] = _presence_from_values(
             kept_reasons,

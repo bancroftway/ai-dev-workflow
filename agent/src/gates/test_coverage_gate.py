@@ -25,7 +25,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -34,17 +33,18 @@ from typing import TYPE_CHECKING, Any
 import defusedxml.ElementTree as ET
 from pydantic import BaseModel, Field
 
-from .. import repo_files, stack_runner, tech_stack_signals, workflow_persistence
+from .. import config, repo_files, stack_runner, tech_stack_signals, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
+from ..text_truncate import truncate_middle
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
 logger = logging.getLogger(__name__)
 
-MIN_COVERAGE_PERCENT = float(os.environ.get("MIN_COVERAGE_PERCENT", "95.0"))
+MIN_COVERAGE_PERCENT = config.MIN_COVERAGE_PERCENT
 
 # The only strings `measure_coverage` may return as its "reason" -- this value ends up in
 # repo_scan's `metrics.coverage.reason`, which IS hashed into ScanReport.content_hash (see
@@ -61,8 +61,8 @@ STABLE_REASON_CODES = frozenset(
     {REASON_TIMEOUT, REASON_RUNNER_ERROR, REASON_PARSE_ERROR, REASON_CONTRACT_REPLAY_FAILED, REASON_NO_TOOLING_MAPPING}
 )
 
-COVERAGE_COMMANDS_PATH = ".ai-dev-workflow/coverage-commands.json"
-_CONTRACT_FORMATS = ("cobertura", "istanbul-json-summary")
+COVERAGE_COMMANDS_PATH = config.COVERAGE_COMMANDS_PATH
+_CONTRACT_FORMATS = config.CONTRACT_FORMATS
 
 
 class CoverageEntry(BaseModel):
@@ -393,7 +393,7 @@ async def _check_integration_fidelity(
     )
     backend_paths += [line.strip() for line in (project_files.stdout or "").splitlines() if line.strip()]
     texts: dict[str, str] = {}
-    for path in sorted(set(backend_paths))[:25]:
+    for path in sorted(set(backend_paths))[:config.TEST_COVERAGE_BACKEND_FILES_MAX]:
         content = await repo_files.read_repo_file(provider, thread_id, path)
         if content is not None:
             texts[path] = content
@@ -423,7 +423,7 @@ async def _check_integration_fidelity(
         if line.strip() and not _non_app(line.strip())
     ]
     otel_extra_texts: dict[str, str] = {}
-    for path in sorted(set(otel_extra_paths))[:14]:
+    for path in sorted(set(otel_extra_paths))[:config.TEST_COVERAGE_OTEL_EXTRA_FILES_MAX]:
         content = await repo_files.read_repo_file(provider, thread_id, path)
         if content is not None:
             otel_extra_texts[path] = content
@@ -478,7 +478,7 @@ async def _check_integration_fidelity(
         and not is_non_application_path(p)
     ]
     frontend_texts: dict[str, str] = {}
-    for path in frontend_candidates[:30]:
+    for path in frontend_candidates[:config.TEST_COVERAGE_FRONTEND_CANDIDATES_MAX]:
         content = await repo_files.read_repo_file(provider, thread_id, path)
         if content is not None:
             frontend_texts[path] = content
@@ -562,7 +562,7 @@ async def _missing_declared_frontend(
             return by_signature  # nothing to check against; trust the signature verdict
         # Satisfied if ANY manifest actually depends on the framework -- which package.json owns
         # the frontend is the repo's own layout decision, not this gate's to dictate.
-        for manifest_path in manifests[:10]:
+        for manifest_path in manifests[:config.TEST_COVERAGE_MANIFESTS_MAX]:
             raw_manifest = await repo_files.read_repo_file(provider, thread_id, manifest_path)
             if missing_frontend_dependency(names, raw_manifest) is None:
                 return None
@@ -694,7 +694,10 @@ def _parse_cobertura_counts(raw_xml: str) -> tuple[_Counts | None, str]:
             # Name the exact lines whose branches are only half-taken -- that is the actionable
             # part; a bare percentage tells the model nothing about which case it forgot to test.
             if uncovered_lines:
-                name = f"{name} (partially-covered branch lines: {', '.join(uncovered_lines[:20])})"
+                name = (
+                    f"{name} (partially-covered branch lines: "
+                    f"{', '.join(uncovered_lines[:config.TEST_COVERAGE_UNCOVERED_LINES_MAX])})"
+                )
             gaps.append(CoverageGap(file=name, line_rate=cls_line_rate, branch_rate=cls_branch_rate))
     if lt <= 0:
         return None, "every instrumented line is in generated code -- nothing authored was measured"
@@ -739,7 +742,7 @@ def _parse_istanbul_counts(raw: str) -> tuple[_Counts | None, str]:
 
 # Per-command ceiling for a deterministic contract replay (same knob repo_scan's own coverage
 # leg honours; a hung `dotnet test` must not stall the gate forever).
-_REPLAY_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIMEOUT_SECONDS", "600"))
+_REPLAY_TIMEOUT_SECONDS = config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS
 
 
 def _load_coverage_contract(raw: str | None) -> list[CoverageEntry]:
@@ -785,7 +788,12 @@ async def _replay_coverage_contract(
         result = await provider.exec_in_sandbox(thread_id, command)
         runs.append({
             "root": root, "command": entry.command, "exit_code": result.returncode,
-            "stdout_tail": (result.stdout or "")[-1500:], "stderr_tail": (result.stderr or "")[-1500:],
+            "stdout_tail": truncate_middle(
+                result.stdout or "", config.TEST_COVERAGE_OUTPUT_HEAD_CHARS, config.TEST_COVERAGE_OUTPUT_TAIL_CHARS
+            ),
+            "stderr_tail": truncate_middle(
+                result.stderr or "", config.TEST_COVERAGE_OUTPUT_HEAD_CHARS, config.TEST_COVERAGE_OUTPUT_TAIL_CHARS
+            ),
         })
     return runs
 
@@ -835,7 +843,12 @@ async def _run_coverage_via_ghcp(
         replay_runs = await _replay_coverage_contract(provider, thread_id, contract)
         entries = contract
         failure_detail = "; ".join(
-            f"[{r['root']}] `{r['command']}` exited {r['exit_code']}: {(r['stderr_tail'] or r['stdout_tail'])[-300:]}"
+            f"[{r['root']}] `{r['command']}` exited {r['exit_code']}: "
+            + truncate_middle(
+                r['stderr_tail'] or r['stdout_tail'],
+                config.TEST_COVERAGE_FAILURE_DETAIL_HEAD_CHARS,
+                config.TEST_COVERAGE_FAILURE_DETAIL_TAIL_CHARS,
+            )
             for r in replay_runs
         )
     else:
@@ -865,7 +878,7 @@ async def _run_coverage_via_ghcp(
     entry_reports: list[dict[str, Any]] = []
     if replay_runs:
         entry_reports.append({"replay": replay_runs})
-    for entry in entries[:10]:  # bounded: dozens of entries is itself suspect
+    for entry in entries[:config.TEST_COVERAGE_CONTRACT_ENTRIES_MAX]:  # bounded: dozens of entries is itself suspect
         detail: dict[str, Any] = {"entry": entry.model_dump()}
         entry_reports.append(detail)
         try:
@@ -912,7 +925,7 @@ async def _run_coverage_via_ghcp(
         entries = await _discover()
         replay_runs = []
         merged, entry_reports = [], []
-        for entry in entries[:10]:
+        for entry in entries[:config.TEST_COVERAGE_CONTRACT_ENTRIES_MAX]:
             detail = {"entry": entry.model_dump()}
             entry_reports.append(detail)
             try:
@@ -1362,11 +1375,14 @@ async def verify_coverage(
     # -- observed live: every branch stuck across 8 flat laps was a `??`/ternary fallback the
     # code could never produce).
     gap_snippets: list[str] = []
-    for gap in gaps[:6]:
+    for gap in gaps[:config.TEST_COVERAGE_GAP_DETAIL_MAX]:
         anno = re.match(r"(.+?) \(partially-covered branch lines: ([0-9, ]+)\)$", gap.file)
         if not anno:
             continue
-        rel_name, nums = anno.group(1), [n.strip() for n in anno.group(2).split(",") if n.strip()][:6]
+        rel_name, nums = (
+            anno.group(1),
+            [n.strip() for n in anno.group(2).split(",") if n.strip()][:config.TEST_COVERAGE_GAP_DETAIL_MAX],
+        )
         awk = (
             f"awk -v ns={shlex.quote(','.join(nums))} "
             "'BEGIN{split(ns,a,\",\"); for(i in a) want[a[i]]=1} (NR in want){printf \"    line %d: %s\\n\", NR, $0}'"

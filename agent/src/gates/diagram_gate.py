@@ -22,10 +22,11 @@ from typing import TYPE_CHECKING, Any
 
 import json
 
-from .. import git_ops, repo_files, spec_ledger, workflow_persistence
+from .. import config, git_ops, repo_files, spec_ledger, workflow_persistence
 from ..failure_classification import classify_failure
 from ..sandbox.provider import SandboxProvider
 from ..schemas import presence_values as _presence_values
+from ..text_truncate import truncate_middle
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
@@ -42,8 +43,8 @@ def wireframe_preview_url(owner: str, repo: str, branch: str, screen: str) -> st
         f"https://github.com/{owner}/{repo}/blob/{branch}/{WIREFRAMES_DIR}/{screen}.html"
     )
 
-MAX_WIREFRAMES = 6
-MAX_WIREFRAME_BYTES = 30 * 1024
+MAX_WIREFRAMES = config.DIAGRAM_MAX_WIREFRAMES
+MAX_WIREFRAME_BYTES = config.DIAGRAM_MAX_WIREFRAME_BYTES
 
 # Trust-boundary checks on model-emitted wireframe HTML. This denylist is hygiene for the
 # committed artifact, NOT the security boundary -- the frontend confines every wireframe (both
@@ -277,7 +278,7 @@ def _mermaid_error_summary(output: str) -> str:
     draft node burned three verify cycles live -- the model never saw what was wrong. Keep the
     first meaningful lines, drop stack frames."""
     lines = [l.strip() for l in output.splitlines() if l.strip() and not l.lstrip().startswith("at ")]
-    return " | ".join(lines[:10])[:700]
+    return " | ".join(lines[:config.DIAGRAM_ERROR_SUMMARY_LINES_MAX])[:config.DIAGRAM_ERROR_SUMMARY_JOINED_CHARS]
 
 
 _SAFE_DIAGRAM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -324,10 +325,8 @@ async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[s
     # error survives on a long output AND the tail is still there for a failure that only shows up
     # at the end (a crash, a non-zero exit message).
     raw_output = result.stdout or result.stderr or ""
-    stderr_tail = (
-        raw_output
-        if len(raw_output) <= 4000
-        else f"{raw_output[:2000]}\n...[{len(raw_output) - 4000} chars omitted]...\n{raw_output[-2000:]}"
+    stderr_tail = truncate_middle(
+        raw_output, config.DIAGRAM_ERROR_SUMMARY_HEAD_CHARS, config.DIAGRAM_ERROR_SUMMARY_TAIL_CHARS
     )
     # Infra unless mmdc actually named a source problem -- see _MERMAID_SYNTAX_MARKERS. The
     # classify_failure call stays as the first test so this gate keeps agreeing with the rest of

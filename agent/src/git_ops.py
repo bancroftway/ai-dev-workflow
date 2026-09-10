@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from . import config
 from .sandbox.provider import SandboxProvider
 
 from .repo_files import validate_repo_relative_path
@@ -72,7 +73,7 @@ async def open_pull_request(
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=config.GIT_OPS_HTTP_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.post(
                 f"https://api.github.com/repos/{owner}/{repo}/pulls",
@@ -101,7 +102,7 @@ async def open_pull_request(
 
         logger.warning(
             "open_pull_request failed for %s/%s %s->%s: %s %s",
-            owner, repo, work_branch, source_branch, resp.status_code, resp.text[:300],
+            owner, repo, work_branch, source_branch, resp.status_code, resp.text[:config.GIT_OPS_API_ERROR_PREVIEW_CHARS],
         )
         return None
 
@@ -123,7 +124,7 @@ async def update_pull_request(*, owner: str, repo: str, pr_url: str, body: str, 
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=config.GIT_OPS_HTTP_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.patch(
                 f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}",
@@ -136,7 +137,8 @@ async def update_pull_request(*, owner: str, repo: str, pr_url: str, body: str, 
         if resp.status_code == 200:
             return True
         logger.warning(
-            "update_pull_request failed for %s/%s#%d: %s %s", owner, repo, number, resp.status_code, resp.text[:300],
+            "update_pull_request failed for %s/%s#%d: %s %s",
+            owner, repo, number, resp.status_code, resp.text[:config.GIT_OPS_API_ERROR_PREVIEW_CHARS],
         )
         return False
 
@@ -157,7 +159,7 @@ async def delete_remote_branch(*, owner: str, repo: str, branch: str, token: str
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=config.GIT_OPS_HTTP_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.delete(
                 f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}", headers=headers
@@ -168,7 +170,8 @@ async def delete_remote_branch(*, owner: str, repo: str, branch: str, token: str
     if resp.status_code in (204, 404):
         return True
     logger.warning(
-        "delete_remote_branch failed for %s/%s@%s: %s %s", owner, repo, branch, resp.status_code, resp.text[:300]
+        "delete_remote_branch failed for %s/%s@%s: %s %s",
+        owner, repo, branch, resp.status_code, resp.text[:config.GIT_OPS_API_ERROR_PREVIEW_CHARS]
     )
     return False
 
@@ -205,7 +208,7 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
     result = await provider.exec_in_sandbox(thread_id, command)
     _LAST_PUSH[thread_id] = {
         "ok": result.ok,
-        "error": None if result.ok else (result.stderr or result.stdout or "push failed")[-500:],
+        "error": None if result.ok else (result.stderr or result.stdout or "push failed")[-config.GIT_OPS_PUSH_ERROR_TAIL_CHARS:],
         "at": datetime.now(timezone.utc).isoformat(),
     }
     if not result.ok:
@@ -549,7 +552,8 @@ async def ignore_generated_files(provider: SandboxProvider, thread_id: str) -> l
     logger.info(
         "gitignore: %d generated path(s) detected and ignored: %s",
         len(missing),
-        ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else ""),
+        ", ".join(missing[:config.GIT_OPS_GITIGNORE_PREVIEW_MAX])
+        + (" ..." if len(missing) > config.GIT_OPS_GITIGNORE_PREVIEW_MAX else ""),
     )
     return missing
 

@@ -139,7 +139,23 @@ async def run(args: argparse.Namespace) -> int:
     from src import checkpoint
 
     await checkpoint.attach_sqlite_checkpointer(graph)
+    # close_checkpointer here is load-bearing, not cosmetic: aiosqlite's Connection spawns its
+    # worker thread as non-daemon (aiosqlite/core.py Connection.__init__: `Thread(target=...)`,
+    # no daemon=True), so an open connection blocks process exit forever even after this
+    # coroutine returns/raises -- sys.exit() only raises SystemExit in the main thread, the
+    # interpreter still waits on every live non-daemon thread. Observed live 2026-09-09: five
+    # run_headless.py processes (one this run's own) sat alive for hours after finishing --
+    # each had printed its final report and had nothing left to do -- because nothing here ever
+    # closed the connection this attach opened. try/finally around the whole pipeline is the fix;
+    # a bare call after the pipeline would skip it on any raised exception, which is exactly the
+    # case (a provisioning failure, an unhandled node error) most likely to need cleanup most.
+    try:
+        return await _run_pipeline(args)
+    finally:
+        await checkpoint.close_checkpointer()
 
+
+async def _run_pipeline(args: argparse.Namespace) -> int:
     requirements = Path(args.requirements_file).read_text(encoding="utf-8")
     if not requirements.strip():
         logger.error("requirements file is empty")

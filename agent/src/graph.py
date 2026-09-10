@@ -1285,7 +1285,7 @@ def _build_exit_prompt(state: GraphState, stage_key: str = "metrics-exit") -> li
         SystemMessage(content=EXIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{state['stages']['specification']['approved_content']}"),
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{state['stages']['plan']['approved_content']}"),
-        HumanMessage(content=f"metrics-report metrics summary (JSON):\n\n{_bounded_json(metrics_compute, 8000)}"),
+        HumanMessage(content=f"metrics-report metrics summary (JSON):\n\n{_bounded_json(metrics_compute, workflow_config.GRAPH_METRICS_JSON_MAX_CHARS)}"),
     ]
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior report (JSON):\n{stage['draft']}"))
@@ -1380,7 +1380,7 @@ def _bounded_json(payload: Any, limit: int) -> str:
             "_truncated": True,
             "_original_chars": len(text),
             "_note": "payload exceeded the prompt budget; `preview` is the leading fragment",
-            "preview": text[: max(0, limit - 240)],
+            "preview": text[: max(0, limit - workflow_config.GRAPH_BOUNDED_JSON_MARGIN_CHARS)],
         },
         default=str,
     )
@@ -1403,7 +1403,7 @@ def _build_adversarial_compliance_prompt(state: GraphState) -> list[BaseMessage]
         "status": e2e.get("status"),
         "passed": e2e.get("passed"),
         "total": e2e.get("total"),
-        "failed_tests": (e2e.get("failed_tests") or [])[:10],
+        "failed_tests": (e2e.get("failed_tests") or [])[:workflow_config.GRAPH_FAILED_TESTS_MAX],
         "screenshots": e2e.get("screenshots") or [],
         "skipped_reason": e2e.get("skipped_reason"),
         # Its own key, NOT competing for the failed_tests[:10] slots: a 12-route auth failure
@@ -1414,7 +1414,7 @@ def _build_adversarial_compliance_prompt(state: GraphState) -> list[BaseMessage]
         SystemMessage(content=ADVERSARIAL_COMPLIANCE_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{state['stages']['specification']['approved_content']}"),
         HumanMessage(content=f"Approved Implementation Plan (JSON):\n\n{state['stages']['plan']['approved_content']}"),
-        HumanMessage(content=f"End-to-end run outcome (JSON):\n\n{_bounded_json(e2e_summary, 4000)}"),
+        HumanMessage(content=f"End-to-end run outcome (JSON):\n\n{_bounded_json(e2e_summary, workflow_config.GRAPH_E2E_SUMMARY_JSON_MAX_CHARS)}"),
     ]
     stage = state["stages"]["adversarial-compliance"]
     verify_feedback_message = _verification_feedback_message(stage)
@@ -2702,7 +2702,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             logger.warning("draft infra-exhausted for stage %s -- escalating without consuming cycle_count", stage_spec.key, exc_info=exc)
             stages = {key: dict(value) for key, value in state["stages"].items()}
             stages[stage_spec.key]["infra_exhausted"] = True
-            stages[stage_spec.key]["last_infra_error"] = str(exc)[-2000:]
+            stages[stage_spec.key]["last_infra_error"] = str(exc)[-workflow_config.GRAPH_INFRA_ERROR_CHARS:]
             if not stages[stage_spec.key].get("skills"):
                 stages[stage_spec.key]["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
             return {"stages": stages}
@@ -3212,7 +3212,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 logger.warning(
                     "%s: INFRA RETRY %d/%d -- %s",
                     stage_spec.key, stage["infra_retry_count"], workflow_config.VERIFY_INFRA_RETRY_CAP,
-                    " ".join((result.feedback or "no feedback").split())[:1200],
+                    " ".join((result.feedback or "no feedback").split())[:workflow_config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS],
                 )
             else:
                 stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
@@ -3220,16 +3220,11 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 # followed by <stage>_draft again, with no reason. Diagnosing a thrashing stage then
                 # means reconstructing it from whatever the failing sub-system happened to log, which
                 # is exactly how an audit outage masqueraded as "the plan keeps getting rejected".
-                # 1200, not 300: a single-line gate verdict fits in 300, but an adversarial-compliance
-                # rejection is a LIST of findings and 300 characters stops inside the first one --
-                # observed live, the log preserved only "[major] PS-1 (scaffol" and the rest of the
-                # audit was unrecoverable from disk, since state.json holds the hydration snapshot
-                # rather than in-flight state. A truncated reason is barely better than no reason: the
-                # whole point of this line is that a thrash explains itself without a container autopsy.
+                # See config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS for why this preview isn't shorter.
                 logger.warning(
                     "%s: REDRAFT %d/%d -- %s",
                     stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles,
-                    " ".join((result.feedback or "no feedback").split())[:1200],
+                    " ".join((result.feedback or "no feedback").split())[:workflow_config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS],
                 )
             # Reset the session ONLY when the stage fabricated -- i.e. claimed work while writing
             # nothing but pipeline artifacts. That specific failure is self-reinforcing: the false
@@ -3497,7 +3492,10 @@ def make_draft_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, Run
         thread_id = config["configurable"]["thread_id"]
         stage = state["stages"][stage_spec.key]
         detail = stage.get("last_infra_error") or ""
-        payload = {"stage": stage_spec.key, "type": "draft_infra_exhausted", "detail": detail[-2000:]}
+        # No re-slice here: `detail` was already capped to GRAPH_INFRA_ERROR_CHARS when
+        # last_infra_error was written above, so a second [-N:] on an already-short string was
+        # always a no-op -- removed rather than parameterized.
+        payload = {"stage": stage_spec.key, "type": "draft_infra_exhausted", "detail": detail}
         prior_failure = state.get("run_failure")
         if prior_failure:
             # Same first-cause preservation as make_escalate_node below: a run already carrying a
