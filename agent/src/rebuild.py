@@ -24,7 +24,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import config, git_ops, model_config, repo_files, run_failure, stack_runner, test_results, workflow_persistence
+from . import config, git_ops, model_config, repo_files, run_event_store, run_event_stream, run_failure, stack_runner, test_results, workflow_persistence
+from .run_events import RunEvent, RunEventType
 from .chat_model import close_session, get_chat_model_for_thread
 from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
@@ -427,8 +428,13 @@ async def _verify_all_red(
 
 
 def make_rebuild_node(spec: RebuildSpec):
-    async def rebuild_node(state: dict[str, Any], config) -> dict[str, Any]:
-        thread_id = config["configurable"]["thread_id"]
+    async def rebuild_node(state: dict[str, Any], run_config) -> dict[str, Any]:
+        # Named run_config, not config -- config.py's module import above is used throughout this
+        # function (config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS etc.); a same-named parameter here
+        # silently shadows it for the rest of the function body, resolving every config.CONSTANT
+        # read to this RunnableConfig dict instead and crashing with AttributeError (root-caused
+        # 2026-09-11, introduced by the output-truncation/config refactor before this fix).
+        thread_id = run_config["configurable"]["thread_id"]
         rebuild = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
         rb = rebuild.get(spec.key, default_rebuild_state())
 
@@ -445,6 +451,23 @@ def make_rebuild_node(spec: RebuildSpec):
         # Clear the sticky no-sandbox flag: it survives END-terminated runs in the checkpoint,
         # and the router checks it FIRST -- without this a healthy resubmit insta-fails.
         rb["cannot_verify"] = False
+
+        # Durable + live NODE_STARTED (root-caused 2026-09-11): a real build/red-gate check here
+        # can run for minutes, but until now this node emitted no run_event at all, so
+        # BuildView.tsx's RebuildConnector had NOTHING to show for a placement's first-ever
+        # attempt (state.rebuild[spec.key] only exists after this function RETURNS) -- read live
+        # as "two stages active at once" the first time it happened to overlap with the FOLLOWING
+        # stage's own draft event arriving before this node's slower state-snapshot-based check
+        # caught up. Same two-call pattern (append_event then emit_live) as every other RunEvent
+        # site in this file; only fires on the path that can reach this node's own NODE_FINISHED
+        # below (the no-sandbox early return above never touches either event).
+        run_id = state.get("run_id", "unknown")
+        start_event = RunEvent(
+            run_id=run_id, session_id=thread_id, type=RunEventType.NODE_STARTED,
+            stage=spec.key, node="rebuild", summary="rebuild check started",
+        )
+        start_event = await run_event_store.append_event(start_event)
+        await run_event_stream.emit_live(start_event, run_config)
 
         # GHCP finds every buildable project and builds it from the right directory, then reports
         # through a schema-validated terminal tool. Replaces "an audit model guesses a build
@@ -609,6 +632,15 @@ def make_rebuild_node(spec: RebuildSpec):
             # (codegen, fixes) become worth keeping -- the artifact-only commit sites never stage
             # source, so without this the pushed work branch would carry no code at all.
             await git_ops.commit_all(provider, thread_id, f"ai-dev-workflow: {spec.key} source changes (build green)")
+
+        # Durable + live NODE_FINISHED, closing the NODE_STARTED span above.
+        finish_event = RunEvent(
+            run_id=run_id, session_id=thread_id, type=RunEventType.NODE_FINISHED,
+            stage=spec.key, node="rebuild", summary=f"rebuild check {'passed' if build_ok else 'failed'}",
+            payload={"passed": build_ok, "cycle": rb["fix_cycle_count"]},
+        )
+        finish_event = await run_event_store.append_event(finish_event)
+        await run_event_stream.emit_live(finish_event, run_config)
         return {"rebuild": rebuild}
 
     return rebuild_node
@@ -649,8 +681,9 @@ _SCAFFOLD_ONLY_ADDENDUM = (
 
 
 def make_fix_node(spec: RebuildSpec):
-    async def fix_node(state: dict[str, Any], config) -> dict[str, Any]:
-        thread_id = config["configurable"]["thread_id"]
+    async def fix_node(state: dict[str, Any], run_config) -> dict[str, Any]:
+        # See rebuild_node's own comment: named run_config to avoid shadowing the config module.
+        thread_id = run_config["configurable"]["thread_id"]
         rebuild = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
         rb = rebuild.get(spec.key, default_rebuild_state())
 
@@ -717,8 +750,9 @@ def make_fix_node(spec: RebuildSpec):
 
 
 def make_escalate_node(spec: RebuildSpec):
-    async def escalate_node(state: dict[str, Any], config) -> dict[str, Any]:
-        thread_id = config["configurable"]["thread_id"]
+    async def escalate_node(state: dict[str, Any], run_config) -> dict[str, Any]:
+        # See rebuild_node's own comment: named run_config to avoid shadowing the config module.
+        thread_id = run_config["configurable"]["thread_id"]
         rb = (state.get("rebuild") or {}).get(spec.key, default_rebuild_state())
         # R never auto-approves past a failing build -- and never pauses for a human either: with
         # run_failure set, the run continues into metrics-exit (sandbox alive) so the exit report
@@ -820,6 +854,53 @@ def _demo() -> None:
     lap_c = ["  gating: [medium] sast/security/detect-non-literal-fs-filename @ apps/web/serve-dist.js:34 -- Found existsSync"]
     assert _scan_finding_fingerprint(lap_a) != _scan_finding_fingerprint(lap_c), "a finding that actually disappeared must change the fingerprint"
     assert _scan_finding_fingerprint([]) == frozenset()
+
+    # Regression for the config/run_config shadowing bug (root-caused 2026-09-11): rebuild_node,
+    # fix_node and escalate_node all take a LangGraph RunnableConfig as their second positional
+    # arg -- naming it `config` used to silently shadow this module's own `from . import config`
+    # for the rest of the function body, so every config.SOME_CONSTANT read inside resolved to the
+    # RunnableConfig dict instead and crashed with AttributeError the first time any of these three
+    # functions actually reached one (observed live: r_ac_to_tests_rebuild, mid-run, on a resumed
+    # thread). Two levels of guard: an end-to-end call through rebuild_node's replay path (the
+    # exact branch that crashed) proving config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS resolves
+    # correctly end to end, plus a cheap signature check on all three so the parameter can never be
+    # renamed back to `config` without this self-check catching it immediately.
+    import inspect
+
+    global get_sandbox_provider
+
+    demo_spec = RebuildSpec(
+        key="rebuild-selfcheck", max_fix_cycles=3, fix_prompt_addendum="", fix_scope="full",
+        next_node="next", scan_delta_gate=False,
+    )
+    for fn in (make_fix_node(demo_spec), make_escalate_node(demo_spec)):
+        params = list(inspect.signature(fn).parameters)
+        assert params[1] != "config", (
+            f"{fn.__name__}'s second parameter must never be literally named `config` -- it "
+            f"shadows this module's own config import for the whole function body, got {params}"
+        )
+
+    thread_id = "t-rebuild-selfcheck"
+    sandbox_registry.set(thread_id, object())  # rebuild_node only checks presence, not shape
+    original_get_sandbox_provider = get_sandbox_provider
+    get_sandbox_provider = lambda: _StubProvider(0)  # noqa: E731
+    try:
+        rebuild_state = {
+            **default_rebuild_state(),
+            "fix_cycle_count": 1,  # >0 with build_commands -> _replay_build path, no LLM call
+            "build_commands": [{"cwd": ".", "command": "true"}],
+        }
+        result = asyncio.run(make_rebuild_node(demo_spec)(
+            {"provider": "claude", "run_id": "r1", "stages": {}, "rebuild": {demo_spec.key: rebuild_state}},
+            {"configurable": {"thread_id": thread_id}},
+        ))
+        rb_after = result["rebuild"][demo_spec.key]
+        assert rb_after["last_exit_ok"] is True, rb_after
+        assert rb_after["last_stdout_tail"], "config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS must have resolved to a real int, not crashed"
+    finally:
+        get_sandbox_provider = original_get_sandbox_provider
+        sandbox_registry.pop(thread_id)
+
     print("rebuild red-gate self-check: all assertions passed")
 
 

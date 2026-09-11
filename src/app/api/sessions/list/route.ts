@@ -41,7 +41,13 @@ export async function GET(request: Request) {
 
   const response = await agentFetch(`sessions?${agentParams}`);
   if (!response.ok) {
-    return NextResponse.json({ sessions: [] }, { headers: NO_STORE });
+    // Root-caused 2026-09-11: this used to fake a successful empty list here, indistinguishable
+    // from "this repo genuinely has zero sessions" -- a dead/unreachable agent (agentFetch's own
+    // synthetic 502) then read as data loss instead of a backend outage. Forward the real status
+    // and detail; SessionHistory.tsx already throws on a non-ok response and renders it as an
+    // error (not a false "no sessions yet"), it just never received one before this.
+    const body = await response.json().catch(() => ({ detail: `agent request failed (${response.status})` }));
+    return NextResponse.json(body, { status: response.status, headers: NO_STORE });
   }
   const body = (await response.json()) as { sessions: Session[] };
   return NextResponse.json(body, { headers: NO_STORE });

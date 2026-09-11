@@ -527,12 +527,21 @@ class LocalDockerProvider(SandboxProvider):
         ground truth, not the in-memory map (found live 2026-08-31: `docker kill` left a phantom
         entry and the UI pill said Connected until the next exec failed). Duck-typed optional on
         SandboxProvider: sessions_api probes it with getattr and falls back to registry presence
-        for providers that don't implement it."""
+        for providers that don't implement it.
+
+        No registry entry is handled the SAME way as a phantom entry, not assumed dead: an agent
+        restart wipes `self._sandboxes` (in-memory, this process only) even though the container
+        itself is a separate Docker resource that outlives it -- found live 2026-09-11, the mirror
+        image of the 2026-08-31 bug above, on the READ side only (`provision()`'s own `_try_reattach`
+        already repopulates the registry correctly for the ACTUAL reattach path; this just makes the
+        list/detail views' liveness probe tell the truth in the meantime, without provisioning
+        anything or mutating any bookkeeping). Looked up by the container's well-known name, since
+        there is by definition no `_RunningSandbox.container_id` to inspect yet.
+        """
         async with self._lock:
             sandbox = self._sandboxes.get(session_id)
-        if sandbox is None:
-            return False
-        returncode, out, _ = await _run_docker("inspect", "--format", "{{.State.Running}}", sandbox.container_id)
+        target = sandbox.container_id if sandbox is not None else f"{_CONTAINER_NAME_PREFIX}{session_id}"
+        returncode, out, _ = await _run_docker("inspect", "--format", "{{.State.Running}}", target)
         return returncode == 0 and out.strip() == "true"
 
     def _ensure_reaper_running(self) -> None:

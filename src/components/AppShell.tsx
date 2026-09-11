@@ -260,6 +260,7 @@ export function AppShell({
     current_stage: string | null;
     status: string;
     awaiting_gate: boolean | null;
+    container_alive: boolean;
   } | null>(null);
   // One-shot, separate from the fresh-session auto-trigger's own ref below: that effect fires (or
   // doesn't) once at mount and never retries, so a reattach whose gate wasn't open YET at mount
@@ -290,7 +291,10 @@ export function AppShell({
       // load with a status implying something failed, when nothing did. Still "ready"/"error" as
       // before for an in_progress session (the one case a live container is actually expected).
       setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "error" : "terminated");
-      setDurableRow({ current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate });
+      setDurableRow({
+        current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate,
+        container_alive: row.container_alive ?? false,
+      });
       // Same payload, lifted into context so BuildView/SessionOverview/SpecificationView/
       // PlanView/RequirementsView can read run_active/interrupted without a second fetch.
       setRunActivity({
@@ -388,6 +392,18 @@ export function AppShell({
   const isAwaitingFirstRequirements =
     state.stages?.["tech-stack"]?.status === "approved" &&
     (state.stages?.["raw-requirements"]?.status ?? "not_started") === "not_started";
+
+  // Reattach vs Resume (root-caused 2026-09-11, same distinction as SessionHistory.tsx's own
+  // fix): a "failed" run always needs a real restart-from-checkpoint regardless of container
+  // state (its approval/counters were already revoked by make_escalate_node). An "interrupted"
+  // run (nothing attached, but not failed) only needs that if its sandbox is actually gone --
+  // container_alive is verified Docker truth (sessions_api._verified_container_alive), not the
+  // stale "is a stream attached in THIS process" signal `interrupted` itself is. When the
+  // container is alive, copilotkit.runAgent() alone reattaches for free. When it is not,
+  // runAgent() alone has nothing to exec into -- only a fresh mount (SandboxSessionBoot) actually
+  // reprovisions, so that case reloads the page instead.
+  const runFailed = durableRow?.status === "failed";
+  const canReattach = !runFailed && Boolean(durableRow?.container_alive);
 
   // Auto-trigger the run once, as soon as the sandbox is ready, on a thread that's never run
   // before -- scaffold_node hard-fails with no local-working-tree fallback if run before the
@@ -643,21 +659,23 @@ export function AppShell({
             "failed"` is the other stopped-and-recoverable case, whose only Resume button used to
             live buried in the Overview tab (SessionOverview.tsx) -- this one is visible from
             every tab. */}
-        {((runActivity?.interrupted && !isAwaitingFirstRequirements) || durableRow?.status === "failed") && (
+        {((runActivity?.interrupted && !isAwaitingFirstRequirements) || runFailed) && (
           <div className="flex items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
             <span>
-              {durableRow?.status === "failed"
+              {runFailed
                 ? "This run failed and stopped."
-                : "This run appears to have stopped (no process is currently attached)."}{" "}
-              Resume picks up from the last checkpoint.
+                : canReattach
+                  ? "This run's sandbox is still alive, but nothing is currently attached to it."
+                  : "This run appears to have stopped, and its sandbox is gone."}{" "}
+              {canReattach ? "Reattaching resumes the live run for free." : "Resume picks up from the last checkpoint."}
             </span>
             <button
               type="button"
               className="shrink-0 rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40"
               disabled={agent.isRunning}
-              onClick={() => void copilotkit.runAgent({ agent })}
+              onClick={() => (canReattach ? void copilotkit.runAgent({ agent }) : window.location.reload())}
             >
-              {agent.isRunning ? "Resuming…" : "Resume"}
+              {agent.isRunning ? "Resuming…" : canReattach ? "Reattach" : "Resume"}
             </button>
           </div>
         )}

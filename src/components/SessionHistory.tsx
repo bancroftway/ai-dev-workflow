@@ -117,6 +117,11 @@ export function SessionHistory({
         .then((data: { sessions: Session[] }) => {
           if (cancelled) return;
           setSessions(data.sessions);
+          // Root-caused 2026-09-11: a failed poll (one-off docker/agent hiccup, the 15s interval
+          // below usually recovers on its own) used to set `error` and leave it stuck forever --
+          // nothing ever cleared it on a subsequent successful poll, so a transient blip looked
+          // like a permanent failure. Same class of bug as TransportErrorBanner's own fix.
+          setError(null);
           onInProgressChange?.(data.sessions.some((s) => s.status === "in_progress"));
         })
         .catch((err: Error) => {
@@ -233,7 +238,17 @@ export function SessionHistory({
               </p>
             )}
             <div className="flex gap-2">
-              {(s.status === "failed" || (s.status === "in_progress" && s.interrupted)) && (
+              {/* Reattach vs Resume is keyed on container_alive (verified Docker truth,
+                  sessions_api._verified_container_alive), not `interrupted` (run_activity's
+                  in-memory "is a stream attached in THIS process right now" refcount, which reads
+                  false after every agent restart regardless of the container). A live container
+                  can always be cheaply reattached to -- SandboxSessionBoot's plain-URL provision
+                  call reattaches for free (local_docker's own _try_reattach) whether or not this
+                  process currently sees a stream as active -- so `interrupted` alone used to route
+                  a perfectly reattachable session through the costly resume-from-intake path
+                  instead (root-caused 2026-09-11). A genuinely failed run has no run to reattach
+                  to regardless of container state, so it always gets Resume. */}
+              {(s.status === "failed" || (s.status === "in_progress" && !s.container_alive)) && (
                 <button
                   type="button"
                   title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
@@ -243,17 +258,14 @@ export function SessionHistory({
                   Resume
                 </button>
               )}
-              {/* Workflow Liveness Fix: an "in_progress" session whose process has actually died
-                  (interrupted) routes to Resume above instead -- a plain-URL reattach here would
-                  open the workflow page and reconnect to nothing. */}
-              {s.status === "in_progress" && !s.interrupted && (
+              {s.status === "in_progress" && s.container_alive && (
                 <button
                   type="button"
-                  title="Reattaches to the run already in progress -- nothing restarts, nothing is lost."
+                  title="Reattaches to the sandbox already running -- nothing restarts, nothing is lost."
                   className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
                   onClick={() => openLive(s)}
                 >
-                  Open
+                  Reattach
                 </button>
               )}
               {s.status === "failed" && (

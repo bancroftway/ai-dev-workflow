@@ -483,23 +483,36 @@ class SessionResponse(BaseModel):
 
 
 async def _verified_container_alive(session_id: str) -> bool:
-    """Registry presence VERIFIED against the actual container (found live 2026-08-31: `docker
-    kill` left a phantom registry entry, so the UI pill said Connected until the next exec
-    failed). The docker-events watcher (local_docker._watch_docker_events) evicts phantoms in
-    real time; this read-side check is the belt for events missed while that stream was down.
-    A dead check evicts the phantom so execs, the per-repo cap, and /active all agree. Providers
-    without is_session_alive (duck-typed optional) keep the plain registry answer; a probe
-    failure fails OPEN -- a docker hiccup must not flap the UI or evict a live sandbox."""
-    if registry.get(session_id) is None:
-        return False
+    """Registry presence VERIFIED against the actual container -- in BOTH directions, not just
+    the phantom-eviction one:
+
+    - found live 2026-08-31: `docker kill` left a phantom registry entry, so the UI pill said
+      Connected until the next exec failed. The docker-events watcher
+      (local_docker._watch_docker_events) evicts phantoms in real time; this read-side check is
+      the belt for events missed while that stream was down. A dead check evicts the phantom so
+      execs, the per-repo cap, and /active all agree.
+    - found live 2026-09-11, the mirror image: an agent restart wipes the in-memory registry
+      (this process's own memory) even though the container is a separate Docker resource that
+      outlives it -- the OLD short-circuit here (`if registry.get() is None: return False`)
+      never even asked the provider, so a container that survived a restart read as Stopped until
+      something (opening its workflow page) reprovisioned it. Always probes now when the provider
+      supports it, registry entry or not -- `local_docker.is_session_alive`'s own fix makes that
+      probe check Docker by the container's well-known name when the registry has nothing to
+      check by container_id instead.
+
+    Providers without is_session_alive (duck-typed optional), and a probe that raises, both fall
+    back to the plain registry answer -- a docker hiccup must not flap the UI or evict a live
+    sandbox, and must not fabricate "alive" for a session the registry never knew about either.
+    """
+    had_entry = registry.get(session_id) is not None
     probe = getattr(get_sandbox_provider(), "is_session_alive", None)
     if probe is None:
-        return True
+        return had_entry
     try:
         alive = bool(await probe(session_id))
     except Exception:  # noqa: BLE001
-        return True
-    if not alive:
+        return had_entry
+    if not alive and had_entry:
         logger.warning("phantom sandbox evicted for session_id=%s (container not running)", session_id)
         registry.pop(session_id)
     return alive
@@ -2707,7 +2720,10 @@ def _demo() -> None:
     i3_calls: list[tuple[str, str | None]] = []
 
     async def _i3_get_session_with_stored_provider(thread_id: str) -> dict[str, Any] | None:
-        return {"project_id": "proj-i3-selfcheck", "status": "in_progress", "provider": "claude"}
+        return {
+            "project_id": "proj-i3-selfcheck", "status": "in_progress", "provider": "claude",
+            "user_login": "i3-selfcheck-user",
+        }
 
     async def _i3_get_provider_live_disagrees() -> str:
         i3_calls.append(("get_provider", None))
@@ -2729,6 +2745,12 @@ def _demo() -> None:
     ) -> list[dict[str, Any]]:
         return []  # this test's own thread is resuming, not competing with another open ticket
 
+    async def _i3_get_repo_auth_settings(owner: str, repo: str) -> dict[str, Any]:
+        return dict(repo_auth_settings.DEFAULT_SETTINGS)  # real read shares session_store's pool -- stub it out
+
+    async def _i3_get_repo_test_users(owner: str, repo: str) -> list[dict[str, Any]]:
+        return []  # same reason: a real read here shares session_store's pool, cross-event-loop unsafe in _demo
+
     class _I3FakeSandboxProvider:
         async def provision(self, **kwargs: Any) -> SandboxSession:
             i3_calls.append(("provider.provision", kwargs.get("provider")))
@@ -2748,6 +2770,8 @@ def _demo() -> None:
     original_get_sandbox_provider_i3 = get_sandbox_provider
     original_set_session_provider_i3 = session_store.set_session_provider
     original_list_sessions_i3 = session_store.list_sessions
+    original_get_repo_auth_settings_i3 = repo_auth_settings.get_settings
+    original_get_repo_test_users_i3 = repo_test_users.get_users
     session_store.get_session = _i3_get_session_with_stored_provider  # type: ignore[assignment]
     chat_model.get_provider = _i3_get_provider_live_disagrees  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _i3_get_runtime_auth_token  # type: ignore[assignment]
@@ -2755,6 +2779,8 @@ def _demo() -> None:
     project_store.get_project = _i3_get_project  # type: ignore[assignment]
     session_store.set_session_provider = _i3_set_session_provider_must_not_be_called  # type: ignore[assignment]
     session_store.list_sessions = _i3_list_sessions_none_open  # type: ignore[assignment]
+    repo_auth_settings.get_settings = _i3_get_repo_auth_settings  # type: ignore[assignment]
+    repo_test_users.get_users = _i3_get_repo_test_users  # type: ignore[assignment]
     get_sandbox_provider = lambda: _I3FakeSandboxProvider()  # noqa: E731
     try:
         response = asyncio.run(provision_session(
@@ -2772,8 +2798,12 @@ def _demo() -> None:
         project_store.get_project = original_get_project_i3  # type: ignore[assignment]
         session_store.set_session_provider = original_set_session_provider_i3  # type: ignore[assignment]
         session_store.list_sessions = original_list_sessions_i3  # type: ignore[assignment]
+        repo_auth_settings.get_settings = original_get_repo_auth_settings_i3  # type: ignore[assignment]
+        repo_test_users.get_users = original_get_repo_test_users_i3  # type: ignore[assignment]
         get_sandbox_provider = original_get_sandbox_provider_i3
         registry.pop("t-i3-selfcheck")
+        repo_auth_settings.pop_for_thread("t-i3-selfcheck")
+        repo_test_users.pop_for_thread("t-i3-selfcheck")
 
     assert i3_calls == [("get_runtime_auth_token", "claude"), ("provider.provision", "claude")], (
         f"the session's STORED provider ('claude') must reach both calls, and live get_provider() "
@@ -2787,7 +2817,10 @@ def _demo() -> None:
     m3_calls: list[tuple[str, str]] = []
 
     async def _m3_get_session_null_provider(thread_id: str) -> dict[str, Any] | None:
-        return {"project_id": "proj-m3-selfcheck", "status": "in_progress", "provider": None}
+        return {
+            "project_id": "proj-m3-selfcheck", "status": "in_progress", "provider": None,
+            "user_login": "m3-selfcheck-user",
+        }
 
     async def _m3_get_provider_live() -> str:
         return "claude"
@@ -2809,6 +2842,12 @@ def _demo() -> None:
     ) -> list[dict[str, Any]]:
         return []
 
+    async def _m3_get_repo_auth_settings(owner: str, repo: str) -> dict[str, Any]:
+        return dict(repo_auth_settings.DEFAULT_SETTINGS)
+
+    async def _m3_get_repo_test_users(owner: str, repo: str) -> list[dict[str, Any]]:
+        return []
+
     class _M3FakeSandboxProvider:
         async def provision(self, **kwargs: Any) -> SandboxSession:
             return SandboxSession(kwargs["session_id"], "localhost", 0, "")
@@ -2821,6 +2860,8 @@ def _demo() -> None:
     original_set_session_provider_m3 = session_store.set_session_provider
     original_get_sandbox_provider_m3 = get_sandbox_provider
     original_list_sessions_m3 = session_store.list_sessions
+    original_get_repo_auth_settings_m3 = repo_auth_settings.get_settings
+    original_get_repo_test_users_m3 = repo_test_users.get_users
     session_store.get_session = _m3_get_session_null_provider  # type: ignore[assignment]
     chat_model.get_provider = _m3_get_provider_live  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _m3_get_runtime_auth_token  # type: ignore[assignment]
@@ -2828,6 +2869,8 @@ def _demo() -> None:
     project_store.get_project = _m3_get_project  # type: ignore[assignment]
     session_store.set_session_provider = _m3_set_session_provider  # type: ignore[assignment]
     session_store.list_sessions = _m3_list_sessions_none_open  # type: ignore[assignment]
+    repo_auth_settings.get_settings = _m3_get_repo_auth_settings  # type: ignore[assignment]
+    repo_test_users.get_users = _m3_get_repo_test_users  # type: ignore[assignment]
     get_sandbox_provider = lambda: _M3FakeSandboxProvider()  # noqa: E731
     try:
         asyncio.run(provision_session(
@@ -2844,13 +2887,62 @@ def _demo() -> None:
         project_store.get_project = original_get_project_m3  # type: ignore[assignment]
         session_store.set_session_provider = original_set_session_provider_m3  # type: ignore[assignment]
         session_store.list_sessions = original_list_sessions_m3  # type: ignore[assignment]
+        repo_auth_settings.get_settings = original_get_repo_auth_settings_m3  # type: ignore[assignment]
+        repo_test_users.get_users = original_get_repo_test_users_m3  # type: ignore[assignment]
         get_sandbox_provider = original_get_sandbox_provider_m3
         registry.pop("t-m3-selfcheck")
+        repo_auth_settings.pop_for_thread("t-m3-selfcheck")
+        repo_test_users.pop_for_thread("t-m3-selfcheck")
 
     assert m3_calls == [("t-m3-selfcheck", "claude")], (
         f"a legacy NULL-provider row must be stamped with the live-resolved chat_provider on "
         f"reprovision, got {m3_calls}"
     )
+
+    # _verified_container_alive (2026-09-11 fix): must probe even with NO registry entry -- an
+    # agent restart wipes the registry but not the container -- not just verify a phantom that's
+    # already there. Covers both new directions plus the two pre-existing ones (phantom eviction,
+    # no-probe-capability fallback) so this one fix can't silently regress either.
+    from .sandbox.provider import SandboxSession
+
+    class _CAFakeProvider:
+        def __init__(self, alive: bool | None) -> None:
+            self._alive = alive  # None means "no is_session_alive at all" (duck-typed optional)
+
+        async def is_session_alive(self, session_id: str) -> bool:  # noqa: ARG002
+            assert self._alive is not None, "must not be called on a provider without this method"
+            return self._alive
+
+    class _CANoProbeProvider:
+        pass  # deliberately no is_session_alive -- duck-typed optional
+
+    original_get_sandbox_provider_ca = get_sandbox_provider
+    try:
+        # No registry entry, container genuinely still running: must probe and say True, not
+        # short-circuit False the way the pre-fix version did.
+        get_sandbox_provider = lambda: _CAFakeProvider(True)  # noqa: E731
+        assert registry.get("t-ca-selfcheck") is None
+        assert asyncio.run(_verified_container_alive("t-ca-selfcheck")) is True
+
+        # No registry entry, container genuinely gone: still correctly False.
+        get_sandbox_provider = lambda: _CAFakeProvider(False)  # noqa: E731
+        assert asyncio.run(_verified_container_alive("t-ca-selfcheck")) is False
+
+        # Registry entry present but the probe says dead (phantom, pre-existing 2026-08-31 case):
+        # evicted, and reported False.
+        registry.set("t-ca-selfcheck", SandboxSession("t-ca-selfcheck", "localhost", 0, ""))
+        get_sandbox_provider = lambda: _CAFakeProvider(False)  # noqa: E731
+        assert asyncio.run(_verified_container_alive("t-ca-selfcheck")) is False
+        assert registry.get("t-ca-selfcheck") is None, "a dead-probe entry must be evicted"
+
+        # No is_session_alive at all: falls back to the plain registry answer, both ways.
+        get_sandbox_provider = lambda: _CANoProbeProvider()  # noqa: E731
+        assert asyncio.run(_verified_container_alive("t-ca-selfcheck")) is False
+        registry.set("t-ca-selfcheck", SandboxSession("t-ca-selfcheck", "localhost", 0, ""))
+        assert asyncio.run(_verified_container_alive("t-ca-selfcheck")) is True
+    finally:
+        get_sandbox_provider = original_get_sandbox_provider_ca
+        registry.pop("t-ca-selfcheck")
 
     print("sessions_api self-check: all assertions passed")
 

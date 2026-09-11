@@ -13,7 +13,9 @@ import { catalog } from "@/a2ui/catalog";
  * only the library's own console.error); the only app-reachable channel is
  * `copilotkit.subscribe({ onError })`, so a subscriber component inside the provider raises the
  * banner. The run does NOT always continue server-side (a killed agent process is gone), so the
- * copy offers both reattach-by-reload and Resume. */
+ * copy offers both reattach-by-reload and the Resume/Reattach banner (AppShell.tsx, visible on
+ * every tab, not just Overview -- the copy here named "the Overview tab" specifically until
+ * 2026-09-11, stale since that banner moved). */
 export function WorkflowProviders({ children }: { children: ReactNode }) {
   return (
     <CopilotKit runtimeUrl="/api/copilotkit" a2ui={{ catalog }} showDevConsole={false}>
@@ -34,6 +36,15 @@ function TransportErrorBanner({ children }: { children: ReactNode }) {
         console.warn("[workflow] agent transport error:", code, error);
         setTransportError(String((context as { runtimeErrorCode?: string })?.runtimeErrorCode ?? code ?? "unknown"));
       },
+      // Root-cause note (2026-09-11): a transient transportError with no auto-recovery signal
+      // used to stay pinned forever once set -- only the Dismiss button below ever cleared it.
+      // In dev, React Strict Mode double-invokes this provider's mount, which can cancel the
+      // FIRST connection attempt (reported here as onError) right before the second, healthy one
+      // takes over -- the run was actually fine, but the banner never knew that. A fresh agent
+      // run/connect beginning is direct evidence the transport is alive again, so clear the stale
+      // error here rather than requiring a manual Dismiss for something that already resolved
+      // itself. A genuinely still-broken backend re-fires onError immediately after this anyway.
+      onAgentRunStarted: () => setTransportError(null),
     });
     return () => subscription.unsubscribe();
   }, [copilotkit]);
@@ -44,8 +55,8 @@ function TransportErrorBanner({ children }: { children: ReactNode }) {
         <div className="flex shrink-0 items-center justify-between gap-4 border-b border-red-300 bg-red-50 px-4 py-2 text-sm text-red-900">
           <span>
             Agent connection lost ({transportError}) — the run stream ended unexpectedly. The backend may be
-            down and the state below may be stale. Reload to reattach, or Resume from the Overview tab once the
-            backend is back.
+            down and the state below may be stale. Reload to reattach, or use the Resume/Reattach control
+            below once the backend is back.
           </span>
           <button
             type="button"
