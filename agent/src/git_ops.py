@@ -219,15 +219,23 @@ async def push_head(provider: SandboxProvider, thread_id: str) -> None:
 
 
 async def record_run_failure(
-    thread_id: str, payload: dict[str, Any], run_id: str | None = None, *, keep_sandbox: bool = False
+    thread_id: str, payload: dict[str, Any], run_id: str | None = None, *, status: str = "failed", keep_sandbox: bool = False
 ) -> dict[str, Any]:
-    """Durably records a terminal run failure ({stage, type, ...detail}) and returns the payload.
+    """Durably records a terminal run outcome ({stage, type, ...detail}) and returns the payload.
 
     The SQL session close runs FIRST and unconditionally -- it needs no sandbox, and skipping it
     when the sandbox was gone (as this function used to) left every `cannot_verify` failure's
     session row open until the next deploy-drain sweep, with no persisted trace at all. The ledger
     row and the commit still require a live sandbox and are skipped without one. Best-effort by
     design: a failed write must never mask the failure itself.
+
+    status="failed" for every real failure (the default every existing call site relies on).
+    graph.py's make_no_new_work_node is the one exception, passing status="rejected" for a
+    Specification stage with zero net ledger delta -- not a failure, just nothing to do, but still
+    routed through this one function rather than session_store.close_session directly: this is the
+    single choke point for the SQL close / ledger append / commit / container-teardown-timing
+    sequence below, and bypassing it for a new call site already caused a real bug once (see
+    session_store.close_session's own docstring on keep_sandbox).
 
     keep_sandbox=True (see session_store.close_session) is for a call site whose escalation still
     routes into metrics-exit_draft in the same sandbox -- only `cannot_verify` (sandbox already
@@ -238,7 +246,7 @@ async def record_run_failure(
 
     try:
         await session_store.close_session(
-            thread_id, run_id=run_id, status="failed", failure=payload, keep_sandbox=keep_sandbox
+            thread_id, run_id=run_id, status=status, failure=payload, keep_sandbox=keep_sandbox
         )
     except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
         logger.warning("failed to close session for run_failure thread_id=%s", thread_id, exc_info=True)
@@ -252,7 +260,8 @@ async def record_run_failure(
         await repo_files.append_ledger_entry(
             provider, thread_id, {"stage": payload.get("stage"), "node": "run_failure", **payload}
         )
-        await commit_ai_dev_workflow(provider, thread_id, f"ai-dev-workflow: run failed at {payload.get('stage')}")
+        verb = "ended (no new work)" if status == "rejected" else "failed"
+        await commit_ai_dev_workflow(provider, thread_id, f"ai-dev-workflow: run {verb} at {payload.get('stage')}")
     except Exception:  # noqa: BLE001 -- best-effort trace; the failure payload is what matters
         logger.warning("failed to durably record run_failure for thread_id=%s", thread_id, exc_info=True)
     return payload

@@ -21,7 +21,7 @@ flowchart TD
     
     stage1["STAGE 1: TECH STACK<br/>Detect languages, frameworks, build/test commands<br/>Agent: tech-stack-draft (read-only discovery)"]
     
-    stage2["STAGE 2: SPECIFICATION<br/>Draft user stories + acceptance criteria (delta ticket: cite existing_us_id/existing_ac_id, retire removed features; deferred=true parks a story/criterion without retiring it)<br/>Agents: specification-draft → specification-audit<br/>Verify: spec ledger id sync — stable US-####.# ids, fail-closed citations; change badges (new/modified/deferred/activated) diffed against the last APPROVED spec, never the ledger's own rolling pre-sync state<br/>Gate: human approval + sign to APPROVALS.md; approval applies tracking resets for genuinely reworded ACs. No reject box — Requirements is the sole source of truth; submitting there resolves this gate with the revised document"]
+    stage2["STAGE 2: SPECIFICATION<br/>Draft user stories + acceptance criteria (delta ticket: cite existing_us_id/existing_ac_id, retire removed features; deferred=true parks a story/criterion without retiring it)<br/>Agents: specification-draft → specification-audit<br/>Verify: spec ledger id sync — stable US-####.# ids, fail-closed citations; change badges (new/modified/deferred/activated) diffed against the last APPROVED spec, never the ledger's own rolling pre-sync state<br/>Zero-net-delta gate: every story/AC unchanged vs. the last approval and nothing newly retired -&gt; the run ends automatically here, BEFORE the human gate (status=rejected, distinct from a real failure)<br/>Gate: human approval + sign to APPROVALS.md; approval applies tracking resets for genuinely reworded ACs (and their resolved-at provenance). No reject box — Requirements is the sole source of truth; submitting there resolves this gate with the revised document"]
     
     stage3["STAGE 3: PLAN<br/>Ordered implementation steps + diagrams + wireframes<br/>Agents: plan-draft → plan-audit<br/>Verify: step↔AC linkage BOTH directions (every step cites live ac_ids or kind=infrastructure — a step may cite ONLY live ids, never a retired/deferred one alongside a live one;<br/>every eligible (new/modified/promoted) AC cited; retired-only steps dropped; a criterion DELIVERED by an earlier run and retired this round must be named in some step's removes_ids, never demanded if it was never built; every criterion the Specification marks ui_related must be cited in some wireframe's ac_ids) + Mermaid/wireframe validation<br/>Gate: human approval + sign to APPROVALS.md; approval records plan_step_ids on the ledger. No reject box either — submitting revised Requirements here restarts the cascade at Specification (GraphState.restart_from_specification), never redrafts Plan alone against a stale spec"]
     
@@ -49,6 +49,7 @@ flowchart TD
     stage1 -.->|not ready, or rejected| stage1
     stage1 -.->|"tech-stack-first: no requirements typed yet — run ends after the stack is approved; the Requirements tab unlocks and its submit re-enters at intake"| done
     stage2 -.->|not ready, or rejected| stage2
+    stage2 -.->|"zero-net-delta: no new/modified/deleted US/AC since the last approval — auto-ends, never reaches the gate"| done
     stage3 -.->|not ready, or rejected with PLAN-only feedback -- unreachable, no reject box| stage3
     stage3 -.->|"rejected via revised Requirements (the only path): restarts at Specification, not Plan's own draft"| stage2
     stage4 -.->|gate failure, 3 tries| stage4
@@ -80,7 +81,7 @@ flowchart TD
 | `.ai-dev-workflow/tech-stack.md` | tech-stack | The detected stack, rendered. **This is the file `AGENTS.md` tells every agent to read first.** |
 | `.ai-dev-workflow/tech-stack.approved.json` | tech-stack | Typed sidecar. Its presence is what makes a later run skip detection entirely. |
 | `.ai-dev-workflow/raw-requirements.md`, `specification.md`, `plan.md` | record raw requirements, specification, plan | The reviewed artifacts (raw requirements are recorded verbatim, never redrafted). |
-| `.ai-dev-workflow/spec/ledger.json` | specification verify + approval, plan approval, metrics | Permanently stable US/AC ids — the sync target for every later traceability check — plus per-AC delivery provenance: `plan_step_ids` (plan approval), `coded_run_id/at` + `tested_run_id/at` + measured `test_ids` (metrics, regression-clean runs only; cleared on spec approval when a criterion's wording genuinely changed). |
+| `.ai-dev-workflow/spec/ledger.json` | specification verify + approval, plan approval, metrics, exit finalize | Permanently stable US/AC ids — the sync target for every later traceability check — plus per-AC delivery provenance: `plan_step_ids` (plan approval), `coded_run_id/at` + `tested_run_id/at` + measured `test_ids` (metrics, regression-clean runs only), and `resolved_at`/`resolved_run_id` (exit finalize, only once `merge_ready` is true; bubbles up to a story once every live child AC is resolved). All three are cleared on spec approval when a criterion's wording genuinely changed. |
 | `.ai-dev-workflow/plan/diagrams/*.{mmd,svg}` | plan verify | Rendered Mermaid diagrams. |
 | `.ai-dev-workflow/plan/wireframes/*.html` | plan verify | Self-contained HTML wireframes (UI plans only) — open directly in a browser. |
 | `.ai-dev-workflow/coverage-commands.json` | minimal-code-to-green | The coverage contract: per-stack command + artifact + format. Written by the draft, REPLAYED by the coverage gate — the gate deletes artifacts and re-runs each command itself, so the number is always machine-derived. |
@@ -197,6 +198,7 @@ flowchart LR
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves<br/>or rejects with feedback.<br/>tech-stack, specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
     aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>skips the audit and the human gate —<br/>never the deterministic verify. Approval is<br/>persisted only after verify passes."]
     e["ESCALATE<br/>Verify cap exhausted. The run ENDs with<br/>run_failure recorded (ledger + commit + push).<br/>Never auto-approved past a failed<br/>deterministic gate. Counters reset for resubmit.<br/>Verify verdicts tagged infra_error (the platform<br/>could not measure, e.g. the coverage gate's test-run<br/>evidence missing) spend a separate small budget<br/>(VERIFY_INFRA_RETRY_CAP, default 2) instead of the<br/>stage's verify laps, and escalate as<br/>failure_type=infra_transient — resumable."]
+    nw["NO NEW WORK<br/>Specification only: verify passed AND classifies<br/>zero net US/AC delta (all unchanged, nothing newly<br/>retired) vs. the last approved spec. The run ENDs<br/>automatically, before the gate — content did NOT<br/>fail, so nothing is revoked or reset. Closes via<br/>git_ops.record_run_failure(status='rejected'), the<br/>same choke point ESCALATE uses, never a direct DB<br/>call. Dead-but-harmless wiring on every other stage."]
     ie["DRAFT-ESCALATE<br/>Copilot session failure survived infra_retry's<br/>own backoff attempts (quota/timeout/429) — never<br/>charged against cycle_count. run_failure tagged<br/>failure_type=infra_transient/quota_exhausted,<br/>not gate_exhausted. Wired for every stage,<br/>including tech-stack, the one with no verify."]
     q(["Not ready: emit clarifying questions, end the run"])
 
@@ -206,9 +208,11 @@ flowchart LR
     d -.->|infra exhausted| ie
     a --> v
     v -->|passed| g
+    v -.->|"passed, zero net delta (specification only)"| nw
     v -.->|failed, retries left| d
     v -->|failed at cap| e
     e --> theend(["END"])
+    nw --> theend
     ie --> theend
     g -->|approved| next["next stage"]
     g -.->|rejected, with feedback| d
@@ -379,7 +383,7 @@ distinct paths do, and each covers a case the others structurally cannot:
 
 | When | Mechanism | Why not one of the others |
 |---|---|---|
-| Run reaches a genuine terminal | `close_thread_session` from `exit_nodes.exit_finalize_node` (success), `graph.make_escalate_node` (failed deterministic gate), and `graph.make_draft_escalate_node` (draft-level infra exhaustion) | Graceful: awaits `disconnect()`, which preserves on-disk session state |
+| Run reaches a genuine terminal | `close_thread_session` from `exit_nodes.exit_finalize_node` (success), `graph.make_escalate_node` (failed deterministic gate), `graph.make_draft_escalate_node` (draft-level infra exhaustion), and `graph.make_no_new_work_node` (specification zero-net-delta, not a failure) | Graceful: awaits `disconnect()`, which preserves on-disk session state |
 | Verify lap stalls (near-identical feedback / zero new changes, `VERIFY_STALL_LAPS` consecutive laps) | `close_session` (`graph.py`'s `make_verify_node`) | Same self-reinforcing shape as a fabrication reset, just not one of the three named patterns — see `infra_retry.py`'s module docstring |
 | Container destroyed | `forget_thread_sessions` from `sandbox.registry.pop` | The idle reaper fires ~30 min later with no stage on the stack, so nothing unwinds and no `finally` can run |
 | Unhandled node exception | `forget_thread_sessions` from `telemetry.traced_node` | An exception aborts the whole graph invocation, so neither terminal node above ever runs |
@@ -484,4 +488,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: f425d73401ee9d3cbe1881393fb5da1b167a37d265a5d87da5a805abade7e312 -->
+<!-- graph-source-sha256: a1a97738ac7bb98d0154fef5b7ac3c687d379a9a5a0f1470133df4e9e07508ca -->

@@ -411,6 +411,10 @@ export interface EscalationPayload {
     | "exit_gate_failed_twice"
     | "e2e_cap_exceeded"
     | "draft_infra_exhausted"
+    // Not a failure -- the Specification stage's zero-net-delta gate (graph.py
+    // make_no_new_work_node): the draft passed its ledger sync, but classifies zero new/modified/
+    // deleted US/AC versus the last approved baseline, so the run ends before the human gate.
+    | "no_new_work"
     | string;
   // WHY the run died (a real gate-verified defect vs. a quota/timeout/infra failure) --
   // orthogonal to `type` above (WHICH ceiling was hit). See agent/src/failure_classification.py.

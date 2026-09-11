@@ -334,7 +334,15 @@ export function MetricsBar({
           push failing — GitHub persistence off
         </span>
       )}
-      {state.run_failure && (() => {
+      {state.run_failure && state.run_failure.type === "no_new_work" && (
+        // Not a failure -- the Specification stage's zero-net-delta gate. Gray, not red/amber, and
+        // its own copy: the underlying session status is "rejected" for DB/UI-badge reuse reasons
+        // (see git_ops.record_run_failure's docstring), but that word must never reach the user.
+        <span className={`rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS.gray}`}>
+          no new or changed requirements — nothing to build
+        </span>
+      )}
+      {state.run_failure && state.run_failure.type !== "no_new_work" && (() => {
         // failure_type distinguishes a real gate-verified defect (red -- your code needs a fix)
         // from a quota/timeout/infra failure (amber -- resubmitting may just work, nothing about
         // the generated code was actually wrong). Older payloads predate this field and fall back

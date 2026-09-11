@@ -920,6 +920,53 @@ SPECIFICATION_HARD_RULES: tuple[str, ...] = (
 )
 
 
+def _stamp_gate_change_and_check_delta(
+    content_dict: dict[str, Any], prior_by_id: dict[str, dict[str, Any]], updated_entries: list[dict[str, Any]]
+) -> bool:
+    """Pure: stamps `story["change"]`/`ac["change"]` in place (spec_ledger.gate_change_status vs.
+    the last-approved baseline) and returns whether this draft is a zero-net-delta no-op.
+
+    Extracted out of _verify_specification_ledger's I/O wrapper so the delta-gate logic is
+    directly unit-testable without a sandbox provider (same reasoning as spec_ledger.py's own
+    stamp_delivery/stamp_resolution: pure functions here, thin async I/O wrappers around them).
+
+    Zero-net-delta gate: a subsequent run must add/modify/delete at least one US/AC versus the
+    last approved baseline, or there is nothing for Plan/AC-to-tests/... to act on (user
+    requirement 2026-09-10). Built on gate_change_status (not change_status, which is per-RUN and
+    unstable across a reject-and-redraft cycle -- see gate_change_status's own docstring) so this
+    can never fire mid-redraft, only once, right before the human ever sees the gate. A
+    newly-retired entry counts as a delta even though gate_change_status has no "retired"
+    classification of its own (it only diffs the two specs' text/deferred fields, and a
+    retirement is expressed by ABSENCE from the draft rather than a text change) -- `prior_by_id`
+    only contains ids that were LIVE in the last approved spec, so membership there isolates a
+    real new retirement from one that was already retired as of that approval. On a project's (or
+    a brownfield repo's) first-ever approved spec, prior_by_id is empty and
+    gate_change_status(None, ...) always returns "new", so this can never false-trigger there.
+    """
+    for story in content_dict.get("user_stories") or []:
+        story["change"] = spec_ledger.gate_change_status(
+            prior_by_id.get(story.get("id")),
+            {"text": story.get("title", ""), "deferred": bool(story.get("deferred"))},
+        )
+        for ac in story.get("acceptance_criteria") or []:
+            ac["change"] = spec_ledger.gate_change_status(
+                prior_by_id.get(ac.get("id")),
+                {"text": ac.get("description", ""), "deferred": bool(ac.get("deferred"))},
+            )
+    all_changes = [s["change"] for s in content_dict.get("user_stories") or []]
+    all_changes += [
+        ac["change"] for s in content_dict.get("user_stories") or [] for ac in s.get("acceptance_criteria") or []
+    ]
+    newly_retired_ids = [
+        e["id"]
+        for e in updated_entries
+        if e.get("kind") in ("user_story", "acceptance_criterion")
+        and e.get("status") == "retired"
+        and e["id"] in prior_by_id
+    ]
+    return bool(all_changes) and all(c == "unchanged" for c in all_changes) and not newly_retired_ids
+
+
 async def _verify_specification_ledger(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
     _chat_provider: str,
@@ -958,8 +1005,14 @@ async def _verify_specification_ledger(
     retired_ac_ids = content_dict.get("retired_ac_ids") or []
     retired_us_ids = content_dict.get("retired_us_ids") or []
     result = spec_ledger.sync_ledger(
-        entries, user_stories, run_id, retired_ac_ids=retired_ac_ids, retired_us_ids=retired_us_ids
+        entries,
+        user_stories,
+        run_id,
+        retired_ac_ids=retired_ac_ids,
+        retired_us_ids=retired_us_ids,
+        source_ticket_id=thread_id,
     )
+    no_new_work = False
     if result.passed:
         # Completeness gate (2026-08-31, observed live TWICE): a redraft that emits only the
         # stories it touched silently shrinks the specification -- the ledger keeps the dropped
@@ -1047,16 +1100,8 @@ async def _verify_specification_ledger(
                         }
             except json.JSONDecodeError:
                 pass
-        for story in content_dict.get("user_stories") or []:
-            story["change"] = spec_ledger.gate_change_status(
-                prior_by_id.get(story.get("id")),
-                {"text": story.get("title", ""), "deferred": bool(story.get("deferred"))},
-            )
-            for ac in story.get("acceptance_criteria") or []:
-                ac["change"] = spec_ledger.gate_change_status(
-                    prior_by_id.get(ac.get("id")),
-                    {"text": ac.get("description", ""), "deferred": bool(ac.get("deferred"))},
-                )
+        no_new_work = _stamp_gate_change_and_check_delta(content_dict, prior_by_id, updated_entries)
+
         content_dict["retired_user_stories"] = [
             {"id": e["id"], "title": e.get("title", "")}
             for e in updated_entries
@@ -1070,7 +1115,11 @@ async def _verify_specification_ledger(
     return VerificationResult(
         passed=result.passed,
         feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
-        report={"reasons": result.reasons, "ledger_entry_count": len(result.updated_entries)},
+        report={
+            "reasons": result.reasons,
+            "ledger_entry_count": len(result.updated_entries),
+            "no_new_work": no_new_work,
+        },
     )
 
 
@@ -3372,6 +3421,10 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
         last = stage.get("last_verification") or {}
         if last.get("cannot_verify"):
             return "escalate"  # no sandbox -- never loop or pass, a human must see it
+        # Only ever set by _verify_specification_ledger's zero-net-delta gate -- this report flag
+        # is inert (never present) for every other stage's deterministic_verify.
+        if (last.get("report") or {}).get("no_new_work"):
+            return "no_new_work"
         if last.get("passed"):
             return "gate"
         # Infra verdicts spend their own budget (see make_verify_node's counter split).
@@ -3588,6 +3641,38 @@ def make_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableC
         return {"stages": stages, "run_failure": payload}
 
     return escalate_node
+
+
+def make_no_new_work_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
+    """Only ever reached via make_route_after_verify's "no_new_work" outcome (currently only
+    _verify_specification_ledger's report can produce it): the Specification draft genuinely
+    passed its deterministic ledger sync, but classifies zero net US/AC delta against the last
+    approved baseline (user requirement 2026-09-10) -- there is nothing for Plan/AC-to-tests/...
+    to act on. Ends the run automatically, before the human gate ever runs -- unlike
+    make_escalate_node, this stage's content did NOT fail its check, so its approval is not
+    revoked and no counters are reset.
+
+    Routes the DB close through git_ops.record_run_failure (status="rejected") rather than calling
+    session_store.close_session directly -- record_run_failure is the one choke point every other
+    terminal node in this file uses for the SQL-close/ledger-append/commit/container-teardown-
+    timing sequence (see its own docstring); bypassing it for a new call site already caused a
+    real bug once here. Skips run_failure.record_run_failure_and_reset's classify_failure step
+    deliberately -- failure_type answers "why did this fail", which doesn't apply when nothing
+    failed.
+    """
+
+    async def no_new_work_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+        thread_id = config["configurable"]["thread_id"]
+        stage = state["stages"][stage_spec.key]
+        feedback = (stage.get("last_verification") or {}).get("feedback") or (
+            "no new or changed requirements since the last approved specification"
+        )
+        payload = {"stage": stage_spec.key, "type": "no_new_work", "feedback": feedback}
+        await git_ops.record_run_failure(thread_id, payload, state.get("run_id"), status="rejected")
+        await close_thread_session(thread_id, provider=state["provider"])
+        return {"run_failure": payload}
+
+    return no_new_work_node
 
 
 def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]:
@@ -4369,8 +4454,13 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
         # feedback context) up to max_verify_cycles; at the cap the run ENDs with run_failure
         # (no human escalation -- spec/plan approval are the only human touchpoints).
         escalate_name = f"{stage_spec.key}_escalate"
+        # Only ever reached via make_route_after_verify's "no_new_work" outcome, which only
+        # _verify_specification_ledger's report can produce -- dead-but-harmless wiring on every
+        # other stage.
+        no_new_work_name = f"{stage_spec.key}_no_new_work"
         builder.add_node(verify_name, make_verify_node(stage_spec))
         builder.add_node(escalate_name, make_escalate_node(stage_spec))
+        builder.add_node(no_new_work_name, make_no_new_work_node(stage_spec))
         retry_target = draft_name
         if stage_spec.verify_fix_prompt:
             fix_name = f"{stage_spec.key}_verify_fix"
@@ -4380,9 +4470,10 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
         builder.add_conditional_edges(
             verify_name,
             make_route_after_verify(stage_spec),
-            {"gate": gate_name, "retry": retry_target, "escalate": escalate_name},
+            {"gate": gate_name, "retry": retry_target, "escalate": escalate_name, "no_new_work": no_new_work_name},
         )
         builder.add_edge(escalate_name, END)
+        builder.add_edge(no_new_work_name, END)
 
     # Part 2 Task 10 (Ruling 3): was an unconditional add_edge(gate_name, next_draft_name) --
     # gate_node could only ever mark a stage approved before this task. "rejected" only ever
@@ -5665,6 +5756,50 @@ def _demo() -> None:
         ), "a non-UI repo must not get UI critique framing"
     finally:
         _tech_stack_has_ui_framework = _original_ui_gate
+
+    # Zero-net-delta gate (user requirement 2026-09-10): _stamp_gate_change_and_check_delta is
+    # pure, tested directly rather than through _verify_specification_ledger's full sandbox-I/O
+    # wrapper.
+    unchanged_prior = {"US-0001": {"text": "Sign in", "deferred": False}, "US-0001.1": {"text": "Shows an error.", "deferred": False}}
+    unchanged_draft = {
+        "user_stories": [
+            {"id": "US-0001", "title": "Sign in",
+             "acceptance_criteria": [{"id": "US-0001.1", "description": "Shows an error."}]}
+        ]
+    }
+    assert _stamp_gate_change_and_check_delta(copy.deepcopy(unchanged_draft), unchanged_prior, []), (
+        "every story/AC unchanged versus the last approval, nothing retired -> no new work"
+    )
+
+    modified_draft = copy.deepcopy(unchanged_draft)
+    modified_draft["user_stories"][0]["acceptance_criteria"][0]["description"] = "Shows an error on a wrong password."
+    assert not _stamp_gate_change_and_check_delta(modified_draft, unchanged_prior, []), (
+        "a genuinely modified AC is a real delta"
+    )
+
+    assert not _stamp_gate_change_and_check_delta({"user_stories": []}, {}, []), (
+        "first-ever approval (empty prior baseline) has no changes list to be vacuously all-unchanged"
+    )
+
+    retirement_only_updated = [{"id": "US-0002", "kind": "user_story", "status": "retired"}]
+    retirement_only_prior = {**unchanged_prior, "US-0002": {"text": "Old story", "deferred": False}}
+    assert not _stamp_gate_change_and_check_delta(copy.deepcopy(unchanged_draft), retirement_only_prior, retirement_only_updated), (
+        "a retirement not present in the draft, but live in the prior approval, is still a real delta"
+    )
+
+    already_retired_updated = [{"id": "US-0003", "kind": "user_story", "status": "retired"}]
+    assert _stamp_gate_change_and_check_delta(copy.deepcopy(unchanged_draft), unchanged_prior, already_retired_updated), (
+        "a retirement from BEFORE the last approval (not live in prior_by_id) is not a new delta"
+    )
+
+    route_spec = by_key["specification"]
+    route = make_route_after_verify(route_spec)
+    no_new_work_state = {"stages": {route_spec.key: {"last_verification": {"passed": True, "report": {"no_new_work": True}}}}}
+    assert route(no_new_work_state) == "no_new_work"  # type: ignore[arg-type]
+    real_delta_state = {"stages": {route_spec.key: {"last_verification": {"passed": True, "report": {"no_new_work": False}}}}}
+    assert route(real_delta_state) == "gate"  # type: ignore[arg-type]
+    failed_state = {"stages": {route_spec.key: {"last_verification": {"passed": False, "report": {}}, "verify_cycle_count": 0}}}
+    assert route(failed_state) == "retry", "no_new_work must never mask a genuine verify failure"  # type: ignore[arg-type]
 
     print("graph self-check: all assertions passed")
 

@@ -54,6 +54,14 @@ TRACKING_FIELDS = ("plan_step_ids", "coded_run_id", "coded_at", "tested_run_id",
 # markers (from runs that never reached approval) on its next pass.
 PENDING_RESET_FIELD = "pending_reset_run_id"
 
+# "Resolved" provenance: a FOURTH tracking site, kept separate from TRACKING_FIELDS above because
+# it fires on a different trigger (merge_ready going true in exit_nodes.exit_finalize_node) than
+# TRACKING_FIELDS's "regression-clean run" -- folding it into that tuple would make the sites-list
+# in TRACKING_FIELDS's own comment wrong. Written only by stamp_resolution() below. Cleared by
+# apply_tracking_resets_hook on the same genuine-reword signal that clears TRACKING_FIELDS: once a
+# requirement's wording really changed, its old "resolved" fact is no longer evidence of anything.
+RESOLUTION_FIELDS = ("resolved_at", "resolved_run_id")
+
 
 @dataclass(frozen=True)
 class LedgerSyncResult:
@@ -186,6 +194,7 @@ def sync_ledger(
     run_id: str,
     retired_ac_ids: list[str] | None = None,
     retired_us_ids: list[str] | None = None,
+    source_ticket_id: str | None = None,
 ) -> LedgerSyncResult:
     """The deterministic core of P2's ledger-sync gate.
 
@@ -241,6 +250,12 @@ def sync_ledger(
     orphaned still-`"active"` ACs would keep demanding coverage for criteria whose story is gone.
     This is a plain structural invariant (retiring a container retires its contents), not the
     supersession-lineage machinery Ruling 3 explicitly defers.
+
+    `source_ticket_id` (Tickets-view requirements-SOT work): stamped only onto entries CREATED by
+    this call, so the elevated ledger doc can show which ticket introduced each requirement. Never
+    backfilled onto a pre-existing entry revised/retired by a later ticket -- attribution names the
+    entry's origin, not its most recent editor. None (the default) leaves new entries unstamped,
+    same as every entry created before this field existed.
     """
     updated = [dict(e) for e in entries]
     reasons: list[str] = []
@@ -302,16 +317,17 @@ def sync_ledger(
         else:
             story_deferred = bool(story.get("deferred"))
             resolved_us_id = allocate_next_id(updated, "user_story")
-            updated.append(
-                {
-                    "id": resolved_us_id,
-                    "kind": "user_story",
-                    "status": "deferred" if story_deferred else "active",
-                    "title": story.get("title", ""),
-                    "first_seen_run_id": run_id,
-                    "last_revised_run_id": run_id,
-                }
-            )
+            new_entry = {
+                "id": resolved_us_id,
+                "kind": "user_story",
+                "status": "deferred" if story_deferred else "active",
+                "title": story.get("title", ""),
+                "first_seen_run_id": run_id,
+                "last_revised_run_id": run_id,
+            }
+            if source_ticket_id is not None:
+                new_entry["source_ticket_id"] = source_ticket_id
+            updated.append(new_entry)
 
         story["id"] = resolved_us_id
         touched_ids.add(resolved_us_id)
@@ -369,18 +385,19 @@ def sync_ledger(
                 resolved_ac_id = existing_ac_id
             else:
                 resolved_ac_id = allocate_next_id(updated, "acceptance_criterion", resolved_us_id)
-                updated.append(
-                    {
-                        "id": resolved_ac_id,
-                        "kind": "acceptance_criterion",
-                        "parent_us_id": resolved_us_id,
-                        "status": "deferred" if ac_deferred else "active",
-                        "description": ac.get("description", ""),
-                        "ui_related": ac.get("ui_related", False),
-                        "first_seen_run_id": run_id,
-                        "last_revised_run_id": run_id,
-                    }
-                )
+                new_ac_entry = {
+                    "id": resolved_ac_id,
+                    "kind": "acceptance_criterion",
+                    "parent_us_id": resolved_us_id,
+                    "status": "deferred" if ac_deferred else "active",
+                    "description": ac.get("description", ""),
+                    "ui_related": ac.get("ui_related", False),
+                    "first_seen_run_id": run_id,
+                    "last_revised_run_id": run_id,
+                }
+                if source_ticket_id is not None:
+                    new_ac_entry["source_ticket_id"] = source_ticket_id
+                updated.append(new_ac_entry)
 
             ac["id"] = resolved_ac_id
             touched_ids.add(resolved_ac_id)
@@ -620,20 +637,57 @@ def stamp_delivery(
     return changed
 
 
-async def apply_tracking_resets_hook(
-    thread_id: str, content: dict[str, Any], state: "GraphState", provider: SandboxProvider
-) -> None:
-    """StageSpec.post_approve_hook for the specification stage: executes the second phase of the
-    two-phase tracking reset (see PENDING_RESET_FIELD). Only markers stamped by THIS run's own
-    sync are honored; markers from abandoned runs are dropped without clearing anything.
+def stamp_resolution(entries: list[dict[str, Any]], run_id: str, now_iso: str) -> bool:
+    """Mutates `entries` with resolution stamps; returns whether anything changed. Pure.
 
-    ponytail: fires through _run_post_approve_hook, so a sandbox evicted at the gate or a raised
-    save skips/loses the reset silently (logged) -- pre-existing hook ceiling, the next healthy
-    sync re-marks a still-changed description.
+    Called ONLY from exit_nodes.exit_finalize_node, guarded on `merge_ready` -- delivery
+    (stamp_delivery, above) fires on a merely regression-clean run, but verify_exit_readiness can
+    still force merge_ready=False afterward (missing screenshots, no test command, unverified
+    auth). "Resolved" must lag "coded/tested" by that one more gate, or a run that never actually
+    reaches a mergeable state would still claim its criteria resolved.
+
+    Unlike stamp_delivery, deliberately NOT scoped to the calling ticket's own AC ids: an AC
+    delivered by an earlier run in the same lineage must still resolve here, once merge-readiness
+    is finally reached by whichever run gets there -- "resolved" is a whole-ledger fact, not a
+    per-ticket one. Do not "fix" this back to scoped.
+
+    AC pass first, then a story bubble-up pass in the same call so a story whose last child is
+    resolved by THIS call's AC pass resolves in the same run rather than lagging one run behind.
     """
-    del content  # the marker on the ledger entry, not the approved spec, is the authority
-    run_id = state.get("run_id", "unknown")
-    entries = await load_ledger(provider, thread_id)
+    changed = False
+    for entry in entries:
+        if (
+            entry.get("kind") == "acceptance_criterion"
+            and entry.get("status") in ("active", "revised")
+            and entry.get("coded_run_id")
+            and entry.get("tested_run_id")
+            and not entry.get("resolved_at")
+        ):
+            entry["resolved_at"] = now_iso
+            entry["resolved_run_id"] = run_id
+            changed = True
+    for story in entries:
+        if story.get("kind") != "user_story" or story.get("status") not in ("active", "revised") or story.get("resolved_at"):
+            continue
+        live_children = [
+            e for e in entries
+            if e.get("kind") == "acceptance_criterion"
+            and e.get("parent_us_id") == story.get("id")
+            and e.get("status") in ("active", "revised")
+        ]
+        if live_children and all(child.get("resolved_at") for child in live_children):
+            story["resolved_at"] = now_iso
+            story["resolved_run_id"] = run_id
+            changed = True
+    return changed
+
+
+def _apply_tracking_resets(entries: list[dict[str, Any]], run_id: str) -> bool:
+    """Pure second phase of the two-phase tracking reset (see PENDING_RESET_FIELD): clears
+    TRACKING_FIELDS and RESOLUTION_FIELDS on any entry marked by THIS run's own sync, and cascades
+    the RESOLUTION_FIELDS clear to the entry's parent story unconditionally (a resolved story's
+    "all live children resolved" fact no longer holds once one of them is un-resolved). Markers
+    from abandoned runs are dropped without clearing anything. Returns whether anything changed."""
     changed = False
     for entry in entries:
         marker = entry.get(PENDING_RESET_FIELD)
@@ -642,8 +696,31 @@ async def apply_tracking_resets_hook(
         if marker == run_id:
             for field in TRACKING_FIELDS:
                 entry.pop(field, None)
+            for field in RESOLUTION_FIELDS:
+                entry.pop(field, None)
+            parent = _find(entries, entry.get("parent_us_id")) if entry.get("parent_us_id") else None
+            if parent is not None:
+                for field in RESOLUTION_FIELDS:
+                    parent.pop(field, None)
         entry.pop(PENDING_RESET_FIELD, None)
         changed = True
+    return changed
+
+
+async def apply_tracking_resets_hook(
+    thread_id: str, content: dict[str, Any], state: "GraphState", provider: SandboxProvider
+) -> None:
+    """StageSpec.post_approve_hook for the specification stage: executes _apply_tracking_resets
+    against the persisted ledger.
+
+    ponytail: fires through _run_post_approve_hook, so a sandbox evicted at the gate or a raised
+    save skips/loses the reset silently (logged) -- pre-existing hook ceiling, the next healthy
+    sync re-marks a still-changed description.
+    """
+    del content  # the marker on the ledger entry, not the approved spec, is the authority
+    run_id = state.get("run_id", "unknown")
+    entries = await load_ledger(provider, thread_id)
+    changed = _apply_tracking_resets(entries, run_id)
     if changed:
         await save_ledger(provider, thread_id, entries)
         from . import git_ops
@@ -732,6 +809,30 @@ def _demo() -> None:
     assert ac1["status"] == "active", "an untouched, unnamed AC must not be silently retired"
     ac_new = next(e for e in result.updated_entries if e.get("description") == "Produces a .csv file.")
     assert ac_new["ui_related"] is True, "ui_related from the draft must persist on a new AC entry"
+
+    # Provenance (Tickets-view requirements SOT work): a NEW entry stamps which ticket introduced
+    # it; a later ticket revising a PRE-EXISTING entry must not steal or backfill its attribution.
+    prov_draft = [
+        {
+            "id": "draft-2",
+            "existing_us_id": None,
+            "title": "Reset password",
+            "acceptance_criteria": [{"id": "draft-2.1", "existing_ac_id": None, "description": "Emails a reset link."}],
+        }
+    ]
+    prov_result = sync_ledger([dict(e) for e in seed], prov_draft, "run-11", source_ticket_id="ticket-A")
+    assert prov_result.passed, prov_result.reasons
+    new_us = next(e for e in prov_result.updated_entries if e.get("title") == "Reset password")
+    new_ac = next(e for e in prov_result.updated_entries if e.get("description") == "Emails a reset link.")
+    assert new_us["source_ticket_id"] == "ticket-A", "a new entry must be stamped with the ticket that introduced it"
+    assert new_ac["source_ticket_id"] == "ticket-A"
+    revise_draft = [
+        {"id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in (updated)", "acceptance_criteria": []}
+    ]
+    revised = sync_ledger([dict(e) for e in seed], revise_draft, "run-12", source_ticket_id="ticket-B")
+    assert revised.passed, revised.reasons
+    us_after_revise = next(e for e in revised.updated_entries if e["id"] == "US-0001")
+    assert "source_ticket_id" not in us_after_revise, "revising a pre-existing entry must not backfill attribution"
 
     # THE FIX: naming a story in retired_us_ids DOES retire it, and cascades to its own AC.
     result2 = sync_ledger([dict(e) for e in seed], [], "run-3", retired_us_ids=["US-0001"])
@@ -896,6 +997,54 @@ def _demo() -> None:
     assert "coded_run_id" not in delivery_pool[2], "retired entries never stamped"
     assert "coded_run_id" not in delivery_pool[3], "other tickets' entries never stamped"
     assert not stamp_delivery(delivery_pool, {"US-0001.1", "US-0001.2"}, execution, "r2", "t2"), "idempotent"
+
+    # --- Resolution lifecycle ---
+    # A live AC with both stamps set resolves; one missing a stamp does not; a retired AC never
+    # resolves even fully delivered; a story only bubbles once EVERY live child is resolved.
+    resolution_pool = [
+        {"id": "US-0001", "kind": "user_story", "status": "active"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "parent_us_id": "US-0001", "status": "active",
+         "coded_run_id": "r1", "tested_run_id": "r1"},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "parent_us_id": "US-0001", "status": "active",
+         "coded_run_id": "r1"},  # never tested -- must not resolve, and must block the story bubble
+        {"id": "US-0002", "kind": "user_story", "status": "active"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "parent_us_id": "US-0002", "status": "retired",
+         "coded_run_id": "r1", "tested_run_id": "r1"},  # retired -- must never resolve
+    ]
+    assert stamp_resolution(resolution_pool, "r2", "t2")
+    ac_resolved = next(e for e in resolution_pool if e["id"] == "US-0001.1")
+    ac_unresolved = next(e for e in resolution_pool if e["id"] == "US-0001.2")
+    story_blocked = next(e for e in resolution_pool if e["id"] == "US-0001")
+    ac_retired = next(e for e in resolution_pool if e["id"] == "US-0002.1")
+    assert ac_resolved["resolved_at"] == "t2" and ac_resolved["resolved_run_id"] == "r2"
+    assert "resolved_at" not in ac_unresolved, "coded without tested must not resolve"
+    assert "resolved_at" not in story_blocked, "story must not bubble while a live child is unresolved"
+    assert "resolved_at" not in ac_retired, "a retired AC never resolves, however fully delivered"
+    assert not stamp_resolution(resolution_pool, "r2", "t2"), "idempotent"
+
+    # Once the last live child resolves, the story bubbles up in the SAME call.
+    ac_unresolved["tested_run_id"] = "r1"
+    assert stamp_resolution(resolution_pool, "r3", "t3")
+    story_after = next(e for e in resolution_pool if e["id"] == "US-0001")
+    assert story_after["resolved_at"] == "t3" and story_after["resolved_run_id"] == "r3"
+
+    # Retirement never clobbers a prior resolution -- historical fact survives sync_ledger's own
+    # retirement path (status/last_revised_run_id are the only fields it touches).
+    resolved_then_retired = sync_ledger(
+        [dict(e) for e in resolution_pool], [], "run-13", retired_us_ids=["US-0001"]
+    )
+    assert resolved_then_retired.passed, resolved_then_retired.reasons
+    retired_ac = next(e for e in resolved_then_retired.updated_entries if e["id"] == "US-0001.1")
+    assert retired_ac["status"] == "retired" and retired_ac["resolved_at"] == "t2", "resolved_at survives retirement"
+
+    # A genuine re-word clears resolved_at on the AC AND cascades to clear it on the parent story.
+    reworded_pool = [dict(e) for e in resolution_pool]
+    next(e for e in reworded_pool if e["id"] == "US-0001.1")[PENDING_RESET_FIELD] = "run-14"
+    assert _apply_tracking_resets(reworded_pool, "run-14")
+    reworded_ac = next(e for e in reworded_pool if e["id"] == "US-0001.1")
+    reworded_story = next(e for e in reworded_pool if e["id"] == "US-0001")
+    assert "resolved_at" not in reworded_ac and "coded_run_id" not in reworded_ac
+    assert "resolved_at" not in reworded_story, "un-resolving a child must cascade-clear the parent story"
 
     # --- Deferred scope lifecycle ---
     # New story emitted deferred: parked from birth, cascades to its own new AC, out of the queue.

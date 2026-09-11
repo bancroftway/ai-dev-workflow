@@ -1376,6 +1376,16 @@ async def exit_finalize_node(
         )
 
         ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+        # "Resolved" marking (user requirement 2026-09-10): only once this run's own merge_ready
+        # is true -- stamp_delivery (metrics_compute_node) fires on a merely regression-clean run,
+        # but verify_exit_readiness above can still force merge_ready=False afterward (missing
+        # screenshots, no test command, unverified auth). Deliberately BEFORE us_ac_rows/the
+        # snapshot write below, so this run's own exit report/snapshot reflects the just-stamped
+        # state rather than stale pre-stamp state. Not scoped to this ticket's own AC ids -- see
+        # stamp_resolution's own docstring.
+        resolution_changed = merge_ready and spec_ledger.stamp_resolution(ledger_entries, run_id, timestamp)
+        if resolution_changed:
+            await spec_ledger.save_ledger(provider, thread_id, ledger_entries)
         # US/AC provenance rows: this run's own spec scope from STATE (already in hand -- no sandbox
         # read; the approved file equals it byte-for-byte), row set + carried-over from the ledger.
         own_spec = ((state.get("stages") or {}).get("specification") or {}).get("approved_content") or {}
@@ -1547,6 +1557,8 @@ async def exit_finalize_node(
         commit_targets = [MANIFEST_PATH, HISTORY_DIR, CHANGELOG_PATH, EXIT_REPORT_PATH, workflow_persistence.METRICS_EXIT_MD_PATH]
         if baseline_payload is not None:
             commit_targets.append(repo_scan.BASELINE_PATH)
+        if resolution_changed:
+            commit_targets.append(spec_ledger.LEDGER_PATH)
         await git_ops.commit_paths(
             provider,
             thread_id,

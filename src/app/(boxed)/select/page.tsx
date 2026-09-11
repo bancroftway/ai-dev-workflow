@@ -5,7 +5,6 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { RepoSummary } from "@/app/api/github/repos/route";
 import type { BranchSummary } from "@/app/api/github/branches/route";
-import type { ProjectListResponse, ProjectSummary } from "@/app/api/projects/route";
 import { SessionHistory } from "@/components/SessionHistory";
 import { SettingsBanner } from "@/components/SettingsBanner";
 
@@ -35,13 +34,6 @@ export default function SelectPage() {
   const [githubNotConnected, setGithubNotConnected] = useState(false);
   const [selectedFullName, setSelectedFullName] = useState<string>("");
   const [filter, setFilter] = useState("");
-  // Minor 15 (Phase E audit): the board's only entry point in the whole app was the New Ticket
-  // form. This page already lists repos, but has no notion of "project" until Connect Repository
-  // (connectProject, below) actually runs -- so a board link can only ever exist for a repo that's
-  // ALREADY connected. Same full-list-then-match technique board/page.tsx's own fetchProject and
-  // tickets/new's fetchProject already use -- no `GET /api/projects?owner=&repo=` exists, and one
-  // ticket's worth of board-link plumbing doesn't earn a new backend route.
-  const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   // Per-repo container cap: lowercase "owner/repo" set of repos with a live sandbox container
   // right now. Advisory only -- the agent's provision-time 409 is the enforcement; this just
   // explains it before the user hits it.
@@ -51,20 +43,6 @@ export default function SelectPage() {
     () => repos?.find((r) => r.fullName === selectedFullName) ?? null,
     [repos, selectedFullName],
   );
-
-  // Case-insensitive: GitHub's own casing for owner/repo reaches dbo.projects via whichever path
-  // first connected it (Connect Repository here, or a "+ New Project" ticket's scaffold), and
-  // nothing in this codebase asserts the two paths agree on case -- defensive, not evidence of a
-  // real mismatch seen anywhere.
-  const selectedProjectId = useMemo(() => {
-    if (!selectedRepo || !projects) return null;
-    const match = projects.find(
-      (p) =>
-        p.owner?.toLowerCase() === selectedRepo.owner.toLowerCase() &&
-        p.repo?.toLowerCase() === selectedRepo.repo.toLowerCase(),
-    );
-    return match?.project_id ?? null;
-  }, [selectedRepo, projects]);
 
   // Already sorted updated-desc by the API's own octokit query -- filter only, no re-sort needed.
   const filteredRepos = useMemo(() => {
@@ -90,18 +68,6 @@ export default function SelectPage() {
         if (data) setRepos(data.repos);
       })
       .catch((err: Error) => setReposError(err.message));
-  }, []);
-
-  useEffect(() => {
-    // Best-effort only: a failed/slow fetch just means no board link shows yet (selectedProjectId
-    // stays null) -- not worth a second error slot on this page for a link that's a bonus, not the
-    // page's own job.
-    fetch("/api/projects")
-      .then((res) => (res.ok ? (res.json() as Promise<ProjectListResponse>) : null))
-      .then((data) => {
-        if (data) setProjects(data.projects);
-      })
-      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -197,7 +163,6 @@ export default function SelectPage() {
             <RepoBranchSection
               key={selectedRepo.fullName}
               repo={selectedRepo}
-              projectId={selectedProjectId}
               containerRunning={activeRepos.has(selectedRepo.fullName.toLowerCase())}
             />
           ) : (
@@ -295,11 +260,9 @@ function timeAgo(iso: string): string {
 
 function RepoBranchSection({
   repo,
-  projectId,
   containerRunning,
 }: {
   repo: RepoSummary;
-  projectId: string | null;
   containerRunning: boolean;
 }) {
   const router = useRouter();
@@ -345,15 +308,15 @@ function RepoBranchSection({
     }
   }
 
-  async function connectRepository() {
+  async function openTickets() {
     setActionError(null);
     setConnecting(true);
     try {
+      // Must resolve/connect fresh, not trust `projectId` -- that prop is only populated for a
+      // repo connected before this page loaded (its one-shot fetch on mount), so a repo connected
+      // for the first time right now would otherwise 404.
       await connectProject(repo.owner, repo.repo);
-      // ponytail: no ?project= preselect on the New Ticket form -- the just-connected project
-      // sorts newest-first in its picker, so it's already on top. Add a preselect if that's ever
-      // not enough (e.g. reconnecting an old project buried in the list).
-      router.push("/tickets/new");
+      router.push(`/tickets/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}`);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
       setConnecting(false);
@@ -362,36 +325,19 @@ function RepoBranchSection({
 
   return (
     <>
-      {/* Connect-repository button + View-board link HIDDEN for now (user decision 2026-08-31):
-          "Start new session" connects the project implicitly, so the button's only remaining
-          purpose (ticket-first registration) is parked until the ticket flow is revisited.
-          connectRepository() and the projectId lookup stay wired for when these return. */}
-      {false && (
-        <>
-          <div className="flex items-center justify-between gap-3">
-            <p className="text-sm text-neutral-500">
-              Connecting registers this repo as a project so tickets can be filed against it --
-              no session starts until the first ticket does.
-            </p>
-            <button
-              type="button"
-              className="shrink-0 self-start rounded-lg border border-neutral-300 px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
-              onClick={connectRepository}
-              disabled={connecting}
-            >
-              {connecting ? "Connecting…" : "Connect repository"}
-            </button>
-          </div>
-          {projectId && (
-            <Link
-              href={`/projects/${projectId}/board`}
-              className="self-start text-xs text-neutral-500 underline hover:text-neutral-800"
-            >
-              View board →
-            </Link>
-          )}
-        </>
-      )}
+      {/* Repo-level entry point (Task: Tickets View, Scope §2) -- deliberately its OWN enablement,
+          not a copy of "Start new session"'s: this view lists tickets across every branch, so it
+          needs a repo, not a resolved branch, and must stay enabled while containerRunning (that's
+          a container-capacity signal, irrelevant to browsing/filing tickets) -- see this task's
+          plan for why literally reusing Start Session's gate would have been wrong. */}
+      <button
+        type="button"
+        className="self-start rounded-lg border border-neutral-300 px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
+        onClick={openTickets}
+        disabled={connecting}
+      >
+        {connecting ? "Opening…" : "Open Tickets"}
+      </button>
 
       {actionError && <p className="text-sm text-red-600">{actionError}</p>}
 

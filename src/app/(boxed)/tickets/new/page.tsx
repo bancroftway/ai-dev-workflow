@@ -3,7 +3,7 @@
 import { useAttachments } from "@copilotkit/react-core/v2";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { SettingsBanner } from "@/components/SettingsBanner";
 import { stashHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
@@ -39,10 +39,18 @@ type SubmitState =
  */
 export default function NewTicketPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  // Repo-scoped entry points (the Tickets page's "+ New Ticket", /select's "Open Tickets") pass
+  // ?owner=&repo= so this form skips the project picker instead of defaulting to "+ New Project" --
+  // previously a known, deliberately-deferred gap (select.tsx's own ponytail comment on
+  // connectRepository noted no preselect existed yet).
+  const preselectOwner = searchParams.get("owner");
+  const preselectRepo = searchParams.get("repo");
 
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState<string>(NEW_PROJECT_VALUE);
+  const [preselectApplied, setPreselectApplied] = useState(false);
 
   const [newProjectName, setNewProjectName] = useState("");
   const [catalog, setCatalog] = useState<CannedTechStack[] | null>(null);
@@ -118,6 +126,19 @@ export default function NewTicketPage() {
   if (catalog !== catalogDefaultedFor && catalog && catalog.length > 0) {
     setCatalogDefaultedFor(catalog);
     if (!stackPickerTouched) setSelectedStackId(catalog[0].id);
+  }
+
+  // Same render-time-adjustment pattern as the catalog default above: the instant `projects`
+  // arrives, claim the untouched default exactly once (preselectApplied guards against re-running
+  // on every render, and against ever overwriting a choice the user made after arrival). No match
+  // (repo not connected yet, or owner/repo weren't passed) leaves "+ New Project" selected, same as
+  // today.
+  if (!preselectApplied && projects && preselectOwner && preselectRepo) {
+    setPreselectApplied(true);
+    const match = projects.find(
+      (p) => p.owner?.toLowerCase() === preselectOwner.toLowerCase() && p.repo?.toLowerCase() === preselectRepo.toLowerCase(),
+    );
+    if (match) setSelectedProjectId(match.project_id);
   }
 
   const provider = useOrgProvider();

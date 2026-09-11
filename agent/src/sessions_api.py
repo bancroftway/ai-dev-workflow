@@ -120,6 +120,33 @@ class ProvisionResponse(BaseModel):
     status: str
 
 
+async def _reject_if_another_ticket_open(thread_id: str, owner: str, repo: str) -> None:
+    """One open ticket per repo at a time (Task: Tickets View, Scope §3) -- 409s when a session
+    OTHER than `thread_id` on this exact (owner, repo) still has `status == "in_progress"`.
+
+    Broadened from the previous per-repo guard's question ("is any OTHER thread's sandbox
+    container currently live for this repo?") to a different one ("is any OTHER session on this
+    repo still open at all, live container or not?"). The narrower, container-only question left a
+    real gap: a ticket idling at its own human gate has no live container (idle-reaped to free the
+    slot), so a second ticket could still provision against the same repo while the first was still
+    open and unmerged -- both then independently allocate spec_ledger.py ids from their own, mutually
+    stale clones, colliding at PR-merge time (a real, previously undiagnosed data-integrity risk,
+    not a hypothetical one). Checking `dbo.sessions.status` directly closes that gap: only a
+    session that has actually reached a terminal status (completed/failed/rejected) frees the repo
+    for a new ticket, regardless of container state. The session that already owns the open slot is
+    excluded by `thread_id` so resuming/reattaching to it never blocks itself.
+    """
+    for row in await session_store.list_sessions(owner, repo):
+        if row["session_id"] != thread_id and row["status"] == "in_progress":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"ticket {row['session_id']} is still open on {owner}/{repo} -- "
+                    "finish or close it before starting another"
+                ),
+            )
+
+
 @router.post("/provision", response_model=ProvisionResponse)
 async def provision_session(body: ProvisionRequest, request: Request) -> ProvisionResponse:
     _check_shared_secret(request)
@@ -202,26 +229,13 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     if not project_id:
         raise HTTPException(status_code=422, detail="project_id is required to provision a new session")
 
-    # Per-repo container cap (production CI/CD plan, Phase 5): at most ONE live container per
-    # (owner, repo). Sits with the other pre-side-effect 409s above, before the vault fetch and
-    # long before provider.provision(). The thread that OWNS the live container always passes
-    # (reattach/reload/resume-after-idle keep working); any OTHER thread targeting the same repo
-    # is refused until that container ends -- close_session's teardown (exit paths) and the stop
-    # button free the slot in seconds, the idle reaper is the backstop. A scaffold-new-repo
-    # provision passes vacuously (its repo doesn't exist yet, so nothing matches). Known race:
-    # two concurrent provisions can both pass before either registry.set -- accepted (single agent
-    # process, minReplicas=maxReplicas=1; the reaper bounds the damage).
-    live_others = set(registry.live_ids()) - {body.thread_id}
-    if live_others:
-        for row in await session_store.sessions_by_ids(sorted(live_others)):
-            if (row["owner"], row["repo"]) == (body.owner, body.repo):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"a sandbox container is already running for {body.owner}/{body.repo} "
-                        f"(session {row['session_id']}) -- stop it or wait for it to finish"
-                    ),
-                )
+    # One open ticket per repo at a time -- see _reject_if_another_ticket_open's own docstring.
+    # Sits with the other pre-side-effect 409s above, before the vault fetch and long before
+    # provider.provision(). A scaffold-new-repo provision passes vacuously (its repo doesn't exist
+    # yet, so nothing matches). Known race: two concurrent provisions can both pass before either
+    # session row is created -- accepted (single agent process, minReplicas=maxReplicas=1; this is
+    # the same accepted race the container-only check it replaces already carried).
+    await _reject_if_another_ticket_open(body.thread_id, body.owner, body.repo)
 
     # Vault fetch happens BEFORE the sandbox boots: a misconfigured/revoked vault fails the
     # provision in seconds with the provider's own AADSTS/403 detail, instead of surfacing hours
@@ -1821,6 +1835,37 @@ def _demo() -> None:
     }
     resp = asyncio.run(_row_to_response(fake_row))
     assert resp.awaiting_gate is True, resp
+
+    # One open ticket per repo at a time (Task: Tickets View, Scope §3): _reject_if_another_ticket_
+    # open must 409 when another session on the same (owner, repo) is still in_progress, must
+    # exclude the caller's OWN thread_id (resuming/reattaching to the ticket that already owns the
+    # slot never blocks itself), and must ignore a same-repo session that has already reached a
+    # terminal status. This is the first test this guard has ever had (broadened from the earlier
+    # live-container-only check, which had none either, per this session's own audit).
+    async def _stub_list_sessions_mixed(
+        owner: str, repo: str, source_branch: str | None = None, project_id: str | None = None, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        assert (owner, repo) == ("acme", "widgets")
+        return [
+            {"session_id": "other-ticket", "status": "in_progress"},
+            {"session_id": "old-ticket", "status": "completed"},
+        ]
+
+    original_list_sessions = session_store.list_sessions
+    session_store.list_sessions = _stub_list_sessions_mixed  # type: ignore[assignment]
+    try:
+        try:
+            asyncio.run(_reject_if_another_ticket_open("new-ticket", "acme", "widgets"))
+            raise AssertionError("must 409 when another ticket is still open on this repo")
+        except HTTPException as exc:
+            assert exc.status_code == 409, exc.status_code
+            assert "other-ticket" in exc.detail, exc.detail
+            assert "old-ticket" not in exc.detail, "a completed session must never block a new ticket"
+
+        # The session that already owns the open slot resuming/reattaching to itself must pass.
+        asyncio.run(_reject_if_another_ticket_open("other-ticket", "acme", "widgets"))
+    finally:
+        session_store.list_sessions = original_list_sessions  # type: ignore[assignment]
     assert resp.project_id == "22222222-2222-2222-2222-222222222222", resp
     assert resp.container_alive is False, "no registry entry must read as not alive"
 
@@ -2679,6 +2724,11 @@ def _demo() -> None:
         assert project_id == "proj-i3-selfcheck", project_id
         return {"name": "i3-project", "repo": "already-connected-repo"}  # repo set -- no scaffolding
 
+    async def _i3_list_sessions_none_open(
+        owner: str, repo: str, source_branch: str | None = None, project_id: str | None = None, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return []  # this test's own thread is resuming, not competing with another open ticket
+
     class _I3FakeSandboxProvider:
         async def provision(self, **kwargs: Any) -> SandboxSession:
             i3_calls.append(("provider.provision", kwargs.get("provider")))
@@ -2697,12 +2747,14 @@ def _demo() -> None:
     original_get_project_i3 = project_store.get_project
     original_get_sandbox_provider_i3 = get_sandbox_provider
     original_set_session_provider_i3 = session_store.set_session_provider
+    original_list_sessions_i3 = session_store.list_sessions
     session_store.get_session = _i3_get_session_with_stored_provider  # type: ignore[assignment]
     chat_model.get_provider = _i3_get_provider_live_disagrees  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _i3_get_runtime_auth_token  # type: ignore[assignment]
     keyvault.get_vault_uri = _i3_get_vault_uri  # type: ignore[assignment]
     project_store.get_project = _i3_get_project  # type: ignore[assignment]
     session_store.set_session_provider = _i3_set_session_provider_must_not_be_called  # type: ignore[assignment]
+    session_store.list_sessions = _i3_list_sessions_none_open  # type: ignore[assignment]
     get_sandbox_provider = lambda: _I3FakeSandboxProvider()  # noqa: E731
     try:
         response = asyncio.run(provision_session(
@@ -2719,6 +2771,7 @@ def _demo() -> None:
         keyvault.get_vault_uri = original_get_vault_uri_i3  # type: ignore[assignment]
         project_store.get_project = original_get_project_i3  # type: ignore[assignment]
         session_store.set_session_provider = original_set_session_provider_i3  # type: ignore[assignment]
+        session_store.list_sessions = original_list_sessions_i3  # type: ignore[assignment]
         get_sandbox_provider = original_get_sandbox_provider_i3
         registry.pop("t-i3-selfcheck")
 
@@ -2751,6 +2804,11 @@ def _demo() -> None:
     async def _m3_set_session_provider(thread_id: str, provider: str) -> None:
         m3_calls.append((thread_id, provider))
 
+    async def _m3_list_sessions_none_open(
+        owner: str, repo: str, source_branch: str | None = None, project_id: str | None = None, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return []
+
     class _M3FakeSandboxProvider:
         async def provision(self, **kwargs: Any) -> SandboxSession:
             return SandboxSession(kwargs["session_id"], "localhost", 0, "")
@@ -2762,12 +2820,14 @@ def _demo() -> None:
     original_get_project_m3 = project_store.get_project
     original_set_session_provider_m3 = session_store.set_session_provider
     original_get_sandbox_provider_m3 = get_sandbox_provider
+    original_list_sessions_m3 = session_store.list_sessions
     session_store.get_session = _m3_get_session_null_provider  # type: ignore[assignment]
     chat_model.get_provider = _m3_get_provider_live  # type: ignore[assignment]
     chat_model.get_runtime_auth_token = _m3_get_runtime_auth_token  # type: ignore[assignment]
     keyvault.get_vault_uri = _m3_get_vault_uri  # type: ignore[assignment]
     project_store.get_project = _m3_get_project  # type: ignore[assignment]
     session_store.set_session_provider = _m3_set_session_provider  # type: ignore[assignment]
+    session_store.list_sessions = _m3_list_sessions_none_open  # type: ignore[assignment]
     get_sandbox_provider = lambda: _M3FakeSandboxProvider()  # noqa: E731
     try:
         asyncio.run(provision_session(
@@ -2783,6 +2843,7 @@ def _demo() -> None:
         keyvault.get_vault_uri = original_get_vault_uri_m3  # type: ignore[assignment]
         project_store.get_project = original_get_project_m3  # type: ignore[assignment]
         session_store.set_session_provider = original_set_session_provider_m3  # type: ignore[assignment]
+        session_store.list_sessions = original_list_sessions_m3  # type: ignore[assignment]
         get_sandbox_provider = original_get_sandbox_provider_m3
         registry.pop("t-m3-selfcheck")
 

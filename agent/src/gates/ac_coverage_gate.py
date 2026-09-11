@@ -127,14 +127,42 @@ def _extract_failed_files(lines: list[str]) -> list[str]:
 
 
 def resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
-    """Public: exit's manifest completion records this as the manifest's test_command."""
+    """Public: exit's manifest completion records this as the manifest's test_command.
+
+    Consults the tech-stack stage's own detected `testing_frameworks`/`package_managers`
+    (already derived from the repo's real lockfile/devDependencies by the tech-stack-conventions
+    skill -- schemas.TechStack, not guessed here) before falling back to a generic per-language
+    command. Previously this ignored both fields entirely and always guessed the same
+    vitest-or-jest / bare-python command regardless of what was actually detected -- wrong for a
+    repo using e.g. mocha, poetry, or uv, and wrong at the exit gate specifically, since that
+    guess is what gets written into the manifest and replayed against the repo's real test suite
+    (Task: Tickets View audit finding). Also applies `ecosystem_root_prefix` for node/python, the
+    same monorepo-root fix `dotnet_root_prefix` already has below -- a bare command at the wrong
+    directory fails immediately, same failure class as .NET's MSB1003.
+    """
     languages = [str(l).lower() for l in tech_stack_signals.presence_values(tech_stack, "languages")]
+    testing_frameworks = [str(t).lower() for t in tech_stack_signals.presence_values(tech_stack, "testing_frameworks")]
+    package_managers = [str(p).lower() for p in tech_stack_signals.presence_values(tech_stack, "package_managers")]
+
     if tech_stack_signals.dotnet_detected(tech_stack):
         return f"{tech_stack_signals.dotnet_root_prefix(tech_stack)}dotnet test --logger 'console;verbosity=normal'"
+
     if "typescript" in languages or "javascript" in languages:
-        return "npx --yes vitest run --reporter=verbose || npx --yes jest --verbose"
+        prefix = tech_stack_signals.ecosystem_root_prefix(tech_stack, "node")
+        if "vitest" in testing_frameworks:
+            return f"{prefix}npx --yes vitest run --reporter=verbose"
+        if "jest" in testing_frameworks:
+            return f"{prefix}npx --yes jest --verbose"
+        if "mocha" in testing_frameworks:
+            return f"{prefix}npx --yes mocha"
+        # Detection inconclusive -- same generic guess as before, now at least root-prefixed.
+        return f"{prefix}npx --yes vitest run --reporter=verbose || npx --yes jest --verbose"
+
     if "python" in languages:
-        return "python -m pytest -v"
+        prefix = tech_stack_signals.ecosystem_root_prefix(tech_stack, "python")
+        runner = "poetry run" if "poetry" in package_managers else "uv run" if "uv" in package_managers else "python -m"
+        return f"{prefix}{runner} pytest -v"
+
     return None
 
 
@@ -1296,6 +1324,52 @@ def _demo() -> None:
     ) == "python -m pytest -v"
     assert resolve_test_command({}) is None
     assert resolve_test_command(_ts()) is None
+
+    # Task: Tickets View brownfield-gap fix -- consults testing_frameworks/package_managers
+    # (already detected by the tech-stack-conventions skill from the repo's own lockfile/
+    # devDependencies) instead of guessing generically once they're actually present.
+    assert resolve_test_command(
+        _ts(
+            languages={"status": "present", "values": ["TypeScript"]},
+            testing_frameworks={"status": "present", "values": ["vitest"]},
+        )
+    ) == "npx --yes vitest run --reporter=verbose"
+    assert resolve_test_command(
+        _ts(
+            languages={"status": "present", "values": ["JavaScript"]},
+            testing_frameworks={"status": "present", "values": ["jest"]},
+        )
+    ) == "npx --yes jest --verbose"
+    assert resolve_test_command(
+        _ts(
+            languages={"status": "present", "values": ["JavaScript"]},
+            testing_frameworks={"status": "present", "values": ["mocha"]},
+        )
+    ) == "npx --yes mocha"
+    assert resolve_test_command(
+        _ts(
+            languages={"status": "present", "values": ["Python"]},
+            testing_frameworks={"status": "present", "values": ["pytest"]},
+            package_managers={"status": "present", "values": ["poetry"]},
+        )
+    ) == "poetry run pytest -v"
+    assert resolve_test_command(
+        _ts(
+            languages={"status": "present", "values": ["Python"]},
+            package_managers={"status": "present", "values": ["uv"]},
+        )
+    ) == "uv run pytest -v"
+    # A detected non-root workspace (monorepo) must cd into it first -- the same fix
+    # dotnet_root_prefix already gets for .NET, now extended to node/python via
+    # ecosystem_root_prefix, so a bare command doesn't die at the wrong directory (MSB1003's own
+    # JS/Python equivalent: "no package.json/pyproject.toml here").
+    assert resolve_test_command(
+        _ts(
+            languages={"status": "present", "values": ["TypeScript"]},
+            testing_frameworks={"status": "present", "values": ["vitest"]},
+            convention_roots=[{"ecosystem": "node", "status": "present", "root": "apps/web", "reason": ""}],
+        )
+    ) == "cd apps/web && npx --yes vitest run --reporter=verbose"
 
     # Genuinely legacy on-disk shape (old dotnet_detected/dotnet_solution_root pair) must resolve
     # correctly too, not silently fall through to "no command" for an already-onboarded .NET repo.

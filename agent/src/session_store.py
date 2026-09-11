@@ -499,6 +499,17 @@ async def _demo() -> None:
         row = await get_session(session_id)
         assert row["status"] == "completed" and row["pr_url"] == "https://github.com/o/r/pull/1", row
 
+        # "rejected" (user requirement 2026-09-10): a Specification run with zero net ledger delta
+        # closes with this status via git_ops.record_run_failure(status="rejected"), distinct from
+        # a real "failed" run -- same close_session/get_session round-trip as the failed case above.
+        await close_session(
+            session_id, run_id="r5", status="rejected",
+            failure={"stage": "specification", "type": "no_new_work", "feedback": "no new or changed requirements"},
+        )
+        row = await get_session(session_id)
+        assert row["status"] == "rejected" and row["failure_message"] == "no new or changed requirements", row
+        assert row["ended_at"] is not None, row
+
         sessions = await list_sessions(owner, repo)
         assert any(s["session_id"] == session_id for s in sessions), sessions
 

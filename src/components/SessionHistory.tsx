@@ -49,10 +49,16 @@ function ProgressIndicator({ currentStage }: { currentStage: string | null }) {
 
 /**
  * Session list for /select, rendered once a repo AND branch are both chosen (SelectPage keys this
- * by (repo, branch) so switching either always re-fetches from scratch). Reports whether any
- * session on this repo/branch is in_progress via `onInProgressChange` for cosmetic use only --
- * concurrency is fully open now (branch-per-session), there is no provision-time lock to warn
- * about, unlike the old per-repo 409 guard this replaced.
+ * by (repo, branch) so switching either always re-fetches from scratch), OR the repo-scoped
+ * Tickets page (`sourceBranch` omitted) -- Task: Tickets View, Scope §1. `sessions_api.py`'s
+ * per-repo container cap (`provision_session`, "at most ONE live container per (owner, repo)")
+ * still applies at provision time regardless of which caller this is -- the comment this replaced
+ * was describing an intermediate state, not the current one.
+ *
+ * When `sourceBranch` is omitted, lists every ticket for the repo across all branches, split into
+ * an Active section (`status === "in_progress"`) and a Past section (everything else) -- the
+ * repo-scoped Tickets view has no single branch to key its fetch by. When `sourceBranch` is given,
+ * renders the original flat single-list layout unchanged (existing /select usage).
  */
 export function SessionHistory({
   owner,
@@ -62,7 +68,7 @@ export function SessionHistory({
 }: {
   owner: string;
   repo: string;
-  sourceBranch: string;
+  sourceBranch?: string;
   onInProgressChange?: (inProgress: boolean) => void;
 }) {
   const router = useRouter();
@@ -100,7 +106,8 @@ export function SessionHistory({
 
   useEffect(() => {
     let cancelled = false;
-    const params = new URLSearchParams({ owner, repo, source_branch: sourceBranch });
+    const params = new URLSearchParams({ owner, repo });
+    if (sourceBranch) params.set("source_branch", sourceBranch);
     function load() {
       fetch(`/api/sessions/list?${params}`)
         .then((res) => {
@@ -191,117 +198,143 @@ export function SessionHistory({
     }
   }
 
+  function renderList(list: Session[]) {
+    return (
+      <ul className="flex flex-col gap-2">
+        {list.map((s) => (
+          <li
+            key={s.session_id}
+            className="flex flex-col gap-1 rounded-md border border-neutral-200 px-3 py-2 text-sm"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate font-medium text-neutral-900">{s.title}</span>
+              <div className="flex shrink-0 items-center gap-2">
+                <ContainerStatusButton
+                  status={s.container_alive ? "ready" : "terminated"}
+                  onStop={() => stopContainer(s)}
+                  stopping={stoppingId === s.session_id}
+                />
+                <span
+                  className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[s.status]}`}
+                >
+                  {s.status === "in_progress" && s.run_active && <RunningSpinner className="h-3 w-3" />}
+                  {s.status === "in_progress" ? inProgressLabel(s) : s.status.replace("_", " ")}
+                </span>
+              </div>
+            </div>
+            <div className="text-xs text-neutral-500">
+              {s.user_login || "unknown"} · started {s.started_at} · ended {s.ended_at ?? "—"}
+              {!sourceBranch && ` · ${s.source_branch}`}
+            </div>
+            {s.status === "in_progress" && <ProgressIndicator currentStage={s.current_stage} />}
+            {(s.status === "failed" || s.status === "rejected") && s.failure_message && (
+              <p className={`text-xs ${s.status === "rejected" ? "text-amber-700" : "text-red-700"}`}>
+                {s.failure_stage}: {s.failure_type} — {s.failure_message}
+              </p>
+            )}
+            <div className="flex gap-2">
+              {(s.status === "failed" || (s.status === "in_progress" && s.interrupted)) && (
+                <button
+                  type="button"
+                  title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
+                  className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
+                  onClick={() => resume(s)}
+                >
+                  Resume
+                </button>
+              )}
+              {/* Workflow Liveness Fix: an "in_progress" session whose process has actually died
+                  (interrupted) routes to Resume above instead -- a plain-URL reattach here would
+                  open the workflow page and reconnect to nothing. */}
+              {s.status === "in_progress" && !s.interrupted && (
+                <button
+                  type="button"
+                  title="Reattaches to the run already in progress -- nothing restarts, nothing is lost."
+                  className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
+                  onClick={() => openLive(s)}
+                >
+                  Open
+                </button>
+              )}
+              {s.status === "failed" && (
+                <button
+                  type="button"
+                  title="Files an issue in the org-configured support repo with the thread id and failure details (or opens the existing one)."
+                  className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700 disabled:opacity-40"
+                  disabled={supportIssueId === s.session_id}
+                  onClick={() => openSupportIssue(s)}
+                >
+                  {supportIssueId === s.session_id ? "Filing…" : "Open support issue"}
+                </button>
+              )}
+              {s.status === "completed" && (
+                <>
+                  <button
+                    type="button"
+                    className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
+                    onClick={() => openLive(s)}
+                  >
+                    View report
+                  </button>
+                  {s.pr_url && (
+                    <a
+                      href={s.pr_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
+                    >
+                      View PR
+                    </a>
+                  )}
+                </>
+              )}
+              <button
+                type="button"
+                title="Stops its container if running, deletes its GitHub branch, and removes it from this list."
+                className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-500 hover:border-red-300 hover:bg-red-50 hover:text-red-700 disabled:opacity-40"
+                disabled={deletingId === s.session_id}
+                onClick={() => deleteSession(s)}
+              >
+                {deletingId === s.session_id ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
+  const active = sessions?.filter((s) => s.status === "in_progress") ?? [];
+  const past = sessions?.filter((s) => s.status !== "in_progress") ?? [];
+
   return (
     <div className="flex flex-col gap-2">
-      <h2 className="text-sm font-medium text-neutral-700">Sessions on this branch</h2>
+      {sourceBranch && <h2 className="text-sm font-medium text-neutral-700">Sessions on this branch</h2>}
       {error && <p className="text-sm text-red-600">{error}</p>}
       {deleteError && <p className="text-sm text-red-600">{deleteError}</p>}
       {supportIssueError && <p className="text-sm text-red-600">{supportIssueError}</p>}
-      {!error && sessions === null && <p className="text-sm text-neutral-500">Loading sessions…</p>}
+      {!error && sessions === null && <p className="text-sm text-neutral-500">Loading tickets…</p>}
       {sessions?.length === 0 && (
-        <p className="text-sm text-neutral-500">No sessions yet for this repository/branch.</p>
+        <p className="text-sm text-neutral-500">
+          {sourceBranch ? "No sessions yet for this repository/branch." : "No tickets yet for this repository."}
+        </p>
       )}
-      {sessions && sessions.length > 0 && (
-        <ul className="flex flex-col gap-2">
-          {sessions.map((s) => (
-            <li
-              key={s.session_id}
-              className="flex flex-col gap-1 rounded-md border border-neutral-200 px-3 py-2 text-sm"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate font-medium text-neutral-900">{s.title}</span>
-                <div className="flex shrink-0 items-center gap-2">
-                  <ContainerStatusButton
-                    status={s.container_alive ? "ready" : "terminated"}
-                    onStop={() => stopContainer(s)}
-                    stopping={stoppingId === s.session_id}
-                  />
-                  <span
-                    className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${STATUS_BADGE[s.status]}`}
-                  >
-                    {s.status === "in_progress" && s.run_active && <RunningSpinner className="h-3 w-3" />}
-                    {s.status === "in_progress" ? inProgressLabel(s) : s.status.replace("_", " ")}
-                  </span>
-                </div>
-              </div>
-              <div className="text-xs text-neutral-500">
-                {s.user_login || "unknown"} · started {s.started_at} · ended {s.ended_at ?? "—"}
-              </div>
-              {s.status === "in_progress" && <ProgressIndicator currentStage={s.current_stage} />}
-              {s.status === "failed" && s.failure_message && (
-                <p className="text-xs text-red-700">
-                  {s.failure_stage}: {s.failure_type} — {s.failure_message}
-                </p>
-              )}
-              <div className="flex gap-2">
-                {(s.status === "failed" || (s.status === "in_progress" && s.interrupted)) && (
-                  <button
-                    type="button"
-                    title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
-                    className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
-                    onClick={() => resume(s)}
-                  >
-                    Resume
-                  </button>
-                )}
-                {/* Workflow Liveness Fix: an "in_progress" session whose process has actually died
-                    (interrupted) routes to Resume above instead -- a plain-URL reattach here would
-                    open the workflow page and reconnect to nothing. */}
-                {s.status === "in_progress" && !s.interrupted && (
-                  <button
-                    type="button"
-                    title="Reattaches to the run already in progress -- nothing restarts, nothing is lost."
-                    className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
-                    onClick={() => openLive(s)}
-                  >
-                    Open
-                  </button>
-                )}
-                {s.status === "failed" && (
-                  <button
-                    type="button"
-                    title="Files an issue in the org-configured support repo with the thread id and failure details (or opens the existing one)."
-                    className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700 disabled:opacity-40"
-                    disabled={supportIssueId === s.session_id}
-                    onClick={() => openSupportIssue(s)}
-                  >
-                    {supportIssueId === s.session_id ? "Filing…" : "Open support issue"}
-                  </button>
-                )}
-                {s.status === "completed" && (
-                  <>
-                    <button
-                      type="button"
-                      className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
-                      onClick={() => openLive(s)}
-                    >
-                      View report
-                    </button>
-                    {s.pr_url && (
-                      <a
-                        href={s.pr_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
-                      >
-                        View PR
-                      </a>
-                    )}
-                  </>
-                )}
-                <button
-                  type="button"
-                  title="Stops its container if running, deletes its GitHub branch, and removes it from this list."
-                  className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-500 hover:border-red-300 hover:bg-red-50 hover:text-red-700 disabled:opacity-40"
-                  disabled={deletingId === s.session_id}
-                  onClick={() => deleteSession(s)}
-                >
-                  {deletingId === s.session_id ? "Deleting…" : "Delete"}
-                </button>
-              </div>
-            </li>
-          ))}
-        </ul>
+      {sessions && sessions.length > 0 && sourceBranch && renderList(sessions)}
+      {sessions && sessions.length > 0 && !sourceBranch && (
+        <>
+          <div className="flex flex-col gap-2">
+            <h2 className="text-sm font-medium text-neutral-700">Active</h2>
+            {active.length === 0 ? (
+              <p className="text-sm text-neutral-500">No open ticket right now.</p>
+            ) : (
+              renderList(active)
+            )}
+          </div>
+          <div className="flex flex-col gap-2">
+            <h2 className="text-sm font-medium text-neutral-700">Past</h2>
+            {past.length === 0 ? <p className="text-sm text-neutral-500">No past tickets yet.</p> : renderList(past)}
+          </div>
+        </>
       )}
     </div>
   );
