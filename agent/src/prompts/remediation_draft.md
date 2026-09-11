@@ -76,6 +76,12 @@ when its licence genuinely conflicts with the project's; otherwise record it in 
 Do not touch the acceptance-criteria tests to make anything pass. When your changes are done the
 suite must still be green for the same reasons it was green before.
 
+If you are redrafting after the gate rejected a prior attempt (its feedback is appended below when
+that applies), your new report is the WHOLE report, not a diff -- carry forward every finding you
+or an earlier attempt already fixed or gapped, not just the one named in the feedback. The gate
+re-checks `known_gaps` fresh each time; a previously-explained finding silently dropped from this
+submission reads as newly unaddressed, even if nothing about it actually changed.
+
 Then report:
 - `remediation_summary`: what you actually changed, grouped by kind (dependencies upgraded with
   their old -> new versions, code findings fixed, findings deliberately left).

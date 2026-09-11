@@ -101,6 +101,14 @@ export function SessionOverview() {
   // surfaced before (user feedback 2026-09-01).
   const events = useRunEvents();
   const [runActivity] = useRunActivity();
+  // Lifted out of perStage's own memo below (which used to compute this only for its own local
+  // use) so RebuildRow's phase check (further down) can share the exact same fast-channel signal
+  // instead of falling back to the slower state-snapshot check alone -- see rebuildPhase's own
+  // docstring, "two stages active at once" (root-caused 2026-09-11).
+  const runningPhases = useMemo(
+    () => computeRunningPhases(events, runActivity?.runActive ?? null),
+    [events, runActivity?.runActive],
+  );
   const perStage = useMemo(() => {
     const byStage = new Map<
       string,
@@ -125,10 +133,9 @@ export function SessionOverview() {
     }
     // See computeRunningPhases' own docstring for why this can't just be `stage.status ===
     // "drafting"`: a non-gated stage's status is stale/misleading between verify attempts.
-    const runningPhases = computeRunningPhases(events, runActivity?.runActive ?? null);
     for (const [stageKey, entry] of byStage) entry.node = runningPhases.get(stageKey);
     return byStage;
-  }, [events, runActivity?.runActive]);
+  }, [events, runningPhases]);
 
   // Per-placement duration/cost, windowed between the two real stages either side (see RebuildRow's
   // docstring) rather than trusting the shared "rebuild"/"red-gate" event tag alone. Requires the
@@ -235,7 +242,7 @@ export function SessionOverview() {
               // At most one placement follows any given real stage today (REBUILD_PLACEMENTS has
               // no two entries sharing an afterStageKey) -- find(), not filter().
               const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
-              const phase = placement && rebuildPhase(state, placement, runActivity?.runActive);
+              const phase = placement && rebuildPhase(state, placement, runActivity?.runActive, runningPhases);
               const rebuildRow = placement && phase && (
                 <RebuildRow
                   key={placement.rebuildKey}

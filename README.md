@@ -29,7 +29,7 @@ flowchart TD
     
     stage5["STAGE 5: MINIMAL CODE TO GREEN<br/>Implement least code to pass tests; delete code serving only retired ACs<br/>Agents: minimal-code-to-green-draft → minimal-code-to-green-audit<br/>Gate: 95% line+branch coverage CONTRACT REPLAY (full rebuild)"]
     
-    stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes EVERY actionable finding, any severity (autopilot, write+bash);<br/>unfixable ones need a per-id reason in known_gaps<br/>Gate: deterministic re-scan blocks any unexplained actionable finding;<br/>baseline diff catches scanner-silencing. Rebuild gate after."]
+    stage6["STAGE 6: REMEDIATION<br/>Pre-draft deterministic scan publishes fresh findings<br/>Draft fixes EVERY actionable finding, any severity (autopilot, write+bash);<br/>unfixable ones need a per-id reason in known_gaps<br/>Gate: deterministic re-scan blocks any unexplained actionable finding;<br/>baseline diff catches scanner-silencing + fix prompt (narrow re-close of only the still-blocking items, no full redraft) before the next report resubmission<br/>Stuck-fixer reset: the SAME blocking reason(s) twice running resets the draft session so the next attempt starts fresh<br/>Rebuild gate after."]
     
     harden["TEST HARDENING + E2E<br/>Run suite Nx, triage flakes, regression gate<br/>Stable-regression fix loop (4 laps) before the gate ends the run<br/>Boot the app, run playwright, harvest screenshots<br/>Connectivity preflight: page probe for a broken frontend&lt;-&gt;API proxy/CORS<br/>pinning (a live app that 404s or fetch-fails is caught before the suite's<br/>own pass count would hide it) -- failure joins the fix loop<br/>Lighthouse perf + a11y scored against the live app (UI repos);<br/>scores below the configured floors join the fix loop<br/>Auth-enforcement gate (repo setting + Key Vault secrets present):<br/>probes every route + API unauthenticated; a 2xx on a protected route joins the fix loop<br/>E2E fix loop (8 laps); a failure records run_failure and routes INTO stage 8"]
     
@@ -54,7 +54,7 @@ flowchart TD
     stage3 -.->|"rejected via revised Requirements (the only path): restarts at Specification, not Plan's own draft"| stage2
     stage4 -.->|gate failure, 3 tries| stage4
     stage5 -.->|gate failure, 3 tries| stage5
-    stage6 -.->|gate failure, 3 cycles| stage6
+    stage6 -.->|gate failure, 5 cycles| stage6
     harden -.->|e2e fix loop| harden
     stage7 -.->|gate failure, 6 tries| stage7
     stage8 -.->|regression gate failure, 1 rescan| stage8
@@ -488,4 +488,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 50ca4ed062a925e714d10dfe3369cd2fe6d228f35a411b6c89c84a37a16589ed -->
+<!-- graph-source-sha256: 158b424e8a6065c4ef18231eb092344be4407e33a4f48eeb21096c1e05bb85c1 -->

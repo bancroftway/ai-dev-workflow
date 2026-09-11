@@ -168,26 +168,6 @@ export function MetricsBar({
   });
   const e2ePillNode = e2ePill(state.e2e);
 
-  // Live running total (re-summed each time a background refresh scan lands), falling back to
-  // metrics-report's end-of-run summary for finished runs that predate the live channel.
-  const runningUsage = state.token_usage_running;
-  const finalUsage = state.metrics_report?.metrics?.token_usage_summary;
-  const costChip = (() => {
-    const cost = runningUsage?.cost ?? finalUsage?.total_cost;
-    if (cost == null) return null;
-    const inTokens = runningUsage?.input_tokens ?? finalUsage?.total_input_tokens ?? 0;
-    const outTokens = runningUsage?.output_tokens ?? finalUsage?.total_output_tokens ?? 0;
-    return (
-      <Chip
-        key="cost"
-        label="Cost"
-        value={`$${cost.toFixed(2)}`}
-        tone="gray"
-        title={`LLM spend this run: ${inTokens.toLocaleString()} tokens in / ${outTokens.toLocaleString()} out. Updates as the run progresses; final total comes from the metrics stage.`}
-      />
-    );
-  })();
-
   let chips: React.ReactNode = null;
   if (summary) {
     const security = securityChip(measures, baseMeasures, hasBaseline);
@@ -317,12 +297,19 @@ export function MetricsBar({
 
   // The status/push lines matter before any scan has streamed (a needs_clarification stage was
   // previously invisible exactly when no scan had streamed) -- only hide a truly empty strip.
-  if (!summary && !costChip && !activeStage && !e2ePillNode && !trailing && state.last_push?.ok !== false && state.run_failure == null) return null;
+  // Root-caused 2026-09-11: this row used to carry its own `costChip` (state.token_usage_running,
+  // refreshed only when a background repo-scan lands) alongside `trailing`'s LiveCostChip (summed
+  // live from every draft/audit/fix node_finished event) -- two "Cost" pills with no distinguishing
+  // label, and the state-based one could show stale/reset numbers (observed live: $0.00 next to
+  // LiveCostChip's correct $95.95 right after an agent-restart resume, before any new scan had
+  // landed) that directly contradicted its own sibling. LiveCostChip already replays the full
+  // event history on mount (stream_session_events seeds from seq 0 every time), so it alone
+  // covers both a live run and a completed one -- costChip served no case it didn't.
+  if (!summary && !activeStage && !e2ePillNode && !trailing && state.last_push?.ok !== false && state.run_failure == null) return null;
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-1.5">
       {chips}
-      {costChip}
       {activeStage && (
         <span className="text-xs text-neutral-500">
           {activeStage.label} — {STATUS_LABEL[state.stages?.[activeStage.key]?.status ?? ""] ?? state.stages?.[activeStage.key]?.status}

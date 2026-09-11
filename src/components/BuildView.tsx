@@ -11,6 +11,7 @@ import {
   REBUILD_PLACEMENTS,
   REBUILD_STATUS_LABEL,
   rebuildPhase,
+  stageOrderIndex,
   type StageState,
   type WorkflowState,
 } from "@/lib/workflow-types";
@@ -41,6 +42,7 @@ function StageCard({
   stage,
   runFailure,
   runningLabel,
+  knownComplete,
 }: {
   stageKey: string;
   label: string;
@@ -55,6 +57,12 @@ function StageCard({
   // started". Same fix as AppShell's tab pills and SessionOverview's table. The resolved phase
   // label (e.g. "Auditing"), or null when this stage isn't currently running.
   runningLabel: string | null;
+  // Mid-run reattach gap (fold-in fix, 2026-09-11): `stage` is undefined and `runningLabel` is null
+  // for BOTH Build stages while state.stages hasn't hydrated yet -- without this, a stage the
+  // durable current_stage already confirms finished (e.g. current_stage is "remediation") still
+  // said "Not started" until the next snapshot landed. See BuildView()'s own comment for why
+  // current_stage (approval-only) is the right signal for THIS specific question.
+  knownComplete?: boolean;
 }) {
   const verification = stage?.last_verification;
   // Same guard as AppShell's tab dot: an approved stage's stale failed verification is history,
@@ -68,7 +76,12 @@ function StageCard({
         <h2 className="text-sm font-semibold">{label}</h2>
         <span className="flex items-center gap-1.5 text-sm text-neutral-500">
           {runningLabel && <RunningSpinner />}
-          {runningLabel ?? (STATUS_LABEL[stage?.status ?? "not_started"] ?? stage?.status)}
+          {runningLabel ??
+            (stage
+              ? (STATUS_LABEL[stage.status] ?? stage.status)
+              : knownComplete
+                ? "Completed — waiting for full detail to sync…"
+                : STATUS_LABEL["not_started"])}
         </span>
       </div>
       <p className="text-xs text-neutral-500">{blurb}</p>
@@ -144,6 +157,12 @@ export function BuildView() {
     () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),
     [runEvents, runActivity?.runActive],
   );
+  // Mid-run reattach gap (fold-in fix, 2026-09-11): current_stage only advances on a stage's OWN
+  // APPROVAL (graph.py's _run_post_approve_hook), never on it merely starting -- exactly the
+  // question "has this Build stage already finished" needs, unlike buildTabEnabled's "has it
+  // started" question in AppShell (which needs runningStages instead, current_stage alone lags
+  // there). Used only as a fallback below, when neither `stage` nor `runningLabel` has data yet.
+  const currentStageIdx = stageOrderIndex(runActivity?.currentStage);
   return (
     <ViewContainer>
       <div>
@@ -152,16 +171,23 @@ export function BuildView() {
       </div>
       {BUILD_STAGES.map(({ key, label, blurb }) => {
         const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
-        const phase = placement && rebuildPhase(state, placement, runActivity?.runActive);
+        const phase = placement && rebuildPhase(state, placement, runActivity?.runActive, runningPhases);
+        const stage = state.stages?.[key];
+        const knownComplete =
+          stage == null &&
+          currentStageIdx >= 0 &&
+          currentStageIdx > stageOrderIndex(key) &&
+          !runActivity?.interrupted;
         return (
           <Fragment key={key}>
             <StageCard
               stageKey={key}
               label={label}
               blurb={blurb}
-              stage={state.stages?.[key]}
+              stage={stage}
               runFailure={state.run_failure}
               runningLabel={runningPhases.has(key) ? (NODE_PHASE_LABEL[runningPhases.get(key)!] ?? "Running") : null}
+              knownComplete={knownComplete}
             />
             {placement && phase && (
               <RebuildConnector

@@ -2021,7 +2021,21 @@ STAGES: list[StageSpec] = [
         # Task 13b: no audit_rules -- remediation has no audit pass (see StageSpec above).
         draft_rules="\n".join(f"- {r}" for r in remediation_gate.REMEDIATION_HARD_RULES),
         draft_prompt_context_from_repo_file=hydrate_remediation_ticket_mode_context,
-        max_verify_cycles=3,
+        # Added 2026-09-11 (observed live, thread 8242ea6d): without this, EVERY verify failure
+        # routed straight back to a full redraft carrying the stage's entire ~90-line mandate
+        # (security-review + code-simplifier launch, schema resubmission) even when the gate's own
+        # feedback named exactly one narrow, already-diagnosed gap. make_verify_fix_node's shared
+        # mechanism (already proven for adversarial-compliance) runs a short, targeted fix pass
+        # first -- no schema burden, no mandate re-statement -- then still falls through to one real
+        # draft call afterward for the actual report resubmission (remediation_verify_fix.md is
+        # explicit that it does not produce the report itself).
+        verify_fix_prompt="remediation_verify_fix",
+        # Raised 3 -> 5 (2026-09-11, observed live): a 19-actionable-finding sweep plus a mid-run
+        # infra-crash-forced restart (no session continuity) left too little headroom to close out
+        # a late-discovered single finding within 3 full-redraft cycles. See verify_fix_prompt
+        # above for the other half of this fix -- a narrow fix pass instead of a full redraft is
+        # what actually makes the extra cycles worth having.
+        max_verify_cycles=5,
         # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
         # edits source to fix scanner findings. Without them it could only ever describe the work --
         # which is exactly what it did, for every run, until now. builtin:task is what lets the

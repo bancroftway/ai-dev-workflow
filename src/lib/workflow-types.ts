@@ -113,22 +113,41 @@ export const REBUILD_PLACEMENTS: RebuildPlacement[] = [
  *
  * rebuild.py's own state (rb.status) only updates when the node FUNCTION RETURNS -- same lag every
  * other non-gated stage has (see BuildView.tsx's StageCard comment) -- so "running" here is
- * best-effort: this placement has been entered (state.rebuild has an entry) but the next real stage
- * hasn't started, AND the run isn't known to be idle. `runActive` is the same tri-state signal
- * computeRunningStages/isProvisional already trust: `undefined`/`null` (not loaded yet) must NOT
- * read as "stopped", only an explicit `false` does. */
+ * best-effort: this placement has been entered but the next real stage hasn't started, AND the run
+ * isn't known to be idle. `runActive` is the same tri-state signal computeRunningStages/
+ * isProvisional already trust: `undefined`/`null` (not loaded yet) must NOT read as "stopped",
+ * only an explicit `false` does.
+ *
+ * `runningPhases` (root-caused 2026-09-11, "two stages active at once"): rebuild_node now emits
+ * its own node_started/node_finished pair (stage=placement.rebuildKey, node="rebuild"), the SAME
+ * fast run-events channel StageCard's own "Drafting"/"Auditing" label already trusts -- checked
+ * here for BOTH halves of this function, each OR'd with the slower state-based signal rather than
+ * replacing it (never worse than before if an event is ever dropped):
+ * - "has this placement been entered at all": state.rebuild[key] only exists after rebuild_node's
+ *   first RETURN, so a placement's very-first-ever attempt had NOTHING to show while genuinely
+ *   running (silence read as stalled, same shape as the 2026-09-06 gap this function was built to
+ *   close, just for lap zero instead of lap N).
+ * - "has the NEXT stage genuinely started": state.stages[nextStageKey].status lags the run-events
+ *   stream by however long a state snapshot takes to reach the client -- observed live, the
+ *   connector kept showing "confirming tests fail" for several seconds after Minimal Code to
+ *   Green's own StageCard had already flipped to "Drafting" from the same tab's run-events feed,
+ *   i.e. two stages reading as simultaneously active from two signals that should agree.
+ */
 export function rebuildPhase(
   state: WorkflowState,
   placement: RebuildPlacement,
   runActive: boolean | null | undefined,
+  runningPhases: Map<string, string>,
 ): { status: RebuildState["status"]; running: boolean } | null {
   const rb = state.rebuild?.[placement.rebuildKey];
-  if (!rb) return null;
+  if (!rb && !runningPhases.has(placement.rebuildKey)) return null;
   // Same cast runEnded() above already uses: `stages` carries real backend keys (remediation,
   // adversarial-compliance, metrics-exit) this file's own typed StageState map hasn't caught up to.
   const stages = (state.stages ?? {}) as Record<string, StageState | undefined>;
-  const nextStarted = (stages[placement.nextStageKey]?.status ?? "not_started") !== "not_started";
-  return { status: rb.status, running: !nextStarted && runActive !== false };
+  const nextStarted =
+    (stages[placement.nextStageKey]?.status ?? "not_started") !== "not_started" ||
+    runningPhases.has(placement.nextStageKey);
+  return { status: rb?.status ?? "not_started", running: !nextStarted && runActive !== false };
 }
 
 /** A canned monorepo stack the Tech Stack tab's dropdown offers, loaded from
@@ -360,6 +379,13 @@ export interface WorkflowState {
     plan?: StageState;
     "ac-to-tests"?: StageState;
     "minimal-code-to-green"?: StageState;
+    // Consolidated-pipeline (stage-stable-id rename) keys -- the agent's real post-Build stages.
+    // "adversarial-audit"/"dedup-simplify"/"license-audit"/"exit" below are the pre-rename keys,
+    // never populated by the current graph, kept only so an old completed session's stored data
+    // still resolves a label instead of a raw key.
+    remediation?: StageState;
+    "adversarial-compliance"?: StageState;
+    "metrics-exit"?: StageState;
     "adversarial-audit"?: StageState;
     "dedup-simplify"?: StageState;
     "license-audit"?: StageState;
@@ -382,14 +408,29 @@ export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
   { key: "plan", label: "Implementation Plan" },
   { key: "ac-to-tests", label: "Acceptance Criteria to Tests" },
   { key: "minimal-code-to-green", label: "Minimal Code to Green" },
+  { key: "remediation", label: "Remediation" },
+  { key: "adversarial-compliance", label: "Adversarial Compliance" },
+  { key: "metrics-exit", label: "Metrics & Exit" },
+  // Legacy, pre-rename keys -- never populated by the current graph (see the WorkflowState
+  // comment above); kept only so an old completed session's stored data still resolves a label.
   { key: "adversarial-audit", label: "Adversarial Audit" },
   { key: "dedup-simplify", label: "De-dup / Simplify" },
   { key: "license-audit", label: "License Audit" },
   { key: "exit", label: "Exit" },
 ];
 
-// Which StageState keys each tab's status dot derives from. The quality tab has no StageState
-// stages -- it reads the bespoke quality/security/test/metrics state keys directly (AppShell).
+/** Index of `key` within PIPELINE_STAGE_ORDER, or -1 for an unknown/legacy key. Purely ordinal --
+ * used only to answer "has the durable current_stage moved past stage X" during the mid-run
+ * reattach gap (state.stages empty), never to imply concurrent-execution semantics. */
+export function stageOrderIndex(key: string | null | undefined): number {
+  return PIPELINE_STAGE_ORDER.findIndex((s) => s.key === key);
+}
+
+// Which StageState keys each tab's status dot derives from. Quality's own status dot is still
+// computed from the bespoke quality/security/test/metrics state keys directly (AppShell) -- but
+// remediation/adversarial-compliance ARE real StageState-shaped stages under the consolidated
+// pipeline (agent/src/graph.py), so they belong here for tabForStage's reverse lookup (AppShell) to
+// resolve a mid-run reattach onto the Quality tab instead of silently no-opping.
 export const TAB_STAGE_GROUPS: Record<string, StageKey[]> = {
   "tech-stack": ["tech-stack"],
   requirements: ["raw-requirements"], // recorded as-is (always "approved"); no gate ever surfaces
@@ -397,7 +438,7 @@ export const TAB_STAGE_GROUPS: Record<string, StageKey[]> = {
   plan: ["plan"],
   build: ["ac-to-tests", "minimal-code-to-green"],
   overview: [],
-  quality: [],
+  quality: ["remediation", "adversarial-compliance"],
 };
 
 /** Escalation interrupt payloads (graph.py make_escalate_node, security gate, audit exit gate).

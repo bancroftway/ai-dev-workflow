@@ -25,12 +25,47 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from .. import repo_files
+from ..chat_model import close_session
 from ..schemas import presence_values as _presence_values
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
 logger = logging.getLogger(__name__)
+
+# Stuck-fixer detection (2026-09-11, observed live thread 8242ea6d): rebuild.py's own gate resets
+# a fixer session hammering the IDENTICAL scan-delta finding across laps (_scan_finding_fingerprint,
+# that module's own comment has the full incident); this gate had no equivalent until now, so a
+# redraft that keeps failing on the exact same blocking reason(s) just kept retrying with the same
+# (possibly confused, possibly context-poisoned) conversation until max_verify_cycles ran out. A
+# plain repo file rather than GraphState: verify_remediation is a StageSpec.deterministic_verify
+# callback (thread_id, content_dict, run_id, baseline_commit, provider, chat_provider) with no
+# access to this stage's own prior last_verification -- provider/thread_id are the only cross-call
+# handles it has. Lives under .ai-dev-workflow/ like every other pipeline artifact, swept into the
+# same verify-pass persistence commit spec_ledger.py's own docstring describes.
+_VERIFY_FINGERPRINT_PATH = ".ai-dev-workflow/remediation-verify-fingerprint.json"
+
+
+def _reasons_fingerprint(reasons: list[str]) -> list[str]:
+    """Sorted, deduplicated blocking reasons -- pure. Reasons here are built from stable finding
+    metadata (id, severity, category, title, location), never a line number or timestamp, so
+    (unlike rebuild.py's raw scanner-log fingerprint) no normalization is needed for two calls
+    against the same real finding to compare equal."""
+    return sorted(set(reasons))
+
+
+def _stuck_fixer_check(reasons: list[str], raw_prior_fingerprint: str | None) -> tuple[bool, list[str]]:
+    """(should_reset, fingerprint_to_persist) -- pure, the whole stuck-fixer decision in isolation
+    from the file I/O around it. `raw_prior_fingerprint` is whatever _VERIFY_FINGERPRINT_PATH held
+    coming in (None/empty/malformed all treated as "no prior fingerprint", never a crash)."""
+    fingerprint = _reasons_fingerprint(reasons)
+    try:
+        prior = json.loads(raw_prior_fingerprint) if raw_prior_fingerprint else []
+    except json.JSONDecodeError:
+        prior = []
+    should_reset = bool(fingerprint) and fingerprint == prior
+    return should_reset, fingerprint
 
 # Editing these is how you make a scanner quiet without making the code safe. Remediation has write
 # access, so this is a real temptation and not a hypothetical one: the deleted `security_nodes`
@@ -288,10 +323,8 @@ REMEDIATION_HARD_RULES: tuple[str, ...] = (
 
 async def verify_remediation(
     thread_id: str, content_dict: dict[str, Any], _run_id: str, baseline_commit: str | None, provider: Any,
-    _chat_provider: str,
+    chat_provider: str,
 ) -> "VerificationResult":
-    # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: this check has
-    # no chat-model dispatch call of its own.
     from ..graph import VerificationResult
 
     scan: dict[str, Any] | None = None
@@ -312,6 +345,13 @@ async def verify_remediation(
 
     passed, reasons = evaluate_remediation(content_dict, scan, changed_files, added_lines, prior_ids)
     if passed:
+        # Clear any stuck-fixer marker left by a prior failing lap -- a clean pass means whatever
+        # was stuck got resolved (or never existed), and a stale marker must not survive into a
+        # LATER, unrelated ticket's own first verify lap on this same repo.
+        try:
+            await repo_files.write_repo_file(provider, thread_id, _VERIFY_FINGERPRINT_PATH, "[]\n")
+        except Exception:  # noqa: BLE001 -- best-effort bookkeeping, never worth failing a pass over
+            logger.warning("remediation gate: could not clear verify fingerprint", exc_info=True)
         return VerificationResult(
             passed=True,
             feedback=(
@@ -326,6 +366,27 @@ async def verify_remediation(
         )
 
     logger.info("remediation gate: blocking (%d reason(s))", len(reasons))
+
+    # Stuck-fixer detection: the SAME set of blocking reasons twice running means the last redraft
+    # (or fix pass) made no dent in what actually blocks -- continuing that same conversation just
+    # repeats whatever confused it the first time. Reset it so the NEXT attempt starts fresh, same
+    # remedy rebuild.py's own scan-delta stall detection applies for its own gate.
+    try:
+        raw_prior = await repo_files.read_repo_file(provider, thread_id, _VERIFY_FINGERPRINT_PATH)
+        should_reset, fingerprint = _stuck_fixer_check(reasons, raw_prior)
+        if should_reset:
+            logger.warning(
+                "remediation gate: identical blocking reason(s) twice running for thread_id=%s -- "
+                "resetting the stuck draft session",
+                thread_id,
+            )
+            await close_session(thread_id, "remediation", "draft", provider=chat_provider)
+        await repo_files.write_repo_file(
+            provider, thread_id, _VERIFY_FINGERPRINT_PATH, json.dumps(fingerprint, indent=2) + "\n"
+        )
+    except Exception:  # noqa: BLE001 -- best-effort bookkeeping; a failure here must not mask the real rejection
+        logger.warning("remediation gate: stuck-fixer check failed", exc_info=True)
+
     return VerificationResult(
         passed=False,
         feedback=(
@@ -458,6 +519,91 @@ def _demo() -> None:
     # breakdown).
     assert len(REMEDIATION_HARD_RULES) == 6, len(REMEDIATION_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in REMEDIATION_HARD_RULES)
+
+    # _stuck_fixer_check (2026-09-11 fix): pure decision logic, isolated from the file I/O around it.
+    assert _reasons_fingerprint(["b", "a", "a"]) == ["a", "b"], "sorted, deduplicated"
+    # No prior fingerprint (fresh repo, first-ever failure, or a malformed/absent file) -- never
+    # resets on a first failure, whatever the raw value looks like.
+    for raw in (None, "", "not json", "[]"):
+        should_reset, fp = _stuck_fixer_check(["r1"], raw)
+        assert not should_reset and fp == ["r1"], (raw, should_reset, fp)
+    # Identical reasons twice running -- resets.
+    should_reset, fp = _stuck_fixer_check(["r1", "r2"], json.dumps(["r1", "r2"]))
+    assert should_reset and fp == ["r1", "r2"]
+    # A genuinely DIFFERENT set (even one changed reason) -- progress was made, never resets.
+    should_reset, _ = _stuck_fixer_check(["r1", "r3"], json.dumps(["r1", "r2"]))
+    assert not should_reset
+    # A verify that CLEARED (empty reasons) is never "stuck" -- vacuously equal empty lists must
+    # not trigger a reset (there is nothing to be stuck ON).
+    should_reset, fp = _stuck_fixer_check([], json.dumps([]))
+    assert not should_reset and fp == []
+
+    # verify_remediation end to end: the SAME single blocking reason on two consecutive calls
+    # against the SAME thread must reset the draft session; a first-time failure must not.
+    import asyncio
+
+    class _FakeVerifyProvider:
+        """Minimal exec_in_sandbox stub -- verify_remediation's own scan/diff helpers only ever
+        `cat`/`git diff`/`git show` through it; every unmatched command reads as empty/failed,
+        matching a repo with no baseline_commit (both callers already handle that case)."""
+
+        async def exec_in_sandbox(self, _thread_id: str, _command: str):  # noqa: ANN201
+            class _R:
+                ok = False
+                stdout = ""
+                stderr = ""
+
+            return _R()
+
+    fake_files: dict[str, str] = {}
+
+    async def _fake_read(_provider: Any, _thread_id: str, path: str) -> str | None:
+        return fake_files.get(path)
+
+    async def _fake_write(_provider: Any, _thread_id: str, path: str, content: str) -> None:
+        fake_files[path] = content
+
+    close_calls: list[tuple[str, str, str]] = []
+
+    async def _fake_close_session(thread_id: str, stage: str, role: str, *, provider: str) -> None:
+        close_calls.append((thread_id, stage, role))
+
+    async def _fake_scan_and_publish(_provider: Any, _thread_id: str) -> dict[str, Any]:
+        # One gating finding, never addressed/gapped -- the SAME real blocking reason every call.
+        return {"findings": [{
+            "id": "stuck123", "gating": True, "actionable": True, "severity": "medium",
+            "category": "vulnerability", "title": "stuck finding", "location": {"path": "x.ts"},
+        }]}
+
+    global scan_and_publish, close_session
+    original_scan_and_publish = scan_and_publish
+    original_close_session = close_session
+    original_read_repo_file = repo_files.read_repo_file
+    original_write_repo_file = repo_files.write_repo_file
+    scan_and_publish = _fake_scan_and_publish  # type: ignore[assignment]
+    close_session = _fake_close_session  # type: ignore[assignment]
+    repo_files.read_repo_file = _fake_read  # type: ignore[assignment]
+    repo_files.write_repo_file = _fake_write  # type: ignore[assignment]
+    try:
+        content = {"findings_addressed": [], "known_gaps": []}
+        first = asyncio.run(verify_remediation(
+            "t-remediation-selfcheck", content, "r1", None, _FakeVerifyProvider(), "claude",
+        ))
+        assert not first.passed
+        assert close_calls == [], "must never reset on a FIRST failure"
+
+        second = asyncio.run(verify_remediation(
+            "t-remediation-selfcheck", content, "r2", None, _FakeVerifyProvider(), "claude",
+        ))
+        assert not second.passed
+        assert close_calls == [("t-remediation-selfcheck", "remediation", "draft")], (
+            f"the identical reason twice running must reset the draft session exactly once, got {close_calls}"
+        )
+    finally:
+        scan_and_publish = original_scan_and_publish
+        close_session = original_close_session
+        repo_files.read_repo_file = original_read_repo_file
+        repo_files.write_repo_file = original_write_repo_file
 
     print("remediation_gate self-check: all assertions passed")
 

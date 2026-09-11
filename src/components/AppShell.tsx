@@ -33,6 +33,7 @@ import {
   type EscalationPayload,
   type MergeReadinessReport,
   PIPELINE_STAGE_ORDER,
+  stageOrderIndex,
   type StageState,
   TAB_STAGE_GROUPS,
   type StageKey,
@@ -459,10 +460,23 @@ export function AppShell({
     },
   });
 
-  const buildTabEnabled = buildStarted(state);
-  const qualityStarted = Boolean(
-    state.quality_remediation ?? state.security_remediation ?? state.test_hardening ?? state.metrics_report,
-  );
+  // Reattach relaxation (fold-in fix, 2026-09-11): buildStarted(state) alone stays false for the
+  // whole mid-run reattach gap (state.stages is empty by isReattaching's own definition), which
+  // left this tab wrongly disabled on reload even when Build had genuinely started. `current_stage`
+  // can't fill that gap alone either -- it only advances on a stage's OWN APPROVAL
+  // (_run_post_approve_hook, graph.py), so it stays parked one stage behind while ac-to-tests is
+  // still actively drafting, the single most common reattach moment. `runningStages` (event stream,
+  // approval-independent) is the same backstop stageGroupDot/wasBuildRunningRef already lean on for
+  // this identical lag, checked first; the stageOrderIndex comparison then covers the durably-known
+  // "already past this stage, nothing currently running" case runningStages alone would miss.
+  const buildTabEnabled =
+    buildStarted(state) ||
+    TAB_STAGE_GROUPS.build.some((k) => runningStages.has(k)) ||
+    (isReattaching && stageOrderIndex(durableRow?.current_stage) >= stageOrderIndex("ac-to-tests"));
+  const qualityStarted =
+    Boolean(state.quality_remediation ?? state.security_remediation ?? state.test_hardening ?? state.metrics_report) ||
+    TAB_STAGE_GROUPS.quality.some((k) => runningStages.has(k)) ||
+    (isReattaching && stageOrderIndex(durableRow?.current_stage) >= stageOrderIndex("remediation"));
 
   const qualityError =
     state.quality_remediation?.build_ok === false ||
@@ -680,6 +694,29 @@ export function AppShell({
           </div>
         )}
 
+        {/* Mid-run reattach banner (fold-in fix, 2026-09-11: was a full-page bg-white/95 cover on
+            <main> that blocked every tab's live content, the only absolute-inset-0 blocker in this
+            whole codebase -- every other "something's happening in the background" signal here
+            (SandboxSessionBoot, ContainerStatus, the amber banner above) is this same thin,
+            non-blocking bar convention. isReattaching's own semantics are unchanged: `state.stages`
+            still empty, durable row confirms the run is genuinely in_progress past tech-stack, not
+            interrupted. Placed here (not inside <main>) so it stacks with, rather than covers, the
+            amber banner above -- mutually exclusive in practice since durableRow.status can't be
+            both "in_progress" and "failed" at once. */}
+        {isReattaching && (
+          <div className="flex items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-1.5 text-xs text-neutral-500">
+            <Spinner className="h-3.5 w-3.5" />
+            <span>
+              Reconnecting to your session — currently at{" "}
+              <strong>
+                {PIPELINE_STAGE_ORDER.find((s) => s.key === durableRow?.current_stage)?.label ??
+                  durableRow?.current_stage}
+              </strong>
+              . The pipeline keeps running in the background; this page updates automatically.
+            </span>
+          </div>
+        )}
+
         {/* The Gate UI's new home (Task 10) -- rendered here so it's visible above whichever tab
             is open, matching the comment on useInterrupt above. null for tech-stack's own gate
             (InterruptCard returns null there; TechStackView renders its own controls instead) and
@@ -693,29 +730,14 @@ export function AppShell({
             tab switch reset unsaved editor text, dropdown picks, and scroll -- observed live.
             Every view already tolerates empty state (tabs enable mid-run), so mounting them all
             up front only costs idle renders. Reattach gap (backlog item 4, user found confusing
-            live 2026-08-31): while isReattaching, every tab's own empty-state copy is WRONG (the
-            Tech Stack tab said "Detecting your tech stack…" on a session already several stages
-            past it) -- show one honest, stage-aware message instead of any tab's guess. Views
-            stay mounted underneath (hidden, not unmounted) so they pick up state the instant a
-            snapshot arrives, same as the tab-switch fix above. */}
-        <main className="relative flex-1 overflow-y-auto">
-          {isReattaching && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/95">
-              <div className="flex max-w-sm flex-col items-center gap-2 text-center">
-                <Spinner className="h-6 w-6" />
-                <p className="text-sm font-medium text-neutral-700">Reconnecting to your session…</p>
-                <p className="text-xs text-neutral-500">
-                  Currently at:{" "}
-                  <strong>
-                    {PIPELINE_STAGE_ORDER.find((s) => s.key === durableRow?.current_stage)?.label ??
-                      durableRow?.current_stage}
-                  </strong>
-                  . The pipeline keeps running in the background — this page updates automatically once that
-                  stage pauses for your review.
-                </p>
-              </div>
-            </div>
-          )}
+            live 2026-08-31): while isReattaching, every tab's own empty-state copy is honest again
+            now that buildTabEnabled/qualityStarted are unblocked and BuildView's StageCard knows to
+            say "Completed -- waiting for full detail to sync…" instead of a bare "Not started" for
+            a stage current_stage confirms already finished (fold-in fix, 2026-09-11) -- the banner
+            above this main covers the rest (which stage the durable row is at), so no per-tab guess
+            needs covering up here anymore. Views stay mounted underneath (hidden, not unmounted) so
+            they pick up state the instant a snapshot arrives, same as the tab-switch fix above. */}
+        <main className="flex-1 overflow-y-auto">
           <div hidden={activeView !== "tech-stack"}><TechStackView /></div>
           <div hidden={activeView !== "requirements"}><RequirementsView /></div>
           <div hidden={activeView !== "specification"}><SpecificationView /></div>
