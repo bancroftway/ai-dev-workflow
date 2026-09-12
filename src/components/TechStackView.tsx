@@ -6,9 +6,10 @@ import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/Attach
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import type { CannedTechStack, TechStackCatalogResponse, WorkflowState } from "@/lib/workflow-types";
+import { stageOrderIndex, type CannedTechStack, type TechStackCatalogResponse, type WorkflowState } from "@/lib/workflow-types";
 
 /**
  * First tab in the workflow, before Requirements. Replaces the old chat-sidebar greenfield picker
@@ -27,6 +28,7 @@ export function TechStackView() {
   const { agent } = useAgent({ agentId: localAgentId });
   const { interrupt } = useOpenInterrupt();
   const [sandboxStatus] = useSandboxStatus();
+  const [runActivity] = useRunActivity();
 
   const isOpen = interrupt.open && interrupt.stage === "tech-stack";
   const showDropdown = isOpen && interrupt.fileExisted === false;
@@ -142,14 +144,22 @@ export function TechStackView() {
           with no open interrupt can only be the post-submit phase. */}
       {/* sandboxStatus check: a spinner with no failure signal of its own spun forever on a
           provisioning failure (AppShell's "Sandbox provisioning failed" banner is the actual
-          error surface) or a stale reload of a terminated session -- neither is "detecting". */}
+          error surface) or a stale reload of a terminated session -- neither is "detecting".
+          Empty-tabs fix (root-caused 2026-09-12): none of this ever checked durable truth, so a
+          session long past tech-stack showed "Detecting…" forever whenever the live snapshot
+          hadn't (re)arrived -- now the only way most sessions show anything at all, since nothing
+          auto-fires a live snapshot anymore (this session's pivot). */}
       {!isOpen && stage?.status !== "approved" && (sandboxStatus === "provisioning" || sandboxStatus === "ready") && (
-        <p className="flex items-center gap-2 text-sm text-neutral-500">
-          <Spinner />
-          {stage?.status === "ready_for_review"
-            ? "Saving your tech stack — extracting the structured details every later stage builds on…"
-            : "Detecting your tech stack…"}
-        </p>
+        stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("tech-stack") ? (
+          <p className="text-sm text-neutral-500">Approved — waiting for full detail to sync…</p>
+        ) : (
+          <p className="flex items-center gap-2 text-sm text-neutral-500">
+            <Spinner />
+            {stage?.status === "ready_for_review"
+              ? "Saving your tech stack — extracting the structured details every later stage builds on…"
+              : "Detecting your tech stack…"}
+          </p>
+        )
       )}
 
       {!isOpen && stage?.status === "approved" && (

@@ -1,17 +1,19 @@
 "use client";
 
 import { useAgent, useCopilotKit } from "@copilotkit/react-core/v2";
-import { Fragment, useMemo } from "react";
-import { LiveCostChip } from "@/components/LiveCostChip";
+import { Fragment, useMemo, useState } from "react";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { computeRunningPhases, NODE_PHASE_LABEL, formatDuration, parseEventTs, useRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
+  PIPELINE_STAGE_ORDER,
   REBUILD_PLACEMENTS,
   REBUILD_STATUS_LABEL,
+  realStageForFailure,
   rebuildPhase,
+  stageOrderIndex,
   type RebuildPlacement,
   type StageState,
   type WorkflowState,
@@ -88,19 +90,88 @@ function RebuildRow({
 
 
 export function SessionOverview() {
-  const { localAgentId } = useWorkflowThread();
+  const { localAgentId, threadId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
   const state = (agent.state ?? {}) as WorkflowState;
   const stages = Object.entries(state.stages ?? {});
   const failure = state.run_failure;
+  const [runActivity] = useRunActivity();
+
+  // Pivot (root-caused 2026-09-12): "last successful stage" / "the stage that failed" must be
+  // visible durably, without needing a live snapshot -- and exactly one action (this section)
+  // may ever advance the graph anywhere in the app. `failure_stage` is often NOT one of the 8 real
+  // stage keys (a rebuild placement, e2e, test-hardening, or metrics-regression escalate all name
+  // their own key) -- realStageForFailure resolves the real stage a restart should target.
+  const mappedFailureTarget =
+    runActivity?.status === "failed" && !runActivity?.finishedWithVerdict
+      ? realStageForFailure(runActivity?.failureStage ?? null)
+      : null;
+  // Boundary = where "last known-good" ends. A genuine failure's mapped target is the TRUE
+  // boundary: current_stage can be pushed all the way to metrics-exit by the crash-reporting pass
+  // that still runs after most escalates, which would otherwise misreport "everything through
+  // Metrics & Exit succeeded" (confirmed against graph.py: metrics-exit_draft's own draft-start
+  // write bumps current_stage regardless of why it was reached). When nothing failed (or the
+  // session finished with a real verdict), current_stage is fully trustworthy as-is.
+  const boundaryKey = mappedFailureTarget ?? runActivity?.currentStage ?? null;
+  const boundaryIdx = stageOrderIndex(boundaryKey);
+  const isFailedBoundary = mappedFailureTarget != null;
+  // finished_with_verdict (metrics-exit itself approved a real report, whether or not merge_ready
+  // came back true) never gets a restart button anywhere -- redoing metrics-exit alone would just
+  // reproduce the same verdict against unchanged upstream work; the Report tab already has it.
+  const finishedWithVerdict = runActivity?.finishedWithVerdict ?? false;
+
+  const [restarting, setRestarting] = useState(false);
+  // The one and only place the graph is ever advanced by this frontend (pivot requirement).
+  // Two shapes, not one: a genuine failure needs the full soft-rewind (reset that stage + every
+  // stage after it, confirmed destructive-ish) -- but "nothing failed, just continue from where
+  // it left off" needs no reset at all (the frontier stage was never approved to begin with), so
+  // it's just a plain reattach, with no server-side rewind call and no `status=="failed"` 409 risk
+  // (sessions_api.py's rewind-to-stage action requires that status, which a merely-interrupted
+  // in_progress session never has).
+  async function handleRestart(stageKey: string) {
+    const label = PIPELINE_STAGE_ORDER.find((s) => s.key === stageKey)?.label ?? stageKey;
+    if (isFailedBoundary) {
+      if (
+        !window.confirm(
+          `This resets ${label} and everything after it, then redoes that work from scratch. ` +
+            "Files the failed attempt already wrote are not reverted -- the redraft may leave some behind. Continue?",
+        )
+      ) {
+        return;
+      }
+      setRestarting(true);
+      try {
+        const response = await fetch("/api/sessions/actions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: threadId, action: "rewind-to-stage", stageKey }),
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          window.alert(body?.detail || "Could not restart this session.");
+          return;
+        }
+        void copilotkit.runAgent({ agent });
+      } finally {
+        setRestarting(false);
+      }
+      return;
+    }
+    if (!window.confirm(`Continue this workflow at ${label}?`)) return;
+    setRestarting(true);
+    try {
+      void copilotkit.runAgent({ agent });
+    } finally {
+      setRestarting(false);
+    }
+  }
 
   // Per-stage wall-clock + spend from the durable event stream, plus a redraft/rejection count:
   // a gate_resolved event with payload.decision === "rejected" is exactly a human rejection that
   // sent the stage back to its own draft node (make_gate_node, graph.py) -- a count Overview never
   // surfaced before (user feedback 2026-09-01).
   const events = useRunEvents();
-  const [runActivity] = useRunActivity();
   // Lifted out of perStage's own memo below (which used to compute this only for its own local
   // use) so RebuildRow's phase check (further down) can share the exact same fast-channel signal
   // instead of falling back to the slower state-snapshot check alone -- see rebuildPhase's own
@@ -162,51 +233,30 @@ export function SessionOverview() {
     return timings;
   }, [events, perStage]);
 
-  const failureIsInfra = failure?.failure_type === "infra_transient" || failure?.failure_type === "quota_exhausted";
-
   return (
     <ViewContainer>
-      <div className="flex items-start justify-between gap-4">
-        <h1 className="text-lg font-semibold">Session Overview</h1>
-        <LiveCostChip />
-      </div>
+      {/* No local cost chip here: MetricsBar (AppShell) already mounts its own LiveCostChip as
+          soon as there's any live cost to show -- a second one here was a plain duplicate, not a
+          fallback for an actually-uncovered case (root-caused 2026-09-11, user-reported dupe). */}
+      <h1 className="text-lg font-semibold">Session Overview</h1>
 
-      {failure && (
-        <div
-          className={`rounded-lg border p-4 text-sm ${
-            failureIsInfra ? "border-amber-300 bg-amber-50 text-amber-900" : "border-red-300 bg-red-50 text-red-900"
-          }`}
-        >
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <p className="font-semibold">
-                Run ended: {failure.stage ?? "unknown stage"} — {failure.type ?? "failure"}
-                {failure.failure_type ? ` (${failure.failure_type})` : ""}
-              </p>
-              {failure.feedback && <p className="mt-1 text-xs">{failure.feedback}</p>}
-              <p className="mt-2 text-xs font-medium">
-                {failureIsInfra
-                  ? "This was an infrastructure/quota failure, not a defect in the work. Resume retries from the last checkpoint."
-                  : "A gate rejected the work past its retry budget. Read the feedback above, adjust the requirements if it names a real gap, then Resume — or fix the platform gate first if the feedback looks wrong."}
-              </p>
-            </div>
-            <button
-              className="shrink-0 rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-              disabled={agent.isRunning}
-              // Direct runAgent, NOT ?resume=1: AppShell's autoTriggeredRef never resets and a
-              // query-only navigation doesn't remount it, so the URL path would do nothing.
-              onClick={() => void copilotkit.runAgent({ agent })}
-            >
-              {agent.isRunning ? "Resuming…" : "Resume"}
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Pivot (root-caused 2026-09-12): the old top banner here read live `state.run_failure`
+          (empty for the whole reattach gap) and fired a bare, untargeted `runAgent()` -- no confirm,
+          no stage targeting, no rebuild-sub-state reset, bypassing the "exactly one explicit,
+          stage-anchored action" requirement entirely. Removed: `runActivity.failureType`/
+          `failureMessage` (durable, truncated from the SAME feedback text this used to show live)
+          now render on the boundary row itself, below, alongside the one real restart action. */}
 
       {/* Events flow before stage STATE reaches the client (state streams on run pause/gate), so
           "no stages yet" while events are visibly arriving read as broken -- tell the truth: a run
-          is underway. */}
-      {stages.length === 0 && (
+          is underway. Mid-run reattach gap (same fold-in fix as BuildView's knownComplete,
+          2026-09-11): state.stages is empty for the WHOLE reattach gap, which could otherwise leave
+          this tab stuck on "stages appear here as they start reporting" for the rest of the run --
+          the durable current_stage (user-reported live, thread 8242ea6d: reattached at Remediation,
+          Overview still showed nothing) already proves everything before it finished. Uses
+          boundaryIdx (not raw current_stage) so a genuine failure's mapped target -- possibly
+          EARLIER than current_stage, see the boundary comment above -- decides the split. */}
+      {stages.length === 0 && boundaryIdx < 0 && (
         <p className="text-sm text-neutral-500">
           {runActivity?.interrupted
             ? "This run appears to have stopped before any stage reported in. Resume to pick it back up."
@@ -214,6 +264,96 @@ export function SessionOverview() {
               ? "Run in progress — stages appear here as they start reporting."
               : "No stages have run yet."}
         </p>
+      )}
+
+      {stages.length === 0 && boundaryIdx >= 0 && (
+        <div className="flex flex-col">
+          <div className={`${ROW_GRID} px-4 pb-1 text-xs font-medium text-neutral-400`}>
+            <span>Stage</span>
+            <span className="text-right">Duration</span>
+            <span className="text-right">Cost</span>
+            <span className="text-right">Redrafts</span>
+            <span className="text-right">Status</span>
+          </div>
+          <ol className="flex flex-col gap-2">
+            {PIPELINE_STAGE_ORDER.slice(0, boundaryIdx + 1).map((s, i, arr) => {
+              // Only the LAST (boundary) row is ever ambiguous -- every earlier one is durably
+              // known complete, so it keeps the generic sync-pending copy. The boundary row needs
+              // real status: EITHER the real failure (durable failureType/failureMessage + the one
+              // restart action, root-caused 2026-09-12), OR -- when nothing actually failed --
+              // current_stage's own ambiguity (it advances both on approval AND on a stage's own
+              // draft START, graph.py's make_draft_node, so "current_stage == X" can mean "X
+              // finished" OR "X itself died mid-draft" with no durable way to tell apart for a
+              // non-gated stage). Never claim "Completed" here in that case -- targeting X itself
+              // for the Continue action is always safe (worst case: a harmless redraft of a stage
+              // that had actually finished); claiming it's done and jumping past it is not.
+              const isBoundary = i === arr.length - 1;
+              const running = isBoundary && !isFailedBoundary && runActivity?.runActive !== false;
+              let label: string;
+              if (!isBoundary) {
+                label = "Completed — waiting for full detail to sync…";
+              } else if (isFailedBoundary) {
+                label = "Failed";
+              } else if (finishedWithVerdict) {
+                label = "Approved — see the Report tab for the full verdict";
+              } else if (running) {
+                label = "Running";
+              } else {
+                label = "Last reached — click Continue to pick up from here";
+              }
+              return (
+                <li
+                  key={s.key}
+                  className={`rounded-lg border px-4 py-2 text-sm ${
+                    isBoundary && isFailedBoundary ? "border-red-300 bg-red-50" : "border-neutral-200"
+                  }`}
+                >
+                  <div className={ROW_GRID}>
+                    <span className="font-medium">{s.label}</span>
+                    <span />
+                    <span />
+                    <span />
+                    <span
+                      className={`flex items-center justify-end gap-1.5 ${
+                        isBoundary && isFailedBoundary ? "text-red-700" : "text-neutral-500"
+                      }`}
+                    >
+                      {running && <RunningSpinner />}
+                      {label}
+                    </span>
+                  </div>
+                  {isBoundary && !finishedWithVerdict && (isFailedBoundary || !running) && (
+                    <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
+                      {isFailedBoundary && (runActivity?.failureType || runActivity?.failureMessage) && (
+                        <p className="text-xs text-red-700">
+                          {runActivity?.failureType}
+                          {runActivity?.failureType && runActivity?.failureMessage ? " — " : ""}
+                          {runActivity?.failureMessage}
+                        </p>
+                      )}
+                      <button
+                        type="button"
+                        className={`ml-auto shrink-0 rounded-md px-3 py-1 text-xs font-medium disabled:opacity-40 ${
+                          isFailedBoundary
+                            ? "bg-neutral-900 text-white"
+                            : "border border-neutral-300 bg-white text-neutral-700"
+                        }`}
+                        disabled={restarting}
+                        onClick={() => void handleRestart(s.key)}
+                      >
+                        {restarting
+                          ? "Working…"
+                          : isFailedBoundary
+                            ? "Restart workflow from this stage"
+                            : "Continue workflow from here"}
+                      </button>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ol>
+        </div>
       )}
 
       {stages.length > 0 && (
@@ -239,6 +379,13 @@ export function SessionOverview() {
               // leaves `status === "drafting"` forever, which used to read as running with no other
               // signal to contradict it.
               const running = (stage.status === "drafting" && runActivity?.runActive !== false) || timing?.node !== undefined;
+              // Pivot (root-caused 2026-09-12): the one restart/continue action, on whichever row
+              // is the durable boundary -- computed once above from durable data, so it lands on
+              // the correct row (the mapped real stage, e.g. "ac-to-tests" for an
+              // r_ac_to_tests rebuild failure) even with live per-stage state also available.
+              // Never shown while genuinely still running -- nothing to continue then.
+              const isBoundaryRow = key === boundaryKey;
+              const showAction = isBoundaryRow && !finishedWithVerdict && (isFailedBoundary || !running);
               // At most one placement follows any given real stage today (REBUILD_PLACEMENTS has
               // no two entries sharing an afterStageKey) -- find(), not filter().
               const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
@@ -282,6 +429,33 @@ export function SessionOverview() {
                     </span>
                   </div>
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
+                  {showAction && (
+                    <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
+                      {isFailedBoundary && (runActivity?.failureType || runActivity?.failureMessage) && (
+                        <p className="text-xs text-red-700">
+                          {runActivity?.failureType}
+                          {runActivity?.failureType && runActivity?.failureMessage ? " — " : ""}
+                          {runActivity?.failureMessage}
+                        </p>
+                      )}
+                      <button
+                        type="button"
+                        className={`ml-auto shrink-0 rounded-md px-3 py-1 text-xs font-medium disabled:opacity-40 ${
+                          isFailedBoundary
+                            ? "bg-neutral-900 text-white"
+                            : "border border-neutral-300 bg-white text-neutral-700"
+                        }`}
+                        disabled={restarting}
+                        onClick={() => void handleRestart(key)}
+                      >
+                        {restarting
+                          ? "Working…"
+                          : isFailedBoundary
+                            ? "Restart workflow from this stage"
+                            : "Continue workflow from here"}
+                      </button>
+                    </div>
+                  )}
                 </li>
                 {rebuildRow}
                 </Fragment>

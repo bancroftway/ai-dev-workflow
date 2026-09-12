@@ -38,6 +38,12 @@ export type Session = {
   /** Derived server-side (not a DB status): `status === "in_progress"` but neither `run_active`
    * nor `awaiting_gate` -- the workflow isn't finished, but nothing is currently executing it. */
   interrupted: boolean;
+  /** Derived server-side (root-caused 2026-09-12): `status === "completed"`, or `status ===
+   * "failed"` with `failure_stage === "exit"` -- a run that reached the real end of the pipeline
+   * with a real report, whether merge_ready came back true or false. `status === "failed"` alone
+   * is ambiguous with a genuine mid-pipeline crash; this field isn't. See
+   * agent/src/session_store.py's `is_finished_with_verdict` for the authoritative definition. */
+  finished_with_verdict: boolean;
 };
 
 /** agent/src/graph.py's STAGES list, key order -- used only to render "stage N of M" in the

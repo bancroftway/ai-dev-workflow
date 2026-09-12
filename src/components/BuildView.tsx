@@ -118,7 +118,7 @@ function StageCard({
  * (after minimal-code-to-green, only reachable here if that stage's OWN rebuild is still running
  * when a user checks this tab before moving to Quality) gets the same generic copy
  * REBUILD_STATUS_LABEL already gives it elsewhere. */
-function RebuildConnector({
+export function RebuildConnector({
   running,
   status,
   failedHere,
@@ -157,11 +157,12 @@ export function BuildView() {
     () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),
     [runEvents, runActivity?.runActive],
   );
-  // Mid-run reattach gap (fold-in fix, 2026-09-11): current_stage only advances on a stage's OWN
-  // APPROVAL (graph.py's _run_post_approve_hook), never on it merely starting -- exactly the
-  // question "has this Build stage already finished" needs, unlike buildTabEnabled's "has it
-  // started" question in AppShell (which needs runningStages instead, current_stage alone lags
-  // there). Used only as a fallback below, when neither `stage` nor `runningLabel` has data yet.
+  // Mid-run reattach gap (fold-in fix, 2026-09-11): current_stage advances both on a stage's OWN
+  // approval AND right before that stage's own draft starts (graph.py's make_draft_node) -- either
+  // way, current_stage moving PAST key (strictly greater index) can only happen once key's own
+  // gate/verify has passed (the pipeline is sequentially gated), so it remains a reliable "key is
+  // done" signal regardless of which of the two write sites produced it. Used only as a fallback
+  // below, when neither `stage` nor `runningLabel` has data yet.
   const currentStageIdx = stageOrderIndex(runActivity?.currentStage);
   return (
     <ViewContainer>
@@ -173,11 +174,15 @@ export function BuildView() {
         const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
         const phase = placement && rebuildPhase(state, placement, runActivity?.runActive, runningPhases);
         const stage = state.stages?.[key];
+        // Pivot (root-caused 2026-09-12): `!runActivity?.interrupted` used to gate this off too,
+        // out of excess caution -- but current_stage having moved past `key` is a durable fact
+        // regardless of whether anything is currently attached to the run; interrupted-ness says
+        // nothing about whether that historical fact is trustworthy, and excluding it was exactly
+        // what left this tab showing "Not started" on an interrupted-but-long-finished session.
         const knownComplete =
           stage == null &&
           currentStageIdx >= 0 &&
-          currentStageIdx > stageOrderIndex(key) &&
-          !runActivity?.interrupted;
+          currentStageIdx > stageOrderIndex(key);
         return (
           <Fragment key={key}>
             <StageCard

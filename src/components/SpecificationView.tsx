@@ -12,7 +12,7 @@ import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import type { WorkflowState } from "@/lib/workflow-types";
+import { stageOrderIndex, type WorkflowState } from "@/lib/workflow-types";
 
 export function SpecificationView() {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
@@ -80,6 +80,12 @@ export function SpecificationView() {
             fallback={
               draft ? (
                 <SpecificationSurfaceRenderer specification={draft} />
+              ) : stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("specification") ? (
+                // Empty-tabs fix (root-caused 2026-09-12): durable current_stage already proves
+                // Specification approved -- "No draft yet" is flatly false here, just because the
+                // live snapshot hasn't (re)arrived. Nothing auto-fires one anymore (this session's
+                // pivot), so this durable fallback is now the primary path, not a stopgap.
+                <p className="text-sm text-neutral-500">Approved — waiting for full detail to sync…</p>
               ) : (
                 <p className="text-sm text-neutral-500">No Specification draft yet.</p>
               )

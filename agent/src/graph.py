@@ -2261,6 +2261,33 @@ async def _resolve_thread_provider(thread_id: str, state: GraphState) -> Literal
     return stored_provider or await chat_model.get_provider()
 
 
+def _reset_stage_status_fields(stage: dict[str, Any]) -> None:
+    """AC-6.3's status reset -- extracted verbatim from intake_node's fresh-submission loop below
+    (both branches there set exactly these four fields identically). `approved_content`
+    deliberately survives (see that loop's own comment on why -- diagram_gate's verbatim-carryover
+    exemption depends on it)."""
+    stage["status"] = "not_started"
+    stage["cycle_count"] = 0
+    stage["readiness"] = False
+    stage["clarifying_questions"] = []
+
+
+def _reset_stage_mechanics(stage: dict[str, Any]) -> None:
+    """Per-run mechanics fields intake_node's fresh-submission loop resets UNCONDITIONALLY every
+    run, extracted verbatim -- a stage whose previous run escalated at a cap must not re-enter the
+    next run already there. Shared with the rewind-to-stage reset below (root-caused 2026-09-12),
+    which needs the identical treatment applied to a stage regardless of its current status."""
+    stage["verify_cycle_count"] = 0
+    stage["last_verification"] = None
+    stage["reviewer_feedback"] = None
+    stage["infra_exhausted"] = False
+    stage["last_infra_error"] = None
+    stage["last_verify_feedback"] = None
+    stage["last_verify_changed_paths"] = None
+    stage["verify_stall_count"] = 0
+    stage["best_verify_coverage_rate"] = None
+
+
 async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
 
@@ -2287,11 +2314,19 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
             "falling through to normal intake for thread_id=%s",
             thread_id, exc_info=True,
         )
-    if existing_row is not None and existing_row["status"] == "completed":
+    # Root-caused 2026-09-12: a thread that finished the whole pipeline normally and wrote a real
+    # report, but scored merge_ready=False, is durably "failed" -- the SAME status value a genuine
+    # mid-pipeline crash gets. Checking only `== "completed"` here let a blank auto-reattach run
+    # (or a stale ?resume=1) silently reopen a thread that had already reached its own final
+    # verdict, reset merge_ready, and walk it into a rebuild node against a sandbox already torn
+    # down. is_finished_with_verdict recognizes both shapes; a genuine crash (any other
+    # failure_stage) still falls through to the ordinary, unconfirmed resume path below.
+    if existing_row is not None and session_store.is_finished_with_verdict(existing_row):
         if not sandbox_registry.pop_meta_flag(thread_id, "confirm_reopen"):
             logger.warning(
-                "intake_node: refusing to reopen completed thread_id=%s (no confirm_reopen flag)",
-                thread_id,
+                "intake_node: refusing to reopen finished thread_id=%s status=%s failure_stage=%s "
+                "(no confirm_reopen flag)",
+                thread_id, existing_row["status"], existing_row.get("failure_stage"),
             )
             return {"reopen_blocked": True}
 
@@ -2438,42 +2473,62 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
             # value, which is exactly what diagram_gate.check_plan_linkage reads as the PRIOR
             # plan for its verbatim-carryover exemption until run 2's own gate approves a new
             # one. Clearing approved_content here would break that carryover detection.
-            stage["status"] = "not_started"
-            stage["cycle_count"] = 0
-            stage["readiness"] = False
-            stage["clarifying_questions"] = []
+            _reset_stage_status_fields(stage)
         elif stage_resume and stage["status"] == "ready_for_review":
             # A stage caught mid-review when the previous run died still redrafts -- only
             # APPROVED work is trusted for skip-ahead.
-            stage["status"] = "not_started"
-            stage["cycle_count"] = 0
-            stage["readiness"] = False
-            stage["clarifying_questions"] = []
+            _reset_stage_status_fields(stage)
         # Per-run mechanics reset unconditionally -- a stage whose previous run escalated at the
         # verify cap otherwise re-enters every later run already AT the cap, so its first
         # transient failure escalates instantly (observed live: spec verify logged cycle 3 on a
-        # fresh run's very first attempt).
-        stage["verify_cycle_count"] = 0
-        stage["last_verification"] = None
-        # A rejection's own feedback (Part 2 Task 10) is per-run the same way -- a fresh
-        # submission must not hand a brand-new draft attempt guidance about a completely
-        # different requirements round. Approval already clears it (make_gate_node); this is the
-        # defense-in-depth counterpart for a thread that was left rejected and never resolved.
-        stage["reviewer_feedback"] = None
-        # Same reasoning for draft-level infra exhaustion (make_draft_node/make_draft_escalate_node):
-        # a prior run's Copilot outage must not make this run's very first draft attempt
-        # instant-escalate before it even tries. make_draft_escalate_node also clears this on its
-        # own handling path; reset here too as the same defense-in-depth every other per-run
-        # counter in this loop already gets.
-        stage["infra_exhausted"] = False
-        stage["last_infra_error"] = None
-        # Stall-detector state (make_verify_node): a resume should get a fresh 2-lap window to
-        # re-detect an in-progress stall rather than immediately treating this run's first verify
-        # lap as "identical to whatever the previous run's last lap reported."
-        stage["last_verify_feedback"] = None
-        stage["last_verify_changed_paths"] = None
-        stage["verify_stall_count"] = 0
-        stage["best_verify_coverage_rate"] = None
+        # fresh run's very first attempt). Rejection feedback, draft-level infra exhaustion, and
+        # verify-stall state all get the same defense-in-depth treatment -- see
+        # _reset_stage_mechanics's own docstring for the full field-by-field reasoning.
+        _reset_stage_mechanics(stage)
+
+    # Rewind-to-stage (root-caused 2026-09-12, "user must have control over which stage it resumes
+    # from"): a one-shot meta flag set by POST /api/sessions/actions {action: "rewind-to-stage"}
+    # (sessions_api.py), popped here -- same in-memory, read-once contract as confirm_reopen/resume
+    # above. Applies the SAME full reset (status + mechanics) to the chosen stage and every stage
+    # after it in pipeline order, regardless of is_new_submission/resume/current status -- unlike
+    # the loop above, this is an explicit user action, not a submission-shape inference. Also
+    # clears baseline_commit (never done anywhere else in this file despite this module's own
+    # stale comment claiming otherwise, see capture site below) -- a rewind is exactly the "assume
+    # a human intervened" case that comment already anticipates, and clearing the recorded
+    # reference costs nothing (the tree itself is untouched; this is a "soft" rewind by design).
+    rewind_to_stage = sandbox_registry.pop_meta_value(thread_id, "rewind_to_stage")
+    rewind_rebuild_state: dict[str, Any] | None = None
+    if rewind_to_stage:
+        rewind_keys = [s.key for s in STAGES]
+        if rewind_to_stage in rewind_keys:
+            target_idx = rewind_keys.index(rewind_to_stage)
+            for stage_spec in STAGES[target_idx:]:
+                stage = stages[stage_spec.key]
+                _reset_stage_status_fields(stage)
+                _reset_stage_mechanics(stage)
+                stage["baseline_commit"] = None
+            # Root-caused 2026-09-12 (found during the pivot design, not yet observed live): the
+            # loop above resets the STAGE the rebuild sits after, but never the rebuild placement's
+            # OWN sub-state (POST_STAGE_REBUILD) -- left alone, a placement whose fix_cycle_count was
+            # already at its cap (that's exactly what triggered the escalate this rewind is trying
+            # to recover from) would immediately re-escalate with ZERO fresh fix laps if the same
+            # problem recurs post-rewind, silently defeating the whole point of restarting. Reset
+            # to rebuild.default_rebuild_state() any placement whose OWN real stage sits at or
+            # after the rewind target -- mirrors the e2e["attempt"] = 0 reset just below, same
+            # reasoning, this is the rebuild-placement equivalent.
+            rewind_rebuild_state = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
+            for real_stage_key, rebuild_spec in POST_STAGE_REBUILD.items():
+                if rewind_keys.index(real_stage_key) >= target_idx:
+                    rewind_rebuild_state[rebuild_spec.key] = rebuild.default_rebuild_state()
+            logger.warning(
+                "intake_node: rewound thread_id=%s to stage=%s (and every stage after it)",
+                thread_id, rewind_to_stage,
+            )
+        else:
+            logger.warning(
+                "intake_node: ignoring rewind_to_stage=%s for thread_id=%s -- not a real stage key",
+                rewind_to_stage, thread_id,
+            )
 
     # e2e has no StageState (it's a bespoke cluster, see e2e_nodes.py) but its fix-cycle "attempt"
     # counter needs the exact same unconditional per-run reset as verify_cycle_count above -- a run
@@ -2508,6 +2563,9 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # process has seen for this thread, in which case it's this run's one live resolution.
         "provider": provider,
         "e2e": e2e_state,
+        # Only present when a rewind actually reset a placement -- omitted otherwise so an
+        # ordinary intake call leaves this channel untouched, same as before this existed.
+        **({"rebuild": rewind_rebuild_state} if rewind_rebuild_state is not None else {}),
     }
 
 

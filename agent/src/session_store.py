@@ -58,6 +58,22 @@ def _build_failure(payload: dict[str, Any]) -> tuple[str | None, str | None, str
     return payload.get("stage"), payload.get("type"), str(raw_message).strip()[:500]
 
 
+def is_finished_with_verdict(row: dict[str, Any]) -> bool:
+    """True for a durable row that reached the real end of the pipeline with a real report --
+    status=="completed", or status=="failed" with failure_stage=="exit" (exit_finalize_node's own
+    two failure sites, agent/src/exit_nodes.py -- the only place "exit" is ever written to this
+    column; a genuine mid-pipeline crash always names the stage that actually failed instead, e.g.
+    "r_ac_to_tests"/"e2e"/"test_hardening"). Root-caused 2026-09-12: a thread in this shape
+    (finished normally, merge_ready=False) is durably indistinguishable from a genuine crash by
+    `status` alone, so every reopen guard that only checked `status=="completed"` silently let a
+    blank reattach run reopen and reset an already-finished thread. Both shapes need the SAME
+    confirm-before-reopen treatment `"completed"` already had; any OTHER failure_stage must stay
+    freely, silently resumable -- that's the existing, correct crash-recovery flow."""
+    return row.get("status") == "completed" or (
+        row.get("status") == "failed" and row.get("failure_stage") == "exit"
+    )
+
+
 def _row_to_dict(columns: list[str], row: Any) -> dict[str, Any]:
     """SQL Server returns UNIQUEIDENTIFIER as an uppercase string -- normalize to lowercase so it
     matches the lowercase uuid4() every caller (frontend included) mints and compares against."""
@@ -479,6 +495,12 @@ async def _demo() -> None:
         row = await get_session(session_id)
         assert row["status"] == "failed" and row["failure_message"] == "missing screenshots", row
         assert row["ended_at"] is not None, row
+        # is_finished_with_verdict (root-caused 2026-09-12): a run that reached exit_finalize_node's
+        # own verdict logic and scored merge_ready=False is "failed" but genuinely finished -- must
+        # read the same as "completed" for reopen-guard purposes. A genuine mid-pipeline crash
+        # (any OTHER failure_stage) must not.
+        assert is_finished_with_verdict(row), row
+        assert not is_finished_with_verdict({**row, "failure_stage": "r_ac_to_tests"}), row
 
         # Resume: touch_run must clear the stale failure/pr fields from the failed attempt above,
         # and (Part 3 Task 1) a stale awaiting_gate left behind by a process restart mid-pause --
@@ -498,6 +520,7 @@ async def _demo() -> None:
         )
         row = await get_session(session_id)
         assert row["status"] == "completed" and row["pr_url"] == "https://github.com/o/r/pull/1", row
+        assert is_finished_with_verdict(row), row
 
         # "rejected" (user requirement 2026-09-10): a Specification run with zero net ledger delta
         # closes with this status via git_ops.record_run_failure(status="rejected"), distinct from

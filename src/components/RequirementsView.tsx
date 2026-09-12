@@ -145,14 +145,21 @@ export function RequirementsView() {
   // Specification first rather than redrafting Plan against its now-stale approved spec.
   const sourceOfTruthGateOpen =
     openInterrupt.open && (openInterrupt.stage === "specification" || openInterrupt.stage === "plan");
-  // Requirements-delta into an already-merged session is a supported flow (see runLocked's own
+  // Requirements-delta into an already-finished session is a supported flow (see runLocked's own
   // comment above) but must never fire silently from a stale tab that doesn't know the session
-  // already completed elsewhere -- handleSubmit below confirms with the user first and tells the
+  // already finished elsewhere -- handleSubmit below confirms with the user first and tells the
   // agent via POST /api/sessions/actions {action: "confirm-reopen"} before submitting, which
   // graph.py's intake_node requires (GraphState.reopen_blocked) before it will let this thread
   // reopen. Deliberately does NOT feed into `disabled`: the action must stay available, just
   // confirmed.
-  const isCompleted = runActivity?.status === "completed";
+  //
+  // finishedWithVerdict, not `status === "completed"` (root-caused 2026-09-12): a run that reached
+  // the whole pipeline's end and wrote a real report, but scored merge_ready=false, is durably
+  // "failed" -- the SAME status value a genuine mid-pipeline crash gets. Gating only on
+  // "completed" let a resubmit against a finished-but-not-merge-ready session skip this
+  // confirmation and silently reopen it. See session_store.is_finished_with_verdict's own
+  // docstring for the full reasoning.
+  const needsReopenConfirm = runActivity?.finishedWithVerdict ?? false;
   const disabled =
     text.trim().length === 0 ||
     agent.isRunning ||
@@ -184,8 +191,8 @@ export function RequirementsView() {
       }
       return;
     }
-    if (isCompleted) {
-      if (!window.confirm("This session already completed and merged. Continue working on it anyway?")) {
+    if (needsReopenConfirm) {
+      if (!window.confirm("This session already finished. Continue working on it anyway?")) {
         setSubmitting(false);
         return;
       }

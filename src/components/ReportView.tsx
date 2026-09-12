@@ -90,11 +90,11 @@ export function ReportView({ report, metricsExitStatus, deltaSummary, filesChang
 
       {report ? (
         <>
-          {report.blocking_reasons.length > 0 && (
+          {report.blocking_reasons.status === "present" && (
             <div className="space-y-1 rounded-lg border border-red-300 bg-red-50 p-4">
               <h2 className="text-sm font-medium text-red-900">Blocking reasons</h2>
               <ul className="list-disc space-y-1 pl-5 text-sm text-red-900">
-                {report.blocking_reasons.map((reason, i) => (
+                {report.blocking_reasons.values.map((reason, i) => (
                   <li key={i}>{reason}</li>
                 ))}
               </ul>
@@ -108,11 +108,11 @@ export function ReportView({ report, metricsExitStatus, deltaSummary, filesChang
             </div>
           </div>
 
-          {report.risk_notes.length > 0 && (
+          {report.risk_notes.status === "present" && (
             <div className="space-y-1 rounded-lg border border-amber-300 bg-amber-50 p-4">
               <h2 className="text-sm font-medium text-amber-900">Risk notes</h2>
               <ul className="list-disc space-y-1 pl-5 text-sm text-amber-900">
-                {report.risk_notes.map((note, i) => (
+                {report.risk_notes.values.map((note, i) => (
                   <li key={i}>{note}</li>
                 ))}
               </ul>

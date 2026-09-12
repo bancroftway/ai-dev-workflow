@@ -215,10 +215,17 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     if body.resume:
         if existing is None:
             raise HTTPException(status_code=404, detail="no session found to resume")
-        if existing["status"] == "completed":
-            # Server-enforced, not just a hidden Resume button: a completed session can never be
-            # resumed, regardless of what the frontend sends.
-            raise HTTPException(status_code=409, detail="a completed session cannot be resumed")
+        if session_store.is_finished_with_verdict(existing):
+            # Server-enforced, not just a hidden Resume button: a session that finished the whole
+            # pipeline -- whether merge_ready came back true or false -- can never be plain-Resumed,
+            # regardless of what the frontend sends. Root-caused 2026-09-12: this used to check only
+            # `status=="completed"`, which silently let a merge_ready=False (but fully finished) run
+            # slip through as if it were an ordinary mid-pipeline crash. Continuing work against a
+            # finished thread goes through Requirements' confirm-reopen flow instead.
+            raise HTTPException(
+                status_code=409,
+                detail="this session already finished -- reopen it from the Requirements tab instead of Resume",
+            )
 
     # An existing session row already carries an authoritative project_id -- reused automatically
     # (not just trusted from the request) so a resume, or an incidental reprovision of a session
@@ -480,6 +487,13 @@ class SessionResponse(BaseModel):
     # navigation (link back to the project/Board), which the per-session payload had no way to
     # supply until now.
     project_id: str | None = None
+    # Derived, not persisted (root-caused 2026-09-12): status=="failed" is durably ambiguous
+    # between a genuine mid-pipeline crash and a run that finished the whole pipeline normally with
+    # a real report but merge_ready=False -- see session_store.is_finished_with_verdict's own
+    # docstring. Computed once here, same pattern as `interrupted` above, so the ~4 frontend
+    # surfaces that need "is this thread actually done, whatever its status says" don't each
+    # re-derive the same OR-condition.
+    finished_with_verdict: bool = False
 
 
 async def _verified_container_alive(session_id: str) -> bool:
@@ -531,6 +545,7 @@ async def _row_to_response(row: dict[str, Any], *, container_alive: bool | None 
         container_alive=container_alive,
         run_active=active,
         interrupted=interrupted,
+        finished_with_verdict=session_store.is_finished_with_verdict(row),
     )
 
 
@@ -826,8 +841,11 @@ class SessionActionRequest(BaseModel):
     """Named actions only -- the frontend never sends shell. Adding an action = a new Literal
     member plus a handler branch below; anything else is rejected by validation before it runs."""
 
-    action: Literal["refresh-secrets", "confirm-reopen"]
+    action: Literal["refresh-secrets", "confirm-reopen", "rewind-to-stage"]
     entra_assertion: str = ""
+    # "rewind-to-stage" only: the STAGES key to reset (and reset everything after) to, in pipeline
+    # order. Ignored by every other action.
+    stage_key: str | None = None
 
 
 class SessionActionResponse(BaseModel):
@@ -855,6 +873,36 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
     _check_shared_secret(request)
     if body.action == "confirm-reopen":
         registry.set_meta(thread_id, confirm_reopen=True)
+        return SessionActionResponse(ok=True)
+
+    if body.action == "rewind-to-stage":
+        # "if and only if the workflow has failed or ready_to_merge is false" (user requirement,
+        # root-caused 2026-09-12): a session's own durable current_stage/stages record proves
+        # exactly which stages it actually reached; only those are ever valid rewind targets. Local
+        # import: graph imports this module transitively (via main.py's wiring), so a module-level
+        # import here risks a cycle -- same pattern this module already uses for session_store/
+        # sandbox_registry access elsewhere in this file.
+        from .graph import STAGES
+
+        stage_keys = [s.key for s in STAGES]
+        if body.stage_key not in stage_keys:
+            raise HTTPException(status_code=422, detail="not a real pipeline stage")
+        row = await session_store.get_session(thread_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if row["status"] != "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="rewind is only available for a session that has failed or is not ready to merge",
+            )
+        current_stage = row.get("current_stage")
+        if current_stage not in stage_keys or stage_keys.index(body.stage_key) > stage_keys.index(current_stage):
+            raise HTTPException(status_code=409, detail="this session never reached that stage")
+        # confirm_reopen too: rewinding IS the explicit, informed confirmation (the user picked a
+        # specific stage) -- without it, intake_node's own reopen guard would block this for a
+        # finished-with-verdict thread (the primary case this feature exists for) exactly as it
+        # blocks an un-confirmed plain reattach.
+        registry.set_meta(thread_id, rewind_to_stage=body.stage_key, confirm_reopen=True)
         return SessionActionResponse(ok=True)
 
     row = await session_store.get_session(thread_id)

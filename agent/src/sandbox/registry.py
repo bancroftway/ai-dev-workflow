@@ -81,3 +81,10 @@ def pop_meta_flag(thread_id: str, key: str) -> bool:
     one-shot signals like `resume` that must be consumed by the first intake that sees them and
     never apply again to a later, unrelated run on the same thread."""
     return bool(_meta.get(thread_id, {}).pop(key, False))
+
+
+def pop_meta_value(thread_id: str, key: str) -> Any | None:
+    """Same one-shot contract as pop_meta_flag, but for a signal that carries real data rather
+    than a plain boolean -- e.g. `rewind_to_stage`'s target stage key -- so it isn't coerced away
+    by pop_meta_flag's `bool(...)`. None when absent or never set."""
+    return _meta.get(thread_id, {}).pop(key, None)

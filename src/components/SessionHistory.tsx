@@ -248,7 +248,11 @@ export function SessionHistory({
                   a perfectly reattachable session through the costly resume-from-intake path
                   instead (root-caused 2026-09-11). A genuinely failed run has no run to reattach
                   to regardless of container state, so it always gets Resume. */}
-              {(s.status === "failed" || (s.status === "in_progress" && !s.container_alive)) && (
+              {/* finished_with_verdict (root-caused 2026-09-12): a "failed" row can ALSO mean "this
+                  run finished the whole pipeline normally and wrote a real report, it just scored
+                  merge_ready=false" -- server-enforced now (sessions_api.py's provision guard), so
+                  Resume would just 409. Route to the report instead of offering a button that fails. */}
+              {((s.status === "failed" && !s.finished_with_verdict) || (s.status === "in_progress" && !s.container_alive)) && (
                 <button
                   type="button"
                   title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
@@ -256,6 +260,16 @@ export function SessionHistory({
                   onClick={() => resume(s)}
                 >
                   Resume
+                </button>
+              )}
+              {s.status === "failed" && s.finished_with_verdict && (
+                <button
+                  type="button"
+                  title="This run finished normally but scored merge_ready=false -- view its report, or continue from Requirements."
+                  className="self-start rounded-md border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-700"
+                  onClick={() => openLive(s)}
+                >
+                  View report
                 </button>
               )}
               {s.status === "in_progress" && s.container_alive && (

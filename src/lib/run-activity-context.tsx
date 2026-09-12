@@ -14,6 +14,26 @@ export type RunActivityInfo = {
   awaitingGate: boolean | null;
   currentStage: string | null;
   status: string;
+  /** Root-caused 2026-09-12: status=="failed" alone is ambiguous between a genuine mid-pipeline
+   * crash and a run that finished normally with a real report but merge_ready=false -- see
+   * agent/src/session_store.py's `is_finished_with_verdict`. True for both "completed" and that
+   * finished-but-not-merge-ready shape. */
+  finishedWithVerdict: boolean;
+  /** Root-caused 2026-09-12: Docker-verified truth (sessions_api._verified_container_alive), not
+   * "is a stream attached in THIS process" (that's `interrupted`/`runActive`) -- lets a consumer
+   * tell "sandbox alive, cheap free reattach" apart from "sandbox actually gone, needs a real
+   * Resume" the same way AppShell's own amber banner already can, instead of asserting a bleaker
+   * story than the banner right above it. */
+  containerAlive: boolean;
+  /** Root-caused 2026-09-12 (pivot): durable failure detail (dbo.sessions.failure_stage/
+   * failure_type/failure_message) -- already existed for the session-LIST view
+   * (session-types.ts's Session) but never threaded into the workflow page's own context. Lets
+   * SessionOverview show which stage actually failed and its real error without needing a live
+   * snapshot, and resolve a restart target via workflow-types.ts's `realStageForFailure`. Null
+   * whenever the row has no recorded failure (most of the time). */
+  failureStage: string | null;
+  failureType: string | null;
+  failureMessage: string | null;
 };
 
 const RunActivityContext = createContext<[RunActivityInfo | null, (v: RunActivityInfo | null) => void] | null>(null);

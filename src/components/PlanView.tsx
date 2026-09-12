@@ -12,7 +12,7 @@ import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import type { WorkflowState } from "@/lib/workflow-types";
+import { stageOrderIndex, type WorkflowState } from "@/lib/workflow-types";
 
 export function PlanView() {
   // agentId only -- see RequirementsView.tsx's comment: AppShell already registered this
@@ -90,6 +90,10 @@ export function PlanView() {
             fallback={
               draft ? (
                 <PlanSurfaceRenderer plan={draft} />
+              ) : stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("plan") ? (
+                // Empty-tabs fix (root-caused 2026-09-12): same durable fallback as
+                // SpecificationView -- see that file's identical comment.
+                <p className="text-sm text-neutral-500">Approved — waiting for full detail to sync…</p>
               ) : (
                 <p className="text-sm text-neutral-500">No Plan draft yet.</p>
               )

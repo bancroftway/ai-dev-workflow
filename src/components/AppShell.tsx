@@ -269,6 +269,19 @@ export function AppShell({
   // on a tab that had been sitting on the "Reconnecting…" banner since before that: the banner
   // does not clear on its own, contradicting its own copy ("this page updates automatically").
   const reattachTriggeredRef = useRef(false);
+  // Exposes the durable-row stream's own reconnect-if-closed check to the Resume/Reattach button
+  // below (root-caused 2026-09-11): that stream's "done" handler closes it for good on a REAL
+  // terminal status, with no reopen logic of its own -- by design, since most "done"s (completed)
+  // truly are final. But "failed" is also terminal-shaped here, and failed sessions CAN be
+  // resumed (this file's own canReattach/Resume button exists for exactly that) -- and once
+  // resumed, the OLD closed EventSource never reopens itself. The only existing recovery was
+  // indirect (onFocus, below) and only fires on an actual focus transition, which a tab the user
+  // never alt-tabs away from may not see for a long time -- observed live, thread 8242ea6d: the
+  // reconnect banner and a Build stage card both kept showing the stage as of the LAST update
+  // before that "done" fired (minimal-code-to-green), well after the resumed run had genuinely
+  // moved on to remediation. Calling this at the exact moment the user clicks Resume/Reattach is a
+  // direct, immediate fix instead of waiting on an indirect signal to eventually catch up.
+  const reconnectDurableRowIfClosedRef = useRef<() => void>(() => {});
   // SSE tail of the durable session row, replacing what used to be a 10s `setInterval` fetch loop
   // (both here: `/api/sessions/{id}/stream`, backed by the agent's stream_session_row -- see that
   // function's own docstring). Pushes updates within a few seconds instead of up to 10s late, and
@@ -284,6 +297,10 @@ export function AppShell({
       awaiting_gate: boolean | null;
       run_active?: boolean;
       interrupted?: boolean;
+      finished_with_verdict?: boolean;
+      failure_stage?: string | null;
+      failure_type?: string | null;
+      failure_message?: string | null;
     }) {
       if (sandboxStatusRef.current === "provisioning") return;
       // A terminal session (completed/failed/rejected) has no container to be alive in the first
@@ -304,6 +321,11 @@ export function AppShell({
         awaitingGate: row.awaiting_gate,
         currentStage: row.current_stage,
         status: row.status,
+        finishedWithVerdict: row.finished_with_verdict ?? false,
+        containerAlive: row.container_alive ?? false,
+        failureStage: row.failure_stage ?? null,
+        failureType: row.failure_type ?? null,
+        failureMessage: row.failure_message ?? null,
       });
       // The moment the durable row reports the run PAUSED at its own gate, a blank run request
       // hits ag_ui_langgraph's pending-interrupt short-circuit and main.py's
@@ -348,14 +370,18 @@ export function AppShell({
 
     // Some browsers close an idle EventSource under background/power-saving throttling -- this is
     // the recovery path if that happened while the tab wasn't visible. A healthy open connection
-    // needs no action; only force a reconnect if it's actually dead.
-    const onFocus = () => {
+    // needs no action; only force a reconnect if it's actually dead. Shared with the Resume/
+    // Reattach button's onClick via the ref below -- same "reopen only if actually closed" check,
+    // two different triggers for when it's worth running.
+    const reconnectIfClosed = () => {
       if (source && source.readyState === EventSource.CLOSED) open();
     };
-    window.addEventListener("focus", onFocus);
+    reconnectDurableRowIfClosedRef.current = reconnectIfClosed;
+    window.addEventListener("focus", reconnectIfClosed);
     return () => {
       source?.close();
-      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("focus", reconnectIfClosed);
+      reconnectDurableRowIfClosedRef.current = () => {};
     };
   }, [threadId, setSandboxStatus, setRunActivity, agent, copilotkit]);
 
@@ -406,34 +432,51 @@ export function AppShell({
   const runFailed = durableRow?.status === "failed";
   const canReattach = !runFailed && Boolean(durableRow?.container_alive);
 
-  // Auto-trigger the run once, as soon as the sandbox is ready, on a thread that's never run
-  // before -- scaffold_node hard-fails with no local-working-tree fallback if run before the
-  // sandbox exists, so this waits on sandboxStatus rather than firing on mount.
-  //
-  // `resume` bypasses the "never run before" guard entirely: a Resume click (SessionHistory ->
-  // ?resume=1) targets a thread that DOES already have state (that's the whole point -- a failed
-  // or in-progress run being picked back up), which the ordinary auto-trigger below would
-  // otherwise treat as "already running, don't fire" and stay inert. The ref still guards against
-  // firing twice.
+  // Requirement (root-caused 2026-09-12, non-negotiable): once a stage has ever executed, its tab
+  // must never become disabled again, regardless of the run's CURRENT status. Every durable-truth
+  // fallback in this file used to gate on `isReattaching`, which itself requires
+  // `durableRow?.status === "in_progress"` -- so every one of them went dead the instant status
+  // left "in_progress" (failed/completed), which is exactly what silently re-disabled every tab
+  // on this exact session after it stopped. `durableRow.current_stage` is a monotonic fact (only
+  // ever advances, on a stage's own approval) that stays true forever regardless of what the run
+  // is doing right now -- unlike isReattaching, which intentionally resets once status leaves
+  // in_progress and must keep doing so for its own (unrelated) "Reconnecting…" banner.
+  function durableStageAtLeast(target: string): boolean {
+    return stageOrderIndex(durableRow?.current_stage) >= stageOrderIndex(target);
+  }
+
+  // Requirement (root-caused 2026-09-12): "Resume picks up from the last checkpoint" named no
+  // actual checkpoint -- a user had no way to tell what that even meant. Same lookup the reattach
+  // banner just below already uses.
+  const failedStageLabel = durableRow?.current_stage
+    ? (PIPELINE_STAGE_ORDER.find((s) => s.key === durableRow.current_stage)?.label ?? durableRow.current_stage)
+    : null;
+
+  // Pivot (root-caused 2026-09-12, user requirement): the graph must NEVER advance except via one
+  // explicit, visible action (SessionOverview's stage-anchored restart/continue button). This
+  // effect used to ALSO auto-fire on `?resume=1` and on "the run looks genuinely still running" --
+  // both removed. `?resume=1` still exists and is still consumed (by SandboxSessionBoot's `skip`
+  // computation, to decide whether to attempt reprovisioning a dead container) and is still
+  // stripped from the URL once read here, so a stale link/history entry can't imply meaning it no
+  // longer has -- it just no longer ALSO fires the workflow. The only remaining auto-fire case is
+  // a thread that has never run at all: `current_stage` is null until a stage's first draft even
+  // starts (graph.py's make_draft_node writes it right before the LLM call, not just on
+  // approval), so this is the ordinary first kickoff of a brand-new session, not a "resume" in any
+  // sense this pivot is about.
   const autoTriggeredRef = useRef(false);
   useEffect(() => {
     if (autoTriggeredRef.current) return;
     if (sandboxStatus !== "ready") return;
     if (resume) {
-      autoTriggeredRef.current = true;
-      void copilotkit.runAgent({ agent });
+      router.replace(window.location.pathname, { scroll: false });
       return;
     }
-    if (Object.keys(state.stages ?? {}).length > 0) return;
-    // No messages-guard anymore (2026-08-31): after a reload the thread's messages rehydrate
-    // client-side, so `messages.length > 0` permanently blocked the blank reattach run on any
-    // thread the user had ever submitted requirements on -- the page sat unhydrated ("Detecting
-    // your tech stack…", no gate card) forever. The blank run is safe to fire: the server drops
-    // it while an interrupt is pending (re-emitting the stored gate) and no-ops at intake on an
-    // idle thread (tech-stack-first routing), so stages-empty is the only guard needed.
+    if (durableRow == null) return; // wait for durable truth, not a guess
+    const neverRunBefore = durableRow.status === "in_progress" && durableRow.current_stage == null;
+    if (!neverRunBefore) return;
     autoTriggeredRef.current = true;
     void copilotkit.runAgent({ agent });
-  }, [sandboxStatus, state.stages, agent, copilotkit, resume]);
+  }, [sandboxStatus, agent, copilotkit, resume, durableRow, router]);
 
   // Section 8: the interrupt UI must be reachable regardless of which view is open. Task 7 dropped
   // the CopilotSidebar that renderInChat's default (true) used to publish into; renderInChat:
@@ -469,34 +512,59 @@ export function AppShell({
   // approval-independent) is the same backstop stageGroupDot/wasBuildRunningRef already lean on for
   // this identical lag, checked first; the stageOrderIndex comparison then covers the durably-known
   // "already past this stage, nothing currently running" case runningStages alone would miss.
+  // Same reattach relaxation as buildTabEnabled just below, applied to the three earlier tabs
+  // (user-reported live, thread 8242ea6d: reattached at Remediation with Requirements/
+  // Specification/Plan all still disabled). Each stage's own live fields (state.stages?.[...],
+  // ever_ready_for_review) are empty for the whole reattach gap same as buildStarted(state) is --
+  // the pipeline only reaches a LATER stage after each earlier one is already approved, so a
+  // durable current_stage past a given tab's own stage is sufficient on its own.
+  const requirementsTabEnabled =
+    state.stages?.["tech-stack"]?.status === "approved" ||
+    state.stages?.["raw-requirements"] != null ||
+    durableStageAtLeast("specification");
+  const specificationTabEnabled =
+    Boolean(specification?.ever_ready_for_review) ||
+    Boolean(specification?.clarifying_questions?.length) ||
+    durableStageAtLeast("plan");
+  const planTabEnabled =
+    Boolean(plan?.ever_ready_for_review) ||
+    Boolean(plan?.clarifying_questions?.length) ||
+    durableStageAtLeast("ac-to-tests");
   const buildTabEnabled =
     buildStarted(state) ||
     TAB_STAGE_GROUPS.build.some((k) => runningStages.has(k)) ||
-    (isReattaching && stageOrderIndex(durableRow?.current_stage) >= stageOrderIndex("ac-to-tests"));
+    durableStageAtLeast("ac-to-tests");
   const qualityStarted =
-    Boolean(state.quality_remediation ?? state.security_remediation ?? state.test_hardening ?? state.metrics_report) ||
+    Boolean(state.stages?.remediation ?? state.stages?.["adversarial-compliance"] ?? state.test_hardening ?? state.metrics_report) ||
     TAB_STAGE_GROUPS.quality.some((k) => runningStages.has(k)) ||
-    (isReattaching && stageOrderIndex(durableRow?.current_stage) >= stageOrderIndex("remediation"));
+    durableStageAtLeast("remediation");
 
-  const qualityError =
-    state.quality_remediation?.build_ok === false ||
-    state.quality_remediation?.last_gate_report?.passed === false ||
-    state.security_remediation?.last_gate_report?.passed === false;
-  const qualityDone = state.metrics_report?.metrics != null;
-  const qualityDot: DotState | undefined = qualityError
-    ? "error"
-    : qualityDone
-      ? "done"
-      : qualityStarted && agent.isRunning
-        ? "running"
-        : undefined;
+  // User-reported (2026-09-11): Quality's tab dot stayed a pulsing blue "running" indefinitely
+  // even once the Report tab was fully populated (remediation + adversarial-compliance long since
+  // approved, metrics-exit approved too) -- root cause was this dot alone still using the coarse
+  // pre-fix pattern qualityStarted/buildTabEnabled were already corrected away from above:
+  // `agent.isRunning` is "SOME turn is in flight" (true for as long as ANY later stage -- test
+  // hardening, e2e, metrics-exit -- keeps running), not "remediation/adversarial-compliance
+  // specifically are what's running now"; and `state.metrics_report?.metrics != null` is a
+  // completely different, much-later-populated bespoke field, not "are Quality's own two stages
+  // approved." Every other tab's dot already delegates to stageGroupDot (same runningStages-first,
+  // then status-derived done/awaiting/error logic Build/Spec/Plan/Tech-Stack already trust) --
+  // Quality's dot never got that same treatment when it moved off the phantom
+  // quality_remediation/security_remediation fields (root-caused 2026-09-11, see
+  // workflow-types.ts's RemediationContent docstring) onto the real StageState-shaped
+  // remediation/adversarial-compliance stages. Delegating here fixes both bugs at once with the
+  // exact logic already proven correct for every sibling tab.
+  const qualityDot = stageGroupDot(state, TAB_STAGE_GROUPS.quality, runningStages);
 
   // "metrics-exit" is the agent's real (post stage-stable-ids rename) key; "exit" is stale and
   // never populated (see runEnded()/workflow-types.ts's same dual-key check) -- reading only
   // `.exit` here left this tab's report/enabled/dot state permanently blind to every real run.
   const stagesForExit = (state.stages ?? {}) as Record<string, StageState | undefined>;
   const exitStage = stagesForExit["metrics-exit"] ?? stagesForExit["exit"];
-  const reportEnabled = exitStage?.approved_content != null || state.metrics_report?.metrics != null;
+  const reportEnabled =
+    exitStage?.approved_content != null ||
+    state.metrics_report?.metrics != null ||
+    durableStageAtLeast("metrics-exit");
   const reportDot: DotState | undefined = exitStage?.approved_content != null ? "done" : undefined;
 
   const dots: Record<ViewId, DotState | undefined> = {
@@ -540,21 +608,21 @@ export function AppShell({
             // Tech-stack-first (product requirement 2026-08-31): requirements wait until the
             // stack is determined/selected. Legacy threads that already carry requirements
             // (raw-requirements stage exists) stay reachable regardless.
-            disabled={state.stages?.["tech-stack"]?.status !== "approved" && state.stages?.["raw-requirements"] == null}
+            disabled={!requirementsTabEnabled}
             dot={dots.requirements}
             onClick={() => setActiveView("requirements")}
           />
           <TabButton
             label="Specification"
             active={activeView === "specification"}
-            disabled={!specification?.ever_ready_for_review && !specification?.clarifying_questions?.length}
+            disabled={!specificationTabEnabled}
             dot={dots.specification}
             onClick={() => setActiveView("specification")}
           />
           <TabButton
             label="Plan"
             active={activeView === "plan"}
-            disabled={!plan?.ever_ready_for_review && !plan?.clarifying_questions?.length}
+            disabled={!planTabEnabled}
             dot={dots.plan}
             onClick={() => setActiveView("plan")}
           />
@@ -670,26 +738,28 @@ export function AppShell({
             with nothing actually executing it (process died, container killed, agent restarted --
             durable node events/persisted stage status all outlive the process, so nothing else in
             this file could tell). `interrupted` is server-computed and definitive; `status ===
-            "failed"` is the other stopped-and-recoverable case, whose only Resume button used to
-            live buried in the Overview tab (SessionOverview.tsx) -- this one is visible from
-            every tab. */}
+            "failed"` is the other stopped-and-recoverable case.
+            Pivot (root-caused 2026-09-12, user requirement): this banner used to carry its own
+            Reattach/Resume button and a rewind-stage dropdown -- both fired the workflow directly,
+            which is no longer allowed anywhere except SessionOverview's one stage-anchored restart
+            button (that's the only place with the durable failure detail + real-stage mapping
+            needed to target it correctly anyway). This is now informational only, pointing there. */}
         {((runActivity?.interrupted && !isAwaitingFirstRequirements) || runFailed) && (
           <div className="flex items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
             <span>
               {runFailed
-                ? "This run failed and stopped."
+                ? `This run failed and stopped${failedStageLabel ? ` at ${failedStageLabel}` : ""}.`
                 : canReattach
                   ? "This run's sandbox is still alive, but nothing is currently attached to it."
                   : "This run appears to have stopped, and its sandbox is gone."}{" "}
-              {canReattach ? "Reattaching resumes the live run for free." : "Resume picks up from the last checkpoint."}
+              See Overview for details and to continue.
             </span>
             <button
               type="button"
-              className="shrink-0 rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40"
-              disabled={agent.isRunning}
-              onClick={() => (canReattach ? void copilotkit.runAgent({ agent }) : window.location.reload())}
+              className="shrink-0 rounded-md border border-amber-400 bg-white px-3 py-1 text-xs font-medium text-amber-900"
+              onClick={() => setActiveView("overview")}
             >
-              {agent.isRunning ? "Resuming…" : canReattach ? "Reattach" : "Resume"}
+              Go to Overview
             </button>
           </div>
         )}

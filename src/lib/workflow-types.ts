@@ -276,22 +276,50 @@ export interface RemediationFinding {
   [key: string]: unknown;
 }
 
-export interface QualityRemediationState {
-  cycle_count: number;
-  findings: RemediationFinding[];
-  decisions: Record<string, { decision: string; justification: string; ref?: string }>;
-  duplication_percent: number | null;
-  format_clean: boolean | null;
-  build_ok: boolean;
-  last_gate_report: { passed?: boolean; [key: string]: unknown } | null;
+/** agent/src/schemas.py's PresenceList -- a typed-absence list: `status: "absent"` with a real
+ * `reason` is a valid, deliberate outcome (nothing to report), never conflated with an empty list
+ * that could equally mean "never checked". Shared by RemediationContent and
+ * AdversarialComplianceReport below. */
+export interface PresenceList {
+  status: "present" | "absent";
+  values: string[];
+  reason: string;
 }
 
-export interface SecurityRemediationState {
-  cycle_count: number;
-  findings: RemediationFinding[];
-  decisions: Record<string, { decision: string; justification: string; ref?: string }>;
-  sbom_ok: boolean;
-  last_gate_report: { passed?: boolean; [key: string]: unknown } | null;
+/** agent/src/schemas_remediation.py's RemediationDraftResponse -- the WHOLE response is the
+ * remediation stage's report (StageSpec.content_field=None), so this is exactly
+ * state.stages.remediation's draft/approved_content shape. Replaces the old
+ * QualityRemediationState/SecurityRemediationState split: that shape was never actually produced
+ * by the backend (root-caused 2026-09-11 -- the two stages it described were consolidated into
+ * this single one, and nothing was ever updated to match, so QualityView's "Code
+ * quality"/"Security" sections silently rendered nothing for every run). */
+export interface RemediationContent {
+  readiness: boolean;
+  remediation_summary: string;
+  findings_addressed: PresenceList;
+  dependencies_upgraded: PresenceList;
+  known_gaps: PresenceList;
+}
+
+/** agent/src/schemas_audit.py's DivergenceFinding -- one plan/code mismatch the
+ * adversarial-compliance stage found. */
+export interface DivergenceFinding {
+  id: string;
+  severity: "critical" | "major" | "minor" | "informational";
+  plan_reference: string;
+  description: string;
+  evidence: string[];
+  proposed_resolution: string;
+}
+
+/** agent/src/schemas_audit.py's AdversarialAuditReport -- state.stages["adversarial-compliance"]'s
+ * draft/approved_content shape (StageSpec.content_field="report" unwraps it from the surrounding
+ * AdversarialAuditDraftResponse envelope). */
+export interface AdversarialComplianceReport {
+  plan_conformance_summary: string;
+  divergence_findings: { status: "present" | "absent"; values: DivergenceFinding[]; reason: string };
+  unresolved_risk_notes: PresenceList;
+  overall_verdict: "conforms" | "minor_gaps" | "major_gaps" | "fails_to_conform";
 }
 
 export interface TestHardeningState {
@@ -317,10 +345,15 @@ export interface MetricsReportState {
  * narrowed from `unknown` by whichever view renders it (ReportView). */
 export interface MergeReadinessReport {
   merge_ready: boolean;
-  blocking_reasons: string[];
+  // schemas_exit.py's MergeReadinessReport types both of these as PresenceList, not a bare
+  // list[str] -- ReportView.tsx used to read `.length`/`.map` straight off these (root-caused
+  // 2026-09-11, session 8242ea6d: a real, non-empty blocking_reasons never rendered because a
+  // plain object has no `.length`, so `report.blocking_reasons.length > 0` was always `undefined`
+  // and the whole "Blocking reasons" box silently never showed, even on a genuinely-blocked run).
+  blocking_reasons: PresenceList;
   pr_title: string;
   pr_description_markdown: string;
-  risk_notes: string[];
+  risk_notes: PresenceList;
   suggested_reviewers_note?: string;
 }
 
@@ -355,8 +388,6 @@ export interface PushStatus {
 export interface WorkflowState {
   raw_requirements_text?: string;
   repo_scan?: RepoScanState;
-  quality_remediation?: QualityRemediationState;
-  security_remediation?: SecurityRemediationState;
   test_hardening?: TestHardeningState;
   metrics_report?: MetricsReportState;
   audit_cluster?: { last_outcome?: { passed?: boolean; [key: string]: unknown } | null; [key: string]: unknown };
@@ -424,6 +455,32 @@ export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
  * reattach gap (state.stages empty), never to imply concurrent-execution semantics. */
 export function stageOrderIndex(key: string | null | undefined): number {
   return PIPELINE_STAGE_ORDER.findIndex((s) => s.key === key);
+}
+
+/** Root-caused 2026-09-12: `dbo.sessions.failure_stage` is not always one of PIPELINE_STAGE_ORDER's
+ * real stage keys -- a rebuild placement, e2e, test-hardening, or a metrics-regression escalate
+ * all name THEIR OWN key instead (confirmed exhaustive via a repo-wide search of every
+ * record_run_failure/run_failure call site in agent/src). Resolves the real, human-meaningful
+ * stage a "Restart workflow from this stage" action should target. `REBUILD_PLACEMENTS`' own
+ * `afterStageKey` already IS the reverse map for the four rebuild-originated keys; `e2e`/
+ * `test_hardening` sit between `remediation`'s rebuild and `adversarial-compliance_draft` in the
+ * graph, and `metrics_report` (metrics_nodes.py's own regression check, distinct from the
+ * `"metrics-exit"` stage key) sits between `adversarial-compliance`'s rebuild and the exit stage --
+ * neither has its own REBUILD_PLACEMENTS entry since neither IS a rebuild placement.
+ *
+ * Deliberately returns null for `"exit"` (metrics-exit's own stage approved a real report, just
+ * with merge_ready=false, or the report-writing itself crashed -- the `finished_with_verdict` case
+ * elsewhere in this file, which gets a "View report" link, not a restart) and for `"provisioning"`
+ * (the sandbox never even booted -- current_stage stays null, no stage was ever reached to
+ * restart). Callers must check `!finishedWithVerdict` before relying on this for a failed session. */
+export function realStageForFailure(failureStage: string | null | undefined): string | null {
+  if (!failureStage) return null;
+  if (stageOrderIndex(failureStage) >= 0) return failureStage;
+  const placement = REBUILD_PLACEMENTS.find((p) => p.rebuildKey === failureStage);
+  if (placement) return placement.afterStageKey;
+  if (failureStage === "e2e" || failureStage === "test_hardening") return "remediation";
+  if (failureStage === "metrics_report") return "adversarial-compliance";
+  return null;
 }
 
 // Which StageState keys each tab's status dot derives from. Quality's own status dot is still
