@@ -34,6 +34,13 @@ export type RunActivityInfo = {
   failureStage: string | null;
   failureType: string | null;
   failureMessage: string | null;
+  /** Root-caused 2026-09-12 (user-reported: run finished merge_ready=false, no in-app way to
+   * remedy it cheaply): `finishedWithVerdict` alone collapses "done and ready" and "done but
+   * blocked" into one flag -- SessionOverview needs to tell those apart to offer a "Re-verify
+   * Metrics & Exit" action only for the latter. `null` until the exit stage has actually run
+   * (dbo.sessions.merge_ready is NULL for the entire in_progress lifetime -- see
+   * `SessionResponse.merge_ready`, already exposed backend-side, just not threaded here before). */
+  mergeReady: boolean | null;
 };
 
 const RunActivityContext = createContext<[RunActivityInfo | null, (v: RunActivityInfo | null) => void] | null>(null);

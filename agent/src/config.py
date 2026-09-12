@@ -16,6 +16,13 @@ EXIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("EXIT_MAX_CLARIFICATION_CYCLE
 # so this safety cap should rarely if ever trigger.
 TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFICATION_CYCLES", "2"))
 
+# Root-caused 2026-09-12: caps how many times POST /api/sessions/actions {action: "targeted-fix"}
+# may run its seeded fix pass against one already-closed session (graph.py's intake_node,
+# GraphState.targeted_fix_attempts). Unlike rewind-to-stage, this action never resets a stage, so
+# nothing else bounds how many times a user could invoke it against the same run -- read by
+# intake_node and used by sessions_api.py's rewind endpoint to refuse once exhausted.
+TARGETED_FIX_MAX_ATTEMPTS = int(os.environ.get("TARGETED_FIX_MAX_ATTEMPTS", "3"))
+
 # e2e's own bespoke-cluster caps (agent/src/e2e_nodes.py): fix-cycle cap (same shape as
 # rebuild.py's max_fix_cycles), app-boot readiness timeout, and the whole playwright suite's own
 # timeout (wrapped in `timeout <n>` so a hung suite can't wedge the sandbox forever).

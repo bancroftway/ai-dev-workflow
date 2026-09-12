@@ -39,6 +39,7 @@ from . import (
     branch_naming,
     chat_model,
     checkpoint,
+    config,
     git_ops,
     github_link_store,
     keyvault,
@@ -868,7 +869,7 @@ class SessionActionRequest(BaseModel):
     """Named actions only -- the frontend never sends shell. Adding an action = a new Literal
     member plus a handler branch below; anything else is rejected by validation before it runs."""
 
-    action: Literal["refresh-secrets", "confirm-reopen", "rewind-to-stage"]
+    action: Literal["refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix"]
     entra_assertion: str = ""
     # "rewind-to-stage" only: the STAGES key to reset (and reset everything after) to, in pipeline
     # order. Ignored by every other action.
@@ -930,6 +931,33 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
         # finished-with-verdict thread (the primary case this feature exists for) exactly as it
         # blocks an un-confirmed plain reattach.
         registry.set_meta(thread_id, rewind_to_stage=body.stage_key, confirm_reopen=True)
+        return SessionActionResponse(ok=True)
+
+    if body.action == "targeted-fix":
+        # Root-caused 2026-09-12 ("a way to remedy without starting over and wasting tokens"):
+        # narrower than rewind-to-stage -- only ever valid for a session that finished the WHOLE
+        # pipeline with a real, merge_ready=false verdict (never a genuine mid-pipeline crash,
+        # which has no MergeReadinessReport to seed a fix from at all). Purely additive on the
+        # graph side (intake_node's own handling never resets anything but metrics-exit itself),
+        # so this check is narrower than rewind-to-stage's, not looser.
+        row = await session_store.get_session(thread_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if row["status"] != "failed" or row.get("merge_ready") is not False:
+            raise HTTPException(
+                status_code=409,
+                detail="targeted-fix is only available for a run that finished with a real, not-ready-to-merge verdict",
+            )
+        agent_state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        attempts = (agent_state.values or {}).get("targeted_fix_attempts", 0)
+        if attempts >= config.TARGETED_FIX_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"targeted-fix has already been used {attempts}/{config.TARGETED_FIX_MAX_ATTEMPTS} times for this session",
+            )
+        # confirm_reopen: same reasoning as rewind-to-stage above -- without it intake_node's own
+        # reopen guard blocks any resume of a finished-with-verdict thread.
+        registry.set_meta(thread_id, targeted_fix=True, confirm_reopen=True)
         return SessionActionResponse(ok=True)
 
     row = await session_store.get_session(thread_id)

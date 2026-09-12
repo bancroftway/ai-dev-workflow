@@ -332,6 +332,13 @@ class GraphState(TypedDict):
     # every draft node's own return (see make_draft_node) the instant it's consumed. Read only via
     # state.get() -- checkpoints written before this field shipped lack it.
     restart_from_specification: bool
+    # Root-caused 2026-09-12: how many times POST /api/sessions/actions {action: "targeted-fix"}
+    # has run its seeded fix pass against this thread (see intake_node's own handling and
+    # _run_targeted_fix) -- a genuinely new, additive lever (never resets any stage), so unlike
+    # every rewind-bounded action it needs its own cap to avoid unbounded re-invocation against the
+    # same closed run. Durable (checkpoint-backed, not the in-memory sandbox_registry) so the cap
+    # survives an agent restart. Read only via state.get() -- older checkpoints lack it.
+    targeted_fix_attempts: int
     # One-shot signal (multi-tab/completed-session hardening): set True by intake_node when this
     # thread's dbo.sessions row is already status=="completed" (merge_ready=true) and no
     # confirm_reopen meta flag was popped for this invocation -- i.e. this run must NOT reopen a
@@ -1892,7 +1899,10 @@ STAGES: list[StageSpec] = [
         # tests" while making zero write calls (confirmed from its own session log: glob/view/skill
         # only). The gate catches the fabrication every time and the redraft usually succeeds, so
         # the cheapest reliability win is simply not running out of retries mid-flake.
-        max_verify_cycles=6,
+        # Raised again 6 -> 8 (root-caused 2026-09-12): same shared-budget reasoning as
+        # minimal-code-to-green's own identical bump -- make_verify_node's zero-deferral
+        # audit-finding check now also spends laps from this same counter.
+        max_verify_cycles=8,
         # Root cause of the long escalation streak: `builtin:edit` only edits EXISTING files -- a
         # greenfield repo with no test files yet needs `builtin:create`. That alone wasn't the
         # full story: also needed the session's working directory to actually be /workspace/repo
@@ -1972,7 +1982,13 @@ STAGES: list[StageSpec] = [
         # over six laps and was cut off mid-convergence: the remaining gap was a handful of guard
         # clauses, and each lap was closing roughly one. Six laps is enough to prove a stage is
         # moving, not enough to let it finish; a truly stuck stage still burns out, just later.
-        max_verify_cycles=12,
+        # Raised again 12 -> 14 (root-caused 2026-09-12): make_verify_node's new zero-deferral
+        # audit-finding check now also fails verify whenever this stage's own audit_findings/
+        # known_gaps are non-empty, sharing the SAME verify_cycle_count budget as coverage
+        # convergence -- without headroom, a run needing several coverage laps AND carrying a real
+        # code-review finding would now escalate sooner than before this enforcement existed, as a
+        # side effect rather than a deliberate tightening.
+        max_verify_cycles=14,
         # Draft gets full, unscoped write access -- "minimal code to green" is definitionally a
         # code-writing task (Part A Decisions point 6, tier (iii)). Audit stays read-only, same
         # asymmetry as P4's session_options.
@@ -2530,6 +2546,43 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
                 rewind_to_stage, thread_id,
             )
 
+    # Targeted fix (root-caused 2026-09-12, "a way to remedy without starting over and wasting
+    # tokens"): a one-shot meta flag set by POST /api/sessions/actions {action: "targeted-fix"}
+    # (sessions_api.py), popped here -- same one-shot contract as rewind_to_stage above. Unlike a
+    # rewind, this is purely ADDITIVE: no stage's status/mechanics are reset by the flag itself.
+    # Seeds the fix pass from metrics-exit's own last approved_content (a MergeReadinessReport
+    # dict -- `merge_readiness = content` in exit_nodes.exit_finalize_node, i.e. no extra nesting),
+    # runs the fix, then resets ONLY metrics-exit's own stage (same reset rewind_to_stage already
+    # applies when targeting that stage) so the graph's normal sequential flow re-enters it for a
+    # fresh verdict. Capped (config.TARGETED_FIX_MAX_ATTEMPTS) since nothing else bounds how many
+    # times this lever could be invoked against the same closed run.
+    targeted_fix_attempts = state.get("targeted_fix_attempts", 0)
+    if sandbox_registry.pop_meta_flag(thread_id, "targeted_fix"):
+        if targeted_fix_attempts >= workflow_config.TARGETED_FIX_MAX_ATTEMPTS:
+            logger.warning(
+                "intake_node: targeted-fix refused for thread_id=%s -- already used %d/%d attempts",
+                thread_id, targeted_fix_attempts, workflow_config.TARGETED_FIX_MAX_ATTEMPTS,
+            )
+        else:
+            exit_report = (stages.get("metrics-exit") or {}).get("approved_content") or {}
+            reasons = [str(v) for v in _remediation_presence_values(exit_report.get("blocking_reasons"))]
+            if reasons:
+                await _run_targeted_fix(thread_id, state, config, reasons)
+                exit_stage = stages["metrics-exit"]
+                _reset_stage_status_fields(exit_stage)
+                _reset_stage_mechanics(exit_stage)
+                targeted_fix_attempts += 1
+                logger.warning(
+                    "intake_node: ran targeted-fix for thread_id=%s (attempt %d/%d)",
+                    thread_id, targeted_fix_attempts, workflow_config.TARGETED_FIX_MAX_ATTEMPTS,
+                )
+            else:
+                logger.warning(
+                    "intake_node: targeted-fix requested for thread_id=%s but no blocking_reasons "
+                    "found on metrics-exit's approved_content -- nothing to do",
+                    thread_id,
+                )
+
     # e2e has no StageState (it's a bespoke cluster, see e2e_nodes.py) but its fix-cycle "attempt"
     # counter needs the exact same unconditional per-run reset as verify_cycle_count above -- a run
     # that escalated at the cap must not re-enter every later run already AT it.
@@ -2563,6 +2616,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # process has seen for this thread, in which case it's this run's one live resolution.
         "provider": provider,
         "e2e": e2e_state,
+        "targeted_fix_attempts": targeted_fix_attempts,
         # Only present when a rewind actually reset a placement -- omitted otherwise so an
         # ordinary intake call leaves this channel untouched, same as before this existed.
         **({"rebuild": rewind_rebuild_state} if rewind_rebuild_state is not None else {}),
@@ -3108,6 +3162,15 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # Durable counterpart (Part 2 run-visibility) -- same data, second destination, additive
             # to the ledger write above (see run_event_store.py's module docstring). Fails soft:
             # append_event swallows+logs a DB error internally rather than raising.
+            #
+            # audit_findings (root-caused 2026-09-12, nice-to-have flagged by the zero-deferral
+            # enforcement design): only a COUNT used to be durably persisted here -- stage["audit_
+            # findings"] itself is overwritten every lap (graph.py's own audit_node, no history) and
+            # was never written verbatim to any durable store, so there was no way to later see
+            # whether the SAME finding recurred across laps, only that some number of findings
+            # existed each time. Not load-bearing for the enforcement check itself (that reads
+            # current stage/draft state fresh, not history) -- purely for a human/dashboard reading
+            # this run's own event history later.
             run_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
@@ -3120,6 +3183,7 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 ),
                 payload={
                     "audit_findings_count": len(stage["audit_findings"]),
+                    "audit_findings": stage["audit_findings"],
                     "audit_skipped_infra": audit_skipped_infra,
                 },
                 token_usage=model._last_usage,
@@ -3194,6 +3258,44 @@ def _detect_verify_stall(
     else:
         new_best = best_branch_rate
     return _StallSignals(feedback_similar, paths_unchanged, coverage_not_improving, new_best)
+
+
+def _open_audit_findings(stage: StageState) -> list[str]:
+    """Zero-deferral audit-finding enforcement (root-caused 2026-09-12, user's own non-negotiable
+    requirement: every stage with an audit step must enforce its findings, no exceptions -- a
+    human approval gate is not a substitute for one). Combines both places an unresolved finding
+    can live on a stage: the audit's own cross-check (`stage["audit_findings"]`, already flattened
+    to `list[str]` by make_audit_node) and the draft's own self-admitted gaps (`known_gaps`,
+    present only on stages whose draft schema declares it -- currently minimal-code-to-green --
+    left as the raw PresenceList dict shape here, since nothing normalizes it the way
+    audit_findings is normalized). Called only for stages with `audit_response_schema is not None`
+    (specification, plan, ac-to-tests, minimal-code-to-green) -- remediation/adversarial-compliance
+    have no audit pass of this shape at all and already enforce their own findings independently
+    (remediation_gate/adversarial_gate)."""
+    open_findings: list[str] = list(stage.get("audit_findings") or [])
+    known_gaps = (stage.get("draft") or {}).get("known_gaps")
+    if isinstance(known_gaps, dict) and known_gaps.get("status") == "present":
+        open_findings.extend(str(v) for v in (known_gaps.get("values") or []))
+    return open_findings
+
+
+def _demo_open_audit_findings() -> None:
+    assert _open_audit_findings({}) == []
+    assert _open_audit_findings({"audit_findings": []}) == []
+    assert _open_audit_findings({"audit_findings": ["contrast too low"]}) == ["contrast too low"]
+    assert _open_audit_findings({"draft": {"known_gaps": {"status": "absent", "values": [], "reason": "n/a"}}}) == []
+    assert _open_audit_findings(
+        {"draft": {"known_gaps": {"status": "present", "values": ["no error handler"], "reason": ""}}}
+    ) == ["no error handler"]
+    assert _open_audit_findings(
+        {
+            "audit_findings": ["contrast too low"],
+            "draft": {"known_gaps": {"status": "present", "values": ["no error handler"], "reason": ""}},
+        }
+    ) == ["contrast too low", "no error handler"]
+    # A legacy bare-list known_gaps (never coerced through PresenceList) must not crash this --
+    # isinstance(known_gaps, dict) is false for a list, so it's simply ignored, same as "absent".
+    assert _open_audit_findings({"draft": {"known_gaps": ["legacy bare item"]}}) == []
 
 
 def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
@@ -3301,6 +3403,42 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 feedback=f"deterministic verification crashed unexpectedly: {exc}",
                 report={"infra_error": "verify_crashed"},
             )
+        # Zero-deferral audit-finding enforcement (root-caused 2026-09-12, user's own non-negotiable
+        # requirement: every stage with an audit step must enforce its findings, no exceptions -- a
+        # human approval gate is not a substitute for one). Only for stages with their own audit
+        # pass (audit_response_schema is not None): specification, plan, ac-to-tests,
+        # minimal-code-to-green. remediation/adversarial-compliance have no audit_response_schema at
+        # all (graph.py's own StageSpecs) and already enforce their own findings independently via
+        # remediation_gate/adversarial_gate. Checks both the audit's own cross-check
+        # (`stage["audit_findings"]`, already flattened to list[str] by make_audit_node above) and
+        # the draft's own self-admitted gaps (`known_gaps`, present only on stages whose draft
+        # schema declares it -- currently minimal-code-to-green -- left as the raw PresenceList dict
+        # shape here, since nothing normalizes it the way audit_findings is normalized). Before this
+        # check, NOTHING read either field: the model could honestly report the same unfixed finding
+        # for the stage's entire max_verify_cycles budget and the stage would still auto-approve
+        # (or, for a human-gated stage, still reach the human with an unaddressed finding sitting in
+        # the review UI, approvable anyway) -- exactly what happened for the two findings that
+        # motivated this change (WCAG contrast + missing error handling, both flagged 3 straight
+        # rounds during minimal-code-to-green and never fixed).
+        if stage_spec.audit_response_schema is not None:
+            open_findings: list[str] = list(stage.get("audit_findings") or [])
+            known_gaps = (stage.get("draft") or {}).get("known_gaps")
+            if isinstance(known_gaps, dict) and known_gaps.get("status") == "present":
+                open_findings.extend(str(v) for v in (known_gaps.get("values") or []))
+            if open_findings:
+                audit_feedback = (
+                    "Unresolved audit finding(s) must be fixed before this stage can proceed:\n"
+                    + "\n".join(f"- {f}" for f in open_findings)
+                )
+                merged_report = {
+                    **result.report,
+                    "blocking_reasons": [*(result.report.get("blocking_reasons") or []), *open_findings],
+                }
+                result = VerificationResult(
+                    passed=False,
+                    feedback=audit_feedback if result.passed else f"{result.feedback}\n\n{audit_feedback}",
+                    report=merged_report,
+                )
         if not skill_check.passed:
             # Merge the skill-gate's own verdict into the content gate's, instead of reporting
             # only whichever failed first (2026-09-07 audit, "review all stages/gates" anecdote):
@@ -3602,6 +3740,73 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
         return {}
 
     return verify_fix_node
+
+
+async def _run_targeted_fix(thread_id: str, state: GraphState, config: RunnableConfig, reasons: list[str]) -> None:
+    """Seeded, additive fix pass for `POST /api/sessions/actions {action: "targeted-fix"}`
+    (root-caused 2026-09-12): before this existed, a user's only recourse for a `merge_ready=false`
+    finish was to manually patch the code themselves outside the tool, or `rewind-to-stage` an
+    entire earlier real stage -- expensive, and often structurally blind to the actual findings
+    (e.g. `remediation` only fixes scanner-detected findings, never a WCAG-contrast or missing
+    error-handling gap the exit stage's own review caught).
+
+    Modelled closely on `make_verify_fix_node` (identical model/tool-access shape) but called
+    directly from `intake_node`, not wired as a graph node of its own: this pass isn't owned by any
+    one `StageSpec` -- findings can span concerns (styling, error handling, anything free-form the
+    exit stage's review calls out) -- and runs once, synchronously, before the graph's normal flow
+    proceeds. `intake_node` resets `metrics-exit`'s own stage status alongside calling this (same
+    reset `rewind-to-stage` already applies when targeting that stage), so the graph's ordinary
+    sequential flow naturally re-enters metrics-exit for a fresh verdict afterward -- no new graph
+    topology needed.
+
+    No independent, deterministic regression gate runs after this -- the prompt itself instructs
+    the model to build and test before finishing, the same trust level every redraft/fix pass in
+    this pipeline already operates at. A real, known gap (see this feature's own design notes),
+    not an oversight: building a genuinely independent post-fix regression check is a separate,
+    larger piece of work.
+    """
+    if not reasons or sandbox_registry.get(thread_id) is None:
+        return
+    system_prompt, human_template = load_prompt_pair("targeted_fix")
+    model = get_chat_model_for_thread(
+        thread_id,
+        "targeted-fix",
+        "fix",
+        provider=state["provider"],
+        run_id=state.get("run_id", "unknown"),
+        # Borrows remediation's own configured fix-tier model -- this pass is the same kind of
+        # job (close out named, already-diagnosed findings against real code), and isn't a
+        # StageSpec of its own with a models.yaml entry to read.
+        model_name=(
+            model_config.get_model_name("remediation", "fix", state["provider"])
+            or model_config.get_model_name("remediation", "draft", state["provider"])
+        ),
+        sandbox=sandbox_registry.get(thread_id),
+        agent_mode="autopilot",
+        available_tools=[
+            "builtin:view", "builtin:grep", "builtin:glob", "builtin:bash",
+            "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+        ],
+    )
+    rendered = render_prompt(human_template, blocking_reasons="\n".join(f"- {r}" for r in reasons))
+    await model.ainvoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=rendered)],
+        config={"metadata": {"emit-messages": False}},
+    )
+    await git_ops.commit_all(
+        get_sandbox_provider(), thread_id, "ai-dev-workflow: targeted fix for prior blocking reasons"
+    )
+    run_event = RunEvent(
+        run_id=state.get("run_id", "unknown"),
+        session_id=thread_id,
+        type=RunEventType.NODE_FINISHED,
+        stage="targeted-fix",
+        node="fix",
+        summary="targeted fix applied",
+        token_usage=model._last_usage,
+    )
+    run_event = await run_event_store.append_event(run_event)
+    await run_event_stream.emit_live(run_event, config)
 
 
 def make_draft_escalate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
@@ -5872,6 +6077,8 @@ def _demo() -> None:
     assert route(real_delta_state) == "gate"  # type: ignore[arg-type]
     failed_state = {"stages": {route_spec.key: {"last_verification": {"passed": False, "report": {}}, "verify_cycle_count": 0}}}
     assert route(failed_state) == "retry", "no_new_work must never mask a genuine verify failure"  # type: ignore[arg-type]
+
+    _demo_open_audit_findings()
 
     print("graph self-check: all assertions passed")
 

@@ -211,6 +211,76 @@ export function SessionOverview() {
     }
   }
 
+  // Cheap re-verify (root-caused 2026-09-12, user-reported: a run that finishes merge_ready=false
+  // offers NO in-app action at all -- `handleRestart`'s isFailedBoundary branch can't be reused
+  // here: `realStageForFailure` deliberately returns null for failure_stage=="exit" (metrics-exit
+  // approving with merge_ready=false is a real, verdict-bearing finish, not the "escalate" shape
+  // that function maps), so `isFailedBoundary` is false and handleRestart would silently take the
+  // no-op "just continue" path instead of actually calling rewind-to-stage. This is a separate,
+  // explicit action: reset ONLY metrics-exit (sessions_api.py's rewind-to-stage already allows this
+  // -- status=="failed" and current_stage=="metrics-exit" both already satisfied here -- no earlier
+  // stage's work is touched or re-billed).
+  async function handleReverifyMetricsExit() {
+    if (
+      !window.confirm(
+        "Re-run only Metrics & Exit against the current code -- this does not reset or redo any " +
+          "earlier stage. Use this after you've fixed the blocking reasons yourself (or via a " +
+          "targeted fix). Continue?",
+      )
+    ) {
+      return;
+    }
+    setRestarting(true);
+    try {
+      const response = await fetch("/api/sessions/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: threadId, action: "rewind-to-stage", stageKey: "metrics-exit" }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        window.alert(body?.detail || "Could not re-verify this session.");
+        return;
+      }
+      void copilotkit.runAgent({ agent });
+    } finally {
+      setRestarting(false);
+    }
+  }
+
+  // Seeded targeted-fix (root-caused 2026-09-12, "a way to remedy without starting over and
+  // wasting tokens"): asks the agent itself to fix the prior run's own blocking_reasons directly
+  // against the current code, then automatically re-verifies at Metrics & Exit -- no manual
+  // patching required, and no full stage redo. Purely additive server-side (sessions_api.py's
+  // targeted-fix action never resets any stage but metrics-exit, and only after the fix runs).
+  async function handleTargetedFix() {
+    if (
+      !window.confirm(
+        "Ask the agent to fix the blocking reasons from this run's own report, directly against " +
+          "the current code, then automatically re-verify Metrics & Exit. This does not redo any " +
+          "earlier stage. Continue?",
+      )
+    ) {
+      return;
+    }
+    setRestarting(true);
+    try {
+      const response = await fetch("/api/sessions/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: threadId, action: "targeted-fix" }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        window.alert(body?.detail || "Could not start a targeted fix for this session.");
+        return;
+      }
+      void copilotkit.runAgent({ agent });
+    } finally {
+      setRestarting(false);
+    }
+  }
+
   // Per-stage wall-clock + spend from the durable event stream, plus a redraft/rejection count:
   // a gate_resolved event with payload.decision === "rejected" is exactly a human rejection that
   // sent the stage back to its own draft node (make_gate_node, graph.py) -- a count Overview never
@@ -498,6 +568,32 @@ export function SessionOverview() {
                             ? "Restart workflow from this stage"
                             : "Continue workflow from here"}
                       </button>
+                    </div>
+                  )}
+                  {key === "metrics-exit" && finishedWithVerdict && runActivity?.mergeReady === false && (
+                    <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
+                      <p className="text-xs text-neutral-500">
+                        This run finished but is not ready to merge -- see the Report tab for why.
+                        Ask the agent to fix it, or re-verify if you've already fixed it yourself.
+                      </p>
+                      <div className="ml-auto flex shrink-0 gap-2">
+                        <button
+                          type="button"
+                          className="rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs font-medium text-neutral-700 disabled:opacity-40"
+                          disabled={restarting}
+                          onClick={() => void handleReverifyMetricsExit()}
+                        >
+                          {restarting ? "Working…" : "Re-verify Metrics & Exit"}
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40"
+                          disabled={restarting}
+                          onClick={() => void handleTargetedFix()}
+                        >
+                          {restarting ? "Working…" : "Fix these findings"}
+                        </button>
+                      </div>
                     </div>
                   )}
                 </li>

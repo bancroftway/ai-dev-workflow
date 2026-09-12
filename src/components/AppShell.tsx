@@ -301,6 +301,7 @@ export function AppShell({
       failure_stage?: string | null;
       failure_type?: string | null;
       failure_message?: string | null;
+      merge_ready?: boolean | null;
     }) {
       // A terminal session (completed/failed/rejected) has no container to be alive in the first
       // place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
@@ -336,6 +337,7 @@ export function AppShell({
         failureStage: row.failure_stage ?? null,
         failureType: row.failure_type ?? null,
         failureMessage: row.failure_message ?? null,
+        mergeReady: row.merge_ready ?? null,
       });
       // The moment the durable row reports the run PAUSED at its own gate, a blank run request
       // hits ag_ui_langgraph's pending-interrupt short-circuit and main.py's

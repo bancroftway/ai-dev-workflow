@@ -229,6 +229,63 @@ async def _discover_playwright_layout(provider: Any, thread_id: str) -> tuple[st
     return config_dir, bool((specs.stdout or "").strip())
 
 
+# Root-caused 2026-09-12: matches a `.goto(...)` call's first quoted/templated argument (single,
+# double, or backtick), e.g. `page.goto('/polls')` or `page.goto(\`${baseUrl}/polls/${id}\`)`.
+_GOTO_CALL_RE = re.compile(r"\.goto\(\s*[`'\"]([^`'\"]*)[`'\"]")
+# A dynamic path segment inside a template-literal goto call, e.g. the `${id}` in `/polls/${id}`.
+_TEMPLATE_INTERPOLATION_RE = re.compile(r"\$\{[^}]*\}")
+
+
+def _extract_route_from_goto(call_text: str) -> str | None:
+    """One `.goto(...)` call's literal text -> a Lighthouse-usable path, or None if it isn't one.
+
+    Strips a leading `${baseUrl}`-style prefix down to the first real `/` (Lighthouse wants a
+    path, not a full origin) and replaces any remaining `${...}` interpolation -- a dynamic path
+    segment like the `${id}` in `/polls/${id}` -- with a generic placeholder. Best-effort by
+    design: Lighthouse only needs a real, renderable URL to audit static markup/contrast, not the
+    exact runtime id: a placeholder that happens to 404 is silently dropped by _run_lighthouse's
+    own per-route handling, no worse off than a route that was never in the list at all.
+    """
+    match = _GOTO_CALL_RE.search(call_text)
+    if not match:
+        return None
+    raw = re.sub(r"^\$\{[^}]*\}", "", match.group(1))
+    if not raw.startswith("/"):
+        return None
+    return _TEMPLATE_INTERPOLATION_RE.sub("1", raw) or None
+
+
+async def _discover_routes_from_specs(provider: Any, thread_id: str) -> list[str]:
+    """Best-effort additional routes for Lighthouse, mined from the e2e suite's OWN test source
+    (root-caused 2026-09-12, user-reported: a real WCAG-contrast failure on the poll-detail screen
+    went unnoticed because Lighthouse only ever scans `AppLaunchReport.routes` -- an LLM's
+    pre-declared guess at launch time, confirmed to be the ONLY route list this pipeline has;
+    there is no independent record anywhere of what the suite's browser session actually
+    navigated to). Rather than building new runtime instrumentation (a real trace/network capture,
+    a materially bigger change), grep the suite's own spec files for `.goto(...)` calls -- the
+    suite's test source already names every page it was WRITTEN to visit, which is a direct,
+    zero-new-infrastructure proxy for "a real page a user reaches", the same intent a live capture
+    would be trying to recover. Fails soft to an empty list -- this only ever WIDENS route
+    coverage; a scan that turns up nothing here leaves Lighthouse exactly as it was before.
+    """
+    try:
+        result = await provider.exec_in_sandbox(
+            thread_id,
+            "find . -maxdepth 6 \\( -name '*.spec.ts' -o -name '*.spec.js' -o -name '*.e2e.ts' \\) "
+            "-not -path '*/node_modules/*' -not -path './.git/*' "
+            "-exec grep -oh '\\.goto([^)]*)' {} \\; 2>/dev/null | head -200",
+        )
+    except Exception:  # noqa: BLE001 -- best-effort widening, never worth failing the run over
+        logger.warning("e2e: route discovery from specs failed for thread %s", thread_id, exc_info=True)
+        return []
+    routes: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        route = _extract_route_from_goto(line)
+        if route and route not in routes:
+            routes.append(route)
+    return routes
+
+
 async def e2e_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     e2e = dict(state.get("e2e") or default_e2e_state())
@@ -985,6 +1042,14 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # Hoisted from the screenshot section below (this is its only other consumer): needed earlier
     # now that the connectivity preflight probes the same base route before the suite runs.
     routes = [r for r in (launch.routes or []) if str(r).startswith("/")] or ["/"]
+    # Root-caused 2026-09-12: widen with routes mined from the suite's own spec files (see
+    # _discover_routes_from_specs) -- AppLaunchReport.routes alone missed the poll-detail and
+    # results pages in the real incident that motivated this, since the LLM launch-report step
+    # never named them even though the suite's own tests visit both. Union, not replace: the
+    # launch report can still name pages no spec happens to visit directly.
+    for extra_route in await _discover_routes_from_specs(provider, thread_id):
+        if extra_route not in routes:
+            routes.append(extra_route)
 
     # App secrets (keyvault.py): fetched on-behalf-of the user at provision time, injected here
     # as an env file sourced only into the app's own shell. Cache empty but a vault IS configured
@@ -1999,6 +2064,15 @@ def _demo() -> None:
     assert err is not None and "/" in err and "5080" in err, err
     broken_shell = {"status": 404, "title": "", "errors": [], "text": ""}
     assert connectivity_preflight_error("/", 5080, broken_shell) is not None
+
+    assert _extract_route_from_goto("page.goto('/polls')") == "/polls"
+    assert _extract_route_from_goto('page.goto("/polls/new")') == "/polls/new"
+    assert _extract_route_from_goto("page.goto(`${baseUrl}/polls/${id}`)") == "/polls/1"
+    assert _extract_route_from_goto("page.goto(`/results/${pollId}/summary`)") == "/results/1/summary"
+    assert _extract_route_from_goto("page.goto(baseUrl)") is None, "no quoted argument at all"
+    assert _extract_route_from_goto("page.goto('https://example.com')") is None, "not a relative path"
+    assert _extract_route_from_goto("locator.goto(1)") is None
+
     print("e2e_nodes self-check: ok")
 
 

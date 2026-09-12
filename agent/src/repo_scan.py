@@ -1072,6 +1072,296 @@ def parse_eslint(raw: str) -> ParseResult:
     return findings, {}
 
 
+# Root-caused 2026-09-12: neither WCAG-contrast nor "unhandled HTTP/Observable error" has any
+# deterministic tool in this roster -- both were caught only by an LLM audit's own diligence, which
+# is why a real WCAG AA violation (white text on a gold button, ~3.24:1) and a missing `error`
+# callback survived three straight audit rounds unfixed. Two small, self-contained, first-party
+# checks below (no new sandbox-image dependency -- run entirely through the `python3` this image
+# already needs for bandit) close both gaps deterministically. Each is intentionally a lightweight,
+# regex/text heuristic, not a full CSS/TS parser -- "smallest thing that fails if the logic
+# breaks", same bar every other check in this file already holds itself to; false negatives on
+# exotic syntax are an accepted tradeoff, a false-positive-heavy check that remediation can't trust
+# would be worse. `remediation_verify_fix.md`'s own existing instructions ("a fabricated or
+# mistyped id: ... or drop the claim") already cover a finding that turns out not to apply.
+#
+# Written as a `python3 -c "<script>"` sandbox command rather than a new external binary: adding a
+# genuinely new CLI tool would mean rebuilding the sandbox image (agent/src/sandbox-image/); every
+# sandbox already has python3 (bandit, this roster's own Python SAST tool, requires it). The two
+# script constants below contain no single-quote characters anywhere (comments included) -- each is
+# embedded in its ToolSpec.command as `python3 -c '<script>'`, and a literal single quote would
+# terminate that shell argument early.
+_WCAG_CONTRAST_CHECK_SCRIPT = """
+import json
+import os
+import re
+
+MIN_CONTRAST = 4.5
+EXCLUDE_DIRS = {
+    "node_modules", ".git", "dist", "build", "out", ".next", ".nuxt", ".angular",
+    "bin", "obj", "coverage", "agent-work", ".ai-dev-workflow", "vendor",
+}
+
+
+def srgb_to_linear(c):
+    c = c / 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def relative_luminance(rgb):
+    r, g, b = rgb
+    return 0.2126 * srgb_to_linear(r) + 0.7152 * srgb_to_linear(g) + 0.0722 * srgb_to_linear(b)
+
+
+def contrast_ratio(rgb1, rgb2):
+    l1, l2 = relative_luminance(rgb1), relative_luminance(rgb2)
+    lighter, darker = max(l1, l2), min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def parse_hex(value):
+    value = value.strip()
+    m = re.match(r"^#([0-9a-fA-F]{6})$", value)
+    if m:
+        h = m.group(1)
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    m = re.match(r"^#([0-9a-fA-F]{3})$", value)
+    if m:
+        h = m.group(1)
+        return tuple(int(c * 2, 16) for c in h)
+    return None
+
+
+def collect_root_vars(text, variables):
+    for block in re.finditer(r":root\\s*\\{([^}]*)\\}", text, re.DOTALL):
+        for decl in re.finditer(r"--([a-zA-Z0-9_-]+)\\s*:\\s*([^;]+);", block.group(1)):
+            variables[decl.group(1)] = decl.group(2).strip()
+
+
+def resolve_color(value, variables, depth=0):
+    if depth > 4:
+        return None
+    value = value.strip()
+    m = re.match(r"^var\\(\\s*--([a-zA-Z0-9_-]+)\\s*(?:,\\s*(.+))?\\)$", value)
+    if m:
+        referenced = variables.get(m.group(1))
+        if referenced is not None:
+            return resolve_color(referenced, variables, depth + 1)
+        fallback = m.group(2)
+        return resolve_color(fallback, variables, depth + 1) if fallback else None
+    return parse_hex(value)
+
+
+def find_source_files(root, suffixes):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if name.endswith(suffixes):
+                yield os.path.join(dirpath, name)
+
+
+def main():
+    paths = list(find_source_files(".", (".css", ".scss")))
+    texts = {}
+    variables = {}
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                texts[path] = handle.read()
+        except OSError:
+            continue
+    for text in texts.values():
+        collect_root_vars(text, variables)
+
+    findings = []
+    for path, text in texts.items():
+        for block in re.finditer(r"([^{}]+)\\{([^{}]*)\\}", text):
+            selector = block.group(1).strip()
+            body = block.group(2)
+            color_m = re.search(r"(?<![-\\w])color\\s*:\\s*([^;]+);", body)
+            bg_m = re.search(r"background(?:-color)?\\s*:\\s*([^;]+);", body)
+            if not color_m or not bg_m:
+                continue
+            color_rgb = resolve_color(color_m.group(1), variables)
+            bg_rgb = resolve_color(bg_m.group(1), variables)
+            if color_rgb is None or bg_rgb is None:
+                continue
+            ratio = contrast_ratio(color_rgb, bg_rgb)
+            if ratio < MIN_CONTRAST:
+                line = text[: block.start()].count(chr(10)) + 1
+                findings.append({
+                    "file": path,
+                    "line": line,
+                    "selector": selector,
+                    "ratio": round(ratio, 2),
+                })
+
+    print(json.dumps(findings))
+
+
+main()
+"""
+
+
+def parse_wcag_contrast(raw: str) -> ParseResult:
+    """Output of `_WCAG_CONTRAST_CHECK_SCRIPT`: a JSON list of {file, line, selector, ratio}."""
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], {}
+    if not isinstance(entries, list):
+        return [], {}
+    findings: list[Finding] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = _norm_path(str(entry.get("file") or "unknown"))
+        line = entry.get("line") if isinstance(entry.get("line"), int) else None
+        selector = str(entry.get("selector") or "")
+        ratio = entry.get("ratio")
+        message = (
+            f"{selector!r} has ~{ratio}:1 text/background contrast, below WCAG AA's 4.5:1 floor."
+        )
+        findings.append(
+            Finding(
+                finding_key=stable_id("maintainability", f"wcag-contrast:{selector}", path),
+                tool="wcag-contrast",
+                rule_id="wcag-contrast",
+                severity="high",
+                raw_severity=f"{ratio}:1",
+                file=path,
+                line=line,
+                message=message,
+                category="maintainability",
+                title="WCAG AA contrast violation",
+                severity_source="derived",
+                sources=("wcag-contrast",),
+            )
+        )
+    return findings, {}
+
+
+_UNHANDLED_SUBSCRIBE_CHECK_SCRIPT = """
+import json
+import os
+import re
+
+EXCLUDE_DIRS = {
+    "node_modules", ".git", "dist", "build", "out", ".next", ".nuxt", ".angular",
+    "bin", "obj", "coverage", "agent-work", ".ai-dev-workflow", "vendor",
+}
+TEST_SUFFIXES = (".spec.ts", ".spec.tsx", ".test.ts", ".test.tsx", ".e2e.ts")
+
+
+def find_source_files(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if name.endswith((".ts", ".tsx")) and not name.endswith(TEST_SUFFIXES):
+                yield os.path.join(dirpath, name)
+
+
+def find_calls(text, needle):
+    calls = []
+    start_index = 0
+    while True:
+        found = text.find(needle, start_index)
+        if found == -1:
+            break
+        open_paren = found + len(needle) - 1
+        depth = 1
+        i = open_paren + 1
+        while i < len(text) and depth > 0:
+            ch = text[i]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            i += 1
+        calls.append((found, text[open_paren + 1 : i - 1]))
+        start_index = i
+    return calls
+
+
+def has_top_level_comma(args_text):
+    depth = 0
+    for ch in args_text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return True
+    return False
+
+
+def call_has_error_handler(args_text):
+    stripped = args_text.strip()
+    if not stripped:
+        return True
+    if has_top_level_comma(args_text):
+        return True
+    return bool(re.search(r"(?<![\\w$])error\\s*:", args_text))
+
+
+def main():
+    findings = []
+    for path in find_source_files("."):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for offset, args_text in find_calls(text, ".subscribe("):
+            if call_has_error_handler(args_text):
+                continue
+            line = text[:offset].count(chr(10)) + 1
+            findings.append({"file": path, "line": line})
+
+    print(json.dumps(findings))
+
+
+main()
+"""
+
+
+def parse_unhandled_subscribe(raw: str) -> ParseResult:
+    """Output of `_UNHANDLED_SUBSCRIBE_CHECK_SCRIPT`: a JSON list of {file, line}."""
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], {}
+    if not isinstance(entries, list):
+        return [], {}
+    findings: list[Finding] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = _norm_path(str(entry.get("file") or "unknown"))
+        line = entry.get("line") if isinstance(entry.get("line"), int) else None
+        message = (
+            ".subscribe() here has no error callback (neither a second argument nor an "
+            "object-form `error:` handler) -- a failed request will fail silently instead of "
+            "surfacing to the user."
+        )
+        findings.append(
+            Finding(
+                finding_key=stable_id("maintainability", f"unhandled-subscribe:{line}", path),
+                tool="unhandled-subscribe",
+                rule_id="unhandled-subscribe",
+                severity="medium",
+                raw_severity="",
+                file=path,
+                line=line,
+                message=message,
+                category="maintainability",
+                title="Observable subscribed with no error handler",
+                severity_source="derived",
+                sources=("unhandled-subscribe",),
+            )
+        )
+    return findings, {}
+
+
 # Fraction of SBOM components the dependency graph must actually mention before ancestry is
 # reported at all. Syft emits a near-empty graph for some ecosystems (816 components / 20 edges on
 # this pipeline's own branch), and a split derived from that describes the tool, not the project.
@@ -2208,6 +2498,10 @@ _DOTNET_PROJECT_PROBE = (
     "-not -path '*/obj/*' -not -path '*/node_modules/*' -print -quit | grep -q ."
 )
 _PACKAGE_JSON_PROBE = "find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' -print -quit | grep -q ."
+_CSS_FILES_PROBE = (
+    "find . \\( -name '*.css' -o -name '*.scss' \\) -not -path '*/node_modules/*' "
+    "-not -path '*/agent-work/*' -not -path '*/.ai-dev-workflow/*' -print -quit | grep -q ."
+)
 
 # Every command is offline by construction: no `--config auto`, no DB update, no registry fetch.
 # The databases are baked into the sandbox image at build time -- see agent/sandbox-image/Dockerfile.
@@ -2326,6 +2620,22 @@ TOOLS: tuple[ToolSpec, ...] = (
         "--config /opt/aidw/lint/eslint.config.mjs --no-error-on-unmatched-pattern "
         "-f json -o agent-work/eslint.json . || true",
         "agent-work/eslint.json", parse_eslint, "/opt/aidw/lint/node_modules/.bin/eslint --version",
+        applies=_PACKAGE_JSON_PROBE,
+    ),
+    ToolSpec(
+        # First-party, not a vendored dependency (see _WCAG_CONTRAST_CHECK_SCRIPT's own module
+        # comment for why this is a python3 -c script rather than a real external tool). "n/a"
+        # license/permissive=True matches dotnet-docs' own precedent for a first-party check.
+        "wcag-contrast", "n/a", True,
+        f"python3 -c '{_WCAG_CONTRAST_CHECK_SCRIPT}' > agent-work/wcag-contrast.json",
+        "agent-work/wcag-contrast.json", parse_wcag_contrast, "python3 --version",
+        applies=_CSS_FILES_PROBE,
+    ),
+    ToolSpec(
+        # Same rationale as wcag-contrast just above.
+        "unhandled-subscribe", "n/a", True,
+        f"python3 -c '{_UNHANDLED_SUBSCRIBE_CHECK_SCRIPT}' > agent-work/unhandled-subscribe.json",
+        "agent-work/unhandled-subscribe.json", parse_unhandled_subscribe, "python3 --version",
         applies=_PACKAGE_JSON_PROBE,
     ),
     ToolSpec(
@@ -3728,6 +4038,21 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert not is_gating(_low_quality, severity_floor="medium", introduced_ids=None)
     assert is_gating(replace(_low_quality, finding_key="k8", severity="high"),
                      severity_floor="medium", introduced_ids=None)
+
+    # wcag-contrast / unhandled-subscribe (root-caused 2026-09-12): the two first-party checks'
+    # parsers degrade gracefully on empty/malformed tool output, same contract every other parser
+    # in this file already holds itself to.
+    assert parse_wcag_contrast("") == ([], {})
+    assert parse_wcag_contrast("not json") == ([], {})
+    _contrast_findings, _ = parse_wcag_contrast(
+        json.dumps([{"file": "apps/web/src/styles.scss", "line": 4, "selector": ".btn--gold", "ratio": 3.24}])
+    )
+    assert len(_contrast_findings) == 1 and _contrast_findings[0].severity == "high"
+    assert parse_unhandled_subscribe("") == ([], {})
+    _subscribe_findings, _ = parse_unhandled_subscribe(
+        json.dumps([{"file": "apps/web/src/app/features/results/results.component.ts", "line": 3}])
+    )
+    assert len(_subscribe_findings) == 1 and _subscribe_findings[0].category == "maintainability"
 
     print("repo_scan self-check: all assertions passed")
 
