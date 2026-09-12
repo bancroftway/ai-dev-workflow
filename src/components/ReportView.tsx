@@ -1,8 +1,33 @@
 import { useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import { FindingsTable } from "@/components/QualityView";
 import { ViewContainer } from "@/components/ViewContainer";
 import type { DeltaSummary, MergeReadinessReport, RemediationFinding } from "@/lib/workflow-types";
+
+/** Root-caused 2026-09-12 (user-reported: typography inconsistent between Report and Quality):
+ * Tailwind Typography's `prose` class (the only other use in the whole app is AttachmentEditor's
+ * own free-form document EDITOR, a different UI paradigm) applies its own font-size/weight/color
+ * scale to every markdown element, fighting this file's own utility classes. Body text mapped to
+ * `text-xs` specifically -- QualityView's own equivalent LLM-authored free-text summaries
+ * (remediation_summary, plan_conformance_summary) render at `text-xs` (12px), not `text-sm`
+ * (14px); that file's `text-sm` spots are short status lines, not paragraph prose, so matching
+ * those instead left this block visibly larger than the rest of the app (second report). */
+const MARKDOWN_COMPONENTS: Components = {
+  h1: ({ children }) => <h3 className="text-sm font-medium text-neutral-700">{children}</h3>,
+  h2: ({ children }) => <h3 className="text-sm font-medium text-neutral-700">{children}</h3>,
+  h3: ({ children }) => <h3 className="text-sm font-medium text-neutral-700">{children}</h3>,
+  p: ({ children }) => <p className="text-xs text-neutral-700">{children}</p>,
+  ul: ({ children }) => <ul className="list-disc space-y-1 pl-5 text-xs text-neutral-700">{children}</ul>,
+  ol: ({ children }) => <ol className="list-decimal space-y-1 pl-5 text-xs text-neutral-700">{children}</ol>,
+  li: ({ children }) => <li>{children}</li>,
+  strong: ({ children }) => <strong className="font-medium text-neutral-900">{children}</strong>,
+  code: ({ children }) => <code className="rounded bg-neutral-100 px-1 py-0.5 font-mono text-[11px]">{children}</code>,
+  a: ({ children, href }) => (
+    <a href={href} className="text-neutral-900 underline" target="_blank" rel="noreferrer">
+      {children}
+    </a>
+  ),
+};
 
 export interface FilesChangedSummary {
   stat?: string;
@@ -103,8 +128,10 @@ export function ReportView({ report, metricsExitStatus, deltaSummary, filesChang
 
           <div>
             <h2 className="text-base font-semibold">{report.pr_title || "(no title recorded)"}</h2>
-            <div className="prose prose-sm mt-2 max-w-none">
-              <ReactMarkdown>{report.pr_description_markdown || "Not recorded for this run."}</ReactMarkdown>
+            <div className="mt-2 space-y-2">
+              <ReactMarkdown components={MARKDOWN_COMPONENTS}>
+                {report.pr_description_markdown || "Not recorded for this run."}
+              </ReactMarkdown>
             </div>
           </div>
 

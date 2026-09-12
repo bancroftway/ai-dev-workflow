@@ -43,6 +43,7 @@ function StageCard({
   runFailure,
   runningLabel,
   knownComplete,
+  runActive,
 }: {
   stageKey: string;
   label: string;
@@ -63,6 +64,13 @@ function StageCard({
   // said "Not started" until the next snapshot landed. See BuildView()'s own comment for why
   // current_stage (approval-only) is the right signal for THIS specific question.
   knownComplete?: boolean;
+  // Root-caused 2026-09-12 (user-reported: "why does this say waiting to sync forever?"): the
+  // "waiting to sync" wording assumed the gap was always transient -- a live run actively
+  // progressing, a fresh snapshot arriving within seconds. Post-pivot, nothing auto-fires a live
+  // run anymore, so an idle session sits at knownComplete with no run active INDEFINITELY -- "waiting
+  // to sync" is simply false in that case, nothing is syncing. Only show it while a run is
+  // genuinely active; otherwise the durable fact alone is the complete, final answer.
+  runActive?: boolean;
 }) {
   const verification = stage?.last_verification;
   // Same guard as AppShell's tab dot: an approved stage's stale failed verification is history,
@@ -80,8 +88,10 @@ function StageCard({
             (stage
               ? (STATUS_LABEL[stage.status] ?? stage.status)
               : knownComplete
+                ? runActive
                 ? "Completed — waiting for full detail to sync…"
-                : STATUS_LABEL["not_started"])}
+                : "Completed"
+              : STATUS_LABEL["not_started"])}
         </span>
       </div>
       <p className="text-xs text-neutral-500">{blurb}</p>
@@ -193,6 +203,7 @@ export function BuildView() {
               runFailure={state.run_failure}
               runningLabel={runningPhases.has(key) ? (NODE_PHASE_LABEL[runningPhases.get(key)!] ?? "Running") : null}
               knownComplete={knownComplete}
+              runActive={runActivity?.runActive}
             />
             {placement && phase && (
               <RebuildConnector

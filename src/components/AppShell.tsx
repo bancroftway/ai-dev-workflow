@@ -116,7 +116,7 @@ export function AppShell({
   reportExtras?: ReportExtras | null;
 }) {
   const { threadId, runtimeAgentId, localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({
+  const { agent, isReady: agentIsReady } = useAgent({
     agentId: localAgentId,
     runtimeAgentId,
     threadId,
@@ -302,13 +302,23 @@ export function AppShell({
       failure_type?: string | null;
       failure_message?: string | null;
     }) {
-      if (sandboxStatusRef.current === "provisioning") return;
       // A terminal session (completed/failed/rejected) has no container to be alive in the first
       // place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
       // "error"/Disconnected here would overwrite its correct "terminated" a few seconds after
       // load with a status implying something failed, when nothing did. Still "ready"/"error" as
       // before for an in_progress session (the one case a live container is actually expected).
-      setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "error" : "terminated");
+      // Scoped to JUST this line (root-caused 2026-09-11): this used to guard the whole poll tick
+      // back when this was a setInterval REST poll (skipping one tick was harmless -- the next
+      // tick a few seconds later just tried again). SSE only re-sends a row when it CHANGES
+      // (sessions_api.py's stream_session_row dedupes against last_payload), so the old
+      // whole-handler early return silently dropped durableRow/runActivity for good whenever the
+      // first SSE row raced ahead of SandboxSessionBoot's own provision POST resolving --
+      // observed live: sandboxStatus later reached "ready" via that separate path, but
+      // runActivity.currentStage stayed null forever, so every durable-fallback tab (Tech Stack
+      // included) rendered as if the session had never run.
+      if (sandboxStatusRef.current !== "provisioning") {
+        setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "error" : "terminated");
+      }
       setDurableRow({
         current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate,
         container_alive: row.container_alive ?? false,
@@ -384,6 +394,46 @@ export function AppShell({
       reconnectDurableRowIfClosedRef.current = () => {};
     };
   }, [threadId, setSandboxStatus, setRunActivity, agent, copilotkit]);
+
+  // Idle-session hydration (root-caused 2026-09-12, user-reported: every tab past Tech Stack
+  // rendered as if the session had never run). `agent.state` only ever gets populated by an actual
+  // AG-UI run -- a live turn, or the awaiting_gate blank-runAgent trick above, which only covers the
+  // three human-gated stages. Post-pivot, nothing auto-fires a run anymore, so an idle session
+  // (finished, failed, or simply not yet continued) gets neither, forever -- the durable row above
+  // only ever carries current_stage/status, never the actual draft/approved content each tab
+  // renders. One-shot, read-only fetch of the LangGraph checkpoint (agent/src/sessions_api.py's
+  // get_checkpoint_state -- a pure state read, no node executes, no runAgent call here at all) to
+  // hydrate agent.state directly via its own setState. Re-checks stages is still empty right before
+  // applying: a real run (a Continue/Restart click, or another tab) may have delivered genuine live
+  // state while this fetch was in flight, and that must win, never this stale disk read.
+  const checkpointHydratedRef = useRef(false);
+  useEffect(() => {
+    if (checkpointHydratedRef.current) return;
+    // Root-caused 2026-09-12: useAgent (react-core/v2) returns a throwaway PROVISIONAL agent
+    // object until its own registration effect resolves the real proxy registered under
+    // `localAgentId` -- calling agent.setState() on that provisional instance before `isReady`
+    // silently succeeds (it's a real object with a real setState) but reaches no one else, since
+    // every OTHER view's own `useAgent({agentId: localAgentId})` call resolves through
+    // `copilotkit.getAgent(localAgentId)`, which only starts returning the real registered proxy
+    // once this call's own registration effect has completed. Gating on `isReady` (not just
+    // `agent`'s own identity change) is what makes this fetch actually reach every tab instead of
+    // silently updating a throwaway instance nobody else reads.
+    if (!agentIsReady) return;
+    checkpointHydratedRef.current = true;
+    (async () => {
+      try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(threadId)}/checkpoint-state`);
+        if (!res.ok) return;
+        const snapshot = (await res.json()) as Record<string, unknown>;
+        if (Object.keys(stateRef.current.stages ?? {}).length > 0) return;
+        if (Object.keys(snapshot).length > 0) agent.setState(snapshot);
+      } catch {
+        // Transient network failure -- the durable-row fallbacks above already cover this tab in
+        // the meantime; nothing else retries this specific fetch, same one-shot contract as every
+        // other hydration path in this file.
+      }
+    })();
+  }, [threadId, agent, agentIsReady]);
 
   // Mid-run reattach gap (backlog item 4; user found confusing live 2026-08-31): a client that
   // (re)connects while the graph is actively drafting/auditing -- no gate open, nothing to pause
@@ -743,8 +793,11 @@ export function AppShell({
             Reattach/Resume button and a rewind-stage dropdown -- both fired the workflow directly,
             which is no longer allowed anywhere except SessionOverview's one stage-anchored restart
             button (that's the only place with the durable failure detail + real-stage mapping
-            needed to target it correctly anyway). This is now informational only, pointing there. */}
-        {((runActivity?.interrupted && !isAwaitingFirstRequirements) || runFailed) && (
+            needed to target it correctly anyway). This is now informational only, pointing there.
+            Hidden while already on Overview (root-caused 2026-09-12, user-reported): its whole
+            point is "go see Overview", which is meaningless noise sitting right above that exact
+            tab's own content. */}
+        {activeView !== "overview" && ((runActivity?.interrupted && !isAwaitingFirstRequirements) || runFailed) && (
           <div className="flex items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
             <span>
               {runFailed

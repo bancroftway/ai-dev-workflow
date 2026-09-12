@@ -94,7 +94,11 @@ export function SessionOverview() {
   const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
   const state = (agent.state ?? {}) as WorkflowState;
-  const stages = Object.entries(state.stages ?? {});
+  // Root-caused 2026-09-12 (user-reported: stages rendered out of pipeline order): `state.stages`
+  // is a plain object -- Object.entries has no ordering guarantee of its own, only whatever order
+  // the backend happened to insert keys in. Sort by the same PIPELINE_STAGE_ORDER every other
+  // ordering decision on this page already uses.
+  const stages = Object.entries(state.stages ?? {}).sort(([a], [b]) => stageOrderIndex(a) - stageOrderIndex(b));
   const failure = state.run_failure;
   const [runActivity] = useRunActivity();
 
@@ -103,8 +107,44 @@ export function SessionOverview() {
   // may ever advance the graph anywhere in the app. `failure_stage` is often NOT one of the 8 real
   // stage keys (a rebuild placement, e2e, test-hardening, or metrics-regression escalate all name
   // their own key) -- realStageForFailure resolves the real stage a restart should target.
-  const mappedFailureTarget =
-    runActivity?.status === "failed" && !runActivity?.finishedWithVerdict
+  //
+  // Root-caused 2026-09-12 (user-reported: "Continue" shown on an already-Approved remediation
+  // row): `runActivity` (dbo.sessions, via SSE) can legitimately lag behind genuine further
+  // progress -- current_stage stuck at an earlier stage even though the checkpoint/live state
+  // shows the run continued past it and approved everything since. Now that the checkpoint
+  // hydration fix (above, AppShell.tsx) makes live `state.stages` reliably available even for an
+  // idle session, prefer LIVE signals for the boundary the instant there's live data to read:
+  // `state.run_failure` (this exact run's own live escalation payload) over the durable
+  // `runActivity.failureStage`, and (see firstNonApprovedKey below) live per-stage status over the
+  // durable `runActivity.currentStage` for the non-failed case. Falls back to the durable-only
+  // signals exactly when there's truly no live data at all (stages.length === 0, the empty-tabs
+  // branch below) -- unchanged from before.
+  const hasLiveStages = stages.length > 0;
+  // Root-caused 2026-09-12 (user-reported: boundary landed on Preflight Baseline, a stage this run
+  // never needed): scanning forward for the FIRST non-approved stage picks up any earlier stage
+  // that's conditionally skipped for this run type (brownfield-baseline stays "not_started"
+  // forever on a run that never needed it) -- that's not a frontier, it's a stage the pipeline
+  // deliberately never touches. Scan for the LATEST stage with any non-"not_started" status
+  // instead: if that stage is approved, the frontier is whatever's next after it (or nothing, if
+  // it was the last real stage -- a fully successful run); otherwise that stage itself -- still
+  // incomplete -- IS the frontier.
+  const orderedRealStages = PIPELINE_STAGE_ORDER.filter((s) => state.stages?.[s.key] != null);
+  let lastTouchedIdx = -1;
+  orderedRealStages.forEach((s, i) => {
+    if ((state.stages![s.key]!.status ?? "not_started") !== "not_started") lastTouchedIdx = i;
+  });
+  const firstNonApprovedKey = !hasLiveStages
+    ? null
+    : lastTouchedIdx === -1
+      ? (orderedRealStages[0]?.key ?? null)
+      : state.stages![orderedRealStages[lastTouchedIdx].key]!.status === "approved"
+        ? (orderedRealStages[lastTouchedIdx + 1]?.key ?? null)
+        : orderedRealStages[lastTouchedIdx].key;
+  const mappedFailureTarget = hasLiveStages
+    ? failure
+      ? realStageForFailure(failure.stage ?? null)
+      : null
+    : runActivity?.status === "failed" && !runActivity?.finishedWithVerdict
       ? realStageForFailure(runActivity?.failureStage ?? null)
       : null;
   // Boundary = where "last known-good" ends. A genuine failure's mapped target is the TRUE
@@ -113,9 +153,13 @@ export function SessionOverview() {
   // Metrics & Exit succeeded" (confirmed against graph.py: metrics-exit_draft's own draft-start
   // write bumps current_stage regardless of why it was reached). When nothing failed (or the
   // session finished with a real verdict), current_stage is fully trustworthy as-is.
-  const boundaryKey = mappedFailureTarget ?? runActivity?.currentStage ?? null;
+  const boundaryKey = mappedFailureTarget ?? (hasLiveStages ? firstNonApprovedKey : (runActivity?.currentStage ?? null));
   const boundaryIdx = stageOrderIndex(boundaryKey);
   const isFailedBoundary = mappedFailureTarget != null;
+  // Same live-over-durable preference as the boundary itself, for the actual error text shown
+  // next to the restart button -- the durable copies are only a truncated mirror of this same data.
+  const failureTypeText = hasLiveStages ? (failure?.type ?? failure?.failure_type ?? null) : (runActivity?.failureType ?? null);
+  const failureMessageText = hasLiveStages ? (failure?.feedback ?? null) : (runActivity?.failureMessage ?? null);
   // finished_with_verdict (metrics-exit itself approved a real report, whether or not merge_ready
   // came back true) never gets a restart button anywhere -- redoing metrics-exit alone would just
   // reproduce the same verdict against unchanged upstream work; the Report tab already has it.
@@ -324,11 +368,11 @@ export function SessionOverview() {
                   </div>
                   {isBoundary && !finishedWithVerdict && (isFailedBoundary || !running) && (
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
-                      {isFailedBoundary && (runActivity?.failureType || runActivity?.failureMessage) && (
+                      {isFailedBoundary && (failureTypeText || failureMessageText) && (
                         <p className="text-xs text-red-700">
-                          {runActivity?.failureType}
-                          {runActivity?.failureType && runActivity?.failureMessage ? " — " : ""}
-                          {runActivity?.failureMessage}
+                          {failureTypeText}
+                          {failureTypeText && failureMessageText ? " — " : ""}
+                          {failureMessageText}
                         </p>
                       )}
                       <button
@@ -407,7 +451,7 @@ export function SessionOverview() {
                   }`}
                 >
                   <div className={ROW_GRID}>
-                    <span className="font-medium">{key}</span>
+                    <span className="font-medium">{PIPELINE_STAGE_ORDER.find((s) => s.key === key)?.label ?? key}</span>
                     <span className="text-right text-xs text-neutral-500">
                       {timing && timing.last > timing.first ? formatDuration(timing.last - timing.first) : ""}
                     </span>
@@ -431,11 +475,11 @@ export function SessionOverview() {
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
                   {showAction && (
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
-                      {isFailedBoundary && (runActivity?.failureType || runActivity?.failureMessage) && (
+                      {isFailedBoundary && (failureTypeText || failureMessageText) && (
                         <p className="text-xs text-red-700">
-                          {runActivity?.failureType}
-                          {runActivity?.failureType && runActivity?.failureMessage ? " — " : ""}
-                          {runActivity?.failureMessage}
+                          {failureTypeText}
+                          {failureTypeText && failureMessageText ? " — " : ""}
+                          {failureMessageText}
                         </p>
                       )}
                       <button

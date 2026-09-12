@@ -45,12 +45,28 @@ const SpecQuestionSchema = z.object({
   suggested_choices: z.array(z.string()).optional().default([]),
 });
 
+// Mirrors agent/src/schemas.py's PresenceList (and the structurally-identical DiagramPresence/
+// WireframePresence): a typed replacement for a bare array whenever empty is ambiguous between
+// "looked, found nothing" and "never looked". Root-caused 2026-09-12: assumptions/out_of_scope/
+// risk_notes/diagrams/wireframes were still declared as bare arrays here, so `safeParse` failed
+// the WHOLE Specification/ImplementationPlan object the instant real content arrived (these
+// fields are never actually empty arrays on the wire) -- silently blanking the pre-approval
+// fallback path (the A2UI surface message masked this during a live run; nothing masks it once
+// that surface never arrives, e.g. reading straight from a durable checkpoint).
+function presenceListSchema<T extends z.ZodTypeAny>(valueSchema: T) {
+  return z.object({
+    status: z.enum(["present", "absent"]),
+    values: z.array(valueSchema).optional().default([]),
+    reason: z.string().optional().default(""),
+  });
+}
+
 const SpecificationSchema = z.object({
   title: z.string(),
   summary: z.string(),
   user_stories: z.array(UserStorySchema),
-  assumptions: z.array(z.string()),
-  out_of_scope: z.array(z.string()),
+  assumptions: presenceListSchema(z.string()),
+  out_of_scope: presenceListSchema(z.string()),
   // Optional so envelopes from before the question ledger existed still parse.
   questions: z.array(SpecQuestionSchema).optional().default([]),
   retired_user_stories: z.array(RetiredStorySchema).optional().default([]),
@@ -96,10 +112,10 @@ const PlanDiagramSchema = z.object({
 const ImplementationPlanSchema = z.object({
   overview: z.string(),
   plan_steps: z.array(PlanStepSchema),
-  risk_notes: z.array(z.string()),
+  risk_notes: presenceListSchema(z.string()),
   // Optional so envelopes from before wireframes/diagrams existed still parse.
-  wireframes: z.array(WireframeSchema).optional().default([]),
-  diagrams: z.array(PlanDiagramSchema).optional().default([]),
+  wireframes: presenceListSchema(WireframeSchema).optional().default({ status: "absent", values: [], reason: "" }),
+  diagrams: presenceListSchema(PlanDiagramSchema).optional().default({ status: "absent", values: [], reason: "" }),
 });
 
 export type Specification = z.infer<typeof SpecificationSchema>;
@@ -313,22 +329,22 @@ export function SpecificationSurfaceRenderer({
         ))}
       </div>
 
-      {spec.assumptions.length > 0 && (
+      {spec.assumptions.status === "present" && (
         <div>
           <h4 className="text-sm font-medium">Assumptions</h4>
           <ul className="list-inside list-disc text-sm text-neutral-700">
-            {spec.assumptions.map((assumption, index) => (
+            {spec.assumptions.values.map((assumption, index) => (
               <li key={index}>{assumption}</li>
             ))}
           </ul>
         </div>
       )}
 
-      {spec.out_of_scope.length > 0 && (
+      {spec.out_of_scope.status === "present" && (
         <div>
           <h4 className="text-sm font-medium">Out of Scope</h4>
           <ul className="list-inside list-disc text-sm text-neutral-700">
-            {spec.out_of_scope.map((item, index) => (
+            {spec.out_of_scope.values.map((item, index) => (
               <li key={index}>{item}</li>
             ))}
           </ul>
@@ -385,11 +401,11 @@ export function PlanSurfaceRenderer({
         })}
       </ol>
 
-      {plan.risk_notes.length > 0 && (
+      {plan.risk_notes.status === "present" && (
         <div>
           <h4 className="text-sm font-medium">Risk Notes</h4>
           <ul className="list-inside list-disc text-sm text-neutral-700">
-            {plan.risk_notes.map((note, index) => (
+            {plan.risk_notes.values.map((note, index) => (
               <li key={index}>{note}</li>
             ))}
           </ul>
@@ -403,11 +419,11 @@ export function PlanSurfaceRenderer({
           fetched the backend's rendered SVG through the raw-content proxy, which 404'd for any
           diagram not yet PUSHED to the branch (found live within minutes of shipping it) and
           could lag a commit behind the draft on screen either way. */}
-      {(plan.diagrams ?? []).length > 0 && (
+      {plan.diagrams.status === "present" && (
         <div>
           <h4 className="text-sm font-medium">Diagrams</h4>
           <div className="mt-2 flex flex-wrap gap-4">
-            {(plan.diagrams ?? []).map((d) => (
+            {plan.diagrams.values.map((d) => (
               <div key={d.name} className="rounded-lg border border-neutral-200 p-2">
                 <p className="mb-1 font-mono text-xs text-neutral-500">
                   {d.name} <span className="text-neutral-400">({d.kind})</span>
@@ -419,12 +435,12 @@ export function PlanSurfaceRenderer({
         </div>
       )}
 
-      {(plan.wireframes ?? []).length > 0 && (
+      {plan.wireframes.status === "present" && (
         <div>
           <h4 className="text-sm font-medium">Wireframes</h4>
           <p className="mt-1 text-xs text-neutral-500">Click a thumbnail to open the full-size wireframe in a new tab.</p>
           <div className="mt-2 flex flex-wrap gap-3">
-            {(plan.wireframes ?? []).map((wf) => (
+            {plan.wireframes.values.map((wf) => (
               <WireframeThumbnail key={wf.screen} screen={wf.screen} htmlSource={wf.html_source} acIds={wf.ac_ids} />
             ))}
           </div>

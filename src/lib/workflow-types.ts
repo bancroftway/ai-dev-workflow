@@ -96,10 +96,10 @@ export interface RebuildPlacement {
 }
 
 export const REBUILD_PLACEMENTS: RebuildPlacement[] = [
-  { afterStageKey: "ac-to-tests", rebuildKey: "r_ac_to_tests", nextStageKey: "minimal-code-to-green", label: "red-gate" },
-  { afterStageKey: "minimal-code-to-green", rebuildKey: "r_minimal_code_to_green", nextStageKey: "remediation", label: "rebuild" },
-  { afterStageKey: "remediation", rebuildKey: "r_remediation", nextStageKey: "adversarial-compliance", label: "rebuild" },
-  { afterStageKey: "adversarial-compliance", rebuildKey: "r_adversarial_compliance", nextStageKey: "metrics-exit", label: "rebuild" },
+  { afterStageKey: "ac-to-tests", rebuildKey: "r_ac_to_tests", nextStageKey: "minimal-code-to-green", label: "Red Gate" },
+  { afterStageKey: "minimal-code-to-green", rebuildKey: "r_minimal_code_to_green", nextStageKey: "remediation", label: "Rebuild" },
+  { afterStageKey: "remediation", rebuildKey: "r_remediation", nextStageKey: "adversarial-compliance", label: "Rebuild" },
+  { afterStageKey: "adversarial-compliance", rebuildKey: "r_adversarial_compliance", nextStageKey: "metrics-exit", label: "Rebuild" },
 ];
 
 /** User-reported gap (2026-09-06): a real stage approves, then Build/Overview go quiet for several
@@ -435,6 +435,10 @@ export type StageKey = keyof NonNullable<WorkflowState["stages"]>;
 export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
   { key: "brownfield-baseline", label: "Preflight Baseline" },
   { key: "tech-stack", label: "Tech Stack" },
+  // No gate of its own (TAB_STAGE_GROUPS' own comment: "recorded as-is... no gate ever surfaces"),
+  // but it's a real StageState entry in `state.stages` -- added so SessionOverview's friendly-label
+  // lookup covers it too (root-caused 2026-09-12, user-reported raw "raw-requirements" row).
+  { key: "raw-requirements", label: "Requirements" },
   { key: "specification", label: "Specification" },
   { key: "plan", label: "Implementation Plan" },
   { key: "ac-to-tests", label: "Acceptance Criteria to Tests" },

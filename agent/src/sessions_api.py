@@ -53,6 +53,7 @@ from . import (
     run_event_store,
     session_store,
 )
+from .graph import graph
 from .run_events import RunEvent, RunEventType
 from .sandbox import get_sandbox_provider, registry
 
@@ -602,6 +603,32 @@ async def get_session_row(session_id: str, request: Request) -> SessionResponse:
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
     return await _row_to_response(row)
+
+
+@router.get("/{session_id}/checkpoint-state")
+async def get_checkpoint_state(session_id: str, request: Request) -> dict[str, Any]:
+    """Read-only LangGraph checkpoint peek -- root-caused 2026-09-12 (user-reported: every tab past
+    Tech Stack rendered as if the session had never run). `agent.state` on the frontend only ever
+    gets populated by an actual AG-UI run (a live turn, or the blank-runAgent reattach trick that
+    only fires for the three human-gated stages -- see main.py's _ReattachStateAgent). Post-pivot,
+    nothing auto-fires a run anymore, so a session sitting idle (finished, failed, or simply not
+    yet continued) never gets either of those -- durable dbo.sessions only carries
+    current_stage/status, never the actual draft/approved content each tab renders.
+    `graph.aget_state` is a pure checkpoint read (no node executes -- the same call
+    `_reattach_snapshot_if_stale` already makes from inside an active run, just without needing one)
+    -- exposing it here lets the frontend hydrate `agent.state` directly via `agent.setState(...)`,
+    with no `runAgent` call at all.
+
+    `messages` is stripped: it can be arbitrarily large chat history, and nothing on the frontend's
+    WorkflowState type reads it (AG-UI's own messages channel is a separate, already-covered path).
+    """
+    _check_shared_secret(request)
+    row = await session_store.get_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    agent_state = await graph.aget_state({"configurable": {"thread_id": session_id}})
+    values = agent_state.values or {}
+    return {k: v for k, v in values.items() if k != "messages"}
 
 
 class RunEventResponse(BaseModel):

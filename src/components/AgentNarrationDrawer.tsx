@@ -65,11 +65,6 @@ function useStickToBottom(events: RunLogEvent[]) {
   return { containerRef, onScroll, newCount, jumpToLatest };
 }
 
-/** Character-counted (a "thinking"/"text" block is frequently one long unbroken paragraph with no
- * line structure) fold threshold, same value the deleted EventLogView.tsx used for the identical
- * row. */
-const REASONING_COLLAPSE_CHARS = 480;
-
 /** "ac-to-tests · Auditing" -- which stage AND which phase of it (draft/audit/verify/fix,
  * NODE_PHASE_LABEL, already used elsewhere for the tab-pill spinners) a line belongs to. User
  * request 2026-09-06: a run of consecutive rows all labelled just "ac-to-tests" gave no way to
@@ -87,29 +82,17 @@ function stageLabel(event: RunLogEvent): string | null {
  * `summary` for the pathological case of a payload that didn't survive redaction/serialization as
  * expected, so this never renders blank. */
 function ReasoningRow({ event }: { event: RunLogEvent }) {
-  const [expanded, setExpanded] = useState(false);
   const payload = event.payload;
   const text = typeof payload?.text === "string" ? (payload.text as string) : (event.summary ?? "");
-  const isLong = text.length > REASONING_COLLAPSE_CHARS;
-  const visible = expanded || !isLong ? text : `${text.slice(0, REASONING_COLLAPSE_CHARS)}…`;
 
   return (
-    <div className="bg-neutral-50/70 px-4 py-3">
-      <div className="mb-1 flex items-center gap-2 text-[10px] font-medium uppercase tracking-wide text-neutral-400">
+    <div className="bg-neutral-50/70 px-4 py-2">
+      <div className="mb-1 flex items-center gap-2 text-[9px] font-medium uppercase tracking-wide text-neutral-400">
         <span>Reasoning summary</span>
         {stageLabel(event) && <span>· {stageLabel(event)}</span>}
         <span className="ml-auto shrink-0 normal-case tracking-normal">{formatEventTimestamp(event.ts)}</span>
       </div>
-      <p className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-800">{visible}</p>
-      {isLong && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-1 text-xs font-medium text-neutral-500 hover:text-neutral-700"
-        >
-          {expanded ? "Show less" : "Show more"}
-        </button>
-      )}
+      <p className="whitespace-pre-wrap text-xs leading-relaxed text-neutral-800">{text}</p>
     </div>
   );
 }
@@ -122,12 +105,12 @@ function CompactToolRow({ event }: { event: RunLogEvent }) {
   const tool = toolNameOf(event);
   const arg = argSummary(event.payload);
   return (
-    <div className="flex items-center gap-2 px-4 py-1.5 text-sm">
-      <span aria-hidden className="h-2 w-2 shrink-0 rounded-full bg-neutral-400" />
+    <div className="flex items-center gap-2 px-4 py-1 text-xs">
+      <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-neutral-400" />
       <span className="truncate text-neutral-700">{event.summary ?? tool ?? "tool"}</span>
-      {arg && <span className="truncate font-mono text-xs text-neutral-400">{arg}</span>}
-      {stageLabel(event) && <span className="ml-auto shrink-0 text-xs text-neutral-400">{stageLabel(event)}</span>}
-      <span className="shrink-0 text-xs text-neutral-400">{formatEventTimestamp(event.ts)}</span>
+      {arg && <span className="truncate font-mono text-[10px] text-neutral-400">{arg}</span>}
+      {stageLabel(event) && <span className="ml-auto shrink-0 text-[10px] text-neutral-400">{stageLabel(event)}</span>}
+      <span className="shrink-0 text-[10px] text-neutral-400">{formatEventTimestamp(event.ts)}</span>
     </div>
   );
 }
