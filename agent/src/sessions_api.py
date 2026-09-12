@@ -111,6 +111,15 @@ class ProvisionRequest(BaseModel):
     # (a fresh UUID the frontend mints), since branch-per-session means there is no deterministic
     # (owner, repo, user) -> thread_id formula to recompute from anymore.
     resume: bool = False
+    # Root-caused 2026-09-12 ("rescue mechanism" work): a finished-with-verdict session's own
+    # recovery actions (rewind-to-stage, reverify-metrics-exit, targeted-fix) already set this
+    # exact-named registry meta flag via POST /api/sessions/actions to satisfy intake_node's own
+    # reopen guard (sessions_api.py:929-933, 958-960) -- but that flag never reached THIS endpoint's
+    # separate `is_finished_with_verdict` 409 below, so nothing could actually re-provision a
+    # sandbox for one of those sessions at all. Same name, same meaning, just threaded into the one
+    # place it didn't reach yet -- never set true for an ordinary crash-recovery resume, where the
+    # guard below doesn't fire anyway.
+    confirm_reopen: bool = False
     # The user's Entra access token for the agent API, forwarded by the Next.js provision route.
     # Exchanged once, immediately, on-behalf-of the user for this session's Key Vault secrets
     # (keyvault.py), then discarded -- never stored, never passed into the sandbox. None in
@@ -217,13 +226,16 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     if body.resume:
         if existing is None:
             raise HTTPException(status_code=404, detail="no session found to resume")
-        if session_store.is_finished_with_verdict(existing):
+        if session_store.is_finished_with_verdict(existing) and not body.confirm_reopen:
             # Server-enforced, not just a hidden Resume button: a session that finished the whole
             # pipeline -- whether merge_ready came back true or false -- can never be plain-Resumed,
             # regardless of what the frontend sends. Root-caused 2026-09-12: this used to check only
             # `status=="completed"`, which silently let a merge_ready=False (but fully finished) run
             # slip through as if it were an ordinary mid-pipeline crash. Continuing work against a
-            # finished thread goes through Requirements' confirm-reopen flow instead.
+            # finished thread goes through Requirements' confirm-reopen flow, or one of Session
+            # Overview's own recovery actions -- both already require the user to have explicitly
+            # confirmed reopening it (see `confirm_reopen`'s own doc above) before this bypass ever
+            # applies.
             raise HTTPException(
                 status_code=409,
                 detail="this session already finished -- reopen it from the Requirements tab instead of Resume",

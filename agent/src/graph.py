@@ -124,7 +124,7 @@ from .schemas_audit import (
     AdversarialAuditDraftResponse,
 )
 from .schemas_brownfield import BROWNFIELD_BASELINE_DRAFT_EXAMPLE, BrownfieldBaselineDraftResponse
-from .schemas_exit import EXIT_DRAFT_EXAMPLE, ExitDraftResponse
+from .schemas_exit import EXIT_DRAFT_EXAMPLE, ExitDraftResponse, TargetedFixVerifyResponse
 from .schemas_remediation import REMEDIATION_DRAFT_EXAMPLE, RemediationDraftResponse
 
 logger = logging.getLogger(__name__)
@@ -2567,15 +2567,55 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
             exit_report = (stages.get("metrics-exit") or {}).get("approved_content") or {}
             reasons = [str(v) for v in _remediation_presence_values(exit_report.get("blocking_reasons"))]
             if reasons:
-                await _run_targeted_fix(thread_id, state, config, reasons)
-                exit_stage = stages["metrics-exit"]
-                _reset_stage_status_fields(exit_stage)
-                _reset_stage_mechanics(exit_stage)
-                targeted_fix_attempts += 1
-                logger.warning(
-                    "intake_node: ran targeted-fix for thread_id=%s (attempt %d/%d)",
-                    thread_id, targeted_fix_attempts, workflow_config.TARGETED_FIX_MAX_ATTEMPTS,
+                # Stuck-fixer check (reused from remediation_gate.py's own _stuck_fixer_check,
+                # root-caused 2026-09-12 there for the identical "same reason(s) keep recurring
+                # across attempts" shape): compares what's about to be retried against the
+                # fingerprint _run_targeted_fix's own PRIOR attempt left behind. Gated on
+                # targeted_fix_attempts >= 2 (not on any match at all) so a genuine second attempt
+                # still gets one real try -- just with a fresh, unpoisoned conversation -- and only
+                # a THIRD attempt against the exact same reasons is refused outright.
+                raw_prior_fingerprint = None
+                if sandbox_registry.get(thread_id) is not None:
+                    raw_prior_fingerprint = await repo_files.read_repo_file(
+                        get_sandbox_provider(), thread_id, TARGETED_FIX_FINGERPRINT_PATH
+                    )
+                is_stuck, should_refuse = _targeted_fix_stuck_decision(
+                    reasons, raw_prior_fingerprint, targeted_fix_attempts
                 )
+                if should_refuse:
+                    logger.warning(
+                        "intake_node: targeted-fix refused for thread_id=%s -- the same reason(s) "
+                        "already survived a prior targeted-fix attempt",
+                        thread_id,
+                    )
+                    exit_stage = stages["metrics-exit"]
+                    exit_content = dict(exit_stage.get("approved_content") or {})
+                    existing_reasons = list(_remediation_presence_values(exit_content.get("blocking_reasons")))
+                    stuck_note = (
+                        "a targeted fix already tried and failed to resolve this once -- a further "
+                        "automated attempt is unlikely to help"
+                    )
+                    if stuck_note not in existing_reasons:
+                        exit_content["blocking_reasons"] = exit_nodes._presence_from_values(
+                            [*existing_reasons, stuck_note],
+                            empty_reason="unreachable: existing_reasons is non-empty in this branch",
+                        )
+                        exit_stage["approved_content"] = exit_content
+                else:
+                    if is_stuck:
+                        # Same reasons already survived one attempt -- the remedy half of
+                        # remediation_gate.py's own pattern: a fresh conversation for this retry
+                        # rather than resuming the possibly context-poisoned one.
+                        await close_session(thread_id, "targeted-fix", "fix", provider=state["provider"])
+                    await _run_targeted_fix(thread_id, state, config, reasons)
+                    exit_stage = stages["metrics-exit"]
+                    _reset_stage_status_fields(exit_stage)
+                    _reset_stage_mechanics(exit_stage)
+                    targeted_fix_attempts += 1
+                    logger.warning(
+                        "intake_node: ran targeted-fix for thread_id=%s (attempt %d/%d)",
+                        thread_id, targeted_fix_attempts, workflow_config.TARGETED_FIX_MAX_ATTEMPTS,
+                    )
             else:
                 logger.warning(
                     "intake_node: targeted-fix requested for thread_id=%s but no blocking_reasons "
@@ -3298,6 +3338,37 @@ def _demo_open_audit_findings() -> None:
     assert _open_audit_findings({"draft": {"known_gaps": ["legacy bare item"]}}) == []
 
 
+def _targeted_fix_stuck_decision(
+    reasons: list[str], raw_prior_fingerprint: str | None, attempts: int
+) -> tuple[bool, bool]:
+    """intake_node's targeted-fix stuck-fixer gate, isolated from the file I/O around it (same
+    split remediation_gate.py's own _stuck_fixer_check already uses). Returns (is_stuck,
+    should_refuse). `attempts` is `targeted_fix_attempts` -- the count of already-COMPLETED
+    attempts, so `should_refuse` is only True once a 2nd completed attempt already
+    fingerprint-matched the reasons about to be retried (i.e. this would be a 3rd attempt against
+    the identical, already-twice-unresolved reason set). A first attempt (attempts == 0) or a
+    genuine 2nd attempt (attempts == 1) is never refused -- `is_stuck` alone tells the caller
+    whether that 2nd attempt should still get a fresh chat session first."""
+    is_stuck, _ = remediation_gate._stuck_fixer_check(reasons, raw_prior_fingerprint)
+    return is_stuck, is_stuck and attempts >= 2
+
+
+def _demo_targeted_fix_stuck_decision() -> None:
+    import json as _json
+
+    reasons = ["still 3.24:1 contrast on .btn--gold"]
+    fingerprint = _json.dumps(sorted(set(reasons)))
+    # No prior fingerprint at all (first-ever attempt) -- never stuck, never refused.
+    assert _targeted_fix_stuck_decision(reasons, None, 0) == (False, False)
+    # Matching fingerprint, but only ONE completed attempt so far -- stuck, but give it a real 2nd
+    # try (with a fresh session -- see intake_node's own caller for that half).
+    assert _targeted_fix_stuck_decision(reasons, fingerprint, 1) == (True, False)
+    # Matching fingerprint AND a 2nd attempt already happened -- refuse the 3rd.
+    assert _targeted_fix_stuck_decision(reasons, fingerprint, 2) == (True, True)
+    # Different reasons than what's fingerprinted -- real progress was made, never stuck.
+    assert _targeted_fix_stuck_decision(["a new, different finding"], fingerprint, 2) == (False, False)
+
+
 def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     """Runs stage_spec.deterministic_verify (a real script/parse, never LLM self-attestation)
     between audit and gate. Only wired in when the StageSpec sets deterministic_verify -- see
@@ -3742,6 +3813,59 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
     return verify_fix_node
 
 
+TARGETED_FIX_UNRESOLVED_PATH = ".ai-dev-workflow/targeted-fix-unresolved.json"
+TARGETED_FIX_FINGERPRINT_PATH = ".ai-dev-workflow/targeted-fix-fingerprint.json"
+
+
+async def _verify_targeted_fix(
+    thread_id: str, state: GraphState, config: RunnableConfig, reasons: list[str]
+) -> list[str]:
+    """Independent post-fix check for `_run_targeted_fix` below (closes that function's own
+    previously-documented gap: "no independent, deterministic regression gate runs after this").
+    Re-reads the current repo state and asks, for each seeded `reasons` entry, whether it is
+    actually resolved -- the fix pass's own summary is never taken as proof, the same principle
+    `_open_audit_findings` (graph.py) already applies to an audit's cross-check of a draft.
+
+    Returns the still-open subset of `reasons` (possibly empty). Best-effort: any failure here
+    (timeout, malformed structured output) is logged and treated as "nothing new to report" --
+    this check augments the exit stage's own verdict, it must never be the thing that crashes
+    `intake_node` or blocks a run that a real infra hiccup, not an unresolved finding, is the actual
+    cause of.
+    """
+    sandbox = sandbox_registry.get(thread_id)
+    if not reasons or sandbox is None:
+        return []
+    try:
+        system_prompt, human_template = load_prompt_pair("targeted_fix_verify")
+        model = get_chat_model_for_thread(
+            thread_id,
+            "targeted-fix",
+            "verify",
+            provider=state["provider"],
+            run_id=state.get("run_id", "unknown"),
+            model_name=(
+                model_config.get_model_name("remediation", "fix", state["provider"])
+                or model_config.get_model_name("remediation", "draft", state["provider"])
+            ),
+            sandbox=sandbox,
+            agent_mode="autopilot",
+            available_tools=["builtin:view", "builtin:grep", "builtin:glob", "builtin:bash"],
+        )
+        rendered = render_prompt(human_template, blocking_reasons="\n".join(f"- {r}" for r in reasons))
+        result = await call_with_infra_retry(
+            lambda: ainvoke_structured(
+                model,
+                [SystemMessage(content=system_prompt), HumanMessage(content=rendered)],
+                TargetedFixVerifyResponse,
+            ),
+            label="targeted-fix verify",
+        )
+    except Exception:  # noqa: BLE001 -- best-effort, never mask the redraft's own verdict
+        logger.exception("targeted-fix verify: independent check failed, leaving redraft's verdict alone")
+        return []
+    return list(_remediation_presence_values(result.unresolved_reasons))
+
+
 async def _run_targeted_fix(thread_id: str, state: GraphState, config: RunnableConfig, reasons: list[str]) -> None:
     """Seeded, additive fix pass for `POST /api/sessions/actions {action: "targeted-fix"}`
     (root-caused 2026-09-12): before this existed, a user's only recourse for a `merge_ready=false`
@@ -3759,11 +3883,13 @@ async def _run_targeted_fix(thread_id: str, state: GraphState, config: RunnableC
     sequential flow naturally re-enters metrics-exit for a fresh verdict afterward -- no new graph
     topology needed.
 
-    No independent, deterministic regression gate runs after this -- the prompt itself instructs
-    the model to build and test before finishing, the same trust level every redraft/fix pass in
-    this pipeline already operates at. A real, known gap (see this feature's own design notes),
-    not an oversight: building a genuinely independent post-fix regression check is a separate,
-    larger piece of work.
+    Now followed by `_verify_targeted_fix` (closing this function's own previously-documented gap):
+    its still-open-reasons result is written to `TARGETED_FIX_UNRESOLVED_PATH`, stamped with this
+    run's `run_id`, and committed in the SAME commit as the fix pass's own edits below -- written
+    before `git_ops.commit_all`, not after, so it can never end up uncommitted (see that call's own
+    comment). `verify_exit_readiness` (exit_nodes.py) reads it back and folds any still-open,
+    current-run reason into its own `problems` list, the same force-`merge_ready=False` path every
+    other deterministic blocker already goes through.
     """
     if not reasons or sandbox_registry.get(thread_id) is None:
         return
@@ -3792,6 +3918,28 @@ async def _run_targeted_fix(thread_id: str, state: GraphState, config: RunnableC
     await model.ainvoke(
         [SystemMessage(content=system_prompt), HumanMessage(content=rendered)],
         config={"metadata": {"emit-messages": False}},
+    )
+    unresolved_reasons = await _verify_targeted_fix(thread_id, state, config, reasons)
+    # Written and included in the fix pass's own commit BEFORE commit_all (not after): this file
+    # lives only on the live sandbox filesystem until committed (repo_files.write_repo_file), so
+    # writing it after the commit would leave it uncommitted -- silently lost the moment this
+    # container is later torn down and reprovisioned (targeted-fix's own gap #2, sandbox liveness).
+    await repo_files.write_repo_file(
+        get_sandbox_provider(),
+        thread_id,
+        TARGETED_FIX_UNRESOLVED_PATH,
+        json.dumps({"run_id": state.get("run_id", "unknown"), "reasons": unresolved_reasons}, indent=2) + "\n",
+    )
+    # Stuck-fixer fingerprint (reused from remediation_gate.py's own pattern, see intake_node's
+    # targeted-fix branch, which reads this back before a LATER attempt to decide whether the same
+    # reason(s) already survived one full fix+verify cycle). Not run_id-stamped like the file
+    # above -- this one is deliberately meant to persist and compare ACROSS attempts/resumes, the
+    # same cross-attempt lifetime remediation_gate.py's own fingerprint file already has.
+    await repo_files.write_repo_file(
+        get_sandbox_provider(),
+        thread_id,
+        TARGETED_FIX_FINGERPRINT_PATH,
+        json.dumps(sorted(set(unresolved_reasons)), indent=2) + "\n",
     )
     await git_ops.commit_all(
         get_sandbox_provider(), thread_id, "ai-dev-workflow: targeted fix for prior blocking reasons"
@@ -6079,6 +6227,7 @@ def _demo() -> None:
     assert route(failed_state) == "retry", "no_new_work must never mask a genuine verify failure"  # type: ignore[arg-type]
 
     _demo_open_audit_findings()
+    _demo_targeted_fix_stuck_decision()
 
     print("graph self-check: all assertions passed")
 

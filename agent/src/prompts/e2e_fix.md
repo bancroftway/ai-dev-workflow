@@ -39,6 +39,17 @@ fixed in the suite's own files:
 - **"No tests found"** -- the config's `testDir` does not point at where the specs actually live.
   Fix the path rather than moving the specs.
 
+One more is a **missing test**, not a broken one: a failing entry titled `wireframe coverage:
+<screen>` means the approved plan's wireframe for that screen has zero landed e2e screenshot
+proving it -- not that some assertion failed. Its `error` names the wireframe's own `ac_ids`. Add
+(or extend) a spec under `tests/e2e/` that navigates to that screen and asserts something visible
+on it, with one of the named AC ids embedded in the test's title in this pipeline's own
+`US-####.#` (or `US-####-#`) convention -- e.g. `test('US-0006.3 shows poll-not-found', ...)`. Do
+not write any new screenshot-capture code: `screenshot: 'on'` (required in every
+`playwright.config.ts` this pipeline writes) captures one automatically the moment a correctly
+titled test runs, pass or fail. If the screen genuinely doesn't exist yet in the app, that is an
+app defect like any other -- build it, then add the test.
+
 Everything else here is a real defect: fix the app.
 
 **When a failing test's JSON entry below includes a `screenshot` path, view that file with your

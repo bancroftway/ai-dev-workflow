@@ -97,6 +97,23 @@ def _is_pipeline_owned(path: str) -> bool:
 # specs from a unit run.
 _E2E_PATH_RE = re.compile(r"(^|/)e2e(/|$)|(^|/)playwright\.config\.[jt]sx?$|\.e2e\.[jt]sx?$", re.IGNORECASE)
 
+# Just the config file itself, any changed path -- used to locate it for the content check below
+# (check_screenshot_capture_mode), separate from _E2E_PATH_RE's broader "is this an e2e-shaped
+# path at all" question.
+_PLAYWRIGHT_CONFIG_RE = re.compile(r"(^|/)playwright\.config\.[cm]?[jt]sx?$", re.IGNORECASE)
+
+# `screenshot: 'on'` or `screenshot: "on"`, either quote style, whitespace-tolerant around the colon.
+_SCREENSHOT_ON_RE = re.compile(r"""screenshot\s*:\s*['"]on['"]""")
+
+
+def check_screenshot_capture_mode(config_source: str) -> bool:
+    """True if a playwright.config's `use` block sets `screenshot: 'on'` -- the setting this
+    stage's own prompt mandates (ac_to_tests_draft.md, ac_to_tests_greenfield_segment.md) so a
+    PASSING suite still yields visual evidence, not just failures (Playwright's own default is
+    only-on-failure). Until now this was only ever requested in prompt text, never verified
+    against the actual file -- read the real content, don't trust the model's compliance. Pure."""
+    return bool(_SCREENSHOT_ON_RE.search(config_source))
+
 
 def _classify_e2e_paths(changed_paths: list[str], resolved_root: str | None) -> tuple[bool, str]:
     """(has_e2e, diagnosis) -- diagnosis is "present" exactly when has_e2e is True, else one of
@@ -328,7 +345,7 @@ async def check_write_scope(
 
 
 # Task 8: one line per real rejection branch inside verify_ac_to_tests below, in plain English a
-# model can act on -- not a restatement of the Python. Eight distinct reasons, not five: the four
+# model can act on -- not a restatement of the Python. Nine distinct reasons, not five: the four
 # `check_*` provenance calls folded into one `protection_problems` list (~lines 292-297) are each
 # an independent rejection reason in their own right, not one "retired-AC" umbrella.
 AC_TO_TESTS_HARD_RULES: tuple[str, ...] = (
@@ -350,6 +367,9 @@ AC_TO_TESTS_HARD_RULES: tuple[str, ...] = (
     "If this stack has a UI framework, you must also write at least one real Playwright end-to-end "
     "spec under tests/e2e/ (with a working playwright.config.ts) -- a UI stack with zero browser "
     "tests is rejected.",
+    "Your playwright.config.ts's `use` block must set `screenshot: 'on'` -- Playwright's default "
+    "(only-on-failure) captures nothing for a passing suite, and the e2e stage's wireframe-coverage "
+    "gate needs a screenshot from every test, pass or fail, to verify each wireframed screen.",
 )
 
 
@@ -506,6 +526,27 @@ async def verify_ac_to_tests(
                 )
                 content_report["missing_e2e"] = True
                 content_report["e2e_diagnosis"] = diagnosis
+            else:
+                # A real e2e spec exists, but `screenshot: 'on'` (mandated by this stage's own
+                # prompt -- ac_to_tests_draft.md, ac_to_tests_greenfield_segment.md) was, until
+                # now, only ever REQUESTED, never verified: Playwright's default
+                # (only-on-failure) silently captures nothing for a passing suite, which starves
+                # the e2e stage's wireframe-coverage gate (e2e_nodes.py) of the visual evidence it
+                # needs to match a passing test back to a wireframed screen. Checked here, on the
+                # actual file content, not the model's claim of having written it.
+                config_path = next(
+                    (p for p in real_changes if _PLAYWRIGHT_CONFIG_RE.search(p)), None,
+                )
+                if config_path is not None:
+                    config_source = await repo_files.read_repo_file(provider, thread_id, config_path)
+                    if config_source is not None and not check_screenshot_capture_mode(config_source):
+                        content_problems.append(
+                            f"`{config_path}` does not set `screenshot: 'on'` in its `use` block -- "
+                            "Playwright's default (`only-on-failure`) captures nothing for a passing "
+                            "suite. Add `screenshot: 'on'` to `use` so passing tests still yield "
+                            "visual evidence; the e2e stage's wireframe-coverage gate depends on it."
+                        )
+                        content_report["missing_screenshot_on"] = True
 
     all_problems = protection_problems + content_problems
     if all_problems:
@@ -595,15 +636,26 @@ def _demo() -> None:
 
     # AC_TO_TESTS_HARD_RULES: one line per real rejection branch in verify_ac_to_tests -- write-scope,
     # ledger-integrity, retired-residue, deferred-residue, completed-AC protection, no-files-written,
-    # e2e-only, and missing-e2e. Eight, not five: the four check_* provenance calls folded into one
-    # protection_problems list are each counted separately here, same as they are for the model.
-    assert len(AC_TO_TESTS_HARD_RULES) == 8
+    # e2e-only, missing-e2e, and missing-screenshot-on. Nine, not five: the four check_* provenance
+    # calls folded into one protection_problems list are each counted separately here, same as they
+    # are for the model.
+    assert len(AC_TO_TESTS_HARD_RULES) == 9
     assert all(isinstance(r, str) and r.strip() for r in AC_TO_TESTS_HARD_RULES)
+
+    # check_screenshot_capture_mode: content check, not path check -- a config missing the setting
+    # (or setting it to anything else) is caught; single or double quotes, extra whitespace, and
+    # unrelated `use` block contents around it are all tolerated.
+    assert check_screenshot_capture_mode("use: { screenshot: 'on', baseURL: process.env.BASE_URL }")
+    assert check_screenshot_capture_mode('use: { screenshot: "on" }')
+    assert check_screenshot_capture_mode("use: {\n  screenshot:   'on',\n}")
+    assert not check_screenshot_capture_mode("use: { baseURL: process.env.BASE_URL }")
+    assert not check_screenshot_capture_mode("use: { screenshot: 'only-on-failure' }")
+    assert not check_screenshot_capture_mode("")
 
     # Task 14 item 4: don't just confirm the constant exists -- trace it through the SAME
     # build_schema_contract/ainvoke_structured machinery graph.py's make_draft_node/make_audit_node
     # actually call for ac-to-tests (draft_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
-    # graph.py), and confirm every one of the 8 rule strings really lands in the message the model
+    # graph.py), and confirm every one of the 9 rule strings really lands in the message the model
     # is sent, byte-for-byte, not just "the joined string is non-empty."
     import asyncio
 

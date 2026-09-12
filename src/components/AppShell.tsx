@@ -805,8 +805,8 @@ export function AppShell({
               {runFailed
                 ? `This run failed and stopped${failedStageLabel ? ` at ${failedStageLabel}` : ""}.`
                 : canReattach
-                  ? "This run's sandbox is still alive, but nothing is currently attached to it."
-                  : "This run appears to have stopped, and its sandbox is gone."}{" "}
+                  ? "This run is still active, but you're not viewing its live progress right now."
+                  : "This run appears to have stopped, and its progress can no longer be resumed."}{" "}
               See Overview for details and to continue.
             </span>
             <button
@@ -879,7 +879,7 @@ export function AppShell({
               reportExtras={reportExtras}
             />
           </div>
-          <div hidden={activeView !== "overview"}><SessionOverview /></div>
+          <div hidden={activeView !== "overview"}><SessionOverview owner={owner} repo={repo} branch={workBranch} /></div>
         </main>
         <AgentNarrationDrawer open={narrationOpen} onClose={() => setNarrationOpen(false)} />
       </div>

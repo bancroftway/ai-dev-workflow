@@ -100,6 +100,22 @@ def check_wireframe_ac_ids(
     return problems
 
 
+def check_wireframe_has_ac_ids(wireframes: list[dict[str, Any]]) -> list[str]:
+    """Every wireframe must cite >=1 ac_id. `Wireframe.ac_ids` (schemas.py) defaults to an empty
+    list, and until now nothing rejected that: check_wireframe_ac_ids only validates ids a
+    wireframe DOES cite are real, and check_ui_wireframe_coverage only checks the other direction
+    (every ui_related AC has SOME wireframe). Neither stops a wireframe from citing nothing at
+    all -- which would dodge the e2e stage's wireframe-coverage gate (e2e_nodes.py), which has
+    nothing to match an AC-less screen against. Pure."""
+    return [
+        f"wireframe {wf.get('screen')!r}: cites no ac_ids -- every wireframe must name at least "
+        "one acceptance criterion it is evidence for, or the e2e stage cannot verify this screen "
+        "was actually built and tested"
+        for wf in wireframes
+        if not (wf.get("ac_ids") or [])
+    ]
+
+
 def check_ui_wireframe_coverage(ui_related_ac_ids: set[str], wireframes: list[dict[str, Any]]) -> list[str]:
     """Coverage direction (user requirement 2026-09-01): every criterion the approved
     Specification marks ui_related must be cited by at least one wireframe's ac_ids -- a
@@ -463,6 +479,17 @@ def _demo() -> None:
         [{"screen": "task-list", "ac_ids": ["US-0001"]}], ledger,  # a story id, not a criterion
     ))
 
+    # check_wireframe_has_ac_ids: the mirror direction check_wireframe_ac_ids never covered -- a
+    # wireframe that cites NOTHING is rejected (it would dodge e2e's wireframe-coverage gate
+    # entirely, having nothing to match against), one that cites something real passes.
+    assert check_wireframe_has_ac_ids([{"screen": "task-list", "ac_ids": ["US-0001.1"]}]) == []
+    assert any("task-list" in p for p in check_wireframe_has_ac_ids(
+        [{"screen": "task-list", "ac_ids": []}]
+    ))
+    assert any("task-list" in p for p in check_wireframe_has_ac_ids(
+        [{"screen": "task-list"}]  # ac_ids key absent entirely, not just empty
+    ))
+
     # check_ui_wireframe_coverage (user requirement 2026-09-01): a ui_related AC with no
     # wireframe citing it is flagged; one covered by ANY wireframe's ac_ids passes.
     assert check_ui_wireframe_coverage({"US-0001.1"}, []) and "US-0001.1" in check_ui_wireframe_coverage({"US-0001.1"}, [])[0]
@@ -490,7 +517,7 @@ def _demo() -> None:
 
     # Task 13b: PLAN_HARD_RULES -- one line per real rejection branch in verify_plan_diagrams
     # (see the constant's own comment for the count breakdown).
-    assert len(PLAN_HARD_RULES) == 19, len(PLAN_HARD_RULES)
+    assert len(PLAN_HARD_RULES) == 20, len(PLAN_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in PLAN_HARD_RULES)
     print("diagram_gate wireframe self-check: all assertions passed")
 
@@ -532,6 +559,8 @@ PLAN_HARD_RULES: tuple[str, ...] = (
     "Every acceptance-criterion id a wireframe cites in its ac_ids must be a real id from the "
     "approved Specification's ledger, copied verbatim -- an invented or mistyped id is "
     "rejected.",
+    "Every wireframe must cite at least one ac_id -- a wireframe with an empty ac_ids list is "
+    "rejected, since the e2e stage has nothing to match it against.",
     "Every criterion the approved Specification marks ui_related must be cited by at least one "
     "wireframe's ac_ids -- a UI-facing requirement with zero wireframe evidence is rejected.",
     "Include at most 6 wireframes -- keep only the screens this plan actually changes.",
@@ -620,6 +649,7 @@ async def verify_plan_diagrams(
     linkage_problems = (
         check_plan_linkage(content_dict.get("plan_steps") or [], ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
         + check_wireframe_ac_ids(wireframes, ledger_entries)
+        + check_wireframe_has_ac_ids(wireframes)
         + check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
     )
 

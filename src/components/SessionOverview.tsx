@@ -89,7 +89,34 @@ function RebuildRow({
 }
 
 
-export function SessionOverview() {
+/** Ensures a sandbox is registered for `threadId` before invoking any recovery action below
+ * (rewind-to-stage, reverify-metrics-exit, targeted-fix, resume-stuck-e2e) -- closes the "silent
+ * no-op" gap where `_run_targeted_fix`/`deterministic_verify` (agent/src/graph.py) both bail
+ * quietly when `sandbox_registry.get(thread_id) is None`, which is exactly the state a finished or
+ * long-idle session's container is usually in by the time a user reaches this tab.
+ *
+ * `confirmReopen: true` mirrors the same-named registry meta flag these actions already set via
+ * POST /api/sessions/actions (sessions_api.py:929-933, 958-960) -- without it, `/api/sessions/
+ * provision`'s own `is_finished_with_verdict` guard 409s for exactly the finished, merge_ready=false
+ * sessions these actions exist to act on. Inert (and harmless) for a session that isn't finished
+ * with a verdict, e.g. Change 5's stuck-e2e case below -- that guard never fires for it either way.
+ *
+ * Best-effort: on failure, the action's own POST below still fires and reports whatever error the
+ * agent itself surfaces (a missing sandbox becomes an explicit "no sandbox" failure there rather
+ * than this helper silently blocking the whole action on a provisioning hiccup). */
+async function ensureSandboxProvisioned(threadId: string, owner: string, repo: string, branch: string): Promise<void> {
+  try {
+    await fetch("/api/sessions/provision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: threadId, owner, repo, branch, resume: true, confirmReopen: true }),
+    });
+  } catch {
+    // Best-effort -- see this function's own doc.
+  }
+}
+
+export function SessionOverview({ owner, repo, branch }: { owner: string; repo: string; branch: string }) {
   const { localAgentId, threadId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const { copilotkit } = useCopilotKit();
@@ -186,6 +213,7 @@ export function SessionOverview() {
       }
       setRestarting(true);
       try {
+        await ensureSandboxProvisioned(threadId, owner, repo, branch);
         const response = await fetch("/api/sessions/actions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -205,6 +233,7 @@ export function SessionOverview() {
     if (!window.confirm(`Continue this workflow at ${label}?`)) return;
     setRestarting(true);
     try {
+      await ensureSandboxProvisioned(threadId, owner, repo, branch);
       void copilotkit.runAgent({ agent });
     } finally {
       setRestarting(false);
@@ -232,6 +261,7 @@ export function SessionOverview() {
     }
     setRestarting(true);
     try {
+      await ensureSandboxProvisioned(threadId, owner, repo, branch);
       const response = await fetch("/api/sessions/actions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -265,6 +295,7 @@ export function SessionOverview() {
     }
     setRestarting(true);
     try {
+      await ensureSandboxProvisioned(threadId, owner, repo, branch);
       const response = await fetch("/api/sessions/actions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -275,6 +306,35 @@ export function SessionOverview() {
         window.alert(body?.detail || "Could not start a targeted fix for this session.");
         return;
       }
+      void copilotkit.runAgent({ agent });
+    } finally {
+      setRestarting(false);
+    }
+  }
+
+  // Stuck bespoke-cluster stage (e2e) recovery (Change 5, root-caused 2026-09-12): e2e has no
+  // StageState of its own (e2e_nodes.py is a bespoke cluster -- see MetricsBar.tsx's own e2ePill
+  // comment), so it never surfaces as a boundary row above -- a session whose last real STAGES
+  // entry (through metrics-exit) is already "Approved" gets `firstNonApprovedKey === null` and no
+  // restart affordance anywhere, even when e2e itself is genuinely stuck (its own `status` field
+  // stays "running" forever on a crash -- e2e_nodes.py only ever transitions it away from
+  // "running" on specific explicit branches, never on an unhandled exception). Cross-checked
+  // against the run's actual heartbeat (`runActivity.runActive`, the same liveness signal already
+  // used one row up for an ordinary stage's "drafting" status) so this never fires during a
+  // genuinely healthy e2e run -- only when the persisted status and the real heartbeat disagree.
+  const e2eStuck = state.e2e?.status === "running" && runActivity?.runActive === false && !finishedWithVerdict;
+  async function handleResumeStuckE2e() {
+    if (
+      !window.confirm(
+        "This run appears to have stalled during automated testing -- nothing is currently " +
+          "processing it. Resume to pick back up where it left off?",
+      )
+    ) {
+      return;
+    }
+    setRestarting(true);
+    try {
+      await ensureSandboxProvisioned(threadId, owner, repo, branch);
       void copilotkit.runAgent({ agent });
     } finally {
       setRestarting(false);
@@ -353,6 +413,28 @@ export function SessionOverview() {
           soon as there's any live cost to show -- a second one here was a plain duplicate, not a
           fallback for an actually-uncovered case (root-caused 2026-09-11, user-reported dupe). */}
       <h1 className="text-lg font-semibold">Session Overview</h1>
+
+      {/* Change 5 (root-caused 2026-09-12): e2e is a bespoke cluster with no StageState/boundary
+          row of its own, so a session genuinely stuck inside it -- container alive, nothing
+          driving it -- otherwise gets NO recovery affordance anywhere on this tab once every real
+          STAGES entry already shows "Approved". Standalone, not nested in a stage row, since e2e
+          has no row to nest it in. */}
+      {e2eStuck && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
+          <p>
+            This run appears to have stalled during automated testing — nothing is currently
+            processing it.
+          </p>
+          <button
+            type="button"
+            className="shrink-0 rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40"
+            disabled={restarting}
+            onClick={() => void handleResumeStuckE2e()}
+          >
+            {restarting ? "Working…" : "Resume this run"}
+          </button>
+        </div>
+      )}
 
       {/* Pivot (root-caused 2026-09-12): the old top banner here read live `state.run_failure`
           (empty for the whole reattach gap) and fired a bare, untargeted `runAgent()` -- no confirm,

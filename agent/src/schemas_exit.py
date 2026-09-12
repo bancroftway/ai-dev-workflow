@@ -52,6 +52,20 @@ class ExitDraftResponse(BaseModel):
     )
 
 
+class TargetedFixVerifyResponse(BaseModel):
+    """Structured output contract for the independent post-targeted-fix verification pass
+    (graph.py's `_verify_targeted_fix`) -- re-checks the exact prior run's `blocking_reasons`
+    against the CURRENT repo state instead of trusting the fix pass's own say-so, the same way an
+    audit's `audit_findings` cross-checks a draft rather than trusting it."""
+
+    unresolved_reasons: PresenceList = Field(
+        description="Which of the seeded blocking reasons are still present, with fresh evidence "
+        "quoted from the current file content for each -- or an explicit absent+reason once every "
+        "one is confirmed resolved. Never report a reason as absent just because the fix pass "
+        "claims it handled it -- re-read the actual file/line yourself before deciding."
+    )
+
+
 EXIT_DRAFT_EXAMPLE: ExitDraftResponse = ExitDraftResponse(
     readiness=True,
     clarifying_questions=[],
@@ -167,5 +181,15 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && uv run python -m 
     _report_dumped = json.loads(EXIT_DRAFT_EXAMPLE.report.model_dump_json())
     assert "status" in _report_dumped["blocking_reasons"], "report.blocking_reasons missing 'status'"
     assert "status" in _report_dumped["risk_notes"], "report.risk_notes missing 'status'"
+
+    # TargetedFixVerifyResponse: same typed-absence shape, both directions.
+    _resolved = TargetedFixVerifyResponse(
+        unresolved_reasons=PresenceList(status="absent", reason="both prior reasons are now resolved")
+    )
+    assert _resolved.unresolved_reasons.status == "absent"
+    _still_open = TargetedFixVerifyResponse(
+        unresolved_reasons=PresenceList(status="present", values=["still 3.24:1 contrast on .btn--gold"])
+    )
+    assert _still_open.unresolved_reasons.values == ["still 3.24:1 contrast on .btn--gold"]
 
     print("schemas_exit self-check: all assertions passed")

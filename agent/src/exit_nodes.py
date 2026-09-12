@@ -813,6 +813,28 @@ def _render_history_sections(
     lines += _render_skills_section(stages)
 
     lines += ["## Screens", ""]
+    # Wireframe-coverage figure, stamped by e2e_nodes.check_wireframe_coverage: `total` is None
+    # when there was nothing to check (no wireframes in the approved plan, or it was unreadable),
+    # distinct from an empty `missing` list, which means every wireframed screen was proven. This
+    # is the number a reviewer actually needs -- it can no longer silently diverge from the plan
+    # the way a raw screenshot-file count once did (14 files vs. 6 wireframes, one real incident).
+    wireframe_total = e2e.get("wireframe_coverage_total")
+    if wireframe_total is not None:
+        missing = e2e.get("wireframe_coverage_missing") or []
+        verified = wireframe_total - len(missing)
+        lines.append(f"**Wireframe coverage**: {verified}/{wireframe_total} wireframed screens verified in e2e.")
+        if missing:
+            lines.append(
+                "Missing: " + ", ".join(f"{wf['screen']} ({', '.join(wf['ac_ids']) or 'no ac_ids'})" for wf in missing) + "."
+            )
+        lines.append("")
+    unwireframed = e2e.get("unwireframed_screens") or []
+    if unwireframed:
+        lines.append(
+            f"**Additional e2e evidence with no matching wireframe** (advisory, not blocking): "
+            f"{', '.join(unwireframed)}."
+        )
+        lines.append("")
     if screenshots:
         lines += ["| Screen | Route | Screenshot |", "|---|---|---|"]
         for path in screenshots:
@@ -1024,14 +1046,26 @@ def _presence_from_values(values: list[str], *, empty_reason: str) -> dict[str, 
     return {"status": "absent", "values": [], "reason": empty_reason}
 
 
+def _targeted_fix_unresolved_problems(payload: dict[str, Any], run_id: str) -> list[str]:
+    """Fold TARGETED_FIX_UNRESOLVED_PATH's parsed content into `problems`, run-id-stamped the same
+    way `.ai-dev-workflow/metrics-latest.json` already is a few lines up in verify_exit_readiness --
+    a file whose `run_id` doesn't match THIS run's is from a prior attempt/run and is silently
+    ignored, no explicit clearing step required (a mismatched run_id is self-expiring by
+    construction, unlike relying on `_run_targeted_fix` remembering to clear it on a clean pass)."""
+    if payload.get("run_id") != run_id:
+        return []
+    return [str(r) for r in (payload.get("reasons") or [])]
+
+
 # Task 13b: one line per DISTINCT condition inside verify_exit_readiness below that forces
 # merge_ready=False (this gate always returns passed=True to the graph -- an LLM redraft cannot
 # fix a code regression or a missing screenshot, so the downgrade IS the outcome -- but each
 # condition below is still a real, distinct reason the merge gets blocked, and the model's own
-# blocking_reasons/merge_ready should agree with it). Eight: four independent manifest/evidence
+# blocking_reasons/merge_ready should agree with it). Nine: four independent manifest/evidence
 # presence checks, the metrics-not-recorded-for-this-run guard, the regression gate's own
 # recorded reasons (its granular thresholds live in a different module and are not enumerated
-# here), the README-ownership-scoped check, and the auth-verification requirement.
+# here), the README-ownership-scoped check, the auth-verification requirement, and (added
+# 2026-09-12, "rescue mechanism" work) a prior targeted-fix attempt's own still-open reasons.
 METRICS_EXIT_HARD_RULES: tuple[str, ...] = (
     "manifest.json must record at least one runnable app via app_check.apps (unless "
     "app_check explicitly marked the repo unsuitable) -- an empty app list after the re-scan "
@@ -1051,6 +1085,9 @@ METRICS_EXIT_HARD_RULES: tuple[str, ...] = (
     "problem still open after its own retry laps blocks the merge.",
     "If authentication enforcement was required for this run, the e2e auth probe must "
     "actually have run and passed -- required auth that was never verified blocks the merge.",
+    "If a prior targeted-fix attempt against THIS run's own reasons left any of them "
+    "independently confirmed still open, those reasons block the merge again -- a redraft's own "
+    "say-so is not enough to clear them.",
 )
 
 
@@ -1071,7 +1108,7 @@ async def verify_exit_readiness(
     from . import app_discovery  # local: app_discovery imports nothing from exit_nodes, but keep the surface flat
     from .gates.ac_coverage_gate import resolve_test_command
     from .gates.test_coverage_gate import COVERAGE_COMMANDS_PATH
-    from .graph import VerificationResult  # local: graph imports exit_nodes (same pattern as audit_gates)
+    from .graph import TARGETED_FIX_UNRESOLVED_PATH, VerificationResult  # local: graph imports exit_nodes (same pattern as audit_gates)
     from .tech_stack_signals import frameworks_have_ui, presence_values
 
     def _parse(raw: str | None) -> dict[str, Any]:
@@ -1137,6 +1174,11 @@ async def verify_exit_readiness(
             problems.extend(readme.get("problems") or [])
     else:
         problems.append("metrics were not recorded for this run -- the regression gate never passed")
+
+    # --- independent post-targeted-fix verification (closes _run_targeted_fix's own previously
+    # documented gap: "no independent, deterministic regression gate runs after this") ---
+    targeted_fix_unresolved = _parse(await repo_files.read_repo_file(provider, thread_id, TARGETED_FIX_UNRESOLVED_PATH))
+    problems.extend(_targeted_fix_unresolved_problems(targeted_fix_unresolved, run_id))
 
     # --- auth enforcement can't silently vanish (W4): a run that REQUIRED auth but whose e2e
     # never ran (non-UI repo, runner missing, suite skipped) verified nothing -- exactly the
@@ -1675,6 +1717,15 @@ def _demo() -> None:
         "status": "absent", "values": [], "reason": "nothing to report",
     }
 
+    # _targeted_fix_unresolved_problems: run-id-stamped fold-in, same staleness contract as
+    # metrics-latest.json's own run_id check a few lines up in verify_exit_readiness.
+    assert _targeted_fix_unresolved_problems({"run_id": "r1", "reasons": ["still open"]}, "r1") == ["still open"]
+    assert _targeted_fix_unresolved_problems({"run_id": "r1", "reasons": ["still open"]}, "r2") == [], (
+        "a different run_id must be ignored -- stale file from a prior attempt/run"
+    )
+    assert _targeted_fix_unresolved_problems({"run_id": "r1", "reasons": []}, "r1") == []
+    assert _targeted_fix_unresolved_problems({}, "r1") == [], "no file/empty payload -- nothing to fold in"
+
     # _diff_ledger: added/revised/retired classification against a prior snapshot.
     prior = [{"id": "US-0001", "status": "active", "last_revised_run_id": "r1"}]
     current = [
@@ -1710,6 +1761,38 @@ def _demo() -> None:
     )
     assert "| Journal Entries | `/journal-entries` |" in routed, routed
     assert "## Lighthouse" in routed and "color-contrast" in routed and "`button.btn`" in routed and "| `/accounts` | 55 | 93 |" in routed, routed
+
+    # Wireframe-coverage line (e2e_nodes.check_wireframe_coverage's stamped fields): a fully-covered
+    # run states the parity plainly; total=None (nothing to check -- no wireframes in the plan)
+    # renders no line at all rather than a misleading "0/0". This is the fix for the exact bug this
+    # feature shipped for: a raw screenshot-file count (14) silently read as if it meant the same
+    # thing as the plan's wireframe count (6).
+    full_coverage = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,
+        screenshots=[], run_id="r1",
+        e2e={"status": "passed", "wireframe_coverage_total": 6, "wireframe_coverage_missing": []},
+    )
+    assert "**Wireframe coverage**: 6/6 wireframed screens verified in e2e." in full_coverage, full_coverage
+    assert "Missing:" not in full_coverage
+
+    partial_coverage = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,
+        screenshots=[], run_id="r1",
+        e2e={
+            "status": "passed", "wireframe_coverage_total": 6,
+            "wireframe_coverage_missing": [{"screen": "poll-not-found", "ac_ids": ["US-0006.3"]}],
+            "unwireframed_screens": ["US-9999-9"],
+        },
+    )
+    assert "**Wireframe coverage**: 5/6 wireframed screens verified in e2e." in partial_coverage, partial_coverage
+    assert "Missing: poll-not-found (US-0006.3)." in partial_coverage, partial_coverage
+    assert "**Additional e2e evidence with no matching wireframe** (advisory, not blocking): US-9999-9." in partial_coverage
+
+    not_applicable = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,
+        screenshots=[], run_id="r1", e2e={"status": "passed", "wireframe_coverage_total": None},
+    )
+    assert "Wireframe coverage" not in not_applicable, not_applicable
 
     # --- scan sections: score table, findings dispositions, tool table --------------------------
     scan_fixture = {
@@ -1983,7 +2066,7 @@ def _demo() -> None:
 
     # Task 13b: METRICS_EXIT_HARD_RULES -- one line per real merge-blocking condition in
     # verify_exit_readiness (see the constant's own comment for the count breakdown).
-    assert len(METRICS_EXIT_HARD_RULES) == 8, len(METRICS_EXIT_HARD_RULES)
+    assert len(METRICS_EXIT_HARD_RULES) == 9, len(METRICS_EXIT_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in METRICS_EXIT_HARD_RULES)
 
     print("exit_nodes self-check: ok")

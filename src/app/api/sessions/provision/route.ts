@@ -28,7 +28,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { sessionId, projectId, owner, repo, branch, resume } = (await request.json()) as {
+  const { sessionId, projectId, owner, repo, branch, resume, confirmReopen } = (await request.json()) as {
     sessionId?: string;
     // Which project (Part 3) this ticket belongs to. Optional here, not required: the agent's own
     // ProvisionRequest.project_id (Task 5) falls back to an already-existing session's own stored
@@ -41,6 +41,12 @@ export async function POST(request: Request) {
     repo?: string;
     branch?: string;
     resume?: boolean;
+    // Root-caused 2026-09-12 ("rescue mechanism" work): Session Overview's recovery actions
+    // (rewind-to-stage, reverify-metrics-exit, targeted-fix) already confirm reopening a finished
+    // session via POST /api/sessions/actions before calling this route -- this just carries that
+    // same confirmation through to the agent's own `is_finished_with_verdict` 409, which used to
+    // refuse a resume-provision for exactly the sessions those actions exist to act on.
+    confirmReopen?: boolean;
   };
   if (!sessionId || !owner || !repo || !branch) {
     return NextResponse.json(
@@ -62,6 +68,7 @@ export async function POST(request: Request) {
       // Advisory only -- see session_store.py's module docstring.
       user_login: userLogin ?? "",
       resume: Boolean(resume),
+      confirm_reopen: Boolean(confirmReopen),
       // Fresh Entra access token (the jwt callback refreshes it before this route reads it) --
       // the agent exchanges it on-behalf-of for the session's Key Vault secrets at provision
       // time, then discards it. Absent in E2E-bypass mode; the agent skips the vault fetch then.

@@ -50,9 +50,11 @@ from pydantic import Field
 from . import app_discovery
 from . import config as workflow_config
 from . import fake_idp, git_ops, keyvault, model_config, repo_files, repo_test_config, run_failure, session_store
+from . import workflow_persistence
 from .chat_model import get_chat_model_for_thread, secret_env_names
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
+from .schemas import presence_values
 from .text_truncate import truncate_middle
 
 logger = logging.getLogger(__name__)
@@ -400,6 +402,68 @@ def suite_screenshot_name(index: int, source_path: str) -> str:
         return f"{index:03d}-suite.png"
     ac_id = match.group(1).upper().replace("_", "-").replace(".", "-")
     return f"{index:03d}-{ac_id}-suite.png"
+
+
+# The AC id a landed suite screenshot's OWN filename carries, once suite_screenshot_name has
+# already embedded it (e.g. '001-US-0006-3-suite.png') -- the read-back half of that function.
+_SUITE_SCREENSHOT_AC_RE = re.compile(r"^\d{3}-(US-\d{4}(?:-\d+)?)-suite\.png$", re.IGNORECASE)
+
+
+def _normalize_ac_id(ac_id: str) -> str:
+    """Same separator collapse suite_screenshot_name applies before embedding an AC id in a
+    filename ('US-0006.3' -> 'US-0006-3') -- a wireframe's ac_ids come from the ledger in the
+    dotted form, so both sides of the wireframe-coverage match (e2e_run_node) must go through this
+    exact same normalization or a real match silently fails on the separator alone."""
+    return ac_id.strip().upper().replace("_", "-").replace(".", "-")
+
+
+def match_wireframe_coverage(
+    screenshots: list[str], wireframes: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Pure matcher: reconciles a plan's wireframes against landed e2e screenshots, by AC id only
+    -- no route/slug fallback (a wireframe's screen name never resembles a URL slug by
+    construction, and two wireframes can legitimately share one route with different app state,
+    e.g. a detail screen vs. its not-found variant; only their distinct ac_ids tell them apart).
+
+    Returns `{"missing": [...], "unwireframed_ac_ids": [...], "total": N}`: `missing` is every
+    wireframe (each `{"screen", "ac_ids"}`) with ZERO landed evidence (empty = fully covered, gates
+    the stage); `unwireframed_ac_ids` is every proven AC id no wireframe cites at all (advisory
+    only, never gates); `total` is `len(wireframes)`, for the exit report's "X/Y verified" line."""
+    proven_ac_ids = {
+        match.group(1).upper()
+        for path in screenshots
+        if (match := _SUITE_SCREENSHOT_AC_RE.match(path.rsplit("/", 1)[-1]))
+    }
+    wireframed_ac_ids = {_normalize_ac_id(a) for wf in wireframes for a in (wf.get("ac_ids") or [])}
+    return {
+        "missing": [
+            {"screen": wf.get("screen"), "ac_ids": wf.get("ac_ids") or []}
+            for wf in wireframes
+            if not any(_normalize_ac_id(a) in proven_ac_ids for a in (wf.get("ac_ids") or []))
+        ],
+        "unwireframed_ac_ids": sorted(proven_ac_ids - wireframed_ac_ids),
+        "total": len(wireframes),
+    }
+
+
+async def check_wireframe_coverage(
+    provider: Any, thread_id: str, screenshots: list[str]
+) -> dict[str, Any] | None:
+    """Reads the approved plan and applies match_wireframe_coverage. Returns None when there's
+    nothing to check: no approved wireframes (a plan with no UI work), or the plan file can't be
+    read at all -- an infra gap must not manufacture a false gate failure, the same fail-open
+    discipline diagram_gate.py's own prior-plan read uses."""
+    raw_plan = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.PLAN_APPROVED_PATH)
+    if raw_plan is None:
+        return None
+    try:
+        plan_doc = json.loads(raw_plan)
+    except json.JSONDecodeError:
+        return None
+    wireframes = presence_values(plan_doc.get("wireframes"))
+    if not wireframes:
+        return None
+    return match_wireframe_coverage(screenshots, wireframes)
 
 
 def _route_slug(route: str) -> str:
@@ -1538,6 +1602,38 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             e2e["failed_tests"] = failures
             e2e["status"] = "failed"
 
+    # Wireframe-coverage gate: every screen the approved plan wireframed must have at least one
+    # landed e2e screenshot proving it, matched by AC id (see match_wireframe_coverage's own
+    # docstring for why route/slug matching was tried and dropped). None means there was nothing
+    # to check (no wireframes, or the plan file was unreadable) -- fail-open, not a pass/fail signal
+    # of its own.
+    coverage = await check_wireframe_coverage(provider, thread_id, e2e.get("screenshots") or [])
+    missing_wireframes = (coverage or {}).get("missing") or []
+    if missing_wireframes:
+        failures = list(e2e.get("failed_tests") or [])
+        for wf in missing_wireframes:
+            failures.append({
+                "title": f"wireframe coverage: {wf['screen']}",
+                "error": (
+                    f"The approved plan's {wf['screen']!r} wireframe cites "
+                    f"{', '.join(wf['ac_ids']) or '(no ac_ids)'}, but no landed e2e screenshot "
+                    "carries any of those AC ids -- this screen has zero visual proof it was built "
+                    "and exercised through the real running app (a unit/component test proves the "
+                    "component in isolation, never that it's reachable through actual routing). Add "
+                    "or extend a Playwright spec under tests/e2e/ that navigates to this screen and "
+                    f"asserts something visible on it, with one of {wf['ac_ids']} embedded in the "
+                    "test title in this pipeline's US-####.# convention -- screenshot: 'on' then "
+                    "captures it automatically, pass or fail."
+                ),
+            })
+        e2e["failed_tests"] = failures
+        e2e["status"] = "failed"
+    # None (not []) when there was nothing to check at all (no wireframes, or plan unreadable) --
+    # the exit report needs to tell "6/6 verified" apart from "not applicable, no UI work planned".
+    e2e["wireframe_coverage_missing"] = coverage.get("missing") if coverage is not None else None
+    e2e["wireframe_coverage_total"] = coverage.get("total") if coverage is not None else None
+    e2e["unwireframed_screens"] = (coverage or {}).get("unwireframed_ac_ids") or []
+
     # Authentication enforcement gate (gates/auth_gate.py) -- while the app is still up, probing
     # WITHOUT the AIDW_TEST_AUTH seam (the probe carries no env; the seam lives in the app's own
     # process and only answers a caller who USES it). Deliberately NOT fail-open: an
@@ -1957,6 +2053,50 @@ def _demo() -> None:
     ) == "002-US-0002-3-suite.png"
     # No id in the path -> plain name, never a fabricated id.
     assert suite_screenshot_name(3, "test-results/smoke/test-finished-1.png") == "003-suite.png"
+
+    # _normalize_ac_id: both separator styles a ledger/suite-filename might use collapse to the
+    # same form, so the wireframe-coverage match below can't silently miss on punctuation alone.
+    assert _normalize_ac_id("US-0006.3") == "US-0006-3"
+    assert _normalize_ac_id("us_0006_3") == "US-0006-3"
+    assert _normalize_ac_id("US-0006-3") == "US-0006-3"
+
+    # match_wireframe_coverage: the exact shape of the bug this gate exists to catch -- a wireframe
+    # whose AC has a landed, AC-tagged suite screenshot is covered; one with none is reported
+    # missing (and its ac_ids come back verbatim, so the fix loop knows exactly what to add); an
+    # extra suite screenshot proving an AC no wireframe cites is advisory-only, never in "missing".
+    wireframes = [
+        {"screen": "poll-detail", "ac_ids": ["US-0002.6", "US-0004.1"]},
+        {"screen": "poll-not-found", "ac_ids": ["US-0006.3"]},
+    ]
+    covered = match_wireframe_coverage(
+        ["history/r1-screens/001-US-0004-1-suite.png"], wireframes,
+    )
+    assert covered["missing"] == [{"screen": "poll-not-found", "ac_ids": ["US-0006.3"]}]
+    assert covered["unwireframed_ac_ids"] == []
+    # Dotted-vs-dashed AC id on either side must still match.
+    both_covered = match_wireframe_coverage(
+        ["history/r1-screens/001-US-0002-6-suite.png", "history/r1-screens/002-US-0006-3-suite.png"],
+        wireframes,
+    )
+    assert both_covered["missing"] == []
+    # A per-route screenshot (no AC id in its name at all) never counts as coverage -- only an
+    # AC-tagged suite screenshot does, which is exactly the naive-route-slug bug this design
+    # dropped in favour of AC-id-only matching.
+    route_only = match_wireframe_coverage(["history/r1-screens/003-polls-new.png"], wireframes)
+    assert len(route_only["missing"]) == 2
+    # An AC proven by e2e that no wireframe cites is advisory, not gating.
+    extra = match_wireframe_coverage(
+        ["history/r1-screens/001-US-0002-6-suite.png", "history/r1-screens/002-US-0004-1-suite.png",
+         "history/r1-screens/003-US-0006-3-suite.png", "history/r1-screens/004-US-9999-9-suite.png"],
+        wireframes,
+    )
+    assert extra["missing"] == []
+    assert extra["unwireframed_ac_ids"] == ["US-9999-9"]
+    # No wireframes at all -> nothing to check, empty on every key.
+    assert match_wireframe_coverage(["history/r1-screens/001-suite.png"], []) == {
+        "missing": [], "unwireframed_ac_ids": [], "total": 0,
+    }
+    assert covered["total"] == 2
 
     # The playwright JSON report path has to be rewritten relative to the directory the suite runs
     # in. Passing the repo-relative path unchanged wrote the report to apps/web/agent-work/... and
