@@ -355,11 +355,23 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     # provider=chat_provider (I-3): the same pinned-or-live choice resolved above, so the container
     # this call bakes AGENT_PROVIDER/credentials into always matches the credential that was just
     # fetched for it -- see SandboxProvider.provision's own docstring for the full reasoning.
+    # An existing session row already carries an authoritative source_branch -- same reuse
+    # principle as project_id above (existing.get("project_id") or body.project_id), and for the
+    # same reason: root-caused 2026-09-13 ("container keeps dying" investigation), a caller can
+    # resend a STALE branch value for a session that already exists (e.g. a workflow page's own
+    # URL catch-all segment, snapshotted at the tab's first navigation and never updated after
+    # provisioning actually happens). local_docker.py's provision() treats ANY branch value that
+    # disagrees with the running container's checked-out branch as a genuine "PR target changed"
+    # and stops + reprovisions -- fine for an actual PR-target change, destructive churn (and, live,
+    # a run of container deaths) when the caller's value was simply stale. source_branch is set
+    # once at create_session and never mutated after, so it can't itself go stale the way a
+    # resent URL parameter can.
+    branch = existing.get("source_branch") if existing is not None else body.branch
     try:
         session = await provider.provision(
             session_id=body.thread_id,
             repo_clone_url=repo_clone_url,
-            branch=body.branch,
+            branch=branch,
             work_branch=work_branch,
             git_user_token=body.github_token,
             runtime_auth_token=runtime_auth_token,
@@ -936,7 +948,22 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
                 detail="rewind is only available for a session that has failed or is not ready to merge",
             )
         current_stage = row.get("current_stage")
-        if current_stage not in stage_keys or stage_keys.index(body.stage_key) > stage_keys.index(current_stage):
+        target_reached = current_stage in stage_keys and stage_keys.index(body.stage_key) <= stage_keys.index(current_stage)
+        if not target_reached:
+            # Root-caused 2026-09-13 (user-reported: Minimal Code to Green showed "Approved" with
+            # everything through Metrics & Exit also approved, yet rewinding to it 409'd): the
+            # durable current_stage column can be STALER than what the run's own live checkpoint
+            # already proves happened -- a later resume attempt that failed early (e.g. a rebuild
+            # gate false-positive at r_ac_to_tests) can leave current_stage pointing at an EARLIER
+            # stage than ones the run genuinely reached and approved before that resume. Same
+            # "prefer live per-stage truth over the durable marker" principle this codebase already
+            # applies elsewhere for this exact staleness class (SessionOverview.tsx's own boundary
+            # computation) -- fall back to the live checkpoint's own per-stage status before
+            # refusing outright.
+            agent_state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+            live_stages = (agent_state.values or {}).get("stages") or {}
+            target_reached = (live_stages.get(body.stage_key) or {}).get("status") == "approved"
+        if not target_reached:
             raise HTTPException(status_code=409, detail="this session never reached that stage")
         # confirm_reopen too: rewinding IS the explicit, informed confirmation (the user picked a
         # specific stage) -- without it, intake_node's own reopen guard would block this for a

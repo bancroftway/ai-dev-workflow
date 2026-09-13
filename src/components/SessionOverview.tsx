@@ -200,8 +200,42 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
   // it's just a plain reattach, with no server-side rewind call and no `status=="failed"` 409 risk
   // (sessions_api.py's rewind-to-stage action requires that status, which a merely-interrupted
   // in_progress session never has).
+  // Cheap infra-only retry (root-caused 2026-09-13, "FE must show true live state" investigation):
+  // `cannot_verify` means the check never actually ran -- no sandbox was available at the moment a
+  // deterministic verify/rebuild gate tried to run (make_escalate_node and rebuild.py's own
+  // escalate_node both tag it identically) -- never that the stage's own content was judged and
+  // found wanting. The stage this failure is mapped to is still `approved`; nothing about it needs
+  // redoing. intake_node's reopen guard doesn't even apply here either: it only blocks
+  // `is_finished_with_verdict` sessions (status=="completed", or failed with failure_stage=="exit"),
+  // and this shape is neither -- a genuine crash with any other failure_stage already "falls
+  // through to the ordinary, unconfirmed resume path" (that guard's own comment). So a bare resume,
+  // once a sandbox actually exists, naturally re-enters the graph, finds the mapped stage still
+  // approved, and retries just the check that never ran -- no rewind-to-stage call, no redraft.
+  const isCannotVerifyBoundary = isFailedBoundary && failureTypeText === "cannot_verify";
   async function handleRestart(stageKey: string) {
     const label = PIPELINE_STAGE_ORDER.find((s) => s.key === stageKey)?.label ?? stageKey;
+    // Only the boundary's OWN stage qualifies for the cheap retry -- a user who explicitly picked
+    // a DIFFERENT (earlier) stage via its own row's button is asking for a real rewind to THAT
+    // stage, which still needs the full reset regardless of why the boundary itself failed.
+    if (isCannotVerifyBoundary && stageKey === boundaryKey) {
+      if (
+        !window.confirm(
+          "This failed because no sandbox was available to run the check -- nothing about " +
+            `${label}'s own work was judged and found wrong. Retrying just re-runs that check ` +
+            "against a fresh sandbox; it does not reset or redo any stage. Continue?",
+        )
+      ) {
+        return;
+      }
+      setRestarting(true);
+      try {
+        await ensureSandboxProvisioned(threadId, owner, repo, branch);
+        void copilotkit.runAgent({ agent });
+      } finally {
+        setRestarting(false);
+      }
+      return;
+    }
     if (isFailedBoundary) {
       if (
         !window.confirm(
@@ -322,7 +356,19 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
   // against the run's actual heartbeat (`runActivity.runActive`, the same liveness signal already
   // used one row up for an ordinary stage's "drafting" status) so this never fires during a
   // genuinely healthy e2e run -- only when the persisted status and the real heartbeat disagree.
-  const e2eStuck = state.e2e?.status === "running" && runActivity?.runActive === false && !finishedWithVerdict;
+  //
+  // Same bug class as rebuildPhase's own fix, user-reported again 2026-09-13 ("FE must show true
+  // live state"): `state.e2e` is never reset between attempts, so a leftover "running" from an
+  // EARLIER, since-superseded pass through e2e (this same run had one, 12/12 passed, long before
+  // a later rewind sent it all the way back to Remediation) kept firing this banner while the run
+  // sat idle at Remediation -- nowhere near e2e in this life. Bounded the same way: e2e is only
+  // structurally CURRENT when its own prerequisite (Remediation) has actually approved and its own
+  // successor (Adversarial Compliance) hasn't started yet -- exactly rebuildPhase's
+  // prior-approved/next-not-started window, inlined here since e2e isn't a RebuildPlacement.
+  const e2eCurrentlyRelevant =
+    state.stages?.["remediation"]?.status === "approved" &&
+    (state.stages?.["adversarial-compliance"]?.status ?? "not_started") === "not_started";
+  const e2eStuck = e2eCurrentlyRelevant && state.e2e?.status === "running" && runActivity?.runActive === false && !finishedWithVerdict;
   async function handleResumeStuckE2e() {
     if (
       !window.confirm(
@@ -575,13 +621,39 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
               // leaves `status === "drafting"` forever, which used to read as running with no other
               // signal to contradict it.
               const running = (stage.status === "drafting" && runActivity?.runActive !== false) || timing?.node !== undefined;
-              // Pivot (root-caused 2026-09-12): the one restart/continue action, on whichever row
-              // is the durable boundary -- computed once above from durable data, so it lands on
+              // Pivot (root-caused 2026-09-12): the restart/continue action on whichever row is
+              // the durable boundary -- computed once above from durable data, so it lands on
               // the correct row (the mapped real stage, e.g. "ac-to-tests" for an
               // r_ac_to_tests rebuild failure) even with live per-stage state also available.
               // Never shown while genuinely still running -- nothing to continue then.
               const isBoundaryRow = key === boundaryKey;
-              const showAction = isBoundaryRow && !finishedWithVerdict && (isFailedBoundary || !running);
+              // User-directed restart target (root-caused 2026-09-13, user-reported: the mapped
+              // boundary can point at a stage the run only cannot_verify'd through, while the
+              // actual defect a rewind should target lives on a DIFFERENT already-reached stage --
+              // e.g. WCAG-contrast/error-handling findings flagged repeatedly during Minimal Code
+              // to Green, approved along with everything after it through Metrics & Exit, while
+              // the durable boundary maps to an unrelated, later-resumed rebuild failure at an
+              // EARLIER stage key). Not index-bounded against boundaryIdx: this run's own
+              // current_stage regressed backward on that later resume, so a plain "must be before
+              // the boundary" check would just exclude the very stages this exists to reach.
+              // `stage.status === "approved"` is the live, trustworthy proof of reachability --
+              // sessions_api.py's rewind-to-stage now accepts it too (falls back to the live
+              // checkpoint's own per-stage status whenever the durable current_stage column
+              // disagrees). Failed-run-only: a merely interrupted (not failed) run has nothing to
+              // "rewind" to, only the single continue-from-here action on its own frontier row.
+              const isEarlierReachableRow = isFailedBoundary && !isBoundaryRow && stage.status === "approved";
+              // "FE must show true live state" (user directive, 2026-09-13): a session-level
+              // active run (runActivity.runActive === true, backed by the real heartbeat/container
+              // check -- see run_activity.is_active) must never show an action button implying the
+              // user needs to do something, even on the frontier row whose OWN draft hasn't
+              // started yet -- the run is already progressing on its own (e.g. still finishing an
+              // earlier rebuild gate). Explicit `=== true` here, not the `!== false` tri-state
+              // pattern `running` uses above: an unknown/not-yet-loaded signal must still let the
+              // button through (never hide a genuinely-needed action on a guess), only a
+              // CONFIRMED-active run suppresses it.
+              const sessionGenuinelyActive = runActivity?.runActive === true;
+              const showAction =
+                !finishedWithVerdict && !sessionGenuinelyActive && ((isBoundaryRow && (isFailedBoundary || !running)) || isEarlierReachableRow);
               // At most one placement follows any given real stage today (REBUILD_PLACEMENTS has
               // no two entries sharing an afterStageKey) -- find(), not filter().
               const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
@@ -627,7 +699,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
                   {showAction && (
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
-                      {isFailedBoundary && (failureTypeText || failureMessageText) && (
+                      {isBoundaryRow && isFailedBoundary && (failureTypeText || failureMessageText) && (
                         <p className="text-xs text-red-700">
                           {failureTypeText}
                           {failureTypeText && failureMessageText ? " — " : ""}
@@ -646,9 +718,11 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                       >
                         {restarting
                           ? "Working…"
-                          : isFailedBoundary
-                            ? "Restart workflow from this stage"
-                            : "Continue workflow from here"}
+                          : isBoundaryRow && isCannotVerifyBoundary
+                            ? "Retry (no rewind needed)"
+                            : isFailedBoundary
+                              ? "Restart workflow from this stage"
+                              : "Continue workflow from here"}
                       </button>
                     </div>
                   )}

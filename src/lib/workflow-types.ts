@@ -147,7 +147,17 @@ export function rebuildPhase(
   const nextStarted =
     (stages[placement.nextStageKey]?.status ?? "not_started") !== "not_started" ||
     runningPhases.has(placement.nextStageKey);
-  return { status: rb?.status ?? "not_started", running: !nextStarted && runActive !== false };
+  // User-reported (2026-09-13, "FE must show true live state"): `!nextStarted` alone answers "has
+  // this placement's OWN successor not started YET", which is true for every downstream placement
+  // at once whenever an earlier stage in the chain is reset (e.g. a rewind-to-stage) -- three
+  // "Rebuild" rows all spinning "Verifying" simultaneously, none of which could possibly be the
+  // real one (rebuild_node for THIS placement cannot even run before its own `afterStageKey` stage
+  // has approved). Bounded the other side too: only a placement whose prior stage has actually
+  // reached "approved" (the slower state signal) or has a live event for this exact rebuildKey
+  // (the fast runningPhases signal, same OR'd pattern this function already uses below) can
+  // possibly be the one currently active.
+  const priorReached = stages[placement.afterStageKey]?.status === "approved" || runningPhases.has(placement.rebuildKey);
+  return { status: rb?.status ?? "not_started", running: priorReached && !nextStarted && runActive !== false };
 }
 
 /** A canned monorepo stack the Tech Stack tab's dropdown offers, loaded from

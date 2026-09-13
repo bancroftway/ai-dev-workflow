@@ -492,6 +492,20 @@ def make_rebuild_node(spec: RebuildSpec):
             rb["build_commands"] = [c.model_dump() for c in (report.build_commands or [])]
             if not rb["build_commands"]:
                 logger.warning("rebuild %s: discovery reported no build_commands -- fix laps will fall back to the model", spec.key)
+            else:
+                # Deterministic re-verify (root-caused 2026-09-13, observed live thread 8242ea6d):
+                # every LATER fix lap already re-runs these exact commands and judges on exit code
+                # alone (_replay_build, this module's own docstring: "No LLM at all in the happy
+                # path... gates on its exit code") -- the discovery turn alone skipped that and
+                # trusted the model's own self-reported ok/success instead. A model can get spooked
+                # by benign stderr noise unrelated to the actual result: observed live, `dotnet
+                # build` printed "Build succeeded. 0 Warning(s) 0 Error(s)" (exit 0) plus an
+                # unrelated SDK advisory ("An issue was encountered verifying workloads") on
+                # stderr, and the model self-reported ok=false anyway -- permanently blocking a run
+                # at its very first rebuild gate for a diagnostic that never affected the build.
+                # Re-running here costs one extra build, the same cost every subsequent fix lap
+                # already pays for the identical guarantee.
+                report = await _replay_build(provider, thread_id, rb["build_commands"])
         build_ok = report.success and report.ok
 
         # TDD-red gate, scaffold placement only: a green build is necessary but NOT sufficient --
@@ -899,6 +913,48 @@ def _demo() -> None:
         assert rb_after["last_stdout_tail"], "config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS must have resolved to a real int, not crashed"
     finally:
         get_sandbox_provider = original_get_sandbox_provider
+        sandbox_registry.pop(thread_id)
+
+    # Regression for the discovery-turn self-report bug (root-caused 2026-09-13, observed live
+    # thread 8242ea6d): the FIRST rebuild check (fix_cycle_count == 0) used to trust the model's
+    # own self-reported ok/success verbatim instead of deterministically replaying its own
+    # build_commands the way every later fix lap already does -- a model that gets spooked by
+    # benign stderr noise on an otherwise exit-0 build could self-report ok=false and permanently
+    # block a run at its very first rebuild gate. Stub stack_runner.run_and_report to return
+    # exactly that shape (self-reported ok=False, but a real command that actually exits 0) and
+    # confirm the deterministic replay overrides it.
+    global stack_runner
+
+    async def _fake_run_and_report(*_args: Any, **_kwargs: Any) -> BuildVerifyReport:
+        return BuildVerifyReport(
+            success=True, ok=False, error=None,
+            stdout_tail="Build succeeded. 0 Warning(s) 0 Error(s)",
+            stderr_tail="An issue was encountered verifying workloads.",
+            build_commands=[BuildCommand(cwd=".", command="true")],
+        )
+
+    class _FakeStackRunner:
+        run_and_report = staticmethod(_fake_run_and_report)
+
+    thread_id = "t-rebuild-discovery-selfcheck"
+    sandbox_registry.set(thread_id, object())
+    original_get_sandbox_provider = get_sandbox_provider
+    original_stack_runner = stack_runner
+    get_sandbox_provider = lambda: _StubProvider(0)  # noqa: E731
+    stack_runner = _FakeStackRunner()
+    try:
+        result = asyncio.run(make_rebuild_node(demo_spec)(
+            {"provider": "claude", "run_id": "r1", "stages": {}, "rebuild": {demo_spec.key: default_rebuild_state()}},
+            {"configurable": {"thread_id": thread_id}},
+        ))
+        rb_after = result["rebuild"][demo_spec.key]
+        assert rb_after["last_exit_ok"] is True, (
+            "the discovery turn's own self-reported ok=False must be overridden by a deterministic "
+            f"replay of its build_commands (which actually exit 0): {rb_after}"
+        )
+    finally:
+        get_sandbox_provider = original_get_sandbox_provider
+        stack_runner = original_stack_runner
         sandbox_registry.pop(thread_id)
 
     print("rebuild red-gate self-check: all assertions passed")

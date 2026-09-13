@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 
 /**
@@ -50,8 +50,25 @@ export function SandboxSessionBoot({
   // 404/409 resume guards) -- falls back to the generic copy below when the response has no (or
   // an unparseable) error body.
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // One-shot latch (root-caused 2026-09-13, "container keeps dying" investigation): this
+  // component's own name promises a boot-time decision, but `skip` sat in the effect's dependency
+  // array below, so any LATER change to it re-ran this whole effect mid-session -- and a fetch
+  // fired from it uses THIS component's own `branch` prop, which is the URL's source/PR-target
+  // segment, not `sessionRow.work_branch`. `skip` flips true->false the instant a Session
+  // Overview recovery action (rewind/retry/continue) succeeds and the durable row's status leaves
+  // its terminal state -- exactly when this fired a SECOND, wrongly-branched provision call.
+  // local_docker.py's provision() treats any branch mismatch against the running container as a
+  // genuine "PR target changed", stops the container that action's own (correctly-branched)
+  // ensureSandboxProvisioned call had just set up, and reprovisions against the wrong branch,
+  // which then dies. Session Overview's own recovery handlers already provision correctly before
+  // every action now, so this component's ENTIRE job -- skip or fetch -- only needs to happen
+  // once per session, at genuine page-open; latched before either branch below, not just the
+  // fetch one, so a session that started `skip`-true also never re-decides later.
+  const decidedForRef = useRef<string | null>(null);
 
   useEffect(() => {
+    if (decidedForRef.current === sessionId) return;
+    decidedForRef.current = sessionId;
     if (skip) {
       setStatus("terminated");
       return;
