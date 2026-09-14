@@ -47,6 +47,59 @@ function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+/** Plain-language failure summary for the recovery panel (root-caused 2026-09-13, user-reported:
+ * the raw `failureTypeText` enum, e.g. "cannot_verify", was shown to users completely unexplained).
+ * `rawFailureStage` is the PRE-`realStageForFailure` value (`failure.stage`/`runActivity.
+ * failureStage`) -- often a REBUILD_PLACEMENTS `rebuildKey` (e.g. "r_ac_to_tests", set by
+ * agent/src/rebuild.py's own make_escalate_node), not a real stage key. Using the placement's own
+ * label ("Red Gate") when it matches one avoids misattributing a rebuild-gate's own build-check
+ * failure to the real stage's content/audit, which is already approved and uninvolved. */
+function describeFailure(
+  rawFailureStage: string | null,
+  failureTypeText: string | null,
+  failureMessageText: string | null,
+  mappedStageLabel: string,
+): string {
+  const placement = REBUILD_PLACEMENTS.find((p) => p.rebuildKey === rawFailureStage);
+  const label = placement?.label ?? mappedStageLabel;
+  if (failureTypeText === "cannot_verify") {
+    return `${label}'s last check couldn't run because no sandbox was available — this is an infrastructure hiccup, not a problem with your code.`;
+  }
+  return failureMessageText ? `${label} hit a problem: ${failureMessageText}` : `${label} hit a problem.`;
+}
+
+/** Plain-language "what a redo actually costs" copy, built from `stagesResetByRewind`'s own output.
+ * Degrades gracefully when `labels` is empty (the durable-only fallback view, which has no live
+ * per-stage data to enumerate) -- never renders an empty "— —" fragment. */
+function buildRedoCopy(stageLabel: string, labels: string[], approxCost: number): string {
+  const parts = [`This resets ${stageLabel} and everything after it`];
+  if (labels.length > 0) parts.push(`— ${labels.join(", ")} —`);
+  parts.push("and redoes them from scratch");
+  if (labels.length > 0) {
+    parts.push(`(≈$${approxCost.toFixed(2)} so far across those stages this run, based on the most recent attempt at each)`);
+  }
+  return `${parts.join(" ")}. Files already written are not reverted.`;
+}
+
+/** The single "just continue, nothing failed" affordance (root-caused 2026-09-13: this used to be
+ * hand-duplicated in both the live and durable-fallback rendering branches below, and a rename
+ * applied to only one of them would have silently left the other stale -- exactly the class of bug
+ * this redesign exists to close). Shared by both branches so a future change can't do that again. */
+function ContinueAction({ restarting, onClick }: { restarting: boolean; onClick: () => void }) {
+  return (
+    <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
+      <button
+        type="button"
+        className="ml-auto shrink-0 rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs font-medium text-neutral-700 disabled:opacity-40"
+        disabled={restarting}
+        onClick={onClick}
+      >
+        {restarting ? "Working…" : "Resume this run"}
+      </button>
+    </div>
+  );
+}
+
 // Shared between the header row and every stage row so the columns actually line up like a table
 // (user feedback 2026-09-01) instead of each row's flex layout drifting with its own content width.
 const ROW_GRID = "grid grid-cols-[1fr_4.5rem_4rem_5rem_9rem] items-center gap-3";
@@ -167,13 +220,14 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
       : state.stages![orderedRealStages[lastTouchedIdx].key]!.status === "approved"
         ? (orderedRealStages[lastTouchedIdx + 1]?.key ?? null)
         : orderedRealStages[lastTouchedIdx].key;
-  const mappedFailureTarget = hasLiveStages
-    ? failure
-      ? realStageForFailure(failure.stage ?? null)
-      : null
-    : runActivity?.status === "failed" && !runActivity?.finishedWithVerdict
-      ? realStageForFailure(runActivity?.failureStage ?? null)
-      : null;
+  // Exposed separately from mappedFailureTarget (root-caused 2026-09-13): this is the PRE-mapped
+  // value -- often a REBUILD_PLACEMENTS rebuildKey, not a real stage key -- needed by
+  // describeFailure below to attribute a rebuild-gate's own failure to the placement itself
+  // ("Red Gate") rather than the real stage it's mapped to for row/rewind-targeting purposes.
+  const rawFailureStage = hasLiveStages
+    ? (failure ? (failure.stage ?? null) : null)
+    : (runActivity?.status === "failed" && !runActivity?.finishedWithVerdict ? (runActivity?.failureStage ?? null) : null);
+  const mappedFailureTarget = rawFailureStage != null ? realStageForFailure(rawFailureStage) : null;
   // Boundary = where "last known-good" ends. A genuine failure's mapped target is the TRUE
   // boundary: current_stage can be pushed all the way to metrics-exit by the crash-reporting pass
   // that still runs after most escalates, which would otherwise misreport "everything through
@@ -183,6 +237,17 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
   const boundaryKey = mappedFailureTarget ?? (hasLiveStages ? firstNonApprovedKey : (runActivity?.currentStage ?? null));
   const boundaryIdx = stageOrderIndex(boundaryKey);
   const isFailedBoundary = mappedFailureTarget != null;
+  const boundaryLabel = PIPELINE_STAGE_ORDER.find((s) => s.key === boundaryKey)?.label ?? boundaryKey ?? "This stage";
+  // The "redo a different stage instead" disclosure's own candidate list (root-caused 2026-09-13
+  // UX redesign): every OTHER stage this run has genuinely approved, excluding the boundary --
+  // `stage.status === "approved"` is the same live, trustworthy reachability proof
+  // `sessions_api.py`'s rewind-to-stage endpoint itself now accepts (falls back to it whenever the
+  // durable current_stage column disagrees). Naturally empty in the durable-only fallback view
+  // (state.stages has no live per-stage data yet there) -- nothing to offer alternatives from, so
+  // the disclosure correctly renders nothing rather than guessing.
+  const otherApprovedStages = isFailedBoundary
+    ? PIPELINE_STAGE_ORDER.filter((s) => s.key !== boundaryKey && state.stages?.[s.key]?.status === "approved")
+    : [];
   // Same live-over-durable preference as the boundary itself, for the actual error text shown
   // next to the restart button -- the durable copies are only a truncated mirror of this same data.
   const failureTypeText = hasLiveStages ? (failure?.type ?? failure?.failure_type ?? null) : (runActivity?.failureType ?? null);
@@ -369,6 +434,16 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     state.stages?.["remediation"]?.status === "approved" &&
     (state.stages?.["adversarial-compliance"]?.status ?? "not_started") === "not_started";
   const e2eStuck = e2eCurrentlyRelevant && state.e2e?.status === "running" && runActivity?.runActive === false && !finishedWithVerdict;
+  // "FE must show true live state" (user directive, 2026-09-13): a session-level active run
+  // (runActivity.runActive === true, backed by the real heartbeat/container check -- see
+  // run_activity.is_active) must never show an action button implying the user needs to do
+  // something, even on the frontier row whose OWN draft hasn't started yet -- the run is already
+  // progressing on its own (e.g. still finishing an earlier rebuild gate). Explicit `=== true`
+  // here, not the `!== false` tri-state pattern `running` uses elsewhere: an unknown/not-yet-loaded
+  // signal must still let the button through (never hide a genuinely-needed action on a guess),
+  // only a CONFIRMED-active run suppresses it. Component-level (not per-row): used by both
+  // rendering branches below, and doesn't depend on which row is being rendered.
+  const sessionGenuinelyActive = runActivity?.runActive === true;
   async function handleResumeStuckE2e() {
     if (
       !window.confirm(
@@ -401,12 +476,26 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     [events, runActivity?.runActive],
   );
   const perStage = useMemo(() => {
+    // Per-stage "most recent run_id touching it" (root-caused 2026-09-13, cost-accuracy fix for
+    // the recovery-UX redesign): this used to fold EVERY event ever recorded for a stage,
+    // cumulative across every rewind/resume this whole session ever had -- a stage rewound more
+    // than once could show 2-3x its real next-redo cost, exactly when a user is deciding whether
+    // to redo it. A single session-wide "latest run_id" (computeRunningPhases' own convention,
+    // use-run-events.ts) is the wrong fix here: it would blank out Duration/Cost for a stage that
+    // was approved under an OLDER run_id and never touched again by the latest attempt, which is
+    // real, still-relevant history, not staleness. Each stage keeps only ITS OWN latest run_id's
+    // events instead -- events are oldest-first, so the last write per stage wins.
+    const latestRunIdByStage = new Map<string, string>();
+    for (const e of events) {
+      if (!e.stage) continue;
+      latestRunIdByStage.set(e.stage, e.run_id);
+    }
     const byStage = new Map<
       string,
       { first: number; last: number; cost: number; sawCost: boolean; rejections: number; node: string | undefined }
     >();
     for (const e of events) {
-      if (!e.stage) continue;
+      if (!e.stage || e.run_id !== latestRunIdByStage.get(e.stage)) continue;
       const ts = parseEventTs(e.ts);
       const entry =
         byStage.get(e.stage) ?? { first: ts, last: ts, cost: 0, sawCost: false, rejections: 0, node: undefined };
@@ -453,6 +542,31 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     return timings;
   }, [events, perStage]);
 
+  // What a rewind to `stageKey` actually resets (root-caused 2026-09-13 UX redesign): mirrors
+  // agent/src/graph.py:2515-2542's own rewind-to-stage handling exactly -- every real stage from
+  // `stageKey` onward, plus every REBUILD_PLACEMENTS entry whose `afterStageKey` sits at or after
+  // it (graph.py:2536-2538) -- so the enumerated label list and cost match the real consequence,
+  // not an approximation. `state.stages?.[s.key] == null` filters out PIPELINE_STAGE_ORDER's own
+  // legacy/never-populated tail keys (brownfield-baseline, raw-requirements, and four retired
+  // stage keys the current graph never writes -- see that file's own comment) so the confirm copy
+  // never lists a phantom stage. `rebuildTimings` is keyed by `rebuildKey`, never a real stage key,
+  // so each stage's own trailing placement (if any) must be looked up via REBUILD_PLACEMENTS
+  // explicitly -- a direct `rebuildTimings.get(s.key)` would silently always miss.
+  function stagesResetByRewind(stageKey: string): { labels: string[]; approxCost: number } {
+    const startIdx = stageOrderIndex(stageKey);
+    const labels: string[] = [];
+    let approxCost = 0;
+    for (const s of PIPELINE_STAGE_ORDER) {
+      if (stageOrderIndex(s.key) < startIdx) continue;
+      if (state.stages?.[s.key] == null) continue;
+      labels.push(s.label);
+      approxCost += perStage.get(s.key)?.cost ?? 0;
+      const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === s.key);
+      if (placement) approxCost += rebuildTimings.get(placement.rebuildKey)?.cost ?? 0;
+    }
+    return { labels, approxCost };
+  }
+
   return (
     <ViewContainer>
       {/* No local cost chip here: MetricsBar (AppShell) already mounts its own LiveCostChip as
@@ -482,12 +596,83 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
         </div>
       )}
 
-      {/* Pivot (root-caused 2026-09-12): the old top banner here read live `state.run_failure`
-          (empty for the whole reattach gap) and fired a bare, untargeted `runAgent()` -- no confirm,
-          no stage targeting, no rebuild-sub-state reset, bypassing the "exactly one explicit,
-          stage-anchored action" requirement entirely. Removed: `runActivity.failureType`/
-          `failureMessage` (durable, truncated from the SAME feedback text this used to show live)
-          now render on the boundary row itself, below, alongside the one real restart action. */}
+      {/* Consolidated recovery panel (root-caused 2026-09-13, user-reported: once a real failure
+          existed, every approved stage grew its own black "Restart workflow from this stage"
+          button -- five near-identical CTAs with no indication some were free retries and others
+          were expensive full redos, and no explanation that an already-approved downstream stage
+          gets SKIPPED, not redone (should_skip_draft, agent/src/graph.py:4433-4453), when the
+          graph reaches it again. Replaces every per-row raw-failure-text + button block below (in
+          BOTH the live and durable-fallback rendering branches) with exactly one panel, rendered
+          once here -- above both branches, since isFailedBoundary is computed once, above either
+          of them. Pivot (root-caused 2026-09-12): the old top banner here read live
+          `state.run_failure` and fired a bare, untargeted `runAgent()` -- no confirm, no stage
+          targeting, no rebuild-sub-state reset. This panel is that pivot's proper replacement:
+          the one explicit, stage-anchored action, now explained instead of just targeted. */}
+      {isFailedBoundary && mappedFailureTarget && (
+        <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900">
+          <p className="font-medium">
+            {describeFailure(rawFailureStage, failureTypeText, failureMessageText, boundaryLabel)}
+          </p>
+          {(failureTypeText || failureMessageText) && (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-xs text-red-700">Show technical details</summary>
+              <p className="mt-1 text-xs text-red-700">
+                {failureTypeText}
+                {failureTypeText && failureMessageText ? " — " : ""}
+                {failureMessageText}
+              </p>
+            </details>
+          )}
+
+          <div className="mt-3 flex items-start justify-between gap-3">
+            <p className="text-xs text-red-800">
+              {isCannotVerifyBoundary
+                ? "This only retries the failed check. Any stage already marked Approved above is reused as-is, not redone."
+                : (() => {
+                    const { labels, approxCost } = stagesResetByRewind(mappedFailureTarget);
+                    return buildRedoCopy(boundaryLabel, labels, approxCost);
+                  })()}
+            </p>
+            <button
+              type="button"
+              className="shrink-0 rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40"
+              disabled={restarting}
+              onClick={() => void handleRestart(mappedFailureTarget)}
+            >
+              {restarting ? "Working…" : isCannotVerifyBoundary ? "Retry this check" : `Redo ${boundaryLabel}`}
+            </button>
+          </div>
+
+          {otherApprovedStages.length > 0 && (
+            <details className="mt-3">
+              <summary className="cursor-pointer text-xs font-medium text-red-800">Redo a different stage instead</summary>
+              <ol className="mt-2 flex flex-col gap-2">
+                {otherApprovedStages.map((s) => {
+                  const { labels, approxCost } = stagesResetByRewind(s.key);
+                  return (
+                    <li
+                      key={s.key}
+                      className="flex items-center justify-between gap-3 rounded-md border border-red-200 bg-white px-3 py-2"
+                    >
+                      <span className="text-xs text-red-900">
+                        {s.label} — resets {labels.length} stage{labels.length === 1 ? "" : "s"} (≈${approxCost.toFixed(2)} so far)
+                      </span>
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs font-medium text-neutral-700 disabled:opacity-40"
+                        disabled={restarting}
+                        onClick={() => void handleRestart(s.key)}
+                      >
+                        {restarting ? "Working…" : "Redo from here"}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ol>
+            </details>
+          )}
+        </div>
+      )}
 
       {/* Events flow before stage STATE reaches the client (state streams on run pause/gate), so
           "no stages yet" while events are visibly arriving read as broken -- tell the truth: a run
@@ -564,32 +749,11 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                       {label}
                     </span>
                   </div>
-                  {isBoundary && !finishedWithVerdict && (isFailedBoundary || !running) && (
-                    <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
-                      {isFailedBoundary && (failureTypeText || failureMessageText) && (
-                        <p className="text-xs text-red-700">
-                          {failureTypeText}
-                          {failureTypeText && failureMessageText ? " — " : ""}
-                          {failureMessageText}
-                        </p>
-                      )}
-                      <button
-                        type="button"
-                        className={`ml-auto shrink-0 rounded-md px-3 py-1 text-xs font-medium disabled:opacity-40 ${
-                          isFailedBoundary
-                            ? "bg-neutral-900 text-white"
-                            : "border border-neutral-300 bg-white text-neutral-700"
-                        }`}
-                        disabled={restarting}
-                        onClick={() => void handleRestart(s.key)}
-                      >
-                        {restarting
-                          ? "Working…"
-                          : isFailedBoundary
-                            ? "Restart workflow from this stage"
-                            : "Continue workflow from here"}
-                      </button>
-                    </div>
+                  {/* The failure case is fully handled by the consolidated recovery panel above
+                      now -- this row only ever needs the plain "nothing failed, just continue"
+                      affordance, same shared component the live branch below uses. */}
+                  {isBoundary && !finishedWithVerdict && !isFailedBoundary && !running && !sessionGenuinelyActive && !e2eStuck && (
+                    <ContinueAction restarting={restarting} onClick={() => void handleRestart(s.key)} />
                   )}
                 </li>
               );
@@ -627,33 +791,13 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
               // r_ac_to_tests rebuild failure) even with live per-stage state also available.
               // Never shown while genuinely still running -- nothing to continue then.
               const isBoundaryRow = key === boundaryKey;
-              // User-directed restart target (root-caused 2026-09-13, user-reported: the mapped
-              // boundary can point at a stage the run only cannot_verify'd through, while the
-              // actual defect a rewind should target lives on a DIFFERENT already-reached stage --
-              // e.g. WCAG-contrast/error-handling findings flagged repeatedly during Minimal Code
-              // to Green, approved along with everything after it through Metrics & Exit, while
-              // the durable boundary maps to an unrelated, later-resumed rebuild failure at an
-              // EARLIER stage key). Not index-bounded against boundaryIdx: this run's own
-              // current_stage regressed backward on that later resume, so a plain "must be before
-              // the boundary" check would just exclude the very stages this exists to reach.
-              // `stage.status === "approved"` is the live, trustworthy proof of reachability --
-              // sessions_api.py's rewind-to-stage now accepts it too (falls back to the live
-              // checkpoint's own per-stage status whenever the durable current_stage column
-              // disagrees). Failed-run-only: a merely interrupted (not failed) run has nothing to
-              // "rewind" to, only the single continue-from-here action on its own frontier row.
-              const isEarlierReachableRow = isFailedBoundary && !isBoundaryRow && stage.status === "approved";
-              // "FE must show true live state" (user directive, 2026-09-13): a session-level
-              // active run (runActivity.runActive === true, backed by the real heartbeat/container
-              // check -- see run_activity.is_active) must never show an action button implying the
-              // user needs to do something, even on the frontier row whose OWN draft hasn't
-              // started yet -- the run is already progressing on its own (e.g. still finishing an
-              // earlier rebuild gate). Explicit `=== true` here, not the `!== false` tri-state
-              // pattern `running` uses above: an unknown/not-yet-loaded signal must still let the
-              // button through (never hide a genuinely-needed action on a guess), only a
-              // CONFIRMED-active run suppresses it.
-              const sessionGenuinelyActive = runActivity?.runActive === true;
-              const showAction =
-                !finishedWithVerdict && !sessionGenuinelyActive && ((isBoundaryRow && (isFailedBoundary || !running)) || isEarlierReachableRow);
+              // The failure case (both the boundary row's own action and every other approved
+              // stage's "redo from here" option) is fully handled by the consolidated recovery
+              // panel above now (root-caused 2026-09-13 UX redesign) -- this row only ever needs
+              // the plain "nothing failed, just continue" affordance, on its own frontier row,
+              // same shared component the durable-fallback branch above uses.
+              const showPlainContinue =
+                !finishedWithVerdict && !sessionGenuinelyActive && !e2eStuck && isBoundaryRow && !isFailedBoundary && !running;
               // At most one placement follows any given real stage today (REBUILD_PLACEMENTS has
               // no two entries sharing an afterStageKey) -- find(), not filter().
               const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
@@ -697,35 +841,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                     </span>
                   </div>
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
-                  {showAction && (
-                    <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
-                      {isBoundaryRow && isFailedBoundary && (failureTypeText || failureMessageText) && (
-                        <p className="text-xs text-red-700">
-                          {failureTypeText}
-                          {failureTypeText && failureMessageText ? " — " : ""}
-                          {failureMessageText}
-                        </p>
-                      )}
-                      <button
-                        type="button"
-                        className={`ml-auto shrink-0 rounded-md px-3 py-1 text-xs font-medium disabled:opacity-40 ${
-                          isFailedBoundary
-                            ? "bg-neutral-900 text-white"
-                            : "border border-neutral-300 bg-white text-neutral-700"
-                        }`}
-                        disabled={restarting}
-                        onClick={() => void handleRestart(key)}
-                      >
-                        {restarting
-                          ? "Working…"
-                          : isBoundaryRow && isCannotVerifyBoundary
-                            ? "Retry (no rewind needed)"
-                            : isFailedBoundary
-                              ? "Restart workflow from this stage"
-                              : "Continue workflow from here"}
-                      </button>
-                    </div>
-                  )}
+                  {showPlainContinue && <ContinueAction restarting={restarting} onClick={() => void handleRestart(key)} />}
                   {key === "metrics-exit" && finishedWithVerdict && runActivity?.mergeReady === false && (
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
                       <p className="text-xs text-neutral-500">
