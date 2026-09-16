@@ -52,8 +52,8 @@ flowchart TD
     stage2 -.->|"zero-net-delta: no new/modified/deleted US/AC since the last approval — auto-ends, never reaches the gate"| done
     stage3 -.->|not ready, or rejected with PLAN-only feedback -- unreachable, no reject box| stage3
     stage3 -.->|"rejected via revised Requirements (the only path): restarts at Specification, not Plan's own draft"| stage2
-    stage4 -.->|gate failure, 3 tries| stage4
-    stage5 -.->|gate failure, 3 tries| stage5
+    stage4 -.->|gate failure, 8 tries| stage4
+    stage5 -.->|gate failure, 14 tries| stage5
     stage6 -.->|gate failure, 5 cycles| stage6
     harden -.->|e2e fix loop| harden
     stage7 -.->|gate failure, 6 tries| stage7
@@ -259,7 +259,7 @@ fails open (no readable session log). Every stage's persisted skills evidence al
 |---|---|---|---|
 | brownfield-baseline | — | preflight-baseline, tech-stack-conventions, caveman | first-party, caveman |
 | tech-stack | — | tech-stack-conventions | first-party |
-| specification | brainstorming | spec-sync, grill-me, grill-with-docs; audit: ponytail | superpowers, first-party, mattpocock, ponytail |
+| specification | brainstorming, grill-me | spec-sync, grill-with-docs; audit: ponytail | superpowers, mattpocock, first-party, ponytail |
 | plan | writing-plans | audit: ponytail | superpowers, ponytail |
 | ac-to-tests | test-driven-development | ac-to-tests | superpowers, first-party |
 | minimal-code-to-green | executing-plans, requesting-code-review, verification-before-completion, ponytail, code-review | subagent-driven-development, dispatching-parallel-agents; UI repos: frontend-design + impeccable segments; bug tickets: systematic-debugging + diagnosing-bugs | superpowers, ponytail, CLI built-in, frontend-design, impeccable, mattpocock |
@@ -269,9 +269,13 @@ fails open (no readable session log). Every stage's persisted skills evidence al
 | e2e (node cluster) | — (deterministic lighthouse perf/a11y floors gate the fix loop) | fix laps: systematic-debugging, diagnosing-bugs | lighthouse CLI (baked), superpowers, mattpocock |
 | fix nodes (rebuild / test-hardening) | — | systematic-debugging, diagnosing-bugs | superpowers, mattpocock |
 
-The mattpocock skills (grill-me, grill-with-docs, diagnosing-bugs, improve-codebase-architecture +
-their grilling/domain-modeling/codebase-design support skills) start prompt-encouraged; promotion to
-required is decided from the per-run skills evidence (`invoked`/`unsubstantiated`), not upfront.
+The mattpocock skills start prompt-encouraged; promotion to required is decided from the per-run
+skills evidence (`invoked`/`unsubstantiated`), not upfront. `grill-me` was promoted this way
+(2026-08-31, after a live run shipped a spec with zero Skill calls); `grill-with-docs`,
+`diagnosing-bugs` and `improve-codebase-architecture` remain encouraged-only. `grill-me`'s entire
+SKILL.md body is a redirect to `grilling` -- the skill gate accepts either name as satisfying the
+requirement (agent/src/gates/skill_gate.py's `_SKILL_ALIASES`), since a model that calls `grilling`
+directly still ran the real interview.
 Bug-ticket conditionality comes from the specification stage's `work_kind` classification
 (schemas.Specification), which gates minimal-code-to-green's reproduce-first debugging segment.
 
@@ -488,4 +492,4 @@ After updating the diagram, re-stamp it:
 node .claude/hooks/graph-diagram-check.mjs --stamp
 ```
 
-<!-- graph-source-sha256: 450d474baccc48e3c319c17040a7027df1fd0317dd02627e88aa5fe41abb586a -->
+<!-- graph-source-sha256: 48c993f3b78e5b09abe7d727f70ced941f508f77b15a82e6ead77f08e4b87920 -->

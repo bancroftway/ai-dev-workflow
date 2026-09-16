@@ -1814,6 +1814,8 @@ STAGES: list[StageSpec] = [
         session_options=lambda _state, _role: {
             "disabled_skills": workflow_config.COPILOT_DISABLED_SKILLS_SPECIFICATION
         },
+        # Tuning history/rationale lives on the constant itself (config.py's SPEC_MAX_VERIFY_CYCLES).
+        max_verify_cycles=workflow_config.SPEC_MAX_VERIFY_CYCLES,
     ),
     StageSpec(
         key="plan",
@@ -1851,11 +1853,8 @@ STAGES: list[StageSpec] = [
         session_options=lambda _state, _role: {
             "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
         },
-        # Above the default 3 because this stage's one recurring failure -- not invoking
-        # writing-plans -- is now answered by restarting the draft session (see make_verify_node),
-        # and a restart only helps if there are laps left to spend on it. At 3, the first attempt
-        # plus one reset exhausted the budget before a fresh session got a fair chance.
-        max_verify_cycles=5,
+        # Tuning history/rationale lives on the constant itself (config.py's PLAN_MAX_VERIFY_CYCLES).
+        max_verify_cycles=workflow_config.PLAN_MAX_VERIFY_CYCLES,
     ),
     StageSpec(
         key="ac-to-tests",
@@ -1890,19 +1889,13 @@ STAGES: list[StageSpec] = [
         # audit_rules with a worked draft_example/audit_example -- this stage had the rules half but
         # not the example half, despite being the one AcceptanceCriteriaTestsDraftResponse's own
         # docstring documents a live "dominant failure" history for (observed across 3 consecutive
-        # sessions), and the reason it alone carries max_verify_cycles=6 below.
+        # sessions), and the reason it alone carries an above-default max_verify_cycles below.
         draft_example=AC_TO_TESTS_DRAFT_EXAMPLE,
         audit_example=AC_TO_TESTS_AUDIT_EXAMPLE,
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ac_to_tests_ticket_mode_context,
-        # Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block --
-        # the model returns a fully-detailed coverage_plan claiming it "created failing RED-phase
-        # tests" while making zero write calls (confirmed from its own session log: glob/view/skill
-        # only). The gate catches the fabrication every time and the redraft usually succeeds, so
-        # the cheapest reliability win is simply not running out of retries mid-flake.
-        # Raised again 6 -> 8 (root-caused 2026-09-12): same shared-budget reasoning as
-        # minimal-code-to-green's own identical bump -- make_verify_node's zero-deferral
-        # audit-finding check now also spends laps from this same counter.
-        max_verify_cycles=8,
+        # Tuning history/rationale lives on the constant itself (config.py's
+        # AC_TO_TESTS_MAX_VERIFY_CYCLES).
+        max_verify_cycles=workflow_config.AC_TO_TESTS_MAX_VERIFY_CYCLES,
         # Root cause of the long escalation streak: `builtin:edit` only edits EXISTING files -- a
         # greenfield repo with no test files yet needs `builtin:create`. That alone wasn't the
         # full story: also needed the session's working directory to actually be /workspace/repo
@@ -1974,21 +1967,9 @@ STAGES: list[StageSpec] = [
         # Coverage verification (the deterministic gate) is the real check; the human checkpoints
         # are specification and plan only.
         requires_human_gate=False,
-        # Higher than the default 3: closing a real coverage gap is iterative, and each lap makes
-        # measurable progress (observed live: a genuine app landed at 100% lines / 83.3% branches
-        # and simply ran out of laps before reaching the 95% branch threshold). A stage that is
-        # genuinely stuck still fails -- just after it has actually had a chance to converge.
-        # Raised 6 -> 12 after a vue-dotnet run climbed 88.1% -> 91.9% branches (74/84 -> 79/86)
-        # over six laps and was cut off mid-convergence: the remaining gap was a handful of guard
-        # clauses, and each lap was closing roughly one. Six laps is enough to prove a stage is
-        # moving, not enough to let it finish; a truly stuck stage still burns out, just later.
-        # Raised again 12 -> 14 (root-caused 2026-09-12): make_verify_node's new zero-deferral
-        # audit-finding check now also fails verify whenever this stage's own audit_findings/
-        # known_gaps are non-empty, sharing the SAME verify_cycle_count budget as coverage
-        # convergence -- without headroom, a run needing several coverage laps AND carrying a real
-        # code-review finding would now escalate sooner than before this enforcement existed, as a
-        # side effect rather than a deliberate tightening.
-        max_verify_cycles=14,
+        # Tuning history/rationale lives on the constant itself (config.py's
+        # MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES).
+        max_verify_cycles=workflow_config.MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES,
         # Draft gets full, unscoped write access -- "minimal code to green" is definitionally a
         # code-writing task (Part A Decisions point 6, tier (iii)). Audit stays read-only, same
         # asymmetry as P4's session_options.
@@ -2046,12 +2027,11 @@ STAGES: list[StageSpec] = [
         # draft call afterward for the actual report resubmission (remediation_verify_fix.md is
         # explicit that it does not produce the report itself).
         verify_fix_prompt="remediation_verify_fix",
-        # Raised 3 -> 5 (2026-09-11, observed live): a 19-actionable-finding sweep plus a mid-run
-        # infra-crash-forced restart (no session continuity) left too little headroom to close out
-        # a late-discovered single finding within 3 full-redraft cycles. See verify_fix_prompt
-        # above for the other half of this fix -- a narrow fix pass instead of a full redraft is
-        # what actually makes the extra cycles worth having.
-        max_verify_cycles=5,
+        # Tuning history/rationale lives on the constant itself (config.py's
+        # REMEDIATION_MAX_VERIFY_CYCLES). See verify_fix_prompt above for the other half of that
+        # fix -- a narrow fix pass instead of a full redraft is what actually makes the extra
+        # cycles worth having.
+        max_verify_cycles=workflow_config.REMEDIATION_MAX_VERIFY_CYCLES,
         # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
         # edits source to fix scanner findings. Without them it could only ever describe the work --
         # which is exactly what it did, for every run, until now. builtin:task is what lets the
@@ -2087,13 +2067,9 @@ STAGES: list[StageSpec] = [
         deterministic_verify=adversarial_gate.verify_adversarial_compliance,
         # Task 13b: no audit_rules -- adversarial-compliance has no audit pass of its own.
         draft_rules="\n".join(f"- {r}" for r in adversarial_gate.ADVERSARIAL_COMPLIANCE_HARD_RULES),
-        # 6, not 3: this stage's fix laps carry the whole back-half workload (wireframe
-        # conformance, negative-path e2e specs, frontend unit tests) and each lap is ~8 minutes of
-        # real multi-file work. Observed live (s04 run 6): 3 laps all made measurable progress --
-        # the audit's own findings went from absent panels to "closer now, still not full match" --
-        # and the run was cut off mid-convergence, same failure shape that moved
-        # minimal-code-to-green from 6 to 12.
-        max_verify_cycles=6,
+        # Tuning history/rationale lives on the constant itself (config.py's
+        # ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES).
+        max_verify_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES,
         verify_fix_prompt="adversarial_compliance_fix",
     ),
     StageSpec(
@@ -2123,12 +2099,8 @@ STAGES: list[StageSpec] = [
         deterministic_verify=exit_nodes.verify_exit_readiness,
         # Task 13b: no audit_rules -- metrics-exit has no audit pass of its own.
         draft_rules="\n".join(f"- {r}" for r in exit_nodes.METRICS_EXIT_HARD_RULES),
-        # Was 0, on the (then-true) reasoning that verify_exit_readiness always returns passed=True
-        # so no retry could ever be needed. The skill gate now runs BEFORE deterministic_verify and
-        # CAN fail, which turned any missed skill here into an instant, unrecoverable run failure --
-        # observed live: one `invoked: []` at metrics-exit ended a run that had cleared every other
-        # stage. Any stage with a required skill needs laps to correct it (asserted below).
-        max_verify_cycles=3,
+        # Tuning history/rationale lives on the constant itself (config.py's EXIT_MAX_VERIFY_CYCLES).
+        max_verify_cycles=workflow_config.EXIT_MAX_VERIFY_CYCLES,
         # Every run reaches this stage's approval (requires_human_gate=False, deterministic_verify
         # always returns passed=True) -- this is the only place exit_finalize_node ever runs; it
         # was never add_node'd/wired before this hook existed.

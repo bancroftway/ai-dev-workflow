@@ -45,6 +45,22 @@ logger = logging.getLogger(__name__)
 # NO prefix: the CLI unifies commands into the Skill tool, so they arrive as plain skill names.
 _KNOWN_PREFIXES = ("agent:",)
 
+# A required name whose OWN SKILL.md body is nothing but a redirect to a second skill -- so
+# invoking either one is genuine evidence the methodology ran. `grill-me`'s entire body (mattpocock
+# pack) is the literal instruction "Call the Skill tool with 'grilling'"; a model that recognizes
+# the redirect and calls `grilling` directly did the real interview, it just skipped the pointless
+# first hop. Observed live 2026-09-15: specification stage REDRAFT 1/3 fired solely because
+# `grilling` appeared in the transcript without the literal string `grill-me` -- punishing the
+# model for reaching the substance without the ceremony. Same reasoning _requirement_phrase already
+# applies to "agent:x" (bare vs. plugin-qualified) -- two spellings of one real action.
+_SKILL_ALIASES: dict[str, frozenset[str]] = {
+    "grill-me": frozenset({"grill-me", "grilling"}),
+}
+
+
+def _satisfies(required_name: str, invoked: list[str]) -> bool:
+    return any(name in invoked for name in _SKILL_ALIASES.get(required_name, frozenset({required_name})))
+
 
 def _requirement_phrase(name: str) -> str:
     """How to tell the model to satisfy one required entry, matched to its invocation kind."""
@@ -189,7 +205,7 @@ async def check_required_skills(
             # amplification this union exists to prevent (2026-08-24 audit): one unreadable log
             # would retroactively "un-invoke" everything earlier laps genuinely proved. So a
             # requirement already substantiated stays substantiated; only the rest fails shut.
-            unproven = [skill for skill in required if skill not in invoked]
+            unproven = [skill for skill in required if not _satisfies(skill, invoked)]
             if unproven:
                 logger.error(
                     "skill gate: stage=%s FAILED SHUT -- provider %r should produce a readable "
@@ -220,7 +236,7 @@ async def check_required_skills(
         )
         return SkillCheckOutcome(passed=True, required=required, invoked=invoked, missing=[], verified=False)
 
-    missing = [skill for skill in required if skill not in invoked]
+    missing = [skill for skill in required if not _satisfies(skill, invoked)]
     if missing:
         logger.info("skill gate: stage=%s missing required skills %s (invoked across %s: %s)",
                     stage, missing, list(roles), invoked)
@@ -289,7 +305,7 @@ async def skills_record(
         "invoked": invoked,
         "self_reported": claimed,
         "unsubstantiated": [s for s in claimed if s not in invoked and s not in invoked_bare],
-        "missing": [s for s in required if s not in invoked],
+        "missing": [s for s in required if not _satisfies(s, invoked)],
         # False means NO role produced a readable log. Kept distinct from `missing: []` on purpose:
         # "no evidence" must never read as "enforced".
         "verified": any_readable,
@@ -314,6 +330,12 @@ def _demo() -> None:
     ok = SkillCheckOutcome(passed=True, required=["a"], invoked=["a"], missing=[], verified=True)
     bad = SkillCheckOutcome(passed=False, required=["a", "b"], invoked=["a"], missing=["b"], verified=True)
     assert ok.passed and not bad.passed
+    # grill-me's whole SKILL.md body is a redirect to grilling -- invoking grilling directly must
+    # satisfy a grill-me requirement, not just a literal "grill-me" transcript entry.
+    assert _satisfies("grill-me", ["grilling"])
+    assert _satisfies("grill-me", ["grill-me"])
+    assert not _satisfies("grill-me", ["brainstorming"])
+    assert _satisfies("brainstorming", ["brainstorming"])  # unaliased names still require themselves
     assert "['b']" in feedback_for(bad)
     assert "a" in feedback_for(bad)  # names what WAS invoked, so the model can see the gap
     # Per-kind feedback wording: an agent requirement names the subagent tool, a skill the Skill tool.

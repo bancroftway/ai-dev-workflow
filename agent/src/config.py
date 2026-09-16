@@ -16,6 +16,77 @@ EXIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("EXIT_MAX_CLARIFICATION_CYCLE
 # so this safety cap should rarely if ever trigger.
 TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFICATION_CYCLES", "2"))
 
+# graph.py's StageSpec.max_verify_cycles per stage: the deterministic-gate verify->draft retry
+# budget (independent of the *_MAX_CLARIFICATION_CYCLES pair above, which bounds the LLM's own
+# clarification loop). Deliberately SEVEN SEPARATE constants, not one shared cap: each stage's
+# number was tuned from that stage's own observed failure mode, and a stage bound to an
+# arbitrarily complex human spec needs different headroom than one bounded by a mechanical check
+# (e.g. metrics-exit's deterministic_verify always passes). Sharing one constant would let
+# retuning any single stage silently move every other stage's budget too. Raising one below widens
+# that stage's retry budget (more real spend/wall-clock on a stuck run before it escalates);
+# lowering it escalates sooner on a run that might still have converged with one more lap.
+#
+# Above the default 3 (2026-09-15, observed live: income-investor spec, a genuinely intricate
+# financial domain -- percentile normalization, GA optimization, Sortino ratio). Every lap made
+# real, distinct progress (lap 2 fixed a zero-weight/minimum-holdings contradiction; lap 3 resolved
+# an ambiguous percentile-rescale AC and reconfirmed every earlier fix still held) and the audit's
+# own lap-3 note ("no other gaps found") signals convergence was close -- the run still escalated
+# at 3/3, the same cut-off-mid-convergence shape that moved the other stages below off the
+# default. A stage bound to an arbitrarily complex human spec needs the same headroom they got.
+SPEC_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_SPEC_MAX_VERIFY_CYCLES", "5"))
+
+# Above the default 3 because this stage's one recurring failure -- not invoking writing-plans --
+# is now answered by restarting the draft session (see graph.py's make_verify_node), and a restart
+# only helps if there are laps left to spend on it. At 3, the first attempt plus one reset
+# exhausted the budget before a fresh session got a fair chance.
+PLAN_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_PLAN_MAX_VERIFY_CYCLES", "5"))
+
+# Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block -- the
+# model returns a fully-detailed coverage_plan claiming it "created failing RED-phase tests" while
+# making zero write calls (confirmed from its own session log: glob/view/skill only). The gate
+# catches the fabrication every time and the redraft usually succeeds, so the cheapest reliability
+# win is simply not running out of retries mid-flake. Raised again 6 -> 8 (root-caused
+# 2026-09-12): same shared-budget reasoning as minimal-code-to-green's own identical bump --
+# graph.py's make_verify_node's zero-deferral audit-finding check now also spends laps from this
+# same counter.
+AC_TO_TESTS_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_AC_TO_TESTS_MAX_VERIFY_CYCLES", "8"))
+
+# Higher than the default 3: closing a real coverage gap is iterative, and each lap makes
+# measurable progress (observed live: a genuine app landed at 100% lines / 83.3% branches and
+# simply ran out of laps before reaching the 95% branch threshold). A stage that is genuinely stuck
+# still fails -- just after it has actually had a chance to converge. Raised 6 -> 12 after a
+# vue-dotnet run climbed 88.1% -> 91.9% branches (74/84 -> 79/86) over six laps and was cut off
+# mid-convergence: the remaining gap was a handful of guard clauses, and each lap was closing
+# roughly one. Six laps is enough to prove a stage is moving, not enough to let it finish; a truly
+# stuck stage still burns out, just later. Raised again 12 -> 14 (root-caused 2026-09-12):
+# graph.py's make_verify_node's new zero-deferral audit-finding check now also fails verify
+# whenever this stage's own audit_findings/known_gaps are non-empty, sharing the SAME
+# verify_cycle_count budget as coverage convergence -- without headroom, a run needing several
+# coverage laps AND carrying a real code-review finding would now escalate sooner than before this
+# enforcement existed, as a side effect rather than a deliberate tightening.
+MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES", "14"))
+
+# Raised 3 -> 5 (2026-09-11, observed live): a 19-actionable-finding sweep plus a mid-run
+# infra-crash-forced restart (no session continuity) left too little headroom to close out a
+# late-discovered single finding within 3 full-redraft cycles. Paired with graph.py's
+# verify_fix_prompt="remediation_verify_fix" (a short, targeted fix pass instead of a full redraft)
+# -- that pairing is what actually makes the extra cycles worth having.
+REMEDIATION_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_REMEDIATION_MAX_VERIFY_CYCLES", "5"))
+
+# 6, not the default 3: this stage's fix laps carry the whole back-half workload (wireframe
+# conformance, negative-path e2e specs, frontend unit tests) and each lap is ~8 minutes of real
+# multi-file work. Observed live (s04 run 6): 3 laps all made measurable progress -- the audit's
+# own findings went from absent panels to "closer now, still not full match" -- and the run was cut
+# off mid-convergence, same failure shape that moved minimal-code-to-green from 6 to 12.
+ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES", "6"))
+
+# Was 0, on the (then-true) reasoning that verify_exit_readiness always returns passed=True so no
+# retry could ever be needed. graph.py's skill gate now runs BEFORE deterministic_verify and CAN
+# fail, which turned any missed skill here into an instant, unrecoverable run failure -- observed
+# live: one `invoked: []` at metrics-exit ended a run that had cleared every other stage. Any stage
+# with a required skill needs laps to correct it (asserted by gates/skill_gate.py's own self-check).
+EXIT_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_EXIT_MAX_VERIFY_CYCLES", "3"))
+
 # Root-caused 2026-09-12: caps how many times POST /api/sessions/actions {action: "targeted-fix"}
 # may run its seeded fix pass against one already-closed session (graph.py's intake_node,
 # GraphState.targeted_fix_attempts). Unlike rewind-to-stage, this action never resets a stage, so

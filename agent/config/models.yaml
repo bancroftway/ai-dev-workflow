@@ -59,7 +59,17 @@ specification:
     audit_model: gemini-3.6-flash
   claude:
     draft_model: haiku
-    audit_model: haiku
+    # EXCEPTION to the 2026-09-01 blanket haiku dev override (see file header): restored to
+    # sonnet (2026-09-15) after a live run (income-investor, thread 9f253ae4) needed 3 straight
+    # audit-finding redraft laps to converge on a complex spec -- each lap's haiku audit caught
+    # exactly one more real gap a stronger single-pass review should have caught sooner. haiku
+    # auditing a haiku draft also collapses the "second opinion from a different model" property
+    # the file header itself requires. Same class of fix as ac-to-tests/minimal-code-to-green/
+    # remediation/adversarial-compliance above; restore to haiku only if cost pressure outweighs
+    # this. NOTE: plan's claude.audit_model has the identical silent regression (its own comment
+    # below still argues for sonnet) but was left on haiku per user decision 2026-09-15 -- revisit
+    # if plan shows the same multi-lap grind live.
+    audit_model: sonnet
 plan:
   copilot:
     # gpt-5.4 (not -mini): the plan draft is one large structured reply (steps + inline mermaid +
