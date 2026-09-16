@@ -35,7 +35,6 @@ AC_TO_TESTS_SURFACE_ID = "ac-to-tests"
 MINIMAL_CODE_TO_GREEN_SURFACE_ID = "minimal-code-to-green"
 ADVERSARIAL_AUDIT_SURFACE_ID = "adversarial-audit"
 EXIT_SURFACE_ID = "exit"
-BROWNFIELD_BASELINE_SURFACE_ID = "brownfield-baseline"
 
 
 def _build_generic_envelope(surface_id: str, component_name: str, data_field: str, data: dict, audit_findings: list[str] | None = None) -> dict:
@@ -58,10 +57,6 @@ def build_adversarial_audit_envelope(report: dict, audit_findings: list[str] | N
 
 def build_exit_envelope(report: dict, audit_findings: list[str] | None = None) -> dict:
     return _build_generic_envelope(EXIT_SURFACE_ID, "ExitSurface", "report", report, audit_findings)
-
-
-def build_brownfield_baseline_envelope(baseline: dict, audit_findings: list[str] | None = None) -> dict:
-    return _build_generic_envelope(BROWNFIELD_BASELINE_SURFACE_ID, "BrownfieldBaselineSurface", "baseline", baseline, audit_findings)
 
 
 def build_specification_envelope(specification: dict, audit_findings: list[str] | None = None) -> dict:
@@ -163,7 +158,6 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.a2
         (build_minimal_code_to_green_envelope, "minimal-code-to-green", "MinimalCodeToGreenSurface", "iteration"),
         (build_adversarial_audit_envelope, "adversarial-audit", "AdversarialAuditSurface", "report"),
         (build_exit_envelope, "exit", "ExitSurface", "report"),
-        (build_brownfield_baseline_envelope, "brownfield-baseline", "BrownfieldBaselineSurface", "baseline"),
     ]
     payload = {"k": "v"}
     for build, surface_id, component, field in builders:

@@ -128,16 +128,15 @@ async def invoked_skills(
 _ROLES_CHECKED = ("draft", "audit")
 
 
-# Providers whose sessions leave a transcript this gate can actually read. Claude writes one per
-# session (claude_chat_model.read_skill_invocations); Copilot's counterpart is documented as
-# "currently always None" -- a standing capability gap, not a per-run hiccup. The distinction is
-# what lets an unreadable log fail SHUT where a log was expected, without making every Copilot run
-# unpassable. Add a provider here only once its read_skill_invocations genuinely returns evidence.
-_TRANSCRIPT_VERIFIABLE_PROVIDERS = frozenset({"claude"})
-
-
+# The distinction (Claude readable, Copilot not) is what lets an unreadable log fail SHUT where a
+# log was expected, without making every Copilot run unpassable. Delegates to chat_model.py's
+# shared predicate (file-based-editing plan follow-up: gates/diagram_gate.py's own
+# transcript-verified check -- read_full_file_reads -- needs the identical policy, so this used to
+# be a gate-local copy that could silently drift from the one below; now there is exactly one).
 def _provider_can_verify_transcripts(chat_provider: str) -> bool:
-    return (chat_provider or "").strip().lower() in _TRANSCRIPT_VERIFIABLE_PROVIDERS
+    from ..chat_model import provider_can_verify_transcripts
+
+    return provider_can_verify_transcripts(chat_provider)
 
 
 async def check_required_skills(

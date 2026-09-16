@@ -22,7 +22,7 @@ import logging
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .. import config as workflow_config
 from .. import repo_files, workflow_persistence
@@ -89,6 +89,35 @@ _RUNNER_ARTIFACT_RE = re.compile(r"(^|/)(ac-run-[^/]*\.json$|test-results/|TestR
 
 def _is_pipeline_owned(path: str) -> bool:
     return path.startswith(_PIPELINE_OWNED_PREFIXES) or bool(_RUNNER_ARTIFACT_RE.search(path))
+
+
+# File-based-editing plan, Part 2 sect. 7: plan's own write-scope allowlist. Unlike ac-to-tests
+# (which has no legitimate reason to write anywhere under .ai-dev-workflow/), plan's model now
+# writes real content to its own scratch dir plus the resolved clean output tier (Part 2 sect. 1's
+# second file tier) -- everything else, including plan's own approved/draft snapshots and every
+# other stage's files, stays out of scope.
+def is_plan_scratch_path(path: str) -> bool:
+    return path.startswith((
+        ".ai-dev-workflow/plan/_draft/",
+        ".ai-dev-workflow/plan/diagrams/",
+        ".ai-dev-workflow/plan/wireframes/",
+    ))
+
+
+# Narrower than the default _is_pipeline_owned (ac-to-tests' own predicate): still exempts what
+# the pipeline's own code writes during a plan-stage run (ledger.jsonl, APPROVALS.md, AGENTS.md,
+# plan's own persisted snapshots), but deliberately does NOT blanket-exempt the whole
+# `.ai-dev-workflow/` prefix the way the default does -- that would silently let a plan-stage edit
+# to `.ai-dev-workflow/spec/ledger.json` or the approved specification through unflagged, exactly
+# the risk this write-scope guard exists to close. The specification stage has already finished
+# and committed before plan ever runs, so the pipeline itself has no reason to touch
+# `.ai-dev-workflow/spec/**` (the ledger/sketchpad) or `.ai-dev-workflow/03-specification.*` (the
+# numbered stage files workflow_persistence._stage_file writes -- NOT under spec/, a top-level
+# sibling) during a plan turn -- excluding both from the exemption costs nothing legitimate.
+def is_plan_pipeline_owned(path: str) -> bool:
+    if path.startswith(".ai-dev-workflow/spec/") or path.startswith(".ai-dev-workflow/03-specification"):
+        return False
+    return _is_pipeline_owned(path)
 
 
 # A Playwright end-to-end spec: either it sits in an e2e directory, or it's the playwright config
@@ -252,8 +281,18 @@ class WriteScopeOutcome:
 
 
 async def check_write_scope(
-    provider: SandboxProvider, thread_id: str, baseline_commit: str | None, run_id: str = "unknown"
+    provider: SandboxProvider,
+    thread_id: str,
+    baseline_commit: str | None,
+    run_id: str = "unknown",
+    is_in_scope: Callable[[str], bool] = _is_test_path,
+    is_pipeline_owned: Callable[[str], bool] = _is_pipeline_owned,
 ) -> WriteScopeOutcome:
+    """`is_in_scope`/`is_pipeline_owned` default to ac-to-tests' own predicates (zero behavior
+    change for its existing callers). File-based-editing plan, Part 2 sect. 7: the plan stage
+    passes `is_plan_scratch_path`/`is_plan_pipeline_owned` instead -- same mechanism, a different
+    allowlist, since plan now legitimately writes real content under `.ai-dev-workflow/plan/`
+    where ac-to-tests never writes under `.ai-dev-workflow/` at all."""
     if baseline_commit is None:
         # No baseline captured (e.g. this draft never actually ran against a sandbox) -- nothing
         # to diff against, so nothing to flag. StageSpec.capture_baseline_commit guarantees this
@@ -271,7 +310,7 @@ async def check_write_scope(
         f"git diff --name-only {baseline_commit} -- . && git ls-files --others --exclude-standard",
     )
     changed_paths = sorted({line.strip() for line in (result.stdout or "").splitlines() if line.strip()})
-    violating = [p for p in changed_paths if not _is_test_path(p) and not _is_pipeline_owned(p)]
+    violating = [p for p in changed_paths if not is_in_scope(p) and not is_pipeline_owned(p)]
     if violating:
         # Retirement carve-out: deleting a test file for a RETIRED criterion is exactly what the
         # residue check demands, but on a stack _ALL_PATTERNS doesn't recognize (Go, Rust, Java
@@ -633,6 +672,27 @@ def _demo() -> None:
     # just makes that fact a standing check instead of a one-time reading of the source.
     assert _is_test_path("apps/api.Tests/TaskTests.cs")  # true whether this path was added, edited, or deleted
     assert not _is_test_path("apps/api/Startup.cs")  # same regardless of operation -- always reverted if changed
+
+    # File-based-editing plan, Part 2 sect. 7: plan's own scope/pipeline-owned predicates.
+    assert is_plan_scratch_path(".ai-dev-workflow/plan/_draft/steps.json")
+    assert is_plan_scratch_path(".ai-dev-workflow/plan/_draft/diagrams/x.mmd")
+    assert is_plan_scratch_path(".ai-dev-workflow/plan/diagrams/x.mmd")
+    assert is_plan_scratch_path(".ai-dev-workflow/plan/wireframes/login.html")
+    assert not is_plan_scratch_path(".ai-dev-workflow/spec/ledger.json"), "plan has no business writing the spec ledger"
+    assert not is_plan_scratch_path(".ai-dev-workflow/04-plan.approved.json"), "not under plan's own scratch/output tier"
+    assert not is_plan_scratch_path("apps/api/Startup.cs")
+
+    # The narrower pipeline-owned predicate must NOT exempt .ai-dev-workflow/spec/** (the exact gap
+    # this guard closes) while still exempting everything the default one does.
+    assert not is_plan_pipeline_owned(".ai-dev-workflow/spec/ledger.json")
+    assert not is_plan_pipeline_owned(".ai-dev-workflow/03-specification.approved.json")
+    assert is_plan_pipeline_owned(".ai-dev-workflow/ledger.jsonl")
+    assert is_plan_pipeline_owned("APPROVALS.md")
+    assert _is_pipeline_owned(".ai-dev-workflow/spec/ledger.json"), (
+        "the DEFAULT predicate (ac-to-tests' own) still blanket-exempts .ai-dev-workflow/ -- only "
+        "plan's narrower predicate must reject it, confirming the two are genuinely different, not "
+        "accidentally identical"
+    )
 
     # AC_TO_TESTS_HARD_RULES: one line per real rejection branch in verify_ac_to_tests -- write-scope,
     # ledger-integrity, retired-residue, deferred-residue, completed-AC protection, no-files-written,

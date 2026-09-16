@@ -437,6 +437,19 @@ async def close_session(thread_id: str, stage: str, role: str, *, provider: str)
     await _provider_module(provider).close_session(thread_id, stage, role)
 
 
+# Providers whose sessions leave a transcript read_skill_invocations/read_full_file_reads can
+# actually read. Claude writes one per session; Copilot's counterparts are documented as
+# "currently always None" -- a standing capability gap, not a per-run hiccup. Shared here (not
+# duplicated per gate) so every transcript-verified check agrees on which providers can prove
+# anything at all -- gates/skill_gate.py's own _provider_can_verify_transcripts now delegates to
+# this rather than keeping an independent copy that could silently drift from it.
+_TRANSCRIPT_VERIFIABLE_PROVIDERS = frozenset({"claude"})
+
+
+def provider_can_verify_transcripts(chat_provider: str) -> bool:
+    return (chat_provider or "").strip().lower() in _TRANSCRIPT_VERIFIABLE_PROVIDERS
+
+
 def get_session_id(thread_id: str, stage: str, role: str, *, provider: str) -> str | None:
     """The session id backing one (thread, stage, role), or None if none was created yet -- lets a
     gate (gates/skill_gate.py) verify what a stage's session actually did, rather than trusting the
@@ -482,6 +495,26 @@ async def read_skill_invocations(
     return await _provider_module(active_provider).read_skill_invocations(provider, thread_id, session_id)
 
 
+async def read_full_file_reads(
+    provider: SandboxProvider,
+    thread_id: str,
+    session_id: str,
+    file_path: str,
+    total_lines: int,
+    *,
+    active_provider: str,
+) -> bool | None:
+    """Whether a session's own transcript proves it read `file_path` in full, or None if
+    unverifiable -- see each provider module's own docstring for its fail-open contract, same
+    dispatch shape as read_skill_invocations above (`provider` is the pre-existing SandboxProvider
+    connection object; `active_provider` is this module's own "claude"/"copilot" string, required,
+    keyword-only, no default -- Ruling 4).
+    """
+    return await _provider_module(active_provider).read_full_file_reads(
+        provider, thread_id, session_id, file_path, total_lines
+    )
+
+
 def secret_env_names(*, provider: str) -> set[str]:
     """Provider-specific env var names -- see each provider module's own docstring, since despite
     the shared name this means two DIFFERENT things per provider (Claude: what the sandbox must
@@ -508,6 +541,8 @@ __all__ = [
     "get_session_id",
     "get_resume_state",
     "read_skill_invocations",
+    "read_full_file_reads",
+    "provider_can_verify_transcripts",
     "secret_env_names",
     "ainvoke_structured",
 ]
@@ -677,6 +712,44 @@ def _demo() -> None:
             "code-review",
             "agent:code-simplifier",
         ], "claude_chat_model.read_skill_invocations should have parsed all three invocation shapes"
+
+        # read_full_file_reads (async): same dispatch shape -- Copilot always None, Claude parses a
+        # fake sandbox's transcript for real Read tool_use calls against the target file.
+        class _FakeReadResult:
+            ok = True
+            stdout = (
+                '{"type": "assistant", "message": {"content": ['
+                '{"type": "tool_use", "name": "Read", '
+                '"input": {"file_path": "/workspace/repo/.ai-dev-workflow/spec/draft-specification.json"}}'
+                "]}}\n"
+            )
+            stderr = ""
+
+        class _FakeReadProvider:
+            async def exec_in_sandbox(self, thread_id: str, command: str):
+                return _FakeReadResult()
+
+        fake_read_provider = _FakeReadProvider()
+        assert asyncio.run(
+            read_full_file_reads(
+                fake_read_provider, thread_id, "sess-1",
+                ".ai-dev-workflow/spec/draft-specification.json", 500,
+                active_provider="copilot",
+            )
+        ) is None
+        assert asyncio.run(
+            read_full_file_reads(
+                fake_read_provider, thread_id, "sess-1",
+                ".ai-dev-workflow/spec/draft-specification.json", 500,
+                active_provider="claude",
+            )
+        ) is True, "a single unparameterized Read covering a 500-line file should register as fully read"
+
+        # provider_can_verify_transcripts: the shared predicate gates/skill_gate.py's own
+        # (formerly gate-local, now-delegating) copy and gates/diagram_gate.py both rely on.
+        assert provider_can_verify_transcripts("claude") is True
+        assert provider_can_verify_transcripts("copilot") is False
+        assert provider_can_verify_transcripts("") is False
 
         # forget_thread_sessions_everywhere (sync): the teardown-only eighth function, deliberately
         # NOT one of the 7 that take a `provider` argument -- it has none, by design (module

@@ -29,7 +29,8 @@ Stage = Literal[
     "remediation",
     "adversarial-compliance",
     "metrics-exit",
-    "brownfield-baseline",
+    "brownfield-spec",
+    "brownfield-plan",
     "rebuild",
     "e2e",
     "e2e-run",
@@ -100,14 +101,15 @@ def _demo() -> None:
     """
     # "specification" has an explicit audit_model on both providers -- values must resolve
     # correctly AND differ per provider, or a stage would silently run the wrong vendor's model.
-    # Claude's draft/audit values are EQUAL right now (TEMPORARY DEV OVERRIDE, models.yaml header,
-    # 2026-09-01: every claude: block forced to haiku) -- the "audit differs from draft" property
-    # models.yaml's own header comment normally requires is genuinely suspended on this provider
-    # until that override is reverted, not a bug in this lookup.
+    # Claude's draft/audit values are EQUAL right now, but not because of the 2026-09-01 blanket
+    # dev override -- both legs were explicitly restored to sonnet (2026-09-15 user decision, see
+    # models.yaml's own comment) after a live run needed 3 straight audit-finding redraft laps to
+    # converge on a complex spec under haiku. The "audit differs from draft" property models.yaml's
+    # header normally requires is a deliberate exception here, not a bug in this lookup.
     assert get_model_name("specification", "draft", "copilot") == "gpt-5.4-mini"
-    assert get_model_name("specification", "draft", "claude") == "haiku"
+    assert get_model_name("specification", "draft", "claude") == "sonnet"
     assert get_model_name("specification", "audit", "copilot") == "gemini-3.6-flash"
-    assert get_model_name("specification", "audit", "claude") == "haiku"
+    assert get_model_name("specification", "audit", "claude") == "sonnet"
 
     # "ac-to-tests" joined the audited stages 2026-08-24 -- same shape as "specification" above.
     # Claude audit was opus (2026-08-24 user default), downshifted to sonnet by the 2026-08-26

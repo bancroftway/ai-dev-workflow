@@ -176,6 +176,17 @@ already specified in detail. This also lets adversarial-compliance (which checks
 against these same wireframes later) find fewer real divergences, since your suite is what will
 have caught a missing element first.
 
+**If the AC touches persisted data (create/read/update/delete, relationships, cascading
+behavior), check the ER diagram, if one exists, for the actual modeled shape before asserting on
+it.** Its Mermaid source lives at `.ai-dev-workflow/plan/diagrams/<name>.mmd` -- the diagram is
+authoritative over guessing a schema shape from the AC text alone. No ER diagram means nothing to
+check here.
+
+**If the approved Specification names this AC in `bug_affected_ac_ids`, the RED test must
+specifically reproduce the reported failure mode**, not just a generic AC-satisfaction test -- read
+the Raw Requirements Text for what was actually reported broken and write a test that pins THAT
+failure (the difference between "assert the AC" and "pin the actual bug that was reported").
+
 Besides that proving (happy-path) test, for every AC write further tests where meaningful, each
 following the same AC-id-in-test-name rule above unchanged: negative tests covering invalid input,
 unauthorized/forbidden access, and wrong state, asserting the SPECIFIC rejection/error behavior

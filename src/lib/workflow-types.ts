@@ -413,7 +413,14 @@ export interface WorkflowState {
   // actually entered. See redGatePhase's own docstring for the one placement the UI reads today.
   rebuild?: Record<string, RebuildState>;
   stages?: {
+    // File-based-editing plan, Part 6 (true brownfield/greenfield convergence): the one-time
+    // baseline pass is now two real StageSpecs (spec, then plan) using the identical
+    // Specification/ImplementationPlan schemas and SpecificationSurface/PlanSurface components a
+    // real ticket gets -- not its own bespoke "brownfield-baseline" key/surface. Never populated
+    // by the current graph; kept only so an old completed session's stored data still resolves.
     "brownfield-baseline"?: StageState;
+    "brownfield-spec"?: StageState;
+    "brownfield-plan"?: StageState;
     "tech-stack"?: StageState;
     "raw-requirements"?: StageState;
     specification?: StageState;
@@ -443,7 +450,8 @@ export type StageKey = keyof NonNullable<WorkflowState["stages"]>;
 // intentionally absent here -- the Session Overview panel reads state.stages dynamically, so their
 // absence from this static list doesn't hide them from that panel, only from this ordered lookup.
 export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
-  { key: "brownfield-baseline", label: "Preflight Baseline" },
+  { key: "brownfield-spec", label: "Baseline Specification" },
+  { key: "brownfield-plan", label: "Baseline Plan" },
   { key: "tech-stack", label: "Tech Stack" },
   // No gate of its own (TAB_STAGE_GROUPS' own comment: "recorded as-is... no gate ever surfaces"),
   // but it's a real StageState entry in `state.stages` -- added so SessionOverview's friendly-label

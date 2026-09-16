@@ -174,6 +174,14 @@ DIAGRAM_ERROR_SUMMARY_TAIL_CHARS = int(os.environ.get("AIDW_DIAGRAM_ERROR_SUMMAR
 DIAGRAM_MAX_WIREFRAMES = int(os.environ.get("AIDW_DIAGRAM_MAX_WIREFRAMES", "6"))
 DIAGRAM_MAX_WIREFRAME_BYTES = int(os.environ.get("AIDW_DIAGRAM_MAX_WIREFRAME_BYTES", str(30 * 1024)))
 
+# claude_chat_model.py's read_full_file_reads: the Claude CLI's own Read tool default read window
+# (line count returned when a call carries no explicit `limit`), used to compute the covered line
+# range of an unparameterized Read call when proving a session read a whole file. Matches the CLI's
+# documented default of up to 2000 lines -- raise this only if that CLI default itself changes;
+# setting it too low would make a genuine full-file single read register as incomplete and reject a
+# stage that actually did the work, too high would let a partial read pass as complete.
+READ_TOOL_DEFAULT_WINDOW_LINES = int(os.environ.get("AIDW_READ_TOOL_DEFAULT_WINDOW_LINES", "2000"))
+
 # gates/test_coverage_gate.py's _replay_coverage_contract: one coverage-command's raw stdout/
 # stderr, captured before it's joined into failure_detail below. Read by _run_coverage_via_ghcp's
 # next discovery attempt. 750/750 (1500 total) matches the pre-existing tail-only budget; shape
@@ -442,6 +450,15 @@ SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS = int(
     os.environ.get("AIDW_SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS", "600")
 )
 
+# run_activity.py's per-thread event fan-out: how many published graph events one attached
+# subscriber (a browser tab's SSE connection, via main.py's _ReattachStateAgent.run) may have
+# queued before the oldest queued event is dropped to make room for the newest. Read by
+# run_activity.publish. Raising this lets a briefly slow/backgrounded tab fall further behind
+# before losing early events (more memory held per stalled subscriber); lowering it drops events
+# sooner under load. Never blocks or stalls the background graph task itself either way -- only
+# a stalled subscriber's own view of the stream is affected.
+RUN_SUBSCRIBER_QUEUE_MAXSIZE = int(os.environ.get("AIDW_RUN_SUBSCRIBER_QUEUE_MAXSIZE", "500"))
+
 # In-container path the sandbox image bakes the Agent Plugin content to (agent/sandbox-image/
 # Dockerfile's COPY plugins/ -> this path). Overridable for local spikes without a code change.
 COPILOT_PLUGIN_ROOT_IN_CONTAINER = os.environ.get(
@@ -504,6 +521,14 @@ REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
     # the gate is what closes the prompt-says/agent-skips gap.
     "specification": ["brainstorming", "grill-me"],
     "plan": ["writing-plans"],
+    # File-based-editing plan, Part 6 (true brownfield/greenfield convergence): both passes reuse
+    # specification_draft.md/plan_draft.md verbatim, so they carry the identical mandatory-skill
+    # instructions those prompts already give -- without an entry here, the gate would silently NOT
+    # enforce a claim the reused prompt text itself makes ("a deterministic gate REJECTS... if
+    # either Skill-tool call is missing"), the exact prompt-says/gate-checks gap this dict exists
+    # to close everywhere else.
+    "brownfield-spec": ["brainstorming", "grill-me"],
+    "brownfield-plan": ["writing-plans"],
     "ac-to-tests": ["test-driven-development"],
     # ponytail: minimal_code_to_green_draft.md has mandated it for as long as the prompt existed --
     # requiring it here just closes the prompt-says/gate-checks gap the skill gate exists for.

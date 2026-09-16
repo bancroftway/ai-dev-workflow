@@ -18,21 +18,33 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import json
 
-from .. import config, git_ops, repo_files, spec_ledger, workflow_persistence
+from .. import chat_model, config, git_ops, repo_files, spec_ledger, workflow_persistence
 from ..failure_classification import classify_failure
 from ..sandbox.provider import SandboxProvider
 from ..schemas import presence_values as _presence_values
 from ..text_truncate import truncate_middle
+from . import write_scope_gate
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
 DIAGRAMS_DIR = ".ai-dev-workflow/plan/diagrams"
 WIREFRAMES_DIR = ".ai-dev-workflow/plan/wireframes"
+
+# File-based-editing plan, Part 2 sect. 1: the model's own scratch sandbox, edited directly with
+# real file tools across draft/audit laps -- mirrors Part 1's DRAFT_SPEC_PATH sketchpad, one level
+# up (a directory of files, since plan's content -- steps + a manifest + raw wireframe/diagram
+# sources -- doesn't fit one JSON file the way specification's does without re-introducing the
+# same up-to-180KB-of-escaped-HTML corruption risk this design exists to avoid).
+DRAFT_DIR = ".ai-dev-workflow/plan/_draft"
+DRAFT_STEPS_PATH = f"{DRAFT_DIR}/steps.json"
+DRAFT_MANIFEST_PATH = f"{DRAFT_DIR}/manifest.json"
+DRAFT_WIREFRAMES_DIR = f"{DRAFT_DIR}/wireframes"
+DRAFT_DIAGRAMS_DIR = f"{DRAFT_DIR}/diagrams"
 
 
 def wireframe_preview_url(owner: str, repo: str, branch: str, screen: str) -> str:
@@ -131,6 +143,131 @@ def check_ui_wireframe_coverage(ui_related_ac_ids: set[str], wireframes: list[di
         "is wrong for this criterion)"
         for ac_id in sorted(ui_related_ac_ids - covered)
     ]
+
+
+def check_dangling_visual_retirement(
+    wireframe_refs: list[dict[str, Any]],
+    diagram_refs: list[dict[str, Any]],
+    ledger_entries: list[dict[str, Any]],
+    retired_wireframe_screens: set[str],
+    retired_diagram_names: set[str],
+) -> list[str]:
+    """File-based-editing plan, Part 2 sect. 6 (gap found and closed, user-raised): a wireframe or
+    `user_flow` diagram whose every cited AC is now retired is a deleted feature's leftover and
+    must be named in retired_wireframe_screens/retired_diagram_names -- mirrors
+    check_plan_linkage's own removal side for plan steps ("a step whose every criterion this
+    Specification retires is a deleted feature's leftover and must be dropped"), applied to visual
+    artifacts instead. A wireframe/diagram with a live citation, or with NO citations at all
+    (caught separately by check_wireframe_has_ac_ids), is never flagged here. `er`/`architecture`
+    diagrams are exempt -- whole-system views, not retired this way (schemas.ImplementationPlan's
+    own retired_diagram_names docstring). Pure.
+    """
+    retired_ac_ids = {
+        e["id"] for e in ledger_entries if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
+    }
+    problems: list[str] = []
+    for wf in wireframe_refs:
+        ac_ids = wf.get("ac_ids") or []
+        if ac_ids and all(i in retired_ac_ids for i in ac_ids) and wf.get("screen") not in retired_wireframe_screens:
+            problems.append(
+                f"wireframe {wf.get('screen')!r} cites only retired criteria ({', '.join(ac_ids)}) -- "
+                "name it in retired_wireframe_screens or fix its citations"
+            )
+    for d in diagram_refs:
+        if d.get("kind") != "user_flow":
+            continue
+        ac_ids = d.get("ac_ids") or []
+        if ac_ids and all(i in retired_ac_ids for i in ac_ids) and d.get("name") not in retired_diagram_names:
+            problems.append(
+                f"diagram {d.get('name')!r} cites only retired criteria ({', '.join(ac_ids)}) -- "
+                "name it in retired_diagram_names or fix its citations"
+            )
+    return problems
+
+
+def _spec_changed_this_run(ledger_entries: list[dict[str, Any]], run_id: str) -> bool:
+    """File-based-editing plan, Part 2 sect. 6: did THIS run genuinely change the spec (US/AC
+    content), scoped to `EntryKind in ("user_story", "acceptance_criterion")` specifically --
+    explicitly excludes `plan_step` entries (both kinds share one ledger file, Part 2 sect. 5) so a
+    plan-only revision with no AC wording change never counts as "the spec changed" and force a
+    diagram review that has nothing to do with it. Pure."""
+    return any(
+        e.get("kind") in ("user_story", "acceptance_criterion")
+        and (e.get("first_seen_run_id") == run_id or e.get("last_revised_run_id") == run_id)
+        for e in ledger_entries
+    )
+
+
+def _reopened_or_changed_ac_ids(ledger_entries: list[dict[str, Any]], run_id: str, bug_affected_ac_ids: set[str]) -> set[str]:
+    """AC ids this run either genuinely changed (first-seen/last-revised this run_id) or reopened
+    via bug_affected_ac_ids (wording unchanged, §Part5's 'reopened' case) -- the citation-scoped
+    trigger set for wireframe/user_flow-diagram stale-review enforcement below."""
+    changed = {
+        e["id"]
+        for e in ledger_entries
+        if e.get("kind") == "acceptance_criterion"
+        and (e.get("first_seen_run_id") == run_id or e.get("last_revised_run_id") == run_id)
+    }
+    return changed | bug_affected_ac_ids
+
+
+def check_stale_visual_review(
+    diagram_refs: list[dict[str, Any]],
+    wireframe_refs: list[dict[str, Any]],
+    prior_diagram_names: set[str],
+    prior_wireframe_screens: set[str],
+    ledger_entries: list[dict[str, Any]],
+    run_id: str,
+    bug_affected_ac_ids: set[str],
+    diagrams_reviewed: list[dict[str, Any]],
+    wireframes_reviewed: list[dict[str, Any]],
+) -> list[str]:
+    """File-based-editing plan, Part 2 sect. 6 (user decision 2026-09-16: full parity, no visual
+    artifact may go stale silently) -- two trigger shapes, matched to what each kind has to scope
+    by:
+
+    - `er`/`architecture` (no ac_ids, whole-system view): BLANKET trigger -- if the spec changed
+      at all this run, every one must appear in `diagrams_reviewed`. Justified by count (typically
+      one or two per project).
+    - `user_flow` diagrams and wireframes (both ac_ids-scoped): PER-ITEM trigger -- only a
+      PRE-EXISTING item (already in the prior approved manifest; a brand-new one is exempt, its
+      existence already proves it isn't stale) whose own cited ac_ids include one this run changed
+      or bug-reopened must appear in `{diagrams,wireframes}_reviewed`. Scales to many items, unlike
+      the blanket rule.
+
+    Pure -- the mechanical `mermaid_source`/html diff-on-"revised" verification is a separate
+    check (verify_plan_diagrams itself, which has the file content to diff).
+    """
+    reviewed_diagram_names = {r.get("name") for r in diagrams_reviewed}
+    reviewed_wireframe_screens = {r.get("screen") for r in wireframes_reviewed}
+    problems: list[str] = []
+
+    if _spec_changed_this_run(ledger_entries, run_id):
+        for d in diagram_refs:
+            if d.get("kind") in ("er", "architecture") and d.get("name") not in reviewed_diagram_names:
+                problems.append(
+                    f"diagram {d.get('name')!r} was not reviewed even though the specification "
+                    "changed this ticket -- confirm it's still accurate or revise it"
+                )
+
+    trigger_ac_ids = _reopened_or_changed_ac_ids(ledger_entries, run_id, bug_affected_ac_ids)
+    for d in diagram_refs:
+        if d.get("kind") != "user_flow" or d.get("name") not in prior_diagram_names:
+            continue
+        if set(d.get("ac_ids") or []) & trigger_ac_ids and d.get("name") not in reviewed_diagram_names:
+            problems.append(
+                f"diagram {d.get('name')!r} cites a criterion that changed this run but was not "
+                "reviewed -- confirm it's still accurate or revise it"
+            )
+    for wf in wireframe_refs:
+        if wf.get("screen") not in prior_wireframe_screens:
+            continue
+        if set(wf.get("ac_ids") or []) & trigger_ac_ids and wf.get("screen") not in reviewed_wireframe_screens:
+            problems.append(
+                f"wireframe {wf.get('screen')!r} cites a criterion that changed this run but was "
+                "not reviewed -- confirm it's still accurate or revise it"
+            )
+    return problems
 
 
 def check_plan_linkage(
@@ -519,6 +656,84 @@ def _demo() -> None:
     # (see the constant's own comment for the count breakdown).
     assert len(PLAN_HARD_RULES) == 20, len(PLAN_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in PLAN_HARD_RULES)
+
+    # --- File-based-editing plan, Part 2 sect. 6: check_dangling_visual_retirement ---
+    retirement_ledger = [
+        {"id": "US-0006.1", "kind": "acceptance_criterion", "status": "retired"},
+        {"id": "US-0006.2", "kind": "acceptance_criterion", "status": "active"},
+    ]
+    # A wireframe citing ONLY retired criteria and not named retired -- flagged.
+    assert any(
+        "task-list" in p
+        for p in check_dangling_visual_retirement(
+            [{"screen": "task-list", "ac_ids": ["US-0006.1"]}], [], retirement_ledger, set(), set()
+        )
+    )
+    # Same, but already named in retired_wireframe_screens -- not flagged.
+    assert check_dangling_visual_retirement(
+        [{"screen": "task-list", "ac_ids": ["US-0006.1"]}], [], retirement_ledger, {"task-list"}, set()
+    ) == []
+    # A live citation alongside a retired one is fine -- not flagged.
+    assert check_dangling_visual_retirement(
+        [{"screen": "task-list", "ac_ids": ["US-0006.1", "US-0006.2"]}], [], retirement_ledger, set(), set()
+    ) == []
+    # user_flow diagrams get the identical treatment; er/architecture never do (whole-system views).
+    assert any(
+        "old-flow" in p
+        for p in check_dangling_visual_retirement(
+            [], [{"name": "old-flow", "kind": "user_flow", "ac_ids": ["US-0006.1"]}], retirement_ledger, set(), set()
+        )
+    )
+    assert check_dangling_visual_retirement(
+        [], [{"name": "system-er", "kind": "er", "ac_ids": []}], retirement_ledger, set(), set()
+    ) == [], "er/architecture diagrams are never retired this way"
+
+    # --- check_stale_visual_review ---
+    changed_ledger = [
+        {"id": "US-0007.1", "kind": "acceptance_criterion", "status": "revised", "last_revised_run_id": "r9", "first_seen_run_id": "r1"},
+        {"id": "US-0007.2", "kind": "acceptance_criterion", "status": "active", "first_seen_run_id": "r1", "last_revised_run_id": "r1"},
+    ]
+    # er/architecture blanket trigger: spec changed this run, diagram not in diagrams_reviewed -> flagged.
+    assert any(
+        "system-er" in p
+        for p in check_stale_visual_review(
+            [{"name": "system-er", "kind": "er", "ac_ids": []}], [], {"system-er"}, set(),
+            changed_ledger, "r9", set(), [], [],
+        )
+    )
+    # Confirmed current satisfies it.
+    assert check_stale_visual_review(
+        [{"name": "system-er", "kind": "er", "ac_ids": []}], [], {"system-er"}, set(),
+        changed_ledger, "r9", set(),
+        [{"name": "system-er", "action": "confirmed_current", "reason": "still accurate"}], [],
+    ) == []
+    # user_flow/wireframe per-item trigger: only a PRE-EXISTING item whose own cited AC changed is
+    # demanded -- a brand-new one (not in the prior set) is exempt, and an untouched AC's item is
+    # never demanded even though the spec changed elsewhere this run.
+    assert check_stale_visual_review(
+        [{"name": "brand-new-flow", "kind": "user_flow", "ac_ids": ["US-0007.1"]}], [], set(), set(),
+        changed_ledger, "r9", set(), [], [],
+    ) == [], "a diagram created THIS run is exempt -- its existence already proves it isn't stale"
+    assert check_stale_visual_review(
+        [], [{"screen": "untouched", "ac_ids": ["US-0007.2"]}], set(), {"untouched"},
+        changed_ledger, "r9", set(), [], [],
+    ) == [], "a wireframe whose own cited AC did not change this run is never demanded"
+    assert any(
+        "affected-flow" in p
+        for p in check_stale_visual_review(
+            [{"name": "affected-flow", "kind": "user_flow", "ac_ids": ["US-0007.1"]}], [], {"affected-flow"}, set(),
+            changed_ledger, "r9", set(), [], [],
+        )
+    )
+    # A bug-reopened (wording unchanged) AC also triggers the per-item wireframe/user_flow check.
+    assert any(
+        "reopened-screen" in p
+        for p in check_stale_visual_review(
+            [], [{"screen": "reopened-screen", "ac_ids": ["US-0007.2"]}], set(), {"reopened-screen"},
+            changed_ledger, "r9", {"US-0007.2"}, [], [],
+        )
+    )
+
     print("diagram_gate wireframe self-check: all assertions passed")
 
 
@@ -581,180 +796,520 @@ PLAN_HARD_RULES: tuple[str, ...] = (
 )
 
 
-async def verify_plan_diagrams(
-    thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
-    _chat_provider: str,
-) -> "VerificationResult":
-    # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: rendering a
-    # mermaid diagram has no chat-model dispatch call of its own.
-    from ..graph import VerificationResult  # local import: graph.py imports this module
+async def _load_and_sync_plan_steps(
+    provider: SandboxProvider,
+    thread_id: str,
+    run_id: str,
+    stage_key: str,
+    chat_provider: str,
+    has_audit_role: bool,
+) -> tuple[list[dict[str, Any]] | None, list[str], list[dict[str, Any]]]:
+    """File-based-editing plan, Part 2 sect. 5/6: reads _draft/steps.json, validates each entry
+    against schemas.PlanStep, computes `fully_reviewed` (Part 3's review-depth safety net,
+    targeting the AUDIT session for `stage_key` -- `has_audit_role=False` skips this entirely, the
+    audit-role carve-out a stage with no audit pass, e.g. a brownfield baseline pass, needs so it
+    can ever pass verify at all), and calls sync_plan_ledger. Persists the ledger and writes the
+    ledger-resolved content back to steps.json on success (mirrors Part 1's identical write-back
+    for draft-specification.json).
 
-    if not content_dict:
-        # Reachable via the clarification-cycle safety cap: auto_approve_node promotes whatever
-        # the last draft attempt produced straight to "approved" content, and a draft that never
-        # got past a (headless-disallowed) clarifying-question response can leave that empty/None.
-        # A crash here would kill the whole run; report it through the normal retry/escalate path
-        # instead, same as any other failed verification.
-        return VerificationResult(
-            passed=False,
-            feedback="Plan content is empty -- the draft never produced a real plan (safety-cap auto-approve after repeated clarification attempts). Draft a complete plan with no clarifying questions.",
-            report={"plan_content": "empty"},
-        )
+    Returns (resolved_plan_steps_or_None-on-failure, problems, ledger_entries) -- ledger_entries is
+    always returned, even on failure, so the caller's later checks (stale-review's spec-changed
+    delta) can still compute against it.
+    """
+    from ..schemas import PlanStep
 
-    # Provenance first: pure checks against the ledger, cheaper than any render, and a plan whose
-    # steps aren't linked to this ticket's criteria is wrong regardless of its diagrams. The spec
-    # read falls back to an empty own-set (coverage direction skipped) the same way
-    # ac_coverage_gate's identical read does -- an infra hiccup must not manufacture a false gap.
+    raw = await repo_files.read_repo_file(provider, thread_id, DRAFT_STEPS_PATH)
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
-    own_ac_ids: set[str] = set()
-    spec_doc: dict[str, Any] = {}
-    raw_spec = await repo_files.read_repo_file(
-        provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
-    )
-    if raw_spec is not None:
+    if raw is None:
+        return None, [
+            f"{DRAFT_STEPS_PATH} does not exist -- create it with your file tools, shaped "
+            '{"plan_steps": [...], "retired_step_ids": [...]}.'
+        ], ledger_entries
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, [f"{DRAFT_STEPS_PATH} is not valid JSON: {exc}. Fix it and resubmit."], ledger_entries
+    if not isinstance(doc, dict):
+        return None, [f"{DRAFT_STEPS_PATH} must be a JSON object with 'plan_steps'/'retired_step_ids' keys."], ledger_entries
+
+    raw_steps = doc.get("plan_steps")
+    retired_step_ids = doc.get("retired_step_ids") or []
+    if not isinstance(raw_steps, list):
+        return None, [f"{DRAFT_STEPS_PATH}'s 'plan_steps' must be a list."], ledger_entries
+    validated: list[dict[str, Any]] = []
+    for i, raw_step in enumerate(raw_steps):
         try:
-            spec_doc = json.loads(raw_spec)
-            own_ac_ids = spec_ledger.own_ac_ids_from_specification(spec_doc)
-        except json.JSONDecodeError:
-            pass
-    prior_steps_by_id: dict[str, dict[str, Any]] = {}
-    raw_prior_plan = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.PLAN_APPROVED_PATH)
-    if raw_prior_plan is not None:
-        try:
-            prior_steps_by_id = {
-                s.get("id"): s for s in (json.loads(raw_prior_plan).get("plan_steps") or []) if s.get("id")
-            }
-        except json.JSONDecodeError:
-            pass
-    # Every LIVE (not deferred, not retired -- retired entries are absent from spec_doc's own
-    # user_stories entirely; a deferred one stays present with deferred=true) ui_related
-    # criterion, straight from the approved Specification -- the same read already fetched above
-    # for own_ac_ids, no ledger schema change needed. A criterion inside a deferred STORY is
-    # deferred even if its own `deferred` field was left at the schema default (schemas.py's own
-    # "automatically" cascade note), so both levels are checked.
-    ui_related_ac_ids = {
-        ac.get("id")
-        for story in (spec_doc.get("user_stories") or [])
-        if not story.get("deferred")
-        for ac in (story.get("acceptance_criteria") or [])
-        if ac.get("ui_related") and not ac.get("deferred")
-    }
-    # wireframes is WireframePresence-shaped (schemas.py, Task 10): `{"status", "values", "reason"}`
-    # rather than a bare list -- extract its values once, reused by every check below.
-    wireframes = _presence_values(content_dict.get("wireframes"))
-    # Aggregated, not early-returned (2026-09-07 audit): these three check independent aspects of
-    # the same content -- ledger/AC linkage, wireframe count, and per-wireframe HTML validity --
-    # with no ordering dependency between them, so union them into one lap's feedback instead of
-    # reporting only whichever hit first.
-    linkage_problems = (
-        check_plan_linkage(content_dict.get("plan_steps") or [], ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
-        + check_wireframe_ac_ids(wireframes, ledger_entries)
-        + check_wireframe_has_ac_ids(wireframes)
-        + check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
+            validated.append(PlanStep.model_validate(raw_step).model_dump())
+        except Exception as exc:  # noqa: BLE001 -- surfaced as actionable feedback, never a crash
+            return None, [
+                f"{DRAFT_STEPS_PATH}'s plan_steps[{i}] does not match the PlanStep shape: {exc}"
+            ], ledger_entries
+
+    fully_reviewed: bool | None = None
+    if has_audit_role:
+        session_id = chat_model.get_session_id(thread_id, stage_key, "audit", provider=chat_provider)
+        evidence: bool | None = None
+        if session_id is not None:
+            total_lines = raw.count("\n") + 1
+            evidence = await chat_model.read_full_file_reads(
+                provider, thread_id, session_id, DRAFT_STEPS_PATH, total_lines, active_provider=chat_provider
+            )
+        # None (no session yet, or the provider genuinely cannot verify transcripts -- Copilot)
+        # gets the SAME provider-aware fail-shut/fail-open policy skill_gate.py already applies to
+        # read_skill_invocations: fails CLOSED under a provider that should be able to prove this
+        # (Claude), fails OPEN (vacuous None -> sync_plan_ledger skips the check) under one that
+        # structurally cannot (Copilot) -- an infrastructure gap must never masquerade as "not
+        # reviewed", but it must also never silently stop enforcing where it CAN be proven.
+        if evidence is None:
+            fully_reviewed = None if not chat_model.provider_can_verify_transcripts(chat_provider) else False
+        else:
+            fully_reviewed = evidence
+
+    sync_result = spec_ledger.sync_plan_ledger(
+        ledger_entries, validated, run_id, retired_step_ids=retired_step_ids, fully_reviewed=fully_reviewed,
     )
-
-    # Scope-lifecycle stamps for the Plan review UI (user requirement 2026-08-31, mirroring the
-    # spec view's badges): each step inherits the strongest change classification of the criteria
-    # it fulfils, straight from the approved Specification's own per-AC `change` stamps -- so a
-    # reviewer sees which steps exist because of NEW scope, an UPDATE, or a promotion
-    # ("activated"), and removal steps are recognizable by their removes_ids. Deterministic,
-    # stamped in place (this verify's established contract -- see the wireframe preview_url
-    # stamping below). Unconditional: harmless on a failing lap (the envelope this feeds is only
-    # ever built on a PASS, graph.py's make_verify_node), so it doesn't need to wait on
-    # linkage_problems.
-    ac_change_by_id = {
-        ac.get("id"): ac.get("change")
-        for story in (spec_doc.get("user_stories") or [])
-        for ac in (story.get("acceptance_criteria") or [])
-    }
-    _CHANGE_PRIORITY = ["activated", "new", "modified", "deferred", "unchanged"]
-    for step in content_dict.get("plan_steps") or []:
-        changes = {ac_change_by_id.get(i) for i in (step.get("ac_ids") or [])}
-        step["change"] = next((c for c in _CHANGE_PRIORITY if c in changes), None)
-
-    # diagrams is DiagramPresence-shaped (schemas.py, Task 10) -- same extraction as wireframes
-    # above (already computed; re-used here, not re-fetched from content_dict).
-    diagrams = _presence_values(content_dict.get("diagrams"))
-
-    structural_problems = list(linkage_problems)
-    wireframes_too_many = len(wireframes) > MAX_WIREFRAMES
-    if wireframes_too_many:
-        structural_problems.append(
-            f"{len(wireframes)} wireframes exceeds the cap of {MAX_WIREFRAMES} -- keep only the screens this plan actually changes."
-        )
-    wireframe_errors = [
-        err for wf in wireframes if (err := check_wireframe(wf.get("screen") or "", wf.get("html_source") or "")) is not None
+    if not sync_result.passed:
+        return None, sync_result.reasons, ledger_entries
+    await spec_ledger.save_ledger(provider, thread_id, sync_result.updated_entries)
+    resolved = [
+        e for e in sync_result.updated_entries
+        if e.get("kind") == "plan_step" and e.get("status") in ("active", "revised")
     ]
-    structural_problems.extend(wireframe_errors)
+    resolved_doc = {
+        "plan_steps": [
+            {
+                "id": e["id"],
+                "description": e.get("description", ""),
+                "ac_ids": e.get("ac_ids") or [],
+                "kind": e.get("step_kind", "feature"),
+                "ui_related": e.get("ui_related", False),
+                "removes_ids": e.get("removes_ids") or [],
+            }
+            for e in resolved
+        ],
+        "retired_step_ids": retired_step_ids,
+    }
+    await repo_files.write_repo_file(provider, thread_id, DRAFT_STEPS_PATH, json.dumps(resolved_doc, indent=2))
+    return resolved_doc["plan_steps"], [], sync_result.updated_entries
 
-    # Wireframes are only written to the sandbox once individually valid and within the cap
-    # (unchanged invariant) -- gated on wireframe_errors/count specifically, not on linkage
-    # problems elsewhere in the same content, since a bad AC citation has nothing to do with
-    # whether a given wireframe's own HTML is safe to persist.
-    if wireframes and not wireframe_errors and not wireframes_too_many:
-        for wf in wireframes:
-            await repo_files.write_repo_file(provider, thread_id, f"{WIREFRAMES_DIR}/{wf['screen']}.html", wf["html_source"])
-        # Stamp a rendered-preview link onto each wireframe entry. In-place mutation of
-        # content_dict is this verify's established contract (it already rewrites ids/fields before
-        # the gate), so the link lands in approved_content and plan.md. Repo/branch come from the
-        # session row -- the only place they are durably known; unavailable (DB down, no row) means
-        # plan.md keeps just the relative link, never a broken absolute one.
+
+async def _load_and_check_manifest(
+    provider: SandboxProvider, thread_id: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """File-based-editing plan, Part 2 sect. 6: reads _draft/manifest.json, validates each entry
+    against schemas.PlanDiagramRef/PlanWireframeRef, and checks disk-vs-manifest consistency --
+    every file in _draft/wireframes//_draft/diagrams/ must be listed in manifest.json (current or
+    explicitly retired), and vice versa (no ledger needed for this direction -- see the plan's own
+    YAGNI reasoning: nothing downstream cites a "wireframe id" for cross-run provenance the way
+    plan steps/ACs are). Returns (manifest-shaped dict or None on failure, problems).
+    """
+    from ..schemas import PlanDiagramRef, PlanWireframeRef
+
+    raw = await repo_files.read_repo_file(provider, thread_id, DRAFT_MANIFEST_PATH)
+    if raw is None:
+        return None, [
+            f"{DRAFT_MANIFEST_PATH} does not exist -- create it with your file tools, shaped "
+            '{"wireframes": [...], "diagrams": [...], "retired_wireframe_screens": [...], '
+            '"retired_diagram_names": [...]}.'
+        ]
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, [f"{DRAFT_MANIFEST_PATH} is not valid JSON: {exc}. Fix it and resubmit."]
+    if not isinstance(doc, dict):
+        return None, [f"{DRAFT_MANIFEST_PATH} must be a JSON object."]
+
+    problems: list[str] = []
+    wireframe_refs: list[dict[str, Any]] = []
+    for i, wf in enumerate(doc.get("wireframes") or []):
         try:
-            from .. import session_store
+            wireframe_refs.append(PlanWireframeRef.model_validate(wf).model_dump())
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"manifest.json's wireframes[{i}] does not match the expected shape (screen/ac_ids): {exc}")
+    diagram_refs: list[dict[str, Any]] = []
+    for i, d in enumerate(doc.get("diagrams") or []):
+        try:
+            diagram_refs.append(PlanDiagramRef.model_validate(d).model_dump())
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"manifest.json's diagrams[{i}] does not match the expected shape (name/kind/ac_ids): {exc}")
+    if problems:
+        return None, problems
 
-            row = await session_store.get_session(thread_id)
-        except Exception:  # noqa: BLE001 -- cosmetic link, never a gate failure
-            row = None
-        if row and row.get("owner") and row.get("repo") and row.get("work_branch"):
-            for wf in wireframes:
-                wf["preview_url"] = wireframe_preview_url(row["owner"], row["repo"], row["work_branch"], wf["screen"])
+    retired_wireframe_screens = set(doc.get("retired_wireframe_screens") or [])
+    retired_diagram_names = set(doc.get("retired_diagram_names") or [])
 
-    # Diagrams and wireframes are independent artifacts (2026-09-07 audit, confirmed by reading
-    # _render_one: it only ever touches diagram["name"]/["mermaid_source"], nothing wireframe-
-    # related) -- render regardless of any structural problem found above, so a broken wireframe
-    # and a failing diagram can both be reported in the same lap instead of costing two.
-    outcomes = [await _render_one(provider, thread_id, diagram) for diagram in diagrams] if diagrams else []
-    failures = [o for o in outcomes if not o.ok]
-    infra_failures = [o for o in failures if o.is_infra_failure]
+    wf_ls = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(DRAFT_WIREFRAMES_DIR)} 2>/dev/null")
+    disk_wireframe_screens = {
+        line.strip()[: -len(".html")] for line in (wf_ls.stdout or "").splitlines() if line.strip().endswith(".html")
+    }
+    manifest_wireframe_screens = {wf["screen"] for wf in wireframe_refs}
+    for screen in sorted(disk_wireframe_screens - manifest_wireframe_screens - retired_wireframe_screens):
+        problems.append(
+            f"{DRAFT_WIREFRAMES_DIR}/{screen}.html exists on disk but is not listed in "
+            "manifest.json's wireframes (or retired_wireframe_screens)"
+        )
+    for screen in sorted(manifest_wireframe_screens - disk_wireframe_screens):
+        problems.append(f"manifest.json lists wireframe {screen!r} but {DRAFT_WIREFRAMES_DIR}/{screen}.html does not exist -- create it")
 
-    if structural_problems or failures:
-        feedback_parts = list(structural_problems)
-        if failures:
-            if infra_failures:
-                # Distinct from a real syntax problem -- the draft node retrying with "fix your
-                # Mermaid syntax" feedback would be nonsensical here since the syntax was never
-                # actually checked.
-                feedback_parts.append(
-                    f"Diagram rendering infrastructure failure (mermaid-cli/Chromium), not a diagram syntax "
-                    f"problem -- affected: {[o.name for o in infra_failures]}. First error: "
-                    f"{infra_failures[0].stderr_tail}"
-                )
-            else:
-                feedback_parts.append(
-                    "; ".join(f"{o.name}: {_mermaid_error_summary(o.stderr_tail)}" for o in failures)
-                )
-        report: dict[str, Any] = {}
-        if linkage_problems:
-            report["plan_linkage_failed"] = linkage_problems
+    dg_ls = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(DRAFT_DIAGRAMS_DIR)} 2>/dev/null")
+    disk_diagram_names = {
+        line.strip()[: -len(".mmd")] for line in (dg_ls.stdout or "").splitlines() if line.strip().endswith(".mmd")
+    }
+    manifest_diagram_names = {d["name"] for d in diagram_refs}
+    for name in sorted(disk_diagram_names - manifest_diagram_names - retired_diagram_names):
+        problems.append(
+            f"{DRAFT_DIAGRAMS_DIR}/{name}.mmd exists on disk but is not listed in manifest.json's "
+            "diagrams (or retired_diagram_names)"
+        )
+    for name in sorted(manifest_diagram_names - disk_diagram_names):
+        problems.append(f"manifest.json lists diagram {name!r} but {DRAFT_DIAGRAMS_DIR}/{name}.mmd does not exist -- create it")
+
+    if problems:
+        return None, problems
+    return {
+        "wireframes": wireframe_refs,
+        "diagrams": diagram_refs,
+        "retired_wireframe_screens": sorted(retired_wireframe_screens),
+        "retired_diagram_names": sorted(retired_diagram_names),
+    }, []
+
+
+def make_verify_plan_diagrams(
+    stage_key: str = "plan", has_audit_role: bool = True
+) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str], Any]:
+    """Factory, not a bare function (file-based-editing plan, Part 6 audit fix): Part 6's
+    brownfield plan-pass reuses this exact verification logic under a DIFFERENT stage-key (not the
+    real "plan" key, so the graph's own linear stage-chain doesn't misroute -- see graph.py's
+    brownfield wiring) and with no audit role at all. A bare module-level function had no way to
+    know which stage-key/audit-role it was running for -- StageSpec.deterministic_verify's own
+    calling convention (make_verify_node) never passes the stage key through, so hardcoding
+    "plan"/"audit" inline (as this function originally did) would look up the WRONG session, or
+    the right session under the wrong provider policy, for any caller besides the real plan stage.
+
+    `verify_plan_diagrams` below is `make_verify_plan_diagrams("plan")` -- the real plan
+    StageSpec's own `deterministic_verify`, unchanged from every existing caller's perspective.
+    """
+
+    async def verify_plan_diagrams(
+        thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None,
+        provider: SandboxProvider, chat_provider: str,
+    ) -> "VerificationResult":
+        from ..graph import VerificationResult  # local import: graph.py imports this module
+
+        if not content_dict:
+            # Reachable via the clarification-cycle safety cap: auto_approve_node promotes whatever
+            # the last draft attempt produced straight to "approved" content, and a draft that never
+            # got past a (headless-disallowed) clarifying-question response can leave that empty/None.
+            # A crash here would kill the whole run; report it through the normal retry/escalate path
+            # instead, same as any other failed verification.
+            return VerificationResult(
+                passed=False,
+                feedback="Plan content is empty -- the draft never produced a real plan (safety-cap auto-approve after repeated clarification attempts). Draft a complete plan with no clarifying questions.",
+                report={"plan_content": "empty"},
+            )
+
+        # File-based-editing plan, Part 2 sect. 1: commit the whole scratch dir on EVERY
+        # invocation, pass or fail -- unlike specification's single sketchpad file (which already
+        # rides along in every git_ops.commit_ai_dev_workflow call), _draft/ is new scratch with no
+        # existing commit path, and losing it to a mid-run container swap would be a real
+        # regression versus today's durably-persisted stage["draft"].
+        await git_ops.commit_paths(provider, thread_id, [DRAFT_DIR], "ai-dev-workflow: plan draft scratch")
+
+        # Part 2 sect. 7: the write-scope guard -- plan previously had zero write tools, so this is
+        # a genuinely new risk (a plan-stage edit accidentally touching spec_ledger.json, approved
+        # specs, or real application source). Same mechanism ac-to-tests already uses, a different
+        # allowlist.
+        write_scope = await write_scope_gate.check_write_scope(
+            provider, thread_id, baseline_commit, run_id,
+            is_in_scope=write_scope_gate.is_plan_scratch_path,
+            is_pipeline_owned=write_scope_gate.is_plan_pipeline_owned,
+        )
+        if not write_scope.passed:
+            return VerificationResult(
+                passed=False,
+                feedback=(
+                    "These files are outside plan's write scope and could not be auto-reverted: "
+                    f"{write_scope.violating_paths}. Only .ai-dev-workflow/plan/_draft/** may be "
+                    "created or modified here."
+                ),
+                report={"violating_paths": write_scope.violating_paths, "changed_paths": write_scope.changed_paths},
+            )
+
+        # Provenance first: pure checks against the ledger, cheaper than any render, and a plan whose
+        # steps aren't linked to this ticket's criteria is wrong regardless of its diagrams. The spec
+        # read falls back to an empty own-set (coverage direction skipped) the same way
+        # ac_coverage_gate's identical read does -- an infra hiccup must not manufacture a false gap.
+        own_ac_ids: set[str] = set()
+        spec_doc: dict[str, Any] = {}
+        raw_spec = await repo_files.read_repo_file(
+            provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+        )
+        if raw_spec is not None:
+            try:
+                spec_doc = json.loads(raw_spec)
+                own_ac_ids = spec_ledger.own_ac_ids_from_specification(spec_doc)
+            except json.JSONDecodeError:
+                pass
+        bug_affected_ac_ids = set(spec_doc.get("bug_affected_ac_ids") or [])
+
+        prior_steps_by_id: dict[str, dict[str, Any]] = {}
+        prior_wireframe_screens: set[str] = set()
+        prior_diagram_names: set[str] = set()
+        prior_diagrams_by_name: dict[str, str] = {}
+        prior_wireframes_by_screen: dict[str, str] = {}
+        raw_prior_plan = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.PLAN_APPROVED_PATH)
+        if raw_prior_plan is not None:
+            try:
+                prior_plan_doc = json.loads(raw_prior_plan)
+            except json.JSONDecodeError:
+                prior_plan_doc = {}
+            prior_steps_by_id = {
+                s.get("id"): s for s in (prior_plan_doc.get("plan_steps") or []) if s.get("id")
+            }
+            for d in _presence_values(prior_plan_doc.get("diagrams")):
+                if d.get("name"):
+                    prior_diagram_names.add(d["name"])
+                    prior_diagrams_by_name[d["name"]] = d.get("mermaid_source", "")
+            for wf in _presence_values(prior_plan_doc.get("wireframes")):
+                if wf.get("screen"):
+                    prior_wireframe_screens.add(wf["screen"])
+                    prior_wireframes_by_screen[wf["screen"]] = wf.get("html_source", "")
+
+        # File-based-editing plan, Part 2 sect. 5/6: load+sync steps.json and manifest.json BEFORE
+        # check_plan_linkage runs -- a new, earlier check, not a replacement (everything below this
+        # point that already existed is unchanged).
+        resolved_steps, step_problems, ledger_entries = await _load_and_sync_plan_steps(
+            provider, thread_id, run_id, stage_key, chat_provider, has_audit_role,
+        )
+        manifest, manifest_problems = await _load_and_check_manifest(provider, thread_id)
+        if step_problems or manifest_problems:
+            return VerificationResult(
+                passed=False,
+                feedback="\n\n".join(step_problems + manifest_problems),
+                report={"step_problems": step_problems, "manifest_problems": manifest_problems},
+            )
+        assert resolved_steps is not None and manifest is not None  # guaranteed by the empty-problems check above
+
+        wireframe_refs = manifest["wireframes"]
+        diagram_refs = manifest["diagrams"]
+        retired_wireframe_screens = set(manifest["retired_wireframe_screens"])
+        retired_diagram_names = set(manifest["retired_diagram_names"])
+
+        pre_check_problems = check_dangling_visual_retirement(
+            wireframe_refs, diagram_refs, ledger_entries, retired_wireframe_screens, retired_diagram_names,
+        )
+        pre_check_problems += check_stale_visual_review(
+            diagram_refs, wireframe_refs, prior_diagram_names, prior_wireframe_screens,
+            ledger_entries, run_id, bug_affected_ac_ids,
+            content_dict.get("diagrams_reviewed") or [], content_dict.get("wireframes_reviewed") or [],
+        )
+
+        # Read every diagram/wireframe's real content from its sidecar file -- needed both to
+        # mechanically verify a claimed "revised" action actually changed the content (below) and
+        # to inject the full ImplementationPlan-shaped content back into content_dict once
+        # everything passes (Part 2 sect. 2's "critical property": the persisted shape stays
+        # byte-for-byte identical to today, so downstream code never needs to change).
+        diagram_sources: dict[str, str] = {}
+        for d in diagram_refs:
+            raw_src = await repo_files.read_repo_file(provider, thread_id, f"{DRAFT_DIAGRAMS_DIR}/{d['name']}.mmd")
+            if raw_src is None:
+                pre_check_problems.append(f"{DRAFT_DIAGRAMS_DIR}/{d['name']}.mmd could not be read")
+                continue
+            diagram_sources[d["name"]] = raw_src
+        wireframe_sources: dict[str, str] = {}
+        for wf in wireframe_refs:
+            raw_src = await repo_files.read_repo_file(provider, thread_id, f"{DRAFT_WIREFRAMES_DIR}/{wf['screen']}.html")
+            if raw_src is None:
+                pre_check_problems.append(f"{DRAFT_WIREFRAMES_DIR}/{wf['screen']}.html could not be read")
+                continue
+            wireframe_sources[wf["screen"]] = raw_src
+
+        # Mechanical verification of a claimed "revised" action (Part 2 sect. 6 item 4): the file
+        # must actually differ from the last-approved version -- catches a false "revised" claim,
+        # not just trusting the label. A diagram/wireframe with no prior version (new this run) is
+        # trivially "revised" by virtue of not having existed; only checked when a prior exists.
+        for record in content_dict.get("diagrams_reviewed") or []:
+            name = record.get("name")
+            if record.get("action") == "revised" and name in prior_diagrams_by_name:
+                if diagram_sources.get(name, "") == prior_diagrams_by_name[name]:
+                    pre_check_problems.append(
+                        f"diagram {name!r} claims action='revised' but its mermaid_source is "
+                        "byte-identical to the last-approved version -- either actually revise it "
+                        "or claim 'confirmed_current' instead"
+                    )
+        for record in content_dict.get("wireframes_reviewed") or []:
+            screen = record.get("screen")
+            if record.get("action") == "revised" and screen in prior_wireframes_by_screen:
+                if wireframe_sources.get(screen, "") == prior_wireframes_by_screen[screen]:
+                    pre_check_problems.append(
+                        f"wireframe {screen!r} claims action='revised' but its HTML is "
+                        "byte-identical to the last-approved version -- either actually revise it "
+                        "or claim 'confirmed_current' instead"
+                    )
+
+        if pre_check_problems:
+            return VerificationResult(passed=False, feedback="\n\n".join(pre_check_problems), report={"pre_check_problems": pre_check_problems})
+
+        # Inject the file-resolved FULL content back into content_dict, matching today's
+        # ImplementationPlan shape exactly, before any of the existing logic below (all of it
+        # unchanged from before this rewrite) ever sees it -- Part 2 sect. 2's "critical property".
+        content_dict["plan_steps"] = resolved_steps
+        content_dict["diagrams"] = {
+            "status": "present" if diagram_refs else "absent",
+            "values": [
+                {"name": d["name"], "kind": d["kind"], "ac_ids": d.get("ac_ids") or [], "mermaid_source": diagram_sources[d["name"]]}
+                for d in diagram_refs
+            ],
+            "reason": "" if diagram_refs else "No diagrams in this plan.",
+        }
+        content_dict["wireframes"] = {
+            "status": "present" if wireframe_refs else "absent",
+            "values": [
+                {"screen": wf["screen"], "ac_ids": wf.get("ac_ids") or [], "html_source": wireframe_sources[wf["screen"]]}
+                for wf in wireframe_refs
+            ],
+            "reason": "" if wireframe_refs else "No user-interface work in this plan.",
+        }
+        content_dict["retired_wireframe_screens"] = manifest["retired_wireframe_screens"]
+        content_dict["retired_diagram_names"] = manifest["retired_diagram_names"]
+
+        # Every LIVE (not deferred, not retired -- retired entries are absent from spec_doc's own
+        # user_stories entirely; a deferred one stays present with deferred=true) ui_related
+        # criterion, straight from the approved Specification -- the same read already fetched above
+        # for own_ac_ids, no ledger schema change needed. A criterion inside a deferred STORY is
+        # deferred even if its own `deferred` field was left at the schema default (schemas.py's own
+        # "automatically" cascade note), so both levels are checked.
+        ui_related_ac_ids = {
+            ac.get("id")
+            for story in (spec_doc.get("user_stories") or [])
+            if not story.get("deferred")
+            for ac in (story.get("acceptance_criteria") or [])
+            if ac.get("ui_related") and not ac.get("deferred")
+        }
+        # wireframes is WireframePresence-shaped (schemas.py, Task 10): `{"status", "values", "reason"}`
+        # rather than a bare list -- extract its values once, reused by every check below.
+        wireframes = _presence_values(content_dict.get("wireframes"))
+        # Aggregated, not early-returned (2026-09-07 audit): these three check independent aspects of
+        # the same content -- ledger/AC linkage, wireframe count, and per-wireframe HTML validity --
+        # with no ordering dependency between them, so union them into one lap's feedback instead of
+        # reporting only whichever hit first.
+        linkage_problems = (
+            check_plan_linkage(content_dict.get("plan_steps") or [], ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
+            + check_wireframe_ac_ids(wireframes, ledger_entries)
+            + check_wireframe_has_ac_ids(wireframes)
+            + check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
+        )
+
+        # Scope-lifecycle stamps for the Plan review UI (user requirement 2026-08-31, mirroring the
+        # spec view's badges): each step inherits the strongest change classification of the criteria
+        # it fulfils, straight from the approved Specification's own per-AC `change` stamps -- so a
+        # reviewer sees which steps exist because of NEW scope, an UPDATE, or a promotion
+        # ("activated"), and removal steps are recognizable by their removes_ids. Deterministic,
+        # stamped in place (this verify's established contract -- see the wireframe preview_url
+        # stamping below). Unconditional: harmless on a failing lap (the envelope this feeds is only
+        # ever built on a PASS, graph.py's make_verify_node), so it doesn't need to wait on
+        # linkage_problems.
+        ac_change_by_id = {
+            ac.get("id"): ac.get("change")
+            for story in (spec_doc.get("user_stories") or [])
+            for ac in (story.get("acceptance_criteria") or [])
+        }
+        _CHANGE_PRIORITY = ["activated", "new", "modified", "deferred", "unchanged"]
+        for step in content_dict.get("plan_steps") or []:
+            changes = {ac_change_by_id.get(i) for i in (step.get("ac_ids") or [])}
+            step["change"] = next((c for c in _CHANGE_PRIORITY if c in changes), None)
+
+        # diagrams is DiagramPresence-shaped (schemas.py, Task 10) -- same extraction as wireframes
+        # above (already computed; re-used here, not re-fetched from content_dict).
+        diagrams = _presence_values(content_dict.get("diagrams"))
+
+        structural_problems = list(linkage_problems)
+        wireframes_too_many = len(wireframes) > MAX_WIREFRAMES
         if wireframes_too_many:
-            report["wireframes_rejected"] = "too_many"
-        if wireframe_errors:
-            report["wireframes_failed"] = wireframe_errors
-        if failures:
-            report["failed"] = [o.name for o in failures]
-            report["infra_failure"] = bool(infra_failures)
-        return VerificationResult(passed=False, feedback="\n\n".join(feedback_parts), report=report)
+            structural_problems.append(
+                f"{len(wireframes)} wireframes exceeds the cap of {MAX_WIREFRAMES} -- keep only the screens this plan actually changes."
+            )
+        wireframe_errors = [
+            err for wf in wireframes if (err := check_wireframe(wf.get("screen") or "", wf.get("html_source") or "")) is not None
+        ]
+        structural_problems.extend(wireframe_errors)
 
-    if not diagrams and not wireframes:
-        return VerificationResult(passed=True, feedback="No diagrams or wireframes in this draft -- nothing to validate.", report={})
+        # Wireframes are only written to the sandbox once individually valid and within the cap
+        # (unchanged invariant) -- gated on wireframe_errors/count specifically, not on linkage
+        # problems elsewhere in the same content, since a bad AC citation has nothing to do with
+        # whether a given wireframe's own HTML is safe to persist.
+        if wireframes and not wireframe_errors and not wireframes_too_many:
+            for wf in wireframes:
+                await repo_files.write_repo_file(provider, thread_id, f"{WIREFRAMES_DIR}/{wf['screen']}.html", wf["html_source"])
+            # Stamp a rendered-preview link onto each wireframe entry. In-place mutation of
+            # content_dict is this verify's established contract (it already rewrites ids/fields before
+            # the gate), so the link lands in approved_content and plan.md. Repo/branch come from the
+            # session row -- the only place they are durably known; unavailable (DB down, no row) means
+            # plan.md keeps just the relative link, never a broken absolute one.
+            try:
+                from .. import session_store
 
-    commit_dirs = ([DIAGRAMS_DIR] if diagrams else []) + ([WIREFRAMES_DIR] if wireframes else [])
-    await git_ops.commit_paths(provider, thread_id, commit_dirs, "ai-dev-workflow: render plan diagrams + wireframes")
-    return VerificationResult(
-        passed=True,
-        feedback=f"All {len(diagrams)} diagram(s) rendered and {len(wireframes)} wireframe(s) validated.",
-        report={"rendered": [o.name for o in outcomes], "wireframes": [wf["screen"] for wf in wireframes]},
-    )
+                row = await session_store.get_session(thread_id)
+            except Exception:  # noqa: BLE001 -- cosmetic link, never a gate failure
+                row = None
+            if row and row.get("owner") and row.get("repo") and row.get("work_branch"):
+                for wf in wireframes:
+                    wf["preview_url"] = wireframe_preview_url(row["owner"], row["repo"], row["work_branch"], wf["screen"])
+
+        # Diagrams and wireframes are independent artifacts (2026-09-07 audit, confirmed by reading
+        # _render_one: it only ever touches diagram["name"]/["mermaid_source"], nothing wireframe-
+        # related) -- render regardless of any structural problem found above, so a broken wireframe
+        # and a failing diagram can both be reported in the same lap instead of costing two.
+        outcomes = [await _render_one(provider, thread_id, diagram) for diagram in diagrams] if diagrams else []
+        failures = [o for o in outcomes if not o.ok]
+        infra_failures = [o for o in failures if o.is_infra_failure]
+
+        if structural_problems or failures:
+            feedback_parts = list(structural_problems)
+            if failures:
+                if infra_failures:
+                    # Distinct from a real syntax problem -- the draft node retrying with "fix your
+                    # Mermaid syntax" feedback would be nonsensical here since the syntax was never
+                    # actually checked.
+                    feedback_parts.append(
+                        f"Diagram rendering infrastructure failure (mermaid-cli/Chromium), not a diagram syntax "
+                        f"problem -- affected: {[o.name for o in infra_failures]}. First error: "
+                        f"{infra_failures[0].stderr_tail}"
+                    )
+                else:
+                    feedback_parts.append(
+                        "; ".join(f"{o.name}: {_mermaid_error_summary(o.stderr_tail)}" for o in failures)
+                    )
+            report: dict[str, Any] = {}
+            if linkage_problems:
+                report["plan_linkage_failed"] = linkage_problems
+            if wireframes_too_many:
+                report["wireframes_rejected"] = "too_many"
+            if wireframe_errors:
+                report["wireframes_failed"] = wireframe_errors
+            if failures:
+                report["failed"] = [o.name for o in failures]
+                report["infra_failure"] = bool(infra_failures)
+            return VerificationResult(passed=False, feedback="\n\n".join(feedback_parts), report=report)
+
+        if not diagrams and not wireframes:
+            return VerificationResult(passed=True, feedback="No diagrams or wireframes in this draft -- nothing to validate.", report={})
+
+        commit_dirs = ([DIAGRAMS_DIR] if diagrams else []) + ([WIREFRAMES_DIR] if wireframes else [])
+        await git_ops.commit_paths(provider, thread_id, commit_dirs, "ai-dev-workflow: render plan diagrams + wireframes")
+        return VerificationResult(
+            passed=True,
+            feedback=f"All {len(diagrams)} diagram(s) rendered and {len(wireframes)} wireframe(s) validated.",
+            report={"rendered": [o.name for o in outcomes], "wireframes": [wf["screen"] for wf in wireframes]},
+        )
+
+    return verify_plan_diagrams
+
+
+# The real plan StageSpec's own `deterministic_verify` -- unchanged reference for every existing
+# caller (graph.py, self-checks below). Part 6's brownfield plan-pass calls
+# make_verify_plan_diagrams("brownfield-plan", has_audit_role=False) instead.
+verify_plan_diagrams = make_verify_plan_diagrams("plan")
 
 
 if __name__ == "__main__":

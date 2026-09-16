@@ -167,6 +167,20 @@ the code is still yours to write, is the cheap version of that fix -- catching i
 the expensive one (that stage's own fix-lap cap is 6, specifically because wireframe rework is
 heavy). No wireframe for a screen means nothing to check here.
 
+**If the Plan includes an ER or architecture diagram, read it before designing your data model or
+module structure.** Its Mermaid source lives at `.ai-dev-workflow/plan/diagrams/<name>.mmd`. Match
+the entities, fields, relationships (ER) or components/boundaries (architecture) it shows -- same
+intent, naming may differ cosmetically, but no modeled entity, relationship, or major component
+may be silently missing or contradicted by what you actually build. No diagram means nothing to
+check here.
+
+**If the Plan includes a `user_flow` diagram for a screen or capability you're building, read it
+before wiring up navigation/transitions between screens.** Its Mermaid source lives at
+`.ai-dev-workflow/plan/diagrams/<name>.mmd`. Match the sequence of steps/screens/decisions it shows
+-- same intent, cosmetic differences in labeling are fine, but no modeled step, branch, or
+transition may be silently missing or contradicted by the flow you actually build. This is in
+addition to, not instead of, honoring each individual screen's own wireframe above.
+
 **If the Plan names a test, write that test -- by that name.** Plan steps routinely spell out
 coverage in prose ("API integration tests cover restart persistence", "verify US-0001.1-3"). Each
 such phrase is a named artifact the adversarial-compliance stage later looks for by hand, and a

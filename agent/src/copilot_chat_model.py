@@ -1034,6 +1034,19 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
     return None
 
 
+async def read_full_file_reads(
+    provider: SandboxProvider, thread_id: str, session_id: str, file_path: str, total_lines: int
+) -> bool | None:
+    """Whether this Copilot session's own transcript proves `file_path` was read in full, or None
+    if unverifiable. Currently always None -- same standing capability gap as
+    read_skill_invocations above (no CLI-exec transcript equivalent exists for Copilot yet), not a
+    per-call decision. gates callers already treat this the same way they treat
+    read_skill_invocations returning None: an infrastructure gap, not evidence the file was only
+    partially read.
+    """
+    return None
+
+
 def secret_env_names() -> set[str]:
     """Names to redact from this turn's own shell output via --secret-env-vars (see
     _agenerate_inner) -- a masking/redaction list, NOT a declaration of what actually authenticates

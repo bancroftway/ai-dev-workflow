@@ -295,23 +295,6 @@ def render_license_audit_markdown(content: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def render_brownfield_baseline_markdown(content: dict[str, Any]) -> str:
-    spec = content.get("as_built_spec") or {}
-    plan = content.get("as_built_plan") or {}
-    lines: list[str] = ["# As-Built Baseline (inferred)", "", "Every story below is `origin: inferred` -- derived from existing code, not a requirements spec.", ""]
-    for s in spec.get("user_stories") or []:
-        lines.append(f"### {s.get('us_id', '')}: {s.get('title', '')} [{s.get('confidence', '')}]")
-        lines.append(s.get("narrative", ""))
-        lines.append("")
-    for ac in spec.get("acceptance_criteria") or []:
-        lines.append(f"- **{ac.get('ac_id', '')}** [{ac.get('confidence', '')}]: {ac.get('description', '')} (test: {ac.get('backing_test') or 'none'})")
-    if plan.get("file_inventory"):
-        lines.append("")
-        lines.append("## File Inventory")
-        lines.extend(f"- {f}" for f in plan["file_inventory"])
-    return "\n".join(lines).strip() + "\n"
-
-
 def render_exit_markdown(content: dict[str, Any]) -> str:
     lines: list[str] = ["# Merge Readiness", "", f"**Ready to merge:** {content.get('merge_ready', False)}", ""]
     _render_presence_section(lines, content, "blocking_reasons", "Blocking Reasons")

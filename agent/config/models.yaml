@@ -58,7 +58,11 @@ specification:
     draft_model: gpt-5.4-mini
     audit_model: gemini-3.6-flash
   claude:
-    draft_model: haiku
+    # EXCEPTION to the 2026-09-01 blanket haiku dev override (see file header): draft_model also
+    # restored to sonnet (2026-09-15, user decision) alongside audit_model below -- both legs of
+    # this stage now match the ac-to-tests/minimal-code-to-green/remediation/adversarial-compliance
+    # exceptions already made for the same reason (haiku hit a live capability/quality floor).
+    draft_model: sonnet
     # EXCEPTION to the 2026-09-01 blanket haiku dev override (see file header): restored to
     # sonnet (2026-09-15) after a live run (income-investor, thread 9f253ae4) needed 3 straight
     # audit-finding redraft laps to converge on a complex spec -- each lap's haiku audit caught
@@ -128,7 +132,16 @@ minimal-code-to-green:
     # restored alongside draft_model above -- a weak model auditing a strong draft's 70k+ tokens
     # loses the "second opinion" value the audit exists for.
     audit_model: sonnet
-brownfield-baseline:
+# File-based-editing plan, Part 6: the one-time baseline pass is now two real StageSpecs (spec
+# pass, then plan pass) replacing the old single "brownfield-baseline" entry -- same model tier
+# carried forward unchanged for both, preserving the existing cost profile rather than making an
+# unrequested tuning decision.
+brownfield-spec:
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: haiku
+brownfield-plan:
   copilot:
     draft_model: gpt-5.4-mini
   claude:

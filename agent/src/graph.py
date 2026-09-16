@@ -23,6 +23,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, TypedDict
@@ -61,7 +62,16 @@ from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
 from .gates import adversarial_gate, remediation_gate, skill_gate
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
-from .gates.diagram_gate import PLAN_HARD_RULES, verify_plan_diagrams
+from .gates.diagram_gate import (
+    DRAFT_DIAGRAMS_DIR,
+    DRAFT_DIR,
+    DRAFT_MANIFEST_PATH,
+    DRAFT_STEPS_PATH,
+    DRAFT_WIREFRAMES_DIR,
+    PLAN_HARD_RULES,
+    make_verify_plan_diagrams,
+    verify_plan_diagrams,
+)
 from .gates.test_coverage_gate import MINIMAL_CODE_TO_GREEN_HARD_RULES, verify_coverage
 from .gates.write_scope_gate import AC_TO_TESTS_HARD_RULES, verify_ac_to_tests
 from .infra_retry import call_with_infra_retry
@@ -70,7 +80,6 @@ from .a2ui_tools import (
     build_adversarial_audit_envelope,
     build_exit_envelope,
     build_minimal_code_to_green_envelope,
-    build_brownfield_baseline_envelope,
     build_plan_envelope,
     build_specification_envelope,
     build_tech_stack_envelope,
@@ -82,7 +91,6 @@ from .markdown_render import (
     render_ac_to_tests_markdown,
     render_adversarial_audit_markdown,
     render_minimal_code_to_green_markdown,
-    render_brownfield_baseline_markdown,
     render_plan_markdown,
     render_raw_requirements_markdown,
     render_specification_markdown,
@@ -100,6 +108,7 @@ from .schemas import (
     SPECIFICATION_DRAFT_EXAMPLE,
     PlanAuditResponse,
     PlanDraftResponse,
+    Specification,
     SpecificationAuditResponse,
     SpecificationDraftResponse,
     DotnetStatus,
@@ -123,7 +132,6 @@ from .schemas_audit import (
     ADVERSARIAL_AUDIT_DRAFT_EXAMPLE,
     AdversarialAuditDraftResponse,
 )
-from .schemas_brownfield import BROWNFIELD_BASELINE_DRAFT_EXAMPLE, BrownfieldBaselineDraftResponse
 from .schemas_exit import EXIT_DRAFT_EXAMPLE, ExitDraftResponse, TargetedFixVerifyResponse
 from .schemas_remediation import REMEDIATION_DRAFT_EXAMPLE, RemediationDraftResponse
 
@@ -583,10 +591,20 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     # call path (including this function's own direct callers in tests).
     if stage.get("ticket_mode_baseline"):
         messages.append(HumanMessage(content=SPEC_TICKET_MODE_SEGMENT))
-    if stage["draft"] is not None:
-        messages.append(
-            HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}")
+    # File-based-editing plan, Part 1 sect. 4/6: the specification lives in a real file now, not a
+    # prompt-injected blob -- `spec_ledger.hydrate_ticket_mode_context` already seeded/bootstrapped
+    # it before this prompt is even built (Part 1 sect. 7), so it always exists by the time drafting
+    # starts. View it first; prefer targeted edits over full recreation.
+    messages.append(
+        HumanMessage(
+            content=(
+                f"The specification lives at `{spec_ledger.DRAFT_SPEC_PATH}` -- view it first. "
+                "Edit it incrementally with your file tools (prefer targeted edits over full "
+                "recreation -- recreation is exactly the failure mode this file-based workflow "
+                "exists to eliminate). It should already exist; create it only if genuinely absent."
+            )
         )
+    )
     if stage["used_ids"]:
         messages.append(
             HumanMessage(content=f"Identifiers already used at some point, never reuse: {stage['used_ids']}")
@@ -619,10 +637,24 @@ def _build_plan_prompt(state: GraphState) -> list[BaseMessage]:
     # path (including this function's own direct callers in tests).
     if plan_stage.get("ticket_mode_baseline"):
         messages.append(HumanMessage(content=PLAN_TICKET_MODE_SEGMENT))
-    if plan_stage["draft"] is not None:
-        messages.append(
-            HumanMessage(content=f"Your immediately-prior draft (JSON):\n{plan_stage['draft']}")
+    # File-based-editing plan, Part 2 sect. 1/4/8: the plan lives in real files now, not a
+    # prompt-injected blob. steps.json/manifest.json should already exist by the time drafting
+    # starts (Part 2 sect. 8's bootstrap); the wireframe/diagram sidecar files under
+    # _draft/wireframes//_draft/diagrams/ are created directly, one per item.
+    messages.append(
+        HumanMessage(
+            content=(
+                f"The plan lives at `{DRAFT_DIR}/` -- view `steps.json` (plan steps + "
+                "retired_step_ids) and `manifest.json` (wireframe/diagram identity + citations + "
+                "retired_wireframe_screens/retired_diagram_names) first. Edit them incrementally "
+                "with your file tools (prefer targeted edits over full recreation). Each "
+                "wireframe/diagram's actual content is its own raw file: "
+                f"`{DRAFT_WIREFRAMES_DIR}/<screen>.html`, "
+                f"`{DRAFT_DIAGRAMS_DIR}/<name>.mmd`. These should already exist; "
+                "create them only if genuinely absent."
+            )
         )
+    )
     if plan_stage["used_ids"]:
         messages.append(
             HumanMessage(content=f"Identifiers already used at some point, never reuse: {plan_stage['used_ids']}")
@@ -767,7 +799,11 @@ def _build_specification_audit_prompt(state: GraphState) -> list[BaseMessage]:
     messages: list[BaseMessage] = [
         SystemMessage(content=SPEC_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"),
-        HumanMessage(content=f"Draft Specification to audit (JSON):\n{stage['draft']}"),
+        # File-based-editing plan, Part 1 sect. 6: the draft specification is a real file now, not
+        # a response-field blob -- the "audit's output is what verify checks" guarantee is
+        # preserved structurally (audit's file edits are what _verify_specification_ledger's own
+        # file-read picks up), not via a response-field overwrite as before this plan.
+        HumanMessage(content=f"The draft specification is at `{spec_ledger.DRAFT_SPEC_PATH}` -- view it before auditing."),
     ]
     verify_feedback_message = _verification_feedback_message(stage)
     if verify_feedback_message is not None:
@@ -781,7 +817,15 @@ def _build_plan_audit_prompt(state: GraphState) -> list[BaseMessage]:
     messages: list[BaseMessage] = [
         SystemMessage(content=PLAN_AUDIT_SYSTEM_PROMPT),
         HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
-        HumanMessage(content=f"Draft Plan to audit (JSON):\n{plan_stage['draft']}"),
+        # File-based-editing plan, Part 2 sect. 6/8: same file-based reframing as specification's
+        # audit prompt above.
+        HumanMessage(
+            content=(
+                f"The draft plan is at `{DRAFT_DIR}/` (`steps.json`, `manifest.json`, and the "
+                "wireframe/diagram sidecar files) -- view it before auditing. You may edit it "
+                "directly when you find something to fix."
+            )
+        ),
     ]
     verify_feedback_message = _verification_feedback_message(plan_stage)
     if verify_feedback_message is not None:
@@ -827,17 +871,79 @@ def _build_tech_stack_interrupt_extra(state: GraphState) -> dict[str, Any]:
     return {"file_existed": False, "markdown": render_tech_stack_markdown(draft)}
 
 
-BROWNFIELD_BASELINE_SYSTEM_PROMPT = load_prompt("brownfield_baseline_draft")
+# File-based-editing plan, Part 6 sect. 4a (user-raised: "why do we need to keep this file"):
+# brownfield_baseline_draft.md is deleted -- both passes below reuse the REAL
+# specification_draft.md/plan_draft.md system prompts and hard rules directly (the model needs the
+# real id-citation/file-editing discipline to produce something sync_ledger/sync_plan_ledger will
+# actually accept), with this one short addendum explaining the one-time reverse-engineering framing.
+BROWNFIELD_REVERSE_ENGINEER_SEGMENT = load_prompt("brownfield_reverse_engineer_segment")
 
 
-def _build_brownfield_baseline_prompt(state: GraphState) -> list[BaseMessage]:
-    stage = state["stages"]["brownfield-baseline"]
+def _build_brownfield_spec_prompt(state: GraphState) -> list[BaseMessage]:
+    """Same shape as _build_specification_prompt, reusing the real SPEC_SYSTEM_PROMPT, but grounded
+    in the deterministic repo scan (state["brownfield_context"]) instead of human-written raw
+    requirements text -- there is none yet. Points at the identical spec_ledger.DRAFT_SPEC_PATH
+    sketchpad the real specification stage uses; this pass runs strictly before that stage ever
+    executes, so there is no collision, and the real stage's own bootstrap naturally inherits
+    whatever this pass leaves committed."""
+    stage = state["stages"]["brownfield-spec"]
     messages: list[BaseMessage] = [
-        SystemMessage(content=BROWNFIELD_BASELINE_SYSTEM_PROMPT),
+        SystemMessage(content=SPEC_SYSTEM_PROMPT),
+        HumanMessage(content=BROWNFIELD_REVERSE_ENGINEER_SEGMENT),
         HumanMessage(content=state.get("brownfield_context") or "(no grounding context available)"),
+        HumanMessage(
+            content=(
+                f"The specification lives at `{spec_ledger.DRAFT_SPEC_PATH}` -- view it first. "
+                "Edit it incrementally with your file tools. It should already exist; create it "
+                "only if genuinely absent."
+            )
+        ),
     ]
-    if stage["draft"] is not None:
-        messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
+    if stage["used_ids"]:
+        messages.append(
+            HumanMessage(content=f"Identifiers already used at some point, never reuse: {stage['used_ids']}")
+        )
+    feedback_message = _reviewer_feedback_message(stage)
+    if feedback_message is not None:
+        messages.append(feedback_message)
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
+    return messages
+
+
+def _build_brownfield_plan_prompt(state: GraphState) -> list[BaseMessage]:
+    """Same shape as _build_plan_prompt, reusing the real PLAN_SYSTEM_PROMPT, but reads the
+    brownfield-spec pass's own approved_content (not "specification" -- that stage hasn't run
+    yet) as the Approved Specification. Points at the identical .ai-dev-workflow/plan/_draft/
+    scratch paths the real plan stage uses, for the same "runs strictly first, no collision"
+    reason as the spec pass above."""
+    spec_stage = state["stages"]["brownfield-spec"]
+    plan_stage = state["stages"]["brownfield-plan"]
+    messages: list[BaseMessage] = [
+        SystemMessage(content=PLAN_SYSTEM_PROMPT),
+        HumanMessage(content=BROWNFIELD_REVERSE_ENGINEER_SEGMENT),
+        HumanMessage(content=f"Approved Specification (JSON):\n\n{spec_stage['approved_content']}"),
+        HumanMessage(
+            content=(
+                f"The plan lives at `{DRAFT_DIR}/` -- view `steps.json` and `manifest.json` "
+                "first. Edit them incrementally with your file tools. Each wireframe/diagram's "
+                f"actual content is its own raw file: `{DRAFT_WIREFRAMES_DIR}/<screen>.html`, "
+                f"`{DRAFT_DIAGRAMS_DIR}/<name>.mmd`. These should already exist; create them only "
+                "if genuinely absent."
+            )
+        ),
+    ]
+    if plan_stage["used_ids"]:
+        messages.append(
+            HumanMessage(content=f"Identifiers already used at some point, never reuse: {plan_stage['used_ids']}")
+        )
+    feedback_message = _reviewer_feedback_message(plan_stage)
+    if feedback_message is not None:
+        messages.append(feedback_message)
+    verify_feedback_message = _verification_feedback_message(plan_stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
     return messages
 
 
@@ -949,7 +1055,18 @@ def _stamp_gate_change_and_check_delta(
     real new retirement from one that was already retired as of that approval. On a project's (or
     a brownfield repo's) first-ever approved spec, prior_by_id is empty and
     gate_change_status(None, ...) always returns "new", so this can never false-trigger there.
+
+    File-based-editing plan, Part 5: a THIRD exemption alongside real-delta/newly-retired -- a bug
+    ticket whose `bug_affected_ac_ids` is non-empty is real work even when every story/AC's text
+    comes back byte-identical, since the fix is pure implementation, not a wording change (see
+    Specification.bug_affected_ac_ids' own docstring). Deliberately narrow: keyed off the model's
+    explicit per-id declaration, not `work_kind == "bug"` alone -- a ticket classified "bug" that
+    genuinely needs no action (duplicate, already-fixed) must still auto-end normally. Each
+    reopened id's `change` also reports "reopened" instead of "unchanged" (gate_change_status's own
+    new classification) -- the `change` badge is the one field a human reviewer or a downstream
+    prompt is most likely to scan for "what's new", and "unchanged" would actively mislead them.
     """
+    bug_affected_ac_ids = set(content_dict.get("bug_affected_ac_ids") or [])
     for story in content_dict.get("user_stories") or []:
         story["change"] = spec_ledger.gate_change_status(
             prior_by_id.get(story.get("id")),
@@ -959,6 +1076,7 @@ def _stamp_gate_change_and_check_delta(
             ac["change"] = spec_ledger.gate_change_status(
                 prior_by_id.get(ac.get("id")),
                 {"text": ac.get("description", ""), "deferred": bool(ac.get("deferred"))},
+                reopened=ac.get("id") in bug_affected_ac_ids,
             )
     all_changes = [s["change"] for s in content_dict.get("user_stories") or []]
     all_changes += [
@@ -971,163 +1089,267 @@ def _stamp_gate_change_and_check_delta(
         and e.get("status") == "retired"
         and e["id"] in prior_by_id
     ]
-    return bool(all_changes) and all(c == "unchanged" for c in all_changes) and not newly_retired_ids
-
-
-async def _verify_specification_ledger(
-    thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
-    _chat_provider: str,
-) -> VerificationResult:
-    """StageSpec.deterministic_verify for the specification stage: resolves/validates every User
-    Story's and Acceptance Criterion's id against spec_ledger.LEDGER_PATH (spec_ledger.py's real
-    logic -- this is just the SandboxProvider-I/O wrapper) and persists the ledger on success.
-
-    content_dict is stage["draft"] (the just-audited, revised Specification, mutated in place by
-    sync_ledger to carry ledger-resolved ids) -- schemas.Specification's own `retired_ac_ids`/
-    `retired_us_ids` fields (Ruling 3) live right on it, so no separate plumbing is needed to reach
-    them here. `_chat_provider` is unused -- a pure ledger sync has no dispatch call of its own
-    (StageSpec.deterministic_verify's own docstring).
-    """
-    # Question-ledger backstop (user requirement 2026-08-31): make_draft_node's routing coercion
-    # keeps open questions away from the gate on the DRAFT path, but the audit revises content
-    # after that and could reintroduce one -- verify is the last deterministic word before the
-    # gate, so an open question here fails the check outright.
-    open_questions = [
-        q for q in (content_dict.get("questions") or []) if isinstance(q, dict) and q.get("status") == "open"
-    ]
-    if open_questions:
-        listed = "; ".join(f"{q.get('id')}: {q.get('question')}" for q in open_questions)
-        return VerificationResult(
-            passed=False,
-            feedback=(
-                "Open clarifying questions can never reach the human gate -- either the revised "
-                "requirements answer them (mark status=answered, citing the wording) or take an "
-                f"explicit assumption (status=assumed, mirrored in `assumptions`): {listed}"
-            ),
-            report={"open_questions": [q.get("id") for q in open_questions]},
-        )
-
-    entries = await spec_ledger.load_ledger(provider, thread_id)
-    user_stories = content_dict.get("user_stories") or []
-    retired_ac_ids = content_dict.get("retired_ac_ids") or []
-    retired_us_ids = content_dict.get("retired_us_ids") or []
-    result = spec_ledger.sync_ledger(
-        entries,
-        user_stories,
-        run_id,
-        retired_ac_ids=retired_ac_ids,
-        retired_us_ids=retired_us_ids,
-        source_ticket_id=thread_id,
+    return (
+        bool(all_changes)
+        and all(c in ("unchanged", "reopened") for c in all_changes)
+        and not newly_retired_ids
+        and not bug_affected_ac_ids
     )
-    no_new_work = False
-    if result.passed:
-        # Completeness gate (2026-08-31, observed live TWICE): a redraft that emits only the
-        # stories it touched silently shrinks the specification -- the ledger keeps the dropped
-        # entries live, but the document (what the human approves and every later stage reads)
-        # loses them. Prompt-level instructions failed to prevent it, so it is deterministic now:
-        # every still-live ledger entry must appear in the draft (sync above already resolved
-        # draft ids) or be explicitly retired this round. Runs only on a PASSING sync so the
-        # feedback names real ids.
-        draft_ids: set[str] = set()
-        for story in content_dict.get("user_stories") or []:
-            if story.get("id"):
-                draft_ids.add(str(story["id"]))
-            for ac in story.get("acceptance_criteria") or []:
-                if ac.get("id"):
-                    draft_ids.add(str(ac["id"]))
-        missing_live = [
-            e["id"]
-            for e in result.updated_entries
-            if e.get("kind") in ("user_story", "acceptance_criterion")
-            # "deferred" included on purpose: parked scope must stay VISIBLE in every draft
-            # (re-emitted with deferred=true), or the document silently loses it exactly like
-            # the delta-shrink this gate exists to prevent.
-            and e.get("status") in ("active", "revised", "deferred")
-            and e["id"] not in draft_ids
-        ]
-        if missing_live:
-            # Feedback carries each missing entry's FULL text, not just its id (observed live
-            # 2026-08-31, thread 47f1be95: three laps burned to verification_cap_exceeded on two
-            # audit-added ACs the draft session had never itself emitted -- bare ids gave the
-            # redraft nothing to re-emit, and it never went to read ledger.json).
-            by_id_live = {e["id"]: e for e in result.updated_entries}
-            detail_lines = []
-            for mid in sorted(missing_live):
-                e = by_id_live[mid]
-                text = e.get("title") if e.get("kind") == "user_story" else e.get("description", "")
-                parent = f" (criterion of {e['parent_us_id']})" if e.get("parent_us_id") else ""
-                flag = " [status=deferred: re-emit with deferred=true]" if e.get("status") == "deferred" else ""
-                detail_lines.append(f"- {mid}{parent}{flag}: {text}")
+
+
+def make_verify_specification_ledger(
+    stage_key: str = "specification", has_audit_role: bool = True
+) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str], Any]:
+    """Factory, not a bare function (file-based-editing plan, Part 6 audit fix -- mirrors
+    gates/diagram_gate.py's make_verify_plan_diagrams exactly, same reasoning): Part 6's brownfield
+    spec-pass reuses this exact verification logic under a DIFFERENT stage-key (not the real
+    "specification" key) and with no audit role. A bare module-level function had no way to know
+    which stage-key/audit-role it was running for, so a hardcoded "specification"/"audit" lookup
+    below would silently target the wrong session for any caller besides the real specification
+    stage.
+
+    `_verify_specification_ledger` below is `make_verify_specification_ledger("specification")` --
+    the real specification StageSpec's own `deterministic_verify`, unchanged from every existing
+    caller's perspective.
+    """
+
+    async def _verify_specification_ledger(
+        thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None,
+        provider: SandboxProvider, chat_provider: str,
+    ) -> VerificationResult:
+        """StageSpec.deterministic_verify for the specification stage: reads
+        spec_ledger.DRAFT_SPEC_PATH (the model's own file-edited sketchpad -- file-based-editing
+        plan, Part 1), validates/resolves every User Story's and Acceptance Criterion's id against
+        spec_ledger.LEDGER_PATH, and persists the ledger on success.
+
+        `content_dict` enters this function as the just-audited response's own metadata dump
+        (`story_changes`/`audit_findings`/`bug_affected_ac_ids` is NOT here -- that lives in the
+        file) -- it is cleared and replaced with the file's real content once the file validates,
+        the same object identity `stage["draft"]` already holds (make_verify_node never reassigns
+        it), so `sync_ledger`'s in-place mutation of ids stays the established contract. Everything
+        below the file-read insertion point is otherwise unchanged from before this rewrite.
+        """
+        raw_file = await repo_files.read_repo_file(provider, thread_id, spec_ledger.DRAFT_SPEC_PATH)
+        if raw_file is None:
             return VerificationResult(
                 passed=False,
                 feedback=(
-                    "The specification draft is INCOMPLETE -- every draft must be the WHOLE "
-                    "specification, never a delta. These still-live ledger entries are absent; "
-                    "re-emit each one VERBATIM below, citing its id via existing_us_id/"
-                    "existing_ac_id (a criterion nests under its parent story's block), or "
-                    "explicitly retire it via retired_us_ids/retired_ac_ids if the requirements "
-                    "no longer call for it:\n" + "\n".join(detail_lines)
+                    f"{spec_ledger.DRAFT_SPEC_PATH} does not exist -- view it, then create it with "
+                    "your file tools (it should already be seeded; if genuinely absent, create it "
+                    "shaped like a Specification: title/summary/user_stories/assumptions/"
+                    "out_of_scope/questions/etc.)."
                 ),
-                report={"missing_live_entries": sorted(missing_live)},
+                report={"draft_file": "missing"},
+            )
+        try:
+            file_specification = Specification.model_validate(json.loads(raw_file)).model_dump(mode="json")
+        except (json.JSONDecodeError, ValidationError) as exc:
+            return VerificationResult(
+                passed=False,
+                feedback=f"{spec_ledger.DRAFT_SPEC_PATH} does not match the Specification shape: {exc}. View it and fix it.",
+                report={"draft_file": "invalid"},
+            )
+        # File-based-editing plan, Part 1 audit fix (implementation-time refinement, simpler and
+        # more robust than the response-validator design originally planned): reject outright if
+        # the file's own user_stories is empty -- mirrors _ready_means_files_were_written's actual
+        # spirit ("claimed done, nothing was produced"), and correct where a response-level
+        # readiness check could not be: this function only ever runs once readiness was True at
+        # some point this ticket (make_route_after_draft never routes a False draft to audit/
+        # verify), and Part 1's own file contract re-emits the WHOLE document every lap, so a
+        # genuinely non-empty file always has non-empty user_stories for any real ticket -- only a
+        # true first-ever no-op leaves it empty.
+        if not file_specification.get("user_stories"):
+            return VerificationResult(
+                passed=False,
+                feedback=(
+                    f"{spec_ledger.DRAFT_SPEC_PATH} has an empty user_stories list -- this response is "
+                    "metadata ABOUT the specification, not the specification itself. Nothing has "
+                    "been written to the file yet. Use your file tools to actually write the "
+                    "specification's real content, then resubmit."
+                ),
+                report={"draft_file": "empty"},
+            )
+        content_dict.clear()
+        content_dict.update(file_specification)
+
+        # File-based-editing plan, Part 3's review-depth safety net: transcript-verified proof the
+        # AUDIT session read the whole draft file this lap, threaded into sync_ledger below.
+        # `has_audit_role=False` (Part 6's brownfield spec-pass, which has no audit at all) skips
+        # this entirely -- see spec_ledger.sync_ledger's own `fully_reviewed` docstring for the
+        # three-state contract.
+        fully_reviewed: bool | None = None
+        if has_audit_role:
+            session_id = chat_model.get_session_id(thread_id, stage_key, "audit", provider=chat_provider)
+            evidence: bool | None = None
+            if session_id is not None:
+                total_lines = raw_file.count("\n") + 1
+                evidence = await chat_model.read_full_file_reads(
+                    provider, thread_id, session_id, spec_ledger.DRAFT_SPEC_PATH, total_lines,
+                    active_provider=chat_provider,
+                )
+            if evidence is None:
+                fully_reviewed = None if not chat_model.provider_can_verify_transcripts(chat_provider) else False
+            else:
+                fully_reviewed = evidence
+
+        # Question-ledger backstop (user requirement 2026-08-31): make_draft_node's routing coercion
+        # keeps open questions away from the gate on the DRAFT path, but the audit revises content
+        # after that and could reintroduce one -- verify is the last deterministic word before the
+        # gate, so an open question here fails the check outright.
+        open_questions = [
+            q for q in (content_dict.get("questions") or []) if isinstance(q, dict) and q.get("status") == "open"
+        ]
+        if open_questions:
+            listed = "; ".join(f"{q.get('id')}: {q.get('question')}" for q in open_questions)
+            return VerificationResult(
+                passed=False,
+                feedback=(
+                    "Open clarifying questions can never reach the human gate -- either the revised "
+                    "requirements answer them (mark status=answered, citing the wording) or take an "
+                    f"explicit assumption (status=assumed, mirrored in `assumptions`): {listed}"
+                ),
+                report={"open_questions": [q.get("id") for q in open_questions]},
             )
 
-        # Durable question provenance: every question ever raised (answered/assumed included)
-        # upserts into the same committed ledger the US/AC ids live in, keyed by the model's
-        # stable question id -- the requirements document plus this ledger together explain how
-        # every ambiguity was resolved.
-        updated_entries = spec_ledger.upsert_questions(
-            result.updated_entries, content_dict.get("questions") or [], run_id
+        entries = await spec_ledger.load_ledger(provider, thread_id)
+        user_stories = content_dict.get("user_stories") or []
+        retired_ac_ids = content_dict.get("retired_ac_ids") or []
+        retired_us_ids = content_dict.get("retired_us_ids") or []
+        bug_affected_ac_ids = content_dict.get("bug_affected_ac_ids") or []
+        result = spec_ledger.sync_ledger(
+            entries,
+            user_stories,
+            run_id,
+            retired_ac_ids=retired_ac_ids,
+            retired_us_ids=retired_us_ids,
+            source_ticket_id=thread_id,
+            bug_affected_ac_ids=bug_affected_ac_ids,
+            fully_reviewed=fully_reviewed,
         )
-        # No explicit commit: the ledger lives under .ai-dev-workflow/, which the verify-pass
-        # persistence commit sweeps up.
-        await spec_ledger.save_ledger(provider, thread_id, updated_entries)
-        # Scope-lifecycle stamps for the review UI (user requirement 2026-08-31): every live
-        # story/AC carries its change classification versus the specification the human last
-        # APPROVED -- read fresh from disk here rather than from the ledger's own pre-sync state,
-        # which mutates on every verify pass and so falsely reports "unchanged" for a story
-        # re-cited identically from an earlier draft the human never actually approved (spec_
-        # ledger.gate_change_status's own docstring has the full story; observed live 2026-08-31:
-        # a reject-and-redraft cycle before approval silently dropped the "new" badge from every
-        # story except the one genuinely added in the redraft). Absent entirely before this
-        # ticket's first-ever approval, in which case every story/AC correctly reports "new".
-        raw_prior_spec = await repo_files.read_repo_file(
-            provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
-        )
-        prior_by_id: dict[str, dict[str, Any]] = {}
-        if raw_prior_spec is not None:
-            try:
-                prior_spec = json.loads(raw_prior_spec)
-                for prior_story in prior_spec.get("user_stories") or []:
-                    prior_by_id[prior_story.get("id")] = {
-                        "text": prior_story.get("title", ""), "deferred": bool(prior_story.get("deferred")),
-                    }
-                    for prior_ac in prior_story.get("acceptance_criteria") or []:
-                        prior_by_id[prior_ac.get("id")] = {
-                            "text": prior_ac.get("description", ""), "deferred": bool(prior_ac.get("deferred")),
-                        }
-            except json.JSONDecodeError:
-                pass
-        no_new_work = _stamp_gate_change_and_check_delta(content_dict, prior_by_id, updated_entries)
+        no_new_work = False
+        if result.passed:
+            # Completeness gate (2026-08-31, observed live TWICE): a redraft that emits only the
+            # stories it touched silently shrinks the specification -- the ledger keeps the dropped
+            # entries live, but the document (what the human approves and every later stage reads)
+            # loses them. Prompt-level instructions failed to prevent it, so it is deterministic now:
+            # every still-live ledger entry must appear in the draft (sync above already resolved
+            # draft ids) or be explicitly retired this round. Runs only on a PASSING sync so the
+            # feedback names real ids.
+            draft_ids: set[str] = set()
+            for story in content_dict.get("user_stories") or []:
+                if story.get("id"):
+                    draft_ids.add(str(story["id"]))
+                for ac in story.get("acceptance_criteria") or []:
+                    if ac.get("id"):
+                        draft_ids.add(str(ac["id"]))
+            missing_live = [
+                e["id"]
+                for e in result.updated_entries
+                if e.get("kind") in ("user_story", "acceptance_criterion")
+                # "deferred" included on purpose: parked scope must stay VISIBLE in every draft
+                # (re-emitted with deferred=true), or the document silently loses it exactly like
+                # the delta-shrink this gate exists to prevent.
+                and e.get("status") in ("active", "revised", "deferred")
+                and e["id"] not in draft_ids
+            ]
+            if missing_live:
+                # Feedback carries each missing entry's FULL text, not just its id (observed live
+                # 2026-08-31, thread 47f1be95: three laps burned to verification_cap_exceeded on two
+                # audit-added ACs the draft session had never itself emitted -- bare ids gave the
+                # redraft nothing to re-emit, and it never went to read ledger.json).
+                by_id_live = {e["id"]: e for e in result.updated_entries}
+                detail_lines = []
+                for mid in sorted(missing_live):
+                    e = by_id_live[mid]
+                    text = e.get("title") if e.get("kind") == "user_story" else e.get("description", "")
+                    parent = f" (criterion of {e['parent_us_id']})" if e.get("parent_us_id") else ""
+                    flag = " [status=deferred: re-emit with deferred=true]" if e.get("status") == "deferred" else ""
+                    detail_lines.append(f"- {mid}{parent}{flag}: {text}")
+                return VerificationResult(
+                    passed=False,
+                    feedback=(
+                        "The specification draft is INCOMPLETE -- every draft must be the WHOLE "
+                        "specification, never a delta. These still-live ledger entries are absent; "
+                        "re-emit each one VERBATIM below, citing its id via existing_us_id/"
+                        "existing_ac_id (a criterion nests under its parent story's block), or "
+                        "explicitly retire it via retired_us_ids/retired_ac_ids if the requirements "
+                        "no longer call for it:\n" + "\n".join(detail_lines)
+                    ),
+                    report={"missing_live_entries": sorted(missing_live)},
+                )
 
-        content_dict["retired_user_stories"] = [
-            {"id": e["id"], "title": e.get("title", "")}
-            for e in updated_entries
-            if e.get("kind") == "user_story" and e.get("status") == "retired"
-        ]
-        content_dict["retired_acceptance_criteria"] = [
-            {"id": e["id"], "description": e.get("description", ""), "parent_us_id": e.get("parent_us_id", "")}
-            for e in updated_entries
-            if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
-        ]
-    return VerificationResult(
-        passed=result.passed,
-        feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
-        report={
-            "reasons": result.reasons,
-            "ledger_entry_count": len(result.updated_entries),
-            "no_new_work": no_new_work,
-        },
-    )
+            # Durable question provenance: every question ever raised (answered/assumed included)
+            # upserts into the same committed ledger the US/AC ids live in, keyed by the model's
+            # stable question id -- the requirements document plus this ledger together explain how
+            # every ambiguity was resolved.
+            updated_entries = spec_ledger.upsert_questions(
+                result.updated_entries, content_dict.get("questions") or [], run_id
+            )
+            # No explicit commit: the ledger lives under .ai-dev-workflow/, which the verify-pass
+            # persistence commit sweeps up.
+            await spec_ledger.save_ledger(provider, thread_id, updated_entries)
+            # Scope-lifecycle stamps for the review UI (user requirement 2026-08-31): every live
+            # story/AC carries its change classification versus the specification the human last
+            # APPROVED -- read fresh from disk here rather than from the ledger's own pre-sync state,
+            # which mutates on every verify pass and so falsely reports "unchanged" for a story
+            # re-cited identically from an earlier draft the human never actually approved (spec_
+            # ledger.gate_change_status's own docstring has the full story; observed live 2026-08-31:
+            # a reject-and-redraft cycle before approval silently dropped the "new" badge from every
+            # story except the one genuinely added in the redraft). Absent entirely before this
+            # ticket's first-ever approval, in which case every story/AC correctly reports "new".
+            raw_prior_spec = await repo_files.read_repo_file(
+                provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+            )
+            prior_by_id: dict[str, dict[str, Any]] = {}
+            if raw_prior_spec is not None:
+                try:
+                    prior_spec = json.loads(raw_prior_spec)
+                    for prior_story in prior_spec.get("user_stories") or []:
+                        prior_by_id[prior_story.get("id")] = {
+                            "text": prior_story.get("title", ""), "deferred": bool(prior_story.get("deferred")),
+                        }
+                        for prior_ac in prior_story.get("acceptance_criteria") or []:
+                            prior_by_id[prior_ac.get("id")] = {
+                                "text": prior_ac.get("description", ""), "deferred": bool(prior_ac.get("deferred")),
+                            }
+                except json.JSONDecodeError:
+                    pass
+            no_new_work = _stamp_gate_change_and_check_delta(content_dict, prior_by_id, updated_entries)
+
+            content_dict["retired_user_stories"] = [
+                {"id": e["id"], "title": e.get("title", "")}
+                for e in updated_entries
+                if e.get("kind") == "user_story" and e.get("status") == "retired"
+            ]
+            content_dict["retired_acceptance_criteria"] = [
+                {"id": e["id"], "description": e.get("description", ""), "parent_us_id": e.get("parent_us_id", "")}
+                for e in updated_entries
+                if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
+            ]
+            # File-based-editing plan, Part 1 sect. 5: write the ledger-resolved content back to
+            # the sketchpad so the next lap's `view` shows resolved real ids, not the model's
+            # placeholders. On failure (returns above), deliberately NOT written back -- leaves the
+            # model's own edit exactly as submitted, next to the feedback naming what's wrong.
+            await repo_files.write_repo_file(
+                provider, thread_id, spec_ledger.DRAFT_SPEC_PATH, json.dumps(content_dict, indent=2)
+            )
+        return VerificationResult(
+            passed=result.passed,
+            feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
+            report={
+                "reasons": result.reasons,
+                "ledger_entry_count": len(result.updated_entries),
+                "no_new_work": no_new_work,
+            },
+        )
+
+    return _verify_specification_ledger
+
+
+# The real specification StageSpec's own `deterministic_verify` -- unchanged reference for every
+# existing caller. Part 6's brownfield spec-pass calls
+# make_verify_specification_ledger("brownfield-spec", has_audit_role=False) instead.
+_verify_specification_ledger = make_verify_specification_ledger("specification")
 
 
 # playwright.config.ts's exact content is a template file (agent/src/templates/playwright/), not
@@ -1783,13 +2005,18 @@ STAGES: list[StageSpec] = [
     StageSpec(
         key="specification",
         response_schema=SpecificationDraftResponse,
-        content_field="specification",
+        # File-based-editing plan, Part 1 sect. 2: content_field=None -- the response is
+        # metadata-only now (story_changes/summary/skills_invoked); the actual Specification
+        # content lives in and is edited directly in spec_ledger.DRAFT_SPEC_PATH, reusing the
+        # "whole response is the artifact" branch of _stage_content (the same mechanism
+        # remediation already relies on).
+        content_field=None,
         surface_tool_name="present_specification",
         build_envelope=build_specification_envelope,
         build_prompt=_build_specification_prompt,
         max_cycles=workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
         audit_response_schema=SpecificationAuditResponse,
-        audit_content_field="revised_specification",
+        audit_content_field=None,
         build_audit_prompt=_build_specification_audit_prompt,
         render_markdown=render_specification_markdown,
         draft_example=SPECIFICATION_DRAFT_EXAMPLE,
@@ -1808,11 +2035,25 @@ STAGES: list[StageSpec] = [
         # inert and are swept by the next sync.
         post_approve_hook=spec_ledger.apply_tracking_resets_hook,
         sign_approval=True,
-        # The one stage that may use `brainstorming` -- exploring intent and requirements before
-        # anything is built is precisely its purpose. It stays disabled for every other stage
-        # (config.COPILOT_DISABLED_SKILLS), where it fires as a blanket mandate on mechanical work.
+        # use_custom_agent=False is EMPIRICALLY required, not stylistic -- same finding ac-to-tests'
+        # own StageSpec documents (agent-work/ghcp-bug-report-custom-agents-tools.md): custom_agents
+        # silently drops part of its own declared tools list; available_tools is the route that
+        # actually works.
+        use_custom_agent=False,
+        # File-based-editing plan, Part 1 sect. 3: real file-edit tools, same grant for both draft
+        # and audit roles (audit keeps write access -- preserves the capability today's
+        # revised_specification already had). The one stage that may use `brainstorming` --
+        # exploring intent and requirements before anything is built is precisely its purpose. It
+        # stays disabled for every other stage (config.COPILOT_DISABLED_SKILLS), where it fires as
+        # a blanket mandate on mechanical work. No bash, no ask_user -- same reasoning ac-to-tests
+        # already documents.
         session_options=lambda _state, _role: {
-            "disabled_skills": workflow_config.COPILOT_DISABLED_SKILLS_SPECIFICATION
+            "disabled_skills": workflow_config.COPILOT_DISABLED_SKILLS_SPECIFICATION,
+            "agent_mode": "autopilot",
+            "available_tools": [
+                "builtin:view", "builtin:grep", "builtin:glob",
+                "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+            ],
         },
         # Tuning history/rationale lives on the constant itself (config.py's SPEC_MAX_VERIFY_CYCLES).
         max_verify_cycles=workflow_config.SPEC_MAX_VERIFY_CYCLES,
@@ -1820,13 +2061,16 @@ STAGES: list[StageSpec] = [
     StageSpec(
         key="plan",
         response_schema=PlanDraftResponse,
-        content_field="plan",
+        # File-based-editing plan, Part 2 sect. 2: content_field=None -- same mechanism as
+        # specification's redesign above. The actual plan content lives in
+        # .ai-dev-workflow/plan/_draft/ (steps.json/manifest.json/sidecar files), edited directly.
+        content_field=None,
         surface_tool_name="present_plan",
         build_envelope=build_plan_envelope,
         build_prompt=_build_plan_prompt,
         max_cycles=workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
         audit_response_schema=PlanAuditResponse,
-        audit_content_field="revised_plan",
+        audit_content_field=None,
         build_audit_prompt=_build_plan_audit_prompt,
         render_markdown=render_plan_markdown,
         draft_example=PLAN_DRAFT_EXAMPLE,
@@ -1841,17 +2085,25 @@ STAGES: list[StageSpec] = [
         # (spec_ledger entries' plan_step_ids). Overwrite semantics -- idempotent on resume.
         post_approve_hook=spec_ledger.stamp_plan_links_hook,
         draft_prompt_context_from_repo_file=hydrate_plan_ticket_mode_context,
-        # Wireframes are LLM-emitted self-contained HTML validated by verify_plan_diagrams -- no
-        # MCP servers needed (Excalidraw MCP deleted: never spike-tested, fetched unpinned
-        # `npx -y mcp-excalidraw` at runtime, and had no export path). The UI-repo branch keeps
-        # the same read-only allowlist it had when the MCP was attached.
-        # Unconditional read-only tools: the plan agent must inspect the repo and
-        # .ai-dev-workflow/tech-stack.md to plan concretely, and it never writes. The previous
-        # UI-framework conditional left non-UI stacks (e.g. blazor-dotnet) with no tools at all
-        # once custom_agents stopped supplying them -- the agent answered "I can't inspect the
-        # repository contents from this interface" and the stage died with an empty plan.
+        # use_custom_agent=False -- same empirically-required fix as specification/ac-to-tests above.
+        use_custom_agent=False,
+        # capture_baseline_commit=True: file-based-editing plan, Part 2 sect. 3 -- plan previously
+        # had zero write tools, so there was no baseline to diff against; now it does, and the new
+        # write-scope guard (verify_plan_diagrams -> write_scope_gate.check_write_scope) needs this
+        # diff reference point, same mechanism ac-to-tests already relies on.
+        capture_baseline_commit=True,
+        # File-based-editing plan, Part 2 sect. 3: same real file-edit tool grant as specification
+        # above, for both draft and audit roles -- plan_audit.md already mandates the audit pass
+        # fix wireframe/diagram content directly, so it needs the same write access its draft gets.
+        # Wireframes/diagrams are still LLM-emitted, validated by verify_plan_diagrams -- no MCP
+        # servers needed (Excalidraw MCP deleted: never spike-tested, fetched unpinned
+        # `npx -y mcp-excalidraw` at runtime, and had no export path).
         session_options=lambda _state, _role: {
-            "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
+            "agent_mode": "autopilot",
+            "available_tools": [
+                "builtin:view", "builtin:grep", "builtin:glob",
+                "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+            ],
         },
         # Tuning history/rationale lives on the constant itself (config.py's PLAN_MAX_VERIFY_CYCLES).
         max_verify_cycles=workflow_config.PLAN_MAX_VERIFY_CYCLES,
@@ -3093,7 +3345,15 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 ),
                 label=f"{stage_spec.key}:audit",
             )
-            content_dict = getattr(response, stage_spec.audit_content_field).model_dump(mode="json")
+            # File-based-editing plan, Part 1 sect. 5 (generic, no-op for every other stage):
+            # routes through the same _stage_content helper make_draft_node already uses, so
+            # audit_content_field=None (specification/plan's new metadata-only shape) is handled
+            # the same way content_field=None already is for drafts -- a hardcoded
+            # getattr(response, None) here would crash outright the moment either stage flips.
+            _audit_content = _stage_content(response, stage_spec.audit_content_field)
+            content_dict = (
+                _audit_content.model_dump(mode="json") if isinstance(_audit_content, BaseModel) else _audit_content
+            )
             # As of Task 14, every audit_response_schema this node is actually wired to
             # (Specification/Plan since Task 10, AcToTests/MinimalCodeToGreen since Task 14) types
             # audit_findings as a real PresenceList -- the shape asymmetry this comment used to
@@ -3611,6 +3871,16 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
 
         extra_messages: list[BaseMessage] = []
         if result.passed:
+            # File-based-editing plan, Part 1 sect. 5 (generic, no-op for every other stage):
+            # specification/plan's deterministic_verify swaps stage["draft"] from the model's
+            # slim metadata response to the file-resolved FULL content (real ids, real
+            # user_stories/plan_steps) -- re-extract used_ids against that now-complete content so
+            # the next redraft's "already used" list is accurate. A no-op for every stage whose
+            # deterministic_verify doesn't do this swap (the ids extracted are identical to what
+            # make_audit_node already put there).
+            used_ids: set[str] = set(stage["used_ids"])
+            _extract_ids(stage["draft"], used_ids)
+            stage["used_ids"] = sorted(used_ids)
             # deterministic_verify (e.g. spec_ledger.sync_ledger) may have mutated stage["draft"]
             # in place (ids resolved/overwritten) -- build+send the human-facing surface only now,
             # against the final, ledger-correct content (see make_audit_node's matching comment).
@@ -4644,34 +4914,155 @@ def _wire_tech_stack_intake(builder: StateGraph) -> None:
     builder.add_edge("record_raw_requirements", f"{STAGES[1].key}_draft")
 
 
-BROWNFIELD_BASELINE_SPEC = StageSpec(
-    key="brownfield-baseline",
-    response_schema=BrownfieldBaselineDraftResponse,
-    content_field="baseline",
-    surface_tool_name="present_brownfield_baseline",
-    build_envelope=build_brownfield_baseline_envelope,
-    build_prompt=_build_brownfield_baseline_prompt,
-    max_cycles=2,
-    render_markdown=render_brownfield_baseline_markdown,
-    draft_example=BROWNFIELD_BASELINE_DRAFT_EXAMPLE,
-    # Ratification (brownfield_write_manifest_node, this stage's next_draft_name below) now runs
-    # automatically after the audit -- the human checkpoints are specification and plan only.
-    requires_human_gate=False,
-    session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
+async def _brownfield_spec_approve_hook(
+    thread_id: str, content: dict[str, Any], state: "GraphState", provider: SandboxProvider
+) -> None:
+    """StageSpec.post_approve_hook for brownfield-spec (file-based-editing plan, Part 6 sect. 8):
+    writes the approved baseline Specification directly to the SAME numbered path the real
+    specification stage owns -- true convergence, not a bespoke brownfield file. Not the generic
+    per-stage-key writer (workflow_persistence.persist_state): "brownfield-spec" is not the real
+    "specification" key, so the generic writer would derive the wrong filename from it.
+
+    Delivery pre-stamping deliberately does NOT happen here -- see
+    _brownfield_plan_approve_hook's own docstring for why it waits for the plan pass instead (the
+    2026-09-16 timing fix).
+    """
+    del state
+    await repo_files.write_repo_file(
+        provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH, json.dumps(content, indent=2)
+    )
+    await repo_files.write_repo_file(
+        provider, thread_id, workflow_persistence.SPECIFICATION_MD_PATH, render_specification_markdown(content)
+    )
+    await git_ops.commit_paths(
+        provider, thread_id,
+        [workflow_persistence.SPECIFICATION_APPROVED_PATH, workflow_persistence.SPECIFICATION_MD_PATH],
+        "ai-dev-workflow: brownfield baseline -- specification approved",
+    )
+
+
+async def _brownfield_plan_approve_hook(
+    thread_id: str, content: dict[str, Any], state: "GraphState", provider: SandboxProvider
+) -> None:
+    """StageSpec.post_approve_hook for brownfield-plan (file-based-editing plan, Part 6 sect. 5/8):
+    writes the approved baseline Plan to PLAN_APPROVED_PATH (true convergence, same reasoning as
+    the spec pass's own hook above), THEN stamps delivery (coded_run_id/tested_run_id) on every
+    AC newly minted by THIS baseline -- the one piece of this design with no existing analog,
+    since a normal specification approval never stamps these (they come later, only after a real
+    regression-clean build); this baseline describes code that's already built by definition.
+    Without this, the user's first real feature request would come back with the entire
+    reverse-engineered baseline showing up as "eligible" work too.
+
+    Fires HERE, on the PLAN pass's approval, not the spec pass's (2026-09-16 adversarial-audit
+    fix, confirmed by user): pre-stamping before the plan pass ever drafts a step would pull every
+    baseline AC out of eligible_ac_ids before check_plan_linkage's own AC-coverage gate (the same
+    deterministic query the plan pass's own verify already runs) ever gets to demand a step for
+    each one -- leaving "the model must synthesize a real step per inferred story/AC cluster"
+    enforced by prompt instruction alone, not by any gate. Firing here means that gate has already
+    forced full step coverage while those ACs were still eligible.
+    """
+    run_id = state.get("run_id", "unknown")
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    await repo_files.write_repo_file(
+        provider, thread_id, workflow_persistence.PLAN_APPROVED_PATH, json.dumps(content, indent=2)
+    )
+    await repo_files.write_repo_file(
+        provider, thread_id, workflow_persistence.PLAN_MD_PATH, render_plan_markdown(content)
+    )
+    entries = await spec_ledger.load_ledger(provider, thread_id)
+    changed = False
+    for entry in entries:
+        if entry.get("kind") != "acceptance_criterion" or entry.get("first_seen_run_id") != run_id:
+            continue
+        if not entry.get("coded_run_id"):
+            entry["coded_run_id"] = run_id
+            entry["coded_at"] = now_iso
+            changed = True
+        if not entry.get("tested_run_id"):
+            entry["tested_run_id"] = run_id
+            entry["tested_at"] = now_iso
+            changed = True
+    if changed:
+        await spec_ledger.save_ledger(provider, thread_id, entries)
+    await git_ops.commit_paths(
+        provider, thread_id,
+        [workflow_persistence.PLAN_APPROVED_PATH, workflow_persistence.PLAN_MD_PATH, spec_ledger.LEDGER_PATH],
+        "ai-dev-workflow: brownfield baseline -- plan approved, delivery pre-stamped",
+    )
+
+
+# File-based-editing plan, Part 6: both passes reuse the real Specification/Plan file-editing tool
+# grant directly (Part 1 sect. 3/Part 2 sect. 3) -- this baseline pass writes real content into the
+# exact same scratch files (spec_ledger.DRAFT_SPEC_PATH, .ai-dev-workflow/plan/_draft/) the real
+# stages use, so it needs the same real file tools, not the old read-only allowlist.
+_BROWNFIELD_SESSION_OPTIONS = lambda _state, _role: {  # noqa: E731
+    "agent_mode": "autopilot",
+    "available_tools": [
+        "builtin:view", "builtin:grep", "builtin:glob",
+        "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
+    ],
+}
+
+BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
+    key="brownfield-spec",
+    response_schema=SpecificationDraftResponse,
+    content_field=None,
+    surface_tool_name="present_specification",
+    build_envelope=build_specification_envelope,
+    build_prompt=_build_brownfield_spec_prompt,
+    max_cycles=workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
+    render_markdown=None,  # bespoke hook writes SPECIFICATION_MD_PATH directly -- see its own docstring
+    draft_example=SPECIFICATION_DRAFT_EXAMPLE,
+    deterministic_verify=make_verify_specification_ledger("brownfield-spec", has_audit_role=False),
+    draft_rules="\n".join(f"- {r}" for r in SPECIFICATION_HARD_RULES),
+    draft_prompt_context_from_repo_file=spec_ledger.hydrate_ticket_mode_context,
+    post_approve_hook=_brownfield_spec_approve_hook,
+    sign_approval=True,
+    requires_human_gate=True,
+    use_custom_agent=False,
+    session_options=_BROWNFIELD_SESSION_OPTIONS,
+    max_verify_cycles=workflow_config.SPEC_MAX_VERIFY_CYCLES,
+)
+
+BROWNFIELD_BASELINE_PLAN_STAGE = StageSpec(
+    key="brownfield-plan",
+    response_schema=PlanDraftResponse,
+    content_field=None,
+    surface_tool_name="present_plan",
+    build_envelope=build_plan_envelope,
+    build_prompt=_build_brownfield_plan_prompt,
+    max_cycles=workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
+    render_markdown=None,  # bespoke hook writes PLAN_MD_PATH directly -- see its own docstring
+    draft_example=PLAN_DRAFT_EXAMPLE,
+    deterministic_verify=make_verify_plan_diagrams("brownfield-plan", has_audit_role=False),
+    draft_rules="\n".join(f"- {r}" for r in PLAN_HARD_RULES),
+    draft_prompt_context_from_repo_file=hydrate_plan_ticket_mode_context,
+    post_approve_hook=_brownfield_plan_approve_hook,
+    sign_approval=True,
+    requires_human_gate=True,
+    use_custom_agent=False,
+    capture_baseline_commit=True,  # needed by verify_plan_diagrams' own write-scope guard
+    session_options=_BROWNFIELD_SESSION_OPTIONS,
+    max_verify_cycles=workflow_config.PLAN_MAX_VERIFY_CYCLES,
 )
 
 
 def _wire_brownfield(builder: StateGraph) -> None:
-    """Wires brownfield-baseline's brownfield sub-flow: only reached when scaffold's manifest_exists check finds
-    no manifest.json (_wire_app_discovery's "manifest_branch" conditional edge, not this function,
-    does that branch). brownfield_baseline_pre (deterministic schema/migration/route grep) -> BROWNFIELD_BASELINE_SPEC
-    (draft->audit->gate) -> brownfield_write_manifest (deterministic: ratification IS what creates
-    manifest.json) -> app_check_record, where both branches converge before raw-requirements.
+    """Wires the brownfield sub-flow: only reached when scaffold's manifest_exists check finds no
+    manifest.json (_wire_app_discovery's "manifest_branch" conditional edge, not this function,
+    does that branch). File-based-editing plan, Part 6 (true convergence): brownfield_baseline_pre
+    (deterministic schema/migration/route grep) -> BROWNFIELD_BASELINE_SPEC_STAGE (spec pass:
+    draft->verify->human gate) -> BROWNFIELD_BASELINE_PLAN_STAGE (plan pass: draft->verify->human
+    gate) -> brownfield_write_manifest (deterministic: ratification IS what creates manifest.json,
+    now running after BOTH passes) -> app_check_record, where both branches converge before
+    raw-requirements. Neither pass has an audit leg (draft-only, unchanged from before this plan --
+    scope discipline: convergence is about documents/ledger, not audit rigor).
     Verification status: NOT exercised against a real sandbox."""
     builder.add_node("brownfield_baseline_pre", preflight_nodes.brownfield_baseline_context_node)
     builder.add_node("brownfield_write_manifest", preflight_nodes.brownfield_write_manifest_node)
-    _wire_stage(builder, BROWNFIELD_BASELINE_SPEC, "brownfield_write_manifest")
-    builder.add_edge("brownfield_baseline_pre", "brownfield-baseline_draft")
+    _wire_stage(builder, BROWNFIELD_BASELINE_SPEC_STAGE, "brownfield-plan_draft")
+    _wire_stage(builder, BROWNFIELD_BASELINE_PLAN_STAGE, "brownfield_write_manifest")
+    builder.add_edge("brownfield_baseline_pre", "brownfield-spec_draft")
     builder.add_edge("brownfield_write_manifest", "app_check_record")
 
 
@@ -4900,7 +5291,8 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
 # Note: ADVERSARIAL_AUDIT_SPEC, DEDUP_SPEC, LICENSE_AUDIT_SPEC, EXIT_SPEC are now consolidated
 # into stages 7 (adversarial-compliance) and 8 (metrics-exit), so they're no longer standalone.
 _STANDALONE_STAGE_SPECS: list[StageSpec] = [
-    BROWNFIELD_BASELINE_SPEC,
+    BROWNFIELD_BASELINE_SPEC_STAGE,
+    BROWNFIELD_BASELINE_PLAN_STAGE,
 ]
 _ALL_STAGE_SPECS: list[StageSpec] = STAGES + _STANDALONE_STAGE_SPECS
 # raw-requirements has no StageSpec (deterministic record node) but its stage KEY must stay in
@@ -6033,10 +6425,12 @@ def _demo() -> None:
 
     # Task 13b: now that every StageSpec with a deterministic_verify has been wired with real
     # draft_rules/audit_rules (Tasks 7/8/13 combined), the real registry must satisfy its own
-    # check cleanly -- not just the synthetic fixtures above. _ALL_STAGE_SPECS (not just STAGES)
-    # so brownfield-baseline's real StageSpec proves "no deterministic_verify -> exempt" against
-    # actual production wiring, not only the synthetic "no-gate" fixture above; tech-stack (in
-    # STAGES, also no deterministic_verify) is exempt the same way.
+    # check cleanly -- not just the synthetic fixtures above. _ALL_STAGE_SPECS (not just STAGES) so
+    # this proves it against actual production wiring, not only the synthetic fixtures above:
+    # tech-stack (no deterministic_verify at all) is exempt the "no-gate" way; brownfield-spec/
+    # brownfield-plan (file-based-editing plan, Part 6 -- DO have a deterministic_verify, reusing
+    # SPECIFICATION_HARD_RULES/PLAN_HARD_RULES as their own draft_rules, no audit leg) are exempt
+    # the "draft-only-ok" way instead.
     assert stages_missing_rules(_ALL_STAGE_SPECS) == [], stages_missing_rules(_ALL_STAGE_SPECS)
 
     # Task 13b: SPECIFICATION_HARD_RULES -- 2 rules from _verify_specification_ledger's own code

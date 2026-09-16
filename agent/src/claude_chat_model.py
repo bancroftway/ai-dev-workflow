@@ -1122,6 +1122,91 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
     return names
 
 
+async def read_full_file_reads(
+    provider: SandboxProvider, thread_id: str, session_id: str, file_path: str, total_lines: int
+) -> bool | None:
+    """Whether this Claude session's own transcript proves `file_path` was read in full (every
+    line covered by at least one `Read` call), or None if unverifiable -- same
+    _CLAUDE_PROJECTS_DIR fail-open contract as read_skill_invocations (an infrastructure gap here
+    must never masquerade as "the file was not fully read").
+
+    Built for the review-depth safety net (graph.py's specification/plan verify, Part 3 of the
+    file-based-editing plan): file-based editing lets a model touch only the one entry feedback
+    named and never re-examine the rest, so this is the deterministic, transcript-verified proof a
+    full read actually happened this lap -- not a self-reported checklist, the same reasoning
+    read_skill_invocations already applies to skill invocations.
+
+    Transcript line shape (confirmed against this very module's own captured transcript,
+    2026-09-16 -- a real session showing plain reads, offset+limit reads, and offset-only reads):
+    an assistant-role JSONL entry whose `message.content` contains a block shaped
+    `{"type": "tool_use", "name": "Read", "input": {"file_path": ..., "offset": ..., "limit":
+    ...}}`. `offset`/`limit` are both absent on an unparameterized read (whole small file in one
+    call); an absent `offset` means "start at line 1"; an absent `limit` means the CLI's own
+    default read window (`config.READ_TOOL_DEFAULT_WINDOW_LINES`). Several `Read` calls across one
+    session's laps are merged (interval union) so two partial reads that together cover the file
+    (e.g. lines 1-2000, then 2001-3000) count the same as one call would have.
+
+    `file_path` may be given relative (as callers here always have it) while the transcript's own
+    `input.file_path` is typically absolute inside the sandbox -- matched by suffix, not equality.
+    """
+    path = shlex.quote(f"{_CLAUDE_PROJECTS_DIR}/{session_id}.jsonl")
+    result = await provider.exec_in_sandbox(thread_id, f"cat {path} 2>/dev/null")
+    if not result.ok or not (result.stdout or "").strip():
+        return None
+
+    target = file_path.replace("\\", "/").lstrip("/")
+    ranges: list[tuple[int, int]] = []
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not (isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Read"):
+                continue
+            block_input = block.get("input")
+            if not isinstance(block_input, dict):
+                continue
+            read_path = block_input.get("file_path")
+            if not isinstance(read_path, str):
+                continue
+            normalized = read_path.replace("\\", "/").lstrip("/")
+            if normalized != target and not normalized.endswith(f"/{target}"):
+                continue
+            offset = block_input.get("offset")
+            limit = block_input.get("limit")
+            start = offset if isinstance(offset, int) and offset > 0 else 1
+            span = limit if isinstance(limit, int) and limit > 0 else config.READ_TOOL_DEFAULT_WINDOW_LINES
+            ranges.append((start, start + span - 1))
+
+    if not ranges:
+        return False
+    return _covers_whole_file(ranges, total_lines)
+
+
+def _covers_whole_file(ranges: list[tuple[int, int]], total_lines: int) -> bool:
+    """Pure interval-union check: do these 1-indexed, inclusive (start, end) line ranges together
+    cover [1, total_lines] with no gap? Split out from read_full_file_reads so this logic has a
+    sandbox-free self-check (ponytail: non-trivial branch/loop logic needs one runnable check).
+    """
+    ranges = sorted(ranges)
+    covered_through = 0
+    for start, end in ranges:
+        if start > covered_through + 1:
+            break  # gap in coverage -- union stops advancing here, whatever follows can't close it
+        covered_through = max(covered_through, end)
+    return covered_through >= total_lines
+
+
 def secret_env_names() -> set[str]:
     """Env var names the sandbox container must already have set for this provider's CLI to
     authenticate.
@@ -1530,6 +1615,16 @@ def _demo() -> None:
     assert _init_session_id(killed_head) == "abc-123"
     assert _init_session_id('{"type":"assistant","message":{}}\n') is None
     assert _init_session_id("") is None
+
+    # _covers_whole_file: the pure interval-union half of read_full_file_reads (the transcript-exec
+    # half needs a sandbox, same "pure half only" scoping as everywhere else in this self-check).
+    assert _covers_whole_file([(1, 2000)], 1500), "one call whose window exceeds the file must cover it"
+    assert not _covers_whole_file([], 1500), "no matching Read calls at all must not count as covered"
+    assert not _covers_whole_file([(500, 2000)], 1500), "a read that skips the start of the file is incomplete"
+    assert _covers_whole_file([(1, 2000), (2001, 3000)], 3000), "two adjoining reads must union to full coverage"
+    assert not _covers_whole_file([(1, 1000), (1500, 3000)], 3000), "a gap between reads must not count as covered"
+    assert _covers_whole_file([(2001, 3000), (1, 2000)], 3000), "out-of-order calls must still union correctly"
+    assert _covers_whole_file([(1, 2000), (1, 2000)], 2000), "a repeated identical read must not double-count wrongly"
     print("claude_chat_model self-check: all assertions passed")
 
 

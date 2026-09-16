@@ -6,12 +6,13 @@ from src.env_bootstrap import bootstrap_env
 
 bootstrap_env()  # .env, then AZURE_CONFIG_VAULT_URI -- before any import that reads os.environ
 
+import asyncio
 import logging
 import os
 
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 
-from ag_ui.core import EventType, StateSnapshotEvent
+from ag_ui.core import EventType, RunStartedEvent, StateSnapshotEvent
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
 from copilotkit import LangGraphAGUIAgent
 from fastapi import FastAPI, Request
@@ -46,6 +47,11 @@ async def _lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        # Background graph tasks (_ReattachStateAgent._drive_graph) are detached from any HTTP
+        # request, so uvicorn's own graceful-shutdown drain (in-flight requests only) never waits
+        # for them -- cancel them explicitly before the checkpointer connection underneath them
+        # closes, or a task can still be mid-write to an already-closed SQLite connection.
+        await run_activity.cancel_all_tasks()
         await checkpoint.close_checkpointer()
 
 
@@ -113,45 +119,90 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
             logging.getLogger(__name__).warning("mid-run reattach snapshot failed for thread_id=%r", thread_id, exc_info=True)
             return None
 
-    async def run(self, input):  # noqa: A002 - library signature
-        """Marks this session's run_active signal (run_activity.py) for the lifetime of the
-        stream -- endpoint.py clones the registered agent per request (`agent.clone()`), so this
-        override runs once per HTTP call, not once per process; the `finally` is what makes it
-        cover normal completion, a mid-stream exception (see _RECURSION_LIMIT below), AND a client
-        disconnect (StreamingResponse cancels the streaming task on disconnect, which propagates
-        into this generator's current await point same as any other exception).
+    async def _drive_graph(self, thread_id: str, input) -> None:  # noqa: A002 - library signature
+        """The actual graph execution -- runs as a detached asyncio.Task (see run() below), not
+        inside any HTTP request's coroutine tree, so a browser disconnect can no longer cancel it
+        (the SSE disconnect fix; run_activity.py's module docstring has the full picture).
 
-        The actual graph execution (super().run(), which internally calls prepare_stream() too) is
-        serialized per thread_id via run_activity.get_lock(): multiple browser tabs on the same
-        session each independently trigger a reattach/resume call, and without this a second tab's
-        call used to drive graph.astream concurrently with the first's -- a real risk of doubled
-        side effects (duplicate git ops, duplicate PR opens) and checkpoint-write races. incr/decr
-        stay OUTSIDE the lock so the run_active display flag still flips true immediately for
-        every attaching tab, not only whichever currently holds the lock. Safe to have a tab wait
-        here a long time: this exact shape (a turn running silent for 5-10+ minutes) is why
-        route.ts already disabled the proxy's idle timeouts, and a waiting tab still sees live
-        progress via the separate run-events poll in the meantime."""
-        thread_id = input.thread_id
-        if thread_id:
-            run_activity.incr(thread_id)
+        incr()/decr() now bracket THIS task's lifetime instead of a request's: run_active reflects
+        whether the graph is actually running, regardless of whether any tab is attached to watch
+        it -- the same true-state guarantee run_activity.heartbeat() already gives run_headless.py,
+        extended to the interactive path.
+
+        Exactly one call per thread_id ever reaches this method (run() below only creates a task
+        when none is already registered), so there's no concurrent-astream_events risk to guard
+        against here -- that's now structural (the task registry), not lock-based."""
+        run_activity.incr(thread_id)
         try:
-            lock = run_activity.get_lock(thread_id) if thread_id else nullcontext()
-            async with lock:
-                is_first_event = True
-                async for event in super().run(input):
-                    yield event
-                    # Inserted right after the first event (RUN_STARTED, same position
-                    # prepare_stream's own injection uses above) rather than before the loop --
-                    # AG-UI clients assume RUN_STARTED always leads.
-                    if is_first_event:
-                        is_first_event = False
-                        if thread_id:
-                            snapshot = await self._reattach_snapshot_if_stale(thread_id)
-                            if snapshot is not None:
-                                yield snapshot
+            is_first_event = True
+            async for event in super().run(input):
+                run_activity.publish(thread_id, event)
+                # Inserted right after the first event (RUN_STARTED, same position
+                # prepare_stream's own injection uses above) rather than before the loop -- AG-UI
+                # clients assume RUN_STARTED always leads.
+                if is_first_event:
+                    is_first_event = False
+                    snapshot = await self._reattach_snapshot_if_stale(thread_id)
+                    if snapshot is not None:
+                        run_activity.publish(thread_id, snapshot)
+        except asyncio.CancelledError:
+            raise  # real cancellation: run_activity.cancel_run (Stop container) or app shutdown
+        except Exception:
+            # Mirrors today's behavior for an exception escaping this far: node-level
+            # telemetry.traced_node already owns failure recording for graph nodes, so this is
+            # already-unexpected territory, not a new silent-failure mode -- just log and let the
+            # stream end, same as an uncaught exception mid-request would have done before.
+            logging.getLogger(__name__).exception(
+                "background graph run crashed thread_id=%r", thread_id
+            )
         finally:
-            if thread_id:
-                run_activity.decr(thread_id)
+            run_activity.decr(thread_id)
+            run_activity.pop_task(thread_id)
+            run_activity.publish(thread_id, run_activity.DONE)
+
+    async def run(self, input):  # noqa: A002 - library signature
+        """Per-request generator is now just a SUBSCRIBER to whichever task is driving this
+        thread's graph (_drive_graph above) -- endpoint.py clones the registered agent per request
+        (`agent.clone()`), so this runs once per HTTP call, same as before, but no longer drives
+        the graph itself. A client disconnect now only cancels this generator's `queue.get()`
+        await (the `finally` unsubscribes), never the background task.
+
+        Subscribing BEFORE creating a new task (not after) matters: a task starts publishing the
+        instant it's created, and a subscriber added afterwards would miss its first event.
+
+        thread_id-less input (the library's type allows it, though this pipeline always sets one)
+        has nothing to key a task/subscriber registry on -- fall back to driving it inline, same
+        as every call used to work before this change."""
+        thread_id = input.thread_id
+        if not thread_id:
+            async for event in super().run(input):
+                yield event
+            return
+
+        queue = run_activity.subscribe(thread_id)
+        existing = run_activity.get_task(thread_id)
+        if existing is None or existing.done():
+            task = asyncio.create_task(self._drive_graph(thread_id, input))
+            run_activity.register_task(thread_id, task)
+        else:
+            # Reattach: a task is already driving this thread -- never call super().run() again
+            # here (would double-invoke astream_events concurrently on the same graph thread).
+            # Synthesize the RUN_STARTED + snapshot _drive_graph's own first iteration already
+            # produced for whoever attached first. run_id reuses thread_id (no consumer correlates
+            # by run_id across reconnects today); thread the real active_run id through if that
+            # ever changes.
+            queue.put_nowait(RunStartedEvent(thread_id=thread_id, run_id=thread_id))
+            snapshot = await self._reattach_snapshot_if_stale(thread_id)
+            if snapshot is not None:
+                queue.put_nowait(snapshot)
+        try:
+            while True:
+                item = await queue.get()
+                if item is run_activity.DONE:
+                    return
+                yield item
+        finally:
+            run_activity.unsubscribe(thread_id, queue)
 
 
 # LangGraph's own default recursion_limit (25 super-steps) is far below what this pipeline's own

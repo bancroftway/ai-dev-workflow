@@ -50,7 +50,14 @@ class HydrationError(Exception):
 # here fails loudly instead of silently dropping a stage's number.
 #
 # raw-requirements sorts first: it is the human's input, recorded before tech-stack drafts anything.
-# brownfield-baseline sits at the end because it only runs on the brownfield entrypoint.
+# brownfield-spec/brownfield-plan sit at the end because they only run on the brownfield
+# entrypoint. File-based-editing plan, Part 6 (true convergence): the one-time baseline pass is
+# now two real passes reusing specification/plan's own machinery -- replaces the old single
+# "brownfield-baseline" key. Neither ever gets a render_markdown (both StageSpecs leave it unset),
+# so _stage_file's numbering here only governs their internal .draft.json/.approved.json scratch
+# snapshots, never a rendered .md -- their real deliverable documents are written directly to
+# SPECIFICATION_APPROVED_PATH/PLAN_APPROVED_PATH by their own bespoke post-approve hooks (graph.py),
+# so no `1N-brownfield-*` file is ever produced, exactly the convergence this plan directs.
 _STAGE_ORDER: tuple[str, ...] = (
     "raw-requirements",
     "tech-stack",
@@ -61,7 +68,8 @@ _STAGE_ORDER: tuple[str, ...] = (
     "remediation",
     "adversarial-compliance",
     "metrics-exit",
-    "brownfield-baseline",
+    "brownfield-spec",
+    "brownfield-plan",
 )
 
 
@@ -108,6 +116,14 @@ PLAN_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('plan', 'approved.json')}"
 # ["approved_content"] the way spec_ledger.hydrate_ac_to_tests_ticket_mode_context does for the
 # identical "this ticket's own AC ids" question.
 SPECIFICATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('specification', 'approved.json')}"
+
+# File-based-editing plan, Part 6 sect. 8: graph.py's brownfield-spec/brownfield-plan bespoke
+# post-approve hooks write these directly (not through the generic per-stage-key persist_state
+# path, since their own stage keys -- "brownfield-spec"/"brownfield-plan" -- would derive the
+# wrong filename) -- true convergence means the SAME numbered .md a real ticket's approval renders,
+# not a bespoke brownfield one.
+SPECIFICATION_MD_PATH = f"{WORKFLOW_DIR}/{_stage_file('specification', 'md')}"
+PLAN_MD_PATH = f"{WORKFLOW_DIR}/{_stage_file('plan', 'md')}"
 
 # Same reasoning again -- graph.py's hydrate_remediation_ticket_mode_context (Task 7b) reads this
 # to detect an earlier ticket's own approved remediation report for this same project, so a later
@@ -318,6 +334,8 @@ def _demo() -> None:
     assert TECH_STACK_DRAFT_PATH == f"{WORKFLOW_DIR}/02-tech-stack.draft.json"
     assert PLAN_APPROVED_PATH == f"{WORKFLOW_DIR}/04-plan.approved.json"
     assert SPECIFICATION_APPROVED_PATH == f"{WORKFLOW_DIR}/03-specification.approved.json"
+    assert SPECIFICATION_MD_PATH == f"{WORKFLOW_DIR}/03-specification.md"
+    assert PLAN_MD_PATH == f"{WORKFLOW_DIR}/04-plan.md"
     assert REMEDIATION_APPROVED_PATH == f"{WORKFLOW_DIR}/07-remediation.approved.json"
     assert RAW_REQUIREMENTS_APPROVED_PATH == f"{WORKFLOW_DIR}/01-raw-requirements.approved.json"
 

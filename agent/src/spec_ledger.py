@@ -37,8 +37,19 @@ if TYPE_CHECKING:
 LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json"
 SCHEMA_VERSION = 1
 
+# File-based-editing plan, Part 1 sect. 1: the model's own sketchpad -- edited directly with real
+# file tools across draft/audit laps, read back and validated by _verify_specification_ledger
+# before anything downstream ever sees it. Sibling to LEDGER_PATH, never touched by
+# workflow_persistence.persist_state (that keeps writing 03-specification.draft/approved.json as
+# today, from the ledger-resolved content, not from this file directly).
+DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json"
+
 EntryStatus = Literal["active", "retired", "revised", "deferred"]
-EntryKind = Literal["user_story", "acceptance_criterion"]
+# "plan_step" added for the file-based-editing plan's Part 2: one shared ledger, not a second
+# implementation -- sync_plan_ledger below reuses load_ledger/save_ledger/_find/allocate_next_id's
+# sibling logic unchanged, just a simpler single-level sync (no parent/child, no deferred cascade,
+# no placeholder/citation indirection -- PlanStep.id is trusted directly as the real id).
+EntryKind = Literal["user_story", "acceptance_criterion", "plan_step"]
 
 # Per-AC execution provenance, written by exactly three pipeline-owned sites (never the model):
 # apply_tracking_resets_hook (spec approval -- clears them when the requirement really changed),
@@ -88,7 +99,7 @@ async def save_ledger(provider: SandboxProvider, thread_id: str, entries: list[d
 
 
 async def hydrate_ticket_mode_context(
-    thread_id: str, _state: "GraphState", provider: SandboxProvider
+    thread_id: str, state: "GraphState", provider: SandboxProvider
 ) -> dict[str, Any] | None:
     """StageSpec.draft_prompt_context_from_repo_file for the specification stage.
 
@@ -107,8 +118,39 @@ async def hydrate_ticket_mode_context(
     absent. Re-reads the file on every draft call rather than caching the result on GraphState --
     it's one cheap read, and unlike StageSpec.capture_baseline_commit this signal has no "must
     stay stable across this run's retry cycles" requirement to protect.
+
+    File-based-editing plan, Part 1 sect. 7 (migration bootstrap, folded into this existing hook
+    rather than a new one): also seeds DRAFT_SPEC_PATH the first time this hook runs against a
+    project that doesn't have it yet -- from the in-flight stage["draft"] if it's already
+    full-shaped (an old-code run resuming post-upgrade), else from the last-approved specification
+    (a new ticket in an existing project), else an empty Specification. Pure best-effort: seeding
+    failure here never blocks drafting -- the model's own `create` on first view is the fallback
+    this bootstrap merely tries to make unnecessary.
     """
     entries = await load_ledger(provider, thread_id)
+    if await repo_files.read_repo_file(provider, thread_id, DRAFT_SPEC_PATH) is None:
+        from . import workflow_persistence
+
+        in_flight = ((state.get("stages") or {}).get("specification") or {}).get("draft")
+        if isinstance(in_flight, dict) and in_flight.get("user_stories") is not None:
+            seed: dict[str, Any] = in_flight
+        else:
+            approved_raw = await repo_files.read_repo_file(
+                provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+            )
+            try:
+                seed = json.loads(approved_raw) if approved_raw is not None else None
+            except json.JSONDecodeError:
+                seed = None
+            if not isinstance(seed, dict):
+                seed = {
+                    "title": "", "summary": "", "work_kind": "feature", "user_stories": [],
+                    "assumptions": {"status": "absent", "values": [], "reason": "Not yet drafted."},
+                    "out_of_scope": {"status": "absent", "values": [], "reason": "Not yet drafted."},
+                    "questions": [], "attachment_notes": [], "retired_ac_ids": [], "retired_us_ids": [],
+                    "bug_affected_ac_ids": [],
+                }
+        await repo_files.write_repo_file(provider, thread_id, DRAFT_SPEC_PATH, json.dumps(seed, indent=2))
     return {"ticket_mode_baseline": True} if entries else None
 
 
@@ -195,6 +237,8 @@ def sync_ledger(
     retired_ac_ids: list[str] | None = None,
     retired_us_ids: list[str] | None = None,
     source_ticket_id: str | None = None,
+    bug_affected_ac_ids: list[str] | None = None,
+    fully_reviewed: bool | None = None,
 ) -> LedgerSyncResult:
     """The deterministic core of P2's ledger-sync gate.
 
@@ -256,6 +300,38 @@ def sync_ledger(
     backfilled onto a pre-existing entry revised/retired by a later ticket -- attribution names the
     entry's origin, not its most recent editor. None (the default) leaves new entries unstamped,
     same as every entry created before this field existed.
+
+    `bug_affected_ac_ids` (file-based-editing plan, Part 5): the model's explicit declaration that
+    a bug report is about these existing, LIVE acceptance criteria even though their wording is
+    unchanged -- Specification.bug_affected_ac_ids, same category as retired_ac_ids, always
+    validated the same fail-closed way: every id must already exist as a "acceptance_criterion"
+    entry whose status is active/revised/deferred (a made-up, retired, or wrong-kind id fails the
+    whole sync, same posture as a bad existing_ac_id/retired_ac_ids citation), and an id may not
+    appear in BOTH bug_affected_ac_ids and retired_ac_ids in the same draft -- "this bug affects
+    it" and "remove it" are contradictory claims, the same "revise or retire, never both" rule
+    existing_ac_id/retired_ac_ids already enforce. Each valid id gets PENDING_RESET_FIELD stamped
+    (independent of whether its text also changed this call) so apply_tracking_resets_hook clears
+    its delivery stamps on the next spec approval, reopening it in eligible_ac_ids -- the ONLY
+    other trigger for that field besides a genuine wording change (see the description-diff branch
+    above). None/empty is the ordinary case (most drafts are not bug reports); never force-populate
+    it just because a ticket is classified work_kind="bug" -- a genuinely no-op bug ticket (already
+    fixed, duplicate) must be able to leave this empty too.
+
+    `fully_reviewed` (file-based-editing plan, Part 3's review-depth safety net): `None` means "do
+    not enforce this lap" (no audit role for the calling stage, or the calling provider cannot
+    verify transcripts -- see claude_chat_model.read_full_file_reads' own fail-open contract) --
+    entries are neither stamped nor checked. `True` means the caller has transcript evidence the
+    audit session read the WHOLE draft file this lap: every entry (kind="user_story" or
+    "acceptance_criterion") whose status is active/revised/deferred gets `last_reviewed_run_id`
+    stamped to `run_id`, not just the ones this draft actually touched -- a single mechanical
+    action over the whole live set. `False` means the caller expected evidence but the file was
+    only partially read (or not read at all) this lap -- no stamping happens, but any entry
+    already stamped `last_reviewed_run_id == run_id` from an EARLIER lap of this same run_id stays
+    stamped (stamps persist across every lap of one ticket's stage, not per-lap). Either way (True
+    or False), a completeness sweep then runs: any live entry whose `last_reviewed_run_id != run_id`
+    fails the whole sync, same shape as the existing_ac_id/retired_ac_ids validation above -- so a
+    ticket's first lap without a genuine full read can never pass, but once one lap proves the
+    whole file was read, later same-run_id laps stay passing without re-demanding it.
     """
     updated = [dict(e) for e in entries]
     reasons: list[str] = []
@@ -473,8 +549,199 @@ def sync_ledger(
             entry["status"] = "retired"
             entry["last_revised_run_id"] = run_id
 
+    retired_ac_id_set = set(retired_ac_ids or [])
+    for bug_ac_id in bug_affected_ac_ids or []:
+        entry = _find(updated, bug_ac_id)
+        if entry is None:
+            reasons.append(f"bug_affected_ac_ids cites {bug_ac_id!r}, which does not exist in the ledger")
+            continue
+        if entry.get("kind") != "acceptance_criterion":
+            reasons.append(f"bug_affected_ac_ids cites {bug_ac_id!r}, which is not an acceptance criterion id")
+            continue
+        if entry.get("status") not in ("active", "revised", "deferred"):
+            reasons.append(
+                f"bug_affected_ac_ids cites {bug_ac_id!r}, which is not a live criterion "
+                f"(status={entry.get('status')!r}) -- a retired/nonexistent id cannot be reopened"
+            )
+            continue
+        if bug_ac_id in retired_ac_id_set:
+            reasons.append(
+                f"bug_affected_ac_ids cites {bug_ac_id!r}, but this draft also retires it via "
+                "retired_ac_ids -- a criterion cannot be both reopened by a bug and removed in the same draft"
+            )
+            continue
+        entry[PENDING_RESET_FIELD] = run_id
+
     if reasons:
         return LedgerSyncResult(passed=False, reasons=reasons, updated_entries=entries)
+
+    if fully_reviewed is not None:
+        if fully_reviewed:
+            for entry in updated:
+                if entry.get("kind") in ("user_story", "acceptance_criterion") and entry.get("status") in (
+                    "active", "revised", "deferred",
+                ):
+                    entry["last_reviewed_run_id"] = run_id
+        not_reviewed = [
+            e["id"]
+            for e in updated
+            if e.get("kind") in ("user_story", "acceptance_criterion")
+            and e.get("status") in ("active", "revised", "deferred")
+            and e.get("last_reviewed_run_id") != run_id
+        ]
+        if not_reviewed:
+            return LedgerSyncResult(
+                passed=False,
+                reasons=[
+                    "the audit session did not prove it read the ENTIRE draft file this lap -- these "
+                    f"still-live ids were not confirmed reviewed: {not_reviewed}. View the whole file, "
+                    "not a partial read, before resubmitting."
+                ],
+                updated_entries=entries,
+            )
+
+    return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
+
+
+def sync_plan_ledger(
+    entries: list[dict[str, Any]],
+    draft_plan_steps: list[dict[str, Any]],
+    run_id: str,
+    retired_step_ids: list[str] | None = None,
+    fully_reviewed: bool | None = None,
+) -> LedgerSyncResult:
+    """File-based-editing plan, Part 2 sect. 5: plan's completeness gate, sharing sync_ledger's
+    same ledger FILE (EntryKind="plan_step") rather than a second, independently-evolving
+    implementation -- reuses load_ledger/save_ledger/_find unchanged.
+
+    Deliberately simpler than sync_ledger's two-tier US/AC scheme: single-level (no parent/child,
+    no deferred cascade -- plan steps have no deferred concept) and identity-direct.
+    schemas.PlanStep.id (e.g. "PS-1") is trusted as the real ledger id directly -- there is no
+    placeholder/citation indirection the way UserStory/AcceptanceCriterion need
+    (existing_us_id/existing_ac_id vs. a same-response-scoped `id` placeholder); the model assigns
+    a stable id itself and keeps citing that same id on every later revision, so "found by this
+    id" IS "cites this existing entry."
+
+    Every entry in `draft_plan_steps` (schemas.PlanStep, .model_dump()'d) is either a revision of
+    an existing ledger entry sharing its own `id` (status flips to "revised"; `last_revised_run_id`
+    bumps only when `description`/`ac_ids` actually changed, same "real change only" discipline as
+    sync_ledger's title/description bump) or a brand-new one (status "active"). A step id that
+    collides with a non-plan-step entry, or refers to an already-retired step (ids are never
+    reused), fails the whole sync -- same fail-closed posture as sync_ledger's own citation checks.
+
+    `retired_step_ids` names ids no longer in the plan -- the ONLY way a step's status becomes
+    "retired" (explicit-only retirement, same Ruling 3 reasoning sync_ledger's own docstring
+    explains: a step silently absent from this draft simply keeps its current status).
+
+    `fully_reviewed`: identical contract to sync_ledger's own parameter -- see its docstring --
+    scoped to kind="plan_step" entries here instead of user_story/acceptance_criterion.
+
+    Deliberately does NOT compute the "missing_live" completeness sweep (which still-live steps
+    from the LAST-APPROVED plan are absent from this draft) -- that lives at the call site
+    (gates/diagram_gate.py's verify_plan_diagrams), mirroring exactly how graph.py's
+    _verify_specification_ledger computes its own missing_live sweep around sync_ledger rather than
+    inside it. This function only validates citation/retirement mechanics, same division of labor
+    as sync_ledger.
+    """
+    updated = [dict(e) for e in entries]
+    reasons: list[str] = []
+    touched_ids: set[str] = set()
+
+    for step in draft_plan_steps:
+        step_id = step.get("id")
+        if not step_id:
+            reasons.append("a plan step is missing its own id")
+            continue
+        entry = _find(updated, step_id)
+        if entry is not None and entry.get("kind") != "plan_step":
+            reasons.append(f"plan step id {step_id!r} collides with a non-plan-step ledger entry")
+            continue
+        if entry is not None and entry.get("status") == "retired":
+            reasons.append(f"plan step id {step_id!r} refers to a retired step -- ids are never reused")
+            continue
+        new_description = step.get("description", "")
+        new_ac_ids = sorted(step.get("ac_ids") or [])
+        # "step_kind" (feature/infrastructure), not "kind" -- this ledger entry's own `kind` field
+        # already means EntryKind ("plan_step"); PlanStep.kind is a different axis entirely and
+        # would silently collide/overwrite it if stored under the same key.
+        new_step_kind = step.get("kind", "feature")
+        new_ui_related = bool(step.get("ui_related", False))
+        new_removes_ids = sorted(step.get("removes_ids") or [])
+        if entry is None:
+            updated.append({
+                "id": step_id,
+                "kind": "plan_step",
+                "status": "active",
+                "description": new_description,
+                "ac_ids": new_ac_ids,
+                "step_kind": new_step_kind,
+                "ui_related": new_ui_related,
+                "removes_ids": new_removes_ids,
+                "first_seen_run_id": run_id,
+                "last_revised_run_id": run_id,
+            })
+        else:
+            entry["status"] = "revised"
+            changed = (
+                new_description != entry.get("description")
+                or new_ac_ids != sorted(entry.get("ac_ids") or [])
+                or new_step_kind != entry.get("step_kind", "feature")
+                or new_removes_ids != sorted(entry.get("removes_ids") or [])
+            )
+            entry["description"] = new_description
+            entry["ac_ids"] = new_ac_ids
+            entry["step_kind"] = new_step_kind
+            # Metadata, not content -- synced independently, never bumps last_revised_run_id (same
+            # "ui_related is metadata" discipline sync_ledger already applies to AC.ui_related).
+            entry["ui_related"] = new_ui_related
+            entry["removes_ids"] = new_removes_ids
+            if changed:
+                entry["last_revised_run_id"] = run_id
+        touched_ids.add(step_id)
+
+    for step_id in retired_step_ids or []:
+        entry = _find(updated, step_id)
+        if entry is None:
+            reasons.append(f"retired_step_ids cites {step_id!r}, which does not exist in the ledger")
+            continue
+        if entry.get("kind") != "plan_step":
+            reasons.append(f"retired_step_ids cites {step_id!r}, which is not a plan step id")
+            continue
+        if step_id in touched_ids:
+            reasons.append(
+                f"retired_step_ids cites {step_id!r}, but this draft also revises it -- a step "
+                "cannot be both revised and retired in the same draft"
+            )
+            continue
+        if entry.get("status") in ("active", "revised"):
+            entry["status"] = "retired"
+            entry["last_revised_run_id"] = run_id
+
+    if reasons:
+        return LedgerSyncResult(passed=False, reasons=reasons, updated_entries=entries)
+
+    if fully_reviewed is not None:
+        if fully_reviewed:
+            for entry in updated:
+                if entry.get("kind") == "plan_step" and entry.get("status") in ("active", "revised"):
+                    entry["last_reviewed_run_id"] = run_id
+        not_reviewed = [
+            e["id"]
+            for e in updated
+            if e.get("kind") == "plan_step"
+            and e.get("status") in ("active", "revised")
+            and e.get("last_reviewed_run_id") != run_id
+        ]
+        if not_reviewed:
+            return LedgerSyncResult(
+                passed=False,
+                reasons=[
+                    "the audit session did not prove it read the ENTIRE steps.json file this lap -- "
+                    f"these still-live step ids were not confirmed reviewed: {not_reviewed}. View the "
+                    "whole file, not a partial read, before resubmitting."
+                ],
+                updated_entries=entries,
+            )
 
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
 
@@ -533,8 +800,8 @@ def change_status(
 
 
 def gate_change_status(
-    old: dict[str, Any] | None, new: dict[str, Any]
-) -> Literal["new", "modified", "unchanged", "deferred", "activated"]:
+    old: dict[str, Any] | None, new: dict[str, Any], *, reopened: bool = False
+) -> Literal["new", "modified", "unchanged", "deferred", "activated", "reopened"]:
     """Per-GATE change classification for the review UI: what changed versus the specification
     the human last actually APPROVED -- not the ledger's own rolling pre-sync state, and not
     change_status's per-RUN classification (both wrong here, for different reasons):
@@ -561,7 +828,14 @@ def gate_change_status(
     their own beyond the ledger's independent bookkeeping. Pure.
 
     old=None means this id did not exist in the previously-approved specification at all (a
-    genuinely new ticket, or a first-ever approval where nothing has been approved yet)."""
+    genuinely new ticket, or a first-ever approval where nothing has been approved yet).
+
+    `reopened` (file-based-editing plan, Part 5): True when the caller has determined this id is
+    named in this run's `bug_affected_ac_ids` -- a bug report about a criterion whose wording was
+    always correct. Checked only for a textually-UNCHANGED id; a real wording change still reports
+    "modified" even if also bug-reopened (the wording delta is the more informative signal). Without
+    this, a bug-affected AC would badge "unchanged" -- the exact opposite of what a human reviewer
+    or a downstream prompt scanning this one field for "what's new" needs to see."""
     if old is None:
         return "new"
     old_deferred, new_deferred = bool(old.get("deferred")), bool(new.get("deferred"))
@@ -571,7 +845,7 @@ def gate_change_status(
         return "deferred"
     if old.get("text") != new.get("text"):
         return "modified"
-    return "unchanged"
+    return "reopened" if reopened else "unchanged"
 
 
 def eligible_ac_ids(entries: list[dict[str, Any]], own_ac_ids: set[str]) -> list[str]:
@@ -1133,6 +1407,174 @@ def _demo() -> None:
     assert q_rows["q-a"]["raised_run_id"] == "r1" and q_rows["q-a"]["updated_run_id"] == "r2"
     assert q_rows["q-b"]["status"] == "assumed"
     assert len(q_rows) == 2 and any(e["kind"] == "user_story" for e in q_entries), "no deletes, other kinds intact"
+
+    # --- bug_affected_ac_ids (Part 5) ---
+    # A valid, live citation reopens the AC (PENDING_RESET_FIELD) even with wording unchanged.
+    bug_seed = [dict(e) for e in coded_seed]  # US-0001.1 already has coded_run_id/tested_run_id
+    bug_result = sync_ledger([dict(e) for e in bug_seed], [], "run-15", bug_affected_ac_ids=["US-0001.1"])
+    assert bug_result.passed, bug_result.reasons
+    bug_ac = next(e for e in bug_result.updated_entries if e["id"] == "US-0001.1")
+    assert bug_ac[PENDING_RESET_FIELD] == "run-15", "a bug-reopened AC must be marked for tracking reset"
+    assert bug_ac["coded_run_id"] == "run-1", "stamps survive until spec approval (two-phase, same as a reword)"
+
+    # Fail-closed: an id that does not exist, or is not an acceptance_criterion, or is retired.
+    assert not sync_ledger([dict(e) for e in seed], [], "run-16", bug_affected_ac_ids=["US-9999.9"]).passed
+    assert not sync_ledger([dict(e) for e in seed], [], "run-16", bug_affected_ac_ids=["US-0001"]).passed
+    retired_seed = [dict(e) for e in result2.updated_entries]  # US-0001.1 retired earlier in this demo
+    assert not sync_ledger(retired_seed, [], "run-16", bug_affected_ac_ids=["US-0001.1"]).passed
+
+    # An id cannot be both reopened and retired in the same draft.
+    contradiction = sync_ledger(
+        [dict(e) for e in seed], [], "run-17", retired_ac_ids=["US-0001.1"], bug_affected_ac_ids=["US-0001.1"]
+    )
+    assert not contradiction.passed, "reopening and retiring the same AC in one draft must be rejected"
+
+    # gate_change_status: "reopened" only for a textually-unchanged id explicitly flagged; a real
+    # wording change still reports "modified" even when also bug-reopened.
+    assert gate_change_status(old_story, dict(old_story), reopened=True) == "reopened"
+    assert gate_change_status(old_story, dict(old_story), reopened=False) == "unchanged"
+    assert (
+        gate_change_status(old_story, {**old_story, "text": "changed"}, reopened=True) == "modified"
+    ), "a real wording change wins over reopened"
+    assert gate_change_status(None, dict(old_story), reopened=True) == "new", "a brand-new id is never 'reopened'"
+
+    # --- fully_reviewed / not_reviewed (Part 3's review-depth safety net) ---
+    # None: no enforcement at all -- passes regardless of any stamps.
+    none_result = sync_ledger([dict(e) for e in seed], [], "run-18", fully_reviewed=None)
+    assert none_result.passed
+    assert "last_reviewed_run_id" not in next(e for e in none_result.updated_entries if e["id"] == "US-0001")
+
+    # True: stamps every live US/AC (not just touched ones) to this run_id, then passes.
+    true_result = sync_ledger([dict(e) for e in seed], [], "run-19", fully_reviewed=True)
+    assert true_result.passed, true_result.reasons
+    for entry_id in ("US-0001", "US-0001.1"):
+        stamped = next(e for e in true_result.updated_entries if e["id"] == entry_id)
+        assert stamped["last_reviewed_run_id"] == "run-19", f"{entry_id} should be stamped by a full read"
+
+    # False, first lap of a run_id with no prior stamp: rejected.
+    false_result = sync_ledger([dict(e) for e in seed], [], "run-20", fully_reviewed=False)
+    assert not false_result.passed, "a lap with incomplete evidence and no prior stamp must reject"
+
+    # False, but an EARLIER lap of the SAME run_id already stamped everyone: still passes -- once
+    # satisfied early in a ticket's redraft loop, later laps do not re-demand it.
+    already_stamped_seed = [dict(e) for e in true_result.updated_entries]  # stamped run_id="run-19"
+    later_lap = sync_ledger(already_stamped_seed, [], "run-19", fully_reviewed=False)
+    assert later_lap.passed, "a stamp from an earlier lap of the same run_id must still satisfy later laps"
+
+    # --- sync_plan_ledger (Part 2 sect. 5) ---
+    plan_draft = [
+        {"id": "PS-1", "description": "Build the login form.", "ac_ids": ["US-0001.1"], "kind": "feature"},
+        {"id": "PS-2", "description": "Set up CI.", "ac_ids": [], "kind": "infrastructure"},
+    ]
+    plan_result = sync_plan_ledger([], plan_draft, "run-21")
+    assert plan_result.passed, plan_result.reasons
+    ps1 = next(e for e in plan_result.updated_entries if e["id"] == "PS-1")
+    ps2 = next(e for e in plan_result.updated_entries if e["id"] == "PS-2")
+    assert ps1["status"] == "active" and ps1["kind"] == "plan_step" and ps1["first_seen_run_id"] == "run-21"
+    assert ps2["ac_ids"] == []
+    # PlanStep.kind (feature/infrastructure) must round-trip under "step_kind" -- NOT "kind",
+    # which this ledger entry's own EntryKind field already occupies ("plan_step").
+    assert ps1["step_kind"] == "feature" and ps2["step_kind"] == "infrastructure"
+
+    # Re-citing the SAME id and content: status flips to "revised", but last_revised_run_id does
+    # NOT bump (identical content is not a real change) -- mirrors sync_ledger's own title/description discipline.
+    unchanged_recite = sync_plan_ledger([dict(e) for e in plan_result.updated_entries], plan_draft, "run-22")
+    assert unchanged_recite.passed, unchanged_recite.reasons
+    ps1_recited = next(e for e in unchanged_recite.updated_entries if e["id"] == "PS-1")
+    assert ps1_recited["status"] == "revised" and ps1_recited["last_revised_run_id"] == "run-21"
+
+    # A genuine content change DOES bump last_revised_run_id.
+    changed_draft = [{"id": "PS-1", "description": "Build the login form with SSO.", "ac_ids": ["US-0001.1"], "kind": "feature"}]
+    changed_result = sync_plan_ledger([dict(e) for e in plan_result.updated_entries], changed_draft, "run-23")
+    assert changed_result.passed, changed_result.reasons
+    ps1_changed = next(e for e in changed_result.updated_entries if e["id"] == "PS-1")
+    assert ps1_changed["last_revised_run_id"] == "run-23"
+
+    # Explicit-only retirement: a step absent from the draft keeps its status; naming it retires it.
+    retire_result = sync_plan_ledger([dict(e) for e in plan_result.updated_entries], [], "run-24", retired_step_ids=["PS-2"])
+    assert retire_result.passed, retire_result.reasons
+    assert next(e for e in retire_result.updated_entries if e["id"] == "PS-1")["status"] == "active", (
+        "a step not named in this draft must keep its current status"
+    )
+    assert next(e for e in retire_result.updated_entries if e["id"] == "PS-2")["status"] == "retired"
+
+    # Fail-closed: retiring a nonexistent id, or citing a retired id as if it were still live.
+    assert not sync_plan_ledger([dict(e) for e in plan_result.updated_entries], [], "run-25", retired_step_ids=["PS-9999"]).passed
+    assert not sync_plan_ledger(retire_result.updated_entries, [dict(plan_draft[1])], "run-26").passed, (
+        "re-citing a retired plan step id must be rejected, not silently un-retire it"
+    )
+
+    # fully_reviewed for plan steps: same contract, scoped to kind="plan_step".
+    plan_true = sync_plan_ledger([dict(e) for e in plan_result.updated_entries], [], "run-27", fully_reviewed=True)
+    assert plan_true.passed
+    assert all(
+        e.get("last_reviewed_run_id") == "run-27"
+        for e in plan_true.updated_entries
+        if e.get("kind") == "plan_step" and e.get("status") in ("active", "revised")
+    )
+    plan_false = sync_plan_ledger([dict(e) for e in plan_result.updated_entries], [], "run-28", fully_reviewed=False)
+    assert not plan_false.passed, "plan steps need the same full-read evidence before passing"
+
+    # --- hydrate_ticket_mode_context's DRAFT_SPEC_PATH bootstrap (Part 1 sect. 7) ---
+    import base64 as _base64
+    import re as _re
+
+    class _FakeBootstrapProvider:
+        """Extends the read-only _FakeProvider pattern above with a minimal, real write-command
+        simulation (write_repo_file's own base64-piped shell shape) so the bootstrap's actual
+        write can be asserted on, not just trusted to not-raise."""
+
+        def __init__(self, files: dict[str, str]) -> None:
+            self._files = dict(files)
+            self.writes: dict[str, str] = {}
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str):  # noqa: ANN201
+            m = _re.search(r"echo (\S+) \| base64 -d > (\S+)", command)
+            if m:
+                target = m.group(2).strip("'\"")
+                self.writes[target] = _base64.b64decode(m.group(1)).decode("utf-8")
+                return _FakeReadResult(True, "")
+            for path, content in self._files.items():
+                if path in command:
+                    return _FakeReadResult(True, content)
+            return _FakeReadResult(False)
+
+    # Case 1: DRAFT_SPEC_PATH absent, no in-flight draft, an approved spec exists -- seeds from it.
+    approved_spec_json = json.dumps({"title": "Existing", "summary": "s", "user_stories": []})
+    from . import workflow_persistence as _wp
+
+    bootstrap_provider = _FakeBootstrapProvider({_wp.SPECIFICATION_APPROVED_PATH: approved_spec_json})
+    ctx = asyncio.run(hydrate_ticket_mode_context("t", {"stages": {}}, bootstrap_provider))
+    assert ctx is None, "empty ledger must not signal ticket-mode framing"
+    assert DRAFT_SPEC_PATH in bootstrap_provider.writes, "should have seeded DRAFT_SPEC_PATH"
+    assert json.loads(bootstrap_provider.writes[DRAFT_SPEC_PATH]) == json.loads(approved_spec_json), (
+        "should have seeded DRAFT_SPEC_PATH from the last-approved specification"
+    )
+
+    # Case 2: an in-flight, full-shaped draft in state wins over the approved file.
+    in_flight_draft = {"title": "In flight", "summary": "s", "user_stories": [{"id": "US-0001"}]}
+    bootstrap_provider2 = _FakeBootstrapProvider({_wp.SPECIFICATION_APPROVED_PATH: approved_spec_json})
+    asyncio.run(
+        hydrate_ticket_mode_context(
+            "t", {"stages": {"specification": {"draft": in_flight_draft}}}, bootstrap_provider2
+        )
+    )
+    assert json.loads(bootstrap_provider2.writes[DRAFT_SPEC_PATH]) == in_flight_draft, (
+        "an in-flight full-shaped draft must win over the approved file"
+    )
+
+    # Case 3: neither exists (brand-new ticket, brand-new project) -- seeds an empty Specification.
+    bootstrap_provider3 = _FakeBootstrapProvider({})
+    asyncio.run(hydrate_ticket_mode_context("t", {"stages": {}}, bootstrap_provider3))
+    empty_seed = json.loads(bootstrap_provider3.writes[DRAFT_SPEC_PATH])
+    assert empty_seed["user_stories"] == [] and empty_seed["title"] == ""
+
+    # Case 4: DRAFT_SPEC_PATH already exists -- must NOT be overwritten (never clobber a live sketchpad).
+    bootstrap_provider4 = _FakeBootstrapProvider(
+        {DRAFT_SPEC_PATH: "already there", _wp.SPECIFICATION_APPROVED_PATH: approved_spec_json}
+    )
+    asyncio.run(hydrate_ticket_mode_context("t", {"stages": {}}, bootstrap_provider4))
+    assert DRAFT_SPEC_PATH not in bootstrap_provider4.writes, "an existing sketchpad must never be overwritten"
 
     print("spec_ledger self-check: ok")
 

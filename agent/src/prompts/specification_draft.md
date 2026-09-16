@@ -19,13 +19,30 @@ domain model -- glossary terms and decision records -- as you go, so later stage
 vocabulary instead of re-deriving it); invoke it when the ticket introduces or reshapes domain
 concepts.
 
-REDRAFT COMPLETENESS -- every draft is the WHOLE specification, never a delta: when you redraft
-(after feedback, revised requirements, or an audit), re-emit EVERY user story and acceptance
-criterion that still applies, each citing its existing id -- not just the ones you changed. A
-story absent from your draft is NOT retired by its absence: silence is treated as an error. The
-ONLY way scope leaves the specification is an explicit entry in `retired_us_ids`/`retired_ac_ids`.
-Removing one feature from the requirements changes THAT feature's stories; every other story must
-reappear unchanged, id intact.
+THE FILE, NOT YOUR RESPONSE, IS THE SPECIFICATION -- the specification lives at
+`.ai-dev-workflow/spec/draft-specification.json`, a real file you edit directly with your file
+tools. **View it first.** It should already exist (seeded from an in-flight draft or the
+last-approved specification); create it only if genuinely absent. Prefer targeted edits (apply_patch/
+edit) over recreating the whole file -- recreating it from memory is exactly the failure mode this
+file-based workflow exists to eliminate: a long document is easy to silently under-reproduce when
+retyped from memory, and a deterministic gate now reads the file, not your response, to check
+completeness.
+
+Your structured response is METADATA about what you did this turn, never the content itself:
+`readiness`, `clarifying_questions`, `story_changes` (one entry per User Story/Acceptance Criterion
+you added, revised, or retired in the file THIS turn -- `ref`, `kind`, `change`, one-line
+`summary`), a short `summary` of the turn, and `skills_invoked`. The file is the only place the
+actual title/summary/user_stories/assumptions/out_of_scope/questions/attachment_notes/
+retired_ac_ids/retired_us_ids/bug_affected_ac_ids content lives.
+
+REDRAFT COMPLETENESS -- the file is the WHOLE specification, never a delta: when you edit it
+(after feedback, revised requirements, or an audit), every user story and acceptance criterion
+that still applies must remain in the file, each keeping its existing id -- not just the ones you
+changed this turn. A story silently deleted from the file is NOT retired by its absence: silence is
+treated as an error, and a deterministic gate rejects a file with a still-live ledger entry
+missing from it. The ONLY way scope leaves the specification is an explicit entry in
+`retired_us_ids`/`retired_ac_ids`. Removing one feature from the requirements changes THAT
+feature's stories; every other story must stay in the file unchanged, id intact.
 
 Set `ui_related: true` on every Acceptance Criterion whose satisfaction involves something the
 user sees or interacts with (a screen, a component, layout, client-side behavior); leave it
@@ -59,11 +76,11 @@ NOT removed from the product:
 QUESTION LEDGER (the `questions` field -- the durable record of every ambiguity and how it was
 resolved; the human's requirements document is the single source of truth and this ledger is how
 everything traces back to it):
-- Emit the COMPLETE history on every draft: every question ever raised for this ticket, each with
-  a stable id you never renumber, its status (`open` / `answered` / `assumed`), and its answer.
-  Prior questions live in your previous draft and in `.ai-dev-workflow/spec/ledger.json`
-  (kind=clarifying_question entries) -- read them before drafting; dropping or re-asking an
-  already-answered question is an error.
+- Keep the COMPLETE history in the file's `questions` field: every question ever raised for this
+  ticket, each with a stable id you never renumber, its status (`open` / `answered` / `assumed`),
+  and its answer. Prior questions live in the file itself and in
+  `.ai-dev-workflow/spec/ledger.json` (kind=clarifying_question entries) -- view them before
+  editing; dropping or re-asking an already-answered question is an error.
 - BEFORE raising anything new on a redraft: re-read the CURRENT requirements document against
   every prior `open` question. The human answers questions by revising that document -- when the
   revised text now settles one, mark it `answered` and quote the wording that settles it in
@@ -86,6 +103,17 @@ that is broken, regressed, or wrong (error reports, "X stopped working", incorre
 `feature` for anything that adds or changes capability. Downstream stages gate a reproduce-first
 debugging discipline on this field -- a wrong classification either wastes a debugging pass or
 skips the discipline the fix depends on.
+
+For a `bug` ticket, check whether the AC's own wording was already correct and the bug is purely
+an implementation gap (the code just doesn't do what the criterion already, correctly, says) --
+that is the common case, not the exception. When it is, leave that criterion's wording UNCHANGED
+(do not tighten wording that was never wrong) and instead name its existing id in the file's
+`bug_affected_ac_ids` -- this reopens it for delivery even though nothing about it looks "changed"
+in the usual sense. Only tighten an AC's actual wording when the requirements reveal it was
+genuinely ambiguous or wrong; that case needs no `bug_affected_ac_ids` entry, `existing_ac_id`
+already covers it. Leave `bug_affected_ac_ids` empty when the ticket, on inspection, needs no
+action at all (a duplicate report, already fixed, user error) -- never populate it just because
+`work_kind == "bug"`.
 
 Synthesis discipline (do these before setting readiness to true):
 - Make the User Stories list EXTENSIVE -- cover every aspect of the capability, not just the happy
@@ -121,40 +149,41 @@ Use the `spec-sync` skill for identity preservation across revisions -- it expla
 full. In short: you never assign a real id yourself. Real ids are ALWAYS shaped `US-0001` (a
 4-digit zero-padded story number) or `US-0001.1` (that same story number, a literal `.`, then the
 criterion's own number -- a criterion id is ALWAYS `US-`-prefixed, sharing its parent story's
-number; there is no `AC-` prefix anywhere in this system). If you are given a prior draft or an
-approved Specification, and a User Story or Acceptance Criterion you're writing is the same
-underlying capability (even reworded or expanded), set its `existing_us_id`/`existing_ac_id`
-field to that item's existing id -- COPIED CHARACTER-FOR-CHARACTER from what you were given, never
-retyped from memory, never reformatted, never re-derived. `US-0001` is not the same string as
-`US-1`, and a criterion of story `US-0005` is `US-0005.2`, never `AC-5.2` -- if you find yourself
-typing a number you don't see verbatim in the prior draft/approved Specification/ledger text in
-front of you, stop and re-read it rather than guessing the shape. The next sequential number is
-NOT a citation: if story `US-0001` currently has criteria `.1`-`.4` and you are adding a new one,
-it is not `.5` -- a real id only ever comes from being copied out of text you were actually given,
-never computed by counting. For a genuinely new story or criterion, leave
-`existing_us_id`/`existing_ac_id` as `null`. Your own `id` field is just a
-same-response-scoped placeholder (e.g. `story-a`, `ac-a`) -- never write something that merely
-LOOKS like a real id there unless it's an exact copy of what you're citing.
+number; there is no `AC-` prefix anywhere in this system). If the file already contains a User
+Story or Acceptance Criterion, and one you're writing is the same underlying capability (even
+reworded or expanded), set its `existing_us_id`/`existing_ac_id` field to that item's existing id
+-- COPIED CHARACTER-FOR-CHARACTER from the file (or `.ai-dev-workflow/spec/ledger.json` if you're
+resolving a citation the file doesn't yet show), never retyped from memory, never reformatted,
+never re-derived. `US-0001` is not the same string as `US-1`, and a criterion of story `US-0005`
+is `US-0005.2`, never `AC-5.2` -- if you find yourself typing a number you don't see verbatim in
+the file/ledger text in front of you, stop and re-read it rather than guessing the shape. The next
+sequential number is NOT a citation: if story `US-0001` currently has criteria `.1`-`.4` and you
+are adding a new one, it is not `.5` -- a real id only ever comes from being copied out of text
+you actually viewed, never computed by counting. For a genuinely new story or criterion, leave
+`existing_us_id`/`existing_ac_id` as `null` in the file. Your own `id` field in the file is just a
+same-edit-scoped placeholder (e.g. `story-a`, `ac-a`) -- never write something that merely LOOKS
+like a real id there unless it's an exact copy of what you're citing.
 
-State plainly what this draft adds or changes. If a User Story or Acceptance Criterion the ledger
-already has no longer belongs -- cut, descoped, superseded by something else in this same draft --
-name its existing id in `retired_ac_ids`/`retired_us_ids` rather than just leaving it out. Omitting
-something is not how you retire it: anything you don't mention simply keeps its current status, on
-purpose, so that one ticket's own narrower draft can never accidentally wipe out another ticket's
-unrelated stories just by not repeating them. Never list an id in `retired_ac_ids`/`retired_us_ids`
-that you are also citing as `existing_ac_id`/`existing_us_id` in this same response -- revise or
-retire, never both.
+State plainly, in `story_changes`, what you added, revised, or retired this turn. If a User Story
+or Acceptance Criterion the ledger already has no longer belongs -- cut, descoped, superseded by
+something else you're writing this turn -- name its existing id in the file's
+`retired_ac_ids`/`retired_us_ids` rather than just deleting it from the file. Deleting something
+from the file without naming it there is not how you retire it: anything you remove without naming
+simply violates REDRAFT COMPLETENESS above, on purpose, so that one ticket's own narrower edit can
+never accidentally wipe out another ticket's unrelated stories just by not re-typing them. Never
+list an id in `retired_ac_ids`/`retired_us_ids` that you are also citing as
+`existing_ac_id`/`existing_us_id` in this same file -- revise or retire, never both.
 
-HARD RULE: if this prompt did NOT hand you an approved Specification or prior draft containing
-real ids, then no such ids exist yet -- every `existing_us_id` and `existing_ac_id` in your
-response MUST be `null`. Never cite an id you were not literally given in this conversation --
-and "literally given" means you can point to the exact substring in the prior draft/approved
-Specification text; the deterministic gate rejects invented citations (including a real one
-retyped with the wrong digit count or prefix) and your draft will be bounced back to you.
+HARD RULE: if the file/ledger does NOT already contain real ids, then no such ids exist yet --
+every `existing_us_id` and `existing_ac_id` you write in the file MUST be `null`. Never cite an id
+you did not literally view in the file or the ledger -- and "literally viewed" means you can point
+to the exact substring in text you actually read this session; the deterministic gate rejects
+invented citations (including a real one retyped with the wrong digit count or prefix) and your
+edit will be bounced back to you.
 
 The same rule binds `retired_ac_ids`/`retired_us_ids`, and there is NO first-draft leniency for
 them: unlike `existing_us_id`/`existing_ac_id` (forgiven when the ledger is empty), a retirement
-citation is always checked strictly. Leave both lists EMPTY unless this prompt literally handed
-you the id you are naming. The gate rejects the whole draft when a named id does not exist in the
-ledger, or when a story id (`US-0001`) appears in `retired_ac_ids` (or a criterion id
+citation is always checked strictly. Leave both lists EMPTY in the file unless you literally
+viewed the id you are naming. The gate rejects the whole edit when a named id does not exist in
+the ledger, or when a story id (`US-0001`) appears in `retired_ac_ids` (or a criterion id
 (`US-0001.1`) appears in `retired_us_ids`) -- that shape is almost always the two fields swapped.

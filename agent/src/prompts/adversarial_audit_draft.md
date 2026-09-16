@@ -41,6 +41,19 @@ same project -- those already passed their own conformance audit when they were 
 the screens the Plan above actually lists; a screen this ticket's Plan does not mention is not
 yours to re-check.
 
+Diagram conformance is part of this audit whenever the approved Implementation Plan above lists
+any `diagrams`: for each `er`/`architecture` diagram it lists
+(`.ai-dev-workflow/plan/diagrams/<name>.mmd`), compare it against the actual implementation --
+every entity/field/relationship (ER) or component/boundary (architecture) it shows must be
+findable in the real code, with the same intent (cosmetic naming differences are fine; a missing
+entity, an undepicted relationship the code actually has, or a structure that contradicts the
+diagram are divergences). For each `user_flow` diagram it lists, compare it against the actual
+built flow the same way -- every modeled step/branch/transition must be findable in the real
+screens and navigation, same intent, a missing or contradicted step is a divergence. Cite the
+diagram file and the implementing source for each one you check. Same ticket-scoping rule as
+wireframes: diagrams from earlier tickets already passed their own conformance audit -- only check
+what this ticket's Plan lists.
+
 The end-to-end run outcome above includes a `screenshots` list -- real captures of what the app
 actually rendered (both were also taken of every test's own screen). View the ones for screens
 you're checking wireframe conformance on WITH YOUR READ TOOL, alongside the implementing source:

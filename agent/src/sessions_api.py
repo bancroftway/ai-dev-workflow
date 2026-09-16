@@ -825,6 +825,10 @@ async def terminate_session(thread_id: str, request: Request) -> ProvisionRespon
     untouched -- resuming later just provisions a fresh sandbox onto the same branch. For "delete
     this session entirely," see delete_session_full below."""
     _check_shared_secret(request)
+    # Stop the in-flight background graph task (run_activity.py's SSE disconnect fix) too, not
+    # just the sandbox -- a pure-LLM node otherwise keeps running until its next tool call errors
+    # against the now-gone container. False (nothing was running) is a normal outcome, not an error.
+    run_activity.cancel_run(thread_id)
     provider = get_sandbox_provider()
     await provider.terminate(thread_id)
     # Explicit close discards the persistent workspace too (idle reaps deliberately keep it).
@@ -862,6 +866,7 @@ async def delete_session_full(thread_id: str, body: DeleteSessionRequest, reques
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
 
+    run_activity.cancel_run(thread_id)
     provider = get_sandbox_provider()
     await provider.terminate(thread_id)
     await provider.discard_workspace(thread_id)

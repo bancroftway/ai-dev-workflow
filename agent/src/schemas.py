@@ -278,6 +278,19 @@ class Specification(BaseModel):
         "criteria automatically -- you don't need to repeat them in retired_ac_ids too, though "
         "you may.",
     )
+    bug_affected_ac_ids: list[str] = Field(
+        default_factory=list,
+        description="Stable ids of existing, LIVE Acceptance Criteria (copied CHARACTER-FOR-"
+        "CHARACTER, e.g. 'US-0001.1') that a bug report in the raw requirements is actually about, "
+        "even though their wording is unchanged -- the criterion was always correctly specified, "
+        "the built code just doesn't implement it. Only meaningful when work_kind='bug'; leave "
+        "empty when the ticket needs no action (duplicate, already-fixed, user error) or when a "
+        "real wording fix already covers it via existing_ac_id -- do not force-populate this just "
+        "because work_kind='bug'. Naming an id here reopens it for delivery (clears its coded/"
+        "tested stamps on approval) without treating its wording as changed. Never name an id "
+        "you're also retiring via retired_ac_ids in this same response -- reopening and removing "
+        "are contradictory.",
+    )
 
 
 class PlanStep(BaseModel):
@@ -336,6 +349,14 @@ class PlanDiagram(BaseModel):
 
     name: str = Field(description="Short, filename-safe name (e.g. 'password-reset-er').")
     kind: str = Field(description="One of: er, architecture, user_flow.")
+    ac_ids: list[str] = Field(
+        default_factory=list,
+        description="Only meaningful for kind='user_flow' (a flow diagram genuinely depicts one "
+        "feature's flow, same as a wireframe): the ledger Acceptance Criterion ids (US-####.#) "
+        "this diagram fulfils, copied exactly from the approved Specification -- same convention "
+        "as Wireframe.ac_ids. Always empty for kind='er'/'architecture' -- those are whole-system, "
+        "cumulative views with no natural per-AC citation.",
+    )
     mermaid_source: str = Field(
         description="Complete, valid Mermaid diagram source, including its own type declaration "
         "line (e.g. 'erDiagram', 'flowchart TD'). Node/edge labels containing special characters "
@@ -364,6 +385,27 @@ class Wireframe(BaseModel):
         "invented, never a retired or deferred id. A reviewer must be able to tell which "
         "requirements this wireframe is evidence for at a glance.",
     )
+
+
+class PlanDiagramRef(BaseModel):
+    """Validates one entry of _draft/manifest.json's `diagrams` list -- NOT part of any model
+    response schema (the model edits manifest.json directly with file tools). Reference-only: the
+    real Mermaid source lives in the sidecar `_draft/diagrams/<name>.mmd` file, read separately by
+    gates/diagram_gate.py -- mirrors PlanDiagram's identity fields without its bulk content."""
+
+    name: str
+    kind: str
+    ac_ids: list[str] = Field(default_factory=list)
+
+
+class PlanWireframeRef(BaseModel):
+    """Validates one entry of _draft/manifest.json's `wireframes` list -- NOT part of any model
+    response schema. Reference-only: the real HTML lives in the sidecar
+    `_draft/wireframes/<screen>.html` file -- mirrors Wireframe's identity fields without its bulk
+    content."""
+
+    screen: str
+    ac_ids: list[str] = Field(default_factory=list)
 
 
 class DiagramPresence(BaseModel):
@@ -453,18 +495,59 @@ class ImplementationPlan(BaseModel):
         description="One self-contained high-fidelity HTML wireframe per new or changed screen "
         "(at most 6 screens), or an explicit absent+reason for a plan with no user-interface work."
     )
+    retired_wireframe_screens: list[str] = Field(
+        default_factory=list,
+        description="Screen names of wireframes that no longer belong -- the deleted feature they "
+        "depicted was retired, or every criterion they cited is now retired. The ONLY way a "
+        "wireframe leaves the plan; simply omitting it from `wireframes` does NOT retire it.",
+    )
+    retired_diagram_names: list[str] = Field(
+        default_factory=list,
+        description="Names of diagrams that no longer belong -- same explicit-only retirement "
+        "contract as retired_wireframe_screens, for `user_flow` diagrams whose feature was "
+        "retired. `er`/`architecture` diagrams are cumulative system views and are not retired "
+        "this way.",
+    )
+
+
+class SpecificationChangeTouchpoint(BaseModel):
+    """Metadata ABOUT one change made in the draft-specification.json file -- mirrors
+    schemas_codegen.ChangedFile's contract exactly (path/change_kind/summary there; ref/kind/
+    change/summary here). The file itself is the source of truth for the actual content; this is
+    a one-line pointer for the response, not a duplicate of it."""
+
+    ref: str = Field(
+        description="The id this touchpoint is about -- a real ledger id (e.g. 'US-0001', "
+        "'US-0001.1') for a revision or retirement, or your own same-response placeholder (e.g. "
+        "'story-a') for something genuinely new, matching the id you wrote in the file."
+    )
+    kind: Literal["user_story", "acceptance_criterion"]
+    change: Literal["added", "revised", "retired"]
+    summary: str = Field(description="One line -- the file is the source of truth for the actual content, not this field.")
 
 
 class SpecificationDraftResponse(BaseModel):
-    """Structured output contract for the Specification drafting node."""
+    """Structured output contract for the Specification drafting node.
+
+    Metadata-only (file-based-editing plan, Part 1 sect. 2): the actual Specification content
+    lives in and is edited directly in .ai-dev-workflow/spec/draft-specification.json (real file
+    tools, not this response) -- this response never carries the full document, only what changed.
+    Reuses the "whole response is the artifact" branch of graph._stage_content (content_field=None
+    on the specification StageSpec), the same mechanism `remediation` already relies on today.
+    """
 
     readiness: bool = Field(
-        description="True if this draft is complete enough to present for human review."
+        description="True if the file is complete enough to present for human review."
     )
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
-    specification: Specification | None = Field(
-        default=None, description="Present whenever a draft was produced, ready or not."
+    story_changes: list[SpecificationChangeTouchpoint] = Field(
+        default_factory=list,
+        description="One entry per User Story/Acceptance Criterion you added, revised, or "
+        "retired in the file THIS turn -- not a restatement of the whole document. Empty is valid "
+        "(e.g. a bug ticket that reopens a criterion via bug_affected_ac_ids in the file without "
+        "changing any wording, or readiness=false while still investigating).",
     )
+    summary: str = Field(default="", description="Short plain account of what you actually did this turn.")
     skills_invoked: list[str] = Field(
         default_factory=list,
         description="Exact names of skills you invoked with your `skill` tool this turn (a plugin "
@@ -473,80 +556,155 @@ class SpecificationDraftResponse(BaseModel):
         "Cross-checked against the session's own recorded invocations -- a name you did not "
         "invoke shows up as an unsubstantiated claim. An empty list is a valid answer.",
     )
+
+
+SPECIFICATION_FILE_EXAMPLE: Specification = Specification(
+    title="Password reset via email",
+    summary="Let a user who forgot their password request a time-limited emailed reset link "
+    "and set a new password with it.",
+    work_kind="feature",
+    user_stories=[
+        UserStory(
+            id="story-a",
+            title="Request a password reset",
+            narrative="As a user who forgot my password, I want to request a reset email, "
+            "so that I can regain access to my account.",
+            existing_us_id="US-0001",
+            deferred=False,
+            acceptance_criteria=[
+                AcceptanceCriterion(
+                    id="ac-a",
+                    description="Submitting a registered email sends a reset link that "
+                    "expires after 1 hour.",
+                    existing_ac_id="US-0001.1",
+                    deferred=False,
+                    ui_related=True,
+                ),
+                AcceptanceCriterion(
+                    id="ac-b",
+                    description="Submitting an unregistered email shows the same "
+                    "confirmation message, without revealing whether the account exists.",
+                    existing_ac_id="US-0001.2",
+                    deferred=False,
+                    ui_related=True,
+                ),
+            ],
+        )
+    ],
+    assumptions=PresenceList(
+        status="present", values=["Reset links expire after 1 hour, per the security policy."]
+    ),
+    out_of_scope=PresenceList(
+        status="absent", reason="Nothing was explicitly excluded for this ticket."
+    ),
+    questions=[
+        SpecQuestion(
+            id="q-token-ttl",
+            question="How long should the reset token remain valid?",
+            status="answered",
+            answer="1 hour, per the security policy doc referenced in the requirements.",
+            suggested_choices=[],
+        )
+    ],
+    attachment_notes=[],
+    retired_ac_ids=[],
+    retired_us_ids=[],
+    bug_affected_ac_ids=[],
+)
+"""Fully-populated example of the FILE's shape (.ai-dev-workflow/spec/draft-specification.json) --
+a worked example for prompt text, not wired through ainvoke_structured (the response no longer
+carries this content directly)."""
 
 
 SPECIFICATION_DRAFT_EXAMPLE: SpecificationDraftResponse = SpecificationDraftResponse(
     readiness=True,
     clarifying_questions=[],
-    specification=Specification(
-        title="Password reset via email",
-        summary="Let a user who forgot their password request a time-limited emailed reset link "
-        "and set a new password with it.",
-        work_kind="feature",
-        user_stories=[
-            UserStory(
-                id="story-a",
-                title="Request a password reset",
-                narrative="As a user who forgot my password, I want to request a reset email, "
-                "so that I can regain access to my account.",
-                existing_us_id="US-0001",
-                deferred=False,
-                acceptance_criteria=[
-                    AcceptanceCriterion(
-                        id="ac-a",
-                        description="Submitting a registered email sends a reset link that "
-                        "expires after 1 hour.",
-                        existing_ac_id="US-0001.1",
-                        deferred=False,
-                        ui_related=True,
-                    ),
-                    AcceptanceCriterion(
-                        id="ac-b",
-                        description="Submitting an unregistered email shows the same "
-                        "confirmation message, without revealing whether the account exists.",
-                        existing_ac_id="US-0001.2",
-                        deferred=False,
-                        ui_related=True,
-                    ),
-                ],
-            )
-        ],
-        assumptions=PresenceList(
-            status="present", values=["Reset links expire after 1 hour, per the security policy."]
+    story_changes=[
+        SpecificationChangeTouchpoint(
+            ref="story-a", kind="user_story", change="added",
+            summary="Added the password-reset-request story.",
         ),
-        out_of_scope=PresenceList(
-            status="absent", reason="Nothing was explicitly excluded for this ticket."
+        SpecificationChangeTouchpoint(
+            ref="ac-b", kind="acceptance_criterion", change="added",
+            summary="Added the unregistered-email confirmation criterion.",
         ),
-        questions=[
-            SpecQuestion(
-                id="q-token-ttl",
-                question="How long should the reset token remain valid?",
-                status="answered",
-                answer="1 hour, per the security policy doc referenced in the requirements.",
-                suggested_choices=[],
-            )
-        ],
-        attachment_notes=[],
-        retired_ac_ids=[],
-        retired_us_ids=[],
-    ),
+    ],
+    summary="Drafted password reset via email: one story, two criteria.",
     skills_invoked=["test-driven-development"],
 )
 """Fully-populated example of the specification drafting node's structured output, echoed into
-the draft prompt so the model sees a realistic instance of the current canonical (typed-absence)
-shape."""
+the draft prompt so the model sees a realistic instance of the current metadata-only shape."""
+
+
+class PlanChangeTouchpoint(BaseModel):
+    """Metadata ABOUT one plan step you added, revised, or retired in _draft/steps.json THIS
+    turn -- mirrors SpecificationChangeTouchpoint's contract (itself mirroring
+    schemas_codegen.ChangedFile). The file is the source of truth for the actual content."""
+
+    ref: str = Field(
+        description="The plan step id this touchpoint is about (e.g. 'PS-1') -- PlanStep.id is "
+        "trusted directly as the real id, no placeholder indirection."
+    )
+    change: Literal["added", "revised", "retired"]
+    summary: str = Field(description="One line -- the file is the source of truth for the actual content, not this field.")
+
+
+class DiagramReviewRecord(BaseModel):
+    """Evidence that ONE er/architecture/user_flow diagram was explicitly reviewed this audit lap
+    -- file-based-editing plan, Part 2 sect. 6: mechanically enforced so a diagram can never be
+    silently skipped when the specification (or, for user_flow, that diagram's own cited criteria)
+    changed underneath it."""
+
+    name: str = Field(description="The diagram's name, matching manifest.json's own entry.")
+    action: Literal["revised", "confirmed_current"] = Field(
+        description="'revised' means you actually changed the .mmd file this lap (mechanically "
+        "verified against the last-approved version -- a false claim is caught, not trusted); "
+        "'confirmed_current' means you reviewed it and it still accurately reflects the current "
+        "spec/plan, unchanged."
+    )
+    reason: str = Field(description="One line: what changed, or why no change was needed.")
+
+
+class WireframeReviewRecord(BaseModel):
+    """Same contract as DiagramReviewRecord, for wireframes whose own cited criteria changed this
+    run (file-based-editing plan, Part 2 sect. 6: full parity with diagrams -- no visual artifact
+    may go stale silently)."""
+
+    screen: str = Field(description="The wireframe's screen name, matching manifest.json's own entry.")
+    action: Literal["revised", "confirmed_current"]
+    reason: str = Field(description="One line: what changed, or why no change was needed.")
 
 
 class PlanDraftResponse(BaseModel):
-    """Structured output contract for the Plan drafting node."""
+    """Structured output contract for the Plan drafting node.
+
+    Metadata-only (file-based-editing plan, Part 2 sect. 2) for the BULK content specifically
+    (plan_steps/wireframes/diagrams -- the list-shaped content with the copy-fidelity risk this
+    whole plan exists to close): that lives in and is edited directly in
+    .ai-dev-workflow/plan/_draft/ (steps.json, manifest.json, and one raw .mmd/.html file per
+    diagram/wireframe), never in this response. `overview`/`risk_notes` stay HERE, on the response,
+    same as today -- both are small free text with no per-item identity/list-copy risk (Part 2
+    sect. 2's own reasoning: "no per-item identity to hang a completeness check off"), so keeping
+    them on the response costs nothing and avoids inventing a file for content that was never the
+    problem. Same content_field=None mechanism as specification's response (graph._stage_content).
+    """
 
     readiness: bool = Field(
-        description="True if this draft is complete enough to present for human review."
+        description="True if the plan is complete enough to present for human review."
     )
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
-    plan: ImplementationPlan | None = Field(
-        default=None, description="Present whenever a draft was produced, ready or not."
+    overview: str = Field(default="", description="A short account of the overall implementation approach.")
+    risk_notes: PresenceList = Field(
+        description="Risks/tradeoffs called out during planning, or an explicit absent+reason "
+        "when none apply."
     )
+    step_changes: list[PlanChangeTouchpoint] = Field(
+        default_factory=list,
+        description="One entry per plan step you added, revised, or retired in steps.json THIS "
+        "turn -- not a restatement of the whole plan. Empty is valid (e.g. readiness=false while "
+        "still investigating).",
+    )
+    summary: str = Field(default="", description="Short plain account of what you actually did this turn.")
     skills_invoked: list[str] = Field(
         default_factory=list,
         description="Exact names of skills you invoked with your `skill` tool this turn (a plugin "
@@ -557,82 +715,117 @@ class PlanDraftResponse(BaseModel):
     )
 
 
+PLAN_FILE_EXAMPLE: ImplementationPlan = ImplementationPlan(
+    overview="Implements password reset via a time-limited emailed token, reusing the "
+    "existing auth module's email-sending and session conventions.",
+    plan_steps=[
+        PlanStep(
+            id="PS-1",
+            description="Add POST /auth/reset-request: looks up the email, issues a "
+            "1-hour token, and sends the reset email.",
+            ac_ids=["US-0001.1", "US-0001.2"],
+            kind="feature",
+            ui_related=True,
+            removes_ids=[],
+        ),
+        PlanStep(
+            id="PS-2",
+            description="Add the reset-request page shown by the wireframe below.",
+            ac_ids=["US-0001.1"],
+            kind="feature",
+            ui_related=True,
+            removes_ids=[],
+        ),
+    ],
+    risk_notes=PresenceList(
+        status="present",
+        values=["Email deliverability depends on the third-party SMTP provider's uptime."],
+    ),
+    diagrams=DiagramPresence(
+        status="present",
+        values=[
+            PlanDiagram(
+                name="password-reset-flow",
+                kind="user_flow",
+                ac_ids=["US-0001.1"],
+                mermaid_source="flowchart TD\n"
+                "  A[Request reset] --> B[Send email]\n"
+                "  B --> C[User clicks link]\n"
+                "  C --> D[Set new password]",
+            )
+        ],
+    ),
+    wireframes=WireframePresence(
+        status="present",
+        values=[
+            Wireframe(
+                screen="reset-request",
+                html_source="<html><body><h1>Reset your password</h1>"
+                '<input type="email" placeholder="you@example.com">'
+                "<button>Send reset link</button></body></html>",
+                ac_ids=["US-0001.1"],
+            )
+        ],
+    ),
+    retired_wireframe_screens=[],
+    retired_diagram_names=[],
+)
+"""Fully-populated example of the FILE's shape (steps.json's plan_steps + manifest.json's
+wireframe/diagram entries + their sidecar content, shown here as one combined ImplementationPlan
+for prompt-text convenience) -- a worked example, not wired through ainvoke_structured."""
+
+
 PLAN_DRAFT_EXAMPLE: PlanDraftResponse = PlanDraftResponse(
     readiness=True,
     clarifying_questions=[],
-    plan=ImplementationPlan(
-        overview="Implements password reset via a time-limited emailed token, reusing the "
-        "existing auth module's email-sending and session conventions.",
-        plan_steps=[
-            PlanStep(
-                id="PS-1",
-                description="Add POST /auth/reset-request: looks up the email, issues a "
-                "1-hour token, and sends the reset email.",
-                ac_ids=["US-0001.1", "US-0001.2"],
-                kind="feature",
-                ui_related=True,
-                removes_ids=[],
-            ),
-            PlanStep(
-                id="PS-2",
-                description="Add the reset-request page shown by the wireframe below.",
-                ac_ids=["US-0001.1"],
-                kind="feature",
-                ui_related=True,
-                removes_ids=[],
-            ),
-        ],
-        risk_notes=PresenceList(
-            status="present",
-            values=["Email deliverability depends on the third-party SMTP provider's uptime."],
-        ),
-        diagrams=DiagramPresence(
-            status="present",
-            values=[
-                PlanDiagram(
-                    name="password-reset-flow",
-                    kind="user_flow",
-                    mermaid_source="flowchart TD\n"
-                    "  A[Request reset] --> B[Send email]\n"
-                    "  B --> C[User clicks link]\n"
-                    "  C --> D[Set new password]",
-                )
-            ],
-        ),
-        wireframes=WireframePresence(
-            status="present",
-            values=[
-                Wireframe(
-                    screen="reset-request",
-                    html_source="<html><body><h1>Reset your password</h1>"
-                    '<input type="email" placeholder="you@example.com">'
-                    "<button>Send reset link</button></body></html>",
-                    ac_ids=["US-0001.1"],
-                )
-            ],
-        ),
+    overview="Implements password reset via a time-limited emailed token, reusing the existing "
+    "auth module's email-sending and session conventions.",
+    risk_notes=PresenceList(
+        status="present",
+        values=["Email deliverability depends on the third-party SMTP provider's uptime."],
     ),
+    step_changes=[
+        PlanChangeTouchpoint(ref="PS-1", change="added", summary="Added the reset-request endpoint step."),
+        PlanChangeTouchpoint(ref="PS-2", change="added", summary="Added the reset-request page step."),
+    ],
+    summary="Drafted the password-reset-via-email plan: two steps, one wireframe, one user_flow diagram.",
     skills_invoked=["writing-plans"],
 )
 """Fully-populated example of the plan drafting node's structured output, echoed into the draft
-prompt so the model sees a realistic instance of the current canonical (typed-absence) shape."""
+prompt so the model sees a realistic instance of the current metadata-only shape."""
 
 
 class SpecificationAuditResponse(BaseModel):
-    """Structured output contract for the Specification adversarial-audit node."""
+    """Structured output contract for the Specification adversarial-audit node.
 
-    revised_specification: Specification
+    Metadata-only (file-based-editing plan, Part 1 sect. 2): you may edit
+    draft-specification.json directly when you find something to fix (preserves today's
+    capability) -- this response reports what changed, never carries the content itself.
+    """
+
+    story_changes: list[SpecificationChangeTouchpoint] = Field(
+        default_factory=list,
+        description="One entry per User Story/Acceptance Criterion you added, revised, or "
+        "retired in the file THIS audit pass -- not a restatement of the whole document.",
+    )
     audit_findings: PresenceList = Field(
-        description="Gaps found and fixed, or an explicit absent+reason when none were found."
+        description="Gaps found and fixed, or an explicit absent+reason when none were found. A "
+        "list of DEFECTS, never a changelog -- see specification_audit.md's own instruction."
     )
 
 
 SPECIFICATION_AUDIT_EXAMPLE: SpecificationAuditResponse = SpecificationAuditResponse(
-    revised_specification=SPECIFICATION_DRAFT_EXAMPLE.specification,
+    story_changes=[
+        SpecificationChangeTouchpoint(
+            ref="US-0001.2", kind="acceptance_criterion", change="added",
+            summary="Added the 'unregistered email gives the same confirmation' criterion -- the "
+            "draft only covered the happy path and would have leaked account existence.",
+        ),
+    ],
     audit_findings=PresenceList(
         status="present",
         values=[
-            "Added the 'unregistered email gives the same confirmation' criterion (ac-b) -- the "
+            "Added the 'unregistered email gives the same confirmation' criterion (US-0001.2) -- the "
             "original draft only covered the happy path and would have leaked account existence."
         ],
     ),
@@ -641,16 +834,65 @@ SPECIFICATION_AUDIT_EXAMPLE: SpecificationAuditResponse = SpecificationAuditResp
 
 
 class PlanAuditResponse(BaseModel):
-    """Structured output contract for the Plan adversarial-audit node."""
+    """Structured output contract for the Plan adversarial-audit node.
 
-    revised_plan: ImplementationPlan
+    Metadata-only, same shape/reasoning as SpecificationAuditResponse -- you may edit
+    _draft/steps.json, _draft/manifest.json, and the sidecar .mmd/.html files directly (preserves
+    today's capability); this response reports what changed, never carries the content itself.
+    `overview`/`risk_notes` stay on the response same as the draft's own (PlanDraftResponse's own
+    docstring has the reasoning) -- carry the draft's forward unchanged unless you have reason to
+    revise them.
+    """
+
+    overview: str = Field(default="", description="A short account of the overall implementation approach.")
+    risk_notes: PresenceList = Field(
+        description="Risks/tradeoffs called out during planning, or an explicit absent+reason "
+        "when none apply."
+    )
+    step_changes: list[PlanChangeTouchpoint] = Field(
+        default_factory=list,
+        description="One entry per plan step you added, revised, or retired in steps.json THIS "
+        "audit pass -- not a restatement of the whole plan.",
+    )
+    diagrams_reviewed: list[DiagramReviewRecord] = Field(
+        default_factory=list,
+        description="Every er/architecture diagram, if the specification changed anything this "
+        "run (blanket trigger -- there are only ever a handful of these); every user_flow diagram "
+        "whose own cited criteria changed this run (per-item trigger, since user_flow diagrams "
+        "have ac_ids to scope by). See diagram_gate.py's verify_plan_diagrams for the exact rule.",
+    )
+    wireframes_reviewed: list[WireframeReviewRecord] = Field(
+        default_factory=list,
+        description="Every wireframe whose own cited criteria changed this run (same per-item "
+        "trigger as user_flow diagrams above) -- full parity, no visual artifact may go stale "
+        "silently.",
+    )
     audit_findings: PresenceList = Field(
-        description="Gaps found and fixed, or an explicit absent+reason when none were found."
+        description="Gaps found and fixed, or an explicit absent+reason when none were found. A "
+        "list of DEFECTS, never a changelog."
     )
 
 
 PLAN_AUDIT_EXAMPLE: PlanAuditResponse = PlanAuditResponse(
-    revised_plan=PLAN_DRAFT_EXAMPLE.plan,
+    overview="Implements password reset via a time-limited emailed token, reusing the existing "
+    "auth module's email-sending and session conventions.",
+    risk_notes=PresenceList(
+        status="present",
+        values=["Email deliverability depends on the third-party SMTP provider's uptime."],
+    ),
+    step_changes=[],
+    diagrams_reviewed=[
+        DiagramReviewRecord(
+            name="password-reset-flow", action="confirmed_current",
+            reason="Spec unchanged this run; flow still matches the built screens.",
+        ),
+    ],
+    wireframes_reviewed=[
+        WireframeReviewRecord(
+            screen="reset-request", action="confirmed_current",
+            reason="US-0001.1 unchanged this run; wireframe still matches.",
+        ),
+    ],
     audit_findings=PresenceList(
         status="absent", reason="Plan steps and wireframes already cover every live criterion."
     ),
@@ -1316,31 +1558,34 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert _plan_absent.diagrams.status == "absent"
 
     # SpecificationAuditResponse/PlanAuditResponse.audit_findings: now a real PresenceList, not a
-    # bare list[str] -- present/absent both validate.
-    _spec_for_audit = Specification(
-        title="T", summary="S",
-        assumptions=PresenceList(status="absent", reason="none needed"),
-        out_of_scope=PresenceList(status="absent", reason="none"),
-    )
+    # bare list[str] -- present/absent both validate. File-based-editing plan: both responses are
+    # metadata-only now (story_changes/step_changes touchpoints, never the full content).
     spec_audit_clean = SpecificationAuditResponse(
-        revised_specification=_spec_for_audit,
-        audit_findings=PresenceList(status="absent", reason="no gaps found"),
+        story_changes=[], audit_findings=PresenceList(status="absent", reason="no gaps found"),
     )
     assert spec_audit_clean.audit_findings.values == []
     spec_audit_findings = SpecificationAuditResponse(
-        revised_specification=_spec_for_audit,
+        story_changes=[
+            SpecificationChangeTouchpoint(
+                ref="US-0001.1", kind="acceptance_criterion", change="revised", summary="tightened wording"
+            )
+        ],
         audit_findings=PresenceList(status="present", values=["AC US-0001.1 was untestable as written"]),
     )
     assert spec_audit_findings.audit_findings.status == "present"
 
     plan_audit_clean = PlanAuditResponse(
-        revised_plan=_plan_absent,
+        overview="x", risk_notes=PresenceList(status="absent", reason="none"),
+        step_changes=[], diagrams_reviewed=[], wireframes_reviewed=[],
         audit_findings=PresenceList(status="absent", reason="no gaps found"),
     )
     assert plan_audit_clean.audit_findings.values == []
     # Legacy bare-list audit_findings must still coerce (older sidecars/model output).
     plan_audit_legacy = PlanAuditResponse.model_validate(
-        {"revised_plan": _plan_absent.model_dump(), "audit_findings": ["fixed a missing AC citation"]}
+        {
+            "overview": "x", "risk_notes": {"status": "absent", "reason": "none"},
+            "step_changes": [], "audit_findings": ["fixed a missing AC citation"],
+        }
     )
     assert plan_audit_legacy.audit_findings.status == "present"
     assert plan_audit_legacy.audit_findings.values == ["fixed a missing AC citation"]
@@ -1359,17 +1604,41 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     # "Validates" alone doesn't prove the CURRENT typed shape -- PresenceList's own before-
     # validator would silently coerce a stale bare-list example back into today's shape. Confirm
     # every PresenceList-wrapped field actually dumps a real "status" key, same proof already used
-    # for TechStack above.
-    _spec_dumped = json.loads(SPECIFICATION_DRAFT_EXAMPLE.specification.model_dump_json())
-    assert "status" in _spec_dumped["assumptions"], "SPECIFICATION_DRAFT_EXAMPLE.assumptions missing 'status'"
-    assert "status" in _spec_dumped["out_of_scope"], "SPECIFICATION_DRAFT_EXAMPLE.out_of_scope missing 'status'"
+    # for TechStack above. File-based-editing plan: SPECIFICATION_FILE_EXAMPLE/PLAN_FILE_EXAMPLE
+    # are the worked examples of the FILE's shape now -- the *_DRAFT_EXAMPLE responses no longer
+    # carry this content at all (metadata-only), so these checks moved to the file examples.
+    _spec_dumped = json.loads(SPECIFICATION_FILE_EXAMPLE.model_dump_json())
+    assert "status" in _spec_dumped["assumptions"], "SPECIFICATION_FILE_EXAMPLE.assumptions missing 'status'"
+    assert "status" in _spec_dumped["out_of_scope"], "SPECIFICATION_FILE_EXAMPLE.out_of_scope missing 'status'"
     _spec_audit_dumped = json.loads(SPECIFICATION_AUDIT_EXAMPLE.model_dump_json())
     assert "status" in _spec_audit_dumped["audit_findings"], "SPECIFICATION_AUDIT_EXAMPLE.audit_findings missing 'status'"
 
-    _plan_dumped = json.loads(PLAN_DRAFT_EXAMPLE.plan.model_dump_json())
+    _plan_dumped = json.loads(PLAN_FILE_EXAMPLE.model_dump_json())
     for _plan_field in ("risk_notes", "diagrams", "wireframes"):
-        assert "status" in _plan_dumped[_plan_field], f"PLAN_DRAFT_EXAMPLE.plan.{_plan_field} missing 'status'"
+        assert "status" in _plan_dumped[_plan_field], f"PLAN_FILE_EXAMPLE.{_plan_field} missing 'status'"
     _plan_audit_dumped = json.loads(PLAN_AUDIT_EXAMPLE.model_dump_json())
     assert "status" in _plan_audit_dumped["audit_findings"], "PLAN_AUDIT_EXAMPLE.audit_findings missing 'status'"
+
+    # bug_affected_ac_ids (Part 5) + PlanDiagram.ac_ids/ImplementationPlan retired-lists (Part 2
+    # sect. 6) round-trip through the FILE examples.
+    assert SPECIFICATION_FILE_EXAMPLE.bug_affected_ac_ids == []
+    assert PLAN_FILE_EXAMPLE.retired_wireframe_screens == [] and PLAN_FILE_EXAMPLE.retired_diagram_names == []
+    _user_flow_diagram = PLAN_FILE_EXAMPLE.diagrams.values[0]
+    assert _user_flow_diagram.kind == "user_flow" and _user_flow_diagram.ac_ids == ["US-0001.1"]
+
+    # New metadata-only touchpoint/review-record types round-trip cleanly.
+    assert_example_matches_schema(
+        SpecificationChangeTouchpoint(ref="US-0001", kind="user_story", change="added", summary="x"),
+        SpecificationChangeTouchpoint,
+    )
+    assert_example_matches_schema(PlanChangeTouchpoint(ref="PS-1", change="added", summary="x"), PlanChangeTouchpoint)
+    assert_example_matches_schema(
+        DiagramReviewRecord(name="d", action="confirmed_current", reason="x"), DiagramReviewRecord
+    )
+    assert_example_matches_schema(
+        WireframeReviewRecord(screen="s", action="confirmed_current", reason="x"), WireframeReviewRecord
+    )
+    assert_example_matches_schema(PlanDiagramRef(name="d", kind="er"), PlanDiagramRef)
+    assert_example_matches_schema(PlanWireframeRef(screen="s"), PlanWireframeRef)
 
     print("schemas self-check: all assertions passed")
