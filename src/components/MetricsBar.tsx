@@ -2,6 +2,9 @@
 
 import { useAgent } from "@copilotkit/react-core/v2";
 import { HealthRing } from "@/components/HealthRing";
+import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useRunActivity } from "@/lib/run-activity-context";
+import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import { PIPELINE_STAGE_ORDER, type E2EState, type ScanMeasures, type WorkflowState } from "@/lib/workflow-types";
 import {
@@ -150,6 +153,8 @@ export function MetricsBar({
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
+  const { interrupt } = useOpenInterrupt();
+  const [runActivity] = useRunActivity();
   const state = (agent.state ?? {}) as WorkflowState;
   const scan = state.repo_scan;
 
@@ -166,6 +171,28 @@ export function MetricsBar({
     const status = state.stages?.[s.key]?.status;
     return status != null && status !== "not_started" && status !== "approved";
   });
+  // stage.status flips to "ready_for_review" the moment the DRAFT node emits a ready draft --
+  // BEFORE the audit and deterministic-verify passes run, and it never moves off that value while
+  // a redraft loop (audit finding, verify rejection) keeps sending it back to draft. Raw status
+  // alone, shown here previously, said "ready for review" for the entire redraft loop, directly
+  // contradicting SpecificationView/PlanView's own "still being audited, nothing approvable yet"
+  // banner on the exact same page (observed live 2026-09-15). deriveStageReviewFlags's `isFinal`
+  // (this stage's own gate interrupt actually open) is the one signal those views already treat as
+  // authoritative for "genuinely awaiting a human" -- reuse it here instead of a second, looser
+  // read of the same status field.
+  const activeStageStatus = activeStage ? state.stages?.[activeStage.key]?.status : undefined;
+  const { isFinal: activeStageIsFinal } = deriveStageReviewFlags({
+    stageKey: activeStage?.key ?? "",
+    stageStatus: activeStageStatus,
+    interruptOpen: interrupt.open,
+    interruptStage: interrupt.stage,
+    agentIsRunning: agent.isRunning,
+    runActive: runActivity?.runActive,
+  });
+  const activeStageStatusLabel =
+    activeStageStatus === "ready_for_review" && !activeStageIsFinal
+      ? "auditing"
+      : (STATUS_LABEL[activeStageStatus ?? ""] ?? activeStageStatus);
   const e2ePillNode = e2ePill(state.e2e);
 
   let chips: React.ReactNode = null;
@@ -312,7 +339,7 @@ export function MetricsBar({
       {chips}
       {activeStage && (
         <span className="text-xs text-neutral-500">
-          {activeStage.label} — {STATUS_LABEL[state.stages?.[activeStage.key]?.status ?? ""] ?? state.stages?.[activeStage.key]?.status}
+          {activeStage.label} — {activeStageStatusLabel}
         </span>
       )}
       {e2ePillNode}
