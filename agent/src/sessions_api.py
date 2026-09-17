@@ -674,10 +674,26 @@ class RunEventResponse(BaseModel):
     summary: str | None
     payload: dict[str, Any] | None
     token_usage: dict[str, Any] | None
+    # Overview-tab redraft history (Workstream 3): sizes only, never the full text -- see
+    # run_event_store._COLUMNS' own comment for why. `payload["cycle"]` (already present above for
+    # draft/audit/fix events) is the lap number; there's no separate `cycle` field here since
+    # payload already carries it and duplicating it would just be two representations of one value.
+    input_size: int | None = None
+    output_size: int | None = None
 
 
 class SessionEventsResponse(BaseModel):
     events: list[RunEventResponse]
+
+
+class RunEventIoResponse(BaseModel):
+    """Overview-tab redraft history (Workstream 3): the on-demand, single-event counterpart to
+    RunEventResponse above -- the full input/output text RunEventResponse deliberately omits.
+    Text, not bytes: dbo.run_events stores UTF-8 VARBINARY (run_events.encode_io_text), decoded
+    back to str here so the frontend never has to know about the storage encoding."""
+
+    input_text: str | None
+    output_text: str | None
 
 
 def _event_to_response(e: RunEvent) -> RunEventResponse:
@@ -691,6 +707,7 @@ def _event_to_response(e: RunEvent) -> RunEventResponse:
         seq=e.seq, run_id=e.run_id, session_id=e.session_id, ts=e.ts,
         stage=e.stage, node=e.node, type=e.type.value, summary=e.summary,
         payload=e.payload, token_usage=e.token_usage,
+        input_size=e.input_size, output_size=e.output_size,
     )
 
 
@@ -716,6 +733,34 @@ async def get_session_events(session_id: str, request: Request) -> SessionEvents
         raise HTTPException(status_code=404, detail="session not found")
     events = await run_event_store.list_events_by_session(session_id)
     return SessionEventsResponse(events=[_event_to_response(e) for e in events])
+
+
+@router.get("/{session_id}/events/{seq}/io", response_model=RunEventIoResponse)
+async def get_session_event_io(session_id: str, seq: int, request: Request) -> RunEventIoResponse:
+    """Overview-tab redraft history (Workstream 3): on-demand fetch of ONE event's full
+    input/output text, fired only when a user actually hovers a redraft row's Input/Output cell --
+    deliberately a separate endpoint from get_session_events above, which never carries this text
+    (see RunEventResponse's own comment), so polling/streaming the Overview tab never has to
+    download every lap's full prompt/response just to render size numbers.
+
+    404 for a session that doesn't exist (matching get_session_events), and ALSO 404 -- not a
+    different, more specific error -- for a seq that doesn't belong to this session_id:
+    run_event_store.get_event_io scopes its lookup to (session_id, seq) together specifically so
+    this can't be used to read another session's event text by guessing a seq number; from the
+    caller's side, "wrong session" and "no such event" must look identical.
+    """
+    _check_shared_secret(request)
+    row = await session_store.get_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    io_text = await run_event_store.get_event_io(session_id, seq)
+    if io_text is None:
+        raise HTTPException(status_code=404, detail="event not found")
+    input_bytes, output_bytes = io_text
+    return RunEventIoResponse(
+        input_text=input_bytes.decode("utf-8") if input_bytes is not None else None,
+        output_text=output_bytes.decode("utf-8") if output_bytes is not None else None,
+    )
 
 
 # 30 min: forces the client's EventSource to reconnect periodically. Not just cleanup insurance --
@@ -2389,6 +2434,51 @@ def _demo() -> None:
     try:
         asyncio.run(get_session_events("does-not-exist", _FakeRequest()))  # type: ignore[arg-type]
         raise AssertionError("get_session_events must 404 for an unknown session_id")
+    except HTTPException as exc:
+        assert exc.status_code == 404, exc.status_code
+    finally:
+        session_store.get_session = original_get_session  # type: ignore[assignment]
+
+    # get_session_event_io (Overview-tab redraft history, Workstream 3): the on-demand text
+    # fetch, same monkeypatch style as get_session_events just above. Pins that the route decodes
+    # the stored UTF-8 bytes back to str (not left as bytes, which FastAPI/Pydantic would reject
+    # trying to serialize as JSON), and that a None from get_event_io (wrong session_id, or no
+    # such seq) becomes a 404, not a 200 with null fields or an unhandled exception.
+    async def fake_get_event_io_found(session_id: str, seq: int) -> tuple[bytes | None, bytes | None] | None:
+        assert session_id == "44444444-4444-4444-4444-444444444444", session_id
+        assert seq == 1, seq
+        return "SYSTEM:\nbe helpful".encode("utf-8"), "Added 3 test files.".encode("utf-8")
+
+    original_get_event_io = run_event_store.get_event_io
+    session_store.get_session = fake_get_session_found  # type: ignore[assignment]
+    run_event_store.get_event_io = fake_get_event_io_found  # type: ignore[assignment]
+    try:
+        io_response = asyncio.run(get_session_event_io("44444444-4444-4444-4444-444444444444", 1, _FakeRequest()))  # type: ignore[arg-type]
+    finally:
+        run_event_store.get_event_io = original_get_event_io  # type: ignore[assignment]
+        session_store.get_session = original_get_session  # type: ignore[assignment]
+
+    assert io_response.input_text == "SYSTEM:\nbe helpful", io_response
+    assert io_response.output_text == "Added 3 test files.", io_response
+
+    async def fake_get_event_io_missing(session_id: str, seq: int) -> tuple[bytes | None, bytes | None] | None:
+        return None
+
+    session_store.get_session = fake_get_session_found  # type: ignore[assignment]
+    run_event_store.get_event_io = fake_get_event_io_missing  # type: ignore[assignment]
+    try:
+        asyncio.run(get_session_event_io("44444444-4444-4444-4444-444444444444", 999, _FakeRequest()))  # type: ignore[arg-type]
+        raise AssertionError("get_session_event_io must 404 when get_event_io returns None")
+    except HTTPException as exc:
+        assert exc.status_code == 404, exc.status_code
+    finally:
+        run_event_store.get_event_io = original_get_event_io  # type: ignore[assignment]
+        session_store.get_session = original_get_session  # type: ignore[assignment]
+
+    session_store.get_session = fake_get_session_missing  # type: ignore[assignment]
+    try:
+        asyncio.run(get_session_event_io("does-not-exist", 1, _FakeRequest()))  # type: ignore[arg-type]
+        raise AssertionError("get_session_event_io must 404 for an unknown session_id")
     except HTTPException as exc:
         assert exc.status_code == 404, exc.status_code
     finally:

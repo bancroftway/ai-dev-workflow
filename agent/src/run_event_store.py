@@ -53,9 +53,11 @@ async def append_event(event: RunEvent) -> RunEvent:
         async with pool.acquire() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO dbo.run_events (run_id, session_id, stage, node, type, summary, payload, token_usage)
+                INSERT INTO dbo.run_events
+                    (run_id, session_id, stage, node, type, summary, payload, token_usage,
+                     input_text, output_text, input_size, output_size)
                 OUTPUT INSERTED.seq, INSERTED.ts
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 event.run_id,
                 event.session_id,
@@ -65,6 +67,10 @@ async def append_event(event: RunEvent) -> RunEvent:
                 event.summary,
                 json.dumps(event.payload) if event.payload is not None else None,
                 json.dumps(event.token_usage) if event.token_usage is not None else None,
+                event.input_text,
+                event.output_text,
+                event.input_size,
+                event.output_size,
             )
             seq, ts = await cur.fetchone()
         return replace(event, seq=seq, ts=ts)
@@ -76,18 +82,20 @@ async def append_event(event: RunEvent) -> RunEvent:
         return event
 
 
-# Each event row binds 8 params (run_id, session_id, stage, node, type, summary, payload,
-# token_usage). SQL Server's hard per-statement parameter cap is 2100, so a single multi-row
-# INSERT tops out at 2100 // 8 = 262 rows -- a bare 263-row batch fails outright ("07002 COUNT
-# field incorrect"), confirmed against the real DB in code review. The ORIGINAL single-INSERT
-# append_events swallowed that failure via its own fail-soft `except` below, silently losing the
-# ENTIRE turn's log past 262 events while run_event_stream.emit_live kept firing live regardless
-# (rows visible in the live view that vanish on refresh) -- strictly worse than the serial
-# append_event loop it replaced, and REASONING capture (finding 3) roughly doubles events/turn, so
-# the audit's own "200 tool calls" scenario is realistically over the line. 250 keeps real
-# headroom below the 262 ceiling, not tuned to hug it exactly.
-_PARAMS_PER_EVENT_ROW = 8
-_MAX_ROWS_PER_INSERT = 250
+# Each event row binds 12 params (run_id, session_id, stage, node, type, summary, payload,
+# token_usage, input_text, output_text, input_size, output_size -- the last 4 added for Workstream
+# 3's Overview-tab redraft history; every row binds all 12 regardless of whether a given event
+# actually carries I/O text, since the parameter COUNT is structural, not data-dependent). SQL
+# Server's hard per-statement parameter cap is 2100, so a single multi-row INSERT tops out at
+# 2100 // 12 = 175 rows -- a bare 176-row batch fails outright ("07002 COUNT field incorrect"),
+# same failure mode confirmed against the real DB in code review when this was 8 params/262 rows.
+# The ORIGINAL single-INSERT append_events swallowed that failure via its own fail-soft `except`
+# below, silently losing the ENTIRE turn's log past the ceiling while run_event_stream.emit_live
+# kept firing live regardless (rows visible in the live view that vanish on refresh) -- strictly
+# worse than the serial append_event loop it replaced. 150 keeps real headroom below the 175
+# ceiling, not tuned to hug it exactly.
+_PARAMS_PER_EVENT_ROW = 12
+_MAX_ROWS_PER_INSERT = 150
 
 
 async def append_events(events: list[RunEvent]) -> list[RunEvent]:
@@ -139,7 +147,7 @@ async def _append_events_chunk(events: list[RunEvent]) -> list[RunEvent]:
     """
     try:
         pool = await _get_pool()
-        placeholders = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(events))
+        placeholders = ", ".join([f"({', '.join(['?'] * _PARAMS_PER_EVENT_ROW)})"] * len(events))
         params: list[Any] = []
         for event in events:
             params += [
@@ -151,11 +159,17 @@ async def _append_events_chunk(events: list[RunEvent]) -> list[RunEvent]:
                 event.summary,
                 json.dumps(event.payload) if event.payload is not None else None,
                 json.dumps(event.token_usage) if event.token_usage is not None else None,
+                event.input_text,
+                event.output_text,
+                event.input_size,
+                event.output_size,
             ]
         async with pool.acquire() as conn, conn.cursor() as cur:
             await cur.execute(
                 f"""
-                INSERT INTO dbo.run_events (run_id, session_id, stage, node, type, summary, payload, token_usage)
+                INSERT INTO dbo.run_events
+                    (run_id, session_id, stage, node, type, summary, payload, token_usage,
+                     input_text, output_text, input_size, output_size)
                 OUTPUT INSERTED.seq, INSERTED.ts
                 VALUES {placeholders}
                 """,
@@ -172,7 +186,15 @@ async def _append_events_chunk(events: list[RunEvent]) -> list[RunEvent]:
         return events
 
 
-_COLUMNS = ["seq", "run_id", "session_id", "ts", "stage", "node", "type", "summary", "payload", "token_usage"]
+# Deliberately excludes input_text/output_text (Workstream 3): those are potentially large VARBINARY
+# blobs, and every list/stream call already re-fetches this full column set on every poll --
+# eagerly including them would mean downloading every lap's full prompt/response text just to
+# render a redraft-history row nobody may ever hover over. sessions_api.py's new per-event IO
+# endpoint (get_event_io below) fetches those two columns on demand, by seq, instead.
+_COLUMNS = [
+    "seq", "run_id", "session_id", "ts", "stage", "node", "type", "summary", "payload", "token_usage",
+    "input_size", "output_size",
+]
 
 
 def _row_to_event(row: Any) -> RunEvent:
@@ -188,6 +210,8 @@ def _row_to_event(row: Any) -> RunEvent:
         summary=values["summary"],
         payload=json.loads(values["payload"]) if values["payload"] is not None else None,
         token_usage=json.loads(values["token_usage"]) if values["token_usage"] is not None else None,
+        input_size=values["input_size"],
+        output_size=values["output_size"],
         seq=values["seq"],
         ts=values["ts"],
     )
@@ -246,6 +270,30 @@ async def list_events_by_session(session_id: str, since_seq: int = 0) -> list[Ru
             )
         rows = await cur.fetchall()
         return [_row_to_event(row) for row in rows]
+
+
+async def get_event_io(session_id: str, seq: int) -> tuple[bytes | None, bytes | None] | None:
+    """Overview-tab redraft history (Workstream 3): on-demand fetch of ONE event's full
+    input_text/output_text, by seq -- deliberately not part of list_events_by_session's own
+    column set (see _COLUMNS' own comment) so the list endpoint the Overview tab already
+    polls/streams never has to carry these potentially large blobs.
+
+    Filtered by session_id as well as seq, not seq alone -- seq is a table-wide IDENTITY, not
+    scoped to a session, so a caller must not be able to fetch another session's event text by
+    guessing a seq number. Returns None if no row matches both (wrong session, or seq doesn't
+    exist), the same "absent, not an error" shape get_resume_state (chat_model.py) already uses
+    for an unseen key.
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT input_text, output_text FROM dbo.run_events WHERE session_id = ? AND seq = ?",
+            session_id, seq,
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row[0], row[1]
 
 
 async def delete_events_by_session(session_id: str) -> None:
@@ -312,6 +360,37 @@ async def _demo() -> None:
         events = await list_events(run_id)
         assert len(events) == 1 and events[0] == appended, events
 
+        # Overview-tab redraft history (Workstream 3): an event carrying full input/output text
+        # round-trips its sizes through the normal list query, but NOT the text itself (the
+        # deliberate "split" design -- see _COLUMNS' own comment) -- and get_event_io fetches the
+        # text on demand, scoped to (session_id, seq) so a wrong session_id can't read it.
+        io_event = await append_event(RunEvent(
+            run_id=run_id, session_id=session_id, type=RunEventType.NODE_FINISHED,
+            stage="ac-to-tests", node="draft", summary="draft ready for review",
+            payload={"cycle": 2},
+            input_text="SYSTEM: be helpful\n\nHUMAN: draft the tests".encode("utf-8"),
+            output_text="Added 3 test files.".encode("utf-8"),
+            input_size=len("SYSTEM: be helpful\n\nHUMAN: draft the tests".encode("utf-8")),
+            output_size=len("Added 3 test files.".encode("utf-8")),
+        ))
+        assert io_event.seq is not None, io_event
+        relisted = [e for e in await list_events(run_id) if e.seq == io_event.seq]
+        assert len(relisted) == 1, relisted
+        assert relisted[0].input_size == io_event.input_size and relisted[0].output_size == io_event.output_size, relisted[0]
+        assert relisted[0].input_text is None and relisted[0].output_text is None, (
+            "list_events must never carry the full text -- only its size -- see _COLUMNS' own comment", relisted[0],
+        )
+        assert relisted[0].payload == {"cycle": 2}, relisted[0]
+
+        fetched_io = await get_event_io(session_id, io_event.seq)
+        assert fetched_io == (io_event.input_text, io_event.output_text), (fetched_io, io_event)
+
+        wrong_session_io = await get_event_io(str(uuid.uuid4()), io_event.seq)
+        assert wrong_session_io is None, "get_event_io must not leak another session's event text"
+
+        missing_io = await get_event_io(session_id, -1)
+        assert missing_io is None, "get_event_io must return None for a seq that doesn't exist, not raise"
+
         # A second event for the same run_id, plus one for an unrelated run_id -- list_events must
         # return only this run's events, oldest first, and a payload-less/token_usage-less event
         # (verify_node's real shape -- no LLM call, so no usage) must round-trip its Nones too.
@@ -331,16 +410,16 @@ async def _demo() -> None:
         ))
 
         events = await list_events(run_id)
-        assert [e.seq for e in events] == [appended.seq, second.seq], events
-        assert events[1].payload == {"audit_findings_count": 0, "audit_skipped_infra": False}, events[1]
-        assert events[1].token_usage is None, events[1]
+        assert [e.seq for e in events] == [appended.seq, io_event.seq, second.seq], events
+        assert events[2].payload == {"audit_findings_count": 0, "audit_skipped_infra": False}, events[2]
+        assert events[2].token_usage is None, events[2]
 
         # list_events_by_session (Part 2 Task 8): unlike list_events(run_id) just above (which
         # correctly excludes other_event), list_events_by_session(session_id) must include all
-        # three events, oldest first -- proving a session's full history survives a run_id remint
+        # four events, oldest first -- proving a session's full history survives a run_id remint
         # instead of silently losing the pre-resume attempt's events.
         by_session = await list_events_by_session(session_id)
-        assert [e.seq for e in by_session] == [appended.seq, second.seq, other_event.seq], by_session
+        assert [e.seq for e in by_session] == [appended.seq, io_event.seq, second.seq, other_event.seq], by_session
         assert {e.run_id for e in by_session} == {run_id, other_run_id}, by_session
 
         # since_seq (SSE tail support): passing the middle event's seq must return only what came

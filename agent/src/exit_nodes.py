@@ -1093,7 +1093,7 @@ METRICS_EXIT_HARD_RULES: tuple[str, ...] = (
 
 async def verify_exit_readiness(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any,
-    _chat_provider: str,
+    _chat_provider: str, _lap: int = 0,
 ) -> Any:
     """EXIT_SPEC's deterministic_verify: completes the manifest (greenfield re-record + commands --
     only exit has the complete picture, code exists and coverage-commands.json is final), then

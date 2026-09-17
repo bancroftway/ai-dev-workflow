@@ -414,7 +414,7 @@ AC_TO_TESTS_HARD_RULES: tuple[str, ...] = (
 
 async def verify_ac_to_tests(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: SandboxProvider,
-    chat_provider: str,
+    chat_provider: str, lap: int = 0,
 ) -> "VerificationResult":
     """Combines the write-scope check above with the AC-coverage check (ac_coverage_gate.py) into
     one VerificationResult, since both answer the same question -- "is P4's output acceptable" --
@@ -424,7 +424,13 @@ async def verify_ac_to_tests(
     `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
     through to check_ac_coverage below, which needs it for its own stack_runner.run_and_report
     call -- named distinctly from `provider` (the pre-existing SandboxProvider connection object)
-    to avoid colliding with it."""
+    to avoid colliding with it.
+
+    `lap` (session-poisoning fix): this stage's own verify_cycle_count, threaded through to
+    check_ac_coverage's own run_and_report call below so a re-run of ac-test-run on a later redraft
+    lap gets a fresh session instead of --resuming every prior lap's growing one. Defaults to 0 so
+    the many direct-call self-checks/fakes in this file's and ac_coverage_gate.py's own _demo()s
+    that don't pass it keep working unchanged."""
     from .. import spec_ledger
     from ..graph import VerificationResult
     from .ac_coverage_gate import (
@@ -594,7 +600,7 @@ async def verify_ac_to_tests(
             report["protection_problems"] = protection_problems
         return VerificationResult(passed=False, feedback="\n\n".join(all_problems), report=report)
 
-    coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id)
+    coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id, lap=lap)
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
     feedback = coverage.feedback
     if write_scope.reverted_paths:

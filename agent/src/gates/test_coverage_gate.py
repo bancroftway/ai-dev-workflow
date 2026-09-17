@@ -807,7 +807,7 @@ def _with_timeout(command: str, timeout_seconds: int | None) -> str:
 
 
 async def _run_coverage_via_ghcp(
-    provider: SandboxProvider, thread_id: str, *, chat_provider: str, run_id: str = "unknown"
+    provider: SandboxProvider, thread_id: str, *, chat_provider: str, run_id: str = "unknown", lap: int = 0
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
     """Acquisition half: one GHCP session finds every test root, runs it with coverage, and
     reports where the report files landed; THIS function parses those files and does the math.
@@ -865,6 +865,7 @@ async def _run_coverage_via_ghcp(
             schema=CoverageRunReport,
             provider=chat_provider,
             run_id=run_id,
+            lap=lap,
             failure_detail=failure_detail,
         )
         return list(report.entries)
@@ -1006,7 +1007,7 @@ async def _check_exclusion_gaming(provider: SandboxProvider, thread_id: str) -> 
 
 async def measure_coverage(
     provider: SandboxProvider, thread_id: str, *, chat_provider: str, timeout_seconds: int | None = None,
-    run_id: str = "unknown",
+    run_id: str = "unknown", lap: int = 0,
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
     """Acquisition half of `verify_coverage`: a GHCP session runs the tests with coverage and
     reports its artifacts, which THIS module parses (see `_run_coverage_via_ghcp`).
@@ -1045,7 +1046,7 @@ async def measure_coverage(
         logger.info("repo_scan coverage: reusing measurement for unchanged tree")
         return cached[1]
 
-    result = await _run_coverage_via_ghcp(provider, thread_id, chat_provider=chat_provider, run_id=run_id)
+    result = await _run_coverage_via_ghcp(provider, thread_id, chat_provider=chat_provider, run_id=run_id, lap=lap)
     if result[0] is not None:
         _COVERAGE_MEMO[thread_id] = (memo_key, result)
     return result
@@ -1201,7 +1202,7 @@ MINIMAL_CODE_TO_GREEN_HARD_RULES: tuple[str, ...] = (
 
 async def verify_coverage(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
-    chat_provider: str,
+    chat_provider: str, lap: int = 0,
 ) -> "VerificationResult":
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
     through to measure_coverage below, which needs it for its own stack_runner.run_and_report
@@ -1211,7 +1212,14 @@ async def verify_coverage(
     uses) -- graph.py's deterministic_verify call site already passes a real one
     (`state.get("run_id", "unknown")`) positionally, it just wasn't threaded any further than this
     function's own signature. Now threaded through to measure_coverage the same way chat_provider
-    is."""
+    is.
+
+    `lap` (session-poisoning fix): threaded through to _discover()'s own run_and_report call.
+    Coverage-run mostly replays a validated contract deterministically (no LLM call) once one
+    exists, but re-discovery (a fresh contract needed, or every replay attempt failed) can still
+    fire on more than one verify lap, so it gets the same fresh-session-per-lap treatment as
+    ac-test-run. Defaults to 0 -- repo_scan.py's own _scan_with_coverage caller is a one-shot
+    background scan, not a redraft loop, and keeps working unchanged without passing one."""
     from ..graph import VerificationResult
     from .write_scope_gate import _is_pipeline_owned, _is_test_path
 
@@ -1292,7 +1300,7 @@ async def verify_coverage(
             report={"infra_error": "+".join(structural_codes), **structural_report},
         )
 
-    line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id, chat_provider=chat_provider, run_id=run_id)
+    line_rate, branch_rate, gaps, reason, entry_reports = await measure_coverage(provider, thread_id, chat_provider=chat_provider, run_id=run_id, lap=lap)
 
     if line_rate is None:
         # Infra failure, not a coverage gap: the coverage run itself never produced a readable

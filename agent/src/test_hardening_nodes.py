@@ -104,6 +104,11 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
         schema=TestCommandReport,
         provider=state["provider"],
         run_id=state.get("run_id", "unknown"),
+        # Session-poisoning fix: test_hardening_fix_node loops back into this same node
+        # (graph.py's test_hardening_fix -> test_hardening_run_tests edge), so this discovery call
+        # re-fires every fix lap -- a static key would --resume the same growing session across
+        # every one. fix_attempt is this stage's own existing per-lap counter.
+        lap=test_hardening.get("fix_attempt", 0),
         attempt_token=_ATTEMPT_TOKEN,
     )
     if not discovery.success or not discovery.command or _ATTEMPT_TOKEN not in discovery.result_path:

@@ -937,13 +937,15 @@ class AcCoverageOutcome:
 
 async def check_ac_coverage(
     provider: SandboxProvider, thread_id: str, content_dict: dict[str, Any], *, chat_provider: str,
-    run_id: str = "unknown",
+    run_id: str = "unknown", lap: int = 0,
 ) -> AcCoverageOutcome:
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
     keyword-only, no default -- threaded straight through to stack_runner.run_and_report below,
     which now requires it itself; not resolved in here. `run_id` (Phase E known-bugs fix) is
     threaded the same way, defaulting to "unknown" -- its caller (verify_ac_to_tests) already
-    carries a real one in scope."""
+    carries a real one in scope. `lap` (session-poisoning fix) is the stage's verify_cycle_count,
+    threaded straight through to run_and_report's own `lap` kwarg below so a redraft lap that
+    re-runs ac-test-run gets a fresh session instead of resuming every prior lap's growing one."""
     raw_ledger = await repo_files.read_repo_file(provider, thread_id, LEDGER_PATH)
     ledger_entries: list[dict[str, Any]] = []
     active_ac_ids: list[str] = []
@@ -1060,6 +1062,7 @@ async def check_ac_coverage(
         schema=AcTestRunReport,
         provider=chat_provider,
         run_id=run_id,
+        lap=lap,
         output_path=AC_TEST_OUTPUT_PATH,
     )
     output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)

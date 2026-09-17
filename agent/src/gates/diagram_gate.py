@@ -976,7 +976,7 @@ async def _load_and_check_manifest(
 
 def make_verify_plan_diagrams(
     stage_key: str = "plan", has_audit_role: bool = True
-) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str], Any]:
+) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int], Any]:
     """Factory, not a bare function (file-based-editing plan, Part 6 audit fix): Part 6's
     brownfield plan-pass reuses this exact verification logic under a DIFFERENT stage-key (not the
     real "plan" key, so the graph's own linear stage-chain doesn't misroute -- see graph.py's
@@ -992,7 +992,7 @@ def make_verify_plan_diagrams(
 
     async def verify_plan_diagrams(
         thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None,
-        provider: SandboxProvider, chat_provider: str,
+        provider: SandboxProvider, chat_provider: str, _lap: int = 0,
     ) -> "VerificationResult":
         from ..graph import VerificationResult  # local import: graph.py imports this module
 

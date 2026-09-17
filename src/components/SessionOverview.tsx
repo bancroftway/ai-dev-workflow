@@ -5,7 +5,14 @@ import { Fragment, useMemo, useState } from "react";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningPhases, NODE_PHASE_LABEL, formatDuration, parseEventTs, useRunEvents } from "@/lib/use-run-events";
+import {
+  computeRunningPhases,
+  NODE_PHASE_LABEL,
+  formatDuration,
+  parseEventTs,
+  useRunEvents,
+  type RunLogEvent,
+} from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   PIPELINE_STAGE_ORDER,
@@ -102,7 +109,7 @@ function ContinueAction({ restarting, onClick }: { restarting: boolean; onClick:
 
 // Shared between the header row and every stage row so the columns actually line up like a table
 // (user feedback 2026-09-01) instead of each row's flex layout drifting with its own content width.
-const ROW_GRID = "grid grid-cols-[1fr_4.5rem_4rem_5rem_9rem] items-center gap-3";
+const ROW_GRID = "grid grid-cols-[1fr_4.5rem_4rem_5rem_9rem_11rem] items-center gap-3";
 
 /** One REBUILD_PLACEMENTS row, inserted right after its `afterStageKey`'s own row (rebuildPhase's
  * own docstring: real, unattributed-to-a-single-placement work happening between two stages).
@@ -136,8 +143,101 @@ function RebuildRow({
           {phase.running && <RunningSpinner />}
           {failedHere ? "Failed" : phase.running ? "Verifying" : REBUILD_STATUS_LABEL[phase.status]}
         </span>
+        {/* Redraft History column: rebuild placements aren't real stages (no perStage entry of
+            their own), so there's nothing to show here -- an empty cell keeps the grid aligned. */}
+        <span />
       </div>
     </li>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+type EventIoText = { input_text: string | null; output_text: string | null };
+
+// Module-level, shared across every mounted IoPreviewCell -- dbo.run_events rows are append-only
+// (Workstream 3: a lap's input/output text is written once at NODE_FINISHED and never revised),
+// so caching by "sessionId:seq" forever for the life of this tab is safe: re-hovering the same
+// cell, or a re-render, never needs to refetch.
+const ioTextCache = new Map<string, EventIoText>();
+
+async function fetchEventIo(sessionId: string, seq: number): Promise<EventIoText | null> {
+  const key = `${sessionId}:${seq}`;
+  const cached = ioTextCache.get(key);
+  if (cached) return cached;
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/events/${seq}/io`);
+  if (!res.ok) return null;
+  const data = (await res.json()) as EventIoText;
+  ioTextCache.set(key, data);
+  return data;
+}
+
+/** One Input/Output cell in the redraft-history subtable: shows the byte size always, fetches
+ * and shows the FULL text only on hover. Deliberately not the plain `title` attribute every other
+ * tooltip in this app uses (MetricsBar's Chip, `title={title}`) -- that's a static string already
+ * known at render time, which can't work here since the whole point of the split list/on-demand
+ * API (sessions_api.py's RunEventResponse vs. RunEventIoResponse) is to NOT eagerly download every
+ * lap's full prompt/response just to render a size number nobody may ever hover over. */
+function IoPreviewCell({
+  sessionId,
+  seq,
+  size,
+  field,
+}: {
+  sessionId: string;
+  seq: number;
+  size: number | null;
+  field: keyof EventIoText;
+}) {
+  const [text, setText] = useState<string | null>();
+  const [hovered, setHovered] = useState(false);
+
+  function handleEnter() {
+    setHovered(true);
+    if (text !== undefined) return; // already fetched (or already known-absent) -- don't refetch
+    void fetchEventIo(sessionId, seq).then((io) => setText(io ? io[field] : null));
+  }
+
+  if (size == null) return <span className="text-neutral-300">—</span>;
+  return (
+    <span
+      className="relative cursor-default underline decoration-dotted decoration-neutral-300 underline-offset-2"
+      onMouseEnter={handleEnter}
+      onMouseLeave={() => setHovered(false)}
+    >
+      {formatBytes(size)}
+      {hovered && (
+        <div className="absolute right-0 top-full z-20 mt-1 max-h-64 w-80 overflow-auto whitespace-pre-wrap rounded-md border border-neutral-200 bg-white p-2 text-left text-[10px] normal-case leading-relaxed text-neutral-700 shadow-lg">
+          {text === undefined ? "Loading…" : (text ?? "Not available")}
+        </div>
+      )}
+    </span>
+  );
+}
+
+/** One stage's ordered redraft history: Cycle | Node | Input | Output, one row per completed
+ * draft/audit/fix call. `redrafts` (perStage's own array, above) is already in accurate execution
+ * order -- events arrive oldest-first and seq is a durable monotonic IDENTITY, so no re-sort is
+ * needed here. Compact by design: this sits inside one Overview-table cell, not its own page. */
+function RedraftHistoryCell({ sessionId, redrafts }: { sessionId: string; redrafts: RunLogEvent[] }) {
+  if (redrafts.length === 0) return null;
+  return (
+    <div className="flex max-h-24 flex-col gap-0.5 overflow-y-auto text-[10px] text-neutral-500">
+      {redrafts.map((e) => (
+        <div key={e.seq} className="flex items-center gap-1.5">
+          <span className="w-6 shrink-0 text-neutral-400">
+            {typeof e.payload?.cycle === "number" ? `#${e.payload.cycle}` : ""}
+          </span>
+          <span className="w-10 shrink-0 truncate capitalize">{e.node}</span>
+          <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.input_size} field="input_text" />
+          <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.output_size} field="output_text" />
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -492,13 +592,22 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     }
     const byStage = new Map<
       string,
-      { first: number; last: number; cost: number; sawCost: boolean; rejections: number; node: string | undefined }
+      {
+        first: number;
+        last: number;
+        cost: number;
+        sawCost: boolean;
+        rejections: number;
+        node: string | undefined;
+        redrafts: RunLogEvent[];
+      }
     >();
     for (const e of events) {
       if (!e.stage || e.run_id !== latestRunIdByStage.get(e.stage)) continue;
       const ts = parseEventTs(e.ts);
       const entry =
-        byStage.get(e.stage) ?? { first: ts, last: ts, cost: 0, sawCost: false, rejections: 0, node: undefined };
+        byStage.get(e.stage) ??
+        { first: ts, last: ts, cost: 0, sawCost: false, rejections: 0, node: undefined, redrafts: [] };
       entry.first = Math.min(entry.first, ts);
       entry.last = Math.max(entry.last, ts);
       const cost = Number((e.token_usage as { cost?: unknown } | null)?.cost);
@@ -508,6 +617,15 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
       }
       if (e.type === "gate_resolved" && (e.payload as { decision?: string } | null)?.decision === "rejected") {
         entry.rejections += 1;
+      }
+      // Redraft-history column (Workstream 3): one row per completed draft/audit/fix call --
+      // node_finished only, since that's the point input_size/output_size/payload.cycle are
+      // populated (session_key.md's Workstream 2 fix + graph.py's encode_io_text capture).
+      // `events` is already oldest-first (use-run-events.ts's own contract), and seq is a durable
+      // monotonic IDENTITY, so simply appending in iteration order is already the "accurate
+      // ordered" list the redraft-history column needs -- no separate sort.
+      if (e.type === "node_finished" && (e.node === "draft" || e.node === "audit" || e.node === "fix")) {
+        entry.redrafts.push(e);
       }
       byStage.set(e.stage, entry);
     }
@@ -701,6 +819,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
             <span className="text-right">Cost</span>
             <span className="text-right">Redrafts</span>
             <span className="text-right">Status</span>
+            <span>Redraft History</span>
           </div>
           <ol className="flex flex-col gap-2">
             {PIPELINE_STAGE_ORDER.slice(0, boundaryIdx + 1).map((s, i, arr) => {
@@ -748,6 +867,8 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                       {running && <RunningSpinner />}
                       {label}
                     </span>
+                    {/* No live event data in this durable-only fallback view -- nothing to show. */}
+                    <span />
                   </div>
                   {/* The failure case is fully handled by the consolidated recovery panel above
                       now -- this row only ever needs the plain "nothing failed, just continue"
@@ -770,6 +891,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
             <span className="text-right">Cost</span>
             <span className="text-right">Redrafts</span>
             <span className="text-right">Status</span>
+            <span>Redraft History</span>
           </div>
           <ol className="flex flex-col gap-2">
             {stages.map(([key, stage]) => {
@@ -839,6 +961,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                           ? (timing?.node ? (NODE_PHASE_LABEL[timing.node] ?? "Running") : "Drafting")
                           : (STATUS_LABEL[stage.status] ?? stage.status)}
                     </span>
+                    <RedraftHistoryCell sessionId={threadId} redrafts={timing?.redrafts ?? []} />
                   </div>
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
                   {showPlainContinue && <ContinueAction restarting={restarting} onClick={() => void handleRestart(key)} />}

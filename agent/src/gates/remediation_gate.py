@@ -323,7 +323,7 @@ REMEDIATION_HARD_RULES: tuple[str, ...] = (
 
 async def verify_remediation(
     thread_id: str, content_dict: dict[str, Any], _run_id: str, baseline_commit: str | None, provider: Any,
-    chat_provider: str,
+    chat_provider: str, _lap: int = 0,
 ) -> "VerificationResult":
     from ..graph import VerificationResult
 

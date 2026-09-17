@@ -102,7 +102,7 @@ ADVERSARIAL_COMPLIANCE_HARD_RULES: tuple[str, ...] = (
 
 async def verify_adversarial_compliance(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: Any,
-    _chat_provider: str,
+    _chat_provider: str, _lap: int = 0,
 ) -> "VerificationResult":
     # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: this check has
     # no chat-model dispatch call of its own.

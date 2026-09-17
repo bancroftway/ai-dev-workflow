@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import config, git_ops, model_config, repo_files, run_event_store, run_event_stream, run_failure, stack_runner, test_results, workflow_persistence
-from .run_events import RunEvent, RunEventType
+from .run_events import RunEvent, RunEventType, encode_io_text
 from .chat_model import close_session, get_chat_model_for_thread
 from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
@@ -342,7 +342,8 @@ async def _provenance_reasons(provider: Any, thread_id: str, state: dict[str, An
 
 
 async def _verify_all_red(
-    thread_id: str, chat_provider: str, run_id: str = "unknown", eligible_only: set[str] | None = None
+    thread_id: str, chat_provider: str, run_id: str = "unknown", eligible_only: set[str] | None = None,
+    lap: int = 0,
 ) -> tuple[bool, str]:
     """Deterministic TDD-red gate: run the suite, parse the runners' own structured reports, and
     require zero passing tests (and at least one failing). The scaffold fix node is INSTRUCTED to
@@ -368,6 +369,7 @@ async def _verify_all_red(
         schema=AcTestRunReport,
         provider=chat_provider,
         run_id=run_id,
+        lap=lap,
         output_path=_RED_GATE_OUTPUT_PATH,
     )
     outcomes: dict[str, str] = {}
@@ -569,16 +571,17 @@ def make_rebuild_node(spec: RebuildSpec):
                     build_ok = False
                     red_failed = True
 
-        # Stuck-fixer detection: the fix session (f"rebuild-{spec.key}"/"draft") is resumed
-        # across every fix cycle in this placement (its own conversation history), never reset by
-        # anything below -- so a fixer that keeps making the SAME red-gate mistake (e.g. writing a
-        # real not-found guard clause instead of a NotImplementedException stub) just repeats it
-        # every lap, byte for byte, until the cycle cap is exhausted (the same pathology already
-        # fixed for the ac-test-run sub-agent in gates/ac_coverage_gate.py). The prompt re-supplies
-        # `stderr_tail` fresh each lap regardless of session continuity, so nothing genuinely useful
-        # is lost by starting over -- only the model's own unproductive history is. Reset ONLY on a
-        # confirmed repeat (identical finding twice running), not on every red-gate failure: a
-        # DIFFERENT finding each lap means the fixer is converging and its context should stay.
+        # Stuck-fixer detection: originally written when the fix session (f"rebuild-{spec.key}"/
+        # "draft") was resumed across every fix cycle, so a fixer repeating the SAME red-gate
+        # mistake byte-for-byte would never see fresh context. make_fix_node's session key is now
+        # lap-numbered (session-poisoning fix, mirrors ac-test-run/e2e_fix's own fresh-per-lap
+        # sessions), so every fix cycle already starts a genuinely fresh session -- the
+        # close_session call below now targets a role string ("draft") no lap ever actually uses,
+        # a harmless no-op against a key nothing populates. Left in as belt-and-braces (a future
+        # change reintroducing session reuse here would silently need this again) and because the
+        # repeated-identical-finding detection itself is still useful diagnostic signal regardless
+        # of session mechanics -- a fixer repeating a finding even across fresh sessions means
+        # something else is stuck (misread instructions, a fix that doesn't address the real cause).
         if red_failed and red_detail and red_detail == rb.get("last_red_detail"):
             logger.warning(
                 "rebuild %s: TDD-red gate repeated the identical finding -- resetting the stuck fix session",
@@ -723,7 +726,11 @@ def make_fix_node(spec: RebuildSpec):
         model = get_chat_model_for_thread(
             thread_id,
             f"rebuild-{spec.key}",
-            "draft",
+            # Fresh session per retry lap (mirrors e2e_fix_node/graph.py's draft/audit/fix nodes): a
+            # static "draft" role let --resume replay every prior retry's full transcript into each
+            # new one. fix_cycle_count is this placement's own existing retry counter, already
+            # incremented per attempt and capped by spec.max_fix_cycles -- no new state.
+            f"draft-{state.get('run_id', 'unknown')}-{rb['fix_cycle_count']}",
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) fix-round-3 -- same mechanism/fix as every other
             # graph-node call site in this task.
@@ -737,9 +744,24 @@ def make_fix_node(spec: RebuildSpec):
             # Always autopilot -- a fix node's whole purpose requires write access.
             agent_mode="autopilot",
         )
+        run_id = state.get("run_id", "unknown")
+        # Durable + live NODE_STARTED/FINISHED (Overview-tab redraft history, Workstream 3): this
+        # node previously emitted no run_event of its own (unlike rebuild_node's "rebuild" pair
+        # just above), so a rebuild placement's own fix laps had no Overview-tab entry at all.
+        # Same two-call, sandbox-guarded pattern as every other RunEvent site in this file.
+        if sandbox_registry.get(thread_id) is not None:
+            start_event = RunEvent(
+                run_id=run_id, session_id=thread_id, type=RunEventType.NODE_STARTED,
+                stage=spec.key, node="fix", summary="rebuild fix started",
+            )
+            start_event = await run_event_store.append_event(start_event)
+            await run_event_stream.emit_live(start_event, run_config)
+
+        fix_messages = [SystemMessage(content=system), HumanMessage(content=prompt)]
+        fix_response = None
         try:
-            await call_with_infra_retry(
-                lambda: model.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)]),
+            fix_response = await call_with_infra_retry(
+                lambda: model.ainvoke(fix_messages),
                 label=f"rebuild-{spec.key}:fix",
             )
         except (TimeoutError, RuntimeError) as exc:
@@ -754,6 +776,21 @@ def make_fix_node(spec: RebuildSpec):
             rb["last_stderr_tail"] = (
                 f"[infra failure, fix lap not attempted] {exc}"
             )[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:]
+
+        if sandbox_registry.get(thread_id) is not None:
+            input_text, output_text, input_size, output_size = encode_io_text(
+                fix_messages,
+                str(fix_response.content) if fix_response is not None else "(infra failure -- fix lap not attempted)",
+            )
+            finish_event = RunEvent(
+                run_id=run_id, session_id=thread_id, type=RunEventType.NODE_FINISHED,
+                stage=spec.key, node="fix", summary="rebuild fix applied",
+                payload={"cycle": rb["fix_cycle_count"]},
+                input_text=input_text, output_text=output_text,
+                input_size=input_size, output_size=output_size,
+            )
+            finish_event = await run_event_store.append_event(finish_event)
+            await run_event_stream.emit_live(finish_event, run_config)
 
         rb["fix_cycle_count"] = rb["fix_cycle_count"] + 1
         rb["status"] = "fixing"

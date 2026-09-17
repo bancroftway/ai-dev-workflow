@@ -87,6 +87,7 @@ async def run_and_report(
     # render_prompt (it would bind here instead) rather than erroring; worth knowing if that ever
     # needs debugging.
     run_id: str = "unknown",
+    lap: int = 0,
     available_tools: list[str] | None = None,
     model_name: str | None = None,
     **render_values: str,
@@ -110,6 +111,13 @@ async def run_and_report(
     function tags its own tool-call RunEvents "unknown" regardless of whether a real run_id was
     available one frame up.
 
+    `lap` (session-poisoning fix, mirrors graph.py's draft/audit/fix nodes and rebuild.py's
+    make_fix_node): a static "draft" session role let a caller invoked repeatedly for the same
+    `stage_key` (e.g. ac-to-tests' own verify gate re-running `ac-test-run` every redraft lap)
+    --resume the exact same growing session every time. Defaults to 0, which keeps a genuinely
+    single-shot caller (one that never re-invokes this with the same stage_key) behaving exactly as
+    before -- only a caller that DOES loop needs to pass its own real lap/attempt number.
+
     Always returns a report -- never raises for model misbehavior. If the session ends without a
     valid report (or there is no sandbox at all), a success=False report is synthesized so the
     caller routes into its own existing failure path instead of the run dying. Every outcome,
@@ -128,7 +136,7 @@ async def run_and_report(
         model = get_chat_model_for_thread(
             thread_id,
             stage_key,
-            "draft",
+            f"draft-{run_id}-{lap}",
             provider=provider,
             run_id=run_id,
             model_name=model_name or model_config.get_model_name(stage_key, "draft", provider) or model_config.get_model_name("stack-run", "draft", provider),

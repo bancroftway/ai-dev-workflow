@@ -31,6 +31,12 @@ export interface RunLogEvent {
   summary: string | null;
   payload: Record<string, unknown> | null;
   token_usage: Record<string, unknown> | null;
+  // Overview-tab redraft history (Workstream 3): byte sizes only -- sessions_api.py's
+  // RunEventResponse deliberately never carries the full input/output text here (see that
+  // model's own comment); SessionOverview's redraft-history column fetches text on demand, by
+  // seq, only when a user actually hovers a row.
+  input_size: number | null;
+  output_size: number | null;
 }
 
 /** `RunLogEvent.ts` arrives as a real UTC instant (`dbo.run_events.ts` is SYSUTCDATETIME-assigned,

@@ -53,7 +53,7 @@ from . import exit_nodes
 from . import rebuild
 from . import run_event_store
 from . import run_event_stream
-from .run_events import RunEvent, RunEventType
+from .run_events import RunEvent, RunEventType, encode_io_text
 from . import run_failure
 from . import session_store
 from . import spec_ledger
@@ -1099,7 +1099,7 @@ def _stamp_gate_change_and_check_delta(
 
 def make_verify_specification_ledger(
     stage_key: str = "specification", has_audit_role: bool = True
-) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str], Any]:
+) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int], Any]:
     """Factory, not a bare function (file-based-editing plan, Part 6 audit fix -- mirrors
     gates/diagram_gate.py's make_verify_plan_diagrams exactly, same reasoning): Part 6's brownfield
     spec-pass reuses this exact verification logic under a DIFFERENT stage-key (not the real
@@ -1115,7 +1115,7 @@ def make_verify_specification_ledger(
 
     async def _verify_specification_ledger(
         thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None,
-        provider: SandboxProvider, chat_provider: str,
+        provider: SandboxProvider, chat_provider: str, _lap: int = 0,
     ) -> VerificationResult:
         """StageSpec.deterministic_verify for the specification stage: reads
         spec_ledger.DRAFT_SPEC_PATH (the model's own file-edited sketchpad -- file-based-editing
@@ -1827,10 +1827,15 @@ class StageSpec:
     on every single run, including pure no-op re-runs."""
 
     deterministic_verify: (
-        Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str], Awaitable[VerificationResult]] | None
+        Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int], Awaitable[VerificationResult]] | None
     ) = None
     """A routing-capable check (thread_id, revised content dict, run_id, baseline_commit,
-    provider, chat_provider) -> VerificationResult, inserted between audit and gate when set.
+    provider, chat_provider, lap) -> VerificationResult, inserted between audit and gate when set.
+    `lap` (session-poisoning fix) is this stage's own verify_cycle_count -- the two implementations
+    that dispatch into stack_runner.run_and_report (verify_ac_to_tests, verify_coverage) thread it
+    straight through as run_and_report's own `lap` kwarg, the same fresh-session-per-lap fix
+    graph.py's draft/audit/fix nodes already apply. Every other implementation accepts-and-ignores
+    it, same as they already do for baseline_commit when it isn't relevant.
     baseline_commit is the value StageSpec.capture_baseline_commit stored on this stage's
     StageState (None if that flag is unset) -- write_scope_gate.py's write-scope check is the
     reason this exists; ledger-/diagram-style checks that don't need it just ignore the argument.
@@ -2747,6 +2752,17 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
                 _reset_stage_status_fields(stage)
                 _reset_stage_mechanics(stage)
                 stage["baseline_commit"] = None
+            # Adversarial-audit finding: _reset_stage_mechanics zeroes verify_cycle_count for every
+            # rewound stage WITHOUT minting a new run_id (unlike the escalate path's own reset a
+            # few hundred lines down, which already calls this same close_thread_session right
+            # after its reset -- see there). Left uncalled here, the next draft/audit/fix call for
+            # a rewound stage would reconstruct the exact same run_id+verify_cycle_count session key
+            # as before the rewind and --resume the stale, pre-rewind session -- silently
+            # reintroducing the session-poisoning bug the lap-numbered session key exists to fix.
+            # Whole-thread eviction (not scoped to just the rewound stages) is harmless: stages
+            # before the rewind target stay approved and are never redrafted again unless a later
+            # rewind targets them too, at which point this same call fires again.
+            await close_thread_session(thread_id, provider=state["provider"])
             # Root-caused 2026-09-12 (found during the pivot design, not yet observed live): the
             # loop above resets the STAGE the rebuild sits after, but never the rebuild placement's
             # OWN sub-state (POST_STAGE_REBUILD) -- left alone, a placement whose fix_cycle_count was
@@ -3028,7 +3044,12 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         model = get_chat_model_for_thread(
             thread_id,
             stage_spec.key,
-            "draft",
+            # Fresh session per redraft lap (mirrors e2e_fix_node/readme_write_node): a static
+            # "draft" role let --resume replay every prior lap's full transcript into each new one,
+            # compounding token cost every redraft and risking the same "already addressed, edits
+            # nothing" session-poisoning e2e_fix_node hit before its own fix. verify_cycle_count is
+            # the stage's own lap counter, already correctly threaded -- no new state.
+            f"draft-{state.get('run_id', 'unknown')}-{state['stages'][stage_spec.key].get('verify_cycle_count', 0)}",
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10): thread the real run_id through so a Copilot turn's own
             # tool-call RunEvents (copilot_chat_model.py's _agenerate_inner) carry it instead of
@@ -3245,6 +3266,9 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # its own (gone once this sandbox is torn down). Additive: the ledger write is untouched.
             # Fails soft by design -- append_event itself swallows+logs a DB error rather than
             # raising, so a transient blip here can never abort this node (see its own docstring).
+            input_text, output_text, input_size, output_size = encode_io_text(
+                prompt_messages, response.model_dump_json(indent=2)
+            )
             run_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
@@ -3252,8 +3276,15 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 stage=stage_spec.key,
                 node="draft",
                 summary=f"draft {'ready for review' if response.readiness else 'needs clarification'}",
-                payload={"readiness": response.readiness},
+                # cycle (Overview-tab redraft history, Workstream 3): same verify_cycle_count this
+                # node's own session-key fix already reads -- lets the frontend order/label laps
+                # without needing a separate counter.
+                payload={"readiness": response.readiness, "cycle": stage.get("verify_cycle_count", 0)},
                 token_usage=model._last_usage,
+                input_text=input_text,
+                output_text=output_text,
+                input_size=input_size,
+                output_size=output_size,
             )
             run_event = await run_event_store.append_event(run_event)
             # Live counterpart (Part 2 Task 2) -- same event, third destination: a LangGraph custom
@@ -3297,7 +3328,10 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         model = get_chat_model_for_thread(
             thread_id,
             stage_spec.key,
-            "audit",
+            # Fresh session per lap -- see make_draft_node's identical draft-role comment above.
+            # Same verify_cycle_count value the paired draft call for this lap already used (read
+            # before the post-reject increment), so draft-N and audit-N stay correctly paired.
+            f"audit-{state.get('run_id', 'unknown')}-{state['stages'][stage_spec.key].get('verify_cycle_count', 0)}",
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) -- see the draft-role call's own comment above.
             run_id=state.get("run_id", "unknown"),
@@ -3334,6 +3368,11 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             start_event = await run_event_store.append_event(start_event)
             await run_event_stream.emit_live(start_event, config)
 
+        # Overview-tab redraft history (Workstream 3): None on the ValidationError/TimeoutError
+        # branches below, where ainvoke_structured itself never returned a parsed response --
+        # the NODE_FINISHED event's output_text falls back to a plain skip note in that case
+        # rather than crashing on a None.model_dump_json().
+        response = None
         try:
             response = await call_with_infra_retry(
                 lambda: ainvoke_structured(
@@ -3443,6 +3482,10 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # existed each time. Not load-bearing for the enforcement check itself (that reads
             # current stage/draft state fresh, not history) -- purely for a human/dashboard reading
             # this run's own event history later.
+            input_text, output_text, input_size, output_size = encode_io_text(
+                prompt_messages,
+                response.model_dump_json(indent=2) if response is not None else "(audit skipped -- no response)",
+            )
             run_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
@@ -3457,8 +3500,13 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                     "audit_findings_count": len(stage["audit_findings"]),
                     "audit_findings": stage["audit_findings"],
                     "audit_skipped_infra": audit_skipped_infra,
+                    "cycle": state["stages"][stage_spec.key].get("verify_cycle_count", 0),
                 },
                 token_usage=model._last_usage,
+                input_text=input_text,
+                output_text=output_text,
+                input_size=input_size,
+                output_size=output_size,
             )
             run_event = await run_event_store.append_event(run_event)
             # Live counterpart (Part 2 Task 2) -- same event, third destination; see
@@ -3697,7 +3745,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         try:
             result = await stage_spec.deterministic_verify(
                 thread_id, stage["draft"] or {}, state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
-                state["provider"],
+                state["provider"], stage.get("verify_cycle_count", 0),
             )
         except Exception as exc:  # noqa: BLE001 -- convert to a routed infra verdict, never crash the node
             logger.exception("%s: deterministic_verify crashed", stage_spec.key)
@@ -4000,7 +4048,11 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
         model = get_chat_model_for_thread(
             thread_id,
             stage_spec.key,
-            "fix",
+            # Fresh session per lap -- see make_draft_node's identical comment above. This node has
+            # no fix-attempt counter of its own (confirmed: no attempt-tracking anywhere in this
+            # function); its looping is driven entirely by the stage's shared verify_cycle_count, so
+            # reuse that same value rather than inventing a separate one.
+            f"fix-{state.get('run_id', 'unknown')}-{state['stages'][stage_spec.key].get('verify_cycle_count', 0)}",
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) -- see make_draft_node's draft-role call site's own
             # comment above. This node builds no RunEvent of its own, but a Copilot turn here
@@ -4027,8 +4079,9 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             ],
         )
         rendered = render_prompt(human_template, blocking_reasons="\n".join(f"- {r}" for r in reasons))
-        await model.ainvoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=rendered)],
+        fix_messages = [SystemMessage(content=system_prompt), HumanMessage(content=rendered)]
+        fix_response = await model.ainvoke(
+            fix_messages,
             config={"metadata": {"emit-messages": False}},
         )
         if sandbox_registry.get(thread_id) is not None:
@@ -4039,6 +4092,9 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             # NODE_STARTED above. token_usage=model._last_usage included, unlike make_verify_node's
             # NODE_FINISHED, because this genuinely is an LLM call (mirrors draft/audit's own
             # NODE_FINISHED shape, not verify's no-LLM one).
+            input_text, output_text, input_size, output_size = encode_io_text(
+                fix_messages, str(fix_response.content)
+            )
             run_event = RunEvent(
                 run_id=state.get("run_id", "unknown"),
                 session_id=thread_id,
@@ -4046,7 +4102,12 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
                 stage=stage_spec.key,
                 node="fix",
                 summary="fix applied",
+                payload={"cycle": state["stages"][stage_spec.key].get("verify_cycle_count", 0)},
                 token_usage=model._last_usage,
+                input_text=input_text,
+                output_text=output_text,
+                input_size=input_size,
+                output_size=output_size,
             )
             run_event = await run_event_store.append_event(run_event)
             await run_event_stream.emit_live(run_event, config)

@@ -1087,6 +1087,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         schema=AppLaunchReport,
         provider=state["provider"],
         run_id=run_id,
+        # Session-poisoning fix: this node "re-runs against the SAME run_id" every e2e fix cycle
+        # (see this function's own comment a few lines up), so a static stage_key+role would
+        # --resume the same growing session e2e_fix_node's own attempt-numbered key already avoids.
+        # Same e2e["attempt"] counter, same reasoning.
+        lap=e2e.get("attempt", 0),
         requested_port=str(requested_port),  # render_prompt substitutes strings only
     )
     if launch.success and launch.start_command:
