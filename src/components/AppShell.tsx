@@ -129,6 +129,22 @@ export function AppShell({
   // `null` until that poll's first response arrives; see computeRunningStages' own tri-state note.
   const [runActivity, setRunActivity] = useRunActivity();
   const router = useRouter();
+  // GitHub-branch icon (root-caused 2026-09-16, user-reported: icon never appeared even once
+  // tech-stack was approved and the branch existed in GitHub). `workBranch` is resolved once,
+  // server-side, by the workflow page (see its own prop doc above) -- for a BRAND NEW session,
+  // that server render can happen before SandboxSessionBoot's client-side provision call has
+  // created the row/branch at all, freezing workBranch at "" for this page's entire lifetime
+  // (Next.js Server Components render once per navigation; nothing here ever re-fetches). Once
+  // provisioning finishes, `sandboxStatus` flips to "ready" -- the one signal available client-side
+  // that the row (and its work_branch) now genuinely exists -- so refresh the server-rendered props
+  // exactly once when that happens, but only if workBranch actually still looks stale (empty);
+  // a resumed/already-provisioned session's non-empty workBranch never needs this.
+  const branchRefreshedRef = useRef(false);
+  useEffect(() => {
+    if (workBranch !== "" || sandboxStatus !== "ready" || branchRefreshedRef.current) return;
+    branchRefreshedRef.current = true;
+    router.refresh();
+  }, [workBranch, sandboxStatus, router]);
   const [stoppingContainer, setStoppingContainer] = useState(false);
   // Agent Narration Drawer: plain local state, no new context -- AppShell already persists across
   // tab switches (views are hidden, not unmounted), so this survives tab changes for free. Manual

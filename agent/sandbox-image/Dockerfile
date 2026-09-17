@@ -642,6 +642,50 @@ RUN printf '%s\n' \
       '}' \
       > /opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json
 
+# Skill-enforcement Stop hook (file-based-editing plan follow-up, 2026-09-17): forces
+# REQUIRED_SKILLS_BY_STAGE (agent/src/config.py) to actually be invoked before a draft turn ends,
+# instead of only catching the miss after the whole lap already failed at gates/skill_gate.py --
+# see hooks/require-skills-stop.mjs's own header for the full mechanism and the live incident
+# (specification's draft skipped two MANDATORY-worded required skills twice in a row) that
+# motivated it. Baked into /etc/claude-code/managed-settings.json -- Claude Code's admin-managed
+# settings path, confirmed against this exact CLI version/image via a real docker-exec experiment
+# (a plain user-level ~/.claude/settings.json Stop hook DID fire, but that file is directly
+# editable by the same autopilot session it's meant to constrain -- same tools that write
+# /workspace/repo can write there too, which would let a session simply delete its own
+# enforcement; /etc/claude-code is root-owned and this session always runs as vscode (useradd
+# above), so it can read this file but never modify or remove it -- confirmed that path is ALSO
+# honored, with no project-level settings.json present at all). Root-owned + read-only for the
+# same reason /opt/ai-dev-workflow-plugins is: a self-modifying enforcement hook mid-run is a
+# supply-chain risk this doesn't need to accept.
+COPY hooks/require-skills-stop.mjs /opt/aidw-hooks/require-skills-stop.mjs
+RUN set -eux; \
+    mkdir -p /etc/claude-code; \
+    printf '%s\n' \
+      '{' \
+      '  "hooks": {' \
+      '    "Stop": [' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/require-skills-stop.mjs", "timeout": 30 } ] }' \
+      '    ]' \
+      '  }' \
+      '}' \
+      > /etc/claude-code/managed-settings.json; \
+    chown -R root:root /etc/claude-code /opt/aidw-hooks; \
+    chmod 0755 /etc/claude-code /opt/aidw-hooks; \
+    chmod 0644 /etc/claude-code/managed-settings.json /opt/aidw-hooks/require-skills-stop.mjs
+
+# tini: entrypoint.sh's final `exec` target (replacing a bare `exec sleep infinity`) -- reaps the
+# zombie processes every per-turn `docker exec`/`az container exec` health-check/tool invocation
+# otherwise leaves behind once it exits, since a bare `sleep infinity` as pid 1 never calls wait()
+# (observed live: one new <defunct> zombie roughly every ~30s, matching the host's own polling
+# loop -- harmless at that scale, but unbounded over a long-running session). Exact version pinned
+# like every other apt package in this file; confirmed against this exact base image
+# (mcr.microsoft.com/dotnet/sdk:10.0, Ubuntu 24.04 "noble") via `apt-cache policy tini`, universe
+# component, already enabled by default -- no new apt source needed.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends tini=0.19.0-1; \
+    rm -rf /var/lib/apt/lists/*
+
 RUN chmod +x /usr/local/bin/ai-dev-workflow-entrypoint.sh /usr/local/bin/ai-dev-workflow-bootstrap.sh && \
     mkdir -p /workspace && chown -R vscode:vscode /workspace /opt/aidw && \
     # Plugin content is root-owned and read-only, not vscode-writable like /workspace/aidw above:

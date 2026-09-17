@@ -2965,7 +2965,8 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 # "already_approved" straight past audit_node and gate_node, so this is the ONLY
                 # place a hook can run for a repo that has been onboarded before.
                 await _run_post_approve_hook(stage_spec, thread_id, hydrated, state)
-                return {"stages": stages}
+                # See draft_node's main return below for why last_push is refreshed here too.
+                return {"stages": stages, "last_push": git_ops.get_last_push(thread_id)}
 
         # Resume short-circuit: a stage hydrated back as approved (AIDW_RESUME runs) skips its
         # LLM call entirely -- make_route_after_draft's "already_approved" route then bypasses
@@ -2981,13 +2982,17 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # resumed run that re-ran e2e and metrics left the PREVIOUS run's report on the branch
             # -- still reading "no e2e screenshots were captured" beside 14 fresh screenshots.
             await _run_post_approve_hook(stage_spec, thread_id, stage_now["approved_content"], state)
+            # See draft_node's main return further below for why last_push is refreshed here too
+            # -- a resumed, already-approved stage is exactly the case where the branch has
+            # certainly been pushed before, just never surfaced to a freshly (re)loaded client.
+            last_push_update = {"last_push": git_ops.get_last_push(thread_id)}
             if not stage_now.get("skills"):
                 # A resumed stage usually hydrates its original run's evidence; only when that's
                 # absent does this stub in the provider record ({} return would omit it entirely).
                 stages = {key: dict(value) for key, value in state["stages"].items()}
                 stages[stage_spec.key]["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
-                return {"stages": stages}
-            return {}
+                return {"stages": stages, **last_push_update}
+            return last_push_update
 
         if stage_spec.prefill_from_repo_file is not None and not just_rejected and sandbox_registry.get(thread_id) is not None:
             prefilled = await stage_spec.prefill_from_repo_file(thread_id, state, get_sandbox_provider())
@@ -3003,7 +3008,8 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                     stage["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
                 stages[stage_spec.key] = stage
                 logger.info("draft prefilled from repo file for stage %s, skipping LLM", stage_spec.key)
-                return {"stages": stages}
+                # See draft_node's main return further below for why last_push is refreshed here too.
+                return {"stages": stages, "last_push": git_ops.get_last_push(thread_id)}
 
         if (
             stage_spec.capture_baseline_commit
@@ -3165,7 +3171,8 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             stages[stage_spec.key]["last_infra_error"] = str(exc)[-workflow_config.GRAPH_INFRA_ERROR_CHARS:]
             if not stages[stage_spec.key].get("skills"):
                 stages[stage_spec.key]["skills"] = await _stage_skills_evidence(thread_id, stage_spec.key, state)
-            return {"stages": stages}
+            # See draft_node's main return further below for why last_push is refreshed here too.
+            return {"stages": stages, "last_push": git_ops.get_last_push(thread_id)}
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
@@ -3294,7 +3301,15 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # fails soft, same reasoning as append_event above.
             await run_event_stream.emit_live(run_event, config)
 
-        return {"stages": stages}
+        # AppShell's GitHub-branch icon (root-caused 2026-09-16, user-reported: a session sitting
+        # on tech-stack's own first-ever draft -- no audit pass, not yet approved -- showed no
+        # icon despite the work branch genuinely existing on GitHub, since neither of last_push's
+        # two other refresh points (make_audit_node's return, make_gate_node's approval return)
+        # had fired yet for it). _persist_if_sandboxed above already pushed whatever this draft
+        # committed; surface that here too, the same one-line pattern those two other return
+        # points already use, so ANY stage's own draft (not just audited/approved ones) refreshes
+        # the frontend's signal the moment a real push has actually happened.
+        return {"stages": stages, "last_push": git_ops.get_last_push(thread_id)}
 
     return draft_node
 

@@ -20,13 +20,20 @@
 #      (ProvisionRequest.github_token) is handed to both `git_user_token` (this container's
 #      clone/push credential, below) and git_ops.set_push_token (the agent host's own later-push
 #      credential), so it already carries whatever scope the user's GitHub grant has.
-#   2. exec `sleep infinity` so this process (still pid 1) simply holds the container open. Nothing
-#      long-lived runs in here for either provider: both Claude and Copilot are driven by a
-#      per-turn CLI exec from outside the container (agent/src/sandbox/provider.py's
-#      wait_for_cli_ready, plus claude_chat_model.py/copilot_chat_model.py), never by a persistent
-#      in-container server. `exec` (not a backgrounded `sleep`) still matters -- it keeps this
-#      script as pid 1's replacement so `docker stop`/ACI's equivalent deliver SIGTERM directly to
-#      it instead of to a wrapper shell that would have to relay the signal.
+#   2. exec `tini -- sleep infinity` so `tini` (not this script) becomes pid 1, with `sleep
+#      infinity` as its one child, simply holding the container open. Nothing long-lived runs in
+#      here for either provider: both Claude and Copilot are driven by a per-turn CLI exec from
+#      outside the container (agent/src/sandbox/provider.py's wait_for_cli_ready, plus
+#      claude_chat_model.py/copilot_chat_model.py), never by a persistent in-container server.
+#      `exec` (not a backgrounded call) still matters -- it keeps `tini` as pid 1's actual
+#      replacement so `docker stop`/ACI's equivalent deliver SIGTERM directly to it, which tini
+#      then forwards to `sleep infinity`, instead of a wrapper shell that would have to relay the
+#      signal itself. `tini` over a plain `exec sleep infinity` (its own earlier shape) because
+#      every per-turn `docker exec`/`az container exec` health-check/tool invocation is a
+#      short-lived process that gets reparented to pid 1 on exit -- a bare `sleep infinity` never
+#      calls wait() and never reaps them, so they pile up as <defunct> zombies for the life of the
+#      container (observed live: one new zombie roughly every ~30s, matching the host's own
+#      polling cadence). `tini`, built for exactly this job, reaps every one.
 #
 # Ordering note (plan Section C.4): once devcontainer.json onCreateCommand/postCreateCommand
 # support lands, it must run strictly after step 1's credential material is already gone and
@@ -213,9 +220,9 @@ else
   cd "$WORKSPACE_DIR"
 fi
 
-# One shape for every provider: clone, bootstrap, exec sleep infinity. Neither CLI is started
-# here -- both are driven by a per-turn `docker exec`/`az container exec` from outside (see this
-# file's own header comment, responsibility #2) -- so the only provider-specific thing left is
+# One shape for every provider: clone, bootstrap, exec tini (holding sleep infinity). Neither CLI
+# is started here -- both are driven by a per-turn `docker exec`/`az container exec` from outside
+# (see this file's own header comment, responsibility #2) -- so the only provider-specific thing left is
 # which credential gets warned about when empty. An unrecognized AGENT_PROVIDER value falls
 # through to the copilot-shaped warning below rather than crashing the container here (an
 # unrecognized value fails the [[ == "claude" ]] test, so it lands in the else arm);
@@ -252,4 +259,4 @@ else
   fi
 fi
 
-exec sleep infinity
+exec tini -- sleep infinity

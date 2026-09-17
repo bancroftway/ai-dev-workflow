@@ -738,7 +738,7 @@ class ClaudeChatModel(BaseChatModel):
         if self.response_schema is not None:
             argv += ["--json-schema", json.dumps(self.response_schema.model_json_schema())]
 
-        command = shlex.join(argv)
+        command = _required_skills_env_prefix(self.stage, self.role) + shlex.join(argv)
 
         # Agent Narration Drawer feature: classify each JSONL line the instant run_turn's own
         # incremental poll loop sees it complete -- the exact same per-line classifier the
@@ -1043,6 +1043,31 @@ def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | Non
     return _session_cache.get_resume_state(thread_id, stage, role)
 
 
+def _required_skills_env_prefix(stage: str, role: str) -> str:
+    """Shell env-var prefix (e.g. `"AIDW_REQUIRED_SKILLS=brainstorming,grill-me "`, or `""`) for
+    the skill-enforcement Stop hook (sandbox-image/hooks/require-skills-stop.mjs, baked into
+    /etc/claude-code/managed-settings.json): activated per-turn via this env var, draft role only
+    -- every REQUIRED_SKILLS_BY_STAGE entry's full list is documented in that stage's own
+    *_draft.md prompt (confirmed by reading all of them, 2026-09-17), so audit's own session never
+    receives this var and can never be blocked for a skill its own prompt never asked it to invoke.
+
+    Prefixed onto the shell command string by the caller, not passed via a separate exec env=
+    param -- run_turn/_build_startup_command already runs the command as the head of one `sh -c`
+    script, so a plain POSIX `VAR=value cmd` prefix is all this needs.
+
+    Same-turn, deterministic version of what gates/skill_gate.py already enforces post-hoc at the
+    graph level (a live run skipped an explicit "MANDATORY, NOT ADVISORY" prompt instruction twice
+    in a row) -- skill_gate.py stays the fail-closed backstop for whenever this hook is
+    unavailable (Copilot has no hook equivalent) or otherwise bypassed.
+    """
+    if role != "draft":
+        return ""
+    required_skills = config.REQUIRED_SKILLS_BY_STAGE.get(stage, [])
+    if not required_skills:
+        return ""
+    return f"AIDW_REQUIRED_SKILLS={shlex.quote(','.join(required_skills))} "
+
+
 def normalize_skill_name(name: str) -> str:
     """One bare skill name from whatever form a transcript or self-report carries.
 
@@ -1258,6 +1283,14 @@ def _demo() -> None:
     assert normalize_skill_name("code-review/") == "code-review"
     assert normalize_skill_name("  /  ") == ""
     assert normalize_skill_name("x:") == ""
+
+    # _required_skills_env_prefix: draft role for a stage with required skills gets the prefix;
+    # audit role (and a stage with none configured) get nothing to prepend.
+    assert _required_skills_env_prefix("specification", "draft") == "AIDW_REQUIRED_SKILLS=brainstorming,grill-me "
+    assert _required_skills_env_prefix("specification", "audit") == "", (
+        "audit's own prompt never asks for these skills -- must never be blocked for skipping them"
+    )
+    assert _required_skills_env_prefix("tech-stack", "draft") == "", "no required skills configured for this stage"
 
     # Task 3b (Part 2 Ruling 10): run_id threads through the constructor same as CopilotChatModel's
     # (shape parity, even though nothing here reads it yet -- see ClaudeChatModel.run_id's comment).

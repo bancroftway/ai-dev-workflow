@@ -44,6 +44,17 @@ missing from it. The ONLY way scope leaves the specification is an explicit entr
 `retired_us_ids`/`retired_ac_ids`. Removing one feature from the requirements changes THAT
 feature's stories; every other story must stay in the file unchanged, id intact.
 
+"Keeping its existing id" means the `existing_us_id`/`existing_ac_id` FIELD, not just the story
+staying present in the file -- this is a real, repeatedly-observed failure, not a hypothetical one:
+a redraft re-emits a story/criterion word-for-word (or nearly so) but with `existing_us_id`/
+`existing_ac_id` reset to `null`, making already-numbered content look brand new. The story is
+still THERE, so REDRAFT COMPLETENESS above looks satisfied, but a deterministic gate now also
+rejects this specifically: a new entry whose text is identical to an already-tracked one is treated
+as a dropped citation, not new content. Before writing `null` into either field for ANYTHING you
+are re-emitting (not writing for the first time), re-check the file/ledger for a story or criterion
+with the same or near-same title/description text and cite ITS id instead -- `null` is only correct
+for content that is genuinely new this turn, never for something you're simply retyping.
+
 Set `ui_related: true` on every Acceptance Criterion whose satisfaction involves something the
 user sees or interacts with (a screen, a component, layout, client-side behavior); leave it
 `false` (the default) for pure backend/API/data logic with no visible surface. Judge each

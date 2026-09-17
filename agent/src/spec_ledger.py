@@ -230,6 +230,44 @@ def _find(entries: list[dict[str, Any]], entry_id: str) -> dict[str, Any] | None
     return None
 
 
+def _normalize_text(text: str) -> str:
+    """Whitespace/case-insensitive comparison key for the citation-drop check below -- collapses
+    the exact formatting noise (extra spaces, capitalization) a model's re-typed text could
+    plausibly differ on while still being the same content, without doing any fuzzy/similarity
+    matching that could false-positive two genuinely different stories into looking like a dup."""
+    return " ".join(text.split()).strip().lower()
+
+
+def _find_duplicate_by_text(
+    entries: list[dict[str, Any]], kind: EntryKind, text: str, exclude_ids: set[str]
+) -> dict[str, Any] | None:
+    """An already-tracked, still-live entry of the same `kind` whose own title/description text is
+    an EXACT match (after `_normalize_text`) for `text` -- evidence this "new" entry is really an
+    already-numbered one whose citation got dropped, not genuinely new content.
+
+    Root-caused 2026-09-17 (income-investor run d2392db9): 3 of 8 specification laps were spent
+    almost entirely on the auditor manually re-discovering and re-citing already-numbered stories/
+    criteria the draft had re-emitted with `existing_us_id`/`existing_ac_id: null` -- word-for-word
+    identical to content the ledger already tracked under a real id (one lap's own audit note:
+    "Restored the citation to the real ledger id (was null); no wording change" x30). The `else`
+    branches below used to mint a brand-new id for ANY null citation with no cross-check at all,
+    silently accepting -- and duplicating -- content the ledger already had. An EXACT text match
+    (not fuzzy) keeps this zero-false-positive: two genuinely different stories essentially never
+    share byte-identical title/description text, so this only fires on the real regression."""
+    text_key = _normalize_text(text)
+    if not text_key:
+        return None
+    for entry in entries:
+        if (
+            entry.get("kind") == kind
+            and entry.get("id") not in exclude_ids
+            and entry.get("status") in ("active", "revised", "deferred")
+            and _normalize_text(entry.get("title" if kind == "user_story" else "description", "")) == text_key
+        ):
+            return entry
+    return None
+
+
 def sync_ledger(
     entries: list[dict[str, Any]],
     draft_user_stories: list[dict[str, Any]],
@@ -391,6 +429,18 @@ def sync_ledger(
                     entry["activated_run_id"] = run_id
             resolved_us_id = existing_us_id
         else:
+            dup = None if ledger_was_empty else _find_duplicate_by_text(
+                updated, "user_story", story.get("title", ""), touched_ids
+            )
+            if dup is not None:
+                reasons.append(
+                    f"story {story.get('id')!r} (title {story.get('title')!r}) is word-for-word "
+                    f"identical to already-tracked {dup['id']!r} but cites existing_us_id: null -- "
+                    f"this looks like a dropped citation, not new content: cite {dup['id']!r} via "
+                    "existing_us_id instead (copied character-for-character), or if it genuinely is "
+                    "new content, reword it so it isn't identical to an existing story"
+                )
+                continue
             story_deferred = bool(story.get("deferred"))
             resolved_us_id = allocate_next_id(updated, "user_story")
             new_entry = {
@@ -460,6 +510,19 @@ def sync_ledger(
                 ac_entry["ui_related"] = ac.get("ui_related", ac_entry.get("ui_related", False))
                 resolved_ac_id = existing_ac_id
             else:
+                ac_dup = None if ledger_was_empty else _find_duplicate_by_text(
+                    updated, "acceptance_criterion", ac.get("description", ""), touched_ids
+                )
+                if ac_dup is not None:
+                    reasons.append(
+                        f"criterion {ac.get('id')!r} (description {ac.get('description')!r}) is "
+                        f"word-for-word identical to already-tracked {ac_dup['id']!r} but cites "
+                        f"existing_ac_id: null -- this looks like a dropped citation, not new "
+                        f"content: cite {ac_dup['id']!r} via existing_ac_id instead (copied "
+                        "character-for-character), or if it genuinely is new content, reword it so "
+                        "it isn't identical to an existing criterion"
+                    )
+                    continue
                 resolved_ac_id = allocate_next_id(updated, "acceptance_criterion", resolved_us_id)
                 new_ac_entry = {
                     "id": resolved_ac_id,
@@ -1107,6 +1170,37 @@ def _demo() -> None:
     assert revised.passed, revised.reasons
     us_after_revise = next(e for e in revised.updated_entries if e["id"] == "US-0001")
     assert "source_ticket_id" not in us_after_revise, "revising a pre-existing entry must not backfill attribution"
+
+    # Citation-drop detection (root-caused 2026-09-17, income-investor run d2392db9): a draft that
+    # re-emits an already-tracked story/AC word-for-word but with existing_us_id/existing_ac_id
+    # left null must be REJECTED, not silently minted as a duplicate.
+    dropped_us_draft = [
+        {"id": "draft-3", "existing_us_id": None, "title": "Sign in", "acceptance_criteria": []},
+    ]
+    dropped_us_result = sync_ledger([dict(e) for e in seed], dropped_us_draft, "run-13")
+    assert not dropped_us_result.passed, "an identical-title story with a null citation must be rejected"
+    assert any("US-0001" in r and "identical" in r for r in dropped_us_result.reasons), dropped_us_result.reasons
+
+    dropped_ac_draft = [
+        {
+            "id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in",
+            "acceptance_criteria": [
+                {"id": "draft-3.1", "existing_ac_id": None, "description": "Shows an error on a wrong password."}
+            ],
+        },
+    ]
+    dropped_ac_result = sync_ledger([dict(e) for e in seed], dropped_ac_draft, "run-14")
+    assert not dropped_ac_result.passed, "an identical-description AC with a null citation must be rejected"
+    assert any("US-0001.1" in r and "identical" in r for r in dropped_ac_result.reasons), dropped_ac_result.reasons
+
+    # A case-/whitespace-only difference is still caught (normalized comparison, not exact bytes) --
+    # but genuinely different text (the "Export CSV"/"Reset password" cases above) is NOT flagged,
+    # already proven passing above.
+    dropped_us_ws_draft = [
+        {"id": "draft-4", "existing_us_id": None, "title": "  sign   IN  ", "acceptance_criteria": []},
+    ]
+    dropped_us_ws_result = sync_ledger([dict(e) for e in seed], dropped_us_ws_draft, "run-15")
+    assert not dropped_us_ws_result.passed, "whitespace/case differences must not evade the duplicate check"
 
     # THE FIX: naming a story in retired_us_ids DOES retire it, and cascades to its own AC.
     result2 = sync_ledger([dict(e) for e in seed], [], "run-3", retired_us_ids=["US-0001"])

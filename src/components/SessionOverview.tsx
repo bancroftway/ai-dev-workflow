@@ -1,7 +1,8 @@
 "use client";
 
 import { useAgent, useCopilotKit } from "@copilotkit/react-core/v2";
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useMemo, useState, type MouseEvent } from "react";
+import { createPortal } from "react-dom";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
@@ -39,12 +40,14 @@ const STATUS_LABEL: Record<string, string> = {
  * request 2026-09-01) along with their now-dead component files (and DiffView.tsx, which existed
  * only to render EventLogView's diff payloads) -- this was the only place either was mounted. */
 
-/** One stage's short human-facing note: the live failure feedback while it's failing, else what
- * the audit did, else the approved summary. Never the raw draft. */
+/** One stage's short human-facing note: the live failure feedback while it's failing, else the
+ * approved summary. Never the raw draft. The "N audit finding(s) addressed" case is rendered
+ * separately (AuditFindingsNote below, user-requested tooltip listing each finding) rather than
+ * collapsed into this plain string, so it's excluded here -- same priority order as before
+ * (failure text wins over an approved summary), just missing the middle rung. */
 function stageNote(stage: StageState): string | null {
   const v = stage.last_verification;
   if (v && !v.passed && stage.status !== "approved") return truncate(v.feedback, 140);
-  if (stage.audit_findings?.length) return `${stage.audit_findings.length} audit finding(s) addressed`;
   const summary = (stage.approved_content as { summary?: string } | null)?.summary;
   if (stage.status === "approved" && summary) return truncate(summary, 140);
   return null;
@@ -52,6 +55,39 @@ function stageNote(stage: StageState): string | null {
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** "N audit finding(s) addressed", hoverable to reveal the actual findings (user-requested,
+ * 2026-09-17) -- portal-positioned the same way IoPreviewCell's tooltip is (fixed, computed from
+ * the trigger's own bounding rect) so it can never be clipped by a scrolling/overflow ancestor. */
+function AuditFindingsNote({ findings }: { findings: string[] }) {
+  const [anchor, setAnchor] = useState<{ top: number; left: number } | null>(null);
+
+  function handleEnter(e: MouseEvent<HTMLParagraphElement>) {
+    const r = e.currentTarget.getBoundingClientRect();
+    setAnchor({ top: r.bottom + 4, left: r.left });
+  }
+
+  return (
+    <p
+      className="mt-1 w-fit cursor-default text-xs text-neutral-500 underline decoration-dotted decoration-neutral-300 underline-offset-2"
+      onMouseEnter={handleEnter}
+      onMouseLeave={() => setAnchor(null)}
+    >
+      {findings.length} audit finding(s) addressed
+      {anchor &&
+        createPortal(
+          <ul className="fixed z-50 max-h-64 w-96 list-disc overflow-auto whitespace-pre-wrap rounded-md border border-neutral-200 bg-white p-2 pl-6 text-left text-xs normal-case leading-relaxed text-neutral-700 shadow-lg"
+            style={{ top: anchor.top, left: anchor.left }}
+          >
+            {findings.map((f, i) => (
+              <li key={i}>{f}</li>
+            ))}
+          </ul>,
+          document.body,
+        )}
+    </p>
+  );
 }
 
 /** Plain-language failure summary for the recovery panel (root-caused 2026-09-13, user-reported:
@@ -109,7 +145,12 @@ function ContinueAction({ restarting, onClick }: { restarting: boolean; onClick:
 
 // Shared between the header row and every stage row so the columns actually line up like a table
 // (user feedback 2026-09-01) instead of each row's flex layout drifting with its own content width.
-const ROW_GRID = "grid grid-cols-[1fr_4.5rem_4rem_5rem_9rem_11rem] items-center gap-3";
+// Column widths rebalanced 2026-09-17 (user-reported: Redraft History's 4-column subtable forced
+// a horizontal scrollbar) -- Duration/Cost/Redrafts/Status shed 3rem total (each still comfortably
+// fits its actual longest value: "Needs clarification" for Status, "N×" for Redrafts, "$NN.NN" /
+// "NNm NNs" for Cost/Duration), handed to Redraft History so its 4 sub-columns (Lap, Draft/Audit,
+// two byte sizes) fit without overflowing -- same total fixed width as before, just redistributed.
+const ROW_GRID = "grid grid-cols-[1fr_4rem_3.5rem_3.5rem_8.5rem_14rem] items-center gap-3";
 
 /** One REBUILD_PLACEMENTS row, inserted right after its `afterStageKey`'s own row (rebuildPhase's
  * own docstring: real, unattributed-to-a-single-placement work happening between two stages).
@@ -181,7 +222,14 @@ async function fetchEventIo(sessionId: string, seq: number): Promise<EventIoText
  * tooltip in this app uses (MetricsBar's Chip, `title={title}`) -- that's a static string already
  * known at render time, which can't work here since the whole point of the split list/on-demand
  * API (sessions_api.py's RunEventResponse vs. RunEventIoResponse) is to NOT eagerly download every
- * lap's full prompt/response just to render a size number nobody may ever hover over. */
+ * lap's full prompt/response just to render a size number nobody may ever hover over.
+ *
+ * Popup renders through a portal to `document.body`, positioned from the trigger's own
+ * `getBoundingClientRect()` (root-caused 2026-09-17, user-reported "weird display"/scroll-arrow
+ * glitch on hover): this cell lives inside RedraftHistoryCell's `max-h-24 overflow-y-auto` list,
+ * and a merely `absolute`-positioned popup is still clipped by that scrolling ancestor -- the
+ * popup's own overflow forced the tiny row list into scroll mode instead of floating above it.
+ * `position: fixed` + a portal is the standard escape for a tooltip inside a scroll container. */
 function IoPreviewCell({
   sessionId,
   seq,
@@ -194,49 +242,70 @@ function IoPreviewCell({
   field: keyof EventIoText;
 }) {
   const [text, setText] = useState<string | null>();
-  const [hovered, setHovered] = useState(false);
+  const [anchor, setAnchor] = useState<{ top: number; right: number } | null>(null);
 
-  function handleEnter() {
-    setHovered(true);
+  function handleEnter(e: MouseEvent<HTMLSpanElement>) {
+    const r = e.currentTarget.getBoundingClientRect();
+    setAnchor({ top: r.bottom + 4, right: window.innerWidth - r.right });
     if (text !== undefined) return; // already fetched (or already known-absent) -- don't refetch
     void fetchEventIo(sessionId, seq).then((io) => setText(io ? io[field] : null));
   }
 
-  if (size == null) return <span className="text-neutral-300">—</span>;
+  if (size == null) return <span className="w-12 shrink-0 text-right text-neutral-300">—</span>;
   return (
     <span
-      className="relative cursor-default underline decoration-dotted decoration-neutral-300 underline-offset-2"
+      className="w-12 shrink-0 cursor-default text-right underline decoration-dotted decoration-neutral-300 underline-offset-2"
       onMouseEnter={handleEnter}
-      onMouseLeave={() => setHovered(false)}
+      onMouseLeave={() => setAnchor(null)}
     >
       {formatBytes(size)}
-      {hovered && (
-        <div className="absolute right-0 top-full z-20 mt-1 max-h-64 w-80 overflow-auto whitespace-pre-wrap rounded-md border border-neutral-200 bg-white p-2 text-left text-[10px] normal-case leading-relaxed text-neutral-700 shadow-lg">
-          {text === undefined ? "Loading…" : (text ?? "Not available")}
-        </div>
-      )}
+      {anchor &&
+        createPortal(
+          <div
+            className="fixed z-50 max-h-64 w-80 overflow-auto whitespace-pre-wrap rounded-md border border-neutral-200 bg-white p-2 text-left text-[11px] normal-case leading-relaxed text-neutral-700 shadow-lg"
+            style={{ top: anchor.top, right: anchor.right }}
+          >
+            {text === undefined ? "Loading…" : (text ?? "Not available")}
+          </div>,
+          document.body,
+        )}
     </span>
   );
 }
 
-/** One stage's ordered redraft history: Cycle | Node | Input | Output, one row per completed
+/** One stage's ordered redraft history: Lap | Node | Input | Output, one row per completed
  * draft/audit/fix call. `redrafts` (perStage's own array, above) is already in accurate execution
  * order -- events arrive oldest-first and seq is a durable monotonic IDENTITY, so no re-sort is
- * needed here. Compact by design: this sits inside one Overview-table cell, not its own page. */
+ * needed here. Compact by design: this sits inside one Overview-table cell, not its own page.
+ *
+ * Labeled "Lap N" (1-based), derived from this ARRAY's own position, not from `e.payload.cycle`
+ * (`verify_cycle_count`, graph.py). Root-caused 2026-09-17, user-reported "weird numbering and
+ * order": `verify_cycle_count` is in-memory graph state, not a durable-across-restarts counter --
+ * resuming a stage after an agent-process restart can reset it to 0, so a chronologically LATER
+ * event (still correctly ordered here by `seq`, a real monotonic id) can report a LOWER cycle
+ * than an earlier one already in this same list ("Lap 1 Draft" appearing after "Lap 4 Draft").
+ * Counting a new lap every time a "draft" node appears in this already-correctly-ordered array
+ * is immune to that reset -- a draft and the audit that follows it in the same lap still
+ * deliberately share one number. */
 function RedraftHistoryCell({ sessionId, redrafts }: { sessionId: string; redrafts: RunLogEvent[] }) {
   if (redrafts.length === 0) return null;
+  let lap = 0;
   return (
-    <div className="flex max-h-24 flex-col gap-0.5 overflow-y-auto text-[10px] text-neutral-500">
-      {redrafts.map((e) => (
-        <div key={e.seq} className="flex items-center gap-1.5">
-          <span className="w-6 shrink-0 text-neutral-400">
-            {typeof e.payload?.cycle === "number" ? `#${e.payload.cycle}` : ""}
-          </span>
-          <span className="w-10 shrink-0 truncate capitalize">{e.node}</span>
-          <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.input_size} field="input_text" />
-          <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.output_size} field="output_text" />
-        </div>
-      ))}
+    <div className="flex max-h-24 flex-col overflow-x-hidden overflow-y-auto rounded border border-neutral-100 text-[11px] text-neutral-500">
+      {redrafts.map((e) => {
+        if (e.node === "draft") lap += 1;
+        return (
+          <div
+            key={e.seq}
+            className="flex items-center gap-2 px-1 py-0.5 odd:bg-neutral-50 hover:bg-neutral-100"
+          >
+            <span className="w-10 shrink-0 text-neutral-400">{`Lap ${lap}`}</span>
+            <span className="w-10 shrink-0 truncate capitalize">{e.node}</span>
+            <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.input_size} field="input_text" />
+            <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.output_size} field="output_text" />
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -964,6 +1033,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                     <RedraftHistoryCell sessionId={threadId} redrafts={timing?.redrafts ?? []} />
                   </div>
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
+                  {!note && stage.audit_findings?.length > 0 && <AuditFindingsNote findings={stage.audit_findings} />}
                   {showPlainContinue && <ContinueAction restarting={restarting} onClick={() => void handleRestart(key)} />}
                   {key === "metrics-exit" && finishedWithVerdict && runActivity?.mergeReady === false && (
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
