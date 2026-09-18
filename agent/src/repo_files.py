@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import shlex
 import time
 from typing import Any
 
-from .sandbox.provider import SandboxProvider
+from .sandbox.provider import SandboxProvider, is_expected_missing_file
+
+logger = logging.getLogger(__name__)
 
 LEDGER_PATH = ".ai-dev-workflow/ledger.jsonl"
 
@@ -56,10 +59,25 @@ def validate_repo_relative_path(path: str) -> str:
 
 
 async def read_repo_file(provider: SandboxProvider, thread_id: str, path: str) -> str | None:
-    """Returns the file's content, or None if it doesn't exist (or can't be read)."""
+    """Returns the file's content, or None if it doesn't exist (or can't be read).
+
+    Root-caused 2026-09-17: this exec used to redirect the inner `cat`'s stderr to /dev/null
+    inside the container, discarding it before ExecResult's own stderr field could ever see it --
+    a genuinely unexpected failure (permissions, a docker-exec-layer fault) was then
+    indistinguishable from the ordinary, expected "file doesn't exist yet" case (checking whether a
+    ticket's own sketchpad file exists on its first lap happens on every ticket). No `2>/dev/null`
+    now -- stderr flows through to ExecResult.stderr, which is already captured correctly by the
+    exec layer -- and a warning fires only on the genuinely unexpected shape
+    (is_expected_missing_file), not on every ordinary miss.
+    """
     validate_repo_relative_path(path)
-    result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(path)} 2>/dev/null")
+    result = await provider.exec_in_sandbox(thread_id, f"cat {shlex.quote(path)}")
     if not result.ok:
+        if not is_expected_missing_file(result):
+            logger.warning(
+                "read_repo_file: unexpected failure reading %r (returncode=%d, stderr=%r)",
+                path, result.returncode, result.stderr,
+            )
         return None
     return result.stdout
 

@@ -26,11 +26,21 @@ ARG BASE_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0
 # interactive approval prompt a file-read outside /workspace/repo would otherwise need. 1.0.83-5
 # (latest pre-release as of this bump) still carries -4's fix -- pre-release changelogs are
 # cumulative, confirmed by reading both release pages. No CLI flag changed alongside this bump;
-# the fix is entirely CLI-side. This is a real compatibility surface, not just the one plugin-read
-# fix -- re-verify the flags/JSONL-fields list above against a rebuilt image before trusting a
-# run (see agent/sandbox-image/README.md's spike procedure). Rollback: 1.0.79, the prior pin, if
-# 1.0.83-5 shows a compatibility blocker.
-ARG COPILOT_CLI_VERSION=1.0.83-5
+# the fix is entirely CLI-side.
+# 2026-09-17: bumped 1.0.83-5 -> 1.0.86-2 (user directive) specifically because this version's own
+# `copilot help config` (confirmed live against the rebuilt image, not just a changelog read) is
+# the first one this codebase has actually inspected for a `hooks`/`disableAllHooks` config key --
+# repo-level hooks read from `.github/hooks/*.json`, user-level from an inline `hooks` key in the
+# global config.json -- the Copilot-side equivalent of Claude Code's Stop hooks this pipeline
+# already relies on for skill-enforcement (see sandbox-image/hooks/). No dedicated `copilot help
+# hooks` topic exists yet to confirm the exact per-event payload/blocking contract the way a real
+# captured transcript would -- treat the hook wiring below as unverified against a live Copilot
+# turn until one is captured, same "confirm against reality, don't just assume" discipline this
+# file's Claude pin already documents. This is a real compatibility surface, not just the hooks
+# discovery -- re-verify the flags/JSONL-fields list above against a rebuilt image before trusting
+# a run (see agent/sandbox-image/README.md's spike procedure). Rollback: 1.0.83-5, the prior pin,
+# if 1.0.86-2 shows a compatibility blocker.
+ARG COPILOT_CLI_VERSION=1.0.86-2
 # Claude Code CLI -- npm-installed (final stage's Node/npm layer), not curl+tar like Copilot
 # above. Same reasoning as COPILOT_CLI_VERSION now: claude_chat_model.py drives this CLI by
 # per-turn exec, not an SDK, so the pin here IS the compatibility contract for the flags
@@ -281,7 +291,12 @@ RUN set -eux; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list; \
     apt-get update; \
-    apt-get install -y --no-install-recommends gh=2.100.0; \
+    # 2026-09-17: bumped 2.100.0 -> 2.101.0 -- the exact 2.100.0 build had aged out of GitHub's own
+    # apt repo entirely (confirmed live: `apt-cache policy gh` no longer lists it as a candidate at
+    # all, only 2.101.0 from cli.github.com plus Ubuntu's own older 2.45.0), breaking every rebuild
+    # regardless of anything else in this file. 2.101.0 was apt's only available candidate from
+    # this source as of this bump.
+    apt-get install -y --no-install-recommends gh=2.101.0; \
     rm -rf /var/lib/apt/lists/*
 
 # Playwright MCP + its exact-matching browser build, baked at BUILD time into
@@ -642,36 +657,69 @@ RUN printf '%s\n' \
       '}' \
       > /opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json
 
-# Skill-enforcement Stop hook (file-based-editing plan follow-up, 2026-09-17): forces
-# REQUIRED_SKILLS_BY_STAGE (agent/src/config.py) to actually be invoked before a draft turn ends,
-# instead of only catching the miss after the whole lap already failed at gates/skill_gate.py --
-# see hooks/require-skills-stop.mjs's own header for the full mechanism and the live incident
-# (specification's draft skipped two MANDATORY-worded required skills twice in a row) that
-# motivated it. Baked into /etc/claude-code/managed-settings.json -- Claude Code's admin-managed
-# settings path, confirmed against this exact CLI version/image via a real docker-exec experiment
-# (a plain user-level ~/.claude/settings.json Stop hook DID fire, but that file is directly
-# editable by the same autopilot session it's meant to constrain -- same tools that write
-# /workspace/repo can write there too, which would let a session simply delete its own
-# enforcement; /etc/claude-code is root-owned and this session always runs as vscode (useradd
-# above), so it can read this file but never modify or remove it -- confirmed that path is ALSO
-# honored, with no project-level settings.json present at all). Root-owned + read-only for the
-# same reason /opt/ai-dev-workflow-plugins is: a self-modifying enforcement hook mid-run is a
-# supply-chain risk this doesn't need to accept.
+# Deterministic Stop hooks (file-based-editing plan follow-up, 2026-09-17): same-turn nudges that
+# catch a problem before a whole draft/audit/verify lap is wasted discovering it after the fact.
+# See each script's own header for its full mechanism and the live incident that motivated it:
+#   - require-skills-stop.mjs: REQUIRED_SKILLS_BY_STAGE (agent/src/config.py) actually invoked,
+#     not just claimed -- specification's draft skipped two MANDATORY-worded required skills twice
+#     in a row before this existed.
+#   - check-citation-drop-stop.mjs: catches a mass existing_us_id/existing_ac_id citation-drop (a
+#     redraft reconstructing the file from memory instead of editing it) before the whole lap is
+#     spent on the auditor fixing it -- observed live, all 25 stories/~113 criteria at once.
+#
+# BOTH PROVIDERS (user directive, 2026-09-17): baked into BOTH Claude Code's admin-managed
+# settings path AND GitHub Copilot CLI's own config, confirmed live via real docker-exec
+# experiments against this exact image/CLI versions:
+#   - Claude: /etc/claude-code/managed-settings.json. A plain user-level ~/.claude/settings.json
+#     Stop hook DID fire too, but that file is directly editable by the same autopilot session
+#     it's meant to constrain -- same tools that write /workspace/repo can write there too, which
+#     would let a session simply delete its own enforcement. /etc/claude-code is root-owned and
+#     this session always runs as vscode (useradd above), so it can read this file but never
+#     modify or remove it.
+#   - Copilot: confirmed live that 1.0.86-2 has its own real Stop-hook mechanism (`copilot help
+#     config`'s `hooks`/`disableAllHooks` keys; a real authenticated turn's Stop event fired with
+#     `stop_hook_active`/`transcript_path` in its stdin JSON, the same field names Claude Code
+#     uses). Baked into /home/vscode/.copilot/config.json instead of an equivalent root-owned
+#     path: tested `COPILOT_HOME` pointed at a root-owned directory and the CLI failed outright
+#     (exit 1, no output) -- it needs to WRITE session-state/auth-cache under its own home, so
+#     unlike Claude there is no confirmed tamper-proof location for this provider today. This is a
+#     real, disclosed asymmetry, not an oversight: a vscode-writable config.json means a session
+#     COULD in principle edit or delete its own Copilot-side enforcement, which it cannot do for
+#     the Claude-side one -- gates/skill_gate.py's post-hoc, fail-closed check is what actually
+#     closes that gap for Copilot, same "hook is a fast nudge, the gate is the real backstop"
+#     posture this whole mechanism already has.
+# Root-owned + read-only on the Claude side for the same reason /opt/ai-dev-workflow-plugins is: a
+# self-modifying enforcement hook mid-run is a supply-chain risk this doesn't need to accept.
 COPY hooks/require-skills-stop.mjs /opt/aidw-hooks/require-skills-stop.mjs
+COPY hooks/check-citation-drop-stop.mjs /opt/aidw-hooks/check-citation-drop-stop.mjs
 RUN set -eux; \
-    mkdir -p /etc/claude-code; \
+    mkdir -p /etc/claude-code /home/vscode/.copilot; \
     printf '%s\n' \
       '{' \
       '  "hooks": {' \
       '    "Stop": [' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/require-skills-stop.mjs", "timeout": 30 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/require-skills-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-citation-drop-stop.mjs", "timeout": 30 } ] }' \
       '    ]' \
       '  }' \
       '}' \
       > /etc/claude-code/managed-settings.json; \
+    printf '%s\n' \
+      '{' \
+      '  "hooks": {' \
+      '    "Stop": [' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/require-skills-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-citation-drop-stop.mjs" }' \
+      '    ]' \
+      '  }' \
+      '}' \
+      > /home/vscode/.copilot/config.json; \
     chown -R root:root /etc/claude-code /opt/aidw-hooks; \
     chmod 0755 /etc/claude-code /opt/aidw-hooks; \
-    chmod 0644 /etc/claude-code/managed-settings.json /opt/aidw-hooks/require-skills-stop.mjs
+    chmod 0644 /etc/claude-code/managed-settings.json /opt/aidw-hooks/require-skills-stop.mjs \
+      /opt/aidw-hooks/check-citation-drop-stop.mjs; \
+    chown -R vscode:vscode /home/vscode/.copilot; \
+    chmod 0644 /home/vscode/.copilot/config.json
 
 # tini: entrypoint.sh's final `exec` target (replacing a bare `exec sleep infinity`) -- reaps the
 # zombie processes every per-turn `docker exec`/`az container exec` health-check/tool invocation

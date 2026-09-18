@@ -476,6 +476,36 @@ def duplicate_test_pairs(ac_id: str, test_files: dict[str, str]) -> list[tuple[s
     return pairs
 
 
+# Same physical rulebook for ac_to_tests_draft.md and ac_to_tests_audit.md (user directive,
+# 2026-09-17, same reasoning as SPECIFICATION_HARD_RULES/specification_shared_segment.md): both
+# prompts used to independently hand-type these two rules, and a check against the REAL gate below
+# found their matcher lists had already drifted incomplete -- neither prompt mentioned
+# toBeNull()/toBeUndefined()/toBeEmpty(), Assert.DoesNotContain, or the Python
+# assertIsNone/assertFalse/assertNotIn matchers _ABSENCE_ASSERTION_RE actually enforces below. One
+# physical copy, read off the real regexes, closes that drift permanently instead of re-typing a
+# third (still possibly incomplete) list here.
+AC_TO_TESTS_NAMING_RULES: tuple[str, ...] = (
+    "Every test must carry its criterion id in the exact canonical form the ledger spells it "
+    "(`US-0001.2`), in the test's DISPLAY name -- square-bracketed at the start "
+    "(`[US-0001.2] ...`) for a language whose test runner reports an arbitrary string (Playwright, "
+    "pytest), or in an xUnit/NUnit `DisplayName` for a language whose method name cannot contain "
+    "`-`/`.` (a C# method name mangles the id, and `[Trait(\"AC\", ...)]` does NOT work -- its "
+    "value never reaches the .trx report at all). A name that mangles the id still usually works "
+    "via a fallback matcher, but the fallback is counted and reported -- use the bracketed/"
+    "DisplayName form so attribution is exact, not inferred.",
+    "A test that asserts ONLY that something is ABSENT, with no assertion first that anything IS "
+    "present, is rejected -- on a page/object that never rendered/was never built, every absence "
+    "check is trivially true, so such a test would pass identically against a completely broken "
+    "app. This covers, across every runner this pipeline supports: Playwright's `toHaveCount(0)`, "
+    "`.not.*`, `toBeNull()`, `toBeUndefined()`, `toBeEmpty()`; xUnit/NUnit's `Assert.Null`/"
+    "`Assert.Empty`/`Assert.False`/`Assert.DoesNotContain`; and Python's `assertIsNone`/"
+    "`assertFalse`/`assertNotIn`. Before the first absence assertion, anchor on something that "
+    "must exist for the scenario to be meaningful (`toBeVisible()`, `Assert.NotNull`, a rendered "
+    "element/text) -- this applies even to a 'does not show X'/'no longer renders Y' negative test: "
+    "prove the page rendered, THEN prove X is absent.",
+)
+
+
 # An assertion that something is ABSENT. On a page that never rendered, every one of these is
 # trivially true -- so a test built only from them passes against a blank screen and proves nothing.
 # Observed live (blazor-dotnet, US-0006.1 "no sign-in UI is present anywhere"): `goto('/')` followed

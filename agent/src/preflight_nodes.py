@@ -1394,12 +1394,17 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
         async def exec_in_sandbox(self, thread_id: str, command: str):  # noqa: ARG002
             import base64 as _b64
 
-            cat_match = re.search(r"cat (\S+) 2>/dev/null", command)
+            # `2>/dev/null` is now optional: repo_files.read_repo_file stopped appending it
+            # 2026-09-17 (it was discarding stderr before ExecResult's own stderr field could ever
+            # see it, hiding a genuinely unexpected read failure behind the same "file missing"
+            # shape) -- match either form so this fixture doesn't silently stop matching real cat
+            # commands the moment that redirect is removed.
+            cat_match = re.search(r"cat (\S+)", command)
             if cat_match:
                 path = cat_match.group(1)
                 if path in self.files:
                     return _FakeExecResult(0, self.files[path])
-                return _FakeExecResult(1, "", "no such file")
+                return _FakeExecResult(1, "", f"cat: {path}: No such file or directory")
             write_match = re.search(r"echo (\S+) \| base64 -d (>>?) (\S+)$", command)
             if write_match:
                 encoded, mode, path = write_match.groups()

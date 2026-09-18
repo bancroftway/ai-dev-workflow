@@ -53,6 +53,21 @@ class ExecResult:
         return self.returncode == 0
 
 
+# A plain `cat <path>` on a genuinely absent file is the single most common, fully-expected
+# failure shape a caller sees from this exec layer -- e.g. checking whether a ticket's own
+# scratch/sketchpad file exists yet on its first-ever lap, which happens on every ticket, every
+# time, and is not an error. Root-caused 2026-09-17: a same-day fix that started logging a warning
+# on every unreadable-file case (to close a real observability gap in gates/skill_gate.py's
+# transcript reads) would have buried that rare, actually-consequential failure -- a permissions
+# error, a docker-exec-layer fault -- under this routine noise on every ordinary run, making the
+# NEXT investigation harder, not easier. `cat` reports a missing file as exit 1 with exactly this
+# stderr line (confirmed against this exec layer's own real GNU coreutils `cat`); anything else --
+# a different exit code, or a different stderr message on exit 1 -- is genuinely unexpected and
+# should be logged, not silently swallowed.
+def is_expected_missing_file(result: ExecResult) -> bool:
+    return result.returncode == 1 and "no such file or directory" in result.stderr.lower()
+
+
 class SandboxProvider(abc.ABC):
     """Provisions, tracks, and tears down per-session sandboxes.
 

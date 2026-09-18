@@ -73,6 +73,7 @@ from .gates.diagram_gate import (
     verify_plan_diagrams,
 )
 from .gates.test_coverage_gate import MINIMAL_CODE_TO_GREEN_HARD_RULES, verify_coverage
+from .gates.ac_coverage_gate import AC_TO_TESTS_NAMING_RULES
 from .gates.write_scope_gate import AC_TO_TESTS_HARD_RULES, verify_ac_to_tests
 from .infra_retry import call_with_infra_retry
 from .a2ui_tools import (
@@ -421,6 +422,15 @@ def _extract_ids(value: Any, out: set[str]) -> None:
 
 SPEC_SYSTEM_PROMPT = load_prompt("specification_draft")
 
+# Same physical rulebook for both roles (user directive, 2026-09-17): everything that used to be
+# independently hand-typed in BOTH specification_draft.md and specification_audit.md (or, more
+# often, stated in draft's file only despite audit needing it just as much -- audit edits the file
+# directly too) now lives here once, appended to both prompts unchanged. Named with the `_segment`
+# suffix on purpose -- prompt_loader.load_prompt exempts that suffix from having
+# global_system_segment.md's preamble prepended a second time, since this itself gets concatenated
+# into a prompt that's already been through load_prompt once.
+SPECIFICATION_SHARED_SEGMENT = load_prompt("specification_shared_segment")
+
 # Appended only when spec_ledger.hydrate_ticket_mode_context (StageSpec.
 # draft_prompt_context_from_repo_file) finds a non-empty ledger -- a second-or-later ticket
 # against a project that already has an approved baseline, vs. a from-scratch first pass.
@@ -581,6 +591,7 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     )
     messages: list[BaseMessage] = [
         SystemMessage(content=SPEC_SYSTEM_PROMPT),
+        HumanMessage(content=SPECIFICATION_SHARED_SEGMENT),
         HumanMessage(content=requirements_content),
     ]
     if auth_enforced(state):
@@ -798,6 +809,7 @@ def _build_specification_audit_prompt(state: GraphState) -> list[BaseMessage]:
     stage = state["stages"]["specification"]
     messages: list[BaseMessage] = [
         SystemMessage(content=SPEC_AUDIT_SYSTEM_PROMPT),
+        HumanMessage(content=SPECIFICATION_SHARED_SEGMENT),
         HumanMessage(content=f"Raw Requirements Text:\n\n{state['raw_requirements_text']}"),
         # File-based-editing plan, Part 1 sect. 6: the draft specification is a real file now, not
         # a response-field blob -- the "audit's output is what verify checks" guarantee is
@@ -992,7 +1004,11 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
 # sync_ledger, one rule each: existing_us_id unknown/retired (2), story renumbering (1),
 # existing_ac_id unknown/wrong-parent/retired (3), AC renumbering (1), retired_us_ids
 # unknown-id/wrong-kind/revise-and-retire-contradiction (3), retired_ac_ids
-# unknown-id/wrong-kind/revise-and-retire-contradiction (3).
+# unknown-id/wrong-kind/revise-and-retire-contradiction (3). Plus one combined citation-drop rule
+# (covers a new story OR AC identical to an already-tracked one, added 2026-09-17) and one more
+# from check_narrative_format (a sibling deterministic check, not inside sync_ledger itself, added
+# the same day) for the narrative-template shape -- 15 from sync_ledger-adjacent checks, plus the
+# 2 non-sync_ledger rules below (open-question, whole-spec-not-a-delta) = 17 total.
 SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "Never leave a clarifying question open -- every question you raised must be answered "
     "(status=answered, citing the wording that answers it) or explicitly assumed "
@@ -1030,6 +1046,14 @@ SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "Never both revise and retire the same criterion in one draft -- citing a criterion's id "
     "in both existing_ac_id and retired_ac_ids in the same response is a contradiction and is "
     "rejected.",
+    "A new story or criterion whose title/description is word-for-word identical to an "
+    "already-tracked, still-live entry, but cites existing_us_id/existing_ac_id: null, is treated "
+    "as a dropped citation, not new content, and is rejected -- cite the existing entry's real id "
+    "instead, or reword the new one so it isn't identical.",
+    "A User Story's narrative must be 'As a <role>, I want <capability>, so that <benefit>' -- "
+    "<role> must be a real human or organizational stakeholder who can genuinely 'want' "
+    "something, never the system itself, a module, a function, or a named system component; a "
+    "narrative that doesn't match this shape is rejected.",
 )
 
 
@@ -1209,6 +1233,22 @@ def make_verify_specification_ledger(
                     f"explicit assumption (status=assumed, mirrored in `assumptions`): {listed}"
                 ),
                 report={"open_questions": [q.get("id") for q in open_questions]},
+            )
+
+        # Deterministic narrative-template backstop (2026-09-17, endless-redraft investigation):
+        # a fully mechanical rule both prompts already state verbatim was, until now, enforced by
+        # audit's LLM judgment alone -- see spec_ledger.check_narrative_format's own docstring.
+        narrative_violations = spec_ledger.check_narrative_format(content_dict.get("user_stories") or [])
+        if narrative_violations:
+            return VerificationResult(
+                passed=False,
+                feedback=(
+                    "Some User Story narratives don't match the required template ('As a <role>, "
+                    "I want <capability>, so that <benefit>'; the role must be a real "
+                    "person/organization, never the system itself):\n"
+                    + "\n".join(f"- {v}" for v in narrative_violations)
+                ),
+                report={"narrative_violations": narrative_violations},
             )
 
         entries = await spec_ledger.load_ledger(provider, thread_id)
@@ -2136,12 +2176,21 @@ STAGES: list[StageSpec] = [
         # can avoid a rejection instead of only learning the rule from one. Threaded automatically
         # into the draft's ainvoke_structured call by make_draft_node's generic rules=stage_spec.
         # draft_rules -- ac-to-tests has no custom draft node to wire separately.
-        draft_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
-        # Same constant, not a separate set: make_audit_node overwrites stage["draft"] with the
+        # AC_TO_TESTS_NAMING_RULES appended (user directive, 2026-09-17): same one-physical-copy
+        # fix as SPECIFICATION_HARD_RULES got, for the bracketed-id-naming and
+        # positive-anchor-before-absence rules that used to be independently hand-typed (and had
+        # already drifted incomplete) in both ac_to_tests_draft.md and ac_to_tests_audit.md.
+        # Deliberately a second tuple concatenated here, not folded into AC_TO_TESTS_HARD_RULES
+        # itself -- that tuple's own scope (one line per real rejection branch inside
+        # verify_ac_to_tests specifically) is a documented, deliberate exclusion of
+        # ac_coverage_gate.py's checks (see diagram_gate.py's own comment on this), not an
+        # oversight this change should quietly override.
+        draft_rules="\n".join(f"- {r}" for r in (*AC_TO_TESTS_HARD_RULES, *AC_TO_TESTS_NAMING_RULES)),
+        # Same constants, not a separate set: make_audit_node overwrites stage["draft"] with the
         # audit's revised_test_suite BEFORE make_verify_node runs verify_ac_to_tests against it
         # (graph.py's audit-then-verify ordering), so the audit pass needs the identical rules --
         # one gate checks both draft and audit-revised content.
-        audit_rules="\n".join(f"- {r}" for r in AC_TO_TESTS_HARD_RULES),
+        audit_rules="\n".join(f"- {r}" for r in (*AC_TO_TESTS_HARD_RULES, *AC_TO_TESTS_NAMING_RULES)),
         # Final whole-branch review fix wave: every OTHER wired stage already paired its draft_rules/
         # audit_rules with a worked draft_example/audit_example -- this stage had the rules half but
         # not the example half, despite being the one AcceptanceCriteriaTestsDraftResponse's own
@@ -6148,6 +6197,11 @@ def _demo() -> None:
         def __init__(self, ok: bool, stdout: str = "") -> None:
             self.ok = ok
             self.stdout = stdout
+            # repo_files.read_repo_file's own 2026-09-17 fix reads these on the not-ok path
+            # (is_expected_missing_file) -- every fake "not found" result here really does model a
+            # plain missing file, never an unexpected failure, so match that real shape exactly.
+            self.returncode = 0 if ok else 1
+            self.stderr = "" if ok else "cat: file: No such file or directory"
 
     class _FakeRepoFileProvider:
         def __init__(self, files: dict[str, str]) -> None:
@@ -6510,9 +6564,11 @@ def _demo() -> None:
     assert stages_missing_rules(_ALL_STAGE_SPECS) == [], stages_missing_rules(_ALL_STAGE_SPECS)
 
     # Task 13b: SPECIFICATION_HARD_RULES -- 2 rules from _verify_specification_ledger's own code
-    # plus 13 from spec_ledger.sync_ledger's reasons.append(...) branches (see the constant's own
-    # comment for the count breakdown).
-    assert len(SPECIFICATION_HARD_RULES) == 15, len(SPECIFICATION_HARD_RULES)
+    # (open-question, whole-spec-not-a-delta) + 13 from spec_ledger.sync_ledger's original
+    # reasons.append(...) branches + 1 combined citation-drop rule (covers both story and AC in
+    # one entry, added 2026-09-17) + 1 narrative-template rule from check_narrative_format (added
+    # the same day) = 17 (see the constant's own comment for the full breakdown).
+    assert len(SPECIFICATION_HARD_RULES) == 17, len(SPECIFICATION_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in SPECIFICATION_HARD_RULES)
 
     # Task 6: draft_example/draft_rules/audit_example/audit_rules actually reach the two

@@ -13,6 +13,6 @@ shape so callers never know which is behind them.
 
 from . import registry
 from .factory import get_sandbox_provider
-from .provider import SandboxProvider, SandboxSession
+from .provider import SandboxProvider, SandboxSession, is_expected_missing_file
 
-__all__ = ["SandboxProvider", "SandboxSession", "get_sandbox_provider", "registry"]
+__all__ = ["SandboxProvider", "SandboxSession", "get_sandbox_provider", "is_expected_missing_file", "registry"]

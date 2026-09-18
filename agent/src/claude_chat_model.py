@@ -91,7 +91,7 @@ from .cli_agent_exec import (
 )
 from .redaction import redact_text, redact_value
 from .run_events import RunEvent, RunEventType
-from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider
+from .sandbox import SandboxProvider, SandboxSession, get_sandbox_provider, is_expected_missing_file
 
 logger = logging.getLogger(__name__)
 
@@ -853,6 +853,23 @@ class ClaudeChatModel(BaseChatModel):
         final = events[-1]
         is_error = bool(final.get("is_error"))
         new_session_id = final.get("session_id")
+        if not new_session_id and not is_error:
+            # Diagnostic added 2026-09-17 (run dd4a22bf-9447-4cda-bf6d-80bd508c78e5): the
+            # "events[-1] is always the result-shaped summary" assumption two comments above was
+            # never actually seen to fail before -- when it does, get_session_id silently returns
+            # None for the rest of this stage's laps (no cache entry ever written), which then
+            # shows up several layers away as skill_gate's FAILED SHUT and
+            # _verify_specification_ledger's "did not prove it read the ENTIRE file", with nothing
+            # closer to here explaining why. Logs the actual terminal event's shape so the next
+            # occurrence is diagnosable from one line instead of a multi-hour transcript dig.
+            logger.warning(
+                "%s: CLI turn completed without error but the terminal event carried no "
+                "session_id -- get_session_id will return None for this (thread,stage,role) until "
+                "a later turn succeeds. terminal event type=%r keys=%r events_count=%d "
+                "last_3_types=%r",
+                self._session_key, final.get("type"), sorted(final.keys()), len(events),
+                [e.get("type") for e in events[-3:]],
+            )
 
         # Phase E audit C-2: classify THIS turn's resume continuity from what was actually
         # observed -- None when no --resume was requested this turn (a fresh session's first
@@ -1104,8 +1121,23 @@ async def read_skill_invocations(provider: SandboxProvider, thread_id: str, sess
       one, so never make such an inner skill required.
     """
     path = shlex.quote(f"{_CLAUDE_PROJECTS_DIR}/{session_id}.jsonl")
-    result = await provider.exec_in_sandbox(thread_id, f"cat {path} 2>/dev/null")
+    result = await provider.exec_in_sandbox(thread_id, f"cat {path}")
     if not result.ok or not (result.stdout or "").strip():
+        # Root-caused 2026-09-17 (income-investor run 1352296c): this used to redirect stderr to
+        # /dev/null inside the container, so gates/skill_gate.py's own "FAILED SHUT" log line, when
+        # this came back unreadable, carried zero information about why -- turning a real incident
+        # into a multi-hour transcript-archaeology exercise instead of one log line. No
+        # `2>/dev/null` now; warn whenever this ISN'T the one truly expected shape. Unlike
+        # repo_files.read_repo_file's general case, a missing transcript file is inherently MORE
+        # suspicious here: `session_id` is only ever passed in once a real Claude session is known
+        # to exist, so its transcript ought to be there -- both a genuine read failure AND a
+        # successful-but-empty read are worth logging, not just a non-1 exit code.
+        if not is_expected_missing_file(result) or (result.ok and not (result.stdout or "").strip()):
+            logger.warning(
+                "read_skill_invocations: unreadable transcript for session_id=%r (returncode=%d, "
+                "stdout_len=%d, stderr=%r)",
+                session_id, result.returncode, len(result.stdout or ""), result.stderr,
+            )
         return None
 
     names: list[str] = []
@@ -1175,8 +1207,16 @@ async def read_full_file_reads(
     `input.file_path` is typically absolute inside the sandbox -- matched by suffix, not equality.
     """
     path = shlex.quote(f"{_CLAUDE_PROJECTS_DIR}/{session_id}.jsonl")
-    result = await provider.exec_in_sandbox(thread_id, f"cat {path} 2>/dev/null")
+    result = await provider.exec_in_sandbox(thread_id, f"cat {path}")
     if not result.ok or not (result.stdout or "").strip():
+        # Same fix, same reasoning as read_skill_invocations just above: no `2>/dev/null`, so a
+        # genuinely unexpected read failure is distinguishable from an ordinary missing transcript.
+        if not is_expected_missing_file(result) or (result.ok and not (result.stdout or "").strip()):
+            logger.warning(
+                "read_full_file_reads: unreadable transcript for session_id=%r (returncode=%d, "
+                "stdout_len=%d, stderr=%r)",
+                session_id, result.returncode, len(result.stdout or ""), result.stderr,
+            )
         return None
 
     target = file_path.replace("\\", "/").lstrip("/")

@@ -268,6 +268,69 @@ def _find_duplicate_by_text(
     return None
 
 
+# The full template regex, one capture group isolating the role text (non-greedy, stops at the
+# FIRST ", I want" rather than the last) so the deny-list check below reads off this same match
+# instead of a second, separately-maintained pattern. "a/an/the" -- not just "a/an" -- since "As
+# the administrator, I want..." is a perfectly ordinary, grammatically-fine stakeholder phrasing;
+# the article itself was never the problem, only whether the noun after it names a real
+# stakeholder (the deny-list's job) or a wrong connective (the ", so that" requirement below).
+# IGNORECASE for "As a"/"As An"/"I Want"/"So That" case variants; DOTALL because `.` doesn't match a
+# newline by default and nothing guarantees a model never embeds one inside a narrative string --
+# without it, a narrative with a stray newline would false-positive as a template violation it
+# doesn't actually have.
+_NARRATIVE_RE = re.compile(r"^As (?:a|an|the) (.+?), I want .+, so that .+$", re.IGNORECASE | re.DOTALL)
+
+# Generic non-stakeholder role text observed live (income-investor run 1352296c, lap 1: "As the
+# system, I need...", "As the Portfolio Optimizer...") -- a curated internal quality rule, not an
+# operator-tunable runtime knob (AGENTS.md's own test: no deploy operator would plausibly want to
+# override this independent of a code change), same precedent as skill_gate.py's _SKILL_ALIASES
+# living as a plain module constant rather than in config.py. Deliberately generic
+# software-engineering nouns only -- catches "the system"/"the algorithm" reliably across any
+# project, but NOT a project-specific component name used as a role ("the Portfolio Optimizer"):
+# that residual case has no fixed word list to catch it and still needs audit's own judgment, which
+# the evidence shows it already handles.
+_NON_STAKEHOLDER_ROLE_WORDS = frozenset({
+    "system", "application", "api", "backend", "database", "algorithm", "function", "service",
+    "platform", "scheduler", "job", "engine", "module", "process",
+})
+
+
+def check_narrative_format(user_stories: list[dict[str, Any]]) -> list[str]:
+    """Every User Story's `narrative` must be 'As a <role>, I want <capability>, so that
+    <benefit>' -- returns one actionable message per violation (empty list = all pass).
+
+    Root-caused 2026-09-17 (income-investor run 1352296c): both specification prompts already
+    state this template verbatim, yet 16 of lap 1's 19 story_changes were pure reformatting of
+    violations audit had to catch by LLM judgment alone -- a fully mechanical rule with zero
+    deterministic enforcement. Two checks, one regex: the structural 3-part shape (catches a
+    dropped "that" directly), and a deny-list rejecting the specific generic-non-stakeholder
+    pattern observed live ("the system", "the algorithm", ...). Honestly scoped: does not catch a
+    project-specific component name used as a role -- see _NON_STAKEHOLDER_ROLE_WORDS' own
+    docstring for why a fixed word list can't cover that case.
+    """
+    violations: list[str] = []
+    for story in user_stories:
+        narrative = story.get("narrative") or ""
+        story_id = story.get("id") or story.get("existing_us_id") or "(no id)"
+        match = _NARRATIVE_RE.match(narrative)
+        if match is None:
+            violations.append(
+                f"{story_id}: narrative {narrative!r} does not match the required "
+                "'As a <role>, I want <capability>, so that <benefit>' template (check for a "
+                "missing 'that', or a role/capability/benefit segment that isn't actually present)."
+            )
+            continue
+        role_text = _normalize_text(match.group(1)).removeprefix("a ").removeprefix("an ").strip()
+        if role_text in _NON_STAKEHOLDER_ROLE_WORDS:
+            violations.append(
+                f"{story_id}: narrative {narrative!r} names '{match.group(1)}' as the role, which "
+                "is not a real human or organizational stakeholder -- never the system itself, a "
+                "module, a function, or a named system component. Name the actual person/role who "
+                "wants this capability instead."
+            )
+    return violations
+
+
 def sync_ledger(
     entries: list[dict[str, Any]],
     draft_user_stories: list[dict[str, Any]],
@@ -1225,6 +1288,11 @@ def _demo() -> None:
         def __init__(self, ok: bool, stdout: str = "") -> None:
             self.ok = ok
             self.stdout = stdout
+            # repo_files.read_repo_file's own 2026-09-17 fix reads these on the not-ok path
+            # (is_expected_missing_file) -- every fake "not found" result here really does model a
+            # plain missing file, never an unexpected failure, so match that real shape exactly.
+            self.returncode = 0 if ok else 1
+            self.stderr = "" if ok else "cat: file: No such file or directory"
 
     class _FakeProvider:
         def __init__(self, files: dict[str, str]) -> None:
@@ -1669,6 +1737,35 @@ def _demo() -> None:
     )
     asyncio.run(hydrate_ticket_mode_context("t", {"stages": {}}, bootstrap_provider4))
     assert DRAFT_SPEC_PATH not in bootstrap_provider4.writes, "an existing sketchpad must never be overwritten"
+
+    # check_narrative_format (root-caused 2026-09-17, income-investor run 1352296c).
+    valid_story = {"id": "US-0001", "narrative": "As an administrator, I want to configure the risk-free rate, so that Sharpe/Sortino calculations use a current value."}
+    assert check_narrative_format([valid_story]) == [], "a correctly-shaped narrative must pass"
+
+    wrong_role_and_connective = {
+        "id": "US-0002",
+        "narrative": "As the system, I need to refresh the universe so I can keep data current.",
+    }
+    violations = check_narrative_format([wrong_role_and_connective])
+    assert len(violations) == 1 and "US-0002" in violations[0], violations
+
+    missing_that = {
+        "id": "US-0003",
+        "narrative": "As a user, I want to export the data, so I can share it with my team.",
+    }
+    violations = check_narrative_format([missing_that])
+    assert len(violations) == 1 and "US-0003" in violations[0], violations
+
+    # Honestly-scoped boundary: a project-specific component name used as a role is NOT caught --
+    # no fixed word list can cover an arbitrary project's own component names, see
+    # _NON_STAKEHOLDER_ROLE_WORDS' own docstring. This documents the scope, not a bug.
+    project_specific_role = {
+        "id": "US-0004",
+        "narrative": "As the Portfolio Optimizer, I want to reuse the Evaluator function, so that scoring stays consistent.",
+    }
+    assert check_narrative_format([project_specific_role]) == [], (
+        "a project-specific component name as role is a documented gap, not caught by the deny-list"
+    )
 
     print("spec_ledger self-check: ok")
 

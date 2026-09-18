@@ -343,7 +343,32 @@ def _translate_intermediate_events(
     return translated
 
 
-def _build_copilot_wrapper_script(argv: list[str], prompt_path: str, timeout_seconds: int) -> str:
+def _required_skills_env_prefix(stage: str, role: str) -> str:
+    """Shell env-var prefix for the skill-enforcement Stop hook, Copilot side -- mirrors
+    claude_chat_model._required_skills_env_prefix exactly (same config source, same draft-only
+    scoping, same reasoning; duplicated rather than shared to avoid a circular import between the
+    two provider modules, matching this file's existing per-provider-helper convention, e.g.
+    _map_tool_names existing independently in both files rather than one importing the other's).
+
+    User directive, 2026-09-17: the skill-enforcement Stop hook generalizes to both providers --
+    confirmed live that Copilot CLI 1.0.86-2 has its own real hooks mechanism (`copilot help
+    config`'s `hooks`/`disableAllHooks` keys), with a `Stop` event firing `stop_hook_active`/
+    `transcript_path` in its stdin JSON, close enough to Claude Code's own shape that
+    sandbox-image/hooks/require-skills-stop.mjs needed no stdin-handling changes, only a second
+    transcript-line shape to recognize (Copilot's dedicated `{"type":"skill.invoked","data":
+    {"name":...}}` event, vs Claude's generic tool_use block named "Skill").
+    """
+    if role != "draft":
+        return ""
+    required_skills = config.REQUIRED_SKILLS_BY_STAGE.get(stage, [])
+    if not required_skills:
+        return ""
+    return f"AIDW_REQUIRED_SKILLS={shlex.quote(','.join(required_skills))} "
+
+
+def _build_copilot_wrapper_script(
+    argv: list[str], prompt_path: str, timeout_seconds: int, env_prefix: str = ""
+) -> str:
     """Build the text of the tiny wrapper script that feeds `-p` its value via shell expansion.
 
     Pure string construction, no I/O -- so _demo can assert its exact shape without a live sandbox
@@ -367,7 +392,10 @@ def _build_copilot_wrapper_script(argv: list[str], prompt_path: str, timeout_sec
     # guards the path itself the same way, though in practice every scratch path this codebase
     # builds (_SCRATCH_DIR + stage/role/uuid4().hex) is already shlex-safe with no quoting needed.
     prompt_expr = f'"$(cat {shlex.quote(prompt_path)})"'
-    return f"COPILOT_TASK_WAIT_TIMEOUT_SECONDS={timeout_seconds} copilot -p {prompt_expr} {shlex.join(argv[1:])}\n"
+    return (
+        f"{env_prefix}COPILOT_TASK_WAIT_TIMEOUT_SECONDS={timeout_seconds} copilot -p {prompt_expr} "
+        f"{shlex.join(argv[1:])}\n"
+    )
 
 
 def _apply_disabled_skills_instruction(prompt: str, disabled_skills: list[str] | None) -> str:
@@ -731,7 +759,10 @@ class CopilotChatModel(BaseChatModel):
         # it would hit the identical ceiling, not raise it; that is not an upgrade path, just a
         # different way to write the same failure.
         wrapper_path = f"{scratch_prefix}.cmd.sh"
-        wrapper_script = _build_copilot_wrapper_script(argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS)
+        wrapper_script = _build_copilot_wrapper_script(
+            argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
+            env_prefix=_required_skills_env_prefix(self.stage, self.role),
+        )
         await write_scratch_file(provider, self.thread_id, wrapper_path, wrapper_script)
         command = f"sh {shlex.quote(wrapper_path)}"
 
@@ -1108,6 +1139,20 @@ def _demo() -> None:
     wrapper_special = _build_copilot_wrapper_script(["copilot"], dangerous_path, 60)
     assert f"$(cat {shlex.quote(dangerous_path)})" in wrapper_special, (
         f"prompt path with shell-special characters must be shlex-quoted: {wrapper_special!r}"
+    )
+
+    # _required_skills_env_prefix (Copilot side) + its threading into the wrapper script: draft
+    # role for a stage with required skills gets the prefix, prepended before the timeout env var;
+    # audit role (and a stage with none configured) get nothing.
+    assert _required_skills_env_prefix("specification", "draft") == "AIDW_REQUIRED_SKILLS=brainstorming,grill-me "
+    assert _required_skills_env_prefix("specification", "audit") == ""
+    assert _required_skills_env_prefix("tech-stack", "draft") == ""
+    wrapper_with_skills = _build_copilot_wrapper_script(
+        ["copilot"], "/tmp/aidw-agent/fake-prompt", 60,
+        env_prefix=_required_skills_env_prefix("specification", "draft"),
+    )
+    assert wrapper_with_skills.startswith("AIDW_REQUIRED_SKILLS=brainstorming,grill-me COPILOT_TASK_WAIT_TIMEOUT_SECONDS="), (
+        f"required-skills env prefix must precede the timeout env var: {wrapper_with_skills!r}"
     )
 
     # Defensive scan: session_id shows up on an EARLY line, not the (more likely, per this

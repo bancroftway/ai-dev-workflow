@@ -218,16 +218,11 @@ reading as requirements rather than advice:
    state value, error path) or the same behavior at a different layer (unit + integration).
 3. **Category spread.** An AC whose `categories` contains only `happy_path` is blocked. At least one
    negative, edge, or adversarial case per criterion.
-4. **Positive anchor before absence checks.** A test that asserts ONLY absence -- `toHaveCount(0)`,
-   `.not.*`, `expect(x).toBeNull()`, `Assert.Null`/`Assert.False`/`Assert.Empty` and friends, with
-   no assertion that anything IS present -- is blocked. On a page that never rendered (or an object
-   that was never built), every absence check is trivially true, so such a test passes against a
-   blank screen and would pass just as well if the app were entirely broken. Before the first
-   absence assertion, anchor on something that must exist for the scenario to be meaningful:
-   `await expect(page.getByTestId('...')).toBeVisible()` in an e2e/component test,
-   `Assert.NotNull(result)` on the object whose property you then assert absent, a rendered
-   element/text in a React Testing Library test. This applies to EVERY test, including "does not
-   show X" / "no longer renders Y" negatives -- prove the page rendered, THEN prove X is absent.
+4. **Positive anchor before absence checks** (see the required rules below for the exact matcher
+   list this covers across every runner). Worked example: anchor with
+   `await expect(page.getByTestId('...')).toBeVisible()` in an e2e/component test, or
+   `Assert.NotNull(result)` on the object whose property you then assert absent, before any
+   absence check -- including for a "does not show X" / "no longer renders Y" negative test.
 
 You have write access, but ONLY to test files -- test projects/files themselves, and their own
 config. Concretely, these paths are permitted, and they are enough to build the full pyramid
