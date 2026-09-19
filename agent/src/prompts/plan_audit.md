@@ -17,15 +17,20 @@ Criteria the Plan never references anywhere, unstated Risk Notes for anything ge
 internal contradictions between steps.
 
 You must always leave the files fully revised and corrected, addressing every gap you found --
-never just a critique or a list of complaints with nothing actually fixed. List each specific gap
-you found and fixed as a separate entry in `audit_findings`; if you found none (including a pass
-where you re-checked earlier fixes and confirmed they still hold), return `audit_findings` as an
-EMPTY list. `audit_findings` is a list of DEFECTS, never a changelog or a confirmation note -- a
-deterministic gate rejects the stage and forces another full redraft whenever this list is
-non-empty, so an entry that only restates "X is already correct, unchanged" (with nothing to fix)
-costs a wasted redraft cycle instead of proceeding. If the plan is already solid, leave it as-is
-(or revise it minimally) and leave `audit_findings` empty -- do not add an entry announcing that
-it's solid.
+never just a critique or a list of complaints with nothing actually fixed. Report every gap you
+found AND FIXED through `step_changes` (and `diagrams_reviewed`/`wireframes_reviewed` for visual
+artifacts) only -- a fixed gap is NOT an `audit_findings` entry.
+
+`audit_findings` is reserved for defects that are STILL OPEN when your pass ends: something you
+could not resolve in the files yourself, or that needs the drafter or a human -- e.g. an
+Acceptance Criterion no plan step could satisfy without a product decision, or a contradiction
+between the approved Specification and what the plan must build. A deterministic gate rejects the
+stage and forces another full redraft whenever this list is non-empty, so it must contain only
+work that still has to happen; never a changelog, never a confirmation note, never an entry
+restating "X is already correct, unchanged", and never a gap you already fixed (that entry would
+send the plan back for a redraft to re-verify a fix already in place). If everything you found is
+fixed, or you found nothing, return `audit_findings` as an EMPTY list -- do not add an entry
+announcing that the plan is solid.
 
 Report what you changed via `step_changes` -- one entry per plan step you added, revised, or
 retired in `steps.json` THIS pass (not a restatement of the whole plan).
@@ -41,7 +46,7 @@ Verify plan-step provenance on every step before anything else -- a deterministi
 it in both directions: every step either cites `ac_ids` copied exactly from the Specification
 (`US-####.#`, never invented, never a retired id) or is `kind: "infrastructure"` with empty
 `ac_ids`; and every Acceptance Criterion still awaiting delivery is cited by at least one step.
-Fix missing/wrong citations directly in `steps.json` and count each as a finding. Do not "fix" a
+Fix missing/wrong citations directly in `steps.json` and report each via `step_changes`. Do not "fix" a
 carried-over step by rewording it -- a changed description makes it new to the gate. Also check
 the approved Specification's `bug_affected_ac_ids`: each one needs a step framed as a FIX
 (diagnose + resolve existing behavior), not a new-build step -- the draft may have missed this
@@ -82,7 +87,8 @@ create the sidecar `.html` file and add its `manifest.json` entry)? Does each wi
 show the fields, actions, and states the Acceptance Criteria demand? Is it self-contained (inline
 CSS only, no scripts, no external URLs, no `<iframe>`/`<object>`/`<embed>`/`<base>`/`<form>` tags,
 under 30 KB) -- a deterministic step rejects violations, so fix them here first, directly in the
-file. Count each wireframe you fixed or added as an `audit_findings` entry. Remove wireframes only
+file. A wireframe you fixed or added is reported via `wireframes_reviewed` (action `revised`),
+never as an `audit_findings` entry. Remove wireframes only
 when their screen is genuinely out of the plan's scope -- name it in `retired_wireframe_screens`.
 
 Use the `ponytail` skill at `full` intensity for prose fields (`overview`, step descriptions,

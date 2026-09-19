@@ -26,7 +26,7 @@ from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import config, git_ops, model_config, repo_files, run_event_store, run_event_stream, run_failure, stack_runner, test_results, workflow_persistence
 from .run_events import RunEvent, RunEventType, encode_io_text
-from .chat_model import close_session, get_chat_model_for_thread
+from .chat_model import close_session, get_chat_model_for_thread, lap_role
 from .infra_retry import call_with_infra_retry
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -575,10 +575,12 @@ def make_rebuild_node(spec: RebuildSpec):
         # "draft") was resumed across every fix cycle, so a fixer repeating the SAME red-gate
         # mistake byte-for-byte would never see fresh context. make_fix_node's session key is now
         # lap-numbered (session-poisoning fix, mirrors ac-test-run/e2e_fix's own fresh-per-lap
-        # sessions), so every fix cycle already starts a genuinely fresh session -- the
-        # close_session call below now targets a role string ("draft") no lap ever actually uses,
-        # a harmless no-op against a key nothing populates. Left in as belt-and-braces (a future
-        # change reintroducing session reuse here would silently need this again) and because the
+        # sessions), so every fix cycle already starts a genuinely fresh session. The
+        # close_session calls below target that lap-numbered key via chat_model.lap_role
+        # (fix_cycle_count - 1: the fix session that produced THIS build -- make_fix_node
+        # increments the counter after its turn), so the reset really evicts the stuck session.
+        # Until 2026-09-19 they passed the bare "draft" role, a key nothing populates -- a silent
+        # no-op, the same key-mismatch class as graph.py's _lap_role_keys incident. Kept because the
         # repeated-identical-finding detection itself is still useful diagnostic signal regardless
         # of session mechanics -- a fixer repeating a finding even across fresh sessions means
         # something else is stuck (misread instructions, a fix that doesn't address the real cause).
@@ -587,7 +589,11 @@ def make_rebuild_node(spec: RebuildSpec):
                 "rebuild %s: TDD-red gate repeated the identical finding -- resetting the stuck fix session",
                 spec.key,
             )
-            await close_session(thread_id, f"rebuild-{spec.key}", "draft", provider=state["provider"])
+            await close_session(
+                thread_id, f"rebuild-{spec.key}",
+                lap_role("draft", state.get("run_id", "unknown"), rb["fix_cycle_count"] - 1),
+                provider=state["provider"],
+            )
         rb["last_red_detail"] = red_detail if red_failed else ""
 
         # Scan-delta gate: same question the terminal metrics gate asks, asked here where it is
@@ -616,7 +622,11 @@ def make_rebuild_node(spec: RebuildSpec):
                         "resetting the stuck fix session",
                         spec.key, sorted(scan_fingerprint),
                     )
-                    await close_session(thread_id, f"rebuild-{spec.key}", "draft", provider=state["provider"])
+                    await close_session(
+                        thread_id, f"rebuild-{spec.key}",
+                        lap_role("draft", state.get("run_id", "unknown"), rb["fix_cycle_count"] - 1),
+                        provider=state["provider"],
+                    )
                 rb["last_scan_fingerprint"] = scan_fingerprint
             else:
                 rb["last_scan_fingerprint"] = frozenset()
@@ -730,7 +740,7 @@ def make_fix_node(spec: RebuildSpec):
             # static "draft" role let --resume replay every prior retry's full transcript into each
             # new one. fix_cycle_count is this placement's own existing retry counter, already
             # incremented per attempt and capped by spec.max_fix_cycles -- no new state.
-            f"draft-{state.get('run_id', 'unknown')}-{rb['fix_cycle_count']}",
+            lap_role("draft", state.get("run_id", "unknown"), rb["fix_cycle_count"]),
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) fix-round-3 -- same mechanism/fix as every other
             # graph-node call site in this task.

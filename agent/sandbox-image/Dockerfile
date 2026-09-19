@@ -52,7 +52,21 @@ ARG COPILOT_CLI_VERSION=1.0.86-2
 # bumped to 2.1.241 (npm latest 2026-08-23, user directive 2026-08-24) for its bundled built-in
 # skills (security-review/code-review/simplify) -- the same contract points MUST be re-verified
 # against a rebuilt image before trusting a run (see plan's verification section).
-ARG CLAUDE_CODE_CLI_VERSION=2.1.241
+# 2026-09-18: bumped 2.1.241 -> 2.1.276 (npm dist-tags `latest`/`next`, both currently equal --
+# user directive, "latest preview version"; no separate preview tag exists on this package
+# today). Read the real CHANGELOG.md (github.com/anthropics/claude-code) for every entry between
+# the two versions before bumping, not just the version number -- found directly relevant fixes,
+# not just routine churn: "Fixed blocking Stop hooks causing the turn after a block to lose the
+# model's reasoning from that turn and, on some models, miss the prompt cache" (this pipeline's
+# own require-skills-stop.mjs/check-citation-drop-stop.mjs are exactly this shape -- a same-turn
+# blocking Stop hook); "Fixed Stop prompt hooks re-sending their whole prompt on every block";
+# "Fixed hooks silently treating a stdout `{...}` object that isn't valid JSON as plain text --
+# now reported as a hook error". None of the ~35 intervening releases' notes mention session_id/
+# terminal-event shape changes, so this bump is NOT itself a fix for the separate
+# skill_gate.py/registry desync investigated 2026-09-18 (income-investor run e865062d) -- that
+# fix is the new logging in skill_gate.invoked_skills, orthogonal to this version bump. Same
+# contract points as above MUST be re-verified against a rebuilt image before trusting a run.
+ARG CLAUDE_CODE_CLI_VERSION=2.1.276
 # P8/P10/P11/P14 deterministic tool versions -- pinned so a gate's pass/fail is reproducible
 # across sessions, same reasoning as COPILOT_CLI_VERSION above. NOT yet exercised end-to-end
 # against a rebuilt image -- see each gate module's own docstring.

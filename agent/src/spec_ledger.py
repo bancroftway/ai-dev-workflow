@@ -716,12 +716,19 @@ def sync_ledger(
             and e.get("last_reviewed_run_id") != run_id
         ]
         if not_reviewed:
+            # Count, not the id list: a first ticket's ids here are freshly allocated in `updated`
+            # and never saved (this sync fails), so naming them sent the next draft chasing
+            # "ledger ids" that did not exist -- observed 2026-09-18 (session 6244ef47, lap 2
+            # rewrote the whole file to "re-cite" them). The actionable fact is WHO must act: the
+            # AUDIT pass, by viewing the whole file; the draft's content is not in question.
             return LedgerSyncResult(
                 passed=False,
                 reasons=[
-                    "the audit session did not prove it read the ENTIRE draft file this lap -- these "
-                    f"still-live ids were not confirmed reviewed: {not_reviewed}. View the whole file, "
-                    "not a partial read, before resubmitting."
+                    "the AUDIT session did not prove it read the ENTIRE draft file this lap "
+                    f"({len(not_reviewed)} still-live stories/criteria unconfirmed). The audit pass "
+                    f"must view the whole {DRAFT_SPEC_PATH} -- one full Read, or offset/limit reads "
+                    "that together cover every line -- before resubmitting. No content change is "
+                    "implied."
                 ],
                 updated_entries=entries,
             )
@@ -859,12 +866,14 @@ def sync_plan_ledger(
             and e.get("last_reviewed_run_id") != run_id
         ]
         if not_reviewed:
+            # Count, not the id list -- same reasoning as sync_ledger's message above.
             return LedgerSyncResult(
                 passed=False,
                 reasons=[
-                    "the audit session did not prove it read the ENTIRE steps.json file this lap -- "
-                    f"these still-live step ids were not confirmed reviewed: {not_reviewed}. View the "
-                    "whole file, not a partial read, before resubmitting."
+                    "the AUDIT session did not prove it read the ENTIRE steps.json file this lap "
+                    f"({len(not_reviewed)} still-live steps unconfirmed). The audit pass must view the "
+                    "whole file -- one full Read, or offset/limit reads that together cover every "
+                    "line -- before resubmitting. No content change is implied."
                 ],
                 updated_entries=entries,
             )

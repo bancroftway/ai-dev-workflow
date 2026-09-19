@@ -803,7 +803,8 @@ async def _load_and_sync_plan_steps(
     stage_key: str,
     chat_provider: str,
     has_audit_role: bool,
-) -> tuple[list[dict[str, Any]] | None, list[str], list[dict[str, Any]]]:
+    lap: int,
+) -> tuple[list[dict[str, Any]] | None, list[str], list[dict[str, Any]], str | None]:
     """File-based-editing plan, Part 2 sect. 5/6: reads _draft/steps.json, validates each entry
     against schemas.PlanStep, computes `fully_reviewed` (Part 3's review-depth safety net,
     targeting the AUDIT session for `stage_key` -- `has_audit_role=False` skips this entirely, the
@@ -812,9 +813,15 @@ async def _load_and_sync_plan_steps(
     ledger-resolved content back to steps.json on success (mirrors Part 1's identical write-back
     for draft-specification.json).
 
-    Returns (resolved_plan_steps_or_None-on-failure, problems, ledger_entries) -- ledger_entries is
-    always returned, even on failure, so the caller's later checks (stale-review's spec-changed
-    delta) can still compute against it.
+    Returns (resolved_plan_steps_or_None-on-failure, problems, ledger_entries, infra_error) --
+    ledger_entries is always returned, even on failure, so the caller's later checks (stale-review's
+    spec-changed delta) can still compute against it. `infra_error` is None for every content
+    verdict and a report["infra_error"] code when the platform could not produce the evidence a
+    check needed (today: the audit session's transcript for the full-read proof) -- the caller
+    routes that onto the infra-retry budget instead of the stage's own verify laps.
+
+    `lap` is the stage's pre-increment verify_cycle_count, threaded from make_verify_node, so the
+    audit session lookup below keys on the same `audit-{run_id}-{lap}` string make_audit_node used.
     """
     from ..schemas import PlanStep
 
@@ -824,18 +831,18 @@ async def _load_and_sync_plan_steps(
         return None, [
             f"{DRAFT_STEPS_PATH} does not exist -- create it with your file tools, shaped "
             '{"plan_steps": [...], "retired_step_ids": [...]}.'
-        ], ledger_entries
+        ], ledger_entries, None
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return None, [f"{DRAFT_STEPS_PATH} is not valid JSON: {exc}. Fix it and resubmit."], ledger_entries
+        return None, [f"{DRAFT_STEPS_PATH} is not valid JSON: {exc}. Fix it and resubmit."], ledger_entries, None
     if not isinstance(doc, dict):
-        return None, [f"{DRAFT_STEPS_PATH} must be a JSON object with 'plan_steps'/'retired_step_ids' keys."], ledger_entries
+        return None, [f"{DRAFT_STEPS_PATH} must be a JSON object with 'plan_steps'/'retired_step_ids' keys."], ledger_entries, None
 
     raw_steps = doc.get("plan_steps")
     retired_step_ids = doc.get("retired_step_ids") or []
     if not isinstance(raw_steps, list):
-        return None, [f"{DRAFT_STEPS_PATH}'s 'plan_steps' must be a list."], ledger_entries
+        return None, [f"{DRAFT_STEPS_PATH}'s 'plan_steps' must be a list."], ledger_entries, None
     validated: list[dict[str, Any]] = []
     for i, raw_step in enumerate(raw_steps):
         try:
@@ -843,33 +850,39 @@ async def _load_and_sync_plan_steps(
         except Exception as exc:  # noqa: BLE001 -- surfaced as actionable feedback, never a crash
             return None, [
                 f"{DRAFT_STEPS_PATH}'s plan_steps[{i}] does not match the PlanStep shape: {exc}"
-            ], ledger_entries
+            ], ledger_entries, None
 
     fully_reviewed: bool | None = None
     if has_audit_role:
-        session_id = chat_model.get_session_id(thread_id, stage_key, "audit", provider=chat_provider)
+        # Per-lap audit role key, not the bare "audit" label -- identical fix and reasoning to
+        # graph.py's _verify_specification_ledger (2026-09-18, session 6244ef47): the cache is
+        # keyed `audit-{run_id}-{lap}`, so the bare label returned None on every lap and this
+        # gate's fail-closed branch rejected a plan the audit HAD fully read.
+        audit_role = chat_model.lap_role("audit", run_id, lap)
+        session_id = chat_model.get_session_id(thread_id, stage_key, audit_role, provider=chat_provider)
         evidence: bool | None = None
         if session_id is not None:
             total_lines = raw.count("\n") + 1
             evidence = await chat_model.read_full_file_reads(
                 provider, thread_id, session_id, DRAFT_STEPS_PATH, total_lines, active_provider=chat_provider
             )
-        # None (no session yet, or the provider genuinely cannot verify transcripts -- Copilot)
-        # gets the SAME provider-aware fail-shut/fail-open policy skill_gate.py already applies to
-        # read_skill_invocations: fails CLOSED under a provider that should be able to prove this
-        # (Claude), fails OPEN (vacuous None -> sync_plan_ledger skips the check) under one that
-        # structurally cannot (Copilot) -- an infrastructure gap must never masquerade as "not
-        # reviewed", but it must also never silently stop enforcing where it CAN be proven.
-        if evidence is None:
-            fully_reviewed = None if not chat_model.provider_can_verify_transcripts(chat_provider) else False
-        else:
-            fully_reviewed = evidence
+        # A provider that CAN prove this (Claude) but produced nothing to check -- no cached session
+        # id for this lap's audit role, or its transcript unreadable -- is a platform fault, surfaced
+        # as an infra_error verdict (spends config.VERIFY_INFRA_RETRY_CAP, never the stage's own
+        # laps) rather than collapsing into fully_reviewed=False, which is indistinguishable from a
+        # genuine partial read. None under a provider that structurally cannot verify transcripts
+        # (Copilot) stays fail-open: sync_plan_ledger skips the check. A bool is real evidence.
+        if evidence is None and chat_model.provider_can_verify_transcripts(chat_provider):
+            return None, [
+                chat_model.transcript_unreadable_feedback(stage_key, audit_role, session_id)
+            ], ledger_entries, "audit_transcript_unreadable"
+        fully_reviewed = evidence
 
     sync_result = spec_ledger.sync_plan_ledger(
         ledger_entries, validated, run_id, retired_step_ids=retired_step_ids, fully_reviewed=fully_reviewed,
     )
     if not sync_result.passed:
-        return None, sync_result.reasons, ledger_entries
+        return None, sync_result.reasons, ledger_entries, None
     await spec_ledger.save_ledger(provider, thread_id, sync_result.updated_entries)
     resolved = [
         e for e in sync_result.updated_entries
@@ -890,7 +903,7 @@ async def _load_and_sync_plan_steps(
         "retired_step_ids": retired_step_ids,
     }
     await repo_files.write_repo_file(provider, thread_id, DRAFT_STEPS_PATH, json.dumps(resolved_doc, indent=2))
-    return resolved_doc["plan_steps"], [], sync_result.updated_entries
+    return resolved_doc["plan_steps"], [], sync_result.updated_entries, None
 
 
 async def _load_and_check_manifest(
@@ -992,7 +1005,7 @@ def make_verify_plan_diagrams(
 
     async def verify_plan_diagrams(
         thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None,
-        provider: SandboxProvider, chat_provider: str, _lap: int = 0,
+        provider: SandboxProvider, chat_provider: str, lap: int = 0,
     ) -> "VerificationResult":
         from ..graph import VerificationResult  # local import: graph.py imports this module
 
@@ -1078,9 +1091,17 @@ def make_verify_plan_diagrams(
         # File-based-editing plan, Part 2 sect. 5/6: load+sync steps.json and manifest.json BEFORE
         # check_plan_linkage runs -- a new, earlier check, not a replacement (everything below this
         # point that already existed is unchanged).
-        resolved_steps, step_problems, ledger_entries = await _load_and_sync_plan_steps(
-            provider, thread_id, run_id, stage_key, chat_provider, has_audit_role,
+        resolved_steps, step_problems, ledger_entries, step_infra_error = await _load_and_sync_plan_steps(
+            provider, thread_id, run_id, stage_key, chat_provider, has_audit_role, lap,
         )
+        if step_infra_error is not None:
+            # Platform could not evaluate a check (see _load_and_sync_plan_steps): infra verdict,
+            # same routing make_verify_node gives ac_coverage_gate's missing-artifact case.
+            return VerificationResult(
+                passed=False,
+                feedback="\n\n".join(step_problems),
+                report={"infra_error": step_infra_error, "step_problems": step_problems},
+            )
         manifest, manifest_problems = await _load_and_check_manifest(provider, thread_id)
         if step_problems or manifest_problems:
             return VerificationResult(

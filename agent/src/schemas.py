@@ -809,8 +809,10 @@ class SpecificationAuditResponse(BaseModel):
         "retired in the file THIS audit pass -- not a restatement of the whole document.",
     )
     audit_findings: PresenceList = Field(
-        description="Gaps found and fixed, or an explicit absent+reason when none were found. A "
-        "list of DEFECTS, never a changelog -- see specification_audit.md's own instruction."
+        description="Defects STILL OPEN after this pass (could not be fixed in the file; need the "
+        "drafter or a human), or an explicit absent+reason when none remain. Gaps you found and "
+        "fixed belong in story_changes, never here -- a non-empty list forces a full redraft. See "
+        "specification_audit.md's own instruction."
     )
 
 
@@ -823,14 +825,13 @@ SPECIFICATION_AUDIT_EXAMPLE: SpecificationAuditResponse = SpecificationAuditResp
         ),
     ],
     audit_findings=PresenceList(
-        status="present",
-        values=[
-            "Added the 'unregistered email gives the same confirmation' criterion (US-0001.2) -- the "
-            "original draft only covered the happy path and would have leaked account existence."
-        ],
+        status="absent",
+        reason="The one gap found (US-0001.2) was fixed in the file this pass; nothing remains open.",
     ),
 )
-"""Fully-populated example of the specification adversarial-audit node's structured output."""
+"""Fully-populated example of the specification adversarial-audit node's structured output --
+the fixed gap is reported through story_changes, and audit_findings is empty because nothing is
+still open (a non-empty list forces a redraft)."""
 
 
 class PlanAuditResponse(BaseModel):
@@ -868,8 +869,10 @@ class PlanAuditResponse(BaseModel):
         "silently.",
     )
     audit_findings: PresenceList = Field(
-        description="Gaps found and fixed, or an explicit absent+reason when none were found. A "
-        "list of DEFECTS, never a changelog."
+        description="Defects STILL OPEN after this pass (could not be fixed in the files; need the "
+        "drafter or a human), or an explicit absent+reason when none remain. Gaps you found and "
+        "fixed belong in step_changes/diagrams_reviewed/wireframes_reviewed, never here -- a "
+        "non-empty list forces a full redraft."
     )
 
 

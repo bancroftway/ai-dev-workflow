@@ -109,11 +109,48 @@ async def invoked_skills(
     graph node, but it operates on one specific thread's session, which has its own pinned
     provider, so it is not exempt from threading that value through just because it isn't a graph
     node (this was a real gap in this plan's own first draft, corrected as part of Ruling 4).
+
+    Investigated 2026-09-18 (income-investor runs e865062d/c9c293ea) across two live occurrences
+    before the actual root cause surfaced: a real draft turn's transcript had every required
+    skill invoked correctly (confirmed by reading the raw JSONL directly out of the still-running
+    container), yet the persisted `stage["skills"]` record came back with `invoked: []`, and
+    check_required_skills' FAILED SHUT fired every single lap, unconditionally. The two warnings
+    below were added while still narrowing it down (a `provider is None`/no-sandbox theory, then
+    a "session id evicted mid-run" theory) -- both are harmless, correctly-scoped diagnostics that
+    stayed in place, but neither was the actual cause. The real bug: `role` here was being called
+    with the bare "draft"/"audit" labels (`_ROLES_CHECKED`), while `get_chat_model_for_thread`'s
+    real callers (graph.py's make_draft_node/make_audit_node) construct their ChatModel with a
+    per-lap-SUFFIXED role string (`draft-<run_id>-<cycle>`, chat_model.lap_role) specifically so `--resume` never
+    replays a prior lap's whole transcript into the next one. `get_session_id`'s lookup key never
+    matched the cache's write key -- not intermittently, unconditionally, on every stage with a
+    draft/audit split, every lap, every run. Fixed at the caller: graph.py's `_lap_role_keys` is
+    the one shared definition of this string now, threaded into every real call site
+    (`_stage_skills_evidence`, verify_node's `check_required_skills` call, and the two ChatModel
+    constructions themselves) so this can't drift apart again. Both warnings below are kept
+    (cheap, still correctly scoped to genuine anomalies) even though neither one is what actually
+    explained this incident.
     """
     if provider is None:
+        logger.warning(
+            "invoked_skills: no sandbox registered for thread_id=%s (stage=%s, role=%s) -- "
+            "cannot verify %s skills; recorded as unreadable rather than not-invoked",
+            thread_id, stage, role, chat_provider,
+        )
         return None
     session_id = get_session_id(thread_id, stage, role, provider=chat_provider)
     if not session_id:
+        # role="audit"/"audit-..." hitting this is ROUTINE and expected (skills_record checks
+        # both roles unconditionally on every draft-node call, including the very first one,
+        # before any audit session exists yet) -- only warn for the draft role, which should
+        # always have JUST run by the time anything calls this. `role` is either the bare "draft"
+        # (this module's own self-check fixtures) or a real "draft-{run_id}-{cycle}" key (every
+        # production call, post-fix) -- both start with "draft".
+        if role == "draft" or role.startswith("draft-"):
+            logger.warning(
+                "invoked_skills: no cached session id for thread_id=%s (stage=%s, role=%s) -- "
+                "a draft session should exist by now; cannot verify %s skills",
+                thread_id, stage, role, chat_provider,
+            )
         return None
     return await read_skill_invocations(provider, thread_id, session_id, active_provider=chat_provider)
 
@@ -149,6 +186,12 @@ async def check_required_skills(
     prior_invoked: list[str] | None = None,
 ) -> SkillCheckOutcome:
     """Union of every checked role's `skill.invoked` events for this stage.
+
+    `roles` (default `_ROLES_CHECKED`, the bare "draft"/"audit" labels): real callers (graph.py's
+    verify_node) MUST pass the actual per-lap session-cache keys instead -- see
+    `graph._lap_role_keys`'s own docstring for the 2026-09-18 incident where relying on this
+    default made every FAILED SHUT unconditional, on every lap, of every stage. The default
+    exists only for this module's own self-check, which fakes sessions keyed by the bare labels.
 
     `chat_provider` (required, keyword-only, no default -- Ruling 4): this thread's own pinned
     provider, threaded straight through to invoked_skills -- see that function's own docstring.
@@ -247,11 +290,17 @@ async def skills_record(
     thread_id: str,
     stage: str,
     self_reported: list[str] | None = None,
+    roles: tuple[str, ...] = _ROLES_CHECKED,
     *,
     chat_provider: str,
     prior_invoked: list[str] | None = None,
 ) -> dict[str, Any]:
     """The stage's skill evidence, for persistence into state.json -- on the PASS path too.
+
+    `roles` (default `_ROLES_CHECKED`, the bare "draft"/"audit" labels): the session-cache role
+    KEYS to actually look up. graph.py's real draft/audit ChatModel construction never uses those
+    bare labels -- see `_lap_role_keys`'s own docstring for the 2026-09-18 incident this default
+    would silently reproduce for any caller that forgets to pass the real per-lap keys.
 
     Previously only failures stored anything (the pass path returned early), so a healthy run left no
     trace that any skill had been used and `grep skill_gate` on a green log returned nothing. That is
@@ -286,7 +335,7 @@ async def skills_record(
     required = list(workflow_config.REQUIRED_SKILLS_BY_STAGE.get(stage, []))
     invoked: list[str] = [s for s in (prior_invoked or []) if isinstance(s, str) and s]
     any_readable = False
-    for role in _ROLES_CHECKED:
+    for role in roles:
         role_skills = await invoked_skills(provider, thread_id, stage, role, chat_provider=chat_provider)
         if role_skills is None:
             continue

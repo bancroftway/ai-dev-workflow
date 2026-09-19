@@ -461,6 +461,65 @@ def get_session_id(thread_id: str, stage: str, role: str, *, provider: str) -> s
     return _provider_module(provider).get_session_id(thread_id, stage, role)
 
 
+def lap_role(role: str, run_id: str, cycle: int) -> str:
+    """The session-cache ROLE KEY for one lap of a looping node: `<role>-<run_id>-<cycle>` (e.g.
+    `draft-5a2485e5-0`, `audit-5a2485e5-0`, `fix-5a2485e5-2`). THE one place this string is built.
+
+    Every node that runs the same stage/role more than once per run (graph.py's draft/audit/
+    verify-fix nodes, e2e_fix, test-hardening fix, readme, stack_runner's ac-test-run, rebuild's
+    fix node) keys its ChatModel with this so `--resume` never replays a prior lap's whole
+    transcript into the next one. Every LOOKUP or CLOSE of such a session (skill gate, the
+    full-file-read proofs, stall/stuck-session resets) must build its key here too -- passing the
+    bare "draft"/"audit"/"fix" label returns None from get_session_id and evicts nothing from
+    close_session, silently, on every lap.
+
+    Root-caused 2026-09-18 twice, same shape: skill_gate.py's lookups (runs e865062d/c9c293ea),
+    then graph.py's `_verify_specification_ledger` and diagram_gate.py's `_load_and_sync_plan_steps`
+    (session 6244ef47, run 5a2485e5) all looked up the bare "audit" role. The lookup returned None
+    on every lap by construction, the fail-closed branch turned that into "the audit session did
+    not prove it read the ENTIRE draft file", and specification burned all 5 verify laps on an
+    audit whose transcript showed one full Read of the file per lap. A 2026-09-19 sweep found the
+    same bare-label mismatch in four session RESETS (graph.py's verify stall reset, rebuild.py's
+    stuck-fixer reset, remediation_gate's stuck-fixer reset, ac_coverage_gate's ac-test-run reset)
+    -- each logged "resetting the session" and evicted nothing. chat_model's own self-check now
+    scans src/ for hand-built `<role>-{run_id}-{n}` f-strings so a new call site cannot drift.
+    """
+    return f"{role}-{run_id}-{cycle}"
+
+
+def lap_role_keys(run_id: str, cycle: int) -> tuple[str, str]:
+    """(draft, audit) keys for one stage lap -- `lap_role` for the two roles every StageSpec with
+    an audit pass constructs. graph.py's `_lap_role_keys(state, stage_key)` is the state-reading
+    wrapper; a deterministic_verify (which gets run_id and the lap counter, not state) calls
+    `lap_role("audit", run_id, lap)` directly."""
+    return lap_role("draft", run_id, cycle), lap_role("audit", run_id, cycle)
+
+
+def get_lap_session_id(
+    thread_id: str, stage: str, role: str, run_id: str, cycle: int, *, provider: str
+) -> str | None:
+    """`get_session_id` for a lap-keyed session -- the lookup counterpart of `lap_role`, so a
+    caller that wants "this lap's audit session" never types the key shape itself. Same
+    required-keyword `provider` contract as get_session_id (Ruling 4)."""
+    return get_session_id(thread_id, stage, lap_role(role, run_id, cycle), provider=provider)
+
+
+def transcript_unreadable_feedback(stage_key: str, role: str, session_id: str | None) -> str:
+    """Feedback text for a deterministic_verify that needed a session's transcript to prove a
+    full-file read but could not obtain one (no cached session id for `role`, or the transcript
+    file itself was missing/unreadable) under a provider that CAN normally prove it. Shared by
+    graph.py's specification verify and diagram_gate.py's plan verify so both report the same
+    thing. Paired with report["infra_error"] at both call sites: this is a platform fault (spend
+    config.VERIFY_INFRA_RETRY_CAP, log INFRA RETRY), never a content failure that should cost the
+    stage its own verify laps or send the draft chasing a problem it cannot fix."""
+    what = "no cached session id" if session_id is None else f"transcript for session {session_id!r} unreadable"
+    return (
+        f"Platform check could not run for stage {stage_key!r}: {what} for role {role!r}, so the "
+        "full-file-read proof for the audit pass could not be evaluated. No change to the draft's "
+        "content is implied by this message."
+    )
+
+
 def get_resume_state(thread_id: str, stage: str, role: str, *, provider: str) -> str | None:
     """The last-observed resume-continuity classification ("resumed"/"rejected"/"unknown") for one
     (thread, stage, role), or None if no --resume/--session-id has ever been attempted for this
@@ -892,10 +951,38 @@ def _demo() -> None:
                 os.environ[name] = original
         _provider_cache = None
 
+    # lap_role_keys: the ONE per-lap session-key convention. Pins the exact string shape both the
+    # ChatModel constructions (graph.py make_draft_node/make_audit_node via _lap_role_keys) and
+    # every deterministic_verify / skill-gate lookup must agree on -- a bare "draft"/"audit" label
+    # must never come out of it (the 2026-09-18 double incident; see the function's docstring).
+    assert lap_role("fix", "5a2485e5", 2) == "fix-5a2485e5-2"
+    assert lap_role_keys("5a2485e5", 0) == ("draft-5a2485e5-0", "audit-5a2485e5-0"), lap_role_keys("5a2485e5", 0)
+    assert lap_role_keys("r", 3)[1] == "audit-r-3" and "audit" not in lap_role_keys("r", 3)[0]
+    # No call site may hand-build the per-lap key: a literal f"draft-{...}" / f"audit-{...}" /
+    # f"fix-{...}" anywhere else in src/ is exactly the drift that produced both 2026-09-18
+    # incidents (see lap_role's docstring). Static scan (plain substring check, not regex --
+    # avoids fighting this file's own quoting), so the guard covers files this self-check never
+    # imports.
+    from pathlib import Path as _Path
+
+    _src = _Path(__file__).resolve().parent
+    _needles = [f'f"{r}-{{' for r in ("draft", "audit", "fix")] + [f"f'{r}-{{" for r in ("draft", "audit", "fix")]
+    _offenders = sorted(
+        str(p.relative_to(_src))
+        for p in _src.rglob("*.py")
+        if p.name != "chat_model.py" and "__pycache__" not in p.parts
+        and any(n in p.read_text(encoding="utf-8", errors="replace") for n in _needles)
+    )
+    assert not _offenders, f"hand-built per-lap session keys -- use chat_model.lap_role: {_offenders}"
+    # transcript_unreadable_feedback distinguishes the two infra shapes and names the role looked up.
+    assert "no cached session id" in transcript_unreadable_feedback("specification", "audit-r-0", None)
+    assert "'sess-1'" in transcript_unreadable_feedback("plan", "audit-r-1", "sess-1")
+    assert "audit-r-1" in transcript_unreadable_feedback("plan", "audit-r-1", "sess-1")
+
     print(
         "chat_model dispatch self-check: all assertions passed (per-call dispatch proven for all "
         "8 required-provider functions, forget_thread_sessions_everywhere's both-provider evict, "
-        "and the required-argument contract itself)"
+        "the required-argument contract itself, and lap_role_keys' key shape)"
     )
 
 

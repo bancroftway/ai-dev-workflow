@@ -1122,7 +1122,9 @@ async def check_ac_coverage(
         # output" message and nothing to act on -- it cannot fix what it was never told.
         diagnosis = run_report.error or run_report.summary or "no test output was captured"
         claimed = AC_TEST_OUTPUT_PATH in (run_report.summary or "") or bool(run_report.output_artifact)
-        # The "ac-test-run" sub-agent session is keyed by (thread_id, "ac-test-run", "draft") and,
+        # The "ac-test-run" sub-agent session is keyed by (thread_id, "ac-test-run",
+        # chat_model.lap_role("draft", run_id, lap)) -- until 2026-09-19 this close passed the bare
+        # "draft" role and evicted nothing (see chat_model.lap_role) -- and,
         # unlike the stage's own draft session, nothing ever resets it on a bad turn -- so a session
         # that once fails to produce the tee/structured reports stays stuck replaying that same
         # failure on every later ac-to-tests lap (observed live: two INFRA RETRY attempts with
@@ -1130,7 +1132,9 @@ async def check_ac_coverage(
         # moment the infra-retry cap was reached). Close it here so the NEXT invocation -- this
         # verify's own retry, or a future lap's -- gets a fresh attempt instead of resuming the
         # same broken transcript.
-        await chat_model.close_session(thread_id, "ac-test-run", "draft", provider=chat_provider)
+        await chat_model.close_session(
+            thread_id, "ac-test-run", chat_model.lap_role("draft", run_id, lap), provider=chat_provider
+        )
         return AcCoverageOutcome(
             passed=False,
             feedback=(

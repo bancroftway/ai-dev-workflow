@@ -51,7 +51,7 @@ from . import app_discovery
 from . import config as workflow_config
 from . import fake_idp, git_ops, keyvault, model_config, repo_files, repo_test_config, run_failure, session_store
 from . import workflow_persistence
-from .chat_model import get_chat_model_for_thread, secret_env_names
+from .chat_model import get_chat_model_for_thread, lap_role, secret_env_names
 from .exit_nodes import HISTORY_DIR
 from .prompt_loader import load_prompt_pair, render_prompt
 from .schemas import presence_values
@@ -1875,7 +1875,7 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     model = get_chat_model_for_thread(
         thread_id,
         "e2e",
-        f"fix-{state.get('run_id', 'run')}-{e2e.get('attempt', 0) + 1}",
+        lap_role("fix", state.get("run_id", "run"), e2e.get("attempt", 0) + 1),
         provider=state["provider"],
         # Task 3b (Part 2 Ruling 10) fix-round-2: this turn runs through the same
         # copilot_chat_model._agenerate_inner tool-call RunEvent building as graph.py's own

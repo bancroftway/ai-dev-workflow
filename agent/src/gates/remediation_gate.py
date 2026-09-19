@@ -26,7 +26,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from .. import repo_files
-from ..chat_model import close_session
+from ..chat_model import close_session, lap_role
 from ..schemas import presence_values as _presence_values
 
 if TYPE_CHECKING:
@@ -322,8 +322,8 @@ REMEDIATION_HARD_RULES: tuple[str, ...] = (
 
 
 async def verify_remediation(
-    thread_id: str, content_dict: dict[str, Any], _run_id: str, baseline_commit: str | None, provider: Any,
-    chat_provider: str, _lap: int = 0,
+    thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any,
+    chat_provider: str, lap: int = 0,
 ) -> "VerificationResult":
     from ..graph import VerificationResult
 
@@ -380,7 +380,9 @@ async def verify_remediation(
                 "resetting the stuck draft session",
                 thread_id,
             )
-            await close_session(thread_id, "remediation", "draft", provider=chat_provider)
+            # This lap's draft key (2026-09-19 sweep): the bare "draft" label evicted nothing --
+            # the draft node keys its session per lap; see chat_model.lap_role.
+            await close_session(thread_id, "remediation", lap_role("draft", run_id, lap), provider=chat_provider)
         await repo_files.write_repo_file(
             provider, thread_id, _VERIFY_FINGERPRINT_PATH, json.dumps(fingerprint, indent=2) + "\n"
         )
@@ -596,7 +598,11 @@ def _demo() -> None:
             "t-remediation-selfcheck", content, "r2", None, _FakeVerifyProvider(), "claude",
         ))
         assert not second.passed
-        assert close_calls == [("t-remediation-selfcheck", "remediation", "draft")], (
+        # "draft-r2-0" (chat_model.lap_role), not the bare "draft" -- until 2026-09-19 this
+        # asserted the bare label, which the fix below made wrong on purpose: a close_session call
+        # for a role nothing populates is a silent no-op, exactly the bug this reset exists to fix
+        # (see lap_role's own docstring).
+        assert close_calls == [("t-remediation-selfcheck", "remediation", "draft-r2-0")], (
             f"the identical reason twice running must reset the draft session exactly once, got {close_calls}"
         )
     finally:

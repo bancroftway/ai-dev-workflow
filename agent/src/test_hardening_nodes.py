@@ -25,7 +25,7 @@ from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, run_failure, spec_ledger, stack_runner, test_results
-from .chat_model import ainvoke_structured, get_chat_model_for_thread
+from .chat_model import ainvoke_structured, get_chat_model_for_thread, lap_role
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -196,7 +196,7 @@ async def test_hardening_fix_node(state: dict[str, Any], config: RunnableConfig)
     model = get_chat_model_for_thread(
         thread_id,
         "test-hardening",
-        f"fix-{state.get('run_id', 'run')}-{test_hardening.get('fix_attempt', 0) + 1}",
+        lap_role("fix", state.get("run_id", "run"), test_hardening.get("fix_attempt", 0) + 1),
         provider=state["provider"],
         # Task 3b (Part 2 Ruling 10) fix-round-3 -- see e2e_fix_node's own comment (same shape,
         # same mechanism, same fix).

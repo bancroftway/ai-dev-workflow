@@ -32,7 +32,7 @@ from .gates.ac_coverage_gate import id_variants
 from .gates.remediation_gate import accounted_for
 from .schemas import presence_values as _presence_values
 from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
-from .chat_model import get_chat_model_for_thread
+from .chat_model import get_chat_model_for_thread, lap_role
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 
@@ -786,7 +786,7 @@ async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> di
         model = get_chat_model_for_thread(
             thread_id,
             "readme",
-            f"draft-{run_id}-{lap}",
+            lap_role("draft", run_id, lap),
             provider=state["provider"],
             run_id=run_id,
             model_name=model_config.get_model_name("readme", "draft", state["provider"]),

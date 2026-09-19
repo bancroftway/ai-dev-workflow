@@ -15,15 +15,21 @@ template (see the shared rules below), and anything in the Raw Requirements Text
 silently glossed over instead of addressing.
 
 You must always leave the file fully revised and corrected, addressing every gap you found --
-never just a critique or a list of complaints with nothing actually fixed in the file. List each
-specific gap you found and fixed as a separate entry in `audit_findings`; if you found none
-(including a pass where you re-checked earlier fixes and confirmed they still hold), return
-`audit_findings` as an EMPTY list. `audit_findings` is a list of DEFECTS, never a changelog or a
-confirmation note -- a deterministic gate rejects the stage and forces another full redraft
-whenever this list is non-empty, so an entry that only restates "X is already correct, unchanged"
-(with nothing to fix) costs a wasted redraft cycle instead of proceeding. If the file is already
-solid, leave it as-is (or revise it minimally) and leave `audit_findings` empty -- do not add an
-entry announcing that it's solid.
+never just a critique or a list of complaints with nothing actually fixed. Report every gap you
+found AND FIXED in the file through `story_changes` only (one entry per story/criterion you added,
+revised, or retired) -- a fixed gap is NOT an `audit_findings` entry.
+
+`audit_findings` is reserved for defects that are STILL OPEN when your pass ends: something you
+could not resolve in the file yourself, or that needs the drafter or a human -- e.g. two raw
+requirements that genuinely contradict each other with no defensible default, or a gap whose
+resolution would require inventing product scope. A deterministic gate rejects the stage and
+forces another full redraft whenever this list is non-empty, so it must contain only work that
+still has to happen; never a changelog, never a confirmation note, never an entry restating "X is
+already correct, unchanged", and never a gap you already fixed (that entry would send the file
+back for a redraft to re-verify a fix already in place -- observed live: three redraft laps spent
+confirming fixes the audit had already made). If everything you found is fixed, or you found
+nothing, return `audit_findings` as an EMPTY list -- do not add an entry announcing that the file
+is solid.
 
 Everything the shared rules below say about identity/citation discipline binds you exactly as it
 binds the drafter -- including the reconstruction warning: fixing many entries in one pass is still

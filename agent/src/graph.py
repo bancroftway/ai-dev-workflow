@@ -1139,7 +1139,7 @@ def make_verify_specification_ledger(
 
     async def _verify_specification_ledger(
         thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None,
-        provider: SandboxProvider, chat_provider: str, _lap: int = 0,
+        provider: SandboxProvider, chat_provider: str, lap: int = 0,
     ) -> VerificationResult:
         """StageSpec.deterministic_verify for the specification stage: reads
         spec_ledger.DRAFT_SPEC_PATH (the model's own file-edited sketchpad -- file-based-editing
@@ -1203,7 +1203,15 @@ def make_verify_specification_ledger(
         # three-state contract.
         fully_reviewed: bool | None = None
         if has_audit_role:
-            session_id = chat_model.get_session_id(thread_id, stage_key, "audit", provider=chat_provider)
+            # The per-lap audit role key (`audit-{run_id}-{lap}`), NOT the bare "audit" label --
+            # `lap` is the same pre-increment verify_cycle_count make_audit_node keyed this lap's
+            # session with (make_verify_node passes it through; the increment happens after this
+            # returns). Root-caused 2026-09-18, session 6244ef47: the bare label never matched the
+            # cache, so this lookup returned None on every lap and specification failed all 5
+            # verify laps on an audit that had read the whole file every time -- see
+            # chat_model.lap_role_keys' own docstring.
+            audit_role = chat_model.lap_role("audit", run_id, lap)
+            session_id = chat_model.get_session_id(thread_id, stage_key, audit_role, provider=chat_provider)
             evidence: bool | None = None
             if session_id is not None:
                 total_lines = raw_file.count("\n") + 1
@@ -1211,10 +1219,23 @@ def make_verify_specification_ledger(
                     provider, thread_id, session_id, spec_ledger.DRAFT_SPEC_PATH, total_lines,
                     active_provider=chat_provider,
                 )
-            if evidence is None:
-                fully_reviewed = None if not chat_model.provider_can_verify_transcripts(chat_provider) else False
-            else:
-                fully_reviewed = evidence
+            if evidence is None and chat_model.provider_can_verify_transcripts(chat_provider):
+                # A provider that CAN prove this but produced nothing to check is a platform fault
+                # (no session id cached for this lap's audit role, or its transcript unreadable),
+                # not a draft failure: spend the infra budget (config.VERIFY_INFRA_RETRY_CAP) and
+                # say exactly what was missing. It used to collapse into fully_reviewed=False here,
+                # which is indistinguishable from a genuine partial read -- the 2026-09-18 incident
+                # burned every stage lap with feedback the draft could do nothing about.
+                return VerificationResult(
+                    passed=False,
+                    feedback=chat_model.transcript_unreadable_feedback(stage_key, audit_role, session_id),
+                    report={"infra_error": "audit_transcript_unreadable", "audit_role": audit_role},
+                )
+            # None here means a provider that structurally cannot verify transcripts (Copilot):
+            # sync_ledger skips the check (fail-open, its documented contract). A bool is real
+            # transcript evidence -- False (transcript found, file only partially read) stays the
+            # genuine fail-closed path.
+            fully_reviewed = evidence
 
         # Question-ledger backstop (user requirement 2026-08-31): make_draft_node's routing coercion
         # keeps open questions away from the gate on the DRAFT path, but the audit revises content
@@ -2952,6 +2973,33 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     }
 
 
+def _lap_role_keys(state: "GraphState", stage_key: str) -> tuple[str, str]:
+    """(draft, audit) session-cache role keys for THIS stage's CURRENT lap -- the exact strings
+    make_draft_node/make_audit_node construct their ChatModel with (`draft-<run_id>-<cycle>` /
+    `audit-<run_id>-<cycle>`, a fresh session per redraft lap so `--resume` never replays a
+    prior lap's whole transcript into the next one -- see either node's own comment). ONE shared
+    definition so this convention can't drift between the three places that need it to agree.
+
+    Root-caused 2026-09-18 (income-investor runs e865062d/c9c293ea): skill_gate.py's
+    `_ROLES_CHECKED = ("draft", "audit")` -- the bare stage-role labels -- was being passed
+    straight through to `get_session_id`/`invoked_skills` as if THOSE were the cache keys. They
+    never were, not intermittently, not once, on any lap: the session cache was ALWAYS keyed by
+    the per-lap-suffixed string above, so every single skill check's session-id lookup missed by
+    construction and skill_gate's FAILED SHUT branch fired unconditionally on every stage with a
+    draft/audit split, every lap, every run -- read as an intermittent transcript-read flake for
+    a full investigation before the key mismatch itself was found by direct log correlation.
+    Confirmed by reading the real transcript the SAME lap's skill check couldn't find: every
+    required skill was invoked correctly; only the cache lookup was wrong.
+    """
+    cycle = state["stages"][stage_key].get("verify_cycle_count", 0)
+    run_id = state.get("run_id", "unknown")
+    # Delegates to chat_model.lap_role_keys -- the pure (run_id, cycle) form a deterministic_verify
+    # (which receives run_id and the lap counter, not state) uses directly. Same 2026-09-18 bug
+    # hit _verify_specification_ledger / diagram_gate's plan sync after skill_gate was fixed; see
+    # that helper's own docstring.
+    return chat_model.lap_role_keys(run_id, cycle)
+
+
 async def _stage_skills_evidence(
     thread_id: str, stage_key: str, state: "GraphState", self_reported: list[str] | None = None
 ) -> dict[str, Any]:
@@ -2975,6 +3023,7 @@ async def _stage_skills_evidence(
         self_reported,
         chat_provider=state["provider"],
         prior_invoked=prior.get("invoked"),
+        roles=_lap_role_keys(state, stage_key),
     )
 
 
@@ -3103,8 +3152,11 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # "draft" role let --resume replay every prior lap's full transcript into each new one,
             # compounding token cost every redraft and risking the same "already addressed, edits
             # nothing" session-poisoning e2e_fix_node hit before its own fix. verify_cycle_count is
-            # the stage's own lap counter, already correctly threaded -- no new state.
-            f"draft-{state.get('run_id', 'unknown')}-{state['stages'][stage_spec.key].get('verify_cycle_count', 0)}",
+            # the stage's own lap counter, already correctly threaded -- no new state. Shared
+            # helper (_lap_role_keys) so this string can never drift from what skill_gate's own
+            # session-id lookups construct -- see that helper's own docstring for the 2026-09-18
+            # incident where two independently-typed copies of this convention already had.
+            _lap_role_keys(state, stage_spec.key)[0],
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10): thread the real run_id through so a Copilot turn's own
             # tool-call RunEvents (copilot_chat_model.py's _agenerate_inner) carry it instead of
@@ -3395,7 +3447,8 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # Fresh session per lap -- see make_draft_node's identical draft-role comment above.
             # Same verify_cycle_count value the paired draft call for this lap already used (read
             # before the post-reject increment), so draft-N and audit-N stay correctly paired.
-            f"audit-{state.get('run_id', 'unknown')}-{state['stages'][stage_spec.key].get('verify_cycle_count', 0)}",
+            # Shared _lap_role_keys helper -- see its own docstring.
+            _lap_role_keys(state, stage_spec.key)[1],
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) -- see the draft-role call's own comment above.
             run_id=state.get("run_id", "unknown"),
@@ -3753,7 +3806,8 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             s for s in (stage.get("skills") or {}).get("invoked", []) if isinstance(s, str)
         ]
         skill_check = await skill_gate.check_required_skills(
-            provider, thread_id, stage_spec.key, chat_provider=state["provider"], prior_invoked=prior_invoked
+            provider, thread_id, stage_spec.key, _lap_role_keys(state, stage_spec.key),
+            chat_provider=state["provider"], prior_invoked=prior_invoked,
         )
         if skill_check.verified:
             # Refresh the persisted evidence with this check's union: the draft node records
@@ -3963,8 +4017,12 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 # BEFORE this stall/fabrication trigger ever fired, not one this reset itself is
                 # the first thing to disturb -- worth knowing when diagnosing why a stage looks
                 # stuck.
+                # THIS lap's draft key (2026-09-19 sweep): the bare "draft" label matched nothing
+                # here, so this diagnostic always read None and the close below evicted nothing --
+                # see chat_model.lap_role. `state` (not the mutated `stage` copy) still holds the
+                # pre-increment verify_cycle_count the draft/audit nodes keyed this lap with.
                 resume_state = chat_model.get_resume_state(
-                    thread_id, stage_spec.key, "draft", provider=state["provider"]
+                    thread_id, stage_spec.key, _lap_role_keys(state, stage_spec.key)[0], provider=state["provider"]
                 )
                 if resume_state in ("unknown", "rejected"):
                     logger.warning(
@@ -3973,7 +4031,9 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                         "this stall/fabrication trigger fired",
                         stage_spec.key, resume_state,
                     )
-                await close_session(thread_id, stage_spec.key, "draft", provider=state["provider"])
+                await close_session(
+                    thread_id, stage_spec.key, _lap_role_keys(state, stage_spec.key)[0], provider=state["provider"]
+                )
                 stage["verify_stall_count"] = 0
                 # A reset session starts fresh either way; the coverage high-water mark is about
                 # detecting non-improvement, not about the session's memory, so it is NOT cleared
@@ -4116,7 +4176,9 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             # no fix-attempt counter of its own (confirmed: no attempt-tracking anywhere in this
             # function); its looping is driven entirely by the stage's shared verify_cycle_count, so
             # reuse that same value rather than inventing a separate one.
-            f"fix-{state.get('run_id', 'unknown')}-{state['stages'][stage_spec.key].get('verify_cycle_count', 0)}",
+            chat_model.lap_role(
+                "fix", state.get("run_id", "unknown"), state["stages"][stage_spec.key].get("verify_cycle_count", 0)
+            ),
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) -- see make_draft_node's draft-role call site's own
             # comment above. This node builds no RunEvent of its own, but a Copilot turn here
