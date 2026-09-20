@@ -29,10 +29,11 @@ import os
 import re
 import shlex
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import Any
 
 from .. import chat_model, repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
+from . import test_quality_checks
+from .test_quality_checks import _ASSERTION_RE, _TEST_DECL_RE, MAX_TEST_BODY_SIMILARITY
 from .write_scope_gate import _E2E_PATH_RE, _is_pipeline_owned, _is_test_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
@@ -276,29 +277,10 @@ MIN_DISTINCT_ASSERTIONS_PER_AC = int(os.environ.get("MIN_DISTINCT_ASSERTIONS_PER
 # written for: three tests that are really one test.
 MIN_TESTS_BEFORE_ASSERTION_CHECK = int(os.environ.get("MIN_TESTS_BEFORE_ASSERTION_CHECK", "3"))
 
-# How similar two test bodies may be before they count as one test. 0.92 is deliberately high --
-# tests for one criterion legitimately share scaffolding, and the target is copy-paste-with-a-renamed
-# -variable, not family resemblance.
-MAX_TEST_BODY_SIMILARITY = float(os.environ.get("MAX_TEST_BODY_SIMILARITY", "0.92"))
-
-_ASSERTION_RE = re.compile(
-    r"(?:expect|assert|Assert\.\w+|should)\s*\(\s*([^;\n]{3,120}?)\s*\)",
-    re.IGNORECASE,
-)
-# What counts as "a line declaring a test". Two families, because two very different things are:
-#
-#   JS/TS:  test('...'), it('...'), describe('...')          -- keyword, then the name as a string
-#   C#:     [Fact] on one line, `public void TestUS00012...` on the NEXT
-#
-# The C# half is why the second alternative exists. `\b(test|...)\b` cannot match inside
-# `TestUS00012ResolveStateDirectory` (no word boundary between "Test" and "US"), and the `[Fact]`
-# line carries no criterion id -- so a file holding 14 real tests scored ZERO for every criterion.
-# Measured live on apps/api.Tests/CounterApiIntegrationTests.cs.
-_TEST_DECL_RE = re.compile(
-    r"\b(test|it|Fact|Theory|describe)\b"
-    r"|\b(?:public|internal|private)\s+(?:async\s+)?[\w<>\[\],\s]+?\s+\w+\s*\(",
-    re.IGNORECASE,
-)
+# MAX_TEST_BODY_SIMILARITY / _ASSERTION_RE / _TEST_DECL_RE moved to test_quality_checks.py
+# (2026-09-19, imported above) -- that module's own docstring has the full reasoning; this file
+# keeps using the same three names, now bound via import instead of a local definition, so
+# `_tests_for_ac`/`count_tests_per_ac`/`distinct_assertion_targets` below are unchanged.
 
 # The subset that actually carries a test NAME: a `test(...)`/`it(...)`/`describe(...)` call, or a
 # method signature. A bare `[Fact]` / `[Theory]` attribute line matches _TEST_DECL_RE but names
@@ -350,35 +332,16 @@ def _tests_for_ac(ac_id: str, test_files: dict[str, str]) -> list[tuple[str, str
     """(label, normalised body) per test naming this AC. The label ("path :: decl line") exists so
     a failed check can NAME the test to rewrite -- observed live: feedback that only counted
     near-duplicates sent the model rewriting the Playwright spec for 6 laps while the duplicate
-    pair sat in the .NET unit file."""
-    tests: list[tuple[str, str]] = []
+    pair sat in the .NET unit file.
+
+    Filters test_quality_checks._iter_tests' shared parse by the UNTRUNCATED decl line (that
+    module keeps it alongside the display label for exactly this reason) so a declaration longer
+    than the label's own 100-char truncation still matches."""
     variants = id_variants(ac_id)
-    for path, contents in test_files.items():
-        current: list[str] | None = None
-        decl = ""
-        for line in contents.splitlines():
-            if _TEST_DECL_RE.search(line):
-                if current:
-                    tests.append((decl, "\n".join(current)))
-                if any(variant in line for variant in variants):
-                    # Seed with whatever follows the opening brace, so a one-line test
-                    # (`public void X(){ Assert.Equal(1, c.Value); }`) has a body at all -- without
-                    # this its assertion was invisible and it counted as a non-asserting stub.
-                    # Deliberately NOT the whole line: the test NAME must stay out of the body, or
-                    # two identical clones with different names stop looking like duplicates.
-                    inline = line.split("{", 1)[1] if "{" in line else ""
-                    current = [inline.strip()] if inline.strip() else []
-                    decl = f"{path} :: {line.strip()[:100]}"
-                else:
-                    current = None
-            elif current is not None:
-                current.append(line.strip())
-        if current:
-            tests.append((decl, "\n".join(current)))
     return [
-        (decl, re.sub(r"\s+", " ", body).strip())
-        for decl, body in tests
-        if body.strip()
+        (decl, body)
+        for decl, body, raw_line in test_quality_checks._iter_tests(test_files)
+        if any(variant in raw_line for variant in variants)
     ]
 
 
@@ -409,71 +372,11 @@ def duplicate_test_bodies(ac_id: str, test_files: dict[str, str]) -> int:
     return len(duplicate_test_pairs(ac_id, test_files))
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z_]\w*|\d+|\S")
-
-
-def _alpha_profile(body: str) -> tuple[list[str], frozenset[str]]:
-    """(alpha token stream, alpha-normalised assertion-target set) for one test body.
-
-    Type-2 clone normalisation with one deliberate deviation: identifiers are replaced by
-    first-occurrence indexes (i1, i2, ...) so renaming a local/method never defeats the comparison
-    -- EXCEPT tokens that immediately follow a '.', which stay literal. A member access names the
-    API surface under test: alpha-mapping it would collapse `r.Count` and `r.Total` into the same
-    stream, re-creating the tiny-test false positive this function exists to avoid (run d8b09f43,
-    US-0005.1), while keeping it literal still catches the copy-and-rename-the-local dodge
-    (`r.Count` vs `result.Count` -- receiver indexed, member identical). Numbers -> 'n', string
-    literals -> 's', punctuation kept: structure stays, spelling doesn't."""
-    stripped = re.sub(r'"[^"]*"|\'[^\']*\'', " s ", body)
-    mapping: dict[str, str] = {}
-
-    def alpha(tokens: list[str]) -> list[str]:
-        out: list[str] = []
-        prev = ""
-        for token in tokens:
-            if token.isdigit():
-                out.append("n")
-            elif re.match(r"[A-Za-z_]", token) and prev != ".":
-                out.append(mapping.setdefault(token, f"i{len(mapping) + 1}"))
-            else:
-                out.append(token.lower())
-            prev = token
-        return out
-
-    stream = alpha(_TOKEN_RE.findall(stripped))
-    asserts = frozenset(
-        " ".join(alpha(_TOKEN_RE.findall(re.sub(r'"[^"]*"|\'[^\']*\'', " s ", m.group(1)))))
-        for m in _ASSERTION_RE.finditer(body)
-    ) - {""}
-    return stream, asserts
-
-
 def duplicate_test_pairs(ac_id: str, test_files: dict[str, str]) -> list[tuple[str, str]]:
-    """(duplicate test label, original test label) per near-duplicate, so feedback names both.
-
-    A pair is a duplicate only when the alpha token streams are similar AND the alpha-normalised
-    assertion targets match (see _alpha_profile for what alpha means and why member names stay
-    literal). Raw-text similarity alone false-positives on tiny tests: bodies are ~90% shared
-    plumbing, so SequenceMatcher saturates past 0.92 for ANY two short tests -- observed live (run
-    d8b09f43, US-0005.1): six laps rejected, by lap 6 flagging a singleton-registration store test
-    against an accumulation-across-connections controller test. Different assertion targets =
-    different tests, no matter how much scaffolding they share; renamed locals = the same test, no
-    matter how thorough the rename. Two assertion-less bodies (RED-phase stubs) compare equal-empty
-    and stay governed by the stream ratio, as before."""
-    pairs: list[tuple[str, str]] = []
-    kept: list[tuple[str, list[str], frozenset[str]]] = []
-    for decl, body in _tests_for_ac(ac_id, test_files):
-        stream, asserts = _alpha_profile(body)
-        original = next(
-            (k_decl for k_decl, k_stream, k_asserts in kept
-             if asserts == k_asserts
-             and SequenceMatcher(None, stream, k_stream).ratio() >= MAX_TEST_BODY_SIMILARITY),
-            None,
-        )
-        if original is not None:
-            pairs.append((decl, original))
-        else:
-            kept.append((decl, stream, asserts))
-    return pairs
+    """(duplicate test label, original test label) per near-duplicate, so feedback names both --
+    thin AC-scoped wrapper around test_quality_checks.duplicate_pairs (see that function's
+    docstring for the alpha-normalisation reasoning, run d8b09f43/US-0005.1)."""
+    return test_quality_checks.duplicate_pairs(_tests_for_ac(ac_id, test_files))
 
 
 # Same physical rulebook for ac_to_tests_draft.md and ac_to_tests_audit.md (user directive,
@@ -481,9 +384,9 @@ def duplicate_test_pairs(ac_id: str, test_files: dict[str, str]) -> list[tuple[s
 # prompts used to independently hand-type these two rules, and a check against the REAL gate below
 # found their matcher lists had already drifted incomplete -- neither prompt mentioned
 # toBeNull()/toBeUndefined()/toBeEmpty(), Assert.DoesNotContain, or the Python
-# assertIsNone/assertFalse/assertNotIn matchers _ABSENCE_ASSERTION_RE actually enforces below. One
-# physical copy, read off the real regexes, closes that drift permanently instead of re-typing a
-# third (still possibly incomplete) list here.
+# assertIsNone/assertFalse/assertNotIn matchers test_quality_checks._ABSENCE_ASSERTION_RE actually
+# enforces (imported via that module below). One physical copy, read off the real regexes, closes
+# that drift permanently instead of re-typing a third (still possibly incomplete) list here.
 AC_TO_TESTS_NAMING_RULES: tuple[str, ...] = (
     "Every test must carry its criterion id in the exact canonical form the ledger spells it "
     "(`US-0001.2`), in the test's DISPLAY name -- square-bracketed at the start "
@@ -505,70 +408,45 @@ AC_TO_TESTS_NAMING_RULES: tuple[str, ...] = (
     "prove the page rendered, THEN prove X is absent.",
 )
 
-
-# An assertion that something is ABSENT. On a page that never rendered, every one of these is
-# trivially true -- so a test built only from them passes against a blank screen and proves nothing.
-# Observed live (blazor-dotnet, US-0006.1 "no sign-in UI is present anywhere"): `goto('/')` followed
-# by four `toHaveCount(0)` checks and nothing else. It passed while its screenshot was a 5,482-byte
-# blank, and would have passed identically had the app been completely broken.
-_ABSENCE_ASSERTION_RE = re.compile(
-    r"toHaveCount\s*\(\s*0\s*\)"
-    r"|\.not\s*\.\s*to\w+"
-    r"|toBeNull\s*\(\s*\)"
-    r"|toBeUndefined\s*\(\s*\)"
-    r"|toBeEmpty\s*\(\s*\)"
-    r"|Assert\.(?:Null|Empty|False|DoesNotContain)"
-    r"|assertIsNone|assertFalse|assertNotIn",
-    re.IGNORECASE,
-)
-
-# An assertion that something IS there -- the anchor that makes the absence checks meaningful,
-# because it cannot pass until the app has actually rendered.
-_PRESENCE_ASSERTION_RE = re.compile(
-    r"toBeVisible\s*\(\s*\)"
-    r"|toHaveText\s*\(|toContainText\s*\(|toHaveValue\s*\(|toHaveAttribute\s*\("
-    r"|toBeEnabled\s*\(\s*\)|toBeChecked\s*\(\s*\)|toBeFocused\s*\(\s*\)"
-    r"|toHaveCount\s*\(\s*[1-9]"
-    r"|toBe\s*\(|toEqual\s*\(|toMatch\s*\("
-    r"|Assert\.(?:NotNull|NotEmpty|True|Equal|Contains)"
-    r"|assertEqual|assertTrue|assertIn|assertIsNotNone",
-    re.IGNORECASE,
+# Same one-physical-copy strategy as AC_TO_TESTS_NAMING_RULES above, for a DIFFERENT reason: this
+# is advisory, not gate-enforced -- no Python check below can judge whether a test actually proves
+# a range/absence claim, so unlike its sibling this tuple has no matching deterministic_verify
+# branch to stay honest against. Root-caused LIVE (income-investor session f0fef8ba, 2026-09-19,
+# ac-to-tests cycles 0->1 and 1->2): both real audit findings that round shared one shape a test
+# anchored only at a rule's own NAMED reference points cannot distinguish the correct
+# implementation from a plausible, wrong one. "US-0018.1 ... covered ONLY by
+# apps/web/tests/e2e/evaluator.spec.ts ... No unit or integration test anywhere in the suite
+# submits more than 2 holdings to the Evaluator to prove the absence of a cap" -- a test with 1-2
+# holdings passes an Evaluator that secretly caps at 3. "the spec requires ... smoothly
+# interpolated ... a naive step-function implementation (if <= green: 1.0 elif >= red: 0.0 else:
+# 0.5) would pass every one of these tests" -- tests only at the two threshold constants cannot
+# tell a step function from a true interpolation. draft_rules/audit_rules concatenate this WITH
+# AC_TO_TESTS_NAMING_RULES (graph.py) so both roles read the identical text, same reasoning as
+# specification_shared_segment.md.
+AC_TO_TESTS_COVERAGE_GUIDANCE: tuple[str, ...] = (
+    "A rule stated as a claim ACROSS A RANGE or an ABSENCE OF A LIMIT ('accepts any number of X', "
+    "'no minimum or maximum', 'smoothly interpolated between thresholds', 'unbounded') is not "
+    "proven by tests anchored only at the rule's own named reference points (the couple of example "
+    "values the AC text or the neighbouring code happen to mention, or the threshold constants "
+    "themselves) -- those also pass a WRONG implementation that hard-codes a cap just past them, or "
+    "that steps between thresholds instead of truly interpolating. Also probe a value that would "
+    "expose such a wrong implementation: well beyond any example given (many more items than any "
+    "case named in the AC, to prove no hidden cap), or strictly BETWEEN two named thresholds, not "
+    "just AT them (to prove genuine interpolation rather than a step function). Before finishing, "
+    "ask of each such rule: would a plausible but wrong implementation still pass every test I wrote "
+    "for it? If yes, add the one that would catch it.",
+    "When a rule you can state this way is implemented beneath the UI (a validator, a service "
+    "function, a pure calculation), prove it directly at that layer even if a browser-level test "
+    "for the same journey also exists -- a UI test that the app accepted the input proves the UI "
+    "forwarded it, not that the underlying function itself carries no limit.",
 )
 
 
 def absence_only_test_labels(ac_id: str, test_files: dict[str, str]) -> list[str]:
-    """Labels of this AC's tests that assert ONLY absence, with no presence anchor.
-
-    Pure, like every other check here. A test qualifies only if it asserts at least one absence and
-    zero presences: a test with both is fine (the presence assertion forces a render before the
-    absence checks are evaluated), and a test asserting neither is a RED-phase stub the fiat/count
-    checks above already own.
-
-    `.not.to*` is treated as absence even though `expect(x).not.toBe(y)` is a value comparison: on
-    an unrendered page a locator-based `.not.` assertion is exactly the trivially-true shape this
-    exists to catch, and a test that ALSO makes a positive assertion is cleared regardless.
-    """
-    labels: list[str] = []
-    for decl, body in _tests_for_ac(ac_id, test_files):
-        if not _ABSENCE_ASSERTION_RE.search(body):
-            continue
-        if _PRESENCE_ASSERTION_RE.search(body):
-            continue
-        labels.append(decl)
-    return labels
-
-
-# A fiat-failure call: an assertion that fails unconditionally. Full-call patterns, case-sensitive
-# on each language's own keyword casing, so a REAL assertion whose message merely mentions "false"
-# is not caught.
-_FIAT_FAIL_RE = re.compile(
-    r"Assert\s*\.\s*(?:Is)?True\(\s*false\b[^)]*\)"      # xunit/nunit/mstest Assert.True(false, ...)
-    r"|Assert\s*\.\s*Fail\s*\("                          # Assert.Fail("not implemented")
-    r"|expect\(\s*true\s*\)\s*\.\s*toBe\(\s*false\s*\)"  # jest/vitest fiat
-    r"|\b(?:expect|assert)\s*\.\s*fail\s*\("             # chai/node/vitest expect.fail()
-    r"|pytest\s*\.\s*fail\s*\("                          # pytest.fail("...")
-    r"|(?<![\w.])assert\s+False\b"                       # bare python assert False
-)
+    """Labels of this AC's tests that assert ONLY absence, with no presence anchor -- thin
+    AC-scoped wrapper around test_quality_checks.absence_only_labels (see that function's
+    docstring for the presence-anchor reasoning, observed live on blazor-dotnet US-0006.1)."""
+    return test_quality_checks.absence_only_labels(_tests_for_ac(ac_id, test_files))
 
 
 def fiat_stub_tests(ac_id: str, test_files: dict[str, str]) -> int:
@@ -586,14 +464,9 @@ def fiat_stub_tests(ac_id: str, test_files: dict[str, str]) -> int:
 
 
 def fiat_stub_labels(ac_id: str, test_files: dict[str, str]) -> list[str]:
-    """The fiat-failing tests' labels ("path :: decl line"), so feedback names what to rewrite."""
-    labels: list[str] = []
-    for decl, body in _tests_for_ac(ac_id, test_files):
-        if not _FIAT_FAIL_RE.search(body):
-            continue
-        if not _ASSERTION_RE.search(_FIAT_FAIL_RE.sub("", body)):
-            labels.append(decl)
-    return labels
+    """The fiat-failing tests' labels ("path :: decl line"), so feedback names what to rewrite --
+    thin AC-scoped wrapper around test_quality_checks.fiat_stub_labels."""
+    return test_quality_checks.fiat_stub_labels(_tests_for_ac(ac_id, test_files))
 
 
 def category_spread(content_dict: dict[str, Any], ac_id: str) -> set[str]:

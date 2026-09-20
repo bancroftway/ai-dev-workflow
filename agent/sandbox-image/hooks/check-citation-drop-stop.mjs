@@ -13,14 +13,28 @@
 // script deliberately does NOT do text matching, only counts citations, so it's cheap and has no
 // false-positive risk from two genuinely-different stories sharing similar wording.
 //
-// PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION (user directive, 2026-09-17: hooks must work for
-// both Claude Code and GitHub Copilot): no AIDW_-prefixed env var gates this at all, unlike
-// require-skills-stop.mjs -- the specification files' own existence in the current working
-// directory (always /workspace/repo, the repo clone root, for every draft/audit turn on either
-// provider) is the entire scope check. A turn for any OTHER stage simply never has
-// .ai-dev-workflow/spec/draft-specification.json to find, so this exits 0 immediately regardless
-// of which provider or stage is running -- no per-stage/per-role wiring needed anywhere.
+// PROVIDER-AGNOSTIC BY CONSTRUCTION (user directive, 2026-09-17: hooks must work for both Claude
+// Code and GitHub Copilot): no provider-specific logic anywhere in this file.
+//
+// STAGE-SCOPED VIA AIDW_STAGE (root-caused live 2026-09-19, income-investor session 5c555dac,
+// FIXED after originally shipping with no stage gate at all): this file's own first cut assumed
+// "the specification files' own existence in the working directory is the entire scope check...
+// a turn for any OTHER stage simply never has .ai-dev-workflow/spec/draft-specification.json to
+// find" -- FALSE. That file is a scratch sketchpad that outlives specification's own approval for
+// the rest of the ticket, so plan's own draft/audit turns have it sitting right there too, still
+// readable. Worse, the citation-drop heuristic below is a FALSE POSITIVE by construction on any
+// approved GREENFIELD specification once the ledger is populated: every entry legitimately
+// carries `existing_us_id: null`/`existing_ac_id: null` (nothing was pre-existing to cite), which
+// looks identical to a mass-drop to this check. Confirmed live: this fired four times across
+// PLAN's own draft turn, over content plan never touches, and the model's fourth attempt to
+// appease it degraded into a prose response instead of the required JSON, crashing the pipeline's
+// own structured-output parse. `AIDW_STAGE` (claude_chat_model.py's/copilot_chat_model.py's
+// `_stage_env_prefix`, set unconditionally on every turn, both roles) is the general fix: any
+// Stop hook whose check only makes sense for ONE stage must gate on this, never infer scope from
+// a scratch file's mere presence.
 import { readFileSync } from "node:fs";
+
+if (process.env.AIDW_STAGE !== "specification") process.exit(0);
 
 const DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json";
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
@@ -48,7 +62,7 @@ function readJson(relPath) {
   try {
     return JSON.parse(readFileSync(`${cwd}/${relPath}`, "utf8"));
   } catch {
-    return null; // absent, or this turn isn't the specification stage at all -- fail open either way
+    return null; // absent or unreadable -- fail open (the AIDW_STAGE gate above already confirmed this IS specification's own turn)
   }
 }
 
@@ -64,7 +78,7 @@ const liveIds = new Set(
 if (liveIds.size === 0) process.exit(0);
 
 const draft = readJson(DRAFT_SPEC_PATH);
-if (draft === null || !Array.isArray(draft.user_stories)) process.exit(0); // not this stage's turn, or file not written yet
+if (draft === null || !Array.isArray(draft.user_stories)) process.exit(0); // file not written yet this lap
 
 const cited = new Set();
 for (const story of draft.user_stories) {

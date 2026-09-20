@@ -77,6 +77,7 @@ from . import config
 from . import run_event_store
 from . import run_event_stream
 from . import telemetry
+from .session_roles import role_matches
 from .cli_agent_exec import (
     _RESUME_REJECTED_MARKERS,
     _SCRATCH_DIR,
@@ -343,12 +344,22 @@ def _translate_intermediate_events(
     return translated
 
 
+def _stage_env_prefix(stage: str) -> str:
+    """Copilot side of claude_chat_model._stage_env_prefix -- identical mechanism, identical
+    reasoning (see that function's own docstring for the root-caused 2026-09-19 incident this
+    fixes): unconditional, every turn, regardless of role. Duplicated rather than shared for the
+    same circular-import reason `_map_tool_names`/`_required_skills_env_prefix` already are."""
+    return f"AIDW_STAGE={shlex.quote(stage)} "
+
+
 def _required_skills_env_prefix(stage: str, role: str) -> str:
     """Shell env-var prefix for the skill-enforcement Stop hook, Copilot side -- mirrors
     claude_chat_model._required_skills_env_prefix exactly (same config source, same draft-only
     scoping, same reasoning; duplicated rather than shared to avoid a circular import between the
     two provider modules, matching this file's existing per-provider-helper convention, e.g.
-    _map_tool_names existing independently in both files rather than one importing the other's).
+    _map_tool_names existing independently in both files rather than one importing the other's --
+    but see `session_roles.role_matches` below: the ROLE-RECOGNITION half of this function no
+    longer needs that duplication, only the stage-lookup/env-string-formatting half around it).
 
     User directive, 2026-09-17: the skill-enforcement Stop hook generalizes to both providers --
     confirmed live that Copilot CLI 1.0.86-2 has its own real hooks mechanism (`copilot help
@@ -357,13 +368,43 @@ def _required_skills_env_prefix(stage: str, role: str) -> str:
     sandbox-image/hooks/require-skills-stop.mjs needed no stdin-handling changes, only a second
     transcript-line shape to recognize (Copilot's dedicated `{"type":"skill.invoked","data":
     {"name":...}}` event, vs Claude's generic tool_use block named "Skill").
+
+    Root-caused 2026-09-19: mirrors claude_chat_model._required_skills_env_prefix's identical bug
+    (see that function's own docstring) -- `role != "draft"` compared against a role shape
+    (`draft-<run_id>-<cycle>`) no real caller has used since the fresh-session-per-lap fix, so this
+    returned `""` unconditionally on every real call. Copilot's own Stop-hook wiring inherits the
+    same fix, even though skill_gate.py's post-hoc verification is permanently unavailable for this
+    provider regardless (config.py's REQUIRED_SKILLS_BY_STAGE comment) -- this hook was the only
+    enforcement Copilot ever had for these skills, so its being dead mattered MORE here, not less.
+    Fixed via `session_roles.role_matches` (a leaf module, safe for both provider files to import
+    directly) rather than re-writing the same hand-rolled check correctly a second time.
     """
-    if role != "draft":
+    if not role_matches(role, "draft"):
         return ""
     required_skills = config.REQUIRED_SKILLS_BY_STAGE.get(stage, [])
     if not required_skills:
         return ""
     return f"AIDW_REQUIRED_SKILLS={shlex.quote(','.join(required_skills))} "
+
+
+def _full_read_env_prefix(_stage: str, _role: str) -> str:
+    """Copilot side of claude_chat_model._full_read_env_prefix -- ALWAYS returns "" (parameters
+    unused, prefixed with `_` on purpose), never "sometimes empty" the way the Claude version is.
+
+    NOT a placeholder to fill in later without further work: `read_full_file_reads` above is a
+    documented, permanent-until-verified capability gap for this provider (no confirmed CLI-exec
+    transcript equivalent exists for a generic tool call the way Claude's tool_use blocks are
+    confirmed against a real captured sample -- see that function's own docstring). Arming
+    sandbox-image/hooks/check-full-read-stop.mjs's transcript-coverage check for Copilot without
+    that confirmation would mean guessing at a transcript shape this codebase has never verified --
+    exactly the "confirm against reality, don't just assume" line read_skill_invocations/
+    read_full_file_reads already refuse to cross. Until someone captures a real Copilot turn's
+    transcript and confirms what a generic tool call (not just the dedicated `skill.invoked`
+    event require-skills-stop.mjs already relies on) looks like there, this stays a hard `""` --
+    never gated on stage/role at all, so a call site here can never accidentally arm a check this
+    provider cannot honestly support.
+    """
+    return ""
 
 
 def _build_copilot_wrapper_script(
@@ -761,7 +802,11 @@ class CopilotChatModel(BaseChatModel):
         wrapper_path = f"{scratch_prefix}.cmd.sh"
         wrapper_script = _build_copilot_wrapper_script(
             argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
-            env_prefix=_required_skills_env_prefix(self.stage, self.role),
+            env_prefix=(
+                _stage_env_prefix(self.stage)
+                + _required_skills_env_prefix(self.stage, self.role)
+                + _full_read_env_prefix(self.stage, self.role)  # always "" -- see that function's own docstring
+            ),
         )
         await write_scratch_file(provider, self.thread_id, wrapper_path, wrapper_script)
         command = f"sh {shlex.quote(wrapper_path)}"
@@ -1147,6 +1192,20 @@ def _demo() -> None:
     assert _required_skills_env_prefix("specification", "draft") == "AIDW_REQUIRED_SKILLS=brainstorming,grill-me "
     assert _required_skills_env_prefix("specification", "audit") == ""
     assert _required_skills_env_prefix("tech-stack", "draft") == ""
+    # The REAL per-lap shape every production caller passes -- see claude_chat_model.py's identical
+    # assertion/root-cause comment (2026-09-19): this returned "" for every one of these until
+    # fixed, silently disarming the Stop hook on every real Copilot turn too.
+    assert _required_skills_env_prefix("plan", "draft-73bc09ec-0") == "AIDW_REQUIRED_SKILLS=writing-plans "
+    assert _required_skills_env_prefix("plan", "audit-73bc09ec-0") == ""
+    # _full_read_env_prefix: hard "" always, whatever stage/role -- this provider has no confirmed
+    # transcript shape to arm sandbox-image/hooks/check-full-read-stop.mjs against (see that
+    # function's own docstring).
+    assert _full_read_env_prefix("specification", "audit-73bc09ec-0") == ""
+    assert _full_read_env_prefix("plan", "audit-73bc09ec-0") == ""
+    # _stage_env_prefix: unconditional, every stage/role -- see claude_chat_model.py's identical
+    # assertion/root-cause comment (2026-09-19).
+    assert _stage_env_prefix("specification") == "AIDW_STAGE=specification "
+    assert _stage_env_prefix("plan") == "AIDW_STAGE=plan "
     wrapper_with_skills = _build_copilot_wrapper_script(
         ["copilot"], "/tmp/aidw-agent/fake-prompt", 60,
         env_prefix=_required_skills_env_prefix("specification", "draft"),

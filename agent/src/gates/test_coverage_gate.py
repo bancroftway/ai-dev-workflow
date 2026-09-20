@@ -1026,13 +1026,27 @@ async def measure_coverage(
     """
     # Cheap guard, kept from the old tech-stack dispatch: on a repo with no detected languages
     # (the blank-repo baseline scan, which runs before anything is scaffolded) there is nothing to
-    # measure, so don't spend a GHCP session discovering that.
+    # measure, so don't spend a GHCP session discovering that. BUT the tech-stack doc is written
+    # once, early (often while the repo is still genuinely empty), and is never refreshed
+    # afterward -- so "no languages detected" here only reliably means "nothing to measure" for
+    # repo_scan's OWN blank-repo baseline call. By the time minimal-code-to-green's verify_coverage
+    # calls this same function, the repo may already have a real, working coverage-commands.json
+    # contract from an earlier lap; that deterministic replay needs no language detection at all,
+    # so a contract already on disk must win over a stale "no languages" reading. Observed live
+    # (session f0fef8ba): a fully-built Next.js+FastAPI app with 200+ passing tests and a valid
+    # contract failed this guard purely because tech-stack's doc still said "greenfield, no code
+    # yet", skipping the contract replay entirely and burning the stage's infra-retry budget on a
+    # gate that would have passed immediately.
     raw_tech_stack = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.TECH_STACK_APPROVED_PATH)
     tech_stack = json.loads(raw_tech_stack) if raw_tech_stack else {}
     languages = [str(l).lower() for l in tech_stack_signals.presence_values(tech_stack, "languages")]
     if not languages and not tech_stack_signals.dotnet_detected(tech_stack):
-        logger.info("repo_scan coverage: no tooling mapping for detected languages %s", languages)
-        return None, None, [], REASON_NO_TOOLING_MAPPING, []
+        contract_exists = bool(
+            _load_coverage_contract(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH))
+        )
+        if not contract_exists:
+            logger.info("repo_scan coverage: no tooling mapping for detected languages %s", languages)
+            return None, None, [], REASON_NO_TOOLING_MAPPING, []
 
     # Memoized on the exact tree state (HEAD + dirty-file digest): this gate re-fires on every
     # verify cycle and again from metrics-report, and re-running a full coverage suite for a tree

@@ -78,6 +78,7 @@ from . import config
 from . import run_event_store
 from . import run_event_stream
 from . import telemetry
+from .session_roles import role_matches
 from .cli_agent_exec import (
     _RESUME_REJECTED_MARKERS,
     _SCRATCH_DIR,
@@ -738,7 +739,12 @@ class ClaudeChatModel(BaseChatModel):
         if self.response_schema is not None:
             argv += ["--json-schema", json.dumps(self.response_schema.model_json_schema())]
 
-        command = _required_skills_env_prefix(self.stage, self.role) + shlex.join(argv)
+        command = (
+            _stage_env_prefix(self.stage)
+            + _required_skills_env_prefix(self.stage, self.role)
+            + _full_read_env_prefix(self.stage, self.role)
+            + shlex.join(argv)
+        )
 
         # Agent Narration Drawer feature: classify each JSONL line the instant run_turn's own
         # incremental poll loop sees it complete -- the exact same per-line classifier the
@@ -1060,6 +1066,33 @@ def get_resume_state(thread_id: str, stage: str, role: str) -> ResumeState | Non
     return _session_cache.get_resume_state(thread_id, stage, role)
 
 
+def _stage_env_prefix(stage: str) -> str:
+    """Shell env-var prefix `"AIDW_STAGE=<stage> "`, unconditional -- unlike
+    `_required_skills_env_prefix`/`_full_read_env_prefix` below, this is set on EVERY turn,
+    regardless of role, because "which stage is this" is true independent of draft/audit.
+
+    Root-caused 2026-09-19 (income-investor session 5c555dac): sandbox-image/hooks/
+    check-citation-drop-stop.mjs's own header claimed "a turn for any OTHER stage simply never has
+    .ai-dev-workflow/spec/draft-specification.json to find" -- false. That file is a scratch
+    sketchpad that OUTLIVES specification's own approval for the rest of the ticket, so plan's own
+    draft/audit turns have it sitting right there in the working directory too, readable (and, via
+    a write-scope violation logged the same run, even briefly writable) by a session that has no
+    business examining it. Worse: that hook's citation-drop heuristic is a FALSE POSITIVE by
+    construction on any approved GREENFIELD specification once the ledger is populated -- every
+    entry legitimately carries `existing_us_id: null`/`existing_ac_id: null` (nothing was
+    pre-existing to cite), which the hook cannot distinguish from a genuine mass citation-drop.
+    Confirmed live: this fired FOUR TIMES across plan's own draft turn, over content plan never
+    touches, and the model's fourth attempt to satisfy it degraded into a prose explanation instead
+    of the required JSON response, crashing structured_output.ainvoke_structured's own JSON parse
+    and taking the whole run down uncaught (session 5c555dac, run c-lap-2's own draft-6941ef8f-1).
+
+    This env var is the general fix: any Stop hook whose own check only makes sense for ONE stage
+    must gate on `AIDW_STAGE`, not infer scope from file existence -- a scratch file's presence
+    proves only that SOME earlier stage wrote it, never which stage is running now.
+    """
+    return f"AIDW_STAGE={shlex.quote(stage)} "
+
+
 def _required_skills_env_prefix(stage: str, role: str) -> str:
     """Shell env-var prefix (e.g. `"AIDW_REQUIRED_SKILLS=brainstorming,grill-me "`, or `""`) for
     the skill-enforcement Stop hook (sandbox-image/hooks/require-skills-stop.mjs, baked into
@@ -1076,13 +1109,59 @@ def _required_skills_env_prefix(stage: str, role: str) -> str:
     graph level (a live run skipped an explicit "MANDATORY, NOT ADVISORY" prompt instruction twice
     in a row) -- skill_gate.py stays the fail-closed backstop for whenever this hook is
     unavailable (Copilot has no hook equivalent) or otherwise bypassed.
+
+    Root-caused 2026-09-19 (income-investor session 5905ba13): this compared `role` against the
+    bare literal `"draft"`, but every REAL draft call (graph.py's make_draft_node, via
+    `chat_model.lap_role("draft", run_id, cycle)`) has keyed sessions `draft-<run_id>-<cycle>`
+    since the fresh-session-per-lap fix -- BEFORE this function itself existed (2026-09-17). The
+    comparison was written against a role shape that was already stale the day it was added, so in
+    production `role != "draft"` was true on every single call, this returned `""` unconditionally,
+    AIDW_REQUIRED_SKILLS was never set, and the Stop hook exited 0 before reading anything --
+    completely inert since the day it shipped. The unit test below asserting the literal `"draft"`
+    string passed the whole time and gave false confidence; it tested a shape no real caller uses.
+    plan's own draft skipped `writing-plans` in this exact session with zero Stop-hook pushback,
+    caught only by skill_gate.py's post-hoc backstop one redraft lap later -- the fail-closed
+    backstop worked exactly as designed, but the same-turn hook this function exists to arm never
+    fired even once.
+
+    Fixed by routing through `session_roles.role_matches` (2026-09-19) rather than re-writing the
+    same hand-rolled comparison correctly in place: a THIRD hand-written copy of this exact
+    equality/prefix check (after gates/skill_gate.py's `invoked_skills` and this very bug) is how
+    the next drift happens. `session_roles.py` is a leaf module (no project imports) specifically
+    so this file and copilot_chat_model.py can both call the real, single recognizer directly
+    without the circular import that forces `chat_model.py` itself to stay unimported here.
     """
-    if role != "draft":
+    if not role_matches(role, "draft"):
         return ""
     required_skills = config.REQUIRED_SKILLS_BY_STAGE.get(stage, [])
     if not required_skills:
         return ""
     return f"AIDW_REQUIRED_SKILLS={shlex.quote(','.join(required_skills))} "
+
+
+def _full_read_env_prefix(stage: str, role: str) -> str:
+    """Shell env-var prefix (e.g. `"AIDW_AUDIT_FULL_READ_FILE=.ai-dev-workflow/spec/draft-\
+specification.json "`, or `""`) for the same-turn full-read-proof Stop hook
+    (sandbox-image/hooks/check-full-read-stop.mjs): activated per-turn, AUDIT role only --
+    inverted from `_required_skills_env_prefix` above (that one arms draft; specification_audit.md/
+    plan_audit.md's own "View it first, in full" instruction is what the AUDIT session's prompt
+    actually demands every pass, never the draft's).
+
+    Same mechanism, same file (config.AUDIT_FULL_READ_FILE_BY_STAGE, that constant's own docstring
+    has the full cross-module-cycle reasoning for why it's a literal, not an import), same
+    `role_matches`-based recognition -- built 2026-09-19 as the same-turn counterpart of the
+    Review-depth safety net (graph.py's _verify_specification_ledger / gates/diagram_gate.py's
+    _load_and_sync_plan_steps), which only ever caught a partial re-read POST-HOC, after a whole
+    draft->audit->verify round-trip. Same posture as _required_skills_env_prefix: this is a
+    same-turn NUDGE, never a replacement for that deterministic gate, which stays the fail-closed
+    backstop for whenever this hook is unavailable, misconfigured, or bypassed some other way.
+    """
+    if not role_matches(role, "audit"):
+        return ""
+    full_read_file = config.AUDIT_FULL_READ_FILE_BY_STAGE.get(stage)
+    if not full_read_file:
+        return ""
+    return f"AIDW_AUDIT_FULL_READ_FILE={shlex.quote(full_read_file)} "
 
 
 def normalize_skill_name(name: str) -> str:
@@ -1331,6 +1410,50 @@ def _demo() -> None:
         "audit's own prompt never asks for these skills -- must never be blocked for skipping them"
     )
     assert _required_skills_env_prefix("tech-stack", "draft") == "", "no required skills configured for this stage"
+    # The REAL shape every production caller actually passes (chat_model.lap_role("draft", ...)),
+    # not the bare "draft" literal above -- root-caused 2026-09-19: this function returned "" for
+    # every one of these until fixed, silently disarming the Stop hook on every real turn since the
+    # day fresh-session-per-lap shipped, while the bare-literal assertion above passed throughout.
+    assert _required_skills_env_prefix("plan", "draft-73bc09ec-0") == "AIDW_REQUIRED_SKILLS=writing-plans ", (
+        "a real per-lap draft role (draft-<run_id>-<cycle>) must still arm the Stop hook"
+    )
+    assert _required_skills_env_prefix("plan", "audit-73bc09ec-0") == "", (
+        "a per-lap AUDIT role must never arm the Stop hook -- its own prompt never asks for these skills"
+    )
+
+    # _full_read_env_prefix: the INVERSE asymmetry of _required_skills_env_prefix -- audit role
+    # arms it, draft role (and a stage with none configured) get nothing.
+    assert _full_read_env_prefix("specification", "audit-73bc09ec-0") == (
+        "AIDW_AUDIT_FULL_READ_FILE=.ai-dev-workflow/spec/draft-specification.json "
+    )
+    assert _full_read_env_prefix("plan", "audit-73bc09ec-0") == (
+        "AIDW_AUDIT_FULL_READ_FILE=.ai-dev-workflow/plan/_draft/steps.json "
+    )
+    assert _full_read_env_prefix("specification", "draft-73bc09ec-0") == "", (
+        "the DRAFT role must never arm this hook -- only the audit's own prompt demands a full re-read"
+    )
+    assert _full_read_env_prefix("brownfield-spec", "audit-73bc09ec-0") == "", (
+        "brownfield-spec has has_audit_role=False -- no audit role ever exists to arm this for"
+    )
+    # _stage_env_prefix: unconditional -- every stage, every role, no gating at all (unlike the
+    # two prefixes above). Root-caused 2026-09-19: check-citation-drop-stop.mjs fired during
+    # PLAN's own turn over specification content plan never touches, because it inferred stage
+    # from a scratch file's mere presence instead of being told directly.
+    assert _stage_env_prefix("specification") == "AIDW_STAGE=specification "
+    assert _stage_env_prefix("plan") == "AIDW_STAGE=plan "
+    # Drift guard: config.AUDIT_FULL_READ_FILE_BY_STAGE's literals must equal the REAL constants
+    # they duplicate (see that dict's own docstring for why it can't just import them). Local
+    # imports, well after both modules are fully loaded, so this cannot introduce the cycle the
+    # duplication itself exists to avoid.
+    from . import spec_ledger
+    from .gates import diagram_gate
+
+    assert config.AUDIT_FULL_READ_FILE_BY_STAGE["specification"] == spec_ledger.DRAFT_SPEC_PATH, (
+        "config.AUDIT_FULL_READ_FILE_BY_STAGE['specification'] has drifted from spec_ledger.DRAFT_SPEC_PATH"
+    )
+    assert config.AUDIT_FULL_READ_FILE_BY_STAGE["plan"] == diagram_gate.DRAFT_STEPS_PATH, (
+        "config.AUDIT_FULL_READ_FILE_BY_STAGE['plan'] has drifted from diagram_gate.DRAFT_STEPS_PATH"
+    )
 
     # Task 3b (Part 2 Ruling 10): run_id threads through the constructor same as CopilotChatModel's
     # (shape parity, even though nothing here reads it yet -- see ClaudeChatModel.run_id's comment).

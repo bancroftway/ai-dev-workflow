@@ -73,7 +73,7 @@ from .gates.diagram_gate import (
     verify_plan_diagrams,
 )
 from .gates.test_coverage_gate import MINIMAL_CODE_TO_GREEN_HARD_RULES, verify_coverage
-from .gates.ac_coverage_gate import AC_TO_TESTS_NAMING_RULES
+from .gates.ac_coverage_gate import AC_TO_TESTS_COVERAGE_GUIDANCE, AC_TO_TESTS_NAMING_RULES
 from .gates.write_scope_gate import AC_TO_TESTS_HARD_RULES, verify_ac_to_tests
 from .infra_retry import call_with_infra_retry
 from .a2ui_tools import (
@@ -2206,12 +2206,21 @@ STAGES: list[StageSpec] = [
         # verify_ac_to_tests specifically) is a documented, deliberate exclusion of
         # ac_coverage_gate.py's checks (see diagram_gate.py's own comment on this), not an
         # oversight this change should quietly override.
-        draft_rules="\n".join(f"- {r}" for r in (*AC_TO_TESTS_HARD_RULES, *AC_TO_TESTS_NAMING_RULES)),
+        # AC_TO_TESTS_COVERAGE_GUIDANCE appended (2026-09-19, same strategy applied a third time):
+        # advisory, not gate-enforced (see its own docstring for why no deterministic check backs
+        # it), but concatenated into the SAME draft_rules/audit_rules string for the identical
+        # reason as its two siblings -- one physical copy the draft and the audit both read, so the
+        # audit is never checking the draft against a rule the draft was never told.
+        draft_rules="\n".join(
+            f"- {r}" for r in (*AC_TO_TESTS_HARD_RULES, *AC_TO_TESTS_NAMING_RULES, *AC_TO_TESTS_COVERAGE_GUIDANCE)
+        ),
         # Same constants, not a separate set: make_audit_node overwrites stage["draft"] with the
         # audit's revised_test_suite BEFORE make_verify_node runs verify_ac_to_tests against it
         # (graph.py's audit-then-verify ordering), so the audit pass needs the identical rules --
         # one gate checks both draft and audit-revised content.
-        audit_rules="\n".join(f"- {r}" for r in (*AC_TO_TESTS_HARD_RULES, *AC_TO_TESTS_NAMING_RULES)),
+        audit_rules="\n".join(
+            f"- {r}" for r in (*AC_TO_TESTS_HARD_RULES, *AC_TO_TESTS_NAMING_RULES, *AC_TO_TESTS_COVERAGE_GUIDANCE)
+        ),
         # Final whole-branch review fix wave: every OTHER wired stage already paired its draft_rules/
         # audit_rules with a worked draft_example/audit_example -- this stage had the rules half but
         # not the example half, despite being the one AcceptanceCriteriaTestsDraftResponse's own
@@ -2236,6 +2245,12 @@ STAGES: list[StageSpec] = [
         # tool list worked. Something in custom_agents' tool resolution silently drops/ignores part
         # of its own declared list; available_tools isn't affected by it.
         use_custom_agent=False,
+        # `role` here is ALWAYS the bare "draft"/"audit" literal, never a per-lap-suffixed session
+        # key -- make_draft_node/make_audit_node call `session_options(state, "draft")`/
+        # `session_options(state, "audit")` with that literal directly (graph.py's own call sites),
+        # a different contract from the ChatModel's own `self.role` (which IS lap-keyed). Confirmed
+        # 2026-09-19 sweep, not a candidate for session_roles.role_matches -- see that module's own
+        # docstring for why this parameter is excluded on purpose.
         session_options=lambda state, role: (
             {
                 "agent_mode": "autopilot",
@@ -2306,6 +2321,8 @@ STAGES: list[StageSpec] = [
         # minimal-code-to-green "completed" a full Angular+.NET scaffold in 18 seconds having
         # written nothing at all. available_tools is honored where the custom agent's list is not.
         use_custom_agent=False,
+        # `role` here is always the bare "draft"/"audit" literal -- see the identical comment on
+        # ac-to-tests' own session_options above; not a session_roles.role_matches candidate.
         session_options=lambda _state, role: (
             {
                 "agent_mode": "autopilot",
@@ -3571,6 +3588,23 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         await _persist_if_sandboxed(
             thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} draft revised (audit)"
         )
+
+        # minimal-code-to-green's own draft+audit turn is the single most expensive, highest-loss
+        # artifact in this pipeline (a multi-hour agentic code-writing session touching hundreds of
+        # files) -- but its verify_coverage gate is a deterministic check that can fail on an
+        # infra issue wholly unrelated to code quality. Every other commit site here only persists
+        # .ai-dev-workflow/ (see _persist_if_sandboxed); nothing previously committed the actual
+        # application source tree until the r_minimal_code_to_green rebuild stage, which never runs
+        # if verify fails. Observed live (session f0fef8ba): an unrelated coverage-gate bug failed
+        # verify, the run was then torn down (--discard-sandbox), and every uncommitted file the
+        # draft+audit had written was permanently lost, forcing a full from-scratch redo. Committing
+        # here, before verify_coverage runs, means a later gate failure only costs re-verification,
+        # never the code itself. commit_all is idempotent (a no-op if nothing changed since the
+        # last commit), so this is safe even on a redraft cycle that touched nothing new.
+        if stage_spec.key == "minimal-code-to-green" and sandbox_registry.get(thread_id) is not None:
+            await git_ops.commit_all(
+                get_sandbox_provider(), thread_id, f"ai-dev-workflow: {stage_spec.key} source changes (post-audit checkpoint)"
+            )
 
         if sandbox_registry.get(thread_id) is not None:
             await repo_files.append_ledger_entry(
@@ -4996,7 +5030,18 @@ def _route_after_tech_stack(state: GraphState) -> str:
     baseline's LLM stage entirely and goes straight to the deterministic ratification node: there
     is nothing to baseline in an empty repo, and that stage's brownfield draft would just
     needs_clarification->END after the human already confirmed a tech stack on the Tech Stack
-    tab."""
+    tab.
+
+    A specification already approved in this thread's own checkpointed state is trusted ahead of
+    manifest_exists: it is decisive proof this run has already been through onboarding before,
+    while manifest_exists is a single git-file read on a freshly (re-)cloned sandbox that can come
+    back False for reasons having nothing to do with whether onboarding happened. Observed live
+    (session f0fef8ba): a --discard-sandbox resume's fresh clone read manifest_exists=False even
+    though specification/plan/ac-to-tests were all long since approved and minimal-code-to-green
+    was mid-run -- routing sent an otherwise-healthy resume on an expensive, pointless detour
+    through brownfield-spec reverse-engineering instead of straight back to its actual stage."""
+    if (state.get("stages") or {}).get("specification", {}).get("status") == "approved":
+        return "next"
     if state.get("manifest_exists", True):
         return "next"
     if tech_stack_signals.is_greenfield_repo(state):

@@ -97,6 +97,7 @@ from pydantic import BaseModel
 # is that one class/function-definition pass, the same cost any ordinary Python import pays.
 from . import claude_chat_model, copilot_chat_model, org_credential_vault, org_settings
 from .sandbox import SandboxProvider, SandboxSession
+from .session_roles import lap_role, lap_role_keys, role_matches
 from .structured_output import ainvoke_structured
 
 # 30 seconds. Every real caller below sits inside (or just before) a sandboxed CLI-exec turn that
@@ -461,38 +462,13 @@ def get_session_id(thread_id: str, stage: str, role: str, *, provider: str) -> s
     return _provider_module(provider).get_session_id(thread_id, stage, role)
 
 
-def lap_role(role: str, run_id: str, cycle: int) -> str:
-    """The session-cache ROLE KEY for one lap of a looping node: `<role>-<run_id>-<cycle>` (e.g.
-    `draft-5a2485e5-0`, `audit-5a2485e5-0`, `fix-5a2485e5-2`). THE one place this string is built.
-
-    Every node that runs the same stage/role more than once per run (graph.py's draft/audit/
-    verify-fix nodes, e2e_fix, test-hardening fix, readme, stack_runner's ac-test-run, rebuild's
-    fix node) keys its ChatModel with this so `--resume` never replays a prior lap's whole
-    transcript into the next one. Every LOOKUP or CLOSE of such a session (skill gate, the
-    full-file-read proofs, stall/stuck-session resets) must build its key here too -- passing the
-    bare "draft"/"audit"/"fix" label returns None from get_session_id and evicts nothing from
-    close_session, silently, on every lap.
-
-    Root-caused 2026-09-18 twice, same shape: skill_gate.py's lookups (runs e865062d/c9c293ea),
-    then graph.py's `_verify_specification_ledger` and diagram_gate.py's `_load_and_sync_plan_steps`
-    (session 6244ef47, run 5a2485e5) all looked up the bare "audit" role. The lookup returned None
-    on every lap by construction, the fail-closed branch turned that into "the audit session did
-    not prove it read the ENTIRE draft file", and specification burned all 5 verify laps on an
-    audit whose transcript showed one full Read of the file per lap. A 2026-09-19 sweep found the
-    same bare-label mismatch in four session RESETS (graph.py's verify stall reset, rebuild.py's
-    stuck-fixer reset, remediation_gate's stuck-fixer reset, ac_coverage_gate's ac-test-run reset)
-    -- each logged "resetting the session" and evicted nothing. chat_model's own self-check now
-    scans src/ for hand-built `<role>-{run_id}-{n}` f-strings so a new call site cannot drift.
-    """
-    return f"{role}-{run_id}-{cycle}"
-
-
-def lap_role_keys(run_id: str, cycle: int) -> tuple[str, str]:
-    """(draft, audit) keys for one stage lap -- `lap_role` for the two roles every StageSpec with
-    an audit pass constructs. graph.py's `_lap_role_keys(state, stage_key)` is the state-reading
-    wrapper; a deterministic_verify (which gets run_id and the lap counter, not state) calls
-    `lap_role("audit", run_id, lap)` directly."""
-    return lap_role("draft", run_id, cycle), lap_role("audit", run_id, cycle)
+# lap_role/lap_role_keys/role_matches: imported (not defined) here, from session_roles.py -- a
+# leaf module (stdlib only) specifically so claude_chat_model.py/copilot_chat_model.py can import
+# `role_matches` directly, without the circular import that used to force `_required_skills_env_
+# prefix` (and, historically, `_map_tool_names`) into two hand-duplicated copies. Every existing
+# `chat_model.lap_role(...)`/`chat_model.lap_role_keys(...)` caller (graph.py, gates/skill_gate.py,
+# gates/diagram_gate.py) is unaffected -- only where the implementation lives has moved. See
+# session_roles.py's own module docstring for the three root-caused incidents this closes.
 
 
 def get_lap_session_id(
@@ -958,6 +934,10 @@ def _demo() -> None:
     assert lap_role("fix", "5a2485e5", 2) == "fix-5a2485e5-2"
     assert lap_role_keys("5a2485e5", 0) == ("draft-5a2485e5-0", "audit-5a2485e5-0"), lap_role_keys("5a2485e5", 0)
     assert lap_role_keys("r", 3)[1] == "audit-r-3" and "audit" not in lap_role_keys("r", 3)[0]
+    # role_matches: the read-side counterpart, re-exported the same way -- session_roles.py's own
+    # self-check exhaustively covers its logic; this just proves the re-export is wired (the exact
+    # gap that let claude_chat_model.py/copilot_chat_model.py hand-roll this check instead).
+    assert role_matches("draft-5a2485e5-0", "draft") and not role_matches("audit-5a2485e5-0", "draft")
     # No call site may hand-build the per-lap key: a literal f"draft-{...}" / f"audit-{...}" /
     # f"fix-{...}" anywhere else in src/ is exactly the drift that produced both 2026-09-18
     # incidents (see lap_role's docstring). Static scan (plain substring check, not regex --

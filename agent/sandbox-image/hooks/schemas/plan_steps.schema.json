@@ -1,0 +1,75 @@
+{
+  "$defs": {
+    "PlanStep": {
+      "properties": {
+        "ac_ids": {
+          "description": "The ledger Acceptance Criterion ids (US-####.#) this step fulfils, copied exactly from the approved Specification -- never invented, never a retired id. Empty is only valid when kind='infrastructure'. A deterministic gate enforces this in both directions: every step cites live criteria (or is infrastructure), and every criterion still awaiting delivery is cited by at least one step.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Ac Ids",
+          "type": "array"
+        },
+        "description": {
+          "description": "One concrete action.",
+          "title": "Description",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable identifier (e.g. PS-1).",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "default": "feature",
+          "description": "'infrastructure' marks scaffolding/tooling/config steps that fulfil no single criterion; every other step is 'feature' and must cite ac_ids.",
+          "enum": [
+            "feature",
+            "infrastructure"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "removes_ids": {
+          "description": "Stable ids of RETIRED stories/criteria (from the approved Specification's retired lists -- copied exactly, never invented, never a live id) whose already-delivered artifacts this step removes: implementation code, UI screens, navigation links, config. Only for features that were actually BUILT before being removed -- a feature retired before any code existed needs no removal step at all. A pure-removal step is kind='infrastructure' with empty ac_ids; a step may also both fulfil live criteria and remove retired ones. A deterministic gate rejects a live id here, and demands that every criterion delivered by an earlier run and retired this round is named by some step's removes_ids.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Removes Ids",
+          "type": "array"
+        },
+        "ui_related": {
+          "default": false,
+          "description": "True when this step changes what the user sees or interacts with (a screen, a component, layout, styling, client-side behavior) -- False for pure backend/API/data/infrastructure work with no visible surface. Lets the review UI separate UI-facing work from the rest at a glance; not gate-enforced against wireframe coverage.",
+          "title": "Ui Related",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "description"
+      ],
+      "title": "PlanStep",
+      "type": "object"
+    }
+  },
+  "description": "The WHOLE shape of `.ai-dev-workflow/plan/_draft/steps.json` -- gates/diagram_gate.py's\n`_load_and_sync_plan_steps` already validates this same shape field-by-field (each entry\nagainst `PlanStep`, the two lists read directly); this model exists ONLY so that hand-written\nvalidation and a machine-readable JSON Schema can never independently drift apart. It composes\n`PlanStep` UNCHANGED (never redeclares its fields) specifically so the sandbox's same-turn\nschema-check Stop hook (sandbox-image/hooks/check-plan-schema-stop.mjs) validates against the\nreal shape, not a hand-copied approximation of it -- see `export_hook_schemas` below, which is\nthe ONLY place `.model_json_schema()` is called on this model. Never itself used to VALIDATE a\nreal steps.json at verify time; `_load_and_sync_plan_steps` keeps doing that, unchanged, so a\nparse failure there still gets today's precise, PlanStep-scoped error message rather than this\nenvelope's.",
+  "properties": {
+    "plan_steps": {
+      "items": {
+        "$ref": "#/$defs/PlanStep"
+      },
+      "title": "Plan Steps",
+      "type": "array"
+    },
+    "retired_step_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Retired Step Ids",
+      "type": "array"
+    }
+  },
+  "title": "StepsFile",
+  "type": "object"
+}

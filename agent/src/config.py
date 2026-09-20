@@ -564,6 +564,29 @@ REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
     # skills evidence each run persists.
 }
 
+# Same-turn counterpart of the Review-depth safety net (graph.py's _verify_specification_ledger /
+# gates/diagram_gate.py's _load_and_sync_plan_steps, both keyed on spec_ledger.DRAFT_SPEC_PATH /
+# diagram_gate.DRAFT_STEPS_PATH): the file an AUDIT session must prove it read in full THIS lap,
+# activated only for the AUDIT role via claude_chat_model.py's/copilot_chat_model.py's
+# `_full_read_env_prefix` (2026-09-19), the identical draft-only/audit-only asymmetry
+# REQUIRED_SKILLS_BY_STAGE's own comment documents for _required_skills_env_prefix, just inverted
+# (that one arms the DRAFT role; this one arms the AUDIT role, since only the audit's own prompt
+# demands a full re-read every pass -- see specification_audit.md/plan_audit.md's own "View it
+# first, in full" instruction). A literal string here, not an import of the real constant, for the
+# SAME reason config.py stays a leaf module with zero project imports throughout this file --
+# spec_ledger.py/gates/diagram_gate.py both import repo_files/chat_model, and diagram_gate.py
+# imports chat_model.py, which imports claude_chat_model.py/copilot_chat_model.py, which import
+# config.py -- importing either module's real constant HERE would complete that cycle. KEPT IN
+# SYNC by claude_chat_model.py's/copilot_chat_model.py's own self-check, which imports both real
+# modules locally (inside the demo function, well after both are fully loaded, so no cycle) and
+# asserts equality against these literals.
+AUDIT_FULL_READ_FILE_BY_STAGE: dict[str, str] = {
+    "specification": ".ai-dev-workflow/spec/draft-specification.json",
+    "plan": ".ai-dev-workflow/plan/_draft/steps.json",
+    # brownfield-spec/brownfield-plan deliberately absent: both pass has_audit_role=False (no
+    # audit session ever exists for them), so there is no role for this env var to ever arm.
+}
+
 # Read-only tool allowlist (Phase A0 spike finding: excluded_tools blocklisting write-capable
 # tools is incomplete -- the model can reach create/bash/edit/apply_patch interchangeably, so
 # read-only stages must allowlist via available_tools instead). All entries are source-qualified

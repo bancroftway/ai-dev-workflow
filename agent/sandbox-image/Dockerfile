@@ -680,6 +680,41 @@ RUN printf '%s\n' \
 #   - check-citation-drop-stop.mjs: catches a mass existing_us_id/existing_ac_id citation-drop (a
 #     redraft reconstructing the file from memory instead of editing it) before the whole lap is
 #     spent on the auditor fixing it -- observed live, all 25 stories/~113 criteria at once.
+#   - check-plan-schema-stop.mjs (2026-09-19): validates _draft/steps.json and manifest.json
+#     against agent/src/schemas.py's exported JSON Schemas (lib/json-schema-lite.mjs, a generic,
+#     dependency-free walker -- no hook hand-encodes a model's field names), plus wireframe/diagram
+#     file-existence, the wireframe count cap, and wireframe self-containment (ported from
+#     gates/diagram_gate.py) -- all four caught the SAME income-investor plan run's redrafts on
+#     2026-09-19: a manifest field typed `type` instead of `kind`, a referenced wireframe with no
+#     .html file, 7 wireframes over the cap of 6, and one containing a forbidden <iframe>.
+#   - check-narrative-format-stop.mjs (2026-09-19): the User Story narrative template check,
+#     ported from spec_ledger.py's `check_narrative_format` -- observed costing a redraft lap in
+#     BOTH of that day's re-verification runs (sessions 6244ef47 and 5905ba13).
+#   - check-full-read-stop.mjs (2026-09-19): same-turn counterpart of the Review-depth safety net
+#     (graph.py's _verify_specification_ledger / gates/diagram_gate.py's _load_and_sync_plan_steps)
+#     -- proves the AUDIT session's own transcript covers the whole target file with Read calls
+#     before the turn ends. Activated via AIDW_AUDIT_FULL_READ_FILE (claude_chat_model.py's/
+#     copilot_chat_model.py's `_full_read_env_prefix`), audit role only. CLAUDE-ONLY BY DESIGN:
+#     copilot_chat_model.py's own `_full_read_env_prefix` hard-returns "" always, since this
+#     codebase has no confirmed Copilot transcript shape for a generic Read tool call (only the
+#     dedicated skill.invoked event require-skills-stop.mjs relies on is confirmed live) -- see
+#     that function's own docstring.
+#   - check-plan-citations-stop.mjs (2026-09-19): every Acceptance Criterion id steps.json/
+#     manifest.json cite must exist in the ledger, be the right kind, and (for plan steps) be
+#     live -- ported from gates/diagram_gate.py's check_plan_linkage/check_wireframe_ac_ids
+#     citation-validity checks (a narrower scope than those two -- see the hook's own header for
+#     what is deliberately NOT ported and why).
+#   - check-diagram-staleness-stop.mjs (2026-09-19): reminds the plan turn to explicitly review
+#     every er/architecture diagram whose specification appears to have moved on since the diagram
+#     was last touched (git commit ancestry, not the ledger's run_id stamps -- see the hook's own
+#     header for why those are structurally unavailable this early) -- observed costing a redraft
+#     lap in the SAME income-investor plan run above.
+#   - check-test-quality-stop.mjs (2026-09-19): fiat-failure stubs, absence-only tests, and
+#     near-duplicate test bodies, in the ac-to-tests draft/audit turn -- by shelling out to
+#     gates/test_quality_checks.py (COPY'd in below UNMODIFIED, stdlib-only), the real
+#     implementation ac_coverage_gate.py's own deterministic_verify uses, not a second JS port of
+#     it. Observed costing a redraft lap (income-investor session f0fef8ba, cycle 3) on a
+#     near-duplicate pair the audit turn's own review missed entirely (0 findings that cycle).
 #
 # BOTH PROVIDERS (user directive, 2026-09-17): baked into BOTH Claude Code's admin-managed
 # settings path AND GitHub Copilot CLI's own config, confirmed live via real docker-exec
@@ -706,6 +741,27 @@ RUN printf '%s\n' \
 # self-modifying enforcement hook mid-run is a supply-chain risk this doesn't need to accept.
 COPY hooks/require-skills-stop.mjs /opt/aidw-hooks/require-skills-stop.mjs
 COPY hooks/check-citation-drop-stop.mjs /opt/aidw-hooks/check-citation-drop-stop.mjs
+COPY hooks/check-narrative-format-stop.mjs /opt/aidw-hooks/check-narrative-format-stop.mjs
+COPY hooks/check-plan-schema-stop.mjs /opt/aidw-hooks/check-plan-schema-stop.mjs
+COPY hooks/check-full-read-stop.mjs /opt/aidw-hooks/check-full-read-stop.mjs
+COPY hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-plan-citations-stop.mjs
+COPY hooks/check-diagram-staleness-stop.mjs /opt/aidw-hooks/check-diagram-staleness-stop.mjs
+COPY hooks/check-test-quality-stop.mjs /opt/aidw-hooks/check-test-quality-stop.mjs
+# The REAL implementation, not a port -- see check-test-quality-stop.mjs's own header. This is a
+# byte-identical STAGED COPY of agent/src/gates/test_quality_checks.py: Docker's build context
+# here is agent/sandbox-image (see the two documented `docker build ... agent/sandbox-image`
+# invocations), which cannot COPY a path outside itself, so the source module cannot be referenced
+# directly the way it is imported directly from within agent/src/. Unlike the WIREFRAME_FORBIDDEN
+# regex list ported by hand into check-plan-schema-stop.mjs (an unavoidable Python-to-JS
+# translation with nothing to diff), this is plain Python duplicated verbatim into Python -- fully
+# automatable, so test_quality_checks.py's own self-check (`_demo()`) asserts this file is
+# byte-identical to its source on every run; re-run `cp ../src/gates/test_quality_checks.py
+# hooks/test_quality_checks.py` (from agent/sandbox-image) after editing the source and before
+# rebuilding. Needs nothing beyond python3's standard library (already baked above for
+# lizard/semgrep/checkov/bandit), so no requirements.txt or pip install accompanies it.
+COPY hooks/test_quality_checks.py /opt/aidw-hooks/test_quality_checks.py
+COPY hooks/lib/ /opt/aidw-hooks/lib/
+COPY hooks/schemas/ /opt/aidw-hooks/schemas/
 RUN set -eux; \
     mkdir -p /etc/claude-code /home/vscode/.copilot; \
     printf '%s\n' \
@@ -713,7 +769,13 @@ RUN set -eux; \
       '  "hooks": {' \
       '    "Stop": [' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/require-skills-stop.mjs", "timeout": 30 } ] },' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-citation-drop-stop.mjs", "timeout": 30 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-citation-drop-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-narrative-format-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-plan-schema-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-full-read-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-plan-citations-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs", "timeout": 30 } ] }' \
       '    ]' \
       '  }' \
       '}' \
@@ -723,15 +785,25 @@ RUN set -eux; \
       '  "hooks": {' \
       '    "Stop": [' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/require-skills-stop.mjs" },' \
-      '      { "type": "command", "command": "node /opt/aidw-hooks/check-citation-drop-stop.mjs" }' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-citation-drop-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-narrative-format-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-plan-schema-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-full-read-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-plan-citations-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs" }' \
       '    ]' \
       '  }' \
       '}' \
       > /home/vscode/.copilot/config.json; \
     chown -R root:root /etc/claude-code /opt/aidw-hooks; \
-    chmod 0755 /etc/claude-code /opt/aidw-hooks; \
+    chmod 0755 /etc/claude-code /opt/aidw-hooks /opt/aidw-hooks/lib /opt/aidw-hooks/schemas; \
     chmod 0644 /etc/claude-code/managed-settings.json /opt/aidw-hooks/require-skills-stop.mjs \
-      /opt/aidw-hooks/check-citation-drop-stop.mjs; \
+      /opt/aidw-hooks/check-citation-drop-stop.mjs /opt/aidw-hooks/check-narrative-format-stop.mjs \
+      /opt/aidw-hooks/check-plan-schema-stop.mjs /opt/aidw-hooks/check-full-read-stop.mjs \
+      /opt/aidw-hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-diagram-staleness-stop.mjs \
+      /opt/aidw-hooks/check-test-quality-stop.mjs /opt/aidw-hooks/test_quality_checks.py \
+      /opt/aidw-hooks/lib/*.mjs /opt/aidw-hooks/schemas/*.json; \
     chown -R vscode:vscode /home/vscode/.copilot; \
     chmod 0644 /home/vscode/.copilot/config.json
 

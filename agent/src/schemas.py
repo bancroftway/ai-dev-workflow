@@ -408,6 +408,74 @@ class PlanWireframeRef(BaseModel):
     ac_ids: list[str] = Field(default_factory=list)
 
 
+class StepsFile(BaseModel):
+    """The WHOLE shape of `.ai-dev-workflow/plan/_draft/steps.json` -- gates/diagram_gate.py's
+    `_load_and_sync_plan_steps` already validates this same shape field-by-field (each entry
+    against `PlanStep`, the two lists read directly); this model exists ONLY so that hand-written
+    validation and a machine-readable JSON Schema can never independently drift apart. It composes
+    `PlanStep` UNCHANGED (never redeclares its fields) specifically so the sandbox's same-turn
+    schema-check Stop hook (sandbox-image/hooks/check-plan-schema-stop.mjs) validates against the
+    real shape, not a hand-copied approximation of it -- see `export_hook_schemas` below, which is
+    the ONLY place `.model_json_schema()` is called on this model. Never itself used to VALIDATE a
+    real steps.json at verify time; `_load_and_sync_plan_steps` keeps doing that, unchanged, so a
+    parse failure there still gets today's precise, PlanStep-scoped error message rather than this
+    envelope's."""
+
+    plan_steps: list[PlanStep] = Field(default_factory=list)
+    retired_step_ids: list[str] = Field(default_factory=list)
+
+
+class ManifestFile(BaseModel):
+    """The WHOLE shape of `.ai-dev-workflow/plan/_draft/manifest.json` -- same reasoning and same
+    "never used to validate, only to export" contract as `StepsFile` above, mirroring
+    gates/diagram_gate.py's `_load_and_check_manifest` (each list entry already validated against
+    `PlanWireframeRef`/`PlanDiagramRef` there, unchanged)."""
+
+    wireframes: list[PlanWireframeRef] = Field(default_factory=list)
+    diagrams: list[PlanDiagramRef] = Field(default_factory=list)
+    retired_wireframe_screens: list[str] = Field(default_factory=list)
+    retired_diagram_names: list[str] = Field(default_factory=list)
+
+
+# Checked-in schema files a same-turn sandbox Stop hook validates against (Node has no access to
+# this module or to pydantic -- the sandbox never ships the orchestrator's own source). Keyed by
+# the same stem `check-plan-schema-stop.mjs` loads; `export_hook_schemas` below is the ONLY writer
+# and the ONLY reader of "what these files should currently contain" -- see that function's own
+# docstring for the drift this two-step (export, then a self-check that re-runs it and diffs)
+# exists to prevent.
+HOOK_SCHEMAS_DIR = "sandbox-image/hooks/schemas"
+HOOK_SCHEMAS: dict[str, type[BaseModel]] = {"plan_steps": StepsFile, "plan_manifest": ManifestFile}
+
+
+def export_hook_schemas() -> dict[str, dict[str, Any]]:
+    """{stem: JSON Schema dict} for every model in `HOOK_SCHEMAS` -- pure, so both the CLI export
+    below and this module's own self-check (which calls this a second time and diffs against what
+    is actually checked into `HOOK_SCHEMAS_DIR`) exercise the identical code path a real drift
+    would go through, never two independently-written copies of "what the schema should be."
+    """
+    return {stem: model.model_json_schema() for stem, model in HOOK_SCHEMAS.items()}
+
+
+def write_hook_schemas(root: str) -> list[str]:
+    """Writes every `export_hook_schemas()` entry to `<root>/HOOK_SCHEMAS_DIR/<stem>.schema.json`,
+    returning the paths written. `root` is the `agent/` directory (the caller's own cwd in every
+    real invocation: `cd agent && python -m src.schemas --export-hook-schemas`); threaded as a
+    parameter rather than hardcoded so this module's own self-check can point it at a scratch
+    directory instead of overwriting the real checked-in files on every test run.
+    """
+    import os
+
+    out_dir = os.path.join(root, HOOK_SCHEMAS_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    written: list[str] = []
+    for stem, schema in export_hook_schemas().items():
+        path = os.path.join(out_dir, f"{stem}.schema.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(schema, indent=2, sort_keys=True) + "\n")
+        written.append(path)
+    return written
+
+
 class DiagramPresence(BaseModel):
     """Typed-absence wrapper for `ImplementationPlan.diagrams`, same shape/rules as `PresenceList`
     (this module) but with `values: list[PlanDiagram]` -- PresenceList's own `values` is fixed to
@@ -1181,6 +1249,23 @@ extraction-only prompt path that reads approved markdown back into this same sch
 
 
 if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.schemas`
+    import sys
+
+    # `cd agent && python -m src.schemas --export-hook-schemas`: (re)generates the checked-in
+    # sandbox-image/hooks/schemas/*.schema.json files a same-turn Stop hook validates against
+    # (check-plan-schema-stop.mjs) -- run this whenever PlanStep/PlanDiagramRef/PlanWireframeRef
+    # (or StepsFile/ManifestFile themselves) change. The self-check below (no flag) FAILS if these
+    # files are stale, so a change that needed this and skipped it is caught before merge, not
+    # discovered live in a sandbox the way the "type" vs "kind" incident was (2026-09-19).
+    if "--export-hook-schemas" in sys.argv:
+        import os
+
+        written = write_hook_schemas(os.path.dirname(os.path.dirname(__file__)))
+        print(f"wrote {len(written)} hook schema file(s):")
+        for path in written:
+            print(f"  {path}")
+        sys.exit(0)
+
     # NonBlankStr: rejects blank/whitespace-only, strips what it keeps.
     class _NonBlankStrProbe(BaseModel):
         value: NonBlankStr
@@ -1643,5 +1728,26 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     )
     assert_example_matches_schema(PlanDiagramRef(name="d", kind="er"), PlanDiagramRef)
     assert_example_matches_schema(PlanWireframeRef(screen="s"), PlanWireframeRef)
+
+    # export_hook_schemas/write_hook_schemas drift guard: the files actually checked into
+    # sandbox-image/hooks/schemas/ (what check-plan-schema-stop.mjs validates a real sandbox
+    # turn's steps.json/manifest.json against) must be byte-for-byte what StepsFile/ManifestFile
+    # produce RIGHT NOW. A PlanStep/PlanDiagramRef/PlanWireframeRef field changing without
+    # re-running `--export-hook-schemas` would otherwise silently leave the sandbox validating
+    # against a stale shape -- exactly the "two independently-written copies of the same truth"
+    # failure mode this whole module's docstring on HOOK_SCHEMAS warns against, just one level up
+    # (checked-in file vs. live model, rather than JS field list vs. Python model).
+    import os
+
+    _repo_agent_dir = os.path.dirname(os.path.dirname(__file__))
+    for _stem, _schema in export_hook_schemas().items():
+        _checked_in_path = os.path.join(_repo_agent_dir, HOOK_SCHEMAS_DIR, f"{_stem}.schema.json")
+        with open(_checked_in_path, encoding="utf-8") as _f:
+            _checked_in = _f.read()
+        _fresh = json.dumps(_schema, indent=2, sort_keys=True) + "\n"
+        assert _checked_in == _fresh, (
+            f"{_checked_in_path} is stale -- re-run `cd agent && python -m src.schemas "
+            "--export-hook-schemas` and commit the result"
+        )
 
     print("schemas self-check: all assertions passed")

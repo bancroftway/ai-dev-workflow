@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import config as workflow_config
-from ..chat_model import get_session_id, read_skill_invocations
+from ..chat_model import get_session_id, read_skill_invocations, role_matches
 from ..claude_chat_model import normalize_skill_name
 from ..sandbox.provider import SandboxProvider
 
@@ -144,8 +144,12 @@ async def invoked_skills(
         # before any audit session exists yet) -- only warn for the draft role, which should
         # always have JUST run by the time anything calls this. `role` is either the bare "draft"
         # (this module's own self-check fixtures) or a real "draft-{run_id}-{cycle}" key (every
-        # production call, post-fix) -- both start with "draft".
-        if role == "draft" or role.startswith("draft-"):
+        # production call, post-fix) -- role_matches recognizes both (2026-09-19: this file's own
+        # hand-written `role == "draft" or role.startswith("draft-")` was the ORIGINAL copy of
+        # this check; claude_chat_model.py's/copilot_chat_model.py's _required_skills_env_prefix
+        # each independently re-wrote it slightly wrong -- routed through the shared recognizer now
+        # so a fourth hand-written copy can't drift the same way).
+        if role_matches(role, "draft"):
             logger.warning(
                 "invoked_skills: no cached session id for thread_id=%s (stage=%s, role=%s) -- "
                 "a draft session should exist by now; cannot verify %s skills",

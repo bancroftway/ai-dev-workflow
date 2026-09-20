@@ -1,0 +1,84 @@
+{
+  "$defs": {
+    "PlanDiagramRef": {
+      "description": "Validates one entry of _draft/manifest.json's `diagrams` list -- NOT part of any model\nresponse schema (the model edits manifest.json directly with file tools). Reference-only: the\nreal Mermaid source lives in the sidecar `_draft/diagrams/<name>.mmd` file, read separately by\ngates/diagram_gate.py -- mirrors PlanDiagram's identity fields without its bulk content.",
+      "properties": {
+        "ac_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ac Ids",
+          "type": "array"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "title": "PlanDiagramRef",
+      "type": "object"
+    },
+    "PlanWireframeRef": {
+      "description": "Validates one entry of _draft/manifest.json's `wireframes` list -- NOT part of any model\nresponse schema. Reference-only: the real HTML lives in the sidecar\n`_draft/wireframes/<screen>.html` file -- mirrors Wireframe's identity fields without its bulk\ncontent.",
+      "properties": {
+        "ac_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ac Ids",
+          "type": "array"
+        },
+        "screen": {
+          "title": "Screen",
+          "type": "string"
+        }
+      },
+      "required": [
+        "screen"
+      ],
+      "title": "PlanWireframeRef",
+      "type": "object"
+    }
+  },
+  "description": "The WHOLE shape of `.ai-dev-workflow/plan/_draft/manifest.json` -- same reasoning and same\n\"never used to validate, only to export\" contract as `StepsFile` above, mirroring\ngates/diagram_gate.py's `_load_and_check_manifest` (each list entry already validated against\n`PlanWireframeRef`/`PlanDiagramRef` there, unchanged).",
+  "properties": {
+    "diagrams": {
+      "items": {
+        "$ref": "#/$defs/PlanDiagramRef"
+      },
+      "title": "Diagrams",
+      "type": "array"
+    },
+    "retired_diagram_names": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Retired Diagram Names",
+      "type": "array"
+    },
+    "retired_wireframe_screens": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Retired Wireframe Screens",
+      "type": "array"
+    },
+    "wireframes": {
+      "items": {
+        "$ref": "#/$defs/PlanWireframeRef"
+      },
+      "title": "Wireframes",
+      "type": "array"
+    }
+  },
+  "title": "ManifestFile",
+  "type": "object"
+}
