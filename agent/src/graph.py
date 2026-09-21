@@ -72,7 +72,11 @@ from .gates.diagram_gate import (
     make_verify_plan_diagrams,
     verify_plan_diagrams,
 )
-from .gates.test_coverage_gate import MINIMAL_CODE_TO_GREEN_HARD_RULES, verify_coverage
+from .gates.test_coverage_gate import (
+    MINIMAL_CODE_TO_GREEN_HARD_RULES,
+    MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE,
+    verify_coverage,
+)
 from .gates.ac_coverage_gate import AC_TO_TESTS_COVERAGE_GUIDANCE, AC_TO_TESTS_NAMING_RULES
 from .gates.write_scope_gate import AC_TO_TESTS_HARD_RULES, verify_ac_to_tests
 from .infra_retry import call_with_infra_retry
@@ -2303,9 +2307,14 @@ STAGES: list[StageSpec] = [
         deterministic_verify=verify_coverage,
         # Task 13b: same rules text for both passes -- the audit overwrites stage["draft"] with
         # its revised_iteration BEFORE this gate runs, same mechanism Task 8 confirmed for
-        # ac-to-tests.
-        draft_rules="\n".join(f"- {r}" for r in MINIMAL_CODE_TO_GREEN_HARD_RULES),
-        audit_rules="\n".join(f"- {r}" for r in MINIMAL_CODE_TO_GREEN_HARD_RULES),
+        # ac-to-tests. MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE (advisory, no gate backs it) rides
+        # alongside the hard rules the same way AC_TO_TESTS_COVERAGE_GUIDANCE does for ac-to-tests.
+        draft_rules="\n".join(
+            f"- {r}" for r in (*MINIMAL_CODE_TO_GREEN_HARD_RULES, *MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
+        ),
+        audit_rules="\n".join(
+            f"- {r}" for r in (*MINIMAL_CODE_TO_GREEN_HARD_RULES, *MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
+        ),
         # Coverage verification (the deterministic gate) is the real check; the human checkpoints
         # are specification and plan only.
         requires_human_gate=False,

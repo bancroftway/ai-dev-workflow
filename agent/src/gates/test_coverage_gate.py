@@ -1213,6 +1213,42 @@ MINIMAL_CODE_TO_GREEN_HARD_RULES: tuple[str, ...] = (
     "just how it is arranged.",
 )
 
+# Advisory, not deterministic-check-backed -- unlike MINIMAL_CODE_TO_GREEN_HARD_RULES above, none
+# of these has (or needs) a hard gate branch; they steer the model away from specific defect
+# classes an adversarial audit already had to catch by hand. Distilled from three separate
+# unresolved-audit-finding REDRAFTs on the same live run (session f0fef8ba, minimal-code-to-green
+# cycles 2-5): a retracted-but-still-written claim and a citation to test files
+# (test_optimizer_constraints.py/test_optimizer_run.py) that were named in an earlier planning doc
+# but never actually implemented; an e2e test that restored a mutated setting as a plain sequential
+# step instead of try/finally, corrupting the setting for a later test in the same file on any
+# mid-test failure; and a Playwright webServer command (`uv run uvicorn ...`) written for a FastAPI
+# backend that only ever had a plain requirements.txt, never a pyproject.toml/uv.lock -- silently
+# breaking e2e execution end-to-end.
+MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE: tuple[str, ...] = (
+    "Every comment, docstring, known_gaps entry, or memory-file note that names a specific file "
+    "path must be verified to actually exist in the repository (Glob/Grep it) before you write "
+    "it -- citing a path from an earlier stage's planning document as if it were implemented, "
+    "when it was only ever planned, is a fabrication even when the underlying claim it supports "
+    "is otherwise true.",
+    "A test that mutates shared, persistent state as part of its own body (a database row, a "
+    "config value, an app setting) -- not merely asserting on state a fixture already set up -- "
+    "must restore that state in a try/finally or an afterEach hook, never as a plain sequential "
+    "step at the end of the test body; a failed assertion between the mutation and the restore "
+    "must not leave the mutated value in place for a later test in the same file.",
+    "Before writing any command that starts, builds, or tests a DIFFERENT part of this app than "
+    "the file you are currently editing (a Playwright webServer entry, a CI script, a README "
+    "instruction) -- especially one in a different language/runtime -- check TWO things first: "
+    "(1) `.ai-dev-workflow/manifest.json`'s `toolchain.available` map, a deterministic `command -v` "
+    "probe of this sandbox, to confirm the tool you are about to invoke (uv, pnpm, poetry, ...) is "
+    "even installed here -- a `false`/missing entry means it genuinely is not on PATH, full stop; "
+    "(2) that target's own manifest (requirements.txt/pyproject.toml/uv.lock, package.json, etc.) "
+    "to confirm it is the convention THIS SPECIFIC sub-project actually uses, since a tool being "
+    "installed somewhere in the sandbox does not mean every app in this repo uses it. Do not "
+    "assume a modern convention applies just because it is common elsewhere; a wrong manager "
+    "silently breaks whatever consumes that command without ever showing up as a code review "
+    "finding.",
+)
+
 
 async def verify_coverage(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
@@ -1744,6 +1780,8 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     # the constant's own comment for the full count breakdown).
     assert len(MINIMAL_CODE_TO_GREEN_HARD_RULES) == 15, len(MINIMAL_CODE_TO_GREEN_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_HARD_RULES)
+    assert len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE) == 3, len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
+    assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
     print("test_coverage_gate self-check: all assertions passed")
 
 

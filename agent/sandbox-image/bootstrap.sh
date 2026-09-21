@@ -99,10 +99,31 @@ if [[ -f global.json ]]; then
   fi
 fi
 
+# ── 2c. Baseline sandbox tool availability ────────────────────────────────────────────────────
+# Deterministic ground truth for "is X even on PATH in this container" -- independent of what this
+# repo declares (section 2 above only records tools THIS repo asked mise/dotnet to install).
+# Exists because a drafting/audit session otherwise has to guess or grep for a tool's presence, and
+# guessing gets it wrong: observed live (session f0fef8ba, income-investor) a Playwright webServer
+# config was written with `uv run uvicorn ...` for a FastAPI backend that only ever had a plain
+# requirements.txt, and `uv` genuinely is not installed in this image (only its cache dir is
+# reserved) -- silently breaking e2e end-to-end. Extend this list when the image gains a new
+# package manager / runtime; a probe costs nothing and a missing entry just reads "unknown" rather
+# than lying either way.
+available_json=""
+for bin in python3 pip3 pip uv poetry pipenv node npm npx pnpm yarn dotnet git; do
+  if command -v "$bin" >/dev/null 2>&1; then
+    present="true"
+  else
+    present="false"
+  fi
+  available_json="${available_json:+${available_json},}\"${bin}\":${present}"
+done
+
 # ── 3. Report ─────────────────────────────────────────────────────────────────────────────────
 # Read back by preflight_nodes.record_toolchain, which folds it into the ledger, manifest.json and
 # the host-side log. Written even when empty: "we looked and the image already had everything" is
 # a different fact from "bootstrap never ran", and only this file can tell them apart.
-printf '{"image":"%s","tools":{%s}}\n' "${AIDW_IMAGE_REF:-unknown}" "$tools_json" > "$REPORT_PATH"
+printf '{"image":"%s","tools":{%s},"available":{%s}}\n' \
+  "${AIDW_IMAGE_REF:-unknown}" "$tools_json" "$available_json" > "$REPORT_PATH"
 echo "bootstrap: wrote ${REPORT_PATH}"
 exit 0

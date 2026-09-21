@@ -155,6 +155,22 @@ a dated bullet when you learn something durable and repo-specific the code itsel
 Never write secrets or task narration into it.
 """
 
+_TOOLCHAIN_SENTINEL = _guidance_sentinel("toolchain-available")
+
+_TOOLCHAIN_PARAGRAPH = f"""
+{_TOOLCHAIN_SENTINEL}
+## Before invoking a package manager or runtime you did not just install yourself
+
+`.ai-dev-workflow/manifest.json`'s `toolchain.available` map is a deterministic `command -v` probe
+of this sandbox (python3, pip3, pip, uv, poetry, pipenv, node, npm, npx, pnpm, yarn, dotnet, git),
+taken independently of what this repo declares. Check it before writing any command that starts,
+builds, or tests a part of this app -- a webServer entry, a CI script, a README instruction --
+especially one in a different language/runtime than the file you are editing. Do not assume a
+modern convention (uv, pnpm, poetry) is installed just because it is common elsewhere; a `false`
+entry means it genuinely is not on PATH here, and a wrong package manager silently breaks whatever
+consumes that command.
+"""
+
 TECH_STACK_MD_PATH = ".ai-dev-workflow/tech-stack.md"
 # One truth, derived from the stage-file numbering -- see workflow_persistence.
 TECH_STACK_APPROVED_JSON_PATH = workflow_persistence.TECH_STACK_APPROVED_PATH
@@ -283,6 +299,8 @@ async def scaffold_finalize_node(state: "GraphState", config: RunnableConfig) ->
             appended = appended.rstrip() + "\n" + _TECH_STACK_PARAGRAPH
         if _MEMORY_SENTINEL not in appended and ".ai-dev-workflow/memory.md" not in appended:
             appended = appended.rstrip() + "\n" + _MEMORY_PARAGRAPH
+        if _TOOLCHAIN_SENTINEL not in appended and "toolchain.available" not in appended:
+            appended = appended.rstrip() + "\n" + _TOOLCHAIN_PARAGRAPH
         if appended != agents_md:
             await repo_files.write_repo_file(provider, thread_id, "AGENTS.md", appended)
             written_paths.append("AGENTS.md")
@@ -334,7 +352,8 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
     """Folds bootstrap.sh's report into its two sinks. Returns True when manifest.json changed.
 
     Split by write pattern, deliberately:
-      - durable facts (which tools this repo needed, whether the image had them) -> manifest.json,
+      - durable facts (which tools this repo needed and whether the image had them, plus a fixed
+        baseline probe of what's on PATH regardless of what the repo declares) -> manifest.json,
         rewritten only when that set actually changes, so a re-run produces no commit churn;
       - per-run metrics (that this session installed them at all) -> ledger.jsonl, which is fresh
         per session and already aggregated by metrics-report;
@@ -352,6 +371,11 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
         return False
 
     tools = report.get("tools") or {}
+    # Deterministic `command -v` probe of a fixed binary list (bootstrap.sh section 2c) -- ground
+    # truth for "is X even on PATH in this sandbox", independent of what this repo itself declares.
+    # Consulted by MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE so a drafting session checks this instead
+    # of assuming a package manager is installed just because it is common elsewhere.
+    available = report.get("available") or {}
     try:
         log_path = _toolchain_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -364,7 +388,7 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
         provider, thread_id, {"stage": "scaffold", "node": "toolchain", "tools": tools}
     )
 
-    if not tools:
+    if not tools and not available:
         return False
 
     existing_raw = await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH)
@@ -372,7 +396,7 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
         existing = json.loads(existing_raw).get("toolchain") if existing_raw else None
     except json.JSONDecodeError:
         existing = None
-    entry = {"image": report.get("image", "unknown"), "tools": tools}
+    entry = {"image": report.get("image", "unknown"), "tools": tools, "available": available}
     if existing == entry:
         # Same tools, same image, same outcomes -- rewriting would produce a commit whose only
         # content is "we ran again".
