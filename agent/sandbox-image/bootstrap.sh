@@ -119,11 +119,25 @@ for bin in python3 pip3 pip uv poetry pipenv node npm npx pnpm yarn dotnet git; 
   available_json="${available_json:+${available_json},}\"${bin}\":${present}"
 done
 
+# ── 2d. Baked-in Playwright build ─────────────────────────────────────────────────────────────
+# The sandbox image bakes exactly ONE Playwright browser build at image-build time (see the
+# Dockerfile's PLAYWRIGHT_VERSION arg); a target repo's own `@playwright/test` in package.json
+# must match it exactly or e2e fails at RUN time with "browserType.launch: Executable doesn't
+# exist" / a version-mismatch error. That build-time ARG is not itself visible at runtime, so
+# this queries the REAL installed version directly (ground truth over a possibly-stale literal)
+# rather than trusting a value baked into prompt text. Exists because this exact version string
+# was previously hand-duplicated across four files (the Dockerfile, one SKILL.md, two prompts)
+# with no mechanism keeping them in sync -- observed live (session f0fef8ba, income-investor) a
+# draft session hit a live browser-revision mismatch and had to debug and retry its e2e run.
+playwright_version=$(playwright --version 2>/dev/null | sed -E 's/^Version //' | tr -d '\n')
+playwright_browsers_path="${PLAYWRIGHT_BROWSERS_PATH:-}"
+
 # ── 3. Report ─────────────────────────────────────────────────────────────────────────────────
 # Read back by preflight_nodes.record_toolchain, which folds it into the ledger, manifest.json and
 # the host-side log. Written even when empty: "we looked and the image already had everything" is
 # a different fact from "bootstrap never ran", and only this file can tell them apart.
-printf '{"image":"%s","tools":{%s},"available":{%s}}\n' \
-  "${AIDW_IMAGE_REF:-unknown}" "$tools_json" "$available_json" > "$REPORT_PATH"
+printf '{"image":"%s","tools":{%s},"available":{%s},"playwright_version":"%s","playwright_browsers_path":"%s"}\n' \
+  "${AIDW_IMAGE_REF:-unknown}" "$tools_json" "$available_json" \
+  "${playwright_version//\"/\'}" "${playwright_browsers_path//\"/\'}" > "$REPORT_PATH"
 echo "bootstrap: wrote ${REPORT_PATH}"
 exit 0

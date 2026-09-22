@@ -33,8 +33,20 @@ from typing import Any
 
 from .. import chat_model, repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from . import test_quality_checks
-from .test_quality_checks import _ASSERTION_RE, _TEST_DECL_RE, MAX_TEST_BODY_SIMILARITY
-from .write_scope_gate import _E2E_PATH_RE, _is_pipeline_owned, _is_test_path
+from .test_quality_checks import (
+    MAX_TEST_BODY_SIMILARITY,
+    MIN_DISTINCT_ASSERTIONS_PER_AC,
+    MIN_NON_E2E_TESTS_PER_AC,
+    MIN_TESTS_BEFORE_ASSERTION_CHECK,
+    asserting_test_count,
+    classify_test_level,
+    count_tests_per_ac,
+    distinct_assertion_targets,
+    id_variants,
+    non_testid_locators,
+    _tests_for_ac,
+)
+from .write_scope_gate import _is_pipeline_owned, _is_test_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
 from ..spec_ledger import LEDGER_PATH, own_ac_ids_from_specification
@@ -89,26 +101,8 @@ def _has_marker(line: str, markers: tuple[str, ...]) -> bool:
     return False
 
 
-
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _PATH_TOKEN_RE = re.compile(r"[\w@./\\-]+\.[A-Za-z0-9]+")
-
-
-def id_variants(ac_id: str) -> list[str]:
-    """Spellings a test name may legitimately use for one ledger id. Models re-prefix US-0003.6
-    as AC-0003.6 despite instructions (observed live, run 7), and identifier-safe names replace
-    -/. with _ (Test_US_0007_2). Numbering is what identifies the AC; tolerate the spellings.
-    Public: metrics_nodes' traceability matrix reuses it so both scans accept the same spellings."""
-    variants = {ac_id}
-    if ac_id.startswith("US-"):
-        variants.add("AC-" + ac_id[3:])
-    variants.update(v.replace("-", "_").replace(".", "_") for v in list(variants))
-    # Punctuation stripped entirely: a C# method name cannot contain '-' or '.', and the generated
-    # .NET suites name tests `TestUS00012ResolveStateDirectory...`. Without this variant the depth
-    # counter scored a file holding 14 real tests as ZERO tests for every criterion -- measured live,
-    # on apps/api.Tests/CounterApiIntegrationTests.cs.
-    variants.update(v.replace("-", "").replace(".", "").replace("_", "") for v in list(variants))
-    return sorted(variants)
 
 
 def _extract_failed_files(lines: list[str]) -> list[str]:
@@ -168,119 +162,24 @@ def resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
 
 
 # --- per-AC test DEPTH -------------------------------------------------------------------------
-# The gate below used to ask only "does at least one test name this AC" -- true for a single
-# happy-path assertion, which is not a tested criterion.
-#
-# The threshold is PHASE-DEPENDENT, and that is the whole point. The full requirement is 2 tests
-# below the browser layer per criterion, but ac-to-tests writes every test BEFORE any implementation
-# exists: there is no module to unit-test yet, so the model reaches for the one level that can be
-# written against nothing -- a Playwright spec. Enforcing 2 there produced three consecutive fresh
-# runs that escalated at the cap with the same finding ("only 0 test(s) below the browser layer"),
-# having written `Api.Tests.csproj` and no `.cs` files at all. A gate no run can pass is a gate
-# people switch off, so the RED phase asks for 1 and the GREEN phase (minimal-code-to-green, where
-# the code exists) asks for 2. This is the plan's own audit finding A3, applied.
-MIN_NON_E2E_TESTS_PER_AC = int(os.environ.get("MIN_NON_E2E_TESTS_PER_AC", "2"))
-
-# ZERO at the RED phase, and this is a deliberate REDUCTION in strictness with a compensating
-# control, not an oversight -- so here is the evidence and the trade.
-#
-# Measured, not assumed: across every ac-to-tests session of one thread the model made 20 `view`,
-# 12 `skill`, 6 `glob` and 3 `apply_patch` calls. It writes -- it just writes the Playwright spec
-# and `Api.Tests.csproj` and stops, never authoring a `.cs` test. Four consecutive fresh runs
-# escalated at the verify cap on "only 0 test(s) below the browser layer", at thresholds of both 2
-# and 1, with the requirement stated explicitly in the prompt. It is not a permissions problem (the
-# write-scope allowlist permits every realistic .NET test path) and not a measurement problem (the
-# filesystem confirms no `.cs` file exists).
-#
-# The compensating control is `test_coverage_gate.check_ac_depth`, which enforces the FULL
-# MIN_NON_E2E_TESTS_PER_AC at minimal-code-to-green -- where the implementation exists and a unit
-# test is a thing that can actually be written. That is the plan's own audit finding A3.
+# The threshold is PHASE-DEPENDENT. The full requirement is 2 tests below the browser layer per
+# criterion, but ac-to-tests writes every test BEFORE any implementation exists: there is no module
+# to unit-test yet, so the model reaches for the one level that can be written against nothing -- a
+# Playwright spec. Enforcing 2 there produced three consecutive fresh runs that escalated at the cap
+# on "only 0 test(s) below the browser layer", having written `Api.Tests.csproj` and no `.cs` files
+# at all. So the RED phase (here) asks for 0 -- a deliberate reduction, not an oversight, with a
+# compensating control: `MIN_NON_E2E_TESTS_PER_AC` (the FULL threshold, plus the anti-padding
+# checks -- fiat-stub/absence-only/distinct-assertion/near-duplicate) moved to test_quality_checks.py
+# (2026-09-21, imported above), enforced at minimal-code-to-green via
+# `test_coverage_gate.check_ac_depth`/`test_quality_checks.ac_depth_report` -- where the
+# implementation exists and a unit test is a thing that can actually be written. That is the plan's
+# own audit finding A3.
 #
 # What ac-to-tests still enforces: at least one test naming every criterion, those tests actually
 # failing (TDD red, checked mechanically), an e2e test for every criterion the stage marks
-# ui_relevant, and the anti-padding checks. Raise this above 0 only with evidence that the drafting
-# model has started writing below-browser tests at this phase.
+# ui_relevant. Raise this above 0 only with evidence that the drafting model has started writing
+# below-browser tests at this phase.
 MIN_NON_E2E_TESTS_PER_AC_RED = int(os.environ.get("MIN_NON_E2E_TESTS_PER_AC_RED", "0"))
-
-# Symbols that make a .NET/JS test an INTEGRATION test. Detected by symbol, never by directory: a
-# .NET repo keeps unit and integration tests in ONE project (apps/api.Tests/CounterApiTests.cs), so
-# the path proves nothing. e2e is the one level a path does prove, which is why it is the only level
-# with a hard threshold here.
-_INTEGRATION_SYMBOLS = ("WebApplicationFactory", "TestServer", "HttpClient", "createServer", "supertest", "TestClient")
-
-
-def classify_test_level(path: str, contents: str, resolved_root: str | None = None) -> str:
-    """'e2e' | 'integration' | 'unit'. Pure.
-
-    `resolved_root` is the same tech-stack root `write_scope_gate._resolve_web_root` resolves.
-    Optional and defaulting to None (the old location-only-regex behavior, unchanged) so every
-    existing call site keeps working; passed explicitly (today, only ac-to-tests' own RED-phase
-    depth check), an e2e-shaped path outside `{resolved_root}/tests/e2e/` no longer counts as "e2e"
-    -- the exact flattening bug this pipeline exists to catch, where crediting it here would let a
-    UI story pass depth thresholds on a browser test that Playwright's own `testDir` will never
-    actually run.
-    """
-    if _E2E_PATH_RE.search(path):
-        if resolved_root is None:
-            return "e2e"
-        expected_prefix = f"{resolved_root}/tests/e2e/" if resolved_root else "tests/e2e/"
-        if path.startswith(expected_prefix):
-            return "e2e"
-    if any(symbol in contents for symbol in _INTEGRATION_SYMBOLS):
-        return "integration"
-    return "unit"
-
-
-def count_tests_per_ac(
-    ac_ids: list[str], test_files: dict[str, str], resolved_root: str | None = None
-) -> dict[str, dict[str, int]]:
-    """Per AC: how many tests name it, split by level.
-
-    A "test" is counted per test-declaring line mentioning the id, not per file: one file commonly
-    holds several tests for the same criterion, and per-file counting would read three tests in one
-    file as one.
-    """
-    counts = {ac: {"unit": 0, "integration": 0, "e2e": 0} for ac in ac_ids}
-    for path, contents in test_files.items():
-        level = classify_test_level(path, contents, resolved_root)
-        for line in contents.splitlines():
-            # Shared with the anti-padding checks below, so "what is a test" is defined once.
-            if not _TEST_DECL_RE.search(line):
-                continue
-            # One general matcher, not the enumerated `id_variants` list. The list held six
-            # spellings, each added reactively after a run had already reported "0 tests" for a
-            # criterion that was tested -- a naming convention nobody controls cannot be covered by
-            # enumeration. `id_variants` survives only for the sandbox grep, which needs literal
-            # strings to pass to `grep -F`.
-            named = set(test_results.ac_ids_in_name(line))
-            for ac in ac_ids:
-                if ac in named:
-                    counts[ac][level] += 1
-    return counts
-
-
-# --- anti-padding -------------------------------------------------------------------------------
-# A bare count invites padding, and this pipeline has already produced all three forms of it: a
-# placeholder page.tsx, a localStorage-only "backend", and four consecutive turns claiming Playwright
-# specs had been written with zero write calls. So the count is necessary and not sufficient: three
-# tests asserting the same expression are one test, and three tests with the same body are one test.
-#
-# What this CANNOT do, stated plainly rather than implied away: it cannot tell whether a test is
-# GOOD. The prompt demands quality; these checks make padding expensive, not impossible.
-MIN_DISTINCT_ASSERTIONS_PER_AC = int(os.environ.get("MIN_DISTINCT_ASSERTIONS_PER_AC", "2"))
-
-# The distinct-assertion check only applies once an AC has this many tests. Below it, the count
-# thresholds already govern and this check produces false positives on legitimate work: literals are
-# normalised (so `Assert.Equal(1, c.Value)` and `Assert.Equal(0, c.Value)` are ONE target), and for a
-# value-based criterion -- "increment shows 1", "decrement shows 0" -- that pair is exactly how the
-# behaviour is meant to be tested. Requiring three tests first keeps the check aimed at what it was
-# written for: three tests that are really one test.
-MIN_TESTS_BEFORE_ASSERTION_CHECK = int(os.environ.get("MIN_TESTS_BEFORE_ASSERTION_CHECK", "3"))
-
-# MAX_TEST_BODY_SIMILARITY / _ASSERTION_RE / _TEST_DECL_RE moved to test_quality_checks.py
-# (2026-09-19, imported above) -- that module's own docstring has the full reasoning; this file
-# keeps using the same three names, now bound via import instead of a local definition, so
-# `_tests_for_ac`/`count_tests_per_ac`/`distinct_assertion_targets` below are unchanged.
 
 # The subset that actually carries a test NAME: a `test(...)`/`it(...)`/`describe(...)` call, or a
 # method signature. A bare `[Fact]` / `[Theory]` attribute line matches _TEST_DECL_RE but names
@@ -295,72 +194,6 @@ _NAMED_TEST_DECL_RE = re.compile(
 # without it, a constructor or a Dispose reads as an unnamed test.
 _TEST_ATTRIBUTE_RE = re.compile(r"^\s*\[\s*(Fact|Theory|Test|TestMethod|TestCase)\b", re.IGNORECASE)
 _JS_TEST_CALL_RE = re.compile(r"\b(?:test|it)\s*(?:\.\w+)?\s*\(\s*['\"`]", re.IGNORECASE)
-
-
-def _normalise_assertion(target: str) -> str:
-    """Collapse whitespace, quotes and numeric literals so `expect(count).toBe(1)` and
-    `expect(count).toBe(2)` read as ONE assertion target -- they exercise the same expression."""
-    collapsed = re.sub(r"\s+", "", target)
-    collapsed = re.sub(r"[\"']", "", collapsed)
-    return re.sub(r"\d+", "N", collapsed).lower()
-
-
-def distinct_assertion_targets(ac_id: str, test_files: dict[str, str]) -> set[str]:
-    """The distinct expressions asserted by tests naming this AC. Pure.
-
-    Scoped to the lines following each test declaration that names the AC, so assertions belonging
-    to a DIFFERENT criterion in the same file are not credited to this one.
-    """
-    targets: set[str] = set()
-    variants = id_variants(ac_id)
-    for contents in test_files.values():
-        lines = contents.splitlines()
-        inside = False
-        for line in lines:
-            if _TEST_DECL_RE.search(line):
-                # A new test declaration ends the previous test's scope.
-                inside = any(variant in line for variant in variants)
-            if inside:
-                for match in _ASSERTION_RE.finditer(line):
-                    normalised = _normalise_assertion(match.group(1))
-                    if normalised:
-                        targets.add(normalised)
-    return targets
-
-
-def _tests_for_ac(ac_id: str, test_files: dict[str, str]) -> list[tuple[str, str]]:
-    """(label, normalised body) per test naming this AC. The label ("path :: decl line") exists so
-    a failed check can NAME the test to rewrite -- observed live: feedback that only counted
-    near-duplicates sent the model rewriting the Playwright spec for 6 laps while the duplicate
-    pair sat in the .NET unit file.
-
-    Filters test_quality_checks._iter_tests' shared parse by the UNTRUNCATED decl line (that
-    module keeps it alongside the display label for exactly this reason) so a declaration longer
-    than the label's own 100-char truncation still matches."""
-    variants = id_variants(ac_id)
-    return [
-        (decl, body)
-        for decl, body, raw_line in test_quality_checks._iter_tests(test_files)
-        if any(variant in raw_line for variant in variants)
-    ]
-
-
-def _test_bodies(ac_id: str, test_files: dict[str, str]) -> list[str]:
-    """Each test body (as normalised text) belonging to tests that name this AC."""
-    return [body for _, body in _tests_for_ac(ac_id, test_files)]
-
-
-def asserting_test_count(ac_id: str, test_files: dict[str, str]) -> int:
-    """How many of this AC's tests contain at least one assertion. Pure.
-
-    This is the denominator the diversity check must use, not the raw test count. At the RED phase
-    the generated .NET tests are deliberately `throw new NotImplementedException("US-0001.1: ...")`
-    stubs -- they assert nothing, because their job is to fail until the code exists. Counting them
-    made a criterion look like "5 tests, 1 distinct assertion target" (the single target coming from
-    the one real Playwright `expect`), and the run escalated after exhausting all six verify cycles
-    on work that was correct for its phase.
-    """
-    return sum(1 for body in _test_bodies(ac_id, test_files) if _ASSERTION_RE.search(body))
 
 
 def duplicate_test_bodies(ac_id: str, test_files: dict[str, str]) -> int:
@@ -1152,7 +985,15 @@ async def check_ac_coverage(
         if orphans:
             depth_report["unattributed_tests"] = orphans
 
-    if missing or tautological or depth_shortfall:
+    # data-testid-only locator convention (2026-09-21): every e2e spec must locate elements via
+    # page.getByTestId(...) only -- see non_testid_locators' own docstring for the live incident
+    # (a bare `input`/`getByRole` locator silently matching a Next.js Server Action's own hidden
+    # field instead of the real one). Enforced HERE (test authorship time) as well as at
+    # minimal-code-to-green and e2e-fix (test_coverage_gate.check_ac_depth / e2e_run_node), since a
+    # violation can be introduced at any of the three stages that touch these same spec files.
+    testid_violations = non_testid_locators(test_files)
+
+    if missing or tautological or depth_shortfall or testid_violations:
         reasons = []
         if depth_report.get("unattributed_tests") and missing:
             total_orphans = sum(depth_report["unattributed_tests"].values())
@@ -1176,6 +1017,16 @@ async def check_ac_coverage(
                 f"these ACs' tests are already PASSING with no implementation yet, which almost "
                 f"certainly means they're tautological (assertion-free or trivially true): {tautological}"
             )
+        if testid_violations:
+            named = "; ".join(
+                f"{path}: {', '.join(snippets[:3])}" + (f" (+{len(snippets) - 3} more)" if len(snippets) > 3 else "")
+                for path, snippets in sorted(testid_violations.items())
+            )
+            reasons.append(
+                f"these e2e spec(s) locate elements by role/text/CSS instead of data-testid, which "
+                f"can silently match a framework-injected element instead of the real one: {named} "
+                f"-- use page.getByTestId(...) only"
+            )
         return AcCoverageOutcome(
             passed=False,
             feedback="; ".join(reasons),
@@ -1184,6 +1035,7 @@ async def check_ac_coverage(
                 "tautological": tautological,
                 "depth": depth_report,
                 "depth_shortfall": depth_shortfall,
+                "testid_violations": testid_violations,
                 "active_ac_ids": active_ac_ids,
                 # Diagnostics: enough to reconstruct WHY the scan missed an id without rerunning.
                 "runner_exit_ok": result_ok,

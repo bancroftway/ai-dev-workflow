@@ -21,16 +21,15 @@ threshold and name the exclusion-gaming problem, not a full per-line coverage re
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
 import math
 import re
 import shlex
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import defusedxml.ElementTree as ET
 from pydantic import BaseModel, Field
 
 from .. import config, repo_files, stack_runner, tech_stack_signals, workflow_persistence
@@ -38,13 +37,21 @@ from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
 from ..text_truncate import truncate_middle
+from .coverage_parsing import (
+    MIN_COVERAGE_PERCENT,
+    CoverageContractEntry,
+    CoverageGap,
+    _Counts,
+    _load_coverage_contract,
+    _parse_cobertura_counts,
+    _parse_istanbul_counts,
+    merge_counts,
+)
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
 logger = logging.getLogger(__name__)
-
-MIN_COVERAGE_PERCENT = config.MIN_COVERAGE_PERCENT
 
 # The only strings `measure_coverage` may return as its "reason" -- this value ends up in
 # repo_scan's `metrics.coverage.reason`, which IS hashed into ScanReport.content_hash (see
@@ -63,6 +70,14 @@ STABLE_REASON_CODES = frozenset(
 
 COVERAGE_COMMANDS_PATH = config.COVERAGE_COMMANDS_PATH
 _CONTRACT_FORMATS = config.CONTRACT_FORMATS
+
+
+def _entry_dict(entry: "CoverageEntry | CoverageContractEntry") -> dict[str, Any]:
+    """`entries` is either pydantic `CoverageEntry` (from a fresh LLM discovery) or the plain
+    dataclass `CoverageContractEntry` (from `_load_coverage_contract`, shared with the sandbox-side
+    Stop hook) -- both shapes must serialize to the same dict for the persisted contract file and
+    the ledger, so callers use this instead of `.model_dump()` directly."""
+    return entry.model_dump() if isinstance(entry, BaseModel) else dataclasses.asdict(entry)
 
 
 class CoverageEntry(BaseModel):
@@ -597,179 +612,14 @@ _SAFE_EXCLUSION_PATTERNS = {
 }
 
 
-# Files no model authored and no test can meaningfully cover: compiler/source-generator output
-# (observed live: System.Text.RegularExpressions.Generator's RegexGenerator.g.cs held the branch
-# aggregate at 88.9% while every authored file stood higher -- 12 verify laps burned on a
-# denominator the model could not touch). Same rule the scanners already apply to generated paths.
-_GENERATED_FILE_RE = re.compile(
-    r"(^|[/\\])(obj|bin|node_modules|\.next|dist|build)([/\\])"
-    r"|\.(g|g\.i|generated|designer)\.(cs|ts|js)$"
-    r"|\.d\.ts$",
-    re.IGNORECASE,
-)
-
-
-@dataclass(frozen=True)
-class CoverageGap:
-    file: str
-    line_rate: float
-    branch_rate: float
-
-
-@dataclass(frozen=True)
-class _Counts:
-    """Covered/total counts, mergeable across stacks (rates are not -- a 10-line worker and a
-    10k-line app would weigh equally)."""
-
-    lines_covered: int
-    lines_total: int
-    branches_covered: int
-    branches_total: int
-    gaps: list[CoverageGap]
-
-
-def _parse_cobertura_counts(raw_xml: str) -> tuple[_Counts | None, str]:
-    try:
-        root = ET.fromstring(raw_xml)
-    except ET.ParseError:
-        return None, "artifact failed to parse as Cobertura XML"
-    try:
-        lc, lt = int(root.get("lines-covered", "0")), int(root.get("lines-valid", "0"))
-        bc, bt = int(root.get("branches-covered", "0")), int(root.get("branches-valid", "0"))
-    except ValueError:
-        return None, "Cobertura root counters are not integers"
-    if lt == 0:
-        return None, "Cobertura artifact reports zero valid lines -- nothing was instrumented"
-    gaps: list[CoverageGap] = []
-    for cls in root.iter("class"):
-        cls_line_rate = float(cls.get("line-rate", "1")) * 100
-        # Branch numbers are recomputed from the class's own lines rather than trusting its
-        # branch-rate attribute. Two reasons, both seen live: a class with no branch points reports
-        # branch-rate="0" (vacuous, not a real 0% gap), and a class WITH partially-covered branches
-        # can still report a healthy branch-rate, so the aggregate came out at 86% while every
-        # per-file gap looked fine and the model was handed an empty "here's where to look" list.
-        # .lower(): coverlet emits branch="True" (capital T), coverage.py emits "true". Comparing
-        # case-sensitively made branch_lines ALWAYS empty on .NET, so every class scored a vacuous
-        # 100% and gaps came back empty while the aggregate sat at 88% -- the model was told it
-        # failed and handed nowhere to look, for six verify cycles.
-        covered_branches = total_branches = 0
-        cls_lines_covered = cls_lines_total = 0
-        uncovered_lines: list[str] = []
-        # Coverlet emits each <line> TWICE -- once under its <method> and once in the class-level
-        # <lines> block -- so counts and the reported line list are de-duplicated by line number.
-        seen_lines: set[str] = set()
-        for line in cls.iter("line"):
-            if (num := line.get("number")) is not None:
-                if num in seen_lines:
-                    continue
-                seen_lines.add(num)
-            cls_lines_total += 1
-            try:
-                if int(line.get("hits", "0") or "0") > 0:
-                    cls_lines_covered += 1
-            except ValueError:
-                pass
-            if (line.get("branch") or "").lower() != "true":
-                continue
-            # condition-coverage looks like: "50% (1/2)"
-            match = re.search(r"\((\d+)/(\d+)\)", line.get("condition-coverage", ""))
-            if not match:
-                continue
-            hit, total = int(match.group(1)), int(match.group(2))
-            covered_branches += hit
-            total_branches += total
-            if hit < total and (number := line.get("number")) and number not in uncovered_lines:
-                uncovered_lines.append(number)
-        name = cls.get("filename", cls.get("name", "?"))
-        if _GENERATED_FILE_RE.search(name):
-            # Generated code is nobody's to cover: pull its contribution back OUT of the root
-            # aggregate (its per-line counts, deduped above) and never report it as a gap.
-            lc -= cls_lines_covered
-            lt -= cls_lines_total
-            bc -= covered_branches
-            bt -= total_branches
-            continue
-        cls_branch_rate = (100.0 * covered_branches / total_branches) if total_branches else 100.0
-        if cls_line_rate < MIN_COVERAGE_PERCENT or cls_branch_rate < MIN_COVERAGE_PERCENT:
-            # Name the exact lines whose branches are only half-taken -- that is the actionable
-            # part; a bare percentage tells the model nothing about which case it forgot to test.
-            if uncovered_lines:
-                name = (
-                    f"{name} (partially-covered branch lines: "
-                    f"{', '.join(uncovered_lines[:config.TEST_COVERAGE_UNCOVERED_LINES_MAX])})"
-                )
-            gaps.append(CoverageGap(file=name, line_rate=cls_line_rate, branch_rate=cls_branch_rate))
-    if lt <= 0:
-        return None, "every instrumented line is in generated code -- nothing authored was measured"
-    return _Counts(lc, lt, max(bc, 0), max(bt, 0), gaps), ""
-
-
-def _parse_istanbul_counts(raw: str) -> tuple[_Counts | None, str]:
-    try:
-        summary = json.loads(raw)
-    except json.JSONDecodeError:
-        return None, "artifact failed to parse as istanbul json-summary"
-
-    def _count(entry: dict, key: str, field: str) -> int:
-        try:
-            return int(entry.get(key, {}).get(field, 0))
-        except (TypeError, ValueError):
-            return 0
-
-    total = summary.get("total", {})
-    lt, lc = _count(total, "lines", "total"), _count(total, "lines", "covered")
-    bt, bc = _count(total, "branches", "total"), _count(total, "branches", "covered")
-    if lt == 0:
-        return None, "istanbul summary reports zero total lines -- nothing was instrumented"
-
-    def _pct(entry: dict, key: str, default: float) -> float:
-        try:
-            return float(entry.get(key, {}).get("pct", default))
-        except (TypeError, ValueError):
-            return default
-
-    gaps: list[CoverageGap] = []
-    for file_path, entry in summary.items():
-        if file_path == "total" or not isinstance(entry, dict):
-            continue
-        file_line_rate = _pct(entry, "lines", 100)
-        # 0-of-0 branches is vacuous, same rule as the Cobertura parsers.
-        file_branch_rate = 100.0 if _count(entry, "branches", "total") == 0 else _pct(entry, "branches", 100)
-        if file_line_rate < MIN_COVERAGE_PERCENT or file_branch_rate < MIN_COVERAGE_PERCENT:
-            gaps.append(CoverageGap(file=file_path, line_rate=file_line_rate, branch_rate=file_branch_rate))
-    return _Counts(lc, lt, bc, bt, gaps), ""
-
 
 # Per-command ceiling for a deterministic contract replay (same knob repo_scan's own coverage
 # leg honours; a hung `dotnet test` must not stall the gate forever).
 _REPLAY_TIMEOUT_SECONDS = config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS
 
 
-def _load_coverage_contract(raw: str | None) -> list[CoverageEntry]:
-    """Validated entries from a committed coverage-commands.json, or [] when absent/unusable.
-    Pure. Every entry must carry a non-empty command, a repo-relative artifact path and a known
-    format -- anything else means the contract is not replayable and discovery must run."""
-    if not raw:
-        return []
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    entries: list[CoverageEntry] = []
-    for item in (parsed or {}).get("entries") or []:
-        try:
-            entry = CoverageEntry(**item)
-            validate_repo_relative_path(entry.artifact)
-        except Exception:  # noqa: BLE001 -- one bad entry invalidates the whole contract
-            return []
-        if not entry.command.strip() or entry.format not in _CONTRACT_FORMATS:
-            return []
-        entries.append(entry)
-    return entries
-
-
 async def _replay_coverage_contract(
-    provider: SandboxProvider, thread_id: str, entries: list[CoverageEntry]
+    provider: SandboxProvider, thread_id: str, entries: "list[CoverageEntry | CoverageContractEntry]"
 ) -> list[dict[str, Any]]:
     """Deterministic acquisition: delete each entry's prior artifact, then run its command from its
     root. No model in the loop. Returns per-entry run summaries for the gate's feedback; the
@@ -880,7 +730,7 @@ async def _run_coverage_via_ghcp(
     if replay_runs:
         entry_reports.append({"replay": replay_runs})
     for entry in entries[:config.TEST_COVERAGE_CONTRACT_ENTRIES_MAX]:  # bounded: dozens of entries is itself suspect
-        detail: dict[str, Any] = {"entry": entry.model_dump()}
+        detail: dict[str, Any] = {"entry": _entry_dict(entry)}
         entry_reports.append(detail)
         try:
             validate_repo_relative_path(entry.artifact)
@@ -927,7 +777,7 @@ async def _run_coverage_via_ghcp(
         replay_runs = []
         merged, entry_reports = [], []
         for entry in entries[:config.TEST_COVERAGE_CONTRACT_ENTRIES_MAX]:
-            detail = {"entry": entry.model_dump()}
+            detail = {"entry": _entry_dict(entry)}
             entry_reports.append(detail)
             try:
                 validate_repo_relative_path(entry.artifact)
@@ -965,17 +815,10 @@ async def _run_coverage_via_ghcp(
         provider,
         thread_id,
         COVERAGE_COMMANDS_PATH,
-        json.dumps({"entries": [e.model_dump() for e in entries]}, indent=2) + "\n",
+        json.dumps({"entries": [_entry_dict(e) for e in entries]}, indent=2) + "\n",
     )
 
-    lines_total = sum(c.lines_total for c in merged)
-    lines_covered = sum(c.lines_covered for c in merged)
-    branches_total = sum(c.branches_total for c in merged)
-    branches_covered = sum(c.branches_covered for c in merged)
-    line_rate = 100.0 * lines_covered / lines_total if lines_total else 0.0
-    # No branch points anywhere is vacuously satisfied, not a 0% failure.
-    branch_rate = 100.0 * branches_covered / branches_total if branches_total else 100.0
-    gaps = [gap for c in merged for gap in c.gaps]
+    line_rate, branch_rate, gaps = merge_counts(merged)
     return line_rate, branch_rate, gaps, "", entry_reports
 
 
@@ -1098,6 +941,7 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
         count_tests_per_ac,
         depth_shortfalls,
     )
+    from .test_quality_checks import non_testid_locators
     from ..spec_ledger import load_ledger
 
     entries = await load_ledger(provider, thread_id)
@@ -1135,9 +979,36 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
     shortfalls = depth_shortfalls(
         counts, ui_relevant=set(), min_non_e2e=MIN_NON_E2E_TESTS_PER_AC, test_files=test_files
     )
-    if not shortfalls:
+    # data-testid-only locator convention (2026-09-21): enforced here too, not just at
+    # ac-to-tests -- minimal-code-to-green's own draft/audit can add or edit e2e specs (e.g. a
+    # wireframe-coverage gap discovered mid-stage), so a violation introduced here would otherwise
+    # go unchecked until e2e itself ran. See test_quality_checks.non_testid_locators' own docstring
+    # for the live incident (a bare `input`/`getByRole` locator matching a Next.js Server Action's
+    # own hidden field instead of the real one).
+    testid_violations = non_testid_locators(test_files)
+    if not shortfalls and not testid_violations:
         return None
     detail = "; ".join(f"{ac}: {' and '.join(problems)}" for ac, problems in sorted(shortfalls.items()))
+    testid_detail = "; ".join(
+        f"{path}: {', '.join(snippets[:3])}" + (f" (+{len(snippets) - 3} more)" if len(snippets) > 3 else "")
+        for path, snippets in sorted(testid_violations.items())
+    )
+    testid_paragraph = (
+        f"\n\nThese e2e spec(s) locate elements by role/text/CSS instead of data-testid, which can "
+        f"silently match a framework-injected element instead of the real one: {testid_detail} -- "
+        f"use page.getByTestId(...) only."
+        if testid_violations
+        else ""
+    )
+    report = {"ac_depth_shortfalls": {ac: problems for ac, problems in sorted(shortfalls.items())}}
+    if testid_violations:
+        report["testid_violations"] = testid_violations
+    if not shortfalls:
+        return (
+            "Coverage meets the threshold, and per-AC test depth is fine, but the e2e locator "
+            f"convention is violated." + testid_paragraph,
+            report,
+        )
     return (
         "Coverage meets the threshold, but these acceptance criteria are not tested deeply enough "
         f"-- each needs at least {MIN_NON_E2E_TESTS_PER_AC} test(s) BELOW the browser layer (unit "
@@ -1145,8 +1016,8 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
         "A high coverage percentage does not mean each criterion is proven: one integration test "
         "through a small app can colour in every line while most criteria are only ever exercised "
         "through Playwright. Add the missing unit/integration tests -- do not weaken existing "
-        "tests, and do not add browser tests to satisfy this.",
-        {"ac_depth_shortfalls": {ac: problems for ac, problems in sorted(shortfalls.items())}},
+        "tests, and do not add browser tests to satisfy this." + testid_paragraph,
+        report,
     )
 
 
@@ -1215,15 +1086,22 @@ MINIMAL_CODE_TO_GREEN_HARD_RULES: tuple[str, ...] = (
 
 # Advisory, not deterministic-check-backed -- unlike MINIMAL_CODE_TO_GREEN_HARD_RULES above, none
 # of these has (or needs) a hard gate branch; they steer the model away from specific defect
-# classes an adversarial audit already had to catch by hand. Distilled from three separate
+# classes an adversarial audit already had to catch by hand. Distilled from four separate
 # unresolved-audit-finding REDRAFTs on the same live run (session f0fef8ba, minimal-code-to-green
 # cycles 2-5): a retracted-but-still-written claim and a citation to test files
 # (test_optimizer_constraints.py/test_optimizer_run.py) that were named in an earlier planning doc
 # but never actually implemented; an e2e test that restored a mutated setting as a plain sequential
 # step instead of try/finally, corrupting the setting for a later test in the same file on any
-# mid-test failure; and a Playwright webServer command (`uv run uvicorn ...`) written for a FastAPI
+# mid-test failure; a Playwright webServer command (`uv run uvicorn ...`) written for a FastAPI
 # backend that only ever had a plain requirements.txt, never a pyproject.toml/uv.lock -- silently
-# breaking e2e execution end-to-end.
+# breaking e2e execution end-to-end; and (found by a human reviewing the actual screenshots the
+# suite's own `screenshot: "on"` config captured, not by any gate or audit here) every signed-in
+# screen -- Evaluator, Optimizer, Portfolios, Funds Universe, Admin Settings -- rendering as
+# completely unstyled raw HTML across an entire 62-spec passing run, while the two pre-login
+# screens (Home, Sign-in) rendered fully styled. Every text/value assertion in all 62 specs still
+# passed, because none of them asserted on layout or styling at all -- a severe, 100%-reproducible
+# visual defect that a full green e2e run, a clean coverage gate, and a zero-finding audit all
+# missed simultaneously, simply because nothing in this pipeline ever looked at the pixels.
 MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE: tuple[str, ...] = (
     "Every comment, docstring, known_gaps entry, or memory-file note that names a specific file "
     "path must be verified to actually exist in the repository (Glob/Grep it) before you write "
@@ -1247,6 +1125,17 @@ MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE: tuple[str, ...] = (
     "assume a modern convention applies just because it is common elsewhere; a wrong manager "
     "silently breaks whatever consumes that command without ever showing up as a code review "
     "finding.",
+    "After a Playwright e2e run passes, actually LOOK at a sample of the screenshots it captured "
+    "(your Read tool renders images) across every distinct screen/persona your changes touch -- "
+    "do not treat passing assertions as proof a page looks right. A test that only checks text "
+    "content or a computed value passes exactly the same whether the page is fully styled or "
+    "raw unstyled HTML with zero CSS applied; a full green e2e run, a clean coverage gate, and a "
+    "zero-finding audit can all miss a page that renders completely unstyled simultaneously, "
+    "because none of them look at the pixels. If a screenshot shows missing styling (no visible "
+    "spacing/color/typography where the page clearly should have it), a misaligned layout, or a "
+    "value in the wrong place, treat that as a real, reportable defect -- investigate and fix "
+    "the actual cause, or disclose it in known_gaps; never assume the screenshot itself must be "
+    "wrong without verifying against the running app.",
 )
 
 
@@ -1780,7 +1669,7 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     # the constant's own comment for the full count breakdown).
     assert len(MINIMAL_CODE_TO_GREEN_HARD_RULES) == 15, len(MINIMAL_CODE_TO_GREEN_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_HARD_RULES)
-    assert len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE) == 3, len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
+    assert len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE) == 4, len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
     assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
     print("test_coverage_gate self-check: all assertions passed")
 

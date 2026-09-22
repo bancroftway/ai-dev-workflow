@@ -25,6 +25,7 @@ from langchain_core.messages import BaseMessage, SystemMessage
 from . import config
 from . import run_event_store
 from . import run_event_stream
+from .repo_files import _chunked_write_commands
 from .run_events import RunEvent, RunEventType
 from .sandbox.provider import SandboxProvider
 
@@ -368,15 +369,12 @@ async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: st
         parent_mkdir = f"mkdir -p {shlex.quote(parent_dir)} && " if parent_dir else ""
         commands = [f"{parent_mkdir}echo {encoded} | base64 -d > {quoted}"]
     else:
-        # Chunked for the same reason write_repo_file is: WinError 206 on large payloads.
-        tmp = shlex.quote(path + ".b64part")
-        parent_mkdir = f"mkdir -p {shlex.quote(parent_dir)} && " if parent_dir else ""
-        commands = [f"{parent_mkdir}: > {tmp}"]
-        commands += [
-            f"printf %s {encoded[i : i + _EXEC_CMD_BUDGET]} >> {tmp}"
-            for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
-        ]
-        commands.append(f"base64 -d < {tmp} > {quoted} && rm -f {tmp}")
+        # Chunked for the same reason write_repo_file is: WinError 206 on large payloads. Shares
+        # repo_files._chunked_write_commands (unique-per-call tmp sidecar) rather than a third
+        # independent copy of the same pattern -- see that helper's own docstring for the real,
+        # live-observed race (two concurrent writers to one path sharing a fixed tmp name) fixing
+        # it closed.
+        commands = _chunked_write_commands(path, encoded, quoted, parent_dir or ".", ">")
 
     for command in commands:
         result = await provider.exec_in_sandbox(thread_id, command)

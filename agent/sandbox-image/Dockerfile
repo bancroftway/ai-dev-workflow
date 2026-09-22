@@ -212,6 +212,13 @@ ARG PRETTIER_VERSION=3.9.6
 ARG ANGULAR_CLI_VERSION=22.1.6
 ARG RUFF_VERSION=0.16.5
 ARG MYPY_VERSION=2.3.1
+# Used by sandbox-image/hooks/coverage_parsing.py's same-turn coverage-replay Stop hook, which
+# parses a Cobertura XML artifact the sandbox's OWN test run just wrote -- defusedxml over stdlib
+# xml.etree specifically because agent/src/gates/test_coverage_gate.py (the host-side original this
+# hook is a byte-identical copy of, per AGENTS.md's drift-guard convention) already made that
+# choice, and duplicating the SAME parser in two libraries would be exactly the kind of drift this
+# extraction pattern exists to prevent.
+ARG DEFUSEDXML_VERSION=0.7.1
 
 USER root
 
@@ -430,7 +437,7 @@ RUN set -eux; \
     npm install -g "pnpm@${PNPM_VERSION}" "yarn@${YARN_VERSION}" "typescript@${TYPESCRIPT_VERSION}" \
         "eslint@${ESLINT_GLOBAL_VERSION}" "prettier@${PRETTIER_VERSION}" "@angular/cli@${ANGULAR_CLI_VERSION}"; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \
-        "ruff==${RUFF_VERSION}" "mypy==${MYPY_VERSION}"
+        "ruff==${RUFF_VERSION}" "mypy==${MYPY_VERSION}" "defusedxml==${DEFUSEDXML_VERSION}"
 
 # ── /opt/aidw/lint: the pipeline-owned ESLint toolchain, resolved AGAINST ITS OWN node_modules ─
 # Linting a target repo must never mutate that repo's dependency graph: installing our lint
@@ -715,6 +722,23 @@ RUN printf '%s\n' \
 #     implementation ac_coverage_gate.py's own deterministic_verify uses, not a second JS port of
 #     it. Observed costing a redraft lap (income-investor session f0fef8ba, cycle 3) on a
 #     near-duplicate pair the audit turn's own review missed entirely (0 findings that cycle).
+#   - check-coverage-stop.mjs (2026-09-21): replays the committed coverage-commands.json contract
+#     and checks it against the real line/branch threshold, in the minimal-code-to-green draft
+#     turn -- by shelling out to gates/coverage_parsing.py (COPY'd in below UNMODIFIED, needs only
+#     defusedxml beyond the stdlib), the real implementation test_coverage_gate.py's own
+#     deterministic_verify uses, not a second JS port of it. Observed: the large majority of that
+#     stage's redraft cycles on the same income-investor run were triggered by exactly this
+#     deterministic, non-LLM check finding a coverage shortfall the draft could have caught itself
+#     before ending its turn.
+#   - check-testid-locators-stop.mjs (2026-09-21): rejects a Playwright locator that queries an
+#     e2e spec by role/text/label/tag/CSS instead of data-testid, across THREE stages
+#     (ac-to-tests, minimal-code-to-green, e2e) -- by shelling out to the same
+#     gates/test_quality_checks.py already COPY'd in for check-test-quality-stop.mjs. Observed on
+#     the same income-investor run, the same day e2e finally ran for real: a bare
+#     `page.locator("input")` matched a Next.js Server Action's own hidden
+#     `<input name="$ACTION_ID_...">` instead of the real form field, and a
+#     `getByRole('button', { name: 'Save' })` missed on an accessible-name mismatch -- both wasted
+#     e2e-fix cycles on locator bugs, not app bugs.
 #
 # BOTH PROVIDERS (user directive, 2026-09-17): baked into BOTH Claude Code's admin-managed
 # settings path AND GitHub Copilot CLI's own config, confirmed live via real docker-exec
@@ -760,6 +784,15 @@ COPY hooks/check-test-quality-stop.mjs /opt/aidw-hooks/check-test-quality-stop.m
 # rebuilding. Needs nothing beyond python3's standard library (already baked above for
 # lizard/semgrep/checkov/bandit), so no requirements.txt or pip install accompanies it.
 COPY hooks/test_quality_checks.py /opt/aidw-hooks/test_quality_checks.py
+COPY hooks/check-coverage-stop.mjs /opt/aidw-hooks/check-coverage-stop.mjs
+# Byte-identical staged copy of agent/src/gates/coverage_parsing.py -- same build-context
+# constraint and same drift-guard convention as test_quality_checks.py above (that module's own
+# `_demo()` asserts this file matches its source on every self-check run); re-run `cp
+# ../src/gates/coverage_parsing.py hooks/coverage_parsing.py` (from agent/sandbox-image) after
+# editing the source and before rebuilding. Needs defusedxml beyond the stdlib (DEFUSEDXML_VERSION
+# above, installed alongside ruff/mypy) -- everything else it needs is already baked in.
+COPY hooks/coverage_parsing.py /opt/aidw-hooks/coverage_parsing.py
+COPY hooks/check-testid-locators-stop.mjs /opt/aidw-hooks/check-testid-locators-stop.mjs
 COPY hooks/lib/ /opt/aidw-hooks/lib/
 COPY hooks/schemas/ /opt/aidw-hooks/schemas/
 RUN set -eux; \
@@ -775,7 +808,9 @@ RUN set -eux; \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-full-read-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-plan-citations-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs", "timeout": 30 } ] },' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs", "timeout": 30 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs", "timeout": 300 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs", "timeout": 30 } ] }' \
       '    ]' \
       '  }' \
       '}' \
@@ -791,7 +826,9 @@ RUN set -eux; \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-full-read-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-plan-citations-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs" },' \
-      '      { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs" }' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs" }' \
       '    ]' \
       '  }' \
       '}' \
@@ -803,6 +840,8 @@ RUN set -eux; \
       /opt/aidw-hooks/check-plan-schema-stop.mjs /opt/aidw-hooks/check-full-read-stop.mjs \
       /opt/aidw-hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-diagram-staleness-stop.mjs \
       /opt/aidw-hooks/check-test-quality-stop.mjs /opt/aidw-hooks/test_quality_checks.py \
+      /opt/aidw-hooks/check-coverage-stop.mjs /opt/aidw-hooks/coverage_parsing.py \
+      /opt/aidw-hooks/check-testid-locators-stop.mjs \
       /opt/aidw-hooks/lib/*.mjs /opt/aidw-hooks/schemas/*.json; \
     chown -R vscode:vscode /home/vscode/.copilot; \
     chmod 0644 /home/vscode/.copilot/config.json

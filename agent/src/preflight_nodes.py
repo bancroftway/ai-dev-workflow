@@ -376,6 +376,13 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
     # Consulted by MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE so a drafting session checks this instead
     # of assuming a package manager is installed just because it is common elsewhere.
     available = report.get("available") or {}
+    # The image's baked-in Playwright build (bootstrap.sh section 2d), queried directly from the
+    # installed binary rather than trusted from a build-time literal -- a target repo's own
+    # `@playwright/test` in package.json must match this exact version or e2e fails at RUN time.
+    # Consulted by the ac-to-tests/minimal-code-to-green prompts instead of the version string
+    # they used to hardcode (kept in sync by hand across four files before this existed).
+    playwright_version = report.get("playwright_version") or ""
+    playwright_browsers_path = report.get("playwright_browsers_path") or ""
     try:
         log_path = _toolchain_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -388,7 +395,7 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
         provider, thread_id, {"stage": "scaffold", "node": "toolchain", "tools": tools}
     )
 
-    if not tools and not available:
+    if not tools and not available and not playwright_version:
         return False
 
     existing_raw = await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH)
@@ -396,7 +403,13 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
         existing = json.loads(existing_raw).get("toolchain") if existing_raw else None
     except json.JSONDecodeError:
         existing = None
-    entry = {"image": report.get("image", "unknown"), "tools": tools, "available": available}
+    entry = {
+        "image": report.get("image", "unknown"),
+        "tools": tools,
+        "available": available,
+        "playwright_version": playwright_version,
+        "playwright_browsers_path": playwright_browsers_path,
+    }
     if existing == entry:
         # Same tools, same image, same outcomes -- rewriting would produce a commit whose only
         # content is "we ran again".

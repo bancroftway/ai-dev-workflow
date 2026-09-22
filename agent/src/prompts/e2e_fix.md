@@ -50,6 +50,28 @@ not write any new screenshot-capture code: `screenshot: 'on'` (required in every
 titled test runs, pass or fail. If the screen genuinely doesn't exist yet in the app, that is an
 app defect like any other -- build it, then add the test.
 
+**Locate elements with `page.getByTestId(...)` ONLY, same rule as every other stage that touches
+these specs.** Never `page.locator(...)` with a CSS class/tag, and never `getByRole`/`getByText`/
+`getByLabel`/`getByPlaceholder`/`getByAltText`/`getByTitle` -- a role or text query looks safer
+than a raw CSS selector but is not: a framework can inject its own elements you never wrote (a
+Next.js Server Action's own hidden `<input type="hidden" name="$ACTION_ID_...">` renders ahead of
+the real form field, so a bare `input`/`getByRole('textbox')` locator matches THAT, not the field
+you meant -- a live incident, not a hypothetical). If the app element you need to assert on has no
+`data-testid` yet, add one in the app code (semantic name tied to meaning, e.g.
+`data-testid="save-button"`) rather than reaching for a role/text query as a workaround. A
+deterministic check rejects any non-testid locator in an e2e spec, so a fix that adds one will
+itself fail the next verification.
+
+**When multiple tests are missing (a `wireframe coverage` batch, or several failing at once), fix
+and verify them in small batches -- 5-10 at a time, run the suite, confirm those pass, THEN
+continue -- not all of them in one edit followed by a single run at the end.** A locator mistake
+made once and repeated across 60+ new tests is invisible until the whole batch runs, and by then
+you cannot tell which of dozens of edits caused which failure. Running a heavy full suite (every
+spec, sequentially) less often also gives the dev server it's testing against less continuous load
+to fall over under -- a server that dies partway through a long run produces a wall of misleading
+`ERR_CONNECTION_REFUSED` failures that look like many different bugs but are really one dead
+process.
+
 Everything else here is a real defect: fix the app.
 
 **When a failing test's JSON entry below includes a `screenshot` path, view that file with your

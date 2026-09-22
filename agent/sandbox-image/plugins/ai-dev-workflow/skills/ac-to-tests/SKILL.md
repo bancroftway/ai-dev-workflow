@@ -113,10 +113,13 @@ Anti-patterns that look like coverage but aren't:
 
 Any `playwright.config.*` you author must set `use: { screenshot: 'on' }` -- the later e2e stage
 harvests every test's screenshot (not just failures') into the run's report, and a config that
-only captures on failure silently drops passing-test evidence. Also pin `@playwright/test` to
-exactly `1.63.0-alpha-2026-08-05` (the sandbox image's own `PLAYWRIGHT_VERSION`,
-agent/sandbox-image/Dockerfile) in package.json -- a different version's test runner is not
-guaranteed compatible with the browser build already baked into this image.
+only captures on failure silently drops passing-test evidence. Do NOT add `@playwright/test` to
+any `package.json` at this stage -- you cannot (only test files are in scope; a manifest edit is
+auto-reverted) and you do not need to: the sandbox image installs it globally at the exact version
+its baked-in browser build expects, and that import already resolves with no manifest change. If
+you ever need to confirm that version (e.g. writing a comment that names it), read
+`.ai-dev-workflow/manifest.json`'s `toolchain.playwright_version` -- a deterministic probe of what
+is actually installed, not a literal to copy by hand.
 
 ## Reporting your findings
 

@@ -1695,6 +1695,43 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     e2e["wireframe_coverage_total"] = coverage.get("total") if coverage is not None else None
     e2e["unwireframed_screens"] = (coverage or {}).get("unwireframed_ac_ids") or []
 
+    # data-testid-only locator convention (2026-09-21, income-investor run c1458b23): checked here
+    # too, not just at ac-to-tests/minimal-code-to-green -- e2e-fix edits these SAME spec files
+    # directly, and a violation introduced there (or left over from an earlier stage) would
+    # otherwise never be caught until a human read the suite by hand. See
+    # test_quality_checks.non_testid_locators' own docstring for the live incident this exists for
+    # (a bare `input`/`getByRole` locator silently matching a Next.js Server Action's own hidden
+    # field instead of the real one).
+    from .gates.ac_coverage_gate import _TEST_FILE_LISTING
+    from .gates.test_quality_checks import non_testid_locators
+
+    listing = await provider.exec_in_sandbox(thread_id, f"({_TEST_FILE_LISTING}) | head -60 || true")
+    spec_paths = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
+    spec_files: dict[str, str] = {}
+    for spec_path in spec_paths:
+        spec_contents = await repo_files.read_repo_file(provider, thread_id, spec_path)
+        if spec_contents is not None:
+            spec_files[spec_path] = spec_contents
+    testid_violations = non_testid_locators(spec_files)
+    if testid_violations:
+        failures = list(e2e.get("failed_tests") or [])
+        for violation_path, snippets in sorted(testid_violations.items()):
+            named = "; ".join(snippets[:3]) + (f"; and {len(snippets) - 3} more" if len(snippets) > 3 else "")
+            failures.append({
+                "title": f"non-testid locator: {violation_path}",
+                "error": (
+                    f"{len(snippets)} locator call(s) in this e2e spec query by role/text/label/tag "
+                    f"instead of data-testid: {named} -- a generic locator can silently match a "
+                    "framework-injected element instead of the real one (a Next.js Server Action's "
+                    "own hidden <input type=\"hidden\" name=\"$ACTION_ID_...\"> is the live incident "
+                    "this rule exists for). Add a data-testid to the real element and locate it "
+                    "with page.getByTestId('...') instead."
+                ),
+            })
+        e2e["failed_tests"] = failures
+        e2e["status"] = "failed"
+    e2e["testid_violations"] = testid_violations
+
     # Authentication enforcement gate (gates/auth_gate.py) -- while the app is still up, probing
     # WITHOUT the AIDW_TEST_AUTH seam (the probe carries no env; the seam lives in the app's own
     # process and only answers a caller who USES it). Deliberately NOT fail-open: an

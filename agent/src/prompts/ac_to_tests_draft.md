@@ -146,10 +146,12 @@ Three details are not stylistic -- get them wrong and the suite cannot run at al
 - **`baseURL` from `process.env.BASE_URL`.** The orchestrator boots the app on a port it chooses and
   passes it in; a hardcoded URL points at nothing.
 - **Do NOT add `@playwright/test` to any `package.json`.** The sandbox image bakes a pinned
-  Playwright (`1.63.0-alpha-2026-08-05`) and the orchestrator guarantees `'@playwright/test'`
-  resolves with no manifest change. A manifest edit here is silently reverted before the next
-  stage runs -- a version pin you write would not survive anyway, and manifest edits are the most
-  frequently reverted out-of-scope write in this stage's history (8 of 11 observed reverts).
+  Playwright (its exact version is `.ai-dev-workflow/manifest.json`'s `toolchain.playwright_version`,
+  a deterministic probe of what is actually installed) and the orchestrator guarantees
+  `'@playwright/test'` resolves with no manifest change. A manifest edit here is silently reverted
+  before the next stage runs -- a version pin you write would not survive anyway, and manifest
+  edits are the most frequently reverted out-of-scope write in this stage's history (8 of 11
+  observed reverts).
 
 E2E specs may assert ONLY on contracted surfaces: `data-testid` locators and user-visible text/
 state. Never `page.waitForResponse`/`waitForRequest`/`page.route` with a URL or predicate -- the
@@ -160,11 +162,18 @@ cycles). To know an action completed, wait on its USER-VISIBLE effect with a web
 (`await expect(page.getByTestId('book-row')).toContainText('On loan')`) -- these auto-retry, so
 no network synchronization is needed.
 
-Locate elements with **`data-testid`** via `page.getByTestId('expense-row')`, never by CSS class,
-DOM position, or visible text. Class names and copy change for cosmetic reasons and take the suite
-down with them; a test id is a contract. The stage that writes the UI is instructed to put a
-`data-testid` on every element a test needs, so name the ids you expect in that AC's
-`coverage_plan` entry -- that is the handshake between the two stages.
+Locate elements with **`data-testid`** via `page.getByTestId('expense-row')` ONLY. Never
+`page.locator(...)` with a CSS class/tag/DOM position, and never `getByRole`/`getByText`/
+`getByLabel`/`getByPlaceholder`/`getByAltText`/`getByTitle` either -- a role or text query looks
+safer than a raw CSS selector but is not: `page.locator("input")` (or `getByRole('textbox')`)
+matches whatever element the framework happens to render first, and a framework can inject its own
+elements you never wrote. Live incident: a Next.js Server Action silently renders its own
+`<input type="hidden" name="$ACTION_ID_...">` ahead of the real form field, so a bare `input`
+locator matched THAT, not the field the test meant to check, and the assertion failed for the
+wrong reason. A test id is the one contract nothing else can collide with. A deterministic check
+now rejects any non-testid locator in an e2e spec, so this is enforced, not just advised. The stage
+that writes the UI is instructed to put a `data-testid` on every element a test needs, so name the
+ids you expect in that AC's `coverage_plan` entry -- that is the handshake between the two stages.
 
 **If the screen an AC touches has a wireframe, assert against what it shows, not just that the page
 loads.** The Implementation Plan JSON above lists each wireframe's `ac_ids` -- any AC named there is

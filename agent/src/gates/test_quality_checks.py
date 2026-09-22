@@ -17,12 +17,16 @@ its own self-check is the proof this extraction changed no behavior.
 
 CLI mode (`python3 test_quality_checks.py`, stdin: JSON `{"path": "contents", ...}`, stdout: JSON
 `{"absence_only": [label, ...], "fiat_stubs": [label, ...], "duplicates": [[dup_label, orig_label],
-...]}`) is what the Stop hook actually invokes. `absence_only`/`fiat_stubs` are unscoped by
-Acceptance Criterion on purpose (the hook has no ledger to attribute tests to; a bad test is a bad
-test whichever criterion it claims), unlike `ac_coverage_gate.py`'s own per-AC callers which filter
-`_iter_tests`' output down to one AC's own tests via `_tests_for_ac`. `duplicates` is NOT unscoped
-this same way -- see `duplicate_pairs_by_ac`'s own docstring for the live incident that proved
-near-duplicate detection needs per-criterion grouping even without a ledger.
+...], "ac_depth": {ac_id: {"non_e2e_count": int, "shortfalls": [str, ...]}, ...},
+"non_testid_locators": {path: [snippet, ...], ...}}`) is what the Stop hook actually invokes. `absence_only`/`fiat_stubs` are unscoped by Acceptance Criterion on
+purpose (the hook has no ledger to attribute tests to; a bad test is a bad test whichever criterion
+it claims), unlike `ac_coverage_gate.py`'s own per-AC callers which filter `_iter_tests`' output
+down to one AC's own tests via `_tests_for_ac`. `duplicates` is NOT unscoped this same way -- see
+`duplicate_pairs_by_ac`'s own docstring for the live incident that proved near-duplicate detection
+needs per-criterion grouping even without a ledger. `ac_depth` (2026-09-21) IS scoped, per AC, the
+same way -- but its universe of AC ids comes from what the test files THEMSELVES claim
+(`_ac_id_of` on each test's own declared label), not a ledger the hook has no access to; see
+`ac_depth_report`'s own docstring.
 """
 
 from __future__ import annotations
@@ -313,6 +317,252 @@ def duplicate_pairs_by_ac(tests: list[tuple[str, str]]) -> list[tuple[str, str]]
     return pairs
 
 
+# --- AC depth (2026-09-21, extracted from ac_coverage_gate.py the same way as everything above:
+# so check-coverage-stop.mjs's minimal-code-to-green sibling, check-test-quality-stop.mjs itself
+# once its stage gate is widened, can run test_coverage_gate.check_ac_depth's SAME per-AC checks
+# in-turn instead of costing a whole audit+redraft round trip to discover a shortfall this
+# deterministic, non-LLM logic already knows about at draft time. Only the GREEN-phase subset:
+# check_ac_depth always calls the host's own `depth_shortfalls` with `ui_relevant=set()` and
+# `content_dict=None`, so the e2e-required-for-UI-criteria branch and the category_spread
+# (happy-path-only) branch can never fire there and are correctly NOT ported here either -- see
+# that function's own docstring in ac_coverage_gate.py for why.
+_E2E_PATH_RE = re.compile(r"(^|/)e2e(/|$)|(^|/)playwright\.config\.[jt]sx?$|\.e2e\.[jt]sx?$", re.IGNORECASE)
+
+# Symbols that make a .NET/JS test an INTEGRATION test. Detected by symbol, never by directory: a
+# .NET repo keeps unit and integration tests in ONE project, so the path proves nothing. e2e is the
+# one level a path does prove, which is why it is the only level matched by path above.
+_INTEGRATION_SYMBOLS = ("WebApplicationFactory", "TestServer", "HttpClient", "createServer", "supertest", "TestClient")
+
+_AC_IN_NAME_RE = re.compile(r"(?:US|AC)[^A-Za-z0-9]{0,2}(\d{4})[^A-Za-z0-9]{0,2}(\d+)(?!\d)", re.IGNORECASE)
+
+# data-testid-only locator convention (2026-09-21, income-investor run c1458b23): every Playwright
+# call of the form `<receiver>.<method>(<args>)` for the query methods below. `locator` is
+# special-cased in `non_testid_locators` (allowed ONLY when its own argument string contains
+# "data-testid") rather than being flagged outright, since `page.locator('[data-testid="x"]')` is
+# the CSS-attribute-selector spelling of the same convention, not a violation of it.
+_LOCATOR_METHOD_RE = re.compile(
+    r"\.(getByRole|getByText|getByLabel|getByPlaceholder|getByAltText|getByTitle|getByTestId|locator)\s*\(([^)]*)\)"
+)
+# Legacy Playwright/Puppeteer-style shorthand (`page.$('sel')` / `page.$$('sel')`) -- rare in
+# generated code but not caught by the method-name regex above (`$`/`$$` are not identifiers), and
+# a real escape hatch around the convention if left unflagged.
+_DOLLAR_LOCATOR_RE = re.compile(r"\.\${1,2}\s*\(")
+
+# GREEN phase (minimal-code-to-green, where the implementation exists and a unit test is a thing
+# that can actually be written) -- see ac_coverage_gate.py's own MIN_NON_E2E_TESTS_PER_AC/
+# MIN_NON_E2E_TESTS_PER_AC_RED comment for the full RED-vs-GREEN reasoning and the live incidents
+# that set these numbers. Only the GREEN constant is needed here: this module's ac_depth_report is
+# invoked exclusively from check-coverage-stop.mjs's minimal-code-to-green gate, never ac-to-tests'
+# (RED-phase depth is far looser and enforced differently -- see that file's own comment).
+MIN_NON_E2E_TESTS_PER_AC = int(os.environ.get("MIN_NON_E2E_TESTS_PER_AC", "2"))
+MIN_DISTINCT_ASSERTIONS_PER_AC = int(os.environ.get("MIN_DISTINCT_ASSERTIONS_PER_AC", "2"))
+MIN_TESTS_BEFORE_ASSERTION_CHECK = int(os.environ.get("MIN_TESTS_BEFORE_ASSERTION_CHECK", "3"))
+
+
+def id_variants(ac_id: str) -> list[str]:
+    """Spellings a test name may legitimately use for one ledger id. Models re-prefix US-0003.6
+    as AC-0003.6 despite instructions, and identifier-safe names replace -/. with _
+    (Test_US_0007_2). Numbering is what identifies the AC; tolerate the spellings. Public:
+    metrics_nodes.py's traceability matrix reuses it (via ac_coverage_gate.py's re-export) so both
+    scans accept the same spellings."""
+    variants = {ac_id}
+    if ac_id.startswith("US-"):
+        variants.add("AC-" + ac_id[3:])
+    variants.update(v.replace("-", "_").replace(".", "_") for v in list(variants))
+    variants.update(v.replace("-", "").replace(".", "").replace("_", "") for v in list(variants))
+    return sorted(variants)
+
+
+def ac_ids_in_name(test_name: str) -> list[str]:
+    """Every AC id mentioned in a test name/line, normalised to `US-0001.2`. One test/line can
+    legitimately cover several criteria, so this returns a list rather than the first match."""
+    seen: list[str] = []
+    for story, criterion in _AC_IN_NAME_RE.findall(test_name or ""):
+        normalized = f"US-{story}.{criterion}"
+        if normalized not in seen:
+            seen.append(normalized)
+    return seen
+
+
+def classify_test_level(path: str, contents: str, resolved_root: str | None = None) -> str:
+    """'e2e' | 'integration' | 'unit'. Pure.
+
+    `resolved_root` is the same tech-stack root `write_scope_gate._resolve_web_root` resolves.
+    Optional and defaulting to None (the old location-only-regex behavior, unchanged): the
+    GREEN-phase caller (`ac_depth_report`) never has a resolved root to check against and always
+    omits it; ac_coverage_gate.py's own RED-phase depth check passes it explicitly so an e2e-shaped
+    path outside `{resolved_root}/tests/e2e/` no longer counts as "e2e" -- the exact flattening bug
+    this pipeline exists to catch, where crediting it here would let a UI story pass depth
+    thresholds on a browser test that Playwright's own `testDir` will never actually run."""
+    if _E2E_PATH_RE.search(path):
+        if resolved_root is None:
+            return "e2e"
+        expected_prefix = f"{resolved_root}/tests/e2e/" if resolved_root else "tests/e2e/"
+        if path.startswith(expected_prefix):
+            return "e2e"
+    if any(symbol in contents for symbol in _INTEGRATION_SYMBOLS):
+        return "integration"
+    return "unit"
+
+
+def non_testid_locators(test_files: dict[str, str]) -> dict[str, list[str]]:
+    """path -> [violating locator snippet, ...] for every disallowed (non-`data-testid`) Playwright
+    locator call in each E2E-classified file. Pure.
+
+    Scoped to `classify_test_level(...) == "e2e"` files only (via the SAME classifier
+    `count_tests_per_ac`/`ac_depth_report` already use, `resolved_root=None` -- no caller here has
+    one to pass, same as `ac_depth_report`'s own call): a unit/integration test using Testing
+    Library's role/label queries is following a DIFFERENT, legitimate convention (those queries
+    double as an accessibility check at that layer), so this rule only applies where DOM stability
+    across hydration/routing matters more than accessibility-query fidelity -- the browser layer.
+
+    Root-caused live (income-investor run c1458b23): `page.locator("input")` matched a Next.js
+    Server Action's own hidden `<input type="hidden" name="$ACTION_ID_...">` -- rendered by the
+    FRAMEWORK, ahead of the real form field -- instead of the field the test meant to check.
+    `getByRole`/`getByText`/`getByLabel` LOOK safer than a raw CSS/tag locator but carry the exact
+    same risk: any of them matches whatever the framework happens to render that satisfies the
+    query, not necessarily the element the test author had in mind. `data-testid` is the one
+    surface nothing but the app's own author writes onto an element, so it is the only locator this
+    convention allows. `page.locator(...)` is exempted ONLY when its own argument text contains
+    "data-testid" (the CSS-attribute-selector spelling of the same convention, e.g.
+    `locator('[data-testid="save-button"]')`), not flagged as a bare-CSS violation."""
+    violations: dict[str, list[str]] = {}
+    for path, contents in test_files.items():
+        if classify_test_level(path, contents) != "e2e":
+            continue
+        found: list[str] = []
+        for match in _LOCATOR_METHOD_RE.finditer(contents):
+            method, args = match.group(1), match.group(2)
+            if method == "getByTestId":
+                continue
+            if method == "locator" and "data-testid" in args:
+                continue
+            found.append(match.group(0).strip()[:80])
+        for match in _DOLLAR_LOCATOR_RE.finditer(contents):
+            found.append(match.group(0).strip()[:80])
+        if found:
+            violations[path] = found
+    return violations
+
+
+def count_tests_per_ac(
+    ac_ids: list[str], test_files: dict[str, str], resolved_root: str | None = None
+) -> dict[str, dict[str, int]]:
+    """Per AC: how many tests name it, split by level. A "test" is counted per test-declaring line
+    mentioning the id, not per file: one file commonly holds several tests for the same criterion."""
+    counts = {ac: {"unit": 0, "integration": 0, "e2e": 0} for ac in ac_ids}
+    for path, contents in test_files.items():
+        level = classify_test_level(path, contents, resolved_root)
+        for line in contents.splitlines():
+            if not _TEST_DECL_RE.search(line):
+                continue
+            named = set(ac_ids_in_name(line))
+            for ac in ac_ids:
+                if ac in named:
+                    counts[ac][level] += 1
+    return counts
+
+
+def _normalise_assertion(target: str) -> str:
+    """Collapse whitespace, quotes and numeric literals so `expect(count).toBe(1)` and
+    `expect(count).toBe(2)` read as ONE assertion target -- they exercise the same expression."""
+    collapsed = re.sub(r"\s+", "", target)
+    collapsed = re.sub(r"[\"']", "", collapsed)
+    return re.sub(r"\d+", "N", collapsed).lower()
+
+
+def _tests_for_ac(ac_id: str, test_files: dict[str, str]) -> list[tuple[str, str]]:
+    """(label, normalised body) per test naming this AC -- filters `_iter_tests`' shared parse by
+    the UNTRUNCATED decl line so a declaration longer than the label's own 100-char truncation
+    still matches."""
+    variants = id_variants(ac_id)
+    return [
+        (decl, body)
+        for decl, body, raw_line in _iter_tests(test_files)
+        if any(variant in raw_line for variant in variants)
+    ]
+
+
+def distinct_assertion_targets(ac_id: str, test_files: dict[str, str]) -> set[str]:
+    """The distinct expressions asserted by tests naming this AC. Pure. Scoped to the lines
+    following each test declaration that names the AC, so assertions belonging to a DIFFERENT
+    criterion in the same file are not credited to this one."""
+    targets: set[str] = set()
+    variants = id_variants(ac_id)
+    for contents in test_files.values():
+        inside = False
+        for line in contents.splitlines():
+            if _TEST_DECL_RE.search(line):
+                inside = any(variant in line for variant in variants)
+            if inside:
+                for match in _ASSERTION_RE.finditer(line):
+                    normalised = _normalise_assertion(match.group(1))
+                    if normalised:
+                        targets.add(normalised)
+    return targets
+
+
+def asserting_test_count(ac_id: str, test_files: dict[str, str]) -> int:
+    """How many of this AC's tests contain at least one assertion. Pure -- the denominator the
+    diversity check must use, not the raw test count (a RED-phase stub asserts nothing)."""
+    return sum(1 for _decl, body in _tests_for_ac(ac_id, test_files) if _ASSERTION_RE.search(body))
+
+
+def ac_depth_report(test_files: dict[str, str]) -> dict[str, dict[str, object]]:
+    """Per AC (drawn from what the test files THEMSELVES claim via each test's own `[US-####.#]`
+    label, not a ledger this hook has no access to): the GREEN-phase depth shortfalls
+    test_coverage_gate.check_ac_depth would find. Pure.
+
+    Mirrors `depth_shortfalls`'s GREEN-phase call shape exactly (ui_relevant=set(),
+    content_dict=None) -- see this module's own header comment for why those two branches are
+    correctly absent here, not merely deferred."""
+    tests = all_tests(test_files)
+    ac_ids = sorted({ac for decl, _ in tests if (ac := _ac_id_of(decl))})
+    report: dict[str, dict[str, object]] = {}
+    if not ac_ids:
+        return report
+    counts = count_tests_per_ac(ac_ids, test_files)
+    for ac in ac_ids:
+        problems: list[str] = []
+        non_e2e = counts[ac]["unit"] + counts[ac]["integration"]
+        if non_e2e < MIN_NON_E2E_TESTS_PER_AC:
+            problems.append(
+                f"only {non_e2e} test(s) below the browser layer (need "
+                f"{MIN_NON_E2E_TESTS_PER_AC}: unit and/or integration -- a browser test cannot "
+                "prove a rule beneath the UI)"
+            )
+
+        ac_tests = _tests_for_ac(ac, test_files)
+        stub_labels = fiat_stub_labels(ac_tests)
+        if stub_labels:
+            named = "; ".join(stub_labels[:3]) + (f"; and {len(stub_labels) - 3} more" if len(stub_labels) > 3 else "")
+            problems.append(f"{len(stub_labels)} of its test(s) fail by fiat: {named}")
+
+        absence_labels = absence_only_labels(ac_tests)
+        if absence_labels:
+            named = "; ".join(absence_labels[:3]) + (f"; and {len(absence_labels) - 3} more" if len(absence_labels) > 3 else "")
+            problems.append(f"{len(absence_labels)} of its test(s) assert ONLY absence: {named}")
+
+        asserting = asserting_test_count(ac, test_files)
+        if asserting >= MIN_TESTS_BEFORE_ASSERTION_CHECK:
+            targets = distinct_assertion_targets(ac, test_files)
+            if len(targets) < MIN_DISTINCT_ASSERTIONS_PER_AC:
+                problems.append(
+                    f"{asserting} asserting test(s) but only {len(targets)} distinct assertion "
+                    f"target(s) (need {MIN_DISTINCT_ASSERTIONS_PER_AC})"
+                )
+            pairs = duplicate_pairs(ac_tests)
+            if pairs:
+                named = "; ".join(f"'{dup}' duplicates '{orig}'" for dup, orig in pairs[:3]) + (
+                    f"; and {len(pairs) - 3} more" if len(pairs) > 3 else ""
+                )
+                problems.append(f"{len(pairs)} of its test(s) are near-duplicate bodies: {named}")
+
+        if problems:
+            report[ac] = {"non_e2e_count": non_e2e, "shortfalls": problems}
+    return report
+
+
 def run_all_checks(test_files: dict[str, str]) -> dict[str, object]:
     """Everything the CLI entry point reports, computed once over one shared parse -- the same
     function a unit test can call directly, so the CLI wrapper below has no logic of its own to
@@ -322,6 +572,17 @@ def run_all_checks(test_files: dict[str, str]) -> dict[str, object]:
         "absence_only": absence_only_labels(tests),
         "fiat_stubs": fiat_stub_labels(tests),
         "duplicates": [list(pair) for pair in duplicate_pairs_by_ac(tests)],
+        # Computed unconditionally (cheap -- pure string ops, no real cost) but only ACTED on by
+        # whichever hook is scoped to minimal-code-to-green (check-coverage-stop.mjs) -- the
+        # ac-to-tests hook (check-test-quality-stop.mjs) reads this same JSON and simply never
+        # looks at this field, since GREEN-phase thresholds (MIN_NON_E2E_TESTS_PER_AC) do not apply
+        # at RED phase (MIN_NON_E2E_TESTS_PER_AC_RED). See ac_depth_report's own docstring.
+        "ac_depth": ac_depth_report(test_files),
+        # Computed unconditionally too -- ACTED on by every stage that can write/edit an e2e spec
+        # (ac-to-tests, minimal-code-to-green, e2e-fix), not just one of them, since a bad locator
+        # introduced by any of the three is the same real defect. See non_testid_locators' own
+        # docstring for the live incident this exists for.
+        "non_testid_locators": non_testid_locators(test_files),
     }
 
 
@@ -405,6 +666,85 @@ def _demo() -> None:
     )
     assert run_all_checks({"apps/web/tests/e2e/guard.spec.ts": cross_ac_source})["duplicates"] == [], (
         "run_all_checks must use the AC-grouped path end to end, not the flat one"
+    )
+
+    # ac_depth_report: GREEN-phase per-AC checks (test_coverage_gate.check_ac_depth's own logic,
+    # ui_relevant=set()/content_dict=None call shape).
+    assert classify_test_level("apps/web/tests/e2e/nav.spec.ts", "") == "e2e"
+    assert classify_test_level("apps/api.Tests/FooTests.cs", "var f = new WebApplicationFactory<Program>();") == "integration"
+    assert classify_test_level("src/lib/foo.test.ts", "expect(1).toBe(1);") == "unit"
+    assert ac_ids_in_name("public void TestUS00012ResolveStateDirectory()") == ["US-0001.2"]
+    assert "AC-0003_6" in id_variants("US-0003.6") or "AC-0003.6" in id_variants("US-0003.6")
+
+    one_unit_test = {
+        "src/lib/__tests__/calc.test.ts": (
+            "test('[US-0009.1] adds two numbers', () => { expect(add(1, 2)).toBe(3); });\n"
+        ),
+    }
+    depth = ac_depth_report(one_unit_test)
+    assert "US-0009.1" in depth and depth["US-0009.1"]["non_e2e_count"] == 1, depth
+    assert any("below the browser layer" in p for p in depth["US-0009.1"]["shortfalls"]), depth
+
+    two_unit_tests = {
+        "src/lib/__tests__/calc.test.ts": (
+            "test('[US-0009.1] adds two positive numbers', () => { expect(add(1, 2)).toBe(3); });\n"
+            "test('[US-0009.1] adds a negative number', () => { expect(add(1, -2)).toBe(-1); });\n"
+        ),
+    }
+    assert "US-0009.1" not in ac_depth_report(two_unit_tests), (
+        "two below-browser tests for the same AC, distinct assertion targets, must clear the depth check"
+    )
+
+    padded_tests = {
+        "src/lib/__tests__/calc.test.ts": (
+            "test('[US-0009.2] adds 1', () => { expect(add(1, 1)).toBe(2); });\n"
+            "test('[US-0009.2] adds 2', () => { expect(add(1, 2)).toBe(3); });\n"
+            "test('[US-0009.2] adds 3', () => { expect(add(1, 3)).toBe(4); });\n"
+        ),
+    }
+    padded_depth = ac_depth_report(padded_tests)
+    assert "US-0009.2" in padded_depth, "three tests asserting the SAME normalised target must be flagged as padding"
+    assert any("distinct assertion" in p for p in padded_depth["US-0009.2"]["shortfalls"]), padded_depth
+
+    assert "ac_depth" in run_all_checks(one_unit_test), "run_all_checks must surface ac_depth for the coverage hook to read"
+
+    # non_testid_locators: the live incident (Next.js Server Action's hidden $ACTION_ID_ input
+    # colliding with a bare `input` locator) plus every other disallowed query method.
+    bad_e2e = {
+        "apps/web/tests/e2e/settings.spec.ts": (
+            "test('[US-0013.2] admin settings inputs visible', async ({ page }) => {\n"
+            "  await expect(page.locator('input')).toBeVisible();\n"
+            "  await expect(page.getByRole('button', { name: 'Save' })).toBeVisible();\n"
+            "});\n"
+        )
+    }
+    bad_violations = non_testid_locators(bad_e2e)
+    assert "apps/web/tests/e2e/settings.spec.ts" in bad_violations, bad_violations
+    assert len(bad_violations["apps/web/tests/e2e/settings.spec.ts"]) == 2, bad_violations
+
+    good_e2e = {
+        "apps/web/tests/e2e/settings.spec.ts": (
+            "test('[US-0013.2] admin settings inputs visible', async ({ page }) => {\n"
+            "  await expect(page.getByTestId('risk-free-rate-input')).toBeVisible();\n"
+            "  await expect(page.locator('[data-testid=\"save-button\"]')).toBeVisible();\n"
+            "});\n"
+        )
+    }
+    assert non_testid_locators(good_e2e) == {}, non_testid_locators(good_e2e)
+
+    # Scoped to e2e files only: the SAME getByRole call in a unit test (Testing Library's own
+    # legitimate convention there) must never be flagged.
+    unit_with_role_query = {
+        "src/components/__tests__/SettingsForm.test.tsx": (
+            "test('[US-0013.2] renders the save button', () => {\n"
+            "  expect(screen.getByRole('button', { name: 'Save' })).toBeInTheDocument();\n"
+            "});\n"
+        )
+    }
+    assert non_testid_locators(unit_with_role_query) == {}, non_testid_locators(unit_with_role_query)
+
+    assert "non_testid_locators" in run_all_checks(one_unit_test), (
+        "run_all_checks must surface non_testid_locators for the same-turn hook to read"
     )
 
     print("test_quality_checks self-check: all assertions passed")

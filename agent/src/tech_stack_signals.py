@@ -92,9 +92,25 @@ def tech_stack_has_ui_framework(state: dict[str, Any]) -> bool:
     """Shared signal for P3's wireframe requirement, P4's Playwright MCP, and e2e's gate check --
     all three key off whether this repo has a UI framework at all, using tech-stack's own
     TechStack.frameworks report (a real, deliberate simplification from "only for UI-relevant
-    content specifically" to "only for UI-framework repos at all")."""
+    content specifically" to "only for UI-framework repos at all").
+
+    Falls back to the live app-discovery scan (`state["app_scan"]`, recomputed fresh every resume
+    -- graph.py's own comment on why) when tech-stack's own report says "absent". Root-caused live
+    on income-investor (run c1458b23): a genuinely greenfield run's tech-stack.approved.json is
+    captured at the TRUE pre-code moment (the stack-picker's own stub markdown, "no application
+    code found yet") and is never re-derived once the picked stack is actually built out --
+    `frameworks` stayed status="absent" through an entire multi-day run that ended with a fully
+    working Next.js+FastAPI app, silently skipping e2e ("no UI framework detected in this
+    repository") for the run's whole lifetime, so zero screenshots were ever captured. Same
+    "corroborate a frozen doc against a live signal instead of trusting it blindly" fix already
+    applied to test_coverage_gate.measure_coverage for the identical root cause (a frozen
+    greenfield tech-stack doc outliving the code it predates).
+    """
     tech_stack = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
-    return frameworks_have_ui(presence_values(tech_stack, "frameworks"))
+    if frameworks_have_ui(presence_values(tech_stack, "frameworks")):
+        return True
+    candidates = (state.get("app_scan") or {}).get("candidates") or []
+    return any(str(c.get("app_class") or c.get("likely_class") or "").lower() == "web" for c in candidates)
 
 
 def is_greenfield_repo(state: dict[str, Any]) -> bool:
@@ -187,6 +203,26 @@ def _demo() -> None:
             "config_inventory": {"status": "absent", "reason": "test fixture"},
         }
         return {**base, **overrides}
+
+    # tech_stack_has_ui_framework: the frozen-doc case (frameworks report says "present") ...
+    present_next = {"status": "present", "values": ["Next.js"], "reason": ""}
+    ts_state = {"stages": {"tech-stack": {"approved_content": _full(frameworks=present_next)}}}
+    assert tech_stack_has_ui_framework(ts_state) is True
+    # ... and the regression this exists for: a genuinely frozen greenfield doc (frameworks
+    # status="absent", never re-derived after the picked stack was built) must still resolve True
+    # once app_discovery's own LIVE scan (recomputed fresh every resume) finds a "web" candidate --
+    # this is exactly what silently skipped e2e for a whole multi-day run on income-investor.
+    stale_ts_state = {
+        "stages": {"tech-stack": {"approved_content": _full()}},  # frameworks defaults to absent
+        "app_scan": {"candidates": [{"path": "apps/web", "likely_class": "web"}]},
+    }
+    assert tech_stack_has_ui_framework(stale_ts_state) is True
+    # Frozen doc absent AND no live web candidate either -- correctly False, not a blanket True.
+    truly_no_ui_state = {
+        "stages": {"tech-stack": {"approved_content": _full()}},
+        "app_scan": {"candidates": [{"path": "apps/api", "likely_class": "api"}]},
+    }
+    assert tech_stack_has_ui_framework(truly_no_ui_state) is False
 
     assert dotnet_root_prefix(_full(dotnet=_dotnet("apps"))) == "cd apps && "
     assert dotnet_root_prefix(_full(dotnet=_dotnet("apps/backend"))) == "cd apps/backend && "

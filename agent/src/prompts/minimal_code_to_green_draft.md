@@ -95,13 +95,16 @@ fix was a one-line version bump that the package manager would have chosen unpro
 mistake in reverse also happens with runtimes: pin the toolchain version this sandbox actually has
 installed, not the one you are most familiar with.
 
-**One exception, and only one: `@playwright/test`.** Pin it to exactly the version the sandbox image
-installs (`1.63.0-alpha-2026-08-05`). This is not a style preference and it is not stale advice --
-Playwright downloads a browser build matched to its own version, the image bakes exactly one such
-build, and a mismatch fails at RUN time with "Executable doesn't exist at
-.../chromium_headless_shell-<rev>". Observed live: `^1.55.0` resolved to 1.62.1, which wanted
-revision 1234 while the image has 1237, and the whole e2e stage failed on a working app. Do not
-"correct" this pin to a newer version.
+**One exception, and only one: `@playwright/test`.** Pin it to exactly the version in
+`.ai-dev-workflow/manifest.json`'s `toolchain.playwright_version` -- a deterministic probe of what
+is actually installed in this sandbox, not a version to guess or remember. This is not a style
+preference and it is not stale advice -- Playwright downloads a browser build matched to its own
+version, the image bakes exactly one such build, and a mismatch fails at RUN time with "Executable
+doesn't exist at .../chromium_headless_shell-<rev>". Observed live, more than once: `^1.55.0`
+resolved to 1.62.1, which wanted revision 1234 while the image had 1237 -- and separately, a
+hardcoded version literal that used to live in this very prompt drifted stale against the image and
+caused the identical failure again. Read the manifest field fresh each time; do not copy a version
+number from memory, and do not "correct" it to a newer release.
 
 ## The app must be WIRED TOGETHER, and its UI must be testable
 
@@ -154,7 +157,11 @@ with. Use stable semantic names tied to meaning, not layout (`data-testid="expen
 `data-testid="add-member-button"`, `data-testid="net-balance-total"`). The tests written in the
 previous stage locate elements with `page.getByTestId(...)`; check that stage's specs for the ids
 they expect and honour those exact names. Selecting by CSS class or visible text breaks the suite on
-any cosmetic change, which is why the id is the contract.
+any cosmetic change, which is why the id is the contract. If you add or edit an e2e spec yourself
+this stage, the same rule applies to you: `page.getByTestId(...)` only, never `getByRole`/
+`getByText`/`getByLabel`/a raw CSS or tag locator -- a role/text query can silently match a
+framework-injected element (a Next.js Server Action's own hidden `<input name="$ACTION_ID_...">`
+ahead of your real field) instead of the one you meant. A deterministic check enforces this.
 
 **If a screen has a wireframe, read it before you build the screen.** The Implementation Plan JSON
 above lists each wireframe's `ac_ids` -- check it for the AC you're implementing. When one covers

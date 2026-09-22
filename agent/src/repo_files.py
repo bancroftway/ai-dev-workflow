@@ -22,6 +22,7 @@ import logging
 import re
 import shlex
 import time
+import uuid
 from typing import Any
 
 from .sandbox.provider import SandboxProvider, is_expected_missing_file
@@ -45,6 +46,33 @@ _EXEC_CMD_BUDGET = 16000
 # leading /, no `..` segment) remain the actual safety property -- the character class is about
 # catching nonsense, not about quoting.
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.\-/\[\]()@+ ]+$")
+
+
+def _chunked_write_commands(path: str, encoded: str, quoted: str, parent_dir: str, redirect: str) -> list[str]:
+    """Builds the sidecar-chunked write commands `write_repo_file`/`append_ledger_entry` both use
+    once a payload exceeds `_EXEC_CMD_BUDGET`. `redirect` is `>` (overwrite) or `>>` (append).
+
+    Root-caused 2026-09-21 (income-investor session f0fef8ba): the tmp sidecar name used to be
+    `path + ".b64part"` -- fixed, derived only from the target path. `run_repo_scan` writes
+    SBOM_PATH both from the main graph's synchronous remediation_scan_node AND from
+    metrics_nodes' periodic background refresh (confirmed racing live: two "dropped N licence
+    finding(s)" log lines landed within 16ms of each other), so two concurrent writers to the SAME
+    path shared the SAME tmp file -- one writer's final `rm -f` deleted it out from under the
+    other's still-appending `printf ... >> tmp`, surfacing as "cannot open ...b64part: No such
+    file". A unique-per-call token means concurrent writers, even to the same target path, never
+    touch each other's sidecar; the only remaining shared-ness is the final publish command
+    replacing/appending `path` itself, which is the same last-writer-wins semantics the
+    short-payload branch (a single `echo | base64 -d > path`) already has.
+    """
+    token = uuid.uuid4().hex[:12]
+    tmp = shlex.quote(f"{path}.b64part.{token}")
+    commands = [f"mkdir -p {shlex.quote(parent_dir)} && : > {tmp}"]
+    commands += [
+        f"printf %s {encoded[i : i + _EXEC_CMD_BUDGET]} >> {tmp}"
+        for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
+    ]
+    commands.append(f"base64 -d < {tmp} {redirect} {quoted} && rm -f {tmp}")
+    return commands
 
 
 def validate_repo_relative_path(path: str) -> str:
@@ -101,13 +129,7 @@ async def write_repo_file(provider: SandboxProvider, thread_id: str, path: str, 
         # The whole payload used to ride in one exec's argv; Windows' CreateProcess caps the
         # command line at ~32K chars (WinError 206 on a large repo-scan JSON), so large payloads
         # are appended to a sidecar in argv-sized chunks and decoded once at the end.
-        tmp = shlex.quote(path + ".b64part")
-        commands = [f"mkdir -p {shlex.quote(parent_dir)} && : > {tmp}"]
-        commands += [
-            f"printf %s {encoded[i:i + _EXEC_CMD_BUDGET]} >> {tmp}"
-            for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
-        ]
-        commands.append(f"base64 -d < {tmp} > {quoted} && rm -f {tmp}")
+        commands = _chunked_write_commands(path, encoded, quoted, parent_dir, ">")
     for command in commands:
         result = await provider.exec_in_sandbox(thread_id, command)
         if not result.ok:
@@ -148,13 +170,7 @@ async def append_ledger_entry(provider: SandboxProvider, thread_id: str, entry: 
         # most important ledger line in a failed run was the one that could not be written. It was
         # swallowed as a best-effort warning, which is exactly how a run loses the record of why it
         # failed.
-        tmp = shlex.quote(LEDGER_PATH + ".b64part")
-        commands = [f"mkdir -p {shlex.quote(parent_dir)} && : > {tmp}"]
-        commands += [
-            f"printf %s {encoded[i:i + _EXEC_CMD_BUDGET]} >> {tmp}"
-            for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
-        ]
-        commands.append(f"base64 -d < {tmp} >> {quoted} && rm -f {tmp}")
+        commands = _chunked_write_commands(LEDGER_PATH, encoded, quoted, parent_dir, ">>")
     for command in commands:
         result = await provider.exec_in_sandbox(thread_id, command)
         if not result.ok:
@@ -179,6 +195,19 @@ def _demo() -> None:
         except ValueError:
             continue
         raise AssertionError(f"accepted unsafe path: {bad!r}")
+
+    # Regression for the concurrent-writer race (see _chunked_write_commands' own docstring): two
+    # calls for the SAME target path must never reuse the same tmp sidecar name, or one writer's
+    # cleanup `rm -f` can delete the other's still-appending tmp file out from under it.
+    path, quoted = ".ai-dev-workflow/sbom.json", shlex.quote(".ai-dev-workflow/sbom.json")
+    cmds_a = _chunked_write_commands(path, "A" * 10, quoted, ".ai-dev-workflow", ">")
+    cmds_b = _chunked_write_commands(path, "B" * 10, quoted, ".ai-dev-workflow", ">")
+    tmp_a = cmds_a[0].split(": > ", 1)[1]
+    tmp_b = cmds_b[0].split(": > ", 1)[1]
+    assert tmp_a != tmp_b, "two concurrent writers to the same path shared one tmp sidecar name"
+    assert cmds_a[-1].endswith(f"> {quoted} && rm -f {tmp_a}"), cmds_a[-1]
+    cmds_append = _chunked_write_commands(path, "C" * 10, quoted, ".ai-dev-workflow", ">>")
+    assert cmds_append[-1].split(" && rm -f", 1)[0].endswith(f">> {quoted}"), cmds_append[-1]
     print("repo_files self-check: all assertions passed")
 
 
