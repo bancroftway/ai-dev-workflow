@@ -2636,6 +2636,46 @@ def _reset_stage_mechanics(stage: dict[str, Any]) -> None:
     stage["best_verify_coverage_rate"] = None
 
 
+# Which stages a fired reset-e2e must reset alongside e2e itself -- metrics-exit (the run's own
+# verdict) and adversarial-compliance (which "absorbed e2e's compliance role in the consolidation",
+# see _build_adversarial_compliance_prompt's own docstring, and reads state.get("e2e") into its own
+# draft prompt). ONE tuple, read by _apply_reset_e2e below, so a future edit here can't silently
+# diverge from what _demo_reset_e2e_lever's self-check actually exercises.
+_RESET_E2E_STALE_STAGE_KEYS = ("metrics-exit", "adversarial-compliance")
+
+
+def _apply_reset_e2e(stages: dict[str, Any], rebuild_state: dict[str, Any]) -> None:
+    """The reset-e2e lever's actual state mutation (Fix 3, root-caused 2026-09-21) -- extracted out
+    of intake_node's reset-e2e block so _demo_reset_e2e_lever can call the REAL production logic
+    instead of a hand-typed duplicate (review finding: the inline-only version let a regression --
+    e.g. deleting "adversarial-compliance" from the reset set -- pass the self-check green, since
+    the self-check re-typed its own copy of the tuple/assignments instead of exercising this code).
+
+    Resets _RESET_E2E_STALE_STAGE_KEYS's status/mechanics (approved_content survives -- same
+    contract every other _reset_stage_status_fields/_reset_stage_mechanics caller gets) and both
+    rebuild placements downstream of remediation (r_remediation, r_adversarial_compliance) to
+    rebuild.default_rebuild_state() -- mirrors what rewind_to_stage already does for placements at
+    or after its target. remediation's own StageSpec is deliberately never touched here: only its
+    rebuild placement's sub-state needs clearing, since that placement always re-executes on the
+    way through regardless of stage-skip status. Mutates both dicts in place; no I/O, no return."""
+    for stale_stage_key in _RESET_E2E_STALE_STAGE_KEYS:
+        stale_stage = stages[stale_stage_key]
+        _reset_stage_status_fields(stale_stage)
+        _reset_stage_mechanics(stale_stage)
+    rebuild_state[REBUILD_FOR_REMEDIATION.key] = rebuild.default_rebuild_state()
+    rebuild_state[REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key] = rebuild.default_rebuild_state()
+
+
+def _reset_e2e_attempts_exhausted(attempts: int) -> bool:
+    """The exact guard intake_node's reset-e2e handling refuses on -- extracted (review finding)
+    so _demo_reset_e2e_lever exercises the real comparison instead of asserting facts about the
+    `>=` operator against itself. sessions_api.py's own reset-e2e handler makes the identical
+    comparison independently against config.AIDW_E2E_RESET_MAX_ATTEMPTS directly (not through this
+    function) -- same two-independent-checks shape targeted_fix_attempts's own cap already has
+    between intake_node and sessions_api.py."""
+    return attempts >= workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS
+
+
 async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
 
@@ -2845,7 +2885,9 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # a human intervened" case that comment already anticipates, and clearing the recorded
     # reference costs nothing (the tree itself is untouched; this is a "soft" rewind by design).
     rewind_to_stage = sandbox_registry.pop_meta_value(thread_id, "rewind_to_stage")
-    rewind_rebuild_state: dict[str, Any] | None = None
+    # Named for what it carries, not which lever populated it -- reset-e2e (below) writes into
+    # this same channel too, not just a rewind.
+    rebuild_state_update: dict[str, Any] | None = None
     if rewind_to_stage:
         rewind_keys = [s.key for s in STAGES]
         if rewind_to_stage in rewind_keys:
@@ -2875,10 +2917,10 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
             # to rebuild.default_rebuild_state() any placement whose OWN real stage sits at or
             # after the rewind target -- mirrors the e2e["attempt"] = 0 reset just below, same
             # reasoning, this is the rebuild-placement equivalent.
-            rewind_rebuild_state = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
+            rebuild_state_update = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
             for real_stage_key, rebuild_spec in POST_STAGE_REBUILD.items():
                 if rewind_keys.index(real_stage_key) >= target_idx:
-                    rewind_rebuild_state[rebuild_spec.key] = rebuild.default_rebuild_state()
+                    rebuild_state_update[rebuild_spec.key] = rebuild.default_rebuild_state()
             logger.warning(
                 "intake_node: rewound thread_id=%s to stage=%s (and every stage after it)",
                 thread_id, rewind_to_stage,
@@ -2979,7 +3021,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # as targeted_fix_attempts's own cap.
     e2e_reset_attempts = state.get("e2e_reset_attempts", 0)
     reset_e2e = sandbox_registry.pop_meta_flag(thread_id, "reset_e2e")
-    if reset_e2e and e2e_reset_attempts >= workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS:
+    if reset_e2e and _reset_e2e_attempts_exhausted(e2e_reset_attempts):
         logger.warning(
             "intake_node: reset-e2e refused for thread_id=%s -- already used %d/%d attempts",
             thread_id, e2e_reset_attempts, workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS,
@@ -2997,26 +3039,14 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     e2e_state["attempt"] = 0
 
     if reset_e2e:
-        # adversarial-compliance must reset alongside metrics-exit:
-        # _build_adversarial_compliance_prompt reads state.get("e2e") and injects an e2e_summary
-        # into that stage's own draft prompt ("this stage absorbed e2e's compliance role in the
-        # consolidation") -- leaving it "approved" would let should_skip_draft fast-forward past
-        # it on the exact stale e2e evidence this lever exists to replace.
-        for stale_stage_key in ("metrics-exit", "adversarial-compliance"):
-            stale_stage = stages[stale_stage_key]
-            _reset_stage_status_fields(stale_stage)
-            _reset_stage_mechanics(stale_stage)
-        # Both rebuild placements downstream of remediation genuinely re-execute on this replay
-        # (rebuild placements aren't StageSpecs and are never skip-eligible) -- reset their own
-        # sub-state the same way rewind_to_stage already does above, or a stale fix_cycle_count
-        # left over from the prior run could immediately hit its cap and escalate with zero fresh
-        # laps. remediation itself is never reset as a STAGE here: its own rebuild placement
-        # (r_remediation) always re-executes on the way through regardless of stage-skip status,
-        # this just ensures it starts clean when it does.
-        if rewind_rebuild_state is None:
-            rewind_rebuild_state = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
-        rewind_rebuild_state[REBUILD_FOR_REMEDIATION.key] = rebuild.default_rebuild_state()
-        rewind_rebuild_state[REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key] = rebuild.default_rebuild_state()
+        # Delegates to _apply_reset_e2e (adversarial-compliance resets alongside metrics-exit --
+        # see that function's own docstring for why -- and both downstream rebuild placements'
+        # sub-state resets too, mirroring what rewind_to_stage already does above). Extracted so
+        # _demo_reset_e2e_lever can assert against this exact production code, not a hand-typed
+        # duplicate of it.
+        if rebuild_state_update is None:
+            rebuild_state_update = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
+        _apply_reset_e2e(stages, rebuild_state_update)
         e2e_reset_attempts += 1
         logger.warning(
             "intake_node: ran reset-e2e for thread_id=%s (attempt %d/%d)",
@@ -3055,7 +3085,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # Only present when a rewind or a reset-e2e actually reset a placement's sub-state --
         # omitted otherwise so an ordinary intake call leaves this channel untouched, same as
         # before this existed.
-        **({"rebuild": rewind_rebuild_state} if rewind_rebuild_state is not None else {}),
+        **({"rebuild": rebuild_state_update} if rebuild_state_update is not None else {}),
     }
 
 
@@ -3870,13 +3900,16 @@ def _demo_targeted_fix_stuck_decision() -> None:
 
 
 def _demo_reset_e2e_lever() -> None:
-    """Self-check for intake_node's reset-e2e handling (Fix 3): exercises the SAME functions and
-    module constants that block calls -- _reset_stage_status_fields, _reset_stage_mechanics,
-    e2e_nodes.default_e2e_state(), rebuild.default_rebuild_state(), REBUILD_FOR_REMEDIATION,
-    REBUILD_FOR_ADVERSARIAL_COMPLIANCE -- against a synthetic dirtied state, mirroring
-    _demo_targeted_fix_stuck_decision's shape. Does not invoke the full async intake_node itself:
-    that function has no isolated test harness anywhere in this file (its own tested seams are
-    exactly these extracted pure helpers), and stubbing its session_store/sandbox_registry/
+    """Self-check for intake_node's reset-e2e handling (Fix 3): calls the REAL production
+    functions -- _apply_reset_e2e, _reset_e2e_attempts_exhausted, e2e_nodes.default_e2e_state() --
+    against synthetic dirtied fixtures, mirroring _demo_targeted_fix_stuck_decision's own shape
+    (that self-check calls the real _targeted_fix_stuck_decision, not a re-typed copy). Review
+    finding (2026-09-21): an earlier version of this self-check re-typed _apply_reset_e2e's own
+    tuple/assignments and asserted its own duplicate against itself, so it could not have caught a
+    regression in the real code (e.g. "adversarial-compliance" silently dropped from the reset
+    set) -- calling the real helpers closes that gap. Does not invoke the full async intake_node
+    itself: that function has no isolated test harness anywhere in this file (its own tested seams
+    are exactly these extracted pure helpers), and stubbing its session_store/sandbox_registry/
     tech_stack_signals dependencies would be new scaffolding this repo doesn't use elsewhere."""
     # e2e: a fired reset must discard the WHOLE sub-state via default_e2e_state(), not just zero
     # "attempt" the way every ordinary intake call does -- Fix 2's proven_* launch cache is exactly
@@ -3894,10 +3927,13 @@ def _demo_reset_e2e_lever() -> None:
     assert reset_e2e_state["proven_routes"] == []
     assert reset_e2e_state["attempt"] == 0
 
-    # Stages: metrics-exit/adversarial-compliance lose status/mechanics but keep approved_content
-    # (same contract every other _reset_stage_status_fields/_reset_stage_mechanics caller gets);
-    # remediation itself is a STAGE this lever never touches -- only its rebuild placement's own
-    # sub-state resets (checked separately below).
+    # Stages + rebuild placements: drive the REAL _apply_reset_e2e, not a hand-typed duplicate of
+    # its tuple/assignments. metrics-exit/adversarial-compliance lose status/mechanics but keep
+    # approved_content (same contract every other _reset_stage_status_fields/_reset_stage_mechanics
+    # caller gets); remediation itself is a STAGE this lever never touches; an unrelated rebuild
+    # placement (e.g. ac-to-tests's own) must survive completely untouched. If a future edit drops
+    # a key from _RESET_E2E_STALE_STAGE_KEYS or _apply_reset_e2e's own rebuild assignments, the
+    # corresponding assertion below fails against the REAL function's output, not a copy of it.
     stages = {
         "metrics-exit": {
             "status": "approved", "approved_content": {"merge_ready": True}, "cycle_count": 2,
@@ -3913,9 +3949,15 @@ def _demo_reset_e2e_lever() -> None:
         },
     }
     remediation_before = dict(stages["remediation"])
-    for stale_key in ("metrics-exit", "adversarial-compliance"):
-        _reset_stage_status_fields(stages[stale_key])
-        _reset_stage_mechanics(stages[stale_key])
+    dirty_rebuild_entry = {**rebuild.default_rebuild_state(), "status": "fixing", "fix_cycle_count": 3}
+    rebuild_state = {
+        REBUILD_FOR_REMEDIATION.key: dict(dirty_rebuild_entry),
+        REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key: dict(dirty_rebuild_entry),
+        "r_ac_to_tests": dict(dirty_rebuild_entry),
+    }
+
+    _apply_reset_e2e(stages, rebuild_state)  # the real production function, not a re-typed copy
+
     assert stages["metrics-exit"]["status"] == "not_started"
     assert stages["metrics-exit"]["approved_content"] == {"merge_ready": True}, (
         "approved_content must survive a reset (diagram_gate's verbatim-carryover exemption)"
@@ -3927,30 +3969,18 @@ def _demo_reset_e2e_lever() -> None:
         "remediation's own StageSpec must stay untouched -- reset-e2e only clears its rebuild "
         "placement's sub-state, never redrafts the stage itself"
     )
-
-    # Rebuild placements: only r_remediation and r_adversarial_compliance reset; an unrelated
-    # placement (e.g. ac-to-tests's own) must survive completely untouched.
-    dirty_rebuild_entry = {**rebuild.default_rebuild_state(), "status": "fixing", "fix_cycle_count": 3}
-    rebuild_state = {
-        REBUILD_FOR_REMEDIATION.key: dict(dirty_rebuild_entry),
-        REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key: dict(dirty_rebuild_entry),
-        "r_ac_to_tests": dict(dirty_rebuild_entry),
-    }
-    rebuild_state[REBUILD_FOR_REMEDIATION.key] = rebuild.default_rebuild_state()
-    rebuild_state[REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key] = rebuild.default_rebuild_state()
     assert rebuild_state[REBUILD_FOR_REMEDIATION.key] == rebuild.default_rebuild_state()
     assert rebuild_state[REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key] == rebuild.default_rebuild_state()
     assert rebuild_state["r_ac_to_tests"] == dirty_rebuild_entry, "an unrelated placement must never reset"
 
-    # Attempt cap: the exact `attempts >= AIDW_E2E_RESET_MAX_ATTEMPTS` comparison both
-    # intake_node's own guard and sessions_api.py's reset-e2e handler make, over representative
-    # attempts counts.
+    # Attempt cap: call the REAL _reset_e2e_attempts_exhausted (the exact comparison intake_node's
+    # own guard makes), over representative attempts counts, instead of asserting facts about `>=`.
     cap = workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS
     assert cap >= 1, "a cap of 0 would refuse even a first-ever attempt"
-    assert (0 >= cap) is False, "a fresh thread (0 attempts used) must be allowed"
-    assert ((cap - 1) >= cap) is False, "one below the cap must still be allowed"
-    assert (cap >= cap) is True, "exactly at the cap must be refused"
-    assert ((cap + 1) >= cap) is True, "already over the cap must stay refused"
+    assert not _reset_e2e_attempts_exhausted(0), "a fresh thread (0 attempts used) must be allowed"
+    assert not _reset_e2e_attempts_exhausted(cap - 1), "one below the cap must still be allowed"
+    assert _reset_e2e_attempts_exhausted(cap), "exactly at the cap must be refused"
+    assert _reset_e2e_attempts_exhausted(cap + 1), "already over the cap must stay refused"
 
 
 def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:

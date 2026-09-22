@@ -100,7 +100,9 @@ TARGETED_FIX_MAX_ATTEMPTS = int(os.environ.get("TARGETED_FIX_MAX_ATTEMPTS", "3")
 # dedicated cap, not TARGETED_FIX_MAX_ATTEMPTS above -- this lever bounds a state RESET (no LLM
 # fix pass, but a real regression-suite re-run each time), a different cost shape than a seeded
 # fix attempt. Read by intake_node and sessions_api.py's reset-e2e handler to refuse once
-# exhausted.
+# exhausted. Raising it permits more replays against the same closed run before that refusal
+# kicks in; lowering it refuses sooner, at the cost of less room to recover from a genuinely
+# wrongly-skipped e2e that took more than the default 3 tries to shake loose.
 AIDW_E2E_RESET_MAX_ATTEMPTS = int(os.environ.get("AIDW_E2E_RESET_MAX_ATTEMPTS", "3"))
 
 # e2e's own bespoke-cluster caps (agent/src/e2e_nodes.py): fix-cycle cap (same shape as
