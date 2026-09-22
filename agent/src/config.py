@@ -107,6 +107,13 @@ E2E_MAX_FIX_CYCLES = int(os.environ.get("E2E_MAX_FIX_CYCLES", "8"))
 TEST_HARDENING_MAX_FIX_CYCLES = int(os.environ.get("TEST_HARDENING_MAX_FIX_CYCLES", "4"))
 E2E_APP_READY_TIMEOUT_SECONDS = int(os.environ.get("E2E_APP_READY_TIMEOUT_SECONDS", "120"))
 E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "1200"))
+# Operator kill-switch for e2e_run_node's proven-launch cache: when a previous fix-cycle lap this
+# stage attempt already booted a start_command/port pair and confirmed it answers, on by default
+# this skips the paid GHCP launch-discovery turn on the next lap and reboots straight from the
+# cached command (the reboot itself is never skipped). "0" forces every lap to re-run discovery,
+# same escape hatch shape as AIDW_AUTH_GATE below -- for a deployment where a stale cache is
+# suspected of masking a real app-source change the fix loop should have re-discovered.
+AIDW_E2E_REUSE_PROVEN_LAUNCH = os.environ.get("AIDW_E2E_REUSE_PROVEN_LAUNCH", "1").strip().lower() not in ("0", "false", "no", "off", "")
 # Lighthouse (performance + accessibility) runs inside e2e_run_node's live-app window -- the ONE
 # place a served app exists (deliberately NOT a repo_scan tool: repo_scan's contract is offline,
 # no running app). Worst-of-routes scores (0-100) below either floor count as an e2e failure and

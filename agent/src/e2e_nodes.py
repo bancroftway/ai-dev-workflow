@@ -93,6 +93,15 @@ class E2EState(TypedDict):
     # contract as the skill gate: an infra gap must never read as a score of zero.
     service_urls: list[str]  # base urls of the supporting services this run booted (API probes)
     auth_check: dict[str, Any] | None  # gates/auth_gate report + passed/feedback, or None (not run)
+    # A start_command/port/routes/api_routes tuple a PREVIOUS lap this e2e stage attempt actually
+    # booted and confirmed ready (see e2e_run_node's `ready` check) -- lets a retry lap skip the
+    # paid GHCP launch-discovery turn and reboot straight from a known-good command. None/[] means
+    # "nothing proven yet" (fresh stage entry, or a prior lap's cache-hit came back not-ready and
+    # was cleared). Reset by e2e_gate_check_node on every fresh stage entry (see its own comment).
+    proven_start_command: str | None
+    proven_port: int | None
+    proven_routes: list[str]
+    proven_api_routes: list[str]
 
 
 class AppLaunchReport(StageReport):
@@ -133,6 +142,10 @@ def default_e2e_state() -> E2EState:
         "lighthouse": None,
         "service_urls": [],
         "auth_check": None,
+        "proven_start_command": None,
+        "proven_port": None,
+        "proven_routes": [],
+        "proven_api_routes": [],
     }
 
 
@@ -336,6 +349,12 @@ async def e2e_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> 
     # that had zero startable apps before scaffolding has the exact same staleness problem.
     scan = await app_discovery.collect_evidence(provider, thread_id)
     e2e["app_candidates"] = scan["candidates"]
+    # Fresh stage entry -- e2e_run_node's `dict(state.get("e2e") or default_e2e_state())` PRESERVES
+    # the existing e2e dict, so without this explicit reset a second stage entry within the same run
+    # (e.g. a remediation-triggered redo) could reuse a launch config proven against now-stale app
+    # source. Explicit, not "start from default_e2e_state()" here: this function only re-derives
+    # app_candidates fresh, same precedent -- everything else in `e2e` still carries forward.
+    _clear_proven_launch(e2e)
 
     return {"e2e": e2e}
 
@@ -1080,20 +1099,30 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         provider, thread_id, int(app.get("port") or 0), reserved_ports
     )
     reserved_ports.add(requested_port)
-    launch = await stack_runner.run_and_report(
-        thread_id,
-        stage_key="e2e-run",
-        prompt_name="e2e_run",
-        schema=AppLaunchReport,
-        provider=state["provider"],
-        run_id=run_id,
-        # Session-poisoning fix: this node "re-runs against the SAME run_id" every e2e fix cycle
-        # (see this function's own comment a few lines up), so a static stage_key+role would
-        # --resume the same growing session e2e_fix_node's own attempt-numbered key already avoids.
-        # Same e2e["attempt"] counter, same reasoning.
-        lap=e2e.get("attempt", 0),
-        requested_port=str(requested_port),  # render_prompt substitutes strings only
-    )
+    # Skip the paid GHCP proving turn when a previous lap THIS stage attempt already proved a
+    # start_command/port pair boots and answers (see the cache write at `ready` below, and its
+    # clear on a stale-cache failure): retries then only re-pay the reboot, not the discovery.
+    # AIDW_E2E_REUSE_PROVEN_LAUNCH is the operator kill-switch; a falsy cached command (nothing
+    # proven yet this attempt, or e2e_gate_check_node's fresh-stage-entry reset just cleared it)
+    # always falls through to the real discovery turn below, unchanged.
+    used_proven_launch = _should_reuse_proven_launch(e2e)
+    if used_proven_launch:
+        launch = _synthesized_launch_from_cache(e2e, requested_port)
+    else:
+        launch = await stack_runner.run_and_report(
+            thread_id,
+            stage_key="e2e-run",
+            prompt_name="e2e_run",
+            schema=AppLaunchReport,
+            provider=state["provider"],
+            run_id=run_id,
+            # Session-poisoning fix: this node "re-runs against the SAME run_id" every e2e fix cycle
+            # (see this function's own comment a few lines up), so a static stage_key+role would
+            # --resume the same growing session e2e_fix_node's own attempt-numbered key already avoids.
+            # Same e2e["attempt"] counter, same reasoning.
+            lap=e2e.get("attempt", 0),
+            requested_port=str(requested_port),  # render_prompt substitutes strings only
+        )
     if launch.success and launch.start_command:
         port = int(launch.port or requested_port)
         start_command = launch.start_command
@@ -1318,7 +1347,22 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     )
     ready = await _wait_ready(provider, thread_id, port)
 
+    if ready and not used_proven_launch:
+        # A live boot + readiness check just empirically proved this start_command/port pair
+        # works -- whether it came from a fresh GHCP proving turn or the scanned-candidate
+        # fallback above, either way it earns the cache. `routes` is the widened list (spec-mined
+        # routes unioned in above), not the raw `launch.routes`, so a cache-hit lap restores the
+        # same targeting a fresh discovery lap would have produced.
+        _cache_proven_launch(e2e, start_command, port, routes, list(launch.api_routes or []))
+
     if not ready:
+        if used_proven_launch:
+            # RULING: no same-lap retry against a fresh discovery turn -- port selection and the
+            # supporting-services boot loop above already baked in requested_port/WEB_ORIGIN
+            # assumptions a same-lap swap would need to unwind. Instead, clear the stale cache so
+            # the NEXT e2e_fix -> e2e_run lap redoes full discovery instead of retrying the same
+            # bad command -- self-heals within one extra lap rather than looping forever.
+            _clear_proven_launch(e2e)
         log_tail = truncate_middle(
             await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
             workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
@@ -1963,6 +2007,54 @@ def _build_screenshot_copy_script(screens_dir: str, found_paths: list[str]) -> s
     return "\n".join(script_lines)
 
 
+def _should_reuse_proven_launch(e2e: dict[str, Any]) -> bool:
+    """True when a previous lap this e2e stage attempt already booted a start_command/port pair
+    and confirmed it answers (see `_cache_proven_launch`'s call site), and the operator has not
+    disabled reuse via AIDW_E2E_REUSE_PROVEN_LAUNCH. A falsy cached command -- nothing proven yet
+    this attempt, or a fresh stage entry / stale-cache failure just cleared it -- always falls
+    through to the real GHCP discovery turn."""
+    return bool(workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH and e2e.get("proven_start_command"))
+
+
+def _synthesized_launch_from_cache(e2e: dict[str, Any], fallback_port: int) -> AppLaunchReport:
+    """Build the AppLaunchReport a cache-hit lap uses in place of the GHCP proving turn.
+
+    A REAL AppLaunchReport, not a duck-typed stand-in or a new downstream branch -- every line
+    after the launch call (success/start_command/port/routes/api_routes) then works completely
+    unchanged, cache-hit or not.
+    """
+    return AppLaunchReport(
+        success=True,
+        start_command=str(e2e.get("proven_start_command")),
+        port=int(e2e.get("proven_port") or fallback_port),
+        routes=list(e2e.get("proven_routes") or []),
+        api_routes=list(e2e.get("proven_api_routes") or []),
+    )
+
+
+def _cache_proven_launch(
+    e2e: dict[str, Any], start_command: str, port: int, routes: list[str], api_routes: list[str]
+) -> None:
+    """Record a start_command/port/routes/api_routes tuple a lap just booted and confirmed ready
+    (mutates `e2e` in place), so the NEXT lap this e2e stage attempt can skip the GHCP proving
+    turn via `_should_reuse_proven_launch`."""
+    e2e["proven_start_command"] = start_command
+    e2e["proven_port"] = port
+    e2e["proven_routes"] = list(routes)
+    e2e["proven_api_routes"] = list(api_routes)
+
+
+def _clear_proven_launch(e2e: dict[str, Any]) -> None:
+    """Reset the proven-launch cache in place. Called on a fresh e2e stage entry
+    (e2e_gate_check_node) and when a cache-hit lap's cached command failed readiness
+    (e2e_run_node) -- either way, a later lap must not reuse a config that's stale or was never
+    actually proven."""
+    e2e["proven_start_command"] = None
+    e2e["proven_port"] = None
+    e2e["proven_routes"] = []
+    e2e["proven_api_routes"] = []
+
+
 def _demo() -> None:
     """Self-check for the pure half: `uv run python -m src.e2e_nodes`."""
     sample = {
@@ -2255,6 +2347,43 @@ def _demo() -> None:
     # Empty input -> just mkdir, no cp commands.
     empty_script = _build_screenshot_copy_script("/out/screens", [])
     assert empty_script == "mkdir -p /out/screens", f"empty paths should yield just mkdir, got: {empty_script}"
+
+    # Proven-launch cache (skip-decision logic for e2e_run_node's GHCP proving turn). Flip the
+    # module flag directly, same as any other AIDW_-style toggle in this file -- restored in a
+    # finally so this self-check never leaks state into a later run of the same process.
+    _orig_reuse_flag = workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH
+    try:
+        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = True
+        fresh = default_e2e_state()
+        assert not _should_reuse_proven_launch(fresh), "nothing proven yet -- must not reuse"
+
+        cached = default_e2e_state()
+        _cache_proven_launch(cached, "npm run dev", 3101, ["/", "/expenses"], ["/api/expenses"])
+        assert _should_reuse_proven_launch(cached), "a proven command with reuse enabled must be used"
+        launch = _synthesized_launch_from_cache(cached, fallback_port=9999)
+        # A REAL AppLaunchReport (StageReport subclass): success/start_command/port/routes/
+        # api_routes all read exactly the way a fresh GHCP-produced report would be read below.
+        assert launch.success is True and launch.error is None
+        assert launch.start_command == "npm run dev"
+        assert launch.port == 3101, "must restore the cached port, not the fallback"
+        assert launch.routes == ["/", "/expenses"]
+        assert launch.api_routes == ["/api/expenses"]
+
+        # Operator kill-switch: AIDW_E2E_REUSE_PROVEN_LAUNCH=0 disables reuse even with a cache hit.
+        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = False
+        assert not _should_reuse_proven_launch(cached), "kill-switch off must force fresh discovery"
+        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = True
+
+        # Cache miss/failure clears the cache: a stale-cache lap whose readiness probe failed (or a
+        # fresh e2e_gate_check_node stage entry) must leave the next lap with nothing to reuse.
+        _clear_proven_launch(cached)
+        assert not _should_reuse_proven_launch(cached), "a cleared cache must not be reused"
+        assert cached["proven_start_command"] is None
+        assert cached["proven_port"] is None
+        assert cached["proven_routes"] == []
+        assert cached["proven_api_routes"] == []
+    finally:
+        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = _orig_reuse_flag
 
     print("e2e_nodes self-check: ok")
 
