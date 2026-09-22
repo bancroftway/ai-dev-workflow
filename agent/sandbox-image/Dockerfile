@@ -876,6 +876,46 @@ RUN chmod +x /usr/local/bin/ai-dev-workflow-entrypoint.sh /usr/local/bin/ai-dev-
     # root-owned gate binaries in /usr/local/bin.
     chown root:root /opt/aidw/tools/bin && chmod 0755 /opt/aidw/tools/bin
 
+# Deterministic build-time tool manifest for the security/quality analyzers repo_scan.py drives
+# (semgrep/interrogate/bandit/lizard from the pip line above; checkov from the same line; trivy/
+# osv-scanner/gitleaks/syft/scc/jscpd installed earlier in this stage). These are baked into every
+# image at a fixed version, unlike node/python/dotnet (mise-managed, per-target-repo, deliberately
+# NOT baked here) -- so resolving their real path/version once, now, at build time, is strictly
+# more trustworthy than repo_scan.py's runtime `command -v` guess, and lets bootstrap.sh's runtime
+# probe check "does this baked path still work in THIS container" instead of re-discovering paths
+# from scratch every run. Runs after every tool-install step above (this RUN's position in the
+# file is load-bearing) and as root, before USER vscode, so it sees the complete final PATH.
+# Observed live (run f0fef8ba): semgrep and interrogate read "ok" at this run's own baseline scan
+# and "missing" minutes later in the SAME container -- this manifest can't detect that by itself
+# (build-time is necessarily a snapshot), but bootstrap.sh's runtime existence check against it can.
+RUN python3 - <<'PY'
+import json
+import shutil
+import subprocess
+
+TOOLS = [
+    "semgrep", "interrogate", "bandit", "checkov", "lizard",
+    "trivy", "osv-scanner", "gitleaks", "syft", "scc", "jscpd",
+]
+manifest = {}
+for name in TOOLS:
+    path = shutil.which(name)
+    version = None
+    if path:
+        try:
+            probe = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+            first_line = ((probe.stdout or probe.stderr or "").strip().splitlines() or [None])[0]
+            version = first_line.strip() if first_line else None
+        except Exception:
+            version = None
+    manifest[name] = {"path": path, "version": version}
+
+with open("/opt/aidw/tools/manifest.json", "w") as f:
+    json.dump(manifest, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+RUN chown root:root /opt/aidw/tools/manifest.json && chmod 0644 /opt/aidw/tools/manifest.json
+
 USER vscode
 WORKDIR /workspace
 

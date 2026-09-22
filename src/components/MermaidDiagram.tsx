@@ -39,6 +39,19 @@ export function MermaidDiagram({ source, name }: { source: string; name: string 
           mermaid.initialize({ startOnLoad: false, theme: "default", securityLevel: "strict" });
           initialized = true;
         }
+        // `parse` FIRST, separately from `render` (2026-09-22, root-caused live: a Plan diagram
+        // whose `kind` was "architecture" declared itself with the bare word `architecture`
+        // instead of the real Mermaid type `architecture-beta` -- invalid syntax that the
+        // backend's OLDER pinned mmdc-CLI (11.16.0) tolerated at verify time, but this newer
+        // client-side `mermaid` package (11.17.2) does not). `render()` alone does not reliably
+        // throw on a source like that: it can RESOLVE with an SVG that IS mermaid's own built-in
+        // error graphic (the bomb icon + "Syntax error in text..."), which the catch block below
+        // never sees -- so an already-approved, already-committed bad diagram rendered that raw
+        // error graphic as if it were a real diagram instead of the styled fallback below.
+        // `parse()` is documented to reject/throw on invalid source without ever producing that
+        // error-graphic SVG, so validating with it first routes a bad diagram into the catch
+        // block reliably, the same way a `render()` exception always has.
+        await mermaid.parse(source);
         const result = await mermaid.render(diagramId, source);
         if (!cancelled) setSvg(result.svg);
       } catch (err) {

@@ -138,7 +138,7 @@ export function HealthBreakdown({
             if (value == null) return null;
             const weight = weights[key];
             return (
-              <li key={key} className="flex justify-between gap-2 text-xs text-neutral-600">
+              <li key={key} id={`subscore-${key}`} className="flex justify-between gap-2 text-xs text-neutral-600">
                 <span>{label}</span>
                 <span>
                   <span style={{ color: healthColor(value) }} className="font-medium">{Math.round(value)}</span>

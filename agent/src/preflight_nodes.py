@@ -376,6 +376,13 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
     # Consulted by MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE so a drafting session checks this instead
     # of assuming a package manager is installed just because it is common elsewhere.
     available = report.get("available") or {}
+    # Build-time-baked path+version for every security/quality analyzer (Dockerfile's manifest.json
+    # step), cross-checked live against the CURRENT container (bootstrap.sh section 2e) -- unlike
+    # `available` above (bare presence for a fixed generic-toolchain list), this carries the
+    # deterministic build-time path/version alongside a `present_now` liveness bit per tool, so a
+    # tool that built fine but broke later in this specific container's life (run f0fef8ba:
+    # semgrep/interrogate) is visible in manifest.json minutes into a run, not only at the final scan.
+    security_tools = report.get("security_tools") or {}
     # The image's baked-in Playwright build (bootstrap.sh section 2d), queried directly from the
     # installed binary rather than trusted from a build-time literal -- a target repo's own
     # `@playwright/test` in package.json must match this exact version or e2e fails at RUN time.
@@ -392,10 +399,10 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
         logger.warning("could not append to the host-side toolchain log", exc_info=True)
 
     await repo_files.append_ledger_entry(
-        provider, thread_id, {"stage": "scaffold", "node": "toolchain", "tools": tools}
+        provider, thread_id, {"stage": "scaffold", "node": "toolchain", "tools": tools, "security_tools": security_tools}
     )
 
-    if not tools and not available and not playwright_version:
+    if not tools and not available and not security_tools and not playwright_version:
         return False
 
     existing_raw = await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH)
@@ -407,6 +414,7 @@ async def record_toolchain(provider: SandboxProvider, thread_id: str) -> bool:
         "image": report.get("image", "unknown"),
         "tools": tools,
         "available": available,
+        "security_tools": security_tools,
         "playwright_version": playwright_version,
         "playwright_browsers_path": playwright_browsers_path,
     }

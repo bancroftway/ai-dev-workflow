@@ -62,6 +62,61 @@ _GATE_OWNED_REASON_MARKERS = (
     "terminal pipeline failure recorded at",
 )
 
+# Manifest-completeness topics verify_exit_readiness's own manifest-completion step computes fresh
+# on every call -- see that function's stale-reason filter for why these need topic-based (not
+# exact-substring) matching, unlike _GATE_OWNED_REASON_MARKERS above. Each keyword must appear in
+# BOTH this function's own short deterministic phrase ("manifest.json has no test_command for this
+# stack", "...has no coverage_commands -- coverage is not replayable", "...records no runnable
+# app...") and plausibly in the model's own freely-worded paraphrase of the same topic.
+_MANIFEST_COMPLETENESS_TOPIC_KEYWORDS = ("test_command", "coverage_command", "runnable app")
+
+
+def _combined_test_command_from_apps(apps: list[dict[str, Any]]) -> str | None:
+    """One combined `cd <path> && <command>` per app, joined with ` && `, from manifest.json's
+    own app_check.apps -- the fallback verify_exit_readiness's manifest-completion step reaches
+    for when `resolve_test_command(tech_stack)` returns None (tech-stack's own languages/
+    package_managers are empty -- the SAME frozen-greenfield-doc root cause
+    tech_stack_signals.tech_stack_has_ui_framework's own docstring documents) AND a fixing agent
+    has already added a per-app `test_command` directly to one or more app objects.
+
+    Root-caused live (income-investor run c1458b23): a targeted-fix pass, told to "add a
+    test_command entry per app," reasonably nested `test_command` on each object in
+    app_check.apps (structurally sensible -- coverage_commands is ALREADY a per-root list) rather
+    than writing manifest.json's own single top-level string field the deterministic check
+    actually reads -- so the edit was real but invisible to it. A bare per-app command ("npm
+    test") is not yet runnable from the repo root without first `cd`-ing into that app's own
+    path, which this function supplies; a `runtime`-based guess (python -> pytest, node -> npm
+    test) covers an app whose own test_command is still missing, so ONE app carrying it is enough
+    to unblock the whole manifest rather than requiring every app to.
+
+    Purely documentary output (nothing in this codebase executes manifest.json's test_command --
+    unlike coverage_commands, which IS replayed and validated at that point instead), so no path
+    validation is applied here; `path`/`command` already come from app_discovery's own trusted
+    scan or an agent's in-scope manifest edit, not raw external input crossing a trust boundary."""
+    segments: list[str] = []
+    for app in apps:
+        path = app.get("path")
+        if not path:
+            continue
+        command = app.get("test_command")
+        if not command:
+            runtime = app.get("runtime")
+            command = {"python": "python3 -m pytest", "node": "npm test"}.get(str(runtime))
+        if command:
+            segments.append(f"cd {path} && {command}")
+    return " && ".join(segments) or None
+
+
+def _manifest_completeness_topic(reason: str) -> str | None:
+    """Which manifest-completeness topic (if any) `reason` is about -- "manifest.json" together
+    with one of `_MANIFEST_COMPLETENESS_TOPIC_KEYWORDS`, requiring both so a reason that merely
+    mentions one of the keywords in an unrelated context is never falsely claimed. Module-level
+    (not nested in verify_exit_readiness) so this pure string logic gets its own self-check
+    assertions, same as every other pure helper in this file."""
+    if "manifest.json" not in reason:
+        return None
+    return next((kw for kw in _MANIFEST_COMPLETENESS_TOPIC_KEYWORDS if kw in reason), None)
+
 CHANGELOG_PATH = "CHANGELOG.md"
 HISTORY_DIR = ".ai-dev-workflow/history"
 # Stable, run-id-free location for the LATEST run's exit report, so a human landing on the delivered
@@ -1134,7 +1189,7 @@ async def verify_exit_readiness(
         if apps:
             updates["app_check"] = {"apps": apps, "evidence_fingerprint": scan.get("fingerprint")}
     if not manifest.get("test_command"):
-        command = resolve_test_command(tech_stack)
+        command = resolve_test_command(tech_stack) or _combined_test_command_from_apps(app_check.get("apps") or [])
         if command:
             updates["test_command"] = command
     if not manifest.get("coverage_commands"):
@@ -1227,12 +1282,31 @@ async def verify_exit_readiness(
     # Only gate-owned phrasing is filtered. A prose blocker the model reasoned out for itself (an
     # out-of-scope dependency, a broken replay contract) is exactly what this stage is for and is
     # never touched here.
+    #
+    # Manifest-completeness (test_command/coverage_commands/runnable-app, computed fresh a few
+    # lines above THIS SAME call) needs its own, topic-based version of the same drop: unlike the
+    # regression gate's fixed-vocabulary reasons, the drafting model paraphrases these freely
+    # ("manifest.json (.ai-dev-workflow/manifest.json) still got no test_command...") rather than
+    # copying this function's own short deterministic phrase verbatim, so an exact/substring match
+    # against THIS run's `problems` text never catches it. Observed live (income-investor run
+    # c1458b23): the model's own draft-turn belief that coverage_commands was still missing
+    # survived into the final report even though the manifest-completion step above had already
+    # backfilled it from coverage-commands.json moments earlier in this exact call -- this
+    # function is the sole authority on manifest completeness, having just recomputed it fresh, so
+    # any existing reason naming "manifest.json" together with one of these topics is dropped
+    # unless `problems` still raises that SAME topic this run.
     gate_reasons = set(problems)
     model_reasons = _presence_values(content_dict.get("blocking_reasons"))
+    problem_topics = {t for p in problems if (t := _manifest_completeness_topic(p)) is not None}
     kept_reasons, stale_reasons = [], []
     for reason in model_reasons:
-        owned = any(marker in reason for marker in _GATE_OWNED_REASON_MARKERS)
-        (stale_reasons if owned and reason not in gate_reasons else kept_reasons).append(reason)
+        topic = _manifest_completeness_topic(reason)
+        if topic is not None:
+            stale = topic not in problem_topics
+        else:
+            owned = any(marker in reason for marker in _GATE_OWNED_REASON_MARKERS)
+            stale = owned and reason not in gate_reasons
+        (stale_reasons if stale else kept_reasons).append(reason)
     if stale_reasons:
         logger.warning(
             "exit verify: dropping %d blocking reason(s) this run's regression gate did not raise "
@@ -2068,6 +2142,43 @@ def _demo() -> None:
     # verify_exit_readiness (see the constant's own comment for the count breakdown).
     assert len(METRICS_EXIT_HARD_RULES) == 9, len(METRICS_EXIT_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in METRICS_EXIT_HARD_RULES)
+
+    # _combined_test_command_from_apps (2026-09-22, income-investor run c1458b23): a targeted-fix
+    # agent's own per-app test_command edit (structurally reasonable, invisible to the
+    # top-level-string check) must still be picked up and made runnable from the repo root.
+    per_app_commands = [
+        {"path": "apps/api", "runtime": "python", "test_command": "python3 -m pytest"},
+        {"path": "apps/web", "runtime": "node", "test_command": "npm test"},
+    ]
+    assert _combined_test_command_from_apps(per_app_commands) == (
+        "cd apps/api && python3 -m pytest && cd apps/web && npm test"
+    ), _combined_test_command_from_apps(per_app_commands)
+    # One app's own test_command missing -- falls back to a runtime-based guess for THAT app only.
+    partial = [{"path": "apps/api", "runtime": "python"}, {"path": "apps/web", "runtime": "node", "test_command": "npm test"}]
+    assert _combined_test_command_from_apps(partial) == "cd apps/api && python3 -m pytest && cd apps/web && npm test"
+    # No apps, or no app carries a command/known runtime -- correctly nothing to combine.
+    assert _combined_test_command_from_apps([]) is None
+    assert _combined_test_command_from_apps([{"path": "apps/worker", "runtime": "rust"}]) is None
+
+    # _manifest_completeness_topic (2026-09-22, income-investor run c1458b23): the model's own
+    # freely-worded paraphrase of a manifest-completeness topic must still be recognized as that
+    # topic, so a same-run backfill can drop it as stale even though its wording never matches
+    # this function's own short deterministic phrase.
+    assert _manifest_completeness_topic(
+        "manifest.json (.ai-dev-workflow/manifest.json) still got no test_command. Re-read file "
+        "direct this turn: only toolchain + app_check keys exist."
+    ) == "test_command"
+    assert _manifest_completeness_topic(
+        "manifest.json still no coverage_commands. Re-checked this turn: replay contract for "
+        "coverage sit only in sibling file .ai-dev-workflow/coverage-commands.json."
+    ) == "coverage_command"
+    assert _manifest_completeness_topic("manifest.json has no test_command for this stack") == "test_command"
+    assert _manifest_completeness_topic("manifest.json has no coverage_commands -- coverage is not replayable") == "coverage_command"
+    assert _manifest_completeness_topic("manifest.json records no runnable app (app_check.apps is empty even after re-scan)") == "runnable app"
+    # No "manifest.json" mention at all -- an unrelated prose blocker, never claimed as this topic.
+    assert _manifest_completeness_topic("the test_command in package.json points at a script that no longer exists") is None
+    # Mentions "manifest.json" but not one of the three known topics -- correctly unclaimed too.
+    assert _manifest_completeness_topic("manifest.json's auth_kind field looks wrong for this repo") is None
 
     print("exit_nodes self-check: ok")
 

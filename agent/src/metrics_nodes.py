@@ -273,7 +273,8 @@ def regression_reasons(
 ) -> list[str]:
     """Pure decision half of the metrics regression gate (self-checked in _demo). Blocks on:
     open gating findings (severity-floored, introduced-aware -- greenfield's empty-repo baseline
-    makes every finding gate absolutely, which is the correct rule there), unmeasured or
+    makes every finding gate absolutely, which is the correct rule there), a security-critical tool
+    (config.AIDW_SECURITY_CRITICAL_TOOL_NAMES) having failed or gone missing this scan, unmeasured or
     below-threshold coverage, coverage regressing beyond tolerance, and health-score regressing
     beyond tolerance. The health delta is skipped when the baseline has zero findings: greenfield's
     baseline is scanned pre-codegen against an empty repo, and comparing real app code against an
@@ -293,6 +294,18 @@ def regression_reasons(
     gating = latest_summary.get("gating_count") or 0
     if gating > 0:
         reasons.append(f"{gating} gating finding(s) open at/above severity floor {latest_summary.get('severity_floor')!r}")
+
+    # A security-critical tool crashing/going missing must not read as "scanned clean" -- see
+    # config.AIDW_SECURITY_CRITICAL_TOOL_NAMES's own comment for why (run f0fef8ba: gitleaks/syft
+    # both crashed with zero output and nothing gated on it).
+    security_critical_degraded = sorted(
+        set(latest_summary.get("degraded") or []) & set(workflow_config.AIDW_SECURITY_CRITICAL_TOOL_NAMES)
+    )
+    if security_critical_degraded:
+        reasons.append(
+            "security-critical tool(s) failed or are missing, so their findings cannot be trusted "
+            f"as \"clean\": {', '.join(security_critical_degraded)}"
+        )
 
     line, branch = coverage.get("line_rate"), coverage.get("branch_rate")
     if not isinstance(line, (int, float)) or not isinstance(branch, (int, float)):
@@ -878,6 +891,14 @@ def _demo() -> None:
     assert regression_reasons(clean_summary, delta, good_cov, baseline_has_findings=True, health_comparable=False, **kw) == []
     # Gating finding -> blocks.
     assert any("gating" in r for r in regression_reasons({"gating_count": 1, "severity_floor": "medium"}, None, good_cov, baseline_has_findings=False, **kw))
+    # A security-critical tool (gitleaks) failing/missing -> blocks, even with zero gating findings
+    # (run f0fef8ba: gitleaks crashed with no output, which used to read identically to "clean").
+    assert any(
+        "security-critical tool" in r
+        for r in regression_reasons({**clean_summary, "degraded": ["gitleaks", "checkov"]}, None, good_cov, baseline_has_findings=False, **kw)
+    )
+    # A non-critical tool (checkov) alone degraded -> does not block; that's the health-score's job.
+    assert regression_reasons({**clean_summary, "degraded": ["checkov"]}, None, good_cov, baseline_has_findings=False, **kw) == []
     # Coverage null -> blocks; below threshold -> blocks; the 81.8%-branch incident is caught.
     assert any("unmeasured" in r for r in regression_reasons(clean_summary, None, {"line_rate": None, "branch_rate": None}, baseline_has_findings=True, **kw))
     assert any("below threshold" in r for r in regression_reasons(clean_summary, None, {"line_rate": 96.8, "branch_rate": 81.8}, baseline_has_findings=True, **kw))

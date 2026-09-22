@@ -64,14 +64,22 @@ import math
 import os
 import re
 import time
+import types
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Sequence
 
 from langchain_core.runnables import RunnableConfig
 
+from .config import (
+    AIDW_TOOL_PROBE_NOTES_HEAD_CHARS,
+    AIDW_TOOL_PROBE_NOTES_TAIL_CHARS,
+    AIDW_TOOL_PROBE_RETRY_COUNT,
+    AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS,
+)
 from .sarif import Finding, parse_sarif
 from .severity import SEMGREP_SEVERITY_MAP, SEVERITY_ORDER, meets_or_exceeds
+from .text_truncate import truncate_middle
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +124,18 @@ REPO_SCAN_COVERAGE_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIME
 # `sast-quality` are quality-remediation's business and are gated on the baseline delta instead, never absolutely.
 SECURITY_CATEGORIES = frozenset({"vulnerability", "secret", "sast", "misconfig", "license"})
 QUALITY_CATEGORIES = frozenset({"duplication", "maintainability"})
+
+# Which SECURITY_CATEGORIES findings feed the GRADED security measure (worst_open_severity /
+# by_severity in summary()["measures"]["security"], and the health score's security subscore).
+# "license" is deliberately excluded here even though it stays in SECURITY_CATEGORIES for
+# is_gating(): a license-compliance flag (a restricted OSS license on a transitive dependency) is
+# a legal/policy signal, not a vulnerability-severity signal, and the finding itself is already
+# tagged gating=False/actionable=False -- grading it as a "high severity security issue" anyway
+# (observed live: run f0fef8ba's D-grade Security chip was driven entirely by two license findings,
+# zero real vulnerabilities) misrepresents actual risk. "misconfig" stays IN: an IaC
+# misconfiguration is a real exploitable weakness, and summary()'s own self-check already asserts
+# checkov/misconfig must gate -- do not widen this exclusion to it.
+SECURITY_GRADING_CATEGORIES = SECURITY_CATEGORIES - frozenset({"license"})
 
 # The tools whose findings feed SECURITY_CATEGORIES. The health score's security subscore is only
 # trustworthy in proportion to how many of these actually ran ok -- a semgrep timeout that yields
@@ -2077,7 +2097,7 @@ class ScanReport:
             # `by_severity`/`by_category` above stay FULL counts (display truthfully; score fairly).
             if is_non_application_path(finding.file):
                 continue
-            if finding.category in SECURITY_CATEGORIES:
+            if finding.category in SECURITY_GRADING_CATEGORIES:
                 security_by_severity[finding.severity] = security_by_severity.get(finding.severity, 0) + 1
             elif (
                 finding.category == "maintainability"
@@ -2875,6 +2895,20 @@ async def run_repo_scan(
     return report
 
 
+async def _probe_tool_version_with_retry(provider: Any, thread_id: str, version_command: str) -> Any:
+    """Runs `version_command` (already LC_ALL=C/2>&1-shaped by the caller), retrying once after a
+    short fixed delay if it fails -- a transient sandbox blip, not a permanent absence (see
+    config.AIDW_TOOL_PROBE_RETRY_COUNT's own comment). Returns the LAST attempt's ExecResult
+    (whether or not it succeeded) so the caller can still read its stdout for diagnostics."""
+    result = await provider.exec_in_sandbox(thread_id, version_command)
+    attempt = 0
+    while not result.ok and attempt < AIDW_TOOL_PROBE_RETRY_COUNT:
+        attempt += 1
+        await asyncio.sleep(AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS)
+        result = await provider.exec_in_sandbox(thread_id, version_command)
+    return result
+
+
 async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[str, Any], list[Finding], dict[str, Any]]:
     started = time.monotonic()
 
@@ -2901,16 +2935,26 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
             run.update(status="not_applicable", notes="No applicable files detected", duration_ms=_elapsed_ms(started))
             return run, [], {}
 
-    version_result = await provider.exec_in_sandbox(thread_id, f"LC_ALL=C {spec.version_command} 2>&1")
+    version_result = await _probe_tool_version_with_retry(provider, thread_id, f"LC_ALL=C {spec.version_command} 2>&1")
     version_output = (version_result.stdout or "").strip()
     run["version"] = version_output.splitlines()[0].strip() if version_output else None
     run["db_version"] = _extract_db_version(version_output)
 
     if not version_result.ok:
-        # The binary is not on PATH -- a sandbox image problem, not a repo problem. Say so.
-        run.update(status="missing", version=None, notes="binary not on PATH -- sandbox image problem",
-                   duration_ms=_elapsed_ms(started))
-        logger.warning("repo_scan: tool %s is not available in the sandbox", spec.name)
+        # The binary is not on PATH -- a sandbox image problem, not a repo problem. Include the
+        # probe's actual output (already 2>&1-merged into stdout by the command above) instead of
+        # just guessing, so the NEXT occurrence is diagnosable instead of a dead end.
+        probe_detail = version_output or "(no output)"
+        run.update(
+            status="missing", version=None,
+            notes=f"binary not on PATH (exit {version_result.returncode}) -- probe output: "
+                  f"{truncate_middle(probe_detail, AIDW_TOOL_PROBE_NOTES_HEAD_CHARS, AIDW_TOOL_PROBE_NOTES_TAIL_CHARS)}",
+            duration_ms=_elapsed_ms(started),
+        )
+        logger.warning(
+            "repo_scan: tool %s is not available in the sandbox (exit %s): %s",
+            spec.name, version_result.returncode, probe_detail,
+        )
         return run, [], {}
 
     result = await provider.exec_in_sandbox(thread_id, f"LC_ALL=C {spec.command} 2>&1")
@@ -3753,6 +3797,34 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert qs_measures["security"]["worst_open_severity"] == "none"
     assert qs_measures["security"]["by_severity"] == {level: 0 for level in SEVERITY_ORDER}
 
+    # --- measures: license findings must not grade as security severity (run f0fef8ba's D-grade
+    # Security chip was driven entirely by two "high" license findings, zero real vulnerabilities) --
+    license_finding = Finding(
+        finding_key=stable_id("license", "LGPL-3.0-or-later", "package-lock.json"),
+        tool="trivy", rule_id="LGPL-3.0-or-later", severity="high", raw_severity="HIGH",
+        file="package-lock.json", line=None, message="restricted licence LGPL-3.0-or-later",
+        category="license", title="Licence: LGPL-3.0-or-later",
+    )
+    misconfig_finding = Finding(
+        finding_key=stable_id("misconfig", "CKV_DOCKER_2", "Dockerfile"),
+        tool="checkov", rule_id="CKV_DOCKER_2", severity="high", raw_severity="HIGH",
+        file="Dockerfile", line=1, message="Ensure HEALTHCHECK instructions are added",
+        category="misconfig", title="Missing HEALTHCHECK",
+    )
+    license_report = ScanReport(
+        findings=(license_finding, misconfig_finding), metrics={}, tools=(), repo={}, deduped_count=0,
+    )
+    license_summary = license_report.summary()
+    assert license_summary["measures"]["security"]["worst_open_severity"] == "high", (
+        "misconfig must still grade as security severity"
+    )
+    assert license_summary["measures"]["security"]["by_severity"]["high"] == 1, (
+        "exactly one high must count toward grading -- the license finding must not"
+    )
+    assert license_summary["by_category"] == {"license": 1, "misconfig": 1}, (
+        "license findings stay visible in by_category even though they're excluded from grading"
+    )
+
     # --- merge_measures: a partial-profile scan must not blank the OTHER loop's measures --------
     prior_for_merge = {
         "measures": {
@@ -4053,6 +4125,31 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
         json.dumps([{"file": "apps/web/src/app/features/results/results.component.ts", "line": 3}])
     )
     assert len(_subscribe_findings) == 1 and _subscribe_findings[0].category == "maintainability"
+
+    # --- _probe_tool_version_with_retry: recovers from one transient failure, gives up after two -
+    async def _run_probe_check() -> None:
+        class _FakeProvider:
+            def __init__(self, results: list[Any]) -> None:
+                self._results = list(results)
+                self.calls = 0
+
+            async def exec_in_sandbox(self, thread_id: str, command: str) -> Any:
+                self.calls += 1
+                return self._results.pop(0)
+
+        fails_then_ok = types.SimpleNamespace(ok=False, returncode=1, stdout="", stderr="")
+        recovers = types.SimpleNamespace(ok=True, returncode=0, stdout="1.2.3", stderr="")
+        fake_ok = _FakeProvider([fails_then_ok, recovers])
+        result = await _probe_tool_version_with_retry(fake_ok, "t", "semgrep --version")
+        assert result.ok and fake_ok.calls == 2, "must retry once and recover"
+
+        always_down = types.SimpleNamespace(ok=False, returncode=127, stdout="semgrep: command not found", stderr="")
+        fake_down = _FakeProvider([always_down, always_down])
+        result = await _probe_tool_version_with_retry(fake_down, "t", "semgrep --version")
+        assert not result.ok and fake_down.calls == 2, "must give up after exactly one retry"
+        assert "command not found" in result.stdout
+
+    asyncio.run(_run_probe_check())
 
     print("repo_scan self-check: all assertions passed")
 

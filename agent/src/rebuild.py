@@ -342,8 +342,8 @@ async def _provenance_reasons(provider: Any, thread_id: str, state: dict[str, An
 
 
 async def _verify_all_red(
-    thread_id: str, chat_provider: str, run_id: str = "unknown", eligible_only: set[str] | None = None,
-    lap: int = 0,
+    thread_id: str, chat_provider: str, spec_key: str, run_id: str = "unknown",
+    eligible_only: set[str] | None = None, lap: int = 0,
 ) -> tuple[bool, str]:
     """Deterministic TDD-red gate: run the suite, parse the runners' own structured reports, and
     require zero passing tests (and at least one failing). The scaffold fix node is INSTRUCTED to
@@ -357,20 +357,32 @@ async def _verify_all_red(
     `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
     through to stack_runner.run_and_report below, which now requires it itself. `run_id` (Phase E
     known-bugs fix) is threaded the same way, defaulting to "unknown" -- this function has no
-    `state` of its own, same reasoning as chat_provider."""
+    `state` of its own, same reasoning as chat_provider.
+
+    `spec_key` (Overview-tab rebuild-row fix, 2026-09-22): only caller today is
+    make_rebuild_node, gated on `spec.fix_scope == "scaffold_only"` (only r_ac_to_tests uses this
+    gate), but this turn's own events were still tagged with the bare, placement-blind
+    `stage_key="red-gate"` literal -- indistinguishable from any other placement that might reuse
+    this gate later. Placement-specific now (`f"red-gate-{spec_key}"`), matching the pattern
+    already established at make_fix_node's `f"rebuild-{spec.key}"`. model_name is resolved
+    explicitly from the OLD literal "red-gate" key (not in model_config.py's Stage list today,
+    so this preserves the existing stack-run fallback exactly) -- stack_runner.run_and_report's
+    own internal fallback (`model_config.get_model_name(stage_key, ...)`) would otherwise silently
+    re-resolve against the new placement-specific key instead, which is absent from models.yaml."""
     from .gates.ac_coverage_gate import AcTestRunReport  # local: avoids import at module load
 
     provider = get_sandbox_provider()
     await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(_RED_GATE_OUTPUT_PATH)}")
     report = await stack_runner.run_and_report(
         thread_id,
-        stage_key="red-gate",
+        stage_key=f"red-gate-{spec_key}",
         prompt_name="ac_test_run",
         schema=AcTestRunReport,
         provider=chat_provider,
         run_id=run_id,
         lap=lap,
         output_path=_RED_GATE_OUTPUT_PATH,
+        model_name=model_config.get_model_name("red-gate", "draft", chat_provider) or model_config.get_model_name("stack-run", "draft", chat_provider),
     )
     outcomes: dict[str, str] = {}
     for artifact in report.result_artifacts or []:
@@ -482,14 +494,24 @@ def make_rebuild_node(spec: RebuildSpec):
             # asked "does it build?" twice in one placement (see BuildVerifyReport.build_commands).
             report = await _replay_build(provider, thread_id, rb["build_commands"])
         else:
+            # Placement-specific stage_key (Overview-tab rebuild-row fix, 2026-09-22): was the
+            # bare literal "rebuild", shared by every non-ac-to-tests placement's discovery turn
+            # -- indistinguishable in run_events, and (worse) an identical stack_runner
+            # ChatModel._session_key across every placement's first-ever discovery turn within one
+            # run (stage+role were the only two components, and role defaults to lap 0 here).
+            # model_name is resolved explicitly from the OLD literal "rebuild" key so
+            # run_and_report's own internal model_config.get_model_name(stage_key, ...) fallback
+            # doesn't silently re-resolve against the new key instead (absent from models.yaml,
+            # which would fall through to the "stack-run" default model instead of "rebuild"'s).
             report = await stack_runner.run_and_report(
                 thread_id,
-                stage_key="rebuild",
+                stage_key=f"rebuild-{spec.key}",
                 prompt_name="rebuild_verify",
                 schema=BuildVerifyReport,
                 provider=state["provider"],
                 run_id=state.get("run_id", "unknown"),
                 addendum=spec.fix_prompt_addendum or "",
+                model_name=model_config.get_model_name("rebuild", "draft", state["provider"]) or model_config.get_model_name("stack-run", "draft", state["provider"]),
             )
             rb["build_commands"] = [c.model_dump() for c in (report.build_commands or [])]
             if not rb["build_commands"]:
@@ -549,7 +571,7 @@ def make_rebuild_node(spec: RebuildSpec):
             and mctg_status == "not_started"
         )
         if build_ok and spec.fix_scope == "scaffold_only" and mctg_never_ran:
-            red_ok, red_detail = await _verify_all_red(thread_id, state["provider"], run_id=state.get("run_id", "unknown"))
+            red_ok, red_detail = await _verify_all_red(thread_id, state["provider"], spec.key, run_id=state.get("run_id", "unknown"))
             if not red_ok:
                 build_ok = False
                 red_failed = True
@@ -565,7 +587,7 @@ def make_rebuild_node(spec: RebuildSpec):
             eligible = await _eligible_ac_ids_for_run(provider, thread_id, run_id, new_or_modified_only=True)
             if mctg_status == "not_started" and eligible:
                 red_ok, red_detail = await _verify_all_red(
-                    thread_id, state["provider"], run_id=run_id, eligible_only=eligible
+                    thread_id, state["provider"], spec.key, run_id=run_id, eligible_only=eligible
                 )
                 if not red_ok:
                     build_ok = False
@@ -798,6 +820,13 @@ def make_fix_node(spec: RebuildSpec):
                 payload={"cycle": rb["fix_cycle_count"]},
                 input_text=input_text, output_text=output_text,
                 input_size=input_size, output_size=output_size,
+                # Overview-tab rebuild-row cost fix (2026-09-22): every other direct-ainvoke()
+                # node in this codebase (graph.py's draft/audit/fix nodes, e2e_nodes.py,
+                # metrics_nodes.py, test_hardening_nodes.py) attaches model._last_usage to its own
+                # finish event -- this was the one exception, so a rebuild placement's fix laps
+                # never had a cost anywhere. # noqa: SLF001, same private-attribute access every
+                # one of those other call sites already uses.
+                token_usage=model._last_usage,
             )
             finish_event = await run_event_store.append_event(finish_event)
             await run_event_stream.emit_live(finish_event, run_config)

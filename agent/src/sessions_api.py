@@ -52,6 +52,7 @@ from . import (
     repo_test_users,
     run_activity,
     run_event_store,
+    run_event_summary,
     session_store,
 )
 from .graph import graph
@@ -733,6 +734,51 @@ async def get_session_events(session_id: str, request: Request) -> SessionEvents
         raise HTTPException(status_code=404, detail="session not found")
     events = await run_event_store.list_events_by_session(session_id)
     return SessionEventsResponse(events=[_event_to_response(e) for e in events])
+
+
+class StageSummaryEntry(BaseModel):
+    """One normalized stage/rebuild-placement key's duration+cost, computed server-side by
+    run_event_summary.session_stage_summary -- see that module's own docstring for the
+    normalization/latest-run_id rules. Overview-tab fix, 2026-09-22: replaces
+    SessionOverview.tsx re-deriving these two numbers from the full client-held event array on
+    every render."""
+
+    key: str
+    first_ts: datetime
+    last_ts: datetime
+    cost: float
+    cost_known: bool
+
+
+class SessionSummaryResponse(BaseModel):
+    stages: list[StageSummaryEntry]
+
+
+@router.get("/{session_id}/events/summary", response_model=SessionSummaryResponse)
+async def get_session_summary(session_id: str, request: Request) -> SessionSummaryResponse:
+    """Overview-tab fix, 2026-09-22: the server-computed counterpart to get_session_events above
+    -- same auth/lookup shape (_check_shared_secret, 404 on an unknown session), but returns the
+    small per-key duration+cost summary run_event_summary.session_stage_summary computes from
+    the same rows, instead of the full raw event list. SessionOverview.tsx polls this instead of
+    re-scanning its own held event array for these two numbers.
+
+    ponytail: re-fetches and re-reduces this session's ENTIRE event history on every call (no
+    since_seq-style incremental narrowing, unlike stream_session_events above, which already
+    supports one) -- acceptable today since the frontend only polls this while a run is active
+    and at a coarse interval. If a session's total event count ever makes this poll itself too
+    expensive, thread since_seq through and maintain incremental per-key running aggregates
+    instead of reducing from scratch each call.
+    """
+    _check_shared_secret(request)
+    row = await session_store.get_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    events = await run_event_store.list_events_by_session(session_id)
+    summary = run_event_summary.session_stage_summary(events)
+    return SessionSummaryResponse(stages=[
+        StageSummaryEntry(key=s.key, first_ts=s.first_ts, last_ts=s.last_ts, cost=s.cost, cost_known=s.cost_known)
+        for s in summary
+    ])
 
 
 @router.get("/{session_id}/events/{seq}/io", response_model=RunEventIoResponse)

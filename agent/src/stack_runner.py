@@ -29,13 +29,14 @@ so it is now the one path for both.
 from __future__ import annotations
 
 import logging
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from . import model_config, repo_files
+from . import model_config, repo_files, run_event_store, run_event_stream
 from .chat_model import ainvoke_structured, get_chat_model_for_thread, lap_role
 from .prompt_loader import load_prompt_pair, render_prompt
+from .run_events import RunEvent, RunEventType
 from .sandbox import registry as sandbox_registry
 from .schemas import StageReport
 
@@ -132,6 +133,7 @@ async def run_and_report(
             sandboxed=False,
         )
 
+    last_usage: dict[str, Any] | None = None
     try:
         model = get_chat_model_for_thread(
             thread_id,
@@ -157,19 +159,46 @@ async def run_and_report(
         # loop. It either returns a valid `schema` instance or raises once its retries are spent,
         # which the except below turns into the same synthesized failure as any other session error.
         report = await ainvoke_structured(model, messages, schema)
+        # Overview-tab rebuild-row cost fix (2026-09-22): every OTHER LLM-driving node in this
+        # codebase reads model._last_usage right after its own ainvoke() and attaches it to a
+        # cost-bearing event -- this function built the model but never returned it to any of its
+        # 4 callers (e2e-run, ac-test-run, coverage-run, rebuild.py's rebuild/red-gate discovery
+        # turns), so none of them could do that. Captured here, once, so _ledger below can record
+        # it for all 4 instead of patching each call site. # noqa: SLF001, same private-attribute
+        # access every one of those other call sites already uses.
+        last_usage = model._last_usage
     except Exception as exc:  # noqa: BLE001 -- a failed stage must not kill the run
         logger.warning("stack_runner session failed for stage_key=%s", stage_key, exc_info=True)
         return await _ledger(
             thread_id,
             stage_key,
             schema(success=False, ready_for_next_stage=False, error=f"session error: {exc}"),
+            run_id=run_id,
         )
-    return await _ledger(thread_id, stage_key, report)
+    return await _ledger(thread_id, stage_key, report, run_id=run_id, last_usage=last_usage)
 
 
-async def _ledger(thread_id: str, stage_key: str, report: ReportT, *, sandboxed: bool = True) -> ReportT:
+async def _ledger(
+    thread_id: str, stage_key: str, report: ReportT, *, sandboxed: bool = True,
+    run_id: str = "unknown", last_usage: dict[str, Any] | None = None,
+) -> ReportT:
     """The choke point that makes "every stage reports" structurally true rather than a
-    convention: nothing returns from run_and_report without passing through here."""
+    convention: nothing returns from run_and_report without passing through here.
+
+    `last_usage` (Overview-tab rebuild-row cost fix, 2026-09-22): included in the ledger row
+    (fixes metrics_nodes.py's _sum_token_usage for e2e-run/ac-test-run/coverage-run/rebuild/
+    red-gate, which previously had no token_usage key at all) AND emitted as its own durable+live
+    RunEvent (node="stage_run"), tagged with the caller's own stage_key so it groups with that
+    placement/stage's other events -- this is the event the Overview-tab summary sums cost from.
+    append_event/emit_live are both fail-soft internally (their own docstrings), matching every
+    other RunEvent site in this codebase -- no extra try/except needed here."""
+    if last_usage is not None:
+        event = await run_event_store.append_event(RunEvent(
+            run_id=run_id, session_id=thread_id, type=RunEventType.NODE_FINISHED,
+            stage=stage_key, node="stage_run", summary="stack_runner turn finished",
+            token_usage=last_usage,
+        ))
+        await run_event_stream.emit_live(event)
     if sandboxed and sandbox_registry.get(thread_id) is not None:
         from .sandbox.factory import get_sandbox_provider
 
@@ -185,6 +214,7 @@ async def _ledger(thread_id: str, stage_key: str, report: ReportT, *, sandboxed:
                     "error": report.error,
                     "summary": report.summary,
                     "artifacts": report.artifacts,
+                    "token_usage": last_usage,
                 },
             )
         except Exception:  # noqa: BLE001 -- ledger write must never mask the report itself

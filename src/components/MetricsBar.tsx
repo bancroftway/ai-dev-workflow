@@ -41,11 +41,36 @@ const CHIP_CLASS: Record<Tone, string> = {
   gray: "border-neutral-300 bg-neutral-100 text-neutral-500",
 };
 
-export function Chip({ label, value, tone, title }: { label: string; value: string; tone: Tone; title?: string }) {
-  return (
-    <span title={title} className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS[tone]}`}>
+export function Chip({
+  label,
+  value,
+  tone,
+  title,
+  onClick,
+}: {
+  label: string;
+  value: string;
+  tone: Tone;
+  title?: string;
+  /** When present, renders a real <button> (native focus/keyboard handling) instead of a <span>. */
+  onClick?: () => void;
+}) {
+  const cls =
+    `inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs ${CHIP_CLASS[tone]}` +
+    (onClick ? " cursor-pointer transition hover:ring-1 hover:ring-neutral-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-neutral-500" : "");
+  const content = (
+    <>
       <span className="font-medium">{label}</span>
       {value}
+    </>
+  );
+  return onClick ? (
+    <button type="button" title={title} className={cls} onClick={onClick}>
+      {content}
+    </button>
+  ) : (
+    <span title={title} className={cls}>
+      {content}
     </span>
   );
 }
@@ -77,8 +102,10 @@ function bandedChip(opts: {
   hasBaseline: boolean;
   title: (value: number, grade: Grade) => string;
   placeholderTitle: string;
+  /** Omitted (not just falsy) on the placeholder branch below -- there's nothing to jump to yet. */
+  onClick?: () => void;
 }): React.ReactNode {
-  const { metricKey, label, value, baseValue, thresholds, higherIsBetter, decimals, unit, hasBaseline, title, placeholderTitle } = opts;
+  const { metricKey, label, value, baseValue, thresholds, higherIsBetter, decimals, unit, hasBaseline, title, placeholderTitle, onClick } = opts;
   if (value == null) return <Chip key={metricKey} label={label} value="—" tone="gray" title={placeholderTitle} />;
   const g = higherIsBetter ? gradeHigherIsBetter(value, thresholds) : gradeLowerIsBetter(value, thresholds);
   const delta = hasBaseline ? computeDelta(baseValue, value, higherIsBetter, decimals) : null;
@@ -89,13 +116,19 @@ function bandedChip(opts: {
       value={withDelta(`${g} · ${value.toFixed(decimals)}${unit}`, delta)}
       tone={GRADE_TONE[g]}
       title={title(value, g)}
+      onClick={onClick}
     />
   );
 }
 
 /** Security is categorical (worst_open_severity), not banded against numeric thresholds like the
  * other three, so it gets its own small chip builder rather than fitting bandedChip's shape. */
-function securityChip(measures: ScanMeasures | undefined, baseMeasures: ScanMeasures | undefined, hasBaseline: boolean): React.ReactNode {
+function securityChip(
+  measures: ScanMeasures | undefined,
+  baseMeasures: ScanMeasures | undefined,
+  hasBaseline: boolean,
+  onClick?: () => void,
+): React.ReactNode {
   if (!measures) return <Chip key="sec" label="Security" value="—" tone="gray" title="No scan data yet." />;
   const worst = measures.security.worst_open_severity;
   const openCount = securityOpenCount(measures.security.by_severity);
@@ -108,6 +141,7 @@ function securityChip(measures: ScanMeasures | undefined, baseMeasures: ScanMeas
       value={withDelta(`${g} · ${openCount}`, delta)}
       tone={GRADE_TONE[g]}
       title={`Open security findings (vulnerabilities, leaked secrets, insecure code). Grade = worst open severity; fewer and less severe is better. ${openCount} open, worst: ${worst}.`}
+      onClick={onClick}
     />
   );
 }
@@ -141,6 +175,7 @@ function e2ePill(e2e: E2EState | null | undefined): React.ReactNode {
 export function MetricsBar({
   thresholds,
   trailing,
+  onJumpToSection,
 }: {
   thresholds: MetricThresholds;
   // Composed in rather than computed here (LiveCostChip, AppShell.tsx) -- same row as this bar's
@@ -149,6 +184,10 @@ export function MetricsBar({
   // "same row as Metrics bar, but separate from the Metrics bar"). Counted in the early-return
   // guard below so the row doesn't hide itself out from under it.
   trailing?: React.ReactNode;
+  /** Switches AppShell to the Quality tab and scrolls to/highlights the given section key
+   * ("security" | "complexity" | "coverage" | "duplication" | "performance" | "accessibility" |
+   * "gate"). Omitted entirely (not just a no-op) leaves every chip a plain, non-interactive span. */
+  onJumpToSection?: (section: string) => void;
 }) {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
@@ -197,7 +236,7 @@ export function MetricsBar({
 
   let chips: React.ReactNode = null;
   if (summary) {
-    const security = securityChip(measures, baseMeasures, hasBaseline);
+    const security = securityChip(measures, baseMeasures, hasBaseline, onJumpToSection && (() => onJumpToSection("security")));
 
     const maintainability = bandedChip({
       metricKey: "maint",
@@ -214,6 +253,9 @@ export function MetricsBar({
         const [a, b, c, d] = thresholds.ccn;
         return `Average cyclomatic complexity per function — how tangled the code's control flow is; lower is easier to change safely. Mean CCN ${ccn.toFixed(1)} (A≤${a}, B≤${b}, C≤${c}, D≤${d}).`;
       },
+      // This pill's VALUE is mean CCN -- HealthBreakdown's "complexity" subscore row, not its
+      // separate "maintainability" subscore. Jump there, not to a row that grades something else.
+      onClick: onJumpToSection && (() => onJumpToSection("complexity")),
     });
 
     const coverage = bandedChip({
@@ -231,6 +273,7 @@ export function MetricsBar({
         const branch = coverageState?.branch_rate;
         return `Percentage of code lines executed by the test suite; higher means changes are safer to make. Line rate ${rate.toFixed(0)}%, branch ${branch != null ? `${branch.toFixed(0)}%` : "—"}.`;
       },
+      onClick: onJumpToSection && (() => onJumpToSection("coverage")),
     });
 
     const duplication = bandedChip({
@@ -246,6 +289,7 @@ export function MetricsBar({
       placeholderTitle: "No scan data yet.",
       title: (dup) =>
         `Percentage of code duplicated across files; lower means fixes don't need repeating in copies. ${dup.toFixed(1)}% duplicated.`,
+      onClick: onJumpToSection && (() => onJumpToSection("duplication")),
     });
 
     // Lighthouse chips HIDE entirely when unmeasured (non-UI repo, e2e skipped, pre-lighthouse
@@ -265,6 +309,7 @@ export function MetricsBar({
       placeholderTitle: "Not measured.",
       title: (score) =>
         `Lighthouse performance score for the slowest measured route (0-100); higher means faster loads. Worst route: ${score.toFixed(0)}.`,
+      onClick: onJumpToSection && (() => onJumpToSection("performance")),
     });
 
     const a11yValue = measures?.accessibility_score;
@@ -281,6 +326,7 @@ export function MetricsBar({
       placeholderTitle: "Not measured.",
       title: (score) =>
         `Lighthouse accessibility score (axe-based) for the worst measured route (0-100); higher means more usable with assistive tech. Worst route: ${score.toFixed(0)}.`,
+      onClick: onJumpToSection && (() => onJumpToSection("accessibility")),
     });
 
     const gatingCount = summary.gating_count;
@@ -294,6 +340,7 @@ export function MetricsBar({
         value={gatingCount === 0 ? "Pass" : `Fail · ${gatingCount}`}
         tone={gatingCount === 0 ? "green" : "red"}
         title={`Quality gate: fails when any finding at/above the severity floor (or newly introduced quality issue) is open. ${gatingCount} gating findings.`}
+        onClick={onJumpToSection && (() => onJumpToSection("gate"))}
       />
     );
 

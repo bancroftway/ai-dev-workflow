@@ -121,6 +121,19 @@ components, a user-flow diagram for a multi-step UI interaction. Each diagram is
 Mermaid source (its own type declaration line included, e.g. `erDiagram` or `flowchart TD`) --
 write real Mermaid syntax, not pseudo-diagram prose; a deterministic step renders it and will
 reject invalid syntax. Skip diagrams entirely for a trivial change where one wouldn't add value.
+
+**An `architecture`-kind diagram's own Mermaid source must start with `flowchart TD` (or `LR`),
+using `subgraph "Layer name"` blocks to group components -- NEVER the bare word `architecture` and
+NEVER `architecture-beta`.** `architecture-beta` is a real Mermaid diagram type, but its DSL is
+completely different from a flowchart's (`group`/`service`/`edge` keywords, not `subgraph` and
+arrows) -- and a plain `architecture` declaration (missing `-beta`) is not a valid Mermaid diagram
+type at all. Root-caused live (income-investor run c1458b23): a diagram written as `architecture\n
+direction TB\n\n subgraph Client[...]` -- effectively correct flowchart content under the wrong,
+invalid top-level keyword -- rendered successfully through the backend's own mmdc validation (an
+older, more lenient CLI version) but failed with a bomb-icon "Syntax error in text" in the
+frontend's own newer Mermaid engine. `flowchart TD` with `subgraph` blocks is the stable, portable
+way to depict a system's components and layers; it needs no diagram type this pipeline hasn't
+already validated working end to end.
 `user_flow` diagrams name the Acceptance Criteria they depict in `ac_ids` (manifest.json), same
 convention and same citation/retirement discipline as wireframes below -- `er`/`architecture`
 diagrams have no `ac_ids` (whole-system views, nothing to cite).

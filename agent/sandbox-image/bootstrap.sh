@@ -132,12 +132,45 @@ done
 playwright_version=$(playwright --version 2>/dev/null | sed -E 's/^Version //' | tr -d '\n')
 playwright_browsers_path="${PLAYWRIGHT_BROWSERS_PATH:-}"
 
+# ── 2e. Security/quality tool manifest -- build-time path+version, runtime liveness check ───────
+# The Dockerfile bakes /opt/aidw/tools/manifest.json at image-build time (one `command -v`/
+# `--version` resolution per security/quality analyzer, done once, deterministically, as part of
+# the image). That snapshot alone can't catch a tool that built fine but broke LATER in this
+# specific container's life -- observed live (run f0fef8ba): semgrep/interrogate both read "ok" at
+# this same run's own baseline scan and "missing" minutes later in the SAME container. So this
+# re-checks each baked path is still present+executable RIGHT NOW and folds both the build-time
+# facts and the live check into one per-tool record, read back by preflight_nodes.record_toolchain
+# into manifest.json's `toolchain.security_tools` -- visible minutes into a run instead of only at
+# the final metrics scan ~48 minutes in. Best-effort: a missing/unreadable baked manifest (an older
+# image, or this script running outside the sandbox image) reads as "unknown", never fatal.
+security_tools_json=$(python3 - <<'PY' 2>/dev/null || echo '{}'
+import json
+import os
+
+try:
+    with open("/opt/aidw/tools/manifest.json") as f:
+        baked = json.load(f)
+except OSError:
+    baked = {}
+
+out = {}
+for name, info in baked.items():
+    path = info.get("path")
+    out[name] = {
+        "path": path,
+        "version": info.get("version"),
+        "present_now": bool(path) and os.access(path, os.X_OK),
+    }
+print(json.dumps(out))
+PY
+)
+
 # ── 3. Report ─────────────────────────────────────────────────────────────────────────────────
 # Read back by preflight_nodes.record_toolchain, which folds it into the ledger, manifest.json and
 # the host-side log. Written even when empty: "we looked and the image already had everything" is
 # a different fact from "bootstrap never ran", and only this file can tell them apart.
-printf '{"image":"%s","tools":{%s},"available":{%s},"playwright_version":"%s","playwright_browsers_path":"%s"}\n' \
-  "${AIDW_IMAGE_REF:-unknown}" "$tools_json" "$available_json" \
+printf '{"image":"%s","tools":{%s},"available":{%s},"security_tools":%s,"playwright_version":"%s","playwright_browsers_path":"%s"}\n' \
+  "${AIDW_IMAGE_REF:-unknown}" "$tools_json" "$available_json" "${security_tools_json:-{}}" \
   "${playwright_version//\"/\'}" "${playwright_browsers_path//\"/\'}" > "$REPORT_PATH"
 echo "bootstrap: wrote ${REPORT_PATH}"
 exit 0

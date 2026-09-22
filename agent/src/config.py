@@ -361,6 +361,42 @@ CONTRACT_FORMATS = tuple(
 # as-is so an existing deploy's REPO_SCAN_COVERAGE_TIMEOUT_SECONDS keeps working unchanged.
 TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIMEOUT_SECONDS", "600"))
 
+# metrics_nodes.py's regression_reasons(): tool names whose FAILURE means "we have no idea whether
+# this app has secrets/vulnerabilities", checked against ScanReport.summary()["degraded"]
+# (repo_scan.py) -- the list of tool names with status "missing"/"failed" that already excludes
+# "not_applicable" (a legitimate skip, e.g. no IaC files for checkov) and "outdated" (fail-open by
+# design). Every OTHER degraded tool only discounts the health SCORE via
+# health_coverage_fraction/health_coverage_multiplier; it never blocks a merge. Observed live (run
+# f0fef8ba): gitleaks and syft both crashed mid-run with zero output, read identically to "scanned
+# clean", and nothing gated on it. Adding a name here means its crash now blocks merge_ready;
+# removing one demotes that tool's failure back to a score-only discount (e.g. if it proves too
+# flaky in practice and the false-block rate outweighs the safety benefit).
+AIDW_SECURITY_CRITICAL_TOOL_NAMES: tuple[str, ...] = tuple(
+    t.strip() for t in os.environ.get(
+        "AIDW_SECURITY_CRITICAL_TOOL_NAMES", "gitleaks,semgrep,osv-scanner,trivy"
+    ).split(",") if t.strip()
+)
+
+# repo_scan.py's _run_one: retry count/delay for a tool's `{tool} --version` probe before marking
+# it status="missing". Observed live (run f0fef8ba): semgrep/interrogate both read status="ok" at
+# this same run's own baseline scan and "missing" minutes later in the SAME container -- a
+# session-local transient fault, not a permanent image defect (the Dockerfile installs them
+# identically to bandit/checkov, which stayed healthy throughout). One short retry is cheap
+# insurance against exactly that. Raising RETRY_COUNT spends more wall-clock per flaky tool before
+# giving up; raising RETRY_DELAY_SECONDS gives a longer window for the transient condition to clear
+# at the same per-attempt cost.
+AIDW_TOOL_PROBE_RETRY_COUNT = int(os.environ.get("AIDW_TOOL_PROBE_RETRY_COUNT", "1"))
+AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS = float(os.environ.get("AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS", "3.0"))
+
+# repo_scan.py's _run_one: how much of the failed version-probe's actual output (normally a
+# one-line version string, or a one-line "not found") survives into the tool run's `notes` field,
+# in place of a generic "binary not on PATH" guess. Head+tail (not a single tail slice) per
+# AGENTS.md's truncation rule, sized generously since this is a short diagnostic snippet, not a
+# findings list -- exists to bound a pathological case (e.g. a full interpreter traceback), not
+# the normal one-liner.
+AIDW_TOOL_PROBE_NOTES_HEAD_CHARS = int(os.environ.get("AIDW_TOOL_PROBE_NOTES_HEAD_CHARS", "300"))
+AIDW_TOOL_PROBE_NOTES_TAIL_CHARS = int(os.environ.get("AIDW_TOOL_PROBE_NOTES_TAIL_CHARS", "300"))
+
 # graph.py's make_draft_node infra-exhaustion handler: how much of the raw exception message to
 # keep as stage["last_infra_error"]. Tail-only (not head+tail like the pairs above) is correct
 # here -- the content is a short exception string, not a multi-item list, so there's no "start of a

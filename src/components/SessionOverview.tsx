@@ -10,9 +10,10 @@ import {
   computeRunningPhases,
   NODE_PHASE_LABEL,
   formatDuration,
-  parseEventTs,
-  useRunEvents,
+  useSessionSummary,
+  useStructuralRunEvents,
   type RunLogEvent,
+  type StageSummary,
 } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
@@ -34,6 +35,25 @@ const STATUS_LABEL: Record<string, string> = {
   ready_for_review: "Ready for review",
   approved: "Approved",
 };
+
+// User-requested (2026-09-22): a colored status dot per stage/placement row, so a passed/approved
+// row reads as green at a glance instead of every status looking the same plain neutral text.
+// Computed from the SAME raw booleans/status values each row already branches its label text on
+// (failedHere/running/stage.status or phase.status), never from the already-localized label
+// string -- string-matching rendered text is fragile (a copy change silently breaks the color) and
+// this file already has every one of those raw values in scope at each call site.
+type StatusTone = "green" | "red" | "amber" | "gray";
+
+const STATUS_DOT_CLASS: Record<StatusTone, string> = {
+  green: "bg-emerald-500",
+  red: "bg-red-500",
+  amber: "bg-amber-500",
+  gray: "bg-neutral-300",
+};
+
+function StatusDot({ tone }: { tone: StatusTone }) {
+  return <span aria-hidden className={`inline-block h-2 w-2 shrink-0 rounded-full ${STATUS_DOT_CLASS[tone]}`} />;
+}
 
 /** The Overview tab: session cost + a per-stage table (duration, spend, redraft count, status).
  * Timeline (Swimlane.tsx) and the detailed event log (EventLogView.tsx) were removed here (user
@@ -154,12 +174,13 @@ const ROW_GRID = "grid grid-cols-[1fr_4rem_3.5rem_3.5rem_8.5rem_14rem] items-cen
 
 /** One REBUILD_PLACEMENTS row, inserted right after its `afterStageKey`'s own row (rebuildPhase's
  * own docstring: real, unattributed-to-a-single-placement work happening between two stages).
- * `timing` is windowed between the two REAL stages either side of this placement (rebuildTimings,
- * below) rather than read off the ambiguous shared "rebuild" event tag directly -- that sidesteps
- * the tag collision across placements (workflow-types.ts's REBUILD_PLACEMENTS docstring) since the
- * window itself is placement-specific even when the tag inside it isn't. Only set once the next
- * real stage has started (window closed); still-running placements show status only, same as
- * before. */
+ * `timing` (Overview-tab fix, 2026-09-22) is looked up directly from the server-computed summary
+ * (agent/src/run_event_summary.py), keyed by `placement.rebuildKey` -- that key is exactly what
+ * agent/src/rebuild.py now tags every one of a placement's own events with (span events AND, as
+ * of this fix, its inner discovery/red-gate/fix turns), so no client-side time-windowing between
+ * neighboring real stages is needed any more. `undefined` means the placement has no events for
+ * its own latest run_id yet (never entered, or a resume hasn't reached it again) -- still-running
+ * placements now show a live, growing duration each summary poll instead of staying blank. */
 function RebuildRow({
   placement,
   phase,
@@ -168,7 +189,7 @@ function RebuildRow({
 }: {
   placement: RebuildPlacement;
   phase: { status: "not_started" | "clean" | "failed" | "fixing"; running: boolean };
-  timing: { first: number; last: number; cost: number } | undefined;
+  timing: StageSummary | undefined;
   failedHere: boolean;
 }) {
   return (
@@ -176,11 +197,15 @@ function RebuildRow({
       <div className={ROW_GRID}>
         <span className="font-medium">{placement.label}</span>
         <span className="text-right text-xs text-neutral-500">
-          {timing ? formatDuration(timing.last - timing.first) : ""}
+          {/* Defensive guard only now (duration comes from the server-computed summary, which is
+              already correct) -- kept as cheap display-time protection, same as the real-stage
+              row's own identical guard a screen down. */}
+          {timing && timing.last > timing.first ? formatDuration(timing.last - timing.first) : ""}
         </span>
-        <span className="text-right text-xs text-neutral-500">{timing ? `$${timing.cost.toFixed(2)}` : ""}</span>
+        <span className="text-right text-xs text-neutral-500">{timing?.costKnown ? `$${timing.cost.toFixed(2)}` : ""}</span>
         <span className="text-right text-xs text-neutral-500" />
         <span className={`flex items-center justify-end gap-1.5 ${failedHere ? "text-red-700" : "text-neutral-500"}`}>
+          <StatusDot tone={failedHere ? "red" : phase.running ? "amber" : phase.status === "clean" ? "green" : phase.status === "fixing" ? "amber" : "gray"} />
           {phase.running && <RunningSpinner />}
           {failedHere ? "Failed" : phase.running ? "Verifying" : REBUILD_STATUS_LABEL[phase.status]}
         </span>
@@ -286,26 +311,57 @@ function IoPreviewCell({
  * than an earlier one already in this same list ("Lap 1 Draft" appearing after "Lap 4 Draft").
  * Counting a new lap every time a "draft" node appears in this already-correctly-ordered array
  * is immune to that reset -- a draft and the audit that follows it in the same lap still
- * deliberately share one number. */
+ * deliberately share one number.
+ *
+ * Click-to-expand (memory/render-cost fix, 2026-09-22): was unconditionally rendered in full for
+ * every stage that had any redraft history at all -- real cost on a long session with many laps
+ * across many stages. Collapsed by default; expanding is a plain click, no data refetch (the
+ * `redrafts` array is already held by the caller either way -- only the DOM cost of rendering
+ * every row was deferred, per-lap IO text itself was already fetch-on-hover). */
 function RedraftHistoryCell({ sessionId, redrafts }: { sessionId: string; redrafts: RunLogEvent[] }) {
+  const [expanded, setExpanded] = useState(false);
   if (redrafts.length === 0) return null;
+  const lapCount = redrafts.filter((e) => e.node === "draft").length;
+  if (!expanded) {
+    return (
+      <button
+        type="button"
+        className="w-fit cursor-default text-left text-[11px] text-neutral-500 underline decoration-dotted decoration-neutral-300 underline-offset-2"
+        onClick={() => setExpanded(true)}
+      >
+        {lapCount} lap{lapCount === 1 ? "" : "s"} — click to expand
+      </button>
+    );
+  }
+  // Lap numbers computed in a plain loop, not inside the JSX-producing .map() below -- a mutable
+  // counter reassigned inside a render callback trips this codebase's react-hooks/immutability
+  // lint rule.
+  const lapNumbers: number[] = [];
   let lap = 0;
+  for (const e of redrafts) {
+    if (e.node === "draft") lap += 1;
+    lapNumbers.push(lap);
+  }
   return (
     <div className="flex max-h-24 flex-col overflow-x-hidden overflow-y-auto rounded border border-neutral-100 text-[11px] text-neutral-500">
-      {redrafts.map((e) => {
-        if (e.node === "draft") lap += 1;
-        return (
-          <div
-            key={e.seq}
-            className="flex items-center gap-2 px-1 py-0.5 odd:bg-neutral-50 hover:bg-neutral-100"
-          >
-            <span className="w-10 shrink-0 text-neutral-400">{`Lap ${lap}`}</span>
-            <span className="w-10 shrink-0 truncate capitalize">{e.node}</span>
-            <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.input_size} field="input_text" />
-            <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.output_size} field="output_text" />
-          </div>
-        );
-      })}
+      <button
+        type="button"
+        className="shrink-0 self-end px-1 text-neutral-400 underline decoration-dotted decoration-neutral-300 underline-offset-2"
+        onClick={() => setExpanded(false)}
+      >
+        collapse
+      </button>
+      {redrafts.map((e, i) => (
+        <div
+          key={e.seq}
+          className="flex items-center gap-2 px-1 py-0.5 odd:bg-neutral-50 hover:bg-neutral-100"
+        >
+          <span className="w-10 shrink-0 text-neutral-400">{`Lap ${lapNumbers[i]}`}</span>
+          <span className="w-10 shrink-0 truncate capitalize">{e.node}</span>
+          <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.input_size} field="input_text" />
+          <IoPreviewCell sessionId={sessionId} seq={e.seq} size={e.output_size} field="output_text" />
+        </div>
+      ))}
     </div>
   );
 }
@@ -631,11 +687,16 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     }
   }
 
-  // Per-stage wall-clock + spend from the durable event stream, plus a redraft/rejection count:
-  // a gate_resolved event with payload.decision === "rejected" is exactly a human rejection that
-  // sent the stage back to its own draft node (make_gate_node, graph.py) -- a count Overview never
-  // surfaced before (user feedback 2026-09-01).
-  const events = useRunEvents();
+  // Structural (node_started/node_finished/gate_*) events only -- this tab never needed
+  // tool_call/reasoning detail (use-run-events.ts's memory fix, 2026-09-22). Duration/cost numbers
+  // come from the server-computed summary below instead of being re-derived from this array.
+  const events = useStructuralRunEvents();
+  // Server-computed per-stage/per-rebuild-placement duration+cost (Overview-tab fix, 2026-09-22):
+  // replaces this tab re-deriving those two numbers from the full held event array on every
+  // render, and is what makes a rebuild placement's own duration/cost correct for the first time
+  // (see agent/src/run_event_summary.py + agent/src/rebuild.py's retag). Polls only while the run
+  // is active.
+  const summary = useSessionSummary(threadId, runActivity?.runActive);
   // Lifted out of perStage's own memo below (which used to compute this only for its own local
   // use) so RebuildRow's phase check (further down) can share the exact same fast-channel signal
   // instead of falling back to the slower state-snapshot check alone -- see rebuildPhase's own
@@ -644,49 +705,29 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     () => computeRunningPhases(events, runActivity?.runActive ?? null),
     [events, runActivity?.runActive],
   );
+  // Redraft history + lap count only now (Overview-tab fix, 2026-09-22: duration/cost moved to the
+  // server-computed `summary` above, which is where a rebuild placement's numbers now come from
+  // too). `RedraftHistoryCell` still needs its own per-stage event list for per-lap detail
+  // regardless of where the aggregate numbers live, so this narrower pass stays client-side.
   const perStage = useMemo(() => {
     // Per-stage "most recent run_id touching it" (root-caused 2026-09-13, cost-accuracy fix for
     // the recovery-UX redesign): this used to fold EVERY event ever recorded for a stage,
     // cumulative across every rewind/resume this whole session ever had -- a stage rewound more
     // than once could show 2-3x its real next-redo cost, exactly when a user is deciding whether
     // to redo it. A single session-wide "latest run_id" (computeRunningPhases' own convention,
-    // use-run-events.ts) is the wrong fix here: it would blank out Duration/Cost for a stage that
-    // was approved under an OLDER run_id and never touched again by the latest attempt, which is
-    // real, still-relevant history, not staleness. Each stage keeps only ITS OWN latest run_id's
+    // use-run-events.ts) is the wrong fix here: it would blank out the redraft history for a stage
+    // that was approved under an OLDER run_id and never touched again by the latest attempt, which
+    // is real, still-relevant history, not staleness. Each stage keeps only ITS OWN latest run_id's
     // events instead -- events are oldest-first, so the last write per stage wins.
     const latestRunIdByStage = new Map<string, string>();
     for (const e of events) {
       if (!e.stage) continue;
       latestRunIdByStage.set(e.stage, e.run_id);
     }
-    const byStage = new Map<
-      string,
-      {
-        first: number;
-        last: number;
-        cost: number;
-        sawCost: boolean;
-        rejections: number;
-        node: string | undefined;
-        redrafts: RunLogEvent[];
-      }
-    >();
+    const byStage = new Map<string, { rejections: number; node: string | undefined; redrafts: RunLogEvent[] }>();
     for (const e of events) {
       if (!e.stage || e.run_id !== latestRunIdByStage.get(e.stage)) continue;
-      const ts = parseEventTs(e.ts);
-      const entry =
-        byStage.get(e.stage) ??
-        { first: ts, last: ts, cost: 0, sawCost: false, rejections: 0, node: undefined, redrafts: [] };
-      entry.first = Math.min(entry.first, ts);
-      entry.last = Math.max(entry.last, ts);
-      const cost = Number((e.token_usage as { cost?: unknown } | null)?.cost);
-      if (Number.isFinite(cost)) {
-        entry.cost += cost;
-        entry.sawCost = true;
-      }
-      if (e.type === "gate_resolved" && (e.payload as { decision?: string } | null)?.decision === "rejected") {
-        entry.rejections += 1;
-      }
+      const entry = byStage.get(e.stage) ?? { rejections: 0, node: undefined, redrafts: [] };
       // Redraft-history column (Workstream 3): one row per completed draft/audit/fix call --
       // node_finished only, since that's the point input_size/output_size/payload.cycle are
       // populated (session_key.md's Workstream 2 fix + graph.py's encode_io_text capture).
@@ -700,34 +741,23 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     }
     // See computeRunningPhases' own docstring for why this can't just be `stage.status ===
     // "drafting"`: a non-gated stage's status is stale/misleading between verify attempts.
-    for (const [stageKey, entry] of byStage) entry.node = runningPhases.get(stageKey);
+    // `rejections` (the "Redrafts" count column) used to count ONLY `gate_resolved`/"rejected"
+    // events -- a real signal, but one that exists for just the 3 HUMAN-gated stages (tech-stack,
+    // specification, plan). Every other stage (ac-to-tests, minimal-code-to-green, remediation,
+    // ...) redrafts from a DETERMINISTIC verify failure instead, a different event type never
+    // counted here -- so a stage that visibly ran 4 laps (Redraft History, right next to this
+    // column) showed a blank "Redrafts" cell, which reads as a bug even though the narrower
+    // definition was technically doing what it said. Derived from `redrafts` instead, now that
+    // it's fully populated for every stage: same "count a new lap on each draft node" rule
+    // RedraftHistoryCell already uses (see its own docstring), so this column and the one next to
+    // it can never visually disagree. Lap 1 is the first attempt, not a redraft -- floors at 0.
+    for (const [stageKey, entry] of byStage) {
+      entry.node = runningPhases.get(stageKey);
+      const laps = entry.redrafts.filter((e) => e.node === "draft").length;
+      entry.rejections = Math.max(0, laps - 1);
+    }
     return byStage;
   }, [events, runningPhases]);
-
-  // Per-placement duration/cost, windowed between the two real stages either side (see RebuildRow's
-  // docstring) rather than trusting the shared "rebuild"/"red-gate" event tag alone. Requires the
-  // next real stage to have started (window closed) -- an in-flight placement has no `next` entry
-  // yet and is left out, same as before this existed.
-  const rebuildTimings = useMemo(() => {
-    const timings = new Map<string, { first: number; last: number; cost: number }>();
-    for (const placement of REBUILD_PLACEMENTS) {
-      const after = perStage.get(placement.afterStageKey);
-      const next = perStage.get(placement.nextStageKey);
-      if (!after || !next) continue;
-      const start = after.last;
-      const end = next.first;
-      let cost = 0;
-      for (const e of events) {
-        if (e.stage !== "rebuild" && e.stage !== "red-gate") continue;
-        const ts = parseEventTs(e.ts);
-        if (ts < start || ts > end) continue;
-        const c = Number((e.token_usage as { cost?: unknown } | null)?.cost);
-        if (Number.isFinite(c)) cost += c;
-      }
-      timings.set(placement.rebuildKey, { first: start, last: end, cost });
-    }
-    return timings;
-  }, [events, perStage]);
 
   // What a rewind to `stageKey` actually resets (root-caused 2026-09-13 UX redesign): mirrors
   // agent/src/graph.py:2515-2542's own rewind-to-stage handling exactly -- every real stage from
@@ -736,9 +766,10 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
   // not an approximation. `state.stages?.[s.key] == null` filters out PIPELINE_STAGE_ORDER's own
   // legacy/never-populated tail keys (brownfield-baseline, raw-requirements, and four retired
   // stage keys the current graph never writes -- see that file's own comment) so the confirm copy
-  // never lists a phantom stage. `rebuildTimings` is keyed by `rebuildKey`, never a real stage key,
-  // so each stage's own trailing placement (if any) must be looked up via REBUILD_PLACEMENTS
-  // explicitly -- a direct `rebuildTimings.get(s.key)` would silently always miss.
+  // never lists a phantom stage. `summary` (server-computed, Overview-tab fix 2026-09-22) is
+  // keyed by the same normalized stage/placement key either way, so each stage's own trailing
+  // placement (if any) must still be looked up via REBUILD_PLACEMENTS explicitly -- a direct
+  // `summary.get(s.key)` for the placement itself would silently always miss.
   function stagesResetByRewind(stageKey: string): { labels: string[]; approxCost: number } {
     const startIdx = stageOrderIndex(stageKey);
     const labels: string[] = [];
@@ -747,9 +778,9 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
       if (stageOrderIndex(s.key) < startIdx) continue;
       if (state.stages?.[s.key] == null) continue;
       labels.push(s.label);
-      approxCost += perStage.get(s.key)?.cost ?? 0;
+      approxCost += summary.get(s.key)?.cost ?? 0;
       const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === s.key);
-      if (placement) approxCost += rebuildTimings.get(placement.rebuildKey)?.cost ?? 0;
+      if (placement) approxCost += summary.get(placement.rebuildKey)?.cost ?? 0;
     }
     return { labels, approxCost };
   }
@@ -965,6 +996,10 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
           <ol className="flex flex-col gap-2">
             {stages.map(([key, stage]) => {
               const timing = perStage.get(key);
+              // Server-computed duration/cost (Overview-tab fix, 2026-09-22) -- see `summary`'s
+              // own declaration above. `timing` (perStage) still owns redraft history/count and
+              // the live "currently drafting/auditing" node label; `s` owns duration/cost only.
+              const s = summary.get(key);
               const note = stageNote(stage);
               const failedHere = failure?.stage === key;
               // `stage.status` alone misses non-gated stages (ac-to-tests, minimal-code-to-green,
@@ -998,7 +1033,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                   key={placement.rebuildKey}
                   placement={placement}
                   phase={phase}
-                  timing={rebuildTimings.get(placement.rebuildKey)}
+                  timing={summary.get(placement.rebuildKey)}
                   failedHere={failure?.stage === placement.rebuildKey}
                 />
               );
@@ -1012,10 +1047,10 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                   <div className={ROW_GRID}>
                     <span className="font-medium">{PIPELINE_STAGE_ORDER.find((s) => s.key === key)?.label ?? key}</span>
                     <span className="text-right text-xs text-neutral-500">
-                      {timing && timing.last > timing.first ? formatDuration(timing.last - timing.first) : ""}
+                      {s && s.last > s.first ? formatDuration(s.last - s.first) : ""}
                     </span>
                     <span className="text-right text-xs text-neutral-500">
-                      {timing?.sawCost ? `$${timing.cost.toFixed(2)}` : ""}
+                      {s?.costKnown ? `$${s.cost.toFixed(2)}` : ""}
                     </span>
                     <span className="text-right text-xs text-neutral-500">
                       {timing && timing.rejections > 0 ? `${timing.rejections}×` : ""}
@@ -1023,6 +1058,19 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                     <span
                       className={`flex items-center justify-end gap-1.5 ${failedHere ? "text-red-700" : "text-neutral-500"}`}
                     >
+                      <StatusDot
+                        tone={
+                          failedHere
+                            ? "red"
+                            : running
+                              ? "amber"
+                              : stage.status === "approved"
+                                ? "green"
+                                : stage.status === "needs_clarification" || stage.status === "ready_for_review"
+                                  ? "amber"
+                                  : "gray"
+                        }
+                      />
                       {running && <RunningSpinner />}
                       {failedHere
                         ? "Failed"
@@ -1038,8 +1086,8 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                   {key === "metrics-exit" && finishedWithVerdict && runActivity?.mergeReady === false && (
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
                       <p className="text-xs text-neutral-500">
-                        This run finished but is not ready to merge -- see the Report tab for why.
-                        Ask the agent to fix it, or re-verify if you've already fixed it yourself.
+                        {"This run finished but is not ready to merge -- see the Report tab for why. " +
+                          "Ask the agent to fix it, or re-verify if you've already fixed it yourself."}
                       </p>
                       <div className="ml-auto flex shrink-0 gap-2">
                         <button

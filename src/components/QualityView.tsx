@@ -1,12 +1,12 @@
 "use client";
 
 import { useAgent } from "@copilotkit/react-core/v2";
-import { useMemo } from "react";
+import { useEffect, useMemo, type ReactNode } from "react";
 import { RebuildConnector } from "@/components/BuildView";
 import { HealthBreakdown } from "@/components/HealthRing";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningPhases, useRunEvents } from "@/lib/use-run-events";
+import { computeRunningPhases, useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   REBUILD_PLACEMENTS,
@@ -18,6 +18,13 @@ import {
   type RemediationFinding,
   type WorkflowState,
 } from "@/lib/workflow-types";
+
+const TOOL_STATUS_CLASS: Record<string, string> = {
+  ok: "text-emerald-700",
+  failed: "text-red-600",
+  missing: "text-red-600",
+  not_applicable: "text-neutral-400",
+};
 
 const SEVERITY_CLASS: Record<string, string> = {
   critical: "text-red-700 font-semibold",
@@ -63,6 +70,62 @@ function PresenceLines({ items }: { items: PresenceList }) {
   );
 }
 
+// A bare repo_scan.py finding id, as `stable_id()` mints it: exactly 12 lowercase hex characters
+// (sha256 digest, truncated). Matched with word boundaries so it never grabs a substring out of a
+// longer hex-looking token.
+const FINDING_ID_RE = /\b[0-9a-f]{12}\b/g;
+
+/** `remediation.findings_addressed`/`known_gaps` are a DETERMINISTIC gate-enforced data contract
+ * (agent/src/gates/remediation_gate.py's `accounted_for`/verbatim-id requirements) -- the drafting
+ * model MUST write a real finding id, copied exactly, into these strings, or the gate rejects the
+ * draft outright. That is correct and load-bearing for the BACKEND; it is meaningless to a human
+ * reading the Quality tab, who has no reason to know what "7969cc7fc8b6b" refers to. This resolves
+ * every such id embedded in the text (findings_addressed is usually the bare id alone; known_gaps
+ * is typically `"<id> (reason...)"`, but the gate itself only requires the id to appear SOMEWHERE
+ * in the string -- see `_mentions_id`'s own substring check -- so this doesn't assume a fixed
+ * position) against the real scan's own findings, replacing it with the finding's own short,
+ * human title (and its severity, colour-matched the same way FindingsTable already does) while
+ * leaving every other character of the model's own text untouched. An id with no match in
+ * `findingsById` (a stale/renamed finding, or this run has no scan data loaded yet) is left as the
+ * raw text -- never hidden, never a broken reference. */
+function FindingRefLines({
+  items,
+  findingsById,
+}: {
+  items: PresenceList;
+  findingsById: Map<string, RemediationFinding>;
+}) {
+  if (items.status === "absent") {
+    return <p className="text-xs italic text-neutral-500">{items.reason || "None."}</p>;
+  }
+  return (
+    <ul className="list-disc space-y-1 pl-4 text-xs text-neutral-700">
+      {items.values.map((raw, i) => {
+        const matches = [...raw.matchAll(FINDING_ID_RE)].filter((m) => findingsById.has(m[0]));
+        if (matches.length === 0) return <li key={i}>{raw}</li>;
+        const parts: ReactNode[] = [];
+        let cursor = 0;
+        matches.forEach((m, mi) => {
+          const start = m.index ?? 0;
+          if (start > cursor) parts.push(raw.slice(cursor, start));
+          const finding = findingsById.get(m[0])!;
+          parts.push(
+            <span key={mi} className="font-medium text-neutral-900">
+              <span className={SEVERITY_CLASS[finding.severity ?? ""] ?? "text-neutral-600"}>
+                {finding.severity ? `${finding.severity}: ` : ""}
+              </span>
+              {finding.title ?? finding.description ?? finding.rule_id ?? "finding"}
+            </span>,
+          );
+          cursor = start + m[0].length;
+        });
+        if (cursor < raw.length) parts.push(raw.slice(cursor));
+        return <li key={i}>{parts}</li>;
+      })}
+    </ul>
+  );
+}
+
 export function FindingsTable({ findings, decisions }: { findings: RemediationFinding[]; decisions?: Record<string, { decision: string }> }) {
   if (findings.length === 0) return <p className="text-xs text-neutral-500">No findings.</p>;
   return (
@@ -71,20 +134,46 @@ export function FindingsTable({ findings, decisions }: { findings: RemediationFi
         <thead>
           <tr className="border-b border-neutral-200 text-neutral-500">
             <th className="py-1 pr-3 font-medium">Severity</th>
+            <th className="py-1 pr-3 font-medium">Category</th>
             <th className="py-1 pr-3 font-medium">Rule</th>
             <th className="py-1 pr-3 font-medium">Location</th>
             <th className="py-1 pr-3 font-medium">Message</th>
+            <th className="py-1 pr-3 font-medium">Sources</th>
+            <th className="py-1 pr-3 font-medium">Refs</th>
             <th className="py-1 font-medium">Decision</th>
           </tr>
         </thead>
         <tbody>
           {findings.map((f, i) => (
-            <tr key={f.finding_key ?? f.id ?? i} className="border-b border-neutral-100 align-top">
+            // `-${i}` breaks a real, not-just-hypothetical tie: repo_scan.py's own `stable_id()`
+            // deliberately excludes the line number from a non-vulnerability finding_key (so a
+            // finding that only drifted down the file during an unrelated edit keeps its trend
+            // history) -- but that means genuinely DISTINCT findings of the SAME rule in the SAME
+            // file (e.g. checkov flagging "Base64 High Entropy String" at 6 different lines in
+            // one JSON file) collide on finding_key even though dedupe()'s own grouping key does
+            // include the line and correctly never merged them. `f.finding_key` (or `f.id`) is
+            // still the right key to decide/track a finding's remediation DECISION by, so the
+            // index only breaks the render-identity tie -- it never touches the lookup below.
+            <tr key={`${f.finding_key ?? f.id ?? "finding"}-${i}`} className="border-b border-neutral-100 align-top">
               <td className={`py-1 pr-3 ${SEVERITY_CLASS[f.severity ?? ""] ?? "text-neutral-600"}`}>{f.severity ?? "—"}</td>
-              <td className="py-1 pr-3 font-mono">{f.rule ?? f.category ?? "—"}</td>
-              <td className="py-1 pr-3 font-mono">{f.file ? `${f.file}${f.line != null ? `:${f.line}` : ""}` : "—"}</td>
-              <td className="py-1 pr-3 text-neutral-700">{f.message ?? "—"}</td>
-              <td className="py-1 text-neutral-500">{decisions?.[f.finding_key ?? ""]?.decision ?? "open"}</td>
+              <td className="py-1 pr-3">{f.category ?? "—"}</td>
+              <td className="py-1 pr-3 font-mono">{f.rule_id ?? f.rule ?? f.category ?? "—"}</td>
+              <td className="py-1 pr-3 font-mono">
+                {f.location?.path
+                  ? `${f.location.path}${f.location.start_line != null ? `:${f.location.start_line}` : ""}`
+                  : f.file
+                    ? `${f.file}${f.line != null ? `:${f.line}` : ""}`
+                    : "—"}
+              </td>
+              <td className="py-1 pr-3 text-neutral-700">{f.title ?? f.description ?? f.message ?? "—"}</td>
+              <td className="py-1 pr-3 text-neutral-500">
+                {f.tools?.length ? f.tools.join(", ") : "—"}
+                {f.confidence === "corroborated" && <span className="ml-1 text-emerald-600">corroborated</span>}
+              </td>
+              <td className="py-1 pr-3 font-mono text-neutral-500">
+                {[f.cve, f.cwe, f.package?.name].filter(Boolean).join(" · ") || "—"}
+              </td>
+              <td className="py-1 text-neutral-500">{decisions?.[f.finding_key ?? f.id ?? ""]?.decision ?? "open"}</td>
             </tr>
           ))}
         </tbody>
@@ -93,9 +182,9 @@ export function FindingsTable({ findings, decisions }: { findings: RemediationFi
   );
 }
 
-function Section({ title, children, status }: { title: string; children: React.ReactNode; status?: React.ReactNode }) {
+function Section({ title, children, status, id }: { title: string; children: React.ReactNode; status?: React.ReactNode; id?: string }) {
   return (
-    <section className="space-y-2 rounded-lg border border-neutral-200 p-4">
+    <section id={id} className="space-y-2 rounded-lg border border-neutral-200 p-4">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold">{title}</h2>
         {status}
@@ -105,7 +194,15 @@ function Section({ title, children, status }: { title: string; children: React.R
   );
 }
 
-export function QualityView() {
+export function QualityView({
+  scanFindings,
+  scrollRequest,
+}: {
+  scanFindings?: RemediationFinding[] | null;
+  /** Set by a MetricsBar pill click (via AppShell's onJumpToSection) -- see the effect below for
+   * how a section key resolves to a scroll target. */
+  scrollRequest?: { section: string } | null;
+}) {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
@@ -113,6 +210,46 @@ export function QualityView() {
   const tests = state.test_hardening;
   const metrics = state.metrics_report?.metrics;
   const scan = state.repo_scan;
+  const tools = metrics?.repo_scan?.tools;
+
+  // Scroll-to-and-highlight the section a metrics pill was clicked for. "gate" has no dedicated
+  // findings list today, so it lands on Remediation (the closest existing anchor); every other key
+  // is a HealthBreakdown subscore row, falling back to the Health score section itself when that
+  // row doesn't exist (old data with no health_subscores, or the row's metric was unmeasured this
+  // scan). Wrapped in one requestAnimationFrame: AppShell flips `hidden` on this whole view and
+  // sets `scrollRequest` in the same event handler, but a just-unhidden subtree isn't guaranteed to
+  // have real layout the same synchronous tick in every browser -- the rAF is free insurance
+  // against scrolling to a stale (zero-height) position rather than an assumption that it's fine.
+  useEffect(() => {
+    if (!scrollRequest) return;
+    const frame = requestAnimationFrame(() => {
+      const target =
+        (scrollRequest.section === "gate"
+          ? document.getElementById("section-remediation")
+          : document.getElementById(`subscore-${scrollRequest.section}`)) ??
+        document.getElementById("section-health");
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      target.classList.add("ring-2", "ring-blue-400", "ring-offset-2", "rounded");
+      setTimeout(() => target.classList.remove("ring-2", "ring-blue-400", "ring-offset-2", "rounded"), 1600);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [scrollRequest]);
+
+  // Keyed by BOTH `id` and `finding_key` (repo_scan.py's own dashboard shape uses `id`; some
+  // older callers/fixtures use `finding_key` for the identical value) so a lookup by either name
+  // resolves the same finding. `scanFindings` is only populated for a COMPLETED run's committed
+  // report.json (see the page component's own comment on why) -- for an in-progress run this is
+  // undefined and every findings_addressed/known_gaps line falls back to its raw id text, which is
+  // the same "degrade to the old behavior, never crash" contract FindingRefLines already has.
+  const findingsById = useMemo(() => {
+    const map = new Map<string, RemediationFinding>();
+    for (const f of scanFindings ?? []) {
+      if (f.id) map.set(f.id, f);
+      if (f.finding_key) map.set(f.finding_key, f);
+    }
+    return map;
+  }, [scanFindings]);
 
   const baselineHealth = scan?.baseline_summary?.health_score;
   const latestHealth = scan?.latest_summary?.health_score;
@@ -136,7 +273,7 @@ export function QualityView() {
   // Same "time lag with nothing shown" gap Build tab already surfaces via RebuildConnector (user
   // feedback 2026-09-06) applies here too: a rebuild check runs after remediation and again after
   // adversarial-compliance, unattributed to either real stage either side of it.
-  const runEvents = useRunEvents();
+  const runEvents = useStructuralRunEvents();
   const [runActivity] = useRunActivity();
   const runningPhases = useMemo(
     () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),
@@ -157,7 +294,7 @@ export function QualityView() {
       </div>
 
       {(latestHealth != null || baselineHealth != null) && (
-        <Section title="Health score">
+        <Section title="Health score" id="section-health">
           {scan?.latest_summary?.health_subscores || scan?.baseline_summary?.health_subscores ? (
             // v2: ring + the accessible per-subscore breakdown (this section, not a tooltip, is
             // the one place the weights and unmeasured legs are actually readable). Before the
@@ -183,6 +320,7 @@ export function QualityView() {
       {remediation && (
         <Section
           title="Remediation"
+          id="section-remediation"
           status={
             <span className="text-xs text-neutral-500">
               {STATUS_LABEL[remediationStage?.status ?? "not_started"] ?? remediationStage?.status}
@@ -193,7 +331,7 @@ export function QualityView() {
           <div className="grid gap-3 sm:grid-cols-3">
             <div>
               <h3 className="mb-1 text-xs font-medium text-neutral-500">Findings addressed</h3>
-              <PresenceLines items={remediation.findings_addressed} />
+              <FindingRefLines items={remediation.findings_addressed} findingsById={findingsById} />
             </div>
             <div>
               <h3 className="mb-1 text-xs font-medium text-neutral-500">Dependencies upgraded</h3>
@@ -201,7 +339,7 @@ export function QualityView() {
             </div>
             <div>
               <h3 className="mb-1 text-xs font-medium text-neutral-500">Known gaps</h3>
-              <PresenceLines items={remediation.known_gaps} />
+              <FindingRefLines items={remediation.known_gaps} findingsById={findingsById} />
             </div>
           </div>
         </Section>
@@ -252,6 +390,37 @@ export function QualityView() {
           <div className="space-y-1 text-xs text-neutral-700">
             <p>Stable failures: {(tests.stable_fail ?? []).length === 0 ? "none" : (tests.stable_fail ?? []).join(", ")}</p>
             <p>Flaky (quarantined): {(tests.flaky ?? []).length === 0 ? "none" : (tests.flaky ?? []).join(", ")}</p>
+          </div>
+        </Section>
+      )}
+
+      {tools && tools.length > 0 && (
+        <Section title="Tools & Results" id="section-tools">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-neutral-200 text-neutral-500">
+                  <th className="py-1 pr-3 font-medium">Tool</th>
+                  <th className="py-1 pr-3 font-medium">Status</th>
+                  <th className="py-1 pr-3 font-medium">Version</th>
+                  <th className="py-1 pr-3 font-medium">Duration</th>
+                  <th className="py-1 pr-3 font-medium">Findings</th>
+                  <th className="py-1 font-medium">Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tools.map((t) => (
+                  <tr key={t.name} className="border-b border-neutral-100 align-top">
+                    <td className="py-1 pr-3 font-mono">{t.name}</td>
+                    <td className={`py-1 pr-3 ${TOOL_STATUS_CLASS[t.status] ?? ""}`}>{t.status}</td>
+                    <td className="py-1 pr-3 font-mono">{t.version ?? "—"}</td>
+                    <td className="py-1 pr-3">{t.duration_ms != null ? `${(t.duration_ms / 1000).toFixed(1)}s` : "—"}</td>
+                    <td className="py-1 pr-3">{t.findings ?? 0}</td>
+                    <td className="py-1 text-neutral-500">{t.notes || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </Section>
       )}

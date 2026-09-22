@@ -1,12 +1,12 @@
 "use client";
 
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import {
   argSummary,
   formatEventTimestamp,
   NODE_PHASE_LABEL,
   toolNameOf,
-  useRunEvents,
+  useNarrationRunEvents,
   type RunLogEvent,
 } from "@/lib/use-run-events";
 
@@ -116,13 +116,11 @@ function CompactToolRow({ event }: { event: RunLogEvent }) {
 }
 
 export function AgentNarrationDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const events = useRunEvents();
   // node_started/node_finished/gate_* already surface elsewhere (tab-dot spinners, the interrupt/
-  // gate banner) -- this drawer only ever shows the two event types the feature actually asks for.
-  const narrationEvents = useMemo(
-    () => events.filter((e) => e.type === "reasoning" || e.type === "tool_call"),
-    [events],
-  );
+  // gate banner) -- this drawer only ever shows the two event types the feature actually asks
+  // for. Pre-filtered at the shared-store level now (use-run-events.ts's memory fix, 2026-09-22)
+  // instead of this component holding the full stream and filtering it itself on every mount.
+  const narrationEvents = useNarrationRunEvents();
   const { containerRef, onScroll, newCount, jumpToLatest } = useStickToBottom(narrationEvents);
 
   return (

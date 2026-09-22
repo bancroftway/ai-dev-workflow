@@ -105,11 +105,16 @@ export const REBUILD_PLACEMENTS: RebuildPlacement[] = [
 /** User-reported gap (2026-09-06): a real stage approves, then Build/Overview go quiet for several
  * minutes with no row/card for it -- reads as stalled. That gap is real work: graph.py's
  * POST_STAGE_REBUILD wires a clean-build (+ TDD-red, ac-to-tests' placement only) check between
- * one stage's gate and the next one's draft (agent/src/rebuild.py's rebuild_node). The other three
- * placements' initial build-check calls all share ONE literal event stage tag ("rebuild",
- * stack_runner.run_and_report's stage_key) with each other -- SessionOverview.tsx's rebuildTimings
- * resolves that by time-windowing each placement between the two REAL stages either side of it
- * (afterStageKey's last event, nextStageKey's first) instead of trusting the shared tag alone.
+ * one stage's gate and the next one's draft (agent/src/rebuild.py's rebuild_node).
+ *
+ * Overview-tab fix (2026-09-22): every one of a placement's discovery/red-gate/fix turns used to
+ * share bare, placement-blind event stage tags ("rebuild"/"red-gate") across all 4 placements --
+ * SessionOverview.tsx's rebuildTimings worked around that by time-windowing each placement between
+ * the two REAL stages either side of it instead of trusting the tag. rebuild.py now tags every one
+ * of a placement's own events (span AND inner turns) with its own `spec.key` (or a
+ * `rebuild-`/`red-gate-`-prefixed variant of it) -- run_event_summary.py's server-computed summary
+ * groups on that directly, so rebuildTimings/the time-windowing above no longer exist; Overview
+ * looks up a placement's duration/cost straight from that summary now.
  *
  * rebuild.py's own state (rb.status) only updates when the node FUNCTION RETURNS -- same lag every
  * other non-gated stage has (see BuildView.tsx's StageCard comment) -- so "running" here is
@@ -272,18 +277,69 @@ export interface RepoScanState {
   reason?: string;
 }
 
-/** Finding rows as quality/security remediation stream them (repo_scan _dashboard_finding shape,
- * plus triage decoration). Loosely typed on purpose -- QualityView renders what's present. */
+/** Finding rows as quality/security remediation stream them -- agent/src/repo_scan.py's
+ * `_dashboard_finding()` is the actual producer of this shape (`id`/`title`/`description`/
+ * `location.path`+`location.start_line`, NOT the flat `file`/`line`/`message` this interface
+ * used to declare, which never matched any real backend output -- root-caused 2026-09-22 while
+ * making QualityView's Remediation section show finding titles instead of bare ids: FindingsTable
+ * had been silently reading fields that don't exist on the real payload). `rule`/`message`/`file`/
+ * `line` kept as optional legacy aliases (loosely typed on purpose, `[key: string]: unknown`) in
+ * case an older/alternate data path still produces them; every current call site should prefer
+ * `rule_id`/`title`/`description`/`location`. */
 export interface RemediationFinding {
   finding_key?: string;
   id?: string;
   severity?: string;
+  /** repo_scan.py's own severity classification vs. the raw tool-reported value ("native", "cvss",
+   * etc.) -- distinct from `severity_source` fields elsewhere; kept loosely typed since it's
+   * display-only. */
+  severity_source?: string;
   category?: string;
+  rule_id?: string;
+  title?: string;
+  description?: string;
+  location?: { path?: string | null; start_line?: number | null; end_line?: number | null };
+  /** Whether this finding counts toward gating_count (is_gating() in repo_scan.py) -- distinct from
+   * severity/category grading, which may include a finding this is false for (see SECURITY_GRADING_CATEGORIES). */
+  gating?: boolean;
+  /** Whether fix-everything remediation should act on this finding at all. */
+  actionable?: boolean;
+  /** Corroborating tool names (repo_scan.py's `sorted(finding.sources)`), e.g. ["osv-scanner", "trivy"]. */
+  tools?: string[];
+  cve?: string | null;
+  cwe?: string | null;
+  aliases?: string[];
+  package?: { name?: string; ecosystem?: string; version?: string } | null;
+  /** "corroborated" = 2+ tools agree on the same finding; "single" = one tool only. */
+  confidence?: "corroborated" | "single" | string;
+  occurrences?: number;
+  /** @deprecated not a real repo_scan.py output field -- prefer `rule_id`. */
   rule?: string;
+  /** @deprecated not a real repo_scan.py output field -- prefer `description`. */
   message?: string;
+  /** @deprecated not a real repo_scan.py output field -- prefer `location.path`. */
   file?: string;
+  /** @deprecated not a real repo_scan.py output field -- prefer `location.start_line`. */
   line?: number | null;
   [key: string]: unknown;
+}
+
+/** repo_scan.py's per-tool run record (`_run_one`'s `run` dict, surfaced via
+ * ScanReport.to_dashboard_dict()'s top-level `tools` array) -- one entry per analyzer this scan
+ * attempted, independent of what it found. `status: "missing"` means the binary wasn't on PATH;
+ * `"failed"` means it ran but produced no readable output; `"not_applicable"` means the repo has
+ * nothing for it to look at (never a degraded signal). */
+export interface ScanTool {
+  name: string;
+  license?: string | null;
+  permissive?: boolean | null;
+  version?: string | null;
+  db_version?: string | null;
+  status: "ok" | "not_applicable" | "missing" | "failed" | string;
+  exit_code?: number | null;
+  duration_ms?: number;
+  findings?: number;
+  notes?: string;
 }
 
 /** agent/src/schemas.py's PresenceList -- a typed-absence list: `status: "absent"` with a real
@@ -344,9 +400,11 @@ export interface MetricsReportState {
     coverage?: { line_rate: number | null; branch_rate: number | null };
     traceability_summary?: { total: number; covered: number; tests_only: number; untested: number };
     token_usage_summary?: { total_input_tokens: number; total_output_tokens: number; total_cost: number; by_stage?: Record<string, unknown> };
-    // repo_scan.py's ScanReport.to_dashboard_dict() -- only `.summary` (the ScanSummary, same
-    // shape MetricsBar reads) is used on the frontend; full findings stay in the committed files.
-    repo_scan?: { summary?: ScanSummary; [key: string]: unknown };
+    // repo_scan.py's ScanReport.to_dashboard_dict() -- `.summary` (the ScanSummary, same shape
+    // MetricsBar reads), `.tools` (per-analyzer run status, for the Tools & Results section) and
+    // `.findings` (for FindingsTable) are all live on this SAME channel already; no report.json
+    // plumbing needed for any of them to work on both an in-progress and a reloaded session.
+    repo_scan?: { summary?: ScanSummary; tools?: ScanTool[]; findings?: RemediationFinding[]; [key: string]: unknown };
     [key: string]: unknown;
   };
 }

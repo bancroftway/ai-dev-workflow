@@ -5,7 +5,7 @@ import { Fragment, useMemo } from "react";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningPhases, NODE_PHASE_LABEL, useRunEvents } from "@/lib/use-run-events";
+import { computeRunningPhases, NODE_PHASE_LABEL, useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   REBUILD_PLACEMENTS,
@@ -161,7 +161,7 @@ export function BuildView() {
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId });
   const state = (agent.state ?? {}) as WorkflowState;
-  const runEvents = useRunEvents();
+  const runEvents = useStructuralRunEvents();
   const [runActivity] = useRunActivity();
   const runningPhases = useMemo(
     () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),

@@ -26,7 +26,7 @@ import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningStages, useRunEvents } from "@/lib/use-run-events";
+import { computeRunningStages, useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   buildStarted,
@@ -152,11 +152,21 @@ export function AppShell({
   // without direct user action per turn, and auto-popping this over whatever tab someone's working
   // in every time a turn starts would fight their navigation constantly.
   const [narrationOpen, setNarrationOpen] = useState(false);
+  // MetricsBar pill -> Quality tab section navigation. A fresh object literal on every click (not
+  // a request id/counter) is deliberate: MetricsBar is visible on every tab, so clicking the SAME
+  // pill twice in a row while already on Quality must still re-trigger the scroll/highlight, and
+  // `{section}` is never Object.is-equal to its predecessor either way. Nothing ever needs to
+  // clear this back to null.
+  const [scrollRequest, setScrollRequest] = useState<{ section: string } | null>(null);
+  const jumpToQualitySection = (section: string) => {
+    setActiveView("quality");
+    setScrollRequest({ section });
+  };
 
   const state = (agent.state ?? {}) as WorkflowState;
   const specification = state.stages?.specification;
   const plan = state.stages?.plan;
-  const runEvents = useRunEvents();
+  const runEvents = useStructuralRunEvents();
   const runningStages = useMemo(
     () => computeRunningStages(runEvents, runActivity?.runActive ?? null),
     [runEvents, runActivity?.runActive],
@@ -661,7 +671,7 @@ export function AppShell({
             (spec/plan already spend real tokens before Build starts), per the same 2026-09-01
             feedback that put `trailing` on its own always-eligible footing. */}
         {(buildTabEnabled || state.run_failure != null || runEvents.some((e) => e.token_usage != null)) && (
-          <MetricsBar thresholds={metricThresholds} trailing={<LiveCostChip />} />
+          <MetricsBar thresholds={metricThresholds} trailing={<LiveCostChip />} onJumpToSection={jumpToQualitySection} />
         )}
         <nav className="flex items-center gap-1 border-b border-neutral-200 px-4 py-2">
           <TabButton
@@ -884,7 +894,7 @@ export function AppShell({
           <div hidden={activeView !== "specification"}><SpecificationView /></div>
           <div hidden={activeView !== "plan"}><PlanView /></div>
           <div hidden={activeView !== "build"}><BuildView /></div>
-          <div hidden={activeView !== "quality"}><QualityView /></div>
+          <div hidden={activeView !== "quality"}><QualityView scanFindings={reportExtras?.findings} scrollRequest={scrollRequest} /></div>
           <div hidden={activeView !== "report"}>
             <ReportView
               report={exitStage?.approved_content as MergeReadinessReport | null | undefined}

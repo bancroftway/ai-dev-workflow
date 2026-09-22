@@ -1,7 +1,7 @@
 "use client";
 
 import { Chip } from "@/components/MetricsBar";
-import { useRunEvents } from "@/lib/use-run-events";
+import { useStructuralRunEvents } from "@/lib/use-run-events";
 
 /**
  * Live per-run cost/token chip -- Part 2 Task 11. Same value/tooltip shape as MetricsBar.tsx's own
@@ -27,7 +27,7 @@ import { useRunEvents } from "@/lib/use-run-events";
  * is real data" rule MetricsBar's costChip already applies.
  */
 export function LiveCostChip() {
-  const events = useRunEvents();
+  const events = useStructuralRunEvents();
 
   let inputTokens = 0;
   let outputTokens = 0;
