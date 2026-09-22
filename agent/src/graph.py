@@ -1426,9 +1426,11 @@ _verify_specification_ledger = make_verify_specification_ledger("specification")
 
 # playwright.config.ts's exact content is a template file (agent/src/templates/playwright/), not
 # hand-duplicated prose here -- it must byte-for-byte match the sandbox image's pinned Playwright
-# version (Dockerfile's PLAYWRIGHT_VERSION comment: "this literal is duplicated in the ac-to-tests
-# SKILL.md and in two prompts... so all four change together"). Substituted once at module load,
-# same caching lifetime as load_prompt's own lru_cache.
+# version (Dockerfile's PLAYWRIGHT_VERSION ARG). The version STRING itself no longer needs
+# hand-duplicating across the ac-to-tests SKILL.md and two prompts either: bootstrap.sh probes the
+# real installed version at container start and records it in manifest.json's
+# toolchain.playwright_version, which those files read instead of a literal. Substituted once at
+# module load, same caching lifetime as load_prompt's own lru_cache.
 AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft").replace(
     "<<playwright_config_template>>", template_loader.load_template("playwright/playwright.config.ts").strip()
 )
@@ -3373,15 +3375,21 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 ),
                 label=f"{stage_spec.key}:draft",
             )
-        except (TimeoutError, RuntimeError) as exc:
+        except (TimeoutError, RuntimeError, ValidationError, ValueError) as exc:
             # A Copilot session failure (quota, 429, stream hiccup) that survived infra_retry's own
-            # backoff attempts. This must NOT consume cycle_count -- that budget bounds genuine
-            # "not good enough yet" clarification attempts, and charging an infra outage against it
-            # would just move the same "run dies for an infra reason" failure a few laps later while
-            # shrinking the budget available for real fixes. There is also no new draft content to
-            # hand an audit/verify step, so this cannot fall through to the stage's normal routing
-            # the way a not-ready draft does -- it takes its own dedicated escalate edge instead
-            # (see make_route_after_draft / _wire_stage's draft_escalate wiring).
+            # backoff attempts, OR a response that came back truncated/malformed enough that
+            # ainvoke_structured's own retries never produced parseable JSON (ValidationError/
+            # ValueError -- observed live, session f0fef8ba: "EOF while parsing an object" on the
+            # model's own structured output, previously uncaught here and crashing the whole
+            # run_headless.py process outright, unlike make_audit_node's identical two-exception
+            # split which already treats this same failure mode as infra, not a content problem).
+            # This must NOT consume cycle_count -- that budget bounds genuine "not good enough yet"
+            # clarification attempts, and charging an infra outage against it would just move the
+            # same "run dies for an infra reason" failure a few laps later while shrinking the
+            # budget available for real fixes. There is also no new draft content to hand an
+            # audit/verify step, so this cannot fall through to the stage's normal routing the way
+            # a not-ready draft does -- it takes its own dedicated escalate edge instead (see
+            # make_route_after_draft / _wire_stage's draft_escalate wiring).
             logger.warning("draft infra-exhausted for stage %s -- escalating without consuming cycle_count", stage_spec.key, exc_info=exc)
             stages = {key: dict(value) for key, value in state["stages"].items()}
             stages[stage_spec.key]["infra_exhausted"] = True
