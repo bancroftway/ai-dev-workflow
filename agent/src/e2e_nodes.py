@@ -1440,13 +1440,9 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         thread_id, f"find {shlex.quote(results_root)} -name '*.png' -print0 2>/dev/null"
     )
     found_paths = [p for p in (find_result.stdout or "").split("\x00") if p]
-    screenshots: list[str] = []
-    script_lines = [f"mkdir -p {shlex.quote(screens_dir)}"]
-    for index, path in enumerate(found_paths, start=1):
-        dest = f"{screens_dir}/{suite_screenshot_name(index, path)}"
-        script_lines.append(f"cp -- {shlex.quote(path)} {shlex.quote(dest)}")
-        screenshots.append(dest)
-    await provider.exec_in_sandbox(thread_id, "\n".join(script_lines))
+    script = _build_screenshot_copy_script(screens_dir, found_paths)
+    screenshots = [f"{screens_dir}/{suite_screenshot_name(i, p)}" for i, p in enumerate(found_paths, start=1)]
+    await provider.exec_in_sandbox(thread_id, script)
 
     # Per-route screenshots, ALWAYS taken (not just as a fallback). Two reasons: playwright's
     # default screenshot config is only-on-failure, so a green suite harvests nothing; and a suite's
@@ -2242,15 +2238,20 @@ def _demo() -> None:
     # instead of many exec_in_sandbox calls. Paths are individually shlex-quoted to prevent
     # injection from repo-controlled test titles.
     script = _build_screenshot_copy_script("/out/screens", [
-        "/results/spec-US_0001_1-abc/test-finished-1.png",
-        "/results/spec-US_0002_2-def/test-finished-1.png",
+        "/results/spec US 0001/test-finished-1.png",  # space in path
+        "/results/spec-$(evil)-0002/test-finished-1.png",  # shell metacharacter
     ])
     lines = script.split("\n")
     assert lines[0] == "mkdir -p /out/screens", f"mkdir must be first, got: {lines[0]}"
     assert len(lines) == 3, f"should have mkdir + 2 cp commands, got {len(lines)} lines"
     # Each cp must quote both src and dest, and use -- to stop flag parsing.
     assert all("cp --" in line for line in lines[1:]), "all cp lines must have '--' separator"
-    assert all(shlex.quote("/results/") in line for line in lines[1:]), "quoted paths must survive"
+    # Paths with spaces and metacharacters MUST be quoted to survive the shell.
+    # If not quoted, 'spec US' would be a separate argument, and '$(...)'would execute.
+    dangerous_quoted = shlex.quote("/results/spec US 0001/test-finished-1.png")
+    evil_quoted = shlex.quote("/results/spec-$(evil)-0002/test-finished-1.png")
+    assert dangerous_quoted in lines[1], f"space-in-path must be quoted: {lines[1]}"
+    assert evil_quoted in lines[2], f"metacharacter must be quoted: {lines[2]}"
     # Empty input -> just mkdir, no cp commands.
     empty_script = _build_screenshot_copy_script("/out/screens", [])
     assert empty_script == "mkdir -p /out/screens", f"empty paths should yield just mkdir, got: {empty_script}"
