@@ -94,6 +94,15 @@ EXIT_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_EXIT_MAX_VERIFY_CYCLES", "3"))
 # intake_node and used by sessions_api.py's rewind endpoint to refuse once exhausted.
 TARGETED_FIX_MAX_ATTEMPTS = int(os.environ.get("TARGETED_FIX_MAX_ATTEMPTS", "3"))
 
+# Root-caused 2026-09-21: caps how many times POST /api/sessions/actions {action: "reset-e2e"}
+# may clear e2e/metrics-exit/adversarial-compliance state and let the pipeline re-walk from
+# remediation's rebuild placement (graph.py's intake_node, GraphState.e2e_reset_attempts). A
+# dedicated cap, not TARGETED_FIX_MAX_ATTEMPTS above -- this lever bounds a state RESET (no LLM
+# fix pass, but a real regression-suite re-run each time), a different cost shape than a seeded
+# fix attempt. Read by intake_node and sessions_api.py's reset-e2e handler to refuse once
+# exhausted.
+AIDW_E2E_RESET_MAX_ATTEMPTS = int(os.environ.get("AIDW_E2E_RESET_MAX_ATTEMPTS", "3"))
+
 # e2e's own bespoke-cluster caps (agent/src/e2e_nodes.py): fix-cycle cap (same shape as
 # rebuild.py's max_fix_cycles), app-boot readiness timeout, and the whole playwright suite's own
 # timeout (wrapped in `timeout <n>` so a hung suite can't wedge the sandbox forever).

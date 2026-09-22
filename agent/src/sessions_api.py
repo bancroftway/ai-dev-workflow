@@ -943,7 +943,7 @@ class SessionActionRequest(BaseModel):
     """Named actions only -- the frontend never sends shell. Adding an action = a new Literal
     member plus a handler branch below; anything else is rejected by validation before it runs."""
 
-    action: Literal["refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix"]
+    action: Literal["refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix", "reset-e2e"]
     entra_assertion: str = ""
     # "rewind-to-stage" only: the STAGES key to reset (and reset everything after) to, in pipeline
     # order. Ignored by every other action.
@@ -1047,6 +1047,37 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
         # confirm_reopen: same reasoning as rewind-to-stage above -- without it intake_node's own
         # reopen guard blocks any resume of a finished-with-verdict thread.
         registry.set_meta(thread_id, targeted_fix=True, confirm_reopen=True)
+        return SessionActionResponse(ok=True)
+
+    if body.action == "reset-e2e":
+        # Root-caused 2026-09-21 ("today the only lever to re-run e2e alone is
+        # rewind-to-stage(remediation), which redoes 3 whole LLM-drafted stages"): narrower than
+        # rewind-to-stage, purely a state reset (no LLM fix pass) that lets the graph's own
+        # already-wired chain re-execute from remediation's rebuild placement onward. Validated
+        # against is_finished_with_verdict rather than targeted-fix's narrower
+        # `status == "failed"` check -- deliberately broader: a wrongly-*skipped* e2e can leave a
+        # false merge_ready=true/completed row, and this lever needs to reach that case too. This
+        # also means reset-e2e can be invoked against a run that completed for entirely legitimate
+        # reasons; accepted as a known tradeoff (operator-invoked, not automatic, and the attempt
+        # cap below bounds blast radius) rather than solved with extra heuristics here.
+        row = await session_store.get_session(thread_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if not session_store.is_finished_with_verdict(row):
+            raise HTTPException(
+                status_code=409,
+                detail="reset-e2e is only available for a run that finished the pipeline (completed, or failed at exit)",
+            )
+        agent_state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        attempts = (agent_state.values or {}).get("e2e_reset_attempts", 0)
+        if attempts >= config.AIDW_E2E_RESET_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"reset-e2e has already been used {attempts}/{config.AIDW_E2E_RESET_MAX_ATTEMPTS} times for this session",
+            )
+        # confirm_reopen: same reasoning as rewind-to-stage/targeted-fix above -- without it
+        # intake_node's own reopen guard blocks any resume of a finished-with-verdict thread.
+        registry.set_meta(thread_id, reset_e2e=True, confirm_reopen=True)
         return SessionActionResponse(ok=True)
 
     row = await session_store.get_session(thread_id)

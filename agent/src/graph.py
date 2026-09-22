@@ -352,6 +352,13 @@ class GraphState(TypedDict):
     # same closed run. Durable (checkpoint-backed, not the in-memory sandbox_registry) so the cap
     # survives an agent restart. Read only via state.get() -- older checkpoints lack it.
     targeted_fix_attempts: int
+    # Root-caused 2026-09-21: how many times POST /api/sessions/actions {action: "reset-e2e"} has
+    # cleared e2e/metrics-exit/adversarial-compliance state against this thread (see intake_node's
+    # own handling below) -- a narrower, purely-state-reset sibling of targeted_fix_attempts above
+    # (no LLM fix pass, but a real regression-suite re-run each time), so it needs its own
+    # independent cap rather than sharing that one. Durable for the same reason
+    # targeted_fix_attempts is. Read only via state.get() -- older checkpoints lack it.
+    e2e_reset_attempts: int
     # One-shot signal (multi-tab/completed-session hardening): set True by intake_node when this
     # thread's dbo.sessions row is already status=="completed" (merge_ready=true) and no
     # confirm_reopen meta flag was popped for this invocation -- i.e. this run must NOT reopen a
@@ -1419,9 +1426,11 @@ _verify_specification_ledger = make_verify_specification_ledger("specification")
 
 # playwright.config.ts's exact content is a template file (agent/src/templates/playwright/), not
 # hand-duplicated prose here -- it must byte-for-byte match the sandbox image's pinned Playwright
-# version (Dockerfile's PLAYWRIGHT_VERSION comment: "this literal is duplicated in the ac-to-tests
-# SKILL.md and in two prompts... so all four change together"). Substituted once at module load,
-# same caching lifetime as load_prompt's own lru_cache.
+# version (Dockerfile's PLAYWRIGHT_VERSION ARG). The version STRING itself no longer needs
+# hand-duplicating across the ac-to-tests SKILL.md and two prompts either: bootstrap.sh probes the
+# real installed version at container start and records it in manifest.json's
+# toolchain.playwright_version, which those files read instead of a literal. Substituted once at
+# module load, same caching lifetime as load_prompt's own lru_cache.
 AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft").replace(
     "<<playwright_config_template>>", template_loader.load_template("playwright/playwright.config.ts").strip()
 )
@@ -2959,11 +2968,62 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
                     thread_id,
                 )
 
+    # Reset-e2e (root-caused 2026-09-21, mirrors targeted-fix's shape above but purely a state
+    # reset -- no LLM fix pass): a one-shot meta flag set by POST /api/sessions/actions
+    # {action: "reset-e2e"} (sessions_api.py), popped here -- same one-shot contract as
+    # targeted_fix/rewind_to_stage above. Exists for the case targeted-fix does NOT cover: e2e
+    # itself produced stale/wrong evidence (e.g. a skipped e2e that still left a false
+    # merge_ready=true), so there's no metrics-exit blocking_reasons to seed a fix from -- the
+    # remedy is to clear e2e's own state and every stage/rebuild-placement that consumes its
+    # evidence, then let the graph's already-wired chain (remediation's r_remediation rebuild
+    # placement -> test_hardening_run_tests -> ... -> test_hardening_exit_check -> e2e_gate_check
+    # -> e2e_run) re-execute for real. Capped (config.AIDW_E2E_RESET_MAX_ATTEMPTS), same reasoning
+    # as targeted_fix_attempts's own cap.
+    e2e_reset_attempts = state.get("e2e_reset_attempts", 0)
+    reset_e2e = sandbox_registry.pop_meta_flag(thread_id, "reset_e2e")
+    if reset_e2e and e2e_reset_attempts >= workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS:
+        logger.warning(
+            "intake_node: reset-e2e refused for thread_id=%s -- already used %d/%d attempts",
+            thread_id, e2e_reset_attempts, workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS,
+        )
+        reset_e2e = False
+
     # e2e has no StageState (it's a bespoke cluster, see e2e_nodes.py) but its fix-cycle "attempt"
     # counter needs the exact same unconditional per-run reset as verify_cycle_count above -- a run
-    # that escalated at the cap must not re-enter every later run already AT it.
-    e2e_state = dict(state.get("e2e") or {})
+    # that escalated at the cap must not re-enter every later run already AT it. A fired reset-e2e
+    # goes further and rebuilds the WHOLE e2e sub-state from e2e_nodes.default_e2e_state() (not
+    # just attempt), so Fix 2's cached proven_start_command/proven_port/proven_routes/
+    # proven_api_routes clear too -- a stale cached launch config carried over from the very run
+    # being reset is exactly the kind of thing this lever exists to discard.
+    e2e_state = dict(e2e_nodes.default_e2e_state()) if reset_e2e else dict(state.get("e2e") or {})
     e2e_state["attempt"] = 0
+
+    if reset_e2e:
+        # adversarial-compliance must reset alongside metrics-exit:
+        # _build_adversarial_compliance_prompt reads state.get("e2e") and injects an e2e_summary
+        # into that stage's own draft prompt ("this stage absorbed e2e's compliance role in the
+        # consolidation") -- leaving it "approved" would let should_skip_draft fast-forward past
+        # it on the exact stale e2e evidence this lever exists to replace.
+        for stale_stage_key in ("metrics-exit", "adversarial-compliance"):
+            stale_stage = stages[stale_stage_key]
+            _reset_stage_status_fields(stale_stage)
+            _reset_stage_mechanics(stale_stage)
+        # Both rebuild placements downstream of remediation genuinely re-execute on this replay
+        # (rebuild placements aren't StageSpecs and are never skip-eligible) -- reset their own
+        # sub-state the same way rewind_to_stage already does above, or a stale fix_cycle_count
+        # left over from the prior run could immediately hit its cap and escalate with zero fresh
+        # laps. remediation itself is never reset as a STAGE here: its own rebuild placement
+        # (r_remediation) always re-executes on the way through regardless of stage-skip status,
+        # this just ensures it starts clean when it does.
+        if rewind_rebuild_state is None:
+            rewind_rebuild_state = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
+        rewind_rebuild_state[REBUILD_FOR_REMEDIATION.key] = rebuild.default_rebuild_state()
+        rewind_rebuild_state[REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key] = rebuild.default_rebuild_state()
+        e2e_reset_attempts += 1
+        logger.warning(
+            "intake_node: ran reset-e2e for thread_id=%s (attempt %d/%d)",
+            thread_id, e2e_reset_attempts, workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS,
+        )
 
     if not raw_requirements_text.strip():
         # Textless run (no new submission): hydration may have restored an already-approved
@@ -2993,8 +3053,10 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         "provider": provider,
         "e2e": e2e_state,
         "targeted_fix_attempts": targeted_fix_attempts,
-        # Only present when a rewind actually reset a placement -- omitted otherwise so an
-        # ordinary intake call leaves this channel untouched, same as before this existed.
+        "e2e_reset_attempts": e2e_reset_attempts,
+        # Only present when a rewind or a reset-e2e actually reset a placement's sub-state --
+        # omitted otherwise so an ordinary intake call leaves this channel untouched, same as
+        # before this existed.
         **({"rebuild": rewind_rebuild_state} if rewind_rebuild_state is not None else {}),
     }
 
@@ -3283,15 +3345,21 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
                 ),
                 label=f"{stage_spec.key}:draft",
             )
-        except (TimeoutError, RuntimeError) as exc:
+        except (TimeoutError, RuntimeError, ValidationError, ValueError) as exc:
             # A Copilot session failure (quota, 429, stream hiccup) that survived infra_retry's own
-            # backoff attempts. This must NOT consume cycle_count -- that budget bounds genuine
-            # "not good enough yet" clarification attempts, and charging an infra outage against it
-            # would just move the same "run dies for an infra reason" failure a few laps later while
-            # shrinking the budget available for real fixes. There is also no new draft content to
-            # hand an audit/verify step, so this cannot fall through to the stage's normal routing
-            # the way a not-ready draft does -- it takes its own dedicated escalate edge instead
-            # (see make_route_after_draft / _wire_stage's draft_escalate wiring).
+            # backoff attempts, OR a response that came back truncated/malformed enough that
+            # ainvoke_structured's own retries never produced parseable JSON (ValidationError/
+            # ValueError -- observed live, session f0fef8ba: "EOF while parsing an object" on the
+            # model's own structured output, previously uncaught here and crashing the whole
+            # run_headless.py process outright, unlike make_audit_node's identical two-exception
+            # split which already treats this same failure mode as infra, not a content problem).
+            # This must NOT consume cycle_count -- that budget bounds genuine "not good enough yet"
+            # clarification attempts, and charging an infra outage against it would just move the
+            # same "run dies for an infra reason" failure a few laps later while shrinking the
+            # budget available for real fixes. There is also no new draft content to hand an
+            # audit/verify step, so this cannot fall through to the stage's normal routing the way
+            # a not-ready draft does -- it takes its own dedicated escalate edge instead (see
+            # make_route_after_draft / _wire_stage's draft_escalate wiring).
             logger.warning("draft infra-exhausted for stage %s -- escalating without consuming cycle_count", stage_spec.key, exc_info=exc)
             stages = {key: dict(value) for key, value in state["stages"].items()}
             stages[stage_spec.key]["infra_exhausted"] = True
@@ -3807,6 +3875,90 @@ def _demo_targeted_fix_stuck_decision() -> None:
     assert _targeted_fix_stuck_decision(reasons, fingerprint, 2) == (True, True)
     # Different reasons than what's fingerprinted -- real progress was made, never stuck.
     assert _targeted_fix_stuck_decision(["a new, different finding"], fingerprint, 2) == (False, False)
+
+
+def _demo_reset_e2e_lever() -> None:
+    """Self-check for intake_node's reset-e2e handling (Fix 3): exercises the SAME functions and
+    module constants that block calls -- _reset_stage_status_fields, _reset_stage_mechanics,
+    e2e_nodes.default_e2e_state(), rebuild.default_rebuild_state(), REBUILD_FOR_REMEDIATION,
+    REBUILD_FOR_ADVERSARIAL_COMPLIANCE -- against a synthetic dirtied state, mirroring
+    _demo_targeted_fix_stuck_decision's shape. Does not invoke the full async intake_node itself:
+    that function has no isolated test harness anywhere in this file (its own tested seams are
+    exactly these extracted pure helpers), and stubbing its session_store/sandbox_registry/
+    tech_stack_signals dependencies would be new scaffolding this repo doesn't use elsewhere."""
+    # e2e: a fired reset must discard the WHOLE sub-state via default_e2e_state(), not just zero
+    # "attempt" the way every ordinary intake call does -- Fix 2's proven_* launch cache is exactly
+    # the kind of carryover this lever exists to clear.
+    dirty_e2e = dict(e2e_nodes.default_e2e_state())
+    dirty_e2e["attempt"] = 4
+    dirty_e2e["proven_start_command"] = "npm run dev"
+    dirty_e2e["proven_port"] = 3000
+    dirty_e2e["proven_routes"] = ["/"]
+    reset_e2e_state = dict(e2e_nodes.default_e2e_state())
+    reset_e2e_state["attempt"] = 0
+    assert reset_e2e_state != dirty_e2e, "sanity: the dirtied fixture must actually differ from a fresh reset"
+    assert reset_e2e_state["proven_start_command"] is None
+    assert reset_e2e_state["proven_port"] is None
+    assert reset_e2e_state["proven_routes"] == []
+    assert reset_e2e_state["attempt"] == 0
+
+    # Stages: metrics-exit/adversarial-compliance lose status/mechanics but keep approved_content
+    # (same contract every other _reset_stage_status_fields/_reset_stage_mechanics caller gets);
+    # remediation itself is a STAGE this lever never touches -- only its rebuild placement's own
+    # sub-state resets (checked separately below).
+    stages = {
+        "metrics-exit": {
+            "status": "approved", "approved_content": {"merge_ready": True}, "cycle_count": 2,
+            "verify_cycle_count": 3, "readiness": True, "clarifying_questions": ["x"],
+        },
+        "adversarial-compliance": {
+            "status": "approved", "approved_content": {"verdict": "pass"}, "cycle_count": 1,
+            "verify_cycle_count": 1, "readiness": True, "clarifying_questions": [],
+        },
+        "remediation": {
+            "status": "approved", "approved_content": {"fixed": True}, "cycle_count": 0,
+            "verify_cycle_count": 0, "readiness": True, "clarifying_questions": [],
+        },
+    }
+    remediation_before = dict(stages["remediation"])
+    for stale_key in ("metrics-exit", "adversarial-compliance"):
+        _reset_stage_status_fields(stages[stale_key])
+        _reset_stage_mechanics(stages[stale_key])
+    assert stages["metrics-exit"]["status"] == "not_started"
+    assert stages["metrics-exit"]["approved_content"] == {"merge_ready": True}, (
+        "approved_content must survive a reset (diagram_gate's verbatim-carryover exemption)"
+    )
+    assert stages["metrics-exit"]["verify_cycle_count"] == 0
+    assert stages["adversarial-compliance"]["status"] == "not_started"
+    assert stages["adversarial-compliance"]["approved_content"] == {"verdict": "pass"}
+    assert stages["remediation"] == remediation_before, (
+        "remediation's own StageSpec must stay untouched -- reset-e2e only clears its rebuild "
+        "placement's sub-state, never redrafts the stage itself"
+    )
+
+    # Rebuild placements: only r_remediation and r_adversarial_compliance reset; an unrelated
+    # placement (e.g. ac-to-tests's own) must survive completely untouched.
+    dirty_rebuild_entry = {**rebuild.default_rebuild_state(), "status": "fixing", "fix_cycle_count": 3}
+    rebuild_state = {
+        REBUILD_FOR_REMEDIATION.key: dict(dirty_rebuild_entry),
+        REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key: dict(dirty_rebuild_entry),
+        "r_ac_to_tests": dict(dirty_rebuild_entry),
+    }
+    rebuild_state[REBUILD_FOR_REMEDIATION.key] = rebuild.default_rebuild_state()
+    rebuild_state[REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key] = rebuild.default_rebuild_state()
+    assert rebuild_state[REBUILD_FOR_REMEDIATION.key] == rebuild.default_rebuild_state()
+    assert rebuild_state[REBUILD_FOR_ADVERSARIAL_COMPLIANCE.key] == rebuild.default_rebuild_state()
+    assert rebuild_state["r_ac_to_tests"] == dirty_rebuild_entry, "an unrelated placement must never reset"
+
+    # Attempt cap: the exact `attempts >= AIDW_E2E_RESET_MAX_ATTEMPTS` comparison both
+    # intake_node's own guard and sessions_api.py's reset-e2e handler make, over representative
+    # attempts counts.
+    cap = workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS
+    assert cap >= 1, "a cap of 0 would refuse even a first-ever attempt"
+    assert (0 >= cap) is False, "a fresh thread (0 attempts used) must be allowed"
+    assert ((cap - 1) >= cap) is False, "one below the cap must still be allowed"
+    assert (cap >= cap) is True, "exactly at the cap must be refused"
+    assert ((cap + 1) >= cap) is True, "already over the cap must stay refused"
 
 
 def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
@@ -6842,6 +6994,7 @@ def _demo() -> None:
 
     _demo_open_audit_findings()
     _demo_targeted_fix_stuck_decision()
+    _demo_reset_e2e_lever()
 
     print("graph self-check: all assertions passed")
 
