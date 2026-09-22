@@ -1136,6 +1136,17 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         start_command = _with_port_env(
             _scanned_launch_command(app), port, str(app.get("runtime") or "")
         )
+    # `port` can differ from `requested_port` (a cache hit or a GHCP report naming a different one),
+    # so it must join `reserved_ports` too -- otherwise a supporting service picked below could be
+    # handed this exact port before the app binds it.
+    reserved_ports.add(port)
+    # Captured BEFORE the api_env/AIDW_TEST_AUTH prefixes below mutate `start_command` further:
+    # those prefixes embed THIS LAP's freshly-chosen service port/seam flag, so caching the
+    # decorated string would replay a stale `export API_URL=...` on a future cache-hit lap ahead of
+    # that lap's own freshly-prefixed one -- shell exports run left-to-right, so the stale value
+    # would silently win while the app still boots "ready" against the wrong backend. The cache
+    # only ever needs the base, port-bound command; every lap re-applies its own prefixes on top.
+    base_start_command = start_command
 
     # Hoisted from the screenshot section below (this is its only other consumer): needed earlier
     # now that the connectivity preflight probes the same base route before the suite runs.
@@ -1352,8 +1363,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         # works -- whether it came from a fresh GHCP proving turn or the scanned-candidate
         # fallback above, either way it earns the cache. `routes` is the widened list (spec-mined
         # routes unioned in above), not the raw `launch.routes`, so a cache-hit lap restores the
-        # same targeting a fresh discovery lap would have produced.
-        _cache_proven_launch(e2e, start_command, port, routes, list(launch.api_routes or []))
+        # same targeting a fresh discovery lap would have produced. `base_start_command`, NOT
+        # `start_command`: the latter is decorated with THIS LAP's own api_env/AIDW_TEST_AUTH
+        # prefixes by now, and caching that would replay a stale service-url export ahead of a
+        # future lap's freshly-prefixed one (see the comment where base_start_command is captured).
+        _cache_proven_launch(e2e, base_start_command, port, routes, list(launch.api_routes or []))
 
     if not ready:
         if used_proven_launch:
@@ -2025,7 +2039,7 @@ def _synthesized_launch_from_cache(e2e: dict[str, Any], fallback_port: int) -> A
     """
     return AppLaunchReport(
         success=True,
-        start_command=str(e2e.get("proven_start_command")),
+        start_command=e2e.get("proven_start_command") or "",
         port=int(e2e.get("proven_port") or fallback_port),
         routes=list(e2e.get("proven_routes") or []),
         api_routes=list(e2e.get("proven_api_routes") or []),
@@ -2368,6 +2382,28 @@ def _demo() -> None:
         assert launch.port == 3101, "must restore the cached port, not the fallback"
         assert launch.routes == ["/", "/expenses"]
         assert launch.api_routes == ["/api/expenses"]
+
+        # Regression guard for the production bug this fix addresses: the cache must hold the
+        # BASE (undecorated) start_command, never the api_env/AIDW_TEST_AUTH-prefixed string a lap
+        # actually boots with -- caching the decorated form would let a stale, previous-lap service
+        # URL survive under a future lap's own freshly-prefixed export (shell exports run
+        # left-to-right, so the STALE one would silently win while the app still boots "ready").
+        base_cmd = "cd apps/web && npm run dev"
+        base_cache = default_e2e_state()
+        _cache_proven_launch(base_cache, base_cmd, 3000, ["/"], [])
+        assert base_cache["proven_start_command"] == base_cmd, "cache must hold the base command"
+        assert "export" not in base_cache["proven_start_command"], (
+            "a decorated command must never reach the cache"
+        )
+        # Two laps, two different freshly-chosen service ports, decorating the SAME restored base
+        # command: each lap's own prefix wins outright, no earlier lap's export lingers underneath.
+        restored = _synthesized_launch_from_cache(base_cache, fallback_port=3000).start_command
+        assert restored == base_cmd, "a cache-hit lap must restore the base command, not a decorated one"
+        lap1_decorated = f"export API_URL={shlex.quote('http://127.0.0.1:5150')}; {restored}"
+        lap2_decorated = f"export API_URL={shlex.quote('http://127.0.0.1:5151')}; {restored}"
+        assert lap1_decorated.count("export API_URL") == 1
+        assert lap2_decorated.count("export API_URL") == 1
+        assert lap1_decorated != lap2_decorated, "each lap's own service port must actually take effect"
 
         # Operator kill-switch: AIDW_E2E_REUSE_PROVEN_LAUNCH=0 disables reuse even with a cache hit.
         workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = False
