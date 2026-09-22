@@ -295,6 +295,17 @@ E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS = tuple(
 # ladder above on a cold render) and the number of screenshots in the exit report.
 E2E_ROUTES_MAX = int(os.environ.get("AIDW_E2E_ROUTES_MAX", "12"))
 
+# e2e_nodes.py's full-suite screenshot harvest: caps how many `find`-matched PNGs get folded into
+# the single batched mkdir+cp script handed to exec_in_sandbox in one shell string. That script is
+# built entirely in Python then passed through to `docker exec` via asyncio's subprocess_exec, whose
+# argv on this repo's Windows dev host is capped by CreateProcess's ~32767-char command-line limit;
+# at a realistic ~175 chars per `cp` line that ceiling lands around 185 files, plausibly hit by a
+# large suite with retries (Playwright can emit multiple PNGs per failed test). Raising this risks
+# re-hitting that ceiling (an uncaught OSError crashing the node, worse than the old one-exec-per-
+# file loop this batching replaced); lowering it just harvests fewer of the suite's own screenshots
+# -- the always-taken per-route screenshots (E2E_ROUTES_MAX) are unaffected either way.
+E2E_SCREENSHOT_COPY_MAX_FILES = int(os.environ.get("AIDW_E2E_SCREENSHOT_COPY_MAX_FILES", "100"))
+
 # e2e_nodes.py's per-route screenshot/lighthouse failure log lines (logger.warning only, never
 # reach a model) -- how much of that one command's own stdout to include in the log message.
 E2E_SCREENSHOT_STDOUT_TAIL_CHARS = int(os.environ.get("AIDW_E2E_SCREENSHOT_STDOUT_TAIL_CHARS", "500"))

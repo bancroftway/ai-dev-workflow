@@ -1370,6 +1370,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         _cache_proven_launch(e2e, base_start_command, port, routes, list(launch.api_routes or []))
 
     if not ready:
+        cache_note = ""
         if used_proven_launch:
             # RULING: no same-lap retry against a fresh discovery turn -- port selection and the
             # supporting-services boot loop above already baked in requested_port/WEB_ORIGIN
@@ -1377,6 +1378,14 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             # the NEXT e2e_fix -> e2e_run lap redoes full discovery instead of retrying the same
             # bad command -- self-heals within one extra lap rather than looping forever.
             _clear_proven_launch(e2e)
+            # Told to the fix model below, not just logged: without this, "app never answered"
+            # reads identically to a fresh-discovery boot failure and burns a real fix-cycle
+            # (E2E_MAX_FIX_CYCLES is capped) diagnosing what may just be a stale cache that
+            # self-corrects next lap via the fresh discovery the line above just triggered.
+            cache_note = (
+                " (this boot reused a cached launch command from an earlier lap; that cache has "
+                "just been cleared, so the next attempt will re-discover the launch command fresh)"
+            )
         log_tail = truncate_middle(
             await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
             workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
@@ -1398,7 +1407,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             status="failed", total=0, passed=0, screenshots=[],
             failed_tests=[{
                 "title": "app readiness",
-                "error": f"app never answered on port {port} within {workflow_config.E2E_APP_READY_TIMEOUT_SECONDS}s -- log tail:\n{log_tail}{hint}",
+                "error": f"app never answered on port {port} within {workflow_config.E2E_APP_READY_TIMEOUT_SECONDS}s{cache_note} -- log tail:\n{log_tail}{hint}",
             }],
         )
         return await _finalize_run(provider, thread_id, e2e)
@@ -1497,7 +1506,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     find_result = await provider.exec_in_sandbox(
         thread_id, f"find {shlex.quote(results_root)} -name '*.png' -print0 2>/dev/null"
     )
-    found_paths = [p for p in (find_result.stdout or "").split("\x00") if p]
+    # Capped the same way routes[:E2E_ROUTES_MAX] already truncates elsewhere in this file -- an
+    # uncapped match count here would fold one `cp` line per file into a single script string, and
+    # on this repo's Windows dev host that string ultimately becomes a `docker exec` argv subject to
+    # CreateProcess's ~32767-char limit (see E2E_SCREENSHOT_COPY_MAX_FILES's own comment).
+    found_paths = [p for p in (find_result.stdout or "").split("\x00") if p][:workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES]
     script = _build_screenshot_copy_script(screens_dir, found_paths)
     screenshots = [f"{screens_dir}/{suite_screenshot_name(i, p)}" for i, p in enumerate(found_paths, start=1)]
     await provider.exec_in_sandbox(thread_id, script)
@@ -2398,6 +2411,17 @@ def _demo() -> None:
     # Empty input -> just mkdir, no cp commands.
     empty_script = _build_screenshot_copy_script("/out/screens", [])
     assert empty_script == "mkdir -p /out/screens", f"empty paths should yield just mkdir, got: {empty_script}"
+
+    # Regression guard: e2e_run_node slices found_paths to E2E_SCREENSHOT_COPY_MAX_FILES BEFORE
+    # building the batched script, the same routes[:E2E_ROUTES_MAX] pattern used elsewhere in this
+    # file, so an oversized suite can never fold an unbounded number of `cp` lines into one script
+    # string (see that config constant's own comment for the CreateProcess argv limit this avoids).
+    oversized = [f"/results/spec-{i}/test-finished-1.png" for i in range(workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES + 20)]
+    capped = oversized[:workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES]
+    capped_script = _build_screenshot_copy_script("/out/screens", capped)
+    assert len(capped_script.split("\n")) == workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES + 1, (
+        "capped input must yield exactly mkdir + E2E_SCREENSHOT_COPY_MAX_FILES cp lines"
+    )
 
     # Proven-launch cache (skip-decision logic for e2e_run_node's GHCP proving turn). Flip the
     # module flag directly, same as any other AIDW_-style toggle in this file -- restored in a
