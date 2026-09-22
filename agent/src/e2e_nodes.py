@@ -1433,18 +1433,20 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
 
     # Screenshot harvest. Filenames derive from repo-controlled test titles -- a real shell
     # metacharacter injection risk -- so `find`'s raw output is NEVER re-interpolated into another
-    # sh -c string. Each path is instead individually shlex-quoted from Python and used in its own
-    # exec, which gives the same safety `find -print0 | xargs -0` would inside one shell pipeline.
+    # sh -c string. Each path is instead individually shlex-quoted from Python, and the mkdir +
+    # all cp commands are sent as one batched multi-line script, which gives the same safety
+    # `find -print0 | xargs -0` would inside one shell pipeline.
     find_result = await provider.exec_in_sandbox(
         thread_id, f"find {shlex.quote(results_root)} -name '*.png' -print0 2>/dev/null"
     )
     found_paths = [p for p in (find_result.stdout or "").split("\x00") if p]
     screenshots: list[str] = []
-    await provider.exec_in_sandbox(thread_id, f"mkdir -p {shlex.quote(screens_dir)}")
+    script_lines = [f"mkdir -p {shlex.quote(screens_dir)}"]
     for index, path in enumerate(found_paths, start=1):
         dest = f"{screens_dir}/{suite_screenshot_name(index, path)}"
-        await provider.exec_in_sandbox(thread_id, f"cp -- {shlex.quote(path)} {shlex.quote(dest)}")
+        script_lines.append(f"cp -- {shlex.quote(path)} {shlex.quote(dest)}")
         screenshots.append(dest)
+    await provider.exec_in_sandbox(thread_id, "\n".join(script_lines))
 
     # Per-route screenshots, ALWAYS taken (not just as a fallback). Two reasons: playwright's
     # default screenshot config is only-on-failure, so a green suite harvests nothing; and a suite's
@@ -1947,6 +1949,24 @@ _iter_specs = test_results._iter_specs
 _parse_playwright_json = test_results.parse_playwright_json
 
 
+def _build_screenshot_copy_script(screens_dir: str, found_paths: list[str]) -> str:
+    """Build a multi-line shell script for mkdir + all screenshot copies.
+
+    Args:
+        screens_dir: Destination directory (will be created).
+        found_paths: List of source screenshot paths.
+
+    Returns:
+        Multi-line shell script with mkdir -p and cp commands, newline-separated,
+        with per-path shlex.quote() to prevent shell injection.
+    """
+    script_lines = [f"mkdir -p {shlex.quote(screens_dir)}"]
+    for index, path in enumerate(found_paths, start=1):
+        dest = f"{screens_dir}/{suite_screenshot_name(index, path)}"
+        script_lines.append(f"cp -- {shlex.quote(path)} {shlex.quote(dest)}")
+    return "\n".join(script_lines)
+
+
 def _demo() -> None:
     """Self-check for the pure half: `uv run python -m src.e2e_nodes`."""
     sample = {
@@ -2217,6 +2237,23 @@ def _demo() -> None:
     assert _extract_route_from_goto("page.goto(baseUrl)") is None, "no quoted argument at all"
     assert _extract_route_from_goto("page.goto('https://example.com')") is None, "not a relative path"
     assert _extract_route_from_goto("locator.goto(1)") is None
+
+    # Screenshot copy script batching: build one multi-line shell script (mkdir + all cp commands)
+    # instead of many exec_in_sandbox calls. Paths are individually shlex-quoted to prevent
+    # injection from repo-controlled test titles.
+    script = _build_screenshot_copy_script("/out/screens", [
+        "/results/spec-US_0001_1-abc/test-finished-1.png",
+        "/results/spec-US_0002_2-def/test-finished-1.png",
+    ])
+    lines = script.split("\n")
+    assert lines[0] == "mkdir -p /out/screens", f"mkdir must be first, got: {lines[0]}"
+    assert len(lines) == 3, f"should have mkdir + 2 cp commands, got {len(lines)} lines"
+    # Each cp must quote both src and dest, and use -- to stop flag parsing.
+    assert all("cp --" in line for line in lines[1:]), "all cp lines must have '--' separator"
+    assert all(shlex.quote("/results/") in line for line in lines[1:]), "quoted paths must survive"
+    # Empty input -> just mkdir, no cp commands.
+    empty_script = _build_screenshot_copy_script("/out/screens", [])
+    assert empty_script == "mkdir -p /out/screens", f"empty paths should yield just mkdir, got: {empty_script}"
 
     print("e2e_nodes self-check: ok")
 
