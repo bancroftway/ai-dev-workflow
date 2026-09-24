@@ -118,6 +118,23 @@ E2E_MAX_FIX_CYCLES = int(os.environ.get("E2E_MAX_FIX_CYCLES", "8"))
 TEST_HARDENING_MAX_FIX_CYCLES = int(os.environ.get("TEST_HARDENING_MAX_FIX_CYCLES", "4"))
 E2E_APP_READY_TIMEOUT_SECONDS = int(os.environ.get("E2E_APP_READY_TIMEOUT_SECONDS", "120"))
 E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "1200"))
+# e2e_nodes.py's full-suite verification run (`npx playwright test`, no batching -- that's the
+# fix-agent's OWN internal loop, not this final gate check): caps Playwright's own `--workers` flag,
+# overriding whatever the generated `playwright.config.ts` specifies, regardless of host CPU count
+# (Playwright's own default is roughly half the visible cores, which is fine on a bare host but pits
+# N concurrent Chrome instances against the SAME dev server this run also started, inside a sandbox
+# whose Docker Desktop VM may have far less RAM than the host advertises). Observed live (run
+# f0fef8ba): the dev server crashed mid-suite (`ERR_CONNECTION_REFUSED` for the back half of a
+# 71-test run) with the container already at 66% of a 9.5GB VM ceiling before the run even peaked --
+# a wall of misleading failures the e2e_fix prompt's own docstring already names ("a server that
+# dies partway through... looks like many different bugs but is really one dead process"), except
+# no app-code fix can address it since the concurrency causing it is THIS invocation's, not the
+# app's. Raising this trades a faster suite for higher peak memory; 1 is safest, higher values need
+# more Docker Desktop memory headroom than a typical dev machine allocates by default. Confirmed
+# live on the same run: 2 workers still let the dev server die mid-suite (23
+# ERR_CONNECTION_REFUSED failures out of 67) -- only fully serialized (1) removes the concurrent-
+# Chrome-instance pressure entirely; raise this only on a machine with meaningfully more headroom.
+AIDW_E2E_PLAYWRIGHT_WORKERS = int(os.environ.get("AIDW_E2E_PLAYWRIGHT_WORKERS", "1"))
 # Operator kill-switch for e2e_run_node's proven-launch cache: when a previous fix-cycle lap this
 # stage attempt already booted a start_command/port pair and confirmed it answers, on by default
 # this skips the paid GHCP launch-discovery turn on the next lap and reboots straight from the

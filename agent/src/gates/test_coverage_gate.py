@@ -941,7 +941,7 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
         count_tests_per_ac,
         depth_shortfalls,
     )
-    from .test_quality_checks import non_testid_locators
+    from .test_quality_checks import flaky_navigation_waits, non_testid_locators
     from ..spec_ledger import load_ledger
 
     entries = await load_ledger(provider, thread_id)
@@ -986,7 +986,12 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
     # for the live incident (a bare `input`/`getByRole` locator matching a Next.js Server Action's
     # own hidden field instead of the real one).
     testid_violations = non_testid_locators(test_files)
-    if not shortfalls and not testid_violations:
+    # waitForNavigation()/networkidle anti-pattern (2026-09-23): enforced here too, same reasoning
+    # as the testid convention just above -- minimal-code-to-green can add/edit e2e specs, and a
+    # violation introduced here is the same real defect as one introduced at ac-to-tests or
+    # e2e-fix. See flaky_navigation_waits' own docstring for the live incident.
+    nav_wait_violations = flaky_navigation_waits(test_files)
+    if not shortfalls and not testid_violations and not nav_wait_violations:
         return None
     detail = "; ".join(f"{ac}: {' and '.join(problems)}" for ac, problems in sorted(shortfalls.items()))
     testid_detail = "; ".join(
@@ -1000,13 +1005,26 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
         if testid_violations
         else ""
     )
+    nav_wait_detail = "; ".join(
+        f"{path}: {', '.join(snippets[:3])}" + (f" (+{len(snippets) - 3} more)" if len(snippets) > 3 else "")
+        for path, snippets in sorted(nav_wait_violations.items())
+    )
+    nav_wait_paragraph = (
+        f"\n\nThese e2e spec(s) use waitForNavigation() or a networkidle wait condition, which can "
+        f"race a multi-hop redirect or never resolve: {nav_wait_detail} -- replace with a "
+        f"locator-based assertion, e.g. expect(locator).toBeVisible()."
+        if nav_wait_violations
+        else ""
+    )
     report = {"ac_depth_shortfalls": {ac: problems for ac, problems in sorted(shortfalls.items())}}
     if testid_violations:
         report["testid_violations"] = testid_violations
+    if nav_wait_violations:
+        report["nav_wait_violations"] = nav_wait_violations
     if not shortfalls:
         return (
-            "Coverage meets the threshold, and per-AC test depth is fine, but the e2e locator "
-            f"convention is violated." + testid_paragraph,
+            "Coverage meets the threshold, and per-AC test depth is fine, but the e2e spec "
+            "convention(s) above are violated." + testid_paragraph + nav_wait_paragraph,
             report,
         )
     return (
@@ -1016,7 +1034,7 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
         "A high coverage percentage does not mean each criterion is proven: one integration test "
         "through a small app can colour in every line while most criteria are only ever exercised "
         "through Playwright. Add the missing unit/integration tests -- do not weaken existing "
-        "tests, and do not add browser tests to satisfy this." + testid_paragraph,
+        "tests, and do not add browser tests to satisfy this." + testid_paragraph + nav_wait_paragraph,
         report,
     )
 

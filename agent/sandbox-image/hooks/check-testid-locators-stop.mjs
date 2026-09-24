@@ -1,10 +1,13 @@
 #!/usr/bin/env node
-// Stop hook: rejects a Playwright locator that queries by role/text/label/tag/CSS instead of
-// data-testid, in the SAME turn that wrote it, instead of waiting a full redraft/fix round-trip
-// for the deterministic gate that already enforces this (ac_coverage_gate.py's
-// check_ac_coverage, test_coverage_gate.py's check_ac_depth, or e2e_nodes.py's e2e_run_node --
-// all three call the SAME gates/test_quality_checks.non_testid_locators this hook shells out to)
-// to report the same thing.
+// Stop hook: rejects two live-incident e2e-spec anti-patterns in the SAME turn that wrote them,
+// instead of waiting a full redraft/fix round-trip for the deterministic gates that already
+// enforce both (ac_coverage_gate.py's check_ac_coverage, test_coverage_gate.py's check_ac_depth,
+// and e2e_nodes.py's e2e_run_node -- all three call the SAME
+// gates/test_quality_checks.non_testid_locators/flaky_navigation_waits this hook shells out to)
+// to report the same thing:
+//
+//   1. a Playwright locator that queries by role/text/label/tag/CSS instead of data-testid
+//   2. a waitForNavigation()/networkidle wait that races a multi-hop redirect
 //
 // Root-caused 2026-09-21 (income-investor session f0fef8ba, run c1458b23): once e2e finally ran
 // for real (a separate platform fix, same day), it hit a wall of failures that were not app bugs
@@ -19,6 +22,13 @@
 // using Testing Library's role/label queries -- a real accessibility check at THAT layer, not a
 // liability -- see non_testid_locators' own docstring for why the rule is scoped to 'e2e' files
 // only).
+//
+// Root-caused 2026-09-23 (income-investor commit fd6c91a, thread f0fef8ba): a shared signIn()
+// test helper used Promise.all([page.waitForNavigation({ waitUntil: "networkidle" }),
+// page.getByTestId(...).click()]) to wait out a multi-hop auth redirect. waitForNavigation() can
+// resolve on the WRONG intermediate hop, and networkidle is not guaranteed to ever fire -- once
+// this raced inside a helper every test in the spec calls, it regressed the whole suite (67/74
+// passing -> 30/75), not just the sign-in test. See flaky_navigation_waits' own docstring.
 //
 // WHY A PYTHON SUBPROCESS, NOT A JS PORT: same reasoning as every other same-turn hook in this
 // image (check-test-quality-stop.mjs, check-coverage-stop.mjs) -- gates/test_quality_checks.py is
@@ -101,22 +111,44 @@ try {
   process.exit(0);
 }
 
-const violations = result.non_testid_locators || {};
-const paths = Object.keys(violations).sort();
-if (paths.length === 0) process.exit(0);
+// Two independent checks, one subprocess call, one JSON payload -- reported as separate
+// paragraphs so a model fixing one doesn't read the other's file list as still-outstanding work.
+function describe(violations, limit = 3) {
+  const paths = Object.keys(violations).sort();
+  if (paths.length === 0) return null;
+  return (
+    paths
+      .slice(0, 6)
+      .map((p) => `${p}: ${violations[p].slice(0, limit).join(", ")}`)
+      .join("\n  - ") + (paths.length > 6 ? `\n  - and ${paths.length - 6} more file(s)` : "")
+  );
+}
 
-const named = paths
-  .slice(0, 6)
-  .map((p) => `${p}: ${violations[p].slice(0, 3).join(", ")}`)
-  .join("\n  - ") + (paths.length > 6 ? `\n  - and ${paths.length - 6} more file(s)` : "");
+const testidNamed = describe(result.non_testid_locators || {});
+const navWaitNamed = describe(result.flaky_navigation_waits || {});
+if (!testidNamed && !navWaitNamed) process.exit(0);
 
-process.stderr.write(
-  "These e2e spec(s) locate elements by role/text/label/tag instead of data-testid -- close this " +
+let message = "";
+if (testidNamed) {
+  message +=
+    "These e2e spec(s) locate elements by role/text/label/tag instead of data-testid -- close this " +
     "now, in this same turn, before finishing. A generic locator can silently match a " +
     "framework-injected element instead of the real one (a Next.js Server Action's own hidden " +
     "<input name=\"$ACTION_ID_...\"> is the live incident this rule exists for); use " +
     "page.getByTestId('...') only, adding a data-testid to the real element if it doesn't have " +
     "one yet:\n" +
-    `  - ${named}\n`,
-);
+    `  - ${testidNamed}\n`;
+}
+if (navWaitNamed) {
+  message +=
+    "These e2e spec(s) use waitForNavigation() or a networkidle wait condition -- close this now, " +
+    "in this same turn, before finishing. waitForNavigation() can resolve on the wrong hop of a " +
+    "multi-hop redirect and networkidle is not guaranteed to ever fire (a shared signIn() helper " +
+    "racing an auth redirect regressed a whole e2e suite this way -- 67/74 passing to 30/75); " +
+    "replace with a locator-based assertion instead, e.g. " +
+    "expect(page.getByTestId('...')).toBeVisible(), which auto-retries regardless of how many " +
+    "redirects happen first:\n" +
+    `  - ${navWaitNamed}\n`;
+}
+process.stderr.write(message);
 process.exit(2);

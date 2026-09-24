@@ -18,7 +18,8 @@ its own self-check is the proof this extraction changed no behavior.
 CLI mode (`python3 test_quality_checks.py`, stdin: JSON `{"path": "contents", ...}`, stdout: JSON
 `{"absence_only": [label, ...], "fiat_stubs": [label, ...], "duplicates": [[dup_label, orig_label],
 ...], "ac_depth": {ac_id: {"non_e2e_count": int, "shortfalls": [str, ...]}, ...},
-"non_testid_locators": {path: [snippet, ...], ...}}`) is what the Stop hook actually invokes. `absence_only`/`fiat_stubs` are unscoped by Acceptance Criterion on
+"non_testid_locators": {path: [snippet, ...], ...},
+"flaky_navigation_waits": {path: [snippet, ...], ...}}`) is what the Stop hook actually invokes. `absence_only`/`fiat_stubs` are unscoped by Acceptance Criterion on
 purpose (the hook has no ledger to attribute tests to; a bad test is a bad test whichever criterion
 it claims), unlike `ac_coverage_gate.py`'s own per-AC callers which filter `_iter_tests`' output
 down to one AC's own tests via `_tests_for_ac`. `duplicates` is NOT unscoped this same way -- see
@@ -348,6 +349,22 @@ _LOCATOR_METHOD_RE = re.compile(
 # a real escape hatch around the convention if left unflagged.
 _DOLLAR_LOCATOR_RE = re.compile(r"\.\${1,2}\s*\(")
 
+# waitForNavigation()/networkidle anti-pattern (2026-09-23, income-investor commit fd6c91a, thread
+# f0fef8ba): a shared `signIn()` test helper used `Promise.all([page.waitForNavigation({ waitUntil:
+# "networkidle" }), page.getByTestId(...).click()])` to wait out a multi-hop auth redirect (POST ->
+# callback -> home). `waitForNavigation()` can resolve on the WRONG intermediate hop of a
+# multi-hop redirect, and `networkidle` is not guaranteed to ever fire -- Playwright's own docs
+# discourage both, recommending a locator-based assertion instead. Because `signIn()` was called by
+# every test in the spec, this one helper's flakiness regressed the WHOLE suite (67/74 passing ->
+# 30/75), including tests that had nothing to do with sign-in. `expect(locator).toBeVisible()`
+# auto-retries and is immune to how many redirects happen in between -- that's the replacement this
+# rule steers toward. Two independent patterns, same as _LOCATOR_METHOD_RE/_DOLLAR_LOCATOR_RE
+# above: the risky API itself, and the risky wait condition used anywhere ELSE (a `waitForNavigation`
+# call's own "networkidle" option is already captured whole by the first pattern, so the second is
+# scoped to `waitForLoadState`/`goto` to avoid double-reporting one call as two violations).
+_NAV_WAIT_RE = re.compile(r"\.waitForNavigation\s*\([^)]*\)")
+_NETWORKIDLE_WAIT_RE = re.compile(r"\.(?:waitForLoadState|goto)\s*\([^)]*networkidle[^)]*\)")
+
 # GREEN phase (minimal-code-to-green, where the implementation exists and a unit test is a thing
 # that can actually be written) -- see ac_coverage_gate.py's own MIN_NON_E2E_TESTS_PER_AC/
 # MIN_NON_E2E_TESTS_PER_AC_RED comment for the full RED-vs-GREEN reasoning and the live incidents
@@ -440,6 +457,34 @@ def non_testid_locators(test_files: dict[str, str]) -> dict[str, list[str]]:
             found.append(match.group(0).strip()[:80])
         for match in _DOLLAR_LOCATOR_RE.finditer(contents):
             found.append(match.group(0).strip()[:80])
+        if found:
+            violations[path] = found
+    return violations
+
+
+def flaky_navigation_waits(test_files: dict[str, str]) -> dict[str, list[str]]:
+    """path -> [violating snippet, ...] for every `waitForNavigation()` call or `networkidle` wait
+    condition in each E2E-classified file. Pure.
+
+    Scoped to `classify_test_level(...) == "e2e"` files only, same reasoning and same classifier
+    call shape as `non_testid_locators` (a `resolved_root=None` call -- no caller here has one to
+    pass either): this is a browser-layer navigation-race pattern, not a claim about how a
+    unit/integration test awaits a promise.
+
+    Root-caused live (income-investor commit fd6c91a, thread f0fef8ba): see `_NAV_WAIT_RE`'s own
+    comment above for the incident. `waitForNavigation()` is inherently racy on a multi-hop
+    redirect (it can resolve on the wrong intermediate hop), and `networkidle` is not guaranteed to
+    ever fire; a shared test helper built on either is unreliable for every test that calls it, not
+    just one. `expect(locator).toBeVisible()` is the replacement: it auto-retries and needs no
+    knowledge of how many redirects happen first."""
+    violations: dict[str, list[str]] = {}
+    for path, contents in test_files.items():
+        if classify_test_level(path, contents) != "e2e":
+            continue
+        found: list[str] = []
+        for pattern in (_NAV_WAIT_RE, _NETWORKIDLE_WAIT_RE):
+            for match in pattern.finditer(contents):
+                found.append(match.group(0).strip()[:80])
         if found:
             violations[path] = found
     return violations
@@ -583,6 +628,9 @@ def run_all_checks(test_files: dict[str, str]) -> dict[str, object]:
         # introduced by any of the three is the same real defect. See non_testid_locators' own
         # docstring for the live incident this exists for.
         "non_testid_locators": non_testid_locators(test_files),
+        # Same reasoning, same three stages, same call shape -- see flaky_navigation_waits' own
+        # docstring for the live incident this exists for.
+        "flaky_navigation_waits": flaky_navigation_waits(test_files),
     }
 
 
@@ -745,6 +793,56 @@ def _demo() -> None:
 
     assert "non_testid_locators" in run_all_checks(one_unit_test), (
         "run_all_checks must surface non_testid_locators for the same-turn hook to read"
+    )
+
+    # flaky_navigation_waits: the live incident (a shared signIn() helper racing a multi-hop auth
+    # redirect via waitForNavigation()+networkidle) plus the standalone networkidle-elsewhere case.
+    bad_nav_e2e = {
+        "apps/web/e2e/portfolio.spec.ts": (
+            "test('[US-0001.1] sign in', async ({ page }) => {\n"
+            "  await Promise.all([\n"
+            "    page.waitForNavigation({ waitUntil: 'networkidle' }),\n"
+            "    page.getByTestId('submit').click(),\n"
+            "  ]);\n"
+            "});\n"
+        )
+    }
+    bad_nav_violations = flaky_navigation_waits(bad_nav_e2e)
+    assert "apps/web/e2e/portfolio.spec.ts" in bad_nav_violations, bad_nav_violations
+    assert len(bad_nav_violations["apps/web/e2e/portfolio.spec.ts"]) == 1, (
+        "one waitForNavigation(...) call, whole-call snippet, must be reported once -- not once "
+        "per pattern just because its own options happen to contain the word networkidle"
+    )
+
+    bad_goto_e2e = {
+        "apps/web/e2e/home.spec.ts": (
+            "test('[US-0002.1] loads home', async ({ page }) => {\n"
+            "  await page.goto('/', { waitUntil: 'networkidle' });\n"
+            "});\n"
+        )
+    }
+    assert "apps/web/e2e/home.spec.ts" in flaky_navigation_waits(bad_goto_e2e)
+
+    good_nav_e2e = {
+        "apps/web/e2e/portfolio.spec.ts": (
+            "test('[US-0001.1] sign in', async ({ page }) => {\n"
+            "  await page.getByTestId('submit').click();\n"
+            "  await expect(page.getByTestId('sign-out-button')).toBeVisible();\n"
+            "});\n"
+        )
+    }
+    assert flaky_navigation_waits(good_nav_e2e) == {}, flaky_navigation_waits(good_nav_e2e)
+
+    # Scoped to e2e files only, same as non_testid_locators.
+    unit_with_goto_lookalike = {
+        "src/lib/__tests__/router.test.ts": (
+            "test('[US-0002.1] navigates', () => { page.goto('/', { waitUntil: 'networkidle' }); });\n"
+        )
+    }
+    assert flaky_navigation_waits(unit_with_goto_lookalike) == {}
+
+    assert "flaky_navigation_waits" in run_all_checks(one_unit_test), (
+        "run_all_checks must surface flaky_navigation_waits for the same-turn hook to read"
     )
 
     print("test_quality_checks self-check: all assertions passed")

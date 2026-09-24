@@ -730,15 +730,31 @@ RUN printf '%s\n' \
 #     stage's redraft cycles on the same income-investor run were triggered by exactly this
 #     deterministic, non-LLM check finding a coverage shortfall the draft could have caught itself
 #     before ending its turn.
-#   - check-testid-locators-stop.mjs (2026-09-21): rejects a Playwright locator that queries an
-#     e2e spec by role/text/label/tag/CSS instead of data-testid, across THREE stages
-#     (ac-to-tests, minimal-code-to-green, e2e) -- by shelling out to the same
-#     gates/test_quality_checks.py already COPY'd in for check-test-quality-stop.mjs. Observed on
-#     the same income-investor run, the same day e2e finally ran for real: a bare
-#     `page.locator("input")` matched a Next.js Server Action's own hidden
-#     `<input name="$ACTION_ID_...">` instead of the real form field, and a
-#     `getByRole('button', { name: 'Save' })` missed on an accessible-name mismatch -- both wasted
-#     e2e-fix cycles on locator bugs, not app bugs.
+#   - check-testid-locators-stop.mjs (2026-09-21, extended 2026-09-23): rejects two e2e-spec
+#     anti-patterns, across the SAME three stages (ac-to-tests, minimal-code-to-green, e2e) -- by
+#     shelling out to the same gates/test_quality_checks.py already COPY'd in for
+#     check-test-quality-stop.mjs:
+#       1. a Playwright locator that queries by role/text/label/tag/CSS instead of data-testid.
+#          Observed on the same income-investor run, the same day e2e finally ran for real: a bare
+#          `page.locator("input")` matched a Next.js Server Action's own hidden
+#          `<input name="$ACTION_ID_...">` instead of the real form field, and a
+#          `getByRole('button', { name: 'Save' })` missed on an accessible-name mismatch -- both
+#          wasted e2e-fix cycles on locator bugs, not app bugs.
+#       2. a waitForNavigation()/networkidle wait, which can race a multi-hop redirect or never
+#          resolve. Observed on the same income-investor repo (commit fd6c91a): a shared signIn()
+#          test helper built on this pattern regressed the WHOLE e2e suite (67/74 passing -> 30/75)
+#          once the auth flow it waited on turned out to be a multi-hop redirect, since every test
+#          in the spec called the same broken helper.
+#   - check-quick-scan-stop.mjs (2026-09-23, user directive: catch a good portion of SAST/quality
+#     defects earlier, right at the end of mctg instead of waiting for remediation's own later
+#     stage): auto-applies formatting (ruff format/prettier -- 100% mechanical, never blocks) and
+#     runs bandit + eslint-security (blocked+reported, same posture as check-coverage-stop.mjs's
+#     own deterministic gap) -- in the minimal-code-to-green draft turn only. Reuses
+#     gates/quick_scan.py's BANDIT_COMMAND/ESLINT_SECURITY_COMMAND, which repo_scan.py's own
+#     TOOLS tuple imports directly for its full remediation-time scan -- ONE command definition,
+#     two callers, drift-guarded by quick_scan.py's own _demo(). Dead-code detection deliberately
+#     left out of v1 (no existing tool covers it, auto-removal risk is real) -- extend the same
+#     way this hook itself was added, if it shows up in practice.
 #
 # BOTH PROVIDERS (user directive, 2026-09-17): baked into BOTH Claude Code's admin-managed
 # settings path AND GitHub Copilot CLI's own config, confirmed live via real docker-exec
@@ -793,6 +809,14 @@ COPY hooks/check-coverage-stop.mjs /opt/aidw-hooks/check-coverage-stop.mjs
 # above, installed alongside ruff/mypy) -- everything else it needs is already baked in.
 COPY hooks/coverage_parsing.py /opt/aidw-hooks/coverage_parsing.py
 COPY hooks/check-testid-locators-stop.mjs /opt/aidw-hooks/check-testid-locators-stop.mjs
+COPY hooks/check-quick-scan-stop.mjs /opt/aidw-hooks/check-quick-scan-stop.mjs
+# Byte-identical staged copy of agent/src/gates/quick_scan.py -- same build-context constraint and
+# same drift-guard convention as test_quality_checks.py/coverage_parsing.py above (that module's
+# own _demo() asserts this file matches its source, AND that its two command strings match
+# repo_scan.py's own live ToolSpec.command for bandit/eslint-security, on every self-check run);
+# re-run `cp ../src/gates/quick_scan.py hooks/quick_scan.py` (from agent/sandbox-image) after
+# editing the source and before rebuilding. Needs nothing beyond python3's standard library.
+COPY hooks/quick_scan.py /opt/aidw-hooks/quick_scan.py
 COPY hooks/lib/ /opt/aidw-hooks/lib/
 COPY hooks/schemas/ /opt/aidw-hooks/schemas/
 RUN set -eux; \
@@ -810,7 +834,8 @@ RUN set -eux; \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs", "timeout": 300 } ] },' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs", "timeout": 30 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs", "timeout": 300 } ] }' \
       '    ]' \
       '  }' \
       '}' \
@@ -828,7 +853,8 @@ RUN set -eux; \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs" },' \
-      '      { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs" }' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs" }' \
       '    ]' \
       '  }' \
       '}' \

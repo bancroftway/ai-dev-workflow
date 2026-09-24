@@ -42,6 +42,7 @@ from .test_quality_checks import (
     classify_test_level,
     count_tests_per_ac,
     distinct_assertion_targets,
+    flaky_navigation_waits,
     id_variants,
     non_testid_locators,
     _tests_for_ac,
@@ -992,8 +993,13 @@ async def check_ac_coverage(
     # minimal-code-to-green and e2e-fix (test_coverage_gate.check_ac_depth / e2e_run_node), since a
     # violation can be introduced at any of the three stages that touch these same spec files.
     testid_violations = non_testid_locators(test_files)
+    # waitForNavigation()/networkidle anti-pattern (2026-09-23): same reasoning and same three
+    # enforcement points as the testid convention just above -- see flaky_navigation_waits' own
+    # docstring for the live incident (a shared signIn() helper racing a multi-hop auth redirect
+    # regressed a whole e2e suite).
+    nav_wait_violations = flaky_navigation_waits(test_files)
 
-    if missing or tautological or depth_shortfall or testid_violations:
+    if missing or tautological or depth_shortfall or testid_violations or nav_wait_violations:
         reasons = []
         if depth_report.get("unattributed_tests") and missing:
             total_orphans = sum(depth_report["unattributed_tests"].values())
@@ -1027,6 +1033,16 @@ async def check_ac_coverage(
                 f"can silently match a framework-injected element instead of the real one: {named} "
                 f"-- use page.getByTestId(...) only"
             )
+        if nav_wait_violations:
+            named = "; ".join(
+                f"{path}: {', '.join(snippets[:3])}" + (f" (+{len(snippets) - 3} more)" if len(snippets) > 3 else "")
+                for path, snippets in sorted(nav_wait_violations.items())
+            )
+            reasons.append(
+                f"these e2e spec(s) use waitForNavigation() or a networkidle wait condition, which "
+                f"can race a multi-hop redirect or never resolve: {named} -- replace with a "
+                f"locator-based assertion, e.g. expect(locator).toBeVisible()"
+            )
         return AcCoverageOutcome(
             passed=False,
             feedback="; ".join(reasons),
@@ -1036,6 +1052,7 @@ async def check_ac_coverage(
                 "depth": depth_report,
                 "depth_shortfall": depth_shortfall,
                 "testid_violations": testid_violations,
+                "nav_wait_violations": nav_wait_violations,
                 "active_ac_ids": active_ac_ids,
                 # Diagnostics: enough to reconstruct WHY the scan missed an id without rerunning.
                 "runner_exit_ok": result_ok,

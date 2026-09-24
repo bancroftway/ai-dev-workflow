@@ -203,10 +203,38 @@ def classify_candidates(files: dict[str, str]) -> list[dict[str, Any]]:
         elif name == "manage.py":
             add(path, {"likely_class": "web", "runtime": "python", "marker": "Django manage.py", "start_command": "python manage.py runserver"})
         elif name in ("main.py", "app.py", "asgi.py", "wsgi.py"):
-            # ponytail: no deterministic start_command for FastAPI/Flask/Procfile -- the module:app
-            # target isn't determinable from marker files alone. Extend if this shows up in practice.
-            if re.search(r"FastAPI\(|Flask\(", text):
-                add(path, {"likely_class": "api", "runtime": "python", "marker": f"{name} instantiates FastAPI/Flask"})
+            # Extended 2026-09-23 (income-investor run f0fef8ba): the FastAPI half of the old
+            # "no deterministic start_command" gap WAS determinable from the marker alone -- the
+            # instance variable name is right there in the same assignment. Left with no
+            # start_command, this candidate never entered e2e_nodes.py's `startable` list (that
+            # filters on a truthy start_command), so e2e booted the frontend only; every Server
+            # Action calling the API got a dead connection, and 45/71 e2e specs failed on assertions
+            # that had nothing to do with the actual defect -- 8 fix cycles spent editing app code
+            # that was never the problem.
+            fastapi_match = re.search(r"(\w+)\s*=\s*FastAPI\(", text)
+            if fastapi_match:
+                app_var = fastapi_match.group(1)
+                module = name.removesuffix(".py")
+                add(path, {
+                    "likely_class": "api",
+                    "runtime": "python",
+                    "marker": f"{name} instantiates FastAPI() as `{app_var}`",
+                    # $PORT, not a literal number: e2e_nodes._with_port_env's generic (non-dotnet)
+                    # fallback already does `export PORT={port}; {command}` before running this --
+                    # uvicorn has no PORT-env-var convention of its own (unlike Next/Express/Vite),
+                    # so the command reads the shell var itself instead of guessing a CLI flag name
+                    # that differs per framework. `_scanned_launch_command` prepends `cd {path} &&`
+                    # for any command that doesn't already handle its own directory, so `module` is
+                    # resolved relative to the app's own directory, not the repo root.
+                    "start_command": f"python3 -m uvicorn {module}:{app_var} --host 0.0.0.0 --port $PORT",
+                })
+            elif re.search(r"Flask\(", text):
+                # ponytail: still no deterministic start_command for Flask/Procfile -- Flask's own
+                # launch convention (FLASK_APP env var + `flask run`, or a bare `app.run(port=...)`
+                # call whose port argument isn't determinable from a marker alone) doesn't have
+                # FastAPI's one obvious answer (a module-level ASGI app + a single standard ASGI
+                # server). Extend if THIS shows up in practice too.
+                add(path, {"likely_class": "api", "runtime": "python", "marker": f"{name} instantiates Flask()"})
         elif name in ("pyproject.toml", "requirements.txt"):
             if _PY_WEB_RE.search(text):
                 add(path, {"likely_class": "api", "runtime": "python", "marker": f"{name} declares a Python web framework"})
@@ -421,6 +449,22 @@ def _demo() -> None:
     nextjs = {"package.json": '{"dependencies":{"next":"15"},"scripts":{"dev":"next dev"}}'}
     web = classify_candidates(nextjs)[0]
     assert web["likely_class"] == "web" and web["start_command"] == "npm run dev" and web["port"] == 3000, web
+
+    # A plain-requirements.txt FastAPI app (income-investor run f0fef8ba, 2026-09-23) now gets a
+    # real start_command instead of null -- the instance variable name is read straight off the
+    # marker's own assignment, not assumed to be "app".
+    fastapi_default_var = classify_candidates({"apps/api/main.py": "from fastapi import FastAPI\napp = FastAPI()\n"})
+    fastapi_app = fastapi_default_var[0]
+    assert fastapi_app["likely_class"] == "api" and fastapi_app["path"] == "apps/api", fastapi_app
+    assert fastapi_app["start_command"] == "python3 -m uvicorn main:app --host 0.0.0.0 --port $PORT", fastapi_app
+
+    fastapi_other_var = classify_candidates({"apps/api/app.py": "application = FastAPI()\n"})[0]
+    assert fastapi_other_var["start_command"] == "python3 -m uvicorn app:application --host 0.0.0.0 --port $PORT", fastapi_other_var
+
+    # Flask still has no ONE obvious launch convention (see this branch's own ponytail comment) --
+    # still classified, still no start_command, unchanged from before this fix.
+    flask_app = classify_candidates({"apps/api/app.py": "app = Flask(__name__)\n"})[0]
+    assert flask_app["likely_class"] == "api" and not flask_app.get("start_command"), flask_app
 
     # Fingerprint: order-insensitive over paths, sensitive to content.
     assert fingerprint(nextjs) == fingerprint(dict(reversed(list(nextjs.items()))))

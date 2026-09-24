@@ -12,8 +12,13 @@ import { requireAuthorizedSession } from "@/lib/session-access";
  * actions only -- the agent's dispatch validates the action name; nothing here or there ever
  * forwards shell. Authorization is the app's standard repo-access check (session-access.ts):
  * anyone who can see the repo can act on its session, same as they could resume it.
+ * "reset-e2e" (sessions_api.py's broader recovery lever -- resets metrics-exit AND
+ * adversarial-compliance, valid on any finished-with-verdict session including a completed/
+ * merge_ready one, unlike the narrower rewind-to-stage) was implemented backend-side but never
+ * reached this whitelist -- no UI button ever called it either, so it was unreachable through the
+ * app at all until now.
  */
-const KNOWN_ACTIONS = ["refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix"] as const;
+const KNOWN_ACTIONS = ["refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix", "reset-e2e"] as const;
 
 export async function POST(request: Request) {
   const token = await getServerAuthToken();

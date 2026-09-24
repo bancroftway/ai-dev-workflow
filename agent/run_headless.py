@@ -43,7 +43,7 @@ logger = logging.getLogger("run_headless")
 from langchain_core.messages import HumanMessage  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
-from src import app_discovery, branch_naming, chat_model, git_ops, project_store, run_activity, session_store  # noqa: E402
+from src import app_discovery, branch_naming, chat_model, config, git_ops, project_store, run_activity, session_store  # noqa: E402
 from src.graph import graph  # noqa: E402
 from src.sandbox import get_sandbox_provider, registry  # noqa: E402
 
@@ -68,6 +68,15 @@ def _parse_args() -> argparse.Namespace:
         "set AIDW_RESUME -- the new requirements submission runs the FULL pipeline again as a "
         "second-or-later ticket (ticket-mode delta against the existing spec/plan/ledger), "
         "instead of skipping stages the earlier run approved.",
+    )
+    parser.add_argument(
+        "--reset-e2e",
+        action="store_true",
+        help="with --thread, against a session that already finished with a verdict (completed or "
+        "failed-at-exit): reset metrics-exit + adversarial-compliance in-process (same effect as "
+        "sessions_api.py's POST .../actions {action:'reset-e2e'}) before resuming, so this one "
+        "process both performs the reset and drives the re-run -- no live server/registry needed. "
+        "Same is_finished_with_verdict + AIDW_E2E_RESET_MAX_ATTEMPTS guard as the API action.",
     )
     parser.add_argument(
         "--greenfield-stack",
@@ -187,6 +196,10 @@ async def _run_pipeline(args: argparse.Namespace) -> int:
     # full canonical uuid4 string, not a truncated .hex -- session_store's `sessions.session_id`
     # column is SQL Server `uniqueidentifier`; a short hex-only string fails that conversion
     # (matches the format session_store.create_session mints for API-driven sessions).
+    if args.reset_e2e and not args.thread:
+        logger.error("--reset-e2e requires --thread <existing thread id>")
+        return 2
+
     thread_id = args.thread or str(uuid.uuid4())
     if args.thread and args.fresh_run:
         os.environ.pop("AIDW_RESUME", None)
@@ -226,6 +239,30 @@ async def _run_pipeline(args: argparse.Namespace) -> int:
     )
     registry.set(thread_id, session)
     git_ops.set_push_token(thread_id, git_token)
+
+    if args.reset_e2e:
+        # Mirrors sessions_api.py's POST .../actions {action:"reset-e2e"} exactly (same guards,
+        # same registry.set_meta pairing) -- see that handler's own docstring for the full
+        # reasoning. Done here, in-process, because registry.set_meta only means anything to the
+        # SAME process that later pops it inside intake_node (registry.py: "process-local"); a
+        # separate call against a live server's registry is invisible to this one.
+        row = await session_store.get_session(thread_id)
+        if row is None:
+            logger.error("--reset-e2e: no session row found for thread %s", thread_id)
+            return 2
+        if not session_store.is_finished_with_verdict(row):
+            logger.error("--reset-e2e: thread %s has not finished the pipeline (completed, or failed at exit)", thread_id)
+            return 2
+        agent_state = await graph.aget_state(cfg)
+        attempts = (agent_state.values or {}).get("e2e_reset_attempts", 0)
+        if attempts >= config.AIDW_E2E_RESET_MAX_ATTEMPTS:
+            logger.error(
+                "--reset-e2e: already used %d/%d times for thread %s",
+                attempts, config.AIDW_E2E_RESET_MAX_ATTEMPTS, thread_id,
+            )
+            return 2
+        registry.set_meta(thread_id, reset_e2e=True, confirm_reopen=True)
+        logger.info("reset-e2e armed for thread %s -- metrics-exit + adversarial-compliance will reset on entry", thread_id)
 
     outcome: dict = {"thread_id": thread_id, "ok": False}
     # Cross-process counterpart of main.py's run_activity.incr/decr: this process's graph

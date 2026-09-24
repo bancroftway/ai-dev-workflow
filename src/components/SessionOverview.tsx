@@ -636,6 +636,42 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     }
   }
 
+  // Broader than handleReverifyMetricsExit above: valid on ANY finished-with-verdict session,
+  // including a genuinely completed/merge_ready one (root-caused 2026-09-21, "today the only
+  // lever to re-run e2e alone is rewind-to-stage(remediation), which redoes 3 whole LLM-drafted
+  // stages"). Resets metrics-exit AND adversarial-compliance (sessions_api.py's reset-e2e), so a
+  // fresh scan/e2e pass runs against a rebuilt sandbox image or a scoring fix without touching
+  // spec/plan/remediation. Capped server-side (config.AIDW_E2E_RESET_MAX_ATTEMPTS) -- a 409 here
+  // just surfaces that cap's message, same as any other rejected action.
+  async function handleResetE2e() {
+    if (
+      !window.confirm(
+        "Re-run E2E + Metrics & Exit against a fresh sandbox -- this also redoes the " +
+          "adversarial-compliance audit, but does not touch specification/plan/remediation. Use " +
+          "this after a sandbox-image or scoring fix. Continue?",
+      )
+    ) {
+      return;
+    }
+    setRestarting(true);
+    try {
+      await ensureSandboxProvisioned(threadId, owner, repo, branch);
+      const response = await fetch("/api/sessions/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: threadId, action: "reset-e2e" }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        window.alert(body?.detail || "Could not reset E2E for this session.");
+        return;
+      }
+      void copilotkit.runAgent({ agent });
+    } finally {
+      setRestarting(false);
+    }
+  }
+
   // Stuck bespoke-cluster stage (e2e) recovery (Change 5, root-caused 2026-09-12): e2e has no
   // StageState of its own (e2e_nodes.py is a bespoke cluster -- see MetricsBar.tsx's own e2ePill
   // comment), so it never surfaces as a boundary row above -- a session whose last real STAGES
@@ -1107,6 +1143,22 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
                           {restarting ? "Working…" : "Fix these findings"}
                         </button>
                       </div>
+                    </div>
+                  )}
+                  {key === "metrics-exit" && finishedWithVerdict && (
+                    <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
+                      <p className="text-xs text-neutral-500">
+                        {"Re-run E2E and Metrics & Exit against a fresh sandbox (e.g. after a sandbox-image "
+                          + "or scoring fix) -- also redoes the adversarial-compliance audit, but not any earlier stage."}
+                      </p>
+                      <button
+                        type="button"
+                        className="ml-auto shrink-0 rounded-md border border-neutral-300 bg-white px-3 py-1 text-xs font-medium text-neutral-700 disabled:opacity-40"
+                        disabled={restarting}
+                        onClick={() => void handleResetE2e()}
+                      >
+                        {restarting ? "Working…" : "Reset E2E / Recompute Metrics"}
+                      </button>
                     </div>
                   )}
                 </li>

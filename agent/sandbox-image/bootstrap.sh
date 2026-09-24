@@ -170,7 +170,7 @@ PY
 # the host-side log. Written even when empty: "we looked and the image already had everything" is
 # a different fact from "bootstrap never ran", and only this file can tell them apart.
 printf '{"image":"%s","tools":{%s},"available":{%s},"security_tools":%s,"playwright_version":"%s","playwright_browsers_path":"%s"}\n' \
-  "${AIDW_IMAGE_REF:-unknown}" "$tools_json" "$available_json" "${security_tools_json:-{}}" \
+  "${AIDW_IMAGE_REF:-unknown}" "$tools_json" "$available_json" "$security_tools_json" \
   "${playwright_version//\"/\'}" "${playwright_browsers_path//\"/\'}" > "$REPORT_PATH"
 echo "bootstrap: wrote ${REPORT_PATH}"
 exit 0

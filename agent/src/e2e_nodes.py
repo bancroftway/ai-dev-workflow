@@ -602,6 +602,20 @@ async def _pick_free_port(
 # so the very name this exists to find never matched.
 _ENV_NAME_RE = re.compile(r"(?:process\.env|import\.meta\.env)\.([A-Z][A-Z0-9_]*)")
 _API_ENV_HINTS = ("API", "BACKEND", "SERVER")
+# Suffixes that mean "this env var holds a credential, not a base URL" even when the name also
+# contains an _API_ENV_HINTS substring -- income-investor run f0fef8ba (2026-09-23): API_JWT_SECRET
+# matches "API" and was getting the booted service's URL injected into it, so the frontend signed
+# JWTs with a URL string as the HMAC key while the backend verified against its real, separately
+# configured secret. Every authenticated request 401'd; the e2e suite just read as "everything
+# behind a sign-in wall," 4 fix cycles spent editing app code that was never the problem.
+_CREDENTIAL_ENV_SUFFIXES = ("_SECRET", "_KEY", "_TOKEN", "_PASSWORD")
+
+
+def _is_api_url_env_name(name: str) -> bool:
+    """Whether `name` plausibly wants the booted backend's URL, not a credential that merely has
+    an API_ENV_HINTS substring in its own name too. Pure and separately self-checked (below) --
+    this is the one part of _api_env_names actually worth testing without a sandbox."""
+    return not name.endswith(_CREDENTIAL_ENV_SUFFIXES) and any(hint in name for hint in _API_ENV_HINTS)
 
 
 def _service_name_tokens(candidate: dict[str, Any]) -> set[str]:
@@ -659,7 +673,7 @@ async def _api_env_names(provider: Any, thread_id: str) -> list[str]:
         if not match:
             continue
         name = match.group(1)
-        if any(hint in name for hint in _API_ENV_HINTS) and name not in names:
+        if _is_api_url_env_name(name) and name not in names:
             names.append(name)
     return names
 
@@ -1468,7 +1482,8 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             # The suite sees the seam flag too, so tests can branch on it (e.g. hit the test
             # sign-in endpoint) -- the seam itself lives in the APP, exported at boot above.
             + ("AIDW_TEST_AUTH=1 " if test_auth_enforced else "")
-            + f"timeout {workflow_config.E2E_SUITE_TIMEOUT_SECONDS} {run_cmd} --reporter=json 2>&1"
+            + f"timeout {workflow_config.E2E_SUITE_TIMEOUT_SECONDS} {run_cmd} --reporter=json "
+              f"--workers={workflow_config.AIDW_E2E_PLAYWRIGHT_WORKERS} 2>&1"
         )
         keepalive = asyncio.create_task(_keepalive_touch(provider, thread_id))
         try:
@@ -1716,7 +1731,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # (a bare `input`/`getByRole` locator silently matching a Next.js Server Action's own hidden
     # field instead of the real one).
     from .gates.ac_coverage_gate import _TEST_FILE_LISTING
-    from .gates.test_quality_checks import non_testid_locators
+    from .gates.test_quality_checks import flaky_navigation_waits, non_testid_locators
 
     listing = await provider.exec_in_sandbox(thread_id, f"({_TEST_FILE_LISTING}) | head -60 || true")
     spec_paths = [line.strip() for line in (listing.stdout or "").splitlines() if line.strip()]
@@ -1744,6 +1759,32 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         e2e["failed_tests"] = failures
         e2e["status"] = "failed"
     e2e["testid_violations"] = testid_violations
+
+    # waitForNavigation()/networkidle anti-pattern (2026-09-23, income-investor commit fd6c91a,
+    # thread f0fef8ba): checked here too, same reasoning as the testid convention just above --
+    # e2e-fix edits these SAME spec files directly, and this is exactly where the live incident
+    # happened (a shared signIn() helper's race regressed the whole suite from 67/74 to 30/75
+    # passing). See test_quality_checks.flaky_navigation_waits' own docstring.
+    nav_wait_violations = flaky_navigation_waits(spec_files)
+    if nav_wait_violations:
+        failures = list(e2e.get("failed_tests") or [])
+        for violation_path, snippets in sorted(nav_wait_violations.items()):
+            named = "; ".join(snippets[:3]) + (f"; and {len(snippets) - 3} more" if len(snippets) > 3 else "")
+            failures.append({
+                "title": f"flaky navigation wait: {violation_path}",
+                "error": (
+                    f"{len(snippets)} wait(s) in this e2e spec use waitForNavigation() or a "
+                    f"networkidle wait condition: {named} -- waitForNavigation() can resolve on "
+                    "the wrong hop of a multi-hop redirect and networkidle is not guaranteed to "
+                    "ever fire (a shared signIn() helper racing an auth redirect this exact way "
+                    "regressed a whole e2e suite from 67/74 to 30/75 passing). Replace with a "
+                    "locator-based assertion, e.g. expect(page.getByTestId('...')).toBeVisible(), "
+                    "which auto-retries regardless of how many redirects happen first."
+                ),
+            })
+        e2e["failed_tests"] = failures
+        e2e["status"] = "failed"
+    e2e["nav_wait_violations"] = nav_wait_violations
 
     # Authentication enforcement gate (gates/auth_gate.py) -- while the app is still up, probing
     # WITHOUT the AIDW_TEST_AUTH seam (the probe carries no env; the seam lives in the app's own
@@ -2121,6 +2162,18 @@ def _clear_proven_launch(e2e: dict[str, Any]) -> None:
 
 def _demo() -> None:
     """Self-check for the pure half: `uv run python -m src.e2e_nodes`."""
+    # A credential-shaped name must never be treated as "wants the booted service's URL", even
+    # when it also contains an _API_ENV_HINTS substring (income-investor run f0fef8ba, 2026-09-23:
+    # API_JWT_SECRET matched "API" and got a URL injected into it in place of its real signing key).
+    assert not _is_api_url_env_name("API_JWT_SECRET")
+    assert not _is_api_url_env_name("BACKEND_API_KEY")
+    assert not _is_api_url_env_name("SERVER_AUTH_TOKEN")
+    assert not _is_api_url_env_name("DB_PASSWORD")  # no API_ENV_HINTS substring either -- must stay excluded
+    # Genuine "give me the base URL" names still match, unchanged from before this fix.
+    assert _is_api_url_env_name("API_BASE_URL")
+    assert _is_api_url_env_name("BACKEND_URL")
+    assert _is_api_url_env_name("NEXT_PUBLIC_API_URL")
+
     sample = {
         "suites": [
             {

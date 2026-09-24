@@ -77,6 +77,7 @@ from .config import (
     AIDW_TOOL_PROBE_RETRY_COUNT,
     AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS,
 )
+from .gates import quick_scan
 from .sarif import Finding, parse_sarif
 from .severity import SEMGREP_SEVERITY_MAP, SEVERITY_ORDER, meets_or_exceeds
 from .text_truncate import truncate_middle
@@ -2621,9 +2622,12 @@ TOOLS: tuple[ToolSpec, ...] = (
         # (see the Dockerfile) have no Python coverage, and bandit is the licence-clean
         # (Apache-2.0) native scanner. -s B101 skips assert-used -- pytest suites are built on
         # assert and B101 on them is a documented false-positive flood.
+        # Command sourced from gates/quick_scan.py's BANDIT_COMMAND, not redefined here: that
+        # module's own staged sandbox-image copy (the mctg-time Stop hook) runs the SAME command
+        # string, so the two can never silently diverge on flags/excludes/output paths -- see that
+        # module's own docstring and its _demo()'s drift guard.
         "bandit", "Apache-2.0", True,
-        "bandit -r . -f json -o agent-work/bandit.json -s B101 "
-        "-x './node_modules,./.venv,./apps/*/.venv,./agent-work,./.ai-dev-workflow' --exit-zero",
+        quick_scan.BANDIT_COMMAND,
         "agent-work/bandit.json", parse_bandit, "bandit --version",
         applies=_PYTHON_FILES_PROBE,
     ),
@@ -2635,10 +2639,10 @@ TOOLS: tuple[ToolSpec, ...] = (
         # build gate) deliberately does NOT apply -- a Next.js scaffold's own eslint config is
         # exactly why no security rule ever ran on one. `|| true`: eslint exits 1 whenever anything
         # matched; _run_one judges on the output file, not the exit code.
+        # Command sourced from gates/quick_scan.py's ESLINT_SECURITY_COMMAND -- same reuse/drift-
+        # guard reasoning as bandit's own ToolSpec immediately above.
         "eslint-security", "MIT (eslint) / Apache-2.0 (plugin-security) / LGPL-3.0 (plugin-sonarjs)", True,
-        "/opt/aidw/lint/node_modules/.bin/eslint --no-config-lookup "
-        "--config /opt/aidw/lint/eslint.config.mjs --no-error-on-unmatched-pattern "
-        "-f json -o agent-work/eslint.json . || true",
+        quick_scan.ESLINT_SECURITY_COMMAND,
         "agent-work/eslint.json", parse_eslint, "/opt/aidw/lint/node_modules/.bin/eslint --version",
         applies=_PACKAGE_JSON_PROBE,
     ),
@@ -2935,7 +2939,17 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
             run.update(status="not_applicable", notes="No applicable files detected", duration_ms=_elapsed_ms(started))
             return run, [], {}
 
-    version_result = await _probe_tool_version_with_retry(provider, thread_id, f"LC_ALL=C {spec.version_command} 2>&1")
+    # PYTHONNOUSERSITE=1 (not just LC_ALL=C): observed live (run f0fef8ba) -- semgrep/interrogate
+    # (both pip-installed system-wide into /usr/local/lib/.../dist-packages at image build time)
+    # crashed with ImportError once the TARGET REPO'S OWN Python deps got pip-installed into the
+    # vscode user's home site-packages (~/.local/lib/.../site-packages), which Python's import
+    # resolution checks BEFORE dist-packages -- an unrelated app dependency (e.g. a newer
+    # opentelemetry-sdk, or an old `py` package pulled in by a legacy pytest pin) silently shadowed
+    # these tools' own pinned dependencies. This was never a PATH problem: the binary was always
+    # findable, it just imported the wrong package version once the repo's install ran. Setting
+    # this disables the user site-packages directory for these subprocesses entirely, so a target
+    # repo's own dependency install can never again shadow a system-level analyzer's imports.
+    version_result = await _probe_tool_version_with_retry(provider, thread_id, f"LC_ALL=C PYTHONNOUSERSITE=1 {spec.version_command} 2>&1")
     version_output = (version_result.stdout or "").strip()
     run["version"] = version_output.splitlines()[0].strip() if version_output else None
     run["db_version"] = _extract_db_version(version_output)
@@ -2957,7 +2971,7 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
         )
         return run, [], {}
 
-    result = await provider.exec_in_sandbox(thread_id, f"LC_ALL=C {spec.command} 2>&1")
+    result = await provider.exec_in_sandbox(thread_id, f"LC_ALL=C PYTHONNOUSERSITE=1 {spec.command} 2>&1")
     run["exit_code"] = result.returncode
 
     from . import repo_files
