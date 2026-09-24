@@ -1518,6 +1518,20 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # sh -c string. Each path is instead individually shlex-quoted from Python, and the mkdir +
     # all cp commands are sent as one batched multi-line script, which gives the same safety
     # `find -print0 | xargs -0` would inside one shell pipeline.
+    #
+    # `sync` + a settle pause before the find: root-caused live (income-investor thread f0fef8ba)
+    # -- the suite process this `exec_in_sandbox` call above already awaited to completion had
+    # genuinely written every result PNG (confirmed: re-running this exact find+harvest by hand
+    # minutes later, against the SAME on-disk results, correctly found and copied all of them), yet
+    # the harvest's own `find` -- run immediately after the suite exits, in the SAME turn -- only
+    # ever saw a small, execution-order-first subset (9 of 75 one run). `sync` alone measurably
+    # helped (9 -> 23 on a live retry) without fully closing the gap, which points to something
+    # above the OS write-back layer -- Playwright's own per-test artifact writer plausibly still
+    # finishing after the parent process it spawned from has already exited. See
+    # E2E_SCREENSHOT_HARVEST_SETTLE_SECONDS's own comment for the full reasoning and the tuning
+    # tradeoff.
+    await provider.exec_in_sandbox(thread_id, "sync")
+    await asyncio.sleep(workflow_config.E2E_SCREENSHOT_HARVEST_SETTLE_SECONDS)
     find_result = await provider.exec_in_sandbox(
         thread_id, f"find {shlex.quote(results_root)} -name '*.png' -print0 2>/dev/null"
     )
