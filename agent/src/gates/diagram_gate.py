@@ -28,6 +28,12 @@ from ..sandbox.provider import SandboxProvider
 from ..schemas import presence_values as _presence_values
 from ..text_truncate import truncate_middle
 from . import write_scope_gate
+from .wireframe_linkage_checks import (
+    check_plan_step_wireframe_coverage,
+    check_ui_wireframe_coverage,
+    check_wireframe_ac_ids,
+    check_wireframe_has_ac_ids,
+)
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
@@ -55,7 +61,6 @@ def wireframe_preview_url(owner: str, repo: str, branch: str, screen: str) -> st
         f"https://github.com/{owner}/{repo}/blob/{branch}/{WIREFRAMES_DIR}/{screen}.html"
     )
 
-MAX_WIREFRAMES = config.DIAGRAM_MAX_WIREFRAMES
 MAX_WIREFRAME_BYTES = config.DIAGRAM_MAX_WIREFRAME_BYTES
 
 # Trust-boundary checks on model-emitted wireframe HTML. This denylist is hygiene for the
@@ -89,61 +94,6 @@ def check_wireframe(screen: str, html_source: str) -> str | None:
         if pattern.search(html_source):
             return f"wireframe {screen!r} {reason} -- wireframes must be fully self-contained (inline CSS only)"
     return None
-
-def check_wireframe_ac_ids(
-    wireframes: list[dict[str, Any]], ledger_entries: list[dict[str, Any]]
-) -> list[str]:
-    """Citation-validity only (user requirement 2026-08-31: 'the wireframes must indicate which
-    US/AC they are fulfilling') -- each id a wireframe names must actually exist and be an
-    acceptance criterion, same discipline as PlanStep.ac_ids. Deliberately NOT a coverage
-    direction (no demand that every UI-touching AC have a wireframe, or that ui_related steps
-    have one) -- that would be new scope beyond what was asked; this only catches an invented or
-    mistyped id. Pure."""
-    by_id = {e.get("id"): e for e in ledger_entries}
-    problems: list[str] = []
-    for wf in wireframes:
-        screen = wf.get("screen") or "?"
-        bad = [i for i in wf.get("ac_ids") or [] if by_id.get(i) is None or by_id[i].get("kind") != "acceptance_criterion"]
-        if bad:
-            problems.append(
-                f"wireframe {screen!r}: cites {', '.join(bad)} which is not an acceptance criterion "
-                "in the ledger -- copy ids exactly from the approved Specification"
-            )
-    return problems
-
-
-def check_wireframe_has_ac_ids(wireframes: list[dict[str, Any]]) -> list[str]:
-    """Every wireframe must cite >=1 ac_id. `Wireframe.ac_ids` (schemas.py) defaults to an empty
-    list, and until now nothing rejected that: check_wireframe_ac_ids only validates ids a
-    wireframe DOES cite are real, and check_ui_wireframe_coverage only checks the other direction
-    (every ui_related AC has SOME wireframe). Neither stops a wireframe from citing nothing at
-    all -- which would dodge the e2e stage's wireframe-coverage gate (e2e_nodes.py), which has
-    nothing to match an AC-less screen against. Pure."""
-    return [
-        f"wireframe {wf.get('screen')!r}: cites no ac_ids -- every wireframe must name at least "
-        "one acceptance criterion it is evidence for, or the e2e stage cannot verify this screen "
-        "was actually built and tested"
-        for wf in wireframes
-        if not (wf.get("ac_ids") or [])
-    ]
-
-
-def check_ui_wireframe_coverage(ui_related_ac_ids: set[str], wireframes: list[dict[str, Any]]) -> list[str]:
-    """Coverage direction (user requirement 2026-09-01): every criterion the approved
-    Specification marks ui_related must be cited by at least one wireframe's ac_ids -- a
-    UI-facing requirement with zero wireframe evidence is exactly what this exists to catch. The
-    caller only ever passes LIVE, non-deferred ids (see verify_plan_diagrams's own build of
-    ui_related_ac_ids) -- nothing is demanded for scope not being built this ticket. Pure."""
-    covered: set[str] = set()
-    for wf in wireframes:
-        covered.update(wf.get("ac_ids") or [])
-    return [
-        f"{ac_id}: marked ui_related in the Specification, but no wireframe's ac_ids cites it -- "
-        "add a wireframe for the screen that satisfies it (or fix the Specification if ui_related "
-        "is wrong for this criterion)"
-        for ac_id in sorted(ui_related_ac_ids - covered)
-    ]
-
 
 def check_dangling_visual_retirement(
     wireframe_refs: list[dict[str, Any]],
@@ -739,8 +689,11 @@ def _demo() -> None:
 
 # Task 13b: one line per DISTINCT rejection reason inside verify_plan_diagrams below, including
 # every reason folded into check_plan_linkage/check_wireframe_ac_ids/check_ui_wireframe_coverage/
-# check_wireframe/_render_one -- all defined in THIS file, so (unlike write_scope_gate.py's
-# delegation to ac_coverage_gate.py) none of it is out-of-scope delegation. The 8
+# check_plan_step_wireframe_coverage/check_wireframe/_render_one -- check_plan_linkage/
+# check_wireframe/_render_one are defined in THIS file; the other three live in
+# gates/wireframe_linkage_checks.py (imported below) so the sandbox's same-turn Stop hook can run
+# them directly instead of a hand-ported JS copy -- still first-party pipeline code, not
+# out-of-scope delegation the way write_scope_gate.py's delegation to ac_coverage_gate.py is. The 8
 # _WIREFRAME_FORBIDDEN patterns are one rule ("must be self-contained/safe"), not eight -- same
 # granularity write_scope_gate.py's _is_test_path regex family gets. A render failure classified
 # as infrastructure (mmdc/Chromium broken, not a genuine Mermaid syntax error) is deliberately
@@ -778,7 +731,8 @@ PLAN_HARD_RULES: tuple[str, ...] = (
     "rejected, since the e2e stage has nothing to match it against.",
     "Every criterion the approved Specification marks ui_related must be cited by at least one "
     "wireframe's ac_ids -- a UI-facing requirement with zero wireframe evidence is rejected.",
-    "Include at most 6 wireframes -- keep only the screens this plan actually changes.",
+    "Every plan step marked ui_related must be cited by at least one wireframe's ac_ids -- a "
+    "UI-facing step with zero wireframe evidence is rejected.",
     "Every wireframe's screen name must be a plain filename (letters, digits, underscore, "
     "hyphen only).",
     "Every wireframe's HTML must stay under 30 KB -- simplify an oversized wireframe rather "
@@ -1210,15 +1164,17 @@ def make_verify_plan_diagrams(
         # wireframes is WireframePresence-shaped (schemas.py, Task 10): `{"status", "values", "reason"}`
         # rather than a bare list -- extract its values once, reused by every check below.
         wireframes = _presence_values(content_dict.get("wireframes"))
-        # Aggregated, not early-returned (2026-09-07 audit): these three check independent aspects of
-        # the same content -- ledger/AC linkage, wireframe count, and per-wireframe HTML validity --
-        # with no ordering dependency between them, so union them into one lap's feedback instead of
-        # reporting only whichever hit first.
+        # Aggregated, not early-returned (2026-09-07 audit): these checks cover independent aspects
+        # of the same content -- ledger/AC linkage, per-wireframe HTML validity, and (both
+        # directions) AC/PlanStep<->wireframe coverage -- with no ordering dependency between them,
+        # so union them into one lap's feedback instead of reporting only whichever hit first.
+        plan_steps = content_dict.get("plan_steps") or []
         linkage_problems = (
-            check_plan_linkage(content_dict.get("plan_steps") or [], ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
+            check_plan_linkage(plan_steps, ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
             + check_wireframe_ac_ids(wireframes, ledger_entries)
             + check_wireframe_has_ac_ids(wireframes)
             + check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
+            + check_plan_step_wireframe_coverage(plan_steps, wireframes)
         )
 
         # Scope-lifecycle stamps for the Plan review UI (user requirement 2026-08-31, mirroring the
@@ -1245,21 +1201,16 @@ def make_verify_plan_diagrams(
         diagrams = _presence_values(content_dict.get("diagrams"))
 
         structural_problems = list(linkage_problems)
-        wireframes_too_many = len(wireframes) > MAX_WIREFRAMES
-        if wireframes_too_many:
-            structural_problems.append(
-                f"{len(wireframes)} wireframes exceeds the cap of {MAX_WIREFRAMES} -- keep only the screens this plan actually changes."
-            )
         wireframe_errors = [
             err for wf in wireframes if (err := check_wireframe(wf.get("screen") or "", wf.get("html_source") or "")) is not None
         ]
         structural_problems.extend(wireframe_errors)
 
-        # Wireframes are only written to the sandbox once individually valid and within the cap
-        # (unchanged invariant) -- gated on wireframe_errors/count specifically, not on linkage
-        # problems elsewhere in the same content, since a bad AC citation has nothing to do with
-        # whether a given wireframe's own HTML is safe to persist.
-        if wireframes and not wireframe_errors and not wireframes_too_many:
+        # Wireframes are only written to the sandbox once individually valid (unchanged invariant --
+        # there is deliberately no count cap) -- gated on wireframe_errors specifically, not on
+        # linkage problems elsewhere in the same content, since a bad AC citation has nothing to do
+        # with whether a given wireframe's own HTML is safe to persist.
+        if wireframes and not wireframe_errors:
             for wf in wireframes:
                 await repo_files.write_repo_file(provider, thread_id, f"{WIREFRAMES_DIR}/{wf['screen']}.html", wf["html_source"])
             # Stamp a rendered-preview link onto each wireframe entry. In-place mutation of
@@ -1304,8 +1255,6 @@ def make_verify_plan_diagrams(
             report: dict[str, Any] = {}
             if linkage_problems:
                 report["plan_linkage_failed"] = linkage_problems
-            if wireframes_too_many:
-                report["wireframes_rejected"] = "too_many"
             if wireframe_errors:
                 report["wireframes_failed"] = wireframe_errors
             if failures:

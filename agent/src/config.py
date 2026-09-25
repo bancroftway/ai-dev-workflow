@@ -202,11 +202,11 @@ REBUILD_OUTPUT_COMBINED_TAIL_CHARS = int(os.environ.get("AIDW_REBUILD_OUTPUT_COM
 DIAGRAM_ERROR_SUMMARY_HEAD_CHARS = int(os.environ.get("AIDW_DIAGRAM_ERROR_SUMMARY_HEAD_CHARS", "2000"))
 DIAGRAM_ERROR_SUMMARY_TAIL_CHARS = int(os.environ.get("AIDW_DIAGRAM_ERROR_SUMMARY_TAIL_CHARS", "2000"))
 
-# gates/diagram_gate.py's plan-diagram caps: how many diagrams a plan may include, and how large
-# one wireframe's HTML may be, before the deterministic_verify gate rejects the draft outright and
-# asks for fewer/smaller ones. Purely a plan-content ceiling, unrelated to the truncation pairs
-# above -- relocated from local module constants of the same name, values unchanged.
-DIAGRAM_MAX_WIREFRAMES = int(os.environ.get("AIDW_DIAGRAM_MAX_WIREFRAMES", "6"))
+# gates/diagram_gate.py's plan-diagram cap: how large one wireframe's HTML may be, before the
+# deterministic_verify gate rejects the draft outright and asks for a smaller one. Purely a
+# plan-content ceiling, unrelated to the truncation pairs above -- relocated from a local module
+# constant of the same name, value unchanged. There is deliberately no wireframe COUNT cap
+# (removed 2026-09-24) -- a plan may cite as many wireframes as the work actually needs.
 DIAGRAM_MAX_WIREFRAME_BYTES = int(os.environ.get("AIDW_DIAGRAM_MAX_WIREFRAME_BYTES", str(30 * 1024)))
 
 # claude_chat_model.py's read_full_file_reads: the Claude CLI's own Read tool default read window
@@ -322,20 +322,6 @@ E2E_ROUTES_MAX = int(os.environ.get("AIDW_E2E_ROUTES_MAX", "12"))
 # file loop this batching replaced); lowering it just harvests fewer of the suite's own screenshots
 # -- the always-taken per-route screenshots (E2E_ROUTES_MAX) are unaffected either way.
 E2E_SCREENSHOT_COPY_MAX_FILES = int(os.environ.get("AIDW_E2E_SCREENSHOT_COPY_MAX_FILES", "100"))
-
-# e2e_nodes.py's screenshot harvest: wall-clock pause, AFTER `sync` and BEFORE the `find` that
-# locates the suite's own PNGs, to cover Playwright's own post-exit artifact flushing. Root-caused
-# live (income-investor thread f0fef8ba): the harvesting `find` -- run immediately after the suite
-# process's own exit -- only ever saw a small, execution-order-first subset of the run's screenshots
-# (9 of 75 one run), even though a `sync` immediately before it (closing the OS-level disk-flush
-# window) measurably helped (9 -> 23) without fully closing the gap; a manual re-run of the exact
-# same find+copy minutes later, against the same on-disk results, found every file. That combination
-# (sync helps but doesn't fully fix it) points to something above the OS write-back layer -- likely
-# Playwright's own per-test artifact writer still finishing after the parent process it spawned
-# from has exited -- so a plain wall-clock pause covers what `sync` alone does not. Raising this
-# closes the gap further at the cost of a slower e2e stage on every lap, pass or fail; lowering it
-# risks reintroducing the missed-screenshot gap this constant exists to close.
-E2E_SCREENSHOT_HARVEST_SETTLE_SECONDS = float(os.environ.get("AIDW_E2E_SCREENSHOT_HARVEST_SETTLE_SECONDS", "5"))
 
 # e2e_nodes.py's per-route screenshot/lighthouse failure log lines (logger.warning only, never
 # reach a model) -- how much of that one command's own stdout to include in the log message.

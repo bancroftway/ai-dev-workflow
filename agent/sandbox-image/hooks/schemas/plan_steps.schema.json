@@ -40,7 +40,7 @@
         },
         "ui_related": {
           "default": false,
-          "description": "True when this step changes what the user sees or interacts with (a screen, a component, layout, styling, client-side behavior) -- False for pure backend/API/data/infrastructure work with no visible surface. Lets the review UI separate UI-facing work from the rest at a glance; not gate-enforced against wireframe coverage.",
+          "description": "True when this step changes what the user sees or interacts with (a screen, a component, layout, styling, client-side behavior) -- False for pure backend/API/data/infrastructure work with no visible surface. A deterministic Plan gate demands at least one wireframe (Wireframe.ac_ids) cite one of this step's ac_ids -- set this honestly, not defensively; marking a backend-only step true forces an unneeded wireframe, and marking a real UI step false lets it slip through unreviewed.",
           "title": "Ui Related",
           "type": "boolean"
         }

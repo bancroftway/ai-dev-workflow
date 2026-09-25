@@ -785,6 +785,14 @@ COPY hooks/check-narrative-format-stop.mjs /opt/aidw-hooks/check-narrative-forma
 COPY hooks/check-plan-schema-stop.mjs /opt/aidw-hooks/check-plan-schema-stop.mjs
 COPY hooks/check-full-read-stop.mjs /opt/aidw-hooks/check-full-read-stop.mjs
 COPY hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-plan-citations-stop.mjs
+# Byte-identical staged copy of agent/src/gates/wireframe_linkage_checks.py -- same build-context
+# constraint and same drift-guard convention as test_quality_checks.py below (that module's own
+# `_demo()` asserts this file matches its source on every self-check run); re-run `cp
+# ../src/gates/wireframe_linkage_checks.py hooks/wireframe_linkage_checks.py` (from
+# agent/sandbox-image) after editing the source and before rebuilding. Needs nothing beyond
+# python3's standard library. Shelled to by check-plan-citations-stop.mjs above, not a separate
+# Stop hook of its own.
+COPY hooks/wireframe_linkage_checks.py /opt/aidw-hooks/wireframe_linkage_checks.py
 COPY hooks/check-diagram-staleness-stop.mjs /opt/aidw-hooks/check-diagram-staleness-stop.mjs
 COPY hooks/check-test-quality-stop.mjs /opt/aidw-hooks/check-test-quality-stop.mjs
 # The REAL implementation, not a port -- see check-test-quality-stop.mjs's own header. This is a
@@ -864,7 +872,8 @@ RUN set -eux; \
     chmod 0644 /etc/claude-code/managed-settings.json /opt/aidw-hooks/require-skills-stop.mjs \
       /opt/aidw-hooks/check-citation-drop-stop.mjs /opt/aidw-hooks/check-narrative-format-stop.mjs \
       /opt/aidw-hooks/check-plan-schema-stop.mjs /opt/aidw-hooks/check-full-read-stop.mjs \
-      /opt/aidw-hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-diagram-staleness-stop.mjs \
+      /opt/aidw-hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/wireframe_linkage_checks.py \
+      /opt/aidw-hooks/check-diagram-staleness-stop.mjs \
       /opt/aidw-hooks/check-test-quality-stop.mjs /opt/aidw-hooks/test_quality_checks.py \
       /opt/aidw-hooks/check-coverage-stop.mjs /opt/aidw-hooks/coverage_parsing.py \
       /opt/aidw-hooks/check-testid-locators-stop.mjs \

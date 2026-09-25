@@ -80,8 +80,8 @@ const PlanStepSchema = z.object({
   // stamped deterministically by the plan verify (strongest change among the criteria the step
   // fulfils, from the approved spec's own per-AC stamps); `removes_ids` is the model's explicit
   // declaration of which retired scope's delivered artifacts this step deletes (gate-validated);
-  // `ui_related` is a display-only tag (not gate-enforced) for whether this step has a visible
-  // surface.
+  // `ui_related` flags whether this step has a visible surface -- gate-enforced (a deterministic
+  // Plan gate demands at least one wireframe cite one of a ui_related step's ac_ids).
   kind: z.enum(["feature", "infrastructure"]).optional().default("feature"),
   ac_ids: z.array(z.string()).optional().default([]),
   removes_ids: z.array(z.string()).optional().default([]),

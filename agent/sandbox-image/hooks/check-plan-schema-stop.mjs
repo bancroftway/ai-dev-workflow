@@ -9,9 +9,11 @@
 // (writing JSON to a file has no schema enforcement the way `--json-schema`-constrained structured
 // output does) and cost a full redraft lap to discover. The SAME run also escalated after 5 laps
 // partly on plainly mechanical problems: a wireframe referenced in manifest.json whose sidecar
-// .html file was never created, 7 wireframes exceeding the cap of 6, and a wireframe containing a
-// forbidden <iframe>. Every one of these is checkable from files already in the working directory,
-// with zero LLM judgment involved -- this hook catches all four in the SAME turn that caused them.
+// .html file was never created, and a wireframe containing a forbidden <iframe> (a THIRD problem
+// that run hit, a wireframe-count cap, was removed 2026-09-24 -- there is deliberately no upper
+// limit on wireframe count now). Every one of these is checkable from files already in the working
+// directory, with zero LLM judgment involved -- this hook catches them in the SAME turn that
+// caused them.
 //
 // SCHEMA SOURCE OF TRUTH: schemas/*.schema.json here are GENERATED, not hand-typed -- see
 // agent/src/schemas.py's `export_hook_schemas`/`HOOK_SCHEMAS` (StepsFile/ManifestFile, composed
@@ -22,14 +24,15 @@
 // ONE generic walker every schema file here is validated through -- no hook re-encodes a model's
 // field names as its own magic strings.
 //
-// WIREFRAME_FORBIDDEN/_SAFE_DIAGRAM_NAME_RE/MAX_WIREFRAMES/MAX_WIREFRAME_BYTES below are PORTED
-// from gates/diagram_gate.py (check_wireframe, DIAGRAM_MAX_WIREFRAMES/DIAGRAM_MAX_WIREFRAME_BYTES
-// config constants), not re-derived -- Node in the sandbox has no path to call Python, the same
-// constraint that already keeps claude_chat_model.py's/copilot_chat_model.py's `_map_tool_names`
-// as two independently-typed copies (see either file's own docstring). KEEP THESE IN SYNC WITH
-// gates/diagram_gate.py BY HAND -- there is no automated drift guard for this half (unlike the
-// schema files above, which regenerate mechanically); re-read that module's own regex list here
-// whenever either changes.
+// WIREFRAME_FORBIDDEN/_SAFE_DIAGRAM_NAME_RE/MAX_WIREFRAME_BYTES below are PORTED from
+// gates/diagram_gate.py (check_wireframe, DIAGRAM_MAX_WIREFRAME_BYTES config constant), not
+// re-derived -- this half genuinely needs the wireframe's own HTML body (forbidden-pattern/byte
+// checks), which the wireframe_linkage_checks.py shared module below doesn't carry, so a Python
+// subprocess call isn't a clean fit here the way it is for the linkage checks below. KEEP THESE IN
+// SYNC WITH gates/diagram_gate.py BY HAND -- there is no automated drift guard for this half
+// (unlike the schema files above, which regenerate mechanically); re-read that module's own regex
+// list here whenever either changes. There is deliberately no wireframe COUNT cap (removed
+// 2026-09-24) -- a plan may cite as many wireframes as the work actually needs.
 //
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs:
 // no AIDW_-prefixed env var gates this -- steps.json/manifest.json's own existence in the working
@@ -56,11 +59,10 @@ function listStems(dir, ext) {
   }
 }
 
-// Ported from config.py's DIAGRAM_MAX_WIREFRAMES/DIAGRAM_MAX_WIREFRAME_BYTES (env-overridable
-// there; a fixed value here is fine -- this hook is a same-turn NUDGE, not the authoritative gate,
-// and using a stale default only means an operator-tuned cap takes one extra lap to be enforced
-// here, never a false rejection since diagram_gate.py's own check still runs after).
-const MAX_WIREFRAMES = 6;
+// Ported from config.py's DIAGRAM_MAX_WIREFRAME_BYTES (env-overridable there; a fixed value here
+// is fine -- this hook is a same-turn NUDGE, not the authoritative gate, and using a stale default
+// only means an operator-tuned cap takes one extra lap to be enforced here, never a false
+// rejection since diagram_gate.py's own check still runs after).
 const MAX_WIREFRAME_BYTES = 30 * 1024;
 const SAFE_DIAGRAM_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -151,12 +153,6 @@ if (manifestDoc !== undefined) {
   // exist yet.
   const wireframes = Array.isArray(manifestDoc.wireframes) ? manifestDoc.wireframes : [];
   const diagrams = Array.isArray(manifestDoc.diagrams) ? manifestDoc.diagrams : [];
-
-  if (wireframes.length > MAX_WIREFRAMES) {
-    problems.push(
-      `${MANIFEST_PATH}: ${wireframes.length} wireframes exceeds the cap of ${MAX_WIREFRAMES} -- keep only the screens this plan actually changes.`,
-    );
-  }
 
   for (const wf of wireframes) {
     if (typeof wf?.screen !== "string") continue; // already reported by the schema check above

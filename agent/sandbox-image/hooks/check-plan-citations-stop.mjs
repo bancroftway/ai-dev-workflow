@@ -1,28 +1,34 @@
 #!/usr/bin/env node
 // Stop hook: validates every Acceptance Criterion id `.ai-dev-workflow/plan/_draft/steps.json`
 // and `manifest.json` cite before the plan draft/audit turn ends, instead of waiting a full
-// draft->audit->verify round-trip for gates/diagram_gate.py's `check_plan_linkage`/
-// `check_wireframe_ac_ids` (both ported from, verbatim below) to report the identical thing.
+// draft->audit->verify round-trip for gates/diagram_gate.py to report the identical thing.
 //
-// Scope, deliberately narrower than the real gate: an invented/mistyped id, a wrong-kind id (an
-// AC id where the real ledger entry is a user_story or vice versa), or a retired/deferred id cited
-// as live -- the same fail-closed, zero-judgment citation checks check-citation-drop-stop.mjs
-// already applies to Specification's own existing_us_id/existing_ac_id -- PLUS one coverage-
-// direction check (root-caused live 2026-09-19, income-investor session 598b633d, plan lap 2):
-// every criterion the approved Specification marks ui_related must be cited by SOME wireframe,
-// ported from gates/diagram_gate.py's `check_ui_wireframe_coverage` -- PLUS retired_step_ids
-// validity (root-caused live 2026-09-19, income-investor session 5c555dac, plan lap 1: a plan
-// step id retired that was never a real ledger entry), ported from spec_ledger.py's
-// `sync_plan_ledger`. Deliberately NOT ported: the
-// "every eligible AC must be cited by SOME step" completeness sweep and the "already-delivered
-// criteria only" carryover check (gates/diagram_gate.py's own `check_plan_linkage`) -- both need
-// `coded_run_id`/prior-step state this hook would have to re-derive with real risk of getting a
-// subtler rule wrong; the real deterministic gate stays the authority for those two.
+// Two kinds of check below, same split as check-testid-locators-stop.mjs vs. its own
+// hand-ported siblings:
+//
+// 1. WIREFRAME/PLAN-STEP <-> AC LINKAGE (citation validity + both coverage directions) SHELLS OUT
+//    to the real Python implementation, gates/wireframe_linkage_checks.py (byte-identical staged
+//    copy at /opt/aidw-hooks/wireframe_linkage_checks.py) -- not a hand-ported reimplementation.
+//    Covers: every ac_id a wireframe cites is real (`check_wireframe_ac_ids`); every wireframe
+//    cites >=1 ac_id (`check_wireframe_has_ac_ids`); every ui_related AC is cited by some
+//    wireframe (`check_ui_wireframe_coverage`, root-caused live 2026-09-19, income-investor
+//    session 598b633d, plan lap 2); every ui_related plan step is cited by some wireframe
+//    (`check_plan_step_wireframe_coverage`, 2026-09-24, the PlanStep-side half of the same
+//    coverage discipline).
+// 2. Everything else below stays hand-ported (steps'/diagrams' own ac_ids citation validity, and
+//    retired_step_ids validity -- root-caused live 2026-09-19, income-investor session 5c555dac,
+//    plan lap 1: a plan step id retired that was never a real ledger entry, ported from
+//    spec_ledger.py's `sync_plan_ledger`). Deliberately NOT ported at all: the "every eligible AC
+//    must be cited by SOME step" completeness sweep and the "already-delivered criteria only"
+//    carryover check (gates/diagram_gate.py's own `check_plan_linkage`) -- both need
+//    `coded_run_id`/prior-step state this hook would have to re-derive with real risk of getting a
+//    subtler rule wrong; the real deterministic gate stays the authority for those two.
 //
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs and
 // check-plan-schema-stop.mjs: no AIDW_-prefixed env var gates this -- steps.json's own existence
 // in the working directory is the entire scope check.
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 const STEPS_PATH = ".ai-dev-workflow/plan/_draft/steps.json";
@@ -138,18 +144,6 @@ if (ledgerPopulated && Array.isArray(stepsDoc?.plan_steps)) {
   }
 }
 
-if (ledgerPopulated && Array.isArray(manifestDoc?.wireframes)) {
-  for (const wf of manifestDoc.wireframes) {
-    const screen = wf?.screen || "?";
-    const acIds = Array.isArray(wf?.ac_ids) ? wf.ac_ids : [];
-    if (acIds.length === 0) {
-      problems.push(`wireframe ${JSON.stringify(screen)}: cites no ac_ids -- every wireframe must name at least one acceptance criterion it is evidence for.`);
-      continue;
-    }
-    problems.push(...checkAcIds(`wireframe ${JSON.stringify(screen)}`, acIds, false));
-  }
-}
-
 if (ledgerPopulated && Array.isArray(manifestDoc?.diagrams)) {
   for (const dg of manifestDoc.diagrams) {
     const acIds = Array.isArray(dg?.ac_ids) ? dg.ac_ids : [];
@@ -159,36 +153,55 @@ if (ledgerPopulated && Array.isArray(manifestDoc?.diagrams)) {
   }
 }
 
-// The COVERAGE direction, ported from gates/diagram_gate.py's `check_ui_wireframe_coverage`
-// (root-caused live 2026-09-19, income-investor session 598b633d, plan lap 2 -- every check above
-// only validates a citation a wireframe/diagram DOES make; this is the other half, "every
-// ui_related criterion the approved Specification names must be cited by SOME wireframe").
-// Requires the approved Specification -- absent for plan's very first lap of a first-ever ticket
-// only in the sense that plan cannot start before specification is approved, so this file always
-// exists by the time plan's own draft/audit turn runs; still read defensively (undefined -> skip).
-if (Array.isArray(manifestDoc?.wireframes)) {
-  const specDoc = readJson(SPECIFICATION_APPROVED_PATH);
-  if (specDoc !== undefined && Array.isArray(specDoc.user_stories)) {
-    const uiRelatedAcIds = new Set();
-    for (const story of specDoc.user_stories) {
-      if (story?.deferred) continue;
-      for (const ac of Array.isArray(story?.acceptance_criteria) ? story.acceptance_criteria : []) {
-        if (ac?.ui_related && !ac?.deferred && typeof ac?.id === "string") uiRelatedAcIds.add(ac.id);
-      }
-    }
-    const covered = new Set();
-    for (const wf of manifestDoc.wireframes) {
-      for (const id of Array.isArray(wf?.ac_ids) ? wf.ac_ids : []) covered.add(id);
-    }
-    for (const acId of [...uiRelatedAcIds].sort()) {
-      if (!covered.has(acId)) {
-        problems.push(
-          `${acId}: marked ui_related in the Specification, but no wireframe's ac_ids cites it -- ` +
-            "add a wireframe for the screen that satisfies it (or fix the Specification if ui_related is wrong for this criterion).",
-        );
-      }
+// Wireframe/PlanStep <-> AC linkage: SHELLS OUT to gates/wireframe_linkage_checks.py (see this
+// file's own header) instead of hand-porting `check_wireframe_ac_ids`/`check_wireframe_has_ac_ids`/
+// `check_ui_wireframe_coverage`/`check_plan_step_wireframe_coverage`. Requires the approved
+// Specification for the ui_related coverage direction only -- absent for plan's very first lap of
+// a first-ever ticket only in the sense that plan cannot start before specification is approved,
+// so this file always exists by the time plan's own draft/audit turn runs; still read defensively
+// (undefined -> an empty ui_related_ac_ids list, same fail-open discipline as everywhere else in
+// this hook).
+const specDoc = readJson(SPECIFICATION_APPROVED_PATH);
+const uiRelatedAcIds = [];
+if (specDoc !== undefined && Array.isArray(specDoc.user_stories)) {
+  for (const story of specDoc.user_stories) {
+    if (story?.deferred) continue;
+    for (const ac of Array.isArray(story?.acceptance_criteria) ? story.acceptance_criteria : []) {
+      if (ac?.ui_related && !ac?.deferred && typeof ac?.id === "string") uiRelatedAcIds.push(ac.id);
     }
   }
+}
+const wireframesForLinkageCheck = Array.isArray(manifestDoc?.wireframes) ? manifestDoc.wireframes : [];
+const planStepsForLinkageCheck = Array.isArray(stepsDoc?.plan_steps) ? stepsDoc.plan_steps : [];
+let linkageResult;
+try {
+  const proc = spawnSync(
+    "python3",
+    ["/opt/aidw-hooks/wireframe_linkage_checks.py", "--check-hook"],
+    {
+      input: JSON.stringify({
+        wireframes: wireframesForLinkageCheck,
+        ledger_entries: ledgerEntries,
+        ui_related_ac_ids: uiRelatedAcIds,
+        plan_steps: planStepsForLinkageCheck,
+      }),
+      encoding: "utf8",
+      timeout: 20000,
+    },
+  );
+  if (proc.status === 0 && proc.stdout) linkageResult = JSON.parse(proc.stdout);
+} catch {
+  linkageResult = undefined; // infra gap -- never a false rejection
+}
+if (linkageResult) {
+  // Citation-validity against the ledger only means something once the ledger is populated --
+  // same greenfield leniency as every checkAcIds call above. The other three checks don't depend
+  // on ledger state at all (has_ac_ids is a shape check; both coverage directions depend on the
+  // Specification/plan_steps, not the ledger), so they run unconditionally.
+  if (ledgerPopulated) problems.push(...(linkageResult.wireframe_ac_ids || []));
+  problems.push(...(linkageResult.wireframe_has_ac_ids || []));
+  problems.push(...(linkageResult.ui_wireframe_coverage || []));
+  problems.push(...(linkageResult.plan_step_wireframe_coverage || []));
 }
 
 if (problems.length === 0) process.exit(0);

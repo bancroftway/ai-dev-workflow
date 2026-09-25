@@ -313,8 +313,10 @@ class PlanStep(BaseModel):
         default=False,
         description="True when this step changes what the user sees or interacts with (a screen, "
         "a component, layout, styling, client-side behavior) -- False for pure backend/API/data/"
-        "infrastructure work with no visible surface. Lets the review UI separate UI-facing work "
-        "from the rest at a glance; not gate-enforced against wireframe coverage.",
+        "infrastructure work with no visible surface. A deterministic Plan gate demands at least "
+        "one wireframe (Wireframe.ac_ids) cite one of this step's ac_ids -- set this honestly, "
+        "not defensively; marking a backend-only step true forces an unneeded wireframe, and "
+        "marking a real UI step false lets it slip through unreviewed.",
     )
     removes_ids: list[str] = Field(
         default_factory=list,
@@ -561,7 +563,7 @@ class ImplementationPlan(BaseModel):
     )
     wireframes: WireframePresence = Field(
         description="One self-contained high-fidelity HTML wireframe per new or changed screen "
-        "(at most 6 screens), or an explicit absent+reason for a plan with no user-interface work."
+        "(no cap on how many), or an explicit absent+reason for a plan with no user-interface work."
     )
     retired_wireframe_screens: list[str] = Field(
         default_factory=list,

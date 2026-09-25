@@ -79,6 +79,7 @@ class E2EState(TypedDict):
     total: int
     cannot_verify: bool  # sandbox missing at run time -- the suite never ran, escalate not pass
     screenshots: list[str]  # repo-relative paths
+    executed_ac_ids: list[str]  # AC ids embedded in any executed (non-skipped) test's title
     skipped_reason: str | None
     app_candidates: list[dict[str, Any]]  # gate_check's own fresh re-scan (see its own comment)
     suite: bool  # a playwright suite exists to run; False -> boot and screenshot only
@@ -407,16 +408,17 @@ async def _finalize_run(provider: Any, thread_id: str, e2e: E2EState) -> dict[st
     return {"e2e": e2e}
 
 
-def suite_screenshot_name(index: int, source_path: str) -> str:
-    """`001-US-0005-1-suite.png` from playwright's own result directory name.
+def suite_screenshot_name(index: int, title: str) -> str:
+    """`001-US-0005-1-suite.png` from the test's own JSON-reported title.
 
-    Playwright names each result dir after the test title, and this pipeline requires the AC id IN
-    that title -- so the id is sitting right there in the path
-    (`test-results/e2e-click-counter--US-0005-1-63f6d--.../test-finished-1.png`). The harvest used to
-    flatten everything to `001-suite.png`, throwing away the one thing that links visual evidence to
-    an acceptance criterion. Falls back to plain `-suite` when no id is present.
+    This pipeline requires the AC id IN the test's own title (ac_to_tests_draft.md), so the id is
+    sitting right there in `title` as Playwright's JSON reporter gives it -- exact and unmangled,
+    unlike the auto-generated `test-results/<slug>/...` result directory name this used to regex
+    against, which can lossily substitute/truncate characters. The harvest used to flatten
+    everything to `001-suite.png`, throwing away the one thing that links visual evidence to an
+    acceptance criterion. Falls back to plain `-suite` when no id is present.
     """
-    match = re.search(r"(US[-_]\d{4}(?:[._-]\d+)?)", source_path, re.IGNORECASE)
+    match = re.search(r"(US[-_]\d{4}(?:[._-]\d+)?)", title, re.IGNORECASE)
     if not match:
         return f"{index:03d}-suite.png"
     ac_id = match.group(1).upper().replace("_", "-").replace(".", "-")
@@ -437,22 +439,35 @@ def _normalize_ac_id(ac_id: str) -> str:
 
 
 def match_wireframe_coverage(
-    screenshots: list[str], wireframes: list[dict[str, Any]]
+    screenshots: list[str], wireframes: list[dict[str, Any]], executed_ac_ids: list[str]
 ) -> dict[str, Any]:
-    """Pure matcher: reconciles a plan's wireframes against landed e2e screenshots, by AC id only
-    -- no route/slug fallback (a wireframe's screen name never resembles a URL slug by
-    construction, and two wireframes can legitimately share one route with different app state,
-    e.g. a detail screen vs. its not-found variant; only their distinct ac_ids tell them apart).
+    """Pure matcher: reconciles a plan's wireframes against landed e2e screenshots AND executed
+    tests, by AC id only -- no route/slug fallback (a wireframe's screen name never resembles a URL
+    slug by construction, and two wireframes can legitimately share one route with different app
+    state, e.g. a detail screen vs. its not-found variant; only their distinct ac_ids tell them
+    apart).
 
-    Returns `{"missing": [...], "unwireframed_ac_ids": [...], "total": N}`: `missing` is every
-    wireframe (each `{"screen", "ac_ids"}`) with ZERO landed evidence (empty = fully covered, gates
-    the stage); `unwireframed_ac_ids` is every proven AC id no wireframe cites at all (advisory
-    only, never gates); `total` is `len(wireframes)`, for the exit report's "X/Y verified" line."""
+    `missing` (screenshot evidence) and `missing_tests` (executed-test evidence) are independent,
+    both-gate signals, NOT one merged condition (2026-09-24) -- a screenshot is a byproduct of an
+    executed test, so in practice `missing_tests` rarely fires without `missing` also firing, but
+    they diverge exactly in the case worth catching on its own: a test ran (proving `missing_tests`
+    empty) but its screenshot attachment failed to land (an infra gap, not "no test exists" --
+    telling a model to "add a test" when one already ran would be wrong advice). Kept as two
+    separate keys instead of reshaping `missing` so every existing consumer of `missing`'s
+    `{screen, ac_ids}` shape (the exit report renderer, this module's own self-check) is untouched.
+
+    Returns `{"missing": [...], "missing_tests": [...], "unwireframed_ac_ids": [...], "total": N}`:
+    `missing`/`missing_tests` are each a list of `{"screen", "ac_ids"}` (empty = fully covered,
+    each independently gates the stage); `unwireframed_ac_ids` is every proven AC id no wireframe
+    cites at all (advisory-only computation here -- the caller, check_wireframe_coverage, filters
+    it to ui_related ids before deciding whether to gate on it); `total` is `len(wireframes)`, for
+    the exit report's "X/Y verified" line."""
     proven_ac_ids = {
         match.group(1).upper()
         for path in screenshots
         if (match := _SUITE_SCREENSHOT_AC_RE.match(path.rsplit("/", 1)[-1]))
     }
+    executed_ids_norm = {_normalize_ac_id(a) for a in executed_ac_ids}
     wireframed_ac_ids = {_normalize_ac_id(a) for wf in wireframes for a in (wf.get("ac_ids") or [])}
     return {
         "missing": [
@@ -460,18 +475,31 @@ def match_wireframe_coverage(
             for wf in wireframes
             if not any(_normalize_ac_id(a) in proven_ac_ids for a in (wf.get("ac_ids") or []))
         ],
+        "missing_tests": [
+            {"screen": wf.get("screen"), "ac_ids": wf.get("ac_ids") or []}
+            for wf in wireframes
+            if not any(_normalize_ac_id(a) in executed_ids_norm for a in (wf.get("ac_ids") or []))
+        ],
         "unwireframed_ac_ids": sorted(proven_ac_ids - wireframed_ac_ids),
         "total": len(wireframes),
     }
 
 
 async def check_wireframe_coverage(
-    provider: Any, thread_id: str, screenshots: list[str]
+    provider: Any, thread_id: str, screenshots: list[str], executed_ac_ids: list[str]
 ) -> dict[str, Any] | None:
     """Reads the approved plan and applies match_wireframe_coverage. Returns None when there's
     nothing to check: no approved wireframes (a plan with no UI work), or the plan file can't be
     read at all -- an infra gap must not manufacture a false gate failure, the same fail-open
-    discipline diagram_gate.py's own prior-plan read uses."""
+    discipline diagram_gate.py's own prior-plan read uses.
+
+    Also reads the approved Specification to filter the returned `unwireframed_ac_ids` down to
+    `ui_related` ids only (2026-09-24, promoting that reverse direction from advisory to a gate):
+    a non-ui_related AC's e2e test can legitimately screenshot something incidentally (confirming a
+    backend side effect, say) without that AC ever needing -- or being required to have -- a
+    wireframe; gating on every proven-but-unwireframed AC id regardless of ui_related would fail
+    runs that did nothing wrong. Fail-open to an empty list if the Specification is unreadable,
+    same discipline as the plan read above."""
     raw_plan = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.PLAN_APPROVED_PATH)
     if raw_plan is None:
         return None
@@ -482,7 +510,27 @@ async def check_wireframe_coverage(
     wireframes = presence_values(plan_doc.get("wireframes"))
     if not wireframes:
         return None
-    return match_wireframe_coverage(screenshots, wireframes)
+    result = match_wireframe_coverage(screenshots, wireframes, executed_ac_ids)
+
+    ui_related_ac_ids: set[str] = set()
+    raw_spec = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH)
+    if raw_spec:
+        try:
+            spec_doc = json.loads(raw_spec)
+        except json.JSONDecodeError:
+            spec_doc = None
+        if spec_doc:
+            ui_related_ac_ids = {
+                _normalize_ac_id(ac.get("id"))
+                for story in (spec_doc.get("user_stories") or [])
+                if not story.get("deferred")
+                for ac in (story.get("acceptance_criteria") or [])
+                if ac.get("ui_related") and not ac.get("deferred") and ac.get("id")
+            }
+    result["unwireframed_ac_ids"] = [
+        a for a in result["unwireframed_ac_ids"] if _normalize_ac_id(a) in ui_related_ac_ids
+    ]
+    return result
 
 
 def _route_slug(route: str) -> str:
@@ -1465,8 +1513,12 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # green run -- and they are read as current evidence: the conformance audit failed a run citing
     # "blank white screenshots indicate captured Playwright failures, not passing evidence", pointing
     # at PNGs from an attempt two cycles earlier. Evidence on disk must belong to the run being
-    # judged.
-    await provider.exec_in_sandbox(thread_id, f"rm -rf {shlex.quote(results_root)}")
+    # judged. E2E_REPORT_PATH is cleared alongside it for the same reason: the timeout fix below
+    # means a suite that crashes/OOMs before its JSON reporter ever writes now has nothing stale
+    # left over to be silently read as this attempt's result.
+    await provider.exec_in_sandbox(
+        thread_id, f"rm -rf {shlex.quote(results_root)} {shlex.quote(E2E_REPORT_PATH)}"
+    )
 
     suite_result = None
     if e2e.get("suite"):
@@ -1487,7 +1539,22 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         )
         keepalive = asyncio.create_task(_keepalive_touch(provider, thread_id))
         try:
-            suite_result = await provider.exec_in_sandbox(thread_id, command)
+            # Without an explicit timeout_seconds this call inherits exec_in_sandbox's 30s
+            # "fast-admin" default (SANDBOX_DOCKER_TIMEOUT_SECONDS) -- far shorter than this
+            # suite's own in-container `timeout` above. Root-caused live (income-investor thread
+            # f0fef8ba): when that 30s Python-side timeout fired, `docker exec` (no -i/-t) killed
+            # only the local CLI client, not the process running inside the container -- the
+            # suite kept running orphaned while this call returned early with returncode=-1 (never
+            # 124, so the timeout-124 branch below never caught it either). The harvest that used
+            # to follow then raced a suite that was often still genuinely writing screenshots,
+            # which is what E2E_SCREENSHOT_HARVEST_SETTLE_SECONDS's sync+sleep band-aid was really
+            # fighting -- and could never fully win, since the real remaining runtime was
+            # unbounded relative to any fixed settle pause. Sized to comfortably clear the suite's
+            # own timeout wrapper plus normal exec/spawn overhead.
+            suite_result = await provider.exec_in_sandbox(
+                thread_id, command,
+                timeout_seconds=workflow_config.E2E_SUITE_TIMEOUT_SECONDS + workflow_config.SANDBOX_DOCKER_TIMEOUT_SECONDS,
+            )
         finally:
             keepalive.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1513,35 +1580,43 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         )
         return await _finalize_run(provider, thread_id, e2e)
 
+    # Read+parse the JSON report now (moved up from below `screenshots`/lighthouse/sizing --
+    # nothing between here and there is a dependency of this read). The harvest right below
+    # needs `parsed["screenshot_attachments"]`; `e2e.update(..., **parsed)` further down reuses
+    # this same `parsed` instead of reading+parsing the file a second time.
+    raw_report = await repo_files.read_repo_file(provider, thread_id, E2E_REPORT_PATH)
+    if raw_report:
+        parsed = _parse_playwright_json(raw_report)
+    elif not e2e.get("suite"):
+        # No suite existed to run; the boot+screenshot pass IS the whole stage here. Zero tests is
+        # the truth, not a crash, and must not be reported as a failure.
+        parsed = {"passed": 0, "total": 0, "failed_tests": []}
+    else:
+        # The reporter never wrote a file at all (suite crashed before it could) -- NEVER read
+        # this as "0 tests, all passed": that would let the very failures this stage exists to
+        # catch skip straight past the fix/escalate loop.
+        parsed = {
+            "passed": 0, "total": 0,
+            "failed_tests": [{"title": "e2e report", "error": f"{E2E_REPORT_PATH} was not written (suite exit code {suite_result.returncode})"}],
+        }
+
     # Screenshot harvest. Filenames derive from repo-controlled test titles -- a real shell
-    # metacharacter injection risk -- so `find`'s raw output is NEVER re-interpolated into another
-    # sh -c string. Each path is instead individually shlex-quoted from Python, and the mkdir +
-    # all cp commands are sent as one batched multi-line script, which gives the same safety
-    # `find -print0 | xargs -0` would inside one shell pipeline.
+    # metacharacter injection risk -- so paths are never re-interpolated into another sh -c
+    # string; each is individually shlex-quoted from Python, and the mkdir + all cp commands are
+    # sent as one batched multi-line script.
     #
-    # `sync` + a settle pause before the find: root-caused live (income-investor thread f0fef8ba)
-    # -- the suite process this `exec_in_sandbox` call above already awaited to completion had
-    # genuinely written every result PNG (confirmed: re-running this exact find+harvest by hand
-    # minutes later, against the SAME on-disk results, correctly found and copied all of them), yet
-    # the harvest's own `find` -- run immediately after the suite exits, in the SAME turn -- only
-    # ever saw a small, execution-order-first subset (9 of 75 one run). `sync` alone measurably
-    # helped (9 -> 23 on a live retry) without fully closing the gap, which points to something
-    # above the OS write-back layer -- Playwright's own per-test artifact writer plausibly still
-    # finishing after the parent process it spawned from has already exited. See
-    # E2E_SCREENSHOT_HARVEST_SETTLE_SECONDS's own comment for the full reasoning and the tuning
-    # tradeoff.
-    await provider.exec_in_sandbox(thread_id, "sync")
-    await asyncio.sleep(workflow_config.E2E_SCREENSHOT_HARVEST_SETTLE_SECONDS)
-    find_result = await provider.exec_in_sandbox(
-        thread_id, f"find {shlex.quote(results_root)} -name '*.png' -print0 2>/dev/null"
-    )
-    # Capped the same way routes[:E2E_ROUTES_MAX] already truncates elsewhere in this file -- an
-    # uncapped match count here would fold one `cp` line per file into a single script string, and
-    # on this repo's Windows dev host that string ultimately becomes a `docker exec` argv subject to
-    # CreateProcess's ~32767-char limit (see E2E_SCREENSHOT_COPY_MAX_FILES's own comment).
-    found_paths = [p for p in (find_result.stdout or "").split("\x00") if p][:workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES]
-    script = _build_screenshot_copy_script(screens_dir, found_paths)
-    screenshots = [f"{screens_dir}/{suite_screenshot_name(i, p)}" for i, p in enumerate(found_paths, start=1)]
+    # Sourced from the JSON report's own attachment paths, not a `find` over test-results/: this
+    # pipeline used to `find` the directory right after the suite exited, which non-deterministically
+    # undercounted PNGs (root-caused live on income-investor thread f0fef8ba as the suite exec above
+    # racing an orphaned, still-running suite process -- see that call's own comment; a `sync` +
+    # settle-sleep band-aid here helped but could never fully close a gap whose real cause was "the
+    # suite hadn't actually finished yet"). Every path in `screenshot_attachments` is authoritative
+    # by construction: Playwright's JSON reporter only records an attachment after the `screenshot:
+    # "on"` fixture's own write has been awaited, so there is nothing left to wait or settle for here.
+    attachments = (parsed.pop("screenshot_attachments", None) or [])[:workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES]
+    found = [(a["title"], a["path"]) for a in attachments]
+    script = _build_screenshot_copy_script(screens_dir, found)
+    screenshots = [f"{screens_dir}/{suite_screenshot_name(i, title)}" for i, (title, _path) in enumerate(found, start=1)]
     await provider.exec_in_sandbox(thread_id, script)
 
     # Per-route screenshots, ALWAYS taken (not just as a fallback). Two reasons: playwright's
@@ -1641,21 +1716,8 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             len(identical), thread_id,
         )
 
-    raw_report = await repo_files.read_repo_file(provider, thread_id, E2E_REPORT_PATH)
-    if raw_report:
-        parsed = _parse_playwright_json(raw_report)
-    elif not e2e.get("suite"):
-        # No suite existed to run; the boot+screenshot pass IS the whole stage here. Zero tests is
-        # the truth, not a crash, and must not be reported as a failure.
-        parsed = {"passed": 0, "total": 0, "failed_tests": []}
-    else:
-        # The reporter never wrote a file at all (suite crashed before it could) -- NEVER read
-        # this as "0 tests, all passed": that would let the very failures this stage exists to
-        # catch skip straight past the fix/escalate loop.
-        parsed = {
-            "passed": 0, "total": 0,
-            "failed_tests": [{"title": "e2e report", "error": f"{E2E_REPORT_PATH} was not written (suite exit code {suite_result.returncode})"}],
-        }
+    # `parsed` was already read+computed above (needed there for the screenshot harvest); reused
+    # here rather than reading+parsing E2E_REPORT_PATH a second time.
     e2e.update(status="passed" if not parsed["failed_tests"] else "failed", **parsed)
 
     # Connectivity preflight -- see connectivity_preflight_error's own docstring. Reuses the same
@@ -1706,11 +1768,13 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             e2e["status"] = "failed"
 
     # Wireframe-coverage gate: every screen the approved plan wireframed must have at least one
-    # landed e2e screenshot proving it, matched by AC id (see match_wireframe_coverage's own
-    # docstring for why route/slug matching was tried and dropped). None means there was nothing
-    # to check (no wireframes, or the plan file was unreadable) -- fail-open, not a pass/fail signal
-    # of its own.
-    coverage = await check_wireframe_coverage(provider, thread_id, e2e.get("screenshots") or [])
+    # landed e2e screenshot proving it, AND at least one executed test proving it, matched by AC id
+    # (see match_wireframe_coverage's own docstring for why route/slug matching was tried and
+    # dropped, and why these are two independent checks). None means there was nothing to check (no
+    # wireframes, or the plan file was unreadable) -- fail-open, not a pass/fail signal of its own.
+    coverage = await check_wireframe_coverage(
+        provider, thread_id, e2e.get("screenshots") or [], e2e.get("executed_ac_ids") or [],
+    )
     missing_wireframes = (coverage or {}).get("missing") or []
     if missing_wireframes:
         failures = list(e2e.get("failed_tests") or [])
@@ -1731,9 +1795,56 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             })
         e2e["failed_tests"] = failures
         e2e["status"] = "failed"
+
+    # Independent of missing_wireframes above (2026-09-24): a landed screenshot alone doesn't prove
+    # a real EXECUTED test claims this screen's AC id -- a screenshot's own AC id is scraped from
+    # Playwright's result-dir naming, a weaker signal than the test report's own structured
+    # title-attribution. This catches the case where a test ran and failed to attach a screenshot
+    # (an infra gap, not "no test exists" -- a different fix than missing_wireframes' own message).
+    missing_tests = (coverage or {}).get("missing_tests") or []
+    if missing_tests:
+        failures = list(e2e.get("failed_tests") or [])
+        for wf in missing_tests:
+            failures.append({
+                "title": f"wireframe test coverage: {wf['screen']}",
+                "error": (
+                    f"The approved plan's {wf['screen']!r} wireframe cites "
+                    f"{', '.join(wf['ac_ids']) or '(no ac_ids)'}, but no EXECUTED e2e test's title "
+                    "embeds any of those AC ids -- a landed screenshot alone doesn't prove a real "
+                    "test exercised this screen. Add a Playwright test under tests/e2e/ whose title "
+                    f"embeds one of {wf['ac_ids']} in this pipeline's US-####.# convention."
+                ),
+            })
+        e2e["failed_tests"] = failures
+        e2e["status"] = "failed"
+
+    # Reverse direction (2026-09-24, promoted from advisory to a gate, scoped to ui_related AC ids
+    # only -- see check_wireframe_coverage's own docstring for why the unscoped version would be a
+    # false-positive risk): a ui_related AC id a landed e2e screenshot proves, that no wireframe in
+    # the approved plan cites at all.
+    unwireframed_ac_ids = (coverage or {}).get("unwireframed_ac_ids") or []
+    if unwireframed_ac_ids:
+        failures = list(e2e.get("failed_tests") or [])
+        failures.append({
+            "title": "wireframe coverage: unwireframed AC id(s)",
+            "error": (
+                f"A landed e2e screenshot's title embeds {', '.join(unwireframed_ac_ids)}, marked "
+                "ui_related in the approved Specification, but no wireframe in the approved plan "
+                "cites any of them -- either the test title has the wrong AC id (fix the title to "
+                "reference the correct, wireframed criterion), or this is genuine UI work the plan "
+                "never documented. The plan is already approved and out of this stage's write "
+                "scope, so if the title is correct this cannot be resolved here; after the fix "
+                "budget is exhausted this run escalates to a human, the same fallback every other "
+                "unresolvable e2e failure already uses."
+            ),
+        })
+        e2e["failed_tests"] = failures
+        e2e["status"] = "failed"
+
     # None (not []) when there was nothing to check at all (no wireframes, or plan unreadable) --
     # the exit report needs to tell "6/6 verified" apart from "not applicable, no UI work planned".
     e2e["wireframe_coverage_missing"] = coverage.get("missing") if coverage is not None else None
+    e2e["wireframe_test_coverage_missing"] = coverage.get("missing_tests") if coverage is not None else None
     e2e["wireframe_coverage_total"] = coverage.get("total") if coverage is not None else None
     e2e["unwireframed_screens"] = (coverage or {}).get("unwireframed_ac_ids") or []
 
@@ -1950,12 +2061,19 @@ async def _run_lighthouse(provider: Any, thread_id: str, port: int, routes: list
     for index, route in enumerate(routes[:workflow_config.E2E_ROUTES_MAX], start=1):
         report_file = f"/tmp/aidw-lighthouse-{index}.json"
         url = f"http://localhost:{port}{route}"
+        # Same class of gap as the suite exec above: without timeout_seconds this call inherits
+        # the 30s fast-admin default (SANDBOX_DOCKER_TIMEOUT_SECONDS), shorter than the
+        # in-container `timeout` wrapper's own 150s (E2E_LIGHTHOUSE_TIMEOUT_SECONDS) -- any run
+        # over 30s got client-killed while lighthouse kept running orphaned, and the extract/rm-f
+        # calls below then raced a report that wasn't written yet, silently failing open.
+        # Directly observed this session: "no readable report" for every route, every attempt.
         run = await provider.exec_in_sandbox(
             thread_id,
             f"timeout {workflow_config.E2E_LIGHTHOUSE_TIMEOUT_SECONDS} lighthouse {shlex.quote(url)} --output=json "
             f"--output-path={shlex.quote(report_file)} "
             "--only-categories=performance,accessibility "
             "--chrome-flags='--headless --no-sandbox --disable-gpu' --quiet 2>&1",
+            timeout_seconds=workflow_config.E2E_LIGHTHOUSE_TIMEOUT_SECONDS + workflow_config.SANDBOX_DOCKER_TIMEOUT_SECONDS,
         )
         extract = await provider.exec_in_sandbox(
             thread_id,
@@ -2108,20 +2226,20 @@ _iter_specs = test_results._iter_specs
 _parse_playwright_json = test_results.parse_playwright_json
 
 
-def _build_screenshot_copy_script(screens_dir: str, found_paths: list[str]) -> str:
+def _build_screenshot_copy_script(screens_dir: str, found: list[tuple[str, str]]) -> str:
     """Build a multi-line shell script for mkdir + all screenshot copies.
 
     Args:
         screens_dir: Destination directory (will be created).
-        found_paths: List of source screenshot paths.
+        found: List of (test title, source screenshot path) pairs.
 
     Returns:
         Multi-line shell script with mkdir -p and cp commands, newline-separated,
         with per-path shlex.quote() to prevent shell injection.
     """
     script_lines = [f"mkdir -p {shlex.quote(screens_dir)}"]
-    for index, path in enumerate(found_paths, start=1):
-        dest = f"{screens_dir}/{suite_screenshot_name(index, path)}"
+    for index, (title, path) in enumerate(found, start=1):
+        dest = f"{screens_dir}/{suite_screenshot_name(index, title)}"
         script_lines.append(f"cp -- {shlex.quote(path)} {shlex.quote(dest)}")
     return "\n".join(script_lines)
 
@@ -2287,16 +2405,12 @@ def _demo() -> None:
     assert degenerate_screenshots({"blank.png": 4254, "real.png": 96281}) == ["blank.png"]
     assert degenerate_screenshots({}) == []
 
-    # Suite screenshots keep the AC id playwright already put in its result directory name -- the
+    # Suite screenshots keep the AC id embedded in the test's own JSON-reported title -- the
     # harvest used to flatten it away, severing visual evidence from the criterion it proves.
-    assert suite_screenshot_name(
-        1, "apps/web/test-results/e2e-click-counter--US-0005-1-63f6d--reload/test-finished-1.png"
-    ) == "001-US-0005-1-suite.png"
-    assert suite_screenshot_name(
-        2, "test-results/spec-US_0002_3-abc/test-failed-1.png"
-    ) == "002-US-0002-3-suite.png"
-    # No id in the path -> plain name, never a fabricated id.
-    assert suite_screenshot_name(3, "test-results/smoke/test-finished-1.png") == "003-suite.png"
+    assert suite_screenshot_name(1, "US-0005.1 reload works") == "001-US-0005-1-suite.png"
+    assert suite_screenshot_name(2, "US_0002_3 something") == "002-US-0002-3-suite.png"
+    # No id in the title -> plain name, never a fabricated id.
+    assert suite_screenshot_name(3, "smoke test, no id here") == "003-suite.png"
 
     # _normalize_ac_id: both separator styles a ledger/suite-filename might use collapse to the
     # same form, so the wireframe-coverage match below can't silently miss on punctuation alone.
@@ -2307,38 +2421,51 @@ def _demo() -> None:
     # match_wireframe_coverage: the exact shape of the bug this gate exists to catch -- a wireframe
     # whose AC has a landed, AC-tagged suite screenshot is covered; one with none is reported
     # missing (and its ac_ids come back verbatim, so the fix loop knows exactly what to add); an
-    # extra suite screenshot proving an AC no wireframe cites is advisory-only, never in "missing".
+    # extra suite screenshot proving an AC no wireframe cites is returned in unwireframed_ac_ids
+    # (check_wireframe_coverage, not this pure matcher, decides whether that gates -- see its own
+    # docstring). missing/missing_tests are independent (2026-09-24): this case deliberately gives
+    # poll-not-found an executed test but no screenshot, proving missing and missing_tests can
+    # disagree in either direction.
     wireframes = [
         {"screen": "poll-detail", "ac_ids": ["US-0002.6", "US-0004.1"]},
         {"screen": "poll-not-found", "ac_ids": ["US-0006.3"]},
     ]
     covered = match_wireframe_coverage(
-        ["history/r1-screens/001-US-0004-1-suite.png"], wireframes,
+        ["history/r1-screens/001-US-0004-1-suite.png"], wireframes, ["US-0004.1", "US-0006.3"],
     )
     assert covered["missing"] == [{"screen": "poll-not-found", "ac_ids": ["US-0006.3"]}]
+    assert covered["missing_tests"] == [], "an executed test exists for US-0006.3 even though its screenshot never landed"
     assert covered["unwireframed_ac_ids"] == []
-    # Dotted-vs-dashed AC id on either side must still match.
+    # Dotted-vs-dashed AC id on either side must still match, for both screenshots and executed ids.
     both_covered = match_wireframe_coverage(
         ["history/r1-screens/001-US-0002-6-suite.png", "history/r1-screens/002-US-0006-3-suite.png"],
-        wireframes,
+        wireframes, ["US-0002.6", "US-0006.3"],
     )
     assert both_covered["missing"] == []
+    assert both_covered["missing_tests"] == []
     # A per-route screenshot (no AC id in its name at all) never counts as coverage -- only an
     # AC-tagged suite screenshot does, which is exactly the naive-route-slug bug this design
-    # dropped in favour of AC-id-only matching.
-    route_only = match_wireframe_coverage(["history/r1-screens/003-polls-new.png"], wireframes)
+    # dropped in favour of AC-id-only matching. No executed_ac_ids either -> both dimensions flag.
+    route_only = match_wireframe_coverage(["history/r1-screens/003-polls-new.png"], wireframes, [])
     assert len(route_only["missing"]) == 2
-    # An AC proven by e2e that no wireframe cites is advisory, not gating.
+    assert len(route_only["missing_tests"]) == 2
+    # An AC proven by e2e that no wireframe cites is returned in unwireframed_ac_ids, not "missing".
     extra = match_wireframe_coverage(
         ["history/r1-screens/001-US-0002-6-suite.png", "history/r1-screens/002-US-0004-1-suite.png",
          "history/r1-screens/003-US-0006-3-suite.png", "history/r1-screens/004-US-9999-9-suite.png"],
-        wireframes,
+        wireframes, ["US-0002.6", "US-0004.1", "US-0006.3", "US-9999-9"],
     )
     assert extra["missing"] == []
+    assert extra["missing_tests"] == []
     assert extra["unwireframed_ac_ids"] == ["US-9999-9"]
+    # Executed tests exist for everything, but nothing screenshotted -> missing flags both, but
+    # missing_tests stays empty -- the mirror-image divergence of `covered` above.
+    no_shots = match_wireframe_coverage([], wireframes, ["US-0002.6", "US-0006.3"])
+    assert len(no_shots["missing"]) == 2
+    assert no_shots["missing_tests"] == []
     # No wireframes at all -> nothing to check, empty on every key.
-    assert match_wireframe_coverage(["history/r1-screens/001-suite.png"], []) == {
-        "missing": [], "unwireframed_ac_ids": [], "total": 0,
+    assert match_wireframe_coverage(["history/r1-screens/001-suite.png"], [], []) == {
+        "missing": [], "missing_tests": [], "unwireframed_ac_ids": [], "total": 0,
     }
     assert covered["total"] == 2
 
@@ -2459,10 +2586,11 @@ def _demo() -> None:
 
     # Screenshot copy script batching: build one multi-line shell script (mkdir + all cp commands)
     # instead of many exec_in_sandbox calls. Paths are individually shlex-quoted to prevent
-    # injection from repo-controlled test titles.
+    # injection from repo-controlled test titles; the title itself only feeds suite_screenshot_name
+    # (never the shell), so these placeholder titles don't need to be dangerous too.
     script = _build_screenshot_copy_script("/out/screens", [
-        "/results/spec US 0001/test-finished-1.png",  # space in path
-        "/results/spec-$(evil)-0002/test-finished-1.png",  # shell metacharacter
+        ("t1", "/results/spec US 0001/test-finished-1.png"),  # space in path
+        ("t2", "/results/spec-$(evil)-0002/test-finished-1.png"),  # shell metacharacter
     ])
     lines = script.split("\n")
     assert lines[0] == "mkdir -p /out/screens", f"mkdir must be first, got: {lines[0]}"
@@ -2479,11 +2607,12 @@ def _demo() -> None:
     empty_script = _build_screenshot_copy_script("/out/screens", [])
     assert empty_script == "mkdir -p /out/screens", f"empty paths should yield just mkdir, got: {empty_script}"
 
-    # Regression guard: e2e_run_node slices found_paths to E2E_SCREENSHOT_COPY_MAX_FILES BEFORE
-    # building the batched script, the same routes[:E2E_ROUTES_MAX] pattern used elsewhere in this
-    # file, so an oversized suite can never fold an unbounded number of `cp` lines into one script
-    # string (see that config constant's own comment for the CreateProcess argv limit this avoids).
-    oversized = [f"/results/spec-{i}/test-finished-1.png" for i in range(workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES + 20)]
+    # Regression guard: e2e_run_node slices found (title, path) pairs to E2E_SCREENSHOT_COPY_MAX_FILES
+    # BEFORE building the batched script, the same routes[:E2E_ROUTES_MAX] pattern used elsewhere in
+    # this file, so an oversized suite can never fold an unbounded number of `cp` lines into one
+    # script string (see that config constant's own comment for the CreateProcess argv limit this
+    # avoids).
+    oversized = [(f"t{i}", f"/results/spec-{i}/test-finished-1.png") for i in range(workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES + 20)]
     capped = oversized[:workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES]
     capped_script = _build_screenshot_copy_script("/out/screens", capped)
     assert len(capped_script.split("\n")) == workflow_config.E2E_SCREENSHOT_COPY_MAX_FILES + 1, (

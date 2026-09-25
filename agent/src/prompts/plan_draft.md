@@ -70,8 +70,10 @@ Plan-step provenance is a HARD, gate-checked contract, both directions:
 
 Set `ui_related: true` on any step that changes what the user sees or interacts with -- a screen,
 a component, layout, styling, client-side behavior -- and leave it `false` (the default) for
-backend/API/data/infrastructure work with no visible surface. This is a display tag for the
-review UI, not gate-enforced.
+backend/API/data/infrastructure work with no visible surface. A deterministic gate demands at
+least one wireframe cite one of a ui_related step's ac_ids -- set this honestly, not defensively;
+marking a backend-only step true forces an unneeded wireframe, and marking a real UI step false
+lets it slip through unreviewed.
 
 The Specification JSON may include `attachment_notes`: the Specification author's own
 distillation of what any screenshots or documents attached to the original request actually

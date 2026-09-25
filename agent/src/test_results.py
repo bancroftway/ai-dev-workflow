@@ -200,11 +200,34 @@ def parse_playwright_json(raw_json: str) -> dict[str, Any]:
     try:
         doc = json.loads(raw_json)
     except json.JSONDecodeError:
-        return {"passed": 0, "total": 0, "failed_tests": [{"title": "e2e report", "error": "e2e-report.json was not valid JSON"}]}
+        return {
+            "passed": 0, "total": 0,
+            "failed_tests": [{"title": "e2e report", "error": "e2e-report.json was not valid JSON"}],
+            "screenshot_attachments": [],
+            "executed_ac_ids": [],
+        }
 
     passed = 0
     total = 0
     failed_tests: list[dict[str, str]] = []
+    # Every AC id an EXECUTED test's title embeds, regardless of pass/fail -- independent evidence
+    # that a real test ran for that criterion, as distinct from screenshot_attachments below (which
+    # only proves a screenshot landed; a test can run and fail to attach one, the exact class of
+    # bug the attachment-sourced harvest above exists to shrink). "skipped" is excluded: it proves
+    # nothing ran, and (separately) a skip already becomes its own failed_tests entry below, so
+    # nothing silently passes either way -- this only controls whether a skip's AC id counts as "an
+    # executed test exists" for e2e_nodes.match_wireframe_coverage's own, independent test-existence
+    # check.
+    executed_ac_ids: set[str] = set()
+    # Every test's screenshot attachment, pass or fail (screenshot: 'on' is mandated in every
+    # playwright.config this pipeline writes, ac_to_tests_draft.md, so Playwright attaches one to
+    # every result regardless of outcome). This is the e2e harvest's authoritative source of
+    # "which screenshots exist and where" -- each entry's path is only ever recorded here after
+    # Playwright's own attach() for it has resolved, so it is race-free by construction, unlike
+    # the `find`-over-test-results/ this replaced (root-caused live on income-investor thread
+    # f0fef8ba as a harness-side exec-timeout bug, not a Playwright timing issue -- see
+    # e2e_nodes.py's suite-exec call site for the full story).
+    screenshot_attachments: list[dict[str, str]] = []
     for suite in doc.get("suites") or []:
         for spec in _iter_specs(suite):
             title = spec.get("title", "unknown")
@@ -212,6 +235,15 @@ def parse_playwright_json(raw_json: str) -> dict[str, Any]:
                 total += 1
                 results = test.get("results") or []
                 outcome = results[-1] if results else {}
+                if outcome.get("status") != "skipped":
+                    ac_ids, _mechanism = attributed_ac_ids(title)
+                    executed_ac_ids.update(i.upper() for i in ac_ids)
+                shot = next(
+                    (a.get("path") for a in (outcome.get("attachments") or []) if a.get("name") == "screenshot" and a.get("path")),
+                    None,
+                )
+                if shot:
+                    screenshot_attachments.append({"title": title, "path": shot})
                 if outcome.get("status") == "passed":
                     passed += 1
                 else:
@@ -225,15 +257,10 @@ def parse_playwright_json(raw_json: str) -> dict[str, Any]:
                         if frame and frame not in error:
                             error = f"{error}\n{frame}"
                     entry = {"title": title, "error": str(error)}
-                    # `screenshot: 'on'` (mandated in every playwright.config this pipeline writes,
-                    # ac_to_tests_draft.md) means Playwright attaches one to every result, pass or
-                    # fail -- surfacing it here is what lets e2e_fix_node hand the fix loop a path
-                    # to actually LOOK at instead of reasoning from the stack trace alone (user
-                    # requirement 2026-09-01: "make sure the agent is looking at the screenshots").
-                    shot = next(
-                        (a.get("path") for a in (outcome.get("attachments") or []) if a.get("name") == "screenshot" and a.get("path")),
-                        None,
-                    )
+                    # Surfacing the same screenshot here too is what lets e2e_fix_node hand the fix
+                    # loop a path to actually LOOK at instead of reasoning from the stack trace
+                    # alone (user requirement 2026-09-01: "make sure the agent is looking at the
+                    # screenshots").
                     if shot:
                         entry["screenshot"] = shot
                     failed_tests.append(entry)
@@ -247,7 +274,11 @@ def parse_playwright_json(raw_json: str) -> dict[str, Any]:
         else:
             failed_tests.append({"title": "e2e suite", "error": "e2e-report.json contained no tests and no top-level errors"})
 
-    return {"passed": passed, "failed_tests": failed_tests, "total": total}
+    return {
+        "passed": passed, "failed_tests": failed_tests, "total": total,
+        "screenshot_attachments": screenshot_attachments,
+        "executed_ac_ids": sorted(executed_ac_ids),
+    }
 
 
 def playwright_outcomes(raw_json: str) -> dict[str, str]:
@@ -382,6 +413,27 @@ def _demo() -> None:
         {"status": "failed", "error": {"message": "boom"}, "attachments": [{"name": "trace", "path": "/x/trace.zip"}]}
     ]}]}]}]})
     assert "screenshot" not in parse_playwright_json(without_shot)["failed_tests"][0]
+
+    # A PASSING test's screenshot attachment must ALSO land in screenshot_attachments -- this is
+    # the e2e harvest's sole source for "which screenshots exist" (replacing a `find` over
+    # test-results/), so a passing test's evidence must not be silently dropped the way it used to
+    # be when only the failed_tests branch ever looked at attachments.
+    passing_with_shot = json.dumps({"suites": [{"specs": [{"title": "US-0009.1 t", "tests": [{"results": [{
+        "status": "passed",
+        "attachments": [{"name": "screenshot", "path": "/x/test-results/t/test-finished-1.png"}],
+    }]}]}]}]})
+    assert parse_playwright_json(passing_with_shot)["screenshot_attachments"] == [
+        {"title": "US-0009.1 t", "path": "/x/test-results/t/test-finished-1.png"}
+    ]
+
+    # executed_ac_ids: independent of screenshot_attachments -- a FAILING test with no screenshot
+    # still counts as "an executed test exists" for its AC id, and a "skipped" test never does even
+    # though it has its own spec entry.
+    mixed_execution = json.dumps({"suites": [{"specs": [
+        {"title": "[US-0010.1] fails, no shot", "tests": [{"results": [{"status": "failed", "error": {"message": "boom"}}]}]},
+        {"title": "[US-0010.2] skipped", "tests": [{"results": [{"status": "skipped"}]}]},
+    ]}]})
+    assert parse_playwright_json(mixed_execution)["executed_ac_ids"] == ["US-0010.1"], parse_playwright_json(mixed_execution)
 
     empty = parse_playwright_json(json.dumps({"suites": []}))
     assert empty["total"] == 0 and empty["failed_tests"], empty
