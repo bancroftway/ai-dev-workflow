@@ -355,6 +355,13 @@ TEST_COVERAGE_CONTRACT_ENTRIES_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_CONT
 # for both before this was named, so one constant here matches that, not two.
 TEST_COVERAGE_GAP_DETAIL_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_GAP_DETAIL_MAX", "6"))
 
+# gates/design_tokens_gate.py's hardcoded_color_violations: how many style-bearing source files
+# (per verify_coverage's already-filtered source_files list) to actually read_repo_file and scan
+# for off-palette color literals, per gate run. Raising this widens how much of a large repo's
+# touched UI code the deterministic DESIGN.md conformance check can see, at the cost of more
+# sandbox round-trips per verify lap -- same tradeoff as TEST_COVERAGE_BACKEND_FILES_MAX above.
+DESIGN_TOKENS_GATE_FILES_MAX = int(os.environ.get("AIDW_DESIGN_TOKENS_GATE_FILES_MAX", "40"))
+
 # gates/test_coverage_gate.py's coverage floor: both line and branch coverage must meet this
 # percentage for the deterministic_verify to pass. Read by metrics_nodes.py too (imported by name,
 # not retyped). Raising it makes the gate strict enough to block on legitimately-untested code that

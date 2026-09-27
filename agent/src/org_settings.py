@@ -45,6 +45,11 @@ class OrgSettings:
     # Migration 0011: "owner/repo" of the TOOL's own support repo, where failed-run issues are
     # filed (never the customer repo). None = not configured.
     support_repo: str | None = None
+    # Migration 0017: deployment-wide default DESIGN.md, used by repo_design_settings.
+    # get_effective_design_md() as the fallback when a repo has no override of its own. None = no
+    # default set -- the platform falls back further to its existing per-repo reverse-engineered
+    # DESIGN.md behavior (impeccable's `document` command).
+    design_md: str | None = None
 
 
 async def get_org_settings() -> OrgSettings | None:
@@ -55,7 +60,7 @@ async def get_org_settings() -> OrgSettings | None:
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             "SELECT provider, credential_secret_name, updated_at, updated_by, credential_kind, "
-            "last_validation_ok, last_validated_at, support_repo FROM dbo.org_settings WHERE id = 1"
+            "last_validation_ok, last_validated_at, support_repo, design_md FROM dbo.org_settings WHERE id = 1"
         )
         row = await cur.fetchone()
         if row is None:
@@ -63,7 +68,7 @@ async def get_org_settings() -> OrgSettings | None:
         return OrgSettings(
             provider=row[0], credential_secret_name=row[1], updated_at=row[2], updated_by=row[3],
             credential_kind=row[4], last_validation_ok=row[5], last_validated_at=row[6],
-            support_repo=row[7],
+            support_repo=row[7], design_md=row[8],
         )
 
 
@@ -110,6 +115,27 @@ async def set_support_repo(support_repo: str | None, updated_by: str, *, fallbac
         )
 
 
+async def set_design_md(design_md: str | None, updated_by: str, *, fallback_provider: str) -> None:
+    """Migration 0017's one writer. Same MERGE-with-invented-row shape as set_support_repo (0011)
+    and for the same reason: this pointer must be savable on a fresh deployment with no org vault
+    and no row yet, and the invented row's provider must be `fallback_provider` (the caller's own
+    env fallback) so it can never disagree with what a session would actually run under."""
+    value = (design_md or "").strip() or None
+    pool = await session_store._get_pool()  # noqa: SLF001
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            MERGE dbo.org_settings AS target
+            USING (SELECT 1 AS id) AS src
+              ON target.id = src.id
+            WHEN MATCHED THEN UPDATE SET design_md = ?, updated_by = ?, updated_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN INSERT (id, provider, design_md, updated_by) VALUES (1, ?, ?, ?);
+            """,
+            value, updated_by,
+            fallback_provider, value, updated_by,
+        )
+
+
 async def record_validation_result(ok: bool) -> None:
     """I-1's periodic re-probe write-back: a plain UPDATE, deliberately not routed through
     set_org_settings's MERGE above -- this only ever runs against an already-existing row (there is
@@ -145,6 +171,7 @@ def _demo() -> None:
     assert settings.updated_by == "octocat", settings
     assert settings.credential_kind == "oauth", settings
     assert settings.last_validation_ok is True, settings
+    assert settings.design_md is None, settings  # not passed above; defaults to None
 
     # credential_kind/last_validation_ok/last_validated_at all default to None (migration 0007's
     # three new nullable columns) -- a caller building an OrgSettings from a pre-0007 row (or from
@@ -157,6 +184,7 @@ def _demo() -> None:
     assert defaulted.credential_kind is None, defaulted
     assert defaulted.last_validation_ok is None, defaulted
     assert defaulted.last_validated_at is None, defaulted
+    assert defaulted.design_md is None, defaulted  # migration 0017's new nullable column, same treatment
 
     # frozen=True must actually block mutation, not just be decorative.
     try:
@@ -175,6 +203,13 @@ def _demo() -> None:
     )
     assert unconfigured.credential_secret_name is None, unconfigured
     assert unconfigured.updated_by is None, unconfigured
+
+    with_design_md = OrgSettings(
+        provider="claude", credential_secret_name=None,
+        updated_at=datetime(2026, 8, 21, 12, 0, 0), updated_by=None,
+        design_md="---\ncolors:\n  primary: \"#000\"\n---\n",
+    )
+    assert with_design_md.design_md is not None and "primary" in with_design_md.design_md, with_design_md
 
     print("org_settings self-check: ok (dataclass only, no live DB in this environment)")
 

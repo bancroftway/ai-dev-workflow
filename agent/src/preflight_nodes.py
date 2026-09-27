@@ -23,7 +23,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
 from . import config as workflow_config
-from . import config_inventory, git_ops, model_config, repo_files, repo_scan, repo_test_config, session_store, tech_stack_signals, template_loader, workflow_persistence
+from . import config_inventory, git_ops, model_config, repo_design_settings, repo_files, repo_scan, repo_test_config, session_store, tech_stack_signals, template_loader, workflow_persistence
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
@@ -304,6 +304,23 @@ async def scaffold_finalize_node(state: "GraphState", config: RunnableConfig) ->
         if appended != agents_md:
             await repo_files.write_repo_file(provider, thread_id, "AGENTS.md", appended)
             written_paths.append("AGENTS.md")
+
+    # DESIGN.md: unlike AGENTS.md above, this is fully operator-owned content (repo_design_settings'
+    # own override, else org_settings' deployment-wide default) -- overwrite unconditionally rather
+    # than never-clobber, so it can never silently drift from what an operator configured. Guarded
+    # on an actual diff, same as AGENTS.md's `appended != agents_md` above, so an unchanged setting
+    # doesn't force a commit every run. Best-effort: a DB hiccup here must not fail scaffolding.
+    try:
+        sess = await session_store.get_session(thread_id)
+        if sess is not None:
+            effective = await repo_design_settings.get_effective_design_md(sess["owner"], sess["repo"])
+            if effective.content is not None:
+                current_design_md = await repo_files.read_repo_file(provider, thread_id, "DESIGN.md")
+                if current_design_md != effective.content:
+                    await repo_files.write_repo_file(provider, thread_id, "DESIGN.md", effective.content)
+                    written_paths.append("DESIGN.md")
+    except Exception:  # noqa: BLE001
+        logger.warning("could not seed DESIGN.md for thread_id=%s", thread_id, exc_info=True)
 
     copilot_instructions = await repo_files.read_repo_file(provider, thread_id, ".github/copilot-instructions.md")
     if copilot_instructions is None:

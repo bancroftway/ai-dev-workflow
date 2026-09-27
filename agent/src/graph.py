@@ -734,6 +734,12 @@ IMPECCABLE_CODEGEN_SEGMENT = (
     " rules and craft-floor reference: contrast, typography, layout, motion, absolute bans),"
     " product/Operate register. The impeccable skill lives at"
     f" {_IMPECCABLE_SKILL_DIR} -- its scripts run with plain `node`."
+    " If a DESIGN.md is already present, it is operator-authoritative fixed input: never"
+    " regenerate, replace, or auto-repair it -- not via `document`, not via `extract`, and not via"
+    " `doctor`'s `CONTEXT_STALE`/`auto`-marked drift fixes, even if it looks stale relative to the"
+    " code. This session has no live user to ask before an overwrite, unlike the skill's own"
+    " interactive safeguards assume. Treat any conflict between existing code and DESIGN.md as a"
+    " bug in the code to fix or flag, never a reason to rewrite the doc."
 )
 
 # IMPECCABLE_CRITIQUE_SEGMENT and IMPECCABLE_DEDUP_SEGMENT were deleted 2026-08-24: both lost

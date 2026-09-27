@@ -66,6 +66,13 @@ export default function RepoSettingsPage() {
   const [testUsers, setTestUsers] = useState<TestUser[]>([]);
   const [usersSave, setUsersSave] = useState<SaveState>({ kind: "idle" });
 
+  // DESIGN.md override -- empty means "no override for this repo", falling back to the
+  // organization default (../../organization/page.tsx).
+  const [designMd, setDesignMd] = useState("");
+  const [designMdSource, setDesignMdSource] = useState<"repo" | "org_default" | "none">("none");
+  const [designMdTokensDetected, setDesignMdTokensDetected] = useState(true);
+  const [designMdSave, setDesignMdSave] = useState<SaveState>({ kind: "idle" });
+
   const loadSecrets = useCallback(() => {
     setSecretsError(null);
     fetch("/api/repos/vault/secrets", {
@@ -127,6 +134,24 @@ export default function RepoSettingsPage() {
       .then((data: { users?: TestUser[] } | null) => {
         if (data?.users?.length) setTestUsers(data.users);
       })
+      .catch(() => undefined);
+    fetch(`/api/repos/design-md?${query}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then(
+        (
+          data: {
+            repo_design_md?: string | null;
+            effective_design_md?: string | null;
+            source?: "repo" | "org_default" | "none";
+            tokens_detected?: boolean;
+          } | null,
+        ) => {
+          if (!data) return;
+          setDesignMd(data.repo_design_md ?? "");
+          setDesignMdSource(data.source ?? "none");
+          setDesignMdTokensDetected(data.tokens_detected ?? true);
+        },
+      )
       .catch(() => undefined);
   }, [owner, repo, loadSecrets]);
 
@@ -253,6 +278,29 @@ export default function RepoSettingsPage() {
       setUsersSave({ kind: "saved", secretCount: 0 });
     } else {
       setUsersSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
+    }
+  }
+
+  async function saveDesignMd() {
+    setDesignMdSave({ kind: "saving" });
+    const res = await fetch("/api/repos/design-md", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner, repo, design_md: designMd.trim() || null }),
+    });
+    const body = (await res.json()) as {
+      repo_design_md?: string | null;
+      source?: "repo" | "org_default" | "none";
+      tokens_detected?: boolean;
+      detail?: string;
+    };
+    if (res.ok) {
+      setDesignMd(body.repo_design_md ?? "");
+      setDesignMdSource(body.source ?? "none");
+      setDesignMdTokensDetected(body.tokens_detected ?? true);
+      setDesignMdSave({ kind: "saved", secretCount: 0 });
+    } else {
+      setDesignMdSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
     }
   }
 
@@ -610,6 +658,58 @@ export default function RepoSettingsPage() {
           {usersSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
         </div>
         {usersSave.kind === "error" && <p className="text-sm text-red-700">{usersSave.detail}</p>}
+      </section>
+
+      <section className="flex max-w-2xl flex-col gap-3 rounded-lg border border-neutral-200 p-4">
+        <div>
+          <h2 className="font-medium">Design system (DESIGN.md)</h2>
+          <p className="mt-1 text-sm text-neutral-500">
+            Overwrites this repo&apos;s DESIGN.md on every run. Leave blank to use the organization
+            default; if no organization default is set either, the repo falls back to its own
+            reverse-engineered design system.
+          </p>
+          {!designMd.trim() && (
+            <p className="mt-1 text-xs text-neutral-400">
+              {designMdSource === "org_default"
+                ? "Currently using the organization default."
+                : "No override and no organization default set — using this repo's own design system."}
+            </p>
+          )}
+        </div>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-sm font-medium text-neutral-700">DESIGN.md content</span>
+          <textarea
+            rows={12}
+            className="rounded-md border border-neutral-300 px-3 py-2 font-mono text-xs"
+            placeholder="Leave blank to use the organization default"
+            value={designMd}
+            onChange={(event) => setDesignMd(event.target.value)}
+          />
+        </label>
+
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            onClick={saveDesignMd}
+            disabled={designMdSave.kind === "saving"}
+          >
+            {designMdSave.kind === "saving" ? "Saving…" : "Save"}
+          </button>
+          {designMdSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
+        </div>
+
+        {designMdSave.kind === "saved" && designMd.trim() && !designMdTokensDetected && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+            No machine-readable <code>colors:</code> frontmatter detected. The agent will still read
+            and follow this document, but the automated color-conformance check has nothing to check
+            against until it includes a YAML frontmatter block (see the organization settings page
+            for the expected shape).
+          </div>
+        )}
+
+        {designMdSave.kind === "error" && <p className="text-sm text-red-700">{designMdSave.detail}</p>}
       </section>
     </div>
   );

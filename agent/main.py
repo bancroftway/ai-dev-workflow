@@ -31,6 +31,7 @@ from src.sessions_api import github_link_router
 from src.sessions_api import org_settings_router
 from src.sessions_api import projects_router
 from src.sessions_api import repo_auth_settings_router
+from src.sessions_api import repo_design_settings_router
 from src.sessions_api import repo_test_config_router
 from src.sessions_api import repo_test_users_router
 from src.sessions_api import router as sessions_router
@@ -72,6 +73,7 @@ app.include_router(repo_auth_settings_router)
 app.include_router(github_link_router)
 app.include_router(repo_test_config_router)
 app.include_router(repo_test_users_router)
+app.include_router(repo_design_settings_router)
 
 class _ReattachStateAgent(LangGraphAGUIAgent):
     """ag_ui_langgraph's pending-interrupt short-circuit (agent.py prepare_stream) re-emits the

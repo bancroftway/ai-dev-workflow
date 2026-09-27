@@ -45,6 +45,7 @@ from . import (
     keyvault,
     org_credential_vault,
     repo_test_config,
+    repo_design_settings,
     org_settings,
     project_store,
     repo_auth_settings,
@@ -70,6 +71,7 @@ repo_auth_settings_router = APIRouter(prefix="/repo-auth-settings", tags=["repo-
 github_link_router = APIRouter(prefix="/github-link", tags=["github-link"])
 repo_test_config_router = APIRouter(prefix="/repo-test-config", tags=["repo-test-config"])
 repo_test_users_router = APIRouter(prefix="/repo-test-users", tags=["repo-test-users"])
+repo_design_settings_router = APIRouter(prefix="/repo-design-settings", tags=["repo-design-settings"])
 
 _SHARED_SECRET_HEADER = "x-aidw-secret"
 
@@ -1440,6 +1442,53 @@ async def put_repo_test_config(body: RepoTestConfigPutRequest, request: Request)
     return RepoTestConfigResponse(entries=await repo_test_config.get_config(body.owner, body.repo))
 
 
+# --- per-repo DESIGN.md override (settings page) -----------------------------------------------
+
+
+class RepoDesignSettingsResponse(BaseModel):
+    # This repo's own override, or None if it has none (falls back to the org default).
+    repo_design_md: str | None
+    # What preflight_nodes.scaffold_finalize_node will actually seed into the repo: repo_design_md
+    # if set, else the org-wide default, else None (today's per-repo reverse-engineered behavior).
+    effective_design_md: str | None
+    source: Literal["repo", "org_default", "none"]
+    tokens_detected: bool
+
+
+@repo_design_settings_router.get("", response_model=RepoDesignSettingsResponse)
+async def get_repo_design_settings(request: Request, owner: str, repo: str) -> RepoDesignSettingsResponse:
+    _check_shared_secret(request)
+    repo_value = await repo_design_settings.get_design_md(owner, repo)
+    effective = await repo_design_settings.get_effective_design_md(owner, repo)
+    return RepoDesignSettingsResponse(
+        repo_design_md=repo_value,
+        effective_design_md=effective.content,
+        source=effective.source,
+        tokens_detected=repo_design_settings.has_parseable_tokens(effective.content),
+    )
+
+
+class RepoDesignSettingsPutRequest(BaseModel):
+    owner: str
+    repo: str
+    updated_by: str
+    design_md: str | None = None  # None or blank clears the override, falling back to the org default
+
+
+@repo_design_settings_router.put("", response_model=RepoDesignSettingsResponse)
+async def put_repo_design_settings(body: RepoDesignSettingsPutRequest, request: Request) -> RepoDesignSettingsResponse:
+    _check_shared_secret(request)
+    await repo_design_settings.set_design_md(body.owner, body.repo, body.design_md, body.updated_by)
+    repo_value = await repo_design_settings.get_design_md(body.owner, body.repo)
+    effective = await repo_design_settings.get_effective_design_md(body.owner, body.repo)
+    return RepoDesignSettingsResponse(
+        repo_design_md=repo_value,
+        effective_design_md=effective.content,
+        source=effective.source,
+        tokens_detected=repo_design_settings.has_parseable_tokens(effective.content),
+    )
+
+
 # --- per-repo test users (settings page) ------------------------------------------------------
 
 
@@ -1488,6 +1537,9 @@ class OrgSettingsResponse(BaseModel):
     # Migration 0011: "owner/repo" of the TOOL's own support repo for failed-run issues. None =
     # not configured; the frontend's support-issue action refuses and points at this settings page.
     support_repo: str | None = None
+    # Migration 0017: deployment-wide default DESIGN.md. None = no default set. A repo without its
+    # own override (repo_design_settings_router below) falls back to this value.
+    design_md: str | None = None
 
 
 # I-1 (lazy version, whole-branch review): re-probing a saved credential on every settings-page
@@ -1622,6 +1674,7 @@ async def _org_settings_response() -> OrgSettingsResponse:
         updated_at=settings.updated_at,
         updated_by=settings.updated_by,
         support_repo=settings.support_repo,
+        design_md=settings.design_md,
     )
 
 
@@ -1652,6 +1705,30 @@ async def put_support_repo_endpoint(body: SupportRepoPutRequest, request: Reques
         raise HTTPException(status_code=400, detail='support_repo must be "owner/repo"')
     await org_settings.set_support_repo(value, body.updated_by, fallback_provider=chat_model.env_fallback_provider())
     return await _org_settings_response()
+
+
+class OrgDesignMdPutRequest(BaseModel):
+    design_md: str | None = None  # None or blank clears the org-wide default
+    updated_by: str
+
+
+class OrgDesignMdPutResponse(OrgSettingsResponse):
+    # Informational only -- never blocks the save. False means the deterministic token gate
+    # (gates/design_tokens_gate.py) has nothing to check against yet: a prose-only brand doc or a
+    # seed-mode placeholder still works for the two LLM-level enforcement layers.
+    tokens_detected: bool
+
+
+@org_settings_router.put("/design-md", response_model=OrgDesignMdPutResponse)
+async def put_org_design_md_endpoint(body: OrgDesignMdPutRequest, request: Request) -> OrgDesignMdPutResponse:
+    """Own endpoint, same reasoning as put_support_repo_endpoint: this is an unrelated pointer, not
+    part of put_org_settings_endpoint's provider+credential contract."""
+    _check_shared_secret(request)
+    await org_settings.set_design_md(body.design_md, body.updated_by, fallback_provider=chat_model.env_fallback_provider())
+    base = await _org_settings_response()
+    return OrgDesignMdPutResponse(
+        **base.model_dump(), tokens_detected=repo_design_settings.has_parseable_tokens(body.design_md),
+    )
 
 
 class OrgSettingsPutRequest(BaseModel):

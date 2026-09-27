@@ -1318,6 +1318,25 @@ async def verify_coverage(
         depth = await check_ac_depth(provider, thread_id)
         if depth is not None:
             return VerificationResult(passed=False, feedback=depth[0], report={**report, **depth[1]})
+        # DESIGN.md color-token conformance, same tier as the depth/testid/nav-wait checks just
+        # above: a deterministic backstop to the two LLM-level enforcement layers (graph.py's
+        # IMPECCABLE_CODEGEN_SEGMENT/IMPECCABLE_CRITIQUE_SEGMENT). Best-effort: an owner/repo lookup
+        # failure here must not fail an otherwise-passing coverage verdict.
+        try:
+            from ..session_store import get_session
+
+            sess = await get_session(thread_id)
+        except Exception:  # noqa: BLE001
+            sess = None
+        if sess is not None:
+            from .design_tokens_gate import check_design_tokens
+
+            design_violation = await check_design_tokens(provider, thread_id, sess["owner"], sess["repo"], source_files)
+            if design_violation is not None:
+                return VerificationResult(
+                    passed=False, feedback=design_violation[0],
+                    report={**report, "design_token_violations": design_violation[1]},
+                )
         return VerificationResult(passed=True, feedback=f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) meets the {MIN_COVERAGE_PERCENT}% threshold.", report=report)
 
     # Absolute deficit, not just rates: "88.0% vs 95%" reads as far away, "+7 branch sides" reads

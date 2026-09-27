@@ -31,12 +31,43 @@ type OrgSettings = {
   // "owner/repo" of the TOOL's own support repo, where failed-run issues are filed (never the
   // customer repo). null = not configured; the support-issue button explains and links here.
   support_repo: string | null;
+  // Deployment-wide default DESIGN.md -- the fallback a repo uses when it has no override of its
+  // own (../[owner]/[repo]/page.tsx). null = no default set.
+  design_md: string | null;
 };
 
 const BILLING_MODE_LABELS: Record<BillingMode, string> = {
   oauth: "Subscription (Pro / Max / Team)",
   api_key: "API key (metered)",
 };
+
+// Shown as placeholder text only (never submitted unless the operator types over it) -- the
+// machine-readable shape the deterministic design-token gate needs, per impeccable's own
+// DESIGN.md format spec (reference/document.md). A plain prose brand doc still works for the two
+// LLM-level enforcement layers; only the automated color-token check needs this frontmatter.
+const DESIGN_MD_PLACEHOLDER = `---
+name: <project title>
+description: <one-line tagline>
+colors:
+  primary: "#b8422e"
+  neutral-bg: "#faf7f2"
+  # ...one entry per brand color; key = descriptive slug
+typography:
+  display:
+    fontFamily: "Cormorant Garamond, Georgia, serif"
+  body:
+    fontFamily: "Inter, system-ui, sans-serif"
+---
+
+# Design System: <project title>
+
+## Overview
+
+...
+
+## Colors
+
+...`;
 
 type SaveState =
   | { kind: "idle" }
@@ -71,6 +102,9 @@ export default function OrganizationSettingsPage() {
   const [save, setSave] = useState<SaveState>({ kind: "idle" });
   const [supportRepo, setSupportRepo] = useState("");
   const [supportSave, setSupportSave] = useState<SaveState>({ kind: "idle" });
+  const [designMd, setDesignMd] = useState("");
+  const [designMdSave, setDesignMdSave] = useState<SaveState>({ kind: "idle" });
+  const [designMdTokensDetected, setDesignMdTokensDetected] = useState(true);
 
   useEffect(() => {
     fetch("/api/settings/organization")
@@ -84,6 +118,7 @@ export default function OrganizationSettingsPage() {
         setUpdatedAt(data.updated_at);
         setUpdatedBy(data.updated_by);
         setSupportRepo(data.support_repo ?? "");
+        setDesignMd(data.design_md ?? "");
       })
       .finally(() => setLoaded(true));
   }, []);
@@ -294,6 +329,75 @@ export default function OrganizationSettingsPage() {
           <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800">
             <p className="font-medium">Could not save support repo</p>
             <p className="mt-1 break-words">{supportSave.detail}</p>
+          </div>
+        )}
+      </section>
+
+      <section className="flex max-w-2xl flex-col gap-4 rounded-lg border border-neutral-200 p-4">
+        <div>
+          <h2 className="font-medium">Default design system (DESIGN.md)</h2>
+          <p className="mt-1 text-sm text-neutral-500">
+            Seeded into every repo that has no design system of its own (per-repo overrides live on
+            that repo&apos;s own settings page). Overwrites the repo&apos;s copy on every run — this
+            is the deployment&apos;s canonical value, not a one-time suggestion. Leave blank to fall
+            back to each repo&apos;s own reverse-engineered design system.
+          </p>
+        </div>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-sm font-medium text-neutral-700">DESIGN.md content</span>
+          <textarea
+            rows={12}
+            className="rounded-md border border-neutral-300 px-3 py-2 font-mono text-xs"
+            placeholder={DESIGN_MD_PLACEHOLDER}
+            value={designMd}
+            onChange={(event) => setDesignMd(event.target.value)}
+            disabled={!loaded}
+          />
+        </label>
+
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            onClick={async () => {
+              setDesignMdSave({ kind: "saving" });
+              const res = await fetch("/api/settings/organization/design-md", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ design_md: designMd.trim() || null }),
+              });
+              const body = (await res.json().catch(() => ({}))) as OrgSettings & {
+                tokens_detected?: boolean;
+                detail?: string;
+              };
+              if (res.ok) {
+                setDesignMd(body.design_md ?? "");
+                setDesignMdTokensDetected(body.tokens_detected ?? true);
+                setDesignMdSave({ kind: "saved" });
+              } else {
+                setDesignMdSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
+              }
+            }}
+            disabled={!loaded || designMdSave.kind === "saving"}
+          >
+            {designMdSave.kind === "saving" ? "Saving…" : "Save"}
+          </button>
+          {designMdSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
+        </div>
+
+        {designMdSave.kind === "saved" && designMd.trim() && !designMdTokensDetected && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+            No machine-readable <code>colors:</code> frontmatter detected. The agent will still read
+            and follow this document, but the automated color-conformance check has nothing to
+            check against until it includes a YAML frontmatter block like the placeholder above.
+          </div>
+        )}
+
+        {designMdSave.kind === "error" && (
+          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+            <p className="font-medium">Could not save default design system</p>
+            <p className="mt-1 break-words">{designMdSave.detail}</p>
           </div>
         )}
       </section>
