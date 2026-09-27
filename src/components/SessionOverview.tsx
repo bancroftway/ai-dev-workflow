@@ -1,15 +1,16 @@
 "use client";
 
-import { useAgent, useCopilotKit } from "@copilotkit/react-core/v2";
-import { Fragment, useMemo, useState, type MouseEvent } from "react";
+import { UseAgentUpdate, useAgent, useCopilotKit } from "@copilotkit/react-core/v2";
+import { Fragment, memo, useMemo, useState, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import {
-  computeRunningPhases,
+  EMPTY_PHASES,
   NODE_PHASE_LABEL,
   formatDuration,
+  useRunningPhases,
   useSessionSummary,
   useStructuralRunEvents,
   type RunLogEvent,
@@ -394,9 +395,9 @@ async function ensureSandboxProvisioned(threadId: string, owner: string, repo: s
   }
 }
 
-export function SessionOverview({ owner, repo, branch }: { owner: string; repo: string; branch: string }) {
+function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: string; branch: string }) {
   const { localAgentId, threadId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { copilotkit } = useCopilotKit();
   const state = (agent.state ?? {}) as WorkflowState;
   // Root-caused 2026-09-12 (user-reported: stages rendered out of pipeline order): `state.stages`
@@ -737,10 +738,8 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
   // use) so RebuildRow's phase check (further down) can share the exact same fast-channel signal
   // instead of falling back to the slower state-snapshot check alone -- see rebuildPhase's own
   // docstring, "two stages active at once" (root-caused 2026-09-11).
-  const runningPhases = useMemo(
-    () => computeRunningPhases(events, runActivity?.runActive ?? null),
-    [events, runActivity?.runActive],
-  );
+  const sharedRunningPhases = useRunningPhases();
+  const runningPhases = runActivity?.runActive === false ? EMPTY_PHASES : sharedRunningPhases;
   // Redraft history + lap count only now (Overview-tab fix, 2026-09-22: duration/cost moved to the
   // server-computed `summary` above, which is where a rebuild placement's numbers now come from
   // too). `RedraftHistoryCell` still needs its own per-stage event list for per-lap detail
@@ -1172,3 +1171,7 @@ export function SessionOverview({ owner, repo, branch }: { owner: string; repo: 
     </ViewContainer>
   );
 }
+
+// owner/repo/branch are primitive strings -- memoized so AppShell's unrelated local-state
+// re-renders don't also force this while it's the hidden tab.
+export const SessionOverview = memo(SessionOverviewImpl);

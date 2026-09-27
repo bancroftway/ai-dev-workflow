@@ -53,6 +53,7 @@ from . import fake_idp, git_ops, keyvault, model_config, repo_files, repo_test_c
 from . import workflow_persistence
 from .chat_model import get_chat_model_for_thread, lap_role, secret_env_names
 from .exit_nodes import HISTORY_DIR
+from .preflight_nodes import MANIFEST_PATH
 from .prompt_loader import load_prompt_pair, render_prompt
 from .schemas import presence_values
 from .text_truncate import truncate_middle
@@ -193,12 +194,22 @@ async def _playwright_runner_available(provider: Any, thread_id: str, config_dir
 BROWSER_ALIAS_DIR = "/tmp/aidw-pw-browsers"
 
 
-async def _alias_browsers_for_local_runner(provider: Any, thread_id: str) -> None:
+async def _alias_browsers_for_local_runner(provider: Any, thread_id: str, config_dir: str) -> None:
     """Make the baked chromium answer to whatever revision the repo's own playwright expects.
 
-    Reads the wanted revision from the repo's playwright-core/browsers.json rather than hardcoding
-    it, so this keeps working as generated apps pin different playwright versions.
+    Reads the wanted revision from the repo's OWN playwright-core/browsers.json via Node's own
+    require.resolve from config_dir -- the same reasoning _playwright_runner_available already
+    documents (node walks node_modules upward only, so this is the exact file the actual runner
+    would load) -- rather than a repo-wide `find . | head -5`, which used to cap out before
+    reaching the right file in a monorepo whose node_modules holds several independently-nested
+    playwright-core copies (transitive test-tooling deps pinning their own), silently leaving the
+    real revision unaliased. A version-conflict-driven NESTED copy (e.g.
+    node_modules/@playwright/test/node_modules/playwright-core/browsers.json, npm's own resolution
+    when a dependency's pin conflicts with something hoisted above it) is exactly the shape
+    require.resolve finds correctly and an ancestor-directory walk could not -- it isn't an
+    ancestor of config_dir at all.
     """
+    cd_prefix = f"cd {shlex.quote(config_dir)} && " if config_dir else ""
     await provider.exec_in_sandbox(
         thread_id,
         f"mkdir -p {shlex.quote(BROWSER_ALIAS_DIR)}; "
@@ -207,13 +218,14 @@ async def _alias_browsers_for_local_runner(provider: Any, thread_id: str) -> Non
         # Mirror everything baked (chromium + ffmpeg) under the writable alias dir first.
         f"for d in /opt/playwright-browsers/*; do "
         f"  ln -sfnT \"$d\" {shlex.quote(BROWSER_ALIAS_DIR)}/$(basename \"$d\") 2>/dev/null; done; "
-        # Then add the revision name each local playwright install asks for.
-        f"for bj in $(find . -path '*/playwright-core/browsers.json' -not -path './.git/*' 2>/dev/null | head -5); do "
-        f"  rev=$(python3 -c \"import json,sys; d=json.load(open(sys.argv[1])); "
+        # Then add the revision name the local playwright install ACTUALLY resolves to.
+        f"bj=$({cd_prefix}node -e \"console.log(require.resolve('playwright-core/browsers.json'))\" 2>/dev/null); "
+        f"[ -n \"$bj\" ] || exit 0; "
+        f"rev=$(python3 -c \"import json,sys; d=json.load(open(sys.argv[1])); "
         f"print(next((b['revision'] for b in d['browsers'] if b['name']=='chromium-headless-shell'), ''))\" \"$bj\" 2>/dev/null); "
-        f"  [ -n \"$rev\" ] || continue; "
-        f"  ln -sfnT \"$baked\" {shlex.quote(BROWSER_ALIAS_DIR)}/chromium_headless_shell-$rev 2>/dev/null; "
-        f"done; true",
+        f"[ -n \"$rev\" ] || exit 0; "
+        f"ln -sfnT \"$baked\" {shlex.quote(BROWSER_ALIAS_DIR)}/chromium_headless_shell-$rev 2>/dev/null; "
+        f"true",
     )
 
 
@@ -243,6 +255,84 @@ async def _discover_playwright_layout(provider: Any, thread_id: str) -> tuple[st
         "-not -path '*/node_modules/*' -not -path './.git/*' | head -5",
     )
     return config_dir, bool((specs.stdout or "").strip())
+
+
+def _playwright_pin_correction(package_json: dict[str, Any], pin: str) -> str | None:
+    """Given a parsed package.json and manifest.json's toolchain.playwright_version, the exact pin
+    to install, or None if there's nothing to correct (pin unknown, @playwright/test not declared
+    here at all -- never introduce a dependency the model chose not to declare -- or it already
+    matches). Pure, self-checked below."""
+    if not pin:
+        return None
+    for section in ("devDependencies", "dependencies"):
+        deps = package_json.get(section)
+        if isinstance(deps, dict) and "@playwright/test" in deps:
+            return None if deps["@playwright/test"] == pin else pin
+    return None
+
+
+async def _correct_playwright_pin(provider: Any, thread_id: str, config_dir: str | None) -> None:
+    """Self-heals a drifted @playwright/test pin against manifest.json's toolchain.playwright_version
+    -- the deterministic enforcement of what minimal_code_to_green_draft.md:98-107 only asks the
+    model to do by hand. Root-caused live (income-investor thread f0fef8ba, 2026-09-26): the
+    generated app's package.json declared "@playwright/test": "^1.63.0" (a loose range), which npm
+    resolved to the real published stable 1.63.0 -- a build wanting a browser revision the sandbox
+    image does not bake (it bakes only the exact alpha build named by toolchain.playwright_version).
+    Every LLM-driven stage after minimal-code-to-green has full write access to package.json and
+    none is reminded of this pin, so it can drift again at any later lap -- this makes the pin
+    self-healing instead of advisory-only.
+
+    Best-effort throughout, mirroring preflight_nodes.hydrate_tech_stack_from_repo_file's idiom:
+    any failure just leaves the repo as-is; the alias fix above and (if that also fails) the
+    "Executable doesn't exist" -> cannot_verify escalation in e2e_run_node are the safety nets that
+    still apply -- this function never raises into its caller.
+
+    config_dir is None when _discover_playwright_layout found no playwright.config.* anywhere --
+    genuinely nothing to correct (a monorepo's root package.json typically only declares
+    "workspaces", never the dependency itself, so guessing repo-root here would silently no-op in
+    exactly the case discovery is already uncertain in). "" means a config WAS found, at repo root.
+    """
+    try:
+        raw_manifest = await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH)
+        if raw_manifest is None:
+            return
+        pin = (json.loads(raw_manifest).get("toolchain") or {}).get("playwright_version") or ""
+        if not pin or config_dir is None:
+            return
+        package_json_path = f"{config_dir}/package.json" if config_dir else "package.json"
+        raw_package = await repo_files.read_repo_file(provider, thread_id, package_json_path)
+        if raw_package is None:
+            return
+        package_json = json.loads(raw_package)
+        corrected_pin = _playwright_pin_correction(package_json, pin)
+        if corrected_pin is None:
+            return
+        cd_prefix = f"cd {shlex.quote(config_dir)} && " if config_dir else ""
+        result = await provider.exec_in_sandbox(
+            thread_id,
+            f"{cd_prefix}npm install {shlex.quote('@playwright/test@' + corrected_pin)} --save-exact 2>&1",
+            timeout_seconds=workflow_config.SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS,
+        )
+        if not result.ok:
+            logger.warning(
+                "playwright pin correction: npm install failed for thread_id=%s: %s",
+                thread_id, (result.stdout or result.stderr or "")[-2000:],
+            )
+            return
+        paths = [package_json_path]
+        for lockfile_path in {f"{config_dir}/package-lock.json" if config_dir else None, "package-lock.json"} - {None}:
+            if await repo_files.read_repo_file(provider, thread_id, lockfile_path) is not None:
+                paths.append(lockfile_path)
+        await git_ops.commit_paths(
+            provider, thread_id, paths,
+            "ai-dev-workflow: pin @playwright/test to the sandbox's baked version",
+        )
+        logger.info(
+            "playwright pin correction: pinned @playwright/test to %s for thread_id=%s",
+            corrected_pin, thread_id,
+        )
+    except Exception:  # noqa: BLE001 -- best-effort correction, never sink the run over it
+        logger.warning("playwright pin correction errored for thread_id=%s", thread_id, exc_info=True)
 
 
 # Root-caused 2026-09-12: matches a `.goto(...)` call's first quoted/templated argument (single,
@@ -322,24 +412,23 @@ async def e2e_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> 
 
     provider = get_sandbox_provider()
     config_dir, has_specs = await _discover_playwright_layout(provider, thread_id)
-    runner = await _playwright_runner_available(provider, thread_id, config_dir or "")
+    # Self-heals a drifted @playwright/test pin against manifest.json's toolchain.playwright_version
+    # BEFORE the runner check below, so a repo whose pin was corrected this call is checked against
+    # its own newly-installed runner, not a stale one. Best-effort -- never raises, never blocks
+    # gate-check on its own failure (see its own docstring).
+    await _correct_playwright_pin(provider, thread_id, config_dir)
 
     # A UI app NEVER skips. Screenshots are the only visual evidence a human gets that the generated
     # app actually renders, and exit's own verify blocks the merge for a UI app with none -- so
     # skipping here just guaranteed that blocker instead of avoiding it. Absent specs now mean "boot
     # and screenshot", not "do nothing": e2e_run_node still starts the app and shoots every route.
-    # Only a missing RUNNER is a genuine skip, and that is an image defect, not something a repo can
-    # cause or a fix cycle can repair.
-    if runner is None:
-        e2e.update(
-            status="skipped",
-            skipped_reason=(
-                "no playwright runner available in this sandbox (neither the repo's own "
-                "@playwright/test nor the image's global playwright package)"
-            ),
-        )
-        return {"e2e": e2e}
-
+    # A missing RUNNER is no longer pre-checked here at all -- e2e_run_node's own runner check
+    # (further down this file) already exists and now escalates immediately (cannot_verify=True) the
+    # instant it fires, so a second, separate check here duplicated the same decision through a
+    # DIFFERENT router (make_e2e_route_after_gate_check) that has no escalate edge at all -- that
+    # duplicate used to route straight past e2e_run/fix/escalate to metrics_compute, silently, never
+    # recording a run_failure. Removed rather than fixed in place: one correctly-escalating check is
+    # simpler than two that have to agree.
     e2e["suite"] = bool(has_specs and config_dir is not None)
     e2e["config_dir"] = config_dir or ""
     e2e["status"] = "running"
@@ -1476,9 +1565,26 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
 
     runner = await _playwright_runner_available(provider, thread_id, str(e2e.get("config_dir") or ""))
     if runner is None:
-        # Should not normally happen -- e2e_gate_check_node already confirmed one of these
-        # resolves. A fix commit that removed the dependency mid-loop gets the same treatment.
-        e2e.update(status="skipped", skipped_reason="@playwright/test is no longer resolvable and no global playwright runner is installed", failed_tests=[], screenshots=[])
+        # Neither the repo's own @playwright/test nor the image's global fallback resolves -- an
+        # image-level defect (gate-check no longer pre-checks this at all; both call sites collapse
+        # into this one, per this bug class's own root-cause writeup) or a fix commit that removed
+        # the dependency mid-loop. Either way there is no realistic fix-cycle path: a missing global
+        # fallback isn't repo-editable, and _correct_playwright_pin deliberately never re-introduces
+        # a dependency the model chose not to declare. Escalate immediately (cannot_verify=True
+        # bypasses the attempt-count check in make_e2e_route_after_run), never burn a fix cycle
+        # hoping an LLM edit repairs something it structurally can't.
+        e2e.update(
+            status="failed",
+            cannot_verify=True,
+            failed_tests=[{
+                "title": "e2e suite",
+                "error": "@playwright/test is no longer resolvable and no global playwright "
+                         "runner is installed -- an image-level or dependency-removal gap the "
+                         "e2e fixer cannot repair; escalating instead of silently passing",
+            }],
+            screenshots=[],
+            skipped_reason=None,
+        )
         return await _finalize_run(provider, thread_id, e2e)
 
     # No runtime `playwright install` -- PLAYWRIGHT_BROWSERS_PATH is baked into the image at
@@ -1490,7 +1596,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     config_dir = str(e2e.get("config_dir") or "")
     # Always populated: the standalone `playwright screenshot` calls below use it too, and a repo
     # with its own playwright may want a browser revision the image does not bake under that name.
-    await _alias_browsers_for_local_runner(provider, thread_id)
+    await _alias_browsers_for_local_runner(provider, thread_id, config_dir)
 
     # The image installs @playwright/test globally at the pinned version, but node does not search
     # global node_modules -- so the idiomatic `import { test } from '@playwright/test'` needs
@@ -1566,9 +1672,31 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
 
     combined_output = ((suite_result.stdout or "") + (suite_result.stderr or "")) if suite_result else ""
     if "Executable doesn't exist" in combined_output:
-        # Infra gap (browser binary missing) -- not fixable by the LLM fixer, so skip with a
-        # reason rather than burn a fix cycle on it.
-        e2e.update(status="skipped", skipped_reason="playwright browser executable is missing in this environment", failed_tests=[], screenshots=[])
+        # Infra gap (browser binary missing -- almost always a @playwright/test version drift
+        # between this repo's package.json and the sandbox's baked build; see
+        # _alias_browsers_for_local_runner's own comment above). Not fixable by the LLM fixer, so
+        # don't burn a fix cycle on it -- but per the no-sandbox (:1099) and app-secrets (:1237)
+        # precedent, an unfixable infra gap must ESCALATE, never silently pass:
+        # make_e2e_route_after_run() checks cannot_verify before failed_tests, so this always
+        # reaches a human regardless of failed_tests' shape. This used to set status="skipped",
+        # failed_tests=[] -- IDENTICAL, from the router's point of view, to a genuinely green run,
+        # which is how a missing browser silently "passed" e2e. screenshots/skipped_reason are
+        # explicitly cleared: this call runs after screens_dir was already wiped earlier in this
+        # same invocation, and a same-run e2e redo otherwise carries the rest of `e2e` forward.
+        e2e.update(
+            status="failed",
+            cannot_verify=True,
+            failed_tests=[{
+                "title": "e2e suite",
+                "error": "playwright browser executable is missing in this environment -- almost "
+                         "always means this repo's @playwright/test pin (package.json) no longer "
+                         "matches the sandbox's baked build (manifest.json's "
+                         "toolchain.playwright_version) -- this is an infra gap the e2e fixer "
+                         "cannot repair; escalating instead of silently passing",
+            }],
+            screenshots=[],
+            skipped_reason=None,
+        )
         return await _finalize_run(provider, thread_id, e2e)
 
     if suite_result and suite_result.returncode == 124:
@@ -2475,6 +2603,38 @@ def _demo() -> None:
     assert _report_path_for("") == E2E_REPORT_PATH
     assert _report_path_for("apps/web") == f"../../{E2E_REPORT_PATH}"
     assert _report_path_for("packages/a/b") == f"../../../{E2E_REPORT_PATH}"
+
+    # _playwright_pin_correction: only ever corrects a pin that's actually declared AND wrong --
+    # never introduces @playwright/test into a package.json that doesn't have it, never touches an
+    # already-correct pin, never acts without a known manifest pin to correct against.
+    assert _playwright_pin_correction(
+        {"devDependencies": {"@playwright/test": "^1.63.0"}}, "1.63.0-alpha-2026-08-05"
+    ) == "1.63.0-alpha-2026-08-05"
+    assert _playwright_pin_correction(
+        {"devDependencies": {"@playwright/test": "1.63.0-alpha-2026-08-05"}}, "1.63.0-alpha-2026-08-05"
+    ) is None
+    assert _playwright_pin_correction({"dependencies": {}}, "1.63.0-alpha-2026-08-05") is None
+    assert _playwright_pin_correction({"devDependencies": {"@playwright/test": "^1.55.0"}}, "") is None
+
+    # make_e2e_route_after_run: the actual regression surface for the browser-missing/runner-missing
+    # bug (income-investor thread f0fef8ba, 2026-09-26) -- cannot_verify must escalate immediately,
+    # regardless of failed_tests' shape, and must never be reachable via a "pass" that happens to
+    # also carry an empty failed_tests list (that IS the bug: two call sites used to set
+    # status="skipped", failed_tests=[] for an unfixable infra gap, which this router read as
+    # indistinguishable from a genuinely green run). This router had NO self-check before this fix.
+    route_after_run = make_e2e_route_after_run()
+    assert route_after_run({"e2e": {"cannot_verify": True, "failed_tests": []}}) == "escalate"
+    assert route_after_run(
+        {"e2e": {"cannot_verify": True, "failed_tests": [{"title": "e2e suite", "error": "x"}]}}
+    ) == "escalate"
+    assert route_after_run({"e2e": {"cannot_verify": False, "failed_tests": []}}) == "pass"
+    assert route_after_run(
+        {"e2e": {"cannot_verify": False, "failed_tests": [{"title": "t", "error": "e"}], "attempt": 0}}
+    ) == "fix"
+    assert route_after_run(
+        {"e2e": {"cannot_verify": False, "failed_tests": [{"title": "t", "error": "e"}],
+                 "attempt": workflow_config.E2E_MAX_FIX_CYCLES}}
+    ) == "escalate"
 
     # A scanned start_command must be runnable FROM THE REPO ROOT. app_discovery records `npm run
     # dev` with no directory, which died with ENOENT on /workspace/repo/package.json when the app

@@ -1,7 +1,7 @@
 "use client";
 
-import { useAgent, useAttachments } from "@copilotkit/react-core/v2";
-import { useEffect, useRef, useState } from "react";
+import { UseAgentUpdate, useAgent, useAttachments } from "@copilotkit/react-core/v2";
+import { memo, useEffect, useRef, useState } from "react";
 import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
@@ -22,10 +22,10 @@ import { stageOrderIndex, type CannedTechStack, type TechStackCatalogResponse, t
  * resolve is what agent/src/graph.py's make_gate_node/resolve_tech_stack_submission actually save,
  * extract into structured JSON, and commit.
  */
-export function TechStackView() {
+function TechStackViewImpl() {
   // agentId only -- AppShell already registered this proxied agent (see RequirementsView.tsx).
   const { localAgentId, threadId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { interrupt } = useOpenInterrupt();
   const [sandboxStatus] = useSandboxStatus();
   const [runActivity] = useRunActivity();
@@ -215,6 +215,10 @@ export function TechStackView() {
     </ViewContainer>
   );
 }
+
+// No props -- memoized so AppShell's unrelated local-state re-renders don't also force this
+// while it's the hidden tab.
+export const TechStackView = memo(TechStackViewImpl);
 
 function ConfirmedTechStackSummary({ content }: { content: unknown }) {
   const c = (content ?? {}) as {

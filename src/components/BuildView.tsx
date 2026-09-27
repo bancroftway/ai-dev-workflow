@@ -1,11 +1,11 @@
 "use client";
 
-import { useAgent } from "@copilotkit/react-core/v2";
-import { Fragment, useMemo } from "react";
+import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
+import { Fragment, memo } from "react";
 import { RunningSpinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningPhases, NODE_PHASE_LABEL, useStructuralRunEvents } from "@/lib/use-run-events";
+import { EMPTY_PHASES, NODE_PHASE_LABEL, useRunningPhases } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   REBUILD_PLACEMENTS,
@@ -156,17 +156,14 @@ export function RebuildConnector({
   );
 }
 
-export function BuildView() {
+function BuildViewImpl() {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const state = (agent.state ?? {}) as WorkflowState;
-  const runEvents = useStructuralRunEvents();
   const [runActivity] = useRunActivity();
-  const runningPhases = useMemo(
-    () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),
-    [runEvents, runActivity?.runActive],
-  );
+  const sharedRunningPhases = useRunningPhases();
+  const runningPhases = runActivity?.runActive === false ? EMPTY_PHASES : sharedRunningPhases;
   // Mid-run reattach gap (fold-in fix, 2026-09-11): current_stage advances both on a stage's OWN
   // approval AND right before that stage's own draft starts (graph.py's make_draft_node) -- either
   // way, current_stage moving PAST key (strictly greater index) can only happen once key's own
@@ -219,3 +216,8 @@ export function BuildView() {
     </ViewContainer>
   );
 }
+
+// No props -- re-renders only from its own scoped useAgent/useRunningPhases/useRunActivity
+// subscriptions, but memoized anyway so AppShell's own local-state re-renders (tab switch,
+// scrollRequest, sandboxStatus, ...) don't also force this while it's the hidden tab.
+export const BuildView = memo(BuildViewImpl);

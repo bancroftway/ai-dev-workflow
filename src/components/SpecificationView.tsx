@@ -1,6 +1,7 @@
 "use client";
 
-import { useAgent } from "@copilotkit/react-core/v2";
+import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
+import { memo } from "react";
 import { parseSpecification, SpecificationSurfaceRenderer } from "@/a2ui/catalog";
 import { A2UISurfaceView } from "@/components/A2UISurfaceView";
 import { AuditFindingsDetails } from "@/components/AuditFindingsDetails";
@@ -14,10 +15,10 @@ import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import { stageOrderIndex, type WorkflowState } from "@/lib/workflow-types";
 
-export function SpecificationView() {
+function SpecificationViewImpl() {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { interrupt } = useOpenInterrupt();
   const [runActivity] = useRunActivity();
   const state = (agent.state ?? {}) as WorkflowState;
@@ -96,3 +97,7 @@ export function SpecificationView() {
     </ViewContainer>
   );
 }
+
+// No props -- memoized so AppShell's unrelated local-state re-renders don't also force this
+// while it's the hidden tab.
+export const SpecificationView = memo(SpecificationViewImpl);

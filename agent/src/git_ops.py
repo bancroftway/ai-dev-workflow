@@ -20,7 +20,7 @@ import httpx
 from . import config
 from .sandbox.provider import SandboxProvider
 
-from .repo_files import validate_repo_relative_path
+from .repo_files import validate_repo_relative_path, write_repo_file
 
 logger = logging.getLogger(__name__)
 
@@ -379,11 +379,16 @@ _GITIGNORE_ENTRIES = (
     ".DS_Store",
     "*.user",
     # Python: the union list is ecosystem-neutral (a `.venv/` entry in a dotnet repo costs nothing).
-    # `.venv/` is the load-bearing one: `.venv/lib/.../flask/app.py` ends in `.py`, which IS in
-    # _AUTHORED_SUFFIXES, so generated_ignore_entries would read a vendored venv as authored files
+    # `.venv/`/`venv/` are the load-bearing ones: `.venv/lib/.../flask/app.py` ends in `.py`, which IS
+    # in _AUTHORED_SUFFIXES, so generated_ignore_entries would read a vendored venv as authored files
     # and commit it. (`__pycache__/` was derivable -- .pyc isn't an authored suffix -- but an
-    # explicit entry beats deriving it fresh per repo.)
+    # explicit entry beats deriving it fresh per repo.) Both spellings are real: `python -m venv venv`
+    # (the stdlib docs' own example) and `.venv` (Poetry/pipenv's default) are both common -- observed
+    # live 2026-09-26, income-investor thread f0fef8ba: `apps/api/venv/lib/.../site-packages/...` had
+    # no tracked ancestor and no matching generated-dir name (only `.venv` was listed), so it fell
+    # through to one .gitignore entry PER FILE, 1928 of them, instead of collapsing to `apps/api/venv/`.
     ".venv/",
+    "venv/",
     "__pycache__/",
     "*.pyc",
     ".pytest_cache/",
@@ -453,11 +458,23 @@ def generated_ignore_entries(untracked: list[str], tracked: list[str]) -> list[s
 
     The entry is the generated directory sitting immediately INSIDE the deepest ancestor that does
     contain tracked files -- so `apps/web/.next/cache/turbopack/x.meta` collapses to `apps/web/.next/`
-    while `apps/web/` itself is never ignored. When no ancestor contains tracked files at all, only
-    the exact file is ignored, never a directory: a subtree with nothing committed in it might be
+    while `apps/web/` itself is never ignored. When no ancestor contains tracked files at all, the
+    file is ignored alone, never a whole directory: a subtree with nothing committed in it might be
     source that simply has not been committed yet, and ignoring it would hide real work. That is
     deliberately conservative -- a first draft of this walked to the highest untracked ancestor and
     would have ignored an entire `services/` tree.
+
+    The one exception to that conservatism: if a KNOWN toolchain directory name (`_GENERATED_DIR_NAMES`
+    -- the same list `_looks_authored` already used to rule this path out as authored) appears
+    anywhere in it, that segment collapses on its own, tracked ancestor or not. Root-caused live
+    (income-investor thread f0fef8ba, 2026-09-26): a stage's whole app tree was still uncommitted
+    (no tracked ancestor anywhere under it) when e2e booted it and `node_modules/` came in fresh --
+    with no collapsing, every one of tens of thousands of vendored files became its OWN entry, and
+    the resulting multi-megabyte `.gitignore` append blew Windows' ~32K `CreateProcess` argv limit
+    (`FileNotFoundError: [WinError 206]`) in `_append_missing_gitignore_entries`. A directory named
+    `node_modules` is toolchain output independent of whether anything above it is tracked yet, so
+    collapsing it here is correct, not just a size workaround -- it was always safe to do, nothing
+    upstream noticed until the entry count made it visible.
 
     `.ai-dev-workflow/` is excluded unconditionally: it is the deliverable, and parts of it are
     legitimately untracked mid-run.
@@ -504,7 +521,12 @@ def generated_ignore_entries(untracked: list[str], tracked: list[str]) -> list[s
             if "/".join(parts[:i]) in tracked_dirs:
                 deepest = i
         if deepest == -1:
-            entries.add(clean)  # nothing committed anywhere above it -- ignore the file only
+            for i in range(1, len(parts)):
+                if parts[i - 1] in _GENERATED_DIR_NAMES:
+                    entries.add("/".join(parts[:i]) + "/")
+                    break
+            else:
+                entries.add(clean)  # no known generated dir name in the path -- ignore the file only
             continue
         for i in range(deepest + 1, len(parts)):
             candidate = "/".join(parts[:i])
@@ -522,13 +544,24 @@ async def _append_missing_gitignore_entries(
     """Append whichever of `candidates` .gitignore doesn't already have, under a `header` comment
     line, and return them (empty when nothing was missing). Appended, never overwritten: a repo
     (or a stage) may have its own entries that matter. Shared by ignore_generated_files and
-    ensure_gitignore below."""
+    ensure_gitignore below.
+
+    Goes through `write_repo_file` (a full-content overwrite, built from the existing text plus the
+    new block) rather than a raw `printf ... >> .gitignore` exec: that used to embed the whole
+    block in one shell argv, and a large `candidates` list -- observed live, income-investor thread
+    f0fef8ba, 2026-09-26 -- blew Windows' ~32K CreateProcess argv limit. write_repo_file already
+    chunks arbitrarily large content through a sidecar file instead of one argv (repo_files.py's own
+    `_chunked_write_commands`), so reusing it here closes this call site's copy of the same bug
+    class instead of adding a second cap to maintain.
+    """
     existing = await provider.exec_in_sandbox(thread_id, "cat .gitignore 2>/dev/null || true")
-    current = {line.strip() for line in str(existing.stdout or "").splitlines()}
+    current_text = str(existing.stdout or "")
+    current = {line.strip() for line in current_text.splitlines()}
     missing = [entry for entry in candidates if entry not in current]
     if missing:
         block = "\n".join([header, *missing])
-        await provider.exec_in_sandbox(thread_id, f"printf '%s\\n' {shlex.quote(block)} >> .gitignore")
+        prefix = f"{current_text.rstrip()}\n" if current_text.strip() else ""
+        await write_repo_file(provider, thread_id, ".gitignore", f"{prefix}{block}\n")
     return missing
 
 
@@ -707,10 +740,38 @@ def _demo() -> None:
         got = generated_ignore_entries([path], polyglot)
         assert got == [expected], (path, got)
 
-    # With NOTHING committed above it, only the file is ignored -- never a directory that might turn
-    # out to be uncommitted source.
+    # With NOTHING committed above it, a KNOWN generated dir name in the path still collapses -- it's
+    # toolchain output regardless of tracked state. Root-caused 2026-09-26 (income-investor thread
+    # f0fef8ba): before this, an entirely uncommitted app tree's freshly-installed node_modules added
+    # one entry PER FILE (tens of thousands), and the resulting .gitignore append blew Windows'
+    # CreateProcess argv limit (WinError 206).
     orphan = generated_ignore_entries(["services/api/__pycache__/app.pyc"], tracked)
-    assert orphan == ["services/api/__pycache__/app.pyc"], orphan
+    assert orphan == ["services/api/__pycache__/"], orphan
+
+    # Genuinely ambiguous -- no tracked ancestor AND no known generated dir name anywhere in the path
+    # -- stays conservative: ignore the file alone, since this could be uncommitted authored work.
+    unknown_orphan = generated_ignore_entries(["services/api/scratch/notes.txt"], tracked)
+    assert unknown_orphan == ["services/api/scratch/notes.txt"], unknown_orphan
+
+    # The actual live crash: a whole node_modules tree with no tracked ancestor anywhere above it
+    # must still collapse to one entry, not one per vendored file.
+    massive_node_modules = [
+        "services/web/node_modules/next/dist/a.js",
+        "services/web/node_modules/next/dist/b.js",
+        "services/web/node_modules/react/index.js",
+    ]
+    got_massive = generated_ignore_entries(massive_node_modules, tracked)
+    assert got_massive == ["services/web/node_modules/"], got_massive
+
+    # Live-observed on the very next run after the fix above (2026-09-26, same thread): the bare
+    # `venv/` spelling (`python -m venv venv`) was missing from _GITIGNORE_ENTRIES -- only `.venv/`
+    # was listed -- so this exact scenario still fell through to 1928 individual file entries.
+    massive_venv = [
+        "apps/api/venv/lib/python3.12/site-packages/pytest/py.typed",
+        "apps/api/venv/lib/python3.12/site-packages/alembic-1.20.0.dist-info/METADATA",
+    ]
+    got_venv = generated_ignore_entries(massive_venv, tracked)
+    assert got_venv == ["apps/api/venv/"], got_venv
 
     # The deliverable is never ignored, however untracked it looks mid-run.
     assert generated_ignore_entries([".ai-dev-workflow/history/r1-screens/001-home.png"], tracked) == []
@@ -741,5 +802,46 @@ def _demo() -> None:
     print("git_ops self-check: all assertions passed")
 
 
+async def _demo_async() -> None:
+    """Covers `_append_missing_gitignore_entries`'s write_repo_file reuse: candidates already present
+    survive untouched, only genuinely-missing ones get appended, and the write goes through
+    write_repo_file's own base64 short-payload command rather than a raw printf."""
+
+    class _FakeProvider:
+        def __init__(self) -> None:
+            self.content = ""
+
+        async def exec_in_sandbox(self, _thread_id: str, cmd: str):
+            class _R:
+                pass
+            r = _R()
+            r.stderr = ""
+            if cmd.startswith("cat "):
+                r.ok = True
+                r.stdout = self.content
+                return r
+            if "echo " in cmd and "base64 -d >" in cmd:
+                encoded = cmd.split("echo ", 1)[1].split(" | base64", 1)[0]
+                self.content = base64.b64decode(encoded).decode("utf-8")
+                r.ok = True
+                r.stdout = ""
+                return r
+            raise AssertionError(f"unexpected command in fake provider: {cmd}")
+
+    provider = _FakeProvider()
+    missing = await _append_missing_gitignore_entries(provider, "t1", ["node_modules/", ".next/"], "# header")
+    assert missing == ["node_modules/", ".next/"], missing
+    assert provider.content == "# header\nnode_modules/\n.next/\n", repr(provider.content)
+
+    # Second call: the already-present entry is skipped, only the new one is appended -- existing
+    # content (including the prior header) survives untouched, never overwritten.
+    missing2 = await _append_missing_gitignore_entries(provider, "t1", ["node_modules/", "dist/"], "# header")
+    assert missing2 == ["dist/"], missing2
+    assert provider.content == "# header\nnode_modules/\n.next/\n# header\ndist/\n", repr(provider.content)
+
+    print("git_ops async self-check: all assertions passed")
+
+
 if __name__ == "__main__":
     _demo()
+    asyncio.run(_demo_async())

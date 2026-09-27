@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import { Chip } from "@/components/MetricsBar";
 import { useStructuralRunEvents } from "@/lib/use-run-events";
 
@@ -26,7 +27,7 @@ import { useStructuralRunEvents } from "@/lib/use-run-events";
  * layout later. Renders nothing until the first usage-bearing event lands, same "hide until there
  * is real data" rule MetricsBar's costChip already applies.
  */
-export function LiveCostChip() {
+function LiveCostChipImpl() {
   const events = useStructuralRunEvents();
 
   let inputTokens = 0;
@@ -53,3 +54,8 @@ export function LiveCostChip() {
     />
   );
 }
+
+// No props -- memoized so it only redoes its full-history token/cost reduction when
+// useStructuralRunEvents() actually returns a new array (a real structural event), not on every
+// unrelated AppShell re-render.
+export const LiveCostChip = memo(LiveCostChipImpl);

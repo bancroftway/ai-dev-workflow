@@ -8,7 +8,6 @@ import {
 } from "@copilotkit/react-core/v2";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AgentNarrationDrawer } from "@/components/AgentNarrationDrawer";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
 import { LiveCostChip } from "@/components/LiveCostChip";
@@ -26,7 +25,7 @@ import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningStages, useStructuralRunEvents } from "@/lib/use-run-events";
+import { EMPTY_STAGES, useRunningStages, useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   buildStarted,
@@ -146,12 +145,6 @@ export function AppShell({
     router.refresh();
   }, [workBranch, sandboxStatus, router]);
   const [stoppingContainer, setStoppingContainer] = useState(false);
-  // Agent Narration Drawer: plain local state, no new context -- AppShell already persists across
-  // tab switches (views are hidden, not unmounted), so this survives tab changes for free. Manual
-  // toggle only (no auto-open on a new turn starting): the pipeline advances through many turns
-  // without direct user action per turn, and auto-popping this over whatever tab someone's working
-  // in every time a turn starts would fight their navigation constantly.
-  const [narrationOpen, setNarrationOpen] = useState(false);
   // MetricsBar pill -> Quality tab section navigation. A fresh object literal on every click (not
   // a request id/counter) is deliberate: MetricsBar is visible on every tab, so clicking the SAME
   // pill twice in a row while already on Quality must still re-trigger the scroll/highlight, and
@@ -167,10 +160,8 @@ export function AppShell({
   const specification = state.stages?.specification;
   const plan = state.stages?.plan;
   const runEvents = useStructuralRunEvents();
-  const runningStages = useMemo(
-    () => computeRunningStages(runEvents, runActivity?.runActive ?? null),
-    [runEvents, runActivity?.runActive],
-  );
+  const sharedRunningStages = useRunningStages();
+  const runningStages = runActivity?.runActive === false ? EMPTY_STAGES : sharedRunningStages;
   // Always-fresh handle for effects below whose own deps intentionally exclude `state` (recreating
   // a poll's setInterval on every state tick would be wasteful) but still need this render's value.
   const stateRef = useRef(state);
@@ -645,6 +636,14 @@ export function AppShell({
     durableStageAtLeast("metrics-exit");
   const reportDot: DotState | undefined = exitStage?.approved_content != null ? "done" : undefined;
 
+  // Stable reference across unrelated re-renders (ReportView is React.memo'd) -- a plain inline
+  // `.map()` in the JSX below would allocate a new array every AppShell render regardless of
+  // whether the screenshot list itself changed, silently defeating that memo.
+  const screenshotUrls = useMemo(
+    () => state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path, workBranch)),
+    [state.e2e?.screenshots, owner, repo, workBranch],
+  );
+
   const dots: Record<ViewId, DotState | undefined> = {
     "tech-stack": stageGroupDot(state, TAB_STAGE_GROUPS["tech-stack"], runningStages),
     requirements: stageGroupDot(state, TAB_STAGE_GROUPS.requirements, runningStages),
@@ -779,20 +778,6 @@ export function AppShell({
                 </svg>
               </a>
             )}
-            {/* Agent Narration Drawer trigger -- reuses the exact same "is a turn running" OR the
-                global spinner above already computes, no new liveness signal invented. */}
-            <button
-              type="button"
-              onClick={() => setNarrationOpen((v) => !v)}
-              aria-label="Toggle agent activity drawer"
-              aria-pressed={narrationOpen}
-              className="relative flex items-center gap-1.5 rounded-md border border-neutral-200 px-2 py-1.5 text-xs text-neutral-600 hover:bg-neutral-100"
-            >
-              Activity
-              {interruptElement == null && (agent.isRunning || runActivity?.runActive) && (
-                <span aria-hidden className="h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
-              )}
-            </button>
             <ContainerStatusButton
               status={sandboxStatus}
               stopping={stoppingContainer}
@@ -901,13 +886,12 @@ export function AppShell({
               metricsExitStatus={exitStage?.status}
               deltaSummary={state.repo_scan?.delta_summary}
               filesChanged={filesChanged}
-              screenshotUrls={state.e2e?.screenshots?.map((path) => rawProxyUrl(owner, repo, path, workBranch))}
+              screenshotUrls={screenshotUrls}
               reportExtras={reportExtras}
             />
           </div>
           <div hidden={activeView !== "overview"}><SessionOverview owner={owner} repo={repo} branch={workBranch} /></div>
         </main>
-        <AgentNarrationDrawer open={narrationOpen} onClose={() => setNarrationOpen(false)} />
       </div>
     </InterruptProvider>
   );

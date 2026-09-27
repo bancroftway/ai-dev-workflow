@@ -60,6 +60,16 @@ _GATE_OWNED_REASON_MARKERS = (
     # section) and in ordinary model prose ("the smoke-test run failed at login"), so it would both
     # get copied forward and falsely filter legitimate reasons.
     "terminal pipeline failure recorded at",
+    # verify_exit_readiness's own "metrics.get('run_id') == run_id" check (this function, a few
+    # hundred lines below _MANIFEST_COMPLETENESS_TOPIC_KEYWORDS) -- this exact marker's own absence
+    # WAS the bug this comment warns about. Root-caused live (income-investor thread f0fef8ba,
+    # 2026-09-26, reproduced across two independent resumes): this phrase got baked into metrics-exit's
+    # approved_content once, on a run whose metrics genuinely hadn't landed yet under the current
+    # run_id, and then survived every later resume forever -- metrics-latest.json's own run_id and
+    # regression_gate.reasons were confirmed correct and clean on both later resumes, but this reason
+    # was never gate-owned by any existing marker, so the stale-filter kept re-displaying it and
+    # merge_ready never got a chance to flip back to True on an otherwise fully clean run.
+    "the regression gate never passed",
 )
 
 # Manifest-completeness topics verify_exit_readiness's own manifest-completion step computes fresh
@@ -1400,6 +1410,44 @@ async def exit_finalize_node(
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     merge_readiness = content
 
+    # Re-run the deterministic merge-readiness recompute UNCONDITIONALLY, on every single call --
+    # not just a fresh approval. This is the fix for a real bug: on a RESUMED run whose metrics-exit
+    # stage was already "approved" from an earlier attempt, make_draft_node's resume short-circuit
+    # (graph.py's "Resume short-circuit" comment) re-fires this hook with the PREVIOUS run's frozen
+    # approved_content, never calling verify_exit_readiness again -- graph.py's own comment on
+    # intake_node's stage_resume computation already names this exact bug ("metrics-exit is NEVER
+    # skip-ahead eligible, resume or not") but nothing ever closed it. Root-caused live
+    # (income-investor thread f0fef8ba): after the gitleaks/e2e failures that ORIGINALLY set
+    # blocking_reasons were fixed on a later resume, the exit report kept re-reporting all of them
+    # forever, keeping merge_ready permanently False on an otherwise-clean run. verify_exit_readiness
+    # already has a correct, tested stale-reason filter built in (_GATE_OWNED_REASON_MARKERS) that
+    # would have caught and dropped all of them -- it simply never got invoked on this path. Calling
+    # it again here is a no-op on the NORMAL (fresh-approval) path too, where it already ran seconds
+    # earlier via make_verify_node -- an idempotent recompute (its own docstring: "always returns
+    # passed=True with the draft mutated in place"), not a redraft. It DOES mean a second round of
+    # live sandbox reads (manifest, tech-stack, coverage-commands, metrics-latest.json, a screenshot
+    # listing) on every run that reaches this stage, not just the buggy resume case -- an honest,
+    # deliberate cost, not free.
+    #
+    # Wrapped in its own try/except, NOT folded into the function's main try block below: this call
+    # sits BEFORE the terminal_failure injection and status/merge_ready derivation just below (both
+    # of which must see the REFRESHED content), which is itself before session_row is fetched and
+    # before the main try block that guarantees close_session always fires. verify_exit_readiness
+    # does live, unguarded sandbox I/O (repo_files.read_repo_file, app_discovery.collect_evidence)
+    # with no exception handling of its own -- and this codebase already documents
+    # provider.exec_in_sandbox raising RuntimeError against a torn-down container (run_headless.py's
+    # own comment: "metrics-exit_gate's own node tears the sandbox down as its LAST action once it
+    # finishes"). Letting that propagate here would skip EVERYTHING below, including the one
+    # guarantee this function's own docstring calls "structurally impossible" to skip:
+    # session_store.close_session always firing. Same degrade-not-abort pattern this function
+    # already uses further down for _files_changed/_list_screenshots/_load_ledger_rows -- on
+    # failure, proceed with content UNREFRESHED (today's existing behavior, not a new regression)
+    # rather than losing the whole finalize.
+    try:
+        await verify_exit_readiness(thread_id, content, run_id, None, provider, "", 0)
+    except Exception:  # noqa: BLE001 -- degrade to today's stale-content behavior, never abort the report
+        logger.warning("exit finalize: verify_exit_readiness re-check failed for thread_id=%s", thread_id, exc_info=True)
+
     terminal_failure = state.get("run_failure")
     if terminal_failure:
         # A terminal escalate (rebuild/e2e/test-hardening) routed into this stage so the report
@@ -1800,6 +1848,21 @@ def _demo() -> None:
     assert _targeted_fix_unresolved_problems({"run_id": "r1", "reasons": []}, "r1") == []
     assert _targeted_fix_unresolved_problems({}, "r1") == [], "no file/empty payload -- nothing to fold in"
 
+    # _GATE_OWNED_REASON_MARKERS: "the regression gate never passed" must match verify_exit_readiness's
+    # own deterministic phrase (exit_nodes.py's "metrics were not recorded for this run" append) so a
+    # stale copy gets dropped once metrics-latest.json's run_id/regression_gate are clean again --
+    # root-caused live, this exact phrase was missing from the tuple and never got dropped, ever.
+    stale_metrics_reason = "metrics were not recorded for this run -- the regression gate never passed"
+    assert any(marker in stale_metrics_reason for marker in _GATE_OWNED_REASON_MARKERS), (
+        "this deterministic phrase must be gate-owned so a stale copy is droppable"
+    )
+    # A model's own unrelated prose must never accidentally match -- same false-positive risk the
+    # "terminal pipeline failure recorded at" marker's own comment already warns about.
+    assert not any(
+        marker in "the API rate limiter never passed a single request during the outage"
+        for marker in _GATE_OWNED_REASON_MARKERS
+    )
+
     # _diff_ledger: added/revised/retired classification against a prior snapshot.
     prior = [{"id": "US-0001", "status": "active", "last_revised_run_id": "r1"}]
     current = [
@@ -2032,6 +2095,25 @@ def _demo() -> None:
     assert "## Screens" in empty
     assert "(none captured -- e2e skipped: no UI framework)" in empty
     assert "- **E2E**: skipped -- no UI framework" in empty
+
+    # Regression lock for the browser/runner-missing infra gap (income-investor thread f0fef8ba,
+    # 2026-09-26): this used to render as a benign "skipped" here (and, worse, route as an
+    # indistinguishable-from-green "pass" in make_e2e_route_after_run) -- it must now always render
+    # as a real failure, never the word "skipped", regardless of no production change being needed
+    # in THIS file (the failed_tests-truthiness check below is already generic).
+    browser_missing_escalated = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None, screenshots=[], run_id="r1",
+        e2e={
+            "status": "failed", "cannot_verify": True, "total": 0,
+            "failed_tests": [{
+                "title": "e2e suite",
+                "error": "playwright browser executable is missing in this environment",
+            }],
+        },
+    )
+    assert "- **E2E**: failed (1/0 failed)" in browser_missing_escalated, browser_missing_escalated
+    assert "(none captured -- e2e failed)" in browser_missing_escalated
+    assert "skipped" not in browser_missing_escalated.lower()
 
     filled = _render_history_sections(
         files_changed_stat="1 file changed",

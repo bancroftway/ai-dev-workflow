@@ -63,6 +63,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import time
 import types
 from dataclasses import dataclass, replace
@@ -1964,15 +1965,23 @@ def health_score(
 #     accessibility scripts under .playwright-browsers/.
 # Nothing here is code a human wrote or can meaningfully fix, and a gate that blocks on it teaches
 # people to ignore the gate.
+#
+# .angular is Angular's build cache -- its vite/deps/*.js are vendored framework bundles, exactly
+# .next's equivalent. Observed live (run e890f410): four lizard complexity findings in
+# .angular/cache/.../deps/@angular_platform-browser.js gated an adversarial rebuild to escalation
+# before this entry existed.
+#
+# Single source of truth: several of repo_scan.py's own scan-tool commands (below, TOOLS) also need
+# to EXCLUDE these same paths from what they walk, not just from what gates -- deriving both from
+# one tuple means the gate filter and what a tool actually scans can never drift apart the way N
+# independently hand-typed lists would.
+_NON_APPLICATION_DIR_NAMES: tuple[str, ...] = (
+    "agent-work", ".ai-dev-workflow", "node_modules", ".playwright-browsers",
+    "bin", "obj", "dist", "build", "out", ".next", ".nuxt", ".angular",
+    ".venv", "vendor", "TestResults", "coverage",
+)
 _NON_APPLICATION_PATH_RE = re.compile(
-    r"(^|/)("
-    r"agent-work|\.ai-dev-workflow|node_modules|\.playwright-browsers|"
-    # .angular is Angular's build cache -- its vite/deps/*.js are vendored framework bundles,
-    # exactly .next's equivalent. Observed live (run e890f410): four lizard complexity findings
-    # in .angular/cache/.../deps/@angular_platform-browser.js gated an adversarial rebuild to
-    # escalation before this entry existed.
-    r"bin|obj|dist|build|out|\.next|\.nuxt|\.angular|\.venv|vendor|TestResults|coverage"
-    r")/",
+    r"(^|/)(" + "|".join(re.escape(n) for n in _NON_APPLICATION_DIR_NAMES) + r")/",
 )
 
 
@@ -1993,6 +2002,16 @@ _NON_GATING_RULE_RE = re.compile(
     # Fires once per dependency block in package.json -- a generic "you have dependencies" lint
     # rather than a finding about this code. Six identical copies gated one run.
     r"|package-dependencies-check"
+    # bash-obfuscation-dev-null (malicious-code-ruleset): flags ANY `> /dev/null`/`2>/dev/null`
+    # redirect as output-hiding obfuscation. Root-caused live (income-investor thread f0fef8ba,
+    # 2026-09-26): fired on run-all-tests.sh's own `trap "... 2>/dev/null ..." EXIT` cleanup --
+    # `kill $PID 2>/dev/null || true` silencing "no such process" on an already-dead PID, the most
+    # ordinary shell-script idiom there is, not malware hiding its actions. Unfixable by the app
+    # loop without breaking the script's own error handling, so it deadlocked adversarial-compliance's
+    # rebuild cap every resume. Narrowly scoped to this ONE leaf rule -- every other
+    # malicious-code-ruleset check (real obfuscation: base64/hex-encoded eval, etc.) stays fully
+    # gating.
+    r"|bash-obfuscation-dev-null"
 )
 
 # Lock files list TRANSITIVE dependencies -- packages this application never chose. A licence
@@ -2507,6 +2526,12 @@ class ToolSpec:
     # here records status="not_applicable" -- excluded from summary.degraded AND from the
     # security-coverage denominator, so "no Python in this repo" never reads as a degraded scan.
     applies: str | None = None
+    # True when a clean, zero-finding run is expected to leave output_path unwritten (gitleaks --
+    # see its own ToolSpec comment below). _run_one synthesizes an empty, successful ToolRun
+    # instead of status="failed" ONLY when this is True AND the tool's own exit code says
+    # "completed cleanly" (0) -- a genuine crash (any other exit code) still fails, unchanged.
+    # False (the default) leaves every other tool's contract exactly as it is today.
+    empty_output_ok: bool = False
 
 
 # Applicability probes (ToolSpec.applies). `-print -quit | grep -q .` = exit 0 on first hit.
@@ -2522,6 +2547,53 @@ _PACKAGE_JSON_PROBE = "find . -maxdepth 3 -name package.json -not -path '*/node_
 _CSS_FILES_PROBE = (
     "find . \\( -name '*.css' -o -name '*.scss' \\) -not -path '*/node_modules/*' "
     "-not -path '*/agent-work/*' -not -path '*/.ai-dev-workflow/*' -print -quit | grep -q ."
+)
+
+# Native exclude flags for the scan tools below that -- unlike scc/lizard/jscpd just above -- have
+# no exclude scoping of their own, all built from _NON_APPLICATION_DIR_NAMES (the same tuple
+# is_non_application_path uses), so the gate filter and what these tools actually walk can never
+# drift apart the way independently hand-typed lists would.
+_TRIVY_SKIP_DIRS = " ".join(
+    f"--skip-dirs '{n}' --skip-dirs '**/{n}'" for n in _NON_APPLICATION_DIR_NAMES
+)
+_SEMGREP_EXCLUDES = " ".join(f"--exclude '{n}'" for n in _NON_APPLICATION_DIR_NAMES)
+_SYFT_EXCLUDES = " ".join(
+    f"--exclude './{n}/**' --exclude '**/{n}/**'" for n in _NON_APPLICATION_DIR_NAMES
+)
+# checkov's --skip-path is a regex, repeatable -- one alternation regex covers every name in one flag.
+_CHECKOV_SKIP_PATH_REGEX = (
+    r"(^|.*/)(" + "|".join(re.escape(n) for n in _NON_APPLICATION_DIR_NAMES) + r")(/|$)"
+)
+
+# gitleaks has no CLI exclude flag at all (verified against its own pinned v8.30.1 source) -- its
+# only mechanism is a --config TOML file's global [allowlist] block (paths/stopwords, verified
+# directly against that tag's own shipped default config). [extend] useDefault=true MERGES with
+# (never replaces) gitleaks' built-in ruleset.
+#
+# TOML LITERAL strings (single-quoted), not basic (double-quoted): a basic string only allows the
+# TOML spec's own fixed escape set (\b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX) -- re.escape's `\-`
+# (produced for every name containing a hyphen, e.g. "agent-work" -> 'agent\-work') is NOT one of
+# them, so a double-quoted rendering would make gitleaks fail to even load the config and exit
+# non-zero on every run -- silently defeating this tool's own empty_output_ok handling below by
+# turning a diagnosed "clean scan" case into an undiagnosed "bad config" one instead. A literal
+# string has zero escape processing (its only forbidden character is a literal single quote, which
+# none of these names or stopwords contain), so `\-`/`\.` from re.escape round-trip verbatim with no
+# TOML-level meaning at all -- gitleaks' OWN shipped default config uses this exact convention
+# (`'''...'''` for its own regex-bearing entries). Parsed with tomllib in this module's own
+# self-check below, not just eyeballed.
+_GITLEAKS_ALLOWLIST_PATHS = ", ".join(
+    f"'(^|/){re.escape(n)}/'" for n in _NON_APPLICATION_DIR_NAMES
+)
+# Generic, stack-agnostic placeholder-secret tokens -- broadly true regardless of which of this
+# pipeline's 8 tech-stack templates generated the scanned app (none of them document a
+# framework-specific false-positive pattern to encode instead, so there is nothing more specific to
+# align to).
+_GITLEAKS_STOPWORDS = ", ".join(
+    f"'{w}'" for w in ("example", "changeme", "placeholder", "test", "xxxxxxxx", "your_api_key_here", "redacted")
+)
+_GITLEAKS_EXCLUDE_CONFIG = (
+    "[extend]\nuseDefault = true\n\n"
+    f"[allowlist]\npaths = [{_GITLEAKS_ALLOWLIST_PATHS}]\nstopwords = [{_GITLEAKS_STOPWORDS}]\n"
 )
 
 # Every command is offline by construction: no `--config auto`, no DB update, no registry fetch.
@@ -2577,16 +2649,31 @@ TOOLS: tuple[ToolSpec, ...] = (
         "gitleaks", "MIT", True,
         # --no-git: working-tree only. A full-history sweep is a separate, slower concern and is
         # flagged rather than silently folded in, matching security_nodes.py's existing decision.
-        "gitleaks detect --report-format json --report-path agent-work/gitleaks.json --no-git --exit-code 0",
+        # --config: gitleaks has no CLI path-exclude flag -- the config (paths + stopwords, see
+        # _GITLEAKS_EXCLUDE_CONFIG's own comment) is written fresh into agent-work/ immediately
+        # before the scan runs. Wrapped in a subshell so _run_one's own env-var prefix
+        # (LC_ALL=C PYTHONNOUSERSITE=1) scopes over BOTH commands, not just the first half of the
+        # && chain.
+        f"(printf '%s' {shlex.quote(_GITLEAKS_EXCLUDE_CONFIG)} > agent-work/gitleaks-exclude.toml && "
+        "gitleaks detect --config agent-work/gitleaks-exclude.toml --report-format json "
+        "--report-path agent-work/gitleaks.json --no-git --exit-code 0)",
         "agent-work/gitleaks.json", parse_gitleaks, "gitleaks version",
+        empty_output_ok=True,
     ),
     ToolSpec(
         "trivy", "Apache-2.0", True,
         "trivy fs --offline-scan --skip-db-update --skip-java-db-update "
-        "--scanners vuln,misconfig,license,secret --format json --output agent-work/trivy.json .",
+        "--scanners vuln,misconfig,license,secret --format json --output agent-work/trivy.json "
+        f"{_TRIVY_SKIP_DIRS} .",
         "agent-work/trivy.json", parse_trivy, "trivy --version",
     ),
     ToolSpec(
+        # No path-exclude mechanism exists at this pin: --exclude was added upstream in osv-scanner
+        # v2.3.3 (its own CHANGELOG/release notes); this pin (OSV_SCANNER_VERSION in the Dockerfile)
+        # is 2.0.2, and that version's own config.toml supports only IgnoredVulns/PackageOverrides,
+        # not paths. Relies solely on the post-hoc is_non_application_path filter until/unless the
+        # pin is bumped -- a separate, riskier image-level change with its own DB/output-schema
+        # compatibility burden, not undertaken here.
         "osv-scanner", "Apache-2.0", True,
         f"osv-scanner scan source --recursive --offline-vulnerabilities --local-db-path {OSV_DB_DIR} "
         "--format json --output agent-work/osv.json .",
@@ -2595,7 +2682,8 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         # The one non-permissive dependency, kept deliberately and recorded as such in `tools[]`.
         "semgrep", "LGPL-2.1", False,
-        f"semgrep scan --config {SEMGREP_RULES_DIR} --metrics=off --sarif --output agent-work/semgrep.sarif .",
+        f"semgrep scan --config {SEMGREP_RULES_DIR} --metrics=off --sarif --output "
+        f"agent-work/semgrep.sarif {_SEMGREP_EXCLUDES} .",
         "agent-work/semgrep.sarif", parse_semgrep, "semgrep --version",
     ),
     ToolSpec(
@@ -2606,7 +2694,8 @@ TOOLS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "checkov", "Apache-2.0", True,
-        "checkov --directory . --compact --quiet --output json > agent-work/checkov.json",
+        f"checkov --directory . --compact --quiet --skip-path '{_CHECKOV_SKIP_PATH_REGEX}' "
+        "--output json > agent-work/checkov.json",
         "agent-work/checkov.json", parse_checkov, "checkov --version",
     ),
     ToolSpec(
@@ -2674,7 +2763,7 @@ TOOLS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "syft", "Apache-2.0", True,
-        "syft dir:. -o cyclonedx-json=agent-work/sbom.json",
+        f"syft dir:. {_SYFT_EXCLUDES} -o cyclonedx-json=agent-work/sbom.json",
         "agent-work/sbom.json", parse_syft, "syft version",
     ),
     ToolSpec(
@@ -2978,6 +3067,16 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
 
     raw = await repo_files.read_repo_file(provider, thread_id, spec.output_path)
     if raw is None or not raw.strip():
+        if spec.empty_output_ok and result.returncode == 0:
+            # A clean run can legitimately leave --report-path unwritten -- exit 0 with no output IS
+            # the successful empty scan, not a crash (gitleaks' own exit-code contract: a genuine
+            # internal error always exits non-zero, checked BEFORE --exit-code's value is ever
+            # consulted -- verified against the pinned v8.30.1 tag's own cmd/root.go). run["status"]
+            # and run["findings"] already default to "ok"/0 above; return shape matches
+            # parse_gitleaks's own empty-result return exactly, so downstream aggregation treats this
+            # identically to a real empty scan.
+            run["duration_ms"] = _elapsed_ms(started)
+            return run, [], {}
         # Non-zero exit is normal for most of these tools (findings present), so the report file --
         # not the exit code -- is what decides success.
         run.update(status="failed", notes=f"no readable output at {spec.output_path}",
@@ -4057,6 +4156,27 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert all("--config auto" not in t.command for t in TOOLS), "no network rule fetch"
     assert "--skip-db-update" in TOOLS_BY_NAME["trivy"].command
     assert "--offline-vulnerabilities" in TOOLS_BY_NAME["osv-scanner"].command
+    # Every tool with a native CLI exclude flag must actually use it, built from the SAME
+    # _NON_APPLICATION_DIR_NAMES tuple is_non_application_path uses -- proves the shared-tuple
+    # refactor actually reached every command, not just some. trivy/semgrep/syft embed the bare dir
+    # name verbatim (a plain substring check works); checkov and gitleaks both regex-escape each
+    # name (re.escape turns e.g. ".ai-dev-workflow" into "\.ai\-dev\-workflow"), so they need the
+    # escaped form checked instead -- gitleaks' own TOML-parse assertion above already covers it,
+    # checkov is checked separately right below. osv-scanner has no exclude mechanism at its pinned
+    # version (see its own ToolSpec comment) and is excluded from all of this.
+    for _dir_name in _NON_APPLICATION_DIR_NAMES:
+        for _tool_name in ("trivy", "semgrep", "syft"):
+            assert _dir_name in TOOLS_BY_NAME[_tool_name].command, (_tool_name, _dir_name)
+        assert re.escape(_dir_name) in TOOLS_BY_NAME["checkov"].command, _dir_name
+
+    # gitleaks' generated exclude config must actually be valid TOML, not just look like it --
+    # re.escape's `\-` is invalid inside a double-quoted TOML string (caught by an earlier adversarial
+    # review of this exact code), which is exactly why these are single-quoted TOML literal strings.
+    import tomllib
+    _parsed_gitleaks_config = tomllib.loads(_GITLEAKS_EXCLUDE_CONFIG)
+    assert _parsed_gitleaks_config["extend"]["useDefault"] is True
+    assert len(_parsed_gitleaks_config["allowlist"]["paths"]) == len(_NON_APPLICATION_DIR_NAMES)
+    assert "changeme" in _parsed_gitleaks_config["allowlist"]["stopwords"]
 
     # Non-application paths never gate. Each of these actually gated a real run.
     assert is_non_application_path("agent-work/gitleaks.json")          # 48 of that run's 68
@@ -4164,6 +4284,40 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
         assert "command not found" in result.stdout
 
     asyncio.run(_run_probe_check())
+
+    # --- _run_one: empty_output_ok reads a clean exit-0/no-output run as success, never masks a
+    # genuine crash --------------------------------------------------------------------------------
+    async def _run_one_empty_output_check() -> None:
+        class _FakeProvider:
+            def __init__(self, results: list[Any]) -> None:
+                self._results = list(results)
+
+            async def exec_in_sandbox(self, thread_id: str, command: str) -> Any:
+                return self._results.pop(0)
+
+        clean_spec = replace(
+            TOOLS_BY_NAME["gitleaks"],
+            name="gitleaks-test", command="fake gitleaks command",
+            output_path="agent-work/gitleaks-test.json", version_command="fake --version",
+        )
+        version_ok = types.SimpleNamespace(ok=True, returncode=0, stdout="v8.30.1", stderr="")
+        clean_exit = types.SimpleNamespace(ok=True, returncode=0, stdout="", stderr="")
+        missing_file = types.SimpleNamespace(
+            ok=False, returncode=1, stdout="",
+            stderr="cat: agent-work/gitleaks-test.json: No such file or directory",
+        )
+        run, findings, fragment = await _run_one(
+            _FakeProvider([version_ok, clean_exit, missing_file]), "t", clean_spec
+        )
+        assert run["status"] == "ok" and findings == [] and fragment == {}, run
+
+        crashed_exit = types.SimpleNamespace(ok=True, returncode=1, stdout="", stderr="panic: boom")
+        run, _, _ = await _run_one(
+            _FakeProvider([version_ok, crashed_exit, missing_file]), "t", clean_spec
+        )
+        assert run["status"] == "failed", "a genuine crash must not be read as a clean empty scan"
+
+    asyncio.run(_run_one_empty_output_check())
 
     print("repo_scan self-check: all assertions passed")
 

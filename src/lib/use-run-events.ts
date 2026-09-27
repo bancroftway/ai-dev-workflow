@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useAgent } from "@copilotkit/react-core/v2";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 
@@ -22,16 +22,21 @@ import { useWorkflowThread } from "@/lib/workflow-thread-context";
  * Memory fix (2026-09-22): every mounted consumer of this module used to hold its OWN full-array
  * copy (a per-component useState fed by mergeEvents) on top of the module-level StreamState that
  * already held the canonical array -- N+1 copies of a session's entire event history for N
- * mounted components. Checking every actual consumer found each one wants exactly one of two
- * disjoint slices, never the raw union: AppShell/BuildView/QualityView/LiveCostChip/
- * SessionOverview only ever read `node_started`/`node_finished`/`gate_paused`/`gate_resolved`
- * events (STRUCTURAL_TYPES below); AgentNarrationDrawer is the only consumer of `tool_call`/
- * `reasoning` events (NARRATION_TYPES), and it already filtered the full array down to them
- * itself. Both filtered arrays are now maintained once, at the shared-store level
- * (`applyMerge` below), and every consumer subscribes via `useSyncExternalStore` to a shared
- * reference instead of copying anything -- `useStructuralRunEvents`/`useNarrationRunEvents`
- * below. `useRunEvents` (the full array) is kept only as a general escape hatch; nothing in this
- * codebase needs it once its former callers are swapped to the narrower hook.
+ * mounted components. Checking every actual consumer found each one wants exactly one filtered
+ * slice, never the raw union: AppShell/BuildView/QualityView/LiveCostChip/SessionOverview only
+ * ever read `node_started`/`node_finished`/`gate_paused`/`gate_resolved` events (STRUCTURAL_TYPES
+ * below). That filtered array is maintained once, at the shared-store level (`applyMerge` below),
+ * and every consumer subscribes via `useSyncExternalStore` to a shared reference instead of
+ * copying anything -- `useStructuralRunEvents` below. `useRunEvents` (the full array) is kept only
+ * as a general escape hatch; nothing in this codebase needs it once its former callers are
+ * swapped to the narrower hook.
+ *
+ * De-dup fix (2026-09-26): `computeRunningPhases` (a full O(n) scan of the structural array) used
+ * to be re-invoked independently, via its own `useMemo`, in every one of AppShell/BuildView/
+ * QualityView/SessionOverview -- 4 identical scans of the same array on every new structural
+ * event. Computed once here instead (`StreamState.runningPhases`, refreshed in `applyMerge`
+ * exactly when `structuralEvents` itself gets a new reference) and shared the same way the event
+ * arrays already are -- see `useRunningPhases`/`useRunningStages` below.
  */
 
 export interface RunLogEvent {
@@ -107,60 +112,6 @@ function mergeEvents(prev: RunLogEvent[], incoming: RunLogEvent[]): MergeResult 
 }
 
 const STRUCTURAL_TYPES = new Set<RunLogEvent["type"]>(["node_started", "node_finished", "gate_paused", "gate_resolved"]);
-const NARRATION_TYPES = new Set<RunLogEvent["type"]>(["tool_call", "reasoning"]);
-
-/** Both providers build a TOOL_CALL event's `summary` as literally `tool call: {name}`
- * (claude_chat_model.py / copilot_chat_model.py's own `_translate_intermediate_events`) -- reading
- * the tool name back out of `summary` works identically for either provider's payload shape,
- * unlike reading a `name`/`toolName`/`tool_name` key off `payload` directly (Claude's is `name`;
- * Copilot's is unconfirmed and may not exist at all, see that module's own docstring). Shared here
- * (originally EventLogView.tsx-only) so Swimlane.tsx's tool-call lane uses the identical rule
- * rather than a second copy that could drift. */
-export function toolNameOf(e: RunLogEvent): string | null {
-  if (e.type !== "tool_call") return null;
-  const m = e.summary?.match(/^tool call: (.+)$/);
-  return m ? m[1] : "tool";
-}
-
-function truncateOneLine(s: string, max: number): string {
-  const oneLine = s.replace(/\s+/g, " ").trim();
-  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
-}
-
-/** One-line arg preview for a dense tool-call row (Agent Narration Drawer feature; recovered from
- * the deleted EventLogView.tsx's identical helper, git show 7a37340^:src/components/
- * EventLogView.tsx). Claude's shape wraps args in `payload.input`; Copilot's uncorrelated shape (no
- * confirmed real example yet -- copilot_chat_model.py's own docstring) has no such wrapper, so this
- * also tries a couple of plausible top-level keys directly on `payload` before giving up and
- * showing no arg summary at all -- never throws, never assumes either shape. */
-export function argSummary(payload: Record<string, unknown> | null): string | null {
-  if (!payload) return null;
-  const input = payload.input;
-  if (input && typeof input === "object") {
-    const obj = input as Record<string, unknown>;
-    const preferred = obj.command ?? obj.file_path ?? obj.path ?? obj.pattern;
-    if (typeof preferred === "string") return truncateOneLine(preferred, 80);
-  }
-  if (typeof input === "string") return truncateOneLine(input, 80);
-  const direct = payload.path ?? payload.command ?? payload.file;
-  return typeof direct === "string" ? truncateOneLine(direct, 80) : null;
-}
-
-/** Absolute clock label for one event row (Agent Narration Drawer, user request 2026-09-06: tell
- * apart same-looking reasoning/tool-call lines from different stages/times at a glance). Includes
- * the date, not just time-of-day -- a run can genuinely span days (SessionOverview's own "stage 2
- * of 8 a day into a run" case), so a bare HH:MM:SS would misleadingly collide across days. Goes
- * through parseEventTs, not a bare `new Date(e.ts)`, for the same UTC-suffix reason that function's
- * own docstring documents. */
-export function formatEventTimestamp(ts: string): string {
-  return new Date(parseEventTs(ts)).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
 
 /** Human-readable duration, shared so a span reads identically in EventLogView's row detail and
  * Swimlane's bars/tooltips. */
@@ -221,17 +172,20 @@ export function computeRunningStages(events: RunLogEvent[], runActive?: boolean 
 interface StreamState {
   events: RunLogEvent[];
   structuralEvents: RunLogEvent[];
-  narrationEvents: RunLogEvent[];
+  // De-dup fix (2026-09-26): computed once here, alongside structuralEvents itself, instead of
+  // separately in every one of AppShell/BuildView/QualityView/SessionOverview's own useMemo --
+  // see this module's own docstring.
+  runningPhases: Map<string, string>;
   listeners: Set<() => void>;
   source?: EventSource;
 }
 
 // Keyed by threadId, module-level (outside React) so every consumer mounted for the same session
 // shares one EventSource instead of each opening its own -- AppShell, BuildView, QualityView,
-// LiveCostChip, SessionOverview and AgentNarrationDrawer all call one of this module's hooks
-// independently, and one connection per tab (not per component) is what actually matters here
-// (same sharing reasoning as the old poll timer this replaced, from a 2026-09-02 investigation
-// that found 4 unsynchronized timers per tab).
+// LiveCostChip and SessionOverview all call one of this module's hooks independently, and one
+// connection per tab (not per component) is what actually matters here (same sharing reasoning as
+// the old poll timer this replaced, from a 2026-09-02 investigation that found 4 unsynchronized
+// timers per tab).
 // First subscriber for a threadId opens the connection; each additional one just registers and
 // gets the current + all future events for free; last one to unmount closes it.
 const streamStates = new Map<string, StreamState>();
@@ -239,7 +193,7 @@ const streamStates = new Map<string, StreamState>();
 function getOrCreateState(threadId: string): StreamState {
   let s = streamStates.get(threadId);
   if (!s) {
-    s = { events: [], structuralEvents: [], narrationEvents: [], listeners: new Set() };
+    s = { events: [], structuralEvents: [], runningPhases: new Map(), listeners: new Set() };
     streamStates.set(threadId, s);
   }
   return s;
@@ -251,13 +205,17 @@ function getOrCreateState(threadId: string): StreamState {
 // server-rendered pass is simply empty, same as the pre-split code's `useState<RunLogEvent[]>([])`
 // initial value before its first effect ran.
 const EMPTY_EVENTS: RunLogEvent[] = [];
+// Exported so callers can special-case `runActive === false` without a rescan -- see
+// useRunningPhases/useRunningStages below.
+export const EMPTY_PHASES: Map<string, string> = new Map();
+export const EMPTY_STAGES: Set<string> = new Set();
 
-/** Merges `incoming` into `s` (canonical array + both filtered views) and notifies listeners.
- * Shared by both live paths (SSE `run_event` messages and the AG-UI CUSTOM channel) so a
- * consumer sees the identical shape regardless of which one actually delivered a given row --
- * redundant delivery of the same seq via both channels is a harmless no-op merge, not a bug, so
- * every mounted hook instance's own AG-UI subscription can push into this SAME shared state
- * without any "only one subscriber does it" coordination. */
+/** Merges `incoming` into `s` (canonical array + the structural view + its derived running-phases
+ * map) and notifies listeners. Shared by both live paths (SSE `run_event` messages and the AG-UI
+ * CUSTOM channel) so a consumer sees the identical shape regardless of which one actually
+ * delivered a given row -- redundant delivery of the same seq via both channels is a harmless
+ * no-op merge, not a bug, so every mounted hook instance's own AG-UI subscription can push into
+ * this SAME shared state without any "only one subscriber does it" coordination. */
 function applyMerge(s: StreamState, incoming: RunLogEvent[]): void {
   const before = s.events;
   const { events, appended } = mergeEvents(before, incoming);
@@ -266,14 +224,15 @@ function applyMerge(s: StreamState, incoming: RunLogEvent[]): void {
   if (appended) {
     if (appended.length > 0) {
       const newStructural = appended.filter((e) => STRUCTURAL_TYPES.has(e.type));
-      const newNarration = appended.filter((e) => NARRATION_TYPES.has(e.type));
-      if (newStructural.length > 0) s.structuralEvents = [...s.structuralEvents, ...newStructural];
-      if (newNarration.length > 0) s.narrationEvents = [...s.narrationEvents, ...newNarration];
+      if (newStructural.length > 0) {
+        s.structuralEvents = [...s.structuralEvents, ...newStructural];
+        s.runningPhases = computeRunningPhases(s.structuralEvents);
+      }
     }
   } else {
     // Slow path (dedup/reorder): same full-rebuild cost mergeEvents' own slow path already pays.
     s.structuralEvents = events.filter((e) => STRUCTURAL_TYPES.has(e.type));
-    s.narrationEvents = events.filter((e) => NARRATION_TYPES.has(e.type));
+    s.runningPhases = computeRunningPhases(s.structuralEvents);
   }
   s.listeners.forEach((l) => l());
 }
@@ -319,16 +278,24 @@ function subscribe(threadId: string, onStoreChange: () => void): () => void {
   };
 }
 
-/** Shared plumbing for all three exported hooks below: subscribes to this thread's module-level
- * StreamState via useSyncExternalStore (one shared array reference per view, no per-component
- * copy) and wires up the AG-UI low-latency channel to push into that same shared state. `select`
- * picks which of the state's three arrays this hook returns -- it must be referentially stable
- * across calls that didn't change that array (useSyncExternalStore compares via Object.is), which
- * `applyMerge` guarantees (a view's array reference only ever changes when something matching
- * that view actually arrived). */
-function useSharedRunEvents(select: (s: StreamState) => RunLogEvent[]): RunLogEvent[] {
+/** Shared plumbing for every exported hook below: subscribes to this thread's module-level
+ * StreamState via useSyncExternalStore (one shared reference per view, no per-component copy) and
+ * wires up the AG-UI low-latency channel to push into that same shared state. `select` picks which
+ * of the state's fields this hook returns -- it must be referentially stable across calls that
+ * didn't change that field (useSyncExternalStore compares via Object.is), which `applyMerge`
+ * guarantees (a view's reference only ever changes when something matching that view actually
+ * arrived). `empty` is the stable server-snapshot fallback for that same field.
+ *
+ * The `useAgent` call here is scoped to `updates: []` -- it exists only to get a stable `agent`
+ * object to call `.subscribe({ onCustomEvent })` on below, not for any of `useAgent`'s own
+ * update-triggered re-renders (this hook's own re-renders come from useSyncExternalStore, on a
+ * real new event arriving). Leaving `updates` unset here would default to `ALL_UPDATES` and force
+ * every one of this hook's callers (AppShell, BuildView, QualityView, LiveCostChip,
+ * SessionOverview) to re-render on every streamed message chunk too, on top of whatever their own
+ * `useAgent` call already does. */
+function useSharedRunEvents<T>(select: (s: StreamState) => T, empty: T): T {
   const { threadId, localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [] });
 
   // `subscribe` must stay referentially stable across renders for the same threadId --
   // useSyncExternalStore re-subscribes (tearing down and re-running the callback below)
@@ -342,10 +309,10 @@ function useSharedRunEvents(select: (s: StreamState) => RunLogEvent[]): RunLogEv
     [threadId],
   );
 
-  const events = useSyncExternalStore(
+  const value = useSyncExternalStore(
     subscribeToThisThread,
     () => select(getOrCreateState(threadId)),
-    () => EMPTY_EVENTS,
+    () => empty,
   );
 
   useEffect(() => {
@@ -365,17 +332,17 @@ function useSharedRunEvents(select: (s: StreamState) => RunLogEvent[]): RunLogEv
     return unsubscribe;
   }, [agent, threadId]);
 
-  return events;
+  return value;
 }
 
 /** This session's full event history, oldest first, live-updating for as long as the caller stays
  * mounted. Reads threadId/localAgentId from useWorkflowThread() internally -- same assumption
  * EventLogView's original effect made: a session switch is a full Next.js route navigation, which
  * remounts the caller, not an in-place threadId prop change, so no reset-on-change handling is
- * needed here. Kept as a general escape hatch -- every current consumer needs only one of the two
- * narrower views below, and is wired to that one instead. */
+ * needed here. Kept as a general escape hatch -- every current consumer needs one of the narrower
+ * views below instead. */
 export function useRunEvents(): RunLogEvent[] {
-  return useSharedRunEvents((s) => s.events);
+  return useSharedRunEvents((s) => s.events, EMPTY_EVENTS);
 }
 
 /** `node_started`/`node_finished`/`gate_paused`/`gate_resolved` events only -- what
@@ -385,15 +352,24 @@ export function useRunEvents(): RunLogEvent[] {
  * single LLM turn issues dozens of tool calls; a node only ever gets one start/finish pair), so
  * this is a substantially smaller array than the full stream for every one of these consumers. */
 export function useStructuralRunEvents(): RunLogEvent[] {
-  return useSharedRunEvents((s) => s.structuralEvents);
+  return useSharedRunEvents((s) => s.structuralEvents, EMPTY_EVENTS);
 }
 
-/** `tool_call`/`reasoning` events only -- AgentNarrationDrawer's own narration feed. Previously
- * that component filtered the full array down to this itself, on every mount, after holding a
- * full copy just to discard most of it; the filtering now happens once, here, shared across
- * however many times the drawer is mounted/unmounted in a session. */
-export function useNarrationRunEvents(): RunLogEvent[] {
-  return useSharedRunEvents((s) => s.narrationEvents);
+/** Shared `computeRunningPhases` result (stage -> currently-open node), recomputed once per
+ * genuinely new structural event at the shared-store level (`applyMerge` above) instead of
+ * independently, via 4 separate `useMemo` calls, in every one of AppShell/BuildView/QualityView/
+ * SessionOverview. `runActive` stays a caller-side check rather than a parameter here: it comes
+ * from `useRunActivity()` context, which has no React lifecycle to push into this module-level
+ * store, and an explicit `false` is cheap to special-case at each call site (just swap in
+ * `EMPTY_PHASES`/`EMPTY_STAGES`, no rescan) -- see `computeRunningPhases`'s own tri-state note for
+ * why that case must win over the store's own (ungated) computation. */
+export function useRunningPhases(): Map<string, string> {
+  return useSharedRunEvents((s) => s.runningPhases, EMPTY_PHASES);
+}
+
+export function useRunningStages(): Set<string> {
+  const phases = useRunningPhases();
+  return useMemo(() => (phases === EMPTY_PHASES ? EMPTY_STAGES : new Set(phases.keys())), [phases]);
 }
 
 /** One normalized stage/rebuild-placement key's server-computed duration+cost (mirrors
@@ -431,7 +407,7 @@ const SESSION_SUMMARY_POLL_MS = 5000;
  * own null-on-failure convention and the backend's fail-soft append_event/emit_live pattern; this
  * must never throw into the caller's render.
  *
- * Scope note: unlike useStructuralRunEvents/useNarrationRunEvents above (one shared snapshot via
+ * Scope note: unlike useStructuralRunEvents/useRunningPhases above (one shared snapshot via
  * useSyncExternalStore), this hook polls independently per mounted instance -- acceptable since
  * SessionOverview is its only consumer today; a second consumer would need the same
  * module-level-dedup treatment those two hooks already have. */

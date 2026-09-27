@@ -1,12 +1,12 @@
 "use client";
 
-import { useAgent } from "@copilotkit/react-core/v2";
-import { useEffect, useMemo, type ReactNode } from "react";
+import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
+import { memo, useEffect, useMemo, type ReactNode } from "react";
 import { RebuildConnector } from "@/components/BuildView";
 import { HealthBreakdown } from "@/components/HealthRing";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
-import { computeRunningPhases, useStructuralRunEvents } from "@/lib/use-run-events";
+import { EMPTY_PHASES, useRunningPhases } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import {
   REBUILD_PLACEMENTS,
@@ -194,7 +194,7 @@ function Section({ title, children, status, id }: { title: string; children: Rea
   );
 }
 
-export function QualityView({
+function QualityViewImpl({
   scanFindings,
   scrollRequest,
 }: {
@@ -205,7 +205,7 @@ export function QualityView({
 }) {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const state = (agent.state ?? {}) as WorkflowState;
   const tests = state.test_hardening;
   const metrics = state.metrics_report?.metrics;
@@ -273,12 +273,9 @@ export function QualityView({
   // Same "time lag with nothing shown" gap Build tab already surfaces via RebuildConnector (user
   // feedback 2026-09-06) applies here too: a rebuild check runs after remediation and again after
   // adversarial-compliance, unattributed to either real stage either side of it.
-  const runEvents = useStructuralRunEvents();
   const [runActivity] = useRunActivity();
-  const runningPhases = useMemo(
-    () => computeRunningPhases(runEvents, runActivity?.runActive ?? null),
-    [runEvents, runActivity?.runActive],
-  );
+  const sharedRunningPhases = useRunningPhases();
+  const runningPhases = runActivity?.runActive === false ? EMPTY_PHASES : sharedRunningPhases;
   const rRemediation = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === "remediation");
   const rRemediationPhase = rRemediation && rebuildPhase(state, rRemediation, runActivity?.runActive, runningPhases);
   const rCompliance = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === "adversarial-compliance");
@@ -462,3 +459,8 @@ export function QualityView({
     </ViewContainer>
   );
 }
+
+// scanFindings/scrollRequest are stable/intentional-change-only props (see AppShell's own call
+// site) -- memoized so AppShell's unrelated local-state re-renders don't also force this while
+// it's the hidden tab.
+export const QualityView = memo(QualityViewImpl);

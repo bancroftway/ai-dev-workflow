@@ -1,8 +1,8 @@
 "use client";
 
-import { useAgent, useAttachments, useCopilotKit } from "@copilotkit/react-core/v2";
+import { UseAgentUpdate, useAgent, useAttachments, useCopilotKit } from "@copilotkit/react-core/v2";
 import type { InputContent } from "@ag-ui/core";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { ViewContainer } from "@/components/ViewContainer";
@@ -12,13 +12,13 @@ import { useRunActivity } from "@/lib/run-activity-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import { anyStageDrafting, buildStarted, runEnded, type WorkflowState } from "@/lib/workflow-types";
 
-export function RequirementsView() {
+function RequirementsViewImpl() {
   // agentId only, not the full {agentId, runtimeAgentId, threadId} triple: AppShell (always
   // mounted above this) already registers the proxied agent once -- registerProxiedAgent throws
   // "already registered" if a second call site re-registers the same agentId (confirmed live),
   // so every other consumer just binds to the existing registration by id.
   const { localAgentId, threadId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { copilotkit } = useCopilotKit();
   const [runActivity] = useRunActivity();
   const [text, setText] = useState("");
@@ -321,6 +321,10 @@ export function RequirementsView() {
     </ViewContainer>
   );
 }
+
+// No props -- memoized so AppShell's unrelated local-state re-renders don't also force this
+// while it's the hidden tab.
+export const RequirementsView = memo(RequirementsViewImpl);
 
 /** The Requirements document is the single source of truth; this skeleton teaches the full-PRD
  * convention: keep EVERYTHING the product needs in one document, scope with "Build now" vs

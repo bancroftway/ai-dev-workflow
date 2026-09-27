@@ -79,6 +79,17 @@ def _parse_args() -> argparse.Namespace:
         "Same is_finished_with_verdict + AIDW_E2E_RESET_MAX_ATTEMPTS guard as the API action.",
     )
     parser.add_argument(
+        "--confirm-reopen",
+        action="store_true",
+        help="with --thread, against a session that already finished with a verdict (completed or "
+        "failed-at-exit): pop the reopen-blocked gate WITHOUT resetting any stage's approved "
+        "content (unlike --reset-e2e, which also wipes metrics-exit + adversarial-compliance back "
+        "to redraft). For exactly the case a stale/incorrect final verdict needs re-judging on its "
+        "OWN already-approved content -- e.g. verify_exit_readiness picking up facts that changed "
+        "since the last time it ran -- not a case that needs the underlying stage's WORK redone. "
+        "Same is_finished_with_verdict guard as --reset-e2e/the API action, no reset side effect.",
+    )
+    parser.add_argument(
         "--greenfield-stack",
         default=None,
         metavar="STACK_ID",
@@ -263,6 +274,21 @@ async def _run_pipeline(args: argparse.Namespace) -> int:
             return 2
         registry.set_meta(thread_id, reset_e2e=True, confirm_reopen=True)
         logger.info("reset-e2e armed for thread %s -- metrics-exit + adversarial-compliance will reset on entry", thread_id)
+
+    if args.confirm_reopen and not args.reset_e2e:
+        # Same guard, no reset: pops intake_node's reopen-blocked gate so an already-verdicted
+        # thread can resume and re-judge its OWN already-approved content fresh (e.g. metrics-exit's
+        # verify_exit_readiness re-running against facts that changed since its last, stale pass) --
+        # without wiping any stage's approved work back to redraft the way --reset-e2e does.
+        row = await session_store.get_session(thread_id)
+        if row is None:
+            logger.error("--confirm-reopen: no session row found for thread %s", thread_id)
+            return 2
+        if not session_store.is_finished_with_verdict(row):
+            logger.error("--confirm-reopen: thread %s has not finished the pipeline (completed, or failed at exit)", thread_id)
+            return 2
+        registry.set_meta(thread_id, confirm_reopen=True)
+        logger.info("confirm-reopen armed for thread %s -- no stage reset, just re-judging current content", thread_id)
 
     outcome: dict = {"thread_id": thread_id, "ok": False}
     # Cross-process counterpart of main.py's run_activity.incr/decr: this process's graph

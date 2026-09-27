@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { memo, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import { FindingsTable } from "@/components/QualityView";
 import { ViewContainer } from "@/components/ViewContainer";
@@ -103,7 +103,7 @@ export interface ReportViewProps {
  * surface -- ReactMarkdown here uses its DEFAULT url sanitizer (no urlTransform override, unlike
  * RequirementsView's attachment-preview case) and no rehype-raw, so no raw HTML/script can render.
  */
-export function ReportView({ report, metricsExitStatus, deltaSummary, filesChanged, screenshotUrls, reportExtras }: ReportViewProps) {
+function ReportViewImpl({ report, metricsExitStatus, deltaSummary, filesChanged, screenshotUrls, reportExtras }: ReportViewProps) {
   return (
     <ViewContainer>
       <div>
@@ -205,6 +205,11 @@ export function ReportView({ report, metricsExitStatus, deltaSummary, filesChang
     </ViewContainer>
   );
 }
+
+// All props are stable property reads at AppShell's call site (screenshotUrls is now hoisted
+// through its own useMemo there) -- memoized so AppShell's unrelated local-state re-renders don't
+// also force this while it's the hidden tab.
+export const ReportView = memo(ReportViewImpl);
 
 function MergeReadyBanner({ report, metricsExitStatus }: { report?: MergeReadinessReport | null; metricsExitStatus?: string }) {
   if (!report) {

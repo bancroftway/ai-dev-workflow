@@ -1,6 +1,6 @@
 "use client";
 
-import { useAgent } from "@copilotkit/react-core/v2";
+import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import { HealthRing } from "@/components/HealthRing";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
@@ -191,7 +191,7 @@ export function MetricsBar({
 }) {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
-  const { agent } = useAgent({ agentId: localAgentId });
+  const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { interrupt } = useOpenInterrupt();
   const [runActivity] = useRunActivity();
   const state = (agent.state ?? {}) as WorkflowState;
