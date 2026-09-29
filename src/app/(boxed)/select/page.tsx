@@ -274,6 +274,7 @@ function RepoBranchSection({
   const [actionError, setActionError] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [generatingReport, setGeneratingReport] = useState(false);
 
   useEffect(() => {
     fetch(`/api/github/branches?owner=${repo.owner}&repo=${repo.repo}`)
@@ -305,6 +306,51 @@ function RepoBranchSection({
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
       setStarting(false);
+    }
+  }
+
+  /** "Generate Code Health Report" -- an on-demand standalone scan (SAST/secrets/duplication/
+   * complexity/maintainability/SBOM/hotspots only, no test execution or DAST), independent of
+   * "Start new session": its own ephemeral sandbox, own container slot (not gated by
+   * containerRunning), own 5-ish-minute background job. Both new 409s this can return (no
+   * coding-agent credential configured; a report job already in flight for this repo) surface
+   * through the same actionError paragraph startNewSession's own 409 already uses -- the
+   * backend's message text is descriptive enough on its own.
+   *
+   * Opens in a NEW TAB, not the current one -- this page (and its selected branch/session list)
+   * stays put while the report generates. `window.open` MUST fire synchronously, before the
+   * `await` below -- every major browser's popup blocker only allows a tab opened directly inside
+   * a click handler's own call stack; one opened after an awaited fetch resolves reads as an
+   * unsolicited popup and gets silently blocked. Open a blank tab now, point it at the real URL
+   * once the job exists. */
+  async function generateReport() {
+    if (!selectedBranch) return;
+    setActionError(null);
+    setGeneratingReport(true);
+    const newTab = window.open("", "_blank");
+    try {
+      const res = await fetch("/api/health-reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ owner: repo.owner, repo: repo.repo, branch: selectedBranch }),
+      });
+      const body = (await res.json().catch(() => null)) as { job_id?: string; detail?: string } | null;
+      if (!res.ok || !body?.job_id) {
+        throw new Error(body?.detail ?? `couldn't start report (${res.status})`);
+      }
+      const url = `/reports/${repo.owner}/${repo.repo}/${body.job_id}`;
+      if (newTab) {
+        newTab.location.href = url;
+      } else {
+        // Popup blocked despite the synchronous open (a stricter blocker setting) -- fall back to
+        // navigating the current tab rather than silently doing nothing.
+        router.push(url);
+      }
+    } catch (err) {
+      newTab?.close();
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGeneratingReport(false);
     }
   }
 
@@ -375,15 +421,28 @@ function RepoBranchSection({
       )}
 
       {selectedBranch && (
-        <button
-          type="button"
-          className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
-          onClick={startNewSession}
-          disabled={starting || containerRunning}
-          title={containerRunning ? "A container is already running for this repository -- one per repo." : undefined}
-        >
-          {starting ? "Starting…" : "Start new session"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            onClick={startNewSession}
+            disabled={starting || containerRunning}
+            title={containerRunning ? "A container is already running for this repository -- one per repo." : undefined}
+          >
+            {starting ? "Starting…" : "Start new session"}
+          </button>
+          {/* Deliberately NOT gated by containerRunning -- this provisions its own short-lived,
+              independent sandbox (health_report_api.py), not the per-repo session container the
+              banner above warns about. */}
+          <button
+            type="button"
+            className="self-start rounded-lg border border-neutral-300 px-4 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40"
+            onClick={generateReport}
+            disabled={generatingReport}
+          >
+            {generatingReport ? "Starting scan…" : "Generate Code Health Report"}
+          </button>
+        </div>
       )}
 
       {/* Sessions are branch-scoped now (each gets its own ai-dev-workflow/<session_id> branch),

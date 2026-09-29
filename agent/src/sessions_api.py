@@ -1540,6 +1540,10 @@ class OrgSettingsResponse(BaseModel):
     # Migration 0017: deployment-wide default DESIGN.md. None = no default set. A repo without its
     # own override (repo_design_settings_router below) falls back to this value.
     design_md: str | None = None
+    # Migration 0019: org-wide extra gitleaks allowlist entries (repo_scan.py's
+    # org_gitleaks_allowlist/_build_gitleaks_command). None = no override, today's exact behavior.
+    gitleaks_extra_stopwords: str | None = None
+    gitleaks_extra_allow_paths: str | None = None
 
 
 # I-1 (lazy version, whole-branch review): re-probing a saved credential on every settings-page
@@ -1675,6 +1679,8 @@ async def _org_settings_response() -> OrgSettingsResponse:
         updated_by=settings.updated_by,
         support_repo=settings.support_repo,
         design_md=settings.design_md,
+        gitleaks_extra_stopwords=settings.gitleaks_extra_stopwords,
+        gitleaks_extra_allow_paths=settings.gitleaks_extra_allow_paths,
     )
 
 
@@ -1729,6 +1735,29 @@ async def put_org_design_md_endpoint(body: OrgDesignMdPutRequest, request: Reque
     return OrgDesignMdPutResponse(
         **base.model_dump(), tokens_detected=repo_design_settings.has_parseable_tokens(body.design_md),
     )
+
+
+class OrgGitleaksAllowlistPutRequest(BaseModel):
+    # Both None/blank clear the setting -- one field, one line per entry, same convention as
+    # design_md's own blank-clears-it treatment.
+    gitleaks_extra_stopwords: str | None = None
+    gitleaks_extra_allow_paths: str | None = None
+    updated_by: str
+
+
+@org_settings_router.put("/gitleaks-allowlist", response_model=OrgSettingsResponse)
+async def put_org_gitleaks_allowlist_endpoint(body: OrgGitleaksAllowlistPutRequest, request: Request) -> OrgSettingsResponse:
+    """Own endpoint, same reasoning as put_support_repo_endpoint/put_org_design_md_endpoint: an
+    unrelated pointer, not part of put_org_settings_endpoint's provider+credential contract."""
+    _check_shared_secret(request)
+    try:
+        await org_settings.set_gitleaks_allowlist(
+            body.gitleaks_extra_stopwords, body.gitleaks_extra_allow_paths, body.updated_by,
+            fallback_provider=chat_model.env_fallback_provider(),
+        )
+    except org_settings.GitleaksAllowlistError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return await _org_settings_response()
 
 
 class OrgSettingsPutRequest(BaseModel):

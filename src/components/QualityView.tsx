@@ -4,6 +4,7 @@ import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import { memo, useEffect, useMemo, type ReactNode } from "react";
 import { RebuildConnector } from "@/components/BuildView";
 import { HealthBreakdown } from "@/components/HealthRing";
+import { HotspotsTable } from "@/components/HotspotsTable";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { EMPTY_PHASES, useRunningPhases } from "@/lib/use-run-events";
@@ -126,11 +127,29 @@ function FindingRefLines({
   );
 }
 
-export function FindingsTable({ findings, decisions }: { findings: RemediationFinding[]; decisions?: Record<string, { decision: string }> }) {
-  if (findings.length === 0) return <p className="text-xs text-neutral-500">No findings.</p>;
+export function FindingsTable({
+  findings,
+  decisions,
+  sourceUrl,
+  textSize,
+}: {
+  findings: RemediationFinding[];
+  decisions?: Record<string, { decision: string }>;
+  /** Optional: when given, the Location cell links out to it instead of rendering plain text --
+   * e.g. the standalone health-report page passes a GitHub blob-URL builder here so a finding's
+   * file:line opens on GitHub with the line highlighted. Undefined for every other existing
+   * caller (ReportView.tsx), which keeps their Location cell exactly as it was. */
+  sourceUrl?: (path: string, startLine?: number | null, endLine?: number | null) => string | null;
+  /** "xs" (default) matches every existing caller's compact remediation-table density; the
+   * standalone health-report page passes "sm" to match its own DuplicationTable/ComplexityTable
+   * (both text-sm) rather than every other table on that page reading smaller than this one. */
+  textSize?: "xs" | "sm";
+}) {
+  const textSizeClass = textSize === "sm" ? "text-sm" : "text-xs";
+  if (findings.length === 0) return <p className={`${textSizeClass} text-neutral-500`}>No findings.</p>;
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-left text-xs">
+      <table className={`w-full text-left ${textSizeClass}`}>
         <thead>
           <tr className="border-b border-neutral-200 text-neutral-500">
             <th className="py-1 pr-3 font-medium">Severity</th>
@@ -159,11 +178,21 @@ export function FindingsTable({ findings, decisions }: { findings: RemediationFi
               <td className="py-1 pr-3">{f.category ?? "—"}</td>
               <td className="py-1 pr-3 font-mono">{f.rule_id ?? f.rule ?? f.category ?? "—"}</td>
               <td className="py-1 pr-3 font-mono">
-                {f.location?.path
-                  ? `${f.location.path}${f.location.start_line != null ? `:${f.location.start_line}` : ""}`
-                  : f.file
-                    ? `${f.file}${f.line != null ? `:${f.line}` : ""}`
-                    : "—"}
+                {(() => {
+                  const path = f.location?.path ?? f.file;
+                  const startLine = f.location?.path ? f.location.start_line : f.line;
+                  const endLine = f.location?.path ? f.location.end_line : null;
+                  if (!path) return "—";
+                  const text = `${path}${startLine != null ? `:${startLine}` : ""}`;
+                  const href = sourceUrl?.(path, startLine, endLine);
+                  return href ? (
+                    <a href={href} target="_blank" rel="noreferrer" className="text-blue-700 underline decoration-blue-300 hover:decoration-blue-600">
+                      {text}
+                    </a>
+                  ) : (
+                    text
+                  );
+                })()}
               </td>
               <td className="py-1 pr-3 text-neutral-700">{f.title ?? f.description ?? f.message ?? "—"}</td>
               <td className="py-1 pr-3 text-neutral-500">
@@ -434,6 +463,15 @@ function QualityViewImpl({
               </p>
             )}
           </div>
+        </Section>
+      )}
+
+      {/* Computed by repo_scan.py on every `full`-profile scan (churn x complexity, joined via
+          _assemble_metrics) but never rendered anywhere until now -- same data the standalone
+          health-report page shows, via the same shared HotspotsTable. */}
+      {metrics?.churn?.hotspots && metrics.churn.hotspots.length > 0 && (
+        <Section title="Hotspots" id="section-hotspots">
+          <HotspotsTable hotspots={metrics.churn.hotspots} />
         </Section>
       )}
 

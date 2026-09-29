@@ -200,7 +200,14 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
     from . import metrics_nodes, repo_scan
 
     try:
-        scan = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
+        # org_gitleaks_allowlist() already fails open on its own (never raises), but it lives
+        # inside this exact try anyway -- this function's own contract is "only the scan call is
+        # covered", and the allowlist fetch is part of standing the scan up correctly.
+        gitleaks_stopwords, gitleaks_allow_paths = await repo_scan.org_gitleaks_allowlist()
+        scan = await repo_scan.run_repo_scan(
+            provider, thread_id, profile="full",
+            gitleaks_extra_stopwords=gitleaks_stopwords, gitleaks_extra_allow_paths=gitleaks_allow_paths,
+        )
     except Exception:  # noqa: BLE001 -- scan execution only; see the fail-open contract above
         logger.warning(
             "scan-delta gate: scan could not run for thread %s -- not blocking on it",

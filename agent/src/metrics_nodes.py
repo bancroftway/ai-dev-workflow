@@ -516,9 +516,11 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     # The ONE caller that opts into the networked `outdated` staleness probe, for the same reason
     # it opts into eval: this is the run's final measurement. The per-commit background refresh
     # stays on the offline "full" profile.
+    gitleaks_stopwords, gitleaks_allow_paths = await repo_scan.org_gitleaks_allowlist()
     scan = await repo_scan.run_repo_scan(
         provider, thread_id, profile="full",
         tools=[*repo_scan.PROFILES["full"], "outdated"], include_eval=True,
+        gitleaks_extra_stopwords=gitleaks_stopwords, gitleaks_extra_allow_paths=gitleaks_allow_paths,
     )
     # Prefer the contract-merged number graph.py's make_verify_node / audit_gates.py's
     # audit_exit_gate_node already promoted onto state.repo_scan.coverage: both read the SAME

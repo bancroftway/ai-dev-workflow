@@ -2591,10 +2591,69 @@ _GITLEAKS_ALLOWLIST_PATHS = ", ".join(
 _GITLEAKS_STOPWORDS = ", ".join(
     f"'{w}'" for w in ("example", "changeme", "placeholder", "test", "xxxxxxxx", "your_api_key_here", "redacted")
 )
-_GITLEAKS_EXCLUDE_CONFIG = (
-    "[extend]\nuseDefault = true\n\n"
-    f"[allowlist]\npaths = [{_GITLEAKS_ALLOWLIST_PATHS}]\nstopwords = [{_GITLEAKS_STOPWORDS}]\n"
-)
+
+
+def _gitleaks_exclude_config(extra_stopwords: Sequence[str] = (), extra_allow_paths: Sequence[str] = ()) -> str:
+    """Builds gitleaks' --config TOML: the fixed base allowlist above, plus any org-configured
+    extras (org_settings.py's gitleaks_extra_stopwords/gitleaks_extra_allow_paths, threaded in by
+    org_gitleaks_allowlist() below). Extra stopwords get the SAME no-escaping treatment as
+    _GITLEAKS_STOPWORDS (literal substrings, not regex) -- they're appended as-is. Extra
+    allow-paths are appended UNESCAPED, unlike _GITLEAKS_ALLOWLIST_PATHS's `re.escape(n)` above:
+    that escaping is specific to turning a plain directory NAME into a regex-safe literal
+    fragment, not a general "how we handle path patterns" convention -- an org's own allow-path
+    (e.g. "**/e2e/**") is meant to already BE a regex, and re.escape-ing it would silently turn a
+    working pattern into one that can never match, with no error anywhere. Callers must reject
+    any extra containing a literal single quote before it reaches here (org_settings.py's
+    set_gitleaks_allowlist already does) -- see the TOML-literal-string comment above this
+    function for why that one character is the only thing that can corrupt this."""
+    paths = ", ".join((_GITLEAKS_ALLOWLIST_PATHS, *(f"'{p}'" for p in extra_allow_paths))) if extra_allow_paths else _GITLEAKS_ALLOWLIST_PATHS
+    stopwords = ", ".join((_GITLEAKS_STOPWORDS, *(f"'{w}'" for w in extra_stopwords))) if extra_stopwords else _GITLEAKS_STOPWORDS
+    return (
+        "[extend]\nuseDefault = true\n\n"
+        f"[allowlist]\npaths = [{paths}]\nstopwords = [{stopwords}]\n"
+    )
+
+
+def _build_gitleaks_command(extra_stopwords: Sequence[str] = (), extra_allow_paths: Sequence[str] = ()) -> str:
+    """The gitleaks ToolSpec's own `command` (see that ToolSpec's own comment for the `dir` vs
+    deprecated `detect` history and the nested-`sh -c` shell-grammar fix). Extracted into a
+    function -- rather than a static f-string -- so run_repo_scan can rebuild it per-scan with an
+    org's own extra allowlist entries merged in; called with no arguments, this returns exactly
+    today's command, byte-for-byte."""
+    config = _gitleaks_exclude_config(extra_stopwords, extra_allow_paths)
+    return (
+        f"sh -c {shlex.quote(f'''printf '%s' {shlex.quote(config)} > agent-work/gitleaks-exclude.toml && "
+        "gitleaks dir --config agent-work/gitleaks-exclude.toml --report-format json "
+        f"--report-path agent-work/gitleaks.json --exit-code 0''')}"
+    )
+
+
+async def org_gitleaks_allowlist() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Org-configured extra gitleaks allowlist entries, parsed from org_settings.py's raw
+    newline-separated `gitleaks_extra_stopwords`/`gitleaks_extra_allow_paths` text. Degrades to
+    `((), ())` -- no extra allowlist, today's exact behavior -- on ANY failure to reach the DB:
+    this is a nice-to-have suppression list, never a required input a scan should block or fail
+    on. Shared by every run_repo_scan caller that wants the org allowlist applied (not just this
+    module's own two background-scan call sites) so the newline-parsing logic lives in one place.
+    Local import: keeps this module's own top-level dependency graph unchanged for every caller
+    that never touches org settings."""
+    try:
+        from . import org_settings
+
+        settings = await org_settings.get_org_settings()
+    except Exception:  # noqa: BLE001 -- fail-open; see docstring
+        logger.warning(
+            "repo_scan: could not fetch org gitleaks allowlist -- scanning with no extra allowlist",
+            exc_info=True,
+        )
+        return (), ()
+    if settings is None:
+        return (), ()
+
+    def _parse(raw: str | None) -> tuple[str, ...]:
+        return tuple(line.strip() for line in (raw or "").splitlines() if line.strip())
+
+    return _parse(settings.gitleaks_extra_stopwords), _parse(settings.gitleaks_extra_allow_paths)
 
 # Every command is offline by construction: no `--config auto`, no DB update, no registry fetch.
 # The databases are baked into the sandbox image at build time -- see agent/sandbox-image/Dockerfile.
@@ -2647,16 +2706,34 @@ TOOLS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "gitleaks", "MIT", True,
-        # --no-git: working-tree only. A full-history sweep is a separate, slower concern and is
-        # flagged rather than silently folded in, matching security_nodes.py's existing decision.
+        # `dir`, not the deprecated/hidden `detect --no-git`: root-caused 2026-09-28 (persistent,
+        # previously-undiagnosable "no readable output" failures) -- `detect`/`protect` have been
+        # deprecated since gitleaks v8.19.0 (still present but hidden from --help; verified
+        # against the pinned v8.30.1 tag's own cmd/detect.go, which even documents its own
+        # replacement: "OLD CMD: gitleaks detect --no-git --source={repo} / NEW CMD: gitleaks
+        # directory {directory/file}"). `dir`'s implementation (cmd/directory.go) defaults its
+        # positional path to "." exactly like `detect --no-git`'s --source default did, and shares
+        # the identical exit-code/report-write logic (cmd/root.go's findingSummaryAndExit) with
+        # every other current subcommand -- so this is a like-for-like swap onto the
+        # actively-maintained code path, not a behavior change. `--no-git` itself does not exist on
+        # `dir` (there is no git mode to opt out of) and is dropped accordingly.
         # --config: gitleaks has no CLI path-exclude flag -- the config (paths + stopwords, see
-        # _GITLEAKS_EXCLUDE_CONFIG's own comment) is written fresh into agent-work/ immediately
-        # before the scan runs. Wrapped in a subshell so _run_one's own env-var prefix
-        # (LC_ALL=C PYTHONNOUSERSITE=1) scopes over BOTH commands, not just the first half of the
-        # && chain.
-        f"(printf '%s' {shlex.quote(_GITLEAKS_EXCLUDE_CONFIG)} > agent-work/gitleaks-exclude.toml && "
-        "gitleaks detect --config agent-work/gitleaks-exclude.toml --report-format json "
-        "--report-path agent-work/gitleaks.json --no-git --exit-code 0)",
+        # _gitleaks_exclude_config's own comment) is written fresh into agent-work/ immediately
+        # before the scan runs.
+        #
+        # Root-caused 2026-09-28 (live sandbox log, exit 2): `LC_ALL=C PYTHONNOUSERSITE=1 (...)`
+        # -- _run_one's own uniform env-var prefix glued directly onto this ToolSpec's bare
+        # `(printf ... && gitleaks ...)` subshell -- is not valid POSIX shell grammar: an inline
+        # assignment prefix may only precede a SIMPLE command, never a compound one like `( ... )`.
+        # ash (this sandbox's /bin/sh) enforces that strictly and rejected the whole line outright
+        # with `sh: 1: Syntax error: "(" unexpected` -- gitleaks never even started, every prior
+        # "no readable output" failure on this tool was this parse error, not a gitleaks bug at
+        # all (bash is more forgiving here, which is why this never showed up in casual manual
+        # testing against a bash shell). Fixed by nesting an explicit `sh -c '...'` instead of a
+        # bare paren group: `sh` is a plain command name, so `VAR=val sh -c '...'` is an ordinary,
+        # fully portable simple-command invocation, and the nested shell still gives both `printf`
+        # and `gitleaks` the same env + scoping the original comment wanted.
+        _build_gitleaks_command(),
         "agent-work/gitleaks.json", parse_gitleaks, "gitleaks version",
         empty_output_ok=True,
     ),
@@ -2814,6 +2891,15 @@ PROFILES: dict[str, tuple[str, ...]] = {
     # `include_eval` docstring for why adding it to an existing profile would run the test suite on
     # every commit.
     "eval": (),
+    # On-demand standalone "Generate Code Health Report" button (health_report_api.py): SAST,
+    # secrets, duplication, complexity, maintainability, SBOM and churn/hotspots only -- no test
+    # execution (coverage) or DAST, so a scan stays a few minutes instead of a full pipeline run.
+    # `scc` sizes `kloc_from_metrics()` for the security leg's density normalization; `git-churn`
+    # + `lizard` together are what `_assemble_metrics` needs to compute `metrics.churn.hotspots`
+    # (see that function). Deliberately excludes `trivy`/`osv-scanner`/`checkov` (dependency/IaC),
+    # `interrogate`/`dotnet-docs` (docs checks) and `outdated` (networked) -- out of scope for a
+    # fast, on-demand scan.
+    "health_report": ("scc", "semgrep", "bandit", "eslint-security", "gitleaks", "jscpd", "lizard", "syft", "git-churn"),
 }
 
 # Tools whose only output is measurement, skipped entirely when a gate caller passes
@@ -2896,6 +2982,8 @@ async def run_repo_scan(
     include_metrics: bool = True,
     report_path: str | None = None,
     include_eval: bool = False,
+    gitleaks_extra_stopwords: Sequence[str] = (),
+    gitleaks_extra_allow_paths: Sequence[str] = (),
 ) -> ScanReport:
     """Runs the selected tools in the sandbox and returns one deduplicated report.
 
@@ -2908,8 +2996,21 @@ async def run_repo_scan(
     it "never runs the test suite". Making eval part of any existing profile would fire N suite runs
     per commit, in the background, concurrently with the pipeline's own test runs and app boots.
     Only a caller that explicitly wants the Eval layer opts in.
+
+    `gitleaks_extra_stopwords`/`gitleaks_extra_allow_paths` (org_gitleaks_allowlist(), above): both
+    default to empty, today's exact behavior. Non-empty only when `"gitleaks"` was actually
+    selected for this scan -- rebuilding its command is otherwise wasted work.
     """
     selected = select_tools(profile, tools, include_metrics)
+    if gitleaks_extra_stopwords or gitleaks_extra_allow_paths:
+        rebuilt = _build_gitleaks_command(gitleaks_extra_stopwords, gitleaks_extra_allow_paths)
+        selected = [replace(spec, command=rebuilt) if spec.name == "gitleaks" else spec for spec in selected]
+        if any(spec.name == "gitleaks" for spec in selected):
+            logger.info(
+                "repo_scan: gitleaks running with a non-default org allowlist "
+                "(%d extra stopword(s), %d extra allow-path(s))",
+                len(gitleaks_extra_stopwords), len(gitleaks_extra_allow_paths),
+            )
     await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work agent-work/jscpd")
 
     findings: list[Finding] = []
@@ -3079,9 +3180,27 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
             return run, [], {}
         # Non-zero exit is normal for most of these tools (findings present), so the report file --
         # not the exit code -- is what decides success.
-        run.update(status="failed", notes=f"no readable output at {spec.output_path}",
-                   duration_ms=_elapsed_ms(started))
-        logger.warning("repo_scan: tool %s produced no readable output at %s", spec.name, spec.output_path)
+        #
+        # Root-caused 2026-09-28 (gitleaks intermittently failing this way in production, exit
+        # code and stdout/stderr previously discarded here): the command's own output (2>&1
+        # merged into stdout at the call site above) is the ONE piece of evidence that tells the
+        # NEXT occurrence why, rather than repeating this exact undiagnosable "no readable
+        # output" message forever -- same truncate-both-ends treatment
+        # _probe_tool_version_with_retry's own failure branch already gives the missing-binary
+        # case, just applied here too.
+        tool_output = (result.stdout or result.stderr or "").strip() or "(no output)"
+        run.update(
+            status="failed",
+            notes=(
+                f"no readable output at {spec.output_path} (exit {result.returncode}) -- "
+                f"command output: {truncate_middle(tool_output, AIDW_TOOL_PROBE_NOTES_HEAD_CHARS, AIDW_TOOL_PROBE_NOTES_TAIL_CHARS)}"
+            ),
+            duration_ms=_elapsed_ms(started),
+        )
+        logger.warning(
+            "repo_scan: tool %s produced no readable output at %s (exit %s): %s",
+            spec.name, spec.output_path, result.returncode, tool_output,
+        )
         return run, [], {}
 
     try:
@@ -3134,13 +3253,24 @@ def start_background_scan(thread_id: str, provider: Any, *, chat_provider: str, 
 _BACKGROUND_REFRESH: dict[str, "asyncio.Task[Any]"] = {}
 
 
+async def _refresh_scan(provider: Any, thread_id: str) -> "ScanReport":
+    """The actual task body for start_background_refresh below -- a plain function (not inlined
+    into the create_task call) so the org-allowlist fetch happens INSIDE the task, not in the
+    synchronous wrapper that schedules it."""
+    stopwords, allow_paths = await org_gitleaks_allowlist()
+    return await run_repo_scan(
+        provider, thread_id, profile="full",
+        gitleaks_extra_stopwords=stopwords, gitleaks_extra_allow_paths=allow_paths,
+    )
+
+
 def start_background_refresh(thread_id: str, provider: Any) -> None:
     task = _BACKGROUND_REFRESH.get(thread_id)
     if task is not None and not task.done():
         return  # one in flight is enough -- the next code commit re-kicks
     # No report_path and no coverage run: this never touches committed artifacts and never runs
     # the test suite -- it exists purely to stream a fresher summary to the metrics bar.
-    _BACKGROUND_REFRESH[thread_id] = asyncio.create_task(run_repo_scan(provider, thread_id, profile="full"))
+    _BACKGROUND_REFRESH[thread_id] = asyncio.create_task(_refresh_scan(provider, thread_id))
 
 
 def pop_finished_refresh(thread_id: str) -> "ScanReport | None":
@@ -3195,8 +3325,13 @@ async def _scan_with_coverage(
             logger.warning("repo_scan: coverage measurement crashed; keeping the completed scan", exc_info=True)
             return None, None, [], "runner_error", []
 
+    gitleaks_stopwords, gitleaks_allow_paths = await org_gitleaks_allowlist()
     report, (line_rate, branch_rate, _gaps, reason, _entry_reports) = await asyncio.gather(
-        run_repo_scan(provider, thread_id, profile="full"), _guarded_coverage()
+        run_repo_scan(
+            provider, thread_id, profile="full",
+            gitleaks_extra_stopwords=gitleaks_stopwords, gitleaks_extra_allow_paths=gitleaks_allow_paths,
+        ),
+        _guarded_coverage(),
     )
 
     coverage: dict[str, Any] = {"line_rate": line_rate, "branch_rate": branch_rate}
@@ -4173,10 +4308,24 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     # re.escape's `\-` is invalid inside a double-quoted TOML string (caught by an earlier adversarial
     # review of this exact code), which is exactly why these are single-quoted TOML literal strings.
     import tomllib
-    _parsed_gitleaks_config = tomllib.loads(_GITLEAKS_EXCLUDE_CONFIG)
+    _parsed_gitleaks_config = tomllib.loads(_gitleaks_exclude_config())
     assert _parsed_gitleaks_config["extend"]["useDefault"] is True
     assert len(_parsed_gitleaks_config["allowlist"]["paths"]) == len(_NON_APPLICATION_DIR_NAMES)
     assert "changeme" in _parsed_gitleaks_config["allowlist"]["stopwords"]
+
+    # Org-configured extras: stopwords appended as literal substrings (no escaping), allow-paths
+    # appended UNESCAPED (they're meant to already be regex) -- a second adversarial review of
+    # THIS code (2026-09-28) caught that reusing _GITLEAKS_ALLOWLIST_PATHS' re.escape treatment for
+    # org-supplied path patterns would silently turn a working pattern like "**/e2e/**" into one
+    # that can never match. Assert the raw fragment survives verbatim in the parsed TOML.
+    _with_extras = tomllib.loads(_gitleaks_exclude_config(
+        extra_stopwords=("e2e-smoke",), extra_allow_paths=("**/e2e/**",),
+    ))
+    assert "e2e-smoke" in _with_extras["allowlist"]["stopwords"]
+    assert "**/e2e/**" in _with_extras["allowlist"]["paths"], _with_extras["allowlist"]["paths"]
+    assert len(_with_extras["allowlist"]["paths"]) == len(_NON_APPLICATION_DIR_NAMES) + 1
+    # _build_gitleaks_command called with no arguments is byte-for-byte today's ToolSpec command.
+    assert _build_gitleaks_command() == TOOLS_BY_NAME["gitleaks"].command
 
     # Non-application paths never gate. Each of these actually gated a real run.
     assert is_non_application_path("agent-work/gitleaks.json")          # 48 of that run's 68

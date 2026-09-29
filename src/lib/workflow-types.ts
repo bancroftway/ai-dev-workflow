@@ -236,6 +236,29 @@ export interface ScanSummary {
   measures?: ScanMeasures;
 }
 
+/** repo_scan.py's `_assemble_metrics()` churn x complexity join -- computed whenever a scan
+ * runs both `git-churn` and `lizard` (true for the `"full"` profile and the health-report's
+ * `"health_report"` profile), one entry per file, sorted descending by `hotspot_score` (top 20).
+ * Tornhill's standard heuristic: the file everyone keeps editing AND nobody can read. */
+export interface HotspotEntry {
+  path: string;
+  commits: number;
+  lines_changed: number;
+  ccn: number;
+  hotspot_score: number;
+}
+
+/** repo_scan.py's `metrics.churn` section (parse_git_churn + the hotspot join). Absent when
+ * `git-churn` didn't run this scan; `hotspots`/`ownership` absent when `lizard` didn't run
+ * alongside it (no complexity data to join against). */
+export interface ChurnMetrics {
+  window_days?: number;
+  commits?: number;
+  files_touched?: number;
+  ownership?: { bus_factor_files: number; single_owner_files: string[] };
+  hotspots?: HotspotEntry[];
+}
+
 /** repo_scan.py's per-metric delta entry (`_metric_deltas`), keyed by metric name (e.g.
  * "health_score", "coverage_line_rate") on DeltaSummary.metrics. */
 export interface MetricDelta {
@@ -398,6 +421,10 @@ export interface TestHardeningState {
 export interface MetricsReportState {
   metrics?: {
     coverage?: { line_rate: number | null; branch_rate: number | null };
+    // Was already flowing through the catch-all index signature below (repo_scan.py has
+    // computed this since before this type existed) -- typed now so QualityView's Hotspots
+    // section and the standalone health-report page can both read it without an `as` cast.
+    churn?: ChurnMetrics;
     traceability_summary?: { total: number; covered: number; tests_only: number; untested: number };
     token_usage_summary?: { total_input_tokens: number; total_output_tokens: number; total_cost: number; by_stage?: Record<string, unknown> };
     // repo_scan.py's ScanReport.to_dashboard_dict() -- `.summary` (the ScanSummary, same shape

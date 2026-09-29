@@ -214,7 +214,11 @@ async def scan_and_publish(provider: Any, thread_id: str) -> dict[str, Any]:
     """
     from .. import metrics_nodes, repo_files, repo_scan
 
-    report = await repo_scan.run_repo_scan(provider, thread_id, profile="full")
+    gitleaks_stopwords, gitleaks_allow_paths = await repo_scan.org_gitleaks_allowlist()
+    report = await repo_scan.run_repo_scan(
+        provider, thread_id, profile="full",
+        gitleaks_extra_stopwords=gitleaks_stopwords, gitleaks_extra_allow_paths=gitleaks_allow_paths,
+    )
     # `actionable` is introduced-aware for quality categories (same split is_gating draws):
     # a brownfield repo's pre-existing lizard/jscpd debt is not this run's to explain, or the
     # fix-everything gate would demand a known_gaps line per legacy finding and deadlock in

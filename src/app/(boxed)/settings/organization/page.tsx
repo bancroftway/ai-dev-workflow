@@ -34,6 +34,10 @@ type OrgSettings = {
   // Deployment-wide default DESIGN.md -- the fallback a repo uses when it has no override of its
   // own (../[owner]/[repo]/page.tsx). null = no default set.
   design_md: string | null;
+  // Org-wide extra gitleaks allowlist entries (repo_scan.py's org_gitleaks_allowlist), one
+  // pattern per line. null = no override, every scan's default behavior.
+  gitleaks_extra_stopwords: string | null;
+  gitleaks_extra_allow_paths: string | null;
 };
 
 const BILLING_MODE_LABELS: Record<BillingMode, string> = {
@@ -105,6 +109,9 @@ export default function OrganizationSettingsPage() {
   const [designMd, setDesignMd] = useState("");
   const [designMdSave, setDesignMdSave] = useState<SaveState>({ kind: "idle" });
   const [designMdTokensDetected, setDesignMdTokensDetected] = useState(true);
+  const [gitleaksStopwords, setGitleaksStopwords] = useState("");
+  const [gitleaksAllowPaths, setGitleaksAllowPaths] = useState("");
+  const [gitleaksSave, setGitleaksSave] = useState<SaveState>({ kind: "idle" });
 
   useEffect(() => {
     fetch("/api/settings/organization")
@@ -119,6 +126,8 @@ export default function OrganizationSettingsPage() {
         setUpdatedBy(data.updated_by);
         setSupportRepo(data.support_repo ?? "");
         setDesignMd(data.design_md ?? "");
+        setGitleaksStopwords(data.gitleaks_extra_stopwords ?? "");
+        setGitleaksAllowPaths(data.gitleaks_extra_allow_paths ?? "");
       })
       .finally(() => setLoaded(true));
   }, []);
@@ -398,6 +407,128 @@ export default function OrganizationSettingsPage() {
           <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800">
             <p className="font-medium">Could not save default design system</p>
             <p className="mt-1 break-words">{designMdSave.detail}</p>
+          </div>
+        )}
+      </section>
+
+      <section className="flex max-w-2xl flex-col gap-4 rounded-lg border border-neutral-200 p-4">
+        <div>
+          <h2 className="font-medium">Gitleaks allowlist</h2>
+          <p className="mt-1 text-sm text-neutral-500">
+            Suppresses known-false-positive secret findings across every scanned repo in this org
+            (e.g. e2e/smoke-test fixture values that merely look like secrets). Applies on top of
+            the platform&apos;s own built-in allowlist -- leave both blank to keep today&apos;s
+            default behavior.
+          </p>
+        </div>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-sm font-medium text-neutral-700">Extra stopwords (one per line)</span>
+          <p className="text-xs text-neutral-500">
+            A literal substring matched against a flagged secret&apos;s VALUE (not the file or
+            variable name) -- if the substring appears anywhere in what gitleaks flagged, that
+            finding is allowed. Case-sensitive, no regex.
+          </p>
+          <ul className="list-disc space-y-0.5 pl-4 text-xs text-neutral-500">
+            <li>
+              <code>e2e-smoke</code> — matches any value containing this, e.g.{" "}
+              <code>e2e-smoke-internal-secret</code>
+            </li>
+            <li>
+              <code>dummy</code>, <code>mock</code>, <code>fake</code> — common placeholder-value
+              prefixes
+            </li>
+            <li>
+              <code>sandbox-</code>, <code>staging-</code> — env-scoped test credentials that
+              aren&apos;t real production secrets
+            </li>
+            <li>
+              <code>fixture</code> — generic test-fixture marker some repos prefix every seeded
+              value with
+            </li>
+          </ul>
+          <textarea
+            rows={4}
+            className="rounded-md border border-neutral-300 px-3 py-2 font-mono text-xs"
+            placeholder={"e2e-smoke\nfixture-only"}
+            value={gitleaksStopwords}
+            onChange={(event) => setGitleaksStopwords(event.target.value)}
+            disabled={!loaded}
+          />
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-sm font-medium text-neutral-700">Extra allow-path patterns (one per line, regex)</span>
+          <p className="text-xs text-neutral-500">
+            Excludes whole files/dirs from secret scanning entirely, by path. Coarser than a
+            stopword: suppresses ALL findings in a matching file, not just one known-safe value --
+            reach for this when a whole file/folder is test-only, not just one value in it.
+          </p>
+          <ul className="list-disc space-y-0.5 pl-4 text-xs text-neutral-500">
+            <li>
+              <code>**/e2e/**</code> — any file under an <code>e2e/</code> directory, at any depth
+            </li>
+            <li>
+              <code>**/*\.(spec|test)\.[jt]sx?$</code> — Jest/Vitest/Playwright test files by
+              extension
+            </li>
+            <li>
+              <code>**/fixtures/**</code>, <code>**/mocks/**</code> — fixture or mock data
+              directories
+            </li>
+            <li>
+              <code>playwright\.config\..*</code>, <code>cypress\.config\..*</code> — e2e-runner
+              config files (where the value in your example lives)
+            </li>
+            <li>
+              <code>docker-compose\.test\.yml</code> — a test-only compose file with seeded
+              env vars
+            </li>
+          </ul>
+          <textarea
+            rows={4}
+            className="rounded-md border border-neutral-300 px-3 py-2 font-mono text-xs"
+            placeholder={"**/e2e/**\nplaywright\\.config\\..*"}
+            value={gitleaksAllowPaths}
+            onChange={(event) => setGitleaksAllowPaths(event.target.value)}
+            disabled={!loaded}
+          />
+        </label>
+
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            className="self-start rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            onClick={async () => {
+              setGitleaksSave({ kind: "saving" });
+              const res = await fetch("/api/settings/organization/gitleaks-allowlist", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  gitleaks_extra_stopwords: gitleaksStopwords.trim() || null,
+                  gitleaks_extra_allow_paths: gitleaksAllowPaths.trim() || null,
+                }),
+              });
+              const body = (await res.json().catch(() => ({}))) as OrgSettings & { detail?: string };
+              if (res.ok) {
+                setGitleaksStopwords(body.gitleaks_extra_stopwords ?? "");
+                setGitleaksAllowPaths(body.gitleaks_extra_allow_paths ?? "");
+                setGitleaksSave({ kind: "saved" });
+              } else {
+                setGitleaksSave({ kind: "error", detail: body.detail ?? `save failed (${res.status})` });
+              }
+            }}
+            disabled={!loaded || gitleaksSave.kind === "saving"}
+          >
+            {gitleaksSave.kind === "saving" ? "Saving…" : "Save"}
+          </button>
+          {gitleaksSave.kind === "saved" && <span className="text-sm text-green-700">✓ Saved</span>}
+        </div>
+
+        {gitleaksSave.kind === "error" && (
+          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+            <p className="font-medium">Could not save gitleaks allowlist</p>
+            <p className="mt-1 break-words">{gitleaksSave.detail}</p>
           </div>
         )}
       </section>

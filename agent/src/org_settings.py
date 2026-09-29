@@ -50,6 +50,16 @@ class OrgSettings:
     # default set -- the platform falls back further to its existing per-repo reverse-engineered
     # DESIGN.md behavior (impeccable's `document` command).
     design_md: str | None = None
+    # Migration 0019: org-wide extra gitleaks allowlist entries (repo_scan.py's
+    # _build_gitleaks_command reads these), one pattern per line. `gitleaks_extra_stopwords` are
+    # literal substrings matched against a flagged secret's VALUE (same treatment as the module's
+    # own hardcoded _GITLEAKS_STOPWORDS -- no regex, no escaping). `gitleaks_extra_allow_paths` are
+    # raw regex excluding whole files/dirs from secret scanning (passed through UNESCAPED, unlike
+    # the module's own _GITLEAKS_ALLOWLIST_PATHS, which re.escapes plain directory NAMES -- these
+    # are meant to already be patterns, e.g. "**/e2e/**"). Both None = no override, today's exact
+    # behavior.
+    gitleaks_extra_stopwords: str | None = None
+    gitleaks_extra_allow_paths: str | None = None
 
 
 async def get_org_settings() -> OrgSettings | None:
@@ -60,7 +70,8 @@ async def get_org_settings() -> OrgSettings | None:
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             "SELECT provider, credential_secret_name, updated_at, updated_by, credential_kind, "
-            "last_validation_ok, last_validated_at, support_repo, design_md FROM dbo.org_settings WHERE id = 1"
+            "last_validation_ok, last_validated_at, support_repo, design_md, "
+            "gitleaks_extra_stopwords, gitleaks_extra_allow_paths FROM dbo.org_settings WHERE id = 1"
         )
         row = await cur.fetchone()
         if row is None:
@@ -69,6 +80,7 @@ async def get_org_settings() -> OrgSettings | None:
             provider=row[0], credential_secret_name=row[1], updated_at=row[2], updated_by=row[3],
             credential_kind=row[4], last_validation_ok=row[5], last_validated_at=row[6],
             support_repo=row[7], design_md=row[8],
+            gitleaks_extra_stopwords=row[9], gitleaks_extra_allow_paths=row[10],
         )
 
 
@@ -136,6 +148,46 @@ async def set_design_md(design_md: str | None, updated_by: str, *, fallback_prov
         )
 
 
+class GitleaksAllowlistError(ValueError):
+    """Raised when a gitleaks allowlist field contains a literal single quote, which would
+    corrupt the TOML config repo_scan.py's _build_gitleaks_command generates (both fields are
+    spliced into TOML *literal* single-quoted strings, whose one forbidden character is a literal
+    `'` -- see that function's own comment). Callers (the PUT endpoint) turn this into a 422."""
+
+
+def _reject_literal_quote(value: str | None, field_name: str) -> None:
+    if value and "'" in value:
+        raise GitleaksAllowlistError(
+            f"{field_name} cannot contain a literal single quote (') -- it would corrupt the "
+            "generated gitleaks config on the next scan. Remove it and try again."
+        )
+
+
+async def set_gitleaks_allowlist(
+    extra_stopwords: str | None, extra_allow_paths: str | None, updated_by: str, *, fallback_provider: str
+) -> None:
+    """Migration 0019's one writer. Same MERGE-with-invented-row shape as set_design_md/
+    set_support_repo, for the same reason: must be savable on a fresh deployment with no org vault
+    and no row yet. Both fields saved together -- they're edited as one settings sub-section."""
+    _reject_literal_quote(extra_stopwords, "Extra stopwords")
+    _reject_literal_quote(extra_allow_paths, "Extra allow-paths")
+    stopwords_value = (extra_stopwords or "").strip() or None
+    allow_paths_value = (extra_allow_paths or "").strip() or None
+    pool = await session_store._get_pool()  # noqa: SLF001
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            MERGE dbo.org_settings AS target
+            USING (SELECT 1 AS id) AS src
+              ON target.id = src.id
+            WHEN MATCHED THEN UPDATE SET gitleaks_extra_stopwords = ?, gitleaks_extra_allow_paths = ?, updated_by = ?, updated_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN INSERT (id, provider, gitleaks_extra_stopwords, gitleaks_extra_allow_paths, updated_by) VALUES (1, ?, ?, ?, ?);
+            """,
+            stopwords_value, allow_paths_value, updated_by,
+            fallback_provider, stopwords_value, allow_paths_value, updated_by,
+        )
+
+
 async def record_validation_result(ok: bool) -> None:
     """I-1's periodic re-probe write-back: a plain UPDATE, deliberately not routed through
     set_org_settings's MERGE above -- this only ever runs against an already-existing row (there is
@@ -185,6 +237,19 @@ def _demo() -> None:
     assert defaulted.last_validation_ok is None, defaulted
     assert defaulted.last_validated_at is None, defaulted
     assert defaulted.design_md is None, defaulted  # migration 0017's new nullable column, same treatment
+    assert defaulted.gitleaks_extra_stopwords is None, defaulted  # migration 0019, same treatment
+    assert defaulted.gitleaks_extra_allow_paths is None, defaulted
+
+    # _reject_literal_quote is the one piece of pure validation logic in this module -- must fire
+    # on a literal quote and stay silent on ordinary text (including None/empty).
+    try:
+        _reject_literal_quote("it's a test", "Extra stopwords")
+    except GitleaksAllowlistError:
+        pass
+    else:
+        raise AssertionError("_reject_literal_quote must raise on a literal single quote")
+    _reject_literal_quote("e2e-smoke", "Extra stopwords")  # must not raise
+    _reject_literal_quote(None, "Extra stopwords")  # must not raise
 
     # frozen=True must actually block mutation, not just be decorative.
     try:

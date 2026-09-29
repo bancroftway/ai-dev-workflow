@@ -25,6 +25,8 @@ logging.basicConfig(level=logging.INFO)
 
 from src import checkpoint, run_activity
 from src.graph import graph
+from src.health_report import reap_orphaned_jobs
+from src.health_report_api import router as health_reports_router
 from src.sessions_api import catalog_router as tech_stack_catalog_router
 from src.sessions_api import config_router as vault_config_router
 from src.sessions_api import github_link_router
@@ -45,6 +47,10 @@ async def _lifespan(_app: FastAPI):
     # in-flight thread state then survive agent restarts. Fail-soft inside; a failed attach
     # boots on the in-memory saver with a loud warning.
     await checkpoint.attach_sqlite_checkpointer(graph)
+    # Before serving any request: force-remove any health-report container/volume this process
+    # doesn't remember provisioning (a report job's own registry entry never survives a restart --
+    # see reap_orphaned_jobs' own docstring for why nothing else would ever tear these down).
+    await reap_orphaned_jobs()
     try:
         yield
     finally:
@@ -65,6 +71,7 @@ app.add_middleware(
 )
 
 app.include_router(sessions_router)
+app.include_router(health_reports_router)
 app.include_router(vault_config_router)
 app.include_router(org_settings_router)
 app.include_router(tech_stack_catalog_router)

@@ -87,6 +87,28 @@ export function HealthRing({
   );
 }
 
+/** Rounds a set of shares that already sum to ~1.0 into whole percentages that themselves sum to
+ * exactly 100 -- the "largest remainder" apportionment method (same technique parliamentary seat
+ * allocation uses). Rounding each row independently (plain Math.round(weight*100) per row) can
+ * under- or overshoot 100 by a point or two purely from rounding even though the underlying
+ * weights are mathematically exact -- e.g. 0.7407/0.1111/0.0741/0.0741 (which DO sum to 1.0)
+ * independently round to 74/11/7/7, summing to 99, not 100. That reads as broken arithmetic to
+ * anyone eyeballing the list, even though nothing is actually wrong with the weights themselves. */
+function roundPercentagesTo100(entries: [string, number][]): Map<string, number> {
+  const scaled = entries.map(([key, w]): [string, number, number] => {
+    const exact = w * 100;
+    return [key, Math.floor(exact), exact - Math.floor(exact)];
+  });
+  const shortfall = 100 - scaled.reduce((sum, [, floor]) => sum + floor, 0);
+  const byRemainderDesc = [...scaled].sort((a, b) => b[2] - a[2]);
+  const result = new Map(scaled.map(([key, floor]) => [key, floor]));
+  for (let i = 0; i < shortfall; i++) {
+    const key = byRemainderDesc[i % byRemainderDesc.length][0];
+    result.set(key, (result.get(key) ?? 0) + 1);
+  }
+  return result;
+}
+
 /** The accessible breakdown list the ring links to -- one row per subscore, weight alongside,
  * unmeasured subscores named rather than hidden (their weight was redistributed). */
 export function HealthBreakdown({
@@ -104,6 +126,7 @@ export function HealthBreakdown({
   if (!subscores || summary.health_score == null) return null;
   const weights = summary.health_weights_used ?? {};
   const unmeasured = HEALTH_SUBSCORE_LABELS.filter(([key]) => subscores[key] == null).map(([, label]) => label);
+  const displayWeights = roundPercentagesTo100(Object.entries(weights));
   return (
     <div className="flex items-start gap-4">
       <HealthRing
@@ -142,7 +165,7 @@ export function HealthBreakdown({
                 <span>{label}</span>
                 <span>
                   <span style={{ color: healthColor(value) }} className="font-medium">{Math.round(value)}</span>
-                  {weight != null && <span className="text-neutral-400"> ×{Math.round(weight * 100)}%</span>}
+                  {weight != null && <span className="text-neutral-400"> ×{displayWeights.get(key)}%</span>}
                 </span>
               </li>
             );
