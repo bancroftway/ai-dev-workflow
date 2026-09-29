@@ -262,6 +262,22 @@ class GraphState(TypedDict):
     # thread, fallback boot, lost DB) and the `or await chat_model.get_provider()` fallback stays
     # this field's ordinary defensive behavior, not a migration shim.
     provider: Literal["copilot", "claude"]
+    # Task 1 (backend mode threading, plan Part 2): "yolo"/"draft_verify"/"mission_critical" this
+    # THREAD is pinned to -- mirrors `provider` immediately above in every structural respect
+    # (pinned per-thread via the identical 3-level fallback, never re-resolved once a run starts,
+    # survives a resume the same way). A LATER task (Task 2) makes a stage's audit/verify steps
+    # skippable based on this value; this task only threads it from a session's first provision
+    # request into this state channel -- see _resolve_thread_code_gen_mode below (mirrors
+    # _resolve_thread_provider exactly) and intake_node's call site.
+    #
+    # Unlike provider, there is no live "org setting" to fall back to when genuinely nothing is
+    # pinned or stored -- the final fallback is a fixed default, "mission_critical", not a live
+    # read of anything: today's actual, unconditional behavior for every existing session (audit
+    # AND full verify both always on) is what "mission_critical" means under this plan's new
+    # vocabulary, so any caller that doesn't yet send a mode (a headless/CI run, an in-flight
+    # session resumed after this ships, an older frontend build mid-rollout) keeps getting exactly
+    # that, never a silent downgrade to a weaker mode it never asked for.
+    code_gen_mode: Literal["yolo", "draft_verify", "mission_critical"]
     # Set by scaffold_node (preflight_nodes.py) -- manifest.json absence is the canonical
     # "never onboarded before" signal, routing into brownfield-baseline's brownfield sub-flow. Read once at
     # scaffold time and routed on from state, never re-read: app_check_record_node writes to
@@ -2683,6 +2699,55 @@ async def _resolve_thread_provider(thread_id: str, state: GraphState) -> Literal
     return stored_provider or await chat_model.get_provider()
 
 
+async def _resolve_thread_code_gen_mode(
+    thread_id: str, state: GraphState
+) -> Literal["yolo", "draft_verify", "mission_critical"]:
+    """The 3-level code-gen-mode-pinning fallback GraphState.code_gen_mode's own comment documents
+    in full (Task 1, backend mode threading) -- mirrors _resolve_thread_provider immediately above
+    exactly: prefer this thread's already-pinned state, then this session's own durable
+    `dbo.sessions` row, fall back to a fixed default only if genuinely neither exists. Split out of
+    intake_node (its only caller) for the identical reason _resolve_thread_provider is: a direct,
+    real self-check below instead of driving intake_node's much larger body just to reach it.
+
+    Pinned per-THREAD, not re-resolved per intake call -- same reasoning as provider's own pin
+    (Ruling 2, docs/superpowers/plans/part-4-org-settings-tasks.md), and the same reason this
+    deliberately does NOT follow run_id's unconditional-remint pattern. The `or` chain
+    short-circuits at each step -- both across plain values AND across `await`s -- so the DB read
+    below only ever fires the first time this process has seen this thread (a brand new thread, or
+    the first intake after a restart -- InMemorySaver keeps neither): every later intake on the
+    same thread, including a blank-resume reattach, keeps whatever this run already pinned and
+    touches the DB not at all.
+
+    The one real difference from _resolve_thread_provider: there is no live org-wide setting to
+    fall back to here, so the final term is a fixed constant, "mission_critical", not an `await`
+    of anything -- see GraphState.code_gen_mode's own comment for why that specific default (never
+    "yolo", and not "draft_verify" either) is load-bearing. `get_session` returning None (a
+    genuinely new thread) or a row with no stored code_gen_mode (pre-migration-0020, or a
+    first-provision call that simply didn't send one) both fall through to that same default.
+
+    The `get_session` call is try/excepted, same as _resolve_thread_provider's own (Phase E audit
+    I-3 review round 2): a transient DB blip here must degrade to the fixed default rather than
+    raise straight through intake_node and hard-fail the run -- and this branch runs on EVERY
+    thread's first post-restart intake, a permanent steady-state condition, not a rare one-off.
+    """
+    pinned = state.get("code_gen_mode")
+    if pinned:
+        return pinned
+
+    stored_code_gen_mode = None
+    try:
+        stored_row = await session_store.get_session(thread_id)
+        stored_code_gen_mode = (stored_row or {}).get("code_gen_mode")
+    except Exception:
+        logger.warning(
+            "session_store.get_session failed while resolving code_gen_mode for thread_id=%s -- "
+            "falling through to the mission_critical default",
+            thread_id, exc_info=True,
+        )
+
+    return stored_code_gen_mode or "mission_critical"
+
+
 def _reset_stage_status_fields(stage: dict[str, Any]) -> None:
     """AC-6.3's status reset -- extracted verbatim from intake_node's fresh-submission loop below
     (both branches there set exactly these four fields identically). `approved_content`
@@ -2795,6 +2860,29 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     stages = {key: dict(value) for key, value in state.get("stages", {}).items()}
 
     provider: Literal["copilot", "claude"] = await _resolve_thread_provider(thread_id, state)
+
+    # Task 1 (backend mode threading, plan Part 2): resolved right alongside provider, same
+    # 3-level fallback shape -- see _resolve_thread_code_gen_mode's own docstring.
+    code_gen_mode: Literal["yolo", "draft_verify", "mission_critical"] = await _resolve_thread_code_gen_mode(
+        thread_id, state
+    )
+
+    # Mirrored into manifest.json, not just dbo.sessions: the DB column above only exists on the
+    # host-side orchestrator's own database -- nothing running INSIDE the sandbox (a Stop hook, a
+    # prompt; both built in later tasks) can read it. Best-effort / no-op when unsandboxed, same
+    # tolerance every other manifest.json writer already has (see update_manifest's own callers,
+    # all guarded on sandbox_registry.get(thread_id) is not None) -- a manifest write failing here
+    # must not take the whole intake down.
+    if sandbox_registry.get(thread_id) is not None:
+        try:
+            await preflight_nodes.update_manifest(
+                get_sandbox_provider(), thread_id, {"code_gen_mode": code_gen_mode}
+            )
+        except Exception:
+            logger.warning(
+                "intake_node: failed to write code_gen_mode into manifest.json for thread_id=%s",
+                thread_id, exc_info=True,
+            )
 
     # Popped unconditionally, right here, on EVERY intake -- a resume=1 provision sets this meta
     # flag once, and it must not survive past the first run that consumes it (else a later,
@@ -3153,6 +3241,11 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # GraphState.provider's own comment) unless this is genuinely the first intake this
         # process has seen for this thread, in which case it's this run's one live resolution.
         "provider": provider,
+        # Echoes whatever this thread already pinned (see the `code_gen_mode` local above and
+        # GraphState.code_gen_mode's own comment) unless this is genuinely the first intake this
+        # process has seen for this thread, in which case it's this run's one resolution --
+        # mirrors provider immediately above exactly (Task 1, backend mode threading).
+        "code_gen_mode": code_gen_mode,
         "e2e": e2e_state,
         "targeted_fix_attempts": targeted_fix_attempts,
         "e2e_reset_attempts": e2e_reset_attempts,

@@ -129,6 +129,13 @@ class ProvisionRequest(BaseModel):
     # (keyvault.py), then discarded -- never stored, never passed into the sandbox. None in
     # E2E-bypass and headless runs, which simply skip the vault fetch.
     entra_assertion: str | None = None
+    # Task 1 (backend mode threading, plan Part 2): "yolo"/"draft_verify"/"mission_critical",
+    # mirrors this class's own lack of a `provider` field -- like provider, this is resolved
+    # stored-or-sent below, never required here. Optional/None because only a genuinely-new
+    # session's frontend call (Task 3's popup, a later task) sends one at all; a resume or an
+    # incidental reprovision of an already-created session omits it and gets this session's own
+    # stored dbo.sessions.code_gen_mode instead (see provision_session below).
+    code_gen_mode: str | None = None
 
 
 class ProvisionResponse(BaseModel):
@@ -188,6 +195,15 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     stored_provider = existing.get("provider") if existing is not None else None
     chat_provider = stored_provider or await chat_model.get_provider()
 
+    # Task 1 (backend mode threading): same stored-or-sent shape as provider just above, minus a
+    # live-org-setting fallback -- there is no such thing for code_gen_mode, only what THIS session
+    # itself already has stored or what this exact request just sent. Both can genuinely be None
+    # (a pre-Task-3 frontend build, a headless/CI run) -- that stays a real, meaningful NULL all
+    # the way through create_session below; graph.py's _resolve_thread_code_gen_mode is what turns
+    # a NULL row into the "mission_critical" default, never this function.
+    stored_code_gen_mode = existing.get("code_gen_mode") if existing is not None else None
+    resolved_code_gen_mode = stored_code_gen_mode or body.code_gen_mode
+
     # I-A fix round (Important, proved by execution): moved here, before ANY side effect --
     # get_runtime_auth_token() itself is side-effect-free, so there is no reason this has to wait
     # until immediately before provider.provision(). It used to sit after the Key Vault fetch AND
@@ -226,6 +242,17 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
     # makes this a no-op once stamped and safe to call unconditionally on every reprovision.
     if existing is not None and stored_provider is None:
         await session_store.set_session_provider(body.thread_id, chat_provider)
+
+    # Task 1 (backend mode threading): identical backfill for code_gen_mode -- a session whose
+    # first-ever provision omitted it has code_gen_mode=NULL forever (create_session's own IF NOT
+    # EXISTS guard is a no-op on every later reprovision), so a LATER reprovision that finally does
+    # resolve one (e.g. a newer frontend build sending it for the first time on this row) must not
+    # have that value silently discarded. Guarded on resolved_code_gen_mode being non-None (unlike
+    # chat_provider, which is never None): a reprovision that still has nothing new to say for a
+    # legacy row must leave it NULL, not write a meaningless NULL-to-NULL update --
+    # set_session_code_gen_mode's own `mode: str` contract is never called with None.
+    if existing is not None and stored_code_gen_mode is None and resolved_code_gen_mode is not None:
+        await session_store.set_session_code_gen_mode(body.thread_id, resolved_code_gen_mode)
 
     if body.resume:
         if existing is None:
@@ -416,6 +443,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
                         title="(untitled session)",
                         project_id=project_id,
                         provider=chat_provider,
+                        code_gen_mode=resolved_code_gen_mode,
                     )
                 except Exception:  # noqa: BLE001 -- best-effort; must not mask the original 502
                     logger.warning(
@@ -450,6 +478,10 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
         # provision (existing is None) -- create_session's own IF NOT EXISTS guard means this
         # write can never happen twice for the same session_id, so this is genuinely a
         # write-once-pin, not just a default that a later call could overwrite.
+        #
+        # code_gen_mode=resolved_code_gen_mode (Task 1): existing is None here, so
+        # resolved_code_gen_mode is exactly body.code_gen_mode -- whatever this genuinely-new
+        # session's frontend call sent (possibly None, e.g. a pre-Task-3 frontend build).
         await session_store.create_session(
             body.thread_id,
             owner=owner,
@@ -460,6 +492,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
             title="(untitled session)",
             project_id=project_id,
             provider=chat_provider,
+            code_gen_mode=resolved_code_gen_mode,
         )
 
     return ProvisionResponse(status="ready")
