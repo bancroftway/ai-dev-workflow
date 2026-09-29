@@ -163,7 +163,7 @@ function TechStackViewImpl() {
       )}
 
       {!isOpen && stage?.status === "approved" && (
-        <ConfirmedTechStackSummary content={stage.approved_content} />
+        <ConfirmedTechStackSummary content={stage.approved_content} threadId={threadId} />
       )}
 
       {isOpen && (
@@ -220,12 +220,57 @@ function TechStackViewImpl() {
 // while it's the hidden tab.
 export const TechStackView = memo(TechStackViewImpl);
 
-function ConfirmedTechStackSummary({ content }: { content: unknown }) {
+function ConfirmedTechStackSummary({ content, threadId }: { content: unknown; threadId: string }) {
   const c = (content ?? {}) as {
     summary?: string;
     languages?: string[];
     frameworks?: string[];
+    // B2 (tech-stack startability pivot): brownfield-only, set once by the boot probe
+    // (preflight_nodes.probe_tech_stack_startability) that runs alongside tech-stack approval.
+    // Absent (undefined) on a greenfield repo or one onboarded before this field existed -- treated
+    // the same as `true` everywhere this is read (backend and frontend both default startable to
+    // true), so this banner only ever renders when it's explicitly `false`.
+    startable?: boolean;
+    not_startable_reason?: string | null;
   };
+  // Local override: the recheck button's own response is the freshest verdict there is (it just
+  // rewrote tech-stack.approved.json), but nothing re-streams `agent.state` outside of an actual
+  // graph run/resume -- see preflight_nodes.recheck_tech_stack_startability's own docstring for why
+  // the file write alone is still correct for the NEXT resume. A successful recheck (startable:
+  // true) self-resolves the banner below with no extra wiring, since `startable` reads the
+  // override first. ponytail: does NOT reset if `content` itself later changes out from under a
+  // still-mounted tab (a real background resync) -- that's a rare edge case this codebase's
+  // stricter react-hooks/refs rules make annoying to guard against during render; add a
+  // content-change reset if it's ever actually observed in practice.
+  const [recheck, setRecheck] = useState<{ startable: boolean; reason: string | null } | null>(null);
+  const [rechecking, setRechecking] = useState(false);
+  const [recheckError, setRecheckError] = useState<string | null>(null);
+
+  const startable = recheck ? recheck.startable : (c.startable ?? true);
+  const notStartableReason = recheck ? recheck.reason : c.not_startable_reason;
+
+  async function handleRecheck() {
+    setRechecking(true);
+    setRecheckError(null);
+    try {
+      const res = await fetch("/api/sessions/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: threadId, action: "recheck-tech-stack-boot" }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.detail || `recheck failed (${res.status})`);
+      }
+      const body = (await res.json()) as { startable?: boolean; not_startable_reason?: string | null };
+      setRecheck({ startable: body.startable ?? false, reason: body.not_startable_reason ?? null });
+    } catch (err) {
+      setRecheckError(err instanceof Error ? err.message : "recheck failed");
+    } finally {
+      setRechecking(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-neutral-200 p-4">
       <div className="flex items-center gap-2">
@@ -238,6 +283,25 @@ function ConfirmedTechStackSummary({ content }: { content: unknown }) {
         <p className="text-xs text-neutral-500">
           {[...(c.languages ?? []), ...(c.frameworks ?? [])].join(" · ")}
         </p>
+      )}
+      {!startable && (
+        <div className="flex flex-col gap-1.5 rounded-md border border-amber-300 bg-amber-50 p-3">
+          <p className="text-xs font-medium text-amber-800">
+            This application did not start during setup — e2e and App Health are unavailable.
+          </p>
+          {notStartableReason && <p className="text-xs text-amber-700">{notStartableReason}</p>}
+          <div>
+            <button
+              type="button"
+              className="rounded-md border border-amber-400 bg-white px-2.5 py-1 text-xs font-medium text-amber-800 disabled:opacity-50"
+              disabled={rechecking}
+              onClick={handleRecheck}
+            >
+              {rechecking ? "Rechecking…" : "Recheck"}
+            </button>
+          </div>
+          {recheckError && <p className="text-xs text-red-700">{recheckError}</p>}
+        </div>
       )}
     </div>
   );

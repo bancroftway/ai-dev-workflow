@@ -44,6 +44,7 @@ from . import (
     github_link_store,
     keyvault,
     org_credential_vault,
+    preflight_nodes,
     repo_test_config,
     repo_design_settings,
     org_settings,
@@ -991,7 +992,10 @@ class SessionActionRequest(BaseModel):
     """Named actions only -- the frontend never sends shell. Adding an action = a new Literal
     member plus a handler branch below; anything else is rejected by validation before it runs."""
 
-    action: Literal["refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix", "reset-e2e"]
+    action: Literal[
+        "refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix", "reset-e2e",
+        "recheck-tech-stack-boot",
+    ]
     entra_assertion: str = ""
     # "rewind-to-stage" only: the STAGES key to reset (and reset everything after) to, in pipeline
     # order. Ignored by every other action.
@@ -1002,6 +1006,10 @@ class SessionActionResponse(BaseModel):
     ok: bool = True
     # Only "refresh-secrets" reports a count; None for every other action (confirm-reopen included).
     secret_count: int | None = None
+    # Only "recheck-tech-stack-boot" reports these -- the B2 boot probe's fresh verdict, straight
+    # back to the Tech Stack tab so it can update without waiting on a graph resume/live-state sync.
+    startable: bool | None = None
+    not_startable_reason: str | None = None
 
 
 @router.post("/{thread_id}/actions", response_model=SessionActionResponse)
@@ -1127,6 +1135,27 @@ async def run_session_action(thread_id: str, body: SessionActionRequest, request
         # intake_node's own reopen guard blocks any resume of a finished-with-verdict thread.
         registry.set_meta(thread_id, reset_e2e=True, confirm_reopen=True)
         return SessionActionResponse(ok=True)
+
+    if body.action == "recheck-tech-stack-boot":
+        # B2's caching-risk fix: a one-time startable verdict computed under a transient condition
+        # (a missing secret not yet configured, a port collision on the sandbox at that moment, a
+        # slow cold start past the timeout) would otherwise permanently disable e2e/App Health for
+        # a repo that's actually fine, with no way back short of hand-editing the approved JSON.
+        # Immediate, synchronous work against the live sandbox -- shaped like "refresh-secrets"
+        # below, NOT like rewind-to-stage/targeted-fix/reset-e2e above: those set a meta flag for
+        # the graph to act on at its own next resume because there's no other way to reach them,
+        # but preflight_nodes.recheck_tech_stack_startability rewrites tech-stack.approved.json
+        # directly, and draft_node's hydrate_from_repo_file (graph.py) re-reads that file fresh on
+        # THIS thread's own next resume regardless -- see that function's own docstring -- so no
+        # flag is needed to make the fix "stick" for a later run.
+        if registry.get(thread_id) is None:
+            raise HTTPException(status_code=409, detail="no active sandbox for this session -- resume it first")
+        updated = await preflight_nodes.recheck_tech_stack_startability(thread_id, get_sandbox_provider())
+        if updated is None:
+            raise HTTPException(status_code=404, detail="no tech-stack.approved.json recorded for this session yet")
+        return SessionActionResponse(
+            ok=True, startable=updated.get("startable"), not_startable_reason=updated.get("not_startable_reason")
+        )
 
     row = await session_store.get_session(thread_id)
     if row is None:

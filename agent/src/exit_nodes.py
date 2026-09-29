@@ -766,14 +766,21 @@ def _render_score_explanations(metrics_summary: dict[str, Any] | None) -> list[s
 
     app_health = metrics_summary.get("app_health_score")
     app_inputs = metrics_summary.get("app_health_inputs") or {}
-    cov_frac, pass_frac = app_inputs.get("coverage_fraction"), app_inputs.get("pass_rate_fraction")
-    lines.append(
-        f"- **App Health ({app_health if app_health is not None else '--'})**: blend of test coverage "
-        f"({f'{cov_frac * 100:.1f}%' if cov_frac is not None else 'unmeasured'}) and whole-suite test pass rate "
-        f"({f'{pass_frac * 100:.1f}%' if pass_frac is not None else 'unmeasured'}), weighted "
-        f"{workflow_config.AIDW_APP_HEALTH_COVERAGE_WEIGHT}/{workflow_config.AIDW_APP_HEALTH_PASS_RATE_WEIGHT}. "
-        "DAST scanning is not yet part of this score."
-    )
+    # B4 (tech-stack startability pivot): a repo the B2 boot probe found non-startable gets this
+    # branch instead of the normal coverage/pass-rate blend wording below -- parallel to that
+    # branch's own "unmeasured" phrasing, not a second None-handling mechanism.
+    not_startable_reason = app_inputs.get("not_startable_reason")
+    if not_startable_reason:
+        lines.append(f"- **App Health (--)**: unavailable -- app not startable: {not_startable_reason}")
+    else:
+        cov_frac, pass_frac = app_inputs.get("coverage_fraction"), app_inputs.get("pass_rate_fraction")
+        lines.append(
+            f"- **App Health ({app_health if app_health is not None else '--'})**: blend of test coverage "
+            f"({f'{cov_frac * 100:.1f}%' if cov_frac is not None else 'unmeasured'}) and whole-suite test pass rate "
+            f"({f'{pass_frac * 100:.1f}%' if pass_frac is not None else 'unmeasured'}), weighted "
+            f"{workflow_config.AIDW_APP_HEALTH_COVERAGE_WEIGHT}/{workflow_config.AIDW_APP_HEALTH_PASS_RATE_WEIGHT}. "
+            "DAST scanning is not yet part of this score."
+        )
 
     ac_resolution = metrics_summary.get("ac_resolution") or {}
     resolution_line = (
@@ -2075,6 +2082,24 @@ def _demo() -> None:
     assert "1 AC(s) were deferred AFTER coding" in explained
     assert "~4.2 hours" in explained and "Capability-Based Lifecycle Benchmarking" in explained
     assert _render_score_explanations(None)[0] == "### How these scores were calculated", "must never raise on absent metrics_summary"
+
+    # B4 (tech-stack startability pivot): a non-startable app's App Health block reads
+    # "unavailable -- app not startable: <reason>" instead of the normal coverage/pass-rate blend
+    # wording, even though app_health_score is None the same way an unmeasured one would be --
+    # metrics_nodes.metrics_compute_node forces app_health_score=None and stamps this reason
+    # whenever tech_stack.get("startable", True) is False.
+    not_startable_fixture = dict(score_metrics_fixture)
+    not_startable_fixture["app_health_score"] = None
+    not_startable_fixture["app_health_inputs"] = {
+        "coverage_fraction": 0.9, "pass_rate_fraction": 0.63,
+        "not_startable_reason": "backend candidate never opened its port within 45s",
+    }
+    not_startable_explained = "\n".join(_render_score_explanations(not_startable_fixture))
+    assert "App Health (--)" in not_startable_explained
+    assert "unavailable -- app not startable: backend candidate never opened its port within 45s" in not_startable_explained
+    assert "blend of test coverage" not in not_startable_explained, (
+        "the not-startable branch must replace the coverage/pass-rate wording, not sit alongside it"
+    )
 
     with_matrix = _render_history_sections(
         files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,

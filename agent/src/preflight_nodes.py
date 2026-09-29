@@ -836,8 +836,119 @@ def _extraction_failed_tech_stack(markdown: str) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
+async def probe_tech_stack_startability(
+    provider: SandboxProvider, thread_id: str, candidates: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """B2 (tech-stack startability pivot): a bounded, real boot attempt for each app_discovery
+    candidate this repo has, reusing e2e_nodes' own boot/readiness/kill mechanism
+    (e2e_nodes.probe_candidate_boot) instead of a second "start a process and poll a port"
+    implementation. A candidate's `start_command` is only ever a static file-marker guess
+    (app_discovery.py's own docstring: "nothing here launches an app") -- e2e's own gate used to be
+    the first thing that ever actually tried to boot it, so a repo whose start script is simply
+    broken sailed through tech-stack approval looking fine and only failed much later, deep into
+    the pipeline.
+
+    Same candidate dedup-by-path and "no start_command -> not part of what gets booted" filter
+    e2e_run_node itself applies before booting (see its own comment there) -- a supporting
+    library/CLI candidate with no start_command is skipped, not counted as a boot failure.
+
+    Returns {"startable": bool, "not_startable_reason": str | None, "boot_evidence": [...]} -- the
+    exact keys _settle_tech_stack/recheck_tech_stack_startability persist onto the approved
+    tech-stack sidecar. `not_startable_reason` is the FIRST candidate's failure only (good enough
+    for a human headline; every candidate's own result is still in `boot_evidence`).
+
+    Local import (e2e_nodes): e2e_nodes.py imports FROM this module (MANIFEST_PATH) at load time,
+    so a top-level import back here would be circular -- same pattern
+    _prefill_from_ticket_tech_stack_selection already uses for app_discovery just above.
+    """
+    from . import e2e_nodes
+
+    seen_paths: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not str(candidate.get("start_command") or "").strip():
+            continue
+        path = str(candidate.get("path") or ".")
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        unique.append(candidate)
+
+    if not unique:
+        return {
+            "startable": False,
+            "not_startable_reason": "no start command could be inferred for any discovered application",
+            "boot_evidence": [],
+        }
+
+    boot_evidence: list[dict[str, Any]] = []
+    first_failure_reason: str | None = None
+    for candidate in unique:
+        started, reason = await e2e_nodes.probe_candidate_boot(
+            provider, thread_id, candidate,
+            timeout_seconds=workflow_config.AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS,
+        )
+        boot_evidence.append({
+            "candidate": str(candidate.get("name") or candidate.get("path") or "app"),
+            "path": candidate.get("path"),
+            "started": started,
+            "reason": reason,
+        })
+        if not started and first_failure_reason is None:
+            first_failure_reason = reason
+
+    return {
+        "startable": first_failure_reason is None,
+        "not_startable_reason": first_failure_reason,
+        "boot_evidence": boot_evidence,
+    }
+
+
+async def recheck_tech_stack_startability(thread_id: str, provider: SandboxProvider) -> dict[str, Any] | None:
+    """sessions_api.py's "recheck-tech-stack-boot" action: re-runs ONLY the B2 boot probe above
+    against a FRESH app_discovery scan, and updates just the startable/not_startable_reason/
+    boot_evidence keys on the already-approved tech-stack.approved.json in place -- no tech-stack
+    redraft, no repo reset.
+
+    Exists because a one-time verdict computed under a transient condition (a missing secret not
+    yet configured, a port collision on the sandbox at that moment, a slow cold start past the
+    timeout) would otherwise permanently disable e2e/App Health for a repo that's actually fine,
+    with no way back short of hand-editing the approved JSON -- the exact caching risk B2 calls
+    out. Mirrors sessions_api.py's "refresh-secrets" action, not "reset-e2e"/"targeted-fix"/
+    "rewind-to-stage": this is immediate, synchronous work against the live sandbox (never a meta
+    flag for the graph to act on next resume), because the file it rewrites is re-read fresh from
+    disk by hydrate_tech_stack_from_repo_file/draft_node on this thread's very next resume
+    regardless -- see that function's own docstring -- so there is nothing else to signal.
+
+    Returns the updated approved dict, or None when this repo has no tech-stack.approved.json yet
+    (recheck is only ever offered once one exists with startable=False)."""
+    raw = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_APPROVED_JSON_PATH)
+    if raw is None:
+        return None
+    try:
+        approved = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("recheck_tech_stack_startability: tech-stack.approved.json isn't valid JSON for thread_id=%s", thread_id)
+        return None
+    if not isinstance(approved, dict):
+        return None
+
+    from . import app_discovery
+
+    scan = await app_discovery.collect_evidence(provider, thread_id)
+    probe = await probe_tech_stack_startability(provider, thread_id, scan["candidates"])
+    approved.update(probe)
+    await repo_files.write_repo_file(
+        provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(approved, indent=2) + "\n"
+    )
+    await git_ops.commit_paths(
+        provider, thread_id, [TECH_STACK_APPROVED_JSON_PATH], "ai-dev-workflow: tech stack startability rechecked"
+    )
+    return approved
+
+
 async def _settle_tech_stack(
-    thread_id: str, tech_stack: dict[str, Any], provider: SandboxProvider
+    thread_id: str, tech_stack: dict[str, Any], provider: SandboxProvider, state: "GraphState"
 ) -> dict[str, Any]:
     """Task 5 fix #1's shared merge-then-persist tail for resolve_tech_stack_submission's TWO
     settle-and-persist points (a cache hit, and fresh-extraction/extraction-failure-fallback):
@@ -855,6 +966,14 @@ async def _settle_tech_stack(
         logger.warning("config inventory scan failed for thread_id=%s", thread_id, exc_info=True)
         scanned_auth, scanned_keys = "none", []
     merged, _changed = _merge_config_signals(tech_stack, scanned_auth, scanned_keys)
+    # B2 (tech-stack startability pivot): brownfield only, and only ever runs once per repo -- this
+    # function only runs on the FIRST-ever approval (hydrate_tech_stack_from_repo_file
+    # short-circuits every later resume straight to the already-approved sidecar, per its own
+    # docstring), and a greenfield repo has no application code yet to boot
+    # (tech_stack_signals.is_greenfield_repo is exactly "app_discovery's scan found nothing").
+    if not tech_stack_signals.is_greenfield_repo(state):
+        probe = await probe_tech_stack_startability(provider, thread_id, (state.get("app_scan") or {}).get("candidates") or [])
+        merged.update(probe)
     await repo_files.write_repo_file(
         provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(merged, indent=2) + "\n"
     )
@@ -909,7 +1028,7 @@ async def resolve_tech_stack_submission(
     cached = _extract_cache_get(markdown)
     if cached is not None:
         logger.info("tech-stack extraction served from cache for thread_id=%s", thread_id)
-        return await _settle_tech_stack(thread_id, cached, provider)
+        return await _settle_tech_stack(thread_id, cached, provider, state)
 
     try:
         tech_stack = await _extract_tech_stack(
@@ -939,7 +1058,7 @@ async def resolve_tech_stack_submission(
             )
         tech_stack = _extraction_failed_tech_stack(markdown)
 
-    return await _settle_tech_stack(thread_id, tech_stack, provider)
+    return await _settle_tech_stack(thread_id, tech_stack, provider, state)
 
 
 # ── Ecosystem convention table ────────────────────────────────────────────────────────────────
@@ -1674,5 +1793,61 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     on_disk_f = json.loads(fake_provider_f.files[TECH_STACK_APPROVED_JSON_PATH])
     assert on_disk_f["conventions_applied"] == ["python"], "fix #3: conventions_applied must self-heal"
     assert "ruff.toml" in fake_provider_f.files and "mypy.ini" in fake_provider_f.files
+
+    # probe_tech_stack_startability, scenario G (B2 -- tech-stack startability pivot): dedups
+    # candidates by path, skips any with no start_command entirely (never counted as a boot
+    # failure -- same filter e2e_run_node itself applies before booting), and reports the FIRST
+    # failing candidate's reason while still recording every probed candidate's own result.
+    # Local import: e2e_nodes.py imports FROM this module at load time (see
+    # probe_tech_stack_startability's own docstring), same reason that function imports it lazily.
+    from . import e2e_nodes as _e2e_nodes_g
+
+    real_probe_candidate_boot = _e2e_nodes_g.probe_candidate_boot
+    boot_calls: list[str] = []
+
+    async def _fake_probe_candidate_boot(provider, thread_id, candidate, *, timeout_seconds):  # noqa: ANN001, ARG001
+        path = candidate.get("path")
+        boot_calls.append(path)
+        return (False, f"{path} never answered") if path == "apps/api" else (True, None)
+
+    _e2e_nodes_g.probe_candidate_boot = _fake_probe_candidate_boot
+    try:
+        # No candidate has a start_command at all -> not startable, nothing probed.
+        result_none = asyncio.run(probe_tech_stack_startability(None, "demo-thread-g", [
+            {"path": "apps/lib", "likely_class": "library"},
+        ]))
+        assert result_none == {
+            "startable": False,
+            "not_startable_reason": "no start command could be inferred for any discovered application",
+            "boot_evidence": [],
+        }
+        assert boot_calls == []
+
+        # Two marker-file duplicates for apps/web (dedup by path), apps/api (fails), apps/lib with
+        # no start_command (skipped, never probed, never counted as a failure).
+        candidates_g = [
+            {"path": "apps/web", "start_command": "npm run dev", "likely_class": "web"},
+            {"path": "apps/web", "start_command": "npm run dev", "likely_class": "web"},
+            {"path": "apps/api", "start_command": "dotnet run", "likely_class": "api"},
+            {"path": "apps/lib", "likely_class": "library"},
+        ]
+        result_g = asyncio.run(probe_tech_stack_startability(None, "demo-thread-g", candidates_g))
+        assert boot_calls == ["apps/web", "apps/api"], "must dedup by path and skip no-start_command candidates"
+        assert result_g["startable"] is False
+        assert result_g["not_startable_reason"] == "apps/api never answered"
+        assert [e["path"] for e in result_g["boot_evidence"]] == ["apps/web", "apps/api"]
+        assert result_g["boot_evidence"][0]["started"] is True and result_g["boot_evidence"][1]["started"] is False
+
+        # Every candidate boots -> startable, no reason.
+        boot_calls.clear()
+        result_g2 = asyncio.run(probe_tech_stack_startability(
+            None, "demo-thread-g2", [{"path": "apps/web", "start_command": "npm run dev"}]
+        ))
+        assert result_g2 == {
+            "startable": True, "not_startable_reason": None,
+            "boot_evidence": [{"candidate": "apps/web", "path": "apps/web", "started": True, "reason": None}],
+        }
+    finally:
+        _e2e_nodes_g.probe_candidate_boot = real_probe_candidate_boot
 
     print("preflight_nodes self-check: ok")

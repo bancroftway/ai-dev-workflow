@@ -16,6 +16,21 @@ EXIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("EXIT_MAX_CLARIFICATION_CYCLE
 # so this safety cap should rarely if ever trigger.
 TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFICATION_CYCLES", "2"))
 
+# preflight_nodes.py's brownfield startability probe (_settle_tech_stack's one-time boot check, and
+# sessions_api.py's "recheck-tech-stack-boot" action, which re-runs the same probe on demand):
+# bounds how long ONE app_discovery candidate gets to open its listening port before this repo is
+# declared not startable. Read by preflight_nodes.probe_tech_stack_startability, which hands this
+# straight to e2e_nodes.probe_candidate_boot's own timeout_seconds -- the same boot/readiness
+# mechanism e2e_run_node uses, just bounded tighter (see below). Too short false-flags a slow-
+# starting app (a cold `npm install`-triggered dev server, a .NET cold JIT) as non-startable,
+# which permanently disables e2e/App Health for a repo that's actually fine (until someone clicks
+# "recheck"); too long stalls the tech-stack gate -- and the on-demand recheck button -- per
+# candidate on a genuinely broken one. Deliberately its OWN, smaller knob rather than reusing
+# E2E_APP_READY_TIMEOUT_SECONDS: this probe boots one candidate in isolation, synchronously, in the
+# critical path of a human waiting on the Tech Stack tab, not inside e2e's own already-bounded
+# multi-service fix-cycle budget.
+AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS = int(os.environ.get("AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS", "45"))
+
 # graph.py's StageSpec.max_verify_cycles per stage: the deterministic-gate verify->draft retry
 # budget (independent of the *_MAX_CLARIFICATION_CYCLES pair above, which bounds the LLM's own
 # clarification loop). Deliberately SEVEN SEPARATE constants, not one shared cap: each stage's
