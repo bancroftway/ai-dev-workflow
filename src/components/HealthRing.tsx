@@ -39,11 +39,18 @@ export function HealthRing({
   baseline,
   comparable,
   size = 28,
+  ariaLabel,
+  title,
 }: {
   score: number;
   baseline?: number | null;
   comparable?: boolean;
   size?: number;
+  /** Overrides the generic "Health score N out of 100" -- used by MetricsBar's 3-way split
+   * (Code Health / App Health / Framework Effectiveness), each of which is NOT the legacy
+   * 9-subscore composite this default text describes. */
+  ariaLabel?: string;
+  title?: string;
 }) {
   const color = healthColor(score);
   return (
@@ -52,10 +59,10 @@ export function HealthRing({
       height={size}
       viewBox="0 0 36 36"
       role="img"
-      aria-label={`Health score ${score} out of 100`}
+      aria-label={ariaLabel ?? `Health score ${score} out of 100`}
       className="shrink-0"
     >
-      <title>{ringTitle(score, baseline, comparable)}</title>
+      <title>{title ?? ringTitle(score, baseline, comparable)}</title>
       {/* currentColor at low opacity: inherits the surrounding text color, so the track and
           numeral stay legible on dark surfaces too (hardcoded #e5e7eb was invisible there). */}
       <circle cx="18" cy="18" r="15.915" fill="none" stroke="currentColor" opacity="0.15" strokeWidth="3.5" />

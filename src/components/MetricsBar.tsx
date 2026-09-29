@@ -344,20 +344,54 @@ export function MetricsBar({
       />
     );
 
-    // The annular health ring leads the strip. Guarded on the SCORE (not just the summary):
-    // pre-v2 stored baselines can rehydrate with health_score null when nothing was measurable.
-    const healthRing = summary.health_score == null ? null : (
+    // Metrics Bar 3-way split (metrics_nodes.metrics_compute_node): Code Health (static analysis
+    // only, identical to the standalone Code Health Report), App Health (coverage + test pass
+    // rate), AI Dev Workflow Framework Effectiveness (AC Resolution % + a separate, non-blended
+    // productivity/effort-saved estimate). Each guarded on its own score, independently of the
+    // others and of the legacy composite health_score -- a pre-migration stored baseline or a
+    // scan that predates this split simply omits the rings it has no number for.
+    const codeHealthRing = summary.code_health_score == null ? null : (
       <HealthRing
-        key="health"
-        score={summary.health_score}
-        baseline={hasBaseline ? scan?.baseline_summary?.health_score : null}
-        comparable={summary.health_score_comparable}
+        key="code-health"
+        score={summary.code_health_score}
+        baseline={hasBaseline ? scan?.baseline_summary?.code_health_score : null}
+        ariaLabel={`Code Health score ${summary.code_health_score} out of 100`}
+        title="Code Health — static analysis only (security, dependencies, complexity, duplication, maintainability). No test coverage or live-app (DAST) scanning. Identical to the standalone Code Health Report for this commit."
       />
+    );
+    const appHealthRing = summary.app_health_score == null ? null : (
+      <HealthRing
+        key="app-health"
+        score={summary.app_health_score}
+        baseline={hasBaseline ? scan?.baseline_summary?.app_health_score : null}
+        ariaLabel={`App Health score ${summary.app_health_score} out of 100`}
+        title="App Health — the health of the running app: test coverage and percent of tests passing, blended. DAST scanning is not yet part of this score."
+      />
+    );
+    const frameworkEffectiveness = summary.framework_effectiveness_score == null ? null : (
+      <span key="framework-effectiveness" className="flex items-center gap-1">
+        <HealthRing
+          score={summary.framework_effectiveness_score}
+          baseline={hasBaseline ? scan?.baseline_summary?.framework_effectiveness_score : null}
+          ariaLabel={`AI Dev Workflow Framework Effectiveness score ${summary.framework_effectiveness_score} out of 100`}
+          title="AI Dev Workflow Framework Effectiveness — percent of acceptance criteria fully resolved by the pipeline. See the exit report for the full traceability matrix."
+        />
+        {summary.estimated_hours_saved != null && (
+          <span
+            className="text-xs text-neutral-500"
+            title="Estimated engineering hours saved (Capability-Based Lifecycle Benchmarking) — an informational estimate, not part of the score above. See the exit report for the formula and this run's inputs."
+          >
+            ~{summary.estimated_hours_saved}h
+          </span>
+        )}
+      </span>
     );
 
     chips = (
       <>
-        {healthRing}
+        {codeHealthRing}
+        {appHealthRing}
+        {frameworkEffectiveness}
         {security}
         {maintainability}
         {coverage}

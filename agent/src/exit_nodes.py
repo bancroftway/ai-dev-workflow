@@ -17,7 +17,7 @@ import shlex
 from datetime import datetime, timezone
 from typing import Any
 
-from . import approvals, chat_model, git_ops, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
+from . import approvals, chat_model, git_ops, metrics_nodes, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
 from . import config as workflow_config
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
@@ -746,6 +746,65 @@ def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[
     return lines
 
 
+def _render_score_explanations(metrics_summary: dict[str, Any] | None) -> list[str]:
+    """Every number on the split Metrics Bar (Code Health / App Health / AI Dev Workflow Framework
+    Effectiveness) gets a matching 'how we got this' block here -- no bar number without a paper
+    trail. Pure rendering: every value printed already exists in metrics_nodes.py's computations
+    (metrics_compute_node), nothing is recomputed here."""
+    metrics_summary = metrics_summary or {}
+    lines = ["### How these scores were calculated", ""]
+
+    code_health = metrics_summary.get("code_health_score")
+    subscores = metrics_summary.get("code_health_subscores") or {}
+    subscore_str = ", ".join(f"{k}={v}" for k, v in sorted(subscores.items()) if v is not None)
+    lines.append(
+        f"- **Code Health ({code_health if code_health is not None else '--'})**: static analysis only "
+        "(security, dependencies, complexity, duplication, maintainability -- the same tool set the "
+        "standalone Code Health Report runs, no coverage or live-app measurement). Subscores: "
+        + (subscore_str or "not measured this run.")
+    )
+
+    app_health = metrics_summary.get("app_health_score")
+    app_inputs = metrics_summary.get("app_health_inputs") or {}
+    cov_frac, pass_frac = app_inputs.get("coverage_fraction"), app_inputs.get("pass_rate_fraction")
+    lines.append(
+        f"- **App Health ({app_health if app_health is not None else '--'})**: blend of test coverage "
+        f"({f'{cov_frac * 100:.1f}%' if cov_frac is not None else 'unmeasured'}) and whole-suite test pass rate "
+        f"({f'{pass_frac * 100:.1f}%' if pass_frac is not None else 'unmeasured'}), weighted "
+        f"{workflow_config.AIDW_APP_HEALTH_COVERAGE_WEIGHT}/{workflow_config.AIDW_APP_HEALTH_PASS_RATE_WEIGHT}. "
+        "DAST scanning is not yet part of this score."
+    )
+
+    ac_resolution = metrics_summary.get("ac_resolution") or {}
+    resolution_line = (
+        f"- **AI Dev Workflow Framework Effectiveness -- AC Resolution ({ac_resolution.get('score', '--')}%)**: "
+        f"{ac_resolution.get('resolved', 0)} of {ac_resolution.get('total', 0)} ACs resolved "
+        f"({ac_resolution.get('deferred_excluded', 0)} deferred-and-never-coded, excluded from the denominator)."
+    )
+    if ac_resolution.get("deferred_after_coding"):
+        resolution_line += (
+            f" **{ac_resolution['deferred_after_coding']} AC(s) were deferred AFTER coding started -- still "
+            "counted as unresolved** (a late deferral cannot remove an AC from the score for free)."
+        )
+    lines.append(resolution_line)
+
+    productivity = metrics_summary.get("productivity_estimate") or {}
+    if productivity:
+        lines.append(
+            "- **AI Dev Workflow Framework Effectiveness -- Productivity / Effort-Saved Estimate "
+            f"(~{productivity.get('estimated_hours_saved', '--')} hours)**: Capability-Based Lifecycle "
+            f"Benchmarking -- sizing: {productivity.get('added_lines', 0)} lines changed this ticket; "
+            f"effort translation: mean cyclomatic complexity {productivity.get('mean_ccn', '--')} applies a "
+            f"{productivity.get('complexity_multiplier', 1.0)}x hours-per-line multiplier; coverage discount: "
+            f"the AC Resolution score above ({productivity.get('ac_resolution_discount', '--')}%) stands in for "
+            "semantic AC-match scoring, since resolution here is already deterministic, not text-similarity-"
+            f"based; less a flat {productivity.get('review_overhead_fraction', 0) * 100:.1f}% review-overhead "
+            "deduction for human review of AI-generated code."
+        )
+    lines.append("")
+    return lines
+
+
 def _render_history_sections(
     *,
     files_changed_stat: str,
@@ -761,6 +820,7 @@ def _render_history_sections(
     carried_over: list[str] | None = None,
     fallback_metrics: dict[str, Any] | None = None,
     remediation: dict[str, Any] | None = None,
+    traceability_matrix_markdown: str | None = None,
 ) -> str:
     """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
     markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
@@ -811,6 +871,7 @@ def _render_history_sections(
             lines.append("Not recorded for this run.")
     else:
         lines.append("Not recorded for this run.")
+    lines += _render_score_explanations(metrics_summary)
     e2e = e2e or {}
     e2e_status = e2e.get("status") or "not run"
     e2e_line = f"- **E2E**: {e2e_status}"
@@ -874,6 +935,8 @@ def _render_history_sections(
     # evaluated" must be stated facts with reasons, never silently missing headings.
     lines += _render_us_ac_section(us_ac_rows, carried_over, run_id)
     lines += _render_eval_section(metrics_summary)
+    if traceability_matrix_markdown:
+        lines += ["", traceability_matrix_markdown.rstrip("\n"), ""]
     lines += _render_supply_chain_section(metrics_summary)
     lines += _render_skills_section(stages)
 
@@ -1557,6 +1620,26 @@ async def exit_finalize_node(
         own_ac_ids = spec_ledger.own_ac_ids_from_specification(own_spec)
         us_ac_rows = _us_ac_rows(ledger_entries, own_us_ids, own_ac_ids, run_id)
         carried_over = _undelivered_ac_ids(ledger_entries)
+
+        # Traceability matrix, rebuilt here (not reused from metrics-report's own committed
+        # traceability-matrix.md) because stamp_resolution just ran a few lines above -- an AC
+        # resolved by THIS run's own exit gate must show as resolved in the SAME run's exit report,
+        # not one run stale. Best-effort: a sandbox hiccup degrades this section, never the report.
+        traceability_matrix_markdown = None
+        try:
+            sha_result = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD 2>/dev/null || true")
+            commit_sha = (sha_result.stdout or "").strip() or None
+            traceability_ac_resolution = spec_ledger.compute_ac_resolution(ledger_entries)
+            traceability_rows = metrics_nodes._traceability_rows(
+                ledger_entries, metrics_summary.get("ac_execution"),
+                (session_row or {}).get("owner"), (session_row or {}).get("repo"), commit_sha,
+            )
+            traceability_matrix_markdown = metrics_nodes._render_traceability_matrix(
+                traceability_rows, traceability_ac_resolution
+            )
+        except Exception:  # noqa: BLE001 -- degrade this section, never abort the report
+            logger.warning("exit finalize: traceability matrix build failed for thread_id=%s", thread_id, exc_info=True)
+
         snapshot_path = f"{HISTORY_DIR}/{run_id}-ledger-snapshot.json"
         prior_snapshot = await _find_prior_ledger_snapshot(provider, thread_id, run_id)
         diff = _diff_ledger(prior_snapshot, ledger_entries)
@@ -1699,6 +1782,7 @@ async def exit_finalize_node(
                     carried_over=carried_over,
                     fallback_metrics=fallback_metrics,
                     remediation=remediation_report,
+                    traceability_matrix_markdown=traceability_matrix_markdown,
                 )
                 + ("\n" + failure_section if failure_section else "")
                 + ("\n" + divergence_section if divergence_section else "")
@@ -1930,6 +2014,34 @@ def _demo() -> None:
         screenshots=[], run_id="r1", e2e={"status": "passed", "wireframe_coverage_total": None},
     )
     assert "Wireframe coverage" not in not_applicable, not_applicable
+
+    # --- score explanations: every Metrics Bar number gets a "how we got this" line -------------
+    score_metrics_fixture = {
+        "code_health_score": 88, "code_health_subscores": {"security": 90.0, "complexity": None},
+        "app_health_score": 76.5, "app_health_inputs": {"coverage_fraction": 0.9, "pass_rate_fraction": 0.63},
+        "ac_resolution": {"score": 80.0, "resolved": 4, "total": 5, "deferred_excluded": 1, "deferred_after_coding": 1},
+        "productivity_estimate": {
+            "added_lines": 300, "mean_ccn": 4.2, "complexity_multiplier": 1.0,
+            "ac_resolution_discount": 80.0, "review_overhead_fraction": 0.175, "estimated_hours_saved": 4.2,
+        },
+    }
+    explained = "\n".join(_render_score_explanations(score_metrics_fixture))
+    assert "Code Health (88)" in explained and "security=90.0" in explained and "complexity=" not in explained
+    assert "App Health (76.5)" in explained and "90.0%" in explained and "63.0%" in explained
+    assert "AC Resolution (80.0%)" in explained and "4 of 5 ACs resolved" in explained
+    assert "1 AC(s) were deferred AFTER coding" in explained
+    assert "~4.2 hours" in explained and "Capability-Based Lifecycle Benchmarking" in explained
+    assert _render_score_explanations(None)[0] == "### How these scores were calculated", "must never raise on absent metrics_summary"
+
+    with_matrix = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,
+        screenshots=[], run_id="r1", traceability_matrix_markdown="# Acceptance Criteria Traceability Matrix\n\n| AC |\n|---|\n",
+    )
+    assert "# Acceptance Criteria Traceability Matrix" in with_matrix
+    without_matrix = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None, screenshots=[], run_id="r1",
+    )
+    assert "Traceability Matrix" not in without_matrix
 
     # --- scan sections: score table, findings dispositions, tool table --------------------------
     scan_fixture = {

@@ -2248,6 +2248,10 @@ STAGES: list[StageSpec] = [
         draft_example=AC_TO_TESTS_DRAFT_EXAMPLE,
         audit_example=AC_TO_TESTS_AUDIT_EXAMPLE,
         draft_prompt_context_from_repo_file=spec_ledger.hydrate_ac_to_tests_ticket_mode_context,
+        # Traceability-matrix plan: records each live AC's test_kind/categories/ui_relevant so the
+        # exit report's Related Tests sub-table can label tests without re-deriving this stage's
+        # own coverage_plan/test_files from scratch.
+        post_approve_hook=spec_ledger.stamp_test_plan_hook,
         # Tuning history/rationale lives on the constant itself (config.py's
         # AC_TO_TESTS_MAX_VERIFY_CYCLES).
         max_verify_cycles=workflow_config.AC_TO_TESTS_MAX_VERIFY_CYCLES,

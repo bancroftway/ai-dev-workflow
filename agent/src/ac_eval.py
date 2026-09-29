@@ -157,6 +157,15 @@ def execution_summary(ac_ids: list[str], attempts: list[dict[str, str]]) -> dict
         }
 
     flaky_ids = sorted(ac_id for ac_id, row in per_ac.items() if row["flaky"])
+    # Whole-suite pass rate (traceability-matrix plan, App Health score) -- deliberately ALL tests
+    # in the LAST attempt, not just ones `attribute_outcomes` could tie to an AC id: `per_ac` above
+    # only sees AC-attributed tests, but a repo's suite (infra tests, pre-existing tests never
+    # bracket-tagged) is bigger than that. "Last attempt" mirrors parse_playwright_json's own
+    # "judged on its LAST result only" convention -- a retry that eventually passes should count as
+    # passing, not average in its earlier failures.
+    last_attempt = attempts[-1]
+    overall_total = len(last_attempt)
+    overall_passed = sum(1 for outcome in last_attempt.values() if outcome == "pass")
     return {
         "status": "evaluated",
         "attempts": len(attempts),
@@ -168,6 +177,11 @@ def execution_summary(ac_ids: list[str], attempts: list[dict[str, str]]) -> dict
         # verified -- it is a criterion whose test sometimes agrees with it.
         "solidly_verified": len(solidly_verified),
         "per_ac": per_ac,
+        "overall_pass_rate": {
+            "passed": overall_passed,
+            "total": overall_total,
+            "pct": round(100.0 * overall_passed / overall_total, 1) if overall_total else None,
+        },
     }
 
 
@@ -448,6 +462,12 @@ def _demo() -> None:
     # Criteria no test touched are not_run, never counted as passing.
     assert summary["per_ac"]["US-0003.2"]["status"] == "not_run"
     assert summary["not_run"] == 2, summary  # US-0001.2 and US-0003.2
+
+    # App Health's whole-suite pass rate: judged on the LAST attempt only (both tests pass there,
+    # even though the first attempt's flaky test failed) -- a retry that eventually passes counts.
+    assert summary["overall_pass_rate"] == {"passed": 2, "total": 2, "pct": 100.0}
+    mixed_last_attempt = execution_summary(ac_ids, [*attempts, {"Increment_US-0001.1_Works": "fail", "US-0002.1 thing": "pass"}])
+    assert mixed_last_attempt["overall_pass_rate"] == {"passed": 1, "total": 2, "pct": 50.0}
 
     # "Could not measure" is never a zero.
     assert execution_summary(ac_ids, []) == {"status": "not_evaluated", "reason": "no_attempts_recorded"}

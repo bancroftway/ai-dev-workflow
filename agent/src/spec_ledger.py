@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
 # What a REAL ledger id looks like. The renumbering guards below only fire when the draft's own
@@ -340,8 +341,17 @@ def sync_ledger(
     source_ticket_id: str | None = None,
     bug_affected_ac_ids: list[str] | None = None,
     fully_reviewed: bool | None = None,
+    now_iso: str | None = None,
 ) -> LedgerSyncResult:
     """The deterministic core of P2's ledger-sync gate.
+
+    `now_iso` (traceability-matrix plan): real-date twin of `first_seen_run_id`/
+    `last_revised_run_id` -- a run id alone can't render a human-readable "changed on" date. Rather
+    than scatter a timestamp assignment next to every one of this function's own `_run_id` writes
+    (this function has many), it is stamped once at the bottom, on every entry whose `_run_id`
+    field this SAME call just set to `run_id` -- provably equivalent since nothing else in this
+    function ever writes `run_id` into those fields. Defaults to "now" so existing callers that
+    don't pass it keep working unchanged.
 
     Every user story/AC in `draft_user_stories` (schemas.Specification.user_stories, already
     .model_dump()'d) must either cite an existing, non-retired id it's revising via its own
@@ -733,7 +743,22 @@ def sync_ledger(
                 updated_entries=entries,
             )
 
+    _stamp_change_dates(updated, run_id, now_iso)
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
+
+
+def _stamp_change_dates(entries: list[dict[str, Any]], run_id: str, now_iso: str | None) -> None:
+    """Real-date twin of first_seen_run_id/last_revised_run_id, stamped once per sync call rather
+    than at each of the caller's many individual `_run_id` writes -- see sync_ledger's/
+    sync_plan_ledger's own `now_iso` docstring. `first_seen_at` is set once and never overwritten
+    (a later revision must not erase the original creation date); `last_revised_at` is refreshed on
+    every call that actually bumped `last_revised_run_id` to this run_id."""
+    stamp = now_iso or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for entry in entries:
+        if entry.get("first_seen_run_id") == run_id and "first_seen_at" not in entry:
+            entry["first_seen_at"] = stamp
+        if entry.get("last_revised_run_id") == run_id:
+            entry["last_revised_at"] = stamp
 
 
 def sync_plan_ledger(
@@ -742,8 +767,12 @@ def sync_plan_ledger(
     run_id: str,
     retired_step_ids: list[str] | None = None,
     fully_reviewed: bool | None = None,
+    now_iso: str | None = None,
 ) -> LedgerSyncResult:
-    """File-based-editing plan, Part 2 sect. 5: plan's completeness gate, sharing sync_ledger's
+    """`now_iso`: see sync_ledger's own docstring -- same _stamp_change_dates convention, applied
+    to plan_step entries' first_seen_run_id/last_revised_run_id here too.
+
+    File-based-editing plan, Part 2 sect. 5: plan's completeness gate, sharing sync_ledger's
     same ledger FILE (EntryKind="plan_step") rather than a second, independently-evolving
     implementation -- reuses load_ledger/save_ledger/_find unchanged.
 
@@ -878,6 +907,7 @@ def sync_plan_ledger(
                 updated_entries=entries,
             )
 
+    _stamp_change_dates(updated, run_id, now_iso)
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
 
 
@@ -1172,6 +1202,125 @@ async def stamp_plan_links_hook(
         await git_ops.commit_paths(
             provider, thread_id, [LEDGER_PATH], "ai-dev-workflow: plan approval -- plan-step links recorded"
         )
+
+
+def append_files(
+    entries: list[dict[str, Any]], changes_by_ac_id: dict[str, list[dict[str, str]]], run_id: str, date: str
+) -> bool:
+    """Mutates `entries` with append-only per-AC file-change history (`files` field); returns
+    whether anything changed. Pure.
+
+    Called from exit_nodes.exit_finalize_node, right before stamp_resolution, over every
+    ChangedFile.related_ac_ids collected from this run's coding-stage approved content and this
+    run's e2e-fix lap diffs. `files` is append-only across RUNS (unlike TRACKING_FIELDS, which
+    stamp-once) because a ticket's traceability matrix must show every file ever touched for an AC,
+    across however many runs/resumes it took -- but idempotent WITHIN one run_id: any existing rows
+    already tagged with THIS run_id are dropped before the fresh ones are appended, so re-running
+    the same interrupted run's collection (a resume re-walks the same approved-content files) never
+    duplicates that run's own contribution. A genuinely new attempt mints a fresh run_id (graph.py),
+    so its rows never collide with an earlier attempt's history.
+    """
+    changed = False
+    for ac_id, changes in changes_by_ac_id.items():
+        entry = _find(entries, ac_id)
+        if entry is None or entry.get("kind") != "acceptance_criterion":
+            continue
+        existing = [f for f in (entry.get("files") or []) if f.get("run_id") != run_id]
+        fresh = [
+            {"path": c["path"], "change_kind": c.get("change_kind", "modified"), "run_id": run_id, "date": date}
+            for c in changes
+            if c.get("path")
+        ]
+        new_files = existing + fresh
+        if new_files != (entry.get("files") or []):
+            entry["files"] = new_files
+            changed = True
+    return changed
+
+
+async def stamp_test_plan_hook(
+    thread_id: str, content: dict[str, Any], state: "GraphState", provider: SandboxProvider
+) -> None:
+    """StageSpec.post_approve_hook for the ac-to-tests stage: records each live AC's test-plan
+    metadata (`ui_relevant`/`categories`/`rationale` from `coverage_plan`, plus a per-test-name kind
+    map from `test_files`) so the traceability matrix can label each of an AC's tests without
+    guessing. `content` is `AcceptanceCriteriaTestSuite.model_dump()` (content_field="test_suite").
+
+    `per_test_kind` is built from `test_files[].kind`/`test_names`, NOT `coverage_plan[].test_kind`
+    -- one AC can legitimately need both unit and e2e tests, so a single AC-level kind would
+    mislabel whichever test wasn't that kind. `test_files` is per-GENERATED-FILE, so this is the
+    accurate join. Overwrite semantics (like stamp_plan_links_hook), idempotent under resume.
+    """
+    del state
+    per_test_kind: dict[str, str] = {}
+    for f in content.get("test_files") or []:
+        kind = f.get("kind")
+        for name in f.get("test_names") or []:
+            if kind:
+                per_test_kind[name] = kind
+    by_ac: dict[str, dict[str, Any]] = {}
+    for plan_entry in content.get("coverage_plan") or []:
+        ac_id = plan_entry.get("ac_id")
+        if not ac_id:
+            continue
+        by_ac[ac_id] = {
+            "ui_relevant": bool(plan_entry.get("ui_relevant")),
+            "categories": list(plan_entry.get("categories") or []),
+            "rationale": plan_entry.get("rationale") or "",
+        }
+    entries = await load_ledger(provider, thread_id)
+    changed = False
+    for entry in entries:
+        if entry.get("kind") != "acceptance_criterion" or entry.get("status") not in ("active", "revised"):
+            continue
+        plan = by_ac.get(entry["id"])
+        if plan is None:
+            continue
+        relevant_kinds = {name: kind for name, kind in per_test_kind.items() if name in (entry.get("test_ids") or [])}
+        new_test_plan = {**plan, "per_test_kind": relevant_kinds}
+        if entry.get("test_plan") != new_test_plan:
+            entry["test_plan"] = new_test_plan
+            changed = True
+    if changed:
+        await save_ledger(provider, thread_id, entries)
+        from . import git_ops
+
+        await git_ops.commit_paths(
+            provider, thread_id, [LEDGER_PATH], "ai-dev-workflow: ac-to-tests approval -- test plan recorded"
+        )
+
+
+def compute_ac_resolution(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Traceability-matrix plan §4: 'AI Dev Workflow Framework Effectiveness' AC Resolution score.
+    Pure, read-only -- called from metrics_nodes.metrics_compute_node with whatever `load_ledger`
+    returns.
+
+    resolved / total * 100, where the denominator excludes a `status == "deferred"` AC (ledger
+    status, not a boolean field -- sync_ledger writes "deferred" as the entry's own `status`, same
+    as "active"/"revised"/"retired") ONLY when it was never actually attempted (no `coded_run_id`).
+    Anti-gaming fix: an AC that already has real coding work attached (stamped while it was still
+    active/revised) and gets deferred afterward keeps that `coded_run_id` (deferral doesn't clear
+    TRACKING_FIELDS -- only a genuine reword does, via apply_tracking_resets_hook), so it still
+    counts as unresolved here; flipping status to "deferred" late can't make a struggling AC
+    disappear from the score for free. `deferred_after_coding` surfaces that suspicious-timing count
+    for the exit report's score-explanation section even though it's already counted as unresolved
+    (never silently enforced).
+    """
+    acs = [e for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") != "retired"]
+    is_deferred = lambda e: e.get("status") == "deferred"  # noqa: E731
+    deferred_after_coding = sum(1 for e in acs if is_deferred(e) and e.get("coded_run_id"))
+    deferred_excluded = sum(1 for e in acs if is_deferred(e) and not e.get("coded_run_id"))
+    counted = [e for e in acs if not (is_deferred(e) and not e.get("coded_run_id"))]
+    resolved = sum(1 for e in counted if e.get("resolved_at"))
+    total = len(counted)
+    score = round(100.0 * resolved / total, 1) if total else 0.0
+    return {
+        "resolved": resolved,
+        "total": total,
+        "deferred_excluded": deferred_excluded,
+        "deferred_after_coding": deferred_after_coding,
+        "score": score,
+    }
 
 
 def _demo() -> None:
@@ -1775,6 +1924,84 @@ def _demo() -> None:
     assert check_narrative_format([project_specific_role]) == [], (
         "a project-specific component name as role is a documented gap, not caught by the deny-list"
     )
+
+    # append_files: idempotent replace-on-resume, additive across distinct run_ids.
+    ac_for_files = {"id": "US-0010.1", "kind": "acceptance_criterion", "status": "active"}
+    files_entries = [dict(ac_for_files)]
+    changed = append_files(files_entries, {"US-0010.1": [{"path": "a.py", "change_kind": "created"}]}, "run-1", "2026-01-01")
+    assert changed and files_entries[0]["files"] == [
+        {"path": "a.py", "change_kind": "created", "run_id": "run-1", "date": "2026-01-01"}
+    ]
+    # Same run_id re-collected (a resume) replaces, does not duplicate, its own contribution.
+    changed_again = append_files(files_entries, {"US-0010.1": [{"path": "a.py", "change_kind": "modified"}]}, "run-1", "2026-01-02")
+    assert changed_again and len(files_entries[0]["files"]) == 1 and files_entries[0]["files"][0]["change_kind"] == "modified"
+    # A genuinely new run_id appends alongside, never overwrites, the earlier run's history.
+    append_files(files_entries, {"US-0010.1": [{"path": "b.py", "change_kind": "created"}]}, "run-2", "2026-02-01")
+    assert len(files_entries[0]["files"]) == 2, files_entries[0]["files"]
+
+    # _stamp_change_dates: first_seen_at set once, last_revised_at refreshed on this run's own bump.
+    dated_entries = [{"id": "US-0011", "kind": "user_story", "status": "active", "first_seen_run_id": "run-9", "last_revised_run_id": "run-9"}]
+    _stamp_change_dates(dated_entries, "run-9", "2026-03-01")
+    assert dated_entries[0]["first_seen_at"] == "2026-03-01" and dated_entries[0]["last_revised_at"] == "2026-03-01"
+    dated_entries[0]["last_revised_run_id"] = "run-10"
+    _stamp_change_dates(dated_entries, "run-10", "2026-04-01")
+    assert dated_entries[0]["first_seen_at"] == "2026-03-01", "creation date must never be overwritten by a later revision"
+    assert dated_entries[0]["last_revised_at"] == "2026-04-01"
+
+    # stamp_test_plan_hook's per_test_kind join: test_files[].kind is per-FILE, not coverage_plan's
+    # AC-level scalar -- an AC with both a unit and an e2e test must label each row correctly.
+    mixed_test_suite = {
+        "coverage_plan": [{"ac_id": "US-0012.1", "us_id": "US-0012", "ui_relevant": True, "categories": ["happy_path"], "rationale": "r"}],
+        "test_files": [
+            {"path": "t1.py", "kind": "unit", "test_names": ["[US-0012.1] a"]},
+            {"path": "t2.spec.ts", "kind": "e2e_playwright_skeleton", "test_names": ["[US-0012.1] b"]},
+        ],
+    }
+    mixed_ac = {"id": "US-0012.1", "kind": "acceptance_criterion", "status": "active", "test_ids": ["[US-0012.1] a", "[US-0012.1] b"]}
+
+    class _FakeProviderForTestPlan:
+        def __init__(self) -> None:
+            self._doc = json.dumps({"schema_version": 1, "entries": [mixed_ac]})
+
+        async def exec_in_sandbox(self, *_a, **_k):  # pragma: no cover -- unused by load/save here
+            raise AssertionError("not expected")
+
+    import asyncio
+
+    async def _run_stamp_test_plan() -> list[dict[str, Any]]:
+        provider = _FakeProviderForTestPlan()
+        original_read = repo_files.read_repo_file
+        original_write = repo_files.write_repo_file
+        state_holder = {"raw": provider._doc}
+
+        async def fake_read(_provider, _thread_id, path):
+            return state_holder["raw"] if path == LEDGER_PATH else None
+
+        async def fake_write(_provider, _thread_id, path, content):
+            if path == LEDGER_PATH:
+                state_holder["raw"] = content
+
+        async def fake_commit(*_a, **_k):
+            return None
+
+        repo_files.read_repo_file = fake_read
+        repo_files.write_repo_file = fake_write
+        from . import git_ops as _git_ops
+
+        original_commit = _git_ops.commit_paths
+        _git_ops.commit_paths = fake_commit
+        try:
+            await stamp_test_plan_hook("thread-1", mixed_test_suite, {}, provider)
+            return json.loads(state_holder["raw"])["entries"]
+        finally:
+            repo_files.read_repo_file = original_read
+            repo_files.write_repo_file = original_write
+            _git_ops.commit_paths = original_commit
+
+    stamped_entries = asyncio.run(_run_stamp_test_plan())
+    stamped_ac = stamped_entries[0]
+    assert stamped_ac["test_plan"]["per_test_kind"] == {"[US-0012.1] a": "unit", "[US-0012.1] b": "e2e_playwright_skeleton"}, stamped_ac
+    assert stamped_ac["test_plan"]["ui_relevant"] is True and stamped_ac["test_plan"]["categories"] == ["happy_path"]
 
     print("spec_ledger self-check: ok")
 

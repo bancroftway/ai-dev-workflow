@@ -234,6 +234,21 @@ export interface ScanSummary {
   gating_count: number;
   severity_floor: string;
   measures?: ScanMeasures;
+
+  // --- Metrics Bar 3-way split (metrics_nodes.metrics_compute_node) ---------------------------
+  /** Static analysis only -- provably identical to the standalone Code Health Report for the same
+   * commit (repo_scan.static_only_summary), no coverage/live-app measurement. */
+  code_health_score?: number | null;
+  code_health_subscores?: Record<string, number | null>;
+  /** Coverage % + whole-suite test pass rate, blended (repo_scan.app_health_score). DAST folds in later. */
+  app_health_score?: number | null;
+  app_health_inputs?: { coverage_fraction: number | null; pass_rate_fraction: number | null };
+  /** % of acceptance criteria fully resolved (spec_ledger.compute_ac_resolution) -- the "AI Dev
+   * Workflow Framework Effectiveness" ring's headline number. */
+  framework_effectiveness_score?: number | null;
+  /** Capability-Based Lifecycle Benchmarking estimate, shown alongside (not blended into)
+   * framework_effectiveness_score -- see exit_nodes._render_score_explanations for the formula. */
+  estimated_hours_saved?: number | null;
 }
 
 /** repo_scan.py's `_assemble_metrics()` churn x complexity join -- computed whenever a scan

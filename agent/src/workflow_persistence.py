@@ -104,6 +104,21 @@ TECH_STACK_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'draft.json'
 # committed to the branch, and carried on the workspace volume across container swaps.
 MINIMAL_CODE_TO_GREEN_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('minimal-code-to-green', 'draft.json')}"
 
+# Same "one truth, derived from the numbering" reasoning -- metrics_nodes.py's traceability-matrix
+# file-attribution collection reads this to recover the coding stage's own self-reported
+# changed_files/related_ac_ids after approval, rather than re-deriving file->AC attribution from
+# scratch.
+MINIMAL_CODE_TO_GREEN_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('minimal-code-to-green', 'approved.json')}"
+
+# Traceability-matrix plan: e2e-fix is a free-form agentic turn (model.ainvoke, no structured
+# response schema like mctg's ChangedFile) -- there is no field to add related_ac_ids to. Instead,
+# e2e_nodes.e2e_fix_node attributes each lap's changed files to whichever AC(s) that lap's own
+# failing tests named (test_results.attributed_ac_ids), appending one JSON line per lap here.
+# metrics_nodes.py reads it to fold e2e-fix's contribution into the ledger's per-AC `files` history
+# alongside mctg's. Lives here (not e2e_nodes.py) so metrics_nodes.py can read the path without
+# importing e2e_nodes.py, which would cycle back through e2e_nodes -> exit_nodes -> metrics_nodes.
+E2E_FIX_FILE_ATTRIBUTION_PATH = f"{WORKFLOW_DIR}/e2e-fix-file-attribution.jsonl"
+
 # Same "one truth, derived from the numbering" reasoning as the tech-stack constants above --
 # graph.py's plan-stage ticket-mode hydrate hook (Task 7a) reads this to detect an earlier ticket's
 # approved Implementation Plan for this same project, independent of whatever this run's own

@@ -2252,6 +2252,36 @@ def make_e2e_route_after_run():
     return route
 
 
+_NAME_STATUS_TO_KIND = {"A": "created", "D": "deleted"}
+
+
+def _e2e_fix_related_ac_ids(failed_tests: list[dict[str, Any]] | None) -> list[str]:
+    """Pure: the AC id(s) named by this lap's own failing tests -- see E2E_FIX_FILE_ATTRIBUTION_PATH's
+    comment for why this (not an LLM self-report) is this stage's file-to-AC attribution signal."""
+    return sorted({
+        ac_id
+        for test_name in {t.get("title", "") for t in (failed_tests or [])}
+        for ac_id in test_results.attributed_ac_ids(test_name)[0]
+    })
+
+
+def _parse_name_status_diff(raw: str) -> list[dict[str, str]]:
+    """Pure: `git diff --name-status` output -> [{path, change_kind}], change_kind in
+    created/deleted/modified. A rename row is 3 tab-separated fields (`R100\told\tnew`), not 2 --
+    splitting on the FIRST tab only would leave `old\tnew` glued together as one garbled path, so
+    this splits on every tab and always takes the LAST field, which is the path git actually left on
+    disk for both a normal 2-field row and a 3-field rename row alike. Falls through to 'modified'
+    for a rename's 'R###'-prefixed status -- the file's CONTENT wasn't necessarily touched, but it
+    is still real evidence something in this AC's area changed."""
+    changed: list[dict[str, str]] = []
+    for row in raw.splitlines():
+        parts = row.split("\t")
+        if len(parts) < 2 or not parts[-1].strip():
+            continue
+        changed.append({"path": parts[-1].strip(), "change_kind": _NAME_STATUS_TO_KIND.get(parts[0][:1], "modified")})
+    return changed
+
+
 async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     e2e = dict(state.get("e2e") or default_e2e_state())
@@ -2259,6 +2289,8 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         return {"e2e": e2e}
 
     provider = get_sandbox_provider()
+    pre_fix_sha_result = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD 2>/dev/null || true")
+    pre_fix_sha = (pre_fix_sha_result.stdout or "").strip() or None
     log_tail = truncate_middle(
         await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
         workflow_config.E2E_FIX_APP_LOG_HEAD_CHARS,
@@ -2315,6 +2347,29 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     if timed_out:
         ledger_entry["timeout"] = timed_out
     await repo_files.append_ledger_entry(provider, thread_id, ledger_entry)
+
+    # File-to-AC attribution (see E2E_FIX_FILE_ATTRIBUTION_PATH's own comment): best-effort, never
+    # blocks the fix cycle -- a sandbox hiccup here must degrade the traceability matrix's file
+    # list, not this lap's actual fix.
+    if pre_fix_sha and not timed_out:
+        try:
+            related_ac_ids = _e2e_fix_related_ac_ids(e2e.get("failed_tests"))
+            if related_ac_ids:
+                status_result = await provider.exec_in_sandbox(
+                    thread_id, f"git diff --name-status {pre_fix_sha} -- . ':!.ai-dev-workflow'"
+                )
+                changed_files = _parse_name_status_diff(status_result.stdout or "")
+                if changed_files:
+                    existing = await repo_files.read_repo_file(
+                        provider, thread_id, workflow_persistence.E2E_FIX_FILE_ATTRIBUTION_PATH
+                    ) or ""
+                    new_line = json.dumps({"changed_files": changed_files, "related_ac_ids": related_ac_ids})
+                    await repo_files.write_repo_file(
+                        provider, thread_id, workflow_persistence.E2E_FIX_FILE_ATTRIBUTION_PATH, existing + new_line + "\n"
+                    )
+        except Exception:  # noqa: BLE001 -- degrade the traceability matrix's file list, never this fix lap
+            logger.warning("e2e fix: file-to-AC attribution failed for thread_id=%s", thread_id, exc_info=True)
+
     await git_ops.commit_all(provider, thread_id, "ai-dev-workflow: e2e fix cycle")
     return {"e2e": e2e}
 
@@ -2837,6 +2892,20 @@ def _demo() -> None:
         assert cached["proven_api_routes"] == []
     finally:
         workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = _orig_reuse_flag
+
+    # --- traceability-matrix plan: e2e-fix's mechanical file-to-AC attribution -------------------
+    assert _e2e_fix_related_ac_ids([{"title": "US-0001.1 shows error"}, {"title": "smoke test"}]) == ["US-0001.1"]
+    assert _e2e_fix_related_ac_ids([]) == []
+    assert _e2e_fix_related_ac_ids(None) == []
+    diff = "M\tsrc/a.py\nA\tsrc/b.py\nD\tsrc/c.py\nR100\tsrc/old.py\tsrc/new.py\n"
+    parsed = _parse_name_status_diff(diff)
+    assert {"path": "src/a.py", "change_kind": "modified"} in parsed
+    assert {"path": "src/b.py", "change_kind": "created"} in parsed
+    assert {"path": "src/c.py", "change_kind": "deleted"} in parsed
+    # A rename row's LAST tab-field is the path git actually left on disk -- the OLD path must never
+    # appear, and the two paths must never get glued together into one garbled string.
+    assert {"path": "src/new.py", "change_kind": "modified"} in parsed, parsed
+    assert not any("old.py" in p["path"] for p in parsed), parsed
 
     print("e2e_nodes self-check: ok")
 

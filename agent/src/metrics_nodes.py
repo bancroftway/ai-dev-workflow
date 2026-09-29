@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import re
-import shlex
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
@@ -28,7 +27,6 @@ from langchain_core.runnables import RunnableConfig
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, tech_stack_signals, workflow_persistence
 from .gates import readme_gate
-from .gates.ac_coverage_gate import id_variants
 from .gates.remediation_gate import accounted_for
 from .schemas import presence_values as _presence_values
 from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
@@ -168,67 +166,143 @@ async def _read_coverage_summary(provider: Any, thread_id: str) -> dict[str, flo
     }
 
 
+def _github_file_url(owner: str | None, repo: str | None, commit_sha: str | None, path: str) -> str | None:
+    if not (owner and repo and commit_sha):
+        return None
+    return f"https://github.com/{owner}/{repo}/blob/{commit_sha}/{path}"
+
+
 def _traceability_rows(
-    ac_entries: list[dict[str, Any]], found_tokens: set[str], commit_log: str
+    entries: list[dict[str, Any]],
+    ac_execution: dict[str, Any] | None,
+    owner: str | None,
+    repo: str | None,
+    commit_sha: str | None,
 ) -> list[dict[str, Any]]:
-    """Pure half of the matrix build, self-checked in _demo(). Matches each AC's ledger id against
-    the id spellings actually found in test files (ac_coverage_gate.id_variants -- the SAME
-    tolerance the P4 gate applies, so a test the gate accepted is never invisible here).
-    `covered` requires only has_test: every pipeline commit subject is a machine-fixed string that
-    never embeds an AC id, so a has_commit requirement made "covered" structurally unreachable
-    (observed live: 0/11 covered on a 96%-coverage repo). commits_found stays as an informational
-    column."""
+    """Pure half of the matrix build, self-checked in _demo(). Sourced entirely from the ledger's
+    own already-attributed fields (test_ids, files, test_plan, plan_step_ids) rather than
+    re-deriving coverage by grepping test files for id mentions -- the ledger's `test_ids` (measured
+    runner attribution, spec_ledger.stamp_delivery) is strictly better evidence than a text-search
+    heuristic, so the old grep-based version is retired along with it.
+    """
+    by_id = {e["id"]: e for e in entries if e.get("id")}
+    ac_entries = [e for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") != "retired"]
+    per_ac_execution = (ac_execution or {}).get("per_ac") or {}
     rows: list[dict[str, Any]] = []
-    for entry in ac_entries:
-        ac_id = entry["id"]
-        variants = id_variants(ac_id)
-        has_test = bool(found_tokens & set(variants))
-        has_commit = any(v in commit_log for v in variants)
+    for ac in ac_entries:
+        ac_id = ac["id"]
+        us = by_id.get(ac.get("parent_us_id")) or {}
+        plan_items = [by_id[pid] for pid in (ac.get("plan_step_ids") or []) if pid in by_id]
+        first_seen_at = ac.get("first_seen_at")
+        last_revised_at = ac.get("last_revised_at")
+        change = "new" if (not last_revised_at or last_revised_at == first_seen_at) else "modified"
+        change_date = last_revised_at or first_seen_at
+
+        test_plan = ac.get("test_plan") or {}
+        per_test_kind = test_plan.get("per_test_kind") or {}
+        exec_row = per_ac_execution.get(ac_id) or {}
+        # Per-test pass/fail isn't durably stored anywhere (only this AC-level aggregate is) --
+        # every test row under one AC shares this same classification, a documented simplification.
+        if exec_row.get("status") == "pass":
+            evidence = "flaky" if exec_row.get("flaky") else "solidly verified"
+        elif exec_row.get("status") == "fail":
+            evidence = "failing"
+        else:
+            evidence = "unverified"
+        test_rows = [
+            {
+                "test_name": name,
+                "kind": per_test_kind.get(name, "unknown"),
+                "ui_relevant": bool(test_plan.get("ui_relevant")),
+                "categories": ", ".join(test_plan.get("categories") or []),
+                "evidence": evidence,
+            }
+            for name in (ac.get("test_ids") or [])
+        ]
+
+        file_rows = [
+            {
+                "path": f["path"],
+                "change_kind": f.get("change_kind", "modified"),
+                "url": _github_file_url(owner, repo, commit_sha, f["path"]),
+            }
+            for f in (ac.get("files") or [])
+            if f.get("path")
+        ]
+
         rows.append({
-            "us_id": entry.get("parent_us_id", ""),
             "ac_id": ac_id,
-            "description": entry.get("description", ""),
-            "tests_found": has_test,
-            "commits_found": has_commit,
-            "status": "covered" if has_test else "untested",
+            "description": ac.get("description", ""),
+            "us_id": ac.get("parent_us_id", ""),
+            "us_title": us.get("title", ""),
+            "plan_items": [{"id": p["id"], "description": p.get("description", "")} for p in plan_items],
+            "ui_related": bool(ac.get("ui_related")),
+            "infrastructure_related": any(p.get("step_kind") == "infrastructure" for p in plan_items),
+            "change": change,
+            "change_date": change_date,
+            "is_deferred": ac.get("status") == "deferred",
+            "resolved_run_id": ac.get("resolved_run_id"),
+            "tests": test_rows,
+            "files": file_rows,
+            # Kept for the metrics dict's traceability_summary counts.
+            "status": "covered" if test_rows else "untested",
         })
     return rows
 
 
-async def _build_traceability_matrix(provider: Any, thread_id: str) -> list[dict[str, Any]]:
-    entries = await spec_ledger.load_ledger(provider, thread_id)
-    ac_entries = [e for e in entries if e.get("kind") == "acceptance_criterion" and e.get("status") != "retired"]
-    if not ac_entries:
+async def _build_traceability_matrix(
+    provider: Any, thread_id: str, entries: list[dict[str, Any]], ac_execution: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    if not any(e.get("kind") == "acceptance_criterion" for e in entries):
         return []
-    log_result = await provider.exec_in_sandbox(thread_id, "git log --oneline -n 500 2>&1")
-    commit_log = log_result.stdout or ""
+    session_row: dict[str, Any] | None = None
+    try:
+        from . import session_store
 
-    # Same two-step scan as ac_coverage_gate's fallback: tracked/untracked-but-not-ignored files
-    # with test/spec in the path (node_modules etc. are gitignored, so never listed), then ONE
-    # grep -F for every id spelling -- no per-file reads, no docker exec per file.
-    # The file list is piped into xargs rather than interpolated into the command, and vendored
-    # directories are filtered out. Both matter: `git ls-files -co` includes UNTRACKED files, and a
-    # run that had npm download a browser into apps/web/.playwright-browsers/ contributed thousands
-    # of paths matching /test|spec/, which built a single command line past Windows' 32 KB limit and
-    # killed the node outright with "[WinError 206] The filename or extension is too long". xargs
-    # chunks the arguments itself, so no file count can reproduce that.
-    id_patterns = " ".join(f"-e {shlex.quote(v)}" for e in ac_entries for v in id_variants(e["id"]))
-    excluded = "/(node_modules|\\.playwright-browsers|bin|obj|dist|build|\\.next|\\.venv|vendor|TestResults|coverage)/"
-    grep = await provider.exec_in_sandbox(
-        thread_id,
-        "git ls-files -co --exclude-standard "
-        "| grep -iE '(test|spec)' "
-        f"| grep -vE {shlex.quote(excluded)} "
-        f"| xargs -r -d '\\n' grep -h -o -F {id_patterns} -- 2>/dev/null | sort -u || true",
-    )
-    found_tokens = set((grep.stdout or "").split())
-    return _traceability_rows(ac_entries, found_tokens, commit_log)
+        session_row = await session_store.get_session(thread_id)
+    except Exception:  # noqa: BLE001 -- a session-lookup failure must not block the whole matrix
+        logger.warning("traceability matrix: could not look up session for thread_id=%s", thread_id, exc_info=True)
+    owner = (session_row or {}).get("owner")
+    repo = (session_row or {}).get("repo")
+    sha_result = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD 2>/dev/null || true")
+    commit_sha = (sha_result.stdout or "").strip() or None
+    return _traceability_rows(entries, ac_execution, owner, repo, commit_sha)
 
 
-def _render_traceability_matrix(rows: list[dict[str, Any]]) -> str:
-    lines = ["# Traceability Matrix", "", "Auto-generated by ai-dev-workflow's metrics-report metrics node -- do not hand-edit.", "", "| US | AC | Description | Tests | Commits | Status |", "|---|---|---|---|---|---|"]
+def _render_traceability_matrix(rows: list[dict[str, Any]], ac_resolution: dict[str, Any]) -> str:
+    lines = [
+        "# Acceptance Criteria Traceability Matrix",
+        "",
+        "Auto-generated by ai-dev-workflow's metrics-report metrics node -- do not hand-edit.",
+        "",
+        f"**AC Resolution: {ac_resolution['score']}%** ({ac_resolution['resolved']} of {ac_resolution['total']} "
+        f"resolved; {ac_resolution['deferred_excluded']} deferred-and-never-coded excluded"
+        + (
+            f"; {ac_resolution['deferred_after_coding']} deferred AFTER coding, still counted unresolved"
+            if ac_resolution["deferred_after_coding"]
+            else ""
+        )
+        + ")",
+        "",
+        "| AC | US | Plan Items | UI | Infra | Change | Deferred | Resolved By | Tests | Files |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
     for row in rows:
-        lines.append(f"| {row['us_id']} | {row['ac_id']} | {row['description'][:60]} | {'yes' if row['tests_found'] else 'no'} | {'yes' if row['commits_found'] else 'no'} | {row['status']} |")
+        plan_cell = "<br>".join(f"{p['id']}: {p['description'][:40]}" for p in row["plan_items"]) or "-"
+        tests_cell = "<br>".join(
+            f"{t['test_name']} ({t['kind']}, ui={'y' if t['ui_relevant'] else 'n'}, "
+            f"[{t['categories']}], {t['evidence']})"
+            for t in row["tests"]
+        ) or "-"
+        files_cell = "<br>".join(
+            f"[{f['path']}]({f['url']})" if f["url"] else f"{f['path']}" for f in row["files"]
+        ) or "-"
+        lines.append(
+            f"| {row['ac_id']}: {row['description'][:50]} | {row['us_id']}: {row['us_title'][:30]} | "
+            f"{plan_cell} | {'yes' if row['ui_related'] else 'no'} | "
+            f"{'yes' if row['infrastructure_related'] else 'no'} | {row['change']} ({row['change_date'] or '-'}) | "
+            f"{'yes' if row['is_deferred'] else 'no'} | {row['resolved_run_id'] or '-'} | {tests_cell} | {files_cell} |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -570,9 +644,6 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     await repo_files.write_repo_file(provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan_report, indent=2, default=str) + "\n")
     delta = repo_scan.diff_scans(baseline, scan_report)
 
-    traceability_rows = await _build_traceability_matrix(provider, thread_id)
-    token_usage_summary = await _sum_token_usage(provider, thread_id)
-
     delta_summ = repo_scan.delta_summary(delta)
     attempt = int(((state.get("repo_scan") or {}).get("metrics_gate") or {}).get("attempt") or 0) + 1
     gate_reasons = regression_reasons(
@@ -585,6 +656,52 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         ac_execution=scan_report.get("ac_execution"),
         is_ui_app=tech_stack_signals.tech_stack_has_ui_framework(state),
     )
+
+    # Loaded ONCE, mutated below by file-attribution collection and stamp_delivery (previously two
+    # separate loads/saves), then saved at most once -- and the traceability matrix/ac_resolution
+    # are built from this SAME post-mutation list further down, so this run's own coded/tested/
+    # test_ids/files stamps are reflected in the matrix this same run commits (not one run stale).
+    ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
+    ledger_changed = False
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # Traceability-matrix plan: attribute this run's changed files back to the AC(s) that motivated
+    # them, from two sources with real per-file/per-lap AC attribution -- the mctg coding stage's
+    # own self-reported changed_files/related_ac_ids, and e2e-fix's mechanically-derived attribution
+    # (each lap's changed files tagged with the AC ids its own failing tests named). Rebuild's
+    # build-fix loop and the remediation stage fix cross-cutting build/scanner concerns, not a
+    # specific AC, so fabricating AC links for their file changes would be dishonest -- deliberately
+    # not attempted. Unconditional on gate_reasons: the files were genuinely written regardless of
+    # whether this run's regression gate ultimately passed.
+    changes_by_ac: dict[str, list[dict[str, str]]] = {}
+    mctg_raw = await repo_files.read_repo_file(
+        provider, thread_id, workflow_persistence.MINIMAL_CODE_TO_GREEN_APPROVED_PATH
+    )
+    if mctg_raw:
+        try:
+            mctg_content = json.loads(mctg_raw)
+        except json.JSONDecodeError:
+            mctg_content = {}
+        for cf in mctg_content.get("changed_files") or []:
+            for ac_id in cf.get("related_ac_ids") or []:
+                changes_by_ac.setdefault(ac_id, []).append(
+                    {"path": cf.get("path", ""), "change_kind": cf.get("change_kind", "modified")}
+                )
+    e2e_fix_raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.E2E_FIX_FILE_ATTRIBUTION_PATH)
+    for line in (e2e_fix_raw or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            lap = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for ac_id in lap.get("related_ac_ids") or []:
+            for cf in lap.get("changed_files") or []:
+                changes_by_ac.setdefault(ac_id, []).append(
+                    {"path": cf.get("path", ""), "change_kind": cf.get("change_kind", "modified")}
+                )
+    if changes_by_ac and spec_ledger.append_files(ledger_entries, changes_by_ac, run_id, now_iso):
+        ledger_changed = True
 
     # Delivery stamps -- the ONLY writer of coded_*/tested_*/test_ids, and only on a healthy run
     # (regression gate clean): see spec_ledger.stamp_delivery. Scoped to this ticket's own live
@@ -601,14 +718,77 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
                 own_ac_ids = spec_ledger.own_ac_ids_from_specification(json.loads(raw_spec))
             except json.JSONDecodeError:
                 pass
-        if own_ac_ids:
-            ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
-            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            if spec_ledger.stamp_delivery(
-                ledger_entries, own_ac_ids, scan_report.get("ac_execution"), run_id, now_iso
-            ):
-                await spec_ledger.save_ledger(provider, thread_id, ledger_entries)
-                ledger_committed_paths = [spec_ledger.LEDGER_PATH]
+        if own_ac_ids and spec_ledger.stamp_delivery(
+            ledger_entries, own_ac_ids, scan_report.get("ac_execution"), run_id, now_iso
+        ):
+            ledger_changed = True
+    if ledger_changed:
+        await spec_ledger.save_ledger(provider, thread_id, ledger_entries)
+        ledger_committed_paths = [spec_ledger.LEDGER_PATH]
+
+    traceability_rows = await _build_traceability_matrix(provider, thread_id, ledger_entries, scan_report.get("ac_execution"))
+    ac_resolution = spec_ledger.compute_ac_resolution(ledger_entries)
+    token_usage_summary = await _sum_token_usage(provider, thread_id)
+
+    # Metrics Bar 3-way split (Code Health / App Health / AI Dev Workflow Framework Effectiveness)
+    # -- computed here (not repo_scan.py's own summary()) because Code Health needs the SAME scan
+    # report's findings/tools re-filtered (repo_scan.static_only_summary), App Health needs the
+    # ledger-independent coverage/pass-rate this node already has in scope, and Framework
+    # Effectiveness is the ledger-derived ac_resolution above -- none of which repo_scan.py's own
+    # pure ScanReport.summary() has access to.
+    code_health = repo_scan.static_only_summary(scan)
+    coverage_fraction = (
+        ((coverage.get("line_rate") or 0.0) + (coverage.get("branch_rate") or 0.0)) / 200.0
+        if isinstance(coverage.get("line_rate"), (int, float)) and isinstance(coverage.get("branch_rate"), (int, float))
+        else None
+    )
+    overall_pass_rate = (scan_report.get("ac_execution") or {}).get("overall_pass_rate") or {}
+    pass_rate_fraction = (overall_pass_rate.get("pct") / 100.0) if isinstance(overall_pass_rate.get("pct"), (int, float)) else None
+    app_health_score = repo_scan.app_health_score(coverage_fraction, pass_rate_fraction)
+
+    # Productivity/effort-saved estimate ("Capability-Based Lifecycle Benchmarking", traceability-
+    # matrix plan): lines changed this ticket (git diff --stat against the run's own baseline
+    # commit) x a mean-CCN complexity multiplier x the AC Resolution discount above, less a flat
+    # review-overhead deduction. See config.py's AIDW_HOURS_PER_LOC_BASE/
+    # AIDW_COMPLEXITY_HOUR_MULTIPLIERS/AIDW_REVIEW_OVERHEAD_FRACTION for the tunable constants.
+    baseline_commit = state.get("run_baseline_commit")
+    added_lines = 0
+    if baseline_commit:
+        diff_stat = await provider.exec_in_sandbox(
+            thread_id, f"git diff --stat {baseline_commit}..HEAD -- . ':!.ai-dev-workflow' 2>/dev/null || true"
+        )
+        # Absent (empty diff) defaults to 0 rather than erroring -- a ticket that changed nothing
+        # yet is a valid, if unusual, state to measure.
+        match = re.search(r"(\d+) insertion", diff_stat.stdout or "")
+        added_lines = int(match.group(1)) if match else 0
+    mean_ccn = (scan.metrics.get("complexity") or {}).get("mean_ccn")
+    complexity_mult = next(
+        (mult for ceiling, mult in workflow_config.AIDW_COMPLEXITY_HOUR_MULTIPLIERS if (mean_ccn or 0) < ceiling),
+        1.0,
+    )
+    raw_hours = added_lines * workflow_config.AIDW_HOURS_PER_LOC_BASE * complexity_mult
+    estimated_hours_saved = round(
+        raw_hours * (ac_resolution["score"] / 100.0) * (1.0 - workflow_config.AIDW_REVIEW_OVERHEAD_FRACTION), 1
+    )
+    productivity_estimate = {
+        "added_lines": added_lines,
+        "mean_ccn": mean_ccn,
+        "complexity_multiplier": complexity_mult,
+        "ac_resolution_discount": ac_resolution["score"],
+        "review_overhead_fraction": workflow_config.AIDW_REVIEW_OVERHEAD_FRACTION,
+        "estimated_hours_saved": estimated_hours_saved,
+    }
+    scan_report["summary"].update(
+        code_health_score=code_health["code_health_score"],
+        app_health_score=app_health_score,
+        framework_effectiveness_score=ac_resolution["score"],
+        estimated_hours_saved=estimated_hours_saved,
+    )
+    # Re-written: the 4 scores above are computed AFTER the first repo_scan.LATEST_PATH write
+    # earlier in this function (they need ledger state that isn't final until after stamp_delivery
+    # runs) -- without this, repo-scan-latest.json on disk would silently lack them even though the
+    # in-memory scan_report (used for state.repo_scan.latest_summary below) has them.
+    await repo_files.write_repo_file(provider, thread_id, repo_scan.LATEST_PATH, json.dumps(scan_report, indent=2, default=str) + "\n")
 
     # Key order is load-bearing for the exit prompt: _build_exit_prompt hands this dict through
     # _bounded_json(..., 8000), which keeps the LEADING fragment when the payload doesn't fit --
@@ -640,6 +820,16 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         # green AND not flaky) is the number this pipeline should be judged on.
         "ac_verification": scan_report.get("ac_verification"),
         "ac_execution": scan_report.get("ac_execution"),
+        # Metrics Bar 3-way split + exit report score-explanations (traceability-matrix plan): the
+        # SAME numbers written onto scan_report["summary"] above, duplicated here so exit's
+        # deterministic code (which reads metrics-latest.json, never graph state) can render the
+        # "how we got this number" section without recomputing anything.
+        "code_health_score": code_health["code_health_score"],
+        "code_health_subscores": code_health["code_health_subscores"],
+        "app_health_score": app_health_score,
+        "app_health_inputs": {"coverage_fraction": coverage_fraction, "pass_rate_fraction": pass_rate_fraction},
+        "ac_resolution": ac_resolution,
+        "productivity_estimate": productivity_estimate,
         "supply_chain": await _supply_chain_delta(provider, thread_id),
         # Persisted (not just channel state) so exit's deterministic verify can read the gate's
         # verdict from metrics-latest.json -- deterministic_verify doesn't receive graph state.
@@ -654,7 +844,9 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     await repo_files.write_repo_file(provider, thread_id, METRICS_LATEST_PATH, json.dumps(metrics, indent=2, default=str) + "\n")
     if delta is not None:
         await repo_files.write_repo_file(provider, thread_id, repo_scan.DELTA_PATH, json.dumps(delta, indent=2, default=str) + "\n")
-    await repo_files.write_repo_file(provider, thread_id, TRACEABILITY_MATRIX_PATH, _render_traceability_matrix(traceability_rows))
+    await repo_files.write_repo_file(
+        provider, thread_id, TRACEABILITY_MATRIX_PATH, _render_traceability_matrix(traceability_rows, ac_resolution)
+    )
     await repo_files.append_ledger_entry(
         provider, thread_id,
         {"stage": "metrics_report", "node": "metrics", "traceability_summary": metrics["traceability_summary"],
@@ -854,19 +1046,40 @@ async def readme_write_node(state: dict[str, Any], config: RunnableConfig) -> di
 
 
 def _demo() -> None:
-    """Self-check for the pure traceability matching -- the ledger mints US-####.# ids and tests
-    may spell them four ways; every spelling must count, and covered must not require commit ids."""
-    entry = {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "parent_us_id": "US-0001", "description": "d"}
-    # Every spelling a gate-passing test may use resolves to the same AC.
-    for token in ("US-0001.1", "AC-0001.1", "US_0001_1", "AC_0001_1"):
-        rows = _traceability_rows([entry], {token}, commit_log="")
-        assert rows[0]["status"] == "covered", (token, rows)
-    # covered == has_test alone; machine-fixed commit subjects never carry ids.
-    rows = _traceability_rows([entry], {"AC-0001.1"}, commit_log="abc123 ai-dev-workflow: metrics_report metrics")
-    assert rows[0]["status"] == "covered" and rows[0]["commits_found"] is False
-    # No token found -> untested, never tests_only (kept in the summary shape for the frontend).
-    rows = _traceability_rows([entry], set(), commit_log="")
-    assert rows[0]["status"] == "untested" and rows[0]["tests_found"] is False
+    """Self-check for the pure traceability matrix build -- sourced entirely from ledger fields
+    (test_ids/files/test_plan/plan_step_ids), not a grep-based text-search heuristic."""
+    us = {"id": "US-0001", "kind": "user_story", "status": "active", "title": "Sign in"}
+    plan_step = {"id": "PS-1", "kind": "plan_step", "status": "active", "description": "Build the form.", "step_kind": "feature"}
+    ac = {
+        "id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "parent_us_id": "US-0001",
+        "description": "d", "ui_related": True, "plan_step_ids": ["PS-1"], "test_ids": ["[US-0001.1] works"],
+        "test_plan": {"ui_relevant": True, "categories": ["happy_path"], "per_test_kind": {"[US-0001.1] works": "unit"}},
+        "files": [{"path": "src/a.py", "change_kind": "created", "run_id": "run-1", "date": "2026-01-01"}],
+        "first_seen_at": "2026-01-01", "last_revised_at": "2026-01-01",
+    }
+    ac_execution = {"per_ac": {"US-0001.1": {"status": "pass", "flaky": False}}}
+    rows = _traceability_rows([us, plan_step, ac], ac_execution, "acme", "widget", "abc123")
+    assert rows[0]["status"] == "covered" and rows[0]["us_title"] == "Sign in"
+    assert rows[0]["plan_items"] == [{"id": "PS-1", "description": "Build the form."}]
+    assert rows[0]["infrastructure_related"] is False and rows[0]["ui_related"] is True
+    assert rows[0]["change"] == "new" and rows[0]["is_deferred"] is False
+    assert rows[0]["tests"][0]["kind"] == "unit" and rows[0]["tests"][0]["evidence"] == "solidly verified"
+    assert rows[0]["files"][0]["url"] == "https://github.com/acme/widget/blob/abc123/src/a.py"
+
+    # No test_ids at all -> untested (kept in the summary shape for the frontend).
+    untested_ac = {**ac, "id": "US-0001.2", "test_ids": [], "files": []}
+    rows2 = _traceability_rows([us, untested_ac], None, None, None, None)
+    assert rows2[0]["status"] == "untested" and rows2[0]["files"][0:] == []
+    assert rows2[0]["files"] == [] and _github_file_url(None, None, None, "x") is None
+
+    # A deferred AC never coded is excluded from ac_resolution's denominator; one deferred AFTER
+    # coding still counts as unresolved (anti-gaming fix, spec_ledger.compute_ac_resolution).
+    pristine_deferred = {**ac, "id": "US-0002.1", "status": "deferred"}
+    gamed_deferred = {**ac, "id": "US-0002.2", "status": "deferred", "coded_run_id": "run-1", "resolved_at": None}
+    resolved = {**ac, "id": "US-0002.3", "resolved_at": "2026-01-02"}
+    resolution = spec_ledger.compute_ac_resolution([us, pristine_deferred, gamed_deferred, resolved])
+    assert resolution["deferred_excluded"] == 1 and resolution["deferred_after_coding"] == 1
+    assert resolution["total"] == 2 and resolution["resolved"] == 1 and resolution["score"] == 50.0
 
     # _health_comparable: same weights is no longer enough -- version and security-tool coverage
     # are part of the formula's identity (a semgrep flake is a x0.89 multiplier drop on identical

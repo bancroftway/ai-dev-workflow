@@ -2258,6 +2258,83 @@ class ScanReport:
         return report
 
 
+# Metrics Bar 3-way split, "Code Health" ring: findings/tools produced ONLY by the tools
+# PROFILES["health_report"] runs. Naive masking of the "full" profile's ALREADY-TALLIED
+# security_by_severity/maintainability_count does not reproduce the standalone Code Health Report's
+# number -- PROFILES["full"] also runs trivy/osv-scanner/checkov, and summary() tallies from
+# self.findings BEFORE health_score() ever sees them, so a real dependency/IaC finding would already
+# be baked into a masked re-tally. This re-tallies from the filtered findings instead.
+def static_only_summary(report: "ScanReport") -> dict[str, Any]:
+    """The 'Code Health' score: `report.summary()`'s health_score(), recomputed from ONLY the
+    findings/tool-runs `PROFILES["health_report"]` would have produced for this same commit --
+    provably identical to a fresh standalone Code Health Report scan, unlike masking the wider
+    "full" scan's own tally (see module comment above).
+
+    A finding kept by `report.summary()`'s dedup as a single merged row can still have been
+    corroborated by MULTIPLE tools (`Finding.sources`); it counts here if EITHER its primary `tool`
+    or any of its `sources` is in the health_report tool set -- i.e. a health_report-profile-only
+    scan would still have found it via that corroborating tool, even if `.tool` itself (chosen by
+    the wider scan's dedup) happens to be trivy/osv/checkov.
+    """
+    static_tools = frozenset(PROFILES["health_report"])
+    by_severity = {level: 0 for level in SEVERITY_ORDER}
+    maintainability_count = 0
+    for finding in report.findings:
+        if finding.tool not in static_tools and not (set(finding.sources) & static_tools):
+            continue
+        if is_non_application_path(finding.file):
+            continue
+        if finding.category in SECURITY_GRADING_CATEGORIES:
+            by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
+        elif finding.category == "maintainability" and finding.rule_id not in _MAINTAINABILITY_EXCLUDED_RULE_IDS:
+            maintainability_count += 1
+
+    security_runs = [
+        t for t in report.tools
+        if t.get("name") in (static_tools & _SECURITY_TOOL_NAMES) and t.get("status") != "not_applicable"
+    ]
+    coverage_fraction = (
+        sum(1 for t in security_runs if t.get("status") == "ok") / len(security_runs) if security_runs else 1.0
+    )
+    security_measured = bool(security_runs)
+    # coverage/lighthouse stripped so those two subscores come out None (unmeasured, weight
+    # redistributed) -- PROFILES["health_report"] never runs a coverage tool or the live-app
+    # Lighthouse probe, so a genuinely narrow scan would never populate them either.
+    static_metrics = {k: v for k, v in report.metrics.items() if k not in ("coverage", "lighthouse")}
+    health = health_score(
+        security_by_severity=by_severity,
+        security_measured=security_measured,
+        maintainability_count=maintainability_count,
+        metrics=static_metrics,
+        ac_verification=None,
+        ac_execution=None,
+        kloc=kloc_from_metrics(report.metrics),
+        coverage_fraction=coverage_fraction,
+    )
+    return {"code_health_score": health["score"], "code_health_subscores": health["subscores"]}
+
+
+def app_health_score(coverage_fraction: float | None, pass_rate_fraction: float | None) -> float | None:
+    """Metrics Bar 3-way split, "App Health" ring: coverage + whole-suite test pass rate blended
+    into one synthetic 0-100 score, weighted by config.AIDW_APP_HEALTH_COVERAGE_WEIGHT/
+    AIDW_APP_HEALTH_PASS_RATE_WEIGHT. DAST folds in later, not yet. None when NEITHER input is
+    measured (both weight redistributed to whichever one IS present; None only when there is
+    nothing at all to score)."""
+    from . import config as workflow_config
+
+    parts: list[tuple[float, float]] = []
+    if coverage_fraction is not None:
+        parts.append((coverage_fraction * 100.0, workflow_config.AIDW_APP_HEALTH_COVERAGE_WEIGHT))
+    if pass_rate_fraction is not None:
+        parts.append((pass_rate_fraction * 100.0, workflow_config.AIDW_APP_HEALTH_PASS_RATE_WEIGHT))
+    if not parts:
+        return None
+    total_weight = sum(w for _, w in parts)
+    if total_weight <= 0:
+        return None
+    return round(sum(v * w for v, w in parts) / total_weight, 1)
+
+
 # Which `summary()["measures"]` keys a given scan profile's own tools actually measure. A
 # partial-profile scan (quality-remediation's own scan runs only scc/lizard/jscpd;
 # security-remediation's runs only semgrep/trivy/gitleaks/osv-scanner) must not blank the OTHER
@@ -4467,6 +4544,52 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
         assert run["status"] == "failed", "a genuine crash must not be read as a clean empty scan"
 
     asyncio.run(_run_one_empty_output_check())
+
+    # --- static_only_summary: Code Health must exclude trivy/osv/checkov-only findings ---------
+    # (the naive "mask the full scan's already-tallied counts" bug the adversarial review caught:
+    # PROFILES["full"] runs trivy, PROFILES["health_report"] never does).
+    trivy_only = _vuln("trivy", "CVE-2024-5555", "leftpad", "high")
+    semgrep_finding = Finding(
+        finding_key=stable_id("sast", "hardcoded-secret", "src/a.py"),
+        tool="semgrep", rule_id="hardcoded-secret", severity="medium", raw_severity="MEDIUM",
+        file="src/a.py", line=1, message="m", category="security", title="t",
+        cve=None, aliases=(), package=None, severity_source="native", sources=("semgrep",),
+    )
+    mixed_report = ScanReport(
+        findings=(trivy_only, semgrep_finding), metrics={"complexity": {"mean_ccn": 3.0}}, tools=(
+            {"name": "semgrep", "status": "ok"}, {"name": "trivy", "status": "ok"},
+        ), repo={}, deduped_count=0,
+    )
+    static = static_only_summary(mixed_report)
+    # security_by_severity fed into health_score only counts the semgrep (medium) finding -- the
+    # trivy-only (high) one must not appear at all, static or masked.
+    assert static["code_health_score"] is not None
+    full_summary = mixed_report.summary()
+    assert full_summary["health_score"] is not None and full_summary["health_score"] <= static["code_health_score"], (
+        "the full scan's score (which sees the trivy-only high finding) must never score BETTER "
+        "than the static-only score (which correctly excludes it)",
+        full_summary["health_score"], static["code_health_score"],
+    )
+    # A finding corroborated by BOTH a static and a non-static tool still counts (sources overlap).
+    corroborated = Finding(
+        finding_key=stable_id("sast", "dep-issue", "package-lock.json"),
+        tool="trivy", rule_id="dep-issue", severity="critical", raw_severity="CRITICAL",
+        file="package-lock.json", line=None, message="m", category="vulnerability", title="t",
+        cve=None, aliases=(), package=None, severity_source="native", sources=("trivy", "semgrep"),
+    )
+    corroborated_report = ScanReport(
+        findings=(corroborated,), metrics={"complexity": {"mean_ccn": 3.0}},
+        tools=({"name": "semgrep", "status": "ok"},), repo={}, deduped_count=0,
+    )
+    static_corroborated = static_only_summary(corroborated_report)
+    assert static_corroborated["code_health_score"] < 100, "a corroborated critical finding must still count"
+
+    # --- app_health_score: weighted blend, None only when both inputs are absent ---------------
+    assert app_health_score(1.0, 1.0) == 100.0
+    assert app_health_score(0.0, 0.0) == 0.0
+    assert app_health_score(None, None) is None
+    assert app_health_score(0.8, None) == 80.0, "one absent input redistributes weight to the other"
+    assert app_health_score(None, 0.6) == 60.0
 
     print("repo_scan self-check: all assertions passed")
 

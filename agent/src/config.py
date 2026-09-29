@@ -694,3 +694,36 @@ READ_ONLY_AVAILABLE_TOOLS = [
     "builtin:ask_user",
     "builtin:skill",
 ]
+
+# App Health (Metrics Bar 3-way split) blend: coverage_fraction and whole-suite test_pass_rate are
+# each already 0-1; this is their relative weight in the synthetic 0-100 App Health score. Read by
+# repo_scan.app_health_score. Equal weight by default -- raise AIDW_APP_HEALTH_COVERAGE_WEIGHT to
+# favor coverage over pass rate, or vice versa (the two must sum to 1.0; callers do not enforce
+# this, so an operator changing one should change the other to match).
+AIDW_APP_HEALTH_COVERAGE_WEIGHT = float(os.environ.get("AIDW_APP_HEALTH_COVERAGE_WEIGHT", "0.5"))
+AIDW_APP_HEALTH_PASS_RATE_WEIGHT = float(os.environ.get("AIDW_APP_HEALTH_PASS_RATE_WEIGHT", "0.5"))
+
+# Productivity/effort-saved estimate (traceability-matrix plan, "Capability-Based Lifecycle
+# Benchmarking"): base hours claimed per line of code changed, before the complexity multiplier and
+# AC-resolution/review-overhead discounts below. Read by metrics_nodes.py's estimated-hours
+# computation. A rough industry-ballpark rate (~1 hour per ~60 changed lines of moderate-complexity
+# code); raising it claims more hours saved per line, lowering it claims fewer -- tune to whatever
+# baseline an operator's own team considers credible for hand-written code of similar size.
+AIDW_HOURS_PER_LOC_BASE = float(os.environ.get("AIDW_HOURS_PER_LOC_BASE", "0.017"))
+
+# Complexity multiplier buckets applied to AIDW_HOURS_PER_LOC_BASE, keyed by the scan's mean
+# cyclomatic complexity (lizard's mean_ccn, repo_scan.py) for this run. Read by metrics_nodes.py.
+# Denser/more-branching code is credited as costing a human more time per line to write correctly;
+# raising a bucket's multiplier claims more hours for code at that complexity level. Keys are the
+# upper bound of each bucket (mean_ccn < key); the last tuple has no upper bound.
+AIDW_COMPLEXITY_HOUR_MULTIPLIERS: tuple[tuple[float, float], ...] = (
+    (5.0, 1.0),
+    (10.0, 1.3),
+    (float("inf"), 1.6),
+)
+
+# Review-overhead deduction on the productivity/effort-saved estimate above: AI-generated code
+# still needs human review/refactoring before it is trustworthy, so this fraction of the raw
+# estimate is subtracted before the final "hours saved" figure is shown. Read by metrics_nodes.py.
+# Raising it claims a more conservative (smaller) net hours-saved number; lowering it claims more.
+AIDW_REVIEW_OVERHEAD_FRACTION = float(os.environ.get("AIDW_REVIEW_OVERHEAD_FRACTION", "0.175"))
