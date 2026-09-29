@@ -27,6 +27,12 @@ export type Session = {
   failure_stage: string | null;
   failure_type: string | null;
   failure_message: string | null;
+  /** "yolo" | "draft_verify" | "mission_critical" (Task 1, backend mode threading, plan Part 2) --
+   * the code generation mode this session is pinned to (agent/src/graph.py's GraphState.
+   * code_gen_mode, resolved once at first provision). Not yet populated by the agent's
+   * SessionResponse (a later task wires that up for Session Overview to display); the field
+   * exists here first so that task doesn't also have to touch this shared type. */
+  codeGenMode: string | null;
   /** Live, not persisted -- whether this session's sandbox is currently registered in the
    * agent's memory right now. False after an agent restart until the session is reprovisioned,
    * regardless of `status`. */

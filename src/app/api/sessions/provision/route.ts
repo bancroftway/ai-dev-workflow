@@ -28,7 +28,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { sessionId, projectId, owner, repo, branch, resume, confirmReopen } = (await request.json()) as {
+  const { sessionId, projectId, owner, repo, branch, resume, confirmReopen, codeGenMode } = (await request.json()) as {
     sessionId?: string;
     // Which project (Part 3) this ticket belongs to. Optional here, not required: the agent's own
     // ProvisionRequest.project_id (Task 5) falls back to an already-existing session's own stored
@@ -47,6 +47,12 @@ export async function POST(request: Request) {
     // same confirmation through to the agent's own `is_finished_with_verdict` 409, which used to
     // refuse a resume-provision for exactly the sessions those actions exist to act on.
     confirmReopen?: boolean;
+    // Task 1 (backend mode threading, plan Part 2): "yolo" / "draft_verify" / "mission_critical".
+    // Optional here, not required -- like projectId above, only a genuinely-new session's frontend
+    // call (Task 3's popup, a later task) sends one at all; a resume or an incidental reprovision
+    // of an already-created session omits it and the agent falls back to this session's own
+    // stored value (see agent/src/sessions_api.py's ProvisionRequest.code_gen_mode).
+    codeGenMode?: string;
   };
   if (!sessionId || !owner || !repo || !branch) {
     return NextResponse.json(
@@ -69,6 +75,7 @@ export async function POST(request: Request) {
       user_login: userLogin ?? "",
       resume: Boolean(resume),
       confirm_reopen: Boolean(confirmReopen),
+      code_gen_mode: codeGenMode,
       // Fresh Entra access token (the jwt callback refreshes it before this route reads it) --
       // the agent exchanges it on-behalf-of for the session's Key Vault secrets at provision
       // time, then discards it. Absent in E2E-bypass mode; the agent skips the vault fetch then.
