@@ -182,11 +182,11 @@ async def update_manifest(
     """Read-modify-write of manifest.json -- the only sanctioned way to touch it.
 
     Every writer goes through here (brownfield_write_manifest_node, app_discovery.app_check_record_node,
-    exit_nodes.exit_finalize_node) because the file is co-owned: brownfield-baseline owns `onboarded`, app discovery
-    owns `app_check`, exit owns the run/approval/metrics summary. A wholesale overwrite by any one
-    of them silently deletes the others' keys -- which is exactly the bug exit_finalize_node had,
-    dropping `onboarded` at the end of every run and re-triggering brownfield onboarding on the
-    next one.
+    exit_nodes.exit_finalize_node, intake_node) because the file is co-owned: brownfield-baseline owns
+    `onboarded`, app discovery owns `app_check`, exit owns the run/approval/metrics summary, intake_node
+    owns `code_gen_mode`. A wholesale overwrite by any one of them silently deletes the others' keys --
+    which is exactly the bug exit_finalize_node had, dropping `onboarded` at the end of every run and
+    re-triggering brownfield onboarding on the next one.
 
     A malformed manifest is replaced rather than raised on, matching
     hydrate_tech_stack_from_repo_file's same tolerance: this runs mid-pipeline, and a hand-edited

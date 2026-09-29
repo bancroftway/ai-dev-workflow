@@ -2872,8 +2872,12 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # prompt; both built in later tasks) can read it. Best-effort / no-op when unsandboxed, same
     # tolerance every other manifest.json writer already has (see update_manifest's own callers,
     # all guarded on sandbox_registry.get(thread_id) is not None) -- a manifest write failing here
-    # must not take the whole intake down.
-    if sandbox_registry.get(thread_id) is not None:
+    # must not take the whole intake down. Also gated on `state.get("code_gen_mode")` being falsy
+    # (Task 1 review, Minor 3) -- same "not already pinned" check _resolve_thread_code_gen_mode
+    # itself makes above: once this thread's first intake in this process has pinned the value into
+    # state, every later intake on the same thread re-resolves the identical already-pinned value
+    # and would otherwise redo this read-modify-write for nothing.
+    if not state.get("code_gen_mode") and sandbox_registry.get(thread_id) is not None:
         try:
             await preflight_nodes.update_manifest(
                 get_sandbox_provider(), thread_id, {"code_gen_mode": code_gen_mode}
@@ -6562,6 +6566,65 @@ def _demo() -> None:
     finally:
         session_store.get_session = real_get_session_blip
         chat_model.get_provider = real_get_provider_blip
+
+    # _resolve_thread_code_gen_mode (Task 1 review, Important 1) -- the same 4 scenarios as
+    # _resolve_thread_provider immediately above, adapted for the 3-way code_gen_mode values and
+    # the fixed "mission_critical" default (there is no live org-wide setting to disagree with
+    # here, so "stored preferred over a disagreeing live value" becomes "stored preferred over the
+    # default" -- the only other value in play).
+
+    async def _fake_get_session_stored_draft_verify(session_id):  # noqa: ANN001, ANN202
+        return {"code_gen_mode": "draft_verify"}
+
+    real_get_session_cgm = session_store.get_session
+    session_store.get_session = _fake_get_session_stored_draft_verify
+    try:
+        # Empty checkpoint -- must resolve the STORED "draft_verify", never fall through to the
+        # "mission_critical" default despite the two disagreeing.
+        resolved = asyncio.run(_resolve_thread_code_gen_mode("cgm-restart-thread", {}))
+        assert resolved == "draft_verify", (
+            f"an empty checkpoint must prefer the session's stored code_gen_mode over the "
+            f"default, got {resolved!r}"
+        )
+
+        # Already-pinned state wins over the stored row -- the fake above would fail this
+        # assertion if reached, since it returns "draft_verify", not "yolo-pinned".
+        resolved = asyncio.run(
+            _resolve_thread_code_gen_mode("cgm-pinned-thread", {"code_gen_mode": "yolo-pinned"})
+        )
+        assert resolved == "yolo-pinned", resolved
+    finally:
+        session_store.get_session = real_get_session_cgm
+
+    # Genuinely new thread (no prior dbo.sessions row at all) -- falls through to the fixed
+    # "mission_critical" default per GraphState.code_gen_mode's own comment (never "yolo", and not
+    # "draft_verify" either).
+    async def _fake_get_session_none_cgm(session_id):  # noqa: ANN001, ANN202
+        return None
+
+    real_get_session_cgm_new = session_store.get_session
+    session_store.get_session = _fake_get_session_none_cgm
+    try:
+        resolved = asyncio.run(_resolve_thread_code_gen_mode("cgm-brand-new-thread", {}))
+        assert resolved == "mission_critical", resolved
+    finally:
+        session_store.get_session = real_get_session_cgm_new
+
+    # DB-blip case -- session_store.get_session raising must NOT propagate out of
+    # _resolve_thread_code_gen_mode -- it must degrade to the "mission_critical" default, same
+    # graceful-degradation contract _resolve_thread_provider's own DB-blip case gets.
+    async def _fake_get_session_raises_cgm(session_id):  # noqa: ANN001, ANN202
+        raise RuntimeError("simulated transient DB blip")
+
+    real_get_session_cgm_blip = session_store.get_session
+    session_store.get_session = _fake_get_session_raises_cgm
+    try:
+        resolved = asyncio.run(_resolve_thread_code_gen_mode("cgm-db-blip-thread", {}))
+        assert resolved == "mission_critical", (
+            f"a raising get_session must degrade to the default, not propagate, got {resolved!r}"
+        )
+    finally:
+        session_store.get_session = real_get_session_cgm_blip
 
     # Regression check (Part 2 Task 10 review fix -- a real Critical bug this file's own review
     # caught): a stage re-entering make_draft_node on a REJECTION must not let
