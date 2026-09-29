@@ -124,9 +124,19 @@ async def hydrate_ticket_mode_context(
     rather than a new one): also seeds DRAFT_SPEC_PATH the first time this hook runs against a
     project that doesn't have it yet -- from the in-flight stage["draft"] if it's already
     full-shaped (an old-code run resuming post-upgrade), else from the last-approved specification
-    (a new ticket in an existing project), else an empty Specification. Pure best-effort: seeding
-    failure here never blocks drafting -- the model's own `create` on first view is the fallback
-    this bootstrap merely tries to make unnecessary.
+    (a new ticket in an existing project), else an empty Specification.
+
+    Requirements-delta pivot: a new ticket's seed carries forward only the last-approved
+    specification's small, cheap-to-restate scalar fields (title/summary/work_kind/assumptions/
+    out_of_scope) -- NOT `user_stories`, which starts empty. The model's own draft file is now the
+    ticket's delta sketchpad, not a copy of the whole prior document to edit in place; everything
+    still-live from earlier tickets stays exactly as it is in the ledger and gets reassembled by
+    `render_live_user_stories` once this ticket's own sync_ledger call resolves its own new/touched
+    items. `questions`/`attachment_notes`/`retired_*_ids`/`bug_affected_ac_ids` are always
+    per-ticket (schemas.py documents `questions` as "every question ever raised across all drafts
+    of THIS ticket"), so they reset empty regardless. Pure best-effort: seeding failure here never
+    blocks drafting -- the model's own `create` on first view is the fallback this bootstrap merely
+    tries to make unnecessary.
     """
     entries = await load_ledger(provider, thread_id)
     if await repo_files.read_repo_file(provider, thread_id, DRAFT_SPEC_PATH) is None:
@@ -140,17 +150,25 @@ async def hydrate_ticket_mode_context(
                 provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
             )
             try:
-                seed = json.loads(approved_raw) if approved_raw is not None else None
+                approved: dict[str, Any] | None = json.loads(approved_raw) if approved_raw is not None else None
             except json.JSONDecodeError:
-                seed = None
-            if not isinstance(seed, dict):
-                seed = {
-                    "title": "", "summary": "", "work_kind": "feature", "user_stories": [],
-                    "assumptions": {"status": "absent", "values": [], "reason": "Not yet drafted."},
-                    "out_of_scope": {"status": "absent", "values": [], "reason": "Not yet drafted."},
-                    "questions": [], "attachment_notes": [], "retired_ac_ids": [], "retired_us_ids": [],
-                    "bug_affected_ac_ids": [],
-                }
+                approved = None
+            if not isinstance(approved, dict):
+                approved = {}
+            seed = {
+                "title": approved.get("title", ""),
+                "summary": approved.get("summary", ""),
+                "work_kind": approved.get("work_kind", "feature"),
+                "user_stories": [],
+                "assumptions": approved.get(
+                    "assumptions", {"status": "absent", "values": [], "reason": "Not yet drafted."}
+                ),
+                "out_of_scope": approved.get(
+                    "out_of_scope", {"status": "absent", "values": [], "reason": "Not yet drafted."}
+                ),
+                "questions": [], "attachment_notes": [], "retired_ac_ids": [], "retired_us_ids": [],
+                "bug_affected_ac_ids": [],
+            }
         await repo_files.write_repo_file(provider, thread_id, DRAFT_SPEC_PATH, json.dumps(seed, indent=2))
     return {"ticket_mode_baseline": True} if entries else None
 
@@ -493,8 +511,10 @@ def sync_ledger(
             # revision, and stamping it polluted _diff_ledger/CHANGELOG with phantom "Revised"
             # rows and would misreport change_status as "modified".
             new_title = story.get("title", entry.get("title", ""))
-            if new_title != entry.get("title"):
+            new_narrative = story.get("narrative", entry.get("narrative", ""))
+            if new_title != entry.get("title") or new_narrative != entry.get("narrative", ""):
                 entry["title"] = new_title
+                entry["narrative"] = new_narrative
                 entry["last_revised_run_id"] = run_id
             if story_deferred != was_deferred:
                 entry["last_revised_run_id"] = run_id
@@ -521,6 +541,7 @@ def sync_ledger(
                 "kind": "user_story",
                 "status": "deferred" if story_deferred else "active",
                 "title": story.get("title", ""),
+                "narrative": story.get("narrative", ""),
                 "first_seen_run_id": run_id,
                 "last_revised_run_id": run_id,
             }
@@ -939,6 +960,61 @@ def upsert_questions(
             row["answer"] = str(q["answer"])
         row["updated_run_id"] = run_id
     return entries
+
+
+def render_live_user_stories(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Assembles the full `user_stories` list (schemas.Specification shape) from the ledger's own
+    live-status bookkeeping instead of trusting the model to have re-emitted everything.
+    Requirements-delta pivot: the draft/audit model's `DRAFT_SPEC_PATH` submission is now
+    delta-only -- new stories/ACs plus anything it explicitly touched via existing_us_id/
+    existing_ac_id or listed in retired_us_ids/retired_ac_ids -- validated and merged into
+    `entries` by `sync_ledger` above; THIS function is what turns that merged ledger back into the
+    complete list written to SPECIFICATION_APPROVED_PATH and shown at the human gate. That is the
+    same guarantee the old "every draft must be the WHOLE specification" completeness gate existed
+    to provide (2026-08-31, two live incidents), but it now comes from reading the ledger's own
+    status/text bookkeeping rather than trusting model re-emission fidelity -- a story/AC can no
+    longer be silently dropped just because a redraft didn't happen to repeat it.
+
+    Every still-live (active/revised/deferred) user_story entry becomes a UserStory, nesting every
+    still-live acceptance_criterion entry whose parent_us_id matches. Every OTHER top-level
+    Specification field (title/summary/work_kind/assumptions/out_of_scope/questions/
+    attachment_notes/retired_ac_ids/retired_us_ids/bug_affected_ac_ids) is untouched here -- those
+    stay small and cheap for the model to resubmit each round, so the caller assigns only
+    `content_dict["user_stories"] = render_live_user_stories(entries)` in place, preserving
+    `content_dict`'s own object identity (the established `stage["draft"]` contract -- see
+    `_verify_specification_ledger`'s docstring). Pure; does not mutate its input.
+    """
+    live_statuses = ("active", "revised", "deferred")
+    acs_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        if entry.get("kind") == "acceptance_criterion" and entry.get("status") in live_statuses:
+            acs_by_parent.setdefault(entry.get("parent_us_id"), []).append(entry)
+
+    user_stories: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.get("kind") != "user_story" or entry.get("status") not in live_statuses:
+            continue
+        user_stories.append(
+            {
+                "id": entry["id"],
+                "existing_us_id": entry["id"],
+                "title": entry.get("title", ""),
+                "narrative": entry.get("narrative", ""),
+                "deferred": entry.get("status") == "deferred",
+                "acceptance_criteria": [
+                    {
+                        "id": ac["id"],
+                        "existing_ac_id": ac["id"],
+                        "description": ac.get("description", ""),
+                        "deferred": ac.get("status") == "deferred",
+                        "ui_related": bool(ac.get("ui_related", False)),
+                    }
+                    for ac in acs_by_parent.get(entry["id"], [])
+                ],
+            }
+        )
+
+    return user_stories
 
 
 def change_status(
@@ -1859,16 +1935,23 @@ def _demo() -> None:
                     return _FakeReadResult(True, content)
             return _FakeReadResult(False)
 
-    # Case 1: DRAFT_SPEC_PATH absent, no in-flight draft, an approved spec exists -- seeds from it.
-    approved_spec_json = json.dumps({"title": "Existing", "summary": "s", "user_stories": []})
+    # Case 1: DRAFT_SPEC_PATH absent, no in-flight draft, an approved spec exists -- seeds the
+    # small scalar fields from it (title/summary/work_kind/assumptions/out_of_scope), but
+    # `user_stories` starts EMPTY (requirements-delta pivot: the sketchpad is this ticket's delta,
+    # not a copy of the whole prior document -- see this function's own docstring).
+    approved_spec_json = json.dumps({"title": "Existing", "summary": "s", "user_stories": [{"id": "US-0001"}]})
     from . import workflow_persistence as _wp
 
     bootstrap_provider = _FakeBootstrapProvider({_wp.SPECIFICATION_APPROVED_PATH: approved_spec_json})
     ctx = asyncio.run(hydrate_ticket_mode_context("t", {"stages": {}}, bootstrap_provider))
     assert ctx is None, "empty ledger must not signal ticket-mode framing"
     assert DRAFT_SPEC_PATH in bootstrap_provider.writes, "should have seeded DRAFT_SPEC_PATH"
-    assert json.loads(bootstrap_provider.writes[DRAFT_SPEC_PATH]) == json.loads(approved_spec_json), (
-        "should have seeded DRAFT_SPEC_PATH from the last-approved specification"
+    seeded = json.loads(bootstrap_provider.writes[DRAFT_SPEC_PATH])
+    assert seeded["title"] == "Existing" and seeded["summary"] == "s", (
+        "should carry forward the last-approved specification's own small scalar fields"
+    )
+    assert seeded["user_stories"] == [], (
+        "the sketchpad must start EMPTY of stories -- this ticket's delta, not the whole prior document"
     )
 
     # Case 2: an in-flight, full-shaped draft in state wins over the approved file.

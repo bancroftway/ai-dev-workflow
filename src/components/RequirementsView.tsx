@@ -8,11 +8,18 @@ import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { takeHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
+import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import { anyStageDrafting, buildStarted, runEnded, type WorkflowState } from "@/lib/workflow-types";
 
-function RequirementsViewImpl() {
+interface RequirementsViewProps {
+  owner: string;
+  repo: string;
+  workBranch: string;
+}
+
+function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps) {
   // agentId only, not the full {agentId, runtimeAgentId, threadId} triple: AppShell (always
   // mounted above this) already registers the proxied agent once -- registerProxiedAgent throws
   // "already registered" if a second call site re-registers the same agentId (confirmed live),
@@ -37,13 +44,9 @@ function RequirementsViewImpl() {
 
   const state = (agent.state ?? {}) as WorkflowState;
   const rawRequirements = state.stages?.["raw-requirements"];
-  // The document as ai-dev-workflow's own P1 stage sees it: its approved content once approved,
-  // otherwise its latest draft (the same "approved-else-draft" precedence workflow_persistence.py
-  // uses for the .md render) -- falls back to the raw seed text only before P1 has ever drafted
-  // anything (a brand new thread's very first paint).
-  const rawRequirementsContent =
-    ((rawRequirements?.approved_content ?? rawRequirements?.draft) as { content?: string } | null)?.content ??
-    state.raw_requirements_text;
+  // Requirements-delta pivot: at least one submission has ever been recorded for this thread, so
+  // the maintained PRD (01-requirements-prd.md) exists to view/download -- see the panel below.
+  const hasRequirementsPrd = rawRequirements?.status === "approved";
 
   // One-shot handoff from the New Ticket form (src/app/(boxed)/tickets/new/page.tsx): title +
   // description typed there before this session's sandbox even existed, stashed in sessionStorage
@@ -87,14 +90,11 @@ function RequirementsViewImpl() {
     }
   }, [threadId, processFiles]);
 
-  // Rehydrate the textarea once from server state (e.g. after a remount),
-  // without ever clobbering text the human is actively editing.
-  useEffect(() => {
-    if (!syncedRef.current && rawRequirementsContent) {
-      setText(rawRequirementsContent);
-      syncedRef.current = true;
-    }
-  }, [rawRequirementsContent]);
+  // Requirements-delta pivot: no server-state rehydrate here on purpose. This tab is now a blank
+  // entry box for "what do you want to do this session" -- pre-filling it with the prior
+  // approved/draft raw-requirements content (the old "the document is the single source of truth,
+  // keep editing it in place" contract) would force the human to delete stale text before typing a
+  // delta. The maintained PRD is still one click away via the view/download panel below.
 
   // Last-resort rehydrate from this tab's own draft copy (saved on every keystroke below).
   // Mid-run, agent state doesn't reach a reloaded client until the run next pauses (the
@@ -175,16 +175,10 @@ function RequirementsViewImpl() {
       try {
         const feedback =
           openInterrupt.stage === "plan"
-            ? "Requirements revised by the reviewer while reviewing the Plan — the Specification redrafts first, strictly from the updated requirements document; once it is re-approved, the Plan will redraft from it. " +
-              "Emit the COMPLETE specification: every still-applicable user story and acceptance criterion re-appears citing its existing id — never just the changed ones. " +
-              "Features REMOVED from the document must be explicitly retired via retired_us_ids/retired_ac_ids (citing their existing ids), never silently dropped. " +
-              "Features the document marks for a LATER phase are specified with deferred=true, never retired; features moved INTO the build-now scope re-appear with deferred=false. " +
-              "A previously deferred feature that no longer appears ANYWHERE in the document has been removed — retire it; the current document alone decides what exists."
-            : "Requirements revised by the reviewer — redraft the Specification strictly from the updated requirements document. " +
-              "Emit the COMPLETE specification: every still-applicable user story and acceptance criterion re-appears citing its existing id — never just the changed ones. " +
-              "Features REMOVED from the document must be explicitly retired via retired_us_ids/retired_ac_ids (citing their existing ids), never silently dropped. " +
-              "Features the document marks for a LATER phase are specified with deferred=true, never retired; features moved INTO the build-now scope re-appear with deferred=false. " +
-              "A previously deferred feature that no longer appears ANYWHERE in the document has been removed — retire it; the current document alone decides what exists.";
+            ? "Requirements revised by the reviewer while reviewing the Plan — the Specification redrafts first, strictly from this correction; once it is re-approved, the Plan will redraft from it. " +
+              "This correction is a DELTA, not the whole specification: only include what it actually adds or changes — a genuinely new story/criterion, or one you're revising (cite its existing id) or retiring (retired_us_ids/retired_ac_ids). Never re-emit anything this correction doesn't touch; leaving it out does not remove it."
+            : "Requirements revised by the reviewer — redraft the Specification strictly from this correction. " +
+              "This correction is a DELTA, not the whole specification: only include what it actually adds or changes — a genuinely new story/criterion, or one you're revising (cite its existing id) or retiring (retired_us_ids/retired_ac_ids). Never re-emit anything this correction doesn't touch; leaving it out does not remove it.";
         openInterrupt.resolve?.({ decision: "rejected", feedback, revised_requirements: trimmed });
       } finally {
         setSubmitting(false);
@@ -237,24 +231,34 @@ function RequirementsViewImpl() {
         <div>
           <h1 className="text-lg font-semibold">Requirements</h1>
           <p className="text-sm text-neutral-500">
-            Describe what you want built. Edit and resubmit at any time — including to answer
-            clarifying questions below. Paste screenshots directly into the text.
+            Describe what you want to add, change, or remove this session — just the delta, not
+            the whole product. Paste screenshots directly into the text.
           </p>
         </div>
-        {/* Teaches the scoping convention by example (user, 2026-08-31): a full PRD with explicit
-            "Build now" vs "Later (deferred)" sections -- deferred items are specified and shown,
-            never built until moved up. */}
-        <button
-          type="button"
-          className="shrink-0 rounded-md border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 disabled:opacity-40"
-          disabled={agent.isRunning || submitting || runLocked}
-          onClick={() => {
-            if (text.trim() && !window.confirm("Replace the current requirements text with the PRD template?")) return;
-            updateText(PRD_TEMPLATE);
-          }}
-        >
-          Start from PRD template
-        </button>
+        {/* Requirements-delta pivot: the maintained PRD (every round's delta merged into one
+            document, in a standard PRD structure) replaces the old "Start from PRD template"
+            button -- this tab no longer asks the human to author or re-author the whole document
+            themselves. */}
+        {hasRequirementsPrd && (
+          <div className="flex shrink-0 items-center gap-2 text-xs">
+            <span className="text-neutral-500">Current PRD:</span>
+            <a
+              href={rawProxyUrl(owner, repo, ".ai-dev-workflow/01-requirements-prd.md", workBranch)}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded-md border border-neutral-300 px-3 py-1.5 font-medium text-neutral-600 hover:bg-neutral-100"
+            >
+              View
+            </a>
+            <a
+              href={rawProxyUrl(owner, repo, ".ai-dev-workflow/01-requirements-prd.md", workBranch)}
+              download="requirements-prd.md"
+              className="rounded-md border border-neutral-300 px-3 py-1.5 font-medium text-neutral-600 hover:bg-neutral-100"
+            >
+              Download
+            </a>
+          </div>
+        )}
       </div>
 
       <ClarifyingQuestions
@@ -322,37 +326,9 @@ function RequirementsViewImpl() {
   );
 }
 
-// No props -- memoized so AppShell's unrelated local-state re-renders don't also force this
-// while it's the hidden tab.
+// Memoized (shallow prop comparison) so AppShell's unrelated local-state re-renders don't also
+// force this while it's the hidden tab -- owner/repo/workBranch are stable per session.
 export const RequirementsView = memo(RequirementsViewImpl);
-
-/** The Requirements document is the single source of truth; this skeleton teaches the full-PRD
- * convention: keep EVERYTHING the product needs in one document, scope with "Build now" vs
- * "Later (deferred)" sections, and promote work by moving items up and resubmitting. */
-const PRD_TEMPLATE = `# <Product name>
-
-## Goal
-One or two sentences: what this product does and for whom.
-
-## Build now
-List the features to build in this pass. Be concrete — each becomes user stories with testable
-acceptance criteria.
-- Feature A — what the user can do and what they see
-- Feature B — ...
-
-## Later (deferred)
-Features that belong to the product but NOT this pass. They are specified and reviewed now, shown
-as "deferred", and no code or tests are written for them until you move them into "Build now" and
-resubmit.
-- Feature C (deferred: planned for a later phase — do not build yet)
-
-## Tech stack
-Confirmed on the Tech Stack tab; note anything extra here (libraries, hosting, integrations).
-
-## Constraints & non-goals
-- Keep it as simple as possible.
-- No auth / no persistence / no ... (delete what doesn't apply)
-`;
 
 /** Parses the New Ticket form's sessionStorage handoff payload (see the rehydrate effect above)
  * into the combined requirements text, or null for a missing/malformed/empty payload -- kept

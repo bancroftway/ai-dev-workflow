@@ -833,6 +833,19 @@ def _build_specification_audit_prompt(state: GraphState) -> list[BaseMessage]:
         # preserved structurally (audit's file edits are what _verify_specification_ledger's own
         # file-read picks up), not via a response-field overwrite as before this plan.
         HumanMessage(content=f"The draft specification is at `{spec_ledger.DRAFT_SPEC_PATH}` -- view it before auditing."),
+        # Requirements-delta pivot: the draft file above is now this ticket's delta only (new/
+        # touched stories and criteria), not the whole project -- if a prior ticket's approved
+        # specification exists, the audit needs it to judge whether the delta duplicates or
+        # conflicts with what's already live, not just whether the delta is internally consistent.
+        # Harmless when absent (a project's first-ever ticket has nothing to compare against yet).
+        HumanMessage(
+            content=(
+                f"If `{workflow_persistence.SPECIFICATION_APPROVED_PATH}` exists, view it too -- it "
+                "is every still-live story/criterion from earlier tickets against this same "
+                "project. Use it to judge whether the delta above duplicates or conflicts with "
+                "existing scope, not just whether it's internally consistent."
+            )
+        ),
     ]
     verify_feedback_message = _verification_feedback_message(stage)
     if verify_feedback_message is not None:
@@ -1011,6 +1024,70 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
     return {"stages": stages, "app_auth": app_auth, "test_users": repo_test_users.get_for_thread(thread_id)}
 
 
+REQUIREMENTS_PRD_MERGE_SYSTEM_PROMPT, REQUIREMENTS_PRD_MERGE_HUMAN_TEMPLATE = load_prompt_pair(
+    "requirements_prd_merge"
+)
+
+
+async def _merge_requirements_prd(
+    thread_id: str, state: "GraphState", provider: SandboxProvider, delta_text: str, *, role: str = "prd-merge",
+) -> None:
+    """Shared core of the requirements-PRD merge: reads whatever PRD already exists, merges
+    `delta_text` into it via `requirements_prd_merge.md`, writes and commits the result. Called
+    from `merge_requirements_prd_node` (a real human submission) and from
+    `_brownfield_spec_approve_hook` (the reverse-engineered baseline, once, so brownfield and
+    greenfield repos converge on the same PRD artifact from that point forward)."""
+    prior_prd = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.REQUIREMENTS_PRD_PATH)
+    model = get_chat_model_for_thread(
+        thread_id,
+        "raw-requirements",
+        role,
+        provider=state["provider"],
+        run_id=state.get("run_id", "unknown"),
+        # Borrows the specification stage's own draft-tier model -- this is the same kind of job
+        # (turn requirements text into a well-structured document) and isn't a StageSpec of its own
+        # with a models.yaml entry to read.
+        model_name=model_config.get_model_name("specification", "draft", state["provider"]),
+        sandbox=sandbox_registry.get(thread_id),
+    )
+    rendered = render_prompt(
+        REQUIREMENTS_PRD_MERGE_HUMAN_TEMPLATE,
+        prior_prd=prior_prd or "(none yet -- this is the project's first round)",
+        delta_text=delta_text,
+        today=datetime.now(timezone.utc).date().isoformat(),
+    )
+    response = await model.ainvoke(
+        [SystemMessage(content=REQUIREMENTS_PRD_MERGE_SYSTEM_PROMPT), HumanMessage(content=rendered)],
+        config={"metadata": {"emit-messages": False}},
+    )
+    merged_prd = str(response.content).strip() + "\n"
+    await repo_files.write_repo_file(provider, thread_id, workflow_persistence.REQUIREMENTS_PRD_PATH, merged_prd)
+    await git_ops.commit_paths(
+        provider, thread_id,
+        [workflow_persistence.REQUIREMENTS_PRD_PATH],
+        "ai-dev-workflow: requirements PRD merged",
+    )
+
+
+async def merge_requirements_prd_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+    """Requirements-delta pivot: maintains `.ai-dev-workflow/01-requirements-prd.md`, the
+    human-facing canonical PRD, by merging this round's raw delta text into whatever PRD already
+    exists. Purely additive next to `record_raw_requirements_node` above -- does not replace
+    `raw_requirements_text`/`stages["raw-requirements"]`, which stays the specification stage's own
+    input exactly as today. This node's only job is the document a human can open, read, and
+    download; nothing downstream reads it.
+
+    Deterministic no-op on an empty submission (a blank reattach, same guard
+    `record_raw_requirements_node` uses) -- there is no delta to merge, and skipping avoids an
+    unnecessary LLM call and commit on every resume."""
+    thread_id = config["configurable"]["thread_id"]
+    text = (state.get("raw_requirements_text") or "").strip()
+    if not text:
+        return {}
+    await _merge_requirements_prd(thread_id, state, get_sandbox_provider(), text)
+    return {}
+
+
 # Task 13b (revised on review): one line per DISTINCT rejection reason inside
 # _verify_specification_ledger AND spec_ledger.sync_ledger (agent/src/spec_ledger.py:183-458),
 # whose real logic this function's own docstring calls itself "just the SandboxProvider-I/O
@@ -1025,16 +1102,15 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
 # (covers a new story OR AC identical to an already-tracked one, added 2026-09-17) and one more
 # from check_narrative_format (a sibling deterministic check, not inside sync_ledger itself, added
 # the same day) for the narrative-template shape -- 15 from sync_ledger-adjacent checks, plus the
-# 2 non-sync_ledger rules below (open-question, whole-spec-not-a-delta) = 17 total.
+# 2 non-sync_ledger rules below (open-question, delta-only-scope) = 17 total.
 SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "Never leave a clarifying question open -- every question you raised must be answered "
     "(status=answered, citing the wording that answers it) or explicitly assumed "
     "(status=assumed, mirrored in assumptions) before this stage can pass.",
-    "Every draft must be the WHOLE specification, never a delta -- every still-live (active, "
-    "revised, or deferred) story/criterion already in the persistent ledger must be re-emitted "
-    "verbatim (citing its id via existing_us_id/existing_ac_id) or explicitly retired via "
-    "retired_us_ids/retired_ac_ids; silently dropping one because this redraft didn't touch it "
-    "is rejected.",
+    "This draft only needs to contain what's NEW or CHANGED this round -- a genuinely new story "
+    "or criterion, or one you're revising (existing_us_id/existing_ac_id) or retiring "
+    "(retired_us_ids/retired_ac_ids). Never re-emit a story/criterion you aren't touching -- the "
+    "complete document is assembled deterministically from the ledger, not from what you repeat.",
     "If you cite an existing_us_id when revising a story, that id must actually exist in the "
     "ledger -- citing an id that was never allocated is rejected.",
     "You may never cite a retired story's id via existing_us_id -- ids are never reused once "
@@ -1192,21 +1268,28 @@ def make_verify_specification_ledger(
             )
         # File-based-editing plan, Part 1 audit fix (implementation-time refinement, simpler and
         # more robust than the response-validator design originally planned): reject outright if
-        # the file's own user_stories is empty -- mirrors _ready_means_files_were_written's actual
-        # spirit ("claimed done, nothing was produced"), and correct where a response-level
-        # readiness check could not be: this function only ever runs once readiness was True at
-        # some point this ticket (make_route_after_draft never routes a False draft to audit/
-        # verify), and Part 1's own file contract re-emits the WHOLE document every lap, so a
-        # genuinely non-empty file always has non-empty user_stories for any real ticket -- only a
-        # true first-ever no-op leaves it empty.
-        if not file_specification.get("user_stories"):
+        # the file has NOTHING in it -- mirrors _ready_means_files_were_written's actual spirit
+        # ("claimed done, nothing was produced"), and correct where a response-level readiness
+        # check could not be: this function only ever runs once readiness was True at some point
+        # this ticket (make_route_after_draft never routes a False draft to audit/verify).
+        # Requirements-delta pivot: an empty `user_stories` is no longer proof of nothing-written
+        # on its own -- a deletion-only ticket (retire something, add nothing new) or a
+        # wording-unchanged bug-reopen ticket (bug_affected_ac_ids only) legitimately has no
+        # stories/criteria to submit. Reject only when EVERY field a real submission could touch is
+        # empty, since that's the only shape a true first-ever no-op can produce.
+        if not (
+            file_specification.get("user_stories")
+            or file_specification.get("retired_us_ids")
+            or file_specification.get("retired_ac_ids")
+            or file_specification.get("bug_affected_ac_ids")
+        ):
             return VerificationResult(
                 passed=False,
                 feedback=(
-                    f"{spec_ledger.DRAFT_SPEC_PATH} has an empty user_stories list -- this response is "
-                    "metadata ABOUT the specification, not the specification itself. Nothing has "
-                    "been written to the file yet. Use your file tools to actually write the "
-                    "specification's real content, then resubmit."
+                    f"{spec_ledger.DRAFT_SPEC_PATH} has nothing in it -- no new/revised stories or "
+                    "criteria, no retirements, no bug-affected ids. This response is metadata ABOUT "
+                    "the specification, not the specification itself. Use your file tools to "
+                    "actually write this ticket's real delta, then resubmit."
                 ),
                 report={"draft_file": "empty"},
             )
@@ -1306,55 +1389,17 @@ def make_verify_specification_ledger(
         )
         no_new_work = False
         if result.passed:
-            # Completeness gate (2026-08-31, observed live TWICE): a redraft that emits only the
-            # stories it touched silently shrinks the specification -- the ledger keeps the dropped
-            # entries live, but the document (what the human approves and every later stage reads)
-            # loses them. Prompt-level instructions failed to prevent it, so it is deterministic now:
-            # every still-live ledger entry must appear in the draft (sync above already resolved
-            # draft ids) or be explicitly retired this round. Runs only on a PASSING sync so the
-            # feedback names real ids.
-            draft_ids: set[str] = set()
-            for story in content_dict.get("user_stories") or []:
-                if story.get("id"):
-                    draft_ids.add(str(story["id"]))
-                for ac in story.get("acceptance_criteria") or []:
-                    if ac.get("id"):
-                        draft_ids.add(str(ac["id"]))
-            missing_live = [
-                e["id"]
-                for e in result.updated_entries
-                if e.get("kind") in ("user_story", "acceptance_criterion")
-                # "deferred" included on purpose: parked scope must stay VISIBLE in every draft
-                # (re-emitted with deferred=true), or the document silently loses it exactly like
-                # the delta-shrink this gate exists to prevent.
-                and e.get("status") in ("active", "revised", "deferred")
-                and e["id"] not in draft_ids
-            ]
-            if missing_live:
-                # Feedback carries each missing entry's FULL text, not just its id (observed live
-                # 2026-08-31, thread 47f1be95: three laps burned to verification_cap_exceeded on two
-                # audit-added ACs the draft session had never itself emitted -- bare ids gave the
-                # redraft nothing to re-emit, and it never went to read ledger.json).
-                by_id_live = {e["id"]: e for e in result.updated_entries}
-                detail_lines = []
-                for mid in sorted(missing_live):
-                    e = by_id_live[mid]
-                    text = e.get("title") if e.get("kind") == "user_story" else e.get("description", "")
-                    parent = f" (criterion of {e['parent_us_id']})" if e.get("parent_us_id") else ""
-                    flag = " [status=deferred: re-emit with deferred=true]" if e.get("status") == "deferred" else ""
-                    detail_lines.append(f"- {mid}{parent}{flag}: {text}")
-                return VerificationResult(
-                    passed=False,
-                    feedback=(
-                        "The specification draft is INCOMPLETE -- every draft must be the WHOLE "
-                        "specification, never a delta. These still-live ledger entries are absent; "
-                        "re-emit each one VERBATIM below, citing its id via existing_us_id/"
-                        "existing_ac_id (a criterion nests under its parent story's block), or "
-                        "explicitly retire it via retired_us_ids/retired_ac_ids if the requirements "
-                        "no longer call for it:\n" + "\n".join(detail_lines)
-                    ),
-                    report={"missing_live_entries": sorted(missing_live)},
-                )
+            # File-based-editing plan, Part 1 sect. 5: write the ledger-resolved content back to
+            # the sketchpad so the next lap's `view` shows resolved real ids, not the model's
+            # placeholders. Requirements-delta pivot: content_dict["user_stories"] here is still
+            # exactly what the model submitted this lap (sync_ledger only resolved ids in place,
+            # it never expands the set) -- the sketchpad stays delta-sized across laps within this
+            # ticket, not a growing copy of the whole project. On failure (returns above),
+            # deliberately not reached -- leaves the model's own edit exactly as submitted, next to
+            # the feedback naming what's wrong.
+            await repo_files.write_repo_file(
+                provider, thread_id, spec_ledger.DRAFT_SPEC_PATH, json.dumps(content_dict, indent=2)
+            )
 
             # Durable question provenance: every question ever raised (answered/assumed included)
             # upserts into the same committed ledger the US/AC ids live in, keyed by the model's
@@ -1366,6 +1411,18 @@ def make_verify_specification_ledger(
             # No explicit commit: the ledger lives under .ai-dev-workflow/, which the verify-pass
             # persistence commit sweeps up.
             await spec_ledger.save_ledger(provider, thread_id, updated_entries)
+
+            # Requirements-delta pivot: expand content_dict's user_stories from "whatever this lap's
+            # delta submitted" to the FULL live set, assembled deterministically from the ledger
+            # (spec_ledger.render_live_user_stories) rather than trusting the model to have
+            # re-typed everything. This is what SPECIFICATION_APPROVED_PATH gets written from and
+            # what the human gate displays -- the same "nothing still-live goes missing" guarantee
+            # the old completeness gate existed to provide (2026-08-31, two live incidents), now
+            # backed by the ledger's own bookkeeping instead of model re-emission fidelity. Done
+            # AFTER the sketchpad write above so the on-disk delta file the model edits next lap
+            # never balloons back to the whole project.
+            content_dict["user_stories"] = spec_ledger.render_live_user_stories(updated_entries)
+
             # Scope-lifecycle stamps for the review UI (user requirement 2026-08-31): every live
             # story/AC carries its change classification versus the specification the human last
             # APPROVED -- read fresh from disk here rather than from the ledger's own pre-sync state,
@@ -1375,6 +1432,9 @@ def make_verify_specification_ledger(
             # a reject-and-redraft cycle before approval silently dropped the "new" badge from every
             # story except the one genuinely added in the redraft). Absent entirely before this
             # ticket's first-ever approval, in which case every story/AC correctly reports "new".
+            # Runs against the now-EXPANDED content_dict, so every live entry gets a real
+            # classification (an untouched one's rendered text matches prior_by_id exactly, so it
+            # comes back "unchanged" for free -- see gate_change_status's own contract).
             raw_prior_spec = await repo_files.read_repo_file(
                 provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
             )
@@ -1404,13 +1464,6 @@ def make_verify_specification_ledger(
                 for e in updated_entries
                 if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
             ]
-            # File-based-editing plan, Part 1 sect. 5: write the ledger-resolved content back to
-            # the sketchpad so the next lap's `view` shows resolved real ids, not the model's
-            # placeholders. On failure (returns above), deliberately NOT written back -- leaves the
-            # model's own edit exactly as submitted, next to the feedback naming what's wrong.
-            await repo_files.write_repo_file(
-                provider, thread_id, spec_ledger.DRAFT_SPEC_PATH, json.dumps(content_dict, indent=2)
-            )
         return VerificationResult(
             passed=result.passed,
             feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
@@ -1600,7 +1653,16 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
         messages.append(HumanMessage(content=FRONTEND_DESIGN_SEGMENT))
     if _spec_work_kind(state) == "bug":
         messages.append(HumanMessage(content=BUG_FIX_SEGMENT))
-    if not tech_stack_signals.is_greenfield_repo(state):
+    # Requirements-delta pivot: this segment's "delete the code paths that exist solely to serve"
+    # a retired feature instruction (minimal_code_to_green_brownfield_segment.md) used to fire only
+    # for repos tech-stack detection classified brownfield -- but a GREENFIELD project's own later
+    # ticket (Day 2+) that retires a Day-1 feature needs the identical instruction, and
+    # is_greenfield_repo is a tech-stack classification, not "is this ticket 1 or ticket N". Fire
+    # it whenever either condition holds: an established brownfield codebase, or this ticket's own
+    # approved Specification actually retired something.
+    spec_approved = spec_stage.get("approved_content") or {}
+    ticket_has_retirements = bool(spec_approved.get("retired_ac_ids") or spec_approved.get("retired_us_ids"))
+    if not tech_stack_signals.is_greenfield_repo(state) or ticket_has_retirements:
         messages.append(HumanMessage(content=MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior iteration (JSON):\n{stage['draft']}"))
@@ -4917,6 +4979,22 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     "use the updated document",
                     stage_spec.key, len(revised),
                 )
+                # Requirements-delta pivot: this correction never routes through
+                # record_raw_requirements_node/merge_requirements_prd_node (it resolves the open
+                # gate's interrupt directly, looping back to this stage's own draft node instead of
+                # re-entering the graph's normal requirements-intake edge) -- merge it into the
+                # maintained PRD here too, or a correction made while reviewing the gate would
+                # silently never reach `01-requirements-prd.md`.
+                try:
+                    await _merge_requirements_prd(
+                        thread_id, state, get_sandbox_provider(), revised, role="prd-merge-gate-correction"
+                    )
+                except Exception:
+                    logger.warning(
+                        "requirements PRD merge failed for gate-correction, thread_id=%s -- the "
+                        "redraft still uses the revised text, only the human-facing PRD doc is stale",
+                        thread_id, exc_info=True,
+                    )
                 # Plan's own draft is built from the approved SPECIFICATION, not raw requirements
                 # directly (see GraphState.restart_from_specification's own docstring) -- looping
                 # back to Plan's own draft node here would redraft Plan against the UNCHANGED old
@@ -5337,6 +5415,7 @@ def _wire_tech_stack_intake(builder: StateGraph) -> None:
     )
     builder.add_edge("app_check_record", "repo_scan_baseline")
     builder.add_node("record_raw_requirements", record_raw_requirements_node)
+    builder.add_node("merge_requirements_prd", merge_requirements_prd_node)
     # Tech-stack-first: a run that exists only to settle the stack ends here (see
     # _route_after_repo_scan_baseline) instead of drafting requirements from nothing.
     builder.add_conditional_edges(
@@ -5344,7 +5423,8 @@ def _wire_tech_stack_intake(builder: StateGraph) -> None:
         _route_after_repo_scan_baseline,
         {"record_raw_requirements": "record_raw_requirements", END: END},
     )
-    builder.add_edge("record_raw_requirements", f"{STAGES[1].key}_draft")
+    builder.add_edge("record_raw_requirements", "merge_requirements_prd")
+    builder.add_edge("merge_requirements_prd", f"{STAGES[1].key}_draft")
 
 
 async def _brownfield_spec_approve_hook(
@@ -5359,8 +5439,12 @@ async def _brownfield_spec_approve_hook(
     Delivery pre-stamping deliberately does NOT happen here -- see
     _brownfield_plan_approve_hook's own docstring for why it waits for the plan pass instead (the
     2026-09-16 timing fix).
+
+    Requirements-delta pivot: also seeds `01-requirements-prd.md` from this baseline, once, so a
+    brownfield repo gets the same canonical PRD artifact a greenfield repo's first ticket produces
+    (`merge_requirements_prd_node`) -- every session after this one, brownfield or greenfield,
+    merges into the same document the same way.
     """
-    del state
     await repo_files.write_repo_file(
         provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH, json.dumps(content, indent=2)
     )
@@ -5372,6 +5456,12 @@ async def _brownfield_spec_approve_hook(
         [workflow_persistence.SPECIFICATION_APPROVED_PATH, workflow_persistence.SPECIFICATION_MD_PATH],
         "ai-dev-workflow: brownfield baseline -- specification approved",
     )
+    baseline_text = (
+        "This is a reverse-engineered baseline of the EXISTING codebase (not new work to build) -- "
+        "describe what the application already does, in the standard PRD structure:\n\n"
+        + json.dumps(content, indent=2)
+    )
+    await _merge_requirements_prd(thread_id, state, provider, baseline_text, role="prd-merge-baseline")
 
 
 async def _brownfield_plan_approve_hook(

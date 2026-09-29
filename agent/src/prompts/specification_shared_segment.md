@@ -9,36 +9,38 @@ scrutiny just because a prior lap already touched it: read the whole file critic
 not just the part any verify feedback names. Prefer targeted edits (apply_patch/edit) over
 recreating the whole file -- recreating it from memory is exactly the failure mode this file-based
 workflow exists to eliminate: a long document is easy to silently under-reproduce, or to silently
-overwrite already-correct content with a stale memory of it, when retyped rather than edited. A
-deterministic gate reads the file, not your response, to check completeness.
+overwrite already-correct content with a stale memory of it, when retyped rather than edited.
 
-REDRAFT COMPLETENESS -- the file after your pass is the WHOLE specification, never a delta: every
-user story and acceptance criterion that still applies must remain in the file (verbatim if you
-found nothing wrong with it), each keeping its existing id -- not just the ones you changed this
-turn. A story silently missing from the file is NOT retired by its absence: silence is treated as
-an error, and a deterministic gate rejects a file with a still-live ledger entry missing from it.
-The ONLY way scope leaves the specification is an explicit entry in `retired_us_ids`/
-`retired_ac_ids`.
+DELTA SCOPE -- this file holds only what THIS ticket adds or changes, never the whole product.
+The complete specification (every still-live story/criterion from this and every earlier ticket) is
+assembled automatically from the ledger; you never have to reproduce it. Put in this file:
+- A genuinely new story or criterion: `existing_us_id`/`existing_ac_id: null`.
+- One you're revising: cite its real id (copied from the ledger/approved specification -- see
+  identity discipline below), with the new wording.
+- One you're removing: name its id in `retired_us_ids`/`retired_ac_ids`. Never touch its wording
+  first, and never just leave it out to remove it -- omission does nothing; only an explicit
+  retirement id removes scope.
+Never write a story/criterion into this file that you aren't touching. If nothing about an
+existing item changed for this ticket, don't mention it at all -- that is not incompleteness, it is
+the correct, expected shape of a delta. A deterministic gate reads this file, not your response, to
+check it against exactly this contract (new/cited/retired only, nothing untouched repeated).
 
-"Keeping its existing id" means the `existing_us_id`/`existing_ac_id` FIELD, not just the story
-staying present in the file -- this is a real, repeatedly-observed failure, not a hypothetical one:
-a redraft re-emits a story/criterion word-for-word (or nearly so) but with `existing_us_id`/
-`existing_ac_id` reset to `null`, making already-numbered content look brand new. The story is
-still THERE, so REDRAFT COMPLETENESS above looks satisfied, but a deterministic gate also rejects
-this specifically: a new entry whose text is identical to an already-tracked one is treated as a
-dropped citation, not new content. Before writing `null` into either field for ANYTHING you are
-re-emitting (not writing for the first time), re-check the file/ledger for a story or criterion
-with the same or near-same title/description text and cite ITS id instead.
+"Citing" an existing item means setting the `existing_us_id`/`existing_ac_id` FIELD, copied
+character-for-character from the ledger or the approved specification -- never retyped from
+memory, never reformatted, never re-derived, and never left `null` for something that already
+exists. Before writing `null` into either field for anything you're proposing, check whether the
+ledger/approved specification already has a story or criterion covering the same underlying
+capability (even if worded differently) and cite ITS id instead -- a new entry whose text is
+identical or near-identical to an already-tracked one is treated as a dropped citation, not new
+content, and is rejected.
 
 This still applies -- in fact applies MORE -- when a lap requires touching many stories at once
 (e.g. resolving a large batch of ledger-assigned ids in one pass, or responding to a big list of
-audit findings). You are still EDITING the existing file, one story/criterion at a time if needed
--- never regenerating the document's content from your own memory of what it should contain, even
-when many entries need the same treatment simultaneously. If you find yourself about to write out a
-story you (or an earlier lap) already wrote, view that exact entry in the file first and copy its
-`existing_us_id`/`existing_ac_id` forward -- do not reconstruct it from scratch just because a lot
-of entries need fixing at once; that "many at once" pressure is exactly when this drops citations
-in bulk, observed live.
+audit findings). You are still EDITING the file's own small delta, one story/criterion at a time if
+needed -- never inflating it with content you don't actually need to touch just because a lot of
+review comments landed at once. If you find yourself about to write out a story you (or an earlier
+lap) already wrote THIS ticket, view that exact entry in the file first and copy its
+`existing_us_id`/`existing_ac_id` forward -- do not reconstruct it from scratch.
 
 SPEC-SYNC IDENTITY DISCIPLINE: you never assign a real id yourself. Real ids are ALWAYS shaped
 `US-0001` (a 4-digit zero-padded story number) or `US-0001.1` (that same story number, a literal
@@ -74,13 +76,12 @@ story id (`US-0001`) appears in `retired_ac_ids` (or a criterion id (`US-0001.1`
 this same file -- revise or retire, never both.
 
 State plainly, in `story_changes`, what you added, revised, or retired this turn (`ref`, `kind`,
-`change`, one-line `summary`) -- not a restatement of the whole document. If a User Story or
-Acceptance Criterion the ledger already has no longer belongs -- cut, descoped, superseded by
-something else you're writing this turn -- name its existing id in `retired_ac_ids`/
-`retired_us_ids` rather than just deleting it from the file. Deleting something without naming it
-there is not how you retire it: it simply violates REDRAFT COMPLETENESS above, on purpose, so that
-one ticket's own narrower edit can never accidentally wipe out another ticket's unrelated stories
-just by not re-typing them.
+`change`, one-line `summary`) -- exactly the delta you put in the file, nothing more. If a User
+Story or Acceptance Criterion the ledger already has no longer belongs -- cut, descoped, superseded
+by something else you're writing this turn -- name its existing id in `retired_ac_ids`/
+`retired_us_ids`. Simply leaving it out of the file does NOT retire it (per DELTA SCOPE above,
+leaving something out just means this ticket doesn't touch it) -- only a named retirement id
+removes it.
 
 NARRATIVE TEMPLATE -- every User Story's narrative must be "As a &lt;role&gt;, I want
 &lt;capability&gt;, so that &lt;benefit&gt;". `&lt;role&gt;` must be a real human or organizational
@@ -112,11 +113,11 @@ NOT removed from the product:
 - When a revision moves a deferred feature into build-now scope, re-emit it citing its existing id
   with `deferred: false` -- the gate records that as a promotion ("activated") and only then does
   it enter the build/test queue.
-- A deferred feature stays deferred ONLY while the requirements document still mentions it
-  (build-now list, a "Later"/deferred section, anywhere). If a deferred ledger entry's feature no
-  longer appears ANYWHERE in the current document, retire it via `retired_us_ids`/`retired_ac_ids`
-  -- never keep a story alive on the strength of an earlier revision alone; the current document is
-  the single source of truth.
+- A deferred feature stays deferred by default -- you don't need to re-mention it for it to remain
+  parked. It changes state only on an explicit action this ticket takes: cite it with
+  `deferred: false` to promote it, or name it in `retired_us_ids`/`retired_ac_ids` to remove it
+  because this ticket's requirements text says it's no longer wanted at all. Simply not mentioning
+  a deferred item leaves it exactly as deferred as it already was.
 - Downstream stages ignore deferred items entirely: plan steps must not cite them and no tests or
   code are demanded for them.
 

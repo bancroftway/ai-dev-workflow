@@ -7,6 +7,11 @@ const CONTENT_TYPE_BY_EXT: Record<string, string> = {
   png: "image/png",
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
+  // Requirements-delta pivot: the maintained PRD (01-requirements-prd.md) needs a view/download
+  // link. Plain markdown is safe to add here unlike the SVG/HTML/XML/JSON this route's own
+  // docstring excludes -- a browser renders text/markdown as inert text, never parses or executes
+  // it, so it carries none of the stored-XSS risk those extensions do.
+  md: "text/markdown",
 };
 
 // Applied to every response this route sends, including error responses -- an attacker probing

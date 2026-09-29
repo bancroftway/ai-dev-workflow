@@ -151,6 +151,13 @@ REMEDIATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('remediation', 'approv
 # so the hash was silently None on every run (the file it looked for was never written).
 RAW_REQUIREMENTS_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('raw-requirements', 'approved.json')}"
 
+# Requirements-delta pivot: the human-facing canonical PRD, maintained by merging each ticket's raw
+# delta text into whatever PRD already exists (graph.py's requirements-PRD-merge node). Deliberately
+# NOT derived from _stage_file/_STAGE_ORDER -- it isn't a StageSpec-tracked stage with its own
+# draft/audit/gate cycle, just a sibling artifact alongside 01-raw-requirements.approved.json that
+# the Requirements tab offers to view/download. Numbered to sort next to it in a directory listing.
+REQUIREMENTS_PRD_PATH = f"{WORKFLOW_DIR}/01-requirements-prd.md"
+
 # The FULL exit report (health table, findings dispositions, scanner tools). Written ONLY by
 # exit_nodes.exit_finalize_node -- metrics-exit's StageSpec sets render_markdown=None so the
 # generic per-stage .md render above never touches it (it would revert the full report to the

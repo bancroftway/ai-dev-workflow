@@ -875,7 +875,9 @@ export function AppShell({
             they pick up state the instant a snapshot arrives, same as the tab-switch fix above. */}
         <main className="flex-1 overflow-y-auto">
           <div hidden={activeView !== "tech-stack"}><TechStackView /></div>
-          <div hidden={activeView !== "requirements"}><RequirementsView /></div>
+          <div hidden={activeView !== "requirements"}>
+            <RequirementsView owner={owner} repo={repo} workBranch={workBranch} />
+          </div>
           <div hidden={activeView !== "specification"}><SpecificationView /></div>
           <div hidden={activeView !== "plan"}><PlanView /></div>
           <div hidden={activeView !== "build"}><BuildView /></div>

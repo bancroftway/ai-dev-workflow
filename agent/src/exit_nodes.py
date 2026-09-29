@@ -1162,6 +1162,41 @@ def _diff_ledger(prior: list[dict[str, Any]] | None, current: list[dict[str, Any
     return {"added": added, "revised": revised, "retired": retired}
 
 
+def _retired_scope_file_review(ledger_entries: list[dict[str, Any]], retired_ids: list[str]) -> list[str]:
+    """Requirements-delta pivot (A4): application/production code cleanup for a retired US/AC is
+    best-effort/prompted (minimal_code_to_green_brownfield_segment.md), not deterministically
+    gated the way retired-AC test residue already is (ac_coverage_gate.check_retired_ac_residue).
+    This is the safety net for whatever the model didn't catch: one review line per retired id,
+    naming the files its ledger entry recorded (`spec_ledger.append_files`) so a human reviewer has
+    a concrete starting point rather than the pipeline guessing what's safe to delete.
+
+    A retired User Story's own ledger entry never carries a `files` field (only its child
+    Acceptance Criterion entries do -- `append_files` only ever matches `kind ==
+    "acceptance_criterion"`), and the `retired_us_ids` cascade only flips each child AC's status
+    without copying anything onto the parent -- so a retired story's file list is assembled here by
+    filtering ledger entries on `parent_us_id`, not by reading a `files` field off the story entry
+    itself (there isn't one)."""
+    by_id = {e["id"]: e for e in ledger_entries}
+    lines: list[str] = []
+    for rid in sorted(retired_ids):
+        entry = by_id.get(rid)
+        if entry is None:
+            continue
+        if entry.get("kind") == "acceptance_criterion":
+            files = entry.get("files") or []
+            label = entry.get("description", "")
+        else:
+            files = [
+                f for child in ledger_entries if child.get("parent_us_id") == rid for f in (child.get("files") or [])
+            ]
+            label = entry.get("title", "")
+        if files:
+            file_list = ", ".join(sorted({f.get("path", "") for f in files if isinstance(f, dict) and f.get("path")}))
+            if file_list:
+                lines.append(f"- {rid} ({label}): {file_list}")
+    return lines
+
+
 def _presence_from_values(values: list[str], *, empty_reason: str) -> dict[str, Any]:
     """Build a PresenceList-shaped dict from a plain list -- the read-modify-rewrite counterpart to
     schemas.presence_values, for the two fields this stage mutates in place after the model's initial
@@ -1652,6 +1687,14 @@ async def exit_finalize_node(
             changelog_section.append(f"- Revised: {', '.join(diff['revised'])}")
         if diff["retired"]:
             changelog_section.append(f"- Retired: {', '.join(diff['retired'])}")
+            review_lines = _retired_scope_file_review(ledger_entries, diff["retired"])
+            if review_lines:
+                changelog_section.append(
+                    "- **Review & remove if unused** (production code cleanup is best-effort, not "
+                    "automatically deleted -- test files referencing a retired id are already "
+                    "gated/removed):"
+                )
+                changelog_section.extend(f"  {line}" for line in review_lines)
         if not any(diff.values()):
             changelog_section.append("- No user-story-level changes since the prior run.")
         changelog_section.append("")
