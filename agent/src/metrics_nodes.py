@@ -744,7 +744,19 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
     )
     overall_pass_rate = (scan_report.get("ac_execution") or {}).get("overall_pass_rate") or {}
     pass_rate_fraction = (overall_pass_rate.get("pct") / 100.0) if isinstance(overall_pass_rate.get("pct"), (int, float)) else None
-    app_health_score = repo_scan.app_health_score(coverage_fraction, pass_rate_fraction)
+    # B4 (tech-stack startability pivot): a repo the B2 boot probe found non-startable gets App
+    # Health blanked to None with its own reason, same shape as the "neither input measured" None
+    # app_health_score already produces -- deliberately even though pass_rate_fraction alone
+    # (ac_eval shells out to the test runner directly, per ac_eval.py's own docstring) doesn't
+    # actually require the app to boot; only the separate e2e-screenshot evidence does. Blanking
+    # the whole subscore anyway is the documented tradeoff from the approved plan: "App Health"
+    # reads as "does the running app work", not "do the unit tests pass on an app nobody can
+    # launch". `startable` defaults True -- a greenfield repo, or one onboarded before B2 existed,
+    # never had this probe run and must not be penalized for it.
+    tech_stack_approved = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
+    app_startable = tech_stack_approved.get("startable", True)
+    app_not_startable_reason = (tech_stack_approved.get("not_startable_reason") or "app not startable") if not app_startable else None
+    app_health_score = repo_scan.app_health_score(coverage_fraction, pass_rate_fraction) if app_startable else None
 
     # Productivity/effort-saved estimate ("Capability-Based Lifecycle Benchmarking", traceability-
     # matrix plan): lines changed this ticket (git diff --stat against the run's own baseline
@@ -827,7 +839,14 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         "code_health_score": code_health["code_health_score"],
         "code_health_subscores": code_health["code_health_subscores"],
         "app_health_score": app_health_score,
-        "app_health_inputs": {"coverage_fraction": coverage_fraction, "pass_rate_fraction": pass_rate_fraction},
+        "app_health_inputs": {
+            "coverage_fraction": coverage_fraction,
+            "pass_rate_fraction": pass_rate_fraction,
+            # B4: set only when the B2 boot probe found this repo non-startable -- exit_nodes.py's
+            # _render_score_explanations checks this key first, ahead of its normal unmeasured-
+            # coverage/pass-rate wording.
+            "not_startable_reason": app_not_startable_reason,
+        },
         "ac_resolution": ac_resolution,
         "productivity_estimate": productivity_estimate,
         "supply_chain": await _supply_chain_delta(provider, thread_id),

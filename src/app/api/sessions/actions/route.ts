@@ -17,8 +17,16 @@ import { requireAuthorizedSession } from "@/lib/session-access";
  * merge_ready one, unlike the narrower rewind-to-stage) was implemented backend-side but never
  * reached this whitelist -- no UI button ever called it either, so it was unreachable through the
  * app at all until now.
+ * "recheck-tech-stack-boot" (tech-stack startability pivot, B2's caching-risk fix): TechStackView's
+ * "Recheck" button on a repo the boot probe found non-startable -- re-runs just that probe and
+ * rewrites tech-stack.approved.json in place, no confirm-reopen/stage_key needed (immediate work
+ * against the live sandbox, not a flag for the graph to act on later -- see
+ * preflight_nodes.recheck_tech_stack_startability's own docstring).
  */
-const KNOWN_ACTIONS = ["refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix", "reset-e2e"] as const;
+const KNOWN_ACTIONS = [
+  "refresh-secrets", "confirm-reopen", "rewind-to-stage", "targeted-fix", "reset-e2e",
+  "recheck-tech-stack-boot",
+] as const;
 
 export async function POST(request: Request) {
   const token = await getServerAuthToken();

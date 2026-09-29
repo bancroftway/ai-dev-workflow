@@ -240,9 +240,15 @@ export interface ScanSummary {
    * commit (repo_scan.static_only_summary), no coverage/live-app measurement. */
   code_health_score?: number | null;
   code_health_subscores?: Record<string, number | null>;
-  /** Coverage % + whole-suite test pass rate, blended (repo_scan.app_health_score). DAST folds in later. */
+  /** Coverage % + whole-suite test pass rate, blended (repo_scan.app_health_score). DAST folds in later.
+   * null when tech-stack's B2 boot probe found this repo non-startable (app_health_inputs.not_startable_reason
+   * set) -- see exit_nodes._render_score_explanations for the rendered explanation. */
   app_health_score?: number | null;
-  app_health_inputs?: { coverage_fraction: number | null; pass_rate_fraction: number | null };
+  app_health_inputs?: {
+    coverage_fraction: number | null;
+    pass_rate_fraction: number | null;
+    not_startable_reason?: string | null;
+  };
   /** % of acceptance criteria fully resolved (spec_ledger.compute_ac_resolution) -- the "AI Dev
    * Workflow Framework Effectiveness" ring's headline number. */
   framework_effectiveness_score?: number | null;

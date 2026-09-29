@@ -400,6 +400,19 @@ async def e2e_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> 
         e2e.update(status="skipped", skipped_reason="tech-stack detection found no UI framework in this repository")
         return {"e2e": e2e}
 
+    # B3 (tech-stack startability pivot): preflight_nodes.probe_tech_stack_startability already
+    # boot-tested this brownfield repo's candidates once, during tech-stack approval (or since, via
+    # the Tech Stack tab's recheck action) -- a real boot attempt, not app_discovery's static
+    # start_command guess. `startable` defaults True (greenfield repos, and any repo onboarded
+    # before this field existed, never had this probe run and must not be skipped over it).
+    tech_stack = (state.get("stages") or {}).get("tech-stack", {}).get("approved_content") or {}
+    if not tech_stack.get("startable", True):
+        e2e.update(
+            status="skipped",
+            skipped_reason=tech_stack.get("not_startable_reason") or "tech-stack detection found this application does not start",
+        )
+        return {"e2e": e2e}
+
     if sandbox_registry.get(thread_id) is None:
         # Defer to e2e_run_node's own no-sandbox handling (cannot_verify -> escalate) instead of
         # silently skipping here -- same discipline every other deterministic gate in this
@@ -1157,7 +1170,7 @@ def _config_keys_from_boot_error(log_tail: str) -> list[str]:
     return found
 
 
-async def _wait_ready(provider: Any, thread_id: str, port: int) -> bool:
+async def _wait_ready(provider: Any, thread_id: str, port: int, timeout_seconds: int | None = None) -> bool:
     """True once the port SPEAKS HTTP -- any status code, not necessarily a successful one.
 
     Deliberately not `curl -sf`: -f makes curl exit non-zero on 4xx/5xx, so an API whose routes are
@@ -1165,8 +1178,14 @@ async def _wait_ready(provider: Any, thread_id: str, port: int) -> bool:
     timeout while its own log said `Now listening on: http://localhost:5033`. Readiness here means
     the server is accepting connections; whether `/` is a route is the app's business.
     `%{http_code}` is 000 when the connection itself failed, which is the real not-up signal.
+
+    `timeout_seconds` defaults to E2E_APP_READY_TIMEOUT_SECONDS (every existing e2e caller below is
+    unaffected) -- probe_candidate_boot passes its own, smaller AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_
+    SECONDS instead, since a tech-stack-stage startability check has a different (tighter, per-
+    candidate, human-waiting-on-a-tab) budget than e2e's own multi-service boot.
     """
-    for _ in range(max(1, workflow_config.E2E_APP_READY_TIMEOUT_SECONDS // 3)):
+    limit = workflow_config.E2E_APP_READY_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    for _ in range(max(1, limit // 3)):
         probe = await provider.exec_in_sandbox(
             thread_id,
             f"curl -s -o /dev/null -m 5 -w '%{{http_code}}' http://localhost:{port} 2>/dev/null || true",
@@ -1175,6 +1194,62 @@ async def _wait_ready(provider: Any, thread_id: str, port: int) -> bool:
             return True
         await asyncio.sleep(3)
     return False
+
+
+async def probe_candidate_boot(
+    provider: Any, thread_id: str, candidate: dict[str, Any], *, timeout_seconds: int
+) -> tuple[bool, str | None]:
+    """Bounded, ISOLATED real-boot probe for ONE app_discovery candidate: boot it alone, poll its
+    own port for readiness, tear it down. Shares e2e_run_node's own boot/readiness/kill mechanism
+    (_scanned_launch_command/_with_port_env/_boot_process/_wait_ready, same PID-file teardown
+    _finalize_run uses) rather than a second "start a process and poll a port" implementation.
+
+    Used by preflight_nodes.probe_tech_stack_startability (the brownfield tech-stack stage's B2
+    startability check, and its on-demand "recheck" action) -- imported lazily there, since
+    e2e_nodes.py already imports FROM preflight_nodes at module load time (MANIFEST_PATH), so a
+    top-level import back this way would be circular.
+
+    Deliberately lighter than e2e_run_node's real boot: no GHCP launch-discovery turn, no
+    cross-service env wiring (WEB_ORIGIN/API_BASE_URL), no auth seam -- this only needs to answer
+    "does this one candidate's OWN start_command bring up a process that opens its port", the
+    static-vs-real gap app_discovery.py's own docstring names. It reuses E2E_APP_LOG_PATH/
+    E2E_APP_PID_PATH (not a separate pair): this probe always runs and tears down well before e2e's
+    own stage does, in the same one-container-per-session sandbox, so there is no concurrent use to
+    collide with.
+
+    Returns (started, reason) -- reason is populated on failure only.
+    """
+    name = str(candidate.get("name") or candidate.get("path") or "app")
+    command = str(candidate.get("start_command") or "").strip()
+    if not command:
+        return False, f"no start command could be inferred for {name}"
+
+    # Same leftover-listener sweep e2e_run_node runs before every boot (see _kill_stale_app_
+    # processes' own docstring) -- cheap insurance against a PREVIOUS probe attempt (this repo's
+    # first approval, or an earlier "recheck" click) having left a process holding this port if it
+    # was interrupted before its own teardown below ran.
+    await _kill_stale_app_processes(provider, thread_id)
+
+    port = await _pick_free_port(provider, thread_id, int(candidate.get("port") or 0))
+    launch_command = _with_port_env(_scanned_launch_command(candidate), port, str(candidate.get("runtime") or ""))
+    await _boot_process(provider, thread_id, launch_command, E2E_APP_LOG_PATH, E2E_APP_PID_PATH, env_file=False)
+    ready = await _wait_ready(provider, thread_id, port, timeout_seconds=timeout_seconds)
+    # Same PID-file teardown _finalize_run uses: negative pid kills the whole setsid'd process
+    # group, not just the `sh -c` wrapper _boot_process's own pid file records.
+    await provider.exec_in_sandbox(
+        thread_id,
+        f"p=$(cat {E2E_APP_PID_PATH} 2>/dev/null); "
+        f"[ -n \"$p\" ] && {{ kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null; }}; "
+        f"rm -f {E2E_APP_PID_PATH}; true",
+    )
+    if ready:
+        return True, None
+    log_tail = truncate_middle(
+        await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
+        workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
+        workflow_config.E2E_BOOT_FAILURE_LOG_TAIL_CHARS,
+    )
+    return False, f"{name} never answered on port {port} within {timeout_seconds}s -- log tail:\n{log_tail}"
 
 
 async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
