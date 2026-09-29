@@ -850,18 +850,21 @@ async def probe_tech_stack_startability(
 
     Same candidate dedup-by-path and "no start_command -> not part of what gets booted" filter
     e2e_run_node itself applies before booting (see its own comment there) -- a supporting
-    library/CLI candidate with no start_command is skipped, not counted as a boot failure.
+    library/CLI candidate with no start_command is skipped, not counted as a boot failure. Sorted
+    by path before probing so "the FIRST candidate's failure" is deterministic given the same
+    candidate set, rather than depending on app_discovery's own scan/dict-iteration order.
 
     Returns {"startable": bool, "not_startable_reason": str | None, "boot_evidence": [...]} -- the
     exact keys _settle_tech_stack/recheck_tech_stack_startability persist onto the approved
     tech-stack sidecar. `not_startable_reason` is the FIRST candidate's failure only (good enough
     for a human headline; every candidate's own result is still in `boot_evidence`).
 
-    Local import (e2e_nodes): e2e_nodes.py imports FROM this module (MANIFEST_PATH) at load time,
-    so a top-level import back here would be circular -- same pattern
-    _prefill_from_ticket_tech_stack_selection already uses for app_discovery just above.
+    Local imports (e2e_nodes, keyvault): e2e_nodes.py imports FROM this module (MANIFEST_PATH) at
+    load time, so a top-level import back here would be circular -- same pattern
+    _prefill_from_ticket_tech_stack_selection already uses for app_discovery just above. keyvault
+    just isn't a top-level import of this module yet.
     """
-    from . import e2e_nodes
+    from . import e2e_nodes, keyvault
 
     seen_paths: set[str] = set()
     unique: list[dict[str, Any]] = []
@@ -873,6 +876,7 @@ async def probe_tech_stack_startability(
             continue
         seen_paths.add(path)
         unique.append(candidate)
+    unique.sort(key=lambda c: str(c.get("path") or ""))
 
     if not unique:
         return {
@@ -881,12 +885,27 @@ async def probe_tech_stack_startability(
             "boot_evidence": [],
         }
 
+    # Same secrets/config a real e2e boot sources (e2e_nodes.e2e_run_node), computed ONCE here
+    # rather than per-candidate: many apps need a vault secret or repo-config value (a connection
+    # string, an API key) just to bind their port, not only to serve authenticated requests later.
+    # Deliberately excludes e2e_run_node's fake-IdP auth seam -- out of scope for "does it boot".
+    app_secrets = keyvault.get_app_secrets(thread_id)
+    config_env: dict[str, str] = {}
+    try:
+        sess_row = await session_store.get_session(thread_id)
+        if sess_row is not None:
+            config_env = repo_test_config.to_env(await repo_test_config.get_config(sess_row["owner"], sess_row["repo"]))
+    except Exception:  # noqa: BLE001 -- config is best-effort; a lookup failure must not sink the probe
+        logger.warning("could not load session/repo_test_config for %s", thread_id, exc_info=True)
+    merged_env = {**config_env, **(app_secrets or {})}
+
     boot_evidence: list[dict[str, Any]] = []
     first_failure_reason: str | None = None
     for candidate in unique:
         started, reason = await e2e_nodes.probe_candidate_boot(
             provider, thread_id, candidate,
             timeout_seconds=workflow_config.AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS,
+            merged_env=merged_env,
         )
         boot_evidence.append({
             "candidate": str(candidate.get("name") or candidate.get("path") or "app"),
@@ -1805,7 +1824,9 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     real_probe_candidate_boot = _e2e_nodes_g.probe_candidate_boot
     boot_calls: list[str] = []
 
-    async def _fake_probe_candidate_boot(provider, thread_id, candidate, *, timeout_seconds):  # noqa: ANN001, ARG001
+    async def _fake_probe_candidate_boot(  # noqa: ANN001, ARG001
+        provider, thread_id, candidate, *, timeout_seconds, merged_env=None,
+    ):
         path = candidate.get("path")
         boot_calls.append(path)
         return (False, f"{path} never answered") if path == "apps/api" else (True, None)
@@ -1832,11 +1853,13 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
             {"path": "apps/lib", "likely_class": "library"},
         ]
         result_g = asyncio.run(probe_tech_stack_startability(None, "demo-thread-g", candidates_g))
-        assert boot_calls == ["apps/web", "apps/api"], "must dedup by path and skip no-start_command candidates"
+        # Sorted by path before probing (deterministic "first failure" regardless of scan order):
+        # "apps/api" precedes "apps/web" alphabetically.
+        assert boot_calls == ["apps/api", "apps/web"], "must dedup by path, sort, and skip no-start_command candidates"
         assert result_g["startable"] is False
         assert result_g["not_startable_reason"] == "apps/api never answered"
-        assert [e["path"] for e in result_g["boot_evidence"]] == ["apps/web", "apps/api"]
-        assert result_g["boot_evidence"][0]["started"] is True and result_g["boot_evidence"][1]["started"] is False
+        assert [e["path"] for e in result_g["boot_evidence"]] == ["apps/api", "apps/web"]
+        assert result_g["boot_evidence"][0]["started"] is False and result_g["boot_evidence"][1]["started"] is True
 
         # Every candidate boots -> startable, no reason.
         boot_calls.clear()

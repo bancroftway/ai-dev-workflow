@@ -1197,25 +1197,34 @@ async def _wait_ready(provider: Any, thread_id: str, port: int, timeout_seconds:
 
 
 async def probe_candidate_boot(
-    provider: Any, thread_id: str, candidate: dict[str, Any], *, timeout_seconds: int
+    provider: Any, thread_id: str, candidate: dict[str, Any], *, timeout_seconds: int,
+    merged_env: dict[str, str] | None = None,
 ) -> tuple[bool, str | None]:
     """Bounded, ISOLATED real-boot probe for ONE app_discovery candidate: boot it alone, poll its
     own port for readiness, tear it down. Shares e2e_run_node's own boot/readiness/kill mechanism
-    (_scanned_launch_command/_with_port_env/_boot_process/_wait_ready, same PID-file teardown
-    _finalize_run uses) rather than a second "start a process and poll a port" implementation.
+    (_scanned_launch_command/_with_port_env/_boot_process/_wait_ready) rather than a second "start a
+    process and poll a port" implementation; teardown reuses _kill_stale_app_processes's own
+    escalating, wait-for-exit sweep (not a bespoke one-shot PID kill) so a `dotnet run`-style
+    candidate killed mid-build can't leave a half-deleted output tree for the NEXT candidate/probe
+    to race against, and always runs (try/finally) even if `_wait_ready` itself raises.
 
     Used by preflight_nodes.probe_tech_stack_startability (the brownfield tech-stack stage's B2
     startability check, and its on-demand "recheck" action) -- imported lazily there, since
     e2e_nodes.py already imports FROM preflight_nodes at module load time (MANIFEST_PATH), so a
     top-level import back this way would be circular.
 
-    Deliberately lighter than e2e_run_node's real boot: no GHCP launch-discovery turn, no
-    cross-service env wiring (WEB_ORIGIN/API_BASE_URL), no auth seam -- this only needs to answer
-    "does this one candidate's OWN start_command bring up a process that opens its port", the
-    static-vs-real gap app_discovery.py's own docstring names. It reuses E2E_APP_LOG_PATH/
-    E2E_APP_PID_PATH (not a separate pair): this probe always runs and tears down well before e2e's
-    own stage does, in the same one-container-per-session sandbox, so there is no concurrent use to
-    collide with.
+    `merged_env` (Key Vault secrets + repo_test_config, computed ONCE by the caller across every
+    candidate, not per-candidate): many apps need a secret/config value (a connection string, an
+    API key) just to bind their port, not only to serve authenticated requests later -- without
+    this, a genuinely startable app whose boot path reads such a value would probe as permanently
+    not-startable, and the "Recheck" action (whose own docstring names exactly this scenario) would
+    re-probe with the same gap and never actually fix it. Deliberately still lighter than
+    e2e_run_node's real boot otherwise: no GHCP launch-discovery turn, no cross-service env wiring
+    (WEB_ORIGIN/API_BASE_URL), no fake-IdP auth seam -- this only needs to answer "does this one
+    candidate's OWN start_command bring up a process that opens its port," the static-vs-real gap
+    app_discovery.py's own docstring names. Reuses E2E_APP_LOG_PATH/E2E_APP_PID_PATH (not a
+    separate pair): this probe always runs and tears down well before e2e's own stage does, in the
+    same one-container-per-session sandbox.
 
     Returns (started, reason) -- reason is populated on failure only.
     """
@@ -1230,18 +1239,22 @@ async def probe_candidate_boot(
     # was interrupted before its own teardown below ran.
     await _kill_stale_app_processes(provider, thread_id)
 
+    use_env_file = bool(merged_env)
+    if merged_env:
+        await keyvault.write_env_file(provider, thread_id, merged_env)
     port = await _pick_free_port(provider, thread_id, int(candidate.get("port") or 0))
     launch_command = _with_port_env(_scanned_launch_command(candidate), port, str(candidate.get("runtime") or ""))
-    await _boot_process(provider, thread_id, launch_command, E2E_APP_LOG_PATH, E2E_APP_PID_PATH, env_file=False)
-    ready = await _wait_ready(provider, thread_id, port, timeout_seconds=timeout_seconds)
-    # Same PID-file teardown _finalize_run uses: negative pid kills the whole setsid'd process
-    # group, not just the `sh -c` wrapper _boot_process's own pid file records.
-    await provider.exec_in_sandbox(
-        thread_id,
-        f"p=$(cat {E2E_APP_PID_PATH} 2>/dev/null); "
-        f"[ -n \"$p\" ] && {{ kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null; }}; "
-        f"rm -f {E2E_APP_PID_PATH}; true",
-    )
+    try:
+        await _boot_process(
+            provider, thread_id, launch_command, E2E_APP_LOG_PATH, E2E_APP_PID_PATH, env_file=use_env_file
+        )
+        ready = await _wait_ready(provider, thread_id, port, timeout_seconds=timeout_seconds)
+    finally:
+        # ponytail: a same-thread double-click of "Recheck" (or a recheck racing tech-stack's own
+        # first-time probe) can interleave two probes' shared PID/log path -- rare, human-paced, and
+        # self-correcting on a re-click; a per-thread lock is more machinery than this edge case
+        # warrants right now.
+        await _kill_stale_app_processes(provider, thread_id)
     if ready:
         return True, None
     log_tail = truncate_middle(
