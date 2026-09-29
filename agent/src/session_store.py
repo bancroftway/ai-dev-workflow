@@ -96,6 +96,7 @@ async def create_session(
     title: str,
     project_id: str,
     provider: str | None = None,
+    code_gen_mode: str | None = None,
 ) -> None:
     """Idempotent: called from sessions_api.provision_session before the sandbox boots. A
     reattach (same session_id provisioned again) is a no-op here -- touch_run is what refreshes
@@ -111,15 +112,22 @@ async def create_session(
     up). Optional/None only because the IF NOT EXISTS guard below makes this whole INSERT a no-op
     on a reattach -- a caller re-provisioning an existing row is not, in practice, expected to omit
     it, but nothing here enforces that; provision_session always resolves and passes a real value
-    for a genuinely new session, which is the only case this INSERT ever actually fires for."""
+    for a genuinely new session, which is the only case this INSERT ever actually fires for.
+
+    code_gen_mode (Task 1, backend mode threading, 0020_add_sessions_code_gen_mode.sql): the
+    "yolo"/"draft_verify"/"mission_critical" this session's FIRST real provision actually asked
+    for -- same write-once-here contract as provider above, mirrors GraphState.code_gen_mode one
+    layer up. Optional/None because only a genuinely-new session's frontend call sends one at all
+    (older frontend builds, headless/CI runs); graph.py's _resolve_thread_code_gen_mode is what
+    turns a NULL row into a real default ("mission_critical"), not this function."""
     pool = await _get_pool()
     async with pool.acquire() as conn, conn.cursor() as cur:
         await cur.execute(
             """
             IF NOT EXISTS (SELECT 1 FROM dbo.sessions WHERE session_id = ?)
             INSERT INTO dbo.sessions
-                (session_id, owner, repo, user_login, title, source_branch, work_branch, project_id, provider, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress')
+                (session_id, owner, repo, user_login, title, source_branch, work_branch, project_id, provider, code_gen_mode, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress')
             """,
             session_id,
             session_id,
@@ -131,6 +139,7 @@ async def create_session(
             work_branch,
             project_id,
             provider,
+            code_gen_mode,
         )
 
 
@@ -248,6 +257,31 @@ async def set_session_provider(session_id: str, provider: str) -> None:
         )
 
 
+async def set_session_code_gen_mode(session_id: str, mode: str) -> None:
+    """Backfill a pre-0020-migration (or first-provision-omitted) row's NULL code_gen_mode once a
+    reprovision resolves one -- mirrors set_session_provider above exactly, same gap, same fix,
+    just for the code_gen_mode column (Task 1, backend mode threading).
+
+    create_session's own IF NOT EXISTS guard only ever WRITES code_gen_mode on a session's
+    first-ever provision -- a session whose first provision omitted it (an older frontend build, a
+    headless/CI run) has code_gen_mode=NULL permanently, since create_session never runs for it
+    again. Without this, sessions_api.provision_session's stored-or-sent resolution keeps
+    resolving NULL on every single reprovision of that one row forever.
+
+    `WHERE code_gen_mode IS NULL` makes this safe to call unconditionally on every reprovision: a
+    no-op once the row is stamped (idempotent), and it can never clobber an already-pinned value
+    even if called with a different one by mistake -- code_gen_mode, once set, stays exactly as
+    write-once as create_session's own IF NOT EXISTS already makes it for a brand-new row."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE dbo.sessions SET code_gen_mode = ?, updated_at = SYSUTCDATETIME() "
+            "WHERE session_id = ? AND code_gen_mode IS NULL",
+            mode,
+            session_id,
+        )
+
+
 async def close_session(
     session_id: str,
     *,
@@ -319,7 +353,7 @@ _COLUMNS = [
     "session_id", "owner", "repo", "user_login", "title", "source_branch", "work_branch",
     "run_id", "current_stage", "status", "started_at", "ended_at", "merge_ready",
     "pr_title", "pr_url", "failure_stage", "failure_type", "failure_message", "updated_at",
-    "project_id", "awaiting_gate", "provider",
+    "project_id", "awaiting_gate", "provider", "code_gen_mode",
 ]
 
 
@@ -405,6 +439,7 @@ async def _demo() -> None:
             title="Initial request",
             project_id=project_id,
             provider="claude",
+            code_gen_mode="mission_critical",
         )
         row = await get_session(session_id)
         assert row is not None and row["status"] == "in_progress" and row["title"] == "Initial request", row
@@ -414,43 +449,65 @@ async def _demo() -> None:
         # value sessions_api.provision_session must prefer over a live get_provider() re-resolve
         # on every later reprovision of this same session.
         assert row["provider"] == "claude", row
+        # Task 1 (backend mode threading): round-trips exactly, same write-once-at-first-provision
+        # contract as provider above.
+        assert row["code_gen_mode"] == "mission_critical", row
 
         # The IF NOT EXISTS guard makes a second create_session call for the SAME session_id a
         # true no-op -- a reattach with a different (e.g. live-resolved) provider must NOT
-        # overwrite the pinned value from the session's first real provision.
+        # overwrite the pinned value from the session's first real provision. Same for
+        # code_gen_mode.
         await create_session(
             session_id, owner=owner, repo=repo, user_login="octocat", source_branch="main",
             work_branch=f"ai-dev-workflow/{session_id}", title="Initial request", project_id=project_id,
-            provider="copilot",
+            provider="copilot", code_gen_mode="yolo",
         )
         row = await get_session(session_id)
         assert row["provider"] == "claude", (
             f"create_session's IF NOT EXISTS guard must leave the first-pinned provider alone, got {row['provider']!r}"
         )
+        assert row["code_gen_mode"] == "mission_critical", (
+            f"create_session's IF NOT EXISTS guard must leave the first-pinned code_gen_mode alone, "
+            f"got {row['code_gen_mode']!r}"
+        )
 
         # set_session_provider (Phase E audit I-3 review, Minor 3): backfills a pre-0008-migration
         # row's NULL provider once something resolves one -- own session_id since `session_id`
-        # above already has a real (non-NULL) provider from create_session.
+        # above already has a real (non-NULL) provider from create_session. Same legacy row also
+        # covers set_session_code_gen_mode's identical backfill contract (Task 1).
         legacy_session_id = str(uuid.uuid4())
         await create_session(
             legacy_session_id, owner=owner, repo=repo, user_login="octocat", source_branch="main",
             work_branch=f"ai-dev-workflow/{legacy_session_id}", title="Legacy row", project_id=project_id,
-            # provider omitted -- simulates a session created before migration 0008 (provider=NULL).
+            # provider/code_gen_mode both omitted -- simulates a session created before migrations
+            # 0008/0020 (provider=NULL, code_gen_mode=NULL).
         )
         row = await get_session(legacy_session_id)
         assert row["provider"] is None, row  # premise check
+        assert row["code_gen_mode"] is None, row  # premise check
 
         await set_session_provider(legacy_session_id, "copilot")
         row = await get_session(legacy_session_id)
         assert row["provider"] == "copilot", row
 
+        await set_session_code_gen_mode(legacy_session_id, "draft_verify")
+        row = await get_session(legacy_session_id)
+        assert row["code_gen_mode"] == "draft_verify", row
+
         # WHERE provider IS NULL guard: a second stamp with a DIFFERENT value must be a no-op, not
         # an overwrite -- once set (by this function or by create_session), provider stays exactly
         # as write-once as create_session's own IF NOT EXISTS already makes it for a brand-new row.
+        # Same WHERE code_gen_mode IS NULL guard for set_session_code_gen_mode.
         await set_session_provider(legacy_session_id, "claude")
         row = await get_session(legacy_session_id)
         assert row["provider"] == "copilot", (
             f"set_session_provider must never overwrite an already-stamped value, got {row['provider']!r}"
+        )
+
+        await set_session_code_gen_mode(legacy_session_id, "yolo")
+        row = await get_session(legacy_session_id)
+        assert row["code_gen_mode"] == "draft_verify", (
+            f"set_session_code_gen_mode must never overwrite an already-stamped value, got {row['code_gen_mode']!r}"
         )
         await delete_session(legacy_session_id)
 
