@@ -13,20 +13,22 @@ one result out. graph.py's own _verify_specification_ledger wraps this as a dete
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
-# What a REAL ledger id looks like. The renumbering guards below only fire when the draft's own
-# `id` field is itself ledger-shaped: schemas.py documents `id` as a same-response placeholder
-# that is "ignored when existing_us_id is set", so a placeholder like 'draft-story-1' alongside a
-# valid citation is the DOCUMENTED contract, not an attempted renumbering. Enforcing equality for
-# placeholders made every revision round fail by construction (observed live: three verify cycles
-# burned on 'draft-story-1' != 'US-0001').
-_REAL_ID_RE = re.compile(r"^US-\d+(\.\d+)?$")
-
 from . import repo_files
+from .gates.ledger_sync_checks import (
+    check_bug_affected_ac_id,
+    check_existing_ac_id_citation,
+    check_existing_us_id_citation,
+    check_fully_reviewed_completeness,
+    check_retired_ac_id,
+    check_retired_us_id,
+    duplicate_ac_reason,
+    duplicate_story_reason,
+    find_duplicate_by_text,
+)
 from .gates.narrative_format_checks import check_narrative_format
 from .gates.wireframe_linkage_checks import check_retired_step_ids
 from .sandbox.provider import SandboxProvider
@@ -251,43 +253,13 @@ def _find(entries: list[dict[str, Any]], entry_id: str) -> dict[str, Any] | None
     return None
 
 
-def _normalize_text(text: str) -> str:
-    """Whitespace/case-insensitive comparison key for the citation-drop check below -- collapses
-    the exact formatting noise (extra spaces, capitalization) a model's re-typed text could
-    plausibly differ on while still being the same content, without doing any fuzzy/similarity
-    matching that could false-positive two genuinely different stories into looking like a dup."""
-    return " ".join(text.split()).strip().lower()
-
-
-def _find_duplicate_by_text(
-    entries: list[dict[str, Any]], kind: EntryKind, text: str, exclude_ids: set[str]
-) -> dict[str, Any] | None:
-    """An already-tracked, still-live entry of the same `kind` whose own title/description text is
-    an EXACT match (after `_normalize_text`) for `text` -- evidence this "new" entry is really an
-    already-numbered one whose citation got dropped, not genuinely new content.
-
-    Root-caused 2026-09-17 (income-investor run d2392db9): 3 of 8 specification laps were spent
-    almost entirely on the auditor manually re-discovering and re-citing already-numbered stories/
-    criteria the draft had re-emitted with `existing_us_id`/`existing_ac_id: null` -- word-for-word
-    identical to content the ledger already tracked under a real id (one lap's own audit note:
-    "Restored the citation to the real ledger id (was null); no wording change" x30). The `else`
-    branches below used to mint a brand-new id for ANY null citation with no cross-check at all,
-    silently accepting -- and duplicating -- content the ledger already had. An EXACT text match
-    (not fuzzy) keeps this zero-false-positive: two genuinely different stories essentially never
-    share byte-identical title/description text, so this only fires on the real regression."""
-    text_key = _normalize_text(text)
-    if not text_key:
-        return None
-    for entry in entries:
-        if (
-            entry.get("kind") == kind
-            and entry.get("id") not in exclude_ids
-            and entry.get("status") in ("active", "revised", "deferred")
-            and _normalize_text(entry.get("title" if kind == "user_story" else "description", "")) == text_key
-        ):
-            return entry
-    return None
-
+# _normalize_text/_find_duplicate_by_text (the exact-text citation-drop dedup check) used to be
+# defined here; extracted 2026-09-29 (Task 11) into gates/ledger_sync_checks.py (imported above,
+# as `find_duplicate_by_text` -- no leading underscore, now that it's a shared export) alongside
+# sync_ledger's own existing_us_id/existing_ac_id/retired_us_ids/retired_ac_ids/bug_affected_ac_ids
+# citation-validity checks, so the sandbox's own same-turn Stop hook (check-ledger-sync-stop.mjs)
+# can shell out to the REAL implementation instead of a hand-ported, unguarded JS twin. See that
+# module's own docstring for the full rule inventory.
 
 # check_narrative_format (and its _NARRATIVE_RE/_NON_STAKEHOLDER_ROLE_WORDS backing) used to be
 # defined here; extracted 2026-09-29 into gates/narrative_format_checks.py (imported above) so the
@@ -430,21 +402,11 @@ def sync_ledger(
             for ac in story.get("acceptance_criteria") or []:
                 ac["existing_ac_id"] = None
         if existing_us_id is not None:
+            problem = check_existing_us_id_citation(existing_us_id, story.get("id"), updated)
+            if problem:
+                reasons.append(problem)
+                continue
             entry = _find(updated, existing_us_id)
-            if entry is None or entry.get("kind") != "user_story":
-                reasons.append(f"existing_us_id {existing_us_id!r} does not exist in the ledger")
-                continue
-            if entry.get("status") == "retired":
-                reasons.append(
-                    f"existing_us_id {existing_us_id!r} refers to a retired story -- ids are never reused"
-                )
-                continue
-            if story.get("id") is not None and _REAL_ID_RE.match(str(story["id"])) and story["id"] != existing_us_id:
-                reasons.append(
-                    f"draft's own id {story.get('id')!r} does not match its cited existing_us_id "
-                    f"{existing_us_id!r} -- do not renumber an existing story"
-                )
-                continue
             # Deferred scope (user requirement 2026-08-31): a story marked deferred in the draft is
             # specified but parked -- not in the work queue, not crossed out. Citing a deferred
             # entry WITHOUT the flag promotes it back to live ("activated"), the delta flow that
@@ -467,17 +429,11 @@ def sync_ledger(
                     entry["activated_run_id"] = run_id
             resolved_us_id = existing_us_id
         else:
-            dup = None if ledger_was_empty else _find_duplicate_by_text(
+            dup = None if ledger_was_empty else find_duplicate_by_text(
                 updated, "user_story", story.get("title", ""), touched_ids
             )
             if dup is not None:
-                reasons.append(
-                    f"story {story.get('id')!r} (title {story.get('title')!r}) is word-for-word "
-                    f"identical to already-tracked {dup['id']!r} but cites existing_us_id: null -- "
-                    f"this looks like a dropped citation, not new content: cite {dup['id']!r} via "
-                    "existing_us_id instead (copied character-for-character), or if it genuinely is "
-                    "new content, reword it so it isn't identical to an existing story"
-                )
+                reasons.append(duplicate_story_reason(story, dup))
                 continue
             story_deferred = bool(story.get("deferred"))
             resolved_us_id = allocate_next_id(updated, "user_story")
@@ -504,27 +460,11 @@ def sync_ledger(
             ac_deferred = bool(ac.get("deferred")) or story_deferred
             existing_ac_id = ac.get("existing_ac_id")
             if existing_ac_id is not None:
+                problem = check_existing_ac_id_citation(existing_ac_id, ac.get("id"), resolved_us_id, updated)
+                if problem:
+                    reasons.append(problem)
+                    continue
                 ac_entry = _find(updated, existing_ac_id)
-                if ac_entry is None or ac_entry.get("kind") != "acceptance_criterion":
-                    reasons.append(f"existing_ac_id {existing_ac_id!r} does not exist in the ledger")
-                    continue
-                if ac_entry.get("parent_us_id") != resolved_us_id:
-                    reasons.append(
-                        f"existing_ac_id {existing_ac_id!r} belongs to a different user story than "
-                        f"{resolved_us_id!r}"
-                    )
-                    continue
-                if ac_entry.get("status") == "retired":
-                    reasons.append(
-                        f"existing_ac_id {existing_ac_id!r} refers to a retired AC -- ids are never reused"
-                    )
-                    continue
-                if ac.get("id") is not None and _REAL_ID_RE.match(str(ac["id"])) and ac["id"] != existing_ac_id:
-                    reasons.append(
-                        f"draft's own id {ac.get('id')!r} does not match its cited existing_ac_id "
-                        f"{existing_ac_id!r} -- do not renumber an existing AC"
-                    )
-                    continue
                 ac_was_deferred = ac_entry.get("status") == "deferred"
                 ac_entry["status"] = "deferred" if ac_deferred else "revised"
                 if ac_deferred != ac_was_deferred:
@@ -549,18 +489,11 @@ def sync_ledger(
                 ac_entry["ui_related"] = ac.get("ui_related", ac_entry.get("ui_related", False))
                 resolved_ac_id = existing_ac_id
             else:
-                ac_dup = None if ledger_was_empty else _find_duplicate_by_text(
+                ac_dup = None if ledger_was_empty else find_duplicate_by_text(
                     updated, "acceptance_criterion", ac.get("description", ""), touched_ids
                 )
                 if ac_dup is not None:
-                    reasons.append(
-                        f"criterion {ac.get('id')!r} (description {ac.get('description')!r}) is "
-                        f"word-for-word identical to already-tracked {ac_dup['id']!r} but cites "
-                        f"existing_ac_id: null -- this looks like a dropped citation, not new "
-                        f"content: cite {ac_dup['id']!r} via existing_ac_id instead (copied "
-                        "character-for-character), or if it genuinely is new content, reword it so "
-                        "it isn't identical to an existing criterion"
-                    )
+                    reasons.append(duplicate_ac_reason(ac, ac_dup))
                     continue
                 resolved_ac_id = allocate_next_id(updated, "acceptance_criterion", resolved_us_id)
                 new_ac_entry = {
@@ -593,19 +526,11 @@ def sync_ledger(
             child["last_revised_run_id"] = run_id
 
     for us_id in retired_us_ids or []:
+        problem = check_retired_us_id(us_id, updated, touched_ids)
+        if problem:
+            reasons.append(problem)
+            continue
         entry = _find(updated, us_id)
-        if entry is None:
-            reasons.append(f"retired_us_ids cites {us_id!r}, which does not exist in the ledger")
-            continue
-        if entry.get("kind") != "user_story":
-            reasons.append(f"retired_us_ids cites {us_id!r}, which is not a user story id")
-            continue
-        if us_id in touched_ids:
-            reasons.append(
-                f"retired_us_ids cites {us_id!r}, but this draft also revises it via "
-                "existing_us_id -- a story cannot be both revised and retired in the same draft"
-            )
-            continue
         if entry.get("status") in ("active", "revised", "deferred"):
             entry["status"] = "retired"
             entry["last_revised_run_id"] = run_id
@@ -634,44 +559,22 @@ def sync_ledger(
                     child["last_revised_run_id"] = run_id
 
     for ac_id in retired_ac_ids or []:
+        problem = check_retired_ac_id(ac_id, updated, touched_ids)
+        if problem:
+            reasons.append(problem)
+            continue
         entry = _find(updated, ac_id)
-        if entry is None:
-            reasons.append(f"retired_ac_ids cites {ac_id!r}, which does not exist in the ledger")
-            continue
-        if entry.get("kind") != "acceptance_criterion":
-            reasons.append(f"retired_ac_ids cites {ac_id!r}, which is not an acceptance criterion id")
-            continue
-        if ac_id in touched_ids:
-            reasons.append(
-                f"retired_ac_ids cites {ac_id!r}, but this draft also revises it via "
-                "existing_ac_id -- an AC cannot be both revised and retired in the same draft"
-            )
-            continue
         if entry.get("status") in ("active", "revised", "deferred"):
             entry["status"] = "retired"
             entry["last_revised_run_id"] = run_id
 
     retired_ac_id_set = set(retired_ac_ids or [])
     for bug_ac_id in bug_affected_ac_ids or []:
+        problem = check_bug_affected_ac_id(bug_ac_id, updated, retired_ac_id_set)
+        if problem:
+            reasons.append(problem)
+            continue
         entry = _find(updated, bug_ac_id)
-        if entry is None:
-            reasons.append(f"bug_affected_ac_ids cites {bug_ac_id!r}, which does not exist in the ledger")
-            continue
-        if entry.get("kind") != "acceptance_criterion":
-            reasons.append(f"bug_affected_ac_ids cites {bug_ac_id!r}, which is not an acceptance criterion id")
-            continue
-        if entry.get("status") not in ("active", "revised", "deferred"):
-            reasons.append(
-                f"bug_affected_ac_ids cites {bug_ac_id!r}, which is not a live criterion "
-                f"(status={entry.get('status')!r}) -- a retired/nonexistent id cannot be reopened"
-            )
-            continue
-        if bug_ac_id in retired_ac_id_set:
-            reasons.append(
-                f"bug_affected_ac_ids cites {bug_ac_id!r}, but this draft also retires it via "
-                "retired_ac_ids -- a criterion cannot be both reopened by a bug and removed in the same draft"
-            )
-            continue
         entry[PENDING_RESET_FIELD] = run_id
 
     if reasons:
@@ -684,30 +587,17 @@ def sync_ledger(
                     "active", "revised", "deferred",
                 ):
                     entry["last_reviewed_run_id"] = run_id
-        not_reviewed = [
-            e["id"]
-            for e in updated
-            if e.get("kind") in ("user_story", "acceptance_criterion")
-            and e.get("status") in ("active", "revised", "deferred")
-            and e.get("last_reviewed_run_id") != run_id
-        ]
-        if not_reviewed:
-            # Count, not the id list: a first ticket's ids here are freshly allocated in `updated`
-            # and never saved (this sync fails), so naming them sent the next draft chasing
-            # "ledger ids" that did not exist -- observed 2026-09-18 (session 6244ef47, lap 2
-            # rewrote the whole file to "re-cite" them). The actionable fact is WHO must act: the
-            # AUDIT pass, by viewing the whole file; the draft's content is not in question.
-            return LedgerSyncResult(
-                passed=False,
-                reasons=[
-                    "the AUDIT session did not prove it read the ENTIRE draft file this lap "
-                    f"({len(not_reviewed)} still-live stories/criteria unconfirmed). The audit pass "
-                    f"must view the whole {DRAFT_SPEC_PATH} -- one full Read, or offset/limit reads "
-                    "that together cover every line -- before resubmitting. No content change is "
-                    "implied."
-                ],
-                updated_entries=entries,
-            )
+        # Count, not the id list: a first ticket's ids here are freshly allocated in `updated` and
+        # never saved (this sync fails), so naming them sent the next draft chasing "ledger ids"
+        # that did not exist -- observed 2026-09-18 (session 6244ef47, lap 2 rewrote the whole file
+        # to "re-cite" them). The actionable fact is WHO must act: the AUDIT pass, by viewing the
+        # whole file; the draft's content is not in question. Moved verbatim (2026-09-29, Task 11)
+        # into gates/ledger_sync_checks.check_fully_reviewed_completeness -- called AFTER the
+        # stamping loop above, so a lap that just proved a full read already has its stamps in
+        # `updated` by the time this runs.
+        completeness_problem = check_fully_reviewed_completeness(updated, run_id)
+        if completeness_problem is not None:
+            return LedgerSyncResult(passed=False, reasons=[completeness_problem], updated_entries=entries)
 
     _stamp_change_dates(updated, run_id, now_iso)
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
@@ -1444,6 +1334,130 @@ def _demo() -> None:
     ]
     dropped_us_ws_result = sync_ledger([dict(e) for e in seed], dropped_us_ws_draft, "run-15")
     assert not dropped_us_ws_result.passed, "whitespace/case differences must not evade the duplicate check"
+
+    # --- Task 11 extraction: previously-untested sync_ledger citation/retirement branches --
+    # unknown/wrong-parent/retired-reuse/renumbering for existing_us_id/existing_ac_id,
+    # wrong-kind for retired_us_ids/retired_ac_ids, and the revise-and-retire contradiction at
+    # both levels. None of these had a direct assertion before this extraction moved their logic
+    # into gates/ledger_sync_checks.py -- added here to actually PIN the behavior the extraction
+    # has to preserve, not just trust it by inspection.
+    rules_seed = [
+        {"id": "US-0001", "kind": "user_story", "status": "active", "title": "Sign in",
+         "first_seen_run_id": "run-1", "last_revised_run_id": "run-1"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "parent_us_id": "US-0001", "status": "active",
+         "description": "Shows an error.", "first_seen_run_id": "run-1", "last_revised_run_id": "run-1"},
+        {"id": "US-0002", "kind": "user_story", "status": "active", "title": "Reset password",
+         "first_seen_run_id": "run-1", "last_revised_run_id": "run-1"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "parent_us_id": "US-0002", "status": "retired",
+         "description": "Old criterion.", "first_seen_run_id": "run-1", "last_revised_run_id": "run-1"},
+        {"id": "US-0003", "kind": "user_story", "status": "retired", "title": "Old feature",
+         "first_seen_run_id": "run-1", "last_revised_run_id": "run-1"},
+    ]
+
+    # existing_us_id: unknown id.
+    unknown_us_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": None, "existing_us_id": "US-9999", "title": "x", "acceptance_criteria": []}],
+        "run-30",
+    )
+    assert not unknown_us_result.passed
+    assert "US-9999" in unknown_us_result.reasons[0] and "does not exist" in unknown_us_result.reasons[0]
+
+    # existing_us_id: retired-reuse.
+    retired_reuse_us_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": None, "existing_us_id": "US-0003", "title": "x", "acceptance_criteria": []}],
+        "run-30",
+    )
+    assert not retired_reuse_us_result.passed
+    assert "never reused" in retired_reuse_us_result.reasons[0]
+
+    # existing_us_id: renumbering guard -- a REAL-shaped draft id that disagrees with its citation.
+    renumber_us_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": "US-0002", "existing_us_id": "US-0001", "title": "x", "acceptance_criteria": []}],
+        "run-30",
+    )
+    assert not renumber_us_result.passed
+    assert "renumber" in renumber_us_result.reasons[0]
+
+    # existing_ac_id: unknown id.
+    unknown_ac_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in", "acceptance_criteria": [
+            {"id": None, "existing_ac_id": "US-9999.9", "description": "x"}
+        ]}],
+        "run-30",
+    )
+    assert not unknown_ac_result.passed
+    assert "US-9999.9" in unknown_ac_result.reasons[0] and "does not exist" in unknown_ac_result.reasons[0]
+
+    # existing_ac_id: wrong parent -- US-0001.1 really belongs to US-0001, cited here under US-0002.
+    wrong_parent_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": "US-0002", "existing_us_id": "US-0002", "title": "Reset password", "acceptance_criteria": [
+            {"id": None, "existing_ac_id": "US-0001.1", "description": "x"}
+        ]}],
+        "run-30",
+    )
+    assert not wrong_parent_result.passed
+    assert "different user story" in wrong_parent_result.reasons[0]
+
+    # existing_ac_id: retired-reuse (the AC itself retired, its still-active parent story revised).
+    retired_reuse_ac_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": "US-0002", "existing_us_id": "US-0002", "title": "Reset password", "acceptance_criteria": [
+            {"id": None, "existing_ac_id": "US-0002.1", "description": "x"}
+        ]}],
+        "run-30",
+    )
+    assert not retired_reuse_ac_result.passed
+    assert "never reused" in retired_reuse_ac_result.reasons[0]
+
+    # existing_ac_id: renumbering guard.
+    renumber_ac_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in", "acceptance_criteria": [
+            {"id": "US-0002.1", "existing_ac_id": "US-0001.1", "description": "x"}
+        ]}],
+        "run-30",
+    )
+    assert not renumber_ac_result.passed
+    assert "renumber" in renumber_ac_result.reasons[0]
+
+    # retired_us_ids: unknown id, and wrong kind (an AC id, not a user story id).
+    assert not sync_ledger([dict(e) for e in rules_seed], [], "run-30", retired_us_ids=["US-9999"]).passed
+    wrong_kind_us_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", retired_us_ids=["US-0001.1"])
+    assert not wrong_kind_us_result.passed
+    assert "not a user story id" in wrong_kind_us_result.reasons[0]
+
+    # retired_ac_ids: wrong kind (a user story id, not an AC id -- almost always the two fields swapped).
+    wrong_kind_ac_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", retired_ac_ids=["US-0001"])
+    assert not wrong_kind_ac_result.passed
+    assert "not an acceptance criterion id" in wrong_kind_ac_result.reasons[0]
+
+    # revise-and-retire contradiction, story level: cited via existing_us_id AND named in
+    # retired_us_ids in the same draft.
+    revise_retire_us_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in", "acceptance_criteria": []}],
+        "run-30",
+        retired_us_ids=["US-0001"],
+    )
+    assert not revise_retire_us_result.passed
+    assert "cannot be both revised and retired" in revise_retire_us_result.reasons[0]
+
+    # Same contradiction, AC level.
+    revise_retire_ac_result = sync_ledger(
+        [dict(e) for e in rules_seed],
+        [{"id": "US-0001", "existing_us_id": "US-0001", "title": "Sign in", "acceptance_criteria": [
+            {"id": "US-0001.1", "existing_ac_id": "US-0001.1", "description": "Shows an error."}
+        ]}],
+        "run-30",
+        retired_ac_ids=["US-0001.1"],
+    )
+    assert not revise_retire_ac_result.passed
+    assert "cannot be both revised and retired" in revise_retire_ac_result.reasons[0]
 
     # THE FIX: naming a story in retired_us_ids DOES retire it, and cascades to its own AC.
     result2 = sync_ledger([dict(e) for e in seed], [], "run-3", retired_us_ids=["US-0001"])

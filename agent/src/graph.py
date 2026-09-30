@@ -62,6 +62,7 @@ from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
 from .gates import adversarial_gate, remediation_gate, skill_gate
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
+from .gates.ledger_sync_checks import check_empty_draft, find_open_questions
 from .gates.diagram_gate import (
     DRAFT_DIAGRAMS_DIR,
     DRAFT_DIR,
@@ -1293,20 +1294,11 @@ def make_verify_specification_ledger(
         # wording-unchanged bug-reopen ticket (bug_affected_ac_ids only) legitimately has no
         # stories/criteria to submit. Reject only when EVERY field a real submission could touch is
         # empty, since that's the only shape a true first-ever no-op can produce.
-        if not (
-            file_specification.get("user_stories")
-            or file_specification.get("retired_us_ids")
-            or file_specification.get("retired_ac_ids")
-            or file_specification.get("bug_affected_ac_ids")
-        ):
+        empty_draft_reason = check_empty_draft(file_specification)
+        if empty_draft_reason is not None:
             return VerificationResult(
                 passed=False,
-                feedback=(
-                    f"{spec_ledger.DRAFT_SPEC_PATH} has nothing in it -- no new/revised stories or "
-                    "criteria, no retirements, no bug-affected ids. This response is metadata ABOUT "
-                    "the specification, not the specification itself. Use your file tools to "
-                    "actually write this ticket's real delta, then resubmit."
-                ),
+                feedback=empty_draft_reason,
                 report={"draft_file": "empty"},
             )
         content_dict.clear()
@@ -1357,9 +1349,7 @@ def make_verify_specification_ledger(
         # keeps open questions away from the gate on the DRAFT path, but the audit revises content
         # after that and could reintroduce one -- verify is the last deterministic word before the
         # gate, so an open question here fails the check outright.
-        open_questions = [
-            q for q in (content_dict.get("questions") or []) if isinstance(q, dict) and q.get("status") == "open"
-        ]
+        open_questions = find_open_questions(content_dict.get("questions") or [])
         if open_questions:
             listed = "; ".join(f"{q.get('id')}: {q.get('question')}" for q in open_questions)
             return VerificationResult(

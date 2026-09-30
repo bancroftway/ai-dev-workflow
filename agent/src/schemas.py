@@ -446,7 +446,17 @@ class ManifestFile(BaseModel):
 # docstring for the drift this two-step (export, then a self-check that re-runs it and diffs)
 # exists to prevent.
 HOOK_SCHEMAS_DIR = "sandbox-image/hooks/schemas"
-HOOK_SCHEMAS: dict[str, type[BaseModel]] = {"plan_steps": StepsFile, "plan_manifest": ManifestFile}
+# "specification" (2026-09-29, Task 11): Specification itself is the WHOLE shape of
+# `.ai-dev-workflow/spec/draft-specification.json` already (unlike StepsFile/ManifestFile above,
+# no envelope wrapper needed -- there is exactly one file, exactly one model). Exported so
+# check-ledger-sync-stop.mjs can validate that file's shape via the same generic
+# lib/json-schema-lite.mjs walker plan's schema hook uses, instead of a hand-typed field list.
+# Known gap, not a bug: the walker has no `anyOf` support (see its own header), so
+# `existing_us_id`/`existing_ac_id` (`str | None`) are not type-checked by the hook -- graph.py's
+# own `Specification.model_validate` (unchanged, still the real gate) still catches those.
+HOOK_SCHEMAS: dict[str, type[BaseModel]] = {
+    "plan_steps": StepsFile, "plan_manifest": ManifestFile, "specification": Specification,
+}
 
 
 def export_hook_schemas() -> dict[str, dict[str, Any]]:
