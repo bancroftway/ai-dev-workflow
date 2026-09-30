@@ -8,31 +8,16 @@ import { fetchProject } from "@/lib/agent-client";
 import { SettingsBanner } from "@/components/SettingsBanner";
 import { inProgressLabel, STATUS_BADGE } from "@/components/SessionHistory";
 import { RunningSpinner } from "@/components/Spinner";
-import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
+import { useFetchedPipeline, type Pipeline } from "@/lib/pipeline";
+import type { Session } from "@/lib/session-types";
 import { providerLabel, useOrgProvider } from "@/lib/use-org-provider";
 
 // Ruling 5 (this Part's own plan): plain polling, no CopilotKit/AG-UI live subscription.
 const POLL_INTERVAL_MS = 15_000;
 
-// Sentinel column key for the one terminal bucket the brief asks for on top of the 8 real
-// StageSpec keys -- deliberately not a real stage key (STAGE_KEYS_IN_ORDER stays exactly what
-// graph.py's STAGES declares, nothing invented added to it).
+// Sentinel column key for the one terminal bucket, on top of the pipeline's own tabs --
+// deliberately not a real tab id.
 const DONE_COLUMN = "__done__";
-
-// Cosmetic display labels only -- the column SET is still exactly STAGE_KEYS_IN_ORDER (graph.py's
-// real 8 StageSpec keys). This is not the wireframe's TS/SP/PL/GF/BD/RM/AR/RR/DN legend (that one
-// folds metrics-exit into Adversarial Review and adds two non-pipeline columns that don't
-// correspond to any real StageSpec) -- just a readable title for each of the same 8 real keys.
-const STAGE_LABELS: Record<(typeof STAGE_KEYS_IN_ORDER)[number], string> = {
-  "tech-stack": "Tech Stack",
-  specification: "Specification",
-  plan: "Plan",
-  "ac-to-tests": "AC → Tests",
-  "minimal-code-to-green": "Minimal Code to Green",
-  remediation: "Remediation",
-  "adversarial-compliance": "Adversarial Compliance",
-  "metrics-exit": "Metrics Exit",
-};
 
 type ProjectState =
   | { kind: "loading" }
@@ -58,23 +43,28 @@ type ProjectState =
  * Coordinator ruling: fix HERE, at the display layer, rather than changing current_stage's backend
  * semantics -- those are documented as deliberate elsewhere and resume/persistence code may depend
  * on them. A non-completed card's column is therefore the stage AFTER current_stage in
- * STAGE_KEYS_IN_ORDER, clamped at the last real stage (an all-8-approved ticket that hasn't
+ * the pipeline's run order, clamped at the last real stage (an all-8-approved ticket that hasn't
  * flipped to status "completed" yet has nowhere further to go but Done, and Done is reserved for
  * that status specifically -- see the branch above). `current_stage === null` means "before the
  * first stage's own approval" (still drafting tech-stack, or never got that far) and keeps landing
- * in the first column, same result "shift index -1 by one" would already give. */
-function columnFor(session: Session): string {
+ * in the first column, same result "shift index -1 by one" would already give.
+ *
+ * Columns are the backend pipeline descriptor's tabs (those with stages), so a card lands in the
+ * tab that owns that next stage -- brownfield-* stages fold into Specification/Plan. */
+function columnFor(session: Session, pipeline: Pipeline): string {
   if (session.status === "completed") return DONE_COLUMN;
+  const first = pipeline.tabs.find((t) => t.stages.length > 0)?.id ?? DONE_COLUMN;
   const stage = session.current_stage;
-  if (stage == null) return STAGE_KEYS_IN_ORDER[0];
-  const index = (STAGE_KEYS_IN_ORDER as readonly string[]).indexOf(stage);
+  if (stage == null) return first;
+  const index = pipeline.stageOrderIndex(stage);
   // Defensive (Task 10 sweep item #14): a non-null value that isn't one of the 8 real keys can't
   // be shifted by one -- same first-column fallback as the null case above. Without this, such a
   // session would land in a `grouped` bucket the render loop below never iterates (it only maps
   // over the fixed `columns` list), silently vanishing from the board instead of degrading
   // gracefully the way SessionHistory.tsx's own ProgressIndicator already does for this same case.
-  if (index === -1) return STAGE_KEYS_IN_ORDER[0];
-  return STAGE_KEYS_IN_ORDER[Math.min(index + 1, STAGE_KEYS_IN_ORDER.length - 1)];
+  if (index === -1) return first;
+  const next = pipeline.nextStageAfter(stage) ?? pipeline.order[pipeline.order.length - 1];
+  return pipeline.tabForStage(next)?.id ?? first;
 }
 
 /**
@@ -96,6 +86,7 @@ export default function ProjectBoardPage() {
   // provider string of its own (finding B.2, still correct), this is the one positive affordance
   // for the whole board.
   const provider = useOrgProvider();
+  const pipeline = useFetchedPipeline();
 
   // Reset both to a loading/empty state the moment projectId itself changes (Task 10 sweep item
   // #13): without this, direct board-to-board navigation (browser back/forward, a typed URL) kept
@@ -194,10 +185,12 @@ export default function ProjectBoardPage() {
   // No repo yet -> definitionally empty (see the effect above); otherwise whatever the last
   // successful poll returned, or still-loading (null) on the very first render.
   const effectiveSessions: Session[] | null = !owner || !repo ? [] : sessions;
-  const columns: string[] = [...STAGE_KEYS_IN_ORDER, DONE_COLUMN];
+  const stageTabs = pipeline?.tabs.filter((t) => t.stages.length > 0) ?? [];
+  const columns: string[] = pipeline ? [...stageTabs.map((t) => t.id), DONE_COLUMN] : [];
+  const columnLabel = (key: string) => (key === DONE_COLUMN ? "Done" : (stageTabs.find((t) => t.id === key)?.label ?? key));
   const grouped: Record<string, Session[]> = Object.fromEntries(columns.map((key) => [key, []]));
-  for (const session of effectiveSessions ?? []) {
-    (grouped[columnFor(session)] ??= []).push(session);
+  if (pipeline) {
+    for (const session of effectiveSessions ?? []) (grouped[columnFor(session, pipeline)] ??= []).push(session);
   }
 
   return (
@@ -240,7 +233,7 @@ export default function ProjectBoardPage() {
         {columns.map((key) => (
           <div key={key} className="flex w-64 shrink-0 flex-col gap-2 rounded-lg bg-neutral-50 p-3">
             <h2 className="flex items-center justify-between text-sm font-semibold text-neutral-700">
-              <span>{key === DONE_COLUMN ? "Done" : STAGE_LABELS[key as keyof typeof STAGE_LABELS]}</span>
+              <span>{columnLabel(key)}</span>
               <span className="text-xs font-normal text-neutral-400">{grouped[key].length}</span>
             </h2>
             <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">

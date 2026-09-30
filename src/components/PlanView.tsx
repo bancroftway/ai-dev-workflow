@@ -13,7 +13,8 @@ import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import { stageOrderIndex, type WorkflowState } from "@/lib/workflow-types";
+import { usePipeline } from "@/lib/pipeline";
+import type { WorkflowState } from "@/lib/workflow-types";
 
 function PlanViewImpl() {
   // agentId only -- see RequirementsView.tsx's comment: AppShell already registered this
@@ -22,6 +23,7 @@ function PlanViewImpl() {
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { interrupt } = useOpenInterrupt();
   const [runActivity] = useRunActivity();
+  const { stageOrderIndex } = usePipeline();
   const state = (agent.state ?? {}) as WorkflowState;
   const plan = state.stages?.plan;
 

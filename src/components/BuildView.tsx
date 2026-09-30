@@ -7,16 +7,10 @@ import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { EMPTY_PHASES, NODE_PHASE_LABEL, useRunningPhases } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import {
-  REBUILD_PLACEMENTS,
-  REBUILD_STATUS_LABEL,
-  rebuildPhase,
-  stageOrderIndex,
-  type StageState,
-  type WorkflowState,
-} from "@/lib/workflow-types";
+import { usePipeline } from "@/lib/pipeline";
+import { REBUILD_STATUS_LABEL, rebuildPhase, type StageState, type WorkflowState } from "@/lib/workflow-types";
 
-// Both stages this view renders (BUILD_STAGES below) are non-gated -- no human ever reviews them
+// The stages this view renders (the tab's stageKeys) are non-gated -- no human ever reviews them
 // (README: only tech-stack/specification/plan pause for a person). "Ready for review" is the
 // backend's generic status name for "draft done, deterministic verify next", shared with the
 // gated stages where it genuinely does mean a human's turn -- reusing that wording here read as
@@ -29,11 +23,6 @@ const STATUS_LABEL: Record<string, string> = {
   ready_for_review: "Auto-verifying",
   approved: "Approved",
 };
-
-const BUILD_STAGES: { key: "ac-to-tests" | "minimal-code-to-green"; label: string; blurb: string }[] = [
-  { key: "ac-to-tests", label: "Acceptance Criteria to Tests", blurb: "Failing tests written from the approved acceptance criteria." },
-  { key: "minimal-code-to-green", label: "Minimal Code to Green", blurb: "The smallest implementation that makes those tests pass." },
-];
 
 function StageCard({
   stageKey,
@@ -156,7 +145,12 @@ export function RebuildConnector({
   );
 }
 
-function BuildViewImpl() {
+/** One StageCard (+ its rebuild connector) per stage key -- the Tests/Code tabs' view, and the
+ * generic fallback for any tab whose view key has no bespoke component (AppShell's VIEWS).
+ * Labels/blurbs come from the backend pipeline descriptor. */
+function BuildViewImpl({ title, stageKeys }: { title: string; stageKeys: readonly string[] }) {
+  const pipeline = usePipeline();
+  const { stageOrderIndex } = pipeline;
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
@@ -174,11 +168,10 @@ function BuildViewImpl() {
   return (
     <ViewContainer>
       <div>
-        <h1 className="text-lg font-semibold">Build</h1>
-        <p className="text-sm text-neutral-500">Tests-first implementation progress after the approved plan.</p>
+        <h1 className="text-lg font-semibold">{title}</h1>
       </div>
-      {BUILD_STAGES.map(({ key, label, blurb }) => {
-        const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
+      {stageKeys.map((key) => {
+        const placement = pipeline.rebuildPlacements.find((p) => p.afterStageKey === key);
         const phase = placement && rebuildPhase(state, placement, runActivity?.runActive, runningPhases);
         const stage = state.stages?.[key];
         // Pivot (root-caused 2026-09-12): `!runActivity?.interrupted` used to gate this off too,
@@ -194,8 +187,8 @@ function BuildViewImpl() {
           <Fragment key={key}>
             <StageCard
               stageKey={key}
-              label={label}
-              blurb={blurb}
+              label={pipeline.stageLabel(key)}
+              blurb={pipeline.stage(key)?.description ?? ""}
               stage={stage}
               runFailure={state.run_failure}
               runningLabel={runningPhases.has(key) ? (NODE_PHASE_LABEL[runningPhases.get(key)!] ?? "Running") : null}
@@ -217,7 +210,7 @@ function BuildViewImpl() {
   );
 }
 
-// No props -- re-renders only from its own scoped useAgent/useRunningPhases/useRunActivity
-// subscriptions, but memoized anyway so AppShell's own local-state re-renders (tab switch,
+// Props are stable (AppShell memoises stageKeys per tab) -- re-renders only from its own scoped
+// useAgent/useRunningPhases/useRunActivity subscriptions, memoized so AppShell's own local-state re-renders (tab switch,
 // scrollRequest, sandboxStatus, ...) don't also force this while it's the hidden tab.
 export const BuildView = memo(BuildViewImpl);

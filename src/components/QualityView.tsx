@@ -9,10 +9,9 @@ import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { EMPTY_PHASES, useRunningPhases } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
+import { usePipeline } from "@/lib/pipeline";
 import {
-  REBUILD_PLACEMENTS,
   rebuildPhase,
-  stageOrderIndex,
   type AdversarialComplianceReport,
   type PresenceList,
   type RemediationContent,
@@ -305,9 +304,10 @@ function QualityViewImpl({
   const [runActivity] = useRunActivity();
   const sharedRunningPhases = useRunningPhases();
   const runningPhases = runActivity?.runActive === false ? EMPTY_PHASES : sharedRunningPhases;
-  const rRemediation = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === "remediation");
+  const { rebuildPlacements, stageOrderIndex } = usePipeline();
+  const rRemediation = rebuildPlacements.find((p) => p.afterStageKey === "remediation");
   const rRemediationPhase = rRemediation && rebuildPhase(state, rRemediation, runActivity?.runActive, runningPhases);
-  const rCompliance = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === "adversarial-compliance");
+  const rCompliance = rebuildPlacements.find((p) => p.afterStageKey === "adversarial-compliance");
   const rCompliancePhase = rCompliance && rebuildPhase(state, rCompliance, runActivity?.runActive, runningPhases);
 
   return (

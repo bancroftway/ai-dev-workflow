@@ -13,58 +13,32 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { usePipeline, type GatePolicy, type Pipeline } from "@/lib/pipeline";
 
-/** "yolo" | "draft_verify" | "mission_critical" -- matches agent/src/graph.py's
- * GraphState.code_gen_mode wire values exactly (Task 1, plan Part 2). Sent as-is in the provision
- * POST body (SandboxSessionBoot.tsx) as `codeGenMode`, which route.ts forwards as `code_gen_mode`. */
-export type CodeGenMode = "yolo" | "draft_verify" | "mission_critical";
+/** A PipelineMode.id from the backend descriptor ("yolo" | "draft_verify" | "mission_critical"
+ * today) -- matches agent/src/graph.py's GraphState.code_gen_mode wire values. Sent as-is in the
+ * provision POST body (SandboxSessionBoot.tsx) as `codeGenMode`, which route.ts forwards as
+ * `code_gen_mode`. */
+export type CodeGenMode = string;
 
-const DEFAULT_MODE: CodeGenMode = "draft_verify";
-
-type ModeInfo = {
-  mode: CodeGenMode;
-  name: string;
-  /** What actually runs -- draft only / draft+check / draft+audit+check. */
-  explanation: string;
-  /** Speed + token/time cost, condensed from the plan's mode table. */
-  speedCost: string;
-  bestFor: string;
-  badge?: { text: string; variant: "default" | "secondary" };
-};
-
-const MODES: ModeInfo[] = [
-  {
-    mode: "yolo",
-    name: "⚡ YOLO",
-    explanation: "Draft only — no second-opinion audit, no deterministic check before advancing.",
-    speedCost:
-      "Instant · 1 LLM call per stage (draft only, pipeline-wide) — the cheapest and fastest option.",
-    bestFor:
-      "Best for quick prototypes, throwaway spikes, scratch scripts — anything you'll read and test yourself end-to-end before it matters.",
-    badge: { text: "Some checks still run in the background (not enforced)", variant: "secondary" },
-  },
-  {
-    mode: "draft_verify",
-    name: "🪵 Draft & Verify",
-    explanation:
-      "Draft, plus each stage's own free, deterministic check (ledger sync, diagram validity, test coverage, remediation confirmation, compliance audit, exit readiness) — no second-opinion audit.",
-    speedCost:
-      "Fast · 1 LLM call per stage, plus each stage's own free check. Only redrafts — costing another LLM call — if a check actually fails.",
-    bestFor:
-      "Best for day-to-day work end to end — every stage's own deterministic check still runs, without paying for a second model to review every draft regardless of whether it's needed.",
-    badge: { text: "Recommended", variant: "default" },
-  },
-  {
-    mode: "mission_critical",
-    name: "🛡️ Mission Critical",
-    explanation:
-      "Draft, a second-opinion audit, and the same deterministic check/redraft loop as Draft & Verify — at every stage.",
-    speedCost:
-      "Thorough · 2+ LLM calls per audited stage (draft + audit) — meaningfully more tokens and wall-clock time across the whole run.",
-    bestFor:
-      "Best for production-critical work — auth, payments, security-sensitive code, complex refactors of core systems, anything you won't hand-review line by line yourself, end to end.",
-  },
-];
+/** "What's checked" under `mode`, from each stage gate's per-mode policy -- the backend's
+ * policy table, not copy that can drift from it. */
+function checkedSummary(pipeline: Pipeline, mode: string): string {
+  const by: Record<GatePolicy, string[]> = { blocking: [], advisory: [], off: [] };
+  for (const tab of pipeline.tabs) {
+    for (const stage of tab.stages) {
+      const policy = stage.gate?.policy[mode];
+      if (policy) by[policy].push(stage.label);
+    }
+  }
+  return [
+    by.blocking.length > 0 && `Enforced: ${by.blocking.join(", ")}`,
+    by.advisory.length > 0 && `Advisory: ${by.advisory.join(", ")}`,
+    by.off.length > 0 && `Not checked: ${by.off.join(", ")}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
 
 /**
  * One-time "how carefully should this session work" choice (plan Part 2 Task 3). Shown by
@@ -75,7 +49,9 @@ const MODES: ModeInfo[] = [
  * for a session that doesn't exist yet.
  */
 export function CodeGenModePicker({ onSelect }: { onSelect: (mode: CodeGenMode) => void }) {
-  const [selected, setSelected] = useState<CodeGenMode>(DEFAULT_MODE);
+  const pipeline = usePipeline();
+  const defaultMode = (pipeline.modes.find((m) => m.default) ?? pipeline.modes[0])?.id ?? "";
+  const [selected, setSelected] = useState<CodeGenMode>(defaultMode);
 
   return (
     <Dialog open onOpenChange={() => {}}>
@@ -88,33 +64,28 @@ export function CodeGenModePicker({ onSelect }: { onSelect: (mode: CodeGenMode) 
           </DialogDescription>
         </DialogHeader>
         <RadioGroup
-          defaultValue={DEFAULT_MODE}
+          defaultValue={defaultMode}
           onValueChange={(value) => setSelected(value as CodeGenMode)}
           className="gap-3"
         >
-          {MODES.map((info) => (
-            <Label key={info.mode} className="block cursor-pointer font-normal">
+          {pipeline.modes.map((info) => (
+            <Label key={info.id} className="block cursor-pointer font-normal">
               <Card className="flex-row items-start gap-3 p-4">
-                <RadioGroupItem value={info.mode} className="mt-1" />
+                <RadioGroupItem value={info.id} className="mt-1" />
                 <CardContent className="flex-1 p-0">
                   <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
-                    {info.name}
+                    {info.label}
                     {info.badge && <Badge variant={info.badge.variant}>{info.badge.text}</Badge>}
                   </CardTitle>
-                  <p className="mt-1 text-xs text-muted-foreground">{info.explanation}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">{info.speedCost}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">{info.bestFor}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{info.blurb}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{info.speed_cost}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{info.best_for}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">{checkedSummary(pipeline, info.id)}</p>
                 </CardContent>
               </Card>
             </Label>
           ))}
         </RadioGroup>
-        <p className="text-xs text-muted-foreground">
-          YOLO skips the second opinion and every stage&apos;s own deterministic check; the same
-          underlying checks still run as one-time, same-turn nudges via baked-in scans across
-          every stage — real protection, but not the guaranteed, repeatable check Mission Critical
-          provides.
-        </p>
         <Button onClick={() => onSelect(selected)} className="w-full">
           Start session
         </Button>

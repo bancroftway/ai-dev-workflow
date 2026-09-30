@@ -27,13 +27,10 @@ export type Session = {
   failure_stage: string | null;
   failure_type: string | null;
   failure_message: string | null;
-  /** "yolo" | "draft_verify" | "mission_critical" (Task 1, backend mode threading, plan Part 2) --
-   * the code generation mode this session is pinned to (agent/src/graph.py's GraphState.
-   * code_gen_mode, resolved once at first provision). Optional: not yet populated by the agent's
-   * SessionResponse (agent/src/sessions_api.py), so the key is genuinely absent (`undefined`) from
-   * every real API response today, not present-but-`null` -- a later task wires up a real populated
-   * value and can drop the `?` then. */
-  codeGenMode?: string | null;
+  /** "yolo" | "draft_verify" | "mission_critical" -- the code generation mode this session's gates
+   * run under (agent/src/sessions_api.py resolves an unset stored value to "mission_critical",
+   * the same fallback graph.py applies). Optional so an older agent without the field still types. */
+  code_gen_mode?: string | null;
   /** Live, not persisted -- whether this session's sandbox is currently registered in the
    * agent's memory right now. False after an agent restart until the session is reprovisioned,
    * regardless of `status`. */
@@ -52,20 +49,3 @@ export type Session = {
    * agent/src/session_store.py's `is_finished_with_verdict` for the authoritative definition. */
   finished_with_verdict: boolean;
 };
-
-/** agent/src/graph.py's STAGES list, key order -- used only to render "stage N of M" in the
- * session-list progress indicator. app-discovery/brownfield-baseline run between tech-stack and
- * specification but aren't StageSpec entries themselves (separate wired sub-flows), so
- * current_stage never reports them -- this list intentionally matches STAGES exactly, not the
- * full graph. Cosmetic only: if the two ever drift, the indicator just falls back to showing the
- * raw stage key (see SessionHistory.tsx), never breaks. */
-export const STAGE_KEYS_IN_ORDER = [
-  "tech-stack",
-  "specification",
-  "plan",
-  "ac-to-tests",
-  "minimal-code-to-green",
-  "remediation",
-  "adversarial-compliance",
-  "metrics-exit",
-] as const;
