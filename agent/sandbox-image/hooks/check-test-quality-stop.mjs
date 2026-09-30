@@ -111,7 +111,7 @@ try {
   process.exit(0);
 }
 
-const { absence_only: absenceOnly = [], fiat_stubs: fiatStubs = [], duplicates = [] } = result;
+const { absence_only: absenceOnly = [], fiat_stubs: fiatStubs = [], duplicates = [], ac_depth: acDepth = {} } = result;
 
 const problems = [];
 
@@ -154,6 +154,28 @@ if (duplicates.length > 0) {
       "ASSERTS, not how it arranges: assert a different observable (status code, header, " +
       "store/state value, error path), or test the same behavior at a different layer (unit on the " +
       "class + integration over HTTP). Rearranging the same assert is still a duplicate.",
+  );
+}
+
+// ac_depth (2026-09-21, run_all_checks) is per-AC scoped and its `shortfalls` list carries the
+// distinct-assertion-per-AC anti-padding rule (3+ asserting tests for one criterion that all
+// assert the same expression with a different literal) -- a check no OTHER field here surfaces:
+// absence_only/fiat_stubs/duplicates above are unscoped across the whole file set, and duplicates
+// only catches near-identical BODIES, not same-target-different-literal padding. Filtered to just
+// that one shortfall kind, not forwarded wholesale: ac_depth also carries a "below the browser
+// layer" count against the FULL (GREEN-phase, minimum 2) threshold, which does not apply at this
+// RED-phase stage (MIN_NON_E2E_TESTS_PER_AC_RED allows 0) -- surfacing that one here would nag on
+// every valid RED-phase suite. See run_all_checks' own docstring for why this field was computed
+// but never read until now.
+const paddingByAc = Object.entries(acDepth)
+  .map(([ac, info]) => [ac, (info.shortfalls || []).filter((s) => s.includes("distinct assertion target"))])
+  .filter(([, shortfalls]) => shortfalls.length > 0);
+if (paddingByAc.length > 0) {
+  const named = paddingByAc.map(([ac, shortfalls]) => `${ac}: ${shortfalls.join("; ")}`).join(" | ");
+  problems.push(
+    `these criteria pad their test count without adding real coverage (same assertion, different ` +
+      `literal, counted as separate tests): ${named} -- make each additional test differ in what it ` +
+      "ASSERTS, not just the value plugged into an identical check.",
   );
 }
 

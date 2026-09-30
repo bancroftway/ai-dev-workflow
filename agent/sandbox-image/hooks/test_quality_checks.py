@@ -617,11 +617,15 @@ def run_all_checks(test_files: dict[str, str]) -> dict[str, object]:
         "absence_only": absence_only_labels(tests),
         "fiat_stubs": fiat_stub_labels(tests),
         "duplicates": [list(pair) for pair in duplicate_pairs_by_ac(tests)],
-        # Computed unconditionally (cheap -- pure string ops, no real cost) but only ACTED on by
-        # whichever hook is scoped to minimal-code-to-green (check-coverage-stop.mjs) -- the
-        # ac-to-tests hook (check-test-quality-stop.mjs) reads this same JSON and simply never
-        # looks at this field, since GREEN-phase thresholds (MIN_NON_E2E_TESTS_PER_AC) do not apply
-        # at RED phase (MIN_NON_E2E_TESTS_PER_AC_RED). See ac_depth_report's own docstring.
+        # Computed unconditionally (cheap -- pure string ops, no real cost). Fully ACTED on by
+        # whichever hook is scoped to minimal-code-to-green (check-coverage-stop.mjs). The
+        # ac-to-tests hook (check-test-quality-stop.mjs) reads this same JSON too, but filters its
+        # `shortfalls` down to just the distinct-assertion-target anti-padding entries (2026-09-30) --
+        # the rest of `ac_depth`'s shortfalls either duplicate what absence_only/fiat_stubs above
+        # already report (unscoped by AC there, scoped here) or are a GREEN-phase-only threshold
+        # (below the browser layer, minimum MIN_NON_E2E_TESTS_PER_AC) that does not apply at this
+        # RED-phase stage (MIN_NON_E2E_TESTS_PER_AC_RED allows 0), so forwarding the field wholesale
+        # there would nag on every valid RED-phase suite. See ac_depth_report's own docstring.
         "ac_depth": ac_depth_report(test_files),
         # Computed unconditionally too -- ACTED on by every stage that can write/edit an e2e spec
         # (ac-to-tests, minimal-code-to-green, e2e-fix), not just one of them, since a bad locator
@@ -755,6 +759,29 @@ def _demo() -> None:
     assert any("distinct assertion" in p for p in padded_depth["US-0009.2"]["shortfalls"]), padded_depth
 
     assert "ac_depth" in run_all_checks(one_unit_test), "run_all_checks must surface ac_depth for the coverage hook to read"
+
+    # Task 13 item 1: check-test-quality-stop.mjs must now READ and ACT ON ac_depth (it always had
+    # the field in `result`, but destructured only absence_only/fiat_stubs/duplicates -- ac_depth's
+    # anti-padding shortfall sat in the JSON, computed, unused). A source-text assertion rather than
+    # a live subprocess spawn: Node's child_process.spawnSync can't invoke a fake `python3` shim on
+    # every platform without `shell: true` (which this hook deliberately omits, same as its
+    # siblings), so a real end-to-end spawn test would be platform-fragile in a way this codebase's
+    # existing hook tests aren't. check-coverage-stop.mjs's own identical spawnSync wiring (already
+    # proven live, same command, same script) is what proves the subprocess call itself works;
+    # this proves the FIX -- the destructure and the padding-only filter -- actually landed in the
+    # one file the brief named.
+    hook_source = (
+        Path(__file__).resolve().parents[2] / "sandbox-image" / "hooks" / "check-test-quality-stop.mjs"
+    ).read_text(encoding="utf-8")
+    assert "ac_depth" in hook_source, (
+        "check-test-quality-stop.mjs must destructure ac_depth from the check-hook result"
+    )
+    assert "distinct assertion target" in hook_source, (
+        "check-test-quality-stop.mjs must filter ac_depth's shortfalls down to the anti-padding "
+        "entries specifically -- forwarding the field wholesale would also surface the GREEN-phase-"
+        "only 'below the browser layer' shortfall (MIN_NON_E2E_TESTS_PER_AC), which does not apply "
+        "at this RED-phase stage"
+    )
 
     # non_testid_locators: the live incident (Next.js Server Action's hidden $ACTION_ID_ input
     # colliding with a bare `input` locator) plus every other disallowed query method.
