@@ -3450,6 +3450,12 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             # the "unknown" placeholder -- same sentinel-fallback convention this file already
             # uses at the RunEvent(...) construction just below.
             run_id=state.get("run_id", "unknown"),
+            # Task 5 (Part 4l): thread this stage's own captured baseline_commit (just set above,
+            # if this call captured it fresh) so the sandbox turn can expose it as
+            # AIDW_BASELINE_COMMIT -- None for any stage that never sets capture_baseline_commit,
+            # same "nothing to diff against" convention every existing baseline_commit consumer
+            # (gates/write_scope_gate.py, gates/remediation_gate.py) already applies.
+            baseline_commit=state["stages"][stage_spec.key].get("baseline_commit"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "draft", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
@@ -3745,6 +3751,8 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             provider=state["provider"],
             # Task 3b (Part 2 Ruling 10) -- see the draft-role call's own comment above.
             run_id=state.get("run_id", "unknown"),
+            # Task 5 (Part 4l) -- see make_draft_node's identical comment above.
+            baseline_commit=state["stages"][stage_spec.key].get("baseline_commit"),
             model_name=agent_config.get("model") if agent_config else model_config.get_model_name(stage_spec.key, "audit", state["provider"]),
             sandbox=sandbox_registry.get(thread_id),
             custom_agents=custom_agents if custom_agents else None,
@@ -4579,6 +4587,10 @@ def make_verify_fix_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnabl
             # still runs through _agenerate_inner's own tool-call RunEvent building, which would
             # otherwise keep seeing "unknown" the same as every other un-threaded call site.
             run_id=state.get("run_id", "unknown"),
+            # Task 5 (Part 4l) -- see make_draft_node's identical comment above. `stage` (this
+            # node's own local, set at the top of this function) is the same
+            # state["stages"][stage_spec.key] dict make_draft_node/make_audit_node index directly.
+            baseline_commit=stage.get("baseline_commit"),
             # The `fix` role is declared in model_config precisely so this write-capable pass can be
             # tiered separately from the read-only audit it serves; falls back to the stage's draft
             # model, matching how e2e_fix resolves its own.

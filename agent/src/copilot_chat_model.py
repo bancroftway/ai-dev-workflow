@@ -352,6 +352,34 @@ def _stage_env_prefix(stage: str) -> str:
     return f"AIDW_STAGE={shlex.quote(stage)} "
 
 
+def _run_id_env_prefix(run_id: str | None) -> str:
+    """Copilot side of claude_chat_model._run_id_env_prefix -- identical mechanism, identical
+    reasoning (see that function's own docstring: Task 5, Part 4l). Duplicated rather than shared
+    for the same circular-import reason `_stage_env_prefix` above already is.
+
+    Returns "" when run_id is None (an older call site that doesn't thread one through yet, per
+    `self.run_id`'s own comment) -- omitted entirely rather than a literal "AIDW_RUN_ID=None ".
+    """
+    if not run_id:
+        return ""
+    return f"AIDW_RUN_ID={shlex.quote(run_id)} "
+
+
+def _baseline_commit_env_prefix(baseline_commit: str | None) -> str:
+    """Copilot side of claude_chat_model._baseline_commit_env_prefix -- identical mechanism,
+    identical reasoning (see that function's own docstring: Task 5, Part 4l). Duplicated rather
+    than shared for the same circular-import reason `_stage_env_prefix` above already is.
+
+    Returns "" when baseline_commit is None -- most stages never capture one
+    (StageSpec.capture_baseline_commit defaults to False), matching how gates/write_scope_gate.py
+    and gates/remediation_gate.py already treat a None baseline_commit as "nothing to diff
+    against."
+    """
+    if not baseline_commit:
+        return ""
+    return f"AIDW_BASELINE_COMMIT={shlex.quote(baseline_commit)} "
+
+
 def _required_skills_env_prefix(stage: str, role: str) -> str:
     """Shell env-var prefix for the skill-enforcement Stop hook, Copilot side -- mirrors
     claude_chat_model._required_skills_env_prefix exactly (same config source, same draft-only
@@ -492,6 +520,15 @@ class CopilotChatModel(BaseChatModel):
     # `state.get("run_id", "unknown")` convention for "not available" rather than inventing a
     # second one.
     run_id: str | None = None
+    # Task 5 (Part 4l): same threaded-in-by-the-dispatcher shape as run_id above, for the same
+    # reason -- graph.py's draft/audit/fix call sites that already capture a real baseline_commit
+    # on `state["stages"][stage_spec.key]` pass it; a caller with no such stage entry (e.g. the
+    # synthetic "targeted-fix" role, or any stage whose StageSpec never sets
+    # capture_baseline_commit) simply doesn't, leaving this None -- not a regression, just "this
+    # turn has no baseline to diff against" (gates/write_scope_gate.py and
+    # gates/remediation_gate.py already treat a None baseline_commit the same way). Read by
+    # _baseline_commit_env_prefix below to expose it to the sandboxed turn as AIDW_BASELINE_COMMIT.
+    baseline_commit: str | None = None
     model_name: str | None = None
     # Purely a gating flag now, not a live-connection selector: unlike the old SDK version (which
     # spawned a local child process when this was None), every turn always execs through
@@ -804,6 +841,8 @@ class CopilotChatModel(BaseChatModel):
             argv, scratch_prefix, config.CLI_AGENT_TURN_TIMEOUT_SECONDS,
             env_prefix=(
                 _stage_env_prefix(self.stage)
+                + _run_id_env_prefix(self.run_id)
+                + _baseline_commit_env_prefix(self.baseline_commit)
                 + _required_skills_env_prefix(self.stage, self.role)
                 + _full_read_env_prefix(self.stage, self.role)  # always "" -- see that function's own docstring
             ),
@@ -989,6 +1028,7 @@ def get_chat_model_for_thread(
     role: str,
     *,
     run_id: str | None = None,
+    baseline_commit: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
     agent_mode: Literal["interactive", "plan", "autopilot", "shell"] = "plan",
@@ -1012,12 +1052,16 @@ def get_chat_model_for_thread(
 
     run_id (Task 3b, Part 2 Ruling 10): optional, defaults to None -- see CopilotChatModel.run_id's
     own comment for who passes a real value and why a caller that doesn't is not a regression.
+
+    baseline_commit (Task 5, Part 4l): optional, defaults to None, same "caller passes it if it has
+    one on hand" shape as run_id -- see CopilotChatModel.baseline_commit's own comment.
     """
     return CopilotChatModel(
         thread_id=thread_id,
         stage=stage,
         role=role,
         run_id=run_id,
+        baseline_commit=baseline_commit,
         model_name=model_name,
         sandbox=sandbox,
         agent_mode=agent_mode,
@@ -1206,6 +1250,15 @@ def _demo() -> None:
     # assertion/root-cause comment (2026-09-19).
     assert _stage_env_prefix("specification") == "AIDW_STAGE=specification "
     assert _stage_env_prefix("plan") == "AIDW_STAGE=plan "
+    # Task 5 (Part 4l): _run_id_env_prefix/_baseline_commit_env_prefix (Copilot side) -- see
+    # claude_chat_model.py's identical assertions for the reasoning; each omits its var entirely
+    # (not "=None"/"=") when the value isn't known.
+    assert _run_id_env_prefix("run-real-123") == "AIDW_RUN_ID=run-real-123 "
+    assert _run_id_env_prefix(None) == "", "no run_id known -- must omit the var, not emit 'None'"
+    assert _baseline_commit_env_prefix("abc123def") == "AIDW_BASELINE_COMMIT=abc123def "
+    assert _baseline_commit_env_prefix(None) == "", (
+        "most stages never capture a baseline_commit -- must omit the var"
+    )
     wrapper_with_skills = _build_copilot_wrapper_script(
         ["copilot"], "/tmp/aidw-agent/fake-prompt", 60,
         env_prefix=_required_skills_env_prefix("specification", "draft"),
@@ -1399,6 +1452,37 @@ def _demo() -> None:
     assert no_run_id_model.run_id is None, "omitting run_id must leave it None, not a silently-injected default"
     assert (no_run_id_model.run_id or "unknown") == "unknown", (
         "omitting run_id must still fall back to the pre-existing 'unknown' sentinel"
+    )
+
+    # Task 5 (Part 4l): baseline_commit threads through the constructor the same way run_id does
+    # just above -- additive, not a replacement, so both fields must thread through independently
+    # AND leave every already-tested run_id/_stage_env_prefix behavior untouched.
+    both_known = get_chat_model_for_thread("t", "s", "r", run_id="run-real-123", baseline_commit="abc123def")
+    assert both_known.run_id == "run-real-123" and both_known.baseline_commit == "abc123def", (
+        "run_id and baseline_commit must both thread through the constructor when both are known"
+    )
+    neither_known = get_chat_model_for_thread("t", "s", "r")
+    assert neither_known.run_id is None and neither_known.baseline_commit is None, (
+        "omitting both must leave both None, exactly like omitting run_id alone already did"
+    )
+    # The composed env prefix (this module's actual call site, ~_agenerate_inner's env_prefix=) --
+    # confirms AIDW_STAGE's own position/format is unchanged by the two new prefixes being spliced
+    # in right after it.
+    composed = (
+        _stage_env_prefix(both_known.stage)
+        + _run_id_env_prefix(both_known.run_id)
+        + _baseline_commit_env_prefix(both_known.baseline_commit)
+    )
+    assert composed == "AIDW_STAGE=s AIDW_RUN_ID=run-real-123 AIDW_BASELINE_COMMIT=abc123def ", (
+        f"unexpected composed env prefix: {composed!r}"
+    )
+    composed_neither = (
+        _stage_env_prefix(neither_known.stage)
+        + _run_id_env_prefix(neither_known.run_id)
+        + _baseline_commit_env_prefix(neither_known.baseline_commit)
+    )
+    assert composed_neither == "AIDW_STAGE=s ", (
+        f"with neither known, AIDW_STAGE's own prefix must be emitted unchanged, nothing appended: {composed_neither!r}"
     )
 
     # Session-cache eviction: one thread's dead sandbox must not evict another thread's live

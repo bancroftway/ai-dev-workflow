@@ -294,6 +294,7 @@ def get_chat_model_for_thread(
     *,
     provider: str,
     run_id: str | None = None,
+    baseline_commit: str | None = None,
     model_name: str | None = None,
     sandbox: SandboxSession | None = None,
     agent_mode: Literal["interactive", "plan", "autopilot", "shell"] = "plan",
@@ -331,9 +332,17 @@ def get_chat_model_for_thread(
     sites elsewhere (e2e_nodes.py, metrics_nodes.py, preflight_nodes.py, rebuild.py,
     test_hardening_nodes.py) are unchanged by this task and simply keep not passing it, same as
     before -- a caller that omits it is not a regression, just not yet wired up.
+
+    baseline_commit (Task 5, Part 4l): same shape/rationale as run_id above, forwarded unchanged to
+    both provider modules so they can expose it to the sandboxed turn as AIDW_BASELINE_COMMIT.
+    Optional, defaulting to None -- graph.py's draft/audit/fix call sites that already have a real
+    `state["stages"][stage]["baseline_commit"]` on hand pass it; a caller with no such stage entry
+    (e.g. the synthetic "targeted-fix" role) simply doesn't, same "not yet wired up, not a
+    regression" convention as run_id.
     """
     common: dict[str, Any] = dict(
         run_id=run_id,
+        baseline_commit=baseline_commit,
         model_name=model_name,
         sandbox=sandbox,
         agent_mode=agent_mode,
@@ -668,6 +677,25 @@ def _demo() -> None:
         assert copilot_model.run_id == "run-real-456", f"copilot instance did not carry the real run_id, got {copilot_model.run_id!r}"
         assert get_chat_model_for_thread(thread_id, stage, role, provider="copilot").run_id is None, (
             "omitting run_id must leave the instance's run_id as None, not a silently-injected placeholder"
+        )
+
+        # baseline_commit (Task 5, Part 4l): same dispatcher-threading proof as run_id just above --
+        # both providers must carry a real value through to the constructed instance, and omitting
+        # it must leave None, not a silently-injected placeholder.
+        claude_bc_model = get_chat_model_for_thread(
+            thread_id, stage, role, provider="claude", baseline_commit="abc123def"
+        )
+        assert claude_bc_model.baseline_commit == "abc123def", (
+            f"claude instance did not carry the real baseline_commit, got {claude_bc_model.baseline_commit!r}"
+        )
+        copilot_bc_model = get_chat_model_for_thread(
+            thread_id, stage, role, provider="copilot", baseline_commit="abc123def"
+        )
+        assert copilot_bc_model.baseline_commit == "abc123def", (
+            f"copilot instance did not carry the real baseline_commit, got {copilot_bc_model.baseline_commit!r}"
+        )
+        assert get_chat_model_for_thread(thread_id, stage, role, provider="copilot").baseline_commit is None, (
+            "omitting baseline_commit must leave the instance's baseline_commit as None"
         )
 
         # get_session_id / forget_thread_sessions (sync): seed each provider's OWN _session_ids
