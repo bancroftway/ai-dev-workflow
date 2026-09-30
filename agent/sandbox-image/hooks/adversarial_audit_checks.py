@@ -44,25 +44,43 @@ def _findings_from(entry: Any) -> list[Any]:
 
 
 def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
-    """(passed, reasons). Pure, so the routing logic is testable without a sandbox.
+    """(passed, reasons) -- `evaluate_audit_checks` with the check ids stripped. This is the shape
+    the Stop hook's CLI and every pre-existing caller consume."""
+    passed, tagged, _ran = evaluate_audit_checks(report)
+    return passed, [reason for _check_id, reason in tagged]
+
+
+# Sub-check ids, as plain strings: this file is stdlib-only (sandbox copy), so it cannot import
+# gates/checks.py's Check. adversarial_gate.py declares the matching Check objects.
+CHECK_REPORT = "adversarial.report"
+CHECK_VERDICT = "adversarial.verdict"
+CHECK_BLOCKING_FINDINGS = "adversarial.blocking_findings"
+
+
+def evaluate_audit_checks(report: dict[str, Any] | None) -> tuple[bool, list[tuple[str, str]], list[str]]:
+    """(passed, [(check_id, reason), ...], ran_check_ids). Pure, so the routing logic is testable
+    without a sandbox. `ran_check_ids` lists every sub-check actually evaluated, in order.
 
     An ABSENT or empty report fails: this stage's entire job is to produce a judgement, and "no
     report" previously sailed through as approval. Blocking on it is the difference between a gate
     and a formality.
     """
     if not report:
-        return False, [
-            "the adversarial audit produced no report at all -- this stage must return a "
-            "plan_conformance_summary and an overall_verdict, and an empty report cannot be "
-            "distinguished from an audit that never happened"
-        ]
+        return False, [(
+            CHECK_REPORT,
+            (
+                "the adversarial audit produced no report at all -- this stage must return a "
+                "plan_conformance_summary and an overall_verdict, and an empty report cannot be "
+                "distinguished from an audit that never happened"
+            ),
+        )], [CHECK_REPORT]
 
-    reasons: list[str] = []
+    reasons: list[tuple[str, str]] = []
     verdict = str(report.get("overall_verdict") or "").strip()
     if not verdict:
-        reasons.append("no overall_verdict was reported")
+        reasons.append((CHECK_VERDICT, "no overall_verdict was reported"))
     elif verdict in BLOCKING_VERDICTS:
-        reasons.append(f"overall_verdict is {verdict!r}")
+        reasons.append((CHECK_VERDICT, f"overall_verdict is {verdict!r}"))
 
     blocking = [
         finding
@@ -74,11 +92,14 @@ def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
         # know WHICH criterion diverged and how it was established, the same reason the coverage gate
         # reports per-line gaps rather than a bare percentage.
         evidence = "; ".join(str(e) for e in (finding.get("evidence") or [])) or "(no evidence cited)"
-        reasons.append(
-            f"[{finding.get('severity')}] {finding.get('plan_reference') or 'unknown plan reference'}: "
-            f"{finding.get('description') or '(no description)'} -- evidence: {evidence}"
-        )
-    return not reasons, reasons
+        reasons.append((
+            CHECK_BLOCKING_FINDINGS,
+            (
+                f"[{finding.get('severity')}] {finding.get('plan_reference') or 'unknown plan reference'}: "
+                f"{finding.get('description') or '(no description)'} -- evidence: {evidence}"
+            ),
+        ))
+    return not reasons, reasons, [CHECK_REPORT, CHECK_VERDICT, CHECK_BLOCKING_FINDINGS]
 
 
 def _demo() -> None:
@@ -139,6 +160,16 @@ def _demo() -> None:
     assert _findings_from([{"severity": "minor"}]) == [{"severity": "minor"}]
     assert _findings_from(None) == []
     assert _findings_from({"status": "absent", "values": [], "reason": "x"}) == []
+
+    # Tagged variant: each reason carries the sub-check that raised it.
+    assert evaluate_audit_checks(None)[1][0][0] == CHECK_REPORT and evaluate_audit_checks({})[2] == [CHECK_REPORT]
+    all_ran = [CHECK_REPORT, CHECK_VERDICT, CHECK_BLOCKING_FINDINGS]
+    assert evaluate_audit_checks(conforms) == (True, [], all_ran)
+    passed, tagged, ran = evaluate_audit_checks({**contradictory, "overall_verdict": "major_gaps"})
+    assert not passed and [t[0] for t in tagged] == [CHECK_VERDICT, CHECK_BLOCKING_FINDINGS] and ran == all_ran
+    assert evaluate_audit_checks({"divergence_findings": absent_findings})[1] == [
+        (CHECK_VERDICT, "no overall_verdict was reported")
+    ]
 
     print("adversarial_audit_checks self-check: all assertions passed")
 

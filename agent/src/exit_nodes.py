@@ -20,6 +20,7 @@ from typing import Any
 from . import approvals, chat_model, git_ops, metrics_nodes, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
 from . import config as workflow_config
 from .gates import exit_readiness_checks
+from .gates.checks import Check, CheckLog
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
@@ -1218,9 +1219,51 @@ METRICS_EXIT_HARD_RULES: tuple[str, ...] = (
 )
 
 
+# Per-sub-check rows for verify_exit_readiness. All advisory: this verify always passes and a
+# problem downgrades merge_ready instead of bouncing the draft, so a problem records "advisory".
+EXIT_MANIFEST = Check(
+    "exit.manifest", "Manifest records app, tests and coverage",
+    "manifest.json must name at least one runnable app, a test command and replayable coverage "
+    "commands. Without them the next run or reviewer can't rebuild and re-test what was merged.",
+    "advisory",
+)
+EXIT_SCREENSHOTS = Check(
+    "exit.screenshots", "UI screenshots captured",
+    "An app with a user interface must have at least one end-to-end screenshot. Passing tests alone "
+    "don't show that a page actually renders, so a person needs the pictures.",
+    "advisory", condition="the tech stack includes a UI framework",
+)
+EXIT_METRICS = Check(
+    "exit.metrics", "No metrics regression",
+    "Code metrics must have been recorded for this run and the regression gate (coverage, duplication, "
+    "security, README) must report nothing. Any regression it names blocks the merge.",
+    "advisory",
+)
+EXIT_TARGETED_FIX = Check(
+    "exit.targeted_fix", "Targeted fix resolved its issues",
+    "If a targeted fix ran against this run's problems, every problem it was sent to fix must be "
+    "independently confirmed closed. The fix's own claim of success isn't enough.",
+    "advisory", condition="a targeted-fix attempt was recorded for this run",
+)
+EXIT_AUTH = Check(
+    "exit.auth", "Required authentication verified",
+    "When the app is required to enforce sign-in, the end-to-end auth probe must have run and passed. "
+    "Auth that was required but never tested counts as unverified.",
+    "advisory", condition="auth enforcement is required and metrics were recorded for this run",
+)
+VERIFY_CHECKS: tuple[Check, ...] = (EXIT_MANIFEST, EXIT_SCREENSHOTS, EXIT_METRICS, EXIT_TARGETED_FIX, EXIT_AUTH)
+
+
+def _record_advisory(log: CheckLog, check: Check, problems: list[str], detail: str | None = None) -> None:
+    if problems:
+        log.advisory(check, "\n".join(problems))
+    else:
+        log.passed(check, detail)
+
+
 async def verify_exit_readiness(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any,
-    _chat_provider: str, _lap: int = 0, _audit_ran_this_lap: bool = True,
+    _chat_provider: str, _lap: int = 0, _audit_ran_this_lap: bool = True, *, log: CheckLog | None = None,
 ) -> Any:
     """EXIT_SPEC's deterministic_verify: completes the manifest (greenfield re-record + commands --
     only exit has the complete picture, code exists and coverage-commands.json is final), then
@@ -1236,6 +1279,8 @@ async def verify_exit_readiness(
     from .gates.ac_coverage_gate import resolve_test_command
     from .graph import TARGETED_FIX_UNRESOLVED_PATH, VerificationResult  # local: graph imports exit_nodes (same pattern as audit_gates)
     from .tech_stack_signals import frameworks_have_ui, presence_values
+
+    log = log or CheckLog("metrics-exit_verify", VERIFY_CHECKS)
 
     def _parse(raw: str | None) -> dict[str, Any]:
         if raw is None:
@@ -1280,22 +1325,34 @@ async def verify_exit_readiness(
 
     # --- presence: what a merge actually needs recorded ---
     problems = exit_readiness_checks.manifest_presence_problems(manifest)
+    _record_advisory(log, EXIT_MANIFEST, problems)
 
     # --- screenshots: mandatory visual evidence for UI apps, whatever path e2e took (covers all
     # of its skip paths with one check) ---
     is_ui = frameworks_have_ui(presence_values(tech_stack, "frameworks"))
     screenshots = await _list_screenshots(provider, thread_id, run_id)
-    problems += exit_readiness_checks.screenshot_problems(is_ui, len(screenshots))
+    screenshot_probs = exit_readiness_checks.screenshot_problems(is_ui, len(screenshots))
+    problems += screenshot_probs
+    if is_ui:
+        _record_advisory(log, EXIT_SCREENSHOTS, screenshot_probs, f"{len(screenshots)} screenshot(s)")
+    else:
+        log.skipped(EXIT_SCREENSHOTS, "no UI framework in the tech stack")
 
     # --- the metrics regression gate's verdict, run-id-stamped so a stale file never gates ---
     metrics = _parse(await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json"))
     metrics_probs, metrics_matched = exit_readiness_checks.metrics_problems(metrics, run_id)
     problems += metrics_probs
+    _record_advisory(log, EXIT_METRICS, metrics_probs)
 
     # --- independent post-targeted-fix verification (closes _run_targeted_fix's own previously
     # documented gap: "no independent, deterministic regression gate runs after this") ---
     targeted_fix_unresolved = _parse(await repo_files.read_repo_file(provider, thread_id, TARGETED_FIX_UNRESOLVED_PATH))
-    problems += exit_readiness_checks.targeted_fix_unresolved_problems(targeted_fix_unresolved, run_id)
+    targeted_probs = exit_readiness_checks.targeted_fix_unresolved_problems(targeted_fix_unresolved, run_id)
+    problems += targeted_probs
+    if targeted_fix_unresolved.get("run_id") == run_id:
+        _record_advisory(log, EXIT_TARGETED_FIX, targeted_probs)
+    else:
+        log.skipped(EXIT_TARGETED_FIX, "no targeted-fix attempt recorded for this run")
 
     # --- auth enforcement can't silently vanish (W4): a run that REQUIRED auth but whose e2e
     # never ran (non-UI repo, runner missing, suite skipped) verified nothing -- exactly the
@@ -1303,9 +1360,15 @@ async def verify_exit_readiness(
     # metrics-latest.json (metrics_compute persists app_auth + the e2e snapshot for exactly this
     # check) -- deterministic verifies are file-based, never graph-state-based. Gated behind the
     # same run_id match as the regression-gate check above (metrics_matched).
+    if not metrics_matched:
+        log.skipped(EXIT_AUTH, "metrics were not recorded for this run, so auth could not be checked")
     if metrics_matched:
         auth_probs, auth_note = exit_readiness_checks.auth_problems(metrics, workflow_config.AIDW_AUTH_GATE)
         problems += auth_probs
+        if auth_probs or auth_note:
+            _record_advisory(log, EXIT_AUTH, auth_probs, auth_note)
+        else:
+            log.skipped(EXIT_AUTH, "authentication enforcement not required for this run")
         if auth_note:
             # Verified: surface the gate's per-route verdict summary in the exit report (via the
             # report's own risk-notes section) -- the "reported, not blocking" inconclusives
@@ -1351,6 +1414,7 @@ async def verify_exit_readiness(
         passed=True,
         feedback=feedback,
         report={"blockers": problems, "ui_app": is_ui, "screenshot_count": len(screenshots), "manifest_completed": sorted(updates)},
+        checks=[r.to_dict() for r in log.results()],
     )
 
 
@@ -2335,6 +2399,64 @@ def _demo() -> None:
     # _combined_test_command_from_apps / _manifest_completeness_topic: moved to
     # gates/exit_readiness_checks.py (Task 14) -- their full assertions live in that module's own
     # self-check now.
+
+    # verify_exit_readiness per-sub-check rows (advisory, never failed; passed stays True), with
+    # the sandbox reads stubbed. A complete manifest means no re-scan / update_manifest call.
+    import asyncio
+
+    from .graph import TARGETED_FIX_UNRESOLVED_PATH
+    from .schemas import TECH_STACK_DRAFT_EXAMPLE
+
+    def _run_exit_verify(files: dict[str, Any], screenshots: list[str], strict_log: bool) -> Any:
+        async def _fake_read(_provider: Any, _thread_id: str, path: str) -> str | None:
+            return json.dumps(files[path]) if path in files else None
+
+        async def _fake_screens(_provider: Any, _thread_id: str, _run_id: str) -> list[str]:
+            return screenshots
+
+        original_read, original_screens = repo_files.read_repo_file, globals()["_list_screenshots"]
+        repo_files.read_repo_file = _fake_read  # type: ignore[assignment]
+        globals()["_list_screenshots"] = _fake_screens
+        try:
+            log = CheckLog("metrics-exit_verify", VERIFY_CHECKS, strict=True) if strict_log else None
+            return asyncio.run(verify_exit_readiness("t-exit", {}, "r1", None, object(), "", 0, log=log))
+        finally:
+            repo_files.read_repo_file = original_read  # type: ignore[assignment]
+            globals()["_list_screenshots"] = original_screens
+
+    full_manifest = {"app_check": {"apps": [{"name": "web"}]}, "test_command": "npm test", "coverage_commands": [{"x": 1}]}
+    ui_stale = _run_exit_verify({
+        MANIFEST_PATH: full_manifest,
+        workflow_persistence.TECH_STACK_APPROVED_PATH: {
+            **TECH_STACK_DRAFT_EXAMPLE.tech_stack.model_dump(mode="json"), "frameworks": ["Next.js"],
+        },
+        ".ai-dev-workflow/metrics-latest.json": {"run_id": "an-older-run"},
+    }, [], strict_log=True)
+    assert ui_stale.passed
+    assert [(r["id"], r["status"]) for r in ui_stale.checks] == [
+        (EXIT_MANIFEST.id, "passed"), (EXIT_SCREENSHOTS.id, "advisory"), (EXIT_METRICS.id, "advisory"),
+        (EXIT_TARGETED_FIX.id, "skipped"), (EXIT_AUTH.id, "skipped"),
+    ], ui_stale.checks
+    assert len(ui_stale.report["blockers"]) == 2 and "never passed" in ui_stale.checks[2]["detail"]
+
+    api_clean = _run_exit_verify({
+        MANIFEST_PATH: full_manifest,
+        ".ai-dev-workflow/metrics-latest.json": {"run_id": "r1", "regression_gate": {"reasons": []}},
+        TARGETED_FIX_UNRESOLVED_PATH: {"run_id": "r1", "reasons": ["coverage below threshold 60%"]},
+    }, [], strict_log=False)  # no log kwarg: exit_finalize_node's own call shape
+    assert [(r["id"], r["status"]) for r in api_clean.checks] == [
+        (EXIT_MANIFEST.id, "passed"), (EXIT_SCREENSHOTS.id, "skipped"), (EXIT_METRICS.id, "passed"),
+        (EXIT_TARGETED_FIX.id, "advisory"), (EXIT_AUTH.id, "skipped"),
+    ], api_clean.checks
+    assert api_clean.report["blockers"] == ["coverage below threshold 60%"]
+
+    # Every declared Check is recorded somewhere in verify_exit_readiness (text scan).
+    import inspect
+
+    verify_src = inspect.getsource(verify_exit_readiness)
+    for check in VERIFY_CHECKS:
+        var = next(k for k, v in globals().items() if v is check)
+        assert f"log, {var}," in verify_src or f"({var}," in verify_src, f"{check.id} is declared but never recorded"
 
     print("exit_nodes self-check: ok")
 

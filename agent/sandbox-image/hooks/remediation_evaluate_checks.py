@@ -97,7 +97,37 @@ def evaluate_remediation(
     *,
     scan_is_fresh: bool = True,
 ) -> tuple[bool, list[str]]:
-    """(passed, reasons). Pure -- `scan` is the dashboard dict repo_scan already writes.
+    """(passed, reasons) -- `evaluate_remediation_checks` with the check ids stripped. This is the
+    shape the Stop hook's CLI and every pre-existing caller consume; see that function for the
+    rules themselves."""
+    passed, tagged, _ran = evaluate_remediation_checks(
+        content, scan, changed_files, added_lines, prior_ids, scan_is_fresh=scan_is_fresh
+    )
+    return passed, [reason for _check_id, reason in tagged]
+
+
+# Sub-check ids, as plain strings: this file is stdlib-only (sandbox copy), so it cannot import
+# gates/checks.py's Check. remediation_gate.py declares the matching Check objects.
+CHECK_CONTENT = "remediation.content"
+CHECK_SCAN = "remediation.scan"
+CHECK_UNEXPLAINED = "remediation.unexplained_findings"
+CHECK_FABRICATED = "remediation.fabricated_ids"
+CHECK_IGNORE_FILES = "remediation.ignore_files"
+CHECK_SUPPRESSION_COMMENTS = "remediation.suppression_comments"
+
+
+def evaluate_remediation_checks(
+    content: dict[str, Any] | None,
+    scan: dict[str, Any] | None,
+    changed_files: list[str] | None = None,
+    added_lines: str = "",
+    prior_ids: frozenset[str] | None = None,
+    *,
+    scan_is_fresh: bool = True,
+) -> tuple[bool, list[tuple[str, str]], list[str]]:
+    """(passed, [(check_id, reason), ...], ran_check_ids). Pure -- `scan` is the dashboard dict
+    repo_scan already writes. `ran_check_ids` lists every sub-check actually evaluated, in order,
+    so a caller can record the ones with no reason as passed.
 
     `scan` is the scan taken AFTER remediation ran; `prior_ids` are the finding ids from the scan it
     was handed BEFORE it ran. Both are needed and they are not interchangeable: a finding that was
@@ -120,12 +150,15 @@ def evaluate_remediation(
     file/comment are both true or false regardless of which scan is on hand.
     """
     if content is None:
-        return False, ["the remediation stage produced no report at all"]
+        return False, [(CHECK_CONTENT, "the remediation stage produced no report at all")], [CHECK_CONTENT]
     if not scan:
-        return False, [
-            "no repo scan was available to verify remediation against -- the stage's claims about "
-            "which findings it fixed cannot be checked, and an unverifiable claim is not an approval"
-        ]
+        return False, [(
+            CHECK_SCAN,
+            (
+                "no repo scan was available to verify remediation against -- the stage's claims about "
+                "which findings it fixed cannot be checked, and an unverifiable claim is not an approval"
+            ),
+        )], [CHECK_CONTENT, CHECK_SCAN]
 
     findings = scan.get("findings") or []
     # The fix-everything contract: every `actionable` finding -- ANY severity, application code
@@ -137,13 +170,15 @@ def evaluate_remediation(
     claimed = [str(c) for c in _presence_values(content.get("findings_addressed"))]
     all_ids = {str(f.get("id")) for f in findings}
 
-    reasons: list[str] = []
+    reasons: list[tuple[str, str]] = []
+    ran = [CHECK_CONTENT, CHECK_SCAN]
 
     # 1. Every actionable finding still open after this stage ran must be explained. This is the
     #    check that actually blocks: it reads the CURRENT scan, so a claim that a finding was
     #    fixed is worth exactly as much as the finding's absence from it. Skipped entirely when
     #    `scan` is known to be stale (`scan_is_fresh=False`) -- see this function's own docstring.
     if scan_is_fresh:
+        ran.append(CHECK_UNEXPLAINED)
         unexplained: list[str] = []
         for finding in actionable:
             finding_id = str(finding.get("id"))
@@ -160,43 +195,51 @@ def evaluate_remediation(
         # the model reads repo-scan-latest.json itself (its own prompt says so). Named-not-counted
         # still holds: the first 30 are named, the remainder is a pointer to the exact file/flag.
         if len(unexplained) > 30:
-            reasons.extend(unexplained[:30])
-            reasons.append(
+            unexplained = unexplained[:30] + [(
                 f"...and {len(unexplained) - 30} more -- every `actionable: true` entry in "
                 f"repo-scan-latest.json must be fixed or explained in known_gaps"
-            )
-        else:
-            reasons.extend(unexplained)
+            )]
+        reasons.extend((CHECK_UNEXPLAINED, reason) for reason in unexplained)
 
     # 2. A claimed id that appears in NEITHER the scan it was handed nor the scan taken after is a
     #    fabrication, not a fix. Both sets count: a fixed finding leaves the post-fix scan, and a
     #    finding fixed non-gatingly stays in it. Union, not intersection.
     if prior_ids is not None:
+        ran.append(CHECK_FABRICATED)
         known_ids = all_ids | set(prior_ids)
         for finding_id in claimed:
             if finding_id not in known_ids:
-                reasons.append(
-                    f"findings_addressed names {finding_id!r}, which is not the id of any finding "
-                    f"in the scan -- ids must be copied verbatim from repo-scan-latest.json"
-                )
+                reasons.append((
+                    CHECK_FABRICATED,
+                    (
+                        f"findings_addressed names {finding_id!r}, which is not the id of any finding "
+                        f"in the scan -- ids must be copied verbatim from repo-scan-latest.json"
+                    ),
+                ))
 
     # 3. Silencing the scanner is not remediation.
+    ran.append(CHECK_IGNORE_FILES)
     for path in changed_files or []:
         normalized = path.replace("\\", "/")
         if any(normalized.endswith(candidate) for candidate in SUPPRESSION_PATHS):
-            reasons.append(
-                f"{path} is a scanner ignore/config file -- remediation must fix findings, never "
-                f"suppress them; revert this and address the finding itself"
-            )
+            reasons.append((
+                CHECK_IGNORE_FILES,
+                (
+                    f"{path} is a scanner ignore/config file -- remediation must fix findings, never "
+                    f"suppress them; revert this and address the finding itself"
+                ),
+            ))
+    ran.append(CHECK_SUPPRESSION_COMMENTS)
     suppressions = sorted(set(_SUPPRESSION_COMMENT_RE.findall(added_lines)))
     if suppressions:
-        reasons.append(
+        reasons.append((
+            CHECK_SUPPRESSION_COMMENTS,
             "added inline scanner-suppression comment(s) "
             + ", ".join(repr(s) for s in suppressions)
-            + " -- fix the finding instead of hiding it"
-        )
+            + " -- fix the finding instead of hiding it",
+        ))
 
-    return not reasons, reasons
+    return not reasons, reasons, ran
 
 
 def _demo() -> None:
@@ -335,6 +378,30 @@ def _demo() -> None:
         },
         scan,
     )[0]
+
+    # Tagged variant: every reason carries the sub-check that raised it, and `ran` lists exactly
+    # the sub-checks evaluated -- the early returns stop the list, prior_ids=None / a stale scan
+    # leave their check out.
+    assert evaluate_remediation_checks(None, scan) == (
+        False, [(CHECK_CONTENT, "the remediation stage produced no report at all")], [CHECK_CONTENT]
+    )
+    passed, tagged, ran = evaluate_remediation_checks(clean, None)
+    assert not passed and [t[0] for t in tagged] == [CHECK_SCAN] and ran == [CHECK_CONTENT, CHECK_SCAN]
+    passed, tagged, ran = evaluate_remediation_checks(
+        {"findings_addressed": ["deadbeef"], "known_gaps": []}, scan, ["repo/.trivyignore"],
+        "x # nosec\n", prior_ids=prior,
+    )
+    assert not passed and [t[0] for t in tagged] == [
+        CHECK_UNEXPLAINED, CHECK_FABRICATED, CHECK_IGNORE_FILES, CHECK_SUPPRESSION_COMMENTS
+    ], tagged
+    assert ran == [CHECK_CONTENT, CHECK_SCAN, CHECK_UNEXPLAINED, CHECK_FABRICATED, CHECK_IGNORE_FILES,
+                   CHECK_SUPPRESSION_COMMENTS], ran
+    passed, tagged, ran = evaluate_remediation_checks(clean, scan, scan_is_fresh=False)
+    assert passed and tagged == [] and ran == [CHECK_CONTENT, CHECK_SCAN, CHECK_IGNORE_FILES,
+                                               CHECK_SUPPRESSION_COMMENTS], ran
+    # The flood cap tags the "...and N more" pointer with the same check id.
+    _, tagged, _ = evaluate_remediation_checks({"known_gaps": []}, flood)
+    assert len(tagged) == 31 and {t[0] for t in tagged} == {CHECK_UNEXPLAINED}
 
     print("remediation_evaluate_checks self-check: all assertions passed")
 
