@@ -28,7 +28,9 @@ from .. import config as workflow_config
 from .. import repo_files, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
+from .ac_coverage_gate import AC_COVERAGE_CHECKS
 from .ac_residue_checks import check_screenshot_capture_mode
+from .checks import Check, CheckLog
 from .write_scope_checks import (
     _is_pipeline_owned,
     _is_test_path,
@@ -291,9 +293,69 @@ AC_TO_TESTS_HARD_RULES: tuple[str, ...] = (
 )
 
 
+# Per-sub-check rows for verify_ac_to_tests (gates/checks.py), in execution order.
+AC_WRITE_SCOPE = Check(
+    "ac_tests.write_scope", "Only test files changed",
+    "This stage may only create or edit tests and their config. Anything else is copied to a "
+    "quarantine folder and reverted; the check fails only if that revert itself fails.",
+    "blocking",
+)
+AC_LEDGER_INTEGRITY = Check(
+    "ac_tests.ledger_integrity", "Spec ledger untouched",
+    "The spec ledger is the pipeline's record of every requirement. Editing it here is tampering, so "
+    "any change is reverted and the attempt fails.",
+    "collected",
+)
+AC_RETIRED_RESIDUE = Check(
+    "ac_tests.retired_residue", "No tests for retired criteria",
+    "Criteria removed from the Specification must not still be named by a test, or the build would "
+    "keep chasing requirements that no longer exist.",
+    "collected",
+)
+AC_DEFERRED_RESIDUE = Check(
+    "ac_tests.deferred_residue", "No tests for deferred criteria",
+    "Criteria that were deferred and never built must not be named by a test -- a failing test would "
+    "drag parked scope into this ticket.",
+    "collected",
+)
+AC_COMPLETED_PROTECTION = Check(
+    "ac_tests.completed_protection", "Delivered criteria keep their tests",
+    "Criteria already delivered keep their regression tests. Deleting or renaming them would let a "
+    "later change silently break shipped behaviour.",
+    "collected",
+)
+AC_WROTE_TESTS = Check(
+    "ac_tests.wrote_tests", "Test files written",
+    "The model actually wrote test files to disk, rather than only describing them in its answer.",
+    "collected", condition="tickets with criteria still needing tests",
+)
+AC_NOT_E2E_ONLY = Check(
+    "ac_tests.not_e2e_only", "Tests below the UI",
+    "The suite includes unit or integration tests, not only browser tests. Browser tests alone "
+    "cannot prove the rules beneath the UI and are slow and brittle.",
+    "collected", condition="test files written and criteria still needing tests",
+)
+AC_E2E_SPEC = Check(
+    "ac_tests.e2e_spec_present", "Browser test present",
+    "A project with a user interface has at least one Playwright end-to-end spec where Playwright "
+    "will find it, so the running app is exercised through a real browser.",
+    "collected", condition="UI stacks with test files written and criteria still needing tests",
+)
+AC_SCREENSHOT_ON = Check(
+    "ac_tests.screenshot_on", "Screenshots on every test",
+    "The Playwright config sets screenshot: 'on', so passing tests still capture the screenshots "
+    "the later visual review of each wireframed screen depends on.",
+    "collected", condition="a browser test is present and the Playwright config changed",
+)
+VERIFY_CHECKS: tuple[Check, ...] = (
+    AC_WRITE_SCOPE, AC_LEDGER_INTEGRITY, AC_RETIRED_RESIDUE, AC_DEFERRED_RESIDUE, AC_COMPLETED_PROTECTION,
+    AC_WROTE_TESTS, AC_NOT_E2E_ONLY, AC_E2E_SPEC, AC_SCREENSHOT_ON, *AC_COVERAGE_CHECKS,
+)
+
+
 async def verify_ac_to_tests(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: SandboxProvider,
-    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True,
+    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True, *, log: CheckLog | None = None,
 ) -> "VerificationResult":
     """Combines the write-scope check above with the AC-coverage check (ac_coverage_gate.py) into
     one VerificationResult, since both answer the same question -- "is P4's output acceptable" --
@@ -309,7 +371,12 @@ async def verify_ac_to_tests(
     check_ac_coverage's own run_and_report call below so a re-run of ac-test-run on a later redraft
     lap gets a fresh session instead of --resuming every prior lap's growing one. Defaults to 0 so
     the many direct-call self-checks/fakes in this file's and ac_coverage_gate.py's own _demo()s
-    that don't pass it keep working unchanged."""
+    that don't pass it keep working unchanged.
+
+    `log` receives one row per sub-check evaluated (VERIFY_CHECKS), shared with check_ac_coverage;
+    None = a fresh log. Every returned VerificationResult carries its rows in `checks`."""
+    if log is None:
+        log = CheckLog("ac-to-tests_verify", VERIFY_CHECKS)
     from .. import spec_ledger
     from ..graph import VerificationResult
     from .ac_coverage_gate import (
@@ -325,6 +392,7 @@ async def verify_ac_to_tests(
         # Only reachable when the gate's own auto-revert failed -- in-scope violations are
         # remediated deterministically (removed/restored), never bounced back to the model,
         # which has no delete tool and no bash to act on such feedback.
+        log.failed(AC_WRITE_SCOPE, "could not auto-revert: " + "; ".join(write_scope.violating_paths))
         return VerificationResult(
             passed=False,
             feedback=(
@@ -333,7 +401,12 @@ async def verify_ac_to_tests(
                 "or modified here."
             ),
             report={"violating_paths": write_scope.violating_paths, "changed_paths": write_scope.changed_paths},
+            checks=[r.to_dict() for r in log.results()],
         )
+    log.passed(
+        AC_WRITE_SCOPE,
+        "reverted out-of-scope: " + "; ".join(write_scope.reverted_paths) if write_scope.reverted_paths else None,
+    )
 
     # Provenance protections: the ledger must be untampered (it is the truth every check below
     # reads), retired criteria's tests must be gone, and completed criteria's tests must be
@@ -341,12 +414,18 @@ async def verify_ac_to_tests(
     # alongside the content checks below rather than gating them (2026-09-07 audit) -- but still
     # gates check_ac_coverage's real test-suite spawn at the bottom, same as before.
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
-    protection_problems = (
-        await check_ledger_integrity(provider, thread_id)
-        + await check_retired_ac_residue(provider, thread_id, ledger_entries)
-        + await check_deferred_ac_residue(provider, thread_id, ledger_entries)
-        + await check_completed_ac_protection(provider, thread_id, baseline_commit, ledger_entries)
-    )
+    protection_problems: list[str] = []
+    for check, problems in (
+        (AC_LEDGER_INTEGRITY, await check_ledger_integrity(provider, thread_id)),
+        (AC_RETIRED_RESIDUE, await check_retired_ac_residue(provider, thread_id, ledger_entries)),
+        (AC_DEFERRED_RESIDUE, await check_deferred_ac_residue(provider, thread_id, ledger_entries)),
+        (AC_COMPLETED_PROTECTION, await check_completed_ac_protection(provider, thread_id, baseline_commit, ledger_entries)),
+    ):
+        if problems:
+            log.failed(check, "; ".join(problems))
+        else:
+            log.passed(check)
+        protection_problems += problems
 
     # Work-queue scoping: when every one of this ticket's own criteria is already delivered (or the
     # ticket only retires criteria), writing no new tests is CORRECT -- the wrote-nothing and
@@ -370,7 +449,13 @@ async def verify_ac_to_tests(
     content_problems: list[str] = []
     content_report: dict[str, Any] = {}
 
+    if no_eligible_work:
+        for check in (AC_WROTE_TESTS, AC_NOT_E2E_ONLY, AC_E2E_SPEC, AC_SCREENSHOT_ON):
+            log.skipped(check, "no criteria still need tests")
     if wrote_nothing_real:
+        log.failed(AC_WROTE_TESTS, "no changes beyond pipeline artifacts")
+        for check in (AC_NOT_E2E_ONLY, AC_E2E_SPEC, AC_SCREENSHOT_ON):
+            log.skipped(check, "no test files written")
         # A precondition, not an independent content check (2026-09-07 audit): with no real test
         # file to look at, the pyramid-shape and missing-e2e checks below are meaningless -- both
         # would misfire against an empty change set (an empty list has no non-e2e test AND no e2e
@@ -389,7 +474,10 @@ async def verify_ac_to_tests(
         # also leaves the coverage gate with nothing instrumentable, since a unit runner cannot
         # execute Playwright specs. Enforced here rather than left to the prompt, which the model
         # can silently ignore.
+        if not no_eligible_work:
+            log.passed(AC_WROTE_TESTS, f"{len(real_changes)} file(s) changed")
         if not _has_non_e2e_test(real_changes) and not no_eligible_work:
+            log.failed(AC_NOT_E2E_ONLY, "every test written is a Playwright end-to-end spec")
             content_problems.append(
                 "Every test you wrote is a Playwright end-to-end spec. A browser test cannot prove "
                 "the rules beneath the UI, and a unit runner cannot execute it, so this suite is "
@@ -401,6 +489,8 @@ async def verify_ac_to_tests(
                 "*.test.ts files with a vitest.config.ts run on the sandbox's baked runners."
             )
             content_report["e2e_only"] = True
+        elif not no_eligible_work:
+            log.passed(AC_NOT_E2E_ONLY)
 
         # The mirror of the check above: a UI stack that wrote NO browser test at all. Both
         # directions are enforced because each alone is satisfiable while dodging the other --
@@ -450,7 +540,10 @@ async def verify_ac_to_tests(
                 )
                 content_report["missing_e2e"] = True
                 content_report["e2e_diagnosis"] = diagnosis
+                log.failed(AC_E2E_SPEC, f"{diagnosis}: no Playwright spec {where}")
+                log.skipped(AC_SCREENSHOT_ON, "no browser test present")
             else:
+                log.passed(AC_E2E_SPEC)
                 # A real e2e spec exists, but `screenshot: 'on'` (mandated by this stage's own
                 # prompt -- ac_to_tests_draft.md, ac_to_tests_greenfield_segment.md) was, until
                 # now, only ever REQUESTED, never verified: Playwright's default
@@ -461,9 +554,16 @@ async def verify_ac_to_tests(
                 config_path = next(
                     (p for p in real_changes if _PLAYWRIGHT_CONFIG_RE.search(p)), None,
                 )
-                if config_path is not None:
+                if config_path is None:
+                    log.skipped(AC_SCREENSHOT_ON, "Playwright config not changed")
+                else:
                     config_source = await repo_files.read_repo_file(provider, thread_id, config_path)
-                    if config_source is not None and not check_screenshot_capture_mode(config_source):
+                    if config_source is None:
+                        log.skipped(AC_SCREENSHOT_ON, f"{config_path} unreadable")
+                    elif check_screenshot_capture_mode(config_source):
+                        log.passed(AC_SCREENSHOT_ON, config_path)
+                    else:
+                        log.failed(AC_SCREENSHOT_ON, f"{config_path} does not set screenshot: 'on'")
                         content_problems.append(
                             f"`{config_path}` does not set `screenshot: 'on'` in its `use` block -- "
                             "Playwright's default (`only-on-failure`) captures nothing for a passing "
@@ -471,15 +571,22 @@ async def verify_ac_to_tests(
                             "visual evidence; the e2e stage's wireframe-coverage gate depends on it."
                         )
                         content_report["missing_screenshot_on"] = True
+        elif not no_eligible_work:
+            log.skipped(AC_E2E_SPEC, "stack has no UI framework")
+            log.skipped(AC_SCREENSHOT_ON, "stack has no UI framework")
 
     all_problems = protection_problems + content_problems
     if all_problems:
         report: dict[str, Any] = {"changed_paths": write_scope.changed_paths, **content_report}
         if protection_problems:
             report["protection_problems"] = protection_problems
-        return VerificationResult(passed=False, feedback="\n\n".join(all_problems), report=report)
+        return VerificationResult(
+            passed=False, feedback="\n\n".join(all_problems), report=report, checks=[r.to_dict() for r in log.results()]
+        )
 
-    coverage = await check_ac_coverage(provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id, lap=lap)
+    coverage = await check_ac_coverage(
+        provider, thread_id, content_dict, chat_provider=chat_provider, run_id=run_id, lap=lap, log=log
+    )
     report = {"changed_paths": write_scope.changed_paths, **coverage.report}
     feedback = coverage.feedback
     if write_scope.reverted_paths:
@@ -494,7 +601,9 @@ async def verify_ac_to_tests(
             f"({', '.join(write_scope.reverted_paths)}) -- do NOT write them again; only test "
             "files, test configs, and their setup files are in scope here."
         )
-    return VerificationResult(passed=coverage.passed, feedback=feedback, report=report)
+    return VerificationResult(
+        passed=coverage.passed, feedback=feedback, report=report, checks=[r.to_dict() for r in log.results()]
+    )
 
 
 def _demo() -> None:
@@ -657,7 +766,106 @@ def _demo() -> None:
         "structured-output turn end with prose instead of the required JSON"
     )
 
+    asyncio.run(_demo_check_rows())
+
     print("write_scope_gate self-check: all assertions passed")
+
+
+async def _demo_check_rows() -> None:
+    """verify_ac_to_tests's per-sub-check rows against a fake sandbox: a full pass, the blocking
+    write-scope early return, and a collected multi-failure lap."""
+    import inspect
+
+    from .. import stack_runner
+    from ..spec_ledger import LEDGER_PATH
+    from . import ac_coverage_gate
+
+    class _R:
+        def __init__(self, ok: bool = True, stdout: str = "") -> None:
+            self.ok, self.stdout = ok, stdout
+            self.returncode, self.stderr = (0, "") if ok else (1, "cat: x: No such file or directory")
+
+    class _Fake:
+        def __init__(self, files: dict[str, str], changed: list[str], ledger_diff: str = "", revert_ok: bool = True) -> None:
+            self.files, self.changed, self.ledger_diff, self.revert_ok = files, changed, ledger_diff, revert_ok
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str) -> _R:
+            if command.startswith("git diff --name-only -- "):
+                return _R(True, self.ledger_diff)
+            if command.startswith("git diff --name-only "):
+                return _R(True, "\n".join(self.changed))
+            if command.startswith("mkdir -p .ai-dev-workflow/quarantine"):
+                return _R(self.revert_ok)
+            if command.startswith("cat "):
+                path = shlex.split(command)[1]
+                return _R(True, self.files[path]) if path in self.files else _R(False)
+            return _R(True, "")
+
+    def ids(result: Any) -> list[tuple[str, str]]:
+        return [(r["id"], r["status"]) for r in result.checks]
+
+    ledger = json.dumps({"entries": [
+        {"id": "US-0002", "kind": "user_story", "status": "active"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"},
+    ]})
+    spec = json.dumps({"title": "T", "summary": "...", "user_stories": [{
+        "id": "US-0002", "title": "S", "narrative": "...",
+        "acceptance_criteria": [{"id": "US-0002.1", "description": "rule"}],
+    }]})
+    absent = {"status": "absent", "reason": "demo"}
+    ui_stack = json.dumps({
+        "summary": "s", "languages": absent, "frameworks": {"status": "present", "values": ["react"]},
+        "package_managers": absent, "testing_frameworks": absent, "conventions": absent,
+        "dotnet": {"status": "not_detected", "reason": "demo"}, "convention_roots": [], "conventions_applied": [],
+        "auth_kind": "none", "config_inventory": absent,
+    })
+    files = {
+        LEDGER_PATH: ledger,
+        workflow_persistence.SPECIFICATION_APPROVED_PATH: spec,
+        workflow_persistence.TECH_STACK_APPROVED_PATH: ui_stack,
+        "playwright.config.ts": "use: { screenshot: 'on' }",
+        ac_coverage_gate.AC_TEST_OUTPUT_PATH: "suite red\n",
+        "TestResults/ac-run.trx": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results>'
+            '<UnitTestResult testName="[US-0002.1] rule" outcome="Failed" /></Results></TestRun>'
+        ),
+    }
+    healthy = ["playwright.config.ts", "tests/e2e/a.spec.ts", "tests/unit/a.test.ts"]
+
+    async def _fake_run_and_report(*_a: Any, **_k: Any) -> Any:
+        return ac_coverage_gate.AcTestRunReport(exit_ok=False, result_artifacts=["TestResults/ac-run.trx"])
+
+    original = stack_runner.run_and_report
+    stack_runner.run_and_report = _fake_run_and_report
+    try:
+        ok = await verify_ac_to_tests("t", {}, "r", "base", _Fake(files, healthy), "claude")  # type: ignore[arg-type]
+        assert ok.passed, ok.feedback
+        assert [i for i, _ in ids(ok)] == [c.id for c in VERIFY_CHECKS], ids(ok)
+        assert dict(ids(ok))["ac_tests.depth"] == "skipped" and {s for i, s in ids(ok) if i != "ac_tests.depth"} == {"passed"}, ok.checks
+    finally:
+        stack_runner.run_and_report = original
+
+    # Blocking early return: the revert of an out-of-scope file fails -- only write_scope is recorded.
+    blocked = await verify_ac_to_tests("t", {}, "r", "base", _Fake(files, ["src/app.ts"], revert_ok=False), "claude")  # type: ignore[arg-type]
+    assert not blocked.passed and ids(blocked) == [("ac_tests.write_scope", "failed")], ids(blocked)
+
+    # Collected: ledger tampering + e2e-only suite + no screenshot:'on' all reported in one lap,
+    # and the coverage checks never run.
+    bad = await verify_ac_to_tests(
+        "t", {}, "r", "base",
+        _Fake({**files, "playwright.config.ts": "use: {}"}, healthy[:2], ledger_diff=LEDGER_PATH),  # type: ignore[arg-type]
+        "claude",
+    )
+    failed = [i for i, s in ids(bad) if s == "failed"]
+    assert not bad.passed and failed == ["ac_tests.ledger_integrity", "ac_tests.not_e2e_only", "ac_tests.screenshot_on"], ids(bad)
+    assert not any(i.startswith(("ac_tests.coverage", "ac_tests.test_run")) for i, _ in ids(bad)), ids(bad)
+
+    # Every declared check is recorded somewhere in the gate's own two function bodies.
+    body = inspect.getsource(verify_ac_to_tests) + inspect.getsource(ac_coverage_gate.check_ac_coverage)
+    names = {v: k for mod in (globals(), vars(ac_coverage_gate)) for k, v in mod.items() if isinstance(v, Check)}
+    for check in VERIFY_CHECKS:
+        assert re.search(rf"\b{names[check]}\b", body), f"{check.id} is declared but never recorded"
 
 
 if __name__ == "__main__":
