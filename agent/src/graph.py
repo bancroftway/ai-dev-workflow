@@ -4539,7 +4539,8 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
             if state.get("code_gen_mode") == "yolo" and stage_spec.key in _VERIFY_ALWAYS_RUNS_STAGE_KEYS:
                 logger.warning(
                     "%s: verify failed (%s) -- proceeding to gate anyway (YOLO mode, no redraft loop for this stage)",
-                    stage_spec.key, (last.get("feedback") or "")[:200],
+                    stage_spec.key,
+                    " ".join((last.get("feedback") or "no feedback").split())[:workflow_config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS],
                 )
                 return "gate"
             return "retry"
