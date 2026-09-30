@@ -48,9 +48,10 @@
 // staged copy at /opt/aidw-hooks/wireframe_linkage_checks.py) -- rather than inventing a second,
 // new transcript-parsing mechanism.
 //
-// PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as this image's other file-only
-// hooks: no AIDW_-prefixed env var gates this -- manifest.json's own existence, and git itself
-// being available (this pipeline's whole model is a git checkout), is the entire scope check.
+// STAGE-SCOPED VIA AIDW_STAGE (final-review fix, 2026-09-30): this used to rely solely on
+// manifest.json's own existence (which persists for the whole run, read by every later stage) --
+// this hook kept firing on every LATER stage's Stop event too. Now gated on AIDW_STAGE below,
+// matching check-citation-drop-stop.mjs's already-correct pattern.
 // AIDW_RUN_ID is read (Task 5) but only gates the per-item half below; its absence never disables
 // the blanket half above.
 import { readFileSync, existsSync } from "node:fs";

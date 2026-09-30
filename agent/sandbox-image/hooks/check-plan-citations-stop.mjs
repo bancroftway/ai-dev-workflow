@@ -42,10 +42,12 @@
 // - `check_plan_step_ids` (spec_ledger.py's `sync_plan_ledger`): the plan-step id-missing/
 //   id-collision guard.
 //
-// PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs and
-// check-plan-schema-stop.mjs: no AIDW_-prefixed env var gates this -- steps.json's own existence
-// in the working directory is the entire scope check. AIDW_RUN_ID is read (Task 5) but only gates
-// the ONE removal-demand sub-check above, never this hook's own scope.
+// STAGE-SCOPED VIA AIDW_STAGE (final-review fix, 2026-09-30): this used to rely solely on
+// steps.json's own existence, which stays on disk for the rest of the ticket once plan is
+// approved -- this hook kept firing on every LATER stage's Stop event too. Now gated on
+// AIDW_STAGE below, matching check-citation-drop-stop.mjs's already-correct pattern.
+// AIDW_RUN_ID is read (Task 5) but only gates the ONE removal-demand sub-check above, never this
+// hook's own stage scope.
 import { readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";

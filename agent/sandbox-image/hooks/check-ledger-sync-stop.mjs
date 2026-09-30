@@ -35,9 +35,12 @@
 //      ALREADY shows completeness for `AIDW_RUN_ID`, from an earlier lap of the same run). Reads
 //      `AIDW_RUN_ID` (Task 5) -- the ONE sub-check this task's brief calls out as needing it.
 //
-// PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION for (1)/(2), same reasoning as
-// check-citation-drop-stop.mjs: no AIDW_-prefixed env var gates those -- draft-specification.json's
-// own existence is the entire scope check. (3) is narrower, as described above.
+// STAGE-SCOPED VIA AIDW_STAGE (final-review fix, 2026-09-30): (1)/(2) used to rely solely on
+// draft-specification.json's own existence, on the mistaken belief that check-narrative-format-
+// stop.mjs's identical posture was safe precedent -- it wasn't (that file had the same bug, from
+// which this one inherited it). The file stays on disk for the rest of the ticket, so both used
+// to keep firing on every LATER stage's Stop event. Now gated on AIDW_STAGE below, matching
+// check-citation-drop-stop.mjs's already-correct pattern. (3) is narrower, as described above.
 import { readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { validate } from "./lib/json-schema-lite.mjs";

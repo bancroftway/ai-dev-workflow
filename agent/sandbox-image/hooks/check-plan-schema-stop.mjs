@@ -37,10 +37,11 @@
 // is deliberately no wireframe COUNT cap (removed 2026-09-24) -- a plan may cite as many wireframes
 // as the work actually needs; do not reintroduce one.
 //
-// PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs:
-// no AIDW_-prefixed env var gates this -- steps.json/manifest.json's own existence in the working
-// directory (always /workspace/repo) is the entire scope check. A turn for any other stage simply
-// never has these files, so this exits 0 immediately.
+// STAGE-SCOPED VIA AIDW_STAGE (final-review fix, 2026-09-30): the claim this comment used to make
+// -- "a turn for any other stage simply never has these files, so this exits 0 immediately" -- was
+// wrong from the start: manifest.json is written early (preflight) and read by every later stage
+// for the rest of the run, so this hook kept firing on every LATER stage's Stop event too. Now
+// gated on AIDW_STAGE below, matching check-citation-drop-stop.mjs's already-correct pattern.
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { validate } from "./lib/json-schema-lite.mjs";

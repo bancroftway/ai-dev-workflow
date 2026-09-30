@@ -20,9 +20,13 @@
 // implementation instead of a second, independently-drifting copy. See that module's own
 // docstring for the full reasoning.
 //
-// PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs: no
-// AIDW_-prefixed env var gates this -- draft-specification.json's own existence in the working
-// directory is the entire scope check.
+// STAGE-SCOPED VIA AIDW_STAGE (final-review fix, 2026-09-30): this comment used to claim no
+// AIDW_-prefixed env var gates this hook, relying solely on draft-specification.json's existence
+// in the working directory -- that file is never deleted once specification is approved, so this
+// hook kept firing on every LATER stage's Stop event for the rest of the run. This is in fact the
+// ORIGINAL instance of that bug (check-ledger-sync-stop.mjs's own header cited this file's old
+// posture as its precedent and inherited the same gap). Now gated on AIDW_STAGE below, matching
+// check-citation-drop-stop.mjs's already-correct pattern.
 import { readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
