@@ -70,6 +70,7 @@ from .gates import (
     write_scope_gate,
 )
 from .gates.checks import (
+    AUDIT_MODES,
     WRAPPER_AUDIT_FINDINGS,
     WRAPPER_CHECKS,
     WRAPPER_SANDBOX,
@@ -5227,7 +5228,7 @@ def _audit_enabled(state: GraphState) -> bool:
     direction, and less is the one that needs an explicit, validated request. Whether VERIFY runs
     is per stage, not per mode -- see _stage_verify_policy.
     """
-    return resolve_code_gen_mode(state.get("code_gen_mode")) == "mission_critical"
+    return resolve_code_gen_mode(state.get("code_gen_mode")) in AUDIT_MODES
 
 
 def _stage_verify_policy(state: GraphState, stage_spec: StageSpec) -> str:

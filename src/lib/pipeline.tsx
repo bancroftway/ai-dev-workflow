@@ -53,6 +53,8 @@ export interface PipelineMode {
   id: string;
   label: string;
   default: boolean;
+  /** Whether this mode runs the adversarial audit leg (checks.AUDIT_MODES). */
+  audit: boolean;
   blurb: string;
   speed_cost: string;
   best_for: string;

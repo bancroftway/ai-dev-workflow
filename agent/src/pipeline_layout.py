@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import graph
-from .gates.checks import CODE_GEN_MODES, WRAPPER_CHECKS, Check
+from .gates.checks import AUDIT_MODES, CODE_GEN_MODES, WRAPPER_CHECKS, Check
 
 
 @dataclass(frozen=True)
@@ -82,7 +82,7 @@ class Pipeline:
         return {
             "tabs": [t.describe(stages) for t in self.tabs],
             "order": list(self.order),
-            "modes": [dict(m) for m in self.modes],
+            "modes": [{**m, "audit": m["id"] in AUDIT_MODES} for m in self.modes],
             "rebuild_placements": [dict(p) for p in self.rebuild_placements],
             "failure_stage_map": dict(self.failure_stage_map),
             "legacy_labels": dict(self.legacy_labels),

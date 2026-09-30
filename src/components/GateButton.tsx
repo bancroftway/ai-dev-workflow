@@ -53,9 +53,6 @@ const TONE_CLASS: Record<RowTone, string> = {
   muted: "text-neutral-500",
 };
 
-// ponytail: the descriptor has no per-mode "runs the audit" flag, so this mirrors graph.py's
-// _audit_enabled (mission_critical only). Move to PipelineMode when the backend exposes it.
-const auditOnFor = (mode: string | null | undefined) => (mode ? mode === "mission_critical" : undefined);
 
 interface StageView {
   stage: PipelineStage;
@@ -238,7 +235,7 @@ function StageSection({
     verdict,
     policy,
     modeLabel,
-    auditOn: auditOnFor(mode),
+    auditOn: mode ? pipeline.modes.find((m) => m.id === mode)?.audit : undefined,
     stageStatus: attempt ? null : (view.stageState?.status ?? null),
     lap: view.lap,
   });
