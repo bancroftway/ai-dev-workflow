@@ -32,7 +32,11 @@
 // `_stage_env_prefix`, set unconditionally on every turn, both roles) is the general fix: any
 // Stop hook whose check only makes sense for ONE stage must gate on this, never infer scope from
 // a scratch file's mere presence.
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-citation-drop-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 if (process.env.AIDW_STAGE !== "specification") process.exit(0);
 
@@ -49,6 +53,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -59,10 +64,15 @@ if (input.stop_hook_active) process.exit(0);
 const cwd = input.cwd || ".";
 
 function readJson(relPath) {
+  const path = `${cwd}/${relPath}`;
+  if (!existsSync(path)) return null; // not written yet this run -- routine, not a failure
   try {
-    return JSON.parse(readFileSync(`${cwd}/${relPath}`, "utf8"));
+    return JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return null; // absent or unreadable -- fail open (the AIDW_STAGE gate above already confirmed this IS specification's own turn)
+    // Present but unreadable/invalid JSON -- fail open (the AIDW_STAGE gate above already
+    // confirmed this IS specification's own turn, so this is a genuine, not routine, problem).
+    reportFailOpen(HOOK_NAME, stage, `unreadable or invalid JSON: ${relPath}`, cwd);
+    return null;
   }
 }
 

@@ -29,6 +29,10 @@
 // in the working directory is the entire scope check.
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-plan-citations-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 const STEPS_PATH = ".ai-dev-workflow/plan/_draft/steps.json";
@@ -39,6 +43,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -189,9 +194,14 @@ try {
       timeout: 20000,
     },
   );
-  if (proc.status === 0 && proc.stdout) linkageResult = JSON.parse(proc.stdout);
+  if (proc.status === 0 && proc.stdout) {
+    linkageResult = JSON.parse(proc.stdout);
+  } else {
+    reportFailOpen(HOOK_NAME, stage, "wireframe_linkage_checks.py subprocess failed, timed out, or produced no output", cwd);
+  }
 } catch {
   linkageResult = undefined; // infra gap -- never a false rejection
+  reportFailOpen(HOOK_NAME, stage, "wireframe_linkage_checks.py subprocess failed, timed out, or returned unparsable output", cwd);
 }
 if (linkageResult) {
   // Citation-validity against the ledger only means something once the ledger is populated --

@@ -40,6 +40,10 @@
 // never has these files, so this exits 0 immediately.
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { validate } from "./lib/json-schema-lite.mjs";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-plan-schema-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 const STEPS_PATH = ".ai-dev-workflow/plan/_draft/steps.json";
 const MANIFEST_PATH = ".ai-dev-workflow/plan/_draft/manifest.json";
@@ -107,6 +111,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -134,6 +139,7 @@ try {
   stepsSchema = JSON.parse(readFileSync(new URL("./schemas/plan_steps.schema.json", import.meta.url)));
   manifestSchema = JSON.parse(readFileSync(new URL("./schemas/plan_manifest.schema.json", import.meta.url)));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "schema files missing from the image (schemas/plan_steps.schema.json / plan_manifest.schema.json)", cwd);
   process.exit(0); // schema files missing from the image -- an infra gap, never a false rejection
 }
 

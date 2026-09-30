@@ -40,6 +40,10 @@
 // being available (this pipeline's whole model is a git checkout), is the entire scope check.
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-diagram-staleness-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 const SPECIFICATION_APPROVED_PATH = ".ai-dev-workflow/03-specification.approved.json";
 const MANIFEST_PATH = ".ai-dev-workflow/plan/_draft/manifest.json";
@@ -56,6 +60,9 @@ function lastCommitHash(cwd, relPath) {
     }).trim();
     return out || null;
   } catch {
+    // git itself failed (missing binary, not a repo, etc.) -- distinct from the ordinary
+    // "never committed yet" case above, which returns null without ever reaching here.
+    reportFailOpen(HOOK_NAME, stage, `git log failed for ${relPath}`, cwd);
     return null;
   }
 }
@@ -80,6 +87,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 

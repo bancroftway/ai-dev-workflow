@@ -132,6 +132,12 @@ HISTORY_DIR = ".ai-dev-workflow/history"
 # Stable, run-id-free location for the LATEST run's exit report, so a human landing on the delivered
 # branch can find it without knowing a run id. The per-run copy under HISTORY_DIR remains the archive.
 EXIT_REPORT_PATH = ".ai-dev-workflow/EXIT-REPORT.md"
+# Append-only JSONL log every Stop hook's `reportFailOpen` (agent/sandbox-image/hooks/lib/
+# report-fail-open.mjs) appends one `{ts, hook, stage, reason}` line to whenever it fails open
+# (missing tool, timeout, unparsable output) -- see that module's own docstring. Read here, not
+# written: this side only surfaces what already happened, one line per fail-open, most sessions
+# never create this file at all.
+HOOK_FAIL_OPENS_PATH = ".ai-dev-workflow/hook-fail-opens.jsonl"
 
 # No retention/pruning of history/ here anymore: that subsystem existed to bound growth across
 # MANY sessions dumping artifacts into one shared branch (WS0's single ai-dev-workflow branch).
@@ -237,6 +243,57 @@ def _render_skills_section(stages: dict[str, Any] | None) -> list[str]:
     if not rows:
         return []
     return ["## Skills invoked per stage", "", "| Stage | Skills invoked | Notes |", "|---|---|---|", *rows, ""]
+
+
+def _parse_hook_fail_opens(raw: str | None) -> list[dict[str, Any]]:
+    """Parses `HOOK_FAIL_OPENS_PATH`'s content (a JSONL file -- one `{ts, hook, stage, reason}`
+    object per line, written by every Stop hook's `reportFailOpen`) into a list of dicts.
+
+    `raw` is `None` on the common case (file absent -- most sessions have zero fail-opens; see
+    repo_files.read_repo_file, which already returns None for both "doesn't exist" and "can't be
+    read"). A line that isn't valid JSON is skipped, not fatal -- one bad line (a hook's own write
+    raced a truncation, say) must not blank out every OTHER hook's real fail-open in the same
+    session's report."""
+    if not raw:
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def _render_hook_fail_opens_section(fail_opens: list[dict[str, Any]] | None) -> list[str]:
+    """Plain-language summary of Stop hooks that failed open this session (missing tool, timeout,
+    or unparsable output -- see report-fail-open.mjs's own docstring). Empty list -- the common
+    case, most sessions have zero -- renders NOTHING, not an empty heading; this is the one
+    exception to the "unconditional heading" convention _render_eval_section/_render_skills_section
+    use, deliberately, per this feature's own spec: a silent file must stay silent in the report."""
+    if not fail_opens:
+        return []
+    lines = [
+        "## Deterministic checks skipped this session",
+        "",
+        f"{len(fail_opens)} deterministic check(s) could not run this session and were skipped "
+        "(a same-turn Stop hook failed open -- see `agent/sandbox-image/hooks/lib/"
+        "report-fail-open.mjs`; the authoritative gate for each still ran normally):",
+        "",
+    ]
+    for fo in fail_opens:
+        hook = fo.get("hook", "?")
+        stage = fo.get("stage", "?")
+        reason = fo.get("reason", "?")
+        ts = fo.get("ts", "?")
+        lines.append(f"- `{hook}` ({stage}, {reason}) at {ts}")
+    lines.append("")
+    return lines
 
 
 def _render_eval_section(metrics_summary: dict[str, Any] | None) -> list[str]:
@@ -828,6 +885,7 @@ def _render_history_sections(
     fallback_metrics: dict[str, Any] | None = None,
     remediation: dict[str, Any] | None = None,
     traceability_matrix_markdown: str | None = None,
+    hook_fail_opens: list[dict[str, Any]] | None = None,
 ) -> str:
     """Deterministic sections appended after render_exit_markdown's own output. Lives here, not in
     markdown_render.py, because that module's contract is content-dict-only (schema-shaped LLM
@@ -946,6 +1004,7 @@ def _render_history_sections(
         lines += ["", traceability_matrix_markdown.rstrip("\n"), ""]
     lines += _render_supply_chain_section(metrics_summary)
     lines += _render_skills_section(stages)
+    lines += _render_hook_fail_opens_section(hook_fail_opens)
 
     lines += ["## Screens", ""]
     # Wireframe-coverage figure, stamped by e2e_nodes.check_wireframe_coverage: `total` is None
@@ -1618,6 +1677,8 @@ async def exit_finalize_node(
         )
         raw_metrics = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json")
         metrics_summary = json.loads(raw_metrics) if raw_metrics else {}
+        raw_hook_fail_opens = await repo_files.read_repo_file(provider, thread_id, HOOK_FAIL_OPENS_PATH)
+        hook_fail_opens = _parse_hook_fail_opens(raw_hook_fail_opens)
         if metrics_summary.get("run_id") != run_id:
             # Stale file from a previous run (metrics_compute short-circuited this run) -- rendering
             # it as this run's numbers was the "traceability from a stale manifest" bug. Say "not
@@ -1833,6 +1894,7 @@ async def exit_finalize_node(
                     fallback_metrics=fallback_metrics,
                     remediation=remediation_report,
                     traceability_matrix_markdown=traceability_matrix_markdown,
+                    hook_fail_opens=hook_fail_opens,
                 )
                 + ("\n" + failure_section if failure_section else "")
                 + ("\n" + divergence_section if divergence_section else "")
@@ -2353,6 +2415,52 @@ def _demo() -> None:
     assert "MISSING test-driven-development" in _text
     assert "CLAIMED BUT NOT INVOKED" in _text, _text
     assert "unverified (session log unreadable)" in _text
+
+    # _parse_hook_fail_opens / _render_hook_fail_opens_section: the file's own common case (absent,
+    # per repo_files.read_repo_file's None-on-missing contract) must add NOTHING to the report --
+    # this is the one section allowed to render no heading at all when empty.
+    assert _parse_hook_fail_opens(None) == []
+    assert _parse_hook_fail_opens("") == []
+    assert _render_hook_fail_opens_section(None) == []
+    assert _render_hook_fail_opens_section([]) == []
+
+    _fixture_jsonl = (
+        '{"ts": "2026-09-29T00:00:00Z", "hook": "check-narrative-format-stop", '
+        '"stage": "specification", "reason": "missing python3"}\n'
+        "not valid json, skipped\n"
+        '{"ts": "2026-09-29T00:00:01Z", "hook": "check-coverage-stop", '
+        '"stage": "minimal-code-to-green", "reason": "unparsable coverage_parsing.py output"}\n'
+        "\n"
+        '{"ts": "2026-09-29T00:00:02Z", "hook": "check-quick-scan-stop", '
+        '"stage": "minimal-code-to-green", "reason": "bandit unavailable, errored, or timed out"}\n'
+    )
+    _fail_opens = _parse_hook_fail_opens(_fixture_jsonl)
+    assert len(_fail_opens) == 3, "the one malformed/blank line must be skipped, not fatal to the rest"
+    assert [fo["hook"] for fo in _fail_opens] == [
+        "check-narrative-format-stop", "check-coverage-stop", "check-quick-scan-stop",
+    ]
+
+    _fail_open_lines = _render_hook_fail_opens_section(_fail_opens)
+    assert _fail_open_lines[0] == "## Deterministic checks skipped this session"
+    _fail_open_text = "\n".join(_fail_open_lines)
+    assert "3 deterministic check(s)" in _fail_open_text, _fail_open_text
+    assert "check-narrative-format-stop` (specification, missing python3)" in _fail_open_text, _fail_open_text
+    assert "check-coverage-stop` (minimal-code-to-green, unparsable coverage_parsing.py output)" in _fail_open_text
+    assert "check-quick-scan-stop` (minimal-code-to-green, bandit unavailable, errored, or timed out)" in _fail_open_text
+
+    # And through the full report renderer: absent file -> no section at all (no stray heading);
+    # present file -> the section actually shows up in the assembled markdown.
+    _no_fail_opens_report = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,
+        screenshots=[], run_id="r1", hook_fail_opens=None,
+    )
+    assert "Deterministic checks skipped" not in _no_fail_opens_report
+    _with_fail_opens_report = _render_history_sections(
+        files_changed_stat="", commits_log="", metrics_summary={}, delta_summary=None,
+        screenshots=[], run_id="r1", hook_fail_opens=_fail_opens,
+    )
+    assert "## Deterministic checks skipped this session" in _with_fail_opens_report
+    assert "check-narrative-format-stop" in _with_fail_opens_report
 
     # _us_ac_rows / _undelivered_ac_ids / _render_us_ac_section: US/AC provenance in the exit
     # report -- own-spec scope + changed entries + delivered-this-run entries, flake-ticket

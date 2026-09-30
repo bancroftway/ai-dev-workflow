@@ -40,6 +40,10 @@
 // the same name (2000) -- KEEP IN SYNC BY HAND if that ever changes; no automated drift guard for
 // this one (it is a plain int literal, not something export_hook_schemas can generate).
 import { readFileSync } from "node:fs";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-full-read-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 const READ_TOOL_DEFAULT_WINDOW_LINES = 2000;
 
@@ -98,6 +102,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -117,6 +122,7 @@ let transcriptText;
 try {
   transcriptText = readFileSync(input.transcript_path, "utf8");
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable transcript file", cwd);
   process.exit(0); // unreadable transcript -- fail open, same contract as the Python backstop
 }
 

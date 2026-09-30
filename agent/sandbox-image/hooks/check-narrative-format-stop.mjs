@@ -22,6 +22,10 @@
 // AIDW_-prefixed env var gates this -- draft-specification.json's own existence in the working
 // directory is the entire scope check.
 import { readFileSync } from "node:fs";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-narrative-format-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 const DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json";
 
@@ -79,6 +83,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 

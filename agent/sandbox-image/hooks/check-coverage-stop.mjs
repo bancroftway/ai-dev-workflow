@@ -37,6 +37,10 @@
 // to second-guess or duplicate that gate's own infra-failure handling.
 import { readFileSync, existsSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-coverage-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 if (process.env.AIDW_STAGE !== "minimal-code-to-green") process.exit(0);
 
@@ -68,6 +72,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -82,7 +87,10 @@ let contract;
 try {
   contract = JSON.parse(readFileSync(contractPath, "utf8"));
 } catch {
-  process.exit(0); // unreadable/malformed -- the real gate's own loader will report this properly
+  // existsSync above already confirmed the file IS there -- unreadable/malformed here is a real
+  // problem, not routine absence; the real gate's own loader will report this properly too.
+  reportFailOpen(HOOK_NAME, stage, "malformed or unreadable coverage-commands.json contract", cwd);
+  process.exit(0);
 }
 
 const rawEntries = Array.isArray(contract?.entries) ? contract.entries : [];
@@ -98,8 +106,15 @@ const entries = rawEntries.filter(
     CONTRACT_FORMATS.has(e.format),
 );
 // A contract that doesn't validate cleanly is not this hook's problem to diagnose -- same
-// fail-open reasoning as every other ambiguous case here.
-if (entries.length === 0 || entries.length !== rawEntries.length) process.exit(0);
+// fail-open reasoning as every other ambiguous case here. Only report when entries were actually
+// dropped by validation (rawEntries.length > 0 but some/all didn't survive) -- a genuinely EMPTY
+// contract (rawEntries.length === 0) is routine early-stage state, not a failure.
+if (entries.length === 0 || entries.length !== rawEntries.length) {
+  if (rawEntries.length > 0 && entries.length !== rawEntries.length) {
+    reportFailOpen(HOOK_NAME, stage, "coverage-commands.json contract entries failed validation (bad command/artifact/format fields)", cwd);
+  }
+  process.exit(0);
+}
 
 // execSync + a shell, not execFile, is deliberate and safe here: entry.command is a real shell
 // command ("cd apps/web && npx vitest run --coverage"), not expressible as one executable + an
@@ -133,9 +148,13 @@ try {
     encoding: "utf8",
     timeout: 20000,
   });
-  if (proc.status !== 0 || !proc.stdout) process.exit(0); // infra gap -- never a false rejection
+  if (proc.status !== 0 || !proc.stdout) {
+    reportFailOpen(HOOK_NAME, stage, "coverage_parsing.py subprocess failed, timed out, or produced no output", cwd);
+    process.exit(0); // infra gap -- never a false rejection
+  }
   result = JSON.parse(proc.stdout);
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unparsable coverage_parsing.py output", cwd);
   process.exit(0);
 }
 
@@ -144,7 +163,10 @@ const { line_rate: lineRate, branch_rate: branchRate, gaps = [] } = result;
 // Nothing usable parsed at all -- this is "the contract doesn't work right now", not "coverage is
 // low"; the real gate's own re-discovery path exists exactly for this and gives a much more
 // specific diagnosis than this hook could. Never block on it here.
-if (lineRate === null || branchRate === null) process.exit(0);
+if (lineRate === null || branchRate === null) {
+  reportFailOpen(HOOK_NAME, stage, "coverage contract replay produced no usable line/branch rate", cwd);
+  process.exit(0);
+}
 
 if (lineRate < MIN_COVERAGE_PERCENT || branchRate < MIN_COVERAGE_PERCENT) {
   const named = gaps
@@ -174,6 +196,7 @@ try {
   });
   testPaths = out.split("\n").map((l) => l.trim()).filter(Boolean);
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "git ls-files unavailable or failed (not a repo?)", cwd);
   process.exit(0); // git not available -- fail open
 }
 
@@ -196,9 +219,13 @@ try {
     encoding: "utf8",
     timeout: 20000,
   });
-  if (proc.status !== 0 || !proc.stdout) process.exit(0); // infra gap -- never a false rejection
+  if (proc.status !== 0 || !proc.stdout) {
+    reportFailOpen(HOOK_NAME, stage, "test_quality_checks.py subprocess failed, timed out, or produced no output (AC depth check)", cwd);
+    process.exit(0); // infra gap -- never a false rejection
+  }
   qualityResult = JSON.parse(proc.stdout);
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unparsable test_quality_checks.py output (AC depth check)", cwd);
   process.exit(0);
 }
 

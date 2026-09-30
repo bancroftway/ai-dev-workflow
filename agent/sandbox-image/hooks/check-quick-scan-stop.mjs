@@ -32,6 +32,10 @@
 // fast-to-find defect), never to second-guess or duplicate remediation's own full scan.
 import { readFileSync, existsSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-quick-scan-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 if (process.env.AIDW_STAGE !== "minimal-code-to-green") process.exit(0);
 
@@ -39,6 +43,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -109,6 +114,7 @@ if (fileExistsMatching(PYTHON_FILES_PROBE)) {
     banditJson = readFileSync(`${cwd}/agent-work/bandit.json`, "utf8");
   } catch {
     banditJson = null; // tool missing/errored/timed out -- fail open on this tool only
+    reportFailOpen(HOOK_NAME, stage, "bandit unavailable, errored, or timed out", cwd);
   }
 }
 
@@ -124,7 +130,8 @@ if (fileExistsMatching(PACKAGE_JSON_PROBE) && existsSync("/opt/aidw/lint/node_mo
     );
     eslintJson = readFileSync(`${cwd}/agent-work/eslint.json`, "utf8");
   } catch {
-    eslintJson = null;
+    eslintJson = null; // tool missing/errored/timed out -- fail open on this tool only
+    reportFailOpen(HOOK_NAME, stage, "eslint-security unavailable, errored, or timed out", cwd);
   }
 }
 
@@ -137,9 +144,13 @@ try {
     encoding: "utf8",
     timeout: 20_000,
   });
-  if (proc.status !== 0 || !proc.stdout) process.exit(0); // infra gap -- never a false rejection
+  if (proc.status !== 0 || !proc.stdout) {
+    reportFailOpen(HOOK_NAME, stage, "quick_scan.py subprocess failed, timed out, or produced no output", cwd);
+    process.exit(0); // infra gap -- never a false rejection
+  }
   result = JSON.parse(proc.stdout);
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unparsable quick_scan.py output", cwd);
   process.exit(0);
 }
 

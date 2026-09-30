@@ -42,6 +42,12 @@
 // live, same "confirm against reality, don't just assume" discipline this codebase applies
 // everywhere else. Falls back to gates/skill_gate.py's post-hoc check regardless.
 import { readFileSync } from "node:fs";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "require-skills-stop";
+// Always set for every stage/role on both CLIs (see this file's own header) -- safe to read here
+// even though this hook's own activation gate below is AIDW_REQUIRED_SKILLS, not AIDW_STAGE.
+const stage = process.env.AIDW_STAGE || "unknown";
 
 const required = (process.env.AIDW_REQUIRED_SKILLS || "")
   .split(",")
@@ -53,6 +59,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -64,6 +71,7 @@ let transcript = "";
 try {
   transcript = readFileSync(input.transcript_path, "utf8");
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable transcript file", input.cwd || ".");
   process.exit(0); // unreadable transcript -- fail open, same contract as read_skill_invocations
 }
 

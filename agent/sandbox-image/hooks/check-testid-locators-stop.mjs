@@ -49,6 +49,10 @@
 // applies here identically.
 import { readFileSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
+import { reportFailOpen } from "./lib/report-fail-open.mjs";
+
+const HOOK_NAME = "check-testid-locators-stop";
+const stage = process.env.AIDW_STAGE || "unknown";
 
 const TESTID_STAGES = new Set(["ac-to-tests", "minimal-code-to-green", "e2e"]);
 if (!TESTID_STAGES.has(process.env.AIDW_STAGE)) process.exit(0);
@@ -66,6 +70,7 @@ let input = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8"));
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unreadable or invalid stdin JSON");
   process.exit(0); // no readable stdin -- fail open
 }
 
@@ -83,6 +88,7 @@ try {
   });
   testPaths = out.split("\n").map((l) => l.trim()).filter(Boolean);
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "git ls-files unavailable or failed (not a repo?)", cwd);
   process.exit(0); // git not available / not a repo yet -- fail open
 }
 
@@ -105,9 +111,13 @@ try {
     encoding: "utf8",
     timeout: 20000,
   });
-  if (proc.status !== 0 || !proc.stdout) process.exit(0); // infra gap -- never a false rejection
+  if (proc.status !== 0 || !proc.stdout) {
+    reportFailOpen(HOOK_NAME, stage, "test_quality_checks.py subprocess failed, timed out, or produced no output", cwd);
+    process.exit(0); // infra gap -- never a false rejection
+  }
   result = JSON.parse(proc.stdout);
 } catch {
+  reportFailOpen(HOOK_NAME, stage, "unparsable test_quality_checks.py output", cwd);
   process.exit(0);
 }
 
