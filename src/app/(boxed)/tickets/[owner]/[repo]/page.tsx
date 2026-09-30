@@ -29,12 +29,20 @@ export default function RepoTicketsPage() {
           </h1>
           <p className="text-sm text-neutral-500">Tickets filed against this repository.</p>
         </div>
-        <Link
-          href={`/tickets/new?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`}
-          className="shrink-0 rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800"
-        >
-          + New Ticket
-        </Link>
+        <div className="flex shrink-0 items-center gap-3">
+          <Link
+            href={`/insights/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/verification`}
+            className="text-sm text-neutral-600 hover:text-neutral-900"
+          >
+            Verification insights
+          </Link>
+          <Link
+            href={`/tickets/new?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`}
+            className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800"
+          >
+            + New Ticket
+          </Link>
+        </div>
       </div>
 
       <SessionHistory owner={owner} repo={repo} />

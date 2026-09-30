@@ -24,6 +24,13 @@ jobs:
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm run build
+      # Gate dialog row states (src/lib/gate-rows.ts), zero-dependency self-check.
+      - run: node --experimental-strip-types scripts/check-gate-rows.mjs
+      # Stage keys come from the backend (agent/src/pipeline_layout.py), hence uv here.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv sync --frozen
+        working-directory: agent
+      - run: node scripts/check-no-stage-literals.mjs
 
   agent:
     runs-on: ubuntu-latest

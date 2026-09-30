@@ -34,12 +34,12 @@ function SpecificationViewImpl() {
   const draft =
     parseSpecification(stage?.draft) ??
     parseSpecification(stage?.approved_content) ??
-    (interrupt.stage === "specification" ? parseSpecification(interrupt.draft) : null);
+    (interrupt.stage === "specification" ? parseSpecification(interrupt.draft) : null); // stage-literal-ok: Specification's own bespoke view
 
   // See stage-review-flags.ts for the isFinal/isProvisional rationale (shared with PlanView --
   // the subtlety here has already caused two live bugs from hand-duplicating this logic).
   const { isProvisional } = deriveStageReviewFlags({
-    stageKey: "specification",
+    stageKey: "specification", // stage-literal-ok: Specification's own bespoke view
     stageStatus: stage?.status,
     interruptOpen: interrupt.open,
     interruptStage: interrupt.stage,
@@ -64,7 +64,7 @@ function SpecificationViewImpl() {
 
       <AuditFindingsDetails findings={stage?.audit_findings ?? []} />
       <ClarifyingQuestions
-        stageKey="specification"
+        stageKey="specification" // stage-literal-ok: Specification's own bespoke view
         questions={stage?.clarifying_questions ?? []}
         hint="Answer by editing the requirements text on the Requirements tab, then resubmit."
       />
@@ -83,7 +83,7 @@ function SpecificationViewImpl() {
             fallback={
               draft ? (
                 <SpecificationSurfaceRenderer specification={draft} />
-              ) : stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("specification") ? (
+              ) : stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("specification") ? ( // stage-literal-ok: Specification's own bespoke view
                 // Empty-tabs fix (root-caused 2026-09-12): durable current_stage already proves
                 // Specification approved -- "No draft yet" is flatly false here, just because the
                 // live snapshot hasn't (re)arrived. Nothing auto-fires one anymore (this session's

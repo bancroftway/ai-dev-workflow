@@ -1,13 +1,22 @@
 "use client";
 
+import { GateButton } from "@/components/GateButton";
 import type { PipelineTab } from "@/lib/pipeline";
 
-/** Seam for the gate icon between stage tabs (plan §6's <GateButton>): AppShell renders one right
- * after every tab, and this decides whether that tab has anything to gate. Renders nothing yet --
- * the dialog lands separately. `codeGenMode` null = mode not known yet (render the gate neutral). */
-export function GateSlot({ tab, codeGenMode }: { tab: PipelineTab; codeGenMode: string | null }) {
+/** The gate icon between stage tabs: AppShell renders one right after every tab, and this decides
+ * whether that tab has anything to gate. `codeGenMode` null = mode not known yet (gate neutral). */
+export function GateSlot({
+  tab,
+  codeGenMode,
+  owner,
+  repo,
+}: {
+  tab: PipelineTab;
+  codeGenMode: string | null;
+  owner: string;
+  repo: string;
+}) {
   const gatedStages = tab.stages.filter((s) => s.gate != null);
   if (gatedStages.length === 0) return null;
-  void codeGenMode; // -> <GateButton stages={gatedStages} codeGenMode={codeGenMode} />
-  return null;
+  return <GateButton stages={gatedStages} codeGenMode={codeGenMode} label={tab.label} owner={owner} repo={repo} />;
 }

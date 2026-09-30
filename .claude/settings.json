@@ -1,5 +1,18 @@
 {
   "env": {
     "PONYTAIL_DEFAULT_MODE": "ultra"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/check-no-stage-literals.mjs\" --hook",
+            "timeout": 180
+          }
+        ]
+      }
+    ]
   }
 }

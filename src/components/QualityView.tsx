@@ -292,7 +292,7 @@ function QualityViewImpl({
     | RemediationContent
     | null
     | undefined;
-  const complianceStage = state.stages?.["adversarial-compliance"];
+  const complianceStage = state.stages?.["adversarial-compliance"]; // stage-literal-ok: bespoke compliance report section
   const compliance = (complianceStage?.approved_content ?? complianceStage?.draft) as
     | AdversarialComplianceReport
     | null
@@ -305,9 +305,9 @@ function QualityViewImpl({
   const sharedRunningPhases = useRunningPhases();
   const runningPhases = runActivity?.runActive === false ? EMPTY_PHASES : sharedRunningPhases;
   const { rebuildPlacements, stageOrderIndex } = usePipeline();
-  const rRemediation = rebuildPlacements.find((p) => p.afterStageKey === "remediation");
+  const rRemediation = rebuildPlacements.find((p) => p.afterStageKey === "remediation"); // stage-literal-ok: bespoke rebuild-placement sections
   const rRemediationPhase = rRemediation && rebuildPhase(state, rRemediation, runActivity?.runActive, runningPhases);
-  const rCompliance = rebuildPlacements.find((p) => p.afterStageKey === "adversarial-compliance");
+  const rCompliance = rebuildPlacements.find((p) => p.afterStageKey === "adversarial-compliance"); // stage-literal-ok: bespoke rebuild-placement sections
   const rCompliancePhase = rCompliance && rebuildPhase(state, rCompliance, runActivity?.runActive, runningPhases);
 
   return (
@@ -485,7 +485,7 @@ function QualityViewImpl({
           for; this leftover paragraph never got the same treatment. */}
       {!remediation && !compliance && !tests && !metrics && (
         <p className="text-sm text-neutral-500">
-          {stageOrderIndex(runActivity?.currentStage) < stageOrderIndex("remediation")
+          {stageOrderIndex(runActivity?.currentStage) < stageOrderIndex("remediation") // stage-literal-ok: bespoke empty-state copy
             ? "Quality stages haven’t run yet — they start after the build stages complete."
             : runActivity?.status === "failed"
               ? "This run stopped before Quality's detail synced — see the Overview tab for the failure and Resume."
