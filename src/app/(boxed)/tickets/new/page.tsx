@@ -246,7 +246,16 @@ export default function NewTicketPage() {
         `aidw:new-ticket:${sessionId}`,
         JSON.stringify({ title: title.trim(), description: description.trim() }),
       );
-      router.push(`/workflow/${owner}/${repo}/${sessionId}/${branch}`);
+      // ?projectId= (same mechanism /select's own "start new session" action uses) is what marks
+      // this as a genuinely-new session for SandboxSessionBoot.tsx's isNewSession gate -- without
+      // it, that component silently skips its own mode-picker popup for every session started from
+      // this form, even though the direct provision call above never had a chance to show one
+      // either (it fires before this navigation, with no UI of its own). code_gen_mode is safe to
+      // leave unset on that first call above: sessions_api.py's provision_session backfills it from
+      // THIS session's next reprovision (SandboxSessionBoot's own call, once the popup answers) as
+      // long as it's still NULL, exactly the "first call omitted it, a later one supplies it" case
+      // its own comment describes.
+      router.push(`/workflow/${owner}/${repo}/${sessionId}/${branch}?projectId=${project.project_id}`);
     } catch (err) {
       setSubmit({ kind: "error", detail: err instanceof Error ? err.message : String(err) });
     }
