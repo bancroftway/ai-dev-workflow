@@ -5,7 +5,8 @@ import { useRouter } from "next/navigation";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
 import { RunningSpinner } from "@/components/Spinner";
 import { terminateSession } from "@/lib/agent-client";
-import { STAGE_KEYS_IN_ORDER, type Session } from "@/lib/session-types";
+import { useFetchedPipeline } from "@/lib/pipeline";
+import type { Session } from "@/lib/session-types";
 
 // Exported (Part 3 Task 9 fix round 1) so the project Board's own cards can reuse this exact
 // palette instead of keeping a second copy -- this was already the one real definition; the
@@ -29,9 +30,13 @@ export function inProgressLabel(s: Session): string {
 }
 
 function ProgressIndicator({ currentStage }: { currentStage: string | null }) {
+  // Stage order/labels from the backend pipeline descriptor; until it loads (or if the agent is
+  // unreachable) this degrades to the raw key with no bar, same as an unknown key.
+  const pipeline = useFetchedPipeline();
   if (!currentStage) return <span className="text-xs text-neutral-500">Starting…</span>;
-  const index = STAGE_KEYS_IN_ORDER.indexOf(currentStage as (typeof STAGE_KEYS_IN_ORDER)[number]);
-  const label = index === -1 ? currentStage : `Stage ${index + 1} of ${STAGE_KEYS_IN_ORDER.length}: ${currentStage}`;
+  const total = pipeline?.order.length ?? 0;
+  const index = pipeline?.order.indexOf(currentStage) ?? -1;
+  const label = index === -1 ? currentStage : `Stage ${index + 1} of ${total}: ${pipeline!.stageLabel(currentStage)}`;
   return (
     <div className="flex flex-col gap-1">
       <span className="text-xs text-neutral-600">{label}</span>
@@ -39,7 +44,7 @@ function ProgressIndicator({ currentStage }: { currentStage: string | null }) {
         <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-100">
           <div
             className="h-full rounded-full bg-blue-500 transition-all"
-            style={{ width: `${((index + 1) / STAGE_KEYS_IN_ORDER.length) * 100}%` }}
+            style={{ width: `${((index + 1) / total) * 100}%` }}
           />
         </div>
       )}

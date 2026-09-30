@@ -9,7 +9,8 @@ import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import { stageOrderIndex, type CannedTechStack, type TechStackCatalogResponse, type WorkflowState } from "@/lib/workflow-types";
+import { usePipeline } from "@/lib/pipeline";
+import type { CannedTechStack, TechStackCatalogResponse, WorkflowState } from "@/lib/workflow-types";
 
 /**
  * First tab in the workflow, before Requirements. Replaces the old chat-sidebar greenfield picker
@@ -29,6 +30,7 @@ function TechStackViewImpl() {
   const { interrupt } = useOpenInterrupt();
   const [sandboxStatus] = useSandboxStatus();
   const [runActivity] = useRunActivity();
+  const { stageOrderIndex } = usePipeline();
 
   const isOpen = interrupt.open && interrupt.stage === "tech-stack";
   const showDropdown = isOpen && interrupt.fileExisted === false;

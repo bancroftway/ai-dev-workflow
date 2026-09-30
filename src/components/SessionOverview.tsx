@@ -17,13 +17,10 @@ import {
   type StageSummary,
 } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
+import { usePipeline } from "@/lib/pipeline";
 import {
-  PIPELINE_STAGE_ORDER,
-  REBUILD_PLACEMENTS,
   REBUILD_STATUS_LABEL,
-  realStageForFailure,
   rebuildPhase,
-  stageOrderIndex,
   type RebuildPlacement,
   type StageState,
   type WorkflowState,
@@ -114,7 +111,7 @@ function AuditFindingsNote({ findings }: { findings: string[] }) {
 /** Plain-language failure summary for the recovery panel (root-caused 2026-09-13, user-reported:
  * the raw `failureTypeText` enum, e.g. "cannot_verify", was shown to users completely unexplained).
  * `rawFailureStage` is the PRE-`realStageForFailure` value (`failure.stage`/`runActivity.
- * failureStage`) -- often a REBUILD_PLACEMENTS `rebuildKey` (e.g. "r_ac_to_tests", set by
+ * failureStage`) -- often a rebuild_placements `rebuildKey` (e.g. "r_ac_to_tests", set by
  * agent/src/rebuild.py's own make_escalate_node), not a real stage key. Using the placement's own
  * label ("Red Gate") when it matches one avoids misattributing a rebuild-gate's own build-check
  * failure to the real stage's content/audit, which is already approved and uninvolved. */
@@ -123,8 +120,9 @@ function describeFailure(
   failureTypeText: string | null,
   failureMessageText: string | null,
   mappedStageLabel: string,
+  placements: RebuildPlacement[],
 ): string {
-  const placement = REBUILD_PLACEMENTS.find((p) => p.rebuildKey === rawFailureStage);
+  const placement = placements.find((p) => p.rebuildKey === rawFailureStage);
   const label = placement?.label ?? mappedStageLabel;
   if (failureTypeText === "cannot_verify") {
     return `${label}'s last check couldn't run because no sandbox was available — this is an infrastructure hiccup, not a problem with your code.`;
@@ -173,7 +171,7 @@ function ContinueAction({ restarting, onClick }: { restarting: boolean; onClick:
 // two byte sizes) fit without overflowing -- same total fixed width as before, just redistributed.
 const ROW_GRID = "grid grid-cols-[1fr_4rem_3.5rem_3.5rem_8.5rem_14rem] items-center gap-3";
 
-/** One REBUILD_PLACEMENTS row, inserted right after its `afterStageKey`'s own row (rebuildPhase's
+/** One rebuild_placements row, inserted right after its `afterStageKey`'s own row (rebuildPhase's
  * own docstring: real, unattributed-to-a-single-placement work happening between two stages).
  * `timing` (Overview-tab fix, 2026-09-22) is looked up directly from the server-computed summary
  * (agent/src/run_event_summary.py), keyed by `placement.rebuildKey` -- that key is exactly what
@@ -400,9 +398,16 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { copilotkit } = useCopilotKit();
   const state = (agent.state ?? {}) as WorkflowState;
+  const pipeline = usePipeline();
+  const { stageOrderIndex, realStageForFailure, rebuildPlacements } = pipeline;
+  // Real run order then legacy keys -- index i here is exactly stageOrderIndex(key).
+  const stageOrder = useMemo(
+    () => [...pipeline.order, ...Object.keys(pipeline.descriptor.legacy_labels)].map((key) => ({ key, label: pipeline.stageLabel(key) })),
+    [pipeline],
+  );
   // Root-caused 2026-09-12 (user-reported: stages rendered out of pipeline order): `state.stages`
   // is a plain object -- Object.entries has no ordering guarantee of its own, only whatever order
-  // the backend happened to insert keys in. Sort by the same PIPELINE_STAGE_ORDER every other
+  // the backend happened to insert keys in. Sort by the same pipeline run order every other
   // ordering decision on this page already uses.
   const stages = Object.entries(state.stages ?? {}).sort(([a], [b]) => stageOrderIndex(a) - stageOrderIndex(b));
   const failure = state.run_failure;
@@ -434,7 +439,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
   // instead: if that stage is approved, the frontier is whatever's next after it (or nothing, if
   // it was the last real stage -- a fully successful run); otherwise that stage itself -- still
   // incomplete -- IS the frontier.
-  const orderedRealStages = PIPELINE_STAGE_ORDER.filter((s) => state.stages?.[s.key] != null);
+  const orderedRealStages = stageOrder.filter((s) => state.stages?.[s.key] != null);
   let lastTouchedIdx = -1;
   orderedRealStages.forEach((s, i) => {
     if ((state.stages![s.key]!.status ?? "not_started") !== "not_started") lastTouchedIdx = i;
@@ -447,7 +452,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
         ? (orderedRealStages[lastTouchedIdx + 1]?.key ?? null)
         : orderedRealStages[lastTouchedIdx].key;
   // Exposed separately from mappedFailureTarget (root-caused 2026-09-13): this is the PRE-mapped
-  // value -- often a REBUILD_PLACEMENTS rebuildKey, not a real stage key -- needed by
+  // value -- often a rebuild_placements rebuildKey, not a real stage key -- needed by
   // describeFailure below to attribute a rebuild-gate's own failure to the placement itself
   // ("Red Gate") rather than the real stage it's mapped to for row/rewind-targeting purposes.
   const rawFailureStage = hasLiveStages
@@ -463,7 +468,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
   const boundaryKey = mappedFailureTarget ?? (hasLiveStages ? firstNonApprovedKey : (runActivity?.currentStage ?? null));
   const boundaryIdx = stageOrderIndex(boundaryKey);
   const isFailedBoundary = mappedFailureTarget != null;
-  const boundaryLabel = PIPELINE_STAGE_ORDER.find((s) => s.key === boundaryKey)?.label ?? boundaryKey ?? "This stage";
+  const boundaryLabel = stageOrder.find((s) => s.key === boundaryKey)?.label ?? boundaryKey ?? "This stage";
   // The "redo a different stage instead" disclosure's own candidate list (root-caused 2026-09-13
   // UX redesign): every OTHER stage this run has genuinely approved, excluding the boundary --
   // `stage.status === "approved"` is the same live, trustworthy reachability proof
@@ -472,7 +477,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
   // (state.stages has no live per-stage data yet there) -- nothing to offer alternatives from, so
   // the disclosure correctly renders nothing rather than guessing.
   const otherApprovedStages = isFailedBoundary
-    ? PIPELINE_STAGE_ORDER.filter((s) => s.key !== boundaryKey && state.stages?.[s.key]?.status === "approved")
+    ? stageOrder.filter((s) => s.key !== boundaryKey && state.stages?.[s.key]?.status === "approved")
     : [];
   // Same live-over-durable preference as the boundary itself, for the actual error text shown
   // next to the restart button -- the durable copies are only a truncated mirror of this same data.
@@ -504,7 +509,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
   // approved, and retries just the check that never ran -- no rewind-to-stage call, no redraft.
   const isCannotVerifyBoundary = isFailedBoundary && failureTypeText === "cannot_verify";
   async function handleRestart(stageKey: string) {
-    const label = PIPELINE_STAGE_ORDER.find((s) => s.key === stageKey)?.label ?? stageKey;
+    const label = stageOrder.find((s) => s.key === stageKey)?.label ?? stageKey;
     // Only the boundary's OWN stage qualifies for the cheap retry -- a user who explicitly picked
     // a DIFFERENT (earlier) stage via its own row's button is asking for a real rewind to THAT
     // stage, which still needs the full reset regardless of why the boundary itself failed.
@@ -796,25 +801,25 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
 
   // What a rewind to `stageKey` actually resets (root-caused 2026-09-13 UX redesign): mirrors
   // agent/src/graph.py:2515-2542's own rewind-to-stage handling exactly -- every real stage from
-  // `stageKey` onward, plus every REBUILD_PLACEMENTS entry whose `afterStageKey` sits at or after
+  // `stageKey` onward, plus every rebuild_placements entry whose `afterStageKey` sits at or after
   // it (graph.py:2536-2538) -- so the enumerated label list and cost match the real consequence,
-  // not an approximation. `state.stages?.[s.key] == null` filters out PIPELINE_STAGE_ORDER's own
+  // not an approximation. `state.stages?.[s.key] == null` filters out the pipeline order's own
   // legacy/never-populated tail keys (brownfield-baseline, raw-requirements, and four retired
   // stage keys the current graph never writes -- see that file's own comment) so the confirm copy
   // never lists a phantom stage. `summary` (server-computed, Overview-tab fix 2026-09-22) is
   // keyed by the same normalized stage/placement key either way, so each stage's own trailing
-  // placement (if any) must still be looked up via REBUILD_PLACEMENTS explicitly -- a direct
+  // placement (if any) must still be looked up via rebuild_placements explicitly -- a direct
   // `summary.get(s.key)` for the placement itself would silently always miss.
   function stagesResetByRewind(stageKey: string): { labels: string[]; approxCost: number } {
     const startIdx = stageOrderIndex(stageKey);
     const labels: string[] = [];
     let approxCost = 0;
-    for (const s of PIPELINE_STAGE_ORDER) {
+    for (const s of stageOrder) {
       if (stageOrderIndex(s.key) < startIdx) continue;
       if (state.stages?.[s.key] == null) continue;
       labels.push(s.label);
       approxCost += summary.get(s.key)?.cost ?? 0;
-      const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === s.key);
+      const placement = rebuildPlacements.find((p) => p.afterStageKey === s.key);
       if (placement) approxCost += summary.get(placement.rebuildKey)?.cost ?? 0;
     }
     return { labels, approxCost };
@@ -864,7 +869,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
       {isFailedBoundary && mappedFailureTarget && (
         <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900">
           <p className="font-medium">
-            {describeFailure(rawFailureStage, failureTypeText, failureMessageText, boundaryLabel)}
+            {describeFailure(rawFailureStage, failureTypeText, failureMessageText, boundaryLabel, rebuildPlacements)}
           </p>
           {(failureTypeText || failureMessageText) && (
             <details className="mt-1">
@@ -957,7 +962,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
             <span>Redraft History</span>
           </div>
           <ol className="flex flex-col gap-2">
-            {PIPELINE_STAGE_ORDER.slice(0, boundaryIdx + 1).map((s, i, arr) => {
+            {stageOrder.slice(0, boundaryIdx + 1).map((s, i, arr) => {
               // Only the LAST (boundary) row is ever ambiguous -- every earlier one is durably
               // known complete, so it keeps the generic sync-pending copy. The boundary row needs
               // real status: EITHER the real failure (durable failureType/failureMessage + the one
@@ -1059,9 +1064,9 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
               // same shared component the durable-fallback branch above uses.
               const showPlainContinue =
                 !finishedWithVerdict && !sessionGenuinelyActive && !e2eStuck && isBoundaryRow && !isFailedBoundary && !running;
-              // At most one placement follows any given real stage today (REBUILD_PLACEMENTS has
+              // At most one placement follows any given real stage today (rebuild_placements has
               // no two entries sharing an afterStageKey) -- find(), not filter().
-              const placement = REBUILD_PLACEMENTS.find((p) => p.afterStageKey === key);
+              const placement = rebuildPlacements.find((p) => p.afterStageKey === key);
               const phase = placement && rebuildPhase(state, placement, runActivity?.runActive, runningPhases);
               const rebuildRow = placement && phase && (
                 <RebuildRow
@@ -1080,7 +1085,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
                   }`}
                 >
                   <div className={ROW_GRID}>
-                    <span className="font-medium">{PIPELINE_STAGE_ORDER.find((s) => s.key === key)?.label ?? key}</span>
+                    <span className="font-medium">{stageOrder.find((s) => s.key === key)?.label ?? key}</span>
                     <span className="text-right text-xs text-neutral-500">
                       {s && s.last > s.first ? formatDuration(s.last - s.first) : ""}
                     </span>

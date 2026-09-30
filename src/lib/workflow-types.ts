@@ -42,11 +42,11 @@ export interface StageState {
   baseline_commit: string | null;
 }
 
-/** Build phase has begun (shared by AppShell's tab gating and RequirementsView's submit lock) --
- * ac-to-tests is the first Build stage, so any status past not_started means implementation work
- * exists that a casual requirements resubmit would race. */
-export function buildStarted(state: WorkflowState): boolean {
-  const status = state.stages?.["ac-to-tests"]?.status;
+/** Build phase has begun (RequirementsView's submit lock) -- `firstBuildStageKey` is the first
+ * stage of the pipeline's build view (usePipeline), so any status past not_started means
+ * implementation work exists that a casual requirements resubmit would race. */
+export function buildStarted(state: WorkflowState, firstBuildStageKey: string | undefined): boolean {
+  const status = firstBuildStageKey ? state.stages?.[firstBuildStageKey]?.status : undefined;
   return status !== undefined && status !== "not_started";
 }
 
@@ -94,13 +94,6 @@ export interface RebuildPlacement {
   nextStageKey: string;
   label: string;
 }
-
-export const REBUILD_PLACEMENTS: RebuildPlacement[] = [
-  { afterStageKey: "ac-to-tests", rebuildKey: "r_ac_to_tests", nextStageKey: "minimal-code-to-green", label: "Red Gate" },
-  { afterStageKey: "minimal-code-to-green", rebuildKey: "r_minimal_code_to_green", nextStageKey: "remediation", label: "Rebuild" },
-  { afterStageKey: "remediation", rebuildKey: "r_remediation", nextStageKey: "adversarial-compliance", label: "Rebuild" },
-  { afterStageKey: "adversarial-compliance", rebuildKey: "r_adversarial_compliance", nextStageKey: "metrics-exit", label: "Rebuild" },
-];
 
 /** User-reported gap (2026-09-06): a real stage approves, then Build/Overview go quiet for several
  * minutes with no row/card for it -- reads as stalled. That gap is real work: graph.py's
@@ -518,113 +511,12 @@ export interface WorkflowState {
   // Keyed by RebuildSpec.key (agent/src/rebuild.py) -- one entry per R placement this thread has
   // actually entered. See redGatePhase's own docstring for the one placement the UI reads today.
   rebuild?: Record<string, RebuildState>;
-  stages?: {
-    // File-based-editing plan, Part 6 (true brownfield/greenfield convergence): the one-time
-    // baseline pass is now two real StageSpecs (spec, then plan) using the identical
-    // Specification/ImplementationPlan schemas and SpecificationSurface/PlanSurface components a
-    // real ticket gets -- not its own bespoke "brownfield-baseline" key/surface. Never populated
-    // by the current graph; kept only so an old completed session's stored data still resolves.
-    "brownfield-baseline"?: StageState;
-    "brownfield-spec"?: StageState;
-    "brownfield-plan"?: StageState;
-    "tech-stack"?: StageState;
-    "raw-requirements"?: StageState;
-    specification?: StageState;
-    plan?: StageState;
-    "ac-to-tests"?: StageState;
-    "minimal-code-to-green"?: StageState;
-    // Consolidated-pipeline (stage-stable-id rename) keys -- the agent's real post-Build stages.
-    // "adversarial-audit"/"dedup-simplify"/"license-audit"/"exit" below are the pre-rename keys,
-    // never populated by the current graph, kept only so an old completed session's stored data
-    // still resolves a label instead of a raw key.
-    remediation?: StageState;
-    "adversarial-compliance"?: StageState;
-    "metrics-exit"?: StageState;
-    "adversarial-audit"?: StageState;
-    "dedup-simplify"?: StageState;
-    "license-audit"?: StageState;
-    "exit"?: StageState;
-  };
+  /** Keyed by stage key -- the pipeline descriptor (usePipeline) owns which keys exist, their
+   * order and labels; an old session's state may still carry pre-rename keys (legacy_labels). */
+  stages?: Record<string, StageState>;
+  /** "yolo" | "draft_verify" | "mission_critical" -- the mode this thread's gates run under. */
+  code_gen_mode?: string | null;
 }
-
-export type StageKey = keyof NonNullable<WorkflowState["stages"]>;
-
-// Ordered pipeline sequence -- drives AppShell's gate label lookup (the first stage in this
-// order currently "ready_for_review" is the one paused on the open interrupt) and the Session
-// Overview panel's timeline. Extend this list, not a hardcoded ternary, as more gated stages land.
-// Bespoke node clusters (quality-remediation/security-remediation/finding-cluster/test-hardening/metrics-report) have no StageState/gate of this shape and are
-// intentionally absent here -- the Session Overview panel reads state.stages dynamically, so their
-// absence from this static list doesn't hide them from that panel, only from this ordered lookup.
-export const PIPELINE_STAGE_ORDER: { key: StageKey; label: string }[] = [
-  { key: "brownfield-spec", label: "Baseline Specification" },
-  { key: "brownfield-plan", label: "Baseline Plan" },
-  { key: "tech-stack", label: "Tech Stack" },
-  // No gate of its own (TAB_STAGE_GROUPS' own comment: "recorded as-is... no gate ever surfaces"),
-  // but it's a real StageState entry in `state.stages` -- added so SessionOverview's friendly-label
-  // lookup covers it too (root-caused 2026-09-12, user-reported raw "raw-requirements" row).
-  { key: "raw-requirements", label: "Requirements" },
-  { key: "specification", label: "Specification" },
-  { key: "plan", label: "Implementation Plan" },
-  { key: "ac-to-tests", label: "Acceptance Criteria to Tests" },
-  { key: "minimal-code-to-green", label: "Minimal Code to Green" },
-  { key: "remediation", label: "Remediation" },
-  { key: "adversarial-compliance", label: "Adversarial Compliance" },
-  { key: "metrics-exit", label: "Metrics & Exit" },
-  // Legacy, pre-rename keys -- never populated by the current graph (see the WorkflowState
-  // comment above); kept only so an old completed session's stored data still resolves a label.
-  { key: "adversarial-audit", label: "Adversarial Audit" },
-  { key: "dedup-simplify", label: "De-dup / Simplify" },
-  { key: "license-audit", label: "License Audit" },
-  { key: "exit", label: "Exit" },
-];
-
-/** Index of `key` within PIPELINE_STAGE_ORDER, or -1 for an unknown/legacy key. Purely ordinal --
- * used only to answer "has the durable current_stage moved past stage X" during the mid-run
- * reattach gap (state.stages empty), never to imply concurrent-execution semantics. */
-export function stageOrderIndex(key: string | null | undefined): number {
-  return PIPELINE_STAGE_ORDER.findIndex((s) => s.key === key);
-}
-
-/** Root-caused 2026-09-12: `dbo.sessions.failure_stage` is not always one of PIPELINE_STAGE_ORDER's
- * real stage keys -- a rebuild placement, e2e, test-hardening, or a metrics-regression escalate
- * all name THEIR OWN key instead (confirmed exhaustive via a repo-wide search of every
- * record_run_failure/run_failure call site in agent/src). Resolves the real, human-meaningful
- * stage a "Restart workflow from this stage" action should target. `REBUILD_PLACEMENTS`' own
- * `afterStageKey` already IS the reverse map for the four rebuild-originated keys; `e2e`/
- * `test_hardening` sit between `remediation`'s rebuild and `adversarial-compliance_draft` in the
- * graph, and `metrics_report` (metrics_nodes.py's own regression check, distinct from the
- * `"metrics-exit"` stage key) sits between `adversarial-compliance`'s rebuild and the exit stage --
- * neither has its own REBUILD_PLACEMENTS entry since neither IS a rebuild placement.
- *
- * Deliberately returns null for `"exit"` (metrics-exit's own stage approved a real report, just
- * with merge_ready=false, or the report-writing itself crashed -- the `finished_with_verdict` case
- * elsewhere in this file, which gets a "View report" link, not a restart) and for `"provisioning"`
- * (the sandbox never even booted -- current_stage stays null, no stage was ever reached to
- * restart). Callers must check `!finishedWithVerdict` before relying on this for a failed session. */
-export function realStageForFailure(failureStage: string | null | undefined): string | null {
-  if (!failureStage) return null;
-  if (stageOrderIndex(failureStage) >= 0) return failureStage;
-  const placement = REBUILD_PLACEMENTS.find((p) => p.rebuildKey === failureStage);
-  if (placement) return placement.afterStageKey;
-  if (failureStage === "e2e" || failureStage === "test_hardening") return "remediation";
-  if (failureStage === "metrics_report") return "adversarial-compliance";
-  return null;
-}
-
-// Which StageState keys each tab's status dot derives from. Quality's own status dot is still
-// computed from the bespoke quality/security/test/metrics state keys directly (AppShell) -- but
-// remediation/adversarial-compliance ARE real StageState-shaped stages under the consolidated
-// pipeline (agent/src/graph.py), so they belong here for tabForStage's reverse lookup (AppShell) to
-// resolve a mid-run reattach onto the Quality tab instead of silently no-opping.
-export const TAB_STAGE_GROUPS: Record<string, StageKey[]> = {
-  "tech-stack": ["tech-stack"],
-  requirements: ["raw-requirements"], // recorded as-is (always "approved"); no gate ever surfaces
-  specification: ["specification"],
-  plan: ["plan"],
-  build: ["ac-to-tests", "minimal-code-to-green"],
-  overview: [],
-  quality: ["remediation", "adversarial-compliance"],
-};
 
 /** Escalation interrupt payloads (graph.py make_escalate_node, security gate, audit exit gate).
  * Distinct from the plain approval gate interrupt, which has no `type`. */

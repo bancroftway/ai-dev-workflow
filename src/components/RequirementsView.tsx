@@ -11,6 +11,7 @@ import { takeHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
+import { usePipeline } from "@/lib/pipeline";
 import { anyStageDrafting, buildStarted, runEnded, type WorkflowState } from "@/lib/workflow-types";
 
 interface RequirementsViewProps {
@@ -135,7 +136,8 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
   // through ac-to-tests. Locked from build-start until the run ends (failure recorded or exit
   // approved -- resubmitting after THAT is the supported requirements-delta flow), and while any
   // stage is actively drafting pre-build.
-  const runLocked = (buildStarted(state) && !runEnded(state)) || anyStageDrafting(state);
+  const firstBuildStageKey = usePipeline().tabs.find((t) => t.view === "build")?.stages[0]?.key;
+  const runLocked = (buildStarted(state, firstBuildStageKey) && !runEnded(state)) || anyStageDrafting(state);
   // Requirements-as-single-source-of-truth (user requirement 2026-08-31, extended to Plan
   // 2026-08-31): while the SPECIFICATION or PLAN gate is open, this tab stays live -- submitting
   // resolves whichever gate is open with the full revised document (graph.py make_gate_node's

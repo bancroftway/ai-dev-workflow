@@ -13,7 +13,8 @@ import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import { stageOrderIndex, type WorkflowState } from "@/lib/workflow-types";
+import { usePipeline } from "@/lib/pipeline";
+import type { WorkflowState } from "@/lib/workflow-types";
 
 function SpecificationViewImpl() {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
@@ -21,6 +22,7 @@ function SpecificationViewImpl() {
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const { interrupt } = useOpenInterrupt();
   const [runActivity] = useRunActivity();
+  const { stageOrderIndex } = usePipeline();
   const state = (agent.state ?? {}) as WorkflowState;
   const stage = state.stages?.specification;
 

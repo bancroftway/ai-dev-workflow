@@ -6,10 +6,11 @@ import {
   useCopilotKit,
   useInterrupt,
 } from "@copilotkit/react-core/v2";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
+import { GateSlot } from "@/components/GateSlot";
 import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
@@ -22,24 +23,14 @@ import { TechStackView } from "@/components/TechStackView";
 import { RunningSpinner, Spinner } from "@/components/Spinner";
 import { terminateSession } from "@/lib/agent-client";
 import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
+import { useCodeGenMode, usePipeline, type PipelineTab } from "@/lib/pipeline";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { EMPTY_STAGES, useRunningStages, useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import {
-  buildStarted,
-  type EscalationPayload,
-  type MergeReadinessReport,
-  PIPELINE_STAGE_ORDER,
-  stageOrderIndex,
-  type StageState,
-  TAB_STAGE_GROUPS,
-  type StageKey,
-  type WorkflowState,
-} from "@/lib/workflow-types";
+import type { EscalationPayload, MergeReadinessReport, WorkflowState } from "@/lib/workflow-types";
 
-type ViewId = "tech-stack" | "requirements" | "specification" | "plan" | "build" | "quality" | "report" | "overview";
 type DotState = "running" | "done" | "error" | "awaiting";
 
 const DOT_CLASS: Record<DotState, string> = {
@@ -49,7 +40,7 @@ const DOT_CLASS: Record<DotState, string> = {
   error: "bg-red-500",
 };
 
-/** Dot for a tab whose status derives from ordinary StageStates (TAB_STAGE_GROUPS). Green dots
+/** Dot for a tab, derived from its stages' ordinary StageStates. Green dots
  * intentionally clear on resubmission: intake resets later stages to not_started on each fresh
  * run, and the dots simply reflect that.
  *
@@ -59,27 +50,84 @@ const DOT_CLASS: Record<DotState, string> = {
  * regardless of whether a human is involved -- so relying on `status` alone showed a stage that
  * was actively retrying as "awaiting" almost the entire time (user feedback 2026-09-01). Checked
  * FIRST: the live event stream is more current than state, which only pushes on a gate pause. */
-function stageGroupDot(state: WorkflowState, keys: StageKey[], runningStages: Set<string>): DotState | undefined {
+function stageGroupDot(
+  state: WorkflowState,
+  keys: string[],
+  runningStages: Set<string>,
+  // A failed verification under an ADVISORY gate policy (e.g. metrics-exit's in yolo) doesn't
+  // block the run, so it must not paint the tab red.
+  isAdvisory: (stageKey: string) => boolean,
+): DotState | undefined {
   // Checked before the stages.length guard below: mid-run reattach (user feedback 2026-09-01)
   // means `state.stages` can be completely empty for a while even though the run is genuinely
   // active -- the event stream still knows, so this must not wait on stage state existing at all.
   if (keys.some((k) => runningStages.has(k))) return "running";
-  const stages = keys.map((k) => state.stages?.[k]).filter((s) => s != null);
+  const present = keys.filter((k) => state.stages?.[k] != null);
+  const stages = present.map((k) => state.stages![k]);
   if (stages.length === 0) return undefined;
   if (stages.some((s) => s.status === "drafting")) return "running";
   if (stages.some((s) => s.status === "ready_for_review" || s.status === "needs_clarification")) return "awaiting";
-  if (stages.some((s) => s.last_verification && !s.last_verification.passed && s.status !== "approved")) return "error";
+  const failed = (k: string) => {
+    const s = state.stages![k];
+    return Boolean(s.last_verification && !s.last_verification.passed && s.status !== "approved");
+  };
+  if (present.some((k) => failed(k) && !isAdvisory(k))) return "error";
   if (stages.every((s) => s.status === "approved")) return "done";
   return undefined;
 }
 
-/** Reverse of TAB_STAGE_GROUPS: which tab a durable `current_stage` value belongs to. Returns
- * undefined for a stage TAB_STAGE_GROUPS doesn't cover (quality/report's own stages aren't
- * listed there either) -- callers must treat that as "nothing to correct", not an error. */
-function tabForStage(stageKey: string): ViewId | undefined {
-  const found = Object.entries(TAB_STAGE_GROUPS).find(([, keys]) => (keys as string[]).includes(stageKey));
-  return found?.[0] as ViewId | undefined;
+/** Tabs whose content is a human-reviewed draft: they open once a draft is actually ready for
+ * review (ever_ready_for_review / clarifying questions), not merely while it's drafting -- the
+ * durable fallback is current_stage having moved PAST the tab's last stage. Keyed by view (the
+ * bespoke component), not by stage key. */
+const REVIEW_GATED_VIEWS = new Set(["specification", "plan"]);
+
+type ViewContext = {
+  owner: string;
+  repo: string;
+  workBranch: string;
+  state: WorkflowState;
+  /** Per-tab memoised stage-key arrays (BuildView is memo'd). */
+  stageKeys: Record<string, string[]>;
+  scrollRequest: { section: string } | null;
+  screenshotUrls: string[] | undefined;
+  filesChanged?: FilesChangedSummary | null;
+  reportExtras?: ReportExtras | null;
+};
+
+/** StageCards for a tab's stages -- the Tests/Code tabs' view, and the fallback for any backend
+ * tab whose view key has no bespoke component here, so a new stage at least appears (with its
+ * gate) without a frontend change. */
+function GenericStageView(tab: PipelineTab, c: ViewContext) {
+  return <BuildView title={tab.label} stageKeys={c.stageKeys[tab.id]} />;
 }
+
+/** Backend TabSpec.view -> the component that renders it. */
+const VIEWS: Record<string, (tab: PipelineTab, ctx: ViewContext) => ReactNode> = {
+  "tech-stack": () => <TechStackView />,
+  requirements: (_tab, c) => <RequirementsView owner={c.owner} repo={c.repo} workBranch={c.workBranch} />,
+  specification: () => <SpecificationView />,
+  plan: () => <PlanView />,
+  build: GenericStageView,
+  quality: (_tab, c) => <QualityView scanFindings={c.reportExtras?.findings} scrollRequest={c.scrollRequest} />,
+  report: (tab, c) => {
+    // The Report tab's own stage, or an old session's pre-rename "exit" key (legacy_labels) --
+    // the live key is metrics-exit; reading only one left this tab blind to the other.
+    const key = tab.stages[0]?.key;
+    const exitStage = (key ? c.state.stages?.[key] : undefined) ?? c.state.stages?.exit;
+    return (
+      <ReportView
+        report={exitStage?.approved_content as MergeReadinessReport | null | undefined}
+        metricsExitStatus={exitStage?.status}
+        deltaSummary={c.state.repo_scan?.delta_summary}
+        filesChanged={c.filesChanged}
+        screenshotUrls={c.screenshotUrls}
+        reportExtras={c.reportExtras}
+      />
+    );
+  },
+  overview: (_tab, c) => <SessionOverview owner={c.owner} repo={c.repo} branch={c.workBranch} />,
+};
 
 export function AppShell({
   owner,
@@ -121,7 +169,11 @@ export function AppShell({
     threadId,
     updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged],
   });
-  const [activeView, setActiveView] = useState<ViewId>("tech-stack");
+  // Tabs, stage order and labels all come from the backend pipeline descriptor (PipelineProvider).
+  const pipeline = usePipeline();
+  const { tabs, stageOrderIndex, stageLabel, tabForStage } = pipeline;
+  const defaultTabId = tabs[0]?.id ?? "";
+  const [activeView, setActiveView] = useState<string>(defaultTabId);
   const { copilotkit } = useCopilotKit();
   const [sandboxStatus, setSandboxStatus] = useSandboxStatus();
   // Declared early (not down by the poll that populates it) so runningStages below can read it --
@@ -152,13 +204,14 @@ export function AppShell({
   // clear this back to null.
   const [scrollRequest, setScrollRequest] = useState<{ section: string } | null>(null);
   const jumpToQualitySection = (section: string) => {
-    setActiveView("quality");
+    const qualityTab = tabs.find((t) => t.view === "quality");
+    if (qualityTab) setActiveView(qualityTab.id);
     setScrollRequest({ section });
   };
 
   const state = (agent.state ?? {}) as WorkflowState;
-  const specification = state.stages?.specification;
-  const plan = state.stages?.plan;
+  // Live state's own mode wins; the session row's is the fallback; null = not known yet.
+  const codeGenMode = useCodeGenMode(state.code_gen_mode);
   const runEvents = useStructuralRunEvents();
   const sharedRunningStages = useRunningStages();
   const runningStages = runActivity?.runActive === false ? EMPTY_STAGES : sharedRunningStages;
@@ -177,6 +230,25 @@ export function AppShell({
   //    hydrated -- a returning user opens where the action is, not on the Tech Stack default.
   // Manual clicks always win afterwards: auto-switches only ever fire on fresh transitions.
   const stagesForFocus = state.stages;
+  // Ordered latest-phase-first (furthest stage in run order): the furthest stage that newly needs
+  // attention wins. A rule whose trigger stage lives in ANOTHER tab (tech-stack:approved ->
+  // Requirements) is a "go to the next thing" jump: it only fires while the target tab's own stages
+  // are all still not_started -- resumed/delta threads that already carry requirements skip it.
+  // Checked by STATUS, not key presence: intake pre-creates every stage entry at not_started.
+  const focusRules = useMemo(
+    () =>
+      pipeline.tabs
+        .flatMap((tab) =>
+          tab.focus_on.map((rule) => {
+            const at = rule.lastIndexOf(":");
+            const key = rule.slice(0, at);
+            const own = tab.stages.map((st) => st.key);
+            return { key, at: rule.slice(at + 1), to: tab.id, untouched: own.includes(key) ? [] : own };
+          }),
+        )
+        .sort((a, b) => pipeline.stageOrderIndex(b.key) - pipeline.stageOrderIndex(a.key)),
+    [pipeline],
+  );
   const prevStageStatusRef = useRef<Record<string, string> | null>(null);
   useEffect(() => {
     if (stagesForFocus == null || Object.keys(stagesForFocus).length === 0) return;
@@ -187,24 +259,11 @@ export function AppShell({
     for (const [key, stage] of Object.entries(stages)) if (stage?.status) current[key] = stage.status;
     prevStageStatusRef.current = current;
 
-    // Ordered latest-phase-first: the furthest stage that newly needs attention wins.
-    const RULES: { key: string; at: string; to: ViewId; also?: () => boolean }[] = [
-      { key: "metrics-exit", at: "approved", to: "report" },
-      { key: "exit", at: "approved", to: "report" },
-      { key: "ac-to-tests", at: "drafting", to: "build" },
-      { key: "plan", at: "ready_for_review", to: "plan" },
-      { key: "specification", at: "ready_for_review", to: "specification" },
-      // Tech stack confirmed -> the only next action is typing requirements. Skip for
-      // resumed/delta threads that already carry them -- checked by STATUS, not key presence:
-      // intake pre-creates every stage entry at not_started, so `== null` never fired (observed
-      // live 2026-08-31, the jump silently skipped).
-      {
-        key: "tech-stack",
-        at: "approved",
-        to: "requirements",
-        also: () => (stages["raw-requirements"]?.status ?? "not_started") === "not_started",
-      },
-    ];
+    // Each tab's backend focus_on ("<stage>:<status>") -- see focusRules above.
+    const RULES = focusRules.map((r) => ({
+      ...r,
+      also: () => r.untouched.every((k) => (stages[k]?.status ?? "not_started") === "not_started"),
+    }));
     // setState-in-effect is the point here: activeView reacts to SERVER stage transitions (an
     // external store), not to derivable render-time data -- same exemption shape as the
     // one-time seeds in RequirementsView.
@@ -217,21 +276,7 @@ export function AppShell({
     const fired = RULES.find((r) => status(r.key) === r.at && prev[r.key] !== r.at && (r.also?.() ?? true));
 
     if (fired) setActiveView(fired.to);
-  }, [stagesForFocus]);
-
-  // Build tab wins the landing race against a same-tick stale gate (e.g. a requirements-delta
-  // reopening Plan's "ready_for_review" while minimal-code-to-green is genuinely running): RULES
-  // above only catches ac-to-tests's "drafting" for the Build jump, but a non-gated build stage
-  // spends most of its active time in "ready_for_review" between verify attempts, not "drafting"
-  // (same status-cycling flaw stageGroupDot backstops with runningStages for the tab dots, above).
-  // Fires only on the false->true edge so it never fights a manual tab click made while build
-  // keeps running (found live 2026-09-01: landed on Plan while Build was active).
-  const wasBuildRunningRef = useRef(false);
-  useEffect(() => {
-    const buildRunning = TAB_STAGE_GROUPS.build.some((k) => runningStages.has(k));
-    if (buildRunning && !wasBuildRunningRef.current) setActiveView("build");
-    wasBuildRunningRef.current = buildRunning;
-  }, [runningStages]);
+  }, [stagesForFocus, focusRules]);
 
   // Third, narrower backstop (Workflow Liveness Fix; user-reported: landed on Tech Stack with a
   // session already at ac-to-tests): the two mechanisms above already cover most of this --
@@ -247,12 +292,15 @@ export function AppShell({
     if (durableTabLandedRef.current) return;
     if (runActivity?.currentStage == null) return;
     durableTabLandedRef.current = true;
-    if (activeView !== "tech-stack") return; // already navigated (manually or by a sibling effect)
-    const tab = tabForStage(runActivity.currentStage);
+    if (activeView !== defaultTabId) return; // already navigated (manually or by a sibling effect)
+    // The tab of current_stage itself, not the stage after it: current_stage is written both at a
+    // stage's draft START and at its approval (graph.py make_draft_node/_run_post_approve_hook),
+    // so it is usually the stage in flight (or paused at its gate) right now.
+    const tab = tabForStage(runActivity.currentStage)?.id;
     // setState-in-effect is the point here, same exemption as the RULES effect above: reacting to
     // a durable SERVER value (current_stage), not to derivable render-time data.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (tab && tab !== "tech-stack") setActiveView(tab);
+    if (tab && tab !== defaultTabId) setActiveView(tab);
     // activeView intentionally excluded -- read once at fire time (one-shot, ref-guarded), not a
     // reactive dependency; listing it would re-run this effect on every later tab switch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -472,7 +520,7 @@ export function AppShell({
     Object.keys(state.stages ?? {}).length === 0 &&
     durableRow?.status === "in_progress" &&
     durableRow.current_stage != null &&
-    durableRow.current_stage !== "tech-stack" &&
+    durableRow.current_stage !== pipeline.order[0] &&
     !runActivity?.interrupted;
 
   // Workflow Liveness Fix false positive (found live 2026-09-06): graph.py's
@@ -481,13 +529,15 @@ export function AppShell({
   // for the Requirements tab", per that router's own docstring). That leaves status=in_progress,
   // run_active=false, awaiting_gate=false: textbook `interrupted` by sessions_api.py's
   // definition, even though nothing crashed -- every fresh session sits in exactly this state
-  // right after approving its tech stack. The RULES table above (tech-stack/approved/also:
-  // raw-requirements still not_started) already trusts this same pair of stage statuses to mean
-  // "waiting on the human to type requirements, not broken" for the auto-navigate jump; reused
-  // here to silence the same false alarm for the banner below.
-  const isAwaitingFirstRequirements =
-    state.stages?.["tech-stack"]?.status === "approved" &&
-    (state.stages?.["raw-requirements"]?.status ?? "not_started") === "not_started";
+  // right after approving its tech stack. Generic form: some tab's enable_after stages are all
+  // approved (Requirements' "tech stack first") while its own stages are all still not_started --
+  // the same pair the focus rule above trusts to mean "waiting on the human, not broken".
+  const isAwaitingFirstRequirements = tabs.some(
+    (t) =>
+      t.enable_after.length > 0 &&
+      t.enable_after.every((k) => state.stages?.[k]?.status === "approved") &&
+      t.stages.every((st) => (state.stages?.[st.key]?.status ?? "not_started") === "not_started"),
+  );
 
   // Reattach vs Resume (root-caused 2026-09-11, same distinction as SessionHistory.tsx's own
   // fix): a "failed" run always needs a real restart-from-checkpoint regardless of container
@@ -510,16 +560,15 @@ export function AppShell({
   // ever advances, on a stage's own approval) that stays true forever regardless of what the run
   // is doing right now -- unlike isReattaching, which intentionally resets once status leaves
   // in_progress and must keep doing so for its own (unrelated) "Reconnecting…" banner.
-  function durableStageAtLeast(target: string): boolean {
+  function durableStageAtLeast(target: string | undefined): boolean {
+    if (target == null) return false;
     return stageOrderIndex(durableRow?.current_stage) >= stageOrderIndex(target);
   }
 
   // Requirement (root-caused 2026-09-12): "Resume picks up from the last checkpoint" named no
   // actual checkpoint -- a user had no way to tell what that even meant. Same lookup the reattach
   // banner just below already uses.
-  const failedStageLabel = durableRow?.current_stage
-    ? (PIPELINE_STAGE_ORDER.find((s) => s.key === durableRow.current_stage)?.label ?? durableRow.current_stage)
-    : null;
+  const failedStageLabel = durableRow?.current_stage ? stageLabel(durableRow.current_stage) : null;
 
   // Pivot (root-caused 2026-09-12, user requirement): the graph must NEVER advance except via one
   // explicit, visible action (SessionOverview's stage-anchored restart/continue button). This
@@ -572,69 +621,63 @@ export function AppShell({
     },
   });
 
-  // Reattach relaxation (fold-in fix, 2026-09-11): buildStarted(state) alone stays false for the
-  // whole mid-run reattach gap (state.stages is empty by isReattaching's own definition), which
-  // left this tab wrongly disabled on reload even when Build had genuinely started. `current_stage`
-  // can't fill that gap alone either -- it only advances on a stage's OWN APPROVAL
-  // (_run_post_approve_hook, graph.py), so it stays parked one stage behind while ac-to-tests is
-  // still actively drafting, the single most common reattach moment. `runningStages` (event stream,
-  // approval-independent) is the same backstop stageGroupDot/wasBuildRunningRef already lean on for
-  // this identical lag, checked first; the stageOrderIndex comparison then covers the durably-known
-  // "already past this stage, nothing currently running" case runningStages alone would miss.
-  // Same reattach relaxation as buildTabEnabled just below, applied to the three earlier tabs
-  // (user-reported live, thread 8242ea6d: reattached at Remediation with Requirements/
-  // Specification/Plan all still disabled). Each stage's own live fields (state.stages?.[...],
-  // ever_ready_for_review) are empty for the whole reattach gap same as buildStarted(state) is --
-  // the pipeline only reaches a LATER stage after each earlier one is already approved, so a
-  // durable current_stage past a given tab's own stage is sufficient on its own.
-  const requirementsTabEnabled =
-    state.stages?.["tech-stack"]?.status === "approved" ||
-    state.stages?.["raw-requirements"] != null ||
-    durableStageAtLeast("specification");
-  const specificationTabEnabled =
-    Boolean(specification?.ever_ready_for_review) ||
-    Boolean(specification?.clarifying_questions?.length) ||
-    durableStageAtLeast("plan");
-  const planTabEnabled =
-    Boolean(plan?.ever_ready_for_review) ||
-    Boolean(plan?.clarifying_questions?.length) ||
-    durableStageAtLeast("ac-to-tests");
-  const buildTabEnabled =
-    buildStarted(state) ||
-    TAB_STAGE_GROUPS.build.some((k) => runningStages.has(k)) ||
-    durableStageAtLeast("ac-to-tests");
-  const qualityStarted =
-    Boolean(state.stages?.remediation ?? state.stages?.["adversarial-compliance"] ?? state.test_hardening ?? state.metrics_report) ||
-    TAB_STAGE_GROUPS.quality.some((k) => runningStages.has(k)) ||
-    durableStageAtLeast("remediation");
+  // Tab enabled rule -- one generic rule over each backend tab's stages. Reattach relaxation
+  // (fold-in fixes 2026-09-11/12): each stage's own live fields are empty for the whole mid-run
+  // reattach gap, so `runningStages` (event stream, approval-independent) and the durable
+  // current_stage (monotonic, survives failed/completed) each open a tab on their own. Once a
+  // stage has ever executed, its tab must never become disabled again.
+  //  - the first (landing) tab and stage-less tabs (Overview) are always open;
+  //  - review-gated views (Specification, Plan) wait for a draft actually ready for review, or a
+  //    durable current_stage PAST the tab's last stage (current_stage == X can mean "X drafting");
+  //  - every other tab opens when any of its stages has a status past not_started (intake
+  //    pre-creates every stage at not_started), is running, or current_stage reached its first
+  //    stage; or once all of enable_after are approved (Requirements: tech-stack-first); or once
+  //    one of its bespoke enable_state_keys is present (Quality: test_hardening/metrics_report).
+  function tabEnabled(tab: PipelineTab, index: number): boolean {
+    if (index === 0 || tab.stages.length === 0) return true;
+    const keys = tab.stages.map((st) => st.key);
+    const stageOf = (k: string) => state.stages?.[k];
+    const readyForReview = keys.some(
+      (k) => Boolean(stageOf(k)?.ever_ready_for_review) || Boolean(stageOf(k)?.clarifying_questions?.length),
+    );
+    if (REVIEW_GATED_VIEWS.has(tab.view)) {
+      return readyForReview || durableStageAtLeast(pipeline.nextStageAfter(keys[keys.length - 1]));
+    }
+    return (
+      readyForReview ||
+      keys.some((k) => (stageOf(k)?.status ?? "not_started") !== "not_started") ||
+      keys.some((k) => runningStages.has(k)) ||
+      durableStageAtLeast(keys[0]) ||
+      (tab.enable_after.length > 0 && tab.enable_after.every((k) => stageOf(k)?.status === "approved")) ||
+      tab.enable_state_keys.some((k) => (state as Record<string, unknown>)[k] != null)
+    );
+  }
+  const enabled: Record<string, boolean> = Object.fromEntries(tabs.map((t, i) => [t.id, tabEnabled(t, i)]));
+  const buildTab = tabs.find((t) => t.view === "build");
+  const buildTabEnabled = buildTab != null && enabled[buildTab.id];
 
-  // User-reported (2026-09-11): Quality's tab dot stayed a pulsing blue "running" indefinitely
-  // even once the Report tab was fully populated (remediation + adversarial-compliance long since
-  // approved, metrics-exit approved too) -- root cause was this dot alone still using the coarse
-  // pre-fix pattern qualityStarted/buildTabEnabled were already corrected away from above:
-  // `agent.isRunning` is "SOME turn is in flight" (true for as long as ANY later stage -- test
-  // hardening, e2e, metrics-exit -- keeps running), not "remediation/adversarial-compliance
-  // specifically are what's running now"; and `state.metrics_report?.metrics != null` is a
-  // completely different, much-later-populated bespoke field, not "are Quality's own two stages
-  // approved." Every other tab's dot already delegates to stageGroupDot (same runningStages-first,
-  // then status-derived done/awaiting/error logic Build/Spec/Plan/Tech-Stack already trust) --
-  // Quality's dot never got that same treatment when it moved off the phantom
-  // quality_remediation/security_remediation fields (root-caused 2026-09-11, see
-  // workflow-types.ts's RemediationContent docstring) onto the real StageState-shaped
-  // remediation/adversarial-compliance stages. Delegating here fixes both bugs at once with the
-  // exact logic already proven correct for every sibling tab.
-  const qualityDot = stageGroupDot(state, TAB_STAGE_GROUPS.quality, runningStages);
-
-  // "metrics-exit" is the agent's real (post stage-stable-ids rename) key; "exit" is stale and
-  // never populated (see runEnded()/workflow-types.ts's same dual-key check) -- reading only
-  // `.exit` here left this tab's report/enabled/dot state permanently blind to every real run.
-  const stagesForExit = (state.stages ?? {}) as Record<string, StageState | undefined>;
-  const exitStage = stagesForExit["metrics-exit"] ?? stagesForExit["exit"];
-  const reportEnabled =
-    exitStage?.approved_content != null ||
-    state.metrics_report?.metrics != null ||
-    durableStageAtLeast("metrics-exit");
-  const reportDot: DotState | undefined = exitStage?.approved_content != null ? "done" : undefined;
+  // Focus follows running work: a stage newly entering runningStages (false->true edge, so it
+  // never fights a manual tab click made while that stage keeps running -- found live 2026-09-01:
+  // landed on Plan while Build was active) switches to its tab, if that tab is open. Catches the
+  // non-gated stages that spend most of their active time in "ready_for_review" between verify
+  // attempts rather than "drafting" (the status-cycling flaw stageGroupDot backstops too), so
+  // they win the landing race against a same-tick stale gate. Furthest newly-running stage wins.
+  const enabledRef = useRef(enabled);
+  useEffect(() => {
+    enabledRef.current = enabled;
+  });
+  const prevRunningRef = useRef<Set<string>>(EMPTY_STAGES);
+  useEffect(() => {
+    const prev = prevRunningRef.current;
+    prevRunningRef.current = runningStages;
+    const target = [...runningStages]
+      .filter((k) => !prev.has(k))
+      .sort((a, b) => stageOrderIndex(b) - stageOrderIndex(a))
+      .map((k) => tabForStage(k))
+      .find((t) => t != null && enabledRef.current[t.id]);
+    // setState-in-effect: reacting to the live event stream (an external store).
+    if (target) setActiveView(target.id);
+  }, [runningStages, stageOrderIndex, tabForStage]);
 
   // Stable reference across unrelated re-renders (ReportView is React.memo'd) -- a plain inline
   // `.map()` in the JSX below would allocate a new array every AppShell render regardless of
@@ -644,15 +687,16 @@ export function AppShell({
     [state.e2e?.screenshots, owner, repo, workBranch],
   );
 
-  const dots: Record<ViewId, DotState | undefined> = {
-    "tech-stack": stageGroupDot(state, TAB_STAGE_GROUPS["tech-stack"], runningStages),
-    requirements: stageGroupDot(state, TAB_STAGE_GROUPS.requirements, runningStages),
-    specification: stageGroupDot(state, TAB_STAGE_GROUPS.specification, runningStages),
-    plan: stageGroupDot(state, TAB_STAGE_GROUPS.plan, runningStages),
-    build: stageGroupDot(state, TAB_STAGE_GROUPS.build, runningStages),
-    quality: qualityDot,
-    report: reportDot,
-    overview: undefined,
+  const isAdvisory = (k: string) => pipeline.gatePolicyFor(k, codeGenMode) === "advisory";
+  const dots: Record<string, DotState | undefined> = Object.fromEntries(
+    tabs.map((t) => [t.id, stageGroupDot(state, t.stages.map((st) => st.key), runningStages, isAdvisory)]),
+  );
+  const stageKeys = useMemo(
+    () => Object.fromEntries(tabs.map((t) => [t.id, t.stages.map((st) => st.key)])),
+    [tabs],
+  );
+  const viewContext: ViewContext = {
+    owner, repo, workBranch, state, stageKeys, scrollRequest, screenshotUrls, filesChanged, reportExtras,
   };
 
   return (
@@ -672,63 +716,22 @@ export function AppShell({
         {(buildTabEnabled || state.run_failure != null || runEvents.some((e) => e.token_usage != null)) && (
           <MetricsBar thresholds={metricThresholds} trailing={<LiveCostChip />} onJumpToSection={jumpToQualitySection} />
         )}
-        <nav className="flex items-center gap-1 border-b border-neutral-200 px-4 py-2">
-          <TabButton
-            label="Tech Stack"
-            active={activeView === "tech-stack"}
-            dot={dots["tech-stack"]}
-            onClick={() => setActiveView("tech-stack")}
-          />
-          <TabButton
-            label="Requirements"
-            active={activeView === "requirements"}
-            // Tech-stack-first (product requirement 2026-08-31): requirements wait until the
-            // stack is determined/selected. Legacy threads that already carry requirements
-            // (raw-requirements stage exists) stay reachable regardless.
-            disabled={!requirementsTabEnabled}
-            dot={dots.requirements}
-            onClick={() => setActiveView("requirements")}
-          />
-          <TabButton
-            label="Specification"
-            active={activeView === "specification"}
-            disabled={!specificationTabEnabled}
-            dot={dots.specification}
-            onClick={() => setActiveView("specification")}
-          />
-          <TabButton
-            label="Plan"
-            active={activeView === "plan"}
-            disabled={!planTabEnabled}
-            dot={dots.plan}
-            onClick={() => setActiveView("plan")}
-          />
-          <TabButton
-            label="Build"
-            active={activeView === "build"}
-            disabled={!buildTabEnabled}
-            dot={dots.build}
-            onClick={() => setActiveView("build")}
-          />
-          <TabButton
-            label="Quality"
-            active={activeView === "quality"}
-            disabled={!qualityStarted}
-            dot={dots.quality}
-            onClick={() => setActiveView("quality")}
-          />
-          <TabButton
-            label="Report"
-            active={activeView === "report"}
-            disabled={!reportEnabled}
-            dot={dots.report}
-            onClick={() => setActiveView("report")}
-          />
-          <TabButton
-            label="Overview"
-            active={activeView === "overview"}
-            onClick={() => setActiveView("overview")}
-          />
+        <nav className="flex items-center gap-1 overflow-x-auto border-b border-neutral-200 px-4 py-2">
+          <div role="tablist" className="flex items-center gap-1">
+            {tabs.map((tab) => (
+              <Fragment key={tab.id}>
+                <TabButton
+                  label={tab.label}
+                  active={activeView === tab.id}
+                  disabled={!enabled[tab.id]}
+                  dot={dots[tab.id]}
+                  onClick={() => setActiveView(tab.id)}
+                />
+                {/* Seam for the gate icon between this tab and the next (GateSlot.tsx). */}
+                <GateSlot tab={tab} codeGenMode={codeGenMode} />
+              </Fragment>
+            ))}
+          </div>
           {/* Session chrome lives HERE, not in WorkspaceHeader: that header mounts in root
               layout, OUTSIDE this page's SandboxStatusProvider, so a status pill there reads
               null context and renders nothing (found dead 2026-08-30). */}
@@ -751,7 +754,7 @@ export function AppShell({
                 <Spinner />
                 {(() => {
                   const drafting = Object.entries(state.stages ?? {}).find(([, s]) => s?.status === "drafting")?.[0];
-                  return drafting ? `${drafting} running…` : "working…";
+                  return drafting ? `${stageLabel(drafting)} running…` : "working…";
                 })()}
               </span>
             )}
@@ -810,7 +813,7 @@ export function AppShell({
             Hidden while already on Overview (root-caused 2026-09-12, user-reported): its whole
             point is "go see Overview", which is meaningless noise sitting right above that exact
             tab's own content. */}
-        {activeView !== "overview" && ((runActivity?.interrupted && !isAwaitingFirstRequirements) || runFailed) && (
+        {tabs.find((t) => t.id === activeView)?.view !== "overview" && ((runActivity?.interrupted && !isAwaitingFirstRequirements) || runFailed) && (
           <div className="flex items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
             <span>
               {runFailed
@@ -823,7 +826,7 @@ export function AppShell({
             <button
               type="button"
               className="shrink-0 rounded-md border border-amber-400 bg-white px-3 py-1 text-xs font-medium text-amber-900"
-              onClick={() => setActiveView("overview")}
+              onClick={() => setActiveView(tabs.find((t) => t.view === "overview")?.id ?? defaultTabId)}
             >
               Go to Overview
             </button>
@@ -845,8 +848,7 @@ export function AppShell({
             <span>
               Reconnecting to your session — currently at{" "}
               <strong>
-                {PIPELINE_STAGE_ORDER.find((s) => s.key === durableRow?.current_stage)?.label ??
-                  durableRow?.current_stage}
+                {stageLabel(durableRow?.current_stage)}
               </strong>
               . The pipeline keeps running in the background; this page updates automatically.
             </span>
@@ -874,25 +876,11 @@ export function AppShell({
             needs covering up here anymore. Views stay mounted underneath (hidden, not unmounted) so
             they pick up state the instant a snapshot arrives, same as the tab-switch fix above. */}
         <main className="flex-1 overflow-y-auto">
-          <div hidden={activeView !== "tech-stack"}><TechStackView /></div>
-          <div hidden={activeView !== "requirements"}>
-            <RequirementsView owner={owner} repo={repo} workBranch={workBranch} />
-          </div>
-          <div hidden={activeView !== "specification"}><SpecificationView /></div>
-          <div hidden={activeView !== "plan"}><PlanView /></div>
-          <div hidden={activeView !== "build"}><BuildView /></div>
-          <div hidden={activeView !== "quality"}><QualityView scanFindings={reportExtras?.findings} scrollRequest={scrollRequest} /></div>
-          <div hidden={activeView !== "report"}>
-            <ReportView
-              report={exitStage?.approved_content as MergeReadinessReport | null | undefined}
-              metricsExitStatus={exitStage?.status}
-              deltaSummary={state.repo_scan?.delta_summary}
-              filesChanged={filesChanged}
-              screenshotUrls={screenshotUrls}
-              reportExtras={reportExtras}
-            />
-          </div>
-          <div hidden={activeView !== "overview"}><SessionOverview owner={owner} repo={repo} branch={workBranch} /></div>
+          {tabs.map((tab) => (
+            <div key={tab.id} role="tabpanel" hidden={activeView !== tab.id}>
+              {(VIEWS[tab.view] ?? GenericStageView)(tab, viewContext)}
+            </div>
+          ))}
         </main>
       </div>
     </InterruptProvider>
@@ -911,7 +899,7 @@ function InterruptCard({
 }) {
   const { setInterrupt } = useOpenInterrupt();
   const stageKey = typeof payload.stage === "string" ? payload.stage : undefined;
-  const stageLabel = PIPELINE_STAGE_ORDER.find((s) => s.key === stageKey)?.label ?? stageKey ?? "this stage";
+  const stageLabel = usePipeline().stageLabel(stageKey) || "this stage";
   const draft = (payload as Record<string, unknown>).draft;
   const draftMarkdown = (payload as Record<string, unknown>).markdown;
   const fileExisted = (payload as Record<string, unknown>).file_existed;
@@ -1058,8 +1046,11 @@ function TabButton({
 }) {
   return (
     <button
+      type="button"
+      role="tab"
+      aria-selected={active}
       className={[
-        "flex items-center rounded-md px-3 py-1.5 text-sm font-medium",
+        "flex shrink-0 items-center whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium",
         active ? "bg-neutral-900 text-white" : "text-neutral-700 hover:bg-neutral-100",
         disabled ? "cursor-not-allowed opacity-40 hover:bg-transparent" : "",
       ].join(" ")}

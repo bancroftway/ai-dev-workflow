@@ -7,7 +7,9 @@ import { SandboxSessionBoot } from "@/components/SandboxSessionBoot";
 import { WorkflowThreadProvider } from "@/lib/workflow-thread-context";
 import { SandboxStatusProvider } from "@/lib/sandbox-status-context";
 import { RunActivityProvider } from "@/lib/run-activity-context";
+import { agentFetch } from "@/lib/agent-client";
 import { getOctokit, readRepoFile } from "@/lib/github";
+import { PipelineProvider, type PipelineDescriptor } from "@/lib/pipeline";
 import { parseThresholds } from "@/lib/metric-grades";
 import { lookupSessionWithAuthorization } from "@/lib/session-access";
 import { WorkflowProviders } from "../../../../providers";
@@ -37,7 +39,14 @@ export default async function WorkflowPage({
   // renders) -- "denied" must hard-redirect rather than fall through the same way, since this
   // page renders AppShell against sessionId as a LangGraph thread_id next, and that checkpointer
   // has no owner/repo check of its own.
-  const lookup = await lookupSessionWithAuthorization(sessionId);
+  // The agent's pipeline descriptor (tabs, stages, gates, run order, modes) -- fetched alongside the
+  // session lookup so the tab strip renders from it on first paint (no client fetch, no flicker).
+  // Mode-independent, so a mode change never needs a refetch.
+  const [lookup, pipelineResponse] = await Promise.all([
+    lookupSessionWithAuthorization(sessionId),
+    agentFetch("pipeline", { cache: "no-store" }),
+  ]);
+  const pipeline = pipelineResponse.ok ? ((await pipelineResponse.json()) as PipelineDescriptor) : null;
   if (lookup.kind === "denied") {
     redirect("/select");
   }
@@ -107,50 +116,64 @@ export default async function WorkflowPage({
     }
   }
 
+  if (pipeline == null) {
+    return (
+      <p className="p-6 text-sm text-red-600">
+        Couldn&apos;t load the workflow pipeline from the agent (HTTP {pipelineResponse.status}). Check the agent is
+        running, then reload this page.
+      </p>
+    );
+  }
+
   return (
     <WorkflowThreadProvider threadId={sessionId}>
       <WorkflowProviders>
         <SandboxStatusProvider>
           <RunActivityProvider>
-            {/* The page shell (header, frozen/scroll split) lives once in root layout now -- this
-                is just this route's own content, filling whatever height that shell hands it. */}
-            <div className="flex h-full w-full flex-col">
-              <div className="shrink-0">
-                {/* Always mounted (it's the one writer of sandboxStatus -- see its own `skip` prop
-                    doc for why skipping the mount too would strand the header's pill on
-                    "Connecting…" forever). `skip` is true for a terminal (completed/failed/
-                    rejected) session opened WITHOUT ?resume=1: this used to POST
-                    /api/sessions/provision unconditionally for EVERY session, including one whose
-                    container/branch may be long gone (the reason completed sessions used to route
-                    to the now-deleted standalone /report page instead of here in the first
-                    place). */}
-                <SandboxSessionBoot
-                  sessionId={sessionId}
-                  owner={owner}
-                  repo={repo}
-                  branch={branch}
-                  resume={resume}
-                  projectId={projectId}
-                  skip={Boolean(sessionRow) && sessionRow?.status !== "in_progress" && !resume}
-                />
-              </div>
-              {/* min-h-0 is required here, not decorative: without it a flex child's default
-                  min-height:auto lets it grow past this row's share of the column instead of
-                  bounding to it, which is what AppShell's own internal scroll region depends on. */}
-              <div className="min-h-0 flex-1">
-                <AppShell
-                  owner={owner}
-                  repo={repo}
-                  // Not yet provisioned (sessionRow is null): no artifacts exist to read yet either,
-                  // so an empty string is never actually dereferenced against GitHub.
-                  workBranch={sessionRow?.work_branch ?? ""}
-                  metricThresholds={metricThresholds}
-                  resume={resume}
-                  filesChanged={filesChanged}
-                  reportExtras={reportExtras}
-                />
-              </div>
-            </div>
+            {/* Above AppShell (and so above its InterruptProvider) and SandboxSessionBoot's mode
+                picker alike. The session row's code_gen_mode is the fallback until live state
+                carries its own. */}
+            <PipelineProvider descriptor={pipeline} codeGenMode={sessionRow?.code_gen_mode ?? null}>
+                {/* The page shell (header, frozen/scroll split) lives once in root layout now -- this
+                    is just this route's own content, filling whatever height that shell hands it. */}
+                <div className="flex h-full w-full flex-col">
+                  <div className="shrink-0">
+                    {/* Always mounted (it's the one writer of sandboxStatus -- see its own `skip` prop
+                        doc for why skipping the mount too would strand the header's pill on
+                        "Connecting…" forever). `skip` is true for a terminal (completed/failed/
+                        rejected) session opened WITHOUT ?resume=1: this used to POST
+                        /api/sessions/provision unconditionally for EVERY session, including one whose
+                        container/branch may be long gone (the reason completed sessions used to route
+                        to the now-deleted standalone /report page instead of here in the first
+                        place). */}
+                    <SandboxSessionBoot
+                      sessionId={sessionId}
+                      owner={owner}
+                      repo={repo}
+                      branch={branch}
+                      resume={resume}
+                      projectId={projectId}
+                      skip={Boolean(sessionRow) && sessionRow?.status !== "in_progress" && !resume}
+                    />
+                  </div>
+                  {/* min-h-0 is required here, not decorative: without it a flex child's default
+                      min-height:auto lets it grow past this row's share of the column instead of
+                      bounding to it, which is what AppShell's own internal scroll region depends on. */}
+                  <div className="min-h-0 flex-1">
+                    <AppShell
+                      owner={owner}
+                      repo={repo}
+                      // Not yet provisioned (sessionRow is null): no artifacts exist to read yet either,
+                      // so an empty string is never actually dereferenced against GitHub.
+                      workBranch={sessionRow?.work_branch ?? ""}
+                      metricThresholds={metricThresholds}
+                      resume={resume}
+                      filesChanged={filesChanged}
+                      reportExtras={reportExtras}
+                    />
+                  </div>
+                </div>
+            </PipelineProvider>
           </RunActivityProvider>
         </SandboxStatusProvider>
       </WorkflowProviders>

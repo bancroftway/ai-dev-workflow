@@ -6,7 +6,8 @@ import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import { PIPELINE_STAGE_ORDER, type E2EState, type ScanMeasures, type WorkflowState } from "@/lib/workflow-types";
+import { usePipeline } from "@/lib/pipeline";
+import type { E2EState, ScanMeasures, WorkflowState } from "@/lib/workflow-types";
 import {
   GRADE_TONE,
   computeDelta,
@@ -206,7 +207,8 @@ export function MetricsBar({
   // not on `measures` -- see repo_scan.py's `{line_rate: null, reason}` shape.
   const coverageState = scan?.latest_summary ? scan?.coverage : scan?.baseline_coverage;
 
-  const activeStage = PIPELINE_STAGE_ORDER.find((s) => {
+  const pipeline = usePipeline();
+  const activeStage = pipeline.order.map((key) => ({ key, label: pipeline.stageLabel(key) })).find((s) => {
     const status = state.stages?.[s.key]?.status;
     return status != null && status !== "not_started" && status !== "approved";
   });

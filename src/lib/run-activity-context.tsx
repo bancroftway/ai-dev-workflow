@@ -29,7 +29,7 @@ export type RunActivityInfo = {
    * failure_type/failure_message) -- already existed for the session-LIST view
    * (session-types.ts's Session) but never threaded into the workflow page's own context. Lets
    * SessionOverview show which stage actually failed and its real error without needing a live
-   * snapshot, and resolve a restart target via workflow-types.ts's `realStageForFailure`. Null
+   * snapshot, and resolve a restart target via pipeline.tsx's `realStageForFailure` (usePipeline). Null
    * whenever the row has no recorded failure (most of the time). */
   failureStage: string | null;
   failureType: string | null;
