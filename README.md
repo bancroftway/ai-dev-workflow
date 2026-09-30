@@ -351,7 +351,7 @@ Legend: **Hard block** = lap fails, redo required. **Warn** = logged only. **Aut
 | | | [hook] `check-coverage-stop.mjs` (`AIDW_STAGE=minimal-code-to-green` only): shells to byte-identical staged `coverage_parsing.py`; same replay-then-parse recipe; `REPLAY_TIMEOUT_MS`=120s vs. the real gate's 600s; plus its own `TEST_FILE_LISTING` AC-depth half | Hard block (same-turn) | Literal shared module with verify `_replay_coverage_contract`; AC-depth half mirrors verify `check_ac_depth` |
 | | | [hook] `check-testid-locators-stop.mjs` (stage is in `TESTID_STAGES`) | Hard block (same-turn) | See ac-to-tests |
 | | audit | none separate | — | — |
-| | verify | `_replay_coverage_contract` → `coverage_parsing.merge_counts`, `_parse_cobertura_counts`/`_parse_istanbul_counts`: deletes each declared coverage artifact, re-executes `.ai-dev-workflow/coverage-commands.json`'s own commands itself (never trusts the model's own run/number), parses Cobertura XML / istanbul JSON, merges line-weighted, requires line AND branch ≥ `MIN_COVERAGE_PERCENT` = 95.0; per-command cap `TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS`=600s | Hard block | Shared module with `check-coverage-stop.mjs` (draft) |
+| | verify | `_replay_coverage_contract` → `coverage_parsing.merge_counts`, `_parse_cobertura_counts`/`_parse_istanbul_counts`: deletes each declared coverage artifact, re-executes `.ai-dev-workflow/coverage-commands.json`'s own commands itself (never trusts the model's own run/number), parses Cobertura XML / istanbul JSON, merges line-weighted, requires line AND branch ≥ `MIN_COVERAGE_PERCENT` = 95.0; per-command cap `TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS`=600s. Acquisition (no/stale contract) now tries `resolve_coverage_command()` deterministically first (`run_resolved_coverage_command`; dotnet's coverlet-collector GUID output located by post-run glob), falling back to an LLM discovery turn only when the resolver has no answer or its glob/artifact isn't confidently exactly one match | Hard block | Shared module with `check-coverage-stop.mjs` (draft); `resolve_test_command` shared with its 3 other call sites (`rebuild.py`, `ac_coverage_gate.py`, `test_hardening_nodes.py`) |
 | | | `_check_exclusion_gaming`: coverage-exclusion config (`.coveragerc`/`jest.config` excludes, etc.) must not have been broadened this run to dodge the threshold | Hard block | — |
 | | | `check_ac_depth`: same per-AC depth check as ac-to-tests, re-checked here since mctg can add/edit tests | Hard block | Shared logic with ac-to-tests verify and `check-coverage-stop.mjs`'s AC-depth half |
 | | | [eca254b] `non_testid_locators`/`flaky_navigation_waits`: same as ac-to-tests. eca254b added the nav-wait call to `test_coverage_gate.py` | Hard block | 4-way reuse chain |
@@ -640,5 +640,5 @@ node .claude/hooks/graph-diagram-check.mjs --stamp graph-source
 node .claude/hooks/graph-diagram-check.mjs --stamp gate-inventory
 ```
 
-<!-- graph-source-sha256: 109b9ae14d52d50ea064bf0e9da2714c2a3ae695b3b8890b49574656c1a36f7e -->
-<!-- gate-inventory-sha256: 245d61dc219a95c82f68e0a253372725448efc43e03fc269de74eff7db3d318b -->
+<!-- graph-source-sha256: d1dda2a5e72c27c361d66df6bc9ed5984f2a4af4ffde5957d47f8af4ac6a4e25 -->
+<!-- gate-inventory-sha256: 26230f29d6314fd5c9137f7692992f11711ba203914780d402f02af8f61792e0 -->
