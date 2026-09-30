@@ -173,6 +173,25 @@ async def _write_file(provider: SandboxProvider, thread_id: str, relative_path: 
     await repo_files.write_repo_file(provider, thread_id, f"{WORKFLOW_DIR}/{relative_path}", content)
 
 
+async def read_tech_stack_json(provider: SandboxProvider, thread_id: str) -> dict[str, Any]:
+    """The approved TechStack dict (TECH_STACK_APPROVED_PATH), or {} when absent/unparseable --
+    the same tolerant read every caller that needs a raw `tech_stack` dict for a resolver/signal
+    function already hand-writes (test_coverage_gate.measure_coverage, exit_nodes.
+    verify_exit_readiness's own `_parse` helper). Pulled here once so Task 6's toolchain-command
+    reuse (rebuild.py, test_hardening_nodes.py, ac_coverage_gate.py) doesn't triplicate it -- note
+    `TECH_STACK_APPROVED_PATH` is already the FULL repo-relative path (WORKFLOW_DIR included), so
+    this reads via `repo_files.read_repo_file` directly rather than `_read_file` above, which would
+    double-prefix it."""
+    raw = await repo_files.read_repo_file(provider, thread_id, TECH_STACK_APPROVED_PATH)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 async def hydrate_state(
     provider: SandboxProvider, thread_id: str, stage_keys: list[str]
 ) -> dict[str, dict[str, Any]] | None:

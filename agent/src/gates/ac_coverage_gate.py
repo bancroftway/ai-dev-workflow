@@ -162,6 +162,85 @@ def resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
     return None
 
 
+def resolve_test_report_format(tech_stack: dict[str, Any]) -> tuple[str, str] | None:
+    """(resolve_test_command()'s resolved base command, machine-readable report format) for a
+    stack shape this pipeline already knows how to parse structurally -- `"trx"` (test_results.
+    parse_trx) or `"vitest-json"` (test_results.parse_vitest_json, which also reads jest's `--json`
+    shape) -- else None.
+
+    None covers every shape resolve_test_command() itself has no SINGLE confident answer for: no
+    detected stack at all, mocha (no reporter format this pipeline already parses), python/pytest
+    (same), or the ambiguous "vitest-or-jest" `||`-joined fallback command (two candidate tools,
+    not one -- augmenting either half with a reporter flag would silently drop the other). Callers
+    (run_resolved_test_command below, test_hardening_nodes.py) fall through to their existing LLM
+    discovery turn in every one of these cases, unchanged -- same "resolver's table doesn't cover
+    this" contract resolve_test_command's own None already has.
+    """
+    command = resolve_test_command(tech_stack)
+    if not command or " || " in command:
+        return None
+    if "dotnet test" in command:
+        return command, "trx"
+    if "vitest run" in command or ("jest" in command and "vitest" not in command):
+        return command, "vitest-json"
+    return None
+
+
+def with_test_reporter(command: str, fmt: str, output_path: str) -> str:
+    """`command` (resolve_test_report_format()'s base command) augmented with the SAME
+    machine-readable reporter flag `prompts/ac_test_run.md` already instructs a discovery agent to
+    add itself, writing to `output_path` (repo-relative), regardless of any `cd` prefix baked into
+    `command` by `dotnet_root_prefix`/`ecosystem_root_prefix` for a monorepo.
+
+    `REPO_ROOT="$(pwd)"` is captured FIRST, before any such `cd` -- the sandbox always execs a fresh
+    command at the repo root, so this is always the repo root regardless of what `command` does
+    next -- and `output_path` is anchored to it explicitly, so the report lands at the same
+    repo-relative path `repo_files.read_repo_file` reads back regardless of which directory the
+    test tool itself ran from.
+    """
+    if fmt == "trx":
+        flag = f'--logger "trx;LogFileName=$REPO_ROOT/{output_path}"'
+    elif "vitest run" in command:
+        flag = f"--reporter=json --outputFile=$REPO_ROOT/{output_path}"
+    else:  # jest
+        flag = f"--json --outputFile=$REPO_ROOT/{output_path}"
+    return f'REPO_ROOT="$(pwd)"; {command} {flag}'
+
+
+async def run_resolved_test_command(
+    provider: SandboxProvider, thread_id: str, tech_stack: dict[str, Any], *, output_path_base: str,
+) -> AcTestRunReport | None:
+    """Deterministic first choice before any LLM discovery turn (Task 6, requirement 1): run
+    resolve_test_command()'s answer directly, augmented with `with_test_reporter`, and synthesize
+    an AcTestRunReport shaped exactly like a real discovery turn's -- so every downstream consumer
+    (parsing `result_artifacts`, checking `exit_ok`, the zero-outcomes-triggers-rediscovery guard
+    each of this function's 3 callers already has or adds) runs completely unchanged regardless of
+    which path produced it. Mirrors `rebuild._replay_build`/`test_coverage_gate.
+    _replay_coverage_contract`'s own "no model in the loop, judge the tree as it is now" shape.
+
+    Returns None -- never a report claiming success -- when `resolve_test_report_format` has no
+    answer for this stack, or the deterministic run produced no readable artifact at all. Callers
+    MUST fall through to their existing LLM discovery turn in either case; this function does not
+    decide "zero outcomes" for them (that parse happens downstream of `result_artifacts`,
+    identically for either path, which is what actually enforces the correctness guard).
+    """
+    resolved = resolve_test_report_format(tech_stack)
+    if resolved is None:
+        return None
+    base_command, fmt = resolved
+    output_path = f"{output_path_base}.{'trx' if fmt == 'trx' else 'json'}"
+    await provider.exec_in_sandbox(thread_id, f"mkdir -p agent-work; rm -f {shlex.quote(output_path)}")
+    result = await provider.exec_in_sandbox(thread_id, with_test_reporter(base_command, fmt, output_path))
+    raw = await repo_files.read_repo_file(provider, thread_id, output_path)
+    if not raw:
+        return None
+    return AcTestRunReport(
+        success=True, ready_for_next_stage=True, exit_ok=result.ok,
+        result_artifacts=[output_path],
+        summary=f"resolved deterministically via resolve_test_command(), no discovery turn: {base_command}",
+    )
+
+
 # --- per-AC test DEPTH -------------------------------------------------------------------------
 # The threshold is PHASE-DEPENDENT. The full requirement is 2 tests below the browser layer per
 # criterion, but ac-to-tests writes every test BEFORE any implementation exists: there is no module
@@ -775,12 +854,6 @@ async def check_ac_coverage(
             report={},
         )
 
-    # A GHCP session finds every test root and runs it, teeing the complete console output to a
-    # file this gate then reads. Replaces "an audit model guesses a test command, Python execs it"
-    # -- that guess kept running the wrong tool from the wrong directory on generated monorepos,
-    # producing an MSB1003-style error instead of any test output, which read here as "no AC is
-    # covered" and deadlocked the stage at its verify cap.
-    #
     # Fresh-lap evidence guard: the write-scope gate treats runner artifacts (ac-run-*.json,
     # test-results/, *.trx) as pipeline-owned, so a PREVIOUS lap's reports survive on disk.
     # Delete them along with the tee before this lap's run -- stale evidence must never pass a lap.
@@ -792,16 +865,29 @@ async def check_ac_coverage(
         "find . \\( -name node_modules -o -name .git \\) -prune -o "
         "-type d \\( -name test-results -o -name TestResults \\) -print0 | xargs -0 -r rm -rf",
     )
-    run_report = await stack_runner.run_and_report(
-        thread_id,
-        stage_key="ac-test-run",
-        prompt_name="ac_test_run",
-        schema=AcTestRunReport,
-        provider=chat_provider,
-        run_id=run_id,
-        lap=lap,
-        output_path=AC_TEST_OUTPUT_PATH,
+    # resolve_test_command() first, deterministically, before any LLM turn (Task 6): only when it
+    # produces nothing usable (no answer for this stack, or its run's own artifact parses to zero
+    # outcomes -- decided further down, uniformly for either path) does a GHCP session run at all.
+    tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)
+    run_report = await run_resolved_test_command(
+        provider, thread_id, tech_stack, output_path_base="agent-work/ac-test-resolved"
     )
+    if run_report is None:
+        # A GHCP session finds every test root and runs it, teeing the complete console output to
+        # a file this gate then reads. Replaces "an audit model guesses a test command, Python
+        # execs it" -- that guess kept running the wrong tool from the wrong directory on
+        # generated monorepos, producing an MSB1003-style error instead of any test output, which
+        # read here as "no AC is covered" and deadlocked the stage at its verify cap.
+        run_report = await stack_runner.run_and_report(
+            thread_id,
+            stage_key="ac-test-run",
+            prompt_name="ac_test_run",
+            schema=AcTestRunReport,
+            provider=chat_provider,
+            run_id=run_id,
+            lap=lap,
+            output_path=AC_TEST_OUTPUT_PATH,
+        )
     output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)
 
     # PREFERRED evidence: the runners' own structured reports (.trx / vitest-json /
@@ -859,8 +945,10 @@ async def check_ac_coverage(
     if tee_missing:
         logger.warning(
             "ac coverage: console tee %s missing but %d structured runner report(s) exist -- "
-            "proceeding on runner reports (the run agent's tee claim was not honored)",
+            "proceeding on runner reports (%s)",
             AC_TEST_OUTPUT_PATH, len(structured_reports),
+            "resolved deterministically, no discovery turn ran" if "resolved deterministically" in (run_report.summary or "")
+            else "the run agent's tee claim was not honored",
         )
         output = ""
     # The suite is expected RED at this stage; exit_ok is the runner's own exit status, which the
@@ -1167,6 +1255,111 @@ def _demo() -> None:
         "config_inventory": [],
     }
     assert resolve_test_command(legacy) == "cd src/Api && dotnet test --logger 'console;verbosity=normal'"
+
+    # --- Task 6: resolve_test_report_format / with_test_reporter / run_resolved_test_command -----
+    # Only the shapes resolve_test_command() answers UNAMBIGUOUSLY get a reporter format -- the
+    # ambiguous vitest-or-jest guess, mocha, and python/pytest all have no format this pipeline
+    # already parses, so resolve_test_report_format must say None for every one of them (falling
+    # through to LLM discovery, unchanged).
+    assert resolve_test_report_format(_ts()) is None, "no resolver answer at all"
+    assert resolve_test_report_format(
+        _ts(languages={"status": "present", "values": ["TypeScript"]})
+    ) is None, "the ambiguous vitest-or-jest `||` fallback has two candidate tools, not one"
+    assert resolve_test_report_format(
+        _ts(languages={"status": "present", "values": ["JavaScript"]}, testing_frameworks={"status": "present", "values": ["mocha"]})
+    ) is None, "mocha has no reporter format this pipeline already parses"
+    assert resolve_test_report_format(
+        _ts(languages={"status": "present", "values": ["Python"]})
+    ) is None, "pytest has no reporter format this pipeline already parses"
+
+    dotnet_resolved = resolve_test_report_format(_ts(dotnet={"status": "detected", "solution_root": "src"}))
+    assert dotnet_resolved == ("cd src && dotnet test --logger 'console;verbosity=normal'", "trx")
+    vitest_resolved = resolve_test_report_format(
+        _ts(languages={"status": "present", "values": ["TypeScript"]}, testing_frameworks={"status": "present", "values": ["vitest"]})
+    )
+    assert vitest_resolved == ("npx --yes vitest run --reporter=verbose", "vitest-json")
+    jest_resolved = resolve_test_report_format(
+        _ts(languages={"status": "present", "values": ["JavaScript"]}, testing_frameworks={"status": "present", "values": ["jest"]})
+    )
+    assert jest_resolved == ("npx --yes jest --verbose", "vitest-json")
+
+    dotnet_augmented = with_test_reporter(*dotnet_resolved, "agent-work/x.trx")
+    assert dotnet_augmented == (
+        'REPO_ROOT="$(pwd)"; cd src && dotnet test --logger \'console;verbosity=normal\' '
+        '--logger "trx;LogFileName=$REPO_ROOT/agent-work/x.trx"'
+    ), dotnet_augmented
+    vitest_augmented = with_test_reporter(*vitest_resolved, "agent-work/x.json")
+    assert vitest_augmented == (
+        'REPO_ROOT="$(pwd)"; npx --yes vitest run --reporter=verbose '
+        '--reporter=json --outputFile=$REPO_ROOT/agent-work/x.json'
+    ), vitest_augmented
+    jest_augmented = with_test_reporter(*jest_resolved, "agent-work/x.json")
+    assert jest_augmented == (
+        'REPO_ROOT="$(pwd)"; npx --yes jest --verbose --json --outputFile=$REPO_ROOT/agent-work/x.json'
+    ), jest_augmented
+
+    class _Result:
+        def __init__(self, ok: bool, stdout: str = "") -> None:
+            self.ok, self.returncode, self.stdout, self.stderr = ok, 0 if ok else 1, stdout, "" if ok else "No such file or directory"
+
+    class _StubProvider:
+        """Records every command; `files` seeds what `read_repo_file` (a `cat` exec) returns."""
+
+        def __init__(self, files: dict[str, str] | None = None) -> None:
+            self.files = dict(files or {})
+            self.commands: list[str] = []
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str) -> _Result:
+            self.commands.append(command)
+            if command.startswith("cat "):
+                path = command[len("cat "):].strip()
+                for candidate_path, content in self.files.items():
+                    if path == shlex.quote(candidate_path):
+                        return _Result(True, content) if content is not None else _Result(False)
+                return _Result(False)
+            return _Result(True)
+
+    # resolver-first-then-fallback: a resolver answer whose run produces a real artifact -> a
+    # synthesized report with NO discovery turn at all (result_artifacts point at the resolved
+    # path; summary says so).
+    vitest_json = json.dumps({"testResults": [{"assertionResults": [
+        {"fullName": "T1", "status": "passed"},
+    ]}]})
+    stub = _StubProvider()
+
+    async def _run() -> AcTestRunReport | None:
+        # The provider doesn't actually know how to run a real vitest -- seed the artifact
+        # AFTER exec_in_sandbox runs, by pre-registering it under the exact path
+        # run_resolved_test_command will read back (output_path_base + ".json" for vitest-json).
+        stub.files["agent-work/demo-resolved.json"] = vitest_json
+        return await run_resolved_test_command(
+            stub, "t", _ts(languages={"status": "present", "values": ["TypeScript"]}, testing_frameworks={"status": "present", "values": ["vitest"]}),
+            output_path_base="agent-work/demo-resolved",
+        )
+
+    resolved_report = asyncio.run(_run())
+    assert resolved_report is not None and resolved_report.success is True
+    assert resolved_report.result_artifacts == ["agent-work/demo-resolved.json"]
+    assert "resolve_test_command()" in resolved_report.summary
+    assert any("vitest run" in c and "--outputFile=" in c for c in stub.commands), stub.commands
+
+    # No resolver answer at all -> None, never a fabricated success.
+    assert asyncio.run(run_resolved_test_command(_StubProvider(), "t", _ts(), output_path_base="x")) is None
+
+    # Resolver answers, but the run produced NOTHING readable (e.g. the tool isn't actually
+    # installed/no test ever ran) -> None, never treated as "0 outcomes = 0 failed" (Task 6's own
+    # critical correctness guard) -- the CALLER's own `if outcomes/report is None:` fallback is what
+    # actually enforces this, but this function must not paper over it with a fake success.
+    class _NoArtifactProvider(_StubProvider):
+        async def exec_in_sandbox(self, _thread_id: str, command: str) -> _Result:
+            self.commands.append(command)
+            return _Result(False) if command.startswith("cat ") else _Result(True)
+
+    assert asyncio.run(run_resolved_test_command(
+        _NoArtifactProvider(), "t",
+        _ts(languages={"status": "present", "values": ["TypeScript"]}, testing_frameworks={"status": "present", "values": ["vitest"]}),
+        output_path_base="agent-work/never-written",
+    )) is None
 
     # Level classification: e2e by PATH (the only level a path proves), integration by SYMBOL,
     # because .NET keeps unit and integration tests in one project and often one file.

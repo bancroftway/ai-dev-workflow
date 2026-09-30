@@ -76,6 +76,47 @@ _parse_vitest_json = test_results.parse_vitest_json
 _repo_relative = test_results.repo_relative
 
 
+async def _run_test_attempts(
+    provider: Any, thread_id: str, discovery: TestCommandReport,
+) -> dict[str, list[str]] | None:
+    """Runs `discovery`'s command TEST_HARDENING_TOTAL_ATTEMPTS times, substituting the attempt
+    token into both command and result path each time -- exactly what
+    test_hardening_run_tests_node always did inline; extracted (Task 6) so a resolver-produced
+    synthetic `discovery` (resolve_test_command()'s answer, wired in before any LLM turn) and a
+    real discovery turn's report run through the IDENTICAL loop.
+
+    Returns None when `discovery.result_path` resolves outside the repo (a bad report -- the
+    caller aborts the node exactly as before this extraction); `{}` when every attempt
+    legitimately produced no readable/parseable result file (the caller's own guard decides
+    whether that means "nothing to harden" or "try the next fallback").
+    """
+    outcomes: dict[str, list[str]] = {}
+    for attempt in range(TEST_HARDENING_TOTAL_ATTEMPTS):
+        command = discovery.command.replace(_ATTEMPT_TOKEN, str(attempt))
+        result_path = _repo_relative(discovery.result_path.replace(_ATTEMPT_TOKEN, str(attempt)))
+        if result_path is None:
+            # A path outside the repo is a bad report, not a reason to kill the run. Previously the
+            # reported '/workspace/repo/test-results-0/test-results-0.trx' reached read_repo_file
+            # verbatim and its ValueError propagated out of the node, ending an otherwise healthy
+            # run with a stack trace instead of a stage result.
+            logger.warning(
+                "test-hardening: reported result_path %r is not inside the repo -- skipping flake check",
+                discovery.result_path,
+            )
+            return None
+        await provider.exec_in_sandbox(thread_id, command)
+        raw_result = await repo_files.read_repo_file(provider, thread_id, result_path)
+        if raw_result is None:
+            continue
+        per_test = (
+            _parse_trx(raw_result) if discovery.format == "trx" or result_path.endswith(".trx")
+            else _parse_vitest_json(raw_result)
+        )
+        for test_name, outcome in per_test.items():
+            outcomes.setdefault(test_name, []).append(outcome)
+    return outcomes
+
+
 async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
     test_hardening = dict(state.get("test_hardening") or default_test_hardening_state())
@@ -93,56 +134,62 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
 
     await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work")
 
-    # GHCP discovers and PROVES the test command once (canned per-stack commands guessed the wrong
-    # root on generated monorepos); Python then repeats that exact command N times. The repetition
-    # deliberately stays here: flake detection compares runs of an IDENTICAL command, and a model
-    # re-deciding the invocation each round would make the comparison meaningless.
-    discovery = await stack_runner.run_and_report(
-        thread_id,
-        stage_key="test-hardening-run",
-        prompt_name="test_hardening_run",
-        schema=TestCommandReport,
-        provider=state["provider"],
-        run_id=state.get("run_id", "unknown"),
-        # Session-poisoning fix: test_hardening_fix_node loops back into this same node
-        # (graph.py's test_hardening_fix -> test_hardening_run_tests edge), so this discovery call
-        # re-fires every fix lap -- a static key would --resume the same growing session across
-        # every one. fix_attempt is this stage's own existing per-lap counter.
-        lap=test_hardening.get("fix_attempt", 0),
-        attempt_token=_ATTEMPT_TOKEN,
-    )
-    if not discovery.success or not discovery.command or _ATTEMPT_TOKEN not in discovery.result_path:
-        # No usable command: treat as "nothing to harden" exactly as an unmapped stack did before,
-        # rather than blocking the pipeline on a flake check that cannot run.
-        logger.warning("test-hardening: no usable test command discovered (%s)", discovery.error)
-        test_hardening["last_exit_ok"] = True
-        return {"test_hardening": test_hardening}
+    # resolve_test_command() first, deterministically, before any LLM turn (Task 6): only when it
+    # has no answer for this stack, or its resolved command's own attempts all produce zero
+    # parseable outcomes, does the real GHCP discovery turn below run at all -- a resolved command
+    # that produces nothing must trigger that fresh discovery, not get silently read as "nothing to
+    # harden" (the same guard requirement 1 also adds at rebuild.py/ac_coverage_gate.py).
+    from . import workflow_persistence
+    from .gates.ac_coverage_gate import resolve_test_report_format, with_test_reporter
 
-    outcomes: dict[str, list[str]] = {}
-    for attempt in range(TEST_HARDENING_TOTAL_ATTEMPTS):
-        command = discovery.command.replace(_ATTEMPT_TOKEN, str(attempt))
-        result_path = _repo_relative(discovery.result_path.replace(_ATTEMPT_TOKEN, str(attempt)))
-        if result_path is None:
-            # A path outside the repo is a bad report, not a reason to kill the run. Previously the
-            # reported '/workspace/repo/test-results-0/test-results-0.trx' reached read_repo_file
-            # verbatim and its ValueError propagated out of the node, ending an otherwise healthy
-            # run with a stack trace instead of a stage result.
-            logger.warning(
-                "test-hardening: reported result_path %r is not inside the repo -- skipping flake check",
-                discovery.result_path,
-            )
+    outcomes: dict[str, list[str]] | None = None
+    tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)
+    resolved = resolve_test_report_format(tech_stack)
+    if resolved is not None:
+        base_command, fmt = resolved
+        result_path_template = f"agent-work/test-hardening-resolved-{_ATTEMPT_TOKEN}.{'trx' if fmt == 'trx' else 'json'}"
+        resolved_discovery = TestCommandReport(
+            success=True, ready_for_next_stage=True, format=fmt, result_path=result_path_template,
+            command=with_test_reporter(base_command, fmt, result_path_template),
+        )
+        outcomes = await _run_test_attempts(provider, thread_id, resolved_discovery)
+        if outcomes is None:
+            # Bad path from OUR OWN synthesized report should never happen (we built it), but the
+            # shared helper's contract is "abort the node" regardless of which discovery produced
+            # it -- honour it uniformly rather than special-casing this caller.
             test_hardening["last_exit_ok"] = True
             return {"test_hardening": test_hardening}
-        await provider.exec_in_sandbox(thread_id, command)
-        raw_result = await repo_files.read_repo_file(provider, thread_id, result_path)
-        if raw_result is None:
-            continue
-        per_test = (
-            _parse_trx(raw_result) if discovery.format == "trx" or result_path.endswith(".trx")
-            else _parse_vitest_json(raw_result)
+
+    if not outcomes:
+        # GHCP discovers and PROVES the test command once (canned per-stack commands guessed the
+        # wrong root on generated monorepos); Python then repeats that exact command N times. The
+        # repetition deliberately stays here: flake detection compares runs of an IDENTICAL
+        # command, and a model re-deciding the invocation each round would make the comparison
+        # meaningless.
+        discovery = await stack_runner.run_and_report(
+            thread_id,
+            stage_key="test-hardening-run",
+            prompt_name="test_hardening_run",
+            schema=TestCommandReport,
+            provider=state["provider"],
+            run_id=state.get("run_id", "unknown"),
+            # Session-poisoning fix: test_hardening_fix_node loops back into this same node
+            # (graph.py's test_hardening_fix -> test_hardening_run_tests edge), so this discovery call
+            # re-fires every fix lap -- a static key would --resume the same growing session across
+            # every one. fix_attempt is this stage's own existing per-lap counter.
+            lap=test_hardening.get("fix_attempt", 0),
+            attempt_token=_ATTEMPT_TOKEN,
         )
-        for test_name, outcome in per_test.items():
-            outcomes.setdefault(test_name, []).append(outcome)
+        if not discovery.success or not discovery.command or _ATTEMPT_TOKEN not in discovery.result_path:
+            # No usable command: treat as "nothing to harden" exactly as an unmapped stack did before,
+            # rather than blocking the pipeline on a flake check that cannot run.
+            logger.warning("test-hardening: no usable test command discovered (%s)", discovery.error)
+            test_hardening["last_exit_ok"] = True
+            return {"test_hardening": test_hardening}
+        outcomes = await _run_test_attempts(provider, thread_id, discovery)
+        if outcomes is None:
+            test_hardening["last_exit_ok"] = True
+            return {"test_hardening": test_hardening}
 
     stable_fail = [name for name, results in outcomes.items() if results and all(r == "fail" for r in results)]
     flaky = [name for name, results in outcomes.items() if len(set(results)) > 1]
@@ -349,3 +396,83 @@ async def test_hardening_exit_escalate_node(state: dict[str, Any], config: Runna
         keep_sandbox=True,
     )
     return {"run_failure": payload}
+
+
+def _demo() -> None:
+    """`cd agent && uv run python -m src.test_hardening_nodes`."""
+    import asyncio
+
+    from . import repo_files as _repo_files_mod
+
+    class _StubProvider:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str) -> None:
+            self.commands.append(command)
+
+    provider = _StubProvider()
+
+    # _run_test_attempts: a result_path that escapes the repo (test_results.repo_relative's own
+    # "starts with / and matches none of the known container prefixes" case) must ABORT (None),
+    # never be silently skipped as "nothing to harden" -- test_hardening_run_tests_node's own
+    # caller treats None as "kill the node", {} as "legitimately nothing, maybe fall through".
+    bad_discovery = TestCommandReport(
+        success=True, command=f"echo {_ATTEMPT_TOKEN}",
+        result_path=f"/etc/out-{_ATTEMPT_TOKEN}.trx", format="trx",
+    )
+    assert asyncio.run(_run_test_attempts(provider, "t", bad_discovery)) is None, (
+        "an outside-the-repo result_path must abort, not silently skip"
+    )
+
+    original_read = _repo_files_mod.read_repo_file
+
+    # Task 6 correctness guard: a command that runs cleanly on every attempt but never produces a
+    # readable artifact must come back {} (usable-but-empty), NEVER None -- {} is exactly the
+    # signal test_hardening_run_tests_node's own `if not outcomes:` uses to fall through to a
+    # fresh LLM discovery turn instead of silently reading the resolved path as "nothing to harden".
+    async def _fake_read_none(*_a: Any, **_k: Any) -> None:
+        return None
+
+    _repo_files_mod.read_repo_file = _fake_read_none
+    try:
+        empty_discovery = TestCommandReport(
+            success=True, command=f"echo {_ATTEMPT_TOKEN}",
+            result_path=f"agent-work/out-{_ATTEMPT_TOKEN}.trx", format="trx",
+        )
+        assert asyncio.run(_run_test_attempts(provider, "t", empty_discovery)) == {}, (
+            "no readable artifact on any attempt must be {} (usable-but-empty), never None"
+        )
+    finally:
+        _repo_files_mod.read_repo_file = original_read
+
+    # A resolved command that DOES parse -- outcomes accumulate across every attempt (flake
+    # detection needs every attempt's own result, not just the first).
+    trx_pass = (
+        '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
+        '<Results><UnitTestResult testName="T1" outcome="Passed" /></Results></TestRun>'
+    )
+
+    async def _fake_read_trx(*_a: Any, **_k: Any) -> str:
+        return trx_pass
+
+    _repo_files_mod.read_repo_file = _fake_read_trx
+    try:
+        good_discovery = TestCommandReport(
+            success=True, command=f"echo {_ATTEMPT_TOKEN}",
+            result_path=f"agent-work/out-{_ATTEMPT_TOKEN}.trx", format="trx",
+        )
+        good_result = asyncio.run(_run_test_attempts(provider, "t", good_discovery))
+        assert good_result is not None and "T1" in good_result, good_result
+        assert len(good_result["T1"]) == TEST_HARDENING_TOTAL_ATTEMPTS, (
+            "must accumulate one outcome per attempt, not just the first/last"
+        )
+        assert all(o == "pass" for o in good_result["T1"])
+    finally:
+        _repo_files_mod.read_repo_file = original_read
+
+    print("test_hardening_nodes self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()
