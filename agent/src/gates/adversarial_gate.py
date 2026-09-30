@@ -18,17 +18,12 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ..schemas import presence_values as _findings_from
+from .adversarial_audit_checks import BLOCKING_SEVERITIES, BLOCKING_VERDICTS, evaluate_audit
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
 logger = logging.getLogger(__name__)
-
-# Verdicts that block. "minor_gaps" passes deliberately: the stage is meant to surface small
-# divergences for the record without deadlocking a run over cosmetic drift, and a run that cannot
-# ever pass its own audit teaches people to disable the audit.
-BLOCKING_VERDICTS = frozenset({"major_gaps", "fails_to_conform"})
-BLOCKING_SEVERITIES = frozenset({"critical", "major"})
 
 # One bounded minor-sweep lap per run: the FIRST otherwise-passing verify that still carries minor
 # findings fails once, so the stage's write-capable fix pass gets one shot at closing what is
@@ -38,44 +33,6 @@ BLOCKING_SEVERITIES = frozenset({"critical", "major"})
 # bounded lap, same tolerance as every other in-memory per-run cache in this codebase.
 _MINOR_SWEEP_DONE: set[tuple[str, str]] = set()
 MINOR_SWEEP_MARKER = "[minor sweep]"
-
-
-def evaluate_audit(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
-    """(passed, reasons). Pure, so the routing logic is testable without a sandbox.
-
-    An ABSENT or empty report fails: this stage's entire job is to produce a judgement, and "no
-    report" previously sailed through as approval. Blocking on it is the difference between a gate
-    and a formality.
-    """
-    if not report:
-        return False, [
-            "the adversarial audit produced no report at all -- this stage must return a "
-            "plan_conformance_summary and an overall_verdict, and an empty report cannot be "
-            "distinguished from an audit that never happened"
-        ]
-
-    reasons: list[str] = []
-    verdict = str(report.get("overall_verdict") or "").strip()
-    if not verdict:
-        reasons.append("no overall_verdict was reported")
-    elif verdict in BLOCKING_VERDICTS:
-        reasons.append(f"overall_verdict is {verdict!r}")
-
-    blocking = [
-        finding
-        for finding in _findings_from(report.get("divergence_findings"))
-        if str(finding.get("severity") or "").lower() in BLOCKING_SEVERITIES
-    ]
-    for finding in blocking:
-        # Feedback names the Plan reference and the evidence, not just a count -- a redraft needs to
-        # know WHICH criterion diverged and how it was established, the same reason the coverage gate
-        # reports per-line gaps rather than a bare percentage.
-        evidence = "; ".join(str(e) for e in (finding.get("evidence") or [])) or "(no evidence cited)"
-        reasons.append(
-            f"[{finding.get('severity')}] {finding.get('plan_reference') or 'unknown plan reference'}: "
-            f"{finding.get('description') or '(no description)'} -- evidence: {evidence}"
-        )
-    return not reasons, reasons
 
 
 # Task 13b: one line per DISTINCT rejection reason inside evaluate_audit/verify_adversarial_
