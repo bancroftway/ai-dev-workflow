@@ -22,7 +22,7 @@ runs:
       working-directory: agent
       run: |
         SKIP="db_migrate session_store project_store org_settings repo_auth_settings \
-          repo_test_users repo_test_config run_event_store deploy_drain sessions_api \
+          repo_test_users repo_test_config run_event_store verify_check_store deploy_drain sessions_api \
           keyvault org_credential_vault github_link_store repo_scaffold chat_model \
           claude_chat_model copilot_chat_model cli_agent_exec telemetry graph \
           e2e_nodes fake_idp rebuild"

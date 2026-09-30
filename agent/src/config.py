@@ -530,6 +530,22 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher preserves more of the failure detail; lower truncates it sooner.",
         "positive integer, characters",
     ),
+    # verify_check_store.append_results: head/tail kept of one CheckResult.detail before it lands
+    # in dbo.verify_check_results.detail (NVARCHAR(2000), migration 0022). head + tail + the
+    # ~30-char omission marker must stay under 2000; the store hard-clamps at the column width
+    # anyway, so an oversized pair just loses the tail instead of failing the insert.
+    "AIDW_VERIFY_CHECK_DETAIL_HEAD_CHARS": _Setting(
+        "int", "AIDW_VERIFY_CHECK_DETAIL_HEAD_CHARS", "900", "truncation",
+        "Head portion of one verify check's detail text stored in the durable verify history.",
+        "Higher keeps more of the detail's start in history/insights; head + tail must stay under ~1970 or the tail gets clipped.",
+        "positive integer, characters; head + tail <= 1970",
+    ),
+    "AIDW_VERIFY_CHECK_DETAIL_TAIL_CHARS": _Setting(
+        "int", "AIDW_VERIFY_CHECK_DETAIL_TAIL_CHARS", "900", "truncation",
+        "Tail portion of one verify check's detail text stored in the durable verify history.",
+        "Higher keeps more of the detail's end in history/insights; head + tail must stay under ~1970 or the tail gets clipped.",
+        "positive integer, characters; head + tail <= 1970",
+    ),
     "E2E_BOOT_FAILURE_LOG_HEAD_CHARS": _Setting(
         "int", "AIDW_E2E_BOOT_FAILURE_LOG_HEAD_CHARS", "1500", "truncation",
         "Head portion of the app-boot readiness failure description embedded in a failed e2e test's error field.",

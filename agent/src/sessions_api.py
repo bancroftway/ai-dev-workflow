@@ -57,9 +57,10 @@ from . import (
     run_event_summary,
     runtime_settings,
     session_store,
+    verify_check_store,
 )
 from .graph import graph
-from .gates.checks import resolve_code_gen_mode
+from .gates.checks import CODE_GEN_MODES, resolve_code_gen_mode
 from .pipeline_layout import PIPELINE
 from .run_events import RunEvent, RunEventType
 from .sandbox import get_sandbox_provider, registry
@@ -923,6 +924,16 @@ async def stream_session_events(session_id: str, _row: dict[str, Any] = Depends(
         await asyncio.sleep(_SSE_EVENTS_POLL_SECONDS)
 
 
+@router.get("/{session_id}/verify-history")
+async def get_verify_history(session_id: str, request: Request, stage: str | None = None) -> dict[str, Any]:
+    """Every verify attempt this session has recorded (dbo.verify_check_results), oldest first,
+    each with its per-check rows. Same auth/404 shape as get_session_events."""
+    _check_shared_secret(request)
+    if await session_store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"attempts": await verify_check_store.list_attempts(session_id, stage)}
+
+
 @router.get("/{session_id}/stream", response_class=EventSourceResponse)
 async def stream_session_row(session_id: str, _row: dict[str, Any] = Depends(_existing_session_for_stream)):
     """SSE tail of get_session_row above -- this is where run_activity.heartbeat's cross-process
@@ -1026,6 +1037,8 @@ async def delete_session_full(thread_id: str, body: DeleteSessionRequest, reques
     # found live via this exact endpoint during Task 14's end-to-end sweep. Must run before the
     # sessions row delete, same order run_event_store._demo()'s own cleanup already uses.
     await run_event_store.delete_events_by_session(thread_id)
+    # Same FK story for dbo.verify_check_results (0022).
+    await verify_check_store.delete_by_session(thread_id)
     await session_store.delete_session(thread_id)
     # Durable checkpoints (src/checkpoint.py): drop this thread's rows so the sqlite file tracks
     # the session list instead of growing forever. Fail-soft inside, like every teardown step.
@@ -2203,6 +2216,25 @@ async def get_pipeline(request: Request) -> dict[str, Any]:
     return PIPELINE.describe()
 
 
+@catalog_router.get("/repos/{owner}/{repo}/verify-insights")
+async def get_verify_insights(
+    owner: str, repo: str, request: Request, since: str | None = None, mode: str | None = None,
+) -> dict[str, Any]:
+    """Per-check fail rates + per-stage attempts-to-pass for one repo. On catalog_router (no
+    prefix) so it can't collide with /sessions/{session_id}. `since`: ISO date/datetime (naive =
+    UTC); `mode`: one of the code-gen modes."""
+    _check_shared_secret(request)
+    if mode is not None and mode not in CODE_GEN_MODES:
+        raise HTTPException(status_code=422, detail=f"mode must be one of {', '.join(CODE_GEN_MODES)}")
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="since must be an ISO date, e.g. 2026-09-01") from None
+    return await verify_check_store.check_stats(owner, repo, since_dt, mode)
+
+
 # --- projects (Part 3: tickets/board -- docs/superpowers/plans/part-3-tickets-tasks.md) --------
 
 
@@ -2890,9 +2922,15 @@ def _demo() -> None:
                 run_id=uuid.uuid4().hex[:8], session_id=session_id, type=RunEventType.NODE_FINISHED,
                 stage="tech-stack", node="draft", summary="draft ready for review",
             ))
+            # Same FK hazard for dbo.verify_check_results (0022) -- must be deleted first too.
+            assert await verify_check_store.append_results(
+                session_id, uuid.uuid4().hex[:8], "tech-stack", 1, "after_submit", "yolo", "blocking", True,
+                [{"id": "tech_stack_ok", "status": "passed", "detail": None, "source": "selfcheck"}],
+            ) == 1, "verify_check_results row must be written for this check to mean anything"
             await delete_session_full(session_id, DeleteSessionRequest(github_token=""), _FakeRequest())  # type: ignore[arg-type]
             assert await session_store.get_session(session_id) is None, "session row must be gone after delete_session_full"
             assert await run_event_store.list_events_by_session(session_id) == [], "run_events rows must be gone too"
+            assert await verify_check_store.list_attempts(session_id) == [], "verify_check_results rows must be gone too"
         finally:
             # Defensive only, not the normal path: delete_session_full's own success path above
             # already removes the session row and its run_events -- this only fires anything if
@@ -2900,6 +2938,7 @@ def _demo() -> None:
             pool = await session_store._get_pool()  # noqa: SLF001 -- same package, one shared pool
             async with pool.acquire() as conn, conn.cursor() as cur:
                 await cur.execute("DELETE FROM dbo.run_events WHERE session_id = ?", session_id)
+                await cur.execute("DELETE FROM dbo.verify_check_results WHERE session_id = ?", session_id)
                 await cur.execute("DELETE FROM dbo.sessions WHERE session_id = ?", session_id)
                 await cur.execute("DELETE FROM dbo.projects WHERE project_id = ?", project_id)
 
