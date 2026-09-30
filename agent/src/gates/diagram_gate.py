@@ -16,6 +16,7 @@ differently, but this distinction itself is unverified in practice.
 from __future__ import annotations
 
 import shlex
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Callable
 
 import json
@@ -24,6 +25,7 @@ from .. import chat_model, git_ops, repo_files, spec_ledger, workflow_persistenc
 from ..sandbox.provider import SandboxProvider
 from ..schemas import presence_values as _presence_values
 from . import write_scope_gate
+from .checks import Check, CheckLog
 from .diagram_render_checks import (
     MERMAID_PUPPETEER_CONFIG_PATH,
     MERMAID_SYNTAX_MARKERS as _MERMAID_SYNTAX_MARKERS,
@@ -558,7 +560,139 @@ def _demo() -> None:
         )
     )
 
+    _demo_verify_checks()
     print("diagram_gate wireframe self-check: all assertions passed")
+
+
+def _demo_verify_checks() -> None:
+    """Per-sub-check rows from verify_plan_diagrams, end to end against an in-memory sandbox."""
+    import asyncio
+    import re
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    # Every declared check is recorded somewhere in this module.
+    src = Path(__file__).read_text(encoding="utf-8")
+    for name, value in list(globals().items()):
+        if isinstance(value, Check) and value in VERIFY_CHECKS:
+            assert re.search(rf"log\.(passed|failed|infra|skipped|advisory)\({name}\b", src), name
+    assert len({c.id for c in VERIFY_CHECKS}) == len(VERIFY_CHECKS)
+
+    files: dict[str, str] = {}
+    scope_ok = [True]
+    render_result = [DiagramRenderOutcome(name="arch", ok=True, is_infra_failure=False, stderr_tail="")]
+
+    async def _read(_p, _t, path):
+        return files.get(path)
+
+    async def _write(_p, _t, path, content):
+        files[path] = content
+
+    async def _ledger(*_a):
+        return []
+
+    async def _noop(*_a, **_k):
+        return None
+
+    async def _scope(*_a, **_k):
+        bad = [] if scope_ok[0] else ["src/app.py"]
+        return write_scope_gate.WriteScopeOutcome(passed=scope_ok[0], violating_paths=bad, changed_paths=bad)
+
+    async def _render(_p, _t, diagram):
+        return render_result[0]
+
+    class _Sandbox:
+        async def exec_in_sandbox(self, _t, cmd):
+            ext = ".html" if DRAFT_WIREFRAMES_DIR in cmd else ".mmd"
+            folder = DRAFT_WIREFRAMES_DIR if ext == ".html" else DRAFT_DIAGRAMS_DIR
+            names = [p.rsplit("/", 1)[1] for p in files if p.startswith(folder + "/") and p.endswith(ext)]
+            return SimpleNamespace(stdout="\n".join(names), stderr="", ok=True)
+
+    def _reset(manifest: dict[str, Any]) -> None:
+        files.clear()
+        files[DRAFT_STEPS_PATH] = json.dumps({"plan_steps": [
+            {"id": "PS-1", "description": "wire CI", "ac_ids": [], "kind": "infrastructure"}
+        ], "retired_step_ids": []})
+        files[DRAFT_MANIFEST_PATH] = json.dumps(manifest)
+        for d in manifest.get("diagrams", []):
+            files[f"{DRAFT_DIAGRAMS_DIR}/{d['name']}.mmd"] = "erDiagram\n  A ||--o{ B : has"
+        for wf in manifest.get("wireframes", []):
+            files[f"{DRAFT_WIREFRAMES_DIR}/{wf['screen']}.html"] = "<div><script>x()</script></div>"
+        scope_ok[0] = True
+
+    one_diagram = {"wireframes": [], "diagrams": [{"name": "arch", "kind": "er", "ac_ids": []}]}
+
+    def _run(factory_args: tuple, content: dict[str, Any], chat_provider: str = "copilot", ran: bool = True):
+        verify = make_verify_plan_diagrams(*factory_args)
+        log = CheckLog("plan_verify", VERIFY_CHECKS, strict=True)
+        result = asyncio.run(verify("t", content, "r1", None, _Sandbox(), chat_provider, 0, ran, log=log))  # type: ignore[arg-type]
+        return result, [(r["id"], r["status"]) for r in result.checks]
+
+    real = (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger,
+            spec_ledger.save_ledger, git_ops.commit_paths, write_scope_gate.check_write_scope,
+            chat_model.get_session_id, globals()["_render_one"])
+    (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger, spec_ledger.save_ledger,
+     git_ops.commit_paths, write_scope_gate.check_write_scope) = (_read, _write, _ledger, _noop, _noop, _scope)
+    chat_model.get_session_id = lambda *_a, **_k: None
+    globals()["_render_one"] = _render
+    try:
+        # Passing path, brownfield-plan (no audit role): everything passed or skipped, audit skipped
+        # for the stated reason, wireframe checks skipped (none in this plan).
+        _reset(one_diagram)
+        result, rows = _run(("brownfield-plan", False), {"x": 1})
+        assert result.passed, result.feedback
+        assert rows == [
+            ("plan.content_nonempty", "passed"), ("plan.write_scope", "passed"), ("plan.steps_json", "passed"),
+            ("plan.audit_full_read", "skipped"), ("plan.ledger_sync", "passed"), ("plan.manifest_json", "passed"),
+            ("plan.visual_retirement", "passed"), ("plan.visual_review_current", "passed"),
+            ("plan.visual_files_readable", "passed"), ("plan.revised_claims", "passed"),
+            ("plan.step_linkage", "passed"), ("plan.wireframe_ac_ids", "skipped"),
+            ("plan.wireframe_has_ac_ids", "skipped"), ("plan.ui_wireframe_coverage", "passed"),
+            ("plan.step_wireframe_coverage", "passed"), ("plan.wireframe_html", "skipped"),
+            ("plan.mermaid_render", "passed"),
+        ], rows
+        assert [r.id for r in VERIFY_CHECKS] == [i for i, _ in rows]
+        assert result.checks[3]["detail"] == "no audit role for this stage", result.checks[3]
+        # Plan stage whose mode skipped the audit this lap: a different skip reason.
+        _reset(one_diagram)
+        result, _ = _run(("plan",), {"x": 1}, ran=False)
+        assert result.passed and result.checks[3]["detail"] == "audit did not run this lap", result.checks[3]
+
+        # Early returns record the failing id and nothing after it.
+        _, rows = _run(("plan",), {})
+        assert rows == [("plan.content_nonempty", "failed")], rows
+        _reset(one_diagram)
+        scope_ok[0] = False
+        _, rows = _run(("plan",), {"x": 1})
+        assert rows == [("plan.content_nonempty", "passed"), ("plan.write_scope", "failed")], rows
+        _reset(one_diagram)
+        result, rows = _run(("plan",), {"x": 1}, chat_provider="claude")  # no audit session to read
+        assert result.report["infra_error"] == "audit_transcript_unreadable", result.report
+        assert rows[-1] == ("plan.audit_full_read", "infra") and len(rows) == 4, rows
+
+        # Collected: steps.json and manifest.json both missing -> both failed in one lap.
+        files.clear()
+        result, rows = _run(("plan",), {"x": 1})
+        assert rows[2:] == [("plan.steps_json", "failed"), ("plan.manifest_json", "failed")], rows
+        assert not result.passed and result.checks[2]["detail"].startswith(DRAFT_STEPS_PATH)
+
+        # Collected structural failures: an uncited, script-bearing wireframe and a syntax-broken
+        # diagram all report in the same lap.
+        _reset({"wireframes": [{"screen": "home", "ac_ids": []}], "diagrams": one_diagram["diagrams"]})
+        render_result[0] = DiagramRenderOutcome(name="arch", ok=False, is_infra_failure=False, stderr_tail="Parse error on line 2")
+        result, rows = _run(("plan",), {"x": 1})
+        failed = {i for i, s in rows if s == "failed"}
+        assert failed == {"plan.wireframe_has_ac_ids", "plan.wireframe_html", "plan.mermaid_render"}, rows
+        assert not result.passed and "infra_failure" in result.report
+        # Broken renderer: infra row, not a content failure.
+        _reset(one_diagram)
+        render_result[0] = DiagramRenderOutcome(name="arch", ok=False, is_infra_failure=True, stderr_tail="spawn ENOENT")
+        result, rows = _run(("plan",), {"x": 1})
+        assert rows[-1] == ("plan.mermaid_render", "infra") and result.report["infra_failure"] is True, rows
+    finally:
+        (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger, spec_ledger.save_ledger,
+         git_ops.commit_paths, write_scope_gate.check_write_scope, chat_model.get_session_id) = real[:7]
+        globals()["_render_one"] = real[7]
 
 
 # Task 13b: one line per DISTINCT rejection reason inside verify_plan_diagrams below, including
@@ -625,6 +759,121 @@ PLAN_HARD_RULES: tuple[str, ...] = (
 )
 
 
+PLAN_CONTENT_NONEMPTY = Check(
+    "plan.content_nonempty", "Plan content present",
+    "Checks the draft actually produced a plan. An empty draft usually means the model got stuck "
+    "asking clarifying questions, so there is nothing to verify.",
+    "blocking",
+)
+PLAN_WRITE_SCOPE = Check(
+    "plan.write_scope", "Edits stay in the plan scratch area",
+    "Checks the plan stage only changed files under .ai-dev-workflow/plan/_draft/. Planning must "
+    "never touch application code, the approved specification or the spec ledger.",
+    "blocking",
+)
+PLAN_STEPS_JSON = Check(
+    "plan.steps_json", "Plan steps file is well-formed",
+    "Checks _draft/steps.json exists, is valid JSON and every step matches the plan-step shape. "
+    "Every later check reads the steps from this file.",
+    "collected", "reported together with the manifest check",
+)
+PLAN_AUDIT_FULL_READ = Check(
+    "plan.audit_full_read", "Audit read every plan step",
+    "Checks the audit session's transcript proves it read the whole steps.json file, so a review "
+    "can't sign off on steps it never looked at.",
+    "collected", "only when the stage has an audit role, the audit ran this lap and steps.json is valid",
+    needs_audit=True,
+)
+PLAN_LEDGER_SYNC = Check(
+    "plan.ledger_sync", "Plan steps recorded in the ledger",
+    "Checks each step's id is new or matches an existing plan step, retired steps stay retired, and "
+    "records the steps in the ledger so later stages can trace work back to its plan step.",
+    "collected", "only when steps.json is valid (and the audit transcript was readable)",
+)
+PLAN_MANIFEST_JSON = Check(
+    "plan.manifest_json", "Wireframe and diagram manifest matches the files",
+    "Checks _draft/manifest.json is valid and lists every wireframe and diagram file on disk, and "
+    "only those, so nothing is silently dropped or left behind.",
+    "collected", "reported together with the steps check",
+)
+PLAN_VISUAL_RETIREMENT = Check(
+    "plan.visual_retirement", "Retired screens and flows are retired",
+    "Checks that a wireframe or user-flow diagram whose criteria were all retired is itself marked "
+    "retired, instead of lingering as a picture of removed scope.",
+    "collected", "only when steps and manifest are valid",
+)
+PLAN_VISUAL_REVIEW_CURRENT = Check(
+    "plan.visual_review_current", "Changed visuals were re-reviewed",
+    "Checks that every existing diagram or wireframe affected by this run's specification changes "
+    "was explicitly revised or confirmed current, so outdated pictures don't slip through.",
+    "collected", "only when steps and manifest are valid",
+)
+PLAN_VISUAL_FILES_READABLE = Check(
+    "plan.visual_files_readable", "Wireframe and diagram files readable",
+    "Checks every wireframe and diagram listed in the manifest can actually be read from the draft "
+    "folder.",
+    "collected", "only when steps and manifest are valid",
+)
+PLAN_REVISED_CLAIMS = Check(
+    "plan.revised_claims", "Claimed revisions really changed",
+    "Checks that a diagram or wireframe the plan says it 'revised' actually differs from the last "
+    "approved version, rather than trusting the label.",
+    "collected", "only when steps and manifest are valid",
+)
+PLAN_STEP_LINKAGE = Check(
+    "plan.step_linkage", "Steps trace to acceptance criteria",
+    "Checks every plan step cites real, live acceptance criteria (or is infrastructure), removal "
+    "steps name what they remove, and every open criterion of this ticket is covered by a step.",
+    "collected", "only when the pre-checks pass",
+)
+PLAN_WIREFRAME_AC_IDS = Check(
+    "plan.wireframe_ac_ids", "Wireframe citations are real",
+    "Checks every acceptance-criterion id a wireframe cites exists in the specification ledger, so "
+    "a typo can't link a screen to nothing.",
+    "collected", "only when the pre-checks pass and the plan has wireframes",
+)
+PLAN_WIREFRAME_HAS_AC_IDS = Check(
+    "plan.wireframe_has_ac_ids", "Every wireframe cites a criterion",
+    "Checks each wireframe cites at least one acceptance criterion, so end-to-end tests have "
+    "something to match the screen against.",
+    "collected", "only when the pre-checks pass and the plan has wireframes",
+)
+PLAN_UI_WIREFRAME_COVERAGE = Check(
+    "plan.ui_wireframe_coverage", "UI criteria have wireframes",
+    "Checks every user-interface acceptance criterion in the specification is shown by at least one "
+    "wireframe.",
+    "collected", "only when the pre-checks pass",
+)
+PLAN_STEP_WIREFRAME_COVERAGE = Check(
+    "plan.step_wireframe_coverage", "UI steps have wireframes",
+    "Checks every plan step marked as user-interface work is shown by at least one wireframe.",
+    "collected", "only when the pre-checks pass",
+)
+PLAN_WIREFRAME_HTML = Check(
+    "plan.wireframe_html", "Wireframes are safe, self-contained HTML",
+    "Checks each wireframe has a safe file name, stays under the size limit, is real HTML and has "
+    "no scripts, event handlers or external resources.",
+    "collected", "only when the pre-checks pass and the plan has wireframes",
+)
+PLAN_MERMAID_RENDER = Check(
+    "plan.mermaid_render", "Diagrams render",
+    "Renders every Mermaid diagram with the real renderer; a syntax error fails the check. A broken "
+    "renderer is reported as an infrastructure problem, not held against the plan.",
+    "collected", "only when the pre-checks pass and the plan has diagrams",
+)
+VERIFY_CHECKS: tuple[Check, ...] = (
+    PLAN_CONTENT_NONEMPTY, PLAN_WRITE_SCOPE, PLAN_STEPS_JSON, PLAN_AUDIT_FULL_READ, PLAN_LEDGER_SYNC,
+    PLAN_MANIFEST_JSON, PLAN_VISUAL_RETIREMENT, PLAN_VISUAL_REVIEW_CURRENT, PLAN_VISUAL_FILES_READABLE,
+    PLAN_REVISED_CLAIMS, PLAN_STEP_LINKAGE, PLAN_WIREFRAME_AC_IDS, PLAN_WIREFRAME_HAS_AC_IDS,
+    PLAN_UI_WIREFRAME_COVERAGE, PLAN_STEP_WIREFRAME_COVERAGE, PLAN_WIREFRAME_HTML, PLAN_MERMAID_RENDER,
+)
+
+# (CheckLog, audit-skip reason) for _load_and_sync_plan_steps, which records its own steps/audit/
+# ledger rows. A ContextVar, not a parameter: graph.py's audit_ran_this_lap self-check swaps that
+# helper for a fixed 7-positional-arg fake, so its signature can't grow. None = not recording.
+_STEP_LOG: ContextVar[tuple[CheckLog, str] | None] = ContextVar("_STEP_LOG", default=None)
+
+
 async def _load_and_sync_plan_steps(
     provider: SandboxProvider,
     thread_id: str,
@@ -654,34 +903,54 @@ async def _load_and_sync_plan_steps(
     """
     from ..schemas import PlanStep
 
+    ctx = _STEP_LOG.get()
+    log, audit_skip_reason = ctx if ctx is not None else (None, "")
+
     raw = await repo_files.read_repo_file(provider, thread_id, DRAFT_STEPS_PATH)
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
     if raw is None:
-        return None, [
+        problem = (
             f"{DRAFT_STEPS_PATH} does not exist -- create it with your file tools, shaped "
             '{"plan_steps": [...], "retired_step_ids": [...]}.'
-        ], ledger_entries, None
+        )
+        if log is not None:
+            log.failed(PLAN_STEPS_JSON, problem)
+        return None, [problem], ledger_entries, None
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return None, [f"{DRAFT_STEPS_PATH} is not valid JSON: {exc}. Fix it and resubmit."], ledger_entries, None
+        problem = f"{DRAFT_STEPS_PATH} is not valid JSON: {exc}. Fix it and resubmit."
+        if log is not None:
+            log.failed(PLAN_STEPS_JSON, problem)
+        return None, [problem], ledger_entries, None
     if not isinstance(doc, dict):
-        return None, [f"{DRAFT_STEPS_PATH} must be a JSON object with 'plan_steps'/'retired_step_ids' keys."], ledger_entries, None
+        problem = f"{DRAFT_STEPS_PATH} must be a JSON object with 'plan_steps'/'retired_step_ids' keys."
+        if log is not None:
+            log.failed(PLAN_STEPS_JSON, problem)
+        return None, [problem], ledger_entries, None
 
     raw_steps = doc.get("plan_steps")
     retired_step_ids = doc.get("retired_step_ids") or []
     if not isinstance(raw_steps, list):
-        return None, [f"{DRAFT_STEPS_PATH}'s 'plan_steps' must be a list."], ledger_entries, None
+        problem = f"{DRAFT_STEPS_PATH}'s 'plan_steps' must be a list."
+        if log is not None:
+            log.failed(PLAN_STEPS_JSON, problem)
+        return None, [problem], ledger_entries, None
     validated: list[dict[str, Any]] = []
     for i, raw_step in enumerate(raw_steps):
         try:
             validated.append(PlanStep.model_validate(raw_step).model_dump())
         except Exception as exc:  # noqa: BLE001 -- surfaced as actionable feedback, never a crash
-            return None, [
-                f"{DRAFT_STEPS_PATH}'s plan_steps[{i}] does not match the PlanStep shape: {exc}"
-            ], ledger_entries, None
+            problem = f"{DRAFT_STEPS_PATH}'s plan_steps[{i}] does not match the PlanStep shape: {exc}"
+            if log is not None:
+                log.failed(PLAN_STEPS_JSON, problem)
+            return None, [problem], ledger_entries, None
+    if log is not None:
+        log.passed(PLAN_STEPS_JSON)
 
     fully_reviewed: bool | None = None
+    if not has_audit_role and log is not None:
+        log.skipped(PLAN_AUDIT_FULL_READ, audit_skip_reason)
     if has_audit_role:
         # Per-lap audit role key, not the bare "audit" label -- identical fix and reasoning to
         # graph.py's _verify_specification_ledger (2026-09-18, session 6244ef47): the cache is
@@ -702,16 +971,28 @@ async def _load_and_sync_plan_steps(
         # genuine partial read. None under a provider that structurally cannot verify transcripts
         # (Copilot) stays fail-open: sync_plan_ledger skips the check. A bool is real evidence.
         if evidence is None and chat_model.provider_can_verify_transcripts(chat_provider):
-            return None, [
-                chat_model.transcript_unreadable_feedback(stage_key, audit_role, session_id)
-            ], ledger_entries, "audit_transcript_unreadable"
+            problem = chat_model.transcript_unreadable_feedback(stage_key, audit_role, session_id)
+            if log is not None:
+                log.infra(PLAN_AUDIT_FULL_READ, problem)
+            return None, [problem], ledger_entries, "audit_transcript_unreadable"
+        if log is not None:
+            if evidence is None:
+                log.skipped(PLAN_AUDIT_FULL_READ, f"{chat_provider} transcripts can't be verified")
+            elif evidence:
+                log.passed(PLAN_AUDIT_FULL_READ)
+            else:
+                log.failed(PLAN_AUDIT_FULL_READ, f"the audit session did not read all of {DRAFT_STEPS_PATH}")
         fully_reviewed = evidence
 
     sync_result = spec_ledger.sync_plan_ledger(
         ledger_entries, validated, run_id, retired_step_ids=retired_step_ids, fully_reviewed=fully_reviewed,
     )
     if not sync_result.passed:
+        if log is not None:
+            log.failed(PLAN_LEDGER_SYNC, "; ".join(sync_result.reasons))
         return None, sync_result.reasons, ledger_entries, None
+    if log is not None:
+        log.passed(PLAN_LEDGER_SYNC)
     await spec_ledger.save_ledger(provider, thread_id, sync_result.updated_entries)
     resolved = [
         e for e in sync_result.updated_entries
@@ -833,8 +1114,15 @@ def make_verify_plan_diagrams(
     async def verify_plan_diagrams(
         thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None,
         provider: SandboxProvider, chat_provider: str, lap: int = 0, audit_ran_this_lap: bool = True,
+        *, log: CheckLog | None = None,
     ) -> "VerificationResult":
         from ..graph import VerificationResult  # local import: graph.py imports this module
+
+        if log is None:
+            log = CheckLog(f"{stage_key}_verify", VERIFY_CHECKS)
+
+        def _rows() -> list[dict[str, Any]]:
+            return [r.to_dict() for r in log.results()]
 
         if not content_dict:
             # Reachable via the clarification-cycle safety cap: auto_approve_node promotes whatever
@@ -842,11 +1130,14 @@ def make_verify_plan_diagrams(
             # got past a (headless-disallowed) clarifying-question response can leave that empty/None.
             # A crash here would kill the whole run; report it through the normal retry/escalate path
             # instead, same as any other failed verification.
+            log.failed(PLAN_CONTENT_NONEMPTY, "plan content is empty")
             return VerificationResult(
                 passed=False,
                 feedback="Plan content is empty -- the draft never produced a real plan (safety-cap auto-approve after repeated clarification attempts). Draft a complete plan with no clarifying questions.",
                 report={"plan_content": "empty"},
+                checks=_rows(),
             )
+        log.passed(PLAN_CONTENT_NONEMPTY)
 
         # File-based-editing plan, Part 2 sect. 1: commit the whole scratch dir on EVERY
         # invocation, pass or fail -- unlike specification's single sketchpad file (which already
@@ -865,6 +1156,7 @@ def make_verify_plan_diagrams(
             is_pipeline_owned=write_scope_gate.is_plan_pipeline_owned,
         )
         if not write_scope.passed:
+            log.failed(PLAN_WRITE_SCOPE, f"outside write scope: {'; '.join(write_scope.violating_paths)}")
             return VerificationResult(
                 passed=False,
                 feedback=(
@@ -873,7 +1165,9 @@ def make_verify_plan_diagrams(
                     "created or modified here."
                 ),
                 report={"violating_paths": write_scope.violating_paths, "changed_paths": write_scope.changed_paths},
+                checks=_rows(),
             )
+        log.passed(PLAN_WRITE_SCOPE)
 
         # Provenance first: pure checks against the ledger, cheaper than any render, and a plan whose
         # steps aren't linked to this ticket's criteria is wrong regardless of its diagrams. The spec
@@ -921,9 +1215,14 @@ def make_verify_plan_diagrams(
         # `audit_ran_this_lap=False` (the session's code_gen_mode skipped audit this lap, e.g.
         # draft_verify) takes the exact has_audit_role=False path: no audit session exists to read,
         # so a missing transcript is expected, not an infra fault (fail-open, fully_reviewed=None).
-        resolved_steps, step_problems, ledger_entries, step_infra_error = await _load_and_sync_plan_steps(
-            provider, thread_id, run_id, stage_key, chat_provider, has_audit_role and audit_ran_this_lap, lap,
-        )
+        audit_skip_reason = "no audit role for this stage" if not has_audit_role else "audit did not run this lap"
+        step_log_token = _STEP_LOG.set((log, audit_skip_reason))
+        try:
+            resolved_steps, step_problems, ledger_entries, step_infra_error = await _load_and_sync_plan_steps(
+                provider, thread_id, run_id, stage_key, chat_provider, has_audit_role and audit_ran_this_lap, lap,
+            )
+        finally:
+            _STEP_LOG.reset(step_log_token)
         if step_infra_error is not None:
             # Platform could not evaluate a check (see _load_and_sync_plan_steps): infra verdict,
             # same routing make_verify_node gives ac_coverage_gate's missing-artifact case.
@@ -931,13 +1230,19 @@ def make_verify_plan_diagrams(
                 passed=False,
                 feedback="\n\n".join(step_problems),
                 report={"infra_error": step_infra_error, "step_problems": step_problems},
+                checks=_rows(),
             )
         manifest, manifest_problems = await _load_and_check_manifest(provider, thread_id)
+        if manifest_problems:
+            log.failed(PLAN_MANIFEST_JSON, "; ".join(manifest_problems))
+        else:
+            log.passed(PLAN_MANIFEST_JSON)
         if step_problems or manifest_problems:
             return VerificationResult(
                 passed=False,
                 feedback="\n\n".join(step_problems + manifest_problems),
                 report={"step_problems": step_problems, "manifest_problems": manifest_problems},
+                checks=_rows(),
             )
         assert resolved_steps is not None and manifest is not None  # guaranteed by the empty-problems check above
 
@@ -949,11 +1254,21 @@ def make_verify_plan_diagrams(
         pre_check_problems = check_dangling_visual_retirement(
             wireframe_refs, diagram_refs, ledger_entries, retired_wireframe_screens, retired_diagram_names,
         )
-        pre_check_problems += check_stale_visual_review(
+        if pre_check_problems:
+            log.failed(PLAN_VISUAL_RETIREMENT, "; ".join(pre_check_problems))
+        else:
+            log.passed(PLAN_VISUAL_RETIREMENT)
+        stale_problems = check_stale_visual_review(
             diagram_refs, wireframe_refs, prior_diagram_names, prior_wireframe_screens,
             ledger_entries, run_id, bug_affected_ac_ids,
             content_dict.get("diagrams_reviewed") or [], content_dict.get("wireframes_reviewed") or [],
         )
+        if stale_problems:
+            log.failed(PLAN_VISUAL_REVIEW_CURRENT, "; ".join(stale_problems))
+        else:
+            log.passed(PLAN_VISUAL_REVIEW_CURRENT)
+        pre_check_problems += stale_problems
+        unreadable_start = len(pre_check_problems)
 
         # Read every diagram/wireframe's real content from its sidecar file -- needed both to
         # mechanically verify a claimed "revised" action actually changed the content (below) and
@@ -974,6 +1289,12 @@ def make_verify_plan_diagrams(
                 pre_check_problems.append(f"{DRAFT_WIREFRAMES_DIR}/{wf['screen']}.html could not be read")
                 continue
             wireframe_sources[wf["screen"]] = raw_src
+        unreadable = pre_check_problems[unreadable_start:]
+        if unreadable:
+            log.failed(PLAN_VISUAL_FILES_READABLE, "; ".join(unreadable))
+        else:
+            log.passed(PLAN_VISUAL_FILES_READABLE)
+        revised_start = len(pre_check_problems)
 
         # Mechanical verification of a claimed "revised" action (Part 2 sect. 6 item 4): the file
         # must actually differ from the last-approved version -- catches a false "revised" claim,
@@ -998,8 +1319,17 @@ def make_verify_plan_diagrams(
                         "or claim 'confirmed_current' instead"
                     )
 
+        false_revisions = pre_check_problems[revised_start:]
+        if false_revisions:
+            log.failed(PLAN_REVISED_CLAIMS, "; ".join(false_revisions))
+        else:
+            log.passed(PLAN_REVISED_CLAIMS)
+
         if pre_check_problems:
-            return VerificationResult(passed=False, feedback="\n\n".join(pre_check_problems), report={"pre_check_problems": pre_check_problems})
+            return VerificationResult(
+                passed=False, feedback="\n\n".join(pre_check_problems), report={"pre_check_problems": pre_check_problems},
+                checks=_rows(),
+            )
 
         # Inject the file-resolved FULL content back into content_dict, matching today's
         # ImplementationPlan shape exactly, before any of the existing logic below (all of it
@@ -1045,13 +1375,41 @@ def make_verify_plan_diagrams(
         # directions) AC/PlanStep<->wireframe coverage -- with no ordering dependency between them,
         # so union them into one lap's feedback instead of reporting only whichever hit first.
         plan_steps = content_dict.get("plan_steps") or []
-        linkage_problems = (
-            check_plan_linkage(plan_steps, ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id)
-            + check_wireframe_ac_ids(wireframes, ledger_entries)
-            + check_wireframe_has_ac_ids(wireframes)
-            + check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
-            + check_plan_step_wireframe_coverage(plan_steps, wireframes)
+        step_linkage_problems = check_plan_linkage(
+            plan_steps, ledger_entries, own_ac_ids, prior_steps_by_id, run_id=run_id
         )
+        wireframe_ac_id_problems = check_wireframe_ac_ids(wireframes, ledger_entries)
+        wireframe_uncited = check_wireframe_has_ac_ids(wireframes)
+        ui_coverage_problems = check_ui_wireframe_coverage(ui_related_ac_ids, wireframes)
+        step_coverage_problems = check_plan_step_wireframe_coverage(plan_steps, wireframes)
+        linkage_problems = (
+            step_linkage_problems + wireframe_ac_id_problems + wireframe_uncited
+            + ui_coverage_problems + step_coverage_problems
+        )
+        if step_linkage_problems:
+            log.failed(PLAN_STEP_LINKAGE, "; ".join(step_linkage_problems))
+        else:
+            log.passed(PLAN_STEP_LINKAGE)
+        if not wireframes:
+            log.skipped(PLAN_WIREFRAME_AC_IDS, "no wireframes in this plan")
+            log.skipped(PLAN_WIREFRAME_HAS_AC_IDS, "no wireframes in this plan")
+        else:
+            if wireframe_ac_id_problems:
+                log.failed(PLAN_WIREFRAME_AC_IDS, "; ".join(wireframe_ac_id_problems))
+            else:
+                log.passed(PLAN_WIREFRAME_AC_IDS)
+            if wireframe_uncited:
+                log.failed(PLAN_WIREFRAME_HAS_AC_IDS, "; ".join(wireframe_uncited))
+            else:
+                log.passed(PLAN_WIREFRAME_HAS_AC_IDS)
+        if ui_coverage_problems:
+            log.failed(PLAN_UI_WIREFRAME_COVERAGE, "; ".join(ui_coverage_problems))
+        else:
+            log.passed(PLAN_UI_WIREFRAME_COVERAGE)
+        if step_coverage_problems:
+            log.failed(PLAN_STEP_WIREFRAME_COVERAGE, "; ".join(step_coverage_problems))
+        else:
+            log.passed(PLAN_STEP_WIREFRAME_COVERAGE)
 
         # Scope-lifecycle stamps for the Plan review UI (user requirement 2026-08-31, mirroring the
         # spec view's badges): each step inherits the strongest change classification of the criteria
@@ -1081,6 +1439,12 @@ def make_verify_plan_diagrams(
             err for wf in wireframes if (err := check_wireframe(wf.get("screen") or "", wf.get("html_source") or "")) is not None
         ]
         structural_problems.extend(wireframe_errors)
+        if not wireframes:
+            log.skipped(PLAN_WIREFRAME_HTML, "no wireframes in this plan")
+        elif wireframe_errors:
+            log.failed(PLAN_WIREFRAME_HTML, "; ".join(wireframe_errors))
+        else:
+            log.passed(PLAN_WIREFRAME_HTML)
 
         # Wireframes are only written to the sandbox once individually valid (unchanged invariant --
         # there is deliberately no count cap) -- gated on wireframe_errors specifically, not on
@@ -1111,6 +1475,20 @@ def make_verify_plan_diagrams(
         outcomes = [await _render_one(provider, thread_id, diagram) for diagram in diagrams] if diagrams else []
         failures = [o for o in outcomes if not o.ok]
         infra_failures = [o for o in failures if o.is_infra_failure]
+        if not diagrams:
+            log.skipped(PLAN_MERMAID_RENDER, "no diagrams in this plan")
+        elif infra_failures:
+            # The stage fails either way (report["infra_failure"] = True, not report["infra_error"]),
+            # but the syntax was never actually checked -- an infra row, not a content failure.
+            log.infra(
+                PLAN_MERMAID_RENDER,
+                f"renderer (mermaid-cli/Chromium) failed for {', '.join(o.name for o in infra_failures)}: "
+                f"{infra_failures[0].stderr_tail}",
+            )
+        elif failures:
+            log.failed(PLAN_MERMAID_RENDER, "; ".join(f"{o.name}: {_mermaid_error_summary(o.stderr_tail)}" for o in failures))
+        else:
+            log.passed(PLAN_MERMAID_RENDER)
 
         if structural_problems or failures:
             feedback_parts = list(structural_problems)
@@ -1136,10 +1514,13 @@ def make_verify_plan_diagrams(
             if failures:
                 report["failed"] = [o.name for o in failures]
                 report["infra_failure"] = bool(infra_failures)
-            return VerificationResult(passed=False, feedback="\n\n".join(feedback_parts), report=report)
+            return VerificationResult(passed=False, feedback="\n\n".join(feedback_parts), report=report, checks=_rows())
 
         if not diagrams and not wireframes:
-            return VerificationResult(passed=True, feedback="No diagrams or wireframes in this draft -- nothing to validate.", report={})
+            return VerificationResult(
+                passed=True, feedback="No diagrams or wireframes in this draft -- nothing to validate.", report={},
+                checks=_rows(),
+            )
 
         commit_dirs = ([DIAGRAMS_DIR] if diagrams else []) + ([WIREFRAMES_DIR] if wireframes else [])
         await git_ops.commit_paths(provider, thread_id, commit_dirs, "ai-dev-workflow: render plan diagrams + wireframes")
@@ -1147,6 +1528,7 @@ def make_verify_plan_diagrams(
             passed=True,
             feedback=f"All {len(diagrams)} diagram(s) rendered and {len(wireframes)} wireframe(s) validated.",
             report={"rendered": [o.name for o in outcomes], "wireframes": [wf["screen"] for wf in wireframes]},
+            checks=_rows(),
         )
 
     return verify_plan_diagrams
