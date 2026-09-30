@@ -31,9 +31,6 @@ from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
 
-# Keep each exec's command line well under Windows' ~32K CreateProcess cap (WinError 206).
-_EXEC_CMD_BUDGET = 16000
-
 # Scratch-file directory for all provider execs (shared, not provider-specific).
 _SCRATCH_DIR = "/tmp/aidw-agent"
 
@@ -365,7 +362,7 @@ async def write_scratch_file(provider: SandboxProvider, thread_id: str, path: st
     parent_dir = path.rsplit("/", 1)[0] if "/" in path else ""
     quoted = shlex.quote(path)
 
-    if len(encoded) <= _EXEC_CMD_BUDGET:
+    if len(encoded) <= config.EXEC_CMD_BUDGET_CHARS:
         parent_mkdir = f"mkdir -p {shlex.quote(parent_dir)} && " if parent_dir else ""
         commands = [f"{parent_mkdir}echo {encoded} | base64 -d > {quoted}"]
     else:
@@ -754,12 +751,12 @@ def _demo() -> None:
     """
     # Test chunking boundary math: edge cases at chunk boundaries.
     short_encoded = base64.b64encode(b"hello").decode("ascii")
-    assert len(short_encoded) < _EXEC_CMD_BUDGET, "short payload overflowed budget"
+    assert len(short_encoded) < config.EXEC_CMD_BUDGET_CHARS, "short payload overflowed budget"
 
-    long_payload = "x" * (_EXEC_CMD_BUDGET * 2 + 100)
+    long_payload = "x" * (config.EXEC_CMD_BUDGET_CHARS * 2 + 100)
     long_encoded = base64.b64encode(long_payload.encode("utf-8")).decode("ascii")
-    assert len(long_encoded) > _EXEC_CMD_BUDGET, "long payload should exceed budget"
-    chunk_count = (len(long_encoded) + _EXEC_CMD_BUDGET - 1) // _EXEC_CMD_BUDGET
+    assert len(long_encoded) > config.EXEC_CMD_BUDGET_CHARS, "long payload should exceed budget"
+    chunk_count = (len(long_encoded) + config.EXEC_CMD_BUDGET_CHARS - 1) // config.EXEC_CMD_BUDGET_CHARS
     assert chunk_count == 3, f"expected 3 chunks, got {chunk_count}"
 
     # Test command-string construction: call the actual production code path, not a hand-copied

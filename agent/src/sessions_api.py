@@ -55,6 +55,7 @@ from . import (
     run_activity,
     run_event_store,
     run_event_summary,
+    runtime_settings,
     session_store,
 )
 from .graph import graph
@@ -66,6 +67,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 config_router = APIRouter(prefix="/vault-config", tags=["vault-config"])
 org_settings_router = APIRouter(prefix="/org-settings", tags=["org-settings"])
+runtime_settings_router = APIRouter(prefix="/runtime-settings", tags=["runtime-settings"])
 catalog_router = APIRouter(tags=["tech-stack"])
 projects_router = APIRouter(prefix="/projects", tags=["projects"])
 repo_auth_settings_router = APIRouter(prefix="/repo-auth-settings", tags=["repo-auth-settings"])
@@ -1691,8 +1693,8 @@ async def _maybe_reprobe_credential(settings: org_settings.OrgSettings) -> bool 
 
 async def _org_settings_response() -> OrgSettingsResponse:
     """Shared GET/PUT response builder -- always a fresh, uncached DB read. The TTL cache lives
-    one layer up (chat_model.get_provider(), _PROVIDER_CACHE_TTL_SECONDS) for in-flight session
-    dispatch, where up to 30s of staleness is fine; this settings-management surface must show a
+    one layer up (chat_model.get_provider(), config.PROVIDER_CACHE_TTL_SECONDS) for in-flight
+    session dispatch, where up to 30s of staleness is fine; this settings-management surface must show a
     just-saved change back immediately, so it reads org_settings directly rather than going
     through that cache.
 
@@ -1927,7 +1929,7 @@ async def _probe_provider_credential(
 
     try:
         if client is None:
-            async with httpx.AsyncClient(timeout=30.0) as c:
+            async with httpx.AsyncClient(timeout=config.GIT_OPS_HTTP_TIMEOUT_SECONDS) as c:
                 resp = await c.get(url, headers=headers)
         else:
             resp = await client.get(url, headers=headers)
@@ -2064,6 +2066,116 @@ async def put_org_settings_endpoint(body: OrgSettingsPutRequest, request: Reques
     return await _org_settings_response()
 
 
+def _jsonable(value: object) -> object:
+    """frozenset/tuple aren't directly JSON-serializable the way a plain list is -- every parser
+    that can produce one (frozenset_csv, csv, csv_int, csv_float) gets normalized to a list here,
+    for both the current live value and the parsed default. Every other parser kind (int/float/
+    str/bool) already returns a JSON-native type unchanged."""
+    if isinstance(value, (frozenset, tuple)):
+        return sorted(value) if isinstance(value, frozenset) else list(value)
+    return value
+
+
+class RuntimeSettingResponse(BaseModel):
+    name: str
+    category: str
+    purpose: str
+    effect: str
+    value_range: str | None
+    parser: str
+    env_var: str
+    default_value: Any
+    current_value: Any
+    is_overridden: bool
+    updated_by: str | None = None
+    updated_at: str | None = None
+
+
+class RuntimeSettingsListResponse(BaseModel):
+    settings: list[RuntimeSettingResponse]
+
+
+@runtime_settings_router.get("", response_model=RuntimeSettingsListResponse)
+async def list_runtime_settings_endpoint(request: Request) -> RuntimeSettingsListResponse:
+    """Every migrated setting's metadata + current resolved value + override status -- always a
+    fresh, uncached DB read (runtime_settings.list_overrides(), not this request's own session
+    snapshot, which doesn't exist here anyway: this is an HTTP request, never a pinned graph-run
+    task), same "admin sees the live truth immediately" contract _org_settings_response() follows.
+    """
+    _check_shared_secret(request)
+    overrides = await runtime_settings.list_overrides()
+    settings = []
+    for meta in config.list_settings():
+        name = meta["name"]
+        override = overrides.get(name)
+        default = config.default_value(name)
+        current = config.parse_setting(name, override["value"]) if override else default
+        settings.append(
+            RuntimeSettingResponse(
+                **meta,
+                default_value=_jsonable(default),
+                current_value=_jsonable(current),
+                is_overridden=override is not None,
+                updated_by=override["updated_by"] if override else None,
+                updated_at=override["updated_at"] if override else None,
+            )
+        )
+    return RuntimeSettingsListResponse(settings=settings)
+
+
+class RuntimeSettingPutRequest(BaseModel):
+    value: Any
+    updated_by: str
+
+
+@runtime_settings_router.put("/{name}", response_model=RuntimeSettingResponse)
+async def put_runtime_setting_endpoint(name: str, body: RuntimeSettingPutRequest, request: Request) -> RuntimeSettingResponse:
+    """Write-time validation (must-fix #2): format the incoming value with `name`'s own formatter,
+    then parse-and-reformat it to prove the exact string persisted round-trips back to an
+    equivalent value -- catches a malformed input (or a formatter/parser mismatch) as a 422 before
+    it ever reaches the DB, rather than corrupting the next session that reads it.
+    """
+    _check_shared_secret(request)
+    try:
+        formatted = config.format_setting(name, body.value)
+        round_tripped = config.parse_setting(name, formatted)
+        reformatted = config.format_setting(name, round_tripped)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown setting {name!r}") from None
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid value for {name!r}: {exc}") from None
+    if reformatted != formatted:
+        raise HTTPException(status_code=422, detail=f"value for {name!r} failed to round-trip")
+    await runtime_settings.set_value(name, formatted, body.updated_by)
+    return await _runtime_setting_response(name)
+
+
+@runtime_settings_router.delete("/{name}", response_model=RuntimeSettingResponse)
+async def delete_runtime_setting_endpoint(name: str, updated_by: str, request: Request) -> RuntimeSettingResponse:
+    """Resets `name` to config.py's env-var/default tier for the next session pinned."""
+    _check_shared_secret(request)
+    if name not in {s["name"] for s in config.list_settings()}:
+        raise HTTPException(status_code=404, detail=f"unknown setting {name!r}")
+    await runtime_settings.delete_value(name, updated_by)
+    return await _runtime_setting_response(name)
+
+
+async def _runtime_setting_response(name: str) -> RuntimeSettingResponse:
+    overrides = await runtime_settings.list_overrides()
+    meta = next(m for m in config.list_settings() if m["name"] == name)
+    override = overrides.get(name)
+    default = config.default_value(name)
+    current = config.parse_setting(name, override["value"]) if override else default
+    return RuntimeSettingResponse(
+        **meta,
+        default_value=_jsonable(default),
+        current_value=_jsonable(current),
+        is_overridden=override is not None,
+        updated_by=override["updated_by"] if override else None,
+        updated_at=override["updated_at"] if override else None,
+    )
+
+
 class TechStackCatalogResponse(BaseModel):
     stacks: list[dict[str, Any]]
 
@@ -2166,7 +2278,7 @@ async def _fetch_default_branch(
     url = f"https://api.github.com/repos/{owner}/{repo}"
     try:
         if client is None:
-            async with httpx.AsyncClient(timeout=30.0) as c:
+            async with httpx.AsyncClient(timeout=config.GIT_OPS_HTTP_TIMEOUT_SECONDS) as c:
                 resp = await c.get(url, headers=headers)
         else:
             resp = await client.get(url, headers=headers)
@@ -3445,6 +3557,85 @@ def _demo() -> None:
         raise AssertionError("an invalid code_gen_mode must raise ValidationError, not pass silently")
     except ValidationError:
         pass
+
+    # Task 7: the runtime_settings_router endpoints, over a real ASGI round-trip (same TestClient
+    # technique as the session-stream check above) with runtime_settings.list_overrides/set_value/
+    # delete_value monkeypatched -- no live DB in this environment.
+    rt_real_shared_secret_env = os.environ.get("AIDW_AGENT_SHARED_SECRET")
+    os.environ["AIDW_AGENT_SHARED_SECRET"] = ""  # keep the shared-secret check a no-op here too
+    rt_test_app = FastAPI()
+    rt_test_app.include_router(runtime_settings_router)
+    rt_test_client = TestClient(rt_test_app)
+
+    _rt_store: dict[str, dict[str, str | None]] = {}
+
+    async def fake_list_overrides() -> dict[str, dict[str, str | None]]:
+        return dict(_rt_store)
+
+    async def fake_set_value(key: str, formatted_value: str, updated_by: str) -> None:
+        _rt_store[key] = {"value": formatted_value, "updated_by": updated_by, "updated_at": "2026-01-01T00:00:00"}
+
+    async def fake_delete_value(key: str, updated_by: str) -> None:  # noqa: ARG001 -- signature symmetry, see runtime_settings.py
+        _rt_store.pop(key, None)
+
+    original_list_overrides = runtime_settings.list_overrides
+    original_set_value = runtime_settings.set_value
+    original_delete_value = runtime_settings.delete_value
+    runtime_settings.list_overrides = fake_list_overrides  # type: ignore[assignment]
+    runtime_settings.set_value = fake_set_value  # type: ignore[assignment]
+    runtime_settings.delete_value = fake_delete_value  # type: ignore[assignment]
+    try:
+        list_resp = rt_test_client.get("/runtime-settings")
+        assert list_resp.status_code == 200, list_resp.text
+        by_name = {s["name"]: s for s in list_resp.json()["settings"]}
+        assert len(by_name) > 100, len(by_name)
+        assert by_name["SPEC_MAX_VERIFY_CYCLES"]["current_value"] == 5, by_name["SPEC_MAX_VERIFY_CYCLES"]
+        assert by_name["SPEC_MAX_VERIFY_CYCLES"]["is_overridden"] is False
+
+        put_resp = rt_test_client.put(
+            "/runtime-settings/SPEC_MAX_VERIFY_CYCLES", json={"value": 9, "updated_by": "tester"}
+        )
+        assert put_resp.status_code == 200, put_resp.text
+        put_body = put_resp.json()
+        assert put_body["current_value"] == 9, put_body
+        assert put_body["is_overridden"] is True and put_body["updated_by"] == "tester", put_body
+        assert _rt_store["SPEC_MAX_VERIFY_CYCLES"]["value"] == "9", _rt_store
+
+        # A CSV-typed setting must round-trip through the formatter/parser split (must-fix #1),
+        # not just plain scalars.
+        csv_resp = rt_test_client.put(
+            "/runtime-settings/LIGHTHOUSE_BLOCKING_AUDITS",
+            json={"value": ["image-alt", "color-contrast"], "updated_by": "tester"},
+        )
+        assert csv_resp.status_code == 200, csv_resp.text
+        assert sorted(csv_resp.json()["current_value"]) == ["color-contrast", "image-alt"], csv_resp.json()
+
+        # Unknown setting name: 404, never a 500/422.
+        unknown_resp = rt_test_client.put("/runtime-settings/_no_such_setting_", json={"value": 1, "updated_by": "t"})
+        assert unknown_resp.status_code == 404, unknown_resp.text
+
+        # Malformed value for the setting's own parser: 422, and never reaches set_value (nothing
+        # gets persisted).
+        bad_resp = rt_test_client.put(
+            "/runtime-settings/SPEC_MAX_VERIFY_CYCLES", json={"value": "not-an-int", "updated_by": "tester"}
+        )
+        assert bad_resp.status_code == 422, bad_resp.text
+        assert _rt_store["SPEC_MAX_VERIFY_CYCLES"]["value"] == "9", "a rejected write must not overwrite the prior value"
+
+        # Reset to default: is_overridden flips back to False and the value reverts.
+        delete_resp = rt_test_client.delete("/runtime-settings/SPEC_MAX_VERIFY_CYCLES", params={"updated_by": "tester"})
+        assert delete_resp.status_code == 200, delete_resp.text
+        delete_body = delete_resp.json()
+        assert delete_body["current_value"] == 5 and delete_body["is_overridden"] is False, delete_body
+        assert "SPEC_MAX_VERIFY_CYCLES" not in _rt_store
+    finally:
+        runtime_settings.list_overrides = original_list_overrides  # type: ignore[assignment]
+        runtime_settings.set_value = original_set_value  # type: ignore[assignment]
+        runtime_settings.delete_value = original_delete_value  # type: ignore[assignment]
+        if rt_real_shared_secret_env is None:
+            os.environ.pop("AIDW_AGENT_SHARED_SECRET", None)
+        else:
+            os.environ["AIDW_AGENT_SHARED_SECRET"] = rt_real_shared_secret_env
 
     print("sessions_api self-check: all assertions passed")
 

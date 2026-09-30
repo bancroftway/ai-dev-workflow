@@ -302,6 +302,13 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 f"AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX', '10')}",
                 f"AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS', '700')}",
                 f"AIDW_DIAGRAM_MAX_WIREFRAME_BYTES={os.environ.get('AIDW_DIAGRAM_MAX_WIREFRAME_BYTES', str(30 * 1024))}",
+                # Org Settings migration Task 3 -- mirrors local_docker.py's identical addition; see
+                # that file's own comment for the full reasoning (gates/test_quality_checks.py is
+                # sandbox-mirrored, these 4 were missing from container-boot passthrough).
+                f"MAX_TEST_BODY_SIMILARITY={os.environ.get('MAX_TEST_BODY_SIMILARITY', '0.92')}",
+                f"MIN_NON_E2E_TESTS_PER_AC={os.environ.get('MIN_NON_E2E_TESTS_PER_AC', '2')}",
+                f"MIN_DISTINCT_ASSERTIONS_PER_AC={os.environ.get('MIN_DISTINCT_ASSERTIONS_PER_AC', '2')}",
+                f"MIN_TESTS_BEFORE_ASSERTION_CHECK={os.environ.get('MIN_TESTS_BEFORE_ASSERTION_CHECK', '3')}",
             ]
             if scaffold_new_repo:
                 # "+ New Project" case only (Part 3 plan, Ruling 6) -- entrypoint.sh reads these to

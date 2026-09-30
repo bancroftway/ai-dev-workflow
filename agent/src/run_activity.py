@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import os
 import time
+from unittest.mock import patch
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -285,9 +286,12 @@ def _demo() -> None:
     # Backpressure: a full queue drops the OLDEST item to make room for the newest, rather than
     # blocking publish() or leaving the subscriber orphaned (see publish's own docstring).
     async def _backpressure() -> None:
-        real_maxsize = config.RUN_SUBSCRIBER_QUEUE_MAXSIZE
-        config.RUN_SUBSCRIBER_QUEUE_MAXSIZE = 2
-        try:
+        # patch.object, not a direct `config.RUN_SUBSCRIBER_QUEUE_MAXSIZE = value` assignment:
+        # config.py resolves this purely via module __getattr__ now (no real __dict__ entry), so a
+        # plain assignment would create one and permanently defeat live-override for this key for
+        # the rest of this process's life (must-fix #4 in the Org Settings migration plan) --
+        # patch.object correctly delattrs on exit instead, restoring dynamic resolution.
+        with patch.object(config, "RUN_SUBSCRIBER_QUEUE_MAXSIZE", 2):
             queue = subscribe("backpressure-check")
             publish("backpressure-check", "a")
             publish("backpressure-check", "b")
@@ -296,8 +300,6 @@ def _demo() -> None:
             assert queue.get_nowait() == "c"
             assert queue.empty()
             unsubscribe("backpressure-check", queue)
-        finally:
-            config.RUN_SUBSCRIBER_QUEUE_MAXSIZE = real_maxsize
 
     asyncio.run(_backpressure())
 

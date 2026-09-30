@@ -1,550 +1,1009 @@
-"""Runtime configuration (SPECIFICATION.md US-10: configurable safety cap)."""
+"""Runtime configuration -- a thin, live-editable shim over agent/src/runtime_settings.py's
+per-session DB-backed overrides (SPECIFICATION.md US-10's original configurable safety cap, since
+folded into the broader Org Settings migration).
+
+Every constant below is resolved dynamically via module __getattr__ (PEP 562, Python 3.12+), not a
+static value computed once at import time: `config.NAME` first checks
+`runtime_settings.get_raw(NAME)` (this session's pinned DB-backed override, if any -- see
+runtime_settings.py's own docstring for exactly when that's populated), and only when that's unset
+falls back to this file's own env-var/default -- exactly the value it always returned before this
+migration. That env-var/Key-Vault-backed fallback tier is PERMANENT, not transitional: it stays the
+deploy-time default forever, this DB layer is only the live-without-redeploy override on top
+(docs/CONFIG.md documents the same precedence for the `provider` setting).
+
+Every one of the ~265 existing call sites across 19 files keeps working completely unchanged --
+`config.NAME` / `workflow_config.NAME` attribute access is exactly what triggers __getattr__ --
+EXCEPT a handful that used to snapshot a value into their own module-level global, function
+default-argument, or dataclass field default at import/def time instead of reading `config.NAME`
+fresh at point of use. Those go stale under live-refresh and were converted to attribute-style
+access as part of this migration (see each file's own diff): repo_scan.py, e2e_nodes.py,
+exit_nodes.py, gates/test_coverage_gate.py.
+
+NOT every constant that used to live here went into the declarative table below. Three groups were
+deliberately excluded from the live settings system and remain plain, static module-level
+assignments further down this file (Python resolves a real module attribute before ever calling
+__getattr__, so they coexist without conflict):
+  - Structural/protocol tables with no realistic operator-tunability case (which skills/tools are
+    even valid to invoke, not a limit to tune) -- REQUIRED_SKILLS_BY_STAGE,
+    AUDIT_FULL_READ_FILE_BY_STAGE, COPILOT_DISABLED_SKILLS[_SPECIFICATION],
+    READ_ONLY_AVAILABLE_TOOLS, COPILOT_PLUGIN_ROOT_IN_CONTAINER (+ its derived
+    COPILOT_PLUGIN_DIRECTORIES).
+  - Category J's productivity/app-health formula weights (AIDW_APP_HEALTH_COVERAGE_WEIGHT,
+    AIDW_APP_HEALTH_PASS_RATE_WEIGHT, AIDW_HOURS_PER_LOC_BASE, AIDW_COMPLEXITY_HOUR_MULTIPLIERS,
+    AIDW_REVIEW_OVERHEAD_FRACTION) -- feed only a cosmetic "hours saved" reporting number, zero
+    observed-live retuning history unlike every verify-cycle cap below.
+  - The whole EXIT_*_CELL_CHARS markdown-table-rendering family (15 constants) -- internal
+    rendering detail exit_nodes.py makes zero LLM calls around; no operator would plausibly tune a
+    table cell's character width via env var (AGENTS.md's own carve-out example). Plus
+    GIT_OPS_PUSH_ERROR_TAIL_CHARS (trivial, UI-display-only).
+8 more constants were deleted outright, not excluded (dead code or log-only with zero downstream
+consumer caring about length): TEST_COVERAGE_UNCOVERED_LINES_MAX, GRAPH_FEEDBACK_LOG_PREVIEW_CHARS,
+GIT_OPS_API_ERROR_PREVIEW_CHARS, GIT_OPS_GITIGNORE_PREVIEW_MAX, E2E_SCREENSHOT_STDOUT_TAIL_CHARS,
+E2E_LIGHTHOUSE_STDOUT_TAIL_CHARS, AIDW_TOOL_PROBE_NOTES_HEAD_CHARS, AIDW_TOOL_PROBE_NOTES_TAIL_CHARS
+-- their call sites now use the full, untruncated text directly.
+
+Must stay a leaf module (only stdlib + runtime_settings imports): claude_chat_model.py/
+copilot_chat_model.py import this file, chat_model.py imports both of those -- importing anything
+that imports chat_model.py here would complete that cycle. runtime_settings.py -> session_store.py
+-> db.py has no import back to chat_model.py, so this dependency is safe.
+
+Self-check (config.py's first-ever test): `cd agent && uv run python -m src.config`.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
+from typing import Callable
 
-SPEC_MAX_CLARIFICATION_CYCLES = int(os.environ.get("SPEC_MAX_CLARIFICATION_CYCLES", "3"))
-PLAN_MAX_CLARIFICATION_CYCLES = int(os.environ.get("PLAN_MAX_CLARIFICATION_CYCLES", "3"))
-AC_TO_TESTS_MAX_CLARIFICATION_CYCLES = int(os.environ.get("AC_TO_TESTS_MAX_CLARIFICATION_CYCLES", "3"))
-MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES = int(
-    os.environ.get("MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES", "3")
-)
-ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES", "2"))
-EXIT_MAX_CLARIFICATION_CYCLES = int(os.environ.get("EXIT_MAX_CLARIFICATION_CYCLES", "2"))
-# Small default: tech-stack detection is autonomous codebase study, not human-clarification-driven,
-# so this safety cap should rarely if ever trigger.
-TECH_STACK_MAX_CLARIFICATION_CYCLES = int(os.environ.get("TECH_STACK_MAX_CLARIFICATION_CYCLES", "2"))
+from . import runtime_settings
 
-# preflight_nodes.py's brownfield startability probe (_settle_tech_stack's one-time boot check, and
-# sessions_api.py's "recheck-tech-stack-boot" action, which re-runs the same probe on demand):
-# bounds how long ONE app_discovery candidate gets to open its listening port before this repo is
-# declared not startable. Read by preflight_nodes.probe_tech_stack_startability, which hands this
-# straight to e2e_nodes.probe_candidate_boot's own timeout_seconds -- the same boot/readiness
-# mechanism e2e_run_node uses, just bounded tighter (see below). Too short false-flags a slow-
-# starting app (a cold `npm install`-triggered dev server, a .NET cold JIT) as non-startable,
-# which permanently disables e2e/App Health for a repo that's actually fine (until someone clicks
-# "recheck"); too long stalls the tech-stack gate -- and the on-demand recheck button -- per
-# candidate on a genuinely broken one. Deliberately its OWN, smaller knob rather than reusing
-# E2E_APP_READY_TIMEOUT_SECONDS: this probe boots one candidate in isolation, synchronously, in the
-# critical path of a human waiting on the Tech Stack tab, not inside e2e's own already-bounded
-# multi-service fix-cycle budget.
-AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS = int(os.environ.get("AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS", "45"))
+logger = logging.getLogger(__name__)
 
-# graph.py's StageSpec.max_verify_cycles per stage: the deterministic-gate verify->draft retry
-# budget (independent of the *_MAX_CLARIFICATION_CYCLES pair above, which bounds the LLM's own
-# clarification loop). Deliberately SEVEN SEPARATE constants, not one shared cap: each stage's
-# number was tuned from that stage's own observed failure mode, and a stage bound to an
-# arbitrarily complex human spec needs different headroom than one bounded by a mechanical check
-# (e.g. metrics-exit's deterministic_verify always passes). Sharing one constant would let
-# retuning any single stage silently move every other stage's budget too. Raising one below widens
-# that stage's retry budget (more real spend/wall-clock on a stuck run before it escalates);
-# lowering it escalates sooner on a run that might still have converged with one more lap.
-#
-# Above the default 3 (2026-09-15, observed live: income-investor spec, a genuinely intricate
-# financial domain -- percentile normalization, GA optimization, Sortino ratio). Every lap made
-# real, distinct progress (lap 2 fixed a zero-weight/minimum-holdings contradiction; lap 3 resolved
-# an ambiguous percentile-rescale AC and reconfirmed every earlier fix still held) and the audit's
-# own lap-3 note ("no other gaps found") signals convergence was close -- the run still escalated
-# at 3/3, the same cut-off-mid-convergence shape that moved the other stages below off the
-# default. A stage bound to an arbitrarily complex human spec needs the same headroom they got.
-SPEC_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_SPEC_MAX_VERIFY_CYCLES", "5"))
+_PARSERS: dict[str, Callable[[str], object]] = {
+    "int": int,
+    "float": float,
+    "str": str,
+    "bool": lambda s: s.strip().lower() not in ("0", "false", "no", "off", ""),
+    "csv": lambda s: tuple(x.strip() for x in s.split(",") if x.strip()),
+    "csv_int": lambda s: tuple(int(x.strip()) for x in s.split(",") if x.strip()),
+    "csv_float": lambda s: tuple(float(x.strip()) for x in s.split(",") if x.strip()),
+    "frozenset_csv": lambda s: frozenset(x.strip() for x in s.split(",") if x.strip()),
+}
 
-# Above the default 3 because this stage's one recurring failure -- not invoking writing-plans --
-# is now answered by restarting the draft session (see graph.py's make_verify_node), and a restart
-# only helps if there are laps left to spend on it. At 3, the first attempt plus one reset
-# exhausted the budget before a fresh session got a fair chance.
-PLAN_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_PLAN_MAX_VERIFY_CYCLES", "5"))
+# The write-side inverse of _PARSERS -- must produce the exact string shape the matching parser
+# above expects (a live Python value formatted back into env-var text), never an arbitrary
+# json.dumps() of it. This split exists because an earlier draft conflated the two: json.dumps of a
+# tuple/frozenset produces JSON array syntax ("[1, 2, 3]"), which the CSV-style parsers above then
+# fail to re-parse (int("[1") raises), and json.dumps(frozenset(...)) raises TypeError outright.
+# Callers (the Settings API) run the matching formatter before calling runtime_settings.set_value,
+# and must run the matching PARSER as a dry-run validation before persisting -- see runtime_settings
+# set_value's own docstring.
+_FORMATTERS: dict[str, Callable[[object], str]] = {
+    "int": str,
+    "float": str,
+    "str": str,
+    "bool": lambda v: "1" if v else "0",
+    "csv": lambda v: ",".join(v),
+    "csv_int": lambda v: ",".join(str(x) for x in v),
+    "csv_float": lambda v: ",".join(str(x) for x in v),
+    "frozenset_csv": lambda v: ",".join(sorted(v)),
+}
 
-# Higher than the default 3: this stage's dominant failure is a FLAKE, not a hard block -- the
-# model returns a fully-detailed coverage_plan claiming it "created failing RED-phase tests" while
-# making zero write calls (confirmed from its own session log: glob/view/skill only). The gate
-# catches the fabrication every time and the redraft usually succeeds, so the cheapest reliability
-# win is simply not running out of retries mid-flake. Raised again 6 -> 8 (root-caused
-# 2026-09-12): same shared-budget reasoning as minimal-code-to-green's own identical bump --
-# graph.py's make_verify_node's zero-deferral audit-finding check now also spends laps from this
-# same counter.
-AC_TO_TESTS_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_AC_TO_TESTS_MAX_VERIFY_CYCLES", "8"))
 
-# Higher than the default 3: closing a real coverage gap is iterative, and each lap makes
-# measurable progress (observed live: a genuine app landed at 100% lines / 83.3% branches and
-# simply ran out of laps before reaching the 95% branch threshold). A stage that is genuinely stuck
-# still fails -- just after it has actually had a chance to converge. Raised 6 -> 12 after a
-# vue-dotnet run climbed 88.1% -> 91.9% branches (74/84 -> 79/86) over six laps and was cut off
-# mid-convergence: the remaining gap was a handful of guard clauses, and each lap was closing
-# roughly one. Six laps is enough to prove a stage is moving, not enough to let it finish; a truly
-# stuck stage still burns out, just later. Raised again 12 -> 14 (root-caused 2026-09-12):
-# graph.py's make_verify_node's new zero-deferral audit-finding check now also fails verify
-# whenever this stage's own audit_findings/known_gaps are non-empty, sharing the SAME
-# verify_cycle_count budget as coverage convergence -- without headroom, a run needing several
-# coverage laps AND carrying a real code-review finding would now escalate sooner than before this
-# enforcement existed, as a side effect rather than a deliberate tightening.
-MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES", "14"))
+@dataclass(frozen=True)
+class _Setting:
+    """One migrated constant's full metadata: how to parse/format it, where its permanent
+    env-var/default fallback comes from, and the purpose/effect/range text the Org Settings UI
+    shows next to its edit control (every settings-form field must explain its own purpose, the
+    ramifications of changing it, and its valid range where one applies)."""
 
-# Raised 3 -> 5 (2026-09-11, observed live): a 19-actionable-finding sweep plus a mid-run
-# infra-crash-forced restart (no session continuity) left too little headroom to close out a
-# late-discovered single finding within 3 full-redraft cycles. Paired with graph.py's
-# verify_fix_prompt="remediation_verify_fix" (a short, targeted fix pass instead of a full redraft)
-# -- that pairing is what actually makes the extra cycles worth having.
-REMEDIATION_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_REMEDIATION_MAX_VERIFY_CYCLES", "5"))
+    parser: str  # key into _PARSERS / _FORMATTERS
+    env_var: str
+    default_raw: str  # env-var-shaped default string; parser(default_raw) must succeed
+    category: str  # UI grouping
+    purpose: str  # one-line: what this knob controls
+    effect: str  # one-line: what raising/lowering/changing it actually does, and the tradeoff
+    value_range: str | None = None  # human-readable valid range/format; None if not meaningfully bounded
 
-# 6, not the default 3: this stage's fix laps carry the whole back-half workload (wireframe
-# conformance, negative-path e2e specs, frontend unit tests) and each lap is ~8 minutes of real
-# multi-file work. Observed live (s04 run 6): 3 laps all made measurable progress -- the audit's
-# own findings went from absent panels to "closer now, still not full match" -- and the run was cut
-# off mid-convergence, same failure shape that moved minimal-code-to-green from 6 to 12.
-ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES", "6"))
 
-# Was 0, on the (then-true) reasoning that verify_exit_readiness always returns passed=True so no
-# retry could ever be needed. graph.py's skill gate now runs BEFORE deterministic_verify and CAN
-# fail, which turned any missed skill here into an instant, unrecoverable run failure -- observed
-# live: one `invoked: []` at metrics-exit ended a run that had cleared every other stage. Any stage
-# with a required skill needs laps to correct it (asserted by gates/skill_gate.py's own self-check).
-EXIT_MAX_VERIFY_CYCLES = int(os.environ.get("AIDW_EXIT_MAX_VERIFY_CYCLES", "3"))
+_SETTINGS: dict[str, _Setting] = {
+    # -- Clarification-cycle caps (SPECIFICATION.md US-10) --------------------------------------
+    "SPEC_MAX_CLARIFICATION_CYCLES": _Setting(
+        "int", "SPEC_MAX_CLARIFICATION_CYCLES", "3", "clarification_cycles",
+        "Max clarification Q&A rounds the Specification stage may use before its safety cap forces a decision.",
+        "Higher allows more back-and-forth before forcing a decision; lower risks cutting off legitimate clarification early.",
+        "positive integer",
+    ),
+    "PLAN_MAX_CLARIFICATION_CYCLES": _Setting(
+        "int", "PLAN_MAX_CLARIFICATION_CYCLES", "3", "clarification_cycles",
+        "Max clarification Q&A rounds the Plan stage may use before its safety cap forces a decision.",
+        "Higher allows more back-and-forth before forcing a decision; lower risks cutting off legitimate clarification early.",
+        "positive integer",
+    ),
+    "AC_TO_TESTS_MAX_CLARIFICATION_CYCLES": _Setting(
+        "int", "AC_TO_TESTS_MAX_CLARIFICATION_CYCLES", "3", "clarification_cycles",
+        "Max clarification Q&A rounds the AC-to-Tests stage may use before its safety cap forces a decision.",
+        "Higher allows more back-and-forth before forcing a decision; lower risks cutting off legitimate clarification early.",
+        "positive integer",
+    ),
+    "MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES": _Setting(
+        "int", "MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES", "3", "clarification_cycles",
+        "Max clarification Q&A rounds the Minimal-Code-to-Green stage may use before its safety cap forces a decision.",
+        "Higher allows more back-and-forth before forcing a decision; lower risks cutting off legitimate clarification early.",
+        "positive integer",
+    ),
+    "ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES": _Setting(
+        "int", "ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES", "2", "clarification_cycles",
+        "Max clarification Q&A rounds the Adversarial Audit stage may use before its safety cap forces a decision.",
+        "Higher allows more back-and-forth before forcing a decision; lower risks cutting off legitimate clarification early.",
+        "positive integer",
+    ),
+    "EXIT_MAX_CLARIFICATION_CYCLES": _Setting(
+        "int", "EXIT_MAX_CLARIFICATION_CYCLES", "2", "clarification_cycles",
+        "Max clarification Q&A rounds the metrics-exit stage may use before its safety cap forces a decision.",
+        "Higher allows more back-and-forth before forcing a decision; lower risks cutting off legitimate clarification early.",
+        "positive integer",
+    ),
+    # Small default: tech-stack detection is autonomous codebase study, not human-clarification-
+    # driven, so this safety cap should rarely if ever trigger.
+    "TECH_STACK_MAX_CLARIFICATION_CYCLES": _Setting(
+        "int", "TECH_STACK_MAX_CLARIFICATION_CYCLES", "2", "clarification_cycles",
+        "Max clarification Q&A rounds the tech-stack detection pass may use before its safety cap forces a decision.",
+        "Rarely triggers (detection is autonomous, not clarification-driven); higher allows more rounds, lower cuts off sooner.",
+        "positive integer",
+    ),
+    # preflight_nodes.py's brownfield startability probe: bounds how long ONE app_discovery
+    # candidate gets to open its listening port before this repo is declared not startable.
+    # Deliberately its OWN, smaller knob rather than reusing E2E_APP_READY_TIMEOUT_SECONDS: this
+    # probe boots one candidate in isolation, synchronously, in the critical path of a human
+    # waiting on the Tech Stack tab.
+    "AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS", "45", "clarification_cycles",
+        "Seconds one app-discovery candidate gets to open its listening port during the Tech Stack tab's startability probe.",
+        "Too short false-flags a slow-starting app as non-startable (disables e2e/App Health until a manual recheck); too long stalls the tab per broken candidate.",
+        "seconds, positive",
+    ),
 
-# Root-caused 2026-09-12: caps how many times POST /api/sessions/actions {action: "targeted-fix"}
-# may run its seeded fix pass against one already-closed session (graph.py's intake_node,
-# GraphState.targeted_fix_attempts). Unlike rewind-to-stage, this action never resets a stage, so
-# nothing else bounds how many times a user could invoke it against the same run -- read by
-# intake_node and used by sessions_api.py's rewind endpoint to refuse once exhausted.
-TARGETED_FIX_MAX_ATTEMPTS = int(os.environ.get("TARGETED_FIX_MAX_ATTEMPTS", "3"))
+    # -- Verify-cycle budgets + attempt caps -----------------------------------------------------
+    # graph.py's StageSpec.max_verify_cycles per stage: the deterministic-gate verify->draft retry
+    # budget. Deliberately SEVEN SEPARATE constants, not one shared cap: each stage's number was
+    # tuned from that stage's own observed failure mode; sharing one constant would let retuning
+    # any single stage silently move every other stage's budget too.
+    "SPEC_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_SPEC_MAX_VERIFY_CYCLES", "5", "verify_cycles",
+        "Max draft<->verify retry laps for the Specification stage before it escalates as failed.",
+        "Higher gives a stuck-but-converging run more laps to resolve (more wall-clock/spend); lower escalates sooner on a run that might still converge.",
+        "positive integer",
+    ),
+    "PLAN_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_PLAN_MAX_VERIFY_CYCLES", "5", "verify_cycles",
+        "Max draft<->verify retry laps for the Plan stage before it escalates as failed.",
+        "Higher gives a stuck-but-converging run more laps to resolve (more wall-clock/spend); lower escalates sooner on a run that might still converge.",
+        "positive integer",
+    ),
+    "AC_TO_TESTS_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_AC_TO_TESTS_MAX_VERIFY_CYCLES", "8", "verify_cycles",
+        "Max draft<->verify retry laps for the AC-to-Tests stage before it escalates as failed.",
+        "Higher gives a stuck-but-converging run more laps to resolve (more wall-clock/spend); lower escalates sooner on a run that might still converge.",
+        "positive integer",
+    ),
+    "MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES", "14", "verify_cycles",
+        "Max draft<->verify retry laps for the Minimal-Code-to-Green stage before it escalates as failed.",
+        "Higher gives a stuck-but-converging coverage run more laps to close the gap (more wall-clock/spend); lower escalates sooner.",
+        "positive integer",
+    ),
+    "REMEDIATION_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_REMEDIATION_MAX_VERIFY_CYCLES", "5", "verify_cycles",
+        "Max draft<->verify retry laps for the Remediation stage before it escalates as failed.",
+        "Higher gives a stuck-but-converging run more laps to resolve (more wall-clock/spend); lower escalates sooner on a run that might still converge.",
+        "positive integer",
+    ),
+    "ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES", "6", "verify_cycles",
+        "Max draft<->verify retry laps for the Adversarial Audit stage before it escalates as failed.",
+        "Higher gives a stuck-but-converging run more laps to resolve (more wall-clock/spend); lower escalates sooner on a run that might still converge.",
+        "positive integer",
+    ),
+    "EXIT_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_EXIT_MAX_VERIFY_CYCLES", "3", "verify_cycles",
+        "Max draft<->verify retry laps for the metrics-exit stage before it escalates as failed.",
+        "Higher gives a stage that failed the pre-exit skill gate more laps to correct it; lower escalates sooner.",
+        "positive integer",
+    ),
+    "TARGETED_FIX_MAX_ATTEMPTS": _Setting(
+        "int", "TARGETED_FIX_MAX_ATTEMPTS", "3", "verify_cycles",
+        "Max times a user may invoke the \"targeted-fix\" action against one already-closed session.",
+        "Higher permits more repeated seeded-fix attempts against the same closed run; lower refuses sooner.",
+        "positive integer",
+    ),
+    "AIDW_E2E_RESET_MAX_ATTEMPTS": _Setting(
+        "int", "AIDW_E2E_RESET_MAX_ATTEMPTS", "3", "verify_cycles",
+        "Max times a user may invoke the \"reset-e2e\" action, which clears e2e/metrics-exit state and re-walks from remediation.",
+        "Higher permits more replays (each a real regression-suite re-run, not just an LLM fix pass) against the same closed run; lower refuses sooner.",
+        "positive integer",
+    ),
+    # make_verify_node's stall-detector: resets the draft session after this many consecutive
+    # verify laps report near-identical feedback/unchanged paths/non-improving coverage.
+    "VERIFY_STALL_LAPS": _Setting(
+        "int", "AIDW_VERIFY_STALL_LAPS", "2", "verify_cycles",
+        "Consecutive non-improving verify laps before the draft session is force-reset.",
+        "Higher tolerates more non-improving laps before resetting (more spend on a possibly-stuck session); lower resets sooner, at the cost of resetting a session that was about to recover.",
+        "positive integer",
+    ),
+    # Deterministic-verify verdicts carrying report["infra_error"] (harness couldn't produce
+    # evidence) burn THIS budget instead of the stage's own max_verify_cycles.
+    "VERIFY_INFRA_RETRY_CAP": _Setting(
+        "int", "AIDW_VERIFY_INFRA_RETRY_CAP", "2", "verify_cycles",
+        "Separate retry budget for verify verdicts caused by a platform/harness failure, not a draft content failure.",
+        "Higher tolerates more infra-caused verify failures before escalating as infra_transient; lower escalates sooner.",
+        "positive integer",
+    ),
 
-# Root-caused 2026-09-21: caps how many times POST /api/sessions/actions {action: "reset-e2e"}
-# may clear e2e/metrics-exit/adversarial-compliance state and let the pipeline re-walk from
-# remediation's rebuild placement (graph.py's intake_node, GraphState.e2e_reset_attempts). A
-# dedicated cap, not TARGETED_FIX_MAX_ATTEMPTS above -- this lever bounds a state RESET (no LLM
-# fix pass, but a real regression-suite re-run each time), a different cost shape than a seeded
-# fix attempt. Read by intake_node and sessions_api.py's reset-e2e handler to refuse once
-# exhausted. Raising it permits more replays against the same closed run before that refusal
-# kicks in; lowering it refuses sooner, at the cost of less room to recover from a genuinely
-# wrongly-skipped e2e that took more than the default 3 tries to shake loose.
-AIDW_E2E_RESET_MAX_ATTEMPTS = int(os.environ.get("AIDW_E2E_RESET_MAX_ATTEMPTS", "3"))
+    # -- E2E cluster (agent/src/e2e_nodes.py) ----------------------------------------------------
+    # The e2e loop's job is to FIX the app, not exit early -- a failing acceptance journey is a
+    # code bug, and escalating hands a human a broken app. The cap exists only as a runaway
+    # backstop, not an expected exit.
+    "E2E_MAX_FIX_CYCLES": _Setting(
+        "int", "E2E_MAX_FIX_CYCLES", "8", "e2e",
+        "Max fix-cycle laps the e2e stage spends trying to make failing acceptance journeys pass.",
+        "Higher gives a genuinely-converging app more laps to get fixed (more spend); lower escalates sooner, handing a human a still-broken app.",
+        "positive integer",
+    ),
+    "TEST_HARDENING_MAX_FIX_CYCLES": _Setting(
+        "int", "TEST_HARDENING_MAX_FIX_CYCLES", "4", "e2e",
+        "Max fix-cycle laps for stable unit/integration-test regressions found after e2e.",
+        "Higher gives more laps to repair regressions in-pipeline; lower escalates sooner as a runaway backstop.",
+        "positive integer",
+    ),
+    "E2E_APP_READY_TIMEOUT_SECONDS": _Setting(
+        "int", "E2E_APP_READY_TIMEOUT_SECONDS", "120", "e2e",
+        "Seconds the e2e stage waits for the app under test to finish booting before treating it as failed to start.",
+        "Higher tolerates a slower-booting app; lower fails faster on a genuinely broken boot, at the risk of false-flagging a slow-but-healthy one.",
+        "seconds, positive",
+    ),
+    "E2E_SUITE_TIMEOUT_SECONDS": _Setting(
+        "int", "E2E_SUITE_TIMEOUT_SECONDS", "1200", "e2e",
+        "Hard wall-clock cap on the whole Playwright verification suite run, via `timeout`.",
+        "Higher tolerates a slower full suite; lower kills a hung suite sooner, at the risk of cutting off a genuinely slow-but-passing run.",
+        "seconds, positive",
+    ),
+    # Caps Playwright's own --workers flag. Raising trades a faster suite for higher peak memory
+    # -- observed live: 2 workers still let the dev server die mid-suite under Docker Desktop
+    # memory pressure; only fully serialized (1) removed it entirely.
+    "AIDW_E2E_PLAYWRIGHT_WORKERS": _Setting(
+        "int", "AIDW_E2E_PLAYWRIGHT_WORKERS", "1", "e2e",
+        "Caps Playwright's own --workers concurrency for the full verification suite run.",
+        "Raising risks the sandboxed dev server crashing mid-suite under memory pressure (observed live even at 2 workers); 1 is safest unless the host has meaningfully more Docker Desktop memory headroom.",
+        "positive integer, 1 recommended unless host has ample memory headroom",
+    ),
+    "AIDW_E2E_REUSE_PROVEN_LAUNCH": _Setting(
+        "bool", "AIDW_E2E_REUSE_PROVEN_LAUNCH", "1", "e2e",
+        "Whether a fix-cycle lap reuses a previously-confirmed start_command/port instead of re-running launch discovery.",
+        "On (default) skips a paid discovery turn per lap once a launch is proven; turn off only if a stale cache is suspected of masking a real app-source change.",
+        "true/false",
+    ),
+    "LIGHTHOUSE_PERF_MIN": _Setting(
+        "int", "LIGHTHOUSE_PERF_MIN", "0", "e2e",
+        "Lighthouse performance score floor (0-100); below it counts as an e2e failure. 0 = report-only, never gates.",
+        "Raising above 0 starts gating on performance, which is timing-noisy on the headless dev-server shell and can burn fix-cycle laps on a number code can't reliably move.",
+        "0-100 (0 disables gating)",
+    ),
+    "LIGHTHOUSE_A11Y_MIN": _Setting(
+        "int", "LIGHTHOUSE_A11Y_MIN", "90", "e2e",
+        "Lighthouse accessibility score floor (0-100); below it counts as an e2e failure and feeds the fix loop.",
+        "Higher enforces stricter accessibility (axe-backed, deterministic, fixable); lower lets weaker accessibility through.",
+        "0-100",
+    ),
+    "LIGHTHOUSE_BLOCKING_AUDITS": _Setting(
+        "frozenset_csv", "LIGHTHOUSE_BLOCKING_AUDITS", "color-contrast", "e2e",
+        "Lighthouse audit ids that block the e2e gate on their own, whatever the aggregate accessibility score.",
+        "Adding an audit id here means a single failure on it blocks merge regardless of overall score; removing one demotes it to score-only. Empty disables entirely.",
+        "comma-separated Lighthouse audit ids, e.g. \"color-contrast\"",
+    ),
+    "AIDW_AUTH_GATE": _Setting(
+        "bool", "AIDW_AUTH_GATE", "1", "e2e",
+        "Operator kill-switch for the whole application-auth enforcement chain (prompt segments + the e2e auth gate).",
+        "On (default) enforces auth; off disables everything auth-related without touching per-repo settings -- the escape hatch if the gate misbehaves.",
+        "true/false",
+    ),
+    "E2E_APP_LOG_PATH": _Setting(
+        "str", "AIDW_E2E_APP_LOG_PATH", "agent-work/e2e-app.log", "e2e",
+        "Sandbox-relative path where the booted app-under-test's stdout+stderr are redirected.",
+        "Changing this only moves where the agent writes/reads inside the sandbox; no effect on suite behavior.",
+        "sandbox-relative file path",
+    ),
+    "E2E_APP_PID_PATH": _Setting(
+        "str", "AIDW_E2E_APP_PID_PATH", "agent-work/e2e-app.pid", "e2e",
+        "Sandbox-relative path where the booted app-under-test's PID is recorded so it can be killed after the suite runs.",
+        "Changing this only moves where the agent writes/reads inside the sandbox; no effect on suite behavior.",
+        "sandbox-relative file path",
+    ),
+    "E2E_PROBE_PREVIEW_CHARS": _Setting(
+        "int", "AIDW_E2E_PROBE_PREVIEW_CHARS", "300", "e2e",
+        "How much of a page-probe's raw output to include in the diagnostic error string when it isn't parseable JSON.",
+        "Higher shows more raw output for diagnosis; this is diagnostics only, never fed to a model.",
+        "positive integer, characters",
+    ),
+    "E2E_CONSOLE_ERRORS_MAX": _Setting(
+        "int", "AIDW_E2E_CONSOLE_ERRORS_MAX", "5", "e2e",
+        "How many captured browser console errors to list per probed route.",
+        "Higher shows more console errors per route to the fix loop; lower truncates the list sooner.",
+        "positive integer",
+    ),
+    "E2E_PAGE_TEXT_PREVIEW_CHARS": _Setting(
+        "int", "AIDW_E2E_PAGE_TEXT_PREVIEW_CHARS", "600", "e2e",
+        "How much of a probed route's rendered page text to show in its failure summary.",
+        "Higher shows more rendered text per route; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "E2E_DEGENERATE_PNG_MAX_BYTES": _Setting(
+        "int", "AIDW_E2E_DEGENERATE_PNG_MAX_BYTES", "8192", "e2e",
+        "A screenshot PNG at or below this byte size is treated as evidence the page painted nothing (blank).",
+        "Raising risks flagging a genuinely tiny-but-real page as blank; lowering risks missing a blank capture a few bytes larger.",
+        "positive integer, bytes",
+    ),
+    "E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS": _Setting(
+        "csv_int", "AIDW_E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS", "3000,10000,15000", "e2e",
+        "Escalating retry ladder (milliseconds between capture attempts) for a client-rendered route that hasn't hydrated yet.",
+        "A longer/higher ladder tolerates slower-hydrating stacks (more wall-clock per route, up to E2E_ROUTES_MAX routes); a shorter one risks capturing an unhydrated page as the final screenshot.",
+        "comma-separated milliseconds, ascending, e.g. \"3000,10000,15000\"",
+    ),
+    "E2E_ROUTES_MAX": _Setting(
+        "int", "AIDW_E2E_ROUTES_MAX", "12", "e2e",
+        "How many routes the screenshot/lighthouse harvest captures per run.",
+        "Higher increases both wall-clock time (each route pays the full hydrate ladder) and exit-report screenshot count; lower captures fewer routes.",
+        "positive integer",
+    ),
+    "E2E_SCREENSHOT_COPY_MAX_FILES": _Setting(
+        "int", "AIDW_E2E_SCREENSHOT_COPY_MAX_FILES", "100", "e2e",
+        "Caps how many suite-generated screenshot PNGs get batched into one copy-out-of-sandbox script.",
+        "Raising risks re-hitting the host OS's command-line length ceiling (an uncaught error); lowering just harvests fewer of the suite's own screenshots (per-route screenshots are unaffected).",
+        "positive integer",
+    ),
+    "E2E_LIGHTHOUSE_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_E2E_LIGHTHOUSE_TIMEOUT_SECONDS", "150", "e2e",
+        "Hard wall-clock cap on one route's Lighthouse run.",
+        "A route that hangs past this is skipped (fail-open, never scored as 0) rather than wedging the whole e2e stage; higher tolerates slower Lighthouse runs.",
+        "seconds, positive",
+    ),
+    "E2E_BLANK_SCREENSHOTS_PREVIEW_MAX": _Setting(
+        "int", "AIDW_E2E_BLANK_SCREENSHOTS_PREVIEW_MAX", "5", "e2e",
+        "How many blank-screenshot filenames to list inline in a failure item before summarizing the rest.",
+        "Higher lists more filenames inline; lower summarizes sooner as \"and N more\".",
+        "positive integer",
+    ),
+    "E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS": _Setting(
+        "int", "AIDW_E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS", "120", "e2e",
+        "Length of one failing Lighthouse audit's title/selector string shown to the e2e fix model.",
+        "Higher shows more detail per failing audit; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "E2E_LIGHTHOUSE_FAILING_AUDITS_MAX": _Setting(
+        "int", "AIDW_E2E_LIGHTHOUSE_FAILING_AUDITS_MAX", "12", "e2e",
+        "How many failing Lighthouse audits survive per route/aggregation into the e2e fix model's context.",
+        "Higher shows more failing audits to the fix model; lower truncates the list sooner.",
+        "positive integer",
+    ),
 
-# e2e's own bespoke-cluster caps (agent/src/e2e_nodes.py): fix-cycle cap (same shape as
-# rebuild.py's max_fix_cycles), app-boot readiness timeout, and the whole playwright suite's own
-# timeout (wrapped in `timeout <n>` so a hung suite can't wedge the sandbox forever).
-# 8: the e2e loop's job is to FIX the app, not to exit early (user directive 2026-08-21) -- a
-# failing acceptance journey is a code bug, and escalating hands a human a broken app. Observed
-# live: 0/6 -> 4/6 in two laps (run 13), so real convergence spans many laps. The cap exists only
-# as a runaway backstop, not as an expected exit.
-E2E_MAX_FIX_CYCLES = int(os.environ.get("E2E_MAX_FIX_CYCLES", "8"))
-# Same philosophy for stable unit/integration-test regressions: repair in-pipeline, cap only as a
-# runaway backstop (see test_hardening_nodes.test_hardening_fix_node).
-TEST_HARDENING_MAX_FIX_CYCLES = int(os.environ.get("TEST_HARDENING_MAX_FIX_CYCLES", "4"))
-E2E_APP_READY_TIMEOUT_SECONDS = int(os.environ.get("E2E_APP_READY_TIMEOUT_SECONDS", "120"))
-E2E_SUITE_TIMEOUT_SECONDS = int(os.environ.get("E2E_SUITE_TIMEOUT_SECONDS", "1200"))
-# e2e_nodes.py's full-suite verification run (`npx playwright test`, no batching -- that's the
-# fix-agent's OWN internal loop, not this final gate check): caps Playwright's own `--workers` flag,
-# overriding whatever the generated `playwright.config.ts` specifies, regardless of host CPU count
-# (Playwright's own default is roughly half the visible cores, which is fine on a bare host but pits
-# N concurrent Chrome instances against the SAME dev server this run also started, inside a sandbox
-# whose Docker Desktop VM may have far less RAM than the host advertises). Observed live (run
-# f0fef8ba): the dev server crashed mid-suite (`ERR_CONNECTION_REFUSED` for the back half of a
-# 71-test run) with the container already at 66% of a 9.5GB VM ceiling before the run even peaked --
-# a wall of misleading failures the e2e_fix prompt's own docstring already names ("a server that
-# dies partway through... looks like many different bugs but is really one dead process"), except
-# no app-code fix can address it since the concurrency causing it is THIS invocation's, not the
-# app's. Raising this trades a faster suite for higher peak memory; 1 is safest, higher values need
-# more Docker Desktop memory headroom than a typical dev machine allocates by default. Confirmed
-# live on the same run: 2 workers still let the dev server die mid-suite (23
-# ERR_CONNECTION_REFUSED failures out of 67) -- only fully serialized (1) removes the concurrent-
-# Chrome-instance pressure entirely; raise this only on a machine with meaningfully more headroom.
-AIDW_E2E_PLAYWRIGHT_WORKERS = int(os.environ.get("AIDW_E2E_PLAYWRIGHT_WORKERS", "1"))
-# Operator kill-switch for e2e_run_node's proven-launch cache: when a previous fix-cycle lap this
-# stage attempt already booted a start_command/port pair and confirmed it answers, on by default
-# this skips the paid GHCP launch-discovery turn on the next lap and reboots straight from the
-# cached command (the reboot itself is never skipped). "0" forces every lap to re-run discovery,
-# same escape hatch shape as AIDW_AUTH_GATE below -- for a deployment where a stale cache is
-# suspected of masking a real app-source change the fix loop should have re-discovered.
-AIDW_E2E_REUSE_PROVEN_LAUNCH = os.environ.get("AIDW_E2E_REUSE_PROVEN_LAUNCH", "1").strip().lower() not in ("0", "false", "no", "off", "")
-# Lighthouse (performance + accessibility) runs inside e2e_run_node's live-app window -- the ONE
-# place a served app exists (deliberately NOT a repo_scan tool: repo_scan's contract is offline,
-# no running app). Worst-of-routes scores (0-100) below either floor count as an e2e failure and
-# feed the same e2e_fix loop/cap above with the failing audit titles. 0 disables that gate (scores
-# still measured and reported). Defaults: a11y gated at 90 (axe-backed, deterministic, and its
-# failing audits are concrete code fixes an LLM lap can actually make); perf REPORT-ONLY by
-# default -- dev-server numbers on the headless shell are timing-noisy, and a score hovering near
-# a floor flip-flops across fix laps, burning up to E2E_MAX_FIX_CYCLES paid model turns on a
-# number a code change can't reliably move (2026-08-24 audit). Set a floor explicitly to gate it.
-LIGHTHOUSE_PERF_MIN = int(os.environ.get("LIGHTHOUSE_PERF_MIN", "0"))
-LIGHTHOUSE_A11Y_MIN = int(os.environ.get("LIGHTHOUSE_A11Y_MIN", "90"))
-# Audit ids that block the e2e gate on their own, whatever the aggregate score: an accessibility
-# score of 93 sailed past the floor while `color-contrast` scored 0 on a primary button (run
-# d16959d3) -- a WCAG AA failure on a delivered UI is a defect, not a rounding error. Comma-separated
-# Lighthouse audit ids; empty disables. Each is a concrete, selector-named fix the e2e_fix lap can make.
-LIGHTHOUSE_BLOCKING_AUDITS = frozenset(
-    a.strip() for a in os.environ.get("LIGHTHOUSE_BLOCKING_AUDITS", "color-contrast").split(",") if a.strip()
-)
+    # -- Prompt-facing truncation (kept bounded -- see the migration plan's "Truncation family"
+    # research: this codebase has zero context-window/token-limit handling, so unbounded
+    # prompt-facing text risks a silent, expensive misattribution as a content failure) ----------
+    "REBUILD_OUTPUT_TAIL_CHARS": _Setting(
+        "int", "AIDW_REBUILD_OUTPUT_TAIL_CHARS", "8000", "truncation",
+        "Per-command build-output capture length fed to the rebuild fix loop's prompt.",
+        "Higher shows more of a long build log to the fix model (more prompt size/cost); lower risks the model never seeing errors outside the tail.",
+        "positive integer, characters",
+    ),
+    "REBUILD_OUTPUT_COMBINED_TAIL_CHARS": _Setting(
+        "int", "AIDW_REBUILD_OUTPUT_COMBINED_TAIL_CHARS", "16000", "truncation",
+        "Combined build-output capture length across all commands fed to the rebuild fix loop's prompt.",
+        "Higher shows more combined output to the fix model (more prompt size/cost); lower risks truncating a multi-command failure's later errors.",
+        "positive integer, characters",
+    ),
+    "READ_TOOL_DEFAULT_WINDOW_LINES": _Setting(
+        "int", "AIDW_READ_TOOL_DEFAULT_WINDOW_LINES", "2000", "truncation",
+        "The CLI's own default Read-tool line window, used to compute whether an unparameterized read counts as a full-file read.",
+        "Should match the CLI's actual documented default; too low makes a genuine full-file read register as incomplete, too high lets a partial read pass as complete.",
+        "positive integer, lines; should match the coding CLI's own documented default",
+    ),
+    "TEST_COVERAGE_OUTPUT_HEAD_CHARS": _Setting(
+        "int", "AIDW_TEST_COVERAGE_OUTPUT_HEAD_CHARS", "750", "truncation",
+        "Head portion of one coverage-command's captured stdout/stderr, before it's joined into a failure summary.",
+        "Higher preserves more of the command's early output; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "TEST_COVERAGE_OUTPUT_TAIL_CHARS": _Setting(
+        "int", "AIDW_TEST_COVERAGE_OUTPUT_TAIL_CHARS", "750", "truncation",
+        "Tail portion of one coverage-command's captured stdout/stderr, before it's joined into a failure summary.",
+        "Higher preserves more of the command's late output; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "TEST_COVERAGE_FAILURE_DETAIL_HEAD_CHARS": _Setting(
+        "int", "AIDW_TEST_COVERAGE_FAILURE_DETAIL_HEAD_CHARS", "150", "truncation",
+        "Head portion of one coverage-command's one-line failure_detail summary.",
+        "Higher preserves more detail per command's summary line; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "TEST_COVERAGE_FAILURE_DETAIL_TAIL_CHARS": _Setting(
+        "int", "AIDW_TEST_COVERAGE_FAILURE_DETAIL_TAIL_CHARS", "150", "truncation",
+        "Tail portion of one coverage-command's one-line failure_detail summary.",
+        "Higher preserves more detail per command's summary line; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "REBUILD_GATING_FINDINGS_MAX": _Setting(
+        "int", "AIDW_REBUILD_GATING_FINDINGS_MAX", "10", "truncation",
+        "How many rebuild scan-delta gating findings get listed before summarizing the rest, in a message the rebuild fix-loop prompt also reads.",
+        "Higher shows more findings inline to the fix model; lower summarizes sooner as \"...and N more\".",
+        "positive integer",
+    ),
+    "REBUILD_FINDING_MESSAGE_CHARS": _Setting(
+        "int", "AIDW_REBUILD_FINDING_MESSAGE_CHARS", "110", "truncation",
+        "How much of one gating finding's own title/message survives per line in the rebuild gate summary.",
+        "Higher shows more detail per finding; lower truncates each line sooner.",
+        "positive integer, characters",
+    ),
+    "GRAPH_FAILED_TESTS_MAX": _Setting(
+        "int", "AIDW_GRAPH_FAILED_TESTS_MAX", "10", "truncation",
+        "How many failed-test entries get inlined into the metrics-report/e2e-outcome prompt messages.",
+        "Higher shows more failing tests to the model; lower truncates the list sooner.",
+        "positive integer",
+    ),
+    "GRAPH_METRICS_JSON_MAX_CHARS": _Setting(
+        "int", "AIDW_GRAPH_METRICS_JSON_MAX_CHARS", "8000", "truncation",
+        "JSON-serialization budget for the metrics-compute payload shown to the model.",
+        "Higher lets the model see more of a large metrics payload (more prompt size/cost); lower truncates it sooner (honestly, via a marked wrapper, not mid-token).",
+        "positive integer, characters",
+    ),
+    "GRAPH_E2E_SUMMARY_JSON_MAX_CHARS": _Setting(
+        "int", "AIDW_GRAPH_E2E_SUMMARY_JSON_MAX_CHARS", "4000", "truncation",
+        "JSON-serialization budget for the e2e-summary payload shown to the model.",
+        "Higher lets the model see more of a large e2e summary (more prompt size/cost); lower truncates it sooner (honestly, via a marked wrapper, not mid-token).",
+        "positive integer, characters",
+    ),
+    "GRAPH_BOUNDED_JSON_MARGIN_CHARS": _Setting(
+        "int", "AIDW_GRAPH_BOUNDED_JSON_MARGIN_CHARS", "240", "truncation",
+        "Reserve space the honest-JSON-truncation helper keeps for its own wrapper keys around a clipped preview.",
+        "Must stay big enough that the wrapper itself never exceeds the overall JSON size limit; only change alongside GRAPH_METRICS_JSON_MAX_CHARS/GRAPH_E2E_SUMMARY_JSON_MAX_CHARS.",
+        "positive integer, characters",
+    ),
+    "GRAPH_INFRA_ERROR_CHARS": _Setting(
+        "int", "AIDW_GRAPH_INFRA_ERROR_CHARS", "2000", "truncation",
+        "How much of a raw infra-exhaustion exception message is kept as the stage's last_infra_error.",
+        "Higher preserves more of the exception text; lower truncates it sooner (tail-only, since this is a short exception string, not a list).",
+        "positive integer, characters",
+    ),
+    "TEST_COVERAGE_GAP_DETAIL_MAX": _Setting(
+        "int", "AIDW_TEST_COVERAGE_GAP_DETAIL_MAX", "6", "truncation",
+        "How many coverage gaps get a quoted source excerpt, and how many branch line numbers per gap, in verify feedback.",
+        "Higher shows more gap detail to the model (avoiding a full coverage-report re-read); lower truncates the list sooner.",
+        "positive integer",
+    ),
+    "DIAGRAM_ERROR_SUMMARY_HEAD_CHARS": _Setting(
+        "int", "AIDW_DIAGRAM_ERROR_SUMMARY_HEAD_CHARS", "2000", "truncation",
+        "Head portion of a diagram-render error's captured output fed into the next draft prompt.",
+        "Higher preserves more of the renderer's own error output (its actionable \"parse error\" text is typically at the start); lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "DIAGRAM_ERROR_SUMMARY_TAIL_CHARS": _Setting(
+        "int", "AIDW_DIAGRAM_ERROR_SUMMARY_TAIL_CHARS", "2000", "truncation",
+        "Tail portion of a diagram-render error's captured output fed into the next draft prompt.",
+        "Higher preserves more of the renderer's own error output; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "DIAGRAM_ERROR_SUMMARY_LINES_MAX": _Setting(
+        "int", "AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX", "10", "truncation",
+        "How many lines of a diagram-render error get joined into the summary shown to the model.",
+        "Higher shows more error lines; lower truncates the summary sooner.",
+        "positive integer",
+    ),
+    "DIAGRAM_ERROR_SUMMARY_JOINED_CHARS": _Setting(
+        "int", "AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS", "700", "truncation",
+        "Overall character cap on the joined diagram-render error summary shown to the model.",
+        "Higher shows more of the joined summary; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
 
-# Operator kill-switch for the whole application-auth enforcement chain (prompt segments + the
-# e2e auth gate). On by default; "0" disables everything auth-related without touching per-repo
-# settings -- the escape hatch for a deployment where the gate misbehaves.
-AIDW_AUTH_GATE = os.environ.get("AIDW_AUTH_GATE", "1").strip().lower() not in ("0", "false", "no", "off", "")
+    # -- Low-stakes but kept (DB/UI-facing, trivial cost either way) -----------------------------
+    "EXIT_FAILURE_DETAIL_HEAD_CHARS": _Setting(
+        "int", "AIDW_EXIT_FAILURE_DETAIL_HEAD_CHARS", "1250", "truncation",
+        "Head portion of the \"Terminal failure\" code block in the human-facing final exit report.",
+        "Higher preserves more of the failure detail (which can be a findings LIST); lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "EXIT_FAILURE_DETAIL_TAIL_CHARS": _Setting(
+        "int", "AIDW_EXIT_FAILURE_DETAIL_TAIL_CHARS", "1250", "truncation",
+        "Tail portion of the \"Terminal failure\" code block in the human-facing final exit report.",
+        "Higher preserves more of the failure detail; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "E2E_BOOT_FAILURE_LOG_HEAD_CHARS": _Setting(
+        "int", "AIDW_E2E_BOOT_FAILURE_LOG_HEAD_CHARS", "1500", "truncation",
+        "Head portion of the app-boot readiness failure description embedded in a failed e2e test's error field.",
+        "Higher preserves more of the boot failure text; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "E2E_BOOT_FAILURE_LOG_TAIL_CHARS": _Setting(
+        "int", "AIDW_E2E_BOOT_FAILURE_LOG_TAIL_CHARS", "1500", "truncation",
+        "Tail portion of the app-boot readiness failure description embedded in a failed e2e test's error field.",
+        "Higher preserves more of the boot failure text; lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "E2E_FIX_APP_LOG_HEAD_CHARS": _Setting(
+        "int", "AIDW_E2E_FIX_APP_LOG_HEAD_CHARS", "2000", "truncation",
+        "Head portion of the app log tail handed directly to the e2e fix model's own prompt.",
+        "Higher shows the fix model more of the app log (more prompt size/cost); lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "E2E_FIX_APP_LOG_TAIL_CHARS": _Setting(
+        "int", "AIDW_E2E_FIX_APP_LOG_TAIL_CHARS", "2000", "truncation",
+        "Tail portion of the app log tail handed directly to the e2e fix model's own prompt.",
+        "Higher shows the fix model more of the app log (more prompt size/cost); lower truncates it sooner.",
+        "positive integer, characters",
+    ),
+    "REBUILD_LEDGER_DETAIL_CHARS": _Setting(
+        "int", "AIDW_REBUILD_LEDGER_DETAIL_CHARS", "1500", "truncation",
+        "How much of the TDD-red gate's blocking detail (a LIST of wrongly-passed tests) is recorded in the durable ledger.",
+        "Higher records more of the list a human later reviews; lower risks recording that the gate fired without recording what it found.",
+        "positive integer, characters",
+    ),
+    "REBUILD_ESCALATE_FEEDBACK_CHARS": _Setting(
+        "int", "AIDW_REBUILD_ESCALATE_FEEDBACK_CHARS", "1000", "truncation",
+        "Length of the one-line failure feedback recorded for the session's DB failure_message once the rebuild fix-cycle cap is exhausted.",
+        "Higher preserves more detail in the stored failure message; lower truncates it sooner. session_store.py's own _build_failure reads this same setting (unified during the Org Settings migration -- it used to have an independent hardcoded 500-char cap that silently shadowed this value).",
+        "positive integer, characters",
+    ),
+    "REBUILD_PASSED_TESTS_PREVIEW_MAX": _Setting(
+        "int", "AIDW_REBUILD_PASSED_TESTS_PREVIEW_MAX", "10", "truncation",
+        "How many wrongly-passed test names the TDD-red gate verdict lists inline before summarizing the rest.",
+        "Higher lists more test names inline; lower summarizes sooner as \"...and N more\".",
+        "positive integer",
+    ),
+    "GIT_OPS_HTTP_TIMEOUT_SECONDS": _Setting(
+        "float", "AIDW_GIT_OPS_HTTP_TIMEOUT_SECONDS", "30.0", "truncation",
+        "Shared httpx client timeout for short outbound GitHub/Anthropic API calls (open/update PR, delete branch, repo create, repo lookup, credential validation).",
+        "Higher tolerates a slower API response before giving up; lower fails faster on a genuine outage. One setting for every short-lived httpx.AsyncClient in this codebase, not one per call site.",
+        "seconds, positive",
+    ),
 
-# make_verify_node's stall-detector (graph.py's _detect_verify_stall): resets the draft session
-# after this many consecutive verify laps report near-identical feedback, an unchanged
-# changed_paths set, or non-improving coverage (whichever signals apply to the stage), on top of
-# the existing fabrication/skipped-skill triggers. Operational kill-switch if the heuristic
-# misfires -- see infra_retry.py's own env vars for the matching draft/audit-side knob.
-VERIFY_STALL_LAPS = int(os.environ.get("AIDW_VERIFY_STALL_LAPS", "2"))
+    # -- Test-coverage gate scan caps -------------------------------------------------------------
+    "TEST_COVERAGE_BACKEND_FILES_MAX": _Setting(
+        "int", "AIDW_TEST_COVERAGE_BACKEND_FILES_MAX", "25", "coverage_gate",
+        "How many candidate backend files the coverage gate reads/scans per repo, per gate run, when checking for a hosted backend framework.",
+        "Higher widens what a large monorepo's gate can see (more sandbox round-trips per verify lap); lower may miss the framework in a very large repo.",
+        "positive integer",
+    ),
+    "TEST_COVERAGE_OTEL_EXTRA_FILES_MAX": _Setting(
+        "int", "AIDW_TEST_COVERAGE_OTEL_EXTRA_FILES_MAX", "14", "coverage_gate",
+        "How many extra candidate files the coverage gate reads/scans per repo when checking for OpenTelemetry instrumentation.",
+        "Higher widens what the gate can see (more sandbox round-trips); lower may miss instrumentation in a very large repo.",
+        "positive integer",
+    ),
+    "TEST_COVERAGE_FRONTEND_CANDIDATES_MAX": _Setting(
+        "int", "AIDW_TEST_COVERAGE_FRONTEND_CANDIDATES_MAX", "30", "coverage_gate",
+        "How many candidate frontend files the coverage gate reads/scans per repo when checking for a frontend dependency.",
+        "Higher widens what the gate can see (more sandbox round-trips); lower may miss the dependency in a very large repo.",
+        "positive integer",
+    ),
+    "TEST_COVERAGE_MANIFESTS_MAX": _Setting(
+        "int", "AIDW_TEST_COVERAGE_MANIFESTS_MAX", "10", "coverage_gate",
+        "How many package-manifest files the coverage gate reads per repo, per gate run.",
+        "Higher widens what a large monorepo's gate can see; lower may miss a manifest in a very large repo.",
+        "positive integer",
+    ),
+    "TEST_COVERAGE_CONTRACT_ENTRIES_MAX": _Setting(
+        "int", "AIDW_TEST_COVERAGE_CONTRACT_ENTRIES_MAX", "10", "coverage_gate",
+        "How many coverage-contract entries get parsed per replay attempt.",
+        "Higher processes more entries per attempt (dozens is itself suspect per the gate's own design); lower processes fewer.",
+        "positive integer",
+    ),
+    "DESIGN_TOKENS_GATE_FILES_MAX": _Setting(
+        "int", "AIDW_DESIGN_TOKENS_GATE_FILES_MAX", "40", "coverage_gate",
+        "How many style-bearing source files the design-tokens gate reads/scans per gate run for off-palette color literals.",
+        "Higher widens how much of a large repo's touched UI code the gate can see (more sandbox round-trips); lower may miss violations in a very large repo.",
+        "positive integer",
+    ),
+    # MIN_COVERAGE_PERCENT is deliberately NOT here -- see gates/coverage_parsing.py:50's own
+    # comment. Its real enforcement source is that sandbox-mirrored module (coverage_parsing.py
+    # reads MIN_COVERAGE_PERCENT itself for pass/fail comparisons, and is baked byte-identical into
+    # the sandbox image); config.py exposing a SEPARATE "live" copy here would be disconnected from
+    # what actually gates a build (test_coverage_gate.py imports the real one directly from
+    # coverage_parsing.py, not from config.py) -- exactly the kind of "looks configurable but
+    # isn't" trap this migration exists to avoid. Stays a plain env-var setting (today's existing
+    # tier), same category as gates/test_quality_checks.py's cluster below.
 
-# Deterministic-verify verdicts that carry report["infra_error"] (the harness could not produce
-# evidence -- e.g. ac_coverage_gate's test-run tee/artifacts missing) burn THIS budget instead of
-# the stage's max_verify_cycles: the draft didn't fail a check, the platform failed to check.
-# Observed live (2026-08-30, greenfield angular-dotnet): identical infra verdicts consumed real
-# verify laps until halt. On exhaustion the run escalates as failure_type="infra_transient".
-VERIFY_INFRA_RETRY_CAP = int(os.environ.get("AIDW_VERIFY_INFRA_RETRY_CAP", "2"))
+    # -- Coverage contract / security scan ---------------------------------------------------------
+    "COVERAGE_COMMANDS_PATH": _Setting(
+        "str", "AIDW_COVERAGE_COMMANDS_PATH", ".ai-dev-workflow/coverage-commands.json", "coverage_gate",
+        "Sandbox-relative path for the model-authored coverage-command contract file.",
+        "Changing this only moves where the agent writes/reads the contract inside the sandbox; no effect on coverage logic.",
+        "sandbox-relative file path",
+    ),
+    # CONTRACT_FORMATS is also deliberately NOT here (found during implementation): it has zero
+    # real consumers anywhere in this codebase (test_coverage_gate.py's own re-export of it was
+    # dead code, removed during this migration) -- coverage_parsing.py's sandbox-side copy is a
+    # hardcoded frozenset, not even env-var-configurable, so this setting never actually gated
+    # anything. Not migrated, not kept as a fallback -- it was dead before this migration too.
+    "TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS": _Setting(
+        "int", "REPO_SCAN_COVERAGE_TIMEOUT_SECONDS", "600", "coverage_gate",
+        "Wall-clock cap on replaying ONE coverage command during contract verification.",
+        "Higher tolerates a slower coverage run; lower kills a hung one sooner.",
+        "seconds, positive",
+    ),
+    "AIDW_SECURITY_CRITICAL_TOOL_NAMES": _Setting(
+        "csv", "AIDW_SECURITY_CRITICAL_TOOL_NAMES", "gitleaks,semgrep,osv-scanner,trivy", "coverage_gate",
+        "Security-scan tool names whose FAILURE (not just a finding) blocks merge_ready outright.",
+        "Adding a tool name means its crash now blocks merge; removing one demotes that tool's failure to a health-score-only discount.",
+        "comma-separated security-tool names",
+    ),
+    "AIDW_TOOL_PROBE_RETRY_COUNT": _Setting(
+        "int", "AIDW_TOOL_PROBE_RETRY_COUNT", "1", "coverage_gate",
+        "Retry count for a security-scan tool's `--version` probe before marking it status=missing.",
+        "Higher spends more wall-clock per flaky tool before giving up; 0 disables retrying entirely.",
+        "non-negative integer",
+    ),
+    "AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS": _Setting(
+        "float", "AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS", "3.0", "coverage_gate",
+        "Delay between a security-scan tool's version-probe retry attempts.",
+        "Higher gives a transient fault more time to clear between attempts, at the same per-attempt cost.",
+        "seconds, non-negative",
+    ),
 
-# rebuild.py's build-output capture for its fix loop (_replay_build's per-command cap, and the
-# combined cap applied both there and again when rebuild_node stores rb["last_stdout_tail"]/
-# last_stderr_tail -- the two fields the fix prompt actually reads). Observed live (2026-09-09,
-# greenfield angular-dotnet): a 126-error `dotnet build` with a 2000/4000-char cap left the fix
-# model seeing only its last ~10 errors every lap, so 3 fix cycles never converged -- the errors
-# outside the tail were structurally invisible, not merely deprioritized. Widened, not removed:
-# still bounded so a truly pathological log can't blow up prompt size/cost unbounded.
-REBUILD_OUTPUT_TAIL_CHARS = int(os.environ.get("AIDW_REBUILD_OUTPUT_TAIL_CHARS", "8000"))
-REBUILD_OUTPUT_COMBINED_TAIL_CHARS = int(os.environ.get("AIDW_REBUILD_OUTPUT_COMBINED_TAIL_CHARS", "16000"))
+    # -- Sandbox/docker -----------------------------------------------------------------------------
+    "SANDBOX_PROVISION_RETRY_ATTEMPTS": _Setting(
+        "int", "AIDW_SANDBOX_PROVISION_RETRY_ATTEMPTS", "2", "sandbox",
+        "Retry count when a sandbox container starts but its CLI tool never responds within its own readiness deadline.",
+        "Higher tolerates a slower-starting container; retrying a container that truly never comes up just spends more time.",
+        "non-negative integer",
+    ),
+    "SANDBOX_DOCKER_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_SANDBOX_DOCKER_TIMEOUT_SECONDS", "30", "sandbox",
+        "How long a single routine `docker` admin command (inspect/rm/stop/start/cp/exec) may run before being treated as wedged.",
+        "Lower is safer: a wedged call here holds a shared lock, freezing every OTHER session's provisioning/touch/liveness too, not just the stuck one. Higher tolerates a slower Docker daemon.",
+        "seconds, positive",
+    ),
+    "SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS", "600", "sandbox",
+        "Timeout for docker operations legitimately allowed to run long (e.g. `docker create`'s first-time image pull, reading back a large turn's stdout/stderr).",
+        "Higher tolerates a slow image pull or large output read; lower risks cutting one off mid-operation.",
+        "seconds, positive",
+    ),
 
-# The same tail-only-truncation bug the pair above fixes for rebuild.py, found live in 4 more
-# spots by the follow-up audit that produced this comment. Each pair below uses
-# text_truncate.truncate_middle to keep BOTH ends of the captured text instead of just the tail,
-# so effect-of-change is identical in shape everywhere: raising either HEAD or TAIL widens how
-# much of that end survives; the total (HEAD+TAIL) is the point below which nothing is cut at all.
+    # -- Session/run activity ------------------------------------------------------------------------
+    "RUN_SUBSCRIBER_QUEUE_MAXSIZE": _Setting(
+        "int", "AIDW_RUN_SUBSCRIBER_QUEUE_MAXSIZE", "500", "misc",
+        "How many published graph events one attached SSE subscriber (a browser tab) may have queued before the oldest is dropped.",
+        "Higher lets a briefly slow/backgrounded tab fall further behind before losing early events (more memory held per stalled subscriber); lower drops events sooner under load. Never affects the background graph task itself.",
+        "positive integer",
+    ),
 
-# claude_chat_model.py's read_full_file_reads: the Claude CLI's own Read tool default read window
-# (line count returned when a call carries no explicit `limit`), used to compute the covered line
-# range of an unparameterized Read call when proving a session read a whole file. Matches the CLI's
-# documented default of up to 2000 lines -- raise this only if that CLI default itself changes;
-# setting it too low would make a genuine full-file single read register as incomplete and reject a
-# stage that actually did the work, too high would let a partial read pass as complete.
-READ_TOOL_DEFAULT_WINDOW_LINES = int(os.environ.get("AIDW_READ_TOOL_DEFAULT_WINDOW_LINES", "2000"))
+    # -- Runtime/misc -------------------------------------------------------------------------------
+    "CLI_AGENT_TURN_TIMEOUT_SECONDS": _Setting(
+        "int", "CLI_AGENT_TURN_TIMEOUT_SECONDS", "5400", "misc",
+        "Timeout for one CLI-based provider turn (Claude Code or GitHub Copilot, per-turn subprocess exec inside the sandbox).",
+        "Generous by design -- a runaway backstop, not an expected exit. Lower risks killing a genuinely complex turn (multiple tool calls, long reasoning) before it finishes.",
+        "seconds, positive",
+    ),
 
-# gates/test_coverage_gate.py's _replay_coverage_contract: one coverage-command's raw stdout/
-# stderr, captured before it's joined into failure_detail below. Read by _run_coverage_via_ghcp's
-# next discovery attempt. 750/750 (1500 total) matches the pre-existing tail-only budget; shape
-# fixed, size unchanged -- unconfirmed whether this one has bitten a real run yet (unlike
-# rebuild.py's), so no widen without an observed incident.
-TEST_COVERAGE_OUTPUT_HEAD_CHARS = int(os.environ.get("AIDW_TEST_COVERAGE_OUTPUT_HEAD_CHARS", "750"))
-TEST_COVERAGE_OUTPUT_TAIL_CHARS = int(os.environ.get("AIDW_TEST_COVERAGE_OUTPUT_TAIL_CHARS", "750"))
+    # -- Newly centralized (previously scattered as independent env-var constants in other files;
+    # folded in here per the Org Settings migration plan's task 5) -----------------------------
+    "EVAL_ATTEMPTS": _Setting(
+        "int", "EVAL_ATTEMPTS", "3", "misc",
+        "How many times the AC-Eval layer (ac_eval.py) re-runs each test suite to detect flakiness.",
+        "Higher gives a more reliable flake signal at the cost of more sandbox round-trips per scan; 1 makes flakiness invisible.",
+        "positive integer",
+    ),
+    "EVAL_TIMEOUT_SECONDS": _Setting(
+        "int", "EVAL_TIMEOUT_SECONDS", "900", "misc",
+        "Wall-clock cap on one AC-Eval suite invocation.",
+        "Higher tolerates a slower suite; lower kills a hung one sooner.",
+        "seconds, positive",
+    ),
+    "INFRA_RETRY_ATTEMPTS": _Setting(
+        "int", "AIDW_LLM_INFRA_RETRY_ATTEMPTS", "3", "misc",
+        "Retry count for a draft/audit/fix LLM call that failed with an infra-shaped error (quota, timeout, transient disconnect), not a content failure.",
+        "Higher tolerates more transient infra failures before giving up; lower gives up sooner. Separate from a stage's own clarification/verify-cycle budgets on purpose -- an infra event should not shrink those.",
+        "positive integer",
+    ),
+    "INFRA_RETRY_BACKOFF_SECONDS": _Setting(
+        "csv_float", "AIDW_LLM_INFRA_RETRY_BACKOFF_SECONDS", "5,20,60", "misc",
+        "Backoff delay (seconds) before each successive infra-retry attempt.",
+        "A quota/rate-limit condition does not clear in 0 seconds -- longer delays give more time to clear, at the cost of slower recovery; the list's last value repeats for any attempt beyond its length.",
+        "comma-separated seconds, e.g. \"5,20,60\"",
+    ),
+    "TEST_HARDENING_TOTAL_ATTEMPTS": _Setting(
+        "int", "TEST_HARDENING_TOTAL_ATTEMPTS", "3", "misc",
+        "How many times test-hardening re-runs a test command (1 initial + N-1 retries) to accumulate per-attempt outcomes for flake detection.",
+        "Higher gives a more reliable flake signal at the cost of more sandbox round-trips per stage run; 1 makes flakiness invisible.",
+        "positive integer",
+    ),
+    "MIN_NON_E2E_TESTS_PER_AC_RED": _Setting(
+        "int", "MIN_NON_E2E_TESTS_PER_AC_RED", "0", "ac_coverage",
+        "Minimum below-browser (unit/integration) tests required per acceptance criterion at the AC-to-Tests (RED/TDD) phase, before any implementation exists.",
+        "Raise above 0 only with evidence the drafting model has started writing below-browser tests at this phase -- this is deliberately a lighter RED-phase floor than the full post-implementation requirement.",
+        "non-negative integer",
+    ),
 
-# gates/test_coverage_gate.py's _run_coverage_via_ghcp: the one-line-per-command failure_detail
-# summary joined from the (already-capped) tails above -- this used to re-truncate that value a
-# SECOND time, tail-only, the exact "truncated twice" shape rebuild.py had. 150/150 (300 total)
-# matches the pre-existing budget for this per-entry summary line.
-TEST_COVERAGE_FAILURE_DETAIL_HEAD_CHARS = int(os.environ.get("AIDW_TEST_COVERAGE_FAILURE_DETAIL_HEAD_CHARS", "150"))
-TEST_COVERAGE_FAILURE_DETAIL_TAIL_CHARS = int(os.environ.get("AIDW_TEST_COVERAGE_FAILURE_DETAIL_TAIL_CHARS", "150"))
+    # -- repo_scan.py (agent-side only, not sandbox-mirrored -- safe for the live tier) -----------
+    # MAX_DUPLICATION_PERCENT: unified from two independent declarations (repo_scan.py's own
+    # QUALITY_MAX_DUPLICATION_PERCENT and metrics_nodes.py's own MAX_DUPLICATION_PERCENT, same
+    # conceptual threshold against the same jscpd-measured value) onto the env var repo_scan.py's
+    # primary scan-time gate already used.
+    "MAX_DUPLICATION_PERCENT": _Setting(
+        "float", "QUALITY_MAX_DUPLICATION_PERCENT", "3.0", "repo_scan",
+        "Code-duplication percentage (jscpd-measured) above which repo_scan's gate blocks, and metrics_nodes' regression check also reads.",
+        "Higher tolerates more duplicated code before blocking; lower blocks sooner. Both consumers now read this one value -- previously two independent env vars could disagree.",
+        "0-100",
+    ),
+    "LIZARD_MAX_CCN": _Setting(
+        "int", "LIZARD_MAX_CCN", "20", "repo_scan",
+        "Cyclomatic complexity above which a function is a HARD gating finding (blocks the run).",
+        "20, not lizard's own warn-level 15: 15 flags ordinary dense-but-flat code (observed live: a CCN-17 function ping-ponged between fixer and gate). Lower blocks more functions; higher lets denser code through.",
+        "positive integer",
+    ),
+    "LIZARD_HIGH_CCN": _Setting(
+        "int", "LIZARD_HIGH_CCN", "25", "repo_scan",
+        "Cyclomatic complexity above LIZARD_MAX_CCN at which a function is flagged as a real complexity \"monster\", not just reviewer-attention territory.",
+        "Higher narrows what counts as a monster; lower widens it.",
+        "positive integer, should stay above LIZARD_MAX_CCN",
+    ),
+    "CHURN_WINDOW_DAYS": _Setting(
+        "int", "REPO_SCAN_CHURN_WINDOW_DAYS", "365", "repo_scan",
+        "Lookback window (days) for the git churn/ownership measurement.",
+        "Longer captures more history (slower git log, may include since-rewritten code); shorter focuses on recent activity.",
+        "positive integer, days",
+    ),
+    "DOC_COVERAGE_MIN_PERCENT": _Setting(
+        "float", "DOC_COVERAGE_MIN_PERCENT", "50.0", "repo_scan",
+        "Minimum docstring-coverage percentage (interrogate) before it's flagged as a maintainability gap.",
+        "A lenient first-cut floor by design, not a calibrated target (interrogate's own README default is 80%) -- higher fires on more repos with partial documentation; lower only catches severe gaps.",
+        "0-100",
+    ),
+    "SECURITY_SEVERITY_FLOOR": _Setting(
+        "str", "SECURITY_SEVERITY_FLOOR", "medium", "repo_scan",
+        "Minimum severity a security finding must reach to be gating (block merge).",
+        "Lower (e.g. \"low\") blocks on more findings; higher (e.g. \"high\"/\"critical\") only blocks on the most severe ones.",
+        "one of: info, low, medium, high, critical",
+    ),
+    "MIN_SECURITY_COVERAGE": _Setting(
+        "float", "HEALTH_MIN_SECURITY_COVERAGE", "1.0", "repo_scan",
+        "Fraction of applicable security tools that must complete before the health score applies no coverage-based haircut.",
+        "1.0 means any failed security tool costs something; lower tolerates more tool failures before discounting the score. A smooth sqrt(fraction) haircut below this point, never a cliff.",
+        "0.0-1.0",
+    ),
+    "METRIC_REGRESSION_TOLERANCE": _Setting(
+        "float", "METRIC_REGRESSION_TOLERANCE", "1.0", "repo_scan",
+        "How much a coverage/quality metric may worsen between scans before metrics_nodes treats it as a real regression, not scan noise.",
+        "Higher tolerates more movement before blocking (jscpd is LOC-sensitive, tool DBs drift); lower blocks on smaller regressions.",
+        "non-negative float",
+    ),
+    "HEALTH_REGRESSION_TOLERANCE": _Setting(
+        "float", "HEALTH_REGRESSION_TOLERANCE", "2.0", "repo_scan",
+        "How much the App Health score may drop between scans before metrics_nodes treats it as a real regression.",
+        "Deliberately kept below one new medium-severity finding's own score penalty (3), so a single real new medium-severity finding still blocks regardless of this tolerance. Higher tolerates more score movement; lower blocks sooner.",
+        "non-negative float",
+    ),
+    # Health score v2/v3 weights -- already independently env-backed, one setting per subscore.
+    # Read via a function (_health_weights() in repo_scan.py), not a frozen module-level dict:
+    # like graph.py's STAGES, a plain dict built once at import time would never reflect a
+    # per-session-pinned override.
+    "HEALTH_WEIGHT_SECURITY": _Setting(
+        "float", "HEALTH_WEIGHT_SECURITY", "0.40", "repo_scan",
+        "App Health score weight for the security subscore (of 9 weights summing to 1.0).",
+        "Higher makes security dominate the overall score more; lower de-emphasizes it. Unmeasured subscores redistribute their weight proportionally over the measured ones.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_COVERAGE": _Setting(
+        "float", "HEALTH_WEIGHT_COVERAGE", "0.12", "repo_scan",
+        "App Health score weight for the coverage subscore (of 9 weights summing to 1.0).",
+        "Higher makes coverage dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_DEPENDENCIES": _Setting(
+        "float", "HEALTH_WEIGHT_DEPENDENCIES", "0.12", "repo_scan",
+        "App Health score weight for the dependencies subscore (of 9 weights summing to 1.0).",
+        "Higher makes dependency health dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_AC_VERIFICATION": _Setting(
+        "float", "HEALTH_WEIGHT_AC_VERIFICATION", "0.10", "repo_scan",
+        "App Health score weight for the AC-verification subscore (of 9 weights summing to 1.0).",
+        "Higher makes AC-verification dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_ACCESSIBILITY": _Setting(
+        "float", "HEALTH_WEIGHT_ACCESSIBILITY", "0.07", "repo_scan",
+        "App Health score weight for the accessibility subscore (of 9 weights summing to 1.0).",
+        "Higher makes accessibility dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_COMPLEXITY": _Setting(
+        "float", "HEALTH_WEIGHT_COMPLEXITY", "0.06", "repo_scan",
+        "App Health score weight for the complexity subscore (of 9 weights summing to 1.0).",
+        "Higher makes complexity dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_PERFORMANCE": _Setting(
+        "float", "HEALTH_WEIGHT_PERFORMANCE", "0.05", "repo_scan",
+        "App Health score weight for the performance subscore (of 9 weights summing to 1.0).",
+        "Higher makes performance dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_DUPLICATION": _Setting(
+        "float", "HEALTH_WEIGHT_DUPLICATION", "0.04", "repo_scan",
+        "App Health score weight for the duplication subscore (of 9 weights summing to 1.0).",
+        "Higher makes duplication dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
+    "HEALTH_WEIGHT_MAINTAINABILITY": _Setting(
+        "float", "HEALTH_WEIGHT_MAINTAINABILITY", "0.04", "repo_scan",
+        "App Health score weight for the maintainability subscore (of 9 weights summing to 1.0).",
+        "Higher makes maintainability dominate the overall score more; lower de-emphasizes it.",
+        "0.0-1.0, all 9 HEALTH_WEIGHT_* settings should sum to 1.0",
+    ),
 
-# exit_nodes.py's _render_terminal_failure: the "## Terminal failure" code block in the final exit
-# report -- the human-facing summary of why a run died. Its `detail` can be graph.py's verify-cap
-# `feedback`, which graph.py's own comments note can be an adversarial-compliance LIST of
-# findings; tail-only here silently dropped the first ones. 1250/1250 (2500 total, unchanged).
-EXIT_FAILURE_DETAIL_HEAD_CHARS = int(os.environ.get("AIDW_EXIT_FAILURE_DETAIL_HEAD_CHARS", "1250"))
-EXIT_FAILURE_DETAIL_TAIL_CHARS = int(os.environ.get("AIDW_EXIT_FAILURE_DETAIL_TAIL_CHARS", "1250"))
+    # -- Newly centralized bare magic numbers (Task 6 sweep) -- none of these were previously an
+    # env var, so each gets an AIDW_ prefix per this file's own convention. ------------------------
+    "PROVIDER_CACHE_TTL_SECONDS": _Setting(
+        "int", "AIDW_PROVIDER_CACHE_TTL_SECONDS", "30", "runtime_misc",
+        "How long chat_model.py caches the resolved active provider (claude/copilot) before re-reading org_settings.",
+        "Higher reduces DB round trips but delays how fast a provider switch in Settings reaches in-flight dispatch calls; lower reflects a switch sooner at the cost of more DB reads.",
+        "positive integer, seconds",
+    ),
+    "AUTH_GATE_CURL_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_AUTH_GATE_CURL_TIMEOUT_SECONDS", "15", "e2e",
+        "Per-probe curl --max-time for the auth gate's unauthenticated route probes.",
+        "Higher tolerates a slower app response before giving up on one probe; lower fails faster but may misclassify a merely-slow route as unreachable.",
+        "positive integer, seconds",
+    ),
+    "AUTH_GATE_MAX_PROBES": _Setting(
+        "int", "AIDW_AUTH_GATE_MAX_PROBES", "40", "e2e",
+        "Max combined page+API routes the auth gate probes in one check, so a discovery pass gone wild cannot stall e2e.",
+        "Higher covers more of a large app's route surface per check but takes longer; lower caps runtime but may leave some routes unverified (reported as dropped_over_cap).",
+        "positive integer",
+    ),
+    "E2E_APP_PORT_RANGE_START": _Setting(
+        "int", "AIDW_E2E_APP_PORT_RANGE_START", "3100", "e2e",
+        "First port in the pool e2e picks from when launching an app or supporting service.",
+        "Change together with E2E_APP_PORT_RANGE_END to move the whole pool; narrowing the range risks port exhaustion on an app with many supporting services.",
+        "positive integer, below E2E_APP_PORT_RANGE_END",
+    ),
+    "E2E_APP_PORT_RANGE_END": _Setting(
+        "int", "AIDW_E2E_APP_PORT_RANGE_END", "3140", "e2e",
+        "Exclusive end of the port pool e2e picks from (range is [START, END)).",
+        "Widening gives more headroom for apps with many supporting services; narrowing risks port exhaustion.",
+        "positive integer, above E2E_APP_PORT_RANGE_START",
+    ),
+    "APP_DISCOVERY_MAX_CANDIDATE_FILES": _Setting(
+        "int", "AIDW_APP_DISCOVERY_MAX_CANDIDATE_FILES", "60", "runtime_misc",
+        "Max candidate marker files app_discovery.collect_evidence reads before stopping.",
+        "Higher examines more of a large/unusual repo layout but costs more sandbox reads; lower is faster but may miss a marker file in an atypical location.",
+        "positive integer",
+    ),
+    "APP_DISCOVERY_MAX_FILE_CHARS": _Setting(
+        "int", "AIDW_APP_DISCOVERY_MAX_FILE_CHARS", "4000", "runtime_misc",
+        "Max characters read from each candidate marker file during app discovery.",
+        "Higher captures more of a large manifest/config file's content as evidence; lower keeps the discovery prompt-grounding blob smaller.",
+        "positive integer, characters",
+    ),
+    "APP_DISCOVERY_MAX_EVIDENCE_CHARS": _Setting(
+        "int", "AIDW_APP_DISCOVERY_MAX_EVIDENCE_CHARS", "24000", "runtime_misc",
+        "Max total characters of the combined evidence blob app_discovery.collect_evidence returns.",
+        "Higher gives the tech-stack detection more context from a large repo; lower keeps it a tighter prompt-grounding artifact, not a repo dump.",
+        "positive integer, characters",
+    ),
+    "VAULT_TIMEOUT_SECONDS": _Setting(
+        "float", "AIDW_VAULT_TIMEOUT_SECONDS", "10.0", "runtime_misc",
+        "Timeout for a single org-credential Key Vault round trip (get/set).",
+        "Shorter than sessions_api's own 30s credential-probe timeout by design, since this sits on a page-load path a signed-in user is actively waiting on. Higher tolerates a slower vault; lower fails faster but may misclassify a merely-slow vault as unreachable.",
+        "positive float, seconds",
+    ),
+    "RUN_LOCK_TASKLIST_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_RUN_LOCK_TASKLIST_TIMEOUT_SECONDS", "10", "runtime_misc",
+        "Windows `tasklist` subprocess timeout used to check whether a run lock's recorded PID is still alive.",
+        "Higher tolerates a slower/loaded host before giving up on the liveness check; lower fails faster. Read before per-session settings are pinned (this check can run before a session starts), so it always resolves from env/default, never a live DB override.",
+        "positive integer, seconds",
+    ),
+}
 
-# e2e_nodes.py's readiness-failure description text (deferred-service retry AND main-app boot,
-# both embed this in e2e["failed_tests"][...]["error"]) -- not the fix prompt itself, see the pair
-# below for that. 1500/1500 (3000 total, unchanged).
-E2E_BOOT_FAILURE_LOG_HEAD_CHARS = int(os.environ.get("AIDW_E2E_BOOT_FAILURE_LOG_HEAD_CHARS", "1500"))
-E2E_BOOT_FAILURE_LOG_TAIL_CHARS = int(os.environ.get("AIDW_E2E_BOOT_FAILURE_LOG_TAIL_CHARS", "1500"))
 
-# e2e_nodes.py's e2e_fix_node: the app log tail handed straight to E2E_FIX_HUMAN_TEMPLATE as the
-# fix model's own prompt input -- the actual fix-loop-facing field, kept separate from the
-# boot-failure-description pair above so this budget can be tuned independently (same reasoning
-# as rebuild.py treating its fix-prompt fields separately from other tails). 2000/2000 (4000
-# total, unchanged).
-E2E_FIX_APP_LOG_HEAD_CHARS = int(os.environ.get("AIDW_E2E_FIX_APP_LOG_HEAD_CHARS", "2000"))
-E2E_FIX_APP_LOG_TAIL_CHARS = int(os.environ.get("AIDW_E2E_FIX_APP_LOG_TAIL_CHARS", "2000"))
+def __getattr__(name: str):
+    spec = _SETTINGS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        raw = runtime_settings.get_raw(name)
+        if raw is None:
+            raw = os.environ.get(spec.env_var, spec.default_raw)
+        return _PARSERS[spec.parser](raw)
+    except Exception:
+        # A malformed override (bad text, an admin typo) must not crash an ordinary attribute
+        # access at a random one of ~265 call sites -- log and fall back to the exact same
+        # env/default resolution as an unset override, same contract as chat_model.get_provider()'s
+        # own DB-failure fallback, just without needing a "last known good" value to track (the
+        # env/default tier is always available).
+        logger.warning(
+            "config.%s: override failed to parse, falling back to env/default", name, exc_info=True
+        )
+        return _PARSERS[spec.parser](os.environ.get(spec.env_var, spec.default_raw))
+    # ponytail: re-parses on every access, no per-name memoization -- this pipeline is LLM-call-
+    # bound (minutes per turn), a dict lookup + int()/float() is not worth caching. Add one only if
+    # a profiler ever says config reads are hot -- they won't be next to an LLM turn.
 
-# rebuild.py's make_rebuild_node: the DURABLE ledger record of why the TDD-red gate blocked a
-# build. 1500, not a smaller head-only preview: the detail is a LIST of tests that wrongly passed,
-# and a 300-char cap once stopped inside the first entry -- the ledger recorded that the gate
-# fired without recording what it found. Head-only (not head+tail) is correct here: the list's
-# start is what a human reviewing the ledger needs, unlike the fix-loop tails above which need
-# both ends because the model reads the whole thing back.
-REBUILD_LEDGER_DETAIL_CHARS = int(os.environ.get("AIDW_REBUILD_LEDGER_DETAIL_CHARS", "1500"))
 
-# rebuild.py's make_escalate_node: the one-line `feedback` field session_store._build_failure reads
-# for the DB row's failure_message, once the rebuild fix-cycle cap is already exhausted (this runs
-# only after fixing is over, so it doesn't feed another fix attempt the way the pairs above do).
-REBUILD_ESCALATE_FEEDBACK_CHARS = int(os.environ.get("AIDW_REBUILD_ESCALATE_FEEDBACK_CHARS", "1000"))
+# ============================================================================================
+# Public accessors for the Settings API (task 7) -- keep _SETTINGS/_PARSERS/_FORMATTERS private
+# (implementation detail) while giving sessions_api.py a small, stable surface to build the
+# list/get/set/delete endpoints against, rather than reaching into this module's underscored
+# internals directly.
+# ============================================================================================
 
-# rebuild.py's scan-delta gate reason list (the "blocking on N reason(s)" log line fed to
-# _detect_verify_stall/warning output, not a fix prompt): how many gating findings to list before
-# summarizing the rest as "...and N more", and how much of one finding's own title/message to show
-# per line.
-REBUILD_GATING_FINDINGS_MAX = int(os.environ.get("AIDW_REBUILD_GATING_FINDINGS_MAX", "10"))
-REBUILD_FINDING_MESSAGE_CHARS = int(os.environ.get("AIDW_REBUILD_FINDING_MESSAGE_CHARS", "110"))
 
-# rebuild.py's TDD-red gate verdict messages (ticket-scope and whole-suite variants): how many
-# wrongly-passed test names to list inline before summarizing the rest as "...and N more".
-REBUILD_PASSED_TESTS_PREVIEW_MAX = int(os.environ.get("AIDW_REBUILD_PASSED_TESTS_PREVIEW_MAX", "10"))
+def list_settings() -> list[dict[str, str | None]]:
+    """Every migrated setting's static metadata -- name/category/purpose/effect/value_range/
+    parser/env_var/default_raw. No current value and no override status here: those are a
+    per-request question (this session's live value, and whatever dbo.runtime_settings currently
+    holds), answered by `getattr(config, name)` and runtime_settings.list_overrides() respectively,
+    not by this module's own static table."""
+    return [
+        {
+            "name": name,
+            "category": spec.category,
+            "purpose": spec.purpose,
+            "effect": spec.effect,
+            "value_range": spec.value_range,
+            "parser": spec.parser,
+            "env_var": spec.env_var,
+            "default_raw": spec.default_raw,
+        }
+        for name, spec in _SETTINGS.items()
+    ]
 
-# e2e_nodes.py's sandbox-relative scratch paths for the booted app under test: where its stdout+
-# stderr are redirected (LOG) and where its PID is recorded so it can be killed after the suite
-# runs (PID). Changing either just moves where the agent writes/reads inside the sandbox -- no
-# effect on suite behavior, but LOG_PATH must stay in sync with the shell redirect that creates it
-# (_boot_process) and PID_PATH with the shell snippet that kills it.
-E2E_APP_LOG_PATH = os.environ.get("AIDW_E2E_APP_LOG_PATH", "agent-work/e2e-app.log")
-E2E_APP_PID_PATH = os.environ.get("AIDW_E2E_APP_PID_PATH", "agent-work/e2e-app.pid")
 
-# e2e_nodes.py's _probe_page: when the page-probe script's stdout isn't parseable JSON, how much of
-# the raw output to fold into the diagnostic error string (a probe failure, not test output --
-# never fed to a model, just surfaced in failed_tests for a human/the fix loop's context).
-E2E_PROBE_PREVIEW_CHARS = int(os.environ.get("AIDW_E2E_PROBE_PREVIEW_CHARS", "300"))
-# e2e_nodes.py's summarise_page_state: how many captured browser console errors to list, and how
-# much of the page's rendered text to show, per probed route.
-E2E_CONSOLE_ERRORS_MAX = int(os.environ.get("AIDW_E2E_CONSOLE_ERRORS_MAX", "5"))
-E2E_PAGE_TEXT_PREVIEW_CHARS = int(os.environ.get("AIDW_E2E_PAGE_TEXT_PREVIEW_CHARS", "600"))
+def default_value(name: str) -> object:
+    """`name`'s parsed (typed) default value -- KeyError if `name` isn't a migrated setting."""
+    spec = _SETTINGS[name]
+    return _PARSERS[spec.parser](spec.default_raw)
 
-# e2e_nodes.py's degenerate_screenshots: a PNG at or below this size is treated as evidence the
-# page painted nothing (observed live: five blank captures were all exactly 4254 bytes). Raising
-# it risks flagging a genuinely tiny-but-real page as blank; lowering it risks missing a blank
-# capture that happens to be a few bytes larger.
-E2E_DEGENERATE_PNG_MAX_BYTES = int(os.environ.get("AIDW_E2E_DEGENERATE_PNG_MAX_BYTES", "8192"))
-# e2e_nodes.py's per-route screenshot retry ladder (milliseconds between capture attempts) for a
-# client-rendered app that hasn't hydrated yet -- see the ladder's own long comment at its call
-# site for the Blazor measurement this was tuned against. Escalating, not fixed, because hydration
-# time varies by stack; total worst case per route is the ladder's sum, bounded by
-# E2E_ROUTES_MAX captures.
-E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS = tuple(
-    int(ms) for ms in os.environ.get("AIDW_E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS", "3000,10000,15000").split(",")
-)
-# e2e_nodes.py's screenshot/lighthouse harvest loops (3 call sites): how many routes to capture
-# per run. Raising this linearly increases both wall-clock time (each route pays the full hydrate
-# ladder above on a cold render) and the number of screenshots in the exit report.
-E2E_ROUTES_MAX = int(os.environ.get("AIDW_E2E_ROUTES_MAX", "12"))
 
-# e2e_nodes.py's full-suite screenshot harvest: caps how many `find`-matched PNGs get folded into
-# the single batched mkdir+cp script handed to exec_in_sandbox in one shell string. That script is
-# built entirely in Python then passed through to `docker exec` via asyncio's subprocess_exec, whose
-# argv on this repo's Windows dev host is capped by CreateProcess's ~32767-char command-line limit;
-# at a realistic ~175 chars per `cp` line that ceiling lands around 185 files, plausibly hit by a
-# large suite with retries (Playwright can emit multiple PNGs per failed test). Raising this risks
-# re-hitting that ceiling (an uncaught OSError crashing the node, worse than the old one-exec-per-
-# file loop this batching replaced); lowering it just harvests fewer of the suite's own screenshots
-# -- the always-taken per-route screenshots (E2E_ROUTES_MAX) are unaffected either way.
-E2E_SCREENSHOT_COPY_MAX_FILES = int(os.environ.get("AIDW_E2E_SCREENSHOT_COPY_MAX_FILES", "100"))
+def format_setting(name: str, value: object) -> str:
+    """Runs `name`'s own formatter against a live Python value (typically JSON-decoded request
+    body data: str/int/float/bool/list), producing the exact string shape its parser expects.
+    Raises KeyError for an unknown setting name, and whatever the formatter itself raises for a
+    value of the wrong shape (e.g. TypeError from `",".join(v)` on a non-iterable)."""
+    spec = _SETTINGS[name]
+    return _FORMATTERS[spec.parser](value)
 
-# e2e_nodes.py's per-route screenshot/lighthouse failure log lines (logger.warning only, never
-# reach a model) -- how much of that one command's own stdout to include in the log message.
-E2E_SCREENSHOT_STDOUT_TAIL_CHARS = int(os.environ.get("AIDW_E2E_SCREENSHOT_STDOUT_TAIL_CHARS", "500"))
-E2E_LIGHTHOUSE_STDOUT_TAIL_CHARS = int(os.environ.get("AIDW_E2E_LIGHTHOUSE_STDOUT_TAIL_CHARS", "300"))
-# e2e_nodes.py's _run_lighthouse: hard wall-clock cap (via `timeout`) on one route's lighthouse
-# run. A route that hangs past this is skipped (fail-open, never scored as 0) rather than wedging
-# the whole e2e stage.
-E2E_LIGHTHOUSE_TIMEOUT_SECONDS = int(os.environ.get("AIDW_E2E_LIGHTHOUSE_TIMEOUT_SECONDS", "150"))
 
-# gates/test_coverage_gate.py's missing_hosted_backend/missing_frontend_dependency source-reading
-# helpers: how many candidate files of each kind to actually read_repo_file and scan, per repo, per
-# gate run. Raising these widens what a large monorepo's coverage gate can see before giving up and
-# assuming the framework is missing, at the cost of more sandbox round-trips per verify lap.
-TEST_COVERAGE_BACKEND_FILES_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_BACKEND_FILES_MAX", "25"))
-TEST_COVERAGE_OTEL_EXTRA_FILES_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_OTEL_EXTRA_FILES_MAX", "14"))
-TEST_COVERAGE_FRONTEND_CANDIDATES_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_FRONTEND_CANDIDATES_MAX", "30"))
-TEST_COVERAGE_MANIFESTS_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_MANIFESTS_MAX", "10"))
+def parse_setting(name: str, raw: str) -> object:
+    """Runs `name`'s own parser against raw env-var-shaped text. Raises KeyError for an unknown
+    setting name, and whatever the parser itself raises (ValueError, etc.) for malformed text --
+    the Settings API's write-time round-trip validation (must-fix #2) depends on this raising
+    loudly rather than silently coercing."""
+    spec = _SETTINGS[name]
+    return _PARSERS[spec.parser](raw)
 
-# gates/test_coverage_gate.py's per-class/per-file coverage feedback: how many partially-covered
-# branch line numbers to list inline in one class's feedback string.
-TEST_COVERAGE_UNCOVERED_LINES_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_UNCOVERED_LINES_MAX", "20"))
 
-# gates/test_coverage_gate.py's _run_coverage_via_ghcp: how many coverage-contract entries to
-# actually parse per attempt (both the first pass and the one re-discovery retry share this cap) --
-# "bounded: dozens of entries is itself suspect" per the file's own comment at this call site.
-TEST_COVERAGE_CONTRACT_ENTRIES_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_CONTRACT_ENTRIES_MAX", "10"))
+# ============================================================================================
+# Excluded from the live settings system -- plain, static module-level constants, unchanged from
+# before this migration. See this file's own module docstring for why each group stays here rather
+# than in _SETTINGS above.
+# ============================================================================================
 
-# gates/test_coverage_gate.py's coverage-gap feedback: how many gaps get a quoted source excerpt,
-# and how many of one gap's own branch line numbers get quoted -- the file used the same literal
-# for both before this was named, so one constant here matches that, not two.
-TEST_COVERAGE_GAP_DETAIL_MAX = int(os.environ.get("AIDW_TEST_COVERAGE_GAP_DETAIL_MAX", "6"))
-
-# gates/design_tokens_gate.py's hardcoded_color_violations: how many style-bearing source files
-# (per verify_coverage's already-filtered source_files list) to actually read_repo_file and scan
-# for off-palette color literals, per gate run. Raising this widens how much of a large repo's
-# touched UI code the deterministic DESIGN.md conformance check can see, at the cost of more
-# sandbox round-trips per verify lap -- same tradeoff as TEST_COVERAGE_BACKEND_FILES_MAX above.
-DESIGN_TOKENS_GATE_FILES_MAX = int(os.environ.get("AIDW_DESIGN_TOKENS_GATE_FILES_MAX", "40"))
-
-# gates/test_coverage_gate.py's coverage floor: both line and branch coverage must meet this
-# percentage for the deterministic_verify to pass. Read by metrics_nodes.py too (imported by name,
-# not retyped). Raising it makes the gate strict enough to block on legitimately-untested code that
-# passed before; lowering it lets code with weaker tests through. Env var name predates this
-# constant's move into config.py -- kept as-is (not AIDW_-prefixed) so an existing deploy's
-# MIN_COVERAGE_PERCENT keeps working unchanged.
-MIN_COVERAGE_PERCENT = float(os.environ.get("MIN_COVERAGE_PERCENT", "95.0"))
-
-# gates/test_coverage_gate.py's sandbox-relative path for the model-authored coverage-command
-# contract (COVERAGE_COMMANDS_PATH) and the report formats _replay_coverage_contract knows how to
-# parse (_CONTRACT_FORMATS -- cobertura XML, istanbul JSON summary). Read by ac_eval.py,
-# exit_nodes.py and metrics_nodes.py too. Adding a format string here does nothing on its own --
-# _parse_cobertura_counts/_parse_istanbul_counts must actually support it.
-COVERAGE_COMMANDS_PATH = os.environ.get("AIDW_COVERAGE_COMMANDS_PATH", ".ai-dev-workflow/coverage-commands.json")
-CONTRACT_FORMATS = tuple(
-    f.strip() for f in os.environ.get("AIDW_CONTRACT_FORMATS", "cobertura,istanbul-json-summary").split(",") if f.strip()
-)
-
-# gates/test_coverage_gate.py's _replay_coverage_contract: wall-clock cap (via `timeout`) on ONE
-# coverage command's replay run. Env var name predates this constant's move into config.py -- kept
-# as-is so an existing deploy's REPO_SCAN_COVERAGE_TIMEOUT_SECONDS keeps working unchanged.
-TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIMEOUT_SECONDS", "600"))
-
-# metrics_nodes.py's regression_reasons(): tool names whose FAILURE means "we have no idea whether
-# this app has secrets/vulnerabilities", checked against ScanReport.summary()["degraded"]
-# (repo_scan.py) -- the list of tool names with status "missing"/"failed" that already excludes
-# "not_applicable" (a legitimate skip, e.g. no IaC files for checkov) and "outdated" (fail-open by
-# design). Every OTHER degraded tool only discounts the health SCORE via
-# health_coverage_fraction/health_coverage_multiplier; it never blocks a merge. Observed live (run
-# f0fef8ba): gitleaks and syft both crashed mid-run with zero output, read identically to "scanned
-# clean", and nothing gated on it. Adding a name here means its crash now blocks merge_ready;
-# removing one demotes that tool's failure back to a score-only discount (e.g. if it proves too
-# flaky in practice and the false-block rate outweighs the safety benefit).
-AIDW_SECURITY_CRITICAL_TOOL_NAMES: tuple[str, ...] = tuple(
-    t.strip() for t in os.environ.get(
-        "AIDW_SECURITY_CRITICAL_TOOL_NAMES", "gitleaks,semgrep,osv-scanner,trivy"
-    ).split(",") if t.strip()
-)
-
-# repo_scan.py's _run_one: retry count/delay for a tool's `{tool} --version` probe before marking
-# it status="missing". Observed live (run f0fef8ba): semgrep/interrogate both read status="ok" at
-# this same run's own baseline scan and "missing" minutes later in the SAME container -- a
-# session-local transient fault, not a permanent image defect (the Dockerfile installs them
-# identically to bandit/checkov, which stayed healthy throughout). One short retry is cheap
-# insurance against exactly that. Raising RETRY_COUNT spends more wall-clock per flaky tool before
-# giving up; raising RETRY_DELAY_SECONDS gives a longer window for the transient condition to clear
-# at the same per-attempt cost.
-AIDW_TOOL_PROBE_RETRY_COUNT = int(os.environ.get("AIDW_TOOL_PROBE_RETRY_COUNT", "1"))
-AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS = float(os.environ.get("AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS", "3.0"))
-
-# repo_scan.py's _run_one: how much of the failed version-probe's actual output (normally a
-# one-line version string, or a one-line "not found") survives into the tool run's `notes` field,
-# in place of a generic "binary not on PATH" guess. Head+tail (not a single tail slice) per
-# AGENTS.md's truncation rule, sized generously since this is a short diagnostic snippet, not a
-# findings list -- exists to bound a pathological case (e.g. a full interpreter traceback), not
-# the normal one-liner.
-AIDW_TOOL_PROBE_NOTES_HEAD_CHARS = int(os.environ.get("AIDW_TOOL_PROBE_NOTES_HEAD_CHARS", "300"))
-AIDW_TOOL_PROBE_NOTES_TAIL_CHARS = int(os.environ.get("AIDW_TOOL_PROBE_NOTES_TAIL_CHARS", "300"))
-
-# graph.py's make_draft_node infra-exhaustion handler: how much of the raw exception message to
-# keep as stage["last_infra_error"]. Tail-only (not head+tail like the pairs above) is correct
-# here -- the content is a short exception string, not a multi-item list, so there's no "start of a
-# long list" to lose.
-GRAPH_INFRA_ERROR_CHARS = int(os.environ.get("AIDW_GRAPH_INFRA_ERROR_CHARS", "2000"))
-
-# graph.py's metrics-report/e2e-outcome prompt messages: how many failed-test entries to inline,
-# and the JSON-serialisation budget (via _bounded_json, which truncates honestly -- see its own
-# docstring -- rather than cutting a serialised payload mid-token) for the metrics-compute and
-# e2e-summary payloads respectively. Raising the JSON limits lets a model see more of a large
-# payload at the cost of prompt size; MARGIN is _bounded_json's own reserve for its wrapper JSON
-# (_truncated/_original_chars/_note keys) around the clipped preview -- it must stay big enough
-# that the wrapper itself never exceeds `limit`.
-GRAPH_FAILED_TESTS_MAX = int(os.environ.get("AIDW_GRAPH_FAILED_TESTS_MAX", "10"))
-GRAPH_METRICS_JSON_MAX_CHARS = int(os.environ.get("AIDW_GRAPH_METRICS_JSON_MAX_CHARS", "8000"))
-GRAPH_E2E_SUMMARY_JSON_MAX_CHARS = int(os.environ.get("AIDW_GRAPH_E2E_SUMMARY_JSON_MAX_CHARS", "4000"))
-GRAPH_BOUNDED_JSON_MARGIN_CHARS = int(os.environ.get("AIDW_GRAPH_BOUNDED_JSON_MARGIN_CHARS", "240"))
-
-# graph.py's make_verify_node INFRA RETRY / REDRAFT log lines: how much of a verify result's own
-# feedback to log. 1200, not a smaller value: an adversarial-compliance rejection is a LIST of
-# findings, and a 300-char cap once stopped inside the first one, making a thrashing stage
-# undiagnosable from the log alone (observed live). Log-only -- the full, untruncated feedback is
-# still stored in stage["last_verification"] and used unmodified for the actual redraft prompt.
-GRAPH_FEEDBACK_LOG_PREVIEW_CHARS = int(os.environ.get("AIDW_GRAPH_FEEDBACK_LOG_PREVIEW_CHARS", "1200"))
-
-# git_ops.py's GitHub REST calls (open/update PR, delete branch): how much of a failed response
-# body to log -- these are log-and-continue failures a human debugs from server logs, never fed
-# back into a model. Also the shared httpx client timeout for all three calls; raising it tolerates
-# a slower GitHub API response before giving up, at the cost of a slower log-and-continue on a
-# genuine outage.
-GIT_OPS_API_ERROR_PREVIEW_CHARS = int(os.environ.get("AIDW_GIT_OPS_API_ERROR_PREVIEW_CHARS", "300"))
-GIT_OPS_HTTP_TIMEOUT_SECONDS = float(os.environ.get("AIDW_GIT_OPS_HTTP_TIMEOUT_SECONDS", "30.0"))
-
-# git_ops.py's push_head: how much of a failed `git push`'s own stderr/stdout to keep in
-# _LAST_PUSH's "error" field, surfaced to the session/UI as why the push didn't happen.
-GIT_OPS_PUSH_ERROR_TAIL_CHARS = int(os.environ.get("AIDW_GIT_OPS_PUSH_ERROR_TAIL_CHARS", "500"))
-
-# git_ops.py's generated-.gitignore detection log line: how many detected paths to list before
-# summarizing the rest with "...".
-GIT_OPS_GITIGNORE_PREVIEW_MAX = int(os.environ.get("AIDW_GIT_OPS_GITIGNORE_PREVIEW_MAX", "8"))
-
-# exit_nodes.py's SBOM-diff section: how many added/removed/version-changed dependency names to
-# list inline before summarizing the rest as "...and N more".
-EXIT_SBOM_DIFF_PREVIEW_MAX = int(os.environ.get("AIDW_EXIT_SBOM_DIFF_PREVIEW_MAX", "15"))
-# exit_nodes.py's _failure_headline: length of the single-line headline bullet shown above the
-# full terminal-failure code block (see EXIT_FAILURE_DETAIL_HEAD/TAIL_CHARS above for that block).
-EXIT_FAILURE_HEADLINE_CHARS = int(os.environ.get("AIDW_EXIT_FAILURE_HEADLINE_CHARS", "300"))
-# exit_nodes.py's tool-run failure notes: how much of one failed tool run's own error/summary text
-# to inline in the exit report's tooling section.
-EXIT_TOOL_ERROR_SNIPPET_CHARS = int(os.environ.get("AIDW_EXIT_TOOL_ERROR_SNIPPET_CHARS", "80"))
-# exit_nodes.py's _md_cell default column width for a markdown table cell (used as-is by the
-# known-gap cell at limit 110) and the per-column widths in the security-findings/tools tables
-# (tools/rule-id/title/where/version/notes). Each is independently tunable because the columns
-# hold very different content (a CVE id vs. a finding title vs. free-text notes) -- raising one
-# widens that column's cell before "..." kicks in, at the cost of a wider markdown table.
-EXIT_MD_CELL_DEFAULT_CHARS = int(os.environ.get("AIDW_EXIT_MD_CELL_DEFAULT_CHARS", "90"))
-EXIT_KNOWN_GAP_CELL_CHARS = int(os.environ.get("AIDW_EXIT_KNOWN_GAP_CELL_CHARS", "110"))
-EXIT_HEALTH_BASIS_CELL_CHARS = int(os.environ.get("AIDW_EXIT_HEALTH_BASIS_CELL_CHARS", "100"))
-EXIT_FINDING_TOOLS_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_TOOLS_CELL_CHARS", "40"))
-EXIT_FINDING_RULE_ID_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_RULE_ID_CELL_CHARS", "40"))
-EXIT_FINDING_TITLE_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_TITLE_CELL_CHARS", "70"))
-EXIT_FINDING_WHERE_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_WHERE_CELL_CHARS", "60"))
-EXIT_TOOL_VERSION_CELL_CHARS = int(os.environ.get("AIDW_EXIT_TOOL_VERSION_CELL_CHARS", "45"))
-EXIT_TOOL_NOTES_CELL_CHARS = int(os.environ.get("AIDW_EXIT_TOOL_NOTES_CELL_CHARS", "60"))
-# exit_nodes.py's security-findings table: how many findings get their own row before the rest
-# collapse into one "...and N more, see repo-scan-latest.json" row.
-EXIT_FINDINGS_TABLE_CAP = int(os.environ.get("AIDW_EXIT_FINDINGS_TABLE_CAP", "60"))
-# exit_nodes.py's user-stories/AC table: how many of one row's own linked test ids to list inline
-# before summarizing the rest as "+N more".
-EXIT_TEST_IDS_PREVIEW_MAX = int(os.environ.get("AIDW_EXIT_TEST_IDS_PREVIEW_MAX", "3"))
-# exit_nodes.py's stale-snapshot divergence log line: how much of each stale reason to include.
-EXIT_STALE_REASON_LOG_CHARS = int(os.environ.get("AIDW_EXIT_STALE_REASON_LOG_CHARS", "120"))
-
-# e2e_nodes.py's blank-screenshot failure item: how many blank-screenshot filenames to list inline
-# before summarizing the rest as "and N more".
-E2E_BLANK_SCREENSHOTS_PREVIEW_MAX = int(os.environ.get("AIDW_E2E_BLANK_SCREENSHOTS_PREVIEW_MAX", "5"))
-# e2e_nodes.py's lighthouse audit summary: length of one failing audit's title/selector string
-# (both truncated inside the sandboxed extraction script, _LH_EXTRACT_PY, before the JSON crosses
-# the exec boundary), and how many failing audits survive -- once per route inside the extraction
-# script, then again across all routes' worst-of results at the Python-side aggregation in
-# _run_lighthouse. Same value shared by both stages by design, not coincidence: raising it shows
-# more/longer failing-audit detail to the e2e fix model at both stages.
-E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS = int(os.environ.get("AIDW_E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS", "120"))
-E2E_LIGHTHOUSE_FAILING_AUDITS_MAX = int(os.environ.get("AIDW_E2E_LIGHTHOUSE_FAILING_AUDITS_MAX", "12"))
-
-# Bounded retry when a sandbox container starts but its CLI tool (whichever provider's --
-# `claude --version`/`copilot --version`, per sandbox/provider.py's wait_for_cli_ready) never
-# responds within that function's own readiness deadline -- distinguishes "the container is slow"
-# (worth retrying) from "the container never came up" (retrying the same dead process is just spent
-# time). Doc rot fix (Phase E audit M-8): this used to describe the retired SDK-based `copilot
-# --server` connect handshake and its wait_for_copilot_ready check, both fully removed by the
-# per-turn CLI-exec rewrite (see sandbox/provider.py's own module docstring). See
-# sandbox/local_docker.py's provision().
-SANDBOX_PROVISION_RETRY_ATTEMPTS = int(os.environ.get("AIDW_SANDBOX_PROVISION_RETRY_ATTEMPTS", "2"))
-
-# How long a single `docker <args>` call (sandbox/local_docker.py's _run_docker) may run before
-# it's treated as wedged and killed. Covers routine admin commands (inspect/rm/stop/start/cp/
-# exec) that only talk to the local daemon. Matters more than an ordinary timeout would suggest:
-# provision()/_try_reattach() hold LocalDockerProvider's one shared, non-reentrant self._lock
-# while calling this, so a wedged call there freezes every OTHER session's provisioning/touch/
-# liveness too, not just the stuck one.
-SANDBOX_DOCKER_TIMEOUT_SECONDS = int(os.environ.get("AIDW_SANDBOX_DOCKER_TIMEOUT_SECONDS", "30"))
-
-# For docker operations that are legitimately allowed to run long and shouldn't share the
-# fast-admin default above: `docker create` can trigger a first-time image pull over the network,
-# and reading a finished turn's full stdout/stderr back (cli_agent_exec.py's post-completion
-# `cat` calls) can plausibly be megabytes (see TurnTimeout's own comment on turn output size).
-SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS = int(
-    os.environ.get("AIDW_SANDBOX_DOCKER_LONG_TIMEOUT_SECONDS", "600")
-)
-
-# run_activity.py's per-thread event fan-out: how many published graph events one attached
-# subscriber (a browser tab's SSE connection, via main.py's _ReattachStateAgent.run) may have
-# queued before the oldest queued event is dropped to make room for the newest. Read by
-# run_activity.publish. Raising this lets a briefly slow/backgrounded tab fall further behind
-# before losing early events (more memory held per stalled subscriber); lowering it drops events
-# sooner under load. Never blocks or stalls the background graph task itself either way -- only
-# a stalled subscriber's own view of the stream is affected.
-RUN_SUBSCRIBER_QUEUE_MAXSIZE = int(os.environ.get("AIDW_RUN_SUBSCRIBER_QUEUE_MAXSIZE", "500"))
+# Platform-constraint constant, not an operator-tunable knob: bounds how large a single chunk of a
+# chunked sandbox write (cli_agent_exec.py, repo_files.py) may be before it's split further, staying
+# well under Windows CreateProcess's ~32767-char argv limit (with headroom for the shell wrapper text
+# around the payload). Raising it past that real platform ceiling breaks the write it's meant to
+# protect; it is not a performance/cost knob to retune. Previously two independent declarations
+# (cli_agent_exec.py's and repo_files.py's own `_EXEC_CMD_BUDGET`, same value, same purpose) --
+# unified here per AGENTS.md's "one constant, not one each" rule; both files now import it from here.
+EXEC_CMD_BUDGET_CHARS = 16000
 
 # In-container path the sandbox image bakes the Agent Plugin content to (agent/sandbox-image/
-# Dockerfile's COPY plugins/ -> this path). Overridable for local spikes without a code change.
+# Dockerfile's COPY plugins/ -> this path). Overridable for local spikes without a code change --
+# a dev-time convenience, not a production admin's lever, so excluded from the live DB-backed tier.
 COPILOT_PLUGIN_ROOT_IN_CONTAINER = os.environ.get(
     "COPILOT_PLUGIN_ROOT_IN_CONTAINER", "/opt/ai-dev-workflow-plugins"
 )
@@ -566,7 +1025,8 @@ COPILOT_PLUGIN_DIRECTORIES = [
 # "Use when starting any conversation ... requiring skill invocation before ANY response", and
 # brainstorming's is "You MUST use this before any creative work". Confirmed live: with these
 # reachable, ac-to-tests-draft spent its turn calling skills 10x and its own edit tools 0x, and
-# escalated with zero test files written.
+# escalated with zero test files written. Protocol wiring (which skills are valid to invoke), not
+# a tunable limit -- excluded from the live DB-backed tier.
 #
 # The rest of the superpowers pack is the opposite -- narrow, opt-in, and already named by this
 # repo's own prompts (test-driven-development in ac_to_tests_draft.md, systematic-debugging in
@@ -585,12 +1045,6 @@ COPILOT_DISABLED_SKILLS = ["using-superpowers", "brainstorming"]
 # including before clarifying questions, and no stage wants that.
 COPILOT_DISABLED_SKILLS_SPECIFICATION = ["using-superpowers"]
 
-# Timeout for CLI-based provider turns (both Claude Code and GitHub Copilot, per-turn subprocess
-# exec inside the sandbox). Generous default since the agent's turn may involve multiple tool
-# calls, waiting for user input/approval, or complex reasoning -- the timeout is a runaway
-# backstop, not an expected exit.
-CLI_AGENT_TURN_TIMEOUT_SECONDS = int(os.environ.get("CLI_AGENT_TURN_TIMEOUT_SECONDS", "5400"))
-
 # Skills each stage is REQUIRED to invoke, enforced deterministically rather than trusted: the
 # stage's prompt names them, and gates/skill_gate.py verifies via chat_model's provider dispatch
 # (get_session_id + read_skill_invocations) -- which means different things per provider. Claude's
@@ -598,7 +1052,8 @@ CLI_AGENT_TURN_TIMEOUT_SECONDS = int(os.environ.get("CLI_AGENT_TURN_TIMEOUT_SECO
 # returns None (no CLI-exec equivalent exists yet to the old SDK-server session log this used to
 # read), so verification is permanently unavailable under the default provider today -- see
 # skill_gate.py's own module docstring. Self-report (StageReport.skills_invoked) is telemetry, not
-# evidence regardless -- a model that skipped a skill will happily claim it used one.
+# evidence regardless -- a model that skipped a skill will happily claim it used one. Protocol
+# wiring, not a tunable limit -- excluded from the live DB-backed tier.
 REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
     # grill-me (mattpocock pack, vendored in the sandbox image): the spec prompt has always asked
     # for it; required here after a live run (2026-08-31) shipped a spec with zero Skill calls --
@@ -663,7 +1118,9 @@ REQUIRED_SKILLS_BY_STAGE: dict[str, list[str]] = {
 # config.py -- importing either module's real constant HERE would complete that cycle. KEPT IN
 # SYNC by claude_chat_model.py's/copilot_chat_model.py's own self-check, which imports both real
 # modules locally (inside the demo function, well after both are fully loaded, so no cycle) and
-# asserts equality against these literals.
+# asserts equality against these literals. Zero drift-safeguard beyond that self-check -- a wrong
+# live edit here has no automated guard, one of the reasons this stays excluded from the live
+# DB-backed tier rather than admin-editable.
 AUDIT_FULL_READ_FILE_BY_STAGE: dict[str, str] = {
     "specification": ".ai-dev-workflow/spec/draft-specification.json",
     "plan": ".ai-dev-workflow/plan/_draft/steps.json",
@@ -675,6 +1132,7 @@ AUDIT_FULL_READ_FILE_BY_STAGE: dict[str, str] = {
 # tools is incomplete -- the model can reach create/bash/edit/apply_patch interchangeably, so
 # read-only stages must allowlist via available_tools instead). All entries are source-qualified
 # ("builtin:<name>") per copilot._mode.ToolSet -- bare names are rejected/silently ignored.
+# Protocol wiring, not a tunable limit -- excluded from the live DB-backed tier.
 READ_ONLY_AVAILABLE_TOOLS = [
     "builtin:view",
     "builtin:grep",
@@ -692,25 +1150,23 @@ READ_ONLY_AVAILABLE_TOOLS = [
 
 # App Health (Metrics Bar 3-way split) blend: coverage_fraction and whole-suite test_pass_rate are
 # each already 0-1; this is their relative weight in the synthetic 0-100 App Health score. Read by
-# repo_scan.app_health_score. Equal weight by default -- raise AIDW_APP_HEALTH_COVERAGE_WEIGHT to
-# favor coverage over pass rate, or vice versa (the two must sum to 1.0; callers do not enforce
-# this, so an operator changing one should change the other to match).
+# repo_scan.app_health_score. Equal weight by default. Feeds only a cosmetic reporting number with
+# zero observed-live retuning history -- excluded from the live DB-backed tier (see this file's own
+# module docstring).
 AIDW_APP_HEALTH_COVERAGE_WEIGHT = float(os.environ.get("AIDW_APP_HEALTH_COVERAGE_WEIGHT", "0.5"))
 AIDW_APP_HEALTH_PASS_RATE_WEIGHT = float(os.environ.get("AIDW_APP_HEALTH_PASS_RATE_WEIGHT", "0.5"))
 
 # Productivity/effort-saved estimate (traceability-matrix plan, "Capability-Based Lifecycle
 # Benchmarking"): base hours claimed per line of code changed, before the complexity multiplier and
 # AC-resolution/review-overhead discounts below. Read by metrics_nodes.py's estimated-hours
-# computation. A rough industry-ballpark rate (~1 hour per ~60 changed lines of moderate-complexity
-# code); raising it claims more hours saved per line, lowering it claims fewer -- tune to whatever
-# baseline an operator's own team considers credible for hand-written code of similar size.
+# computation. Feeds only a cosmetic reporting number -- excluded from the live DB-backed tier.
 AIDW_HOURS_PER_LOC_BASE = float(os.environ.get("AIDW_HOURS_PER_LOC_BASE", "0.017"))
 
 # Complexity multiplier buckets applied to AIDW_HOURS_PER_LOC_BASE, keyed by the scan's mean
 # cyclomatic complexity (lizard's mean_ccn, repo_scan.py) for this run. Read by metrics_nodes.py.
-# Denser/more-branching code is credited as costing a human more time per line to write correctly;
-# raising a bucket's multiplier claims more hours for code at that complexity level. Keys are the
-# upper bound of each bucket (mean_ccn < key); the last tuple has no upper bound.
+# Keys are the upper bound of each bucket (mean_ccn < key); the last tuple has no upper bound.
+# Feeds only a cosmetic reporting number, not independently env-backed today -- excluded from the
+# live DB-backed tier.
 AIDW_COMPLEXITY_HOUR_MULTIPLIERS: tuple[tuple[float, float], ...] = (
     (5.0, 1.0),
     (10.0, 1.3),
@@ -720,5 +1176,124 @@ AIDW_COMPLEXITY_HOUR_MULTIPLIERS: tuple[tuple[float, float], ...] = (
 # Review-overhead deduction on the productivity/effort-saved estimate above: AI-generated code
 # still needs human review/refactoring before it is trustworthy, so this fraction of the raw
 # estimate is subtracted before the final "hours saved" figure is shown. Read by metrics_nodes.py.
-# Raising it claims a more conservative (smaller) net hours-saved number; lowering it claims more.
+# Feeds only a cosmetic reporting number -- excluded from the live DB-backed tier.
 AIDW_REVIEW_OVERHEAD_FRACTION = float(os.environ.get("AIDW_REVIEW_OVERHEAD_FRACTION", "0.175"))
+
+# exit_nodes.py's markdown-table-rendering family: internal rendering detail, zero LLM calls
+# anywhere near it, no operator would plausibly tune a table cell's character width via env var
+# (AGENTS.md's own carve-out example) -- excluded from the live DB-backed tier, unchanged from
+# before this migration.
+EXIT_SBOM_DIFF_PREVIEW_MAX = int(os.environ.get("AIDW_EXIT_SBOM_DIFF_PREVIEW_MAX", "15"))
+EXIT_FAILURE_HEADLINE_CHARS = int(os.environ.get("AIDW_EXIT_FAILURE_HEADLINE_CHARS", "300"))
+EXIT_TOOL_ERROR_SNIPPET_CHARS = int(os.environ.get("AIDW_EXIT_TOOL_ERROR_SNIPPET_CHARS", "80"))
+EXIT_MD_CELL_DEFAULT_CHARS = int(os.environ.get("AIDW_EXIT_MD_CELL_DEFAULT_CHARS", "90"))
+EXIT_KNOWN_GAP_CELL_CHARS = int(os.environ.get("AIDW_EXIT_KNOWN_GAP_CELL_CHARS", "110"))
+EXIT_HEALTH_BASIS_CELL_CHARS = int(os.environ.get("AIDW_EXIT_HEALTH_BASIS_CELL_CHARS", "100"))
+EXIT_FINDING_TOOLS_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_TOOLS_CELL_CHARS", "40"))
+EXIT_FINDING_RULE_ID_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_RULE_ID_CELL_CHARS", "40"))
+EXIT_FINDING_TITLE_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_TITLE_CELL_CHARS", "70"))
+EXIT_FINDING_WHERE_CELL_CHARS = int(os.environ.get("AIDW_EXIT_FINDING_WHERE_CELL_CHARS", "60"))
+EXIT_TOOL_VERSION_CELL_CHARS = int(os.environ.get("AIDW_EXIT_TOOL_VERSION_CELL_CHARS", "45"))
+EXIT_TOOL_NOTES_CELL_CHARS = int(os.environ.get("AIDW_EXIT_TOOL_NOTES_CELL_CHARS", "60"))
+EXIT_FINDINGS_TABLE_CAP = int(os.environ.get("AIDW_EXIT_FINDINGS_TABLE_CAP", "60"))
+EXIT_TEST_IDS_PREVIEW_MAX = int(os.environ.get("AIDW_EXIT_TEST_IDS_PREVIEW_MAX", "3"))
+EXIT_STALE_REASON_LOG_CHARS = int(os.environ.get("AIDW_EXIT_STALE_REASON_LOG_CHARS", "120"))
+
+# git_ops.py's push_head: how much of a failed `git push`'s own stderr/stdout to keep in
+# _LAST_PUSH's "error" field, surfaced to the session/UI as a streamed "warning chip" -- trivial,
+# UI-display-only, not worth an admin setting -- excluded from the live DB-backed tier.
+GIT_OPS_PUSH_ERROR_TAIL_CHARS = int(os.environ.get("AIDW_GIT_OPS_PUSH_ERROR_TAIL_CHARS", "500"))
+
+
+def _demo() -> None:
+    """Offline self-check: `cd agent && uv run python -m src.config`. No live DB in this
+    environment -- exercises the parser/formatter round-trip and the env/default fallback, not a
+    real runtime_settings override (that's covered by runtime_settings.py's own self-check)."""
+    # Env/default fallback: with no session pinned (runtime_settings.get_raw returns None for
+    # everything), every migrated constant must resolve its documented default via its own parser.
+    # Called directly via __getattr__(name), not as a bare name: bare module-level names resolve
+    # against this module's own globals (LEGB), which never consults __getattr__ at all -- that
+    # PEP 562 hook only fires for EXTERNAL `config.NAME` attribute access (every real call site
+    # across the other 19 files), not for code referencing a name bare from inside config.py
+    # itself. Exercising __getattr__ explicitly here is what actually proves the shim works.
+    assert __getattr__("SPEC_MAX_VERIFY_CYCLES") == 5, __getattr__("SPEC_MAX_VERIFY_CYCLES")
+    assert isinstance(__getattr__("SPEC_MAX_VERIFY_CYCLES"), int)
+    assert isinstance(__getattr__("AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS"), float)
+    assert __getattr__("AIDW_E2E_REUSE_PROVEN_LAUNCH") is True, __getattr__("AIDW_E2E_REUSE_PROVEN_LAUNCH")
+    assert __getattr__("LIGHTHOUSE_BLOCKING_AUDITS") == frozenset({"color-contrast"}), __getattr__("LIGHTHOUSE_BLOCKING_AUDITS")
+    assert __getattr__("E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS") == (3000, 10000, 15000), __getattr__("E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS")
+    assert __getattr__("E2E_APP_LOG_PATH") == "agent-work/e2e-app.log", __getattr__("E2E_APP_LOG_PATH")
+    assert __getattr__("PROVIDER_CACHE_TTL_SECONDS") == 30, __getattr__("PROVIDER_CACHE_TTL_SECONDS")
+    assert __getattr__("E2E_APP_PORT_RANGE_START") == 3100 and __getattr__("E2E_APP_PORT_RANGE_END") == 3140
+    assert __getattr__("VAULT_TIMEOUT_SECONDS") == 10.0, __getattr__("VAULT_TIMEOUT_SECONDS")
+
+    # Every _FORMATTERS entry must produce a string _PARSERS[same key] can parse straight back to
+    # an equal value -- the exact round-trip must-fix #1 (CSV-text vs. JSON conflation) depends on.
+    round_trip_cases: list[tuple[str, object]] = [
+        ("int", 7),
+        ("float", 3.5),
+        ("str", "hello"),
+        ("bool", True),
+        ("bool", False),
+        ("csv", ("a", "b", "c")),
+        ("csv_int", (3000, 10000, 15000)),
+        ("frozenset_csv", frozenset({"color-contrast", "image-alt"})),
+    ]
+    for kind, value in round_trip_cases:
+        formatted = _FORMATTERS[kind](value)
+        assert isinstance(formatted, str), (kind, value, formatted)
+        parsed = _PARSERS[kind](formatted)
+        assert parsed == value, (kind, value, formatted, parsed)
+
+    # A malformed override must not crash __getattr__ -- it must fall back to env/default instead.
+    # (Simulated without a live runtime_settings session: directly exercise the parser-failure path
+    # a corrupt DB value would hit.)
+    try:
+        int("not-a-number")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected int() to raise on non-numeric text")
+
+    # Unknown attribute must raise AttributeError, not silently return None or crash differently --
+    # standard Python module-attribute-error contract, must hold even with __getattr__ defined.
+    try:
+        __getattr__("_no_such_setting_")
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("expected AttributeError for an unknown config attribute")
+
+    # Excluded-bucket constants must still resolve as plain static values, completely bypassing
+    # __getattr__ (proves the coexistence of _SETTINGS-backed dynamic attributes and real static
+    # module globals doesn't conflict).
+    assert REQUIRED_SKILLS_BY_STAGE["plan"] == ["writing-plans"], REQUIRED_SKILLS_BY_STAGE
+    assert COPILOT_PLUGIN_DIRECTORIES[0].startswith(COPILOT_PLUGIN_ROOT_IN_CONTAINER), COPILOT_PLUGIN_DIRECTORIES
+    assert EXEC_CMD_BUDGET_CHARS == 16000, EXEC_CMD_BUDGET_CHARS
+
+    # Public accessors (task 7's Settings API surface).
+    all_settings = list_settings()
+    assert len(all_settings) == len(_SETTINGS) and len(all_settings) > 100, len(all_settings)
+    assert {"name", "category", "purpose", "effect", "value_range", "parser", "env_var", "default_raw"} <= all_settings[0].keys()
+    assert default_value("SPEC_MAX_VERIFY_CYCLES") == 5, default_value("SPEC_MAX_VERIFY_CYCLES")
+    assert format_setting("SPEC_MAX_VERIFY_CYCLES", 9) == "9", format_setting("SPEC_MAX_VERIFY_CYCLES", 9)
+    assert parse_setting("SPEC_MAX_VERIFY_CYCLES", "9") == 9, parse_setting("SPEC_MAX_VERIFY_CYCLES", "9")
+    assert format_setting("LIGHTHOUSE_BLOCKING_AUDITS", ["image-alt", "color-contrast"]) == "color-contrast,image-alt"
+    try:
+        format_setting("_no_such_setting_", 1)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("expected KeyError for an unknown setting name")
+
+    print("config self-check: ok (env/default fallback, parser/formatter round-trip, exclusion coexistence)")
+
+
+if __name__ == "__main__":  # pragma: no cover -- cd agent && uv run python -m src.config
+    # Re-dispatch through the PACKAGE name on purpose -- same convention as org_settings.py/
+    # chat_model.py/runtime_settings.py: `python -m src.config` loads this file as "__main__", so a
+    # direct _demo() call would import this module a second time under a separate sys.modules
+    # identity, splitting _SETTINGS/_PARSERS across two entries.
+    from src.config import _demo as _packaged_demo
+
+    _packaged_demo()

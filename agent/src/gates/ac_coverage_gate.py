@@ -25,13 +25,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shlex
 from dataclasses import dataclass
 from typing import Any
 
-from .. import chat_model, repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
+from .. import chat_model, config, repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from . import test_quality_checks
 from .ac_residue_checks import (
     _TEST_FILE_LISTING,
@@ -284,8 +283,8 @@ async def run_resolved_test_command(
 # What ac-to-tests still enforces: at least one test naming every criterion, those tests actually
 # failing (TDD red, checked mechanically), an e2e test for every criterion the stage marks
 # ui_relevant. Raise this above 0 only with evidence that the drafting model has started writing
-# below-browser tests at this phase.
-MIN_NON_E2E_TESTS_PER_AC_RED = int(os.environ.get("MIN_NON_E2E_TESTS_PER_AC_RED", "0"))
+# below-browser tests at this phase. See config.py's own entry for this setting -- centralized
+# there as part of the Org Settings migration.
 
 
 def duplicate_test_bodies(ac_id: str, test_files: dict[str, str]) -> int:
@@ -869,11 +868,11 @@ async def check_ac_coverage(
         counts = count_tests_per_ac(active_ac_ids, test_files, resolved_root if strict else None)
         ui_relevant = _ui_relevant_ac_ids(content_dict, active_ac_ids)
         # RED-phase threshold: this gate runs at ac-to-tests, before any implementation exists.
-        # See MIN_NON_E2E_TESTS_PER_AC_RED for why it is not the full requirement.
+        # See config.MIN_NON_E2E_TESTS_PER_AC_RED for why it is not the full requirement.
         depth_shortfall = depth_shortfalls(
             counts,
             ui_relevant,
-            min_non_e2e=MIN_NON_E2E_TESTS_PER_AC_RED,
+            min_non_e2e=config.MIN_NON_E2E_TESTS_PER_AC_RED,
             test_files=test_files,
             content_dict=content_dict,
         )

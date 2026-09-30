@@ -13,32 +13,37 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Awaitable, Callable, TypeVar
+
+from . import config
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-
-INFRA_RETRY_ATTEMPTS = int(os.environ.get("AIDW_LLM_INFRA_RETRY_ATTEMPTS", "3"))
-# A quota/rate-limit condition does not clear in 0 seconds -- an immediate retry against a still-
-# throttled endpoint just burns the attempt budget faster than a short backoff would.
-INFRA_RETRY_BACKOFF_SECONDS: tuple[float, ...] = tuple(
-    float(s) for s in os.environ.get("AIDW_LLM_INFRA_RETRY_BACKOFF_SECONDS", "5,20,60").split(",") if s.strip()
-)
 
 
 async def call_with_infra_retry(
     fn: Callable[[], Awaitable[T]],
     *,
     label: str,
-    attempts: int = INFRA_RETRY_ATTEMPTS,
-    backoff_seconds: tuple[float, ...] = INFRA_RETRY_BACKOFF_SECONDS,
+    attempts: int | None = None,
+    backoff_seconds: tuple[float, ...] | None = None,
 ) -> T:
     """Calls fn() (a zero-arg async thunk so callers can close over their real arguments), retrying
     on (TimeoutError, RuntimeError) -- a raw Copilot session failure, not a JSON/schema parse
     failure (ainvoke_structured already retries those itself) -- up to `attempts` times with
-    backoff between them, before letting the last exception propagate to the caller."""
+    backoff between them, before letting the last exception propagate to the caller.
+
+    `attempts`/`backoff_seconds`: None (the default, and what every real call site in this
+    codebase passes) resolves config.INFRA_RETRY_ATTEMPTS/INFRA_RETRY_BACKOFF_SECONDS fresh on
+    every call, not a value frozen at function-definition time -- a live, per-session-pinned Org
+    Setting has to be read this way, not baked into a default argument."""
+    if attempts is None:
+        attempts = config.INFRA_RETRY_ATTEMPTS
+    if backoff_seconds is None:
+        # A quota/rate-limit condition does not clear in 0 seconds -- an immediate retry against a
+        # still-throttled endpoint just burns the attempt budget faster than a short backoff would.
+        backoff_seconds = config.INFRA_RETRY_BACKOFF_SECONDS
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:

@@ -646,7 +646,7 @@ def _render_scan_sections(scan_report: dict[str, Any] | None, remediation: dict[
     basis = summary.get("health_basis") or {}
     if subscores:
         lines += ["| Dimension | Weight used | Score | Basis |", "|---|---|---|---|"]
-        for name in repo_scan.HEALTH_WEIGHTS:
+        for name in repo_scan.HEALTH_DIMENSION_NAMES:
             if name not in subscores:
                 continue
             sub = subscores.get(name)
@@ -1234,7 +1234,6 @@ async def verify_exit_readiness(
     no chat-model dispatch call of its own."""
     from . import app_discovery  # local: app_discovery imports nothing from exit_nodes, but keep the surface flat
     from .gates.ac_coverage_gate import resolve_test_command
-    from .gates.test_coverage_gate import COVERAGE_COMMANDS_PATH
     from .graph import TARGETED_FIX_UNRESOLVED_PATH, VerificationResult  # local: graph imports exit_nodes (same pattern as audit_gates)
     from .tech_stack_signals import frameworks_have_ui, presence_values
 
@@ -1271,7 +1270,7 @@ async def verify_exit_readiness(
         )
     coverage_entries = None
     if not manifest.get("coverage_commands"):
-        coverage_entries = _parse(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH)).get("entries")
+        coverage_entries = _parse(await repo_files.read_repo_file(provider, thread_id, workflow_config.COVERAGE_COMMANDS_PATH)).get("entries")
     updates = exit_readiness_checks.resolve_manifest_updates(
         manifest, resolved_apps=resolved_apps, scan_fingerprint=scan_fingerprint,
         resolved_test_command=resolved_test_command, coverage_entries=coverage_entries,

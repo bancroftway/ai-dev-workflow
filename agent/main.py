@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 # actually visible -- Python's root logger defaults to WARNING, which silently drops them.
 logging.basicConfig(level=logging.INFO)
 
-from src import checkpoint, run_activity
+from src import checkpoint, run_activity, runtime_settings
 from src.graph import graph
 from src.health_report import reap_orphaned_jobs
 from src.health_report_api import router as health_reports_router
@@ -37,6 +37,7 @@ from src.sessions_api import repo_design_settings_router
 from src.sessions_api import repo_test_config_router
 from src.sessions_api import repo_test_users_router
 from src.sessions_api import router as sessions_router
+from src.sessions_api import runtime_settings_router
 from src.telemetry import setup as telemetry_setup
 
 
@@ -74,6 +75,7 @@ app.include_router(sessions_router)
 app.include_router(health_reports_router)
 app.include_router(vault_config_router)
 app.include_router(org_settings_router)
+app.include_router(runtime_settings_router)
 app.include_router(tech_stack_catalog_router)
 app.include_router(projects_router)
 app.include_router(repo_auth_settings_router)
@@ -140,7 +142,13 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
 
         Exactly one call per thread_id ever reaches this method (run() below only creates a task
         when none is already registered), so there's no concurrent-astream_events risk to guard
-        against here -- that's now structural (the task registry), not lock-based."""
+        against here -- that's now structural (the task registry), not lock-based.
+
+        runtime_settings.pin_for_session() is called first, before anything else: this task (not
+        the HTTP request that provisioned the session -- a separate, earlier task with no context
+        lineage to this one) is what config.py's __getattr__ shim needs a pinned settings snapshot
+        scoped to, since every node this session runs awaits into THIS task's own context."""
+        await runtime_settings.pin_for_session()
         run_activity.incr(thread_id)
         try:
             is_first_event = True

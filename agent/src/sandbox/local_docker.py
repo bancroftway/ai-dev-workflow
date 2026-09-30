@@ -389,6 +389,21 @@ class LocalDockerProvider(SandboxProvider):
                     f"AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS', '700')}",
                     "-e",
                     f"AIDW_DIAGRAM_MAX_WIREFRAME_BYTES={os.environ.get('AIDW_DIAGRAM_MAX_WIREFRAME_BYTES', str(30 * 1024))}",
+                    # Org Settings migration Task 3: gates/test_quality_checks.py is sandbox-mirrored
+                    # (byte-identical under sandbox-image/hooks/), same "container-boot passthrough,
+                    # not config.py/runtime_settings" reasoning as the block above -- these 4 were
+                    # missing from that passthrough until this fix, so an operator's env override
+                    # never reached the container even though config.py's own identically-named
+                    # os.environ.get() read it correctly on the host. Defaults are literal copies of
+                    # test_quality_checks.py's own defaults for these exact env var names.
+                    "-e",
+                    f"MAX_TEST_BODY_SIMILARITY={os.environ.get('MAX_TEST_BODY_SIMILARITY', '0.92')}",
+                    "-e",
+                    f"MIN_NON_E2E_TESTS_PER_AC={os.environ.get('MIN_NON_E2E_TESTS_PER_AC', '2')}",
+                    "-e",
+                    f"MIN_DISTINCT_ASSERTIONS_PER_AC={os.environ.get('MIN_DISTINCT_ASSERTIONS_PER_AC', '2')}",
+                    "-e",
+                    f"MIN_TESTS_BEFORE_ASSERTION_CHECK={os.environ.get('MIN_TESTS_BEFORE_ASSERTION_CHECK', '3')}",
                 ]
                 if scaffold_new_repo:
                     # "+ New Project" case only (Part 3 plan, Ruling 6) -- entrypoint.sh reads

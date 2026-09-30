@@ -28,7 +28,7 @@ import json
 import re
 from typing import Any
 
-from . import org_credential_vault
+from . import config, org_credential_vault
 from .keyvault import VaultAccessError
 
 # Entra object ids are GUIDs. Validated before building a secret name because the value is
@@ -39,8 +39,9 @@ _OID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
 
 _LINK_SECRET_PREFIX = "github-link-"
 
-# Reuse org_credential_vault's timeout so both org-vault surfaces degrade identically.
-_VAULT_TIMEOUT_SECONDS = org_credential_vault._VAULT_TIMEOUT_SECONDS  # noqa: SLF001 -- same package, one org vault
+# Reuse config.VAULT_TIMEOUT_SECONDS so both org-vault surfaces degrade identically -- read fresh
+# at each call site below (config.VAULT_TIMEOUT_SECONDS), not snapshotted into a module constant,
+# so a live override reaches this module too.
 
 
 def _secret_name(oid: str) -> str:
@@ -69,12 +70,13 @@ async def get_github_link(oid: str) -> dict[str, Any] | None:
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    timeout = config.VAULT_TIMEOUT_SECONDS
     try:
-        return await asyncio.wait_for(_fetch(), timeout=_VAULT_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(_fetch(), timeout=timeout)
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
     except asyncio.TimeoutError as exc:
-        raise VaultAccessError(f"timed out after {_VAULT_TIMEOUT_SECONDS}s contacting the org vault") from exc
+        raise VaultAccessError(f"timed out after {timeout}s contacting the org vault") from exc
 
 
 async def set_github_link(oid: str, payload: dict[str, Any]) -> None:
@@ -89,12 +91,13 @@ async def set_github_link(oid: str, payload: dict[str, Any]) -> None:
     async def _store() -> None:
         await org_credential_vault._get_client().set_secret(name, value)  # noqa: SLF001
 
+    timeout = config.VAULT_TIMEOUT_SECONDS
     try:
-        await asyncio.wait_for(_store(), timeout=_VAULT_TIMEOUT_SECONDS)
+        await asyncio.wait_for(_store(), timeout=timeout)
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
     except asyncio.TimeoutError as exc:
-        raise VaultAccessError(f"timed out after {_VAULT_TIMEOUT_SECONDS}s contacting the org vault") from exc
+        raise VaultAccessError(f"timed out after {timeout}s contacting the org vault") from exc
 
 
 async def delete_github_link(oid: str) -> None:
@@ -113,12 +116,13 @@ async def delete_github_link(oid: str) -> None:
         except ResourceNotFoundError:
             return
 
+    timeout = config.VAULT_TIMEOUT_SECONDS
     try:
-        await asyncio.wait_for(_delete(), timeout=_VAULT_TIMEOUT_SECONDS)
+        await asyncio.wait_for(_delete(), timeout=timeout)
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
     except asyncio.TimeoutError as exc:
-        raise VaultAccessError(f"timed out after {_VAULT_TIMEOUT_SECONDS}s contacting the org vault") from exc
+        raise VaultAccessError(f"timed out after {timeout}s contacting the org vault") from exc
 
 
 def _demo() -> None:

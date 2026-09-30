@@ -102,7 +102,7 @@ async def open_pull_request(
 
         logger.warning(
             "open_pull_request failed for %s/%s %s->%s: %s %s",
-            owner, repo, work_branch, source_branch, resp.status_code, resp.text[:config.GIT_OPS_API_ERROR_PREVIEW_CHARS],
+            owner, repo, work_branch, source_branch, resp.status_code, resp.text,
         )
         return None
 
@@ -138,7 +138,7 @@ async def update_pull_request(*, owner: str, repo: str, pr_url: str, body: str, 
             return True
         logger.warning(
             "update_pull_request failed for %s/%s#%d: %s %s",
-            owner, repo, number, resp.status_code, resp.text[:config.GIT_OPS_API_ERROR_PREVIEW_CHARS],
+            owner, repo, number, resp.status_code, resp.text,
         )
         return False
 
@@ -171,7 +171,7 @@ async def delete_remote_branch(*, owner: str, repo: str, branch: str, token: str
         return True
     logger.warning(
         "delete_remote_branch failed for %s/%s@%s: %s %s",
-        owner, repo, branch, resp.status_code, resp.text[:config.GIT_OPS_API_ERROR_PREVIEW_CHARS]
+        owner, repo, branch, resp.status_code, resp.text
     )
     return False
 
@@ -594,8 +594,7 @@ async def ignore_generated_files(provider: SandboxProvider, thread_id: str) -> l
     logger.info(
         "gitignore: %d generated path(s) detected and ignored: %s",
         len(missing),
-        ", ".join(missing[:config.GIT_OPS_GITIGNORE_PREVIEW_MAX])
-        + (" ..." if len(missing) > config.GIT_OPS_GITIGNORE_PREVIEW_MAX else ""),
+        ", ".join(missing),
     )
     return missing
 

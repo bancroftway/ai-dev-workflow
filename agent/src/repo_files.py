@@ -25,6 +25,7 @@ import time
 import uuid
 from typing import Any
 
+from . import config
 from .sandbox.provider import SandboxProvider, is_expected_missing_file
 
 logger = logging.getLogger(__name__)
@@ -39,9 +40,6 @@ LEDGER_PATH = ".ai-dev-workflow/ledger.jsonl"
 # also owns the reset-per-run lifecycle (reset_hook_fail_opens below), same as reset_ledger/
 # LEDGER_PATH's pairing.
 HOOK_FAIL_OPENS_PATH = ".ai-dev-workflow/hook-fail-opens.jsonl"
-
-# Keep each exec's command line well under Windows' ~32K CreateProcess cap (WinError 206).
-_EXEC_CMD_BUDGET = 16000
 
 # Repo-relative paths only: no leading "/", no ".." traversal, and a conservative character
 # allowlist -- closes a real command-injection gap (found by automated security review) where a
@@ -59,7 +57,7 @@ _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.\-/\[\]()@+ ]+$")
 
 def _chunked_write_commands(path: str, encoded: str, quoted: str, parent_dir: str, redirect: str) -> list[str]:
     """Builds the sidecar-chunked write commands `write_repo_file`/`append_ledger_entry` both use
-    once a payload exceeds `_EXEC_CMD_BUDGET`. `redirect` is `>` (overwrite) or `>>` (append).
+    once a payload exceeds `config.EXEC_CMD_BUDGET_CHARS`. `redirect` is `>` (overwrite) or `>>` (append).
 
     Root-caused 2026-09-21 (income-investor session f0fef8ba): the tmp sidecar name used to be
     `path + ".b64part"` -- fixed, derived only from the target path. `run_repo_scan` writes
@@ -77,8 +75,8 @@ def _chunked_write_commands(path: str, encoded: str, quoted: str, parent_dir: st
     tmp = shlex.quote(f"{path}.b64part.{token}")
     commands = [f"mkdir -p {shlex.quote(parent_dir)} && : > {tmp}"]
     commands += [
-        f"printf %s {encoded[i : i + _EXEC_CMD_BUDGET]} >> {tmp}"
-        for i in range(0, len(encoded), _EXEC_CMD_BUDGET)
+        f"printf %s {encoded[i : i + config.EXEC_CMD_BUDGET_CHARS]} >> {tmp}"
+        for i in range(0, len(encoded), config.EXEC_CMD_BUDGET_CHARS)
     ]
     commands.append(f"base64 -d < {tmp} {redirect} {quoted} && rm -f {tmp}")
     return commands
@@ -132,7 +130,7 @@ async def write_repo_file(provider: SandboxProvider, thread_id: str, path: str, 
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     parent_dir = path.rsplit("/", 1)[0] if "/" in path else "."
     quoted = shlex.quote(path)
-    if len(encoded) <= _EXEC_CMD_BUDGET:
+    if len(encoded) <= config.EXEC_CMD_BUDGET_CHARS:
         commands = [f"mkdir -p {shlex.quote(parent_dir)} && echo {encoded} | base64 -d > {quoted}"]
     else:
         # The whole payload used to ride in one exec's argv; Windows' CreateProcess caps the
@@ -189,7 +187,7 @@ async def append_ledger_entry(provider: SandboxProvider, thread_id: str, entry: 
     encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
     parent_dir = LEDGER_PATH.rsplit("/", 1)[0]
     quoted = shlex.quote(LEDGER_PATH)
-    if len(encoded) <= _EXEC_CMD_BUDGET:
+    if len(encoded) <= config.EXEC_CMD_BUDGET_CHARS:
         commands = [f"mkdir -p {shlex.quote(parent_dir)} && echo {encoded} | base64 -d >> {quoted}"]
     else:
         # Chunked for the same reason write_repo_file is, and found the same way -- WinError 206,

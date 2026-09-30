@@ -44,7 +44,7 @@ whatever you built).
 
 Host/bootstrap code is the one legitimate coverage exception. An ASP.NET `Program.cs`, a Blazor
 host, a `main.ts` bootstrap -- pure framework wiring with no business logic -- is not meaningfully
-unit-testable, and trying to chase it to 95% wastes the stage (observed live: a real app stalled at
+unit-testable, and trying to chase it to <<min_coverage_percent>>% wastes the stage (observed live: a real app stalled at
 88% lines purely because `Program.cs` sat at 0%). Mark such a file `[ExcludeFromCodeCoverage]` in
 .NET (coverlet honours the attribute automatically), or cover it with a real integration test if
 the framework makes that natural. This applies ONLY to wiring: any file containing a decision,
@@ -52,7 +52,7 @@ validation, calculation, or persistence rule -- including a minimal-API `Program
 endpoints -- must be genuinely tested, never attributed away. Broadening coverage-exclusion CONFIG
 to dodge the threshold is separately detected and rejected as gaming.
 
-COVERAGE: a deterministic gate verifies 95% line+branch coverage after this stage. A separate
+COVERAGE: a deterministic gate verifies <<min_coverage_percent>>% line+branch coverage after this stage. A separate
 coverage agent works out how to run your tests with coverage and does it -- you do NOT need to
 record commands or write any coverage config file. What you owe that agent is a suite it can
 actually run: keep each stack's tests runnable from that stack's own project root, keep Playwright

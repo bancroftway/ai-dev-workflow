@@ -44,9 +44,11 @@ from typing import Any
 
 import defusedxml.ElementTree as ET
 
-# Same env var name as test_coverage_gate.py's own config.MIN_COVERAGE_PERCENT read (AGENTS.md's
-# own rule: two reads of the same env var, not a second knob) -- kept in sync by that identity,
-# not by import, since config.py itself pulls in dependencies this sandbox-side module must not.
+# THE single source of truth for this threshold (Org Settings migration, found live: config.py
+# deliberately does NOT define its own MIN_COVERAGE_PERCENT -- see that file's own comment next to
+# where it would otherwise be). test_coverage_gate.py and metrics_nodes.py both import this exact
+# name from here, not from config.py, since config.py itself pulls in dependencies this sandbox-
+# side module must not have, and this way agent-side/sandbox-side enforcement can never disagree.
 MIN_COVERAGE_PERCENT = float(os.environ.get("MIN_COVERAGE_PERCENT", "95.0"))
 
 _CONTRACT_FORMATS = frozenset({"cobertura", "istanbul-json-summary"})

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -34,7 +33,6 @@ from .schemas_test_hardening import FlakeTriageResponse
 
 logger = logging.getLogger(__name__)
 
-TEST_HARDENING_TOTAL_ATTEMPTS = int(os.environ.get("TEST_HARDENING_TOTAL_ATTEMPTS", "3"))  # 1 initial + 2 retries
 FLAKE_QUARANTINE_PATH = ".ai-dev-workflow/test_hardening/flake-quarantine.json"
 
 # Placeholder the discovery agent leaves in its command/result path; Python substitutes the
@@ -91,7 +89,7 @@ async def _run_test_attempts(
     whether that means "nothing to harden" or "try the next fallback").
     """
     outcomes: dict[str, list[str]] = {}
-    for attempt in range(TEST_HARDENING_TOTAL_ATTEMPTS):
+    for attempt in range(workflow_config.TEST_HARDENING_TOTAL_ATTEMPTS):
         command = discovery.command.replace(_ATTEMPT_TOKEN, str(attempt))
         result_path = _repo_relative(discovery.result_path.replace(_ATTEMPT_TOKEN, str(attempt)))
         if result_path is None:
@@ -463,7 +461,7 @@ def _demo() -> None:
         )
         good_result = asyncio.run(_run_test_attempts(provider, "t", good_discovery))
         assert good_result is not None and "T1" in good_result, good_result
-        assert len(good_result["T1"]) == TEST_HARDENING_TOTAL_ATTEMPTS, (
+        assert len(good_result["T1"]) == workflow_config.TEST_HARDENING_TOTAL_ATTEMPTS, (
             "must accumulate one outcome per attempt, not just the first/last"
         )
         assert all(o == "pass" for o in good_result["T1"])

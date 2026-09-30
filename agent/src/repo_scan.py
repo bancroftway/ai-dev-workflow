@@ -72,16 +72,10 @@ from typing import Any, Callable, Iterable, Sequence
 
 from langchain_core.runnables import RunnableConfig
 
-from .config import (
-    AIDW_TOOL_PROBE_NOTES_HEAD_CHARS,
-    AIDW_TOOL_PROBE_NOTES_TAIL_CHARS,
-    AIDW_TOOL_PROBE_RETRY_COUNT,
-    AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS,
-)
+from . import config as workflow_config
 from .gates import quick_scan, sast_parsers
 from .sarif import Finding, parse_sarif
 from .severity import SEMGREP_SEVERITY_MAP, SEVERITY_ORDER, meets_or_exceeds
-from .text_truncate import truncate_middle
 
 logger = logging.getLogger(__name__)
 
@@ -103,24 +97,14 @@ SBOM_BASELINE_PATH = ".ai-dev-workflow/sbom-baseline.json"
 SEMGREP_RULES_DIR = os.environ.get("AIDW_SEMGREP_RULES_DIR", "/opt/aidw/semgrep-rules")
 OSV_DB_DIR = os.environ.get("AIDW_OSV_DB_DIR", "/opt/aidw/osv-db")
 
-# Thresholds -- module constants with env overrides, matching quality_nodes.py's convention.
-MAX_DUPLICATION_PERCENT = float(os.environ.get("QUALITY_MAX_DUPLICATION_PERCENT", "3.0"))
-# 20, not lizard's warn-level 15: this is a HARD gate (an introduced finding blocks the run),
-# and 15 flags ordinary dense-but-flat code -- observed live: a 14-line option-resolver at CCN 17
-# ping-ponged between the quality fixer and the gate, each refactor pushing the complexity into
-# a new helper. 15-19 is reviewer-attention territory, not block-the-pipeline territory; real
-# monsters (20+) still gate.
-LIZARD_MAX_CCN = int(os.environ.get("LIZARD_MAX_CCN", "20"))
-LIZARD_HIGH_CCN = int(os.environ.get("LIZARD_HIGH_CCN", "25"))
-CHURN_WINDOW_DAYS = int(os.environ.get("REPO_SCAN_CHURN_WINDOW_DAYS", "365"))
-# Lenient first-cut floor, not a calibrated target: interrogate's own README default is 80%, but
-# that's tuned for a project treating docstrings as a merge gate from day one. Starting at 50% means
-# this only fires on repos with substantially undocumented public APIs, not on ordinary gaps.
-DOC_COVERAGE_MIN_PERCENT = float(os.environ.get("DOC_COVERAGE_MIN_PERCENT", "50.0"))
-SECURITY_SEVERITY_FLOOR = os.environ.get("SECURITY_SEVERITY_FLOOR", "medium")
-# Bounds the coverage measurement the baseline node runs alongside the scan -- a hung test command
-# must not hang the whole baseline forever. None (gate callers) keeps today's unbounded behavior.
-REPO_SCAN_COVERAGE_TIMEOUT_SECONDS = int(os.environ.get("REPO_SCAN_COVERAGE_TIMEOUT_SECONDS", "600"))
+# Thresholds -- centralized into config.py during the Org Settings migration (this file is
+# agent-side-only, not one of the sandbox-mirrored "pure" modules, so its settings are safe for
+# the live per-session tier). MAX_DUPLICATION_PERCENT was previously TWO independent declarations
+# (this file's own QUALITY_MAX_DUPLICATION_PERCENT and metrics_nodes.py's own
+# MAX_DUPLICATION_PERCENT) -- unified onto this file's env var name since it's the one the primary
+# scan-time gate already used. REPO_SCAN_COVERAGE_TIMEOUT_SECONDS was a second, independent read of
+# the SAME env var config.py's own TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS already reads -- collapsed
+# to that one setting, not renamed (same env var name either way).
 
 # Which categories a security gate is allowed to block on. `duplication`/`maintainability`/
 # `sast-quality` are quality-remediation's business and are gated on the baseline delta instead, never absolutely.
@@ -157,12 +141,6 @@ _RISK_UNITS: dict[str, float] = {"critical": 20.0, "high": 8.0, "medium": 2.5, "
 _SECURITY_REF_KLOC = 10.0
 _SECURITY_MIN_KLOC = 10.0
 _SECURITY_DECAY = 25.0
-# Below this fraction of applicable security tools completing, the whole score is multiplied by
-# sqrt(fraction) -- a smooth haircut, never a cliff, applied to the WHOLE score deliberately: a
-# partial security measurement makes the whole verdict less trustworthy. 1.0 means any failed
-# security tool costs something (at the note's 0.8, one failed tool of five cost nothing).
-MIN_SECURITY_COVERAGE = float(os.environ.get("HEALTH_MIN_SECURITY_COVERAGE", "1.0"))
-
 # scc language names that are data/markup, not authored code -- excluded from the kloc that
 # normalizes the security leg. A 20k-line package-lock.json or a YAML pipeline would otherwise
 # halve the normalised burden. HTML stays IN (Angular templates are application code).
@@ -172,29 +150,29 @@ _NON_CODE_LANGUAGES = frozenset({
 })
 
 
-def _health_weight(env_name: str, default: float) -> float:
-    """Env-overridable weight that can never crash module import on a garbage value."""
-    try:
-        return float(os.environ.get(env_name, str(default)))
-    except ValueError:
-        logger.warning("repo_scan: ignoring non-numeric %s", env_name)
-        return default
+# The fixed set of health-score dimension keys -- structural, never operator-tunable (unlike the
+# WEIGHTS themselves), so exit_nodes.py's own table-rendering loop can iterate these names without
+# needing a live config read just to know what the dimensions ARE.
+HEALTH_DIMENSION_NAMES: tuple[str, ...] = (
+    "security", "coverage", "dependencies", "ac_verification", "accessibility",
+    "complexity", "performance", "duplication", "maintainability",
+)
 
 
-# Health score v2 nominal weights, summing to 1.0. When a subscore is unmeasured (None) its weight
-# is redistributed proportionally over the measured ones -- `health_weights_used` on the summary is
-# the ground truth for what a given score actually weighed. Documented in README.md "Health score".
-HEALTH_WEIGHTS: dict[str, float] = {
-    "security": _health_weight("HEALTH_WEIGHT_SECURITY", 0.40),
-    "coverage": _health_weight("HEALTH_WEIGHT_COVERAGE", 0.12),
-    "dependencies": _health_weight("HEALTH_WEIGHT_DEPENDENCIES", 0.12),
-    "ac_verification": _health_weight("HEALTH_WEIGHT_AC_VERIFICATION", 0.10),
-    "accessibility": _health_weight("HEALTH_WEIGHT_ACCESSIBILITY", 0.07),
-    "complexity": _health_weight("HEALTH_WEIGHT_COMPLEXITY", 0.06),
-    "performance": _health_weight("HEALTH_WEIGHT_PERFORMANCE", 0.05),
-    "duplication": _health_weight("HEALTH_WEIGHT_DUPLICATION", 0.04),
-    "maintainability": _health_weight("HEALTH_WEIGHT_MAINTAINABILITY", 0.04),
-}
+def _health_weights() -> dict[str, float]:
+    """Health score v2 nominal weights, summing to 1.0. When a subscore is unmeasured (None) its
+    weight is redistributed proportionally over the measured ones -- `health_weights_used` on the
+    summary is the ground truth for what a given score actually weighed. Documented in README.md
+    "Health score".
+
+    A function, not a module-level dict: like graph.py's STAGES, a plain dict built once at
+    import time would never reflect a per-session-pinned Org Setting override. config.py's own
+    __getattr__ already falls back to the env/default tier on a malformed value (must-fix #2), so
+    this no longer needs its own try/except around a garbage env value the way the old
+    _health_weight() helper did."""
+    return {name: getattr(workflow_config, f"HEALTH_WEIGHT_{name.upper()}") for name in HEALTH_DIMENSION_NAMES}
+
+
 HEALTH_SCORE_VERSION = 3
 # lizard findings score in the complexity subscore and interrogate's percentage is blended directly,
 # so their findings must not ALSO count in the maintainability subscore (double-counting).
@@ -386,7 +364,9 @@ def parse_lizard(raw: str) -> ParseResult:
         return [], {}
 
     ccns = [f["ccn"] for f in app_functions] or [f["ccn"] for f in functions]
-    over = [f for f in functions if f["ccn"] > LIZARD_MAX_CCN]
+    lizard_max_ccn = workflow_config.LIZARD_MAX_CCN
+    lizard_high_ccn = workflow_config.LIZARD_HIGH_CCN
+    over = [f for f in functions if f["ccn"] > lizard_max_ccn]
     over.sort(key=lambda f: (-f["ccn"], f["path"], f["function"]))
     app_over = [f for f in over if not is_non_application_path(f["path"])]
 
@@ -395,13 +375,13 @@ def parse_lizard(raw: str) -> ParseResult:
             finding_key=stable_id("maintainability", f["function"], f["path"]),
             tool="lizard",
             rule_id="high-cyclomatic-complexity",
-            severity="high" if f["ccn"] > LIZARD_HIGH_CCN else "medium",
+            severity="high" if f["ccn"] > lizard_high_ccn else "medium",
             raw_severity=str(f["ccn"]),
             file=f["path"],
             line=None,
             message=(
                 f"Function `{f['function']}` has cyclomatic complexity {f['ccn']} "
-                f"(threshold {LIZARD_MAX_CCN}), {f['nloc']} lines."
+                f"(threshold {lizard_max_ccn}), {f['nloc']} lines."
             ),
             category="maintainability",
             title=f"Complex function: {f['function']}",
@@ -419,7 +399,7 @@ def parse_lizard(raw: str) -> ParseResult:
             "max_ccn": max(ccns),
             "functions_total": len(app_functions or functions),
             "functions_over_threshold": len(app_over),
-            "threshold": LIZARD_MAX_CCN,
+            "threshold": lizard_max_ccn,
             "worst": app_over[:10],
             # Consumed by the churn join, not serialized -- see _assemble_metrics.
             "_by_path": _max_ccn_by_path(app_functions or functions),
@@ -459,7 +439,8 @@ def parse_jscpd(raw: str) -> ParseResult:
     )
 
     findings: list[Finding] = []
-    if percent > MAX_DUPLICATION_PERCENT:
+    max_duplication_percent = workflow_config.MAX_DUPLICATION_PERCENT
+    if percent > max_duplication_percent:
         # One aggregate finding, not one per clone: jscpd reports every pair, so per-clone findings
         # would flood the dashboard with N^2 noise for a single copy-pasted block. The individual
         # sites are still in metrics.duplication.clones.
@@ -475,7 +456,7 @@ def parse_jscpd(raw: str) -> ParseResult:
                 line=None,
                 message=(
                     f"Copy-paste duplication is {percent:.2f}% of the codebase "
-                    f"(threshold {MAX_DUPLICATION_PERCENT}%), across {len(duplicates)} clone pairs."
+                    f"(threshold {max_duplication_percent}%), across {len(duplicates)} clone pairs."
                 ),
                 category="duplication",
                 title="Duplication over threshold",
@@ -489,7 +470,7 @@ def parse_jscpd(raw: str) -> ParseResult:
             "percent": round(percent, 2),
             "duplicated_lines": total.get("duplicatedLines"),
             "clone_count": len(duplicates),
-            "threshold": MAX_DUPLICATION_PERCENT,
+            "threshold": max_duplication_percent,
             "clones": clones[:20],
         }
     }
@@ -863,7 +844,7 @@ def parse_git_churn(raw: str) -> ParseResult:
 
     return [], {
         "churn": {
-            "window_days": CHURN_WINDOW_DAYS,
+            "window_days": workflow_config.CHURN_WINDOW_DAYS,
             "commits": len(commits_seen),
             "files_touched": len(per_file),
             # Author names are deliberately not serialized -- ownership concentration is the signal,
@@ -951,7 +932,8 @@ def parse_interrogate(raw: str) -> ParseResult:
         percent = float(candidates[-1])
 
     findings: list[Finding] = []
-    if percent < DOC_COVERAGE_MIN_PERCENT:
+    doc_coverage_min_percent = workflow_config.DOC_COVERAGE_MIN_PERCENT
+    if percent < doc_coverage_min_percent:
         # One aggregate finding for the whole repo, not one per undocumented symbol -- same
         # reasoning as jscpd's aggregate duplication finding above: a per-symbol flood would drown
         # the dashboard, and the per-file breakdown already lives in interrogate's own -v output.
@@ -966,7 +948,7 @@ def parse_interrogate(raw: str) -> ParseResult:
                 line=None,
                 message=(
                     f"Python docstring coverage is {percent:.1f}% "
-                    f"(threshold {DOC_COVERAGE_MIN_PERCENT}%)."
+                    f"(threshold {doc_coverage_min_percent}%)."
                 ),
                 category="maintainability",
                 title="Docstring coverage under threshold",
@@ -975,7 +957,7 @@ def parse_interrogate(raw: str) -> ParseResult:
             )
         )
     return findings, {
-        "documentation": {"python_docstring_coverage_percent": round(percent, 1), "python_threshold": DOC_COVERAGE_MIN_PERCENT}
+        "documentation": {"python_docstring_coverage_percent": round(percent, 1), "python_threshold": doc_coverage_min_percent}
     }
 
 
@@ -1905,12 +1887,14 @@ def health_score(
         "maintainability": maintainability_sub,
     }
 
+    min_security_coverage = workflow_config.MIN_SECURITY_COVERAGE
     multiplier = (
         1.0
-        if coverage_fraction >= MIN_SECURITY_COVERAGE or MIN_SECURITY_COVERAGE <= 0
-        else (max(coverage_fraction, 0.0) / MIN_SECURITY_COVERAGE) ** 0.5
+        if coverage_fraction >= min_security_coverage or min_security_coverage <= 0
+        else (max(coverage_fraction, 0.0) / min_security_coverage) ** 0.5
     )
-    present = {name: HEALTH_WEIGHTS[name] for name, sub in subscores.items() if sub is not None}
+    health_weights = _health_weights()
+    present = {name: health_weights[name] for name, sub in subscores.items() if sub is not None}
     total_weight = sum(present.values())
     if not present or total_weight <= 0:
         return {
@@ -2072,10 +2056,15 @@ class ScanReport:
     def summary(
         self,
         *,
-        severity_floor: str = SECURITY_SEVERITY_FLOOR,
+        severity_floor: str | None = None,
         introduced_ids: frozenset[str] | None = None,
         known_gap_ids: frozenset[str] | None = None,
     ) -> dict[str, Any]:
+        # None (every real caller) resolves config.SECURITY_SEVERITY_FLOOR fresh on every call, not
+        # a value frozen at function-definition time -- a live, per-session-pinned Org Setting has
+        # to be read this way, not baked into a default argument.
+        if severity_floor is None:
+            severity_floor = workflow_config.SECURITY_SEVERITY_FLOOR
         by_severity = {level: 0 for level in SEVERITY_ORDER}
         by_category: dict[str, int] = {}
         # Security-only severity tally -- kept separate from `by_severity` above (which is every
@@ -2181,7 +2170,11 @@ class ScanReport:
             },
         }
 
-    def to_dashboard_dict(self, *, severity_floor: str = SECURITY_SEVERITY_FLOOR, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
+    def to_dashboard_dict(self, *, severity_floor: str | None = None, introduced_ids: frozenset[str] | None = None) -> dict[str, Any]:
+        # None (every real caller) resolves config.SECURITY_SEVERITY_FLOOR fresh on every call --
+        # see summary()'s own identical comment just above for why this can't be a default arg.
+        if severity_floor is None:
+            severity_floor = workflow_config.SECURITY_SEVERITY_FLOOR
         findings = [
             _dashboard_finding(
                 f,
@@ -2681,6 +2674,36 @@ def _build_gitleaks_command(extra_stopwords: Sequence[str] = (), extra_allow_pat
     )
 
 
+def _build_jscpd_command(max_duplication_percent: float | None = None) -> str:
+    """The jscpd ToolSpec's own `command` (see that ToolSpec's own comment for why the ignore list
+    is load-bearing). Extracted into a function -- rather than a static f-string -- so
+    run_repo_scan can rebuild it per-scan against config.py's live MAX_DUPLICATION_PERCENT; called
+    with no arguments, this reads that live value itself."""
+    if max_duplication_percent is None:
+        max_duplication_percent = workflow_config.MAX_DUPLICATION_PERCENT
+    return (
+        f"jscpd . --threshold {max_duplication_percent} --reporters json --output agent-work/jscpd --silent "
+        "--format 'typescript,tsx,javascript,jsx,c-sharp,python' "
+        '--ignore "**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/out/**,**/.next/**,'
+        '**/.angular/**,**/.nuxt/**,'
+        '**/coverage/**,**/*.min.js,**/*.d.ts,**/migrations/**,'
+        '**/*.test.*,**/*.spec.*,**/tests/**,**/__tests__/**,**/*Tests.cs,**/*.Tests/**,'
+        '**/.ai-dev-workflow/**,**/agent-work/**,**/drizzle/meta/**,**/.wrangler/**,**/*.snap"'
+    )
+
+
+def _build_git_churn_command(churn_window_days: int | None = None) -> str:
+    """The git-churn ToolSpec's own `command`. Extracted into a function -- rather than a static
+    f-string -- so run_repo_scan can rebuild it per-scan against config.py's live
+    CHURN_WINDOW_DAYS; called with no arguments, this reads that live value itself."""
+    if churn_window_days is None:
+        churn_window_days = workflow_config.CHURN_WINDOW_DAYS
+    return (
+        "git log --no-merges --numstat --format=C%x7C%H%x7C%an%x7C%aI "
+        f"--since={churn_window_days}.days.ago > agent-work/git-churn.txt"
+    )
+
+
 async def org_gitleaks_allowlist() -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Org-configured extra gitleaks allowlist entries, parsed from org_settings.py's raw
     newline-separated `gitleaks_extra_stopwords`/`gitleaks_extra_allow_paths` text. Degrades to
@@ -2748,13 +2771,7 @@ TOOLS: tuple[ToolSpec, ...] = (
         # Tests are excluded too: repeated render/assert scaffolding is idiomatic there, and a
         # tiny greenfield app whose tree is mostly tests deadlocked the 3% quality gate on test
         # boilerplate alone (observed live, headless sc1: every clone pair was a *.test.tsx).
-        f"jscpd . --threshold {MAX_DUPLICATION_PERCENT} --reporters json --output agent-work/jscpd --silent "
-        "--format 'typescript,tsx,javascript,jsx,c-sharp,python' "
-        '--ignore "**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/out/**,**/.next/**,'
-        '**/.angular/**,**/.nuxt/**,'
-        '**/coverage/**,**/*.min.js,**/*.d.ts,**/migrations/**,'
-        '**/*.test.*,**/*.spec.*,**/tests/**,**/__tests__/**,**/*Tests.cs,**/*.Tests/**,'
-        '**/.ai-dev-workflow/**,**/agent-work/**,**/drizzle/meta/**,**/.wrangler/**,**/*.snap"',
+        _build_jscpd_command(),
         "agent-work/jscpd/jscpd-report.json", parse_jscpd, "jscpd --version",
     ),
     ToolSpec(
@@ -2818,8 +2835,7 @@ TOOLS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "git-churn", "n/a", True,
-        f"git log --no-merges --numstat --format=C%x7C%H%x7C%an%x7C%aI "
-        f"--since={CHURN_WINDOW_DAYS}.days.ago > agent-work/git-churn.txt",
+        _build_git_churn_command(),
         "agent-work/git-churn.txt", parse_git_churn, "git --version",
     ),
     ToolSpec(
@@ -3064,6 +3080,17 @@ async def run_repo_scan(
                 "(%d extra stopword(s), %d extra allow-path(s))",
                 len(gitleaks_extra_stopwords), len(gitleaks_extra_allow_paths),
             )
+    # jscpd's --threshold and git-churn's --since both interpolate a live config.py setting into
+    # the command string -- TOOLS is a module-level tuple built once at import time, so these two
+    # ToolSpecs' commands are rebuilt here, at call time, against the current pinned-session value,
+    # same as the gitleaks rebuild above (unconditional here since there's no "only if non-default"
+    # opt-in for these two).
+    selected = [
+        replace(spec, command=_build_jscpd_command()) if spec.name == "jscpd"
+        else replace(spec, command=_build_git_churn_command()) if spec.name == "git-churn"
+        else spec
+        for spec in selected
+    ]
     await provider.exec_in_sandbox(thread_id, "mkdir -p agent-work agent-work/jscpd")
 
     findings: list[Finding] = []
@@ -3149,9 +3176,9 @@ async def _probe_tool_version_with_retry(provider: Any, thread_id: str, version_
     (whether or not it succeeded) so the caller can still read its stdout for diagnostics."""
     result = await provider.exec_in_sandbox(thread_id, version_command)
     attempt = 0
-    while not result.ok and attempt < AIDW_TOOL_PROBE_RETRY_COUNT:
+    while not result.ok and attempt < workflow_config.AIDW_TOOL_PROBE_RETRY_COUNT:
         attempt += 1
-        await asyncio.sleep(AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS)
+        await asyncio.sleep(workflow_config.AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS)
         result = await provider.exec_in_sandbox(thread_id, version_command)
     return result
 
@@ -3204,8 +3231,7 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
         probe_detail = version_output or "(no output)"
         run.update(
             status="missing", version=None,
-            notes=f"binary not on PATH (exit {version_result.returncode}) -- probe output: "
-                  f"{truncate_middle(probe_detail, AIDW_TOOL_PROBE_NOTES_HEAD_CHARS, AIDW_TOOL_PROBE_NOTES_TAIL_CHARS)}",
+            notes=f"binary not on PATH (exit {version_result.returncode}) -- probe output: {probe_detail}",
             duration_ms=_elapsed_ms(started),
         )
         logger.warning(
@@ -3244,10 +3270,7 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
         tool_output = (result.stdout or result.stderr or "").strip() or "(no output)"
         run.update(
             status="failed",
-            notes=(
-                f"no readable output at {spec.output_path} (exit {result.returncode}) -- "
-                f"command output: {truncate_middle(tool_output, AIDW_TOOL_PROBE_NOTES_HEAD_CHARS, AIDW_TOOL_PROBE_NOTES_TAIL_CHARS)}"
-            ),
+            notes=f"no readable output at {spec.output_path} (exit {result.returncode}) -- command output: {tool_output}",
             duration_ms=_elapsed_ms(started),
         )
         logger.warning(
@@ -3295,7 +3318,7 @@ def start_background_scan(thread_id: str, provider: Any, *, chat_provider: str, 
     _BACKGROUND_SCANS[thread_id] = asyncio.create_task(
         _scan_with_coverage(
             provider, thread_id, chat_provider=chat_provider,
-            timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS, run_id=run_id,
+            timeout_seconds=workflow_config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS, run_id=run_id,
         )
     )
 
@@ -3485,12 +3508,12 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
         except Exception:  # noqa: BLE001 -- background failure falls back to a fresh inline run
             logger.warning("background repo scan failed; re-running inline", exc_info=True)
             report, coverage = await _scan_with_coverage(
-                provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS,
+                provider, thread_id, chat_provider=state["provider"], timeout_seconds=workflow_config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS,
                 run_id=state.get("run_id", "unknown"),
             )
     else:
         report, coverage = await _scan_with_coverage(
-            provider, thread_id, chat_provider=state["provider"], timeout_seconds=REPO_SCAN_COVERAGE_TIMEOUT_SECONDS,
+            provider, thread_id, chat_provider=state["provider"], timeout_seconds=workflow_config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS,
             run_id=state.get("run_id", "unknown"),
         )
     report = replace(report, metrics={**report.metrics, "coverage": coverage})
@@ -3925,12 +3948,13 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert dashboard["summary"]["health_score"] < 100
 
     # --- health score v3 -----------------------------------------------------------------------
-    assert abs(sum(HEALTH_WEIGHTS.values()) - 1.0) < 1e-9, "nominal weights must sum to 1.0"
+    health_weights = _health_weights()
+    assert abs(sum(health_weights.values()) - 1.0) < 1e-9, "nominal weights must sum to 1.0"
     # The README's weights table documents these defaults -- keep them in lockstep (the assert is
-    # skipped when an env override is actually set, since then HEALTH_WEIGHTS is deliberately off
+    # skipped when an env override is actually set, since then the weights are deliberately off
     # the documented defaults).
-    if not any(os.environ.get(f"HEALTH_WEIGHT_{name.upper()}") for name in HEALTH_WEIGHTS):
-        assert HEALTH_WEIGHTS == {
+    if not any(os.environ.get(f"HEALTH_WEIGHT_{name.upper()}") for name in HEALTH_DIMENSION_NAMES):
+        assert health_weights == {
             "security": 0.40, "coverage": 0.12, "dependencies": 0.12, "ac_verification": 0.10,
             "accessibility": 0.07, "complexity": 0.06, "performance": 0.05,
             "duplication": 0.04, "maintainability": 0.04,

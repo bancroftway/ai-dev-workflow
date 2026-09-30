@@ -27,24 +27,16 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shlex
 from typing import Any
 
-from . import repo_files, spec_ledger, test_results
+from . import config, repo_files, spec_ledger, test_results
 from .test_results import attributed_ac_ids, attribution_health
 from .gates.ac_coverage_gate import classify_test_level, count_tests_per_ac
 from .gates.test_coverage_gate import _with_timeout
 from .sandbox.provider import SandboxProvider
 
 logger = logging.getLogger(__name__)
-
-# How many times each suite runs. Flakiness is invisible at 1, and the per-AC flake rate is one of
-# the three metrics this layer exists to produce.
-EVAL_ATTEMPTS = int(os.environ.get("EVAL_ATTEMPTS", "3"))
-
-# Bounds one suite invocation. A hung test run must not hang the scan.
-EVAL_TIMEOUT_SECONDS = int(os.environ.get("EVAL_TIMEOUT_SECONDS", "900"))
 
 _TEST_LISTING_COMMAND = (
     "git ls-files -co --exclude-standard | grep -iE '(test|spec)' "
@@ -304,7 +296,7 @@ async def _run_suites(
             # exec_in_sandbox takes no timeout argument -- bounding is done in the shell, via the
             # coverage gate's existing `_with_timeout` (which wraps the WHOLE command in `sh -c` so
             # a chained `cd X && dotnet test` is bounded as one unit rather than just the `cd`).
-            result = await provider.exec_in_sandbox(thread_id, _with_timeout(command, EVAL_TIMEOUT_SECONDS))
+            result = await provider.exec_in_sandbox(thread_id, _with_timeout(command, config.EVAL_TIMEOUT_SECONDS))
             raw = await repo_files.read_repo_file(provider, thread_id, artifact)
             if raw is None:
                 notes.append(f"attempt {attempt + 1}: no result artifact at {artifact}")
@@ -358,13 +350,18 @@ async def _browser_outcomes(provider: SandboxProvider, thread_id: str) -> tuple[
 
 
 async def evaluate(
-    provider: SandboxProvider, thread_id: str, *, attempts: int = EVAL_ATTEMPTS, run_suites: bool = True
+    provider: SandboxProvider, thread_id: str, *, attempts: int | None = None, run_suites: bool = True
 ) -> dict[str, Any]:
     """`{"ac_verification": {...}, "ac_execution": {...}}`.
 
     `run_suites=False` gives the static half only, which is what a caller wanting a hashable report
     without paying for N suite runs should ask for.
-    """
+
+    `attempts`: None (default) resolves config.EVAL_ATTEMPTS fresh on every call, not a value frozen
+    at function-definition time -- a live, per-session-pinned Org Setting has to be read this way,
+    not baked into a default argument."""
+    if attempts is None:
+        attempts = config.EVAL_ATTEMPTS
     ac_ids = await _ac_ids(provider, thread_id)
     if not ac_ids:
         return {"ac_verification": not_evaluated("no_ledger_entries"), "ac_execution": not_evaluated("no_ledger_entries")}
@@ -376,9 +373,7 @@ async def evaluate(
     if not run_suites:
         return {"ac_verification": verification, "ac_execution": not_evaluated("execution_not_requested")}
 
-    from .gates.test_coverage_gate import COVERAGE_COMMANDS_PATH
-
-    raw_commands = await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH)
+    raw_commands = await repo_files.read_repo_file(provider, thread_id, config.COVERAGE_COMMANDS_PATH)
     if raw_commands is None:
         return {"ac_verification": verification, "ac_execution": not_evaluated("no_coverage_commands_contract")}
     try:

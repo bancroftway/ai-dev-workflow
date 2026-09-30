@@ -42,6 +42,7 @@ import logging
 import re
 import shlex
 from typing import Any, Literal, TypedDict
+from unittest.mock import patch
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -65,8 +66,6 @@ from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
 from .tech_stack_signals import is_greenfield_repo, tech_stack_has_ui_framework
 
-E2E_APP_LOG_PATH = workflow_config.E2E_APP_LOG_PATH
-E2E_APP_PID_PATH = workflow_config.E2E_APP_PID_PATH
 E2E_REPORT_PATH = "agent-work/e2e-report.json"
 
 E2E_FIX_SYSTEM_PROMPT, E2E_FIX_HUMAN_TEMPLATE = load_prompt_pair("e2e_fix")
@@ -503,7 +502,7 @@ async def _finalize_run(provider: Any, thread_id: str, e2e: E2EState) -> dict[st
     # make the NEXT fix cycle's boot fail with EADDRINUSE against a stale process.
     await provider.exec_in_sandbox(
         thread_id,
-        f"for f in {E2E_APP_PID_PATH} agent-work/e2e-service-*.pid; do "
+        f"for f in {workflow_config.E2E_APP_PID_PATH} agent-work/e2e-service-*.pid; do "
         f"  [ -f \"$f\" ] || continue; p=$(cat \"$f\" 2>/dev/null); "
         f"  [ -n \"$p\" ] && {{ kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null; }}; "
         f"  rm -f \"$f\"; "
@@ -698,11 +697,13 @@ _STALE_APP_PATTERNS = (
 )
 
 
-# A dedicated range for e2e's dynamically-launched apps and supporting services, well clear of
-# common framework defaults (3000, 5000, 8080, ...) so a boot here is never fighting some
-# framework's own default port choice. Verified free before use regardless (_pick_free_port), so
-# this range is a starting pool, not a guarantee.
-_APP_PORT_RANGE = range(3100, 3140)
+def _app_port_range() -> range:
+    """A dedicated range for e2e's dynamically-launched apps and supporting services, well clear
+    of common framework defaults (3000, 5000, 8080, ...) so a boot here is never fighting some
+    framework's own default port choice. Verified free before use regardless (_pick_free_port), so
+    this range is a starting pool, not a guarantee. A function, not a module-level range built once
+    at import time, so config.E2E_APP_PORT_RANGE_START/_END stay live-editable per session."""
+    return range(workflow_config.E2E_APP_PORT_RANGE_START, workflow_config.E2E_APP_PORT_RANGE_END)
 
 
 async def _listening_ports(provider: Any, thread_id: str) -> set[int]:
@@ -732,10 +733,11 @@ async def _pick_free_port(
     API instead -- every page 404'd and the specs failed on an app that was fine. Callers keep one
     `reserved` set per e2e_run invocation and add every port handed out.
     """
+    app_port_range = _app_port_range()
     busy = await _listening_ports(provider, thread_id) | (reserved or set())
     if preferred and preferred not in busy:
         return preferred
-    for candidate in _APP_PORT_RANGE:
+    for candidate in app_port_range:
         if candidate not in busy:
             # Relocating a DECLARED port is a loud event, not routine bookkeeping. Every stack
             # template hardcodes the cross-process URL somewhere the harness cannot reach:
@@ -756,7 +758,7 @@ async def _pick_free_port(
                     preferred, candidate, preferred,
                 )
             return candidate
-    return _APP_PORT_RANGE.start
+    return app_port_range.start
 
 
 # Environment variables an app might use to locate its backend. Discovered from the repo rather
@@ -963,7 +965,6 @@ def summarise_page_state(route: str, state: dict[str, Any]) -> str:
 # A screenshot of a page that rendered nothing is honest but carries no information, and five of them
 # look like evidence. Observed live: a failed run produced five PNGs of IDENTICAL 4254 bytes. Flagged
 # rather than deleted -- and never fatal, since two genuinely identical pages are possible.
-_DEGENERATE_PNG_MAX_BYTES = workflow_config.E2E_DEGENERATE_PNG_MAX_BYTES
 
 
 # `playwright screenshot` shoots as soon as navigation resolves, which is BEFORE a client-rendered
@@ -983,7 +984,6 @@ _DEGENERATE_PNG_MAX_BYTES = workflow_config.E2E_DEGENERATE_PNG_MAX_BYTES
 # slightly-early one. Escalating rather than fixed, because hydration time is variable (see the
 # capture loop's own comment): a fast stack pays only the first rung, a cold Blazor boot climbs.
 # Total worst case per route is ~28s, bounded by the 12-route cap on captures.
-_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS = workflow_config.E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS
 
 
 def degenerate_screenshots(sizes: dict[str, int]) -> list[str]:
@@ -1001,7 +1001,7 @@ def degenerate_screenshots(sizes: dict[str, int]) -> list[str]:
     """
     if not sizes:
         return []
-    return sorted(path for path, size in sizes.items() if size <= _DEGENERATE_PNG_MAX_BYTES)
+    return sorted(path for path, size in sizes.items() if size <= workflow_config.E2E_DEGENERATE_PNG_MAX_BYTES)
 
 
 def same_size_screenshots(sizes: dict[str, int]) -> list[str]:
@@ -1332,7 +1332,7 @@ async def probe_candidate_boot(
     launch_command = _with_port_env(_scanned_launch_command(candidate), port, str(candidate.get("runtime") or ""))
     try:
         await _boot_process(
-            provider, thread_id, launch_command, E2E_APP_LOG_PATH, E2E_APP_PID_PATH, env_file=use_env_file
+            provider, thread_id, launch_command, workflow_config.E2E_APP_LOG_PATH, workflow_config.E2E_APP_PID_PATH, env_file=use_env_file
         )
         ready = await _wait_ready(provider, thread_id, port, timeout_seconds=timeout_seconds)
     finally:
@@ -1344,7 +1344,7 @@ async def probe_candidate_boot(
     if ready:
         return True, None, launch_command, port
     log_tail = truncate_middle(
-        await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
+        await repo_files.read_repo_file(provider, thread_id, workflow_config.E2E_APP_LOG_PATH) or "",
         workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
         workflow_config.E2E_BOOT_FAILURE_LOG_TAIL_CHARS,
     )
@@ -1713,7 +1713,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         # Same seam as the services above -- see that comment.
         start_command = f"export AIDW_TEST_AUTH=1; {start_command}"
     await _boot_process(
-        provider, thread_id, start_command, E2E_APP_LOG_PATH, E2E_APP_PID_PATH, env_file=use_env_file
+        provider, thread_id, start_command, workflow_config.E2E_APP_LOG_PATH, workflow_config.E2E_APP_PID_PATH, env_file=use_env_file
     )
     ready = await _wait_ready(provider, thread_id, port)
 
@@ -1768,7 +1768,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
                 "just been cleared, so the next attempt will re-discover the launch command fresh)"
             )
         log_tail = truncate_middle(
-            await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
+            await repo_files.read_repo_file(provider, thread_id, workflow_config.E2E_APP_LOG_PATH) or "",
             workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
             workflow_config.E2E_BOOT_FAILURE_LOG_TAIL_CHARS,
         )
@@ -1997,7 +1997,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         # would pass, and a genuinely blank page still exhausts the ladder and is still reported
         # blank. Never weakens the gate -- only stops handing it a photo taken too early.
         shot = None
-        for attempt_ms in _ROUTE_SCREENSHOT_HYDRATE_LADDER_MS:
+        for attempt_ms in workflow_config.E2E_ROUTE_SCREENSHOT_HYDRATE_LADDER_MS:
             shot = await provider.exec_in_sandbox(
                 thread_id,
                 f"PLAYWRIGHT_BROWSERS_PATH={shlex.quote(BROWSER_ALIAS_DIR)} "
@@ -2012,7 +2012,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
                 captured_bytes = int((sized.stdout or "0").strip() or 0)
             except ValueError:
                 captured_bytes = 0
-            if captured_bytes > _DEGENERATE_PNG_MAX_BYTES:
+            if captured_bytes > workflow_config.E2E_DEGENERATE_PNG_MAX_BYTES:
                 break
             if captured_bytes:
                 logger.info(
@@ -2029,7 +2029,7 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             # only chromium-headless-shell is baked and a full-chromium code path fails on it.
             logger.warning(
                 "e2e route screenshot failed for thread_id=%s route=%s: %s",
-                thread_id, route, (shot.stdout or "")[-workflow_config.E2E_SCREENSHOT_STDOUT_TAIL_CHARS:],
+                thread_id, route, shot.stdout or "",
             )
     e2e["screenshots"] = screenshots
     e2e["routes"] = routes
@@ -2442,8 +2442,8 @@ async def _run_lighthouse(provider: Any, thread_id: str, port: int, routes: list
             summary = json.loads((extract.stdout or "").strip())
         except json.JSONDecodeError:
             logger.warning(
-                "lighthouse produced no readable report for %s (tail: %s)",
-                url, (run.stdout or "")[-workflow_config.E2E_LIGHTHOUSE_STDOUT_TAIL_CHARS:],
+                "lighthouse produced no readable report for %s: %s",
+                url, run.stdout or "",
             )
             continue
         if summary.get("performance") is None and summary.get("accessibility") is None:
@@ -2522,7 +2522,7 @@ async def e2e_fix_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     pre_fix_sha_result = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD 2>/dev/null || true")
     pre_fix_sha = (pre_fix_sha_result.stdout or "").strip() or None
     log_tail = truncate_middle(
-        await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
+        await repo_files.read_repo_file(provider, thread_id, workflow_config.E2E_APP_LOG_PATH) or "",
         workflow_config.E2E_FIX_APP_LOG_HEAD_CHARS,
         workflow_config.E2E_FIX_APP_LOG_TAIL_CHARS,
     )
@@ -2969,7 +2969,7 @@ def _demo() -> None:
 
     _first, _second = _asyncio.run(_two_picks())
     assert _first != _second, (_first, _second)
-    assert _first in _APP_PORT_RANGE and _second in _APP_PORT_RANGE
+    assert _first in _app_port_range() and _second in _app_port_range()
 
     async def _same_preferred_twice():
         # The exact live shape: both apps ask for the same preferred port (app_discovery gave one
@@ -3064,12 +3064,13 @@ def _demo() -> None:
         "capped input must yield exactly mkdir + E2E_SCREENSHOT_COPY_MAX_FILES cp lines"
     )
 
-    # Proven-launch cache (skip-decision logic for e2e_run_node's GHCP proving turn). Flip the
-    # module flag directly, same as any other AIDW_-style toggle in this file -- restored in a
-    # finally so this self-check never leaks state into a later run of the same process.
-    _orig_reuse_flag = workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH
-    try:
-        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = True
+    # Proven-launch cache (skip-decision logic for e2e_run_node's GHCP proving turn). Uses
+    # patch.object, not a direct `workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = value` assignment:
+    # config.py resolves this purely via module __getattr__ now (no real __dict__ entry), so a
+    # plain assignment would create one and permanently defeat live-override for this key for the
+    # rest of this process's life (must-fix #4 in the Org Settings migration plan) -- patch.object
+    # correctly delattrs on exit instead, restoring dynamic resolution.
+    with patch.object(workflow_config, "AIDW_E2E_REUSE_PROVEN_LAUNCH", True):
         fresh = default_e2e_state()
         assert not _should_reuse_proven_launch(fresh), "nothing proven yet -- must not reuse"
 
@@ -3108,9 +3109,8 @@ def _demo() -> None:
         assert lap1_decorated != lap2_decorated, "each lap's own service port must actually take effect"
 
         # Operator kill-switch: AIDW_E2E_REUSE_PROVEN_LAUNCH=0 disables reuse even with a cache hit.
-        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = False
-        assert not _should_reuse_proven_launch(cached), "kill-switch off must force fresh discovery"
-        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = True
+        with patch.object(workflow_config, "AIDW_E2E_REUSE_PROVEN_LAUNCH", False):
+            assert not _should_reuse_proven_launch(cached), "kill-switch off must force fresh discovery"
 
         # Cache miss/failure clears the cache: a stale-cache lap whose readiness probe failed (or a
         # fresh e2e_gate_check_node stage entry) must leave the next lap with nothing to reuse.
@@ -3120,8 +3120,6 @@ def _demo() -> None:
         assert cached["proven_port"] is None
         assert cached["proven_routes"] == []
         assert cached["proven_api_routes"] == []
-    finally:
-        workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = _orig_reuse_flag
 
     # Task 6 (requirement 4): cold-attempt hydration priority -- boot_evidence (already
     # independently boot-proven, WITH its own proven port) wins over the manifest-persisted bare

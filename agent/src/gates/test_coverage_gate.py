@@ -68,8 +68,6 @@ STABLE_REASON_CODES = frozenset(
     {REASON_TIMEOUT, REASON_RUNNER_ERROR, REASON_PARSE_ERROR, REASON_CONTRACT_REPLAY_FAILED, REASON_NO_TOOLING_MAPPING}
 )
 
-COVERAGE_COMMANDS_PATH = config.COVERAGE_COMMANDS_PATH
-_CONTRACT_FORMATS = config.CONTRACT_FORMATS
 
 
 def _entry_dict(entry: "CoverageEntry | CoverageContractEntry") -> dict[str, Any]:
@@ -615,7 +613,6 @@ _SAFE_EXCLUSION_PATTERNS = {
 
 # Per-command ceiling for a deterministic contract replay (same knob repo_scan's own coverage
 # leg honours; a hung `dotnet test` must not stall the gate forever).
-_REPLAY_TIMEOUT_SECONDS = config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS
 
 
 async def _replay_coverage_contract(
@@ -633,7 +630,7 @@ async def _replay_coverage_contract(
         root = entry.root.strip() or "."
         command = (
             f"rm -f {shlex.quote(entry.artifact)}; cd {shlex.quote(root)} && "
-            + _with_timeout(entry.command, _REPLAY_TIMEOUT_SECONDS)
+            + _with_timeout(entry.command, config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS)
         )
         result = await provider.exec_in_sandbox(thread_id, command)
         runs.append({
@@ -731,7 +728,7 @@ async def run_resolved_coverage_command(
     output_dir = f"{output_dir_base}-{'cobertura' if fmt == 'cobertura' else 'istanbul'}"
     await provider.exec_in_sandbox(thread_id, f"rm -rf {shlex.quote(output_dir)}; mkdir -p {shlex.quote(output_dir)}")
     await provider.exec_in_sandbox(
-        thread_id, _with_timeout(with_coverage_reporter(base_command, fmt, output_dir), _REPLAY_TIMEOUT_SECONDS)
+        thread_id, _with_timeout(with_coverage_reporter(base_command, fmt, output_dir), config.TEST_COVERAGE_REPLAY_TIMEOUT_SECONDS)
     )
     if fmt == "cobertura":
         find_result = await provider.exec_in_sandbox(
@@ -779,7 +776,7 @@ async def _run_coverage_via_ghcp(
     # Python. The model only runs discovery -- no contract yet, or a replay whose artifacts all
     # fail (a stale contract after the tree changed shape), in which case it gets the replay's
     # own errors as failure_detail and gets to re-discover.
-    contract = _load_coverage_contract(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH))
+    contract = _load_coverage_contract(await repo_files.read_repo_file(provider, thread_id, config.COVERAGE_COMMANDS_PATH))
     replay_runs: list[dict[str, Any]] = []
     entries: list[CoverageEntry] = []
     if contract:
@@ -924,7 +921,7 @@ async def _run_coverage_via_ghcp(
     await repo_files.write_repo_file(
         provider,
         thread_id,
-        COVERAGE_COMMANDS_PATH,
+        config.COVERAGE_COMMANDS_PATH,
         json.dumps({"entries": [_entry_dict(e) for e in entries]}, indent=2) + "\n",
     )
 
@@ -995,7 +992,7 @@ async def measure_coverage(
     languages = [str(l).lower() for l in tech_stack_signals.presence_values(tech_stack, "languages")]
     if not languages and not tech_stack_signals.dotnet_detected(tech_stack):
         contract_exists = bool(
-            _load_coverage_contract(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH))
+            _load_coverage_contract(await repo_files.read_repo_file(provider, thread_id, config.COVERAGE_COMMANDS_PATH))
         )
         if not contract_exists:
             logger.info("repo_scan coverage: no tooling mapping for detected languages %s", languages)
@@ -1021,21 +1018,24 @@ async def measure_coverage(
 
 # Human-readable expansion of each stable reason code, for the GATE's own `feedback` (read by the
 # drafting LLM on retry) -- unlike `reason` itself, this text is never hashed into scan metrics, so
-# it's free to be as actionable as it likes.
-_REASON_FEEDBACK: dict[str, str] = {
-    REASON_TIMEOUT: "the coverage run did not finish within its timeout",
-    REASON_RUNNER_ERROR: "the coverage runner produced no parseable artifact (see server logs for the raw output)",
-    REASON_PARSE_ERROR: "the coverage artifact could not be parsed",
-    REASON_CONTRACT_REPLAY_FAILED: f"every entry in {COVERAGE_COMMANDS_PATH} failed on replay (see server logs for details)",
-    REASON_NO_TOOLING_MAPPING: (
-        "no coverage tooling mapping for this stack. Record working coverage command(s) in "
-        f"{COVERAGE_COMMANDS_PATH} -- a JSON `entries` list where each entry has `command` (runs "
-        "the suite with coverage), `artifact` (the file that command writes), `format` "
-        "('cobertura' or 'istanbul-json-summary'), and `root` (the directory the command runs "
-        "from; '' = repo root) -- one entry per app/test root, so the gate can replay them. The "
-        "tech-stack doc's Testing section shows this stack's exact entries."
-    ),
-}
+# it's free to be as actionable as it likes. A function, not a module-level dict literal: two
+# entries interpolate config.COVERAGE_COMMANDS_PATH, which must be read fresh per call (config.py's
+# __getattr__ shim resolves it live) rather than baked in once at this module's own import time.
+def _reason_feedback(reason: str) -> dict[str, str]:
+    return {
+        REASON_TIMEOUT: "the coverage run did not finish within its timeout",
+        REASON_RUNNER_ERROR: "the coverage runner produced no parseable artifact (see server logs for the raw output)",
+        REASON_PARSE_ERROR: "the coverage artifact could not be parsed",
+        REASON_CONTRACT_REPLAY_FAILED: f"every entry in {config.COVERAGE_COMMANDS_PATH} failed on replay (see server logs for details)",
+        REASON_NO_TOOLING_MAPPING: (
+            "no coverage tooling mapping for this stack. Record working coverage command(s) in "
+            f"{config.COVERAGE_COMMANDS_PATH} -- a JSON `entries` list where each entry has `command` (runs "
+            "the suite with coverage), `artifact` (the file that command writes), `format` "
+            "('cobertura' or 'istanbul-json-summary'), and `root` (the directory the command runs "
+            "from; '' = repo root) -- one entry per app/test root, so the gate can replay them. The "
+            "tech-stack doc's Testing section shows this stack's exact entries."
+        ),
+    }.get(reason, reason)
 
 
 async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str, dict[str, Any]] | None:
@@ -1393,7 +1393,7 @@ async def verify_coverage(
             passed=False,
             feedback=(
                 "The coverage run produced no parseable report -- treat this as an infra failure, "
-                f"not a coverage gap: {_REASON_FEEDBACK.get(reason, reason)}{detail_text}"
+                f"not a coverage gap: {_reason_feedback(reason)}{detail_text}"
             ),
             report={"infra_error": reason, "contract_replay": entry_reports},
         )
@@ -1583,11 +1583,11 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
 
     # Every reason `measure_coverage` can return is a short stable code (never raw subprocess
     # output) -- this is what keeps repo_scan's metrics.coverage.reason, and therefore
-    # content_hash, deterministic across two runs of an unchanged repo. `_REASON_FEEDBACK` must
+    # content_hash, deterministic across two runs of an unchanged repo. `_reason_feedback` must
     # cover every one of them so the gate's own feedback stays actionable despite the terse code.
     for code in STABLE_REASON_CODES:
         assert " " not in code, f"{code!r} looks like prose, not a stable code"
-        assert code in _REASON_FEEDBACK, f"{code!r} has no human-readable gate feedback"
+        assert _reason_feedback(code) != code, f"{code!r} has no human-readable gate feedback"
 
     # MIN_COVERAGE_PERCENT is a module-level env read -- pin that it parsed to a float and still
     # defaults to 95.0 when unset. Its MIN_COVERAGE_PERCENT_DEFAULT alias went with

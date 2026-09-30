@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import config, git_ops, model_config, preflight_nodes, repo_files, run_event_store, run_event_stream, run_failure, stack_runner, tech_stack_signals, test_results, workflow_persistence
+from .text_truncate import truncate_middle
 from .run_events import RunEvent, RunEventType, encode_io_text
 from .chat_model import close_session, get_chat_model_for_thread, lap_role
 from .infra_retry import call_with_infra_retry
@@ -108,12 +109,21 @@ async def _replay_build(provider: Any, thread_id: str, commands: list[dict[str, 
         # same trailing subset while the rest -- invisible every single lap -- never got touched.
         # 8000/16000 is still bounded (not every log gets forwarded verbatim), just wide enough for a
         # realistic multi-dozen-error build to actually reach the model that has to fix it.
-        stdout_parts.append(f"{label}\n{(result.stdout or '')[-config.REBUILD_OUTPUT_TAIL_CHARS:]}")
-        stderr_parts.append(f"{label}\n{(result.stderr or '')[-config.REBUILD_OUTPUT_TAIL_CHARS:]}")
+        #
+        # truncate_middle, not a tail-only slice (fixed alongside the Org Settings migration, root-
+        # caused via that migration's own removability research): the widen 2000/4000 -> 8000/16000
+        # above fixed the SIZE but not the SHAPE -- a `[-N:]` slice still drops whatever comes before
+        # the tail, the exact bug this same comment credits itself with fixing. Halving each single
+        # config value between head_chars/tail_chars keeps today's total budget unchanged while
+        # actually keeping both ends.
+        _tail_half = config.REBUILD_OUTPUT_TAIL_CHARS // 2
+        stdout_parts.append(f"{label}\n{truncate_middle(result.stdout or '', _tail_half, _tail_half)}")
+        stderr_parts.append(f"{label}\n{truncate_middle(result.stderr or '', _tail_half, _tail_half)}")
+    _combined_half = config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS // 2
     return BuildVerifyReport(
         success=ok, ok=ok,
-        stdout_tail="\n".join(stdout_parts)[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:],
-        stderr_tail="\n".join(stderr_parts)[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:],
+        stdout_tail=truncate_middle("\n".join(stdout_parts), _combined_half, _combined_half),
+        stderr_tail=truncate_middle("\n".join(stderr_parts), _combined_half, _combined_half),
         error=None if ok else "replayed build command(s) failed -- see stderr_tail",
         build_commands=[BuildCommand(**c) for c in commands if c.get("command")],
     )
@@ -277,7 +287,7 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
             f for f in scan.findings
             if repo_scan.is_gating(
                 f,
-                severity_floor=latest_summary.get("severity_floor") or repo_scan.SECURITY_SEVERITY_FLOOR,
+                severity_floor=latest_summary.get("severity_floor") or config.SECURITY_SEVERITY_FLOOR,
                 introduced_ids=None,
                 direct_dependencies=scan.direct_dependencies,
                 known_gap_ids=known_gap_ids,
@@ -736,18 +746,21 @@ def make_rebuild_node(spec: RebuildSpec):
 
         rb["status"] = "clean" if build_ok else "failed"
         rb["last_exit_ok"] = build_ok
-        # -16000, matching _replay_build's own cap above -- this used to re-truncate to -4000 on
+        # 16000 total, matching _replay_build's own cap above -- this used to re-truncate to 4000 on
         # top of that, which quietly threw away most of what the wider cap just preserved (the
         # fix prompt below reads exactly these two fields, so THIS slice, not _replay_build's, is
-        # what actually reaches the model).
-        rb["last_stdout_tail"] = (report.stdout_tail or "")[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:]
+        # what actually reaches the model). truncate_middle, not a tail-only slice, for the same
+        # keep-both-ends reason as _replay_build's own fix above.
+        _combined_half = config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS // 2
+        rb["last_stdout_tail"] = truncate_middle(report.stdout_tail or "", _combined_half, _combined_half)
         # A red-gate violation replaces the (green) build's stderr as the fix node's feedback --
         # the passing test names are the actionable part, not a clean compiler log.
-        rb["last_stderr_tail"] = (
+        rb["last_stderr_tail"] = truncate_middle(
             red_detail if red_failed
             else scan_detail if scan_detail
-            else (report.stderr_tail or report.error or "")
-        )[-config.REBUILD_OUTPUT_COMBINED_TAIL_CHARS:]
+            else (report.stderr_tail or report.error or ""),
+            _combined_half, _combined_half,
+        )
         rebuild[spec.key] = rb
 
         ledger_entry: dict[str, Any] = {

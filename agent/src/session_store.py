@@ -53,9 +53,22 @@ async def _get_pool() -> aioodbc.Pool:
 def _build_failure(payload: dict[str, Any]) -> tuple[str | None, str | None, str]:
     """Raw run_failure payload (shape varies per escalate_node) -> (stage, type, message) --
     same normalization session_index.py's _build_failure did, kept as three columns instead of
-    a nested dict."""
+    a nested dict.
+
+    Function-local config import (same reason record_run_failure_and_reset's own
+    end_session_container import is function-local, a few lines below this function): config.py
+    -> runtime_settings.py -> session_store.py is the real import chain (config.py's __getattr__
+    shim reads through runtime_settings, which uses THIS module's _get_pool()) -- a module-level
+    `from . import config` here would complete that cycle. Called only at runtime, long after
+    every module in the chain has already finished loading, so the deferred import is a plain
+    sys.modules lookup, not a real re-import -- see the Org Settings migration plan's "Truncation
+    family" section for why this hardcoded 500 used to silently shadow
+    config.REBUILD_ESCALATE_FEEDBACK_CHARS (default 1000): an admin raising that setting saw no
+    effect until this unification."""
+    from . import config
+
     raw_message = payload.get("feedback") or payload.get("report") or ""
-    return payload.get("stage"), payload.get("type"), str(raw_message).strip()[:500]
+    return payload.get("stage"), payload.get("type"), str(raw_message).strip()[:config.REBUILD_ESCALATE_FEEDBACK_CHARS]
 
 
 def is_finished_with_verdict(row: dict[str, Any]) -> bool:

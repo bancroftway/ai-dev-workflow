@@ -72,6 +72,7 @@ from .gates.diagram_gate import (
     make_verify_plan_diagrams,
     verify_plan_diagrams,
 )
+from .gates.coverage_parsing import MIN_COVERAGE_PERCENT
 from .gates.ledger_sync_checks import check_empty_draft, find_open_questions
 from .gates.test_coverage_gate import (
     MINIMAL_CODE_TO_GREEN_HARD_RULES,
@@ -1498,9 +1499,18 @@ _verify_specification_ledger = make_verify_specification_ledger("specification")
 # real installed version at container start and records it in manifest.json's
 # toolchain.playwright_version, which those files read instead of a literal. Substituted once at
 # module load, same caching lifetime as load_prompt's own lru_cache.
+# <<max_test_body_similarity_percent>>: task 10 fix (Org Settings migration plan) -- this literal
+# prose number used to be hand-typed ("92%"), disconnected from gates/ac_coverage_gate.py's own
+# re-export of gates/test_quality_checks.py's real MAX_TEST_BODY_SIMILARITY (0.92, env-var-backed,
+# sandbox-mirrored -- see config.py's own module docstring for why this setting can't be
+# config.py/runtime_settings-backed). An operator overriding that env var at deploy time used to
+# change what the deterministic gate enforces without ever telling the model what to aim for.
+# Substituted once at module load, not per draft call: MAX_TEST_BODY_SIMILARITY is a plain
+# os.environ.get() read at process start with no live-session override to go stale against, so
+# there's nothing to gain from re-rendering this on every call.
 AC_TO_TESTS_SYSTEM_PROMPT = load_prompt("ac_to_tests_draft").replace(
     "<<playwright_config_template>>", template_loader.load_template("playwright/playwright.config.ts").strip()
-)
+).replace("<<max_test_body_similarity_percent>>", f"{MAX_TEST_BODY_SIMILARITY * 100:g}")
 
 AC_TO_TESTS_GREENFIELD_SEGMENT = load_prompt("ac_to_tests_greenfield_segment")
 
@@ -1625,7 +1635,15 @@ def _build_ac_to_tests_audit_prompt(state: GraphState) -> list[BaseMessage]:
     return messages
 
 
-MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_draft")
+# <<min_coverage_percent>>: task 10 fix (Org Settings migration plan), same reasoning as
+# AC_TO_TESTS_SYSTEM_PROMPT's own <<max_test_body_similarity_percent>> substitution above --
+# MIN_COVERAGE_PERCENT (gates/coverage_parsing.py, sandbox-mirrored) is the real value
+# gates/test_coverage_gate.py enforces; this prompt used to hand-type "95%" regardless of what an
+# operator's env var actually set. Substituted once at module load for the same reason: no live
+# per-session override exists for this setting to go stale against.
+MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_draft").replace(
+    "<<min_coverage_percent>>", f"{MIN_COVERAGE_PERCENT:g}"
+)
 
 MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_audit")
 
@@ -1919,7 +1937,12 @@ class StageSpec:
     surface_tool_name: str
     build_envelope: Callable[[dict[str, Any], list[str] | None], dict[str, Any]]
     build_prompt: Callable[[GraphState], list[BaseMessage]]
-    max_cycles: int
+    max_cycles: Callable[[], int]
+    """A zero-arg thunk, not a plain int: STAGES (and the brownfield stage constants) are built
+    ONCE at module import time, but this value must re-read config.py's __getattr__ shim fresh on
+    every consultation (a per-session-pinned Org Setting, not a value frozen forever at process
+    start) -- same reason session_options below is already a callable rather than a plain dict.
+    Call it (`stage_spec.max_cycles()`), never read it as a value."""
     # None = persist_state writes NO per-stage .md for this stage; some other writer owns that
     # file. Only metrics-exit uses it: exit_finalize_node writes the FULL report (score tables,
     # findings, tools) to 09-metrics-exit.md, and the generic 4-section render here would revert
@@ -2006,9 +2029,10 @@ class StageSpec:
     to draft (with VerificationResult.feedback as context) up to max_verify_cycles, then to a
     human-interrupt escalation node -- never auto-approved past a failed deterministic gate."""
 
-    max_verify_cycles: int = 3
+    max_verify_cycles: Callable[[], int] = lambda: 3  # noqa: E731
     """Safety cap for the verify->draft retry loop, independent of max_cycles (the LLM's own
-    clarification-loop cap)."""
+    clarification-loop cap). A zero-arg thunk, not a plain int -- same reason max_cycles above is
+    one; call it (`stage_spec.max_verify_cycles()`), never read it as a value."""
 
     hydrate_from_repo_file: Callable[[str, "GraphState", SandboxProvider], Awaitable[dict[str, Any] | None]] | None = None
     """Idempotency short-circuit (thread_id, state, provider) -> pre-approved content dict, or
@@ -2143,7 +2167,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_tech_stack",
         build_envelope=build_tech_stack_envelope,
         build_prompt=_build_tech_stack_prompt,
-        max_cycles=workflow_config.TECH_STACK_MAX_CLARIFICATION_CYCLES,
+        max_cycles=lambda: workflow_config.TECH_STACK_MAX_CLARIFICATION_CYCLES,
         render_markdown=render_tech_stack_markdown,
         requires_human_gate=True,
         # No deterministic_verify/audit for this stage (see stages_missing_rules) -- draft_rules/
@@ -2173,7 +2197,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_specification",
         build_envelope=build_specification_envelope,
         build_prompt=_build_specification_prompt,
-        max_cycles=workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
+        max_cycles=lambda: workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
         audit_response_schema=SpecificationAuditResponse,
         audit_content_field=None,
         build_audit_prompt=_build_specification_audit_prompt,
@@ -2215,7 +2239,7 @@ STAGES: list[StageSpec] = [
             ],
         },
         # Tuning history/rationale lives on the constant itself (config.py's SPEC_MAX_VERIFY_CYCLES).
-        max_verify_cycles=workflow_config.SPEC_MAX_VERIFY_CYCLES,
+        max_verify_cycles=lambda: workflow_config.SPEC_MAX_VERIFY_CYCLES,
     ),
     StageSpec(
         key="plan",
@@ -2227,7 +2251,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_plan",
         build_envelope=build_plan_envelope,
         build_prompt=_build_plan_prompt,
-        max_cycles=workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
+        max_cycles=lambda: workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
         audit_response_schema=PlanAuditResponse,
         audit_content_field=None,
         build_audit_prompt=_build_plan_audit_prompt,
@@ -2265,7 +2289,7 @@ STAGES: list[StageSpec] = [
             ],
         },
         # Tuning history/rationale lives on the constant itself (config.py's PLAN_MAX_VERIFY_CYCLES).
-        max_verify_cycles=workflow_config.PLAN_MAX_VERIFY_CYCLES,
+        max_verify_cycles=lambda: workflow_config.PLAN_MAX_VERIFY_CYCLES,
     ),
     StageSpec(
         key="ac-to-tests",
@@ -2274,7 +2298,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_ac_to_tests",
         build_envelope=build_ac_to_tests_envelope,
         build_prompt=_build_ac_to_tests_prompt,
-        max_cycles=workflow_config.AC_TO_TESTS_MAX_CLARIFICATION_CYCLES,
+        max_cycles=lambda: workflow_config.AC_TO_TESTS_MAX_CLARIFICATION_CYCLES,
         # User decision 2026-08-24: ac-to-tests writes the failing TDD-RED tests every downstream
         # stage builds against, so it now gets the same second-model adversarial leg as
         # specification/plan/minimal-code-to-green -- a bad test suite here is a bad foundation for
@@ -2328,7 +2352,7 @@ STAGES: list[StageSpec] = [
         post_approve_hook=spec_ledger.stamp_test_plan_hook,
         # Tuning history/rationale lives on the constant itself (config.py's
         # AC_TO_TESTS_MAX_VERIFY_CYCLES).
-        max_verify_cycles=workflow_config.AC_TO_TESTS_MAX_VERIFY_CYCLES,
+        max_verify_cycles=lambda: workflow_config.AC_TO_TESTS_MAX_VERIFY_CYCLES,
         # Root cause of the long escalation streak: `builtin:edit` only edits EXISTING files -- a
         # greenfield repo with no test files yet needs `builtin:create`. That alone wasn't the
         # full story: also needed the session's working directory to actually be /workspace/repo
@@ -2390,7 +2414,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_minimal_code_to_green",
         build_envelope=build_minimal_code_to_green_envelope,
         build_prompt=_build_minimal_code_to_green_prompt,
-        max_cycles=workflow_config.MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES,
+        max_cycles=lambda: workflow_config.MINIMAL_CODE_TO_GREEN_MAX_CLARIFICATION_CYCLES,
         audit_response_schema=MinimalCodeToGreenAuditResponse,
         audit_content_field="revised_iteration",
         build_audit_prompt=_build_minimal_code_to_green_audit_prompt,
@@ -2413,7 +2437,7 @@ STAGES: list[StageSpec] = [
         requires_human_gate=False,
         # Tuning history/rationale lives on the constant itself (config.py's
         # MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES).
-        max_verify_cycles=workflow_config.MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES,
+        max_verify_cycles=lambda: workflow_config.MINIMAL_CODE_TO_GREEN_MAX_VERIFY_CYCLES,
         # Draft gets full, unscoped write access -- "minimal code to green" is definitionally a
         # code-writing task (Part A Decisions point 6, tier (iii)). Audit stays read-only, same
         # asymmetry as P4's session_options.
@@ -2451,7 +2475,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_remediation",
         build_envelope=build_remediation_envelope,
         build_prompt=_build_remediation_prompt,
-        max_cycles=2,
+        max_cycles=lambda: 2,
         render_markdown=render_remediation_markdown,
         draft_example=REMEDIATION_DRAFT_EXAMPLE,
         requires_human_gate=False,
@@ -2477,7 +2501,7 @@ STAGES: list[StageSpec] = [
         # REMEDIATION_MAX_VERIFY_CYCLES). See verify_fix_prompt above for the other half of that
         # fix -- a narrow fix pass instead of a full redraft is what actually makes the extra
         # cycles worth having.
-        max_verify_cycles=workflow_config.REMEDIATION_MAX_VERIFY_CYCLES,
+        max_verify_cycles=lambda: workflow_config.REMEDIATION_MAX_VERIFY_CYCLES,
         # Full write access + bash: this stage upgrades dependencies (npm install / dotnet add) and
         # edits source to fix scanner findings. Without them it could only ever describe the work --
         # which is exactly what it did, for every run, until now. builtin:task is what lets the
@@ -2499,7 +2523,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_adversarial_compliance",
         build_envelope=build_adversarial_audit_envelope,
         build_prompt=_build_adversarial_compliance_prompt,
-        max_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES,
+        max_cycles=lambda: workflow_config.ADVERSARIAL_AUDIT_MAX_CLARIFICATION_CYCLES,
         render_markdown=render_adversarial_audit_markdown,
         draft_example=ADVERSARIAL_AUDIT_DRAFT_EXAMPLE,
         requires_human_gate=False,
@@ -2515,7 +2539,7 @@ STAGES: list[StageSpec] = [
         draft_rules="\n".join(f"- {r}" for r in adversarial_gate.ADVERSARIAL_COMPLIANCE_HARD_RULES),
         # Tuning history/rationale lives on the constant itself (config.py's
         # ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES).
-        max_verify_cycles=workflow_config.ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES,
+        max_verify_cycles=lambda: workflow_config.ADVERSARIAL_AUDIT_MAX_VERIFY_CYCLES,
         verify_fix_prompt="adversarial_compliance_fix",
     ),
     StageSpec(
@@ -2525,7 +2549,7 @@ STAGES: list[StageSpec] = [
         surface_tool_name="present_exit",
         build_envelope=build_exit_envelope,
         build_prompt=_build_metrics_exit_prompt,
-        max_cycles=workflow_config.EXIT_MAX_CLARIFICATION_CYCLES,
+        max_cycles=lambda: workflow_config.EXIT_MAX_CLARIFICATION_CYCLES,
         # None, not render_exit_markdown: exit_finalize_node (the post_approve_hook below) is the
         # ONLY writer of 09-metrics-exit.md -- it renders the full report (health table, findings
         # dispositions, scanner tools), and a generic persist here would overwrite that file with
@@ -2546,7 +2570,7 @@ STAGES: list[StageSpec] = [
         # Task 13b: no audit_rules -- metrics-exit has no audit pass of its own.
         draft_rules="\n".join(f"- {r}" for r in exit_nodes.METRICS_EXIT_HARD_RULES),
         # Tuning history/rationale lives on the constant itself (config.py's EXIT_MAX_VERIFY_CYCLES).
-        max_verify_cycles=workflow_config.EXIT_MAX_VERIFY_CYCLES,
+        max_verify_cycles=lambda: workflow_config.EXIT_MAX_VERIFY_CYCLES,
         # Every run reaches this stage's approval (requires_human_gate=False, deterministic_verify
         # always returns passed=True) -- this is the only place exit_finalize_node ever runs; it
         # was never add_node'd/wired before this hook existed.
@@ -3601,7 +3625,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             open_questions = [
                 q for q in content_dict["questions"] if isinstance(q, dict) and q.get("status") == "open"
             ]
-            if open_questions and stage["cycle_count"] >= stage_spec.max_cycles:
+            if open_questions and stage["cycle_count"] >= stage_spec.max_cycles():
                 for q in open_questions:
                     q["status"] = "assumed"
                     q["answer"] = q.get("answer") or (
@@ -4334,7 +4358,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             })
             result = VerificationResult(passed=False, feedback=combined_feedback, report=merged_report)
         stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
-        stage["max_verify_cycles"] = stage_spec.max_verify_cycles
+        stage["max_verify_cycles"] = stage_spec.max_verify_cycles()
         if not result.passed:
             # report["infra_error"]: the platform failed to produce evidence (e.g. the coverage
             # gate's test-run tee/artifacts missing) -- the draft didn't fail a check, so this lap
@@ -4344,7 +4368,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 logger.warning(
                     "%s: INFRA RETRY %d/%d -- %s",
                     stage_spec.key, stage["infra_retry_count"], workflow_config.VERIFY_INFRA_RETRY_CAP,
-                    " ".join((result.feedback or "no feedback").split())[:workflow_config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS],
+                    " ".join((result.feedback or "no feedback").split()),
                 )
             else:
                 stage["verify_cycle_count"] = stage.get("verify_cycle_count", 0) + 1
@@ -4352,11 +4376,13 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 # followed by <stage>_draft again, with no reason. Diagnosing a thrashing stage then
                 # means reconstructing it from whatever the failing sub-system happened to log, which
                 # is exactly how an audit outage masqueraded as "the plan keeps getting rejected".
-                # See config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS for why this preview isn't shorter.
+                # Full feedback, not a truncated preview: a thrashing stage's diagnosis lives here,
+                # and this is log-only (never fed to a model) -- see the migration plan's removed
+                # GRAPH_FEEDBACK_LOG_PREVIEW_CHARS entry for why capping this added no value.
                 logger.warning(
                     "%s: REDRAFT %d/%d -- %s",
-                    stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles,
-                    " ".join((result.feedback or "no feedback").split())[:workflow_config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS],
+                    stage_spec.key, stage["verify_cycle_count"], stage_spec.max_verify_cycles(),
+                    " ".join((result.feedback or "no feedback").split()),
                 )
             # Reset the session ONLY when the stage fabricated -- i.e. claimed work while writing
             # nothing but pipeline artifacts. That specific failure is self-reinforcing: the false
@@ -4531,7 +4557,7 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
             if stage.get("infra_retry_count", 0) < workflow_config.VERIFY_INFRA_RETRY_CAP:
                 return "retry"
             return "escalate"
-        if stage.get("verify_cycle_count", 0) < stage_spec.max_verify_cycles:
+        if stage.get("verify_cycle_count", 0) < stage_spec.max_verify_cycles():
             # YOLO still runs these stages' verify (for its persistence -- see
             # _VERIFY_ALWAYS_RUNS_STAGE_KEYS) but keeps its "no deterministic check gates
             # progression" promise: a content-level failure proceeds to the gate instead of
@@ -4540,7 +4566,7 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
                 logger.warning(
                     "%s: verify failed (%s) -- proceeding to gate anyway (YOLO mode, no redraft loop for this stage)",
                     stage_spec.key,
-                    " ".join((last.get("feedback") or "no feedback").split())[:workflow_config.GRAPH_FEEDBACK_LOG_PREVIEW_CHARS],
+                    " ".join((last.get("feedback") or "no feedback").split()),
                 )
                 return "gate"
             return "retry"
@@ -5029,7 +5055,7 @@ def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]
             if stage_spec.deterministic_verify is not None and _stage_verify_enabled(state, stage_spec):
                 return "gate_verify"
             return "gate_direct"
-        if stage["cycle_count"] >= stage_spec.max_cycles:
+        if stage["cycle_count"] >= stage_spec.max_cycles():
             return "auto_approve"
         # Headless: there is no human to answer, so a not-ready draft loops straight back into
         # its own draft node (the draft node already incremented cycle_count, so this is bounded
@@ -5715,7 +5741,7 @@ BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
     surface_tool_name="present_specification",
     build_envelope=build_specification_envelope,
     build_prompt=_build_brownfield_spec_prompt,
-    max_cycles=workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
+    max_cycles=lambda: workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
     render_markdown=None,  # bespoke hook writes SPECIFICATION_MD_PATH directly -- see its own docstring
     draft_example=SPECIFICATION_DRAFT_EXAMPLE,
     deterministic_verify=make_verify_specification_ledger("brownfield-spec", has_audit_role=False),
@@ -5726,7 +5752,7 @@ BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
     requires_human_gate=True,
     use_custom_agent=False,
     session_options=_BROWNFIELD_SESSION_OPTIONS,
-    max_verify_cycles=workflow_config.SPEC_MAX_VERIFY_CYCLES,
+    max_verify_cycles=lambda: workflow_config.SPEC_MAX_VERIFY_CYCLES,
 )
 
 BROWNFIELD_BASELINE_PLAN_STAGE = StageSpec(
@@ -5736,7 +5762,7 @@ BROWNFIELD_BASELINE_PLAN_STAGE = StageSpec(
     surface_tool_name="present_plan",
     build_envelope=build_plan_envelope,
     build_prompt=_build_brownfield_plan_prompt,
-    max_cycles=workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
+    max_cycles=lambda: workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
     render_markdown=None,  # bespoke hook writes PLAN_MD_PATH directly -- see its own docstring
     draft_example=PLAN_DRAFT_EXAMPLE,
     deterministic_verify=make_verify_plan_diagrams("brownfield-plan", has_audit_role=False),
@@ -5748,7 +5774,7 @@ BROWNFIELD_BASELINE_PLAN_STAGE = StageSpec(
     use_custom_agent=False,
     capture_baseline_commit=True,  # needed by verify_plan_diagrams' own write-scope guard
     session_options=_BROWNFIELD_SESSION_OPTIONS,
-    max_verify_cycles=workflow_config.PLAN_MAX_VERIFY_CYCLES,
+    max_verify_cycles=lambda: workflow_config.PLAN_MAX_VERIFY_CYCLES,
 )
 
 
@@ -6267,7 +6293,15 @@ def assert_no_stub_stages() -> None:
     prompt_texts.add(
         load_prompt("ac_to_tests_draft")
         .replace("<<playwright_config_template>>", template_loader.load_template("playwright/playwright.config.ts").strip())
+        .replace("<<max_test_body_similarity_percent>>", f"{MAX_TEST_BODY_SIMILARITY * 100:g}")
         .strip()
+    )
+    # Same reasoning, for task 10's two other <<placeholder>> substitutions (see
+    # AC_TO_TESTS_SYSTEM_PROMPT/MINIMAL_CODE_TO_GREEN_SYSTEM_PROMPT's own comments above): resolved
+    # from a live config value at module load, not hand-duplicated prose, so the by-value stub
+    # check needs the POST-substitution text added here too.
+    prompt_texts.add(
+        load_prompt("minimal_code_to_green_draft").replace("<<min_coverage_percent>>", f"{MIN_COVERAGE_PERCENT:g}").strip()
     )
     problems: list[str] = []
     for spec in _ALL_STAGE_SPECS:
@@ -6764,7 +6798,7 @@ def _demo() -> None:
         surface_tool_name="demo",
         build_envelope=lambda *a: {},
         build_prompt=lambda *a: [],
-        max_cycles=1,
+        max_cycles=lambda: 1,
         render_markdown=lambda *a: "",
     )
     assert demo_gate_spec.requires_human_gate and not demo_gate_spec.sign_approval and demo_gate_spec.resolve_from_interrupt is None, (
@@ -7453,7 +7487,7 @@ def _demo() -> None:
             surface_tool_name="synthetic",
             build_envelope=lambda *a: {},
             build_prompt=lambda *a: [],
-            max_cycles=1,
+            max_cycles=lambda: 1,
             render_markdown=lambda *a: "",
             audit_response_schema=object if audited else None,
             deterministic_verify=(lambda *a: None) if has_verify else None,  # never called -- key is just "is it set"

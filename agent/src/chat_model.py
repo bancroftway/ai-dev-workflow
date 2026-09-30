@@ -86,6 +86,8 @@ from typing import Any, Literal
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 
+from . import config
+
 # Both provider modules are imported unconditionally now (previously chat_model.py imported only
 # whichever one PROVIDER named, at process start). Checked before this rewrite that this is safe:
 # neither claude_chat_model.py nor copilot_chat_model.py does any I/O, network call, subprocess, or
@@ -100,16 +102,15 @@ from .sandbox import SandboxProvider, SandboxSession
 from .session_roles import lap_role, lap_role_keys, role_matches
 from .structured_output import ainvoke_structured
 
-# 30 seconds. Every real caller below sits inside (or just before) a sandboxed CLI-exec turn that
-# itself routinely takes many seconds to minutes (config.CLI_AGENT_TURN_TIMEOUT_SECONDS and this
-# pipeline's other multi-second-to-minute stage timeouts) -- a 30s cache window is imperceptible
-# against that latency, so it costs nothing in practice while still bounding
-# org_settings.get_org_settings() to at most one DB round trip per 30 wall-clock seconds no matter
-# how many dispatch calls happen inside that window. It also satisfies the other half of the
-# fallback-default requirement from the caller's side: an org admin who flips the Settings UI sees
-# the whole fleet converge on the new provider within half a minute -- "soon, not instantly" (this
-# task's own brief), not "next deploy."
-_PROVIDER_CACHE_TTL_SECONDS = 30
+# config.PROVIDER_CACHE_TTL_SECONDS, default 30 seconds. Every real caller below sits inside (or
+# just before) a sandboxed CLI-exec turn that itself routinely takes many seconds to minutes
+# (config.CLI_AGENT_TURN_TIMEOUT_SECONDS and this pipeline's other multi-second-to-minute stage
+# timeouts) -- a 30s cache window is imperceptible against that latency, so it costs nothing in
+# practice while still bounding org_settings.get_org_settings() to at most one DB round trip per
+# cache-window wall-clock seconds no matter how many dispatch calls happen inside that window. It
+# also satisfies the other half of the fallback-default requirement from the caller's side: an org
+# admin who flips the Settings UI sees the whole fleet converge on the new provider within about
+# that window -- "soon, not instantly" (this task's own brief), not "next deploy."
 
 # (resolved provider value, time.monotonic() at fetch) -- a plain module-level tuple, not a
 # decorator/cache library this codebase doesn't already depend on. None until the first resolution.
@@ -142,7 +143,7 @@ def _cached_provider_if_fresh() -> str | None:
     if _provider_cache is None:
         return None
     value, fetched_at = _provider_cache
-    if time.monotonic() - fetched_at >= _PROVIDER_CACHE_TTL_SECONDS:
+    if time.monotonic() - fetched_at >= config.PROVIDER_CACHE_TTL_SECONDS:
         return None
     return value
 
@@ -160,7 +161,7 @@ def env_fallback_provider() -> str:
 
 async def get_provider() -> str:
     """The org's active provider ("claude" or "copilot"), resolved fresh at most once per
-    _PROVIDER_CACHE_TTL_SECONDS.
+    config.PROVIDER_CACHE_TTL_SECONDS.
 
     Reads org_settings.get_org_settings() on a cold/expired cache; falls back to
     os.environ.get("AGENT_PROVIDER", "claude") when that returns None (a fresh deployment whose

@@ -20,6 +20,8 @@ import re
 
 import httpx
 
+from . import config
+
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -53,7 +55,7 @@ async def create_repo(
     payload = {"name": slug, "private": True}
     try:
         if client is None:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=config.GIT_OPS_HTTP_TIMEOUT_SECONDS) as client:
                 resp = await client.post("https://api.github.com/user/repos", headers=headers, json=payload)
         else:
             resp = await client.post("https://api.github.com/user/repos", headers=headers, json=payload)

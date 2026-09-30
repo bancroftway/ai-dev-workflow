@@ -1209,7 +1209,7 @@ def _demo() -> None:
     # Bug A fix (task-12b): the wrapper script must feed `-p` an explicit, double-quoted
     # command-substitution value -- never bare/stdin-fed (the real CLI has no such mode -- see
     # _agenerate_inner's own comment on `argv = ["copilot", ...]`) and never the raw prompt text
-    # inlined (would re-blow cli_agent_exec._EXEC_CMD_BUDGET for a large prompt). Exact-match, not
+    # inlined (would re-blow config.EXEC_CMD_BUDGET_CHARS for a large prompt). Exact-match, not
     # a substring check, so any accidental reordering/re-quoting/missing-newline regression fails
     # loud here rather than only against a live container.
     wrapper = _build_copilot_wrapper_script(

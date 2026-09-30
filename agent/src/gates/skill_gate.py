@@ -472,7 +472,7 @@ def _demo() -> None:
     # required skill ended an otherwise-complete run on its last stage.
     from ..graph import _ALL_STAGE_SPECS
 
-    caps = {spec.key: spec.max_verify_cycles for spec in _ALL_STAGE_SPECS}
+    caps = {spec.key: spec.max_verify_cycles() for spec in _ALL_STAGE_SPECS}
     no_retry = [
         stage
         for stage in workflow_config.REQUIRED_SKILLS_BY_STAGE

@@ -33,14 +33,14 @@ from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from .. import config
+
 if TYPE_CHECKING:  # pragma: no cover -- import cycle guard (graph imports the gates)
     from ..graph import VerificationResult
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1")
-_CURL_TIMEOUT_SECONDS = 15
-_MAX_PROBES = 40  # routes + api_routes combined -- a discovery pass gone wild must not stall e2e
 # The catch-all probe path: no real app serves this; a 200 for it means the server answers 200
 # for EVERYTHING (an SPA shell / dev-server fallback), so page-route 200s prove nothing there.
 _CATCHALL_PROBE_PATH = "/__aidw_auth_probe__/no-such-route"
@@ -112,7 +112,7 @@ async def _probe(provider: Any, thread_id: str, url: str, method: str = "GET") -
     method_arg = f"-X {shlex.quote(method)} " if method != "GET" else ""
     result = await provider.exec_in_sandbox(
         thread_id,
-        f"curl -s -L --max-redirs 5 --max-time {_CURL_TIMEOUT_SECONDS} {method_arg}"
+        f"curl -s -L --max-redirs 5 --max-time {config.AUTH_GATE_CURL_TIMEOUT_SECONDS} {method_arg}"
         f"-o /dev/null -w '%{{http_code}} %{{url_effective}}' {shlex.quote(url)} 2>/dev/null || true",
     )
     parts = ((result.stdout or "").strip() or "0").split(None, 1)
@@ -165,8 +165,9 @@ async def check_auth(
             probes.append((raw, f"{api_base}{path}", method, is_allowlisted(path, anonymous_routes)))
     for route in page_routes:
         probes.append((route, f"{base}{route}", "GET", is_allowlisted(route, anonymous_routes)))
-    dropped = max(0, len(probes) - _MAX_PROBES)
-    probes = probes[:_MAX_PROBES]
+    max_probes = config.AUTH_GATE_MAX_PROBES
+    dropped = max(0, len(probes) - max_probes)
+    probes = probes[:max_probes]
 
     for label, url, method, allowlisted in probes:
         status, final_url = await _probe(provider, thread_id, url, method)
@@ -211,7 +212,7 @@ async def check_auth(
     if inconclusive:
         feedback += f"; {len(inconclusive)} inconclusive (404/405/5xx before auth) -- reported, not blocking"
     if dropped:
-        feedback += f"; {dropped} probe(s) dropped over the {_MAX_PROBES} cap"
+        feedback += f"; {dropped} probe(s) dropped over the {max_probes} cap"
     return VerificationResult(passed=True, feedback=feedback, report=report)
 
 

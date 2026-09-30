@@ -178,6 +178,9 @@ export default function OrganizationSettingsPage() {
           Applies to every new session across the organization. A session already running keeps
           whatever provider it started with.
         </p>
+        <Link href="/settings/organization/advanced" className="mt-2 inline-block text-sm text-neutral-600 underline hover:text-neutral-900">
+          Advanced settings (lap/verify-cycle caps, timeouts, thresholds) →
+        </Link>
       </div>
 
       <section className="flex max-w-2xl flex-col gap-4 rounded-lg border border-neutral-200 p-4">

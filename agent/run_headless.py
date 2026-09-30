@@ -43,7 +43,7 @@ logger = logging.getLogger("run_headless")
 from langchain_core.messages import HumanMessage  # noqa: E402
 from langgraph.types import Command  # noqa: E402
 
-from src import app_discovery, branch_naming, chat_model, config, git_ops, project_store, run_activity, session_store  # noqa: E402
+from src import app_discovery, branch_naming, chat_model, config, git_ops, project_store, run_activity, runtime_settings, session_store  # noqa: E402
 from src.graph import graph  # noqa: E402
 from src.sandbox import get_sandbox_provider, registry  # noqa: E402
 
@@ -191,6 +191,10 @@ async def _run_pipeline(args: argparse.Namespace) -> int:
     # `provider` to the SandboxProvider connection object (below), and chat_model.py's own
     # read_skill_invocations uses this exact same disambiguation for the identical collision.
     active_provider = await chat_model.get_provider()
+    # This whole process IS one session (no separate task boundary the way agent/main.py's
+    # per-request provisioning vs. per-session _drive_graph split has) -- pin once, right here,
+    # alongside the provider resolution it conceptually belongs with.
+    await runtime_settings.pin_for_session()
     # provider=active_provider (Phase E audit I-3): reuse the SAME resolved value rather than a
     # second independent live read -- both are TTL-cached so they'd almost always agree anyway,
     # but there is no reason to leave even a rare cache-boundary disagreement on the table when the

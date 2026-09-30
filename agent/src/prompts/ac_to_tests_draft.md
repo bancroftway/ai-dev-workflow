@@ -221,7 +221,7 @@ reading as requirements rather than advice:
    expressions. Numeric literals are normalised before comparison, so `Assert.Equal(1, c.Value)`
    and `Assert.Equal(2, c.Value)` count as ONE assertion target, not two. Assert a different
    property, a different method's return, or a different observable effect.
-2. **No near-duplicate bodies.** Two tests for the same AC whose bodies are >= 92% similar AND
+2. **No near-duplicate bodies.** Two tests for the same AC whose bodies are >= <<max_test_body_similarity_percent>>% similar AND
    assert the same targets count as one test. Renaming a test and changing a literal does not
    produce a second test; the escape route is asserting a DIFFERENT observable (status code, header,
    state value, error path) or the same behavior at a different layer (unit + integration).

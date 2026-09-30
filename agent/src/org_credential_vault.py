@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from . import config
 from .keyvault import VaultAccessError
 
 # Fixed, well-known secret name. Every set_org_credential call writes a new VERSION under this
@@ -48,13 +49,13 @@ from .keyvault import VaultAccessError
 # with exactly this value, never anything else.
 ORG_CREDENTIAL_SECRET_NAME = "org-provider-credential"
 
-# Bounds a real Key Vault round trip so a slow/unreachable vault degrades to a clear, fast
-# VaultAccessError instead of hanging the caller indefinitely -- found by the whole-branch
-# re-review: get_org_credential() is now called from _org_settings_response() (sessions_api.py),
-# which is polled by the frontend's settings-check on every page mount/repo switch, for every
-# signed-in user. Shorter than _probe_provider_credential's 30s (sessions_api.py) deliberately --
-# this sits on a page-load path a human is actively waiting on, not a one-shot admin save.
-_VAULT_TIMEOUT_SECONDS = 10.0
+# config.VAULT_TIMEOUT_SECONDS bounds a real Key Vault round trip so a slow/unreachable vault
+# degrades to a clear, fast VaultAccessError instead of hanging the caller indefinitely -- found by
+# the whole-branch re-review: get_org_credential() is now called from _org_settings_response()
+# (sessions_api.py), which is polled by the frontend's settings-check on every page mount/repo
+# switch, for every signed-in user. Shorter than _probe_provider_credential's 30s (sessions_api.py)
+# deliberately -- this sits on a page-load path a human is actively waiting on, not a one-shot
+# admin save.
 
 
 def _vault_uri() -> str:
@@ -89,8 +90,8 @@ async def get_org_credential(secret_name: str) -> str:
     identity -- no entra_assertion, no per-user exchange. Raises VaultAccessError (keyvault.py's,
     reused rather than duplicated) with the real Azure error detail on any auth/permission/network
     failure, matching this codebase's existing fail-fast-with-the-provider's-own-error convention.
-    Bounded to _VAULT_TIMEOUT_SECONDS -- a hang here is otherwise unbounded (see that constant's
-    own comment for why this matters more here than it looks).
+    Bounded to config.VAULT_TIMEOUT_SECONDS -- a hang here is otherwise unbounded (see that
+    setting's own comment for why this matters more here than it looks).
     """
     from azure.core.exceptions import AzureError
 
@@ -98,34 +99,32 @@ async def get_org_credential(secret_name: str) -> str:
         secret = await _get_client().get_secret(secret_name)
         return secret.value or ""
 
+    timeout = config.VAULT_TIMEOUT_SECONDS
     try:
-        return await asyncio.wait_for(_fetch(), timeout=_VAULT_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(_fetch(), timeout=timeout)
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
     except asyncio.TimeoutError as exc:
-        raise VaultAccessError(
-            f"timed out after {_VAULT_TIMEOUT_SECONDS}s contacting the org vault"
-        ) from exc
+        raise VaultAccessError(f"timed out after {timeout}s contacting the org vault") from exc
 
 
 async def set_org_credential(value: str) -> str:
     """Writes `value` as a new version of ORG_CREDENTIAL_SECRET_NAME under the agent's OWN
     standing identity, and returns that name so the caller (org_settings.set_org_settings) can
     store it without needing to know the constant itself. Same standing-identity, VaultAccessError,
-    and _VAULT_TIMEOUT_SECONDS-bounded contract as get_org_credential."""
+    and config.VAULT_TIMEOUT_SECONDS-bounded contract as get_org_credential."""
     from azure.core.exceptions import AzureError
 
     async def _store() -> None:
         await _get_client().set_secret(ORG_CREDENTIAL_SECRET_NAME, value)
 
+    timeout = config.VAULT_TIMEOUT_SECONDS
     try:
-        await asyncio.wait_for(_store(), timeout=_VAULT_TIMEOUT_SECONDS)
+        await asyncio.wait_for(_store(), timeout=timeout)
     except AzureError as exc:
         raise VaultAccessError(str(exc)) from exc
     except asyncio.TimeoutError as exc:
-        raise VaultAccessError(
-            f"timed out after {_VAULT_TIMEOUT_SECONDS}s contacting the org vault"
-        ) from exc
+        raise VaultAccessError(f"timed out after {timeout}s contacting the org vault") from exc
     return ORG_CREDENTIAL_SECRET_NAME
 
 

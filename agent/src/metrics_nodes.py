@@ -27,9 +27,9 @@ from langchain_core.runnables import RunnableConfig
 from . import config as workflow_config
 from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, tech_stack_signals, workflow_persistence
 from .gates import readme_gate
+from .gates.coverage_parsing import MIN_COVERAGE_PERCENT
 from .gates.remediation_gate import accounted_for
 from .schemas import presence_values as _presence_values
-from .gates.test_coverage_gate import MIN_COVERAGE_PERCENT
 from .chat_model import get_chat_model_for_thread, lap_role
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -41,10 +41,12 @@ TRACEABILITY_MATRIX_PATH = "traceability-matrix.md"
 
 # Regression gate tolerances: a coverage/health movement smaller than this is scan noise (jscpd is
 # LOC-sensitive, tool DBs drift), not a regression worth blocking a run over. Health tolerance sits
-# below one new medium finding's penalty (3), so a single real new medium still blocks.
-MAX_DUPLICATION_PERCENT = float(os.environ.get("MAX_DUPLICATION_PERCENT", "3.0"))
-METRIC_REGRESSION_TOLERANCE = float(os.environ.get("METRIC_REGRESSION_TOLERANCE", "1.0"))
-HEALTH_REGRESSION_TOLERANCE = float(os.environ.get("HEALTH_REGRESSION_TOLERANCE", "2.0"))
+# below one new medium finding's penalty (3), so a single real new medium still blocks. All three
+# centralized into config.py during the Org Settings migration -- MAX_DUPLICATION_PERCENT was
+# previously a SEPARATE declaration from repo_scan.py's own (different env var name,
+# QUALITY_MAX_DUPLICATION_PERCENT vs this file's MAX_DUPLICATION_PERCENT, same conceptual
+# threshold against the same jscpd-measured duplication_percent value) -- unified onto
+# repo_scan.py's env var name since that's the one the primary scan-time gate already used.
 _METRICS_GATE_MAX_ATTEMPTS = 2  # one automatic re-scan for tool flake, then fail
 
 
@@ -97,7 +99,6 @@ async def _read_coverage_summary(provider: Any, thread_id: str) -> dict[str, flo
     means (including its branch-attribute case handling and per-line condition parsing).
     """
     from .gates.test_coverage_gate import (
-        COVERAGE_COMMANDS_PATH,
         _Counts,
         _parse_cobertura_counts,
         _parse_istanbul_counts,
@@ -110,7 +111,7 @@ async def _read_coverage_summary(provider: Any, thread_id: str) -> dict[str, flo
     # them counts the same assembly over and over. That produced a confident, entirely fictional
     # "88.9% line / 61.9% branch" for a suite the gate had just measured above 95%.
     contract_paths: list[str] = []
-    raw_contract = await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH)
+    raw_contract = await repo_files.read_repo_file(provider, thread_id, workflow_config.COVERAGE_COMMANDS_PATH)
     if raw_contract:
         try:
             contract_paths = [
@@ -360,9 +361,12 @@ def regression_reasons(
     values there would misreport "too early to have run yet" as "silently unmeasured". Only the
     final scan's own call site threads real values through.
     """
+    # Real source is gates/coverage_parsing.py, not config.py -- see that module's own comment and
+    # config.py's own note next to the MIN_COVERAGE_PERCENT entry it deliberately omits: this must
+    # agree with test_coverage_gate.py's own pass/fail threshold (same import), not drift from it.
     min_cov = MIN_COVERAGE_PERCENT if min_coverage is None else min_coverage
-    tol = METRIC_REGRESSION_TOLERANCE if tolerance is None else tolerance
-    health_tol = HEALTH_REGRESSION_TOLERANCE if health_tolerance is None else health_tolerance
+    tol = workflow_config.METRIC_REGRESSION_TOLERANCE if tolerance is None else tolerance
+    health_tol = workflow_config.HEALTH_REGRESSION_TOLERANCE if health_tolerance is None else health_tolerance
     reasons: list[str] = []
 
     gating = latest_summary.get("gating_count") or 0
@@ -393,9 +397,9 @@ def regression_reasons(
     # ship arbitrarily duplicated code with no objection. Absolute threshold, not a delta: a
     # greenfield repo has no baseline to regress against.
     duplication = (latest_summary.get("measures") or {}).get("duplication_percent")
-    if isinstance(duplication, (int, float)) and duplication > MAX_DUPLICATION_PERCENT:
+    if isinstance(duplication, (int, float)) and duplication > workflow_config.MAX_DUPLICATION_PERCENT:
         reasons.append(
-            f"duplication {duplication:.1f}% exceeds the {MAX_DUPLICATION_PERCENT:.0f}% threshold"
+            f"duplication {duplication:.1f}% exceeds the {workflow_config.MAX_DUPLICATION_PERCENT:.0f}% threshold"
         )
 
     metric_deltas = (delta_summ or {}).get("metrics") or {}

@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 from typing import Iterator
 
+from . import config
+
 _LOCK_DIR = Path(__file__).resolve().parents[1] / "data" / "run_locks"
 
 
@@ -35,11 +37,16 @@ def _pid_alive(pid: int) -> bool:
     Deliberately never `os.kill(pid, 0)` on Windows: CPython's Windows implementation of os.kill
     has no signal-0 special case -- it calls `TerminateProcess(handle, 0)`, which actually KILLS
     the target instead of merely probing it. `tasklist` is the safe, stdlib-reachable check there.
+
+    config.RUN_LOCK_TASKLIST_TIMEOUT_SECONDS: this runs before a session is pinned (acquire_run_lock
+    is called before the event loop / runtime_settings.pin_for_session in run_headless.py's own
+    __main__), so it always resolves from env/default, never a live DB override -- documented on
+    the setting itself.
     """
     if sys.platform == "win32":
         out = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=config.RUN_LOCK_TASKLIST_TIMEOUT_SECONDS,
         ).stdout
         return str(pid) in out
     try:

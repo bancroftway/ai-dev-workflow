@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.runnables import RunnableConfig
 
-from . import git_ops, repo_files
+from . import config, git_ops, repo_files
 from .preflight_nodes import update_manifest
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -41,10 +41,6 @@ if TYPE_CHECKING:
 # The 8 canned monorepo stacks the Tech Stack tab's dropdown offers -- DATA (one markdown file per
 # stack), not a prompt: see load_stack_catalog.
 _TECH_STACKS_DIR = Path(__file__).parent / "templates" / "tech_stacks"
-
-_MAX_CANDIDATE_FILES = 60
-_MAX_FILE_CHARS = 4000
-_MAX_EVIDENCE_CHARS = 24000
 
 _PRUNE_DIRS = ("node_modules", ".git", "bin", "obj", "dist", "build", ".venv", "vendor", "Pods")
 _CANDIDATE_NAMES = (
@@ -297,19 +293,19 @@ async def collect_evidence(provider: SandboxProvider, thread_id: str) -> dict[st
     paths = [p.strip().lstrip("./") for p in (listing.stdout or "").splitlines() if p.strip()]
 
     files: dict[str, str] = {}
-    for path in paths[:_MAX_CANDIDATE_FILES]:
+    for path in paths[: config.APP_DISCOVERY_MAX_CANDIDATE_FILES]:
         try:
             content = await repo_files.read_repo_file(provider, thread_id, path)
         except ValueError:
             # validate_repo_relative_path rejects spaces/unicode -- skip the file, never fail the run.
             continue
         if content is not None:
-            files[path] = content[:_MAX_FILE_CHARS]
+            files[path] = content[: config.APP_DISCOVERY_MAX_FILE_CHARS]
 
     sections = [f"--- {path} ---\n{text}" for path, text in sorted(files.items())]
     return {
         "candidates": classify_candidates(files),
-        "evidence": "\n\n".join(sections)[:_MAX_EVIDENCE_CHARS],
+        "evidence": "\n\n".join(sections)[: config.APP_DISCOVERY_MAX_EVIDENCE_CHARS],
         "fingerprint": fingerprint(files),
         "scanned_file_count": len(files),
     }
