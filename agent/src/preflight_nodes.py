@@ -1134,9 +1134,18 @@ class SubmitVerifyFailed:
     draft: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SubmitVerified:
+    """resolve_tech_stack_submission's return when the submitted stack passed verification:
+    `content` is the approved TechStack (already written), `verification` its passing check rows."""
+
+    content: dict[str, Any]
+    verification: VerificationResult
+
+
 async def _settle_tech_stack(
     thread_id: str, tech_stack: dict[str, Any], provider: SandboxProvider, state: "GraphState", markdown: str
-) -> dict[str, Any] | SubmitVerifyFailed:
+) -> SubmitVerified | SubmitVerifyFailed:
     """Task 5 fix #1's shared merge-then-persist tail for resolve_tech_stack_submission's TWO
     settle-and-persist points (a cache hit, and fresh-extraction/extraction-failure-fallback):
     scans this repo's own config_inventory deterministically and unions it into `tech_stack` (via
@@ -1174,7 +1183,7 @@ async def _settle_tech_stack(
     await git_ops.commit_paths(
         provider, thread_id, [TECH_STACK_APPROVED_JSON_PATH], "ai-dev-workflow: tech stack extracted"
     )
-    return merged
+    return SubmitVerified(merged, verdict)
 
 
 def _select_tech_stack_markdown(resume_value: Any, draft: dict[str, Any] | None) -> str:
@@ -1196,12 +1205,13 @@ def _select_tech_stack_markdown(resume_value: Any, draft: dict[str, Any] | None)
 
 async def resolve_tech_stack_submission(
     thread_id: str, resume_value: Any, state: "GraphState", provider: SandboxProvider
-) -> dict[str, Any] | SubmitVerifyFailed | None:
+) -> SubmitVerified | SubmitVerifyFailed | None:
     """StageSpec.resolve_from_interrupt for the tech-stack stage: the Tech Stack tab's Submit
     button resolves with `{"markdown": <edited text>}` -- this is what actually gets that edited
     text saved and turned into the structured TechStack every downstream gate reads, since
     make_gate_node's default behavior (approve stage["draft"] verbatim) has no way to see it.
-    Returns SubmitVerifyFailed (no approved sidecar written) when verify_tech_stack fails.
+    Returns SubmitVerifyFailed (no approved sidecar written) when verify_tech_stack fails, else
+    SubmitVerified (the approved TechStack plus its passing check rows).
     """
     stage = state["stages"]["tech-stack"]
     markdown = _select_tech_stack_markdown(resume_value, stage.get("draft"))
@@ -1819,7 +1829,8 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
         globals()["_extract_cache_get"] = real_extract_cache_get
         config_inventory.inventory = real_inventory
 
-    assert result_a is not None
+    assert isinstance(result_a, SubmitVerified) and result_a.verification.passed, result_a
+    result_a = result_a.content
     assert result_a["auth_kind"] == "entra", "cache-hit path must merge the deterministic scan (fix #1)"
     assert result_a["config_inventory"] == {"status": "present", "values": ["AzureAd:TenantId"], "reason": ""}
     assert json.loads(fake_provider_a.files[TECH_STACK_APPROVED_JSON_PATH]) == result_a
@@ -1865,7 +1876,8 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
         globals()["_extract_tech_stack"] = real_extract_tech_stack
         config_inventory.inventory = real_inventory
 
-    assert result_b is not None
+    assert isinstance(result_b, SubmitVerified) and result_b.verification.passed, result_b
+    result_b = result_b.content
     assert result_b["auth_kind"] == "custom", "extraction path must merge the deterministic scan too (fix #1)"
     assert result_b["config_inventory"]["values"] == ["FOO_KEY", "BAR_KEY"], "union, existing keys first"
     assert len(cache_put_calls) == 1 and cache_put_calls[0][1] == fresh_extracted, (

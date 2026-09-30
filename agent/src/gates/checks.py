@@ -137,6 +137,30 @@ class CheckLog:
         return list(self._rows)
 
 
+# Recorded by graph.make_verify_node itself around every stage's own checks (and listed once, as
+# Pipeline.wrapper_checks, rather than on every Gate).
+WRAPPER_SANDBOX = Check(
+    "wrapper.sandbox", "Sandbox available",
+    "A sandbox was registered for this session, so the gate could run at all.", "blocking",
+)
+WRAPPER_SKILLS = Check(
+    "wrapper.skills", "Required skills invoked",
+    "The stage's sessions invoked every skill it requires, per their own transcripts.", "blocking",
+    "only when the stage requires skills",
+)
+WRAPPER_VERIFY_CRASHED = Check(
+    "wrapper.verify_crashed", "Verify completed",
+    "The stage's verify function returned a verdict instead of raising.", "blocking",
+)
+WRAPPER_AUDIT_FINDINGS = Check(
+    "wrapper.audit_findings", "Audit findings resolved",
+    "Every finding the second-opinion audit raised this lap was addressed.", "blocking",
+    "only for stages with an audit step, when the audit ran this lap or the draft admitted gaps",
+    needs_audit=True,
+)
+WRAPPER_CHECKS: tuple[Check, ...] = (WRAPPER_SANDBOX, WRAPPER_SKILLS, WRAPPER_VERIFY_CRASHED, WRAPPER_AUDIT_FINDINGS)
+
+
 def _demo() -> None:
     """`cd agent && uv run python -m src.gates.checks`."""
     a = Check("a", "A", "first", "blocking")

@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -58,10 +58,27 @@ from . import run_failure
 from . import session_store
 from . import spec_ledger
 from . import telemetry
+from . import verify_check_store
 from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
-from .gates import adversarial_gate, remediation_gate, skill_gate
-from .gates.checks import Gate, resolve_code_gen_mode
+from .gates import (
+    adversarial_gate,
+    diagram_gate,
+    remediation_gate,
+    skill_gate,
+    test_coverage_gate,
+    write_scope_gate,
+)
+from .gates.checks import (
+    WRAPPER_AUDIT_FINDINGS,
+    WRAPPER_CHECKS,
+    WRAPPER_SANDBOX,
+    WRAPPER_SKILLS,
+    WRAPPER_VERIFY_CRASHED,
+    CheckLog,
+    Gate,
+    resolve_code_gen_mode,
+)
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
 from .gates.diagram_gate import (
     DRAFT_DIAGRAMS_DIR,
@@ -1262,6 +1279,27 @@ def _stamp_gate_change_and_check_delta(
     )
 
 
+_SPEC_CHECK_MAP = {c.id: c for c in spec_ledger.VERIFY_CHECKS}
+
+
+def _record_ledger_sync_rows(
+    log: CheckLog, result: spec_ledger.LedgerSyncResult, fully_reviewed: bool | None
+) -> None:
+    """One row per sync_ledger sub-check. Its reasons are tagged with the check they belong to;
+    every other sub-check was evaluated in the same sweep and passed. The completeness sweep (tagged
+    spec.audit_full_read) only runs once every other sub-check passed, and only when there was
+    transcript evidence -- True already recorded its passing row before the sync."""
+    grouped: dict[str, list[str]] = {}
+    for check_id, reason in result.tagged:
+        grouped.setdefault(check_id, []).append(reason)
+    log.record_tagged(_SPEC_CHECK_MAP, [(check_id, "\n".join(reasons)) for check_id, reasons in grouped.items()])
+    for check in spec_ledger.LEDGER_SYNC_CHECKS:
+        if check.id not in grouped:
+            log.passed(check)
+    if fully_reviewed is False and result.passed:
+        log.passed(spec_ledger.SPEC_AUDIT_FULL_READ, "an earlier lap of this run already proved a full read")
+
+
 def make_verify_specification_ledger(
     stage_key: str = "specification", has_audit_role: bool = True
 ) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int, bool], Any]:
@@ -1281,6 +1319,7 @@ def make_verify_specification_ledger(
     async def _verify_specification_ledger(
         thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None,
         provider: SandboxProvider, chat_provider: str, lap: int = 0, audit_ran_this_lap: bool = True,
+        *, log: CheckLog | None = None,
     ) -> VerificationResult:
         """StageSpec.deterministic_verify for the specification stage: reads
         spec_ledger.DRAFT_SPEC_PATH (the model's own file-edited sketchpad -- file-based-editing
@@ -1294,9 +1333,16 @@ def make_verify_specification_ledger(
         it), so `sync_ledger`'s in-place mutation of ids stays the established contract. Everything
         below the file-read insertion point is otherwise unchanged from before this rewrite.
         """
+        if log is None:
+            log = CheckLog(f"{stage_key}_verify", spec_ledger.VERIFY_CHECKS)
+
+        def _verdict(passed: bool, feedback: str, report: dict[str, Any]) -> VerificationResult:
+            return VerificationResult(passed, feedback, report, checks=[r.to_dict() for r in log.results()])
+
         raw_file = await repo_files.read_repo_file(provider, thread_id, spec_ledger.DRAFT_SPEC_PATH)
         if raw_file is None:
-            return VerificationResult(
+            log.failed(spec_ledger.SPEC_DRAFT_FILE_EXISTS, f"{spec_ledger.DRAFT_SPEC_PATH} is missing")
+            return _verdict(
                 passed=False,
                 feedback=(
                     f"{spec_ledger.DRAFT_SPEC_PATH} does not exist -- view it, then create it with "
@@ -1306,14 +1352,17 @@ def make_verify_specification_ledger(
                 ),
                 report={"draft_file": "missing"},
             )
+        log.passed(spec_ledger.SPEC_DRAFT_FILE_EXISTS)
         try:
             file_specification = Specification.model_validate(json.loads(raw_file)).model_dump(mode="json")
         except (json.JSONDecodeError, ValidationError) as exc:
-            return VerificationResult(
+            log.failed(spec_ledger.SPEC_DRAFT_FILE_PARSES, str(exc))
+            return _verdict(
                 passed=False,
                 feedback=f"{spec_ledger.DRAFT_SPEC_PATH} does not match the Specification shape: {exc}. View it and fix it.",
                 report={"draft_file": "invalid"},
             )
+        log.passed(spec_ledger.SPEC_DRAFT_FILE_PARSES)
         # File-based-editing plan, Part 1 audit fix (implementation-time refinement, simpler and
         # more robust than the response-validator design originally planned): reject outright if
         # the file has NOTHING in it -- mirrors _ready_means_files_were_written's actual spirit
@@ -1327,11 +1376,13 @@ def make_verify_specification_ledger(
         # empty, since that's the only shape a true first-ever no-op can produce.
         empty_draft_reason = check_empty_draft(file_specification)
         if empty_draft_reason is not None:
-            return VerificationResult(
+            log.failed(spec_ledger.SPEC_DRAFT_NOT_EMPTY, empty_draft_reason)
+            return _verdict(
                 passed=False,
                 feedback=empty_draft_reason,
                 report={"draft_file": "empty"},
             )
+        log.passed(spec_ledger.SPEC_DRAFT_NOT_EMPTY)
         content_dict.clear()
         content_dict.update(file_specification)
 
@@ -1343,6 +1394,10 @@ def make_verify_specification_ledger(
         # audit this lap, e.g. draft_verify) takes that same path: no audit session exists to read,
         # so a missing transcript is expected, not the infra fault below.
         fully_reviewed: bool | None = None
+        if not has_audit_role:
+            log.skipped(spec_ledger.SPEC_AUDIT_FULL_READ, "no audit role for this stage")
+        elif not audit_ran_this_lap:
+            log.skipped(spec_ledger.SPEC_AUDIT_FULL_READ, "audit did not run this lap")
         if has_audit_role and audit_ran_this_lap:
             # The per-lap audit role key (`audit-{run_id}-{lap}`), NOT the bare "audit" label --
             # `lap` is the same pre-increment verify_cycle_count make_audit_node keyed this lap's
@@ -1367,9 +1422,11 @@ def make_verify_specification_ledger(
                 # say exactly what was missing. It used to collapse into fully_reviewed=False here,
                 # which is indistinguishable from a genuine partial read -- the 2026-09-18 incident
                 # burned every stage lap with feedback the draft could do nothing about.
-                return VerificationResult(
+                unreadable = chat_model.transcript_unreadable_feedback(stage_key, audit_role, session_id)
+                log.infra(spec_ledger.SPEC_AUDIT_FULL_READ, unreadable)
+                return _verdict(
                     passed=False,
-                    feedback=chat_model.transcript_unreadable_feedback(stage_key, audit_role, session_id),
+                    feedback=unreadable,
                     report={"infra_error": "audit_transcript_unreadable", "audit_role": audit_role},
                 )
             # None here means a provider that structurally cannot verify transcripts (Copilot):
@@ -1377,6 +1434,12 @@ def make_verify_specification_ledger(
             # transcript evidence -- False (transcript found, file only partially read) stays the
             # genuine fail-closed path.
             fully_reviewed = evidence
+            if evidence is None:
+                log.skipped(spec_ledger.SPEC_AUDIT_FULL_READ, f"{chat_provider} transcripts can't be verified")
+            elif evidence:
+                log.passed(spec_ledger.SPEC_AUDIT_FULL_READ, "the audit read the whole draft file this lap")
+            # False: sync_ledger's completeness sweep decides (an earlier lap of this run may already
+            # have proved a full read) -- recorded after the sync below.
 
         # Question-ledger backstop (user requirement 2026-08-31): make_draft_node's routing coercion
         # keeps open questions away from the gate on the DRAFT path, but the audit revises content
@@ -1385,7 +1448,8 @@ def make_verify_specification_ledger(
         open_questions = find_open_questions(content_dict.get("questions") or [])
         if open_questions:
             listed = "; ".join(f"{q.get('id')}: {q.get('question')}" for q in open_questions)
-            return VerificationResult(
+            log.failed(spec_ledger.SPEC_NO_OPEN_QUESTIONS, listed)
+            return _verdict(
                 passed=False,
                 feedback=(
                     "Open clarifying questions can never reach the human gate -- either the revised "
@@ -1394,13 +1458,15 @@ def make_verify_specification_ledger(
                 ),
                 report={"open_questions": [q.get("id") for q in open_questions]},
             )
+        log.passed(spec_ledger.SPEC_NO_OPEN_QUESTIONS)
 
         # Deterministic narrative-template backstop (2026-09-17, endless-redraft investigation):
         # a fully mechanical rule both prompts already state verbatim was, until now, enforced by
         # audit's LLM judgment alone -- see spec_ledger.check_narrative_format's own docstring.
         narrative_violations = spec_ledger.check_narrative_format(content_dict.get("user_stories") or [])
         if narrative_violations:
-            return VerificationResult(
+            log.failed(spec_ledger.SPEC_STORY_NARRATIVE, "\n".join(narrative_violations))
+            return _verdict(
                 passed=False,
                 feedback=(
                     "Some User Story narratives don't match the required template ('As a <role>, "
@@ -1410,6 +1476,7 @@ def make_verify_specification_ledger(
                 ),
                 report={"narrative_violations": narrative_violations},
             )
+        log.passed(spec_ledger.SPEC_STORY_NARRATIVE)
 
         entries = await spec_ledger.load_ledger(provider, thread_id)
         user_stories = content_dict.get("user_stories") or []
@@ -1426,6 +1493,7 @@ def make_verify_specification_ledger(
             bug_affected_ac_ids=bug_affected_ac_ids,
             fully_reviewed=fully_reviewed,
         )
+        _record_ledger_sync_rows(log, result, fully_reviewed)
         no_new_work = False
         if result.passed:
             # File-based-editing plan, Part 1 sect. 5: write the ledger-resolved content back to
@@ -1503,7 +1571,7 @@ def make_verify_specification_ledger(
                 for e in updated_entries
                 if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
             ]
-        return VerificationResult(
+        return _verdict(
             passed=result.passed,
             feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
             report={
@@ -2265,6 +2333,7 @@ STAGES: list[StageSpec] = [
         audit_example=SPECIFICATION_AUDIT_EXAMPLE,
         gate=Gate(
             verify=_verify_specification_ledger,
+            checks=spec_ledger.VERIFY_CHECKS,
             policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
             persists=True,
         ),
@@ -2326,6 +2395,7 @@ STAGES: list[StageSpec] = [
         sign_approval=True,
         gate=Gate(
             verify=verify_plan_diagrams,
+            checks=diagram_gate.VERIFY_CHECKS,
             policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
             persists=True,
         ),
@@ -2382,6 +2452,7 @@ STAGES: list[StageSpec] = [
         capture_baseline_commit=True,
         gate=Gate(
             verify=verify_ac_to_tests,
+            checks=write_scope_gate.VERIFY_CHECKS,
             policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
             persists=False,
         ),
@@ -2500,6 +2571,7 @@ STAGES: list[StageSpec] = [
         audit_example=MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE,
         gate=Gate(
             verify=verify_coverage,
+            checks=test_coverage_gate.VERIFY_CHECKS,
             policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
             persists=False,
         ),
@@ -2569,6 +2641,7 @@ STAGES: list[StageSpec] = [
         capture_baseline_commit=True,
         gate=Gate(
             verify=remediation_gate.verify_remediation,
+            checks=remediation_gate.VERIFY_CHECKS,
             policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
             persists=False,
         ),
@@ -2625,6 +2698,7 @@ STAGES: list[StageSpec] = [
         },
         gate=Gate(
             verify=adversarial_gate.verify_adversarial_compliance,
+            checks=adversarial_gate.VERIFY_CHECKS,
             policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
             persists=False,
         ),
@@ -2663,6 +2737,7 @@ STAGES: list[StageSpec] = [
         },
         gate=Gate(
             verify=exit_nodes.verify_exit_readiness,
+            checks=exit_nodes.VERIFY_CHECKS,
             policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
             persists=True,
         ),
@@ -4289,6 +4364,20 @@ def _demo_reset_e2e_lever() -> None:
     assert _reset_e2e_attempts_exhausted(cap + 1), "already over the cap must stay refused"
 
 
+async def _append_verify_history(
+    state: GraphState, thread_id: str, stage_spec: StageSpec, attempt: int, passed: bool,
+    checks: list[dict[str, Any]],
+) -> None:
+    """One verify attempt's rows into dbo.verify_check_results (fail-soft inside append_results)."""
+    gate = stage_spec.gate
+    assert gate is not None
+    mode = state.get("code_gen_mode")
+    await verify_check_store.append_results(
+        session_id=thread_id, run_id=state.get("run_id") or "unknown", stage=stage_spec.key, attempt=attempt,
+        timing=gate.timing, code_gen_mode=mode, policy=gate.policy_for(mode), stage_passed=passed, checks=checks,
+    )
+
+
 def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     """Runs stage_spec.deterministic_verify (a real script/parse, never LLM self-attestation)
     between audit and gate. Only wired in when the StageSpec sets deterministic_verify -- see
@@ -4301,20 +4390,37 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
 
         stages = {key: dict(value) for key, value in state["stages"].items()}
         stage = stages[stage_spec.key]
+        gate = stage_spec.gate
+        assert gate is not None
+        # One log per lap: the stage's own checks plus the wrapper rows recorded below. lap is
+        # 1-based ("lap N of max_verify_cycles"); attempt also counts infra retries, so every verify
+        # run gets its own history entry.
+        log = CheckLog(gate.id, gate.checks + WRAPPER_CHECKS)
+        lap = stage.get("verify_cycle_count", 0) + 1
+        attempt = lap + stage.get("infra_retry_count", 0)
+
+        def _rows() -> list[dict[str, Any]]:
+            return [r.to_dict() for r in log.results()]
 
         if sandbox_registry.get(thread_id) is None:
             # Every deterministic_verify (ledger sync, mermaid render, write-scope/AC-coverage git
             # diff, coverage run, license scan) needs the sandbox. Without one the check cannot run,
             # so escalate to a human rather than let the stage pass unverified (route reads
             # cannot_verify).
+            log.failed(WRAPPER_SANDBOX, "no sandbox registered for this session")
             stage["last_verification"] = {
                 "passed": False,
                 "cannot_verify": True,
                 "feedback": "no sandbox -- deterministic verification did not run",
                 "report": {},
+                "checks": _rows(),
+                "lap": lap,
+                "attempt": attempt,
             }
             stages[stage_spec.key] = stage
+            await _append_verify_history(state, thread_id, stage_spec, attempt, False, stage["last_verification"]["checks"])
             return {"stages": stages}
+        log.passed(WRAPPER_SANDBOX)
 
         # Methodology enforcement, checked before the stage's own content check: a stage built
         # around a skill (RED-before-GREEN, writing-plans, receiving-code-review) that silently
@@ -4345,6 +4451,14 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 "verified": True,
             }
             stages[stage_spec.key] = stage
+        if not skill_check.required:
+            log.skipped(WRAPPER_SKILLS, "this stage requires no skills")
+        elif not skill_check.passed:
+            log.failed(WRAPPER_SKILLS, f"missing: {', '.join(skill_check.missing)}")
+        elif not skill_check.verified:
+            log.skipped(WRAPPER_SKILLS, f"{state['provider']} transcripts can't be verified")
+        else:
+            log.passed(WRAPPER_SKILLS)
         # A failing skill check no longer returns early here -- see the merge with `result` below,
         # right after stage_spec.deterministic_verify runs. The two checks are independent (whether
         # a skill was invoked has no bearing on whether the resulting artifact is itself correct),
@@ -4405,10 +4519,13 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         try:
             result = await stage_spec.deterministic_verify(
                 thread_id, stage["draft"] or {}, state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
-                state["provider"], stage.get("verify_cycle_count", 0), _audit_enabled(state),
+                state["provider"], stage.get("verify_cycle_count", 0), _audit_enabled(state), log=log,
             )
+            log.passed(WRAPPER_VERIFY_CRASHED)
         except Exception as exc:  # noqa: BLE001 -- convert to a routed infra verdict, never crash the node
             logger.exception("%s: deterministic_verify crashed", stage_spec.key)
+            # Rows the gate recorded before raising stay in the log.
+            log.infra(WRAPPER_VERIFY_CRASHED, f"{type(exc).__name__}: {exc}")
             result = VerificationResult(
                 passed=False,
                 feedback=f"deterministic verification crashed unexpectedly: {exc}",
@@ -4437,6 +4554,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
             if isinstance(known_gaps, dict) and known_gaps.get("status") == "present":
                 open_findings.extend(str(v) for v in (known_gaps.get("values") or []))
             if open_findings:
+                log.failed(WRAPPER_AUDIT_FINDINGS, "\n".join(open_findings))
                 audit_feedback = (
                     "Unresolved audit finding(s) must be fixed before this stage can proceed:\n"
                     + "\n".join(f"- {f}" for f in open_findings)
@@ -4450,6 +4568,12 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                     feedback=audit_feedback if result.passed else f"{result.feedback}\n\n{audit_feedback}",
                     report=merged_report,
                 )
+            elif _audit_enabled(state):
+                log.passed(WRAPPER_AUDIT_FINDINGS)
+            else:
+                log.skipped(WRAPPER_AUDIT_FINDINGS, "audit did not run this lap")
+        else:
+            log.skipped(WRAPPER_AUDIT_FINDINGS, "no audit step for this stage")
         if not skill_check.passed:
             # Merge the skill-gate's own verdict into the content gate's, instead of reporting
             # only whichever failed first (2026-09-07 audit, "review all stages/gates" anecdote):
@@ -4471,7 +4595,14 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 "required_skills": skill_check.required,
             })
             result = VerificationResult(passed=False, feedback=combined_feedback, report=merged_report)
-        stage["last_verification"] = {"passed": result.passed, "feedback": result.feedback, "report": result.report}
+        # The log, not the gate's own result.checks: it also holds the wrapper rows, and the rows a
+        # crashed gate recorded before raising.
+        result = replace(result, checks=_rows())
+        stage["last_verification"] = {
+            "passed": result.passed, "feedback": result.feedback, "report": result.report,
+            "checks": result.checks, "lap": lap, "attempt": attempt,
+        }
+        await _append_verify_history(state, thread_id, stage_spec, attempt, result.passed, result.checks)
         stage["max_verify_cycles"] = stage_spec.max_verify_cycles()
         if not result.passed:
             # report["infra_error"]: the platform failed to produce evidence (e.g. the coverage
@@ -5201,6 +5332,7 @@ async def _reopen_gate_after_failed_submit(
     stage["reviewer_feedback"] = None  # a stale earlier rejection must not misroute this to draft
     stage["last_verification"] = _submit_verification_record(failed.verification, attempts)
     stages[stage_spec.key] = stage
+    await _append_verify_history(state, thread_id, stage_spec, attempts, False, stage["last_verification"]["checks"])
     logger.warning(
         "%s submission failed verification (attempt %d of %d):\n%s", stage_spec.key, attempts,
         workflow_config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS, failed.verification.feedback,
@@ -5442,6 +5574,13 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                 )
             if isinstance(resolved, preflight_nodes.SubmitVerifyFailed):
                 return await _reopen_gate_after_failed_submit(stage_spec, state, config, stages, resolved)
+            if isinstance(resolved, preflight_nodes.SubmitVerified):
+                # last_verification is cleared below on a passing submit; history still keeps it.
+                await _append_verify_history(
+                    state, thread_id, stage_spec, approved.get("tech_stack_verify_attempts", 0) + 1, True,
+                    resolved.verification.report.get("checks") or [],
+                )
+                resolved = resolved.content
             if resolved is not None:
                 content = resolved
         approved["status"] = "approved"
@@ -5937,6 +6076,7 @@ BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
     draft_example=SPECIFICATION_DRAFT_EXAMPLE,
     gate=Gate(
         verify=make_verify_specification_ledger("brownfield-spec", has_audit_role=False),
+        checks=spec_ledger.VERIFY_CHECKS,
         policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
         persists=True,
     ),
@@ -5964,6 +6104,7 @@ BROWNFIELD_BASELINE_PLAN_STAGE = StageSpec(
     draft_example=PLAN_DRAFT_EXAMPLE,
     gate=Gate(
         verify=make_verify_plan_diagrams("brownfield-plan", has_audit_role=False),
+        checks=diagram_gate.VERIFY_CHECKS,
         policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
         persists=True,
     ),
@@ -6558,6 +6699,74 @@ def compile_graph():
 graph = compile_graph()
 
 
+def _demo_spec_verify_checks(spec_json: str) -> None:
+    """specification_verify's per-check rows on the early-return, collected (ledger sync) and
+    audit-evidence paths. Verdicts (passed/feedback) must be exactly what they were before rows."""
+    import asyncio
+
+    files: dict[str, str | None] = {}
+    ledger: list[dict[str, Any]] = []
+    evidence: dict[str, Any] = {"session": None, "read": None}
+
+    async def _read(_p, _t, path):
+        return files.get(path)
+
+    async def _noop(*_a, **_k):
+        return None
+
+    async def _load(_p, _t):
+        return [dict(e) for e in ledger]
+
+    async def _full_read(*_a, **_k):
+        return evidence["read"]
+
+    def _rows(result: VerificationResult) -> dict[str, str]:
+        return {r["id"]: r["status"] for r in result.checks}
+
+    real = (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger,
+            spec_ledger.save_ledger, chat_model.get_session_id, chat_model.read_full_file_reads)
+    repo_files.read_repo_file, repo_files.write_repo_file = _read, _noop
+    spec_ledger.load_ledger, spec_ledger.save_ledger = _load, _noop
+    chat_model.get_session_id = lambda *_a, **_k: evidence["session"]
+    chat_model.read_full_file_reads = _full_read
+    verify = make_verify_specification_ledger("specification")
+    try:
+        # Early return: only the rows actually reached.
+        missing = asyncio.run(verify("t", {}, "r", None, None, "claude", 0, False))  # type: ignore[arg-type]
+        assert not missing.passed and "does not exist" in missing.feedback
+        assert _rows(missing) == {"spec.draft_file_exists": "failed"}, missing.checks
+
+        # Collected: sync_ledger's reasons split into their own rows, the rest of the sweep passes.
+        doc = json.loads(spec_json)
+        doc["user_stories"][0]["existing_us_id"] = "US-0099"
+        doc["retired_ac_ids"] = ["AC-0099-01"]
+        files[spec_ledger.DRAFT_SPEC_PATH] = json.dumps(doc)
+        ledger[:] = [{"id": "US-0001", "kind": "user_story", "status": "active", "title": "Old", "narrative": ""}]
+        collected = asyncio.run(verify("t", {}, "r", None, None, "claude", 0, False))  # type: ignore[arg-type]
+        assert not collected.passed and collected.feedback == "; ".join(collected.report["reasons"])
+        rows = _rows(collected)
+        assert rows["spec.ledger_citations"] == "failed" and rows["spec.ledger_retirements"] == "failed", rows
+        assert rows["spec.ledger_duplicates"] == "passed" and rows["spec.ledger_bug_affected"] == "passed", rows
+        assert rows["spec.audit_full_read"] == "skipped", rows
+
+        # Audit ran and read only part of the file: the completeness sweep fails the audit row.
+        files[spec_ledger.DRAFT_SPEC_PATH] = spec_json
+        ledger[:] = []
+        evidence.update(session="sess", read=False)
+        partial = asyncio.run(verify("t", {}, "r", None, None, "claude", 0, True))  # type: ignore[arg-type]
+        rows = _rows(partial)
+        assert not partial.passed and rows["spec.audit_full_read"] == "failed", rows
+        assert all(rows[c.id] == "passed" for c in spec_ledger.LEDGER_SYNC_CHECKS), rows
+        # ...and a full read passes it, recorded before the sync.
+        evidence["read"] = True
+        full = asyncio.run(verify("t", {}, "r", None, None, "claude", 0, True))  # type: ignore[arg-type]
+        assert full.passed and _rows(full)["spec.audit_full_read"] == "passed", full.checks
+        assert len(full.checks) == len(spec_ledger.VERIFY_CHECKS), full.checks
+    finally:
+        (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger,
+         spec_ledger.save_ledger, chat_model.get_session_id, chat_model.read_full_file_reads) = real
+
+
 def _demo_audit_ran_this_lap() -> None:
     """Final-fix round 1 (C1): specification/plan's audit-transcript evidence check must fail open
     when code_gen_mode skipped audit this lap (audit_ran_this_lap=False) -- the same path as
@@ -6608,15 +6817,34 @@ def _demo_audit_ran_this_lap() -> None:
         assert "infra_error" not in skipped.report, skipped.report
         assert skipped.passed, skipped.feedback
         assert written == [spec_ledger.DRAFT_SPEC_PATH] and len(saved) == 1, (written, saved)
+        # Per-check rows: the infra verdict stops at the audit row; the audit-skipped pass records
+        # every check, the audit one as skipped.
+        assert [(r["id"], r["status"]) for r in faulted.checks] == [
+            ("spec.draft_file_exists", "passed"), ("spec.draft_file_parses", "passed"),
+            ("spec.draft_not_empty", "passed"), ("spec.audit_full_read", "infra"),
+        ], faulted.checks
+        skipped_rows = {r["id"]: r for r in skipped.checks}
+        assert set(skipped_rows) == {c.id for c in spec_ledger.VERIFY_CHECKS}, skipped_rows
+        assert skipped_rows["spec.audit_full_read"]["status"] == "skipped"
+        assert skipped_rows["spec.audit_full_read"]["detail"] == "audit did not run this lap"
+        assert all(r["status"] == "passed" for k, r in skipped_rows.items() if k != "spec.audit_full_read")
+        brownfield = asyncio.run(make_verify_specification_ledger("brownfield-spec", has_audit_role=False)(
+            "t", {}, "r", None, None, "claude", 0, True,  # type: ignore[arg-type]
+        ))
+        assert brownfield.passed and {r["id"]: r["detail"] for r in brownfield.checks}["spec.audit_full_read"] == (
+            "no audit role for this stage"
+        ), brownfield.checks
     finally:
         (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger,
          spec_ledger.save_ledger, chat_model.get_session_id) = real
+
+    _demo_spec_verify_checks(spec_json)
 
     # Plan: verify_plan_diagrams forwards `has_audit_role and audit_ran_this_lap` as the evidence
     # flag _load_and_sync_plan_steps gates its transcript lookup on.
     seen_flags: list[bool] = []
 
-    async def _fake_sync(_p, _t, _r, _k, _c, has_audit_role, _lap):  # noqa: ANN001, ANN202
+    async def _fake_sync(_p, _t, _r, _k, _c, has_audit_role, _lap, **_kw):
         seen_flags.append(has_audit_role)
         return None, ["stop here"], [], "demo_short_circuit"
 
@@ -6823,6 +7051,16 @@ def _demo() -> None:
     cluster, no stub stage). What this adds is the routing PREDICATE that no structural check can
     see: whether a stage that failed verification actually gets redrafted.
     """
+    # No verify-history writes to whatever DB db.py resolves to: record them instead (restored below).
+    history: list[dict[str, Any]] = []
+
+    async def _fake_append_results(**kwargs: Any) -> int:
+        history.append(kwargs)
+        return len(kwargs["checks"])
+
+    real_append_results = verify_check_store.append_results
+    verify_check_store.append_results = _fake_append_results  # type: ignore[assignment]
+
     # Genuine resume: approved, content present, verification clean (or never run) -> skip.
     assert should_skip_draft({"status": "approved", "approved_content": {"x": 1}, "last_verification": None})
     assert should_skip_draft({"status": "approved", "approved_content": {"x": 1}})
@@ -6955,6 +7193,16 @@ def _demo() -> None:
         )
         assert last["report"]["missing_skills"] == ["writing-plans"]
         assert not last["report"].get("infra_error"), "a plain content failure must not smuggle an infra_error in"
+        # Wrapper rows around the gate's own (none here -- the fake records nothing), plus lap and
+        # one history write for this attempt with the same rows.
+        assert [(r["id"], r["status"]) for r in last["checks"]] == [
+            ("wrapper.sandbox", "passed"), ("wrapper.skills", "failed"), ("wrapper.verify_crashed", "passed"),
+            ("wrapper.audit_findings", "passed"),
+        ], last["checks"]
+        assert last["lap"] == 1 and last["attempt"] == 1
+        assert history[-1]["checks"] == last["checks"] and history[-1]["stage"] == "minimal-code-to-green"
+        assert history[-1]["attempt"] == 1 and history[-1]["timing"] == "before_review" and not history[-1]["stage_passed"]
+        assert history[-1]["policy"] == "blocking" and history[-1]["run_id"] == "demo"
 
         # Crash-safety: deterministic_verify raising must not crash the node, and the resulting
         # infra_error must survive the skill-gate merge (a genuine platform fault, not a draft one).
@@ -6963,6 +7211,32 @@ def _demo() -> None:
         last2 = out2["stages"]["minimal-code-to-green"]["last_verification"]
         assert not last2["passed"]
         assert last2["report"]["infra_error"] == "verify_crashed", last2["report"]
+        assert {r["id"]: r["status"] for r in last2["checks"]}["wrapper.verify_crashed"] == "infra", last2["checks"]
+
+        # Gate rows recorded before a crash survive it (the log belongs to verify_node).
+        async def _fake_verify_records_then_crashes(*_args, log, **_kwargs):
+            log.passed(test_coverage_gate.VERIFY_CHECKS[0])
+            raise RuntimeError("boom after a row")
+
+        out_partial = asyncio.run(make_verify_node(
+            _with_verify(by_key["minimal-code-to-green"], _fake_verify_records_then_crashes)
+        )({**demo_verify_state, "code_gen_mode": "draft_verify"}, demo_verify_cfg))
+        partial_rows = {r["id"]: r["status"] for r in out_partial["stages"]["minimal-code-to-green"]["last_verification"]["checks"]}
+        assert partial_rows[test_coverage_gate.VERIFY_CHECKS[0].id] == "passed", partial_rows
+        assert partial_rows["wrapper.verify_crashed"] == "infra", partial_rows
+        # draft_verify skips the audit: its findings row says so instead of claiming a pass.
+        assert partial_rows["wrapper.audit_findings"] == "skipped", partial_rows
+        checkpoint_commits.pop()  # this extra run's own checkpoint, not part of the counts below
+
+        # No sandbox: cannot_verify, a failed wrapper.sandbox row, and still one history write.
+        before = len(history)
+        out_nosb = asyncio.run(verify_fn(demo_verify_state, {"configurable": {"thread_id": "demo-verify-no-sandbox"}}))
+        last_nosb = out_nosb["stages"]["minimal-code-to-green"]["last_verification"]
+        assert last_nosb["cannot_verify"] and last_nosb["checks"] == [
+            {"id": "wrapper.sandbox", "status": "failed", "detail": "no sandbox registered for this session",
+             "source": last_nosb["checks"][0]["source"]},
+        ], last_nosb
+        assert last_nosb["lap"] == 1 and len(history) == before + 1 and history[-1]["checks"] == last_nosb["checks"]
 
         # Final-fix round 1 (Bug 3): minimal-code-to-green's source checkpoint commit fires from
         # verify_node BEFORE deterministic_verify, in both modes that run verify -- the two runs
@@ -7931,6 +8205,10 @@ def _demo() -> None:
     _demo_reset_e2e_lever()
     _demo_code_gen_mode_routing()
     _demo_audit_ran_this_lap()
+
+    # The tech-stack failed-submit demo (_demo_code_gen_mode_routing) wrote its after_submit attempt.
+    assert any(h["stage"] == "tech-stack" and h["timing"] == "after_submit" and not h["stage_passed"] for h in history), history
+    verify_check_store.append_results = real_append_results  # type: ignore[assignment]
 
     print("graph self-check: all assertions passed")
 

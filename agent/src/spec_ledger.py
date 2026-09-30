@@ -13,11 +13,12 @@ one result out. graph.py's own _verify_specification_ledger wraps this as a dete
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import repo_files
+from .gates.checks import Check
 from .gates.ledger_sync_checks import (
     check_bug_affected_ac_id,
     check_existing_ac_id_citation,
@@ -84,11 +85,93 @@ PENDING_RESET_FIELD = "pending_reset_run_id"
 RESOLUTION_FIELDS = ("resolved_at", "resolved_run_id")
 
 
+# The specification stage's verify checks (specification_verify / brownfield-spec_verify, run by
+# graph.make_verify_specification_ledger). Declared here, not in graph.py, because sync_ledger
+# below tags each of its reasons with one of these ids so the gate can split "ledger sync" into
+# rows a reader can act on.
+SPEC_DRAFT_FILE_EXISTS = Check(
+    "spec.draft_file_exists", "Draft specification file exists",
+    "Checks the model actually wrote its specification to .ai-dev-workflow/spec/draft-specification.json. "
+    "Every later check reads the stories and criteria from this file.",
+    "blocking",
+)
+SPEC_DRAFT_FILE_PARSES = Check(
+    "spec.draft_file_parses", "Draft file matches the specification shape",
+    "Checks the draft file is valid JSON and has the specification's structure: title, summary, user "
+    "stories with their acceptance criteria, assumptions and so on.",
+    "blocking", "only when the draft file exists",
+)
+SPEC_DRAFT_NOT_EMPTY = Check(
+    "spec.draft_not_empty", "Draft proposes something",
+    "Checks the draft adds, changes, retires or reopens at least one story or criterion. A completely "
+    "empty draft means the model said it was done without writing anything.",
+    "blocking", "only when the draft file is valid",
+)
+SPEC_AUDIT_FULL_READ = Check(
+    "spec.audit_full_read", "Audit read the whole specification",
+    "Checks the audit session's own transcript proves it read the entire draft file, so a review can't "
+    "approve stories it never looked at. Once one lap of a run proves a full read, later laps of the "
+    "same run don't have to repeat it.",
+    "blocking",
+    "only when the stage has an audit role, the audit ran this lap and the AI provider's transcripts "
+    "can be checked",
+    needs_audit=True,
+)
+SPEC_NO_OPEN_QUESTIONS = Check(
+    "spec.no_open_questions", "No open clarifying questions",
+    "Checks every clarifying question is either answered by the requirements or settled by an explicit "
+    "assumption. An open question must never reach the human reviewer disguised as a finished spec.",
+    "blocking", "only when the draft is valid (and the audit transcript was readable)",
+)
+SPEC_STORY_NARRATIVE = Check(
+    "spec.story_narrative", "Stories follow the narrative template",
+    "Checks every user story reads 'As a <role>, I want <capability>, so that <benefit>', with a real "
+    "person or organisation as the role, never the system itself.",
+    "blocking", "only when there are no open questions",
+)
+SPEC_LEDGER_CITATIONS = Check(
+    "spec.ledger_citations", "Revised stories cite real ids",
+    "Checks a story or criterion that says it revises an existing one points at an id that exists, "
+    "isn't retired, sits under the right parent story and isn't being renumbered. Ids are permanent, so "
+    "later stages can always trace work back to its requirement.",
+    "collected", "only when the narrative check passes",
+)
+SPEC_LEDGER_DUPLICATES = Check(
+    "spec.ledger_duplicates", "No duplicate stories or criteria",
+    "Checks a new story or criterion doesn't repeat the wording of one already in the ledger. That one "
+    "should be cited and revised instead, so the same requirement isn't tracked twice.",
+    "collected", "only when the narrative check passes and the ledger already has entries",
+)
+SPEC_LEDGER_RETIREMENTS = Check(
+    "spec.ledger_retirements", "Retirements name real, live ids",
+    "Checks every story or criterion the draft retires exists, is the right kind and isn't also being "
+    "revised in the same draft. Retiring is permanent, so a typo here must not silently drop scope.",
+    "collected", "only when the narrative check passes",
+)
+SPEC_LEDGER_BUG_AFFECTED = Check(
+    "spec.ledger_bug_affected", "Bug-affected criteria are real",
+    "Checks every criterion a bug ticket reopens exists, is live and isn't being retired in the same "
+    "draft, so the fix is traced to the requirement it actually breaks.",
+    "collected", "only when the narrative check passes",
+)
+VERIFY_CHECKS: tuple[Check, ...] = (
+    SPEC_DRAFT_FILE_EXISTS, SPEC_DRAFT_FILE_PARSES, SPEC_DRAFT_NOT_EMPTY, SPEC_AUDIT_FULL_READ,
+    SPEC_NO_OPEN_QUESTIONS, SPEC_STORY_NARRATIVE, SPEC_LEDGER_CITATIONS, SPEC_LEDGER_DUPLICATES,
+    SPEC_LEDGER_RETIREMENTS, SPEC_LEDGER_BUG_AFFECTED,
+)
+# The sub-checks sync_ledger tags its reasons with (its completeness sweep is the audit-read check).
+LEDGER_SYNC_CHECKS: tuple[Check, ...] = (
+    SPEC_LEDGER_CITATIONS, SPEC_LEDGER_DUPLICATES, SPEC_LEDGER_RETIREMENTS, SPEC_LEDGER_BUG_AFFECTED,
+)
+
+
 @dataclass(frozen=True)
 class LedgerSyncResult:
     passed: bool
     reasons: list[str]
     updated_entries: list[dict[str, Any]]
+    # (check id, reason) per reason, same order as `reasons` -- set by sync_ledger only.
+    tagged: list[tuple[str, str]] = field(default_factory=list)
 
 
 async def load_ledger(provider: SandboxProvider, thread_id: str) -> list[dict[str, Any]]:
@@ -376,6 +459,12 @@ def sync_ledger(
     """
     updated = [dict(e) for e in entries]
     reasons: list[str] = []
+    tagged: list[tuple[str, str]] = []
+
+    def fail(check: Check, problem: str) -> None:
+        reasons.append(problem)
+        tagged.append((check.id, problem))
+
     touched_ids: set[str] = set()
     deferred_story_ids: set[str] = set()
 
@@ -399,7 +488,7 @@ def sync_ledger(
         if existing_us_id is not None:
             problem = check_existing_us_id_citation(existing_us_id, story.get("id"), updated)
             if problem:
-                reasons.append(problem)
+                fail(SPEC_LEDGER_CITATIONS, problem)
                 continue
             entry = _find(updated, existing_us_id)
             # Deferred scope (user requirement 2026-08-31): a story marked deferred in the draft is
@@ -428,7 +517,7 @@ def sync_ledger(
                 updated, "user_story", story.get("title", ""), touched_ids
             )
             if dup is not None:
-                reasons.append(duplicate_story_reason(story, dup))
+                fail(SPEC_LEDGER_DUPLICATES, duplicate_story_reason(story, dup))
                 continue
             story_deferred = bool(story.get("deferred"))
             resolved_us_id = allocate_next_id(updated, "user_story")
@@ -457,7 +546,7 @@ def sync_ledger(
             if existing_ac_id is not None:
                 problem = check_existing_ac_id_citation(existing_ac_id, ac.get("id"), resolved_us_id, updated)
                 if problem:
-                    reasons.append(problem)
+                    fail(SPEC_LEDGER_CITATIONS, problem)
                     continue
                 ac_entry = _find(updated, existing_ac_id)
                 ac_was_deferred = ac_entry.get("status") == "deferred"
@@ -488,7 +577,7 @@ def sync_ledger(
                     updated, "acceptance_criterion", ac.get("description", ""), touched_ids
                 )
                 if ac_dup is not None:
-                    reasons.append(duplicate_ac_reason(ac, ac_dup))
+                    fail(SPEC_LEDGER_DUPLICATES, duplicate_ac_reason(ac, ac_dup))
                     continue
                 resolved_ac_id = allocate_next_id(updated, "acceptance_criterion", resolved_us_id)
                 new_ac_entry = {
@@ -523,7 +612,7 @@ def sync_ledger(
     for us_id in retired_us_ids or []:
         problem = check_retired_us_id(us_id, updated, touched_ids)
         if problem:
-            reasons.append(problem)
+            fail(SPEC_LEDGER_RETIREMENTS, problem)
             continue
         entry = _find(updated, us_id)
         if entry.get("status") in ("active", "revised", "deferred"):
@@ -556,7 +645,7 @@ def sync_ledger(
     for ac_id in retired_ac_ids or []:
         problem = check_retired_ac_id(ac_id, updated, touched_ids)
         if problem:
-            reasons.append(problem)
+            fail(SPEC_LEDGER_RETIREMENTS, problem)
             continue
         entry = _find(updated, ac_id)
         if entry.get("status") in ("active", "revised", "deferred"):
@@ -567,13 +656,13 @@ def sync_ledger(
     for bug_ac_id in bug_affected_ac_ids or []:
         problem = check_bug_affected_ac_id(bug_ac_id, updated, retired_ac_id_set)
         if problem:
-            reasons.append(problem)
+            fail(SPEC_LEDGER_BUG_AFFECTED, problem)
             continue
         entry = _find(updated, bug_ac_id)
         entry[PENDING_RESET_FIELD] = run_id
 
     if reasons:
-        return LedgerSyncResult(passed=False, reasons=reasons, updated_entries=entries)
+        return LedgerSyncResult(passed=False, reasons=reasons, updated_entries=entries, tagged=tagged)
 
     if fully_reviewed is not None:
         if fully_reviewed:
@@ -592,7 +681,10 @@ def sync_ledger(
         # `updated` by the time this runs.
         completeness_problem = check_fully_reviewed_completeness(updated, run_id)
         if completeness_problem is not None:
-            return LedgerSyncResult(passed=False, reasons=[completeness_problem], updated_entries=entries)
+            return LedgerSyncResult(
+                passed=False, reasons=[completeness_problem], updated_entries=entries,
+                tagged=[(SPEC_AUDIT_FULL_READ.id, completeness_problem)],
+            )
 
     _stamp_change_dates(updated, run_id, now_iso)
     return LedgerSyncResult(passed=True, reasons=[], updated_entries=updated)
@@ -1299,6 +1391,7 @@ def _demo() -> None:
     ]
     dropped_us_result = sync_ledger([dict(e) for e in seed], dropped_us_draft, "run-13")
     assert not dropped_us_result.passed, "an identical-title story with a null citation must be rejected"
+    assert [t for t, _ in dropped_us_result.tagged] == [SPEC_LEDGER_DUPLICATES.id], dropped_us_result.tagged
     assert any("US-0001" in r and "identical" in r for r in dropped_us_result.reasons), dropped_us_result.reasons
 
     dropped_ac_draft = [
@@ -1348,6 +1441,7 @@ def _demo() -> None:
         "run-30",
     )
     assert not unknown_us_result.passed
+    assert [t for t, _ in unknown_us_result.tagged] == [SPEC_LEDGER_CITATIONS.id], unknown_us_result.tagged
     assert "US-9999" in unknown_us_result.reasons[0] and "does not exist" in unknown_us_result.reasons[0]
 
     # existing_us_id: retired-reuse.
@@ -1416,6 +1510,7 @@ def _demo() -> None:
     assert not sync_ledger([dict(e) for e in rules_seed], [], "run-30", retired_us_ids=["US-9999"]).passed
     wrong_kind_us_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", retired_us_ids=["US-0001.1"])
     assert not wrong_kind_us_result.passed
+    assert [t for t, _ in wrong_kind_us_result.tagged] == [SPEC_LEDGER_RETIREMENTS.id], wrong_kind_us_result.tagged
     assert "not a user story id" in wrong_kind_us_result.reasons[0]
 
     # retired_ac_ids: wrong kind (a user story id, not an AC id -- almost always the two fields swapped).
@@ -1452,6 +1547,7 @@ def _demo() -> None:
     # families just above, all exercised through one consistent seed/pattern).
     unknown_bug_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", bug_affected_ac_ids=["US-9999.9"])
     assert not unknown_bug_result.passed
+    assert [t for t, _ in unknown_bug_result.tagged] == [SPEC_LEDGER_BUG_AFFECTED.id], unknown_bug_result.tagged
     assert "US-9999.9" in unknown_bug_result.reasons[0] and "does not exist" in unknown_bug_result.reasons[0]
 
     wrong_kind_bug_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", bug_affected_ac_ids=["US-0001"])

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import graph
-from .gates.checks import CODE_GEN_MODES, Check
+from .gates.checks import CODE_GEN_MODES, WRAPPER_CHECKS, Check
 
 
 @dataclass(frozen=True)
@@ -171,12 +171,7 @@ PIPELINE = Pipeline(
         "exit": "Exit",
     },
     # Recorded by verify_node itself around every stage's own checks.
-    wrapper_checks=(
-        Check("wrapper.sandbox", "Sandbox available", "A sandbox was registered for this session, so the gate could run at all.", "blocking"),
-        Check("wrapper.skills", "Required skills invoked", "The stage's sessions invoked every skill it requires, per their own transcripts.", "blocking"),
-        Check("wrapper.verify_crashed", "Verify completed", "The stage's verify function returned a verdict instead of raising.", "blocking"),
-        Check("wrapper.audit_findings", "Audit findings resolved", "Every finding the second-opinion audit raised this lap was addressed.", "blocking", needs_audit=True),
-    ),
+    wrapper_checks=WRAPPER_CHECKS,
 )
 
 
@@ -193,6 +188,36 @@ def _assert_mirrors_in_sync() -> int:
                 assert twin.read_bytes() == hook.read_bytes(), f"{twin} drifted from its mirror {hook}"
                 pairs += 1
     return pairs
+
+
+def _unreferenced_checks(checks: list[Check]) -> list[str]:
+    """Ids of declared checks nothing records. A check counts as recorded when a module-level name
+    bound to it appears in a `log.<method>(NAME` / `fail(NAME` call, as the head of a `(NAME, ...)`
+    pair a loop feeds into a log call, or as `NAME.id` (a tagged reason), or when its id literal appears somewhere other than a `Check("<id>"` declaration (the
+    mirrored stdlib helpers tag reasons with bare id strings)."""
+    import re
+    import sys
+
+    src = Path(__file__).resolve().parent
+    text = "\n".join(f.read_text(encoding="utf-8") for f in src.rglob("*.py"))
+    modules = [m for n, m in list(sys.modules.items()) if n.startswith(__package__ or "src") and m is not None]
+    missing = []
+    for check in checks:
+        names = {n for m in modules for n, v in vars(m).items() if v is check}
+        by_name = any(
+            re.search(
+                rf"(?:log\.\w+|\bfail)\(\s*(?:\w+\.)?{re.escape(n)}\b"  # log.failed(NAME / fail(NAME
+                rf"|[(\[,]\s*\(\s*{re.escape(n)}\s*,"  # (NAME, ...) pair iterated into a log call
+                rf"|\b{re.escape(n)}\.id\b",  # NAME.id tagged reason
+                text,
+            )
+            for n in names
+        )
+        literal = f'"{check.id}"'
+        declared = len(re.findall(rf"Check\(\s*{re.escape(literal)}", text))
+        if not by_name and text.count(literal) <= declared:
+            missing.append(check.id)
+    return missing
 
 
 def _diff_paths(a: Any, b: Any, path: str = "") -> list[str]:
@@ -254,6 +279,24 @@ def _demo() -> None:
     assert _diff_paths(described, flipped) == [f".tabs[{code_tab}].stages[0].gate.policy.yolo"], _diff_paths(described, flipped)
     assert PIPELINE.stage("minimal-code-to-green").gate.policy["yolo"] == "off"  # type: ignore[union-attr]
     graph._demo_route_policy_matrix(list(flipped_specs))  # routing follows the flipped policy
+
+    # Every gate declares checks; ids are unique within a gate and never collide with a wrapper id;
+    # every declared check is actually recorded somewhere.
+    wrapper_ids = {c.id for c in p.wrapper_checks}
+    assert len(wrapper_ids) == len(p.wrapper_checks)
+    all_checks: list[Check] = list(p.wrapper_checks)
+    for s in p.stages:
+        if s.gate is None:
+            continue
+        ids = [c.id for c in s.gate.checks]
+        assert ids, f"{s.key}: gate declares no checks"
+        assert len(ids) == len(set(ids)), f"{s.key}: duplicate check ids {ids}"
+        assert not wrapper_ids & set(ids), f"{s.key}: check id collides with a wrapper check"
+        all_checks += [c for c in s.gate.checks if c not in all_checks]
+    unreferenced = _unreferenced_checks(all_checks)
+    assert not unreferenced, f"declared but never recorded: {unreferenced}"
+    probe = Check("demo." + "never_recorded", "x", "x", "blocking")  # split: no literal for the scan to find
+    assert _unreferenced_checks([probe]) == [probe.id]
 
     pairs = _assert_mirrors_in_sync()
     assert pairs >= 13, f"only {pairs} hook mirrors found -- path wrong?"

@@ -16,7 +16,6 @@ differently, but this distinction itself is unverified in practice.
 from __future__ import annotations
 
 import shlex
-from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Callable
 
 import json
@@ -868,12 +867,6 @@ VERIFY_CHECKS: tuple[Check, ...] = (
     PLAN_UI_WIREFRAME_COVERAGE, PLAN_STEP_WIREFRAME_COVERAGE, PLAN_WIREFRAME_HTML, PLAN_MERMAID_RENDER,
 )
 
-# (CheckLog, audit-skip reason) for _load_and_sync_plan_steps, which records its own steps/audit/
-# ledger rows. A ContextVar, not a parameter: graph.py's audit_ran_this_lap self-check swaps that
-# helper for a fixed 7-positional-arg fake, so its signature can't grow. None = not recording.
-_STEP_LOG: ContextVar[tuple[CheckLog, str] | None] = ContextVar("_STEP_LOG", default=None)
-
-
 async def _load_and_sync_plan_steps(
     provider: SandboxProvider,
     thread_id: str,
@@ -882,6 +875,9 @@ async def _load_and_sync_plan_steps(
     chat_provider: str,
     has_audit_role: bool,
     lap: int,
+    *,
+    log: CheckLog | None = None,
+    audit_skip_reason: str = "",
 ) -> tuple[list[dict[str, Any]] | None, list[str], list[dict[str, Any]], str | None]:
     """File-based-editing plan, Part 2 sect. 5/6: reads _draft/steps.json, validates each entry
     against schemas.PlanStep, computes `fully_reviewed` (Part 3's review-depth safety net,
@@ -900,11 +896,11 @@ async def _load_and_sync_plan_steps(
 
     `lap` is the stage's pre-increment verify_cycle_count, threaded from make_verify_node, so the
     audit session lookup below keys on the same `audit-{run_id}-{lap}` string make_audit_node used.
+
+    `log` records this helper's own steps/audit/ledger rows (None = not recording);
+    `audit_skip_reason` is the audit row's detail when `has_audit_role` is False.
     """
     from ..schemas import PlanStep
-
-    ctx = _STEP_LOG.get()
-    log, audit_skip_reason = ctx if ctx is not None else (None, "")
 
     raw = await repo_files.read_repo_file(provider, thread_id, DRAFT_STEPS_PATH)
     ledger_entries = await spec_ledger.load_ledger(provider, thread_id)
@@ -1216,13 +1212,10 @@ def make_verify_plan_diagrams(
         # draft_verify) takes the exact has_audit_role=False path: no audit session exists to read,
         # so a missing transcript is expected, not an infra fault (fail-open, fully_reviewed=None).
         audit_skip_reason = "no audit role for this stage" if not has_audit_role else "audit did not run this lap"
-        step_log_token = _STEP_LOG.set((log, audit_skip_reason))
-        try:
-            resolved_steps, step_problems, ledger_entries, step_infra_error = await _load_and_sync_plan_steps(
-                provider, thread_id, run_id, stage_key, chat_provider, has_audit_role and audit_ran_this_lap, lap,
-            )
-        finally:
-            _STEP_LOG.reset(step_log_token)
+        resolved_steps, step_problems, ledger_entries, step_infra_error = await _load_and_sync_plan_steps(
+            provider, thread_id, run_id, stage_key, chat_provider, has_audit_role and audit_ran_this_lap, lap,
+            log=log, audit_skip_reason=audit_skip_reason,
+        )
         if step_infra_error is not None:
             # Platform could not evaluate a check (see _load_and_sync_plan_steps): infra verdict,
             # same routing make_verify_node gives ac_coverage_gate's missing-artifact case.
