@@ -7,6 +7,12 @@ repository root: a generated monorepo commonly keeps its apps under `apps/` or s
 running a start command from the wrong directory fails instantly for reasons that have nothing to
 do with the app being broken.
 
+A static scan guesses: `<<scanned_start_command_hint>>` -- confirm or correct this before
+proceeding. This is a HINT, not a trusted answer: it was never actually run, so it may be missing a
+`cd` into the app's own directory, wrong for this repo entirely, or stale. Verify it yourself and
+correct it if it's wrong; you must still prove whatever command you end up using actually boots the
+app, exactly as required below.
+
 The command you find will be re-launched later as a long-lived background process by the
 orchestrator, so it must be a single self-contained shell command that:
 - starts the app in the FOREGROUND (the orchestrator handles backgrounding; do not add `&`,

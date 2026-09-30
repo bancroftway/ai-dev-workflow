@@ -53,7 +53,7 @@ from . import fake_idp, git_ops, keyvault, model_config, repo_files, repo_test_c
 from . import workflow_persistence
 from .chat_model import get_chat_model_for_thread, lap_role, secret_env_names
 from .exit_nodes import HISTORY_DIR
-from .preflight_nodes import MANIFEST_PATH
+from .preflight_nodes import MANIFEST_PATH, persist_toolchain_value, read_toolchain_value
 from .prompt_loader import load_prompt_pair, render_prompt
 from .schemas import presence_values
 from .text_truncate import truncate_middle
@@ -63,7 +63,7 @@ from . import stack_runner, test_results
 from .schemas import StageReport
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
-from .tech_stack_signals import tech_stack_has_ui_framework
+from .tech_stack_signals import is_greenfield_repo, tech_stack_has_ui_framework
 
 E2E_APP_LOG_PATH = workflow_config.E2E_APP_LOG_PATH
 E2E_APP_PID_PATH = workflow_config.E2E_APP_PID_PATH
@@ -1059,6 +1059,55 @@ def _scanned_launch_command(candidate: dict[str, Any]) -> str:
     return f"cd {shlex.quote(path)} && {command}"
 
 
+async def _boot_evidence_start_command(provider: Any, thread_id: str) -> tuple[str, int] | None:
+    """(start_command, port) tech-stack approval's own boot probe (preflight_nodes.
+    probe_tech_stack_startability, brownfield-only) already independently proved boots, or None.
+
+    Task 6 synergy: that probe used to keep only the `started` bool per candidate and discard
+    which command string (and port -- it is already baked into the command via `_with_port_env`)
+    actually worked; it now records both in `boot_evidence`, read here as e2e_run_node's own FIRST
+    choice on a cold attempt -- ahead of its manifest-persisted proven-launch cache (see that call
+    site's own comment), since this is independently boot-proven by an earlier stage. Still
+    re-proven by a real boot before e2e_run_node trusts it (never skipped) -- this only supplies
+    the candidate value to try.
+    """
+    raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.TECH_STACK_APPROVED_PATH)
+    if not raw:
+        return None
+    try:
+        approved = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(approved, dict):
+        return None
+    for entry in approved.get("boot_evidence") or []:
+        if not isinstance(entry, dict) or not entry.get("started"):
+            continue
+        command = str(entry.get("start_command") or "").strip()
+        port = entry.get("port")
+        if command and isinstance(port, int):
+            return command, port
+    return None
+
+
+def _resolve_cold_start_hint(
+    boot_evidence_hint: tuple[str, int] | None, persisted_command: Any, requested_port: int,
+) -> tuple[str, int] | None:
+    """Pure decision half of the cold-attempt hydration above: which (command, port) pair to try
+    FIRST, before a real discovery turn -- boot_evidence_hint (already independently boot-proven,
+    WITH the exact port it was proven against) wins over persisted_command (this stage's own
+    manifest-persisted proven-launch cache, a bare command string with no port of its own, paired
+    here with whatever port THIS attempt already picked). Neither is trusted without still being
+    re-proven by a real boot (the caller's existing `ready` check, unchanged) -- this only decides
+    which candidate earns that proof first. None when neither source has anything to offer.
+    """
+    if boot_evidence_hint is not None:
+        return boot_evidence_hint
+    if isinstance(persisted_command, str) and persisted_command.strip():
+        return persisted_command, requested_port
+    return None
+
+
 def _report_path_for(config_dir: str) -> str:
     """The playwright JSON report path, expressed relative to the directory the suite RUNS in.
 
@@ -1226,12 +1275,17 @@ async def probe_candidate_boot(
     separate pair): this probe always runs and tears down well before e2e's own stage does, in the
     same one-container-per-session sandbox.
 
-    Returns (started, reason) -- reason is populated on failure only.
+    Returns (started, reason, launch_command, port) -- reason is populated on failure only;
+    launch_command/port are populated on SUCCESS only (Task 6 synergy: the caller, preflight_nodes.
+    probe_tech_stack_startability, used to keep only the `started` bool and discard which exact,
+    already port-bound command string actually worked -- this is that command, runnable as-is, and
+    the port it was proven against, which e2e_nodes.py's own proven-launch cache needs alongside it
+    since the command has a specific port baked in via `_with_port_env`).
     """
     name = str(candidate.get("name") or candidate.get("path") or "app")
     command = str(candidate.get("start_command") or "").strip()
     if not command:
-        return False, f"no start command could be inferred for {name}"
+        return False, f"no start command could be inferred for {name}", None, None
 
     # Same leftover-listener sweep e2e_run_node runs before every boot (see _kill_stale_app_
     # processes' own docstring) -- cheap insurance against a PREVIOUS probe attempt (this repo's
@@ -1256,13 +1310,13 @@ async def probe_candidate_boot(
         # warrants right now.
         await _kill_stale_app_processes(provider, thread_id)
     if ready:
-        return True, None
+        return True, None, launch_command, port
     log_tail = truncate_middle(
         await repo_files.read_repo_file(provider, thread_id, E2E_APP_LOG_PATH) or "",
         workflow_config.E2E_BOOT_FAILURE_LOG_HEAD_CHARS,
         workflow_config.E2E_BOOT_FAILURE_LOG_TAIL_CHARS,
     )
-    return False, f"{name} never answered on port {port} within {timeout_seconds}s -- log tail:\n{log_tail}"
+    return False, f"{name} never answered on port {port} within {timeout_seconds}s -- log tail:\n{log_tail}", None, None
 
 
 async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
@@ -1338,12 +1392,33 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         provider, thread_id, int(app.get("port") or 0), reserved_ports
     )
     reserved_ports.add(requested_port)
+    # Task 6 (requirement 4): a FRESH e2e attempt (a rewind, a retry, a resumed run) starts this
+    # in-memory cache cold every time, paying the discovery turn again even when the exact same
+    # command would still work -- hydrate it from a value proven OUTSIDE this attempt before
+    # falling through to a real discovery turn, same "prefer known, discover on miss" shape as
+    # requirement 1's test-command wiring. Two sources, most-proven first: tech-stack approval's
+    # own already-boot-proven candidate (brownfield only -- probe_tech_stack_startability never
+    # runs for a greenfield repo), then this stage's own manifest-persisted proven-launch cache (an
+    # earlier e2e attempt THIS run, or a past run's, that got as far as `_cache_proven_launch`
+    # below). Only when the in-memory cache is itself empty -- a lap that already proved something
+    # THIS attempt always wins, unchanged.
+    if workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH and not e2e.get("proven_start_command"):
+        boot_evidence_hint = None if is_greenfield_repo(state) else await _boot_evidence_start_command(provider, thread_id)
+        persisted_command = await read_toolchain_value(provider, thread_id, "start_command")
+        hydrated = _resolve_cold_start_hint(boot_evidence_hint, persisted_command, requested_port)
+        if hydrated is not None:
+            command, port = hydrated
+            _cache_proven_launch(e2e, command, port, [], [])
+
     # Skip the paid GHCP proving turn when a previous lap THIS stage attempt already proved a
     # start_command/port pair boots and answers (see the cache write at `ready` below, and its
     # clear on a stale-cache failure): retries then only re-pay the reboot, not the discovery.
     # AIDW_E2E_REUSE_PROVEN_LAUNCH is the operator kill-switch; a falsy cached command (nothing
     # proven yet this attempt, or e2e_gate_check_node's fresh-stage-entry reset just cleared it)
-    # always falls through to the real discovery turn below, unchanged.
+    # always falls through to the real discovery turn below, unchanged. A value hydrated just above
+    # from OUTSIDE this attempt takes the identical path from here on -- boot it, curl it, and only
+    # trust it once that proof actually passes (`ready` below); never skipped, same guarantee as a
+    # same-attempt cache hit.
     used_proven_launch = _should_reuse_proven_launch(e2e)
     if used_proven_launch:
         launch = _synthesized_launch_from_cache(e2e, requested_port)
@@ -1361,6 +1436,13 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             # Same e2e["attempt"] counter, same reasoning.
             lap=e2e.get("attempt", 0),
             requested_port=str(requested_port),  # render_prompt substitutes strings only
+            # Task 6 (requirement 5): app_discovery's deterministic scan already produced a static
+            # start_command guess for this exact candidate -- a genuinely cold discovery turn (no
+            # proven value at all yet, unlike the hydration branch above) used to omit it entirely
+            # and tell the model to "work out how to start this repository's web app yourself" from
+            # zero. Handed over as a labeled HINT, not a trusted answer -- e2e_run.md still requires
+            # the model to prove it boots, same as always.
+            scanned_start_command_hint=str(app.get("start_command") or "").strip() or "(none found)",
         )
     if launch.success and launch.start_command:
         port = int(launch.port or requested_port)
@@ -1607,6 +1689,11 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
         # prefixes by now, and caching that would replay a stale service-url export ahead of a
         # future lap's freshly-prefixed one (see the comment where base_start_command is captured).
         _cache_proven_launch(e2e, base_start_command, port, routes, list(launch.api_routes or []))
+        # Task 6 (requirement 4): persist into manifest.json's shared `toolchain` section the
+        # moment the in-memory cache above fires, so a FUTURE cold attempt (this run's own next
+        # e2e lap after a rewind, or a resumed run) can hydrate from it too, not just a later lap
+        # of THIS same attempt (see this function's own hydration block, near requested_port).
+        await persist_toolchain_value(provider, thread_id, "start_command", base_start_command)
 
     if not ready:
         cache_note = ""
@@ -1617,6 +1704,14 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             # the NEXT e2e_fix -> e2e_run lap redoes full discovery instead of retrying the same
             # bad command -- self-heals within one extra lap rather than looping forever.
             _clear_proven_launch(e2e)
+            # Also forget the manifest-persisted value (Task 6): unlike the in-memory cache, that
+            # key is not implicitly cold-started by a fresh attempt/lap, so a bad persisted command
+            # would otherwise be re-hydrated and re-tried forever instead of self-healing here.
+            # None on a value hydrated from boot_evidence too -- harmless (that key was never set
+            # from this side), and a rare false failure here (a transient port/cold-start hiccup,
+            # not a genuinely broken command) costs one extra discovery turn next time, the same
+            # cost a same-attempt cache-clear already accepts.
+            await persist_toolchain_value(provider, thread_id, "start_command", None)
             # Told to the fix model below, not just logged: without this, "app never answered"
             # reads identically to a fresh-discovery boot failure and burns a real fix-cycle
             # (E2E_MAX_FIX_CYCLES is capped) diagnosing what may just be a stale cache that
@@ -2980,6 +3075,59 @@ def _demo() -> None:
         assert cached["proven_api_routes"] == []
     finally:
         workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH = _orig_reuse_flag
+
+    # Task 6 (requirement 4): cold-attempt hydration priority -- boot_evidence (already
+    # independently boot-proven, WITH its own proven port) wins over the manifest-persisted bare
+    # command (which carries no port of its own, so it's paired with whatever port this attempt
+    # already picked); neither is used when the corresponding source has nothing to offer.
+    assert _resolve_cold_start_hint(("cd apps/api && dotnet run", 4001), "npm run dev", 9999) == (
+        "cd apps/api && dotnet run", 4001,
+    ), "boot_evidence must win over the persisted command"
+    assert _resolve_cold_start_hint(None, "npm run dev", 9999) == ("npm run dev", 9999), (
+        "the persisted command is paired with THIS attempt's own requested_port"
+    )
+    assert _resolve_cold_start_hint(None, None, 9999) is None
+    assert _resolve_cold_start_hint(None, "   ", 9999) is None, "a blank persisted command must not be used"
+
+    # _boot_evidence_start_command: reads tech-stack.approved.json's own boot_evidence, preferring
+    # the first entry that actually STARTED -- a failed candidate's leftover start_command/port
+    # (or one carrying no start_command at all) must never be returned.
+    class _FakeReadOnlyProvider:
+        def __init__(self, files: dict[str, str]) -> None:
+            self.files = files
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str) -> Any:
+            class _Result:
+                def __init__(self, ok: bool, stdout: str, stderr: str = "") -> None:
+                    self.ok, self.stdout, self.stderr = ok, stdout, stderr
+                    self.returncode = 0 if ok else 1
+
+            for path, content in self.files.items():
+                if command == f"cat {shlex.quote(path)}":
+                    return _Result(True, content)
+            return _Result(False, "", "No such file or directory")
+
+    approved_doc = json.dumps({
+        "boot_evidence": [
+            {"candidate": "apps/api", "path": "apps/api", "started": False, "reason": "boom", "start_command": None, "port": None},
+            {"candidate": "apps/web", "path": "apps/web", "started": True, "reason": None, "start_command": "cd apps/web && npm run dev", "port": 4100},
+        ],
+    })
+    boot_evidence_provider = _FakeReadOnlyProvider({workflow_persistence.TECH_STACK_APPROVED_PATH: approved_doc})
+    hint = _asyncio.run(_boot_evidence_start_command(boot_evidence_provider, "t"))
+    assert hint == ("cd apps/web && npm run dev", 4100), hint
+
+    assert _asyncio.run(_boot_evidence_start_command(_FakeReadOnlyProvider({}), "t")) is None, (
+        "no tech-stack.approved.json at all -- nothing to hydrate from"
+    )
+    all_failed_provider = _FakeReadOnlyProvider({
+        workflow_persistence.TECH_STACK_APPROVED_PATH: json.dumps({
+            "boot_evidence": [{"candidate": "apps/api", "path": "apps/api", "started": False, "reason": "boom"}],
+        }),
+    })
+    assert _asyncio.run(_boot_evidence_start_command(all_failed_provider, "t")) is None, (
+        "every candidate failed to start -- nothing proven to hydrate"
+    )
 
     # --- traceability-matrix plan: e2e-fix's mechanical file-to-AC attribution -------------------
     assert _e2e_fix_related_ac_ids([{"title": "US-0001.1 shows error"}, {"title": "smoke test"}]) == ["US-0001.1"]
