@@ -64,9 +64,14 @@ const TEST_FILE_LISTING =
   "| grep -viE '(^|/)(node_modules|\\.playwright-browsers|bin|obj|dist|build|\\.next|\\.venv|vendor|test-?results|coverage|\\.ai-dev-workflow|agent-work)/' " +
   "| grep -viE '\\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|mp4|webm|woff2?|ttf|eot|dll|exe|so|dylib|pyc|class|jar)$'";
 
-// Same cap as check-test-quality-stop.mjs/check-testid-locators-stop.mjs -- a same-turn NUDGE, not
-// the authoritative gate (which uses the uncapped listing for residue/protection checks). See
-// ac_residue_checks.py's own module docstring for this tradeoff.
+// Same cap as check-test-quality-stop.mjs/check-testid-locators-stop.mjs, used ONLY for the
+// depth-scan-shaped checks below (unattributed_tests, ui_relevant e2e/count_tests_per_ac) --
+// ac_coverage_gate.py's own check_ac_coverage feeds those the SAME capped `head -60` listing (that
+// module's own comment: "head -60 is legitimate HERE"). The residue/protection checks (retired/
+// deferred residue, completed-AC protection) use a SEPARATE, uncapped gather below instead --
+// capping those would silently misreport a completed AC's surviving regression test as deleted
+// once a repo grows past 60 test files, a same-turn hard-block for something the real (uncapped)
+// gate correctly allows. See ac_coverage_gate.py's own comment on this exact split.
 const TEST_FILE_LISTING_CAP = 60;
 
 let input = {};
@@ -101,11 +106,33 @@ function run(cmd) {
 }
 
 // --- test_files: same listing+cap every sibling ac-to-tests hook already uses ------------------
+// This CAPPED set is correct for the depth-scan-shaped checks (unattributed_tests, ui_relevant
+// e2e/count_tests_per_ac) -- ac_coverage_gate.py's own check_ac_coverage feeds those the SAME
+// capped `head -60` listing (see that module's own comment: "head -60 is legitimate HERE").
 let testFiles = {};
 const listing = run(`(${TEST_FILE_LISTING}) | head -${TEST_FILE_LISTING_CAP}`);
 for (const path of listing.split("\n").map((l) => l.trim()).filter(Boolean)) {
   try {
     testFiles[path] = readFileSync(`${cwd}/${path}`, "utf8");
+  } catch {
+    // race with the model's own in-flight write -- not this hook's problem to report.
+  }
+}
+
+// --- residue_test_files: the UNCAPPED twin, for retired/deferred residue + completed-AC
+// protection ONLY -- mirrors ac_coverage_gate.py's own two-listing split exactly (that module's
+// comment: "the grep-only residue/protection checks below use the uncapped _TEST_FILE_LISTING --
+// a cap there silently skipped every test file past the 60th"). completed_ac_protection_violations
+// is an ABSENCE-IMPLIES-VIOLATION check: a completed AC's regression test genuinely surviving past
+// position 60 (plausible in a maturing multi-ticket codebase -- this hook runs on every ac-to-tests
+// cycle, not just ticket 1) must never read as "deleted" here just because the capped listing
+// didn't reach it -- that would same-turn hard-block something the real (uncapped) gate correctly
+// allows, exactly the asymmetry this split exists to prevent.
+let residueTestFiles = {};
+const uncappedListing = run(`(${TEST_FILE_LISTING})`);
+for (const path of uncappedListing.split("\n").map((l) => l.trim()).filter(Boolean)) {
+  try {
+    residueTestFiles[path] = readFileSync(`${cwd}/${path}`, "utf8");
   } catch {
     // race with the model's own in-flight write -- not this hook's problem to report.
   }
@@ -192,6 +219,7 @@ const residue = runCheckHook("ac_residue_checks.py", {
   ledger_diff: ledgerDiff,
   ledger_entries: ledgerEntries,
   test_files: testFiles,
+  residue_test_files: residueTestFiles,
   playwright_config: playwrightConfig,
   coverage_plan: coveragePlan,
 });

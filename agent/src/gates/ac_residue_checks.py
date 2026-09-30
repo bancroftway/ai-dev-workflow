@@ -265,10 +265,18 @@ async def check_completed_ac_protection(
     regression tests must survive. Incidental shared-code/file edits are deliberately NOT policed
     -- the regression suite guards behavior, and this stage's own tooling (create/edit, no delete)
     routinely rewrites a whole test file to add new cases, which a line-level diff cannot tell
-    apart from genuine rework of the untouched ones sitting in the same file. Id-presence (does any
-    test file still name the id), never runner-reported test-name grepping: runner names are
-    FQNs/joined titles that don't exist verbatim in source. `baseline_commit` is unused now (kept in
-    the signature -- callers already pass it, and a future precision check may want it again).
+    apart from genuine rework of the untouched ones sitting in the same file. An earlier
+    line-diff-based "no added line may mention a completed AC" check was removed after it fired on
+    exactly that: a normal whole-file rewrite for NEW work reads every pre-existing line as
+    "added," false-flagging every completed AC the file happens to also cover (observed live: one
+    rewritten controller test file alone false-flagged 8 already-delivered criteria). Presence is
+    the check that actually matters and cannot be fooled by reformatting.
+
+    Id-presence (does any test file still name the id), never runner-reported test-name grepping:
+    runner names are FQNs/joined titles that don't exist verbatim in source. An AC coded but with
+    no tests on disk at all is a deletion either way. `baseline_commit` is unused now (kept in the
+    signature -- callers already pass it, and a future precision check may want it again).
+
     Moved here unchanged from ac_coverage_gate.py (that module imports it back), now delegating its
     message-building to `completed_ac_protection_violations` above."""
     del baseline_commit
@@ -367,7 +375,19 @@ def run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
       - `ledger_diff`: raw stdout of `git diff --name-only -- <ledger path>` (ledger integrity)
       - `ledger_entries`: the ledger's own `entries` list (retired/deferred/completed residue,
         unattributed-tests' own "any real ledger AC id, ever" universe)
-      - `test_files`: {path: contents} for every test file the hook could read this turn
+      - `test_files`: {path: contents} for every test file the hook could read this turn, CAPPED
+        (the hook's own `TEST_FILE_LISTING_CAP`) -- used for `unattributed_tests` and (via
+        `coverage_plan` below) the ui_relevant-e2e/`count_tests_per_ac` check, matching
+        `ac_coverage_gate.check_ac_coverage`'s own depth-scan, which feeds those two the SAME
+        capped `head -60` listing ("head -60 is legitimate HERE", that module's own comment).
+      - `residue_test_files`: {path: contents}, UNCAPPED -- used for retired/deferred residue and
+        completed-AC protection ONLY, mirroring `_grep_test_files_for_ids`'s own uncapped
+        `_TEST_FILE_LISTING` scan those three provider-based checks use. `completed_protection` is
+        an ABSENCE-IMPLIES-VIOLATION check: a completed AC's regression test genuinely surviving
+        past the cap must never read as "deleted" just because a capped listing didn't reach it --
+        that would same-turn hard-block something the real (uncapped) gate correctly allows. Falls
+        back to `test_files` when omitted, so a caller/test that only ever exercised the single-set
+        shape keeps working unchanged.
       - `playwright_config`: a playwright.config.* file's contents, or None if none was found
       - `coverage_plan`: the ac-to-tests draft's own `test_suite.coverage_plan` list (ui_relevant
         flags) -- may be stale by one turn (the draft is persisted by the orchestrator between
@@ -376,6 +396,9 @@ def run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
     """
     ledger_entries = payload.get("ledger_entries") or []
     test_files = payload.get("test_files") or {}
+    residue_test_files = payload.get("residue_test_files")
+    if residue_test_files is None:
+        residue_test_files = test_files
 
     retired = {
         e["id"] for e in ledger_entries
@@ -400,13 +423,13 @@ def run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
     ]
 
     present: set[str] = set()
-    for ids in find_ac_id_hits(test_files, completed).values():
+    for ids in find_ac_id_hits(residue_test_files, completed).values():
         present.update(ids)
 
     result: dict[str, Any] = {
         "ledger_integrity": ledger_integrity_violations(payload.get("ledger_diff") or ""),
-        "retired_residue": retired_ac_residue_violations(find_ac_id_hits(test_files, retired)),
-        "deferred_residue": deferred_ac_residue_violations(find_ac_id_hits(test_files, deferred)),
+        "retired_residue": retired_ac_residue_violations(find_ac_id_hits(residue_test_files, retired)),
+        "deferred_residue": deferred_ac_residue_violations(find_ac_id_hits(residue_test_files, deferred)),
         "completed_protection": completed_ac_protection_violations(completed, present),
         "unattributed_tests": unattributed_tests(all_ledger_ac_ids, test_files),
     }
@@ -541,6 +564,43 @@ def _demo() -> None:
     assert out["unattributed_tests"] == {"apps/api.Tests/OrphanTests.cs": 1}
     assert out["screenshot_missing"] is True
     assert "US-0001.1" in out["ui_relevant_missing_e2e"], out["ui_relevant_missing_e2e"]
+
+    # --- residue_test_files: the completed-AC-past-the-cap false-block this must NOT produce -------
+    # US-0004.1 is completed and its ONLY surviving regression test lives in a file that the hook's
+    # own CAPPED `test_files` listing never reached (position 61+ in a maturing multi-ticket repo,
+    # simulated here by simply leaving it out of `test_files` entirely). Reusing the SAME capped
+    # `test_files` for completed-AC protection (the bug this fix closes) would misreport it as
+    # deleted -- reproduced first, then shown fixed by the separate uncapped `residue_test_files`.
+    past_cap_entries = [
+        {"id": "US-0004", "kind": "user_story", "status": "active"},
+        {"id": "US-0004.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r2"},
+    ]
+    past_cap_test_files = {
+        "apps/api.Tests/UnrelatedTests.cs": "[Fact]\npublic void SomeUnrelatedTest(){ Assert.True(true); }\n",
+    }
+    past_cap_residue_files = {
+        **past_cap_test_files,
+        "apps/api.Tests/z_position_61/SurvivingTests.cs": (
+            "[Fact]\npublic void TestUS00041StillHere(){ Assert.True(true); }\n"
+        ),
+    }
+    bug_reproduced = run_check_hook({
+        "ledger_entries": past_cap_entries,
+        "test_files": past_cap_test_files,  # no residue_test_files -- falls back to the capped set
+    })
+    assert bug_reproduced["completed_protection"] and "US-0004.1" in bug_reproduced["completed_protection"][0], (
+        "sanity check: without a separate uncapped set, a past-the-cap survivor IS misreported as "
+        f"deleted -- {bug_reproduced['completed_protection']}"
+    )
+    fixed = run_check_hook({
+        "ledger_entries": past_cap_entries,
+        "test_files": past_cap_test_files,
+        "residue_test_files": past_cap_residue_files,
+    })
+    assert fixed["completed_protection"] == [], (
+        "completed_protection must NOT flag a regression test that survives past the capped "
+        f"test_files set once residue_test_files (uncapped) is supplied -- {fixed['completed_protection']}"
+    )
 
     # A minimal payload (nothing gathered yet -- e.g. an in-flight first turn) must not crash and
     # must report nothing.

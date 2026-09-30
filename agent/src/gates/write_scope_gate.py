@@ -499,6 +499,20 @@ async def verify_ac_to_tests(
 
 def _demo() -> None:
     """Self-check for the pure path classifiers. The gate's own I/O half needs a sandbox."""
+    # Drift guard: this module's OWN `_E2E_PATH_RE` (used below by verify_ac_to_tests's own
+    # content checks -- e2e-only/missing-e2e/screenshot-config location) and
+    # write_scope_checks.py's independent copy (needed there because _classify_e2e_paths/
+    # _has_non_e2e_test close over it, and those two moved to that module -- see this file's own
+    # comment on why the raw pattern stayed here too) must define the IDENTICAL regex. Unlike the
+    # byte-identical staged hook copies (asserted by each shared module's own `_demo()`), nothing
+    # else catches these two independently-typed copies drifting apart.
+    from .write_scope_checks import _E2E_PATH_RE as _E2E_PATH_RE_SHARED
+
+    assert _E2E_PATH_RE.pattern == _E2E_PATH_RE_SHARED.pattern and _E2E_PATH_RE.flags == _E2E_PATH_RE_SHARED.flags, (
+        "write_scope_gate._E2E_PATH_RE has drifted from write_scope_checks._E2E_PATH_RE -- "
+        "keep these two copies identical by hand (or fold to zero copies) whenever one changes"
+    )
+
     # e2e-only suites are what this stage produced live, and must be rejected
     # A UI stack must ALSO write a browser spec -- the mirror of the e2e-only rejection. A config
     # with no spec does not count: it runs zero tests and yields no screenshots.
