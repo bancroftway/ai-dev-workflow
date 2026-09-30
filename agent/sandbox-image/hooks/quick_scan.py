@@ -16,7 +16,9 @@ mapping, no `finding_key`/dedup, no persisted `Finding` object -- this hook's wh
 the drafting model about something fixable RIGHT NOW, in this turn," using the tool's own raw
 severity string as plain text. repo_scan.py's parsers stay the source of truth for anything
 persisted/graded; this is a genuinely simpler, ephemeral-use parse, not a competing
-implementation of the same concern.
+implementation of the same concern. The RAW extraction the two used to duplicate independently
+now lives in `sast_parsers.py` (Task 6) -- `parse_bandit`/`parse_eslint_security` below are thin
+re-exports of it, reshaped into this module's own `QuickFinding`.
 
 CLI mode (`python3 quick_scan.py --check-hook`, stdin: JSON `{"bandit_json": str|null,
 "eslint_json": str|null}`, stdout: JSON `{"findings": [{"tool":..., "rule_id":..., "file":...,
@@ -36,6 +38,23 @@ import json
 import sys
 from dataclasses import dataclass
 
+try:  # package context (agent/src/gates) -- the normal import path for every in-process caller
+    # (this module's own _demo(), any future caller from within the app).
+    from .sast_parsers import ESLINT_SECURITY_PREFIXES, parse_bandit as _parse_bandit_hits
+    from .sast_parsers import parse_eslint_security as _parse_eslint_hits
+except ImportError:  # standalone script context: staged alone into /opt/aidw-hooks/ (see this
+    # module's own _demo() drift guard and the Dockerfile's byte-identical staged-copy convention,
+    # same as sast_parsers.py itself, staged as a SIBLING file there) -- a relative import has no
+    # parent package to resolve against when this file is executed directly
+    # (`python3 quick_scan.py --check-hook`), so fall back to a flat import of the sibling module
+    # Python's own script-directory sys.path entry already finds.
+    from sast_parsers import ESLINT_SECURITY_PREFIXES, parse_bandit as _parse_bandit_hits  # type: ignore[no-redef]
+    from sast_parsers import parse_eslint_security as _parse_eslint_hits  # type: ignore[no-redef]
+
+# Kept as a module attribute (same name as before this refactor) for any external reader that
+# imports it directly from here, though the derivation itself now lives in sast_parsers.py.
+_ESLINT_SECURITY_PREFIXES = ESLINT_SECURITY_PREFIXES
+
 # Verbatim reuse target: repo_scan.py's own bandit/eslint-security ToolSpec.command strings (see
 # this module's _demo() for the drift guard). repo_scan.py imports these two constants directly
 # for its own TOOLS tuple rather than defining a second copy.
@@ -49,27 +68,6 @@ ESLINT_SECURITY_COMMAND = (
     "-f json -o agent-work/eslint.json . || true"
 )
 
-# Same namespace restriction as repo_scan.py's own _ESLINT_SECURITY_PREFIXES -- the pipeline-owned
-# eslint config also carries style/correctness rules that belong to the BUILD, not a security scan.
-_ESLINT_SECURITY_PREFIXES = ("security/", "sonarjs/")
-
-
-def _norm_path(path: str) -> str:
-    """Repo-relative, forward-slash form. A deliberately simpler copy of repo_scan.py's own
-    `_norm_path` (real historical bug there: `str.lstrip("./")` strips the CHARACTER SET
-    {'.', '/'} repeatedly, silently eating the leading dot off dotfile paths -- prefix-strip,
-    never lstrip, for that exact reason). This hook's findings are ephemeral in-turn feedback the
-    SAME model that just wrote the file reads immediately, not a persisted/graded/deduped record,
-    so the fuller version's edge-case handling isn't worth importing repo_scan.py (and everything
-    IT imports) into a module that must stay stageable standalone into the sandbox image.
-    """
-    normalized = path.replace("\\", "/")
-    if normalized.startswith("./"):
-        normalized = normalized[2:]
-    if normalized.startswith("/workspace/repo/"):
-        normalized = normalized[len("/workspace/repo/"):]
-    return normalized
-
 
 @dataclass(frozen=True)
 class QuickFinding:
@@ -82,59 +80,35 @@ class QuickFinding:
 
 
 def parse_bandit(raw: str) -> list[QuickFinding]:
-    """bandit -f json: {"results": [{filename, line_number, test_id, issue_severity, issue_text}, ...]}."""
-    try:
-        doc = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(doc, dict):
-        return []
-    findings: list[QuickFinding] = []
-    for result in doc.get("results") or []:
-        if not isinstance(result, dict):
-            continue
-        line = result.get("line_number") if isinstance(result.get("line_number"), int) else None
-        findings.append(QuickFinding(
-            tool="bandit",
-            rule_id=str(result.get("test_id") or "bandit"),
-            file=_norm_path(str(result.get("filename") or "unknown")),
-            line=line,
-            severity=str(result.get("issue_severity") or "UNKNOWN"),
-            message=str(result.get("issue_text") or result.get("test_name") or "bandit finding"),
-        ))
-    return findings
+    """bandit -f json: {"results": [{filename, line_number, test_id, issue_severity, issue_text}, ...]}.
+
+    Thin re-export of sast_parsers.parse_bandit's shared extraction, reshaped into this module's
+    own (deliberately simpler, RAW-severity) QuickFinding -- see module docstring.
+    """
+    return [
+        QuickFinding(
+            tool=hit.tool, rule_id=hit.rule_id, file=hit.file, line=hit.line,
+            severity=hit.raw_severity or "UNKNOWN", message=hit.message,
+        )
+        for hit in _parse_bandit_hits(raw)
+    ]
 
 
 def parse_eslint_security(raw: str) -> list[QuickFinding]:
     """`eslint -f json`: [{filePath, messages: [{ruleId, severity(1|2), message, line}]}]. Keeps
-    only security-relevant namespaces -- see _ESLINT_SECURITY_PREFIXES."""
-    try:
-        entries = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(entries, list):
-        return []
-    findings: list[QuickFinding] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        path = _norm_path(str(entry.get("filePath") or "unknown"))
-        for message in entry.get("messages") or []:
-            if not isinstance(message, dict):
-                continue
-            rule_id = str(message.get("ruleId") or "")
-            if not rule_id.startswith(_ESLINT_SECURITY_PREFIXES):
-                continue
-            line = message.get("line") if isinstance(message.get("line"), int) else None
-            findings.append(QuickFinding(
-                tool="eslint-security",
-                rule_id=rule_id,
-                file=path,
-                line=line,
-                severity="medium" if rule_id.startswith("security/") else "low",
-                message=str(message.get("message") or rule_id),
-            ))
-    return findings
+    only security-relevant namespaces -- see _ESLINT_SECURITY_PREFIXES.
+
+    Thin re-export of sast_parsers.parse_eslint_security -- see module docstring. `severity` here
+    is the shared rule-id-derived tier ("medium"/"low"), not eslint's own raw numeric severity --
+    same value this function always reported, per `SastHit.derived_severity`'s own docstring.
+    """
+    return [
+        QuickFinding(
+            tool=hit.tool, rule_id=hit.rule_id, file=hit.file, line=hit.line,
+            severity=hit.derived_severity, message=hit.message,
+        )
+        for hit in _parse_eslint_hits(raw)
+    ]
 
 
 def evaluate(bandit_json: str | None, eslint_json: str | None) -> dict:
@@ -178,6 +152,47 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && python -m src.gates.qui
     assert repo_scan.TOOLS_BY_NAME["eslint-security"].command == ESLINT_SECURITY_COMMAND, (
         "ESLINT_SECURITY_COMMAND has drifted from repo_scan.py's own eslint-security ToolSpec"
     )
+
+    staged_sast = Path(__file__).resolve().parents[2] / "sandbox-image" / "hooks" / "sast_parsers.py"
+    if staged_sast.exists():
+        src_sast = Path(__file__).resolve().parent / "sast_parsers.py"
+        assert staged_sast.read_bytes() == src_sast.read_bytes(), (
+            "sandbox-image/hooks/sast_parsers.py has drifted from src/gates/sast_parsers.py -- "
+            "re-sync with: cp src/gates/sast_parsers.py sandbox-image/hooks/sast_parsers.py"
+        )
+
+    # Task 6 REGRESSION: repo_scan.py's parse_bandit/parse_eslint and this module's
+    # parse_bandit/parse_eslint_security now both derive from the one shared sast_parsers hit --
+    # confirm each still produces exactly its OWN pre-consolidation shape for identical input
+    # (the two were deliberately different shapes before this refactor, and must still be).
+    cross_bandit = json.dumps({"results": [
+        {"filename": "./apps/api/app.py", "line_number": 12, "test_id": "B602",
+         "test_name": "subprocess_popen_with_shell_equals_true", "issue_severity": "HIGH",
+         "issue_text": "subprocess call with shell=True identified.", "issue_cwe": {"id": 78}},
+    ]})
+    quick_bandit = parse_bandit(cross_bandit)
+    gate_bandit, _ = repo_scan.parse_bandit(cross_bandit)
+    assert quick_bandit[0].severity == "HIGH", "quick_scan must keep bandit's RAW severity string, unmapped"
+    assert gate_bandit[0].severity == "high" and gate_bandit[0].cwe == "CWE-78", (
+        "repo_scan.py must still tier-map the severity and format the cwe id -- that opinion is "
+        "this gate's own, not shared"
+    )
+    assert quick_bandit[0].file == gate_bandit[0].file == "apps/api/app.py"
+    assert quick_bandit[0].rule_id == gate_bandit[0].rule_id == "B602"
+
+    cross_eslint = json.dumps([
+        {"filePath": "/workspace/repo/apps/web/src/lib/query.ts", "messages": [
+            {"ruleId": "security/detect-object-injection", "severity": 2,
+             "message": "Generic Object Injection Sink", "line": 42},
+        ]},
+    ])
+    quick_eslint = parse_eslint_security(cross_eslint)
+    gate_eslint, _ = repo_scan.parse_eslint(cross_eslint)
+    assert quick_eslint[0].severity == "medium" == gate_eslint[0].severity, (
+        "both callers already agreed on this rule-id-derived tier before the refactor"
+    )
+    assert gate_eslint[0].raw_severity == "2", "repo_scan.py alone still keeps eslint's raw numeric severity"
+    assert quick_eslint[0].file == gate_eslint[0].file == "apps/web/src/lib/query.ts"
 
     bandit_sample = json.dumps({"results": [
         {"filename": "./app.py", "line_number": 12, "test_id": "B301", "issue_severity": "HIGH", "issue_text": "pickle load is unsafe"},

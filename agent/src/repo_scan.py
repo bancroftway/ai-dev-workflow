@@ -78,7 +78,7 @@ from .config import (
     AIDW_TOOL_PROBE_RETRY_COUNT,
     AIDW_TOOL_PROBE_RETRY_DELAY_SECONDS,
 )
-from .gates import quick_scan
+from .gates import quick_scan, sast_parsers
 from .sarif import Finding, parse_sarif
 from .severity import SEMGREP_SEVERITY_MAP, SEVERITY_ORDER, meets_or_exceeds
 from .text_truncate import truncate_middle
@@ -1002,35 +1002,30 @@ def parse_dotnet_docs(raw: str) -> ParseResult:
 def parse_bandit(raw: str) -> ParseResult:
     """bandit -f json: {"results": [{filename, line_number, test_id, test_name, issue_severity,
     issue_confidence, issue_text, issue_cwe: {id, link}}, ...]}. Python SAST -- the licence-clean
-    replacement for the official semgrep python pack (see the module docstring's licence rule)."""
-    try:
-        doc = json.loads(raw)
-    except json.JSONDecodeError:
-        return [], {}
-    if not isinstance(doc, dict):
-        return [], {}
+    replacement for the official semgrep python pack (see the module docstring's licence rule).
+
+    The raw extraction (JSON shape, field names, path normalization) lives in
+    `gates.sast_parsers.parse_bandit` now -- shared with quick_scan.py's same-turn Stop hook check,
+    which used to duplicate this same extraction independently (Task 6). This function's own job is
+    only the part that's genuinely THIS gate's opinion: mapping bandit's native severity string into
+    this pipeline's tier vocabulary and building the persisted `Finding`.
+    """
     findings: list[Finding] = []
-    for result in doc.get("results") or []:
-        if not isinstance(result, dict):
-            continue
-        rule_id = str(result.get("test_id") or "bandit")
-        path = _norm_path(result.get("filename") or "unknown")
-        tier = normalize_tier(result.get("issue_severity"))
-        cwe = (result.get("issue_cwe") or {}).get("id") if isinstance(result.get("issue_cwe"), dict) else None
-        line = result.get("line_number") if isinstance(result.get("line_number"), int) else None
+    for hit in sast_parsers.parse_bandit(raw):
+        tier = normalize_tier(hit.raw_severity)
         findings.append(
             Finding(
-                finding_key=stable_id("sast", f"{rule_id}:{line}", path),
-                tool="bandit",
-                rule_id=rule_id,
+                finding_key=stable_id("sast", f"{hit.rule_id}:{hit.line}", hit.file),
+                tool=hit.tool,
+                rule_id=hit.rule_id,
                 severity=tier or "low",
-                raw_severity=str(result.get("issue_severity") or ""),
-                file=path,
-                line=line,
-                message=str(result.get("issue_text") or rule_id),
-                cwe=f"CWE-{cwe}" if cwe else None,
+                raw_severity=hit.raw_severity,
+                file=hit.file,
+                line=hit.line,
+                message=hit.message,
+                cwe=f"CWE-{hit.cwe_id}" if hit.cwe_id else None,
                 category="sast",
-                title=str(result.get("test_name") or result.get("issue_text") or rule_id),
+                title=hit.title,
                 severity_source="native" if tier else "defaulted",
                 sources=("bandit",),
             )
@@ -1038,60 +1033,33 @@ def parse_bandit(raw: str) -> ParseResult:
     return findings, {}
 
 
-# Only these rule namespaces from the pipeline-owned ESLint config become findings: the config also
-# carries style/correctness rules (typescript-eslint, react-hooks) that belong to the BUILD, not a
-# security scan -- turning them into scan findings would make remediation re-litigate lint style.
-_ESLINT_SECURITY_PREFIXES = ("security/", "sonarjs/")
-
-
 def parse_eslint(raw: str) -> ParseResult:
     """`eslint -f json`: [{filePath, messages: [{ruleId, severity(1|2), message, line}]}].
-    Keeps only security-relevant namespaces (see _ESLINT_SECURITY_PREFIXES); `security/` rules are
-    pattern-based possible-injection/unsafe-API detections -> medium, `sonarjs/` hotspots -> low.
-    Both are `derived`: ESLint's own 1/2 severity encodes the config's opinion, not risk."""
-    try:
-        entries = json.loads(raw)
-    except json.JSONDecodeError:
-        return [], {}
-    if not isinstance(entries, list):
-        return [], {}
-    findings: list[Finding] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        raw_path = str(entry.get("filePath") or "unknown")
-        # eslint -f json always emits absolute paths; the sandbox clone lives at /workspace/repo
-        # (see README "The sandbox filesystem"). Repo-relative is the vocabulary every other
-        # finding uses, and what is_non_application_path/is_gating match against.
-        for prefix in ("/workspace/repo/",):
-            if raw_path.startswith(prefix):
-                raw_path = raw_path[len(prefix):]
-                break
-        path = _norm_path(raw_path)
-        for message in entry.get("messages") or []:
-            if not isinstance(message, dict):
-                continue
-            rule_id = str(message.get("ruleId") or "")
-            if not rule_id.startswith(_ESLINT_SECURITY_PREFIXES):
-                continue
-            line = message.get("line") if isinstance(message.get("line"), int) else None
-            findings.append(
-                Finding(
-                    finding_key=stable_id("sast", f"{rule_id}:{line}", path),
-                    tool="eslint-security",
-                    rule_id=rule_id,
-                    severity="medium" if rule_id.startswith("security/") else "low",
-                    raw_severity=str(message.get("severity") or ""),
-                    file=path,
-                    line=line,
-                    message=str(message.get("message") or rule_id),
-                    category="sast",
-                    title=str(message.get("message") or rule_id),
-                    severity_source="derived",
-                    sources=("eslint-security",),
-                )
-            )
-    return findings, {}
+    Keeps only security-relevant namespaces (see `sast_parsers.ESLINT_SECURITY_PREFIXES`);
+    `security/` rules are pattern-based possible-injection/unsafe-API detections -> medium,
+    `sonarjs/` hotspots -> low. Both are `derived`: ESLint's own 1/2 severity encodes the config's
+    opinion, not risk -- see `SastHit.derived_severity`'s own docstring for why that derivation is
+    shared rather than repeated here.
+
+    The raw extraction lives in `gates.sast_parsers.parse_eslint_security` now -- see
+    `parse_bandit`'s own comment just above (same Task 6 consolidation, same reasoning)."""
+    return [
+        Finding(
+            finding_key=stable_id("sast", f"{hit.rule_id}:{hit.line}", hit.file),
+            tool=hit.tool,
+            rule_id=hit.rule_id,
+            severity=hit.derived_severity,
+            raw_severity=hit.raw_severity,
+            file=hit.file,
+            line=hit.line,
+            message=hit.message,
+            category="sast",
+            title=hit.title,
+            severity_source="derived",
+            sources=("eslint-security",),
+        )
+        for hit in sast_parsers.parse_eslint_security(raw)
+    ], {}
 
 
 # Root-caused 2026-09-12: neither WCAG-contrast nor "unhandled HTTP/Observable error" has any

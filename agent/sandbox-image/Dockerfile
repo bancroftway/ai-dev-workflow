@@ -818,12 +818,23 @@ COPY hooks/check-coverage-stop.mjs /opt/aidw-hooks/check-coverage-stop.mjs
 COPY hooks/coverage_parsing.py /opt/aidw-hooks/coverage_parsing.py
 COPY hooks/check-testid-locators-stop.mjs /opt/aidw-hooks/check-testid-locators-stop.mjs
 COPY hooks/check-quick-scan-stop.mjs /opt/aidw-hooks/check-quick-scan-stop.mjs
+# Byte-identical staged copy of agent/src/gates/sast_parsers.py -- the shared bandit/eslint-security
+# raw-extraction module quick_scan.py below imports (Task 6 consolidation: quick_scan.py and
+# repo_scan.py used to each parse this tool output independently). Same build-context constraint
+# and drift-guard convention as every other staged .py file here (sast_parsers.py's own _demo()
+# asserts this file matches its source); re-run `cp ../src/gates/sast_parsers.py
+# hooks/sast_parsers.py` (from agent/sandbox-image) after editing the source and before rebuilding.
+# Must be COPY'd BEFORE quick_scan.py: quick_scan.py imports it as a flat sibling-file module
+# (`import sast_parsers`, no package) when run standalone here, which requires this file to already
+# exist alongside it in /opt/aidw-hooks/. Needs nothing beyond python3's standard library.
+COPY hooks/sast_parsers.py /opt/aidw-hooks/sast_parsers.py
 # Byte-identical staged copy of agent/src/gates/quick_scan.py -- same build-context constraint and
 # same drift-guard convention as test_quality_checks.py/coverage_parsing.py above (that module's
-# own _demo() asserts this file matches its source, AND that its two command strings match
-# repo_scan.py's own live ToolSpec.command for bandit/eslint-security, on every self-check run);
-# re-run `cp ../src/gates/quick_scan.py hooks/quick_scan.py` (from agent/sandbox-image) after
-# editing the source and before rebuilding. Needs nothing beyond python3's standard library.
+# own _demo() asserts this file matches its source, that its two command strings match
+# repo_scan.py's own live ToolSpec.command for bandit/eslint-security, AND that sast_parsers.py
+# above is likewise unstaged-drift-free, on every self-check run); re-run `cp
+# ../src/gates/quick_scan.py hooks/quick_scan.py` (from agent/sandbox-image) after editing the
+# source and before rebuilding. Needs nothing beyond python3's standard library.
 COPY hooks/quick_scan.py /opt/aidw-hooks/quick_scan.py
 COPY hooks/lib/ /opt/aidw-hooks/lib/
 COPY hooks/schemas/ /opt/aidw-hooks/schemas/
