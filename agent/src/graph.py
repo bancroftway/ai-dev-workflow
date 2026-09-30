@@ -196,6 +196,9 @@ class StageState(TypedDict):
     # stage's documented failure shape (oscillating branch coverage across laps, not "zero files
     # changed" -- files WERE changed each lap in the observed incident, just not converging).
     best_verify_coverage_rate: float | None
+    # tech-stack only: failed after-submit verifications since the last approval, capped by
+    # config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS (make_route_after_gate's "escalate").
+    tech_stack_verify_attempts: int
 
 
 class GraphState(TypedDict):
@@ -417,6 +420,7 @@ def default_stage_state() -> StageState:
         "last_verify_changed_paths": None,
         "verify_stall_count": 0,
         "best_verify_coverage_rate": None,
+        "tech_stack_verify_attempts": 0,
     }
 
 
@@ -430,6 +434,15 @@ class VerificationResult:
     passed: bool
     feedback: str
     report: dict[str, Any]
+
+
+def _submit_verification_record(result: VerificationResult, lap: int) -> dict[str, Any]:
+    """StageState.last_verification for an after_submit gate (tech-stack): make_verify_node's
+    {passed, feedback, report} plus the check rows and which failed submit this was (0 = hydrate)."""
+    return {
+        "passed": result.passed, "feedback": result.feedback, "report": result.report,
+        "checks": result.report.get("checks") or [], "lap": lap,
+    }
 
 
 # Paths the pipeline itself writes; a "change set" containing only these means the stage produced
@@ -908,9 +921,11 @@ def _build_tech_stack_prompt(state: GraphState) -> list[BaseMessage]:
     messages: list[BaseMessage] = [SystemMessage(content=TECH_STACK_SYSTEM_PROMPT)]
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior draft (JSON):\n{stage['draft']}"))
-    feedback_message = _reviewer_feedback_message(stage)
-    if feedback_message is not None:
-        messages.append(feedback_message)
+    # Reached with a failed last_verification after a hydrate fall-through with no tech-stack.md,
+    # or a human rejection of a gate that had just failed verify -- the failed checks help either.
+    for feedback_message in (_reviewer_feedback_message(stage), _verification_feedback_message(stage)):
+        if feedback_message is not None:
+            messages.append(feedback_message)
     return messages
 
 
@@ -923,13 +938,24 @@ def _build_tech_stack_interrupt_extra(state: GraphState) -> dict[str, Any]:
     shape prefill produces. Both distinctions key off the same shape test preflight_nodes.
     _select_tech_stack_markdown already relies on: prefill's draft has a top-level "markdown" key,
     the LLM draft path's raw TechStack dict does not."""
-    draft = state["stages"]["tech-stack"].get("draft") or {}
+    stage = state["stages"]["tech-stack"]
+    draft = stage.get("draft") or {}
+    # A failed after-submit verify (or a hydrated sidecar that failed it) re-opens this gate: show
+    # the human which checks failed. None when there is nothing to report.
+    last = stage.get("last_verification") or {}
+    verification = None if not last or last.get("passed") else {
+        "passed": False,
+        "feedback": last.get("feedback") or "",
+        "checks": (last.get("report") or {}).get("checks") or [],
+        "attempts": stage.get("tech_stack_verify_attempts", 0),
+        "max_attempts": workflow_config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS,
+    }
     if isinstance(draft, dict) and "markdown" in draft:
         # greenfield_stub (preflight_nodes.prefill_tech_stack_from_repo_file): the markdown is a
         # placeholder for an EMPTY repo, not a real pre-existing file -- the canned-stack dropdown
         # must still show, which file_existed=True would hide.
-        return {"file_existed": not draft.get("greenfield_stub"), "markdown": draft.get("markdown") or ""}
-    return {"file_existed": False, "markdown": render_tech_stack_markdown(draft)}
+        return {"file_existed": not draft.get("greenfield_stub"), "markdown": draft.get("markdown") or "", "verification": verification}
+    return {"file_existed": False, "markdown": render_tech_stack_markdown(draft), "verification": verification}
 
 
 # File-based-editing plan, Part 6 sect. 4a (user-raised: "why do we need to keep this file"):
@@ -2199,6 +2225,14 @@ STAGES: list[StageSpec] = [
         build_interrupt_extra=_build_tech_stack_interrupt_extra,
         resolve_from_interrupt=preflight_nodes.resolve_tech_stack_submission,
         session_options=lambda _state, _role: {"available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS},
+        # after_submit: runs inside resolve_from_interrupt (_settle_tech_stack) on the human's
+        # submitted stack, and on a hydrated sidecar -- never as a pre-review verify node. A failure
+        # re-opens this same gate ("reverify") with the human's text, never an LLM redraft.
+        gate=Gate(
+            verify=preflight_nodes.verify_tech_stack, checks=preflight_nodes.TECH_STACK_CHECKS,
+            policy={"yolo": "blocking", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=False, timing="after_submit",
+        ),
     ),
     # raw-requirements is deliberately NOT a StageSpec anymore: the human's text is accepted
     # as-is by the deterministic record_raw_requirements_node (no draft, no audit, no gate) and
@@ -2855,6 +2889,7 @@ def _reset_stage_mechanics(stage: dict[str, Any]) -> None:
     stage["last_verify_changed_paths"] = None
     stage["verify_stall_count"] = 0
     stage["best_verify_coverage_rate"] = None
+    stage["tech_stack_verify_attempts"] = 0
 
 
 # Which stages a fired reset-e2e must reset alongside e2e itself -- metrics-exit (the run's own
@@ -3412,6 +3447,20 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
 
         if stage_spec.hydrate_from_repo_file is not None and not just_rejected and sandbox_registry.get(thread_id) is not None:
             hydrated = await stage_spec.hydrate_from_repo_file(thread_id, state, get_sandbox_provider())
+            gate = stage_spec.gate
+            if isinstance(hydrated, dict) and gate is not None and gate.timing == "after_submit":
+                # Same checks a fresh submit faces (only legacy sidecars can fail here, since a
+                # failed submit never writes one). Any failure -- blocking, or an extraction-failure
+                # signature the repair retry above couldn't fix -- skips the hydrate-approve and
+                # falls through: the failed last_verification cancels should_skip_draft, and the
+                # prefill below opens the human gate on tech-stack.md with the failed checks shown.
+                verdict = await gate.verify(thread_id, hydrated, state, get_sandbox_provider())
+                if not verdict.passed:
+                    logger.warning("hydrated %s sidecar failed verification; re-opening the gate:\n%s", stage_spec.key, verdict.feedback)
+                    stages = {key: dict(value) for key, value in state["stages"].items()}
+                    stages[stage_spec.key]["last_verification"] = _submit_verification_record(verdict, 0)
+                    state = {**state, "stages": stages}
+                    hydrated = None
             if hydrated is not None:
                 stages = {key: dict(value) for key, value in state["stages"].items()}
                 stage = stages[stage_spec.key]
@@ -5115,6 +5164,71 @@ def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]
     return route
 
 
+async def _emit_run_event(
+    state: GraphState, config: RunnableConfig, stage_key: str, event_type: RunEventType, node: str,
+    summary: str, payload: dict[str, Any] | None = None,
+) -> None:
+    """Durable + live RunEvent, the same fail-soft append_event-then-emit_live pair every other
+    RunEvent site in this file inlines. No-op without a sandbox, like those sites."""
+    thread_id = config["configurable"]["thread_id"]
+    if sandbox_registry.get(thread_id) is None:
+        return
+    event = RunEvent(
+        run_id=state.get("run_id", "unknown"), session_id=thread_id, type=event_type,
+        stage=stage_key, node=node, summary=summary, payload=payload,
+    )
+    event = await run_event_store.append_event(event)
+    await run_event_stream.emit_live(event, config)
+
+
+async def _reopen_gate_after_failed_submit(
+    stage_spec: StageSpec, state: GraphState, config: RunnableConfig, stages: dict[str, Any],
+    failed: preflight_nodes.SubmitVerifyFailed,
+) -> dict[str, Any]:
+    """The human's submission failed its after_submit verify: keep their text as the draft, record
+    the verdict, and leave the stage unapproved -- make_route_after_gate then routes "reverify"
+    (this same gate, re-opened) or "escalate" (infra verdict, or the attempt cap). Never sets
+    reviewer_feedback: that routes to an LLM redraft which would discard the human's edits."""
+    thread_id = config["configurable"]["thread_id"]
+    stage = stages[stage_spec.key]
+    attempts = stage.get("tech_stack_verify_attempts", 0) + 1
+    stage["tech_stack_verify_attempts"] = attempts
+    stage["draft"] = failed.draft
+    stage["status"] = "ready_for_review"
+    stage["reviewer_feedback"] = None  # a stale earlier rejection must not misroute this to draft
+    stage["last_verification"] = _submit_verification_record(failed.verification, attempts)
+    stages[stage_spec.key] = stage
+    logger.warning(
+        "%s submission failed verification (attempt %d of %d):\n%s", stage_spec.key, attempts,
+        workflow_config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS, failed.verification.feedback,
+    )
+    if sandbox_registry.get(thread_id) is not None:
+        # Not paused any more; the re-opened gate records its own GATE_PAUSED.
+        try:
+            await session_store.set_awaiting_gate(thread_id, False)
+        except Exception:
+            logger.warning("set_awaiting_gate failed for stage=%s thread_id=%s", stage_spec.key, thread_id, exc_info=True)
+    await _emit_run_event(
+        state, config, stage_spec.key, RunEventType.GATE_RESOLVED, "gate",
+        f"gate submission failed verification: {stage_spec.key}", {"decision": "verify_failed"},
+    )
+    return {"stages": stages}
+
+
+def _submit_verify_route(stage_spec: StageSpec, stage: dict[str, Any]) -> str | None:
+    """make_route_after_gate's after_submit branch: "reverify"/"escalate" for a stage whose last
+    submit failed verification, else None. A rejection (reviewer_feedback set) is not this."""
+    gate = stage_spec.gate
+    last = stage.get("last_verification") or {}
+    if gate is None or gate.timing != "after_submit" or stage.get("reviewer_feedback") or not last or last.get("passed"):
+        return None
+    if (last.get("report") or {}).get("infra_error"):
+        return "escalate"
+    if stage.get("tech_stack_verify_attempts", 0) >= workflow_config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS:
+        return "escalate"
+    return "reverify"
+
+
 def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
     async def gate_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = config["configurable"]["thread_id"]
@@ -5310,8 +5424,21 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         stages = {key: dict(value) for key, value in state["stages"].items()}
         approved = stages[stage_spec.key]
         content = approved["draft"]
+        submit_gate = stage_spec.gate is not None and stage_spec.gate.timing == "after_submit"
         if stage_spec.resolve_from_interrupt is not None and sandbox_registry.get(thread_id) is not None:
+            # An after_submit gate's verify runs inside resolve_from_interrupt -- bracket it with a
+            # node="verify" span so the tab shows "Verifying" (use-run-events.ts NODE_PHASE_LABEL).
+            if submit_gate:
+                await _emit_run_event(state, config, stage_spec.key, RunEventType.NODE_STARTED, "verify", "verify started")
             resolved = await stage_spec.resolve_from_interrupt(thread_id, resume_value, state, get_sandbox_provider())
+            if submit_gate:
+                passed = not isinstance(resolved, preflight_nodes.SubmitVerifyFailed)
+                await _emit_run_event(
+                    state, config, stage_spec.key, RunEventType.NODE_FINISHED, "verify",
+                    f"verify {'passed' if passed else 'failed'}", {"passed": passed},
+                )
+            if isinstance(resolved, preflight_nodes.SubmitVerifyFailed):
+                return await _reopen_gate_after_failed_submit(stage_spec, state, config, stages, resolved)
             if resolved is not None:
                 content = resolved
         approved["status"] = "approved"
@@ -5321,6 +5448,11 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         # approved right after being rejected once must not carry that stale feedback into some
         # unrelated future redraft (e.g. a later escalate-and-revoke on a DIFFERENT gate).
         approved["reviewer_feedback"] = None
+        if submit_gate:
+            # This submit passed: drop any earlier failed verdict (else should_skip_draft would
+            # refuse to skip this approved stage on resume) and the failed-attempt counter.
+            approved["last_verification"] = None
+            approved["tech_stack_verify_attempts"] = 0
         stages[stage_spec.key] = approved
 
         # Phase E audit finding 4: GATE_RESOLVED, approval branch -- the far more common outcome
@@ -5390,7 +5522,10 @@ def make_route_after_gate(stage_spec: StageSpec) -> Callable[[GraphState], str]:
         if stage_spec.key == "plan" and state.get("restart_from_specification"):
             return "restart"
         stage = state["stages"][stage_spec.key]
-        return "approved" if stage["status"] == "approved" else "rejected"
+        if stage["status"] == "approved":
+            return "approved"
+        # after_submit gate (tech-stack): a failed submit re-opens this gate or escalates.
+        return _submit_verify_route(stage_spec, stage) or "rejected"
 
     return route
 
@@ -5473,6 +5608,10 @@ def make_auto_approve_node(stage_spec: StageSpec) -> Callable[[GraphState, Runna
         # `{coverage_plan: [], test_files: [], summary: "No test files were written in this turn."}`,
         # committed it as "auto-approved (safety cap)", failed its verify -- and every later resume
         # hydrated that empty suite and wrote production code against zero tests.
+        # Known gap (documented, not fixed): this path never calls resolve_from_interrupt, so an
+        # after_submit gate (tech-stack's verify_tech_stack) does NOT run on a clarification-cap
+        # auto-approve -- the draft is approved (and persisted as the approved sidecar) unverified;
+        # only the next run's hydrate-time verify would catch it.
         if stage_spec.deterministic_verify is None:
             await _persist_if_sandboxed(
                 thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} auto-approved (safety cap)"
@@ -6097,6 +6236,15 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
     gate_edges = {"approved": next_draft_name, "rejected": draft_name}
     if stage_spec.key == "plan":
         gate_edges["restart"] = "specification_draft"
+    # after_submit gate (tech-stack): "reverify" re-opens this same gate with the human's text and
+    # the failed checks; "escalate" (infra verdict, or config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS
+    # failed submits) ENDs the run with run_failure via the same escalate node a verify cap uses.
+    if stage_spec.gate is not None and stage_spec.gate.timing == "after_submit":
+        submit_escalate_name = f"{stage_spec.key}_escalate"
+        builder.add_node(submit_escalate_name, make_escalate_node(stage_spec))
+        builder.add_edge(submit_escalate_name, END)
+        gate_edges["reverify"] = gate_name
+        gate_edges["escalate"] = submit_escalate_name
     builder.add_conditional_edges(gate_name, make_route_after_gate(stage_spec), gate_edges)
     # auto_approve (clarification cap) skips the AUDIT and the HUMAN gate -- never the
     # deterministic verify. Observed live (run 14): a stage auto-approved with NO draft content
@@ -6507,6 +6655,8 @@ _EXPECTED_GATE_POLICIES: dict[str, tuple[str, str, str, bool]] = {
     "minimal-code-to-green": ("off", "blocking", "blocking", False),
     "remediation": ("off", "blocking", "blocking", False),
     "adversarial-compliance": ("off", "blocking", "blocking", False),
+    # after_submit: runs inside resolve_from_interrupt, never as a pre-review verify node.
+    "tech-stack": ("blocking", "blocking", "blocking", False),
 }
 
 
@@ -6610,6 +6760,55 @@ def _demo_code_gen_mode_routing() -> None:
                 expected = verify_name if _stage_verify_enabled({"code_gen_mode": mode}, stage_spec) else gate_name  # type: ignore[arg-type]
                 assert target == expected, f"{stage_spec.key}/{mode}: audit edge -> {target!r}, expected {expected!r}"
             assert audit_branch.ends[audit_branch.path.invoke({"code_gen_mode": "mission_critical"})] == verify_name  # type: ignore[arg-type]
+
+    # tech-stack's after_submit gate: a failed submit re-opens the SAME gate ("reverify"), an infra
+    # verdict or the attempt cap escalates, a rejection still redrafts, and no verify node exists.
+    ts_spec = next(s for s in STAGES if s.key == "tech-stack")
+    assert ts_spec.deterministic_verify is None and "tech-stack_verify" not in builder.nodes
+    (ts_gate_branch,) = builder.branches["tech-stack_gate"].values()
+    assert ts_gate_branch.ends["reverify"] == "tech-stack_gate", ts_gate_branch.ends
+    assert ts_gate_branch.ends["escalate"] == "tech-stack_escalate" and ("tech-stack_escalate", END) in builder.edges
+    ts_route = make_route_after_gate(ts_spec)
+    cap = workflow_config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS
+    failed_lv = {"passed": False, "feedback": "- Languages detected: none", "report": {"checks": []}}
+
+    def _ts(**extra: Any) -> dict[str, Any]:
+        return {"stages": {"tech-stack": {**default_stage_state(), "status": "ready_for_review", **extra}}}
+
+    assert ts_route(_ts(last_verification=failed_lv, tech_stack_verify_attempts=1)) == "reverify"  # type: ignore[arg-type]
+    assert ts_route(_ts(last_verification=failed_lv, tech_stack_verify_attempts=cap)) == "escalate"  # type: ignore[arg-type]
+    infra_lv = {**failed_lv, "report": {"infra_error": "extraction failed"}}
+    assert ts_route(_ts(last_verification=infra_lv, tech_stack_verify_attempts=1)) == "escalate"  # type: ignore[arg-type]
+    assert ts_route(_ts(last_verification=failed_lv, reviewer_feedback="redo")) == "rejected"  # type: ignore[arg-type]
+    assert ts_route(_ts(status="approved", last_verification=failed_lv)) == "approved"  # type: ignore[arg-type]
+    assert make_route_after_gate(next(s for s in STAGES if s.key == "specification"))(
+        {"stages": {"specification": {**default_stage_state(), "last_verification": failed_lv}}}  # type: ignore[arg-type]
+    ) == "rejected", "before_review gates never reverify"
+    extra = _build_tech_stack_interrupt_extra(
+        _ts(draft={"markdown": "# mine", "greenfield_stub": False}, last_verification=failed_lv, tech_stack_verify_attempts=1)  # type: ignore[arg-type]
+    )
+    assert extra["markdown"] == "# mine" and extra["file_existed"] is True
+    assert extra["verification"] == {"passed": False, "feedback": failed_lv["feedback"], "checks": [], "attempts": 1, "max_attempts": cap}
+    assert _build_tech_stack_interrupt_extra(_ts(draft={"markdown": "x"}))["verification"] is None  # type: ignore[arg-type]
+    # The gate node's failed-submit branch itself (no sandbox registered -> no events/DB writes).
+    import asyncio
+
+    prior = _ts(draft={"markdown": "# stub", "greenfield_stub": True}, reviewer_feedback="stale")
+    failed_submit = preflight_nodes.SubmitVerifyFailed(
+        VerificationResult(False, failed_lv["feedback"], {"checks": [{"id": "tech_stack.languages", "status": "failed"}]}),
+        {"markdown": "# human text", "greenfield_stub": True},
+    )
+    reopened = asyncio.run(_reopen_gate_after_failed_submit(
+        ts_spec, prior, {"configurable": {"thread_id": "demo-no-sandbox"}},  # type: ignore[arg-type]
+        {k: dict(v) for k, v in prior["stages"].items()}, failed_submit,
+    ))
+    ts_after = reopened["stages"]["tech-stack"]
+    assert ts_after["draft"] == {"markdown": "# human text", "greenfield_stub": True}
+    assert ts_after["status"] == "ready_for_review" and ts_after["reviewer_feedback"] is None
+    assert ts_after["tech_stack_verify_attempts"] == 1 and ts_after["last_verification"]["lap"] == 1
+    assert ts_after["last_verification"]["checks"] == [{"id": "tech_stack.languages", "status": "failed"}]
+    assert ts_route(reopened) == ("reverify" if cap > 1 else "escalate")  # type: ignore[arg-type]
+    checked += 7
 
     print(f"code_gen_mode routing self-check: all assertions passed ({checked} route outcomes)")
 
@@ -7609,7 +7808,9 @@ def _demo() -> None:
             "metrics-exit": {**default_stage_state()},
         },
     }
+    verify_feedback_base_state["stages"]["tech-stack"] = {**default_stage_state()}
     _verify_feedback_cases = [
+        ("tech-stack draft", _build_tech_stack_prompt, "tech-stack"),
         ("specification draft", _build_specification_prompt, "specification"),
         ("specification audit", _build_specification_audit_prompt, "specification"),
         ("plan draft", _build_plan_prompt, "plan"),

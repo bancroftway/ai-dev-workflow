@@ -165,6 +165,17 @@ _SETTINGS: dict[str, _Setting] = {
         "Too short false-flags a slow-starting app as non-startable (disables e2e/App Health until a manual recheck); too long stalls the tab per broken candidate.",
         "seconds, positive",
     ),
+    # Caps how many times a human's Tech Stack submission may fail its after-submit verify
+    # (preflight_nodes.verify_tech_stack) and re-open the gate before the run escalates. Read by
+    # graph.py's make_route_after_gate (reverify vs escalate) and _build_tech_stack_interrupt_extra
+    # (the "attempt N of M" shown to the human). Higher gives the human more tries to fix the stack
+    # text; lower ends a stuck run sooner. The counter resets on approval and on every new run.
+    "AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS": _Setting(
+        "int", "AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS", "3", "verify_cycles",
+        "Failed Tech Stack submissions (after-submit verification) allowed before the run escalates.",
+        "Higher gives the reviewer more tries to fix the submitted stack; lower ends a stuck run sooner with a run failure.",
+        "positive integer",
+    ),
 
     # -- Verify-cycle budgets + attempt caps -----------------------------------------------------
     # graph.py's StageSpec.max_verify_cycles per stage: the deterministic-gate verify->draft retry

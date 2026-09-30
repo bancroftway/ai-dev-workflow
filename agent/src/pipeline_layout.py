@@ -233,6 +233,10 @@ def _demo() -> None:
     assert verify_nodes == {f"{k}_verify" for k in before_review}, verify_nodes
     for key in before_review:
         assert p.verifiers[f"{key}_verify"] is p.stage(key).deterministic_verify  # type: ignore[union-attr]
+    # after_submit gates (tech-stack) are real verifiers but run inside the gate node, never as a node.
+    after_submit = {s.key for s in p.stages if s.gate is not None and s.gate.timing == "after_submit"}
+    assert after_submit == {"tech-stack"}, after_submit
+    assert {f"{k}_verify" for k in after_submit} <= set(p.verifiers) and not verify_nodes & {f"{k}_verify" for k in after_submit}
     assert p.verifiers["specification_verify"] is graph._verify_specification_ledger
 
     described = p.describe()

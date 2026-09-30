@@ -25,6 +25,8 @@ from pydantic import BaseModel, ValidationError
 from . import config as workflow_config
 from . import config_inventory, git_ops, model_config, repo_design_settings, repo_files, repo_scan, repo_test_config, session_store, tech_stack_signals, template_loader, workflow_persistence
 from .chat_model import ainvoke_structured, get_chat_model_for_thread
+from .gates.checks import Check, CheckLog
+from .gates.exit_readiness_checks import tech_stack_resolves_test_command
 from .markdown_render import render_tech_stack_markdown
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .schemas import TECH_STACK_EXTRACT_EXAMPLE, DotnetStatus, PresenceList, TechStack
@@ -34,7 +36,7 @@ from .sandbox.factory import get_sandbox_provider
 from .sandbox.provider import SandboxProvider
 
 if TYPE_CHECKING:
-    from .graph import GraphState
+    from .graph import GraphState, VerificationResult
 
 logger = logging.getLogger(__name__)
 
@@ -1024,9 +1026,117 @@ async def recheck_tech_stack_startability(thread_id: str, provider: SandboxProvi
     return approved
 
 
+TS_SCHEMA = Check("tech_stack.schema", "Valid tech stack", "The extracted tech stack validates against the TechStack schema.", "blocking")
+TS_LANGUAGES = Check("tech_stack.languages", "Languages detected", "At least one programming language is recorded.", "blocking")
+TS_PACKAGE_MANAGERS = Check("tech_stack.package_managers", "Package managers detected", "At least one package manager is recorded.", "blocking")
+TS_TEST_COMMAND = Check("tech_stack.test_command", "Test command resolves", "The stack maps to a test command the coverage gates can run.", "blocking")
+TS_EXTRACTION = Check("tech_stack.extraction", "Extraction succeeded", "Structured extraction of the submitted markdown did not fall back to all-absent.", "blocking")
+TS_TOOLCHAIN = Check("tech_stack.toolchain", "Toolchain recorded", "manifest.json's toolchain section has image, tools and available.", "advisory")
+TS_TESTING_FRAMEWORKS = Check("tech_stack.testing_frameworks", "Testing frameworks detected", "At least one testing framework is recorded.", "advisory")
+TS_STARTABILITY = Check("tech_stack.startability", "Startability evaluated", "The boot probe recorded startable plus evidence or a reason.", "advisory", condition="brownfield")
+TS_CONVENTION_ROOTS = Check("tech_stack.convention_roots", "Convention roots safe", "Every declared ecosystem root is a safe repo-relative path.", "advisory")
+TECH_STACK_CHECKS: tuple[Check, ...] = (
+    TS_SCHEMA, TS_LANGUAGES, TS_PACKAGE_MANAGERS, TS_TEST_COMMAND, TS_EXTRACTION,
+    TS_TOOLCHAIN, TS_TESTING_FRAMEWORKS, TS_STARTABILITY, TS_CONVENTION_ROOTS,
+)
+_TOOLCHAIN_KEYS = ("image", "tools", "available")
+
+
+def _unsafe_convention_roots(tech_stack: dict[str, Any]) -> list[str]:
+    """`ecosystem=root` for each present convention root the path allowlist rejects. Needed because
+    tech_stack_signals.ecosystem_root_prefix returns "" for missing AND unsafe alike."""
+    unsafe = []
+    for entry in tech_stack_signals.load_tech_stack(tech_stack).get("convention_roots") or []:
+        root = entry.get("root")
+        if entry.get("status") != "present" or not root:
+            continue
+        try:
+            repo_files.validate_repo_relative_path(root)
+        except ValueError:
+            unsafe.append(f"{entry.get('ecosystem')}={root!r}")
+    return unsafe
+
+
+def grade_tech_stack(tech_stack: dict[str, Any], toolchain: dict[str, Any], brownfield: bool) -> VerificationResult:
+    """Pure grading behind verify_tech_stack. passed = no blocking failure and no infra verdict;
+    report["infra_error"] is set when extraction fell back to all-absent (escalate, don't bounce
+    the human)."""
+    from .graph import VerificationResult
+
+    log = CheckLog("tech-stack_verify", TECH_STACK_CHECKS)
+    try:
+        TechStack.model_validate(tech_stack)
+        log.passed(TS_SCHEMA)
+    except ValidationError as exc:
+        log.failed(TS_SCHEMA, f"{exc.error_count()} schema error(s): {exc.errors()[0].get('msg')}")
+    normalized = tech_stack_signals.load_tech_stack(tech_stack)
+    for check, field_name in ((TS_LANGUAGES, "languages"), (TS_PACKAGE_MANAGERS, "package_managers")):
+        if tech_stack_signals.presence_values(normalized, field_name):
+            log.passed(check)
+        else:
+            log.failed(check, f"no {field_name.replace('_', ' ')} recorded")
+    if tech_stack_resolves_test_command(tech_stack):
+        log.passed(TS_TEST_COMMAND)
+    else:
+        log.failed(TS_TEST_COMMAND, "no test command resolves for this stack (needs .NET, TypeScript/JavaScript or Python)")
+    if normalized and _looks_like_extraction_failure(normalized):
+        log.infra(TS_EXTRACTION, "structured extraction failed; every field fell back to absent")
+    else:
+        log.passed(TS_EXTRACTION)
+
+    missing = [k for k in _TOOLCHAIN_KEYS if not toolchain.get(k)]
+    if missing:
+        log.advisory(TS_TOOLCHAIN, f"missing: {', '.join(missing)}")
+    else:
+        log.passed(TS_TOOLCHAIN)
+    if tech_stack_signals.presence_values(normalized, "testing_frameworks"):
+        log.passed(TS_TESTING_FRAMEWORKS)
+    else:
+        log.advisory(TS_TESTING_FRAMEWORKS, "no testing frameworks recorded")
+    if not brownfield:
+        log.skipped(TS_STARTABILITY, "greenfield repo: nothing to boot")
+    elif isinstance(tech_stack.get("startable"), bool) and (tech_stack.get("boot_evidence") or tech_stack.get("not_startable_reason")):
+        log.passed(TS_STARTABILITY, None if tech_stack["startable"] else tech_stack.get("not_startable_reason"))
+    else:
+        log.advisory(TS_STARTABILITY, "startability was not evaluated")
+    unsafe = _unsafe_convention_roots(tech_stack)
+    if unsafe:
+        log.advisory(TS_CONVENTION_ROOTS, f"unsafe: {', '.join(unsafe)}")
+    else:
+        log.passed(TS_CONVENTION_ROOTS)
+
+    rows = log.results()
+    labels = {c.id: c.label for c in TECH_STACK_CHECKS}
+    problems = [r for r in rows if r.status in ("failed", "infra")]
+    infra = next((r.detail for r in rows if r.status == "infra"), None)
+    report: dict[str, Any] = {"checks": [r.to_dict() for r in rows]}
+    if infra:
+        report["infra_error"] = infra
+    feedback = "\n".join(f"- {labels.get(r.id, r.id)}: {r.detail}" for r in problems)
+    return VerificationResult(passed=not problems, feedback=feedback, report=report)
+
+
+async def verify_tech_stack(
+    thread_id: str, tech_stack: dict[str, Any], state: GraphState, provider: SandboxProvider
+) -> VerificationResult:
+    """tech-stack's after_submit Gate.verify: run on the merged TechStack before the approved
+    sidecar is written (_settle_tech_stack), and on a loaded sidecar at hydrate (graph.py)."""
+    toolchain = {k: await read_toolchain_value(provider, thread_id, k) for k in _TOOLCHAIN_KEYS}
+    return grade_tech_stack(tech_stack, toolchain, brownfield=not tech_stack_signals.is_greenfield_repo(state))
+
+
+@dataclass(frozen=True)
+class SubmitVerifyFailed:
+    """resolve_tech_stack_submission's return when the submitted stack fails verification: the
+    gate node re-opens the gate with `draft` (the human's own text) and records `verification`."""
+
+    verification: VerificationResult
+    draft: dict[str, Any]
+
+
 async def _settle_tech_stack(
-    thread_id: str, tech_stack: dict[str, Any], provider: SandboxProvider, state: "GraphState"
-) -> dict[str, Any]:
+    thread_id: str, tech_stack: dict[str, Any], provider: SandboxProvider, state: "GraphState", markdown: str
+) -> dict[str, Any] | SubmitVerifyFailed:
     """Task 5 fix #1's shared merge-then-persist tail for resolve_tech_stack_submission's TWO
     settle-and-persist points (a cache hit, and fresh-extraction/extraction-failure-fallback):
     scans this repo's own config_inventory deterministically and unions it into `tech_stack` (via
@@ -1051,6 +1161,13 @@ async def _settle_tech_stack(
     if not tech_stack_signals.is_greenfield_repo(state):
         probe = await probe_tech_stack_startability(provider, thread_id, (state.get("app_scan") or {}).get("candidates") or [])
         merged.update(probe)
+    # Verify BEFORE writing: a failed submission must never leave an approved sidecar behind for
+    # hydrate_tech_stack_from_repo_file to short-circuit the next run on.
+    verdict = await verify_tech_stack(thread_id, merged, state, provider)
+    if not verdict.passed:
+        prior = state["stages"]["tech-stack"].get("draft")
+        greenfield_stub = bool(isinstance(prior, dict) and prior.get("greenfield_stub"))
+        return SubmitVerifyFailed(verdict, {"markdown": markdown, "greenfield_stub": greenfield_stub})
     await repo_files.write_repo_file(
         provider, thread_id, TECH_STACK_APPROVED_JSON_PATH, json.dumps(merged, indent=2) + "\n"
     )
@@ -1079,11 +1196,12 @@ def _select_tech_stack_markdown(resume_value: Any, draft: dict[str, Any] | None)
 
 async def resolve_tech_stack_submission(
     thread_id: str, resume_value: Any, state: "GraphState", provider: SandboxProvider
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | SubmitVerifyFailed | None:
     """StageSpec.resolve_from_interrupt for the tech-stack stage: the Tech Stack tab's Submit
     button resolves with `{"markdown": <edited text>}` -- this is what actually gets that edited
     text saved and turned into the structured TechStack every downstream gate reads, since
     make_gate_node's default behavior (approve stage["draft"] verbatim) has no way to see it.
+    Returns SubmitVerifyFailed (no approved sidecar written) when verify_tech_stack fails.
     """
     stage = state["stages"]["tech-stack"]
     markdown = _select_tech_stack_markdown(resume_value, stage.get("draft"))
@@ -1105,7 +1223,7 @@ async def resolve_tech_stack_submission(
     cached = _extract_cache_get(markdown)
     if cached is not None:
         logger.info("tech-stack extraction served from cache for thread_id=%s", thread_id)
-        return await _settle_tech_stack(thread_id, cached, provider, state)
+        return await _settle_tech_stack(thread_id, cached, provider, state, markdown)
 
     try:
         tech_stack = await _extract_tech_stack(
@@ -1135,7 +1253,7 @@ async def resolve_tech_stack_submission(
             )
         tech_stack = _extraction_failed_tech_stack(markdown)
 
-    return await _settle_tech_stack(thread_id, tech_stack, provider, state)
+    return await _settle_tech_stack(thread_id, tech_stack, provider, state, markdown)
 
 
 # ── Ecosystem convention table ────────────────────────────────────────────────────────────────
@@ -1676,6 +1794,7 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     cached_stack = _full(
         summary="A small Node/Express API.",
         languages={"status": "present", "values": ["TypeScript"], "reason": ""},
+        package_managers={"status": "present", "values": ["npm"], "reason": ""},
         auth_kind="none",
         config_inventory={"status": "absent", "values": [], "reason": "test fixture"},
     )
@@ -1711,6 +1830,7 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     fresh_extracted = _full(
         summary="A small Python service.",
         languages={"status": "present", "values": ["Python"], "reason": ""},
+        package_managers={"status": "present", "values": ["pip"], "reason": ""},
         auth_kind="none",
         config_inventory={"status": "present", "values": ["FOO_KEY"], "reason": ""},
     )
@@ -1784,10 +1904,12 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
         config_inventory.inventory = real_inventory
 
     assert fake_provider_c.files[TECH_STACK_MD_PATH] == markdown_c, "the human's approved text must never be lost"
-    TechStack.model_validate(result_c)
-    assert result_c["summary"].startswith("#"), "fallback summary is raw markdown -- fix #4's repair signature"
-    assert result_c["auth_kind"] == "google", "fix #1's merge still runs on the extraction-failure path"
-    assert result_c["config_inventory"]["values"] == ["GOOG_KEY"]
+    # The typed-absent fallback now fails verify as infra: the gate escalates instead of approving,
+    # and no approved sidecar is written for the next run to hydrate.
+    assert isinstance(result_c, SubmitVerifyFailed), result_c
+    assert result_c.verification.report.get("infra_error"), result_c.verification.report
+    assert result_c.draft == {"markdown": markdown_c, "greenfield_stub": False}
+    assert TECH_STACK_APPROVED_JSON_PATH not in fake_provider_c.files
     assert "extraction failed" in fake_provider_c.files.get(repo_files.LEDGER_PATH, ""), (
         "the extraction failure must be recorded in the ledger (fix #2)"
     )
@@ -1941,5 +2063,42 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
         }
     finally:
         _e2e_nodes_g.probe_candidate_boot = real_probe_candidate_boot
+
+    # grade_tech_stack (tech-stack after_submit gate): blocking vs advisory vs infra split.
+    full_toolchain = {"image": "img", "tools": {"node": "ok"}, "available": {"npm": True}}
+    valid_stack = _full(
+        languages=_langs("TypeScript"), package_managers=_langs("npm"), testing_frameworks=_langs("vitest"),
+        convention_roots=_roots(node="apps/web"),
+    )
+    graded = grade_tech_stack(valid_stack, full_toolchain, brownfield=False)
+    statuses = {r["id"]: r["status"] for r in graded.report["checks"]}
+    assert graded.passed and graded.feedback == "" and "infra_error" not in graded.report, graded
+    assert set(statuses) == {c.id for c in TECH_STACK_CHECKS}, statuses
+    assert statuses["tech_stack.startability"] == "skipped"
+    assert not any(r.get("uncatalogued") for r in graded.report["checks"])
+
+    no_langs = grade_tech_stack({**valid_stack, "languages": _langs()}, full_toolchain, brownfield=False)
+    no_langs_status = {r["id"]: r["status"] for r in no_langs.report["checks"]}
+    assert not no_langs.passed and no_langs_status["tech_stack.languages"] == "failed"
+    assert "Languages detected" in no_langs.feedback and "infra_error" not in no_langs.report
+
+    advisory_only = grade_tech_stack(
+        {**valid_stack, "testing_frameworks": _langs(), "convention_roots": _roots(node="../x")}, {}, brownfield=True,
+    )
+    adv_status = {r["id"]: r["status"] for r in advisory_only.report["checks"]}
+    assert advisory_only.passed, advisory_only.feedback
+    assert adv_status["tech_stack.testing_frameworks"] == "advisory"
+    assert adv_status["tech_stack.toolchain"] == "advisory" and adv_status["tech_stack.startability"] == "advisory"
+    assert adv_status["tech_stack.convention_roots"] == "advisory"
+    assert _unsafe_convention_roots(_full(convention_roots=[])) == []  # missing is not unsafe
+
+    booted = grade_tech_stack({**valid_stack, "startable": False, "not_startable_reason": "port closed"}, full_toolchain, brownfield=True)
+    assert {r["id"]: r["status"] for r in booted.report["checks"]}["tech_stack.startability"] == "passed"
+
+    infra = grade_tech_stack(_extraction_failed_tech_stack("# Tech Stack\n\nx"), full_toolchain, brownfield=False)
+    infra_status = {r["id"]: r["status"] for r in infra.report["checks"]}
+    assert not infra.passed and infra.report.get("infra_error") and infra_status["tech_stack.extraction"] == "infra"
+
+    assert not grade_tech_stack({"summary": 1}, full_toolchain, brownfield=False).passed  # schema + blocking fails
 
     print("preflight_nodes self-check: ok")

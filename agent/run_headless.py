@@ -366,6 +366,17 @@ async def _run_pipeline(args: argparse.Namespace) -> int:
                     outcome.update(stage_statuses=_stage_statuses(snap.values), error="paused_without_interrupt")
                     break
                 payload = interrupts[0].value if isinstance(interrupts[0].value, dict) else {}
+                # A re-opened tech-stack gate after a failed submit ("reverify"): re-sending the same
+                # canned answer would fail the same checks forever, so end the run instead.
+                # attempts == 0 is a hydrated sidecar that failed -- one fresh submit is still worth it.
+                verification = payload.get("verification") if payload.get("stage") == "tech-stack" else None
+                if verification and verification.get("attempts", 0) >= 1:
+                    logger.error("tech-stack submission failed verification -- ending run:\n%s", verification.get("feedback"))
+                    outcome.update(
+                        stage_statuses=_stage_statuses(snap.values), error="tech_stack_verification_failed",
+                        tech_stack_verification=verification,
+                    )
+                    break
                 # Every gate auto-approves. The Tech Stack tab's gate is the one exception: with
                 # --greenfield-stack set, resume it with that canned stack's markdown (matching
                 # preflight_nodes.resolve_tech_stack_submission's expected {"markdown": ...} shape) --
