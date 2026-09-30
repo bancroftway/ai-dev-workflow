@@ -124,12 +124,42 @@ function run(cmd, options = {}) {
   }
 }
 
+// TEST_FILE_LISTING is `git ls-files ... | ` + a static 3-grep filter chain. When that chain runs
+// as the LAST stage of a single shell pipe (no trailing `| head`, e.g. the uncapped listing
+// below), its own exit code becomes the pipe's exit code -- and `grep -v` exits 1 whenever every
+// line was filtered out, which is a genuinely empty result, not a failure. Reproduced live
+// (final-review Round 2 re-review): a repo with zero matching test files made the uncapped
+// listing throw, so `run()` returned the failure sentinel for a case that was never a failure at
+// all. Fix: split git (whose own exit code IS a real success/failure signal) from the grep chain
+// (fed via stdin, so ITS exit code can only ever mean "matched nothing", once git itself is known
+// to have succeeded) -- run each separately instead of trusting one shell pipe's single exit code
+// to speak for both.
+const GIT_LS_FILES_CMD = "git ls-files -co --exclude-standard";
+const TEST_FILE_GREP_CHAIN = TEST_FILE_LISTING.slice(`${GIT_LS_FILES_CMD} | `.length);
+
+function runTestFileListing(options = {}) {
+  let gitOutput;
+  try {
+    gitOutput = execSync(GIT_LS_FILES_CMD, { cwd, encoding: "utf8", shell: "/bin/bash" });
+  } catch {
+    return null; // a real git failure -- not a repo, git unavailable, etc.
+  }
+  try {
+    return execSync(TEST_FILE_GREP_CHAIN, { cwd, encoding: "utf8", shell: "/bin/bash", input: gitOutput, ...options });
+  } catch {
+    // git already succeeded above, and this chain is a static, well-formed pattern fed clean
+    // stdin -- the only way it can fail here is "no line matched", never an infra problem.
+    return "";
+  }
+}
+
 // --- test_files: same listing+cap every sibling ac-to-tests hook already uses ------------------
 // This CAPPED set is correct for the depth-scan-shaped checks (unattributed_tests, ui_relevant
 // e2e/count_tests_per_ac) -- ac_coverage_gate.py's own check_ac_coverage feeds those the SAME
 // capped `head -60` listing (see that module's own comment: "head -60 is legitimate HERE").
 let testFiles = {};
-const listing = run(`(${TEST_FILE_LISTING}) | head -${TEST_FILE_LISTING_CAP}`);
+const rawListing = runTestFileListing();
+const listing = rawListing === null ? null : rawListing.split("\n").slice(0, TEST_FILE_LISTING_CAP).join("\n");
 if (listing === null) {
   // Safe either way even without this guard (unattributed_tests/ui_relevant_missing_e2e both
   // no-op on an empty test_files dict), but report it: a silent empty listing here is still an
@@ -163,7 +193,7 @@ let residueTestFiles = {};
 // ABSENCE-IMPLIES-VIOLATION check, so an empty/wrong residueTestFiles from a swallowed failure
 // would read as "every completed AC's regression test was deleted," a mass false block (item 7).
 let residueListingFailed = false;
-const uncappedListing = run(`(${TEST_FILE_LISTING})`, { maxBuffer: RESIDUE_LISTING_MAX_BUFFER_BYTES });
+const uncappedListing = runTestFileListing({ maxBuffer: RESIDUE_LISTING_MAX_BUFFER_BYTES });
 if (uncappedListing === null) {
   residueListingFailed = true;
   reportFailOpen(
