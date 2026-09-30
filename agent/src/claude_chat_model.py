@@ -78,6 +78,7 @@ from . import config
 from . import run_event_store
 from . import run_event_stream
 from . import telemetry
+from .full_read_checks import _covers_whole_file
 from .session_roles import role_matches
 from .cli_agent_exec import (
     _RESUME_REJECTED_MARKERS,
@@ -1389,20 +1390,6 @@ async def read_full_file_reads(
     return _covers_whole_file(ranges, total_lines)
 
 
-def _covers_whole_file(ranges: list[tuple[int, int]], total_lines: int) -> bool:
-    """Pure interval-union check: do these 1-indexed, inclusive (start, end) line ranges together
-    cover [1, total_lines] with no gap? Split out from read_full_file_reads so this logic has a
-    sandbox-free self-check (ponytail: non-trivial branch/loop logic needs one runnable check).
-    """
-    ranges = sorted(ranges)
-    covered_through = 0
-    for start, end in ranges:
-        if start > covered_through + 1:
-            break  # gap in coverage -- union stops advancing here, whatever follows can't close it
-        covered_through = max(covered_through, end)
-    return covered_through >= total_lines
-
-
 def secret_env_names() -> set[str]:
     """Env var names the sandbox container must already have set for this provider's CLI to
     authenticate.
@@ -1909,7 +1896,9 @@ def _demo() -> None:
     assert _init_session_id("") is None
 
     # _covers_whole_file: the pure interval-union half of read_full_file_reads (the transcript-exec
-    # half needs a sandbox, same "pure half only" scoping as everywhere else in this self-check).
+    # half needs a sandbox, same "pure half only" scoping as everywhere else in this self-check) --
+    # extracted to full_read_checks.py (2026-09-29) and imported here UNCHANGED; full_read_checks.py's
+    # own self-check re-proves these same assertions at the source, this re-proves the import wiring.
     assert _covers_whole_file([(1, 2000)], 1500), "one call whose window exceeds the file must cover it"
     assert not _covers_whole_file([], 1500), "no matching Read calls at all must not count as covered"
     assert not _covers_whole_file([(500, 2000)], 1500), "a read that skips the start of the file is incomplete"

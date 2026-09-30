@@ -694,9 +694,11 @@ RUN printf '%s\n' \
 #     gates/diagram_gate.py) -- all four caught the SAME income-investor plan run's redrafts on
 #     2026-09-19: a manifest field typed `type` instead of `kind`, a referenced wireframe with no
 #     .html file, 7 wireframes over the cap of 6, and one containing a forbidden <iframe>.
-#   - check-narrative-format-stop.mjs (2026-09-19): the User Story narrative template check,
-#     ported from spec_ledger.py's `check_narrative_format` -- observed costing a redraft lap in
-#     BOTH of that day's re-verification runs (sessions 6244ef47 and 5905ba13).
+#   - check-narrative-format-stop.mjs (2026-09-19): the User Story narrative template check -- by
+#     shelling out to gates/narrative_format_checks.py (COPY'd in below UNMODIFIED, stdlib-only,
+#     extracted 2026-09-29 from spec_ledger.py's `check_narrative_format`), the real implementation
+#     spec_ledger.py itself imports, not a second hand-ported JS copy. Observed costing a redraft
+#     lap in BOTH of that day's re-verification runs (sessions 6244ef47 and 5905ba13).
 #   - check-full-read-stop.mjs (2026-09-19): same-turn counterpart of the Review-depth safety net
 #     (graph.py's _verify_specification_ledger / gates/diagram_gate.py's _load_and_sync_plan_steps)
 #     -- proves the AUDIT session's own transcript covers the whole target file with Read calls
@@ -705,7 +707,11 @@ RUN printf '%s\n' \
 #     copilot_chat_model.py's own `_full_read_env_prefix` hard-returns "" always, since this
 #     codebase has no confirmed Copilot transcript shape for a generic Read tool call (only the
 #     dedicated skill.invoked event require-skills-stop.mjs relies on is confirmed live) -- see
-#     that function's own docstring.
+#     that function's own docstring. The hook parses its own turn transcript (already on disk, no
+#     sandbox-exec round trip needed) into Read-call line ranges itself, unchanged; only the pure
+#     whole-file interval-union coverage check moves to Python, by shelling out to
+#     full_read_checks.py (COPY'd in below UNMODIFIED, stdlib-only, extracted 2026-09-29 from
+#     claude_chat_model.py's `_covers_whole_file`).
 #   - check-plan-citations-stop.mjs (2026-09-19): every Acceptance Criterion id steps.json/
 #     manifest.json cite must exist in the ledger, be the right kind, and (for plan steps) be
 #     live -- ported from gates/diagram_gate.py's check_plan_linkage/check_wireframe_ac_ids
@@ -782,8 +788,23 @@ RUN printf '%s\n' \
 COPY hooks/require-skills-stop.mjs /opt/aidw-hooks/require-skills-stop.mjs
 COPY hooks/check-citation-drop-stop.mjs /opt/aidw-hooks/check-citation-drop-stop.mjs
 COPY hooks/check-narrative-format-stop.mjs /opt/aidw-hooks/check-narrative-format-stop.mjs
+# Byte-identical staged copy of agent/src/gates/narrative_format_checks.py -- same build-context
+# constraint and same drift-guard convention as wireframe_linkage_checks.py below (that module's
+# own `_demo()` asserts this file matches its source on every self-check run); re-run `cp
+# ../src/gates/narrative_format_checks.py hooks/narrative_format_checks.py` (from
+# agent/sandbox-image) after editing the source and before rebuilding. Needs nothing beyond
+# python3's standard library. Shelled to by check-narrative-format-stop.mjs above, not a separate
+# Stop hook of its own.
+COPY hooks/narrative_format_checks.py /opt/aidw-hooks/narrative_format_checks.py
 COPY hooks/check-plan-schema-stop.mjs /opt/aidw-hooks/check-plan-schema-stop.mjs
 COPY hooks/check-full-read-stop.mjs /opt/aidw-hooks/check-full-read-stop.mjs
+# Byte-identical staged copy of agent/src/full_read_checks.py (NOT under src/gates/ -- see that
+# module's own docstring for why only the pure interval-union tail of read_full_file_reads moved
+# here) -- same build-context constraint and drift-guard convention as every other staged .py file;
+# re-run `cp ../src/full_read_checks.py hooks/full_read_checks.py` (from agent/sandbox-image) after
+# editing the source and before rebuilding. Needs nothing beyond python3's standard library.
+# Shelled to by check-full-read-stop.mjs above, not a separate Stop hook of its own.
+COPY hooks/full_read_checks.py /opt/aidw-hooks/full_read_checks.py
 COPY hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-plan-citations-stop.mjs
 # Byte-identical staged copy of agent/src/gates/wireframe_linkage_checks.py -- same build-context
 # constraint and same drift-guard convention as test_quality_checks.py below (that module's own
@@ -882,7 +903,9 @@ RUN set -eux; \
     chmod 0755 /etc/claude-code /opt/aidw-hooks /opt/aidw-hooks/lib /opt/aidw-hooks/schemas; \
     chmod 0644 /etc/claude-code/managed-settings.json /opt/aidw-hooks/require-skills-stop.mjs \
       /opt/aidw-hooks/check-citation-drop-stop.mjs /opt/aidw-hooks/check-narrative-format-stop.mjs \
+      /opt/aidw-hooks/narrative_format_checks.py \
       /opt/aidw-hooks/check-plan-schema-stop.mjs /opt/aidw-hooks/check-full-read-stop.mjs \
+      /opt/aidw-hooks/full_read_checks.py \
       /opt/aidw-hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/wireframe_linkage_checks.py \
       /opt/aidw-hooks/check-diagram-staleness-stop.mjs \
       /opt/aidw-hooks/check-test-quality-stop.mjs /opt/aidw-hooks/test_quality_checks.py \

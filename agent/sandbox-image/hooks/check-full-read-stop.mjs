@@ -32,14 +32,27 @@
 // the same "confirm against reality" bar every other transcript-parsing function in this codebase
 // already holds itself to.
 //
-// TRANSCRIPT ALGORITHM PORTED FROM claude_chat_model.py's `read_full_file_reads`/
-// `_covers_whole_file` (that function's own docstring: "confirmed against this very module's own
-// captured transcript... a real session showing plain reads, offset+limit reads, and offset-only
-// reads") -- same offset/limit defaults, same suffix-based path matching, same interval-union
-// coverage check. READ_TOOL_DEFAULT_WINDOW_LINES below is ported from config.py's own constant of
-// the same name (2000) -- KEEP IN SYNC BY HAND if that ever changes; no automated drift guard for
-// this one (it is a plain int literal, not something export_hook_schemas can generate).
+// TRANSCRIPT ALGORITHM: this turn's own transcript file is already on disk inside the sandbox
+// (`input.transcript_path`), so parsing it into Read-call line ranges (`computeReadRanges` below)
+// needs no sandbox-exec round trip and stays exactly as it was -- same offset/limit defaults, same
+// suffix-based path matching as claude_chat_model.py's `read_full_file_reads` (that function's own
+// docstring: "confirmed against this very module's own captured transcript... a real session
+// showing plain reads, offset+limit reads, and offset-only reads"). READ_TOOL_DEFAULT_WINDOW_LINES
+// below is ported from config.py's own constant of the same name (2000) -- KEEP IN SYNC BY HAND if
+// that ever changes; no automated drift guard for this one (it is a plain int literal, not
+// something export_hook_schemas can generate).
+//
+// WHY A PYTHON SUBPROCESS FOR THE COVERAGE CHECK, NOT A JS PORT (2026-09-29): only the pure
+// whole-file interval-union check itself (given the ranges above, do they cover every line with no
+// gap?) used to be hand-ported here as its own JS function, duplicating claude_chat_model.py's
+// private interval-union helper with no automated drift guard. That check now lives in
+// full_read_checks.py (extracted from claude_chat_model.py, which imports it back unchanged),
+// COPY'd in below UNMODIFIED and stdlib-only, so this hook shells out to the REAL implementation
+// for that one piece instead of a second, independently-drifting copy. The transcript-parsing
+// above stays exactly where it was -- it needs no sandbox access claude_chat_model.py's own
+// version doesn't already have from a different source, so there is nothing to dedupe there.
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
 
 const HOOK_NAME = "check-full-read-stop";
@@ -47,24 +60,11 @@ const stage = process.env.AIDW_STAGE || "unknown";
 
 const READ_TOOL_DEFAULT_WINDOW_LINES = 2000;
 
-/** Ported from claude_chat_model.py's `_covers_whole_file` -- pure interval-union check: do these
- * 1-indexed, inclusive (start, end) ranges together cover [1, totalLines] with no gap? */
-function coversWholeFile(ranges, totalLines) {
-  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
-  let coveredThrough = 0;
-  for (const [start, end] of sorted) {
-    if (start > coveredThrough + 1) break; // gap -- union stops advancing, nothing after can close it
-    coveredThrough = Math.max(coveredThrough, end);
-  }
-  return coveredThrough >= totalLines;
-}
-
-/** Ported from claude_chat_model.py's `read_full_file_reads` -- scans a Claude transcript's
- * assistant-role lines for `Read` tool_use blocks targeting `targetPath` (matched by suffix, since
- * the transcript's own `input.file_path` is typically absolute inside the sandbox while
- * `targetPath` here is the relative path this pipeline always passes). Returns the collected
- * (start, end) ranges -- empty if none found. */
-function collectReadRanges(transcriptText, targetPath) {
+/** Scans a Claude transcript's assistant-role lines for `Read` tool_use blocks targeting
+ * `targetPath` (matched by suffix, since the transcript's own `input.file_path` is typically
+ * absolute inside the sandbox while `targetPath` here is the relative path this pipeline always
+ * passes). Returns the collected (start, end) ranges -- empty if none found. */
+function computeReadRanges(transcriptText, targetPath) {
   const target = targetPath.replace(/\\/g, "/").replace(/^\/+/, "");
   const ranges = [];
   for (const line of transcriptText.split("\n")) {
@@ -126,8 +126,28 @@ try {
   process.exit(0); // unreadable transcript -- fail open, same contract as the Python backstop
 }
 
-const ranges = collectReadRanges(transcriptText, targetPath);
-if (ranges.length > 0 && coversWholeFile(ranges, totalLines)) process.exit(0);
+const ranges = computeReadRanges(transcriptText, targetPath);
+
+let covered = false;
+if (ranges.length > 0) {
+  try {
+    const proc = spawnSync("python3", ["/opt/aidw-hooks/full_read_checks.py", "--check-hook"], {
+      input: JSON.stringify({ ranges, total_lines: totalLines }),
+      encoding: "utf8",
+      timeout: 20000,
+    });
+    if (proc.status !== 0 || !proc.stdout) {
+      reportFailOpen(HOOK_NAME, stage, "full_read_checks.py subprocess failed, timed out, or produced no output", cwd);
+      process.exit(0); // infra gap -- never a false rejection
+    }
+    covered = Boolean(JSON.parse(proc.stdout).covered);
+  } catch {
+    reportFailOpen(HOOK_NAME, stage, "unparsable full_read_checks.py output", cwd);
+    process.exit(0);
+  }
+}
+
+if (covered) process.exit(0);
 
 process.stderr.write(
   `You must view the WHOLE ${targetPath} (${totalLines} lines) with your Read tool this pass, not ` +
