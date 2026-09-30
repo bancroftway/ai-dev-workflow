@@ -19,6 +19,7 @@ from typing import Any
 
 from . import approvals, chat_model, git_ops, metrics_nodes, preflight_nodes, repo_files, repo_scan, session_store, spec_ledger, workflow_persistence
 from . import config as workflow_config
+from .gates import exit_readiness_checks
 from .markdown_render import render_exit_markdown
 from .preflight_nodes import MANIFEST_PATH
 from .sandbox.provider import SandboxProvider
@@ -32,100 +33,11 @@ from .schemas import presence_values as _presence_values
 
 logger = logging.getLogger(__name__)
 
-# Phrases the metrics regression gate OWNS -- every one of these comes from
-# metrics_nodes.regression_reasons and from nowhere else. A blocking reason containing one of them
-# is a claim about a deterministic measurement, so this run's gate output is the only authority on
-# whether it is true. Anything outside this vocabulary is the drafting model's own reasoning and is
-# never second-guessed here. Kept as substrings, not exact strings, because the gate interpolates
-# live numbers ("duplication 10.5% exceeds...") that will not match a previous run's text.
-_GATE_OWNED_REASON_MARKERS = (
-    "gating finding(s) open",
-    "coverage unmeasured",
-    "coverage below threshold",
-    "exceeds the",          # duplication threshold
-    "regressed",            # coverage/health regression deltas
-    # Any NEW deterministic blocker vocabulary must be added here too, or a blocker fixed on run
-    # N re-blocks every later run: the drafting model reads the committed EXIT-REPORT.md and
-    # copies old blockers forward verbatim (see verify_exit_readiness's stale-blocker filter).
-    # These MUST be phrases only the deterministic checks emit -- a generic substring (an early
-    # draft used bare "README.md") deletes the model's own legitimate prose blockers that merely
-    # mention the file, and can flip merge_ready back to True on a run that earned its False.
-    "README.md is missing or empty",           # readme_gate hard problems (verbatim prefixes)
-    "standard-readme requires it",
-    "has no H1 title",
-    "must be the LAST section",
-    "authentication enforcement was required for this run",  # verify_exit_readiness's own blocker
-    # exit_finalize_node's run_failure injection. Deliberately NOT "run failed at" -- that exact
-    # phrase appears in git_ops's failure commit message (rendered inside the report's own Commits
-    # section) and in ordinary model prose ("the smoke-test run failed at login"), so it would both
-    # get copied forward and falsely filter legitimate reasons.
-    "terminal pipeline failure recorded at",
-    # verify_exit_readiness's own "metrics.get('run_id') == run_id" check (this function, a few
-    # hundred lines below _MANIFEST_COMPLETENESS_TOPIC_KEYWORDS) -- this exact marker's own absence
-    # WAS the bug this comment warns about. Root-caused live (income-investor thread f0fef8ba,
-    # 2026-09-26, reproduced across two independent resumes): this phrase got baked into metrics-exit's
-    # approved_content once, on a run whose metrics genuinely hadn't landed yet under the current
-    # run_id, and then survived every later resume forever -- metrics-latest.json's own run_id and
-    # regression_gate.reasons were confirmed correct and clean on both later resumes, but this reason
-    # was never gate-owned by any existing marker, so the stale-filter kept re-displaying it and
-    # merge_ready never got a chance to flip back to True on an otherwise fully clean run.
-    "the regression gate never passed",
-)
-
-# Manifest-completeness topics verify_exit_readiness's own manifest-completion step computes fresh
-# on every call -- see that function's stale-reason filter for why these need topic-based (not
-# exact-substring) matching, unlike _GATE_OWNED_REASON_MARKERS above. Each keyword must appear in
-# BOTH this function's own short deterministic phrase ("manifest.json has no test_command for this
-# stack", "...has no coverage_commands -- coverage is not replayable", "...records no runnable
-# app...") and plausibly in the model's own freely-worded paraphrase of the same topic.
-_MANIFEST_COMPLETENESS_TOPIC_KEYWORDS = ("test_command", "coverage_command", "runnable app")
-
-
-def _combined_test_command_from_apps(apps: list[dict[str, Any]]) -> str | None:
-    """One combined `cd <path> && <command>` per app, joined with ` && `, from manifest.json's
-    own app_check.apps -- the fallback verify_exit_readiness's manifest-completion step reaches
-    for when `resolve_test_command(tech_stack)` returns None (tech-stack's own languages/
-    package_managers are empty -- the SAME frozen-greenfield-doc root cause
-    tech_stack_signals.tech_stack_has_ui_framework's own docstring documents) AND a fixing agent
-    has already added a per-app `test_command` directly to one or more app objects.
-
-    Root-caused live (income-investor run c1458b23): a targeted-fix pass, told to "add a
-    test_command entry per app," reasonably nested `test_command` on each object in
-    app_check.apps (structurally sensible -- coverage_commands is ALREADY a per-root list) rather
-    than writing manifest.json's own single top-level string field the deterministic check
-    actually reads -- so the edit was real but invisible to it. A bare per-app command ("npm
-    test") is not yet runnable from the repo root without first `cd`-ing into that app's own
-    path, which this function supplies; a `runtime`-based guess (python -> pytest, node -> npm
-    test) covers an app whose own test_command is still missing, so ONE app carrying it is enough
-    to unblock the whole manifest rather than requiring every app to.
-
-    Purely documentary output (nothing in this codebase executes manifest.json's test_command --
-    unlike coverage_commands, which IS replayed and validated at that point instead), so no path
-    validation is applied here; `path`/`command` already come from app_discovery's own trusted
-    scan or an agent's in-scope manifest edit, not raw external input crossing a trust boundary."""
-    segments: list[str] = []
-    for app in apps:
-        path = app.get("path")
-        if not path:
-            continue
-        command = app.get("test_command")
-        if not command:
-            runtime = app.get("runtime")
-            command = {"python": "python3 -m pytest", "node": "npm test"}.get(str(runtime))
-        if command:
-            segments.append(f"cd {path} && {command}")
-    return " && ".join(segments) or None
-
-
-def _manifest_completeness_topic(reason: str) -> str | None:
-    """Which manifest-completeness topic (if any) `reason` is about -- "manifest.json" together
-    with one of `_MANIFEST_COMPLETENESS_TOPIC_KEYWORDS`, requiring both so a reason that merely
-    mentions one of the keywords in an unrelated context is never falsely claimed. Module-level
-    (not nested in verify_exit_readiness) so this pure string logic gets its own self-check
-    assertions, same as every other pure helper in this file."""
-    if "manifest.json" not in reason:
-        return None
-    return next((kw for kw in _MANIFEST_COMPLETENESS_TOPIC_KEYWORDS if kw in reason), None)
+# _GATE_OWNED_REASON_MARKERS, _MANIFEST_COMPLETENESS_TOPIC_KEYWORDS, _combined_test_command_from_apps
+# and _manifest_completeness_topic all moved to gates/exit_readiness_checks.py (2026-09-30, Task 14)
+# so the sandbox's own same-turn Stop hook (check-exit-readiness-stop.mjs) can shell out to the REAL
+# implementations instead of a second, independently-drifting JS port -- see that module's own
+# docstring. verify_exit_readiness below imports them back unchanged; this is a pure code-move.
 
 CHANGELOG_PATH = "CHANGELOG.md"
 HISTORY_DIR = ".ai-dev-workflow/history"
@@ -1269,16 +1181,8 @@ def _presence_from_values(values: list[str], *, empty_reason: str) -> dict[str, 
     return {"status": "absent", "values": [], "reason": empty_reason}
 
 
-def _targeted_fix_unresolved_problems(payload: dict[str, Any], run_id: str) -> list[str]:
-    """Fold TARGETED_FIX_UNRESOLVED_PATH's parsed content into `problems`, run-id-stamped the same
-    way `.ai-dev-workflow/metrics-latest.json` already is a few lines up in verify_exit_readiness --
-    a file whose `run_id` doesn't match THIS run's is from a prior attempt/run and is silently
-    ignored, no explicit clearing step required (a mismatched run_id is self-expiring by
-    construction, unlike relying on `_run_targeted_fix` remembering to clear it on a clean pass)."""
-    if payload.get("run_id") != run_id:
-        return []
-    return [str(r) for r in (payload.get("reasons") or [])]
-
+# _targeted_fix_unresolved_problems moved to gates/exit_readiness_checks.py (2026-09-30, Task 14) --
+# verify_exit_readiness below imports it back unchanged.
 
 # Task 13b: one line per DISTINCT condition inside verify_exit_readiness below that forces
 # merge_ready=False (this gate always returns passed=True to the graph -- an LLM redraft cannot
@@ -1347,134 +1251,81 @@ async def verify_exit_readiness(
     tech_stack = _parse(await repo_files.read_repo_file(provider, thread_id, workflow_persistence.TECH_STACK_APPROVED_PATH))
 
     # --- manifest completion: same shape regardless of entrypoint (greenfield or brownfield) ---
-    updates: dict[str, Any] = {}
+    # Decision logic (what belongs in `updates`) lives in exit_readiness_checks.resolve_manifest_updates
+    # (2026-09-30, Task 14); the conditional guards below stay HERE so the expensive
+    # app_discovery.collect_evidence sandbox scan is still only called when apps are genuinely
+    # missing, same cost profile as before this extraction.
+    resolved_apps = None
+    scan_fingerprint = None
     app_check = manifest.get("app_check") or {}
     if not (app_check.get("apps") or []):
         # app_check_record ran pre-scaffold (empty [] on greenfield, by construction) -- re-scan
         # now that the code exists, exact reuse of e2e_gate_check_node's greenfield re-scan.
         scan = await app_discovery.collect_evidence(provider, thread_id)
-        apps = app_discovery.candidates_to_apps(scan.get("candidates") or [])
-        if apps:
-            updates["app_check"] = {"apps": apps, "evidence_fingerprint": scan.get("fingerprint")}
+        resolved_apps = app_discovery.candidates_to_apps(scan.get("candidates") or [])
+        scan_fingerprint = scan.get("fingerprint")
+    resolved_test_command = None
     if not manifest.get("test_command"):
-        command = resolve_test_command(tech_stack) or _combined_test_command_from_apps(app_check.get("apps") or [])
-        if command:
-            updates["test_command"] = command
+        resolved_test_command = resolve_test_command(tech_stack) or exit_readiness_checks.combined_test_command_from_apps(
+            app_check.get("apps") or []
+        )
+    coverage_entries = None
     if not manifest.get("coverage_commands"):
-        entries = _parse(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH)).get("entries")
-        if entries:
-            updates["coverage_commands"] = entries
+        coverage_entries = _parse(await repo_files.read_repo_file(provider, thread_id, COVERAGE_COMMANDS_PATH)).get("entries")
+    updates = exit_readiness_checks.resolve_manifest_updates(
+        manifest, resolved_apps=resolved_apps, scan_fingerprint=scan_fingerprint,
+        resolved_test_command=resolved_test_command, coverage_entries=coverage_entries,
+    )
     if updates:
         manifest = await preflight_nodes.update_manifest(provider, thread_id, updates)
 
-    problems: list[str] = []
-
     # --- presence: what a merge actually needs recorded ---
-    app_check = manifest.get("app_check") or {}
-    if app_check.get("suitable") is not False and not (app_check.get("apps") or []):
-        problems.append("manifest.json records no runnable app (app_check.apps is empty even after re-scan)")
-    if not manifest.get("test_command"):
-        problems.append("manifest.json has no test_command for this stack")
-    if not manifest.get("coverage_commands"):
-        problems.append("manifest.json has no coverage_commands -- coverage is not replayable")
+    problems = exit_readiness_checks.manifest_presence_problems(manifest)
 
     # --- screenshots: mandatory visual evidence for UI apps, whatever path e2e took (covers all
     # of its skip paths with one check) ---
     is_ui = frameworks_have_ui(presence_values(tech_stack, "frameworks"))
     screenshots = await _list_screenshots(provider, thread_id, run_id)
-    if is_ui and not screenshots:
-        problems.append("UI application but no e2e screenshots were captured")
+    problems += exit_readiness_checks.screenshot_problems(is_ui, len(screenshots))
 
     # --- the metrics regression gate's verdict, run-id-stamped so a stale file never gates ---
     metrics = _parse(await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json"))
-    if metrics.get("run_id") == run_id:
-        problems.extend((metrics.get("regression_gate") or {}).get("reasons") or [])
-        # README leg (W7): hard standard-readme problems still open after the leg's own retry
-        # laps block the merge -- but only when the leg OWNS the README (a human-authored
-        # brownfield README is advisory-only by design, readme_write_node's rule).
-        readme = metrics.get("readme") or {}
-        if readme.get("owned"):
-            problems.extend(readme.get("problems") or [])
-    else:
-        problems.append("metrics were not recorded for this run -- the regression gate never passed")
+    metrics_probs, metrics_matched = exit_readiness_checks.metrics_problems(metrics, run_id)
+    problems += metrics_probs
 
     # --- independent post-targeted-fix verification (closes _run_targeted_fix's own previously
     # documented gap: "no independent, deterministic regression gate runs after this") ---
     targeted_fix_unresolved = _parse(await repo_files.read_repo_file(provider, thread_id, TARGETED_FIX_UNRESOLVED_PATH))
-    problems.extend(_targeted_fix_unresolved_problems(targeted_fix_unresolved, run_id))
+    problems += exit_readiness_checks.targeted_fix_unresolved_problems(targeted_fix_unresolved, run_id)
 
     # --- auth enforcement can't silently vanish (W4): a run that REQUIRED auth but whose e2e
     # never ran (non-UI repo, runner missing, suite skipped) verified nothing -- exactly the
     # repos (API-only) where auth matters most. A named blocker, not a silent pass. Read from
     # metrics-latest.json (metrics_compute persists app_auth + the e2e snapshot for exactly this
-    # check) -- deterministic verifies are file-based, never graph-state-based.
-    if metrics.get("run_id") == run_id:
-        app_auth = metrics.get("app_auth") or {}
-        e2e_snapshot = metrics.get("e2e") or {}
-        auth_required = (
-            workflow_config.AIDW_AUTH_GATE
-            and app_auth.get("auth_mode") in ("required", "anonymous_list")
-            and bool(app_auth.get("secrets_present"))
-        )
-        # Keyed on the auth gate's own verdict, not e2e.status: an e2e that "passed" without the
-        # auth probe ever running (gate exception, posture arriving late on a resumed checkpoint)
-        # is just as unverified as a skipped one.
-        if auth_required and not (e2e_snapshot.get("auth_check") or {}).get("passed"):
-            problems.append(
-                "authentication enforcement was required for this run but was not verified "
-                f"(e2e status: {e2e_snapshot.get('status') or 'never started'}; auth probe "
-                f"{'failed' if e2e_snapshot.get('auth_check') else 'never ran'})"
-            )
-        elif auth_required:
+    # check) -- deterministic verifies are file-based, never graph-state-based. Gated behind the
+    # same run_id match as the regression-gate check above (metrics_matched).
+    if metrics_matched:
+        auth_probs, auth_note = exit_readiness_checks.auth_problems(metrics, workflow_config.AIDW_AUTH_GATE)
+        problems += auth_probs
+        if auth_note:
             # Verified: surface the gate's per-route verdict summary in the exit report (via the
             # report's own risk-notes section) -- the "reported, not blocking" inconclusives
             # otherwise live only in metrics-latest.json.
-            auth_note = f"Authentication enforcement verified: {(e2e_snapshot.get('auth_check') or {}).get('feedback')}"
             notes = _presence_values(content_dict.get("risk_notes"))
             if auth_note not in notes:
                 content_dict["risk_notes"] = _presence_from_values(
                     notes + [auth_note], empty_reason="no risk notes recorded"
                 )
 
-    # Drop STALE deterministic blockers the model carried over from a previous run's report.
-    #
-    # The metrics regression gate owns a fixed vocabulary of reasons, and it is authoritative: if a
-    # reason in that vocabulary is not in THIS run's gate output, this run did not have that
-    # problem. The drafting model reads the repository, and a previous EXIT-REPORT.md is committed
-    # in it -- so it can and does copy old blockers forward verbatim. Observed live (run 45e08f64):
-    # regression_gate.reasons was EMPTY, coverage measured 100/100, duplication 0.0%, gating count
-    # 0 -- and the report still blocked the merge on "coverage unmeasured", "duplication 10.5%
-    # exceeds the 3% threshold" and "1 gating finding(s) open", all three verbatim strings from a
-    # previous run. Nothing challenged them, because the check below only ever ADDS blockers.
-    #
-    # Only gate-owned phrasing is filtered. A prose blocker the model reasoned out for itself (an
-    # out-of-scope dependency, a broken replay contract) is exactly what this stage is for and is
-    # never touched here.
-    #
-    # Manifest-completeness (test_command/coverage_commands/runnable-app, computed fresh a few
-    # lines above THIS SAME call) needs its own, topic-based version of the same drop: unlike the
-    # regression gate's fixed-vocabulary reasons, the drafting model paraphrases these freely
-    # ("manifest.json (.ai-dev-workflow/manifest.json) still got no test_command...") rather than
-    # copying this function's own short deterministic phrase verbatim, so an exact/substring match
-    # against THIS run's `problems` text never catches it. Observed live (income-investor run
-    # c1458b23): the model's own draft-turn belief that coverage_commands was still missing
-    # survived into the final report even though the manifest-completion step above had already
-    # backfilled it from coverage-commands.json moments earlier in this exact call -- this
-    # function is the sole authority on manifest completeness, having just recomputed it fresh, so
-    # any existing reason naming "manifest.json" together with one of these topics is dropped
-    # unless `problems` still raises that SAME topic this run.
-    gate_reasons = set(problems)
-    model_reasons = _presence_values(content_dict.get("blocking_reasons"))
-    problem_topics = {t for p in problems if (t := _manifest_completeness_topic(p)) is not None}
-    kept_reasons, stale_reasons = [], []
-    for reason in model_reasons:
-        topic = _manifest_completeness_topic(reason)
-        if topic is not None:
-            stale = topic not in problem_topics
-        else:
-            owned = any(marker in reason for marker in _GATE_OWNED_REASON_MARKERS)
-            stale = owned and reason not in gate_reasons
-        (stale_reasons if stale else kept_reasons).append(reason)
+    # Drop STALE deterministic blockers the model carried over from a previous run's report, and
+    # decide the final merge_ready verdict -- exit_readiness_checks.evaluate_merge_readiness (Task
+    # 14) is the same pure logic that used to live inline here; see that function's own docstring
+    # for the full "why" (income-investor runs 45e08f64/c1458b23/f0fef8ba, three separate real
+    # staleness bugs this filter exists to prevent).
+    verdict = exit_readiness_checks.evaluate_merge_readiness(
+        problems, content_dict.get("blocking_reasons"), content_dict.get("merge_ready")
+    )
+    stale_reasons = verdict["stale_reasons"]
     if stale_reasons:
         logger.warning(
             "exit verify: dropping %d blocking reason(s) this run's regression gate did not raise "
@@ -1482,35 +1333,21 @@ async def verify_exit_readiness(
             len(stale_reasons),
             "; ".join(r[:workflow_config.EXIT_STALE_REASON_LOG_CHARS] for r in stale_reasons),
         )
-        content_dict["blocking_reasons"] = _presence_from_values(
-            kept_reasons,
-            empty_reason="deterministic exit checks passed; all model-supplied blocking reasons "
-            "were stale gate reasons carried over from an earlier run and have been cleared",
-        )
-
-    if problems:
-        content_dict["merge_ready"] = False
-        existing = _presence_values(content_dict.get("blocking_reasons"))
-        content_dict["blocking_reasons"] = _presence_from_values(
-            existing + [p for p in problems if p not in existing],
-            empty_reason="unreachable: problems is non-empty in this branch",
-        )
-        feedback = f"merge_ready forced False: {len(problems)} deterministic blocker(s)"
-    elif stale_reasons and not kept_reasons and content_dict.get("merge_ready") is False:
-        # Every deterministic check passed AND every blocker the model listed was a stale copy of a
-        # gate reason this run did not produce. There is nothing left holding the merge shut, so the
-        # False verdict was inherited rather than earned. Left alone, this is precisely the
-        # "Ready to merge: False on a clean tree" outcome that sends a human hunting for a defect
-        # that was already fixed.
-        content_dict["merge_ready"] = True
-        logger.warning(
-            "exit verify: merge_ready flipped False -> True -- every deterministic check passed and "
-            "all %d model-supplied blocker(s) were stale gate reasons from an earlier run",
-            len(stale_reasons),
-        )
-        feedback = "deterministic exit checks passed; cleared stale carried-over blockers"
-    else:
-        feedback = "deterministic exit checks passed (manifest complete, screenshots present for UI, metrics gate clean)"
+    if verdict["blocking_reasons"] is not None:
+        content_dict["blocking_reasons"] = verdict["blocking_reasons"]
+    if verdict["merge_ready"] is not None:
+        content_dict["merge_ready"] = verdict["merge_ready"]
+        if verdict["merge_ready"] is True:
+            # Every deterministic check passed AND every blocker the model listed was a stale copy
+            # of a gate reason this run did not produce -- the False verdict was inherited rather
+            # than earned. Left alone, this is precisely the "Ready to merge: False on a clean
+            # tree" outcome that sends a human hunting for a defect that was already fixed.
+            logger.warning(
+                "exit verify: merge_ready flipped False -> True -- every deterministic check passed "
+                "and all %d model-supplied blocker(s) were stale gate reasons from an earlier run",
+                len(stale_reasons),
+            )
+    feedback = verdict["feedback"]
     return VerificationResult(
         passed=True,
         feedback=feedback,
@@ -1578,8 +1415,9 @@ async def exit_finalize_node(
     # (income-investor thread f0fef8ba): after the gitleaks/e2e failures that ORIGINALLY set
     # blocking_reasons were fixed on a later resume, the exit report kept re-reporting all of them
     # forever, keeping merge_ready permanently False on an otherwise-clean run. verify_exit_readiness
-    # already has a correct, tested stale-reason filter built in (_GATE_OWNED_REASON_MARKERS) that
-    # would have caught and dropped all of them -- it simply never got invoked on this path. Calling
+    # already has a correct, tested stale-reason filter built in (exit_readiness_checks.
+    # GATE_OWNED_REASON_MARKERS) that would have caught and dropped all of them -- it simply never
+    # got invoked on this path. Calling
     # it again here is a no-op on the NORMAL (fresh-approval) path too, where it already ran seconds
     # earlier via make_verify_node -- an idempotent recompute (its own docstring: "always returns
     # passed=True with the draft mutated in place"), not a redraft. It DOES mean a second round of
@@ -1613,7 +1451,7 @@ async def exit_finalize_node(
         # report blames whatever incidental gaps it found ("metrics were not recorded") and never
         # names the actual killer. Injected before update_manifest below so the manifest,
         # report.json, both exit markdowns and the session close all carry it. Phrase is listed in
-        # _GATE_OWNED_REASON_MARKERS -- see that tuple's comment.
+        # exit_readiness_checks.GATE_OWNED_REASON_MARKERS -- see that tuple's comment.
         # The bullet carries the error's first meaningful line -- the report is the artifact a human
         # reads on the branch, and a bare "rebuild_cap_exceeded" sent the drafting model guessing at
         # a root cause (observed live, run d16959d3: it blamed a missing project reference; the real
@@ -2029,28 +1867,16 @@ def _demo() -> None:
         "status": "absent", "values": [], "reason": "nothing to report",
     }
 
-    # _targeted_fix_unresolved_problems: run-id-stamped fold-in, same staleness contract as
-    # metrics-latest.json's own run_id check a few lines up in verify_exit_readiness.
-    assert _targeted_fix_unresolved_problems({"run_id": "r1", "reasons": ["still open"]}, "r1") == ["still open"]
-    assert _targeted_fix_unresolved_problems({"run_id": "r1", "reasons": ["still open"]}, "r2") == [], (
-        "a different run_id must be ignored -- stale file from a prior attempt/run"
-    )
-    assert _targeted_fix_unresolved_problems({"run_id": "r1", "reasons": []}, "r1") == []
-    assert _targeted_fix_unresolved_problems({}, "r1") == [], "no file/empty payload -- nothing to fold in"
-
-    # _GATE_OWNED_REASON_MARKERS: "the regression gate never passed" must match verify_exit_readiness's
-    # own deterministic phrase (exit_nodes.py's "metrics were not recorded for this run" append) so a
-    # stale copy gets dropped once metrics-latest.json's run_id/regression_gate are clean again --
-    # root-caused live, this exact phrase was missing from the tuple and never got dropped, ever.
+    # _targeted_fix_unresolved_problems / GATE_OWNED_REASON_MARKERS / _manifest_completeness_topic /
+    # _combined_test_command_from_apps / evaluate_merge_readiness all moved to
+    # gates/exit_readiness_checks.py (2026-09-30, Task 14) -- their own assertions now live in that
+    # module's self-check (`cd agent && uv run python -m src.gates.exit_readiness_checks`). One
+    # integration-only assertion here proves this module's import/wiring is actually live, not just
+    # that the (already-tested) pure function works in isolation.
     stale_metrics_reason = "metrics were not recorded for this run -- the regression gate never passed"
-    assert any(marker in stale_metrics_reason for marker in _GATE_OWNED_REASON_MARKERS), (
+    assert exit_readiness_checks.targeted_fix_unresolved_problems({"run_id": "r1", "reasons": ["still open"]}, "r1") == ["still open"]
+    assert any(marker in stale_metrics_reason for marker in exit_readiness_checks.GATE_OWNED_REASON_MARKERS), (
         "this deterministic phrase must be gate-owned so a stale copy is droppable"
-    )
-    # A model's own unrelated prose must never accidentally match -- same false-positive risk the
-    # "terminal pipeline failure recorded at" marker's own comment already warns about.
-    assert not any(
-        marker in "the API rate limiter never passed a single request during the outage"
-        for marker in _GATE_OWNED_REASON_MARKERS
     )
 
     # _diff_ledger: added/revised/retired classification against a prior snapshot.
@@ -2507,42 +2333,9 @@ def _demo() -> None:
     assert len(METRICS_EXIT_HARD_RULES) == 9, len(METRICS_EXIT_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in METRICS_EXIT_HARD_RULES)
 
-    # _combined_test_command_from_apps (2026-09-22, income-investor run c1458b23): a targeted-fix
-    # agent's own per-app test_command edit (structurally reasonable, invisible to the
-    # top-level-string check) must still be picked up and made runnable from the repo root.
-    per_app_commands = [
-        {"path": "apps/api", "runtime": "python", "test_command": "python3 -m pytest"},
-        {"path": "apps/web", "runtime": "node", "test_command": "npm test"},
-    ]
-    assert _combined_test_command_from_apps(per_app_commands) == (
-        "cd apps/api && python3 -m pytest && cd apps/web && npm test"
-    ), _combined_test_command_from_apps(per_app_commands)
-    # One app's own test_command missing -- falls back to a runtime-based guess for THAT app only.
-    partial = [{"path": "apps/api", "runtime": "python"}, {"path": "apps/web", "runtime": "node", "test_command": "npm test"}]
-    assert _combined_test_command_from_apps(partial) == "cd apps/api && python3 -m pytest && cd apps/web && npm test"
-    # No apps, or no app carries a command/known runtime -- correctly nothing to combine.
-    assert _combined_test_command_from_apps([]) is None
-    assert _combined_test_command_from_apps([{"path": "apps/worker", "runtime": "rust"}]) is None
-
-    # _manifest_completeness_topic (2026-09-22, income-investor run c1458b23): the model's own
-    # freely-worded paraphrase of a manifest-completeness topic must still be recognized as that
-    # topic, so a same-run backfill can drop it as stale even though its wording never matches
-    # this function's own short deterministic phrase.
-    assert _manifest_completeness_topic(
-        "manifest.json (.ai-dev-workflow/manifest.json) still got no test_command. Re-read file "
-        "direct this turn: only toolchain + app_check keys exist."
-    ) == "test_command"
-    assert _manifest_completeness_topic(
-        "manifest.json still no coverage_commands. Re-checked this turn: replay contract for "
-        "coverage sit only in sibling file .ai-dev-workflow/coverage-commands.json."
-    ) == "coverage_command"
-    assert _manifest_completeness_topic("manifest.json has no test_command for this stack") == "test_command"
-    assert _manifest_completeness_topic("manifest.json has no coverage_commands -- coverage is not replayable") == "coverage_command"
-    assert _manifest_completeness_topic("manifest.json records no runnable app (app_check.apps is empty even after re-scan)") == "runnable app"
-    # No "manifest.json" mention at all -- an unrelated prose blocker, never claimed as this topic.
-    assert _manifest_completeness_topic("the test_command in package.json points at a script that no longer exists") is None
-    # Mentions "manifest.json" but not one of the three known topics -- correctly unclaimed too.
-    assert _manifest_completeness_topic("manifest.json's auth_kind field looks wrong for this repo") is None
+    # _combined_test_command_from_apps / _manifest_completeness_topic: moved to
+    # gates/exit_readiness_checks.py (Task 14) -- their full assertions live in that module's own
+    # self-check now.
 
     print("exit_nodes self-check: ok")
 
