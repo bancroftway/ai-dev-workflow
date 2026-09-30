@@ -37,6 +37,7 @@ from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
 from ..text_truncate import truncate_middle
+from .checks import Check, CheckLog
 from .coverage_parsing import (
     MIN_COVERAGE_PERCENT,
     CoverageContractEntry,
@@ -382,7 +383,7 @@ async def _declared_frameworks(provider: SandboxProvider, thread_id: str) -> lis
 
 
 async def _check_integration_fidelity(
-    provider: SandboxProvider, thread_id: str, source_files: list[str]
+    provider: SandboxProvider, thread_id: str, source_files: list[str], *, log: CheckLog
 ) -> str | None:
     """Feedback describing a declared-but-unbuilt backend or a frontend that never calls it, else None.
 
@@ -391,7 +392,10 @@ async def _check_integration_fidelity(
     """
     frameworks = await _declared_frameworks(provider, thread_id)
     if not frameworks:
+        for check in (CHECK_BACKEND_HOSTED, CHECK_OTEL, CHECK_FRONTEND_CALLS_BACKEND, CHECK_NO_DUPLICATE_BACKEND):
+            log.skipped(check, "no readable tech-stack record declares frameworks")
         return None
+    has_backend = any(marker in str(f).lower() for f in frameworks for marker, _ in _BACKEND_MARKERS)
 
     # Project/entry files that would carry the evidence of a real HTTP host.
     from ..repo_scan import is_non_application_path as _non_app
@@ -443,6 +447,12 @@ async def _check_integration_fidelity(
 
     unhosted = missing_hosted_backend(frameworks, texts)
     if unhosted:
+        log.infra(CHECK_BACKEND_HOSTED, f"{unhosted} declared but no hosted HTTP service found{_INFRA_LABEL_NOTE}")
+    elif not has_backend:
+        log.skipped(CHECK_BACKEND_HOSTED, "no backend framework declared")
+    else:
+        log.passed(CHECK_BACKEND_HOSTED, None if texts else "no backend project/entry files readable (fails open)")
+    if unhosted:
         return (
             f"The approved Tech Stack declares {unhosted} as this app's backend, but nothing in the "
             f"repository actually hosts it: no web-SDK project file and no entry point that builds a "
@@ -456,6 +466,10 @@ async def _check_integration_fidelity(
     # Checked only once the backend is confirmed hosted -- an unhosted backend is missing_hosted_
     # backend's finding to report above, not a second one here for the same root cause.
     missing_otel = missing_otel_instrumentation(frameworks, {**texts, **otel_extra_texts})
+    if missing_otel:
+        log.infra(CHECK_OTEL, f"no OpenTelemetry signal for {missing_otel}{_INFRA_LABEL_NOTE}")
+    else:
+        log.passed(CHECK_OTEL)
     if missing_otel:
         return (
             f"The approved Tech Stack declares {missing_otel} for this app, but no OpenTelemetry "
@@ -478,7 +492,9 @@ async def _check_integration_fidelity(
 
     # Only ask the "does the frontend call it" question when a backend was actually declared --
     # a legitimately single-tier app has nothing to call.
-    if not any(marker in str(f).lower() for f in frameworks for marker, _ in _BACKEND_MARKERS):
+    if not has_backend:
+        log.skipped(CHECK_FRONTEND_CALLS_BACKEND, "no backend framework declared")
+        log.skipped(CHECK_NO_DUPLICATE_BACKEND, "no backend framework declared")
         return None
     # Build output is excluded explicitly: `.next/` chunks are .js and would otherwise be read as
     # "frontend source", both wasting reads and (before the path validator was fixed) crashing the
@@ -496,6 +512,7 @@ async def _check_integration_fidelity(
         if content is not None:
             frontend_texts[path] = content
     if frontend_only_uses_local_storage(frontend_texts):
+        log.infra(CHECK_FRONTEND_CALLS_BACKEND, f"frontend only uses browser storage, no HTTP call{_INFRA_LABEL_NOTE}")
         return (
             "The frontend persists its state in browser storage and never calls the backend over "
             "HTTP -- there is no fetch/axios/HttpClient call anywhere in it. The declared API is "
@@ -512,8 +529,13 @@ async def _check_integration_fidelity(
         if re.search(r"(^|/)(app|src/app|pages)/api/.*/route\.[jt]sx?$", path)
         or re.search(r"(^|/)pages/api/", path)
     }
+    log.passed(CHECK_FRONTEND_CALLS_BACKEND)
     self_implemented = frontend_reimplements_backend(route_handlers)
     if self_implemented and len(self_implemented) == len(route_handlers):
+        log.infra(
+            CHECK_NO_DUPLICATE_BACKEND,
+            f"{len(self_implemented)} route handler(s) re-implement the backend{_INFRA_LABEL_NOTE}",
+        )
         return (
             "The frontend calls its OWN framework route handlers, not the declared backend. These "
             f"handlers implement the state themselves and make no outbound call to any other "
@@ -529,14 +551,32 @@ async def _check_integration_fidelity(
             "response -- forwarding, never re-implementing. Do not satisfy this by deleting the "
             "backend: the Tech Stack that declares it is approved."
         )
+    log.passed(CHECK_NO_DUPLICATE_BACKEND)
     return None
 
 
 async def _missing_declared_frontend(
-    provider: SandboxProvider, thread_id: str, source_files: list[str]
+    provider: SandboxProvider, thread_id: str, source_files: list[str], *, log: CheckLog
 ) -> str | None:
     """Same check against the repo's own approved tech-stack record. Returns None (fails OPEN) when
     that record can't be read -- an unreadable artifact is not evidence the frontend is missing."""
+    missing = await _missing_declared_frontend_verdict(provider, thread_id, source_files)
+    if missing is not None:
+        log.infra(CHECK_FRONTEND_PRESENT, f"{missing} declared but not really built{_INFRA_LABEL_NOTE}")
+        return missing
+    frameworks = await _declared_frameworks(provider, thread_id)
+    if not frameworks:
+        log.skipped(CHECK_FRONTEND_PRESENT, "no readable tech-stack record declares frameworks")
+    elif not any(marker in f.lower() for f in frameworks for marker, _ in _FRONTEND_SIGNATURES):
+        log.skipped(CHECK_FRONTEND_PRESENT, "no frontend framework declared")
+    else:
+        log.passed(CHECK_FRONTEND_PRESENT)
+    return None
+
+
+async def _missing_declared_frontend_verdict(
+    provider: SandboxProvider, thread_id: str, source_files: list[str]
+) -> str | None:
     for path in (workflow_persistence.TECH_STACK_APPROVED_PATH, workflow_persistence.TECH_STACK_DRAFT_PATH):
         raw = await repo_files.read_repo_file(provider, thread_id, path)
         if raw is None:
@@ -1038,7 +1078,9 @@ def _reason_feedback(reason: str) -> dict[str, str]:
     }.get(reason, reason)
 
 
-async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str, dict[str, Any]] | None:
+async def check_ac_depth(
+    provider: SandboxProvider, thread_id: str, *, log: CheckLog | None = None
+) -> tuple[str, dict[str, Any]] | None:
     """GREEN-phase per-AC depth: `(feedback, report)` when a criterion is under-tested, else None.
 
     Reuses ac_coverage_gate's counters so RED and GREEN measure identically -- only the threshold
@@ -1046,6 +1088,8 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
     which this stage does not produce, so only the level-agnostic "tests below the browser layer"
     requirement is enforced at this phase.
     """
+    log = log if log is not None else CheckLog(VERIFY_GATE_ID, VERIFY_CHECKS)
+    depth_checks = (CHECK_AC_DEPTH, CHECK_TESTID_LOCATORS, CHECK_NAV_WAITS)
     from .ac_coverage_gate import (
         MIN_NON_E2E_TESTS_PER_AC,
         count_tests_per_ac,
@@ -1066,6 +1110,8 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
         }
     )
     if not ac_ids:
+        for check in depth_checks:
+            log.skipped(check, "no live acceptance criteria in the spec ledger")
         return None  # no ledger, nothing to attribute -- never a fabricated failure
 
     listing = await provider.exec_in_sandbox(
@@ -1083,6 +1129,8 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
         if contents is not None:
             test_files[path] = contents
     if not test_files:
+        for check in depth_checks:
+            log.skipped(check, "no test files found")
         return None  # the coverage gate above already blocks a repo with no tests
 
     counts = count_tests_per_ac(ac_ids, test_files)
@@ -1101,6 +1149,15 @@ async def check_ac_depth(provider: SandboxProvider, thread_id: str) -> tuple[str
     # violation introduced here is the same real defect as one introduced at ac-to-tests or
     # e2e-fix. See flaky_navigation_waits' own docstring for the live incident.
     nav_wait_violations = flaky_navigation_waits(test_files)
+    for check, found, what in (
+        (CHECK_AC_DEPTH, shortfalls, "criterion(s) under-tested"),
+        (CHECK_TESTID_LOCATORS, testid_violations, "spec file(s) use non-testid locators"),
+        (CHECK_NAV_WAITS, nav_wait_violations, "spec file(s) use waitForNavigation/networkidle"),
+    ):
+        if found:
+            log.failed(check, f"{len(found)} {what}: {', '.join(sorted(found)[:5])}")
+        else:
+            log.passed(check)
     if not shortfalls and not testid_violations and not nav_wait_violations:
         return None
     detail = "; ".join(f"{ac}: {' and '.join(problems)}" for ac, problems in sorted(shortfalls.items()))
@@ -1267,9 +1324,104 @@ MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE: tuple[str, ...] = (
 )
 
 
+# Per-sub-check rows for verify_coverage (gates/checks.py). The structural checks' failures are
+# content problems that this gate nonetheless reports under report["infra_error"] (so graph.py
+# routes them on the infra retry budget) -- they are recorded as `infra` to match that routing,
+# with _INFRA_LABEL_NOTE in the detail so nobody reads them as platform faults.
+_INFRA_LABEL_NOTE = " (a content problem, reported under infra_error by this gate)"
+CHECK_APP_SOURCE = Check(
+    "code.app_source", "Application source exists",
+    "Checks the stage actually wrote application source files, not just tests and pipeline "
+    "artifacts -- with no app there is nothing to build, measure, or ship.",
+    "blocking",
+)
+CHECK_FRONTEND_PRESENT = Check(
+    "code.frontend_present", "Declared frontend is really built",
+    "Checks the frontend framework the Tech Stack approved has real source files or a real "
+    "package.json dependency, so a backend-only delivery can't pass as the approved app.",
+    "collected", "only when the Tech Stack declares a frontend framework",
+)
+CHECK_BACKEND_HOSTED = Check(
+    "code.backend_hosted", "Declared backend is a hosted service",
+    "Checks the declared backend is a running HTTP service (web project plus an entry point that "
+    "maps endpoints), not a class library nothing invokes -- a library can hit any coverage number "
+    "while proving nothing about the product.",
+    "collected", "only when the Tech Stack declares a backend framework",
+)
+CHECK_OTEL = Check(
+    "code.otel", "OpenTelemetry instrumentation present",
+    "Checks every declared framework shows real OpenTelemetry setup, so a failure can be traced to "
+    "the handler or call that actually broke instead of only a symptom.",
+    "collected", "only when the Tech Stack declares frameworks, once the backend-hosted check passes",
+)
+CHECK_FRONTEND_CALLS_BACKEND = Check(
+    "code.frontend_calls_backend", "Frontend calls the backend",
+    "Checks the frontend talks to the backend over HTTP instead of keeping all its state in browser "
+    "storage, which would leave the two halves of the app disconnected.",
+    "collected", "only when a backend framework is declared, once the OpenTelemetry check passes",
+)
+CHECK_NO_DUPLICATE_BACKEND = Check(
+    "code.no_duplicate_backend", "Frontend API routes forward to the backend",
+    "Checks the frontend's own API route handlers proxy to the declared backend rather than "
+    "re-implementing its logic, which would make the real backend dead code.",
+    "collected", "only when a backend framework is declared, once the frontend-calls-backend check passes",
+)
+CHECK_COVERAGE_MEASURED = Check(
+    "code.coverage_measured", "Coverage report produced",
+    "Checks the test suite really ran with coverage and produced a readable report; without one "
+    "there is no number to judge, so it counts as an infrastructure failure.",
+    "blocking", "only once the application, frontend and integration checks pass",
+)
+CHECK_EXCLUSION_GAMING = Check(
+    "code.exclusion_gaming", "No coverage-exclusion gaming",
+    "Checks coverage-exclusion config only skips known generated or vendor code, so the threshold "
+    "can't be met by hiding real code from measurement.",
+    "blocking", "only once a coverage report is produced",
+)
+CHECK_COVERAGE_THRESHOLD = Check(
+    "code.coverage_threshold", "Line and branch coverage meet threshold",
+    f"Checks both line and branch coverage reach {MIN_COVERAGE_PERCENT}%, so untested paths -- "
+    "especially error and edge-case branches -- don't ship unnoticed.",
+    "blocking", "only once no exclusion gaming is found",
+)
+_DEPTH_CONDITION = "only once coverage passes, when the spec ledger has live criteria and tests exist"
+CHECK_AC_DEPTH = Check(
+    "code.ac_depth", "Each criterion tested below the browser",
+    "Checks every live acceptance criterion has enough real unit/integration tests (no fiat "
+    "failures, absence-only, padded or near-duplicate tests) -- high coverage alone doesn't prove "
+    "each criterion works.",
+    "collected", _DEPTH_CONDITION,
+)
+CHECK_TESTID_LOCATORS = Check(
+    "code.testid_locators", "E2E specs use data-testid locators",
+    "Checks browser tests locate elements only by data-testid, since role/text/CSS locators can "
+    "silently match a framework-injected element instead of the real one.",
+    "collected", _DEPTH_CONDITION,
+)
+CHECK_NAV_WAITS = Check(
+    "code.nav_waits", "No flaky navigation waits",
+    "Checks browser tests avoid waitForNavigation() and networkidle waits, which race redirects or "
+    "never resolve and make the suite flaky.",
+    "collected", _DEPTH_CONDITION,
+)
+CHECK_DESIGN_TOKENS = Check(
+    "code.design_tokens", "Colors follow the design tokens",
+    "Checks styles use the DESIGN.md palette rather than hardcoded off-palette colors, so the app "
+    "matches its approved look.",
+    "blocking", "only once coverage and test-depth checks pass, when the session record is readable",
+)
+VERIFY_CHECKS: tuple[Check, ...] = (
+    CHECK_APP_SOURCE, CHECK_FRONTEND_PRESENT, CHECK_BACKEND_HOSTED, CHECK_OTEL,
+    CHECK_FRONTEND_CALLS_BACKEND, CHECK_NO_DUPLICATE_BACKEND, CHECK_COVERAGE_MEASURED,
+    CHECK_EXCLUSION_GAMING, CHECK_COVERAGE_THRESHOLD, CHECK_AC_DEPTH, CHECK_TESTID_LOCATORS,
+    CHECK_NAV_WAITS, CHECK_DESIGN_TOKENS,
+)
+VERIFY_GATE_ID = "minimal-code-to-green_verify"
+
+
 async def verify_coverage(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
-    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True,
+    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True, *, log: CheckLog | None = None,
 ) -> "VerificationResult":
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
     through to measure_coverage below, which needs it for its own stack_runner.run_and_report
@@ -1281,6 +1433,9 @@ async def verify_coverage(
     function's own signature. Now threaded through to measure_coverage the same way chat_provider
     is.
 
+    `log` receives one row per VERIFY_CHECKS sub-check actually evaluated (None = a private one);
+    every result carries those rows as `checks`. An early return leaves later checks unrecorded.
+
     `lap` (session-poisoning fix): threaded through to _discover()'s own run_and_report call.
     Coverage-run mostly replays a validated contract deterministically (no LLM call) once one
     exists, but re-discovery (a fresh contract needed, or every replay attempt failed) can still
@@ -1289,6 +1444,11 @@ async def verify_coverage(
     background scan, not a redraft loop, and keeps working unchanged without passing one."""
     from ..graph import VerificationResult
     from .write_scope_gate import _is_pipeline_owned, _is_test_path
+
+    log = log if log is not None else CheckLog(VERIFY_GATE_ID, VERIFY_CHECKS)
+
+    def _result(**kwargs: Any) -> VerificationResult:
+        return VerificationResult(**kwargs, checks=[row.to_dict() for row in log.results()])
 
     # Did this stage write any APPLICATION code at all? Checked first, deterministically, because
     # the alternative is a confusing infra error several minutes later: with no app in the tree
@@ -1313,11 +1473,15 @@ async def verify_coverage(
         and _is_application_source(stripped)
     ]
     if not source_files:
+        log.infra(CHECK_APP_SOURCE, f"no application source files{_INFRA_LABEL_NOTE}")
+    else:
+        log.passed(CHECK_APP_SOURCE, f"{len(source_files)} source file(s)")
+    if not source_files:
         # No app at all makes every other structural check moot (nothing to check a frontend or
         # integration fidelity against) -- this one stays a lone precondition guard, same as
         # before. Once real app code exists, though, frontend-missing and integration-fidelity are
         # independent problems and get aggregated below instead of hiding one behind the other.
-        return VerificationResult(
+        return _result(
             passed=False,
             feedback=(
                 "You wrote NO application code -- the repository contains only test files and "
@@ -1337,7 +1501,7 @@ async def verify_coverage(
     structural_reasons: list[str] = []
     structural_report: dict[str, Any] = {}
 
-    missing_ui = await _missing_declared_frontend(provider, thread_id, source_files)
+    missing_ui = await _missing_declared_frontend(provider, thread_id, source_files, log=log)
     if missing_ui:
         structural_codes.append("declared_frontend_missing")
         structural_reasons.append(
@@ -1355,13 +1519,13 @@ async def verify_coverage(
         )
         structural_report["framework"] = missing_ui
 
-    integration_problem = await _check_integration_fidelity(provider, thread_id, source_files)
+    integration_problem = await _check_integration_fidelity(provider, thread_id, source_files, log=log)
     if integration_problem:
         structural_codes.append("integration_fidelity")
         structural_reasons.append(integration_problem)
 
     if structural_reasons:
-        return VerificationResult(
+        return _result(
             passed=False,
             feedback="\n\n".join(structural_reasons),
             report={"infra_error": "+".join(structural_codes), **structural_report},
@@ -1389,7 +1553,8 @@ async def verify_coverage(
                 "version that IS installed -- check `dotnet --list-runtimes` / the equivalent for "
                 "this stack rather than assuming a version."
             )
-        return VerificationResult(
+        log.infra(CHECK_COVERAGE_MEASURED, f"no parseable coverage report: {reason}")
+        return _result(
             passed=False,
             feedback=(
                 "The coverage run produced no parseable report -- treat this as an infra failure, "
@@ -1398,9 +1563,11 @@ async def verify_coverage(
             report={"infra_error": reason, "contract_replay": entry_reports},
         )
 
+    log.passed(CHECK_COVERAGE_MEASURED, f"line {line_rate:.1f}% / branch {branch_rate:.1f}%")
     gaming_violations = await _check_exclusion_gaming(provider, thread_id)
     if gaming_violations:
-        return VerificationResult(
+        log.failed(CHECK_EXCLUSION_GAMING, f"{len(gaming_violations)} non-allowlisted exclusion(s): {gaming_violations[0]}")
+        return _result(
             passed=False,
             feedback=(
                 "Coverage-exclusion config was broadened outside known-safe generated-code patterns "
@@ -1409,7 +1576,12 @@ async def verify_coverage(
             report={"gaming_violations": gaming_violations},
         )
 
+    log.passed(CHECK_EXCLUSION_GAMING)
     passed = line_rate >= MIN_COVERAGE_PERCENT and branch_rate >= MIN_COVERAGE_PERCENT
+    (log.passed if passed else log.failed)(
+        CHECK_COVERAGE_THRESHOLD,
+        f"line {line_rate:.1f}% / branch {branch_rate:.1f}% vs {MIN_COVERAGE_PERCENT}% threshold",
+    )
     report = {
         "line_rate": line_rate,
         "branch_rate": branch_rate,
@@ -1425,9 +1597,9 @@ async def verify_coverage(
         # requirement escalated three consecutive runs (see MIN_NON_E2E_TESTS_PER_AC_RED). High
         # coverage does NOT imply per-criterion depth: one integration test through a small app can
         # colour in every line while leaving most criteria proven only in the browser.
-        depth = await check_ac_depth(provider, thread_id)
+        depth = await check_ac_depth(provider, thread_id, log=log)
         if depth is not None:
-            return VerificationResult(passed=False, feedback=depth[0], report={**report, **depth[1]})
+            return _result(passed=False, feedback=depth[0], report={**report, **depth[1]})
         # DESIGN.md color-token conformance, same tier as the depth/testid/nav-wait checks just
         # above: a deterministic backstop to the two LLM-level enforcement layers (graph.py's
         # IMPECCABLE_CODEGEN_SEGMENT/IMPECCABLE_CRITIQUE_SEGMENT). Best-effort: an owner/repo lookup
@@ -1438,16 +1610,22 @@ async def verify_coverage(
             sess = await get_session(thread_id)
         except Exception:  # noqa: BLE001
             sess = None
-        if sess is not None:
+        if sess is None:
+            log.skipped(CHECK_DESIGN_TOKENS, "session record (owner/repo) unavailable")
+        else:
             from .design_tokens_gate import check_design_tokens
 
             design_violation = await check_design_tokens(provider, thread_id, sess["owner"], sess["repo"], source_files)
             if design_violation is not None:
-                return VerificationResult(
+                log.failed(CHECK_DESIGN_TOKENS, f"off-palette color literals in {len(design_violation[1])} file(s)")
+                return _result(
                     passed=False, feedback=design_violation[0],
                     report={**report, "design_token_violations": design_violation[1]},
                 )
-        return VerificationResult(passed=True, feedback=f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) meets the {MIN_COVERAGE_PERCENT}% threshold.", report=report)
+            # check_design_tokens returns None both for "no violations" and for "no DESIGN.md color
+            # tokens to check against" -- it can't tell us which, so both read as passed here.
+            log.passed(CHECK_DESIGN_TOKENS, "no off-palette colors (or no DESIGN.md color tokens to check)")
+        return _result(passed=True, feedback=f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) meets the {MIN_COVERAGE_PERCENT}% threshold.", report=report)
 
     # Absolute deficit, not just rates: "88.0% vs 95%" reads as far away, "+7 branch sides" reads
     # as one lap of work. Summed from the replay entries' own covered/total counts.
@@ -1503,7 +1681,7 @@ async def verify_coverage(
         if line_deficit is not None and branch_deficit is not None
         else ""
     )
-    return VerificationResult(
+    return _result(
         passed=False,
         feedback=(
             f"Coverage {line_rate:.1f}%/{branch_rate:.1f}% (line/branch) is below the "
@@ -1933,7 +2111,88 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_HARD_RULES)
     assert len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE) == 4, len(MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
     assert all(isinstance(r, str) and r.strip() for r in MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE)
+
+    _demo_verify_checks()
     print("test_coverage_gate self-check: all assertions passed")
+
+
+def _demo_verify_checks() -> None:  # pragma: no cover
+    """verify_coverage's per-sub-check rows: pass path, two early-return paths, and a text scan that
+    every declared Check is actually recorded somewhere."""
+    import asyncio
+    import inspect
+
+    from .. import session_store
+    from ..sandbox.provider import ExecResult
+    from . import design_tokens_gate
+
+    class _VerifyProv:
+        def __init__(self, tree: str) -> None:
+            self.tree = tree
+
+        async def exec_in_sandbox(self, _t: str, command: str) -> ExecResult:
+            if command == "git ls-files && git ls-files --others --exclude-standard":
+                return ExecResult(0, self.tree, "")
+            if command.startswith("cat "):
+                return ExecResult(1, "", "cat: x: No such file or directory")
+            return ExecResult(0, "", "")
+
+    async def _no_design_violation(*_a: Any) -> None:
+        return None
+
+    async def _sess(_t: str) -> dict[str, str]:
+        return {"owner": "o", "repo": "r"}
+
+    g = globals()
+    saved = (g["measure_coverage"], session_store.get_session, design_tokens_gate.check_design_tokens)
+    session_store.get_session = _sess
+    design_tokens_gate.check_design_tokens = _no_design_violation
+
+    def _run(tree: str, rates: tuple[float, float]) -> Any:
+        async def _measure(*_a: Any, **_k: Any) -> Any:
+            return rates[0], rates[1], [], "", []
+
+        g["measure_coverage"] = _measure
+        log = CheckLog(VERIFY_GATE_ID, VERIFY_CHECKS, strict=True)
+        result = asyncio.run(verify_coverage("t", {}, "run", None, _VerifyProv(tree), "copilot", log=log))  # type: ignore[arg-type]
+        assert result.checks == [r.to_dict() for r in log.results()], result.checks
+        return result, [(r.id, r.status) for r in log.results()]
+
+    try:
+        # Pass path: every declared check gets exactly one row, in VERIFY_CHECKS order.
+        ok, rows = _run("src/app.py\n", (97.0, 96.0))
+        assert ok.passed and ok.feedback.startswith("Coverage 97.0%/96.0%"), ok.feedback
+        assert [cid for cid, _ in rows] == [c.id for c in VERIFY_CHECKS], rows
+        statuses = dict(rows)
+        assert statuses["code.app_source"] == "passed" and statuses["code.coverage_threshold"] == "passed"
+        assert statuses["code.frontend_present"] == "skipped"  # no tech-stack record in the fake tree
+        assert statuses["code.ac_depth"] == "skipped"  # no spec ledger
+        assert statuses["code.design_tokens"] == "passed", rows
+
+        # Early return: no application source -> one infra row, nothing later recorded.
+        empty, rows = _run("tests/test_app.py\n", (97.0, 96.0))
+        assert not empty.passed and empty.report == {"infra_error": "no_application_code", "source_files": 0}
+        assert rows == [("code.app_source", "infra")], rows
+
+        # Below threshold: the threshold row fails with the rates; depth/tokens never run.
+        low, rows = _run("src/app.py\n", (80.0, 70.0))
+        assert not low.passed and rows[-1] == ("code.coverage_threshold", "failed"), rows
+        assert "line 80.0% / branch 70.0% vs" in low.checks[-1]["detail"], low.checks[-1]
+        assert not {"code.ac_depth", "code.design_tokens"} & {cid for cid, _ in rows}, rows
+    finally:
+        g["measure_coverage"], session_store.get_session, design_tokens_gate.check_design_tokens = saved
+
+    # Text scan: each declared Check is handed to a log.* call in a recording function (directly,
+    # or via a local tuple iterated into one).
+    recording_src = "".join(inspect.getsource(fn) for fn in (
+        verify_coverage, _missing_declared_frontend, _check_integration_fidelity, check_ac_depth,
+    ))
+    assert "log." in recording_src
+    for name, value in list(g.items()):
+        if isinstance(value, Check) and name.startswith("CHECK_"):
+            assert value in VERIFY_CHECKS, name
+            assert name in recording_src, f"{name} is declared but never recorded"
+    assert len({c.id for c in VERIFY_CHECKS}) == len(VERIFY_CHECKS)
 
 
 if __name__ == "__main__":
