@@ -434,6 +434,9 @@ class VerificationResult:
     passed: bool
     feedback: str
     report: dict[str, Any]
+    # Per-sub-check rows (gates/checks.py CheckResult.to_dict()) for the frontend's gate dialog and
+    # dbo.verify_check_results. Empty for a gate not yet instrumented.
+    checks: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _submit_verification_record(result: VerificationResult, lap: int) -> dict[str, Any]:
