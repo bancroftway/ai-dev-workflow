@@ -38,7 +38,7 @@
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as this image's other file-only
 // hooks: no AIDW_-prefixed env var gates this -- manifest.json's own existence, and git itself
 // being available (this pipeline's whole model is a git checkout), is the entire scope check.
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
 
@@ -95,11 +95,16 @@ if (input.stop_hook_active) process.exit(0);
 
 const cwd = input.cwd || ".";
 
+const manifestPath = `${cwd}/${MANIFEST_PATH}`;
+if (!existsSync(manifestPath)) process.exit(0); // not this stage's turn, or file not written yet
+
 let manifestDoc;
 try {
-  manifestDoc = JSON.parse(readFileSync(`${cwd}/${MANIFEST_PATH}`, "utf8"));
+  manifestDoc = JSON.parse(readFileSync(manifestPath, "utf8"));
 } catch {
-  process.exit(0); // not this stage's turn, or file not written yet
+  // Present but unreadable/invalid JSON -- a genuine fail-open, unlike the routine absence above.
+  reportFailOpen(HOOK_NAME, stage, `unreadable or invalid JSON: ${MANIFEST_PATH}`, cwd);
+  process.exit(0);
 }
 
 const diagrams = Array.isArray(manifestDoc?.diagrams) ? manifestDoc.diagrams : [];

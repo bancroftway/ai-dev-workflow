@@ -21,7 +21,7 @@
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs: no
 // AIDW_-prefixed env var gates this -- draft-specification.json's own existence in the working
 // directory is the entire scope check.
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
 
 const HOOK_NAME = "check-narrative-format-stop";
@@ -91,11 +91,16 @@ if (input.stop_hook_active) process.exit(0);
 
 const cwd = input.cwd || ".";
 
+const draftSpecPath = `${cwd}/${DRAFT_SPEC_PATH}`;
+if (!existsSync(draftSpecPath)) process.exit(0); // not this stage's turn, or file not written yet
+
 let draft;
 try {
-  draft = JSON.parse(readFileSync(`${cwd}/${DRAFT_SPEC_PATH}`, "utf8"));
+  draft = JSON.parse(readFileSync(draftSpecPath, "utf8"));
 } catch {
-  process.exit(0); // absent, unreadable, or invalid JSON -- not this hook's problem to report
+  // Present but unreadable/invalid JSON -- a genuine fail-open, unlike the routine absence above.
+  reportFailOpen(HOOK_NAME, stage, `unreadable or invalid JSON: ${DRAFT_SPEC_PATH}`, cwd);
+  process.exit(0);
 }
 
 if (!Array.isArray(draft.user_stories)) process.exit(0); // not this stage's turn, or file not written yet

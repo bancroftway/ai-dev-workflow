@@ -27,7 +27,7 @@
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs and
 // check-plan-schema-stop.mjs: no AIDW_-prefixed env var gates this -- steps.json's own existence
 // in the working directory is the entire scope check.
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
 
@@ -52,10 +52,14 @@ if (input.stop_hook_active) process.exit(0);
 const cwd = input.cwd || ".";
 
 function readJson(relPath) {
+  const path = `${cwd}/${relPath}`;
+  if (!existsSync(path)) return undefined; // not this stage's turn, or file not written yet
   try {
-    return JSON.parse(readFileSync(`${cwd}/${relPath}`, "utf8"));
+    return JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return undefined; // absent, unreadable, or invalid JSON -- reported separately (schema hook) or not this stage's turn
+    // Present but unreadable/invalid JSON -- a genuine fail-open, unlike the routine absence above.
+    reportFailOpen(HOOK_NAME, stage, `unreadable or invalid JSON: ${relPath}`, cwd);
+    return undefined;
   }
 }
 

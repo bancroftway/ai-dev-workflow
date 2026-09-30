@@ -121,10 +121,14 @@ if (input.stop_hook_active) process.exit(0);
 const cwd = input.cwd || ".";
 
 function readJson(relPath) {
+  const path = `${cwd}/${relPath}`;
+  if (!existsSync(path)) return undefined; // not this stage's turn, or file not written yet
   try {
-    return JSON.parse(readFileSync(`${cwd}/${relPath}`, "utf8"));
+    return JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return undefined; // absent, unreadable, or invalid JSON -- reported separately per file below
+    // Present but unreadable/invalid JSON -- a genuine fail-open, unlike the routine absence above.
+    reportFailOpen(HOOK_NAME, stage, `unreadable or invalid JSON: ${relPath}`, cwd);
+    return undefined;
   }
 }
 
