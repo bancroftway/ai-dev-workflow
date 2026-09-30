@@ -25,9 +25,9 @@
 // field names as its own magic strings.
 //
 // WIREFRAME-CONTENT CHECK (check_wireframe) and the MANIFEST-ORPHAN SWEEP below used to be hand-
-// ported from gates/diagram_gate.py (MAX_WIREFRAME_BYTES/SAFE_DIAGRAM_NAME_RE/WIREFRAME_FORBIDDEN/
-// check_wireframe, and _load_and_check_manifest's own disk-vs-manifest set-difference logic) --
-// "KEEP THESE IN SYNC WITH gates/diagram_gate.py BY HAND, no automated drift guard". Both now live
+// ported from gates/diagram_gate.py -- its wireframe byte-size cap, safe-filename pattern, and
+// forbidden-HTML-pattern denylist, plus _load_and_check_manifest's own disk-vs-manifest
+// set-difference logic -- with a "KEEP IN SYNC BY HAND, no automated drift guard" warning. Both now live
 // in gates/wireframe_linkage_checks.py (byte-identical staged copy at
 // /opt/aidw-hooks/wireframe_linkage_checks.py, same as the linkage checks
 // check-plan-citations-stop.mjs already shells out to), so this hook SHELLS OUT to the REAL

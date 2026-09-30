@@ -31,6 +31,7 @@ from . import write_scope_gate
 from .wireframe_linkage_checks import (
     MAX_WIREFRAME_BYTES,
     SAFE_DIAGRAM_NAME_RE,
+    ac_id_existence_kind_problems,
     check_manifest_orphans,
     check_plan_step_wireframe_coverage,
     check_ui_wireframe_coverage,
@@ -275,12 +276,14 @@ def check_plan_linkage(
                     "every feature step must name the US-####.# ids it fulfils"
                 )
             continue
-        bad = [i for i in ac_ids if by_id.get(i) is None or by_id[i].get("kind") != "acceptance_criterion"]
-        if bad:
-            problems.append(
-                f"{step_id}: cites {', '.join(bad)} which is not an acceptance criterion in the "
-                "ledger -- copy ids exactly from the approved Specification"
-            )
+        # Existence+kind validity: shared with check_ac_id_citation (gates/wireframe_linkage_checks.py)
+        # via ac_id_existence_kind_problems (2026-09-29, Task 9 fix-review) -- was two independently
+        # retyped copies of the identical one-liner/message; only THIS sub-check is shared. The
+        # liveness/carryover logic below stays here, unchanged -- it's genuinely entangled with
+        # coded_run_id/prior-step state check_ac_id_citation deliberately doesn't have.
+        existence_problems = ac_id_existence_kind_problems(step_id, ac_ids, by_id)
+        if existence_problems:
+            problems.extend(existence_problems)
             continue
         live = [i for i in ac_ids if by_id[i].get("status") in ("active", "revised")]
         if not live:

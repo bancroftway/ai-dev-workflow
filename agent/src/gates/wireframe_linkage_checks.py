@@ -28,12 +28,15 @@ full_read_checks.py extraction both already used:
 - `check_ac_id_citation` (the hand-ported JS `checkAcIds`'s exact behavior: existence+kind, plus an
   optional liveness check) and `check_retired_step_ids` -- `check-plan-citations-stop.mjs`'s own
   remaining hand-ported half, originally hand-derived from `diagram_gate.py`'s `check_plan_linkage`
-  and `spec_ledger.py`'s `sync_plan_ledger` respectively. Deliberately NOT the same code as
-  `check_plan_linkage` itself: that function's own ac_ids validity logic is inseparably fused with
-  its coverage-side/rework-forbidden rules (a later, separate task's scope -- see this module's own
-  functions' docstrings below for exactly where the two diverge), so `diagram_gate.py` keeps its
-  existing, richer `check_plan_linkage` untouched; only `spec_ledger.py`'s `sync_plan_ledger`, whose
-  `retired_step_ids` validity loop has no such entanglement, was updated to import from here.
+  and `spec_ledger.py`'s `sync_plan_ledger` respectively. `check_plan_linkage` itself keeps its own,
+  richer liveness/carryover/coverage-side/rework-forbidden logic untouched (a later, separate task's
+  scope -- see `check_ac_id_citation`'s own docstring for exactly where the two diverge); only
+  `spec_ledger.py`'s `sync_plan_ledger`'s `retired_step_ids` validity loop, which has no such
+  entanglement, was updated to import `check_retired_step_ids` directly. A task review (2026-09-29)
+  then caught that the ONE sub-check `check_plan_linkage` and `check_ac_id_citation` both genuinely
+  share -- id existence + kind='acceptance_criterion', with no liveness involved -- had been
+  independently retyped in both places rather than called from one; `ac_id_existence_kind_problems`
+  is that shared sub-check, called by both.
 
 CLI mode (`python3 wireframe_linkage_checks.py --check-hook`, stdin JSON: `{"wireframes": [...],
 "ledger_entries": [...], "ui_related_ac_ids": [...], "plan_steps": [...], "diagrams": [...],
@@ -244,15 +247,39 @@ def check_manifest_orphans(
 _LIVE_STATUSES = frozenset({"active", "revised"})
 
 
+def ac_id_existence_kind_problems(
+    label: str, ac_ids: list[str], by_id: dict[str, dict[str, Any] | None]
+) -> list[str]:
+    """Existence+kind validity ONLY -- an id must exist in the ledger and be
+    kind='acceptance_criterion'. Shared by `check_ac_id_citation` below AND
+    `diagram_gate.check_plan_linkage`'s own step-side citation check: a task review (2026-09-29)
+    caught the two independently retyping this exact one-liner with the exact same rejection
+    message -- a real, not hypothetical, drift risk (this rule's own liveness-branching sibling
+    below was already revised once in production, 2026-08-31, for the mixed-citation case; nothing
+    ties two copies of this simpler check together the same way). Deliberately narrower than
+    `check_ac_id_citation` -- no liveness branching lives here, since `check_plan_linkage`'s OWN
+    liveness/carryover logic (the part that genuinely IS entangled with its coded_run_id/prior-step
+    state, and stays untouched by this extraction) needs to run only when THIS check passes. Pure.
+    """
+    bad = [i for i in ac_ids if by_id.get(i) is None or by_id[i].get("kind") != "acceptance_criterion"]
+    if not bad:
+        return []
+    return [
+        f"{label}: cites {', '.join(bad)} which is not an acceptance criterion in the ledger "
+        "-- copy ids exactly from the approved Specification"
+    ]
+
+
 def check_ac_id_citation(
     label: str, ac_ids: list[str], ledger_entries: list[dict[str, Any]], require_live: bool
 ) -> list[str]:
     """Citation-validity for an id list that names acceptance criteria (a plan step's or a
     diagram's own ac_ids) -- moved from check-plan-citations-stop.mjs's own hand-ported `checkAcIds`
     (itself hand-derived from diagram_gate.py's `check_plan_linkage`): every id must exist in the
-    ledger and be kind='acceptance_criterion'; when `require_live` is set (plan steps, which may
-    only cite currently-live work), every id must also be status active/revised -- a diagram may
-    cite a deferred id too (existence+kind only matters there, same as check_wireframe_ac_ids's own
+    ledger and be kind='acceptance_criterion' (delegated to `ac_id_existence_kind_problems` above,
+    shared with `check_plan_linkage`); when `require_live` is set (plan steps, which may only cite
+    currently-live work), every id must also be status active/revised -- a diagram may cite a
+    deferred id too (existence+kind only matters there, same as check_wireframe_ac_ids's own
     citation-validity-only scope above).
 
     Deliberately the SIMPLER of the two liveness checks this pipeline has for plan-step ac_ids:
@@ -261,15 +288,13 @@ def check_ac_id_citation(
     part of its own coverage-side/rework-forbidden logic -- explicitly out of scope for this
     extraction (a separate, later task's job; see this file's own header). This function reports
     ANY non-live id the same way, exactly matching what the hand-ported JS always did -- so
-    `diagram_gate.check_plan_linkage` is NOT rewired to call this; it keeps its own richer,
-    untouched implementation. Pure."""
+    `diagram_gate.check_plan_linkage`'s own liveness/carryover branching is NOT rewired to call
+    this; only its existence/kind sub-check is shared (via `ac_id_existence_kind_problems`). Pure.
+    """
     by_id = {e.get("id"): e for e in ledger_entries}
-    bad = [i for i in ac_ids if by_id.get(i) is None or by_id[i].get("kind") != "acceptance_criterion"]
-    if bad:
-        return [
-            f"{label}: cites {', '.join(bad)} which is not an acceptance criterion in the ledger "
-            "-- copy ids exactly from the approved Specification"
-        ]
+    existence_problems = ac_id_existence_kind_problems(label, ac_ids, by_id)
+    if existence_problems:
+        return existence_problems
     if not require_live:
         return []
     non_live = [i for i in ac_ids if by_id[i].get("status") not in _LIVE_STATUSES]
@@ -489,13 +514,29 @@ def _demo() -> None:
     )), "same sweep, diagram side: a .mmd on disk not in manifest.json is orphaned"
     assert check_manifest_orphans(set(), set(), set(), {"data-model"}, {"data-model"}, set()) == []
 
-    # --- check_ac_id_citation (Task 9: the checkAcIds JS hand-port's exact behavior) ---
+    # --- ac_id_existence_kind_problems (Task 9 fix-review: the shared existence/kind sub-check
+    # both check_ac_id_citation below AND diagram_gate.check_plan_linkage now call, closing a
+    # real duplication a task review caught -- two copies of the identical one-liner/message). ---
     plan_ledger = [
         {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
         {"id": "US-0001.2", "kind": "acceptance_criterion", "status": "retired"},
         {"id": "US-0001.3", "kind": "acceptance_criterion", "status": "deferred"},
         {"id": "US-0002", "kind": "user_story", "status": "active"},
     ]
+    plan_by_id = {e["id"]: e for e in plan_ledger}
+    assert ac_id_existence_kind_problems("PS-1", ["US-0001.1"], plan_by_id) == []
+    assert any("US-0009.9" in p and "not an acceptance criterion" in p for p in ac_id_existence_kind_problems(
+        "PS-1", ["US-0009.9"], plan_by_id
+    )), "an id absent from the ledger entirely"
+    assert any("US-0002" in p for p in ac_id_existence_kind_problems("PS-1", ["US-0002"], plan_by_id)), (
+        "a user_story id, not an acceptance criterion, fails the kind check"
+    )
+    assert ac_id_existence_kind_problems("PS-1", ["US-0001.2", "US-0001.3"], plan_by_id) == [], (
+        "retired/deferred ids are still a real, existing acceptance criterion -- liveness is a "
+        "separate, caller-specific concern this shared sub-check deliberately doesn't touch"
+    )
+
+    # --- check_ac_id_citation (Task 9: the checkAcIds JS hand-port's exact behavior) ---
     assert check_ac_id_citation("PS-1", ["US-0001.1"], plan_ledger, True) == []
     assert any("US-0009.9" in p and "not an acceptance criterion" in p for p in check_ac_id_citation(
         "PS-1", ["US-0009.9"], plan_ledger, True
