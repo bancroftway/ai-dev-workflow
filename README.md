@@ -290,7 +290,7 @@ Bug-ticket conditionality comes from the specification stage's `work_kind` class
 
 ## Deterministic gates and hooks
 
-Every non-LLM check the pipeline enforces on generated apps, in pipeline order. One row group per stage; inside each, one group per phase. Blank Stage/Phase cell = same as the row above. Guarded by the same freshness hook as the graph diagram (see [Keeping this README current](#keeping-this-readme-current)).
+Every non-LLM check the pipeline enforces on generated apps, in pipeline order. One row group per stage; inside each, one group per phase. Blank Stage/Phase cell = same as the row above.
 
 The audit/verify rows below describe each check's own logic — what runs when that phase is reached. Whether a stage's audit and/or verify phase is reached AT ALL is a separate, session-level decision: `GraphState.code_gen_mode` (`yolo`/`draft_verify`/`mission_critical`, `_wire_stage`'s conditional edges, Part 3 Task 2) skips audit unless the session is `mission_critical`, and skips verify entirely in `yolo`. Every session defaults to `mission_critical` today (Task 1's fallback) when no mode is specified at all, so this table's audit/verify rows are exactly what such a session still runs; Task 3's mode-picker popup (already landed, shown before a genuinely brand-new session's provision call, with Draft & Verify pre-highlighted as the recommended default) is what lets a session actually choose `yolo`/`draft_verify` and reach fewer of them.
 
@@ -419,7 +419,6 @@ Legend: **Hard block** = lap fails, redo required. **Warn** = logged only. **Aut
 | | | `VERIFY_INFRA_RETRY_CAP` = 2. Infra-error laps burn a separate budget from real failures | Info | — |
 | | | `TEST_HARDENING_TOTAL_ATTEMPTS` = 3 (`test_hardening_nodes.py`). Suite re-runs to separate flake from regression | Info | — |
 | | | `REBUILD_OUTPUT_TAIL_CHARS` / `REBUILD_OUTPUT_COMBINED_TAIL_CHARS`, `TEST_COVERAGE_OUTPUT_HEAD/TAIL_CHARS`, `DIAGRAM_ERROR_SUMMARY_HEAD/TAIL_CHARS`, `GRAPH_INFRA_ERROR_CHARS`, etc. = various. `text_truncate.truncate_middle` char caps for feedback shown to redraft prompts (not gates themselves, but shape what a failing gate's feedback can say) | Info | — |
-| **repo meta-hook** — repo-root `.claude/`; NOT part of the generated-app pipeline; don't conflate with a pipeline-stage gate | PostToolUse (Edit\|Write) + Stop | `.claude/hooks/graph-diagram-check.mjs` (wired in `.claude/settings.json`): runs on this dev-workflow repo's own codebase, not inside a sandboxed pipeline run. Hashes the graph sources and the gate/hook sources separately and blocks if either changed but its README section (the graph diagram, or this table) wasn't re-stamped | Hard block on Stop (`--stop`, exit 2); note only on PostToolUse | — |
 
 ---
 
@@ -619,26 +618,3 @@ Every resource name derives from `namePrefix = aidw-<target>` (`aidw-nonprod-con
 globally-unique resources (ACR, Key Vault, SQL) from colliding across tenants. Config is
 vault-first: bicep passes no secrets; both apps read `aidw-<target>-config` at boot.
 
----
-
-## Keeping this README current
-
-Two sections of this README are written by hand but guarded automatically by [.claude/hooks/graph-diagram-check.mjs](.claude/hooks/graph-diagram-check.mjs), which hashes each section's source files and stamps the hash into this README:
-
-- **graph-source** — the workflow graph diagram. Sources: `graph.py`, the node-cluster modules, `agent/src/gates/`, `agent/src/prompts/`.
-- **gate-inventory** — the [Deterministic gates and hooks](#deterministic-gates-and-hooks) table. Sources: `agent/src/gates/`, `agent/sandbox-image/hooks/` (Stop hooks and their staged Python), `config.py`, `graph.py`, the node-cluster modules, the ledger/chat-model modules the gates call, and `.claude/hooks/` + `.claude/settings.json`.
-
-Two hooks in [.claude/settings.json](.claude/settings.json) run it:
-
-- **PostToolUse** (after any edit) — injects a note telling Claude which section is stale.
-- **Stop** (before the turn ends) — blocks the turn while a section is still stale, so it does not get forgotten.
-
-After updating a section, re-stamp it (one key, or no key for both):
-
-```bash
-node .claude/hooks/graph-diagram-check.mjs --stamp graph-source
-node .claude/hooks/graph-diagram-check.mjs --stamp gate-inventory
-```
-
-<!-- graph-source-sha256: a67cfd1512390a86d485351ee2ac045f99ef52e04dbc500d6ffe250219079203 -->
-<!-- gate-inventory-sha256: e7e7ebe3159135114515d0916c8b888d49ab3122436a026d0d53e2d23ec64fc5 -->

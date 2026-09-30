@@ -57,8 +57,7 @@ try {
   process.exit(0); // no readable stdin -- fail open
 }
 
-// One nudge per turn, never a loop -- same convention as require-skills-stop.mjs /
-// .claude/hooks/graph-diagram-check.mjs --stop.
+// One nudge per turn, never a loop -- same convention as require-skills-stop.mjs.
 if (input.stop_hook_active) process.exit(0);
 
 const cwd = input.cwd || ".";

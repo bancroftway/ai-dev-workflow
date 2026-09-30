@@ -63,8 +63,7 @@ try {
   process.exit(0); // no readable stdin -- fail open
 }
 
-// One nudge per turn, never a loop -- same convention as this repo's own
-// .claude/hooks/graph-diagram-check.mjs --stop.
+// One nudge per turn, never a loop.
 if (input.stop_hook_active) process.exit(0);
 
 let transcript = "";
