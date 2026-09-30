@@ -32,6 +32,7 @@ from typing import Any
 
 from .. import chat_model, config, repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from . import test_quality_checks
+from .checks import Check, CheckLog
 from .ac_residue_checks import (
     _TEST_FILE_LISTING,
     check_completed_ac_protection,
@@ -562,9 +563,58 @@ class AcCoverageOutcome:
     report: dict[str, Any]
 
 
+# Per-sub-check rows for check_ac_coverage (gates/checks.py). write_scope_gate.VERIFY_CHECKS
+# prepends its own and re-exports the whole gate's list in execution order.
+AC_CRITERIA_TO_COVER = Check(
+    "ac_tests.criteria_to_cover", "Criteria to cover",
+    "The ticket has acceptance criteria that still need tests. If every one is already delivered "
+    "(or the ticket only retires criteria), there is nothing new to cover and the gate passes here.",
+    "blocking",
+)
+AC_TEST_RUN = Check(
+    "ac_tests.test_run", "Test suite ran",
+    "The test suite was actually run and produced output this gate can read. Without it, coverage "
+    "cannot be judged at all -- that is an infrastructure problem, not a coverage gap.",
+    "blocking",
+)
+AC_COVERAGE = Check(
+    "ac_tests.coverage", "Every criterion has a test",
+    "Each acceptance criterion is named by at least one test, so nothing the ticket promises goes "
+    "untested.",
+    "collected",
+)
+AC_NOT_TAUTOLOGICAL = Check(
+    "ac_tests.not_tautological", "Tests fail before implementation",
+    "No test passes before the feature exists. A test that is already green with no code behind it "
+    "almost certainly asserts nothing real.",
+    "collected",
+)
+AC_DEPTH = Check(
+    "ac_tests.depth", "Criteria tested in depth",
+    "Each criterion gets enough distinct tests below the UI (and a browser test where it is "
+    "user-facing), not a single happy-path check.",
+    "collected", condition="test files found in the repo",
+)
+AC_TESTID_LOCATORS = Check(
+    "ac_tests.testid_locators", "Browser tests use data-testid",
+    "End-to-end specs locate elements only by data-testid. Role, text or CSS locators can silently "
+    "match a framework-injected element instead of the real one.",
+    "collected",
+)
+AC_NAV_WAITS = Check(
+    "ac_tests.nav_waits", "No flaky navigation waits",
+    "End-to-end specs avoid waitForNavigation() and networkidle waits, which race multi-step "
+    "redirects or never resolve; they assert on a visible element instead.",
+    "collected",
+)
+AC_COVERAGE_CHECKS: tuple[Check, ...] = (
+    AC_CRITERIA_TO_COVER, AC_TEST_RUN, AC_COVERAGE, AC_NOT_TAUTOLOGICAL, AC_DEPTH, AC_TESTID_LOCATORS, AC_NAV_WAITS,
+)
+
+
 async def check_ac_coverage(
     provider: SandboxProvider, thread_id: str, content_dict: dict[str, Any], *, chat_provider: str,
-    run_id: str = "unknown", lap: int = 0,
+    run_id: str = "unknown", lap: int = 0, log: CheckLog | None = None,
 ) -> AcCoverageOutcome:
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is required,
     keyword-only, no default -- threaded straight through to stack_runner.run_and_report below,
@@ -572,8 +622,11 @@ async def check_ac_coverage(
     threaded the same way, defaulting to "unknown" -- its caller (verify_ac_to_tests) already
     carries a real one in scope. `lap` (session-poisoning fix) is the stage's verify_cycle_count,
     threaded straight through to run_and_report's own `lap` kwarg below so a redraft lap that
-    re-runs ac-test-run gets a fresh session instead of resuming every prior lap's growing one."""
-    raw_ledger = await repo_files.read_repo_file(provider, thread_id, LEDGER_PATH)
+    re-runs ac-test-run gets a fresh session instead of resuming every prior lap's growing one.
+    `log` (optional) receives one row per sub-check evaluated; None = a private throwaway log."""
+    if log is None:
+        log = CheckLog("ac-to-tests_verify", AC_COVERAGE_CHECKS)
+    raw_ledger =await repo_files.read_repo_file(provider, thread_id, LEDGER_PATH)
     ledger_entries: list[dict[str, Any]] = []
     active_ac_ids: list[str] = []
     all_ledger_ac_ids: list[str] = []
@@ -643,6 +696,11 @@ async def check_ac_coverage(
             # Every own criterion is already delivered, and/or this is a deletion-only ticket
             # (a spec with no stories, only retirements). Nothing new to cover is a PASS here --
             # trustworthy because coded stamps exist only from regression-clean metrics runs.
+            log.passed(
+                AC_CRITERIA_TO_COVER,
+                f"nothing to cover: all {len(completed_excluded)} criteria already delivered"
+                if completed_excluded else "nothing to cover: ticket only retires criteria",
+            )
             return AcCoverageOutcome(
                 passed=True,
                 feedback=(
@@ -659,11 +717,13 @@ async def check_ac_coverage(
             )
 
     if not active_ac_ids:
+        log.failed(AC_CRITERIA_TO_COVER, "the spec ledger has no active acceptance criteria")
         return AcCoverageOutcome(
             passed=False,
             feedback=".ai-dev-workflow/spec/ledger.json has no active Acceptance Criteria -- P2 must be approved with real ACs before P4 can run.",
             report={},
         )
+    log.passed(AC_CRITERIA_TO_COVER, f"{len(active_ac_ids)} criteria await coverage")
 
     # Fresh-lap evidence guard: the write-scope gate treats runner artifacts (ac-run-*.json,
     # test-results/, *.trx) as pipeline-owned, so a PREVIOUS lap's reports survive on disk.
@@ -739,6 +799,7 @@ async def check_ac_coverage(
         await chat_model.close_session(
             thread_id, "ac-test-run", chat_model.lap_role("draft", run_id, lap), provider=chat_provider
         )
+        log.infra(AC_TEST_RUN, f"no test output or runner report captured: {diagnosis}")
         return AcCoverageOutcome(
             passed=False,
             feedback=(
@@ -762,6 +823,11 @@ async def check_ac_coverage(
             else "the run agent's tee claim was not honored",
         )
         output = ""
+    log.passed(
+        AC_TEST_RUN,
+        f"{len(structured_reports)} structured runner report(s)" + ("" if tee_missing else " + console output")
+        if structured_reports else "console output only",
+    )
     # The suite is expected RED at this stage; exit_ok is the runner's own exit status, which the
     # tree-grep fallback below keys off exactly as the old exec's returncode did.
     result_ok = run_report.exit_ok
@@ -897,6 +963,26 @@ async def check_ac_coverage(
     # docstring for the live incident (a shared signIn() helper racing a multi-hop auth redirect
     # regressed a whole e2e suite).
     nav_wait_violations = flaky_navigation_waits(test_files)
+
+    if missing:
+        log.failed(AC_COVERAGE, "no test found covering: " + "; ".join(missing))
+    else:
+        log.passed(AC_COVERAGE)
+    if tautological:
+        log.failed(AC_NOT_TAUTOLOGICAL, "already passing pre-implementation: " + "; ".join(tautological))
+    else:
+        log.passed(AC_NOT_TAUTOLOGICAL)
+    if not test_files:
+        log.skipped(AC_DEPTH, "no test files found to read")
+    elif depth_shortfall:
+        log.failed(AC_DEPTH, "; ".join(f"{ac}: {' and '.join(p)}" for ac, p in sorted(depth_shortfall.items())))
+    else:
+        log.passed(AC_DEPTH)
+    for check, violations in ((AC_TESTID_LOCATORS, testid_violations), (AC_NAV_WAITS, nav_wait_violations)):
+        if violations:
+            log.failed(check, "; ".join(sorted(violations)))
+        else:
+            log.passed(check)
 
     if missing or tautological or depth_shortfall or testid_violations or nav_wait_violations:
         reasons = []
@@ -1722,9 +1808,15 @@ async def _demo_ticket_scoping() -> None:
     stack_runner.run_and_report = _fake_run_and_report
     try:
         # (a) Ticket #1's shipped, green AC must be excluded entirely -- not merely un-flagged.
+        pass_log = CheckLog("ac-to-tests_verify", AC_COVERAGE_CHECKS, strict=True)
         outcome = await check_ac_coverage(
-            _FakeCoverageProvider(base_files), "t", {}, chat_provider="claude"
+            _FakeCoverageProvider(base_files), "t", {}, chat_provider="claude", log=pass_log
         )
+        assert [(r.id, r.status) for r in pass_log.results()] == [
+            ("ac_tests.criteria_to_cover", "passed"), ("ac_tests.test_run", "passed"), ("ac_tests.coverage", "passed"),
+            ("ac_tests.not_tautological", "passed"), ("ac_tests.depth", "skipped"),
+            ("ac_tests.testid_locators", "passed"), ("ac_tests.nav_waits", "passed"),
+        ], pass_log.results()
         assert outcome.report.get("active_ac_ids") == ["US-0002.1"], (
             "ticket #1's own already-shipped AC leaked into a scope that should be ticket #2-only: "
             f"{outcome.report}"
@@ -1743,9 +1835,13 @@ async def _demo_ticket_scoping() -> None:
         )
         assert "Passed" in trx_tautological and trx_tautological != trx_correct_red
         tautological_files = {**base_files, "TestResults/ac-run.trx": trx_tautological}
+        taut_log = CheckLog("ac-to-tests_verify", AC_COVERAGE_CHECKS, strict=True)
         outcome2 = await check_ac_coverage(
-            _FakeCoverageProvider(tautological_files), "t", {}, chat_provider="claude"
+            _FakeCoverageProvider(tautological_files), "t", {}, chat_provider="claude", log=taut_log
         )
+        taut_rows = {r.id: r for r in taut_log.results()}
+        assert taut_rows["ac_tests.not_tautological"].status == "failed", taut_rows
+        assert "US-0002.1" in (taut_rows["ac_tests.not_tautological"].detail or ""), taut_rows
         assert not outcome2.passed, "ticket #2's own tautological (fake-green) AC must still block"
         assert outcome2.report.get("tautological") == ["US-0002.1"], outcome2.report
 
@@ -1806,6 +1902,14 @@ async def _demo_ticket_scoping() -> None:
             f"a genuinely unattributed test (names no real AC id at all) must still be caught -- "
             f"the distinction must be restored, not silenced entirely: {orphans}"
         )
+
+        # Early return: an empty ledger fails criteria_to_cover and records nothing after it.
+        empty_log = CheckLog("ac-to-tests_verify", AC_COVERAGE_CHECKS, strict=True)
+        empty = await check_ac_coverage(
+            _FakeCoverageProvider({LEDGER_PATH: json.dumps({"entries": []})}), "t", {}, chat_provider="claude", log=empty_log
+        )
+        assert not empty.passed
+        assert [(r.id, r.status) for r in empty_log.results()] == [("ac_tests.criteria_to_cover", "failed")], empty_log.results()
     finally:
         stack_runner.run_and_report = original_run_and_report
 
