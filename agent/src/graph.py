@@ -4962,10 +4962,17 @@ def _code_gen_mode_flags(state: GraphState) -> tuple[bool, bool]:
     Task 1 should not normally happen but costs nothing to keep consistent.
 
     Any OTHER unrecognized value (a bug upstream -- code_gen_mode is typed as a closed Literal, so
-    this should never happen either) falls through the same way "yolo" does: both flags False,
-    same fail-safe direction as the missing-key case above, never a silent both-True.
+    this should never happen either) is normalized to "mission_critical" too, same as the
+    missing-key case above -- Part 2.4's own rule is "never silently downgrade to a weaker mode
+    a caller never asked for," and an unrecognized value is exactly that: unknown intent, not a
+    signal to skip checks. Falling through to both-False (the earlier design here) got this
+    backwards -- it read "both True" as the risky direction, when for this system more
+    verification is always the safe direction and less is the one that needs an explicit,
+    validated request.
     """
     mode = state.get("code_gen_mode", "mission_critical")
+    if mode not in ("yolo", "draft_verify", "mission_critical"):
+        mode = "mission_critical"
     audit_enabled = mode == "mission_critical"
     verify_enabled = mode in ("draft_verify", "mission_critical")
     return audit_enabled, verify_enabled
