@@ -18,7 +18,9 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ..schemas import presence_values as _findings_from
+from . import adversarial_audit_checks as _ac
 from .adversarial_audit_checks import BLOCKING_SEVERITIES, BLOCKING_VERDICTS, evaluate_audit
+from .checks import Check, CheckLog
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
@@ -57,22 +59,61 @@ ADVERSARIAL_COMPLIANCE_HARD_RULES: tuple[str, ...] = (
 )
 
 
+ADV_REPORT = Check(
+    _ac.CHECK_REPORT, "Audit report present",
+    "The audit must hand back a report comparing the code to the approved Plan. An empty report can't "
+    "be told apart from an audit that never happened.", "blocking",
+)
+ADV_VERDICT = Check(
+    _ac.CHECK_VERDICT, "Verdict given and not blocking",
+    "The audit must commit to an overall verdict, and major_gaps or fails_to_conform stops the run. "
+    "A stage whose job is to judge has to actually judge.", "blocking",
+)
+ADV_BLOCKING_FINDINGS = Check(
+    _ac.CHECK_BLOCKING_FINDINGS, "No critical or major divergences",
+    "Any single finding rated critical or major blocks, whatever the overall verdict says. An upbeat "
+    "summary can't cancel out a serious gap found underneath it.", "blocking",
+)
+ADV_MINOR_SWEEP = Check(
+    "adversarial.minor_sweep", "Minor divergences get one fix pass",
+    "When the audit is otherwise clean but minor divergences remain, the stage gets exactly one extra "
+    "lap to fix the easy ones. One lap only, because a hunt for zero minors never converges.",
+    "blocking", condition="once per run, when the audit is otherwise clean and minor findings remain",
+)
+VERIFY_CHECKS: tuple[Check, ...] = (ADV_REPORT, ADV_VERDICT, ADV_BLOCKING_FINDINGS, ADV_MINOR_SWEEP)
+_CHECK_MAP = {c.id: c for c in VERIFY_CHECKS}
+_SWEEP_SCOPE_NOTE = "sweep flag is per-process: a restart can repeat the one sweep lap"
+
+
 async def verify_adversarial_compliance(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: Any,
-    _chat_provider: str, _lap: int = 0, _audit_ran_this_lap: bool = True,
+    _chat_provider: str, _lap: int = 0, _audit_ran_this_lap: bool = True, *, log: CheckLog | None = None,
 ) -> "VerificationResult":
     # _chat_provider (StageSpec.deterministic_verify's Ruling-4 addition) is unused: this check has
     # no chat-model dispatch call of its own.
     from ..graph import VerificationResult
 
+    log = log or CheckLog("adversarial-compliance_verify", VERIFY_CHECKS)
     await _snapshot_findings(provider, thread_id, run_id, content_dict)
 
-    passed, reasons = evaluate_audit(content_dict)
+    passed, tagged, ran = _ac.evaluate_audit_checks(content_dict)
+    reasons = [reason for _check_id, reason in tagged]
+    for check in VERIFY_CHECKS:
+        check_reasons = [reason for check_id, reason in tagged if check_id == check.id]
+        if check_reasons:
+            log.record_tagged(_CHECK_MAP, [(check.id, "\n".join(check_reasons))])
+        elif check.id in ran:
+            log.passed(check)
     if passed:
         findings = _findings_from(content_dict.get("divergence_findings"))
         minors = [f for f in findings if str(f.get("severity") or "").lower() == "minor"]
+        if not minors:
+            log.passed(ADV_MINOR_SWEEP, "no minor findings")
+        elif (thread_id, run_id) in _MINOR_SWEEP_DONE:
+            log.passed(ADV_MINOR_SWEEP, f"{len(minors)} minor finding(s) left after this run's sweep lap ({_SWEEP_SCOPE_NOTE})")
         if minors and (thread_id, run_id) not in _MINOR_SWEEP_DONE:
             _MINOR_SWEEP_DONE.add((thread_id, run_id))
+            log.failed(ADV_MINOR_SWEEP, f"{len(minors)} minor finding(s): one fix lap ({_SWEEP_SCOPE_NOTE})")
             logger.info("adversarial gate: minor sweep -- one fix lap for %d minor finding(s)", len(minors))
             lines = [
                 f"- {MINOR_SWEEP_MARKER} [{f.get('severity')}] "
@@ -98,6 +139,7 @@ async def verify_adversarial_compliance(
                     "minor_sweep": len(minors),
                     "blocking_reasons": [line[2:] for line in lines],
                 },
+                checks=[r.to_dict() for r in log.results()],
             )
         return VerificationResult(
             passed=True,
@@ -106,6 +148,7 @@ async def verify_adversarial_compliance(
                 f"{len(findings)} divergence finding(s), none critical/major"
             ),
             report={"overall_verdict": content_dict.get("overall_verdict"), "divergence_count": len(findings)},
+            checks=[r.to_dict() for r in log.results()],
         )
 
     logger.info("adversarial gate: blocking (%d reason(s))", len(reasons))
@@ -121,6 +164,7 @@ async def verify_adversarial_compliance(
             "overall_verdict": content_dict.get("overall_verdict") if content_dict else None,
             "blocking_reasons": reasons,
         },
+        checks=[r.to_dict() for r in log.results()],
     )
 
 
@@ -241,6 +285,37 @@ def _demo() -> None:
     ))
     assert clean.passed, clean
     _MINOR_SWEEP_DONE.clear()
+
+    # Per-sub-check rows.
+    def _statuses(result: Any) -> list[tuple[str, str]]:
+        return [(r["id"], r["status"]) for r in result.checks]
+
+    ok = [(ADV_REPORT.id, "passed"), (ADV_VERDICT.id, "passed"), (ADV_BLOCKING_FINDINGS.id, "passed")]
+    assert _statuses(clean) == ok + [(ADV_MINOR_SWEEP.id, "passed")], clean.checks
+    assert _statuses(first) == ok + [(ADV_MINOR_SWEEP.id, "failed")], first.checks
+    assert "per-process" in first.checks[-1]["detail"], first.checks
+    assert _statuses(second) == ok + [(ADV_MINOR_SWEEP.id, "passed")] and "per-process" in second.checks[-1]["detail"]
+    empty = asyncio.run(verify_adversarial_compliance("t3", None, "r1", None, _StubProvider(), "claude"))
+    assert _statuses(empty) == [(ADV_REPORT.id, "failed")], empty.checks  # later checks never reached
+    shared = CheckLog("adversarial-compliance_verify", VERIFY_CHECKS, strict=True)
+    blocked = asyncio.run(verify_adversarial_compliance(
+        "t3", {**contradictory, "overall_verdict": "major_gaps"}, "r1", None, _StubProvider(), "claude", log=shared,
+    ))
+    assert _statuses(blocked) == [(ADV_REPORT.id, "passed"), (ADV_VERDICT.id, "failed"), (ADV_BLOCKING_FINDINGS.id, "failed")]
+    assert "US-0003.2" in blocked.checks[2]["detail"] and len(shared.results()) == 3
+    _MINOR_SWEEP_DONE.clear()
+
+    # Every declared Check is referenced: tagged by the helper or logged here (text scan).
+    import inspect
+    import sys
+
+    helper_src = inspect.getsource(_ac.evaluate_audit_checks)
+    gate_src = inspect.getsource(sys.modules[__name__].verify_adversarial_compliance)
+    for check in VERIFY_CHECKS:
+        name = next((k for k, v in vars(_ac).items() if k.startswith("CHECK_") and v == check.id), None)
+        var = next(k for k, v in globals().items() if v is check)
+        referenced = helper_src.count(name) >= 2 if name else f"({var}" in gate_src
+        assert referenced, f"{check.id} is declared but never recorded"
 
     # Task 13b: ADVERSARIAL_COMPLIANCE_HARD_RULES -- one line per real rejection branch in
     # evaluate_audit/verify_adversarial_compliance (see the constant's own comment for the count

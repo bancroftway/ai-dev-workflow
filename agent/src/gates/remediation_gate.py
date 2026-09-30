@@ -30,6 +30,8 @@ from ..schemas import presence_values as _presence_values
 # accounted_for is re-exported for metrics_nodes.py/exit_nodes.py, both of which do
 # `from .gates.remediation_gate import accounted_for` -- that keeps working unmodified since it is
 # now just this import binding the same function into this module's own namespace.
+from . import remediation_evaluate_checks as _rc
+from .checks import Check, CheckLog
 from .remediation_evaluate_checks import accounted_for, evaluate_remediation
 
 if TYPE_CHECKING:
@@ -191,16 +193,77 @@ REMEDIATION_HARD_RULES: tuple[str, ...] = (
 )
 
 
+REM_CONTENT = Check(
+    _rc.CHECK_CONTENT, "Remediation report present",
+    "The stage must hand back a report of what it fixed and what it left. Without one there is no way "
+    "to tell a finished remediation from one that never ran.", "blocking",
+)
+REM_SCAN = Check(
+    _rc.CHECK_SCAN, "Fresh security scan available",
+    "A new scan is taken after the fixes so the claims can be checked against real scanner output. "
+    "If no scan can be taken, the claims can't be verified, so the stage does not pass.", "blocking",
+)
+REM_UNEXPLAINED = Check(
+    _rc.CHECK_UNEXPLAINED, "No unexplained open findings",
+    "Every actionable finding still in the fresh scan must be listed in known_gaps with a real reason. "
+    "Saying a finding was fixed counts for nothing while the scanner still reports it.", "blocking",
+)
+REM_FABRICATED = Check(
+    _rc.CHECK_FABRICATED, "Claimed fixes are real findings",
+    "Every finding id the stage claims to have addressed must exist in the scan it was given or the "
+    "scan taken after. An invented id is a cheap way to look busy without fixing anything.", "blocking",
+    condition="the pre-remediation scan is readable at the stage's baseline commit",
+)
+REM_IGNORE_FILES = Check(
+    _rc.CHECK_IGNORE_FILES, "Scanner ignore files untouched",
+    "The stage must not edit scanner ignore or config files such as .trivyignore or gitleaks.toml. "
+    "That hides findings from the scanner instead of fixing the code.", "blocking",
+)
+REM_SUPPRESSION_COMMENTS = Check(
+    _rc.CHECK_SUPPRESSION_COMMENTS, "No inline suppression comments",
+    "The stage must not add comments like nosec, noqa or eslint-disable. They make the scanner "
+    "look away from a line while the defect stays in place.", "blocking",
+)
+VERIFY_CHECKS: tuple[Check, ...] = (
+    REM_CONTENT, REM_SCAN, REM_UNEXPLAINED, REM_FABRICATED, REM_IGNORE_FILES, REM_SUPPRESSION_COMMENTS,
+)
+_CHECK_MAP = {c.id: c for c in VERIFY_CHECKS}
+
+
+def _record_checks(
+    log: CheckLog, tagged: list[tuple[str, str]], ran: list[str], infra: dict[str, str], prior_ids_read: bool
+) -> None:
+    """One row per sub-check, in VERIFY_CHECKS order. An infra entry (the scan/diff step that
+    feeds this check raised) wins over whatever was computed from the missing data; several
+    reasons for one check (e.g. many open findings) join into one row."""
+    for check in VERIFY_CHECKS:
+        reasons = [reason for check_id, reason in tagged if check_id == check.id]
+        if check.id in infra:
+            log.infra(check, infra[check.id])
+        elif reasons:
+            log.record_tagged(_CHECK_MAP, [(check.id, "\n".join(reasons))])
+        elif check.id in ran:
+            log.passed(check)
+        elif check is REM_FABRICATED and REM_IGNORE_FILES.id in ran and not prior_ids_read:
+            log.skipped(check, "the scan this stage was handed could not be read at its baseline commit")
+
+
 async def verify_remediation(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: Any,
-    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True,
+    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True, *, log: CheckLog | None = None,
 ) -> "VerificationResult":
     from ..graph import VerificationResult
 
+    log = log or CheckLog("remediation_verify", VERIFY_CHECKS)
     scan: dict[str, Any] | None = None
     prior_ids: frozenset[str] | None = None
     changed_files: list[str] = []
     added_lines = ""
+    # Checks whose input has not been gathered yet; whatever is left here when the try raises is
+    # recorded as infra (the check could not run), not as a content failure. Record-only: the
+    # verdict below is computed exactly as before.
+    unfed = [REM_SCAN, REM_FABRICATED, REM_IGNORE_FILES, REM_SUPPRESSION_COMMENTS]
+    infra: dict[str, str] = {}
     try:
         # A FRESH scan, not `repo-scan-latest.json`: that file is refreshed by a background task
         # fired on commit, so reading it here races the stage's own commit and could block on
@@ -208,12 +271,19 @@ async def verify_remediation(
         # A FRESH scan, republished to LATEST_PATH: a blocked retry then reads exactly what this
         # gate judged it against, rather than the pre-draft scan it has already acted on.
         scan = await scan_and_publish(provider, thread_id)
+        unfed.remove(REM_SCAN)
         prior_ids = await _prior_finding_ids(provider, thread_id, baseline_commit)
+        unfed.remove(REM_FABRICATED)
         changed_files, added_lines = await _stage_diff(provider, thread_id, baseline_commit)
-    except Exception:  # noqa: BLE001 -- an unreadable scan must block, not crash the graph
+        unfed.clear()
+    except Exception as exc:  # noqa: BLE001 -- an unreadable scan must block, not crash the graph
         logger.exception("remediation gate: could not scan/diff for thread %s", thread_id)
+        infra = {c.id: f"could not scan/diff: {type(exc).__name__}: {exc}" for c in unfed}
 
-    passed, reasons = evaluate_remediation(content_dict, scan, changed_files, added_lines, prior_ids)
+    passed, tagged, ran = _rc.evaluate_remediation_checks(content_dict, scan, changed_files, added_lines, prior_ids)
+    reasons = [reason for _check_id, reason in tagged]
+    _record_checks(log, tagged, ran, infra, prior_ids is not None)
+    checks = [r.to_dict() for r in log.results()]
     if passed:
         # Clear any stuck-fixer marker left by a prior failing lap -- a clean pass means whatever
         # was stuck got resolved (or never existed), and a stale marker must not survive into a
@@ -233,6 +303,7 @@ async def verify_remediation(
                 "findings_addressed": _presence_values(content_dict.get("findings_addressed")),
                 "known_gaps": _presence_values(content_dict.get("known_gaps")),
             },
+            checks=checks,
         )
 
     logger.info("remediation gate: blocking (%d reason(s))", len(reasons))
@@ -269,6 +340,7 @@ async def verify_remediation(
             + "\n".join(f"- {reason}" for reason in reasons)
         ),
         report={"blocking_reasons": reasons},
+        checks=checks,
     )
 
 
@@ -475,11 +547,54 @@ def _demo() -> None:
         assert close_calls == [("t-remediation-selfcheck", "remediation", "draft-r2-0")], (
             f"the identical reason twice running must reset the draft session exactly once, got {close_calls}"
         )
+        # Per-sub-check rows: no baseline commit -> fabrication skipped, not passed.
+        assert [(r["id"], r["status"]) for r in second.checks] == [
+            (REM_CONTENT.id, "passed"), (REM_SCAN.id, "passed"), (REM_UNEXPLAINED.id, "failed"),
+            (REM_FABRICATED.id, "skipped"), (REM_IGNORE_FILES.id, "passed"),
+            (REM_SUPPRESSION_COMMENTS.id, "passed"),
+        ], second.checks
+        assert "stuck123" in second.checks[2]["detail"]
+
+        gapped = asyncio.run(verify_remediation(
+            "t-remediation-selfcheck", {"known_gaps": ["stuck123: upstream has no fix yet, tracked"]},
+            "r3", None, _FakeVerifyProvider(), "claude",
+        ))
+        assert gapped.passed and {r["status"] for r in gapped.checks} == {"passed", "skipped"}, gapped.checks
+
+        # A scan that raises: verdict/feedback exactly as before (blocks on "no repo scan"), but
+        # every check the scan/diff would have fed is recorded infra with the exception, not failed.
+        async def _raising_scan(_provider: Any, _thread_id: str) -> dict[str, Any]:
+            raise RuntimeError("sandbox gone")
+
+        scan_and_publish = _raising_scan  # type: ignore[assignment]
+        broken = asyncio.run(verify_remediation("t-rem-infra", content, "r4", None, _FakeVerifyProvider(), "claude"))
+        assert not broken.passed and "no repo scan" in broken.feedback
+        assert broken.report == {"blocking_reasons": [evaluate_remediation(content, None)[1][0]]}, broken.report
+        rows = {r["id"]: r for r in broken.checks}
+        assert rows[REM_CONTENT.id]["status"] == "passed" and REM_UNEXPLAINED.id not in rows, rows
+        for check in (REM_SCAN, REM_FABRICATED, REM_IGNORE_FILES, REM_SUPPRESSION_COMMENTS):
+            assert rows[check.id]["status"] == "infra" and "sandbox gone" in rows[check.id]["detail"], rows
+        # Caller-supplied log collects the same rows.
+        shared = CheckLog("remediation_verify", VERIFY_CHECKS, strict=True)
+        asyncio.run(verify_remediation("t-rem-infra", None, "r5", None, _FakeVerifyProvider(), "claude", log=shared))
+        assert [(r.id, r.status) for r in shared.results()] == [(REM_CONTENT.id, "failed")] + [
+            (c.id, "infra") for c in (REM_SCAN, REM_FABRICATED, REM_IGNORE_FILES, REM_SUPPRESSION_COMMENTS)
+        ], shared.results()
     finally:
         scan_and_publish = original_scan_and_publish
         close_session = original_close_session
         repo_files.read_repo_file = original_read_repo_file
         repo_files.write_repo_file = original_write_repo_file
+
+    # Every declared Check is fed by the helper: its id constant is appended to `ran` or tagged on a
+    # reason inside evaluate_remediation_checks (text scan, so a dropped branch fails here).
+    import inspect
+
+    helper_src = inspect.getsource(_rc.evaluate_remediation_checks)
+    for check in VERIFY_CHECKS:
+        name = next(k for k, v in vars(_rc).items() if k.startswith("CHECK_") and v == check.id)
+        assert helper_src.count(name) >= 2, f"{check.id} is declared but never tagged/ran by the helper"
+    assert set(_CHECK_MAP) == {v for k, v in vars(_rc).items() if k.startswith("CHECK_")}
 
     print("remediation_gate self-check: all assertions passed")
 
