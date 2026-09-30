@@ -1,8 +1,8 @@
 """Pure, dependency-free (stdlib `json`/`os`/`re`/`sys` only) wireframe<->AC/PlanStep linkage
 checks -- extracted from `diagram_gate.py` (2026-09-24) specifically so the sandbox's own same-turn
-Stop hooks (`check-plan-citations-stop.mjs`, `check-plan-schema-stop.mjs`) can run the REAL checks
-by shelling out to `python3` on this ONE file, instead of a hand-ported JavaScript reimplementation
-drifting from it.
+Stop hooks (`check-plan-citations-stop.mjs`, `check-plan-schema-stop.mjs`, and, since Task 12,
+`check-diagram-staleness-stop.mjs`) can run the REAL checks by shelling out to `python3` on this ONE
+file, instead of a hand-ported JavaScript reimplementation drifting from it.
 
 Why a subprocess, not a straight import: `diagram_gate.py`/`spec_ledger.py` (and everything
 upstream of them -- `chat_model.py`, `sandbox/provider.py`, `repo_files.py`, this pipeline's DB
@@ -38,17 +38,36 @@ full_read_checks.py extraction both already used:
   independently retyped in both places rather than called from one; `ac_id_existence_kind_problems`
   is that shared sub-check, called by both.
 
+Extended 2026-09-30 (Task 12) with `check_plan_linkage`'s remaining un-shared halves and three
+previously-un-hooked-but-portable checks -- see the "Task 12" section comment below for the full
+list and each function's own docstring for exactly what moved from where. In short:
+`check_dangling_visual_retirement` (diagram_gate.py), `check_removes_ids_validity`/
+`check_plan_removal_demand`/`check_plan_step_coverage_and_rework` (all split out of
+`diagram_gate.check_plan_linkage`, which now calls them instead of keeping its own copy),
+`check_plan_step_id_guard`/`check_plan_step_ids` (spec_ledger.sync_plan_ledger's id guard), and
+`reopened_or_changed_ac_ids` (diagram_gate.py's private `_reopened_or_changed_ac_ids`, now also
+callable by check-diagram-staleness-stop.mjs now that AIDW_RUN_ID/Task 5 makes `run_id` available
+to a Stop hook). `own_ac_ids_from_specification`/`eligible_ac_ids` also moved here from
+spec_ledger.py (re-exported from there unchanged) since `check_plan_step_coverage_and_rework` needs
+them and this module cannot import spec_ledger.py (see this file's own "why a subprocess" reasoning
+above).
+
 CLI mode (`python3 wireframe_linkage_checks.py --check-hook`, stdin JSON: `{"wireframes": [...],
 "ledger_entries": [...], "ui_related_ac_ids": [...], "plan_steps": [...], "diagrams": [...],
 "retired_step_ids": [...], "wireframe_html": [...], "disk_wireframe_screens": [...],
 "manifest_wireframe_screens": [...], "retired_wireframe_screens": [...], "disk_diagram_names": [...],
-"manifest_diagram_names": [...], "retired_diagram_names": [...]}`, EVERY key optional -- a caller
-passes only the keys its own checks need, stdout JSON: `{"wireframe_ac_ids": [...],
-"wireframe_has_ac_ids": [...], "ui_wireframe_coverage": [...], "plan_step_wireframe_coverage": [...],
-"step_ac_id_problems": [...], "diagram_ac_id_problems": [...], "retired_step_id_problems": [...],
-"wireframe_content_problems": [...], "manifest_orphan_problems": [...]}`, each value a list of
-problem strings) is what the Stop hooks actually invoke -- ONE flag, ONE combined contract; each
-hook only reads the output keys its own checks produced.
+"manifest_diagram_names": [...], "retired_diagram_names": [...], "specification": {...} | null,
+"prior_plan_steps": [...], "run_id": "..." | null, "bug_affected_ac_ids": [...]}`, EVERY key
+optional -- a caller passes only the keys its own checks need, stdout JSON: `{"wireframe_ac_ids":
+[...], "wireframe_has_ac_ids": [...], "ui_wireframe_coverage": [...],
+"plan_step_wireframe_coverage": [...], "step_ac_id_problems": [...], "diagram_ac_id_problems": [...],
+"retired_step_id_problems": [...], "wireframe_content_problems": [...],
+"manifest_orphan_problems": [...], "dangling_visual_retirement_problems": [...],
+"removes_ids_problems": [...], "plan_step_coverage_rework_problems": [...],
+"plan_step_id_problems": [...], "reopened_or_changed_ac_ids": [...] (only when `run_id` was sent)}`,
+each value a list of problem strings (except `reopened_or_changed_ac_ids`, a sorted list of AC ids))
+is what the Stop hooks actually invoke -- ONE flag, ONE combined contract; each hook only reads the
+output keys its own checks produced.
 """
 
 from __future__ import annotations
@@ -334,6 +353,306 @@ def check_retired_step_ids(
     return problems
 
 
+# --- Task 12 (2026-09-30): check_plan_linkage's remaining un-shared halves (coverage-side/
+# rework-forbidden, ported per a task review's judgment call -- see check-plan-citations-stop.mjs's
+# own header for the exact comment that call was based on -- and the run_id-gated removal-side
+# demand, now portable via AIDW_RUN_ID/Task 5), plus three previously-un-hooked-but-portable checks
+# that were plain misses rather than deliberate exclusions: check_dangling_visual_retirement,
+# removes_ids existence/retired-status validity, and the plan-step id-missing/id-collision guard.
+
+def own_ac_ids_from_specification(specification: dict[str, Any] | None) -> set[str]:
+    """Moved from spec_ledger.py (2026-09-30, Task 12) so this stdlib-only module has no
+    dependency on spec_ledger.py for check_plan_step_coverage_and_rework's own_ac_ids need;
+    spec_ledger.py re-exports this exact name (`from .gates.wireframe_linkage_checks import
+    own_ac_ids_from_specification`) so every existing `spec_ledger.own_ac_ids_from_specification(...)`
+    caller is unaffected -- a straight code MOVE, not a fork. This ticket's own approved
+    Specification's AC ids (schemas.Specification shape: {id, kind, ...} nested under
+    user_stories[].acceptance_criteria[]) -- the ledger-resolved ids sync_ledger already wrote back
+    onto the draft in place, so these are real US-####.# ids, not placeholders. Pure."""
+    specification = specification or {}
+    return {
+        ac.get("id")
+        for story in (specification.get("user_stories") or [])
+        for ac in (story.get("acceptance_criteria") or [])
+    }
+
+
+def eligible_ac_ids(entries: list[dict[str, Any]], own_ac_ids: set[str]) -> list[str]:
+    """Moved from spec_ledger.py (2026-09-30, Task 12) -- same reasoning as
+    own_ac_ids_from_specification above; spec_ledger.py re-exports this exact name so every
+    existing `spec_ledger.eligible_ac_ids(...)` caller (diagram_gate.py, write_scope_gate.py) is
+    unaffected. The work queue: this ticket's own ACs that are live and have never been delivered
+    by a healthy run (no coded_run_id -- stamps are written only by metrics_compute on a
+    regression-clean run, and cleared on spec approval when the requirement's wording really
+    changed). Completed ACs are deliberately absent: gates must never send delivered work back for
+    rework. Pure."""
+    return [
+        e["id"]
+        for e in entries
+        if e.get("kind") == "acceptance_criterion"
+        and e.get("status") in _LIVE_STATUSES
+        and e.get("id") in own_ac_ids
+        and not e.get("coded_run_id")
+    ]
+
+
+def check_dangling_visual_retirement(
+    wireframe_refs: list[dict[str, Any]],
+    diagram_refs: list[dict[str, Any]],
+    ledger_entries: list[dict[str, Any]],
+    retired_wireframe_screens: set[str],
+    retired_diagram_names: set[str],
+) -> list[str]:
+    """Moved from diagram_gate.py (2026-09-30, Task 12) byte-for-byte -- a plain miss rather than a
+    deliberate exclusion (not mentioned in any hook's own "deliberately not ported" comments).
+    File-based-editing plan, Part 2 sect. 6 (gap found and closed, user-raised): a wireframe or
+    `user_flow` diagram whose every cited AC is now retired is a deleted feature's leftover and
+    must be named in retired_wireframe_screens/retired_diagram_names -- mirrors
+    check_plan_linkage's own removal side for plan steps ("a step whose every criterion this
+    Specification retires is a deleted feature's leftover and must be dropped"), applied to visual
+    artifacts instead. A wireframe/diagram with a live citation, or with NO citations at all
+    (caught separately by check_wireframe_has_ac_ids), is never flagged here. `er`/`architecture`
+    diagrams are exempt -- whole-system views, not retired this way (schemas.ImplementationPlan's
+    own retired_diagram_names docstring). Pure.
+    """
+    retired_ac_ids = {
+        e["id"] for e in ledger_entries if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
+    }
+    problems: list[str] = []
+    for wf in wireframe_refs:
+        ac_ids = wf.get("ac_ids") or []
+        if ac_ids and all(i in retired_ac_ids for i in ac_ids) and wf.get("screen") not in retired_wireframe_screens:
+            problems.append(
+                f"wireframe {wf.get('screen')!r} cites only retired criteria ({', '.join(ac_ids)}) -- "
+                "name it in retired_wireframe_screens or fix its citations"
+            )
+    for d in diagram_refs:
+        if d.get("kind") != "user_flow":
+            continue
+        ac_ids = d.get("ac_ids") or []
+        if ac_ids and all(i in retired_ac_ids for i in ac_ids) and d.get("name") not in retired_diagram_names:
+            problems.append(
+                f"diagram {d.get('name')!r} cites only retired criteria ({', '.join(ac_ids)}) -- "
+                "name it in retired_diagram_names or fix its citations"
+            )
+    return problems
+
+
+def reopened_or_changed_ac_ids(
+    ledger_entries: list[dict[str, Any]], run_id: str, bug_affected_ac_ids: set[str]
+) -> set[str]:
+    """Moved from diagram_gate.py's private `_reopened_or_changed_ac_ids` (2026-09-30, Task 12) so
+    check-diagram-staleness-stop.mjs can compute the exact same trigger set now that AIDW_RUN_ID
+    (Task 5) makes `run_id` available to a Stop hook -- previously graph-side only. AC ids this run
+    either genuinely changed (first-seen/last-revised this run_id) or reopened via
+    bug_affected_ac_ids (wording unchanged, the "reopened" case) -- the citation-scoped trigger set
+    for wireframe/user_flow-diagram stale-review enforcement. Pure."""
+    changed = {
+        e["id"]
+        for e in ledger_entries
+        if e.get("kind") == "acceptance_criterion"
+        and (e.get("first_seen_run_id") == run_id or e.get("last_revised_run_id") == run_id)
+    }
+    return changed | bug_affected_ac_ids
+
+
+def check_removes_ids_validity(
+    plan_steps: list[dict[str, Any]], ledger_entries: list[dict[str, Any]]
+) -> tuple[list[str], set[str]]:
+    """Moved from diagram_gate.check_plan_linkage (2026-09-30, Task 12) -- existence+retired-status
+    validity for every step's removes_ids entries (a live id there is almost certainly ac_ids/
+    removes_ids swapped), plus the resolved removed_ids set (story ids expanded to their retired
+    criteria) check_plan_removal_demand below needs. No run_id/coded_run_id needed, unlike the
+    demand direction -- a plain miss from hook coverage, not a deliberate exclusion. Pure."""
+    by_id = {e.get("id"): e for e in ledger_entries}
+    problems: list[str] = []
+    removed_ids: set[str] = set()
+    for step in plan_steps:
+        step_id = step.get("id") or "?"
+        for rid in step.get("removes_ids") or []:
+            entry = by_id.get(rid)
+            if entry is None:
+                problems.append(f"{step_id}: removes_ids cites {rid!r}, which does not exist in the ledger")
+                continue
+            if entry.get("status") != "retired":
+                problems.append(
+                    f"{step_id}: removes_ids cites {rid!r}, which is NOT retired -- removal steps "
+                    "only ever name retired scope (live work belongs in ac_ids)"
+                )
+                continue
+            removed_ids.add(rid)
+            # A story id in removes_ids covers all of its (retired) criteria.
+            if entry.get("kind") == "user_story":
+                removed_ids.update(
+                    e["id"] for e in ledger_entries
+                    if e.get("kind") == "acceptance_criterion" and e.get("parent_us_id") == rid
+                )
+    return problems, removed_ids
+
+
+def check_plan_removal_demand(
+    ledger_entries: list[dict[str, Any]], removed_ids: set[str], run_id: str
+) -> list[str]:
+    """Moved from diagram_gate.check_plan_linkage (2026-09-30, Task 12) -- the run_id-gated removal
+    DEMAND direction (user requirement 2026-08-31, brownfield/greenfield asymmetry): a criterion
+    that was DELIVERED by an earlier healthy run (coded_run_id set) and RETIRED this round
+    (last_revised_run_id == run_id) has real artifacts in the repo -- tests, implementation, UI,
+    navigation -- so some step must name it (or its parent story) in removes_ids (see
+    check_removes_ids_validity above for `removed_ids`'s own computation). Needs run_id (Task 5's
+    AIDW_RUN_ID) to scope "retired THIS run" -- the reason this direction stayed graph-side only
+    until now. Pure."""
+    problems: list[str] = []
+    delivered_retired = [
+        e["id"]
+        for e in ledger_entries
+        if e.get("kind") == "acceptance_criterion"
+        and e.get("status") == "retired"
+        and e.get("last_revised_run_id") == run_id
+        and e.get("coded_run_id")
+    ]
+    for ac_id in delivered_retired:
+        if ac_id not in removed_ids:
+            problems.append(
+                f"{ac_id}: this criterion was DELIVERED by an earlier run and retired this "
+                "round -- its code/UI/navigation still exist, so a plan step must name it "
+                "(or its parent story) in removes_ids and describe the removal work"
+            )
+    return problems
+
+
+def check_plan_step_coverage_and_rework(
+    plan_steps: list[dict[str, Any]],
+    ledger_entries: list[dict[str, Any]],
+    eligible_ac_id_list: list[str],
+    prior_steps_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Moved from diagram_gate.check_plan_linkage (2026-09-30, Task 12; see this module's own
+    header and check-plan-citations-stop.mjs's own comment for why these two were deliberately
+    left un-ported until now) -- coverage-side (every ELIGIBLE ac id -- this ticket's own, live,
+    never delivered by a healthy run, see eligible_ac_ids above -- is cited by >=1 step; completed
+    criteria need no step) and rework-forbidden (a NEW or CHANGED step -- vs the prior approved
+    plan -- citing only already-delivered criteria is rework the pipeline forbids; verbatim
+    carryovers are exempt because ticket mode requires restating them).
+
+    Silently skips (does not itself report) any step that fails existence/kind or is entirely
+    non-live -- diagram_gate.check_plan_linkage's own inline loop already reports those
+    (ac_id_existence_kind_problems / its own liveness check), and check_ac_id_citation reports the
+    plan-step ac_ids half of the same thing for the Stop-hook path; this function only tracks
+    which live criteria are validly cited, to feed the coverage/rework rules. Pure."""
+    by_id = {e.get("id"): e for e in ledger_entries}
+    cited_live: set[str] = set()
+    problems: list[str] = []
+    for step in plan_steps:
+        step_id = step.get("id") or "?"
+        ac_ids = step.get("ac_ids") or []
+        if not ac_ids or ac_id_existence_kind_problems(step_id, ac_ids, by_id):
+            continue
+        live = [i for i in ac_ids if by_id[i].get("status") in _LIVE_STATUSES]
+        if not live:
+            continue
+        prior = prior_steps_by_id.get(step.get("id") or "")
+        carryover = prior is not None and prior.get("description") == step.get("description")
+        if not carryover:
+            undelivered = [i for i in live if not by_id[i].get("coded_run_id")]
+            if not undelivered:
+                problems.append(
+                    f"{step_id}: is new/changed but cites only already-delivered criteria "
+                    f"({', '.join(live)}) -- completed criteria are never re-planned; carry the "
+                    "prior step over verbatim or drop it"
+                )
+                continue
+        cited_live.update(live)
+    for ac_id in eligible_ac_id_list:
+        if ac_id not in cited_live:
+            problems.append(
+                f"{ac_id}: this ticket's undelivered criterion is cited by no plan step -- every "
+                "criterion awaiting delivery needs at least one step (ac_ids) that fulfils it"
+            )
+    return problems
+
+
+def check_plan_step_id_guard(step_id: str | None, entry: dict[str, Any] | None) -> str | None:
+    """Moved from spec_ledger.sync_plan_ledger (2026-09-30, Task 12) -- the plan-step id-missing/
+    id-collision guard: every draft plan step must carry its own id, that id must not collide with
+    a non-plan-step ledger entry (kind mismatch), and must not reuse an already-retired step's id
+    (ids are never reused). `entry` is whatever the CALLER already found for `step_id` in its own
+    ledger snapshot (sync_plan_ledger's own incremental `_find(updated, step_id)`, mid-loop, so a
+    within-draft duplicate id is checked the exact same way it always was; check_plan_step_ids below
+    is the batch wrapper a Stop hook uses against a static ledger instead). Returns a single problem
+    string, or None if the id is fine -- the ledger MUTATION (revise-or-create) stays in
+    sync_plan_ledger itself, the authoritative, stateful ledger writer this module has no business
+    duplicating (same division of labor as check_retired_step_ids). Pure."""
+    if not step_id:
+        return "a plan step is missing its own id"
+    if entry is not None and entry.get("kind") != "plan_step":
+        return f"plan step id {step_id!r} collides with a non-plan-step ledger entry"
+    if entry is not None and entry.get("status") == "retired":
+        return f"plan step id {step_id!r} refers to a retired step -- ids are never reused"
+    return None
+
+
+def check_plan_step_ids(
+    plan_steps: list[dict[str, Any]], ledger_entries: list[dict[str, Any]]
+) -> list[str]:
+    """Batch wrapper over check_plan_step_id_guard above, against a STATIC ledger snapshot -- what
+    check-plan-citations-stop.mjs actually calls (a Stop hook has no incrementally-mutating ledger
+    to check against, only whatever sync_plan_ledger last wrote). Pure."""
+    by_id = {e.get("id"): e for e in ledger_entries}
+    problems: list[str] = []
+    for step in plan_steps:
+        step_id = step.get("id")
+        problem = check_plan_step_id_guard(step_id, by_id.get(step_id) if step_id else None)
+        if problem:
+            problems.append(problem)
+    return problems
+
+
+def run_plan_linkage_checks(
+    plan_steps: list[dict[str, Any]],
+    ledger_entries: list[dict[str, Any]],
+    wireframe_refs: list[dict[str, Any]],
+    diagram_refs: list[dict[str, Any]],
+    retired_wireframe_screens: list[str],
+    retired_diagram_names: list[str],
+    specification: dict[str, Any] | None,
+    prior_plan_steps: list[dict[str, Any]],
+    run_id: str | None,
+) -> dict[str, list[str]]:
+    """check-plan-citations-stop.mjs's own Task 12 additions -- see this module's own header.
+    Computed once over the same inputs the CLI wrapper receives, same "no drift" contract as
+    run_all_checks/run_citation_validity_checks above."""
+    own_ac_ids = own_ac_ids_from_specification(specification)
+    prior_steps_by_id = {s.get("id"): s for s in prior_plan_steps if s.get("id")}
+    removal_problems, removed_ids = check_removes_ids_validity(plan_steps, ledger_entries)
+    demand_problems = check_plan_removal_demand(ledger_entries, removed_ids, run_id) if run_id else []
+    return {
+        "dangling_visual_retirement_problems": check_dangling_visual_retirement(
+            wireframe_refs, diagram_refs, ledger_entries,
+            set(retired_wireframe_screens), set(retired_diagram_names),
+        ),
+        "removes_ids_problems": removal_problems + demand_problems,
+        "plan_step_coverage_rework_problems": check_plan_step_coverage_and_rework(
+            plan_steps, ledger_entries, eligible_ac_ids(ledger_entries, own_ac_ids), prior_steps_by_id,
+        ),
+        "plan_step_id_problems": check_plan_step_ids(plan_steps, ledger_entries),
+    }
+
+
+def run_staleness_trigger_check(
+    ledger_entries: list[dict[str, Any]], run_id: str, bug_affected_ac_ids: list[str]
+) -> dict[str, list[str]]:
+    """check-diagram-staleness-stop.mjs's own Task 12 addition -- the per-item (user_flow diagram/
+    wireframe) trigger set, output as a plain sorted list (JSON has no set type) under
+    `reopened_or_changed_ac_ids`, for the hook's own git-ancestry-based staleness sweep to
+    intersect against each item's ac_ids. Computed once, same "no drift" contract as this module's
+    other run_*_checks."""
+    return {
+        "reopened_or_changed_ac_ids": sorted(
+            reopened_or_changed_ac_ids(ledger_entries, run_id, set(bug_affected_ac_ids))
+        ),
+    }
+
+
 def run_all_checks(
     wireframes: list[dict[str, Any]],
     ledger_entries: list[dict[str, Any]],
@@ -566,6 +885,130 @@ def _demo() -> None:
         ["PS-1"], step_ledger, {"PS-1"}
     )), "a step cannot be both revised (touched) and retired in the same draft"
 
+    # --- Task 12 additions ---
+
+    # own_ac_ids_from_specification / eligible_ac_ids (moved from spec_ledger.py)
+    spec_doc = {
+        "user_stories": [
+            {"acceptance_criteria": [{"id": "US-0001.1"}, {"id": "US-0001.2"}]},
+            {"acceptance_criteria": [{"id": "US-0002.1"}]},
+        ]
+    }
+    assert own_ac_ids_from_specification(spec_doc) == {"US-0001.1", "US-0001.2", "US-0002.1"}
+    assert own_ac_ids_from_specification(None) == set()
+    task12_ledger = [
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r0"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "retired"},
+    ]
+    assert eligible_ac_ids(task12_ledger, {"US-0001.1", "US-0001.2", "US-0002.1"}) == ["US-0001.1"], (
+        "delivered (coded_run_id set) and retired ids are both excluded from the work queue"
+    )
+
+    # check_dangling_visual_retirement (moved from diagram_gate.py)
+    dangling_ledger = [{"id": "US-0001.1", "kind": "acceptance_criterion", "status": "retired"}]
+    assert any("login" in p and "retired_wireframe_screens" in p for p in check_dangling_visual_retirement(
+        [{"screen": "login", "ac_ids": ["US-0001.1"]}], [], dangling_ledger, set(), set()
+    )), "a wireframe citing only retired criteria, not itself retired, is flagged"
+    assert check_dangling_visual_retirement(
+        [{"screen": "login", "ac_ids": ["US-0001.1"]}], [], dangling_ledger, {"login"}, set()
+    ) == [], "already named in retired_wireframe_screens -- not dangling"
+    assert check_dangling_visual_retirement(
+        [], [{"name": "flow", "kind": "er", "ac_ids": ["US-0001.1"]}], dangling_ledger, set(), set()
+    ) == [], "er/architecture diagrams are exempt from this check"
+
+    # reopened_or_changed_ac_ids (moved from diagram_gate.py's private _reopened_or_changed_ac_ids)
+    reopen_ledger = [
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "first_seen_run_id": "r1", "last_revised_run_id": "r1"},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "first_seen_run_id": "r0", "last_revised_run_id": "r0"},
+    ]
+    assert reopened_or_changed_ac_ids(reopen_ledger, "r1", set()) == {"US-0001.1"}
+    assert reopened_or_changed_ac_ids(reopen_ledger, "r1", {"US-0009.9"}) == {"US-0001.1", "US-0009.9"}, (
+        "bug_affected_ac_ids is unioned in even though nothing in the ledger names it"
+    )
+
+    # check_removes_ids_validity / check_plan_removal_demand (split from check_plan_linkage)
+    removes_ledger = [
+        {"id": "US-0001", "kind": "user_story", "status": "retired"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "retired", "parent_us_id": "US-0001"},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "active"},
+    ]
+    removal_problems, removed = check_removes_ids_validity(
+        [{"id": "PS-1", "removes_ids": ["US-0001"]}], removes_ledger
+    )
+    assert removal_problems == [] and removed == {"US-0001", "US-0001.1"}, (
+        "a retired story id in removes_ids covers all of its (retired) criteria"
+    )
+    bad_removal_problems, _ = check_removes_ids_validity(
+        [{"id": "PS-2", "removes_ids": ["US-0002.1"]}], removes_ledger
+    )
+    assert any("NOT retired" in p for p in bad_removal_problems), "a LIVE id in removes_ids is rejected"
+    missing_removal_problems, _ = check_removes_ids_validity(
+        [{"id": "PS-3", "removes_ids": ["US-9999.9"]}], removes_ledger
+    )
+    assert any("does not exist" in p for p in missing_removal_problems)
+    demand_ledger = [
+        {"id": "US-0003.1", "kind": "acceptance_criterion", "status": "retired",
+         "last_revised_run_id": "r2", "coded_run_id": "r1"},
+    ]
+    assert any("DELIVERED" in p for p in check_plan_removal_demand(demand_ledger, set(), "r2")), (
+        "delivered-then-retired-this-run with no removes_ids citation is demanded"
+    )
+    assert check_plan_removal_demand(demand_ledger, {"US-0003.1"}, "r2") == [], "citation satisfies the demand"
+    assert check_plan_removal_demand(demand_ledger, set(), "r9") == [], "retired a DIFFERENT run -- not this run's demand"
+
+    # check_plan_step_coverage_and_rework (split from check_plan_linkage)
+    coverage_ledger = [
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r0"},
+    ]
+    assert check_plan_step_coverage_and_rework(
+        [{"id": "PS-1", "description": "build it", "ac_ids": ["US-0001.1"]}],
+        coverage_ledger, ["US-0001.1"], {},
+    ) == [], "a live, undelivered criterion cited by a step is covered"
+    assert any("US-0001.1" in p and "cited by no plan step" in p for p in check_plan_step_coverage_and_rework(
+        [], coverage_ledger, ["US-0001.1"], {}
+    )), "an eligible criterion with no citing step is flagged"
+    assert any("already-delivered" in p for p in check_plan_step_coverage_and_rework(
+        [{"id": "PS-9", "description": "NEW description", "ac_ids": ["US-0001.2"]}],
+        coverage_ledger, [], {"PS-9": {"id": "PS-9", "description": "OLD description"}},
+    )), "a new/changed step citing only already-delivered criteria is rework the pipeline forbids"
+    assert check_plan_step_coverage_and_rework(
+        [{"id": "PS-9", "description": "same text", "ac_ids": ["US-0001.2"]}],
+        coverage_ledger, [], {"PS-9": {"id": "PS-9", "description": "same text"}},
+    ) == [], "a verbatim carryover of an already-delivered criterion is exempt"
+
+    # check_plan_step_id_guard / check_plan_step_ids (moved from spec_ledger.sync_plan_ledger)
+    assert check_plan_step_id_guard("PS-1", None) is None, "a brand-new id is fine"
+    assert check_plan_step_id_guard(None, None) == "a plan step is missing its own id"
+    assert check_plan_step_id_guard("US-0001.1", {"id": "US-0001.1", "kind": "acceptance_criterion"}) is not None, (
+        "colliding with a non-plan-step ledger entry"
+    )
+    assert check_plan_step_id_guard("PS-1", {"id": "PS-1", "kind": "plan_step", "status": "retired"}) is not None, (
+        "reusing a retired step id"
+    )
+    id_ledger = [
+        {"id": "PS-1", "kind": "plan_step", "status": "retired"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active"},
+    ]
+    assert any("PS-1" in p and "retired" in p for p in check_plan_step_ids([{"id": "PS-1"}], id_ledger))
+    assert any("missing its own id" in p for p in check_plan_step_ids([{"description": "no id"}], id_ledger))
+    assert check_plan_step_ids([{"id": "PS-2"}], id_ledger) == [], "a fresh id is fine"
+
+    # run_plan_linkage_checks / run_staleness_trigger_check: same shape the --check-hook CLI emits.
+    linkage_result = run_plan_linkage_checks(
+        plan_steps=[{"id": "PS-1", "description": "d", "ac_ids": ["US-0001.1"]}],
+        ledger_entries=coverage_ledger,
+        wireframe_refs=[], diagram_refs=[],
+        retired_wireframe_screens=[], retired_diagram_names=[],
+        specification={"user_stories": [{"acceptance_criteria": [{"id": "US-0001.1"}]}]},
+        prior_plan_steps=[], run_id=None,
+    )
+    assert linkage_result["plan_step_coverage_rework_problems"] == []
+    assert linkage_result["plan_step_id_problems"] == []
+    staleness_result = run_staleness_trigger_check(reopen_ledger, "r1", ["US-0009.9"])
+    assert staleness_result["reopened_or_changed_ac_ids"] == ["US-0001.1", "US-0009.9"]
+
     # --- run_citation_validity_checks / run_schema_checks: same shape the --check-hook CLI emits.
     citation_result = run_citation_validity_checks(
         plan_steps=[{"id": "PS-1", "ac_ids": ["US-0009.9"]}],
@@ -621,6 +1064,30 @@ def _run_check_hook_cli() -> None:
         manifest_diagram_names=payload.get("manifest_diagram_names") or [],
         retired_diagram_names=payload.get("retired_diagram_names") or [],
     ))
+    # Task 12: check-plan-citations-stop.mjs's own additions -- always computed (cheap over absent/
+    # empty inputs); `run_id` gates only the ONE sub-check (the removal-side demand) that genuinely
+    # needs it, same as run_plan_linkage_checks/check_plan_removal_demand's own docstring.
+    result.update(run_plan_linkage_checks(
+        plan_steps=plan_steps,
+        ledger_entries=ledger_entries,
+        wireframe_refs=payload.get("wireframes") or [],
+        diagram_refs=payload.get("diagrams") or [],
+        retired_wireframe_screens=payload.get("retired_wireframe_screens") or [],
+        retired_diagram_names=payload.get("retired_diagram_names") or [],
+        specification=payload.get("specification"),
+        prior_plan_steps=payload.get("prior_plan_steps") or [],
+        run_id=payload.get("run_id"),
+    ))
+    # check-diagram-staleness-stop.mjs's own addition -- only computed when it sent a run_id (no
+    # AIDW_RUN_ID means the caller never asked for this key; an empty/absent-vs-computed-empty
+    # distinction the JS side can tell apart).
+    run_id = payload.get("run_id")
+    if run_id:
+        result.update(run_staleness_trigger_check(
+            ledger_entries=ledger_entries,
+            run_id=run_id,
+            bug_affected_ac_ids=payload.get("bug_affected_ac_ids") or [],
+        ))
     sys.stdout.write(json.dumps(result))
 
 

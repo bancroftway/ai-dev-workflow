@@ -30,7 +30,12 @@ from .gates.ledger_sync_checks import (
     find_duplicate_by_text,
 )
 from .gates.narrative_format_checks import check_narrative_format
-from .gates.wireframe_linkage_checks import check_retired_step_ids
+from .gates.wireframe_linkage_checks import (
+    check_plan_step_id_guard,
+    check_retired_step_ids,
+    eligible_ac_ids,
+    own_ac_ids_from_specification,
+)
 from .sandbox.provider import SandboxProvider
 
 if TYPE_CHECKING:
@@ -177,22 +182,12 @@ async def hydrate_ticket_mode_context(
     return {"ticket_mode_baseline": True} if entries else None
 
 
-def own_ac_ids_from_specification(specification: dict[str, Any] | None) -> set[str]:
-    """This ticket's own approved Specification's AC ids (schemas.Specification shape: {id, kind,
-    ...} nested under user_stories[].acceptance_criteria[]) -- the ledger-resolved ids sync_ledger
-    already wrote back onto the draft in place, so these are real US-####.# ids, not placeholders.
-
-    Shared by hydrate_ac_to_tests_ticket_mode_context below (decides whether the ledger holds
-    another ticket's ACs too) and ac_coverage_gate.check_ac_coverage (Ruling 7: scopes its own
-    coverage check down to THIS ticket's ACs) -- one computation, so the two can never answer "this
-    ticket's own AC ids" two different, possibly-diverging ways.
-    """
-    specification = specification or {}
-    return {
-        ac.get("id")
-        for story in (specification.get("user_stories") or [])
-        for ac in (story.get("acceptance_criteria") or [])
-    }
+# own_ac_ids_from_specification moved to gates/wireframe_linkage_checks.py (2026-09-30, Task 12,
+# imported above unchanged) -- check_plan_step_coverage_and_rework needs it and that module cannot
+# import spec_ledger.py (see its own header). Re-exported under this exact name so every existing
+# `spec_ledger.own_ac_ids_from_specification(...)` caller (hydrate_ac_to_tests_ticket_mode_context
+# below, ac_coverage_gate.py, exit_nodes.py, rebuild.py, metrics_nodes.py, write_scope_gate.py) is
+# unaffected -- a straight code move, not a fork.
 
 
 async def hydrate_ac_to_tests_ticket_mode_context(
@@ -667,15 +662,18 @@ def sync_plan_ledger(
 
     for step in draft_plan_steps:
         step_id = step.get("id")
-        if not step_id:
-            reasons.append("a plan step is missing its own id")
-            continue
-        entry = _find(updated, step_id)
-        if entry is not None and entry.get("kind") != "plan_step":
-            reasons.append(f"plan step id {step_id!r} collides with a non-plan-step ledger entry")
-            continue
-        if entry is not None and entry.get("status") == "retired":
-            reasons.append(f"plan step id {step_id!r} refers to a retired step -- ids are never reused")
+        # Id-missing/id-collision guard: moved to gates/wireframe_linkage_checks.py (2026-09-30,
+        # Task 12) so check-plan-citations-stop.mjs can shell out to the REAL implementation
+        # instead of a second, independently-drifting copy (same pattern as check_retired_step_ids
+        # below). `entry` is looked up against `updated` -- THIS function's own incrementally-
+        # mutated snapshot -- so a within-draft duplicate id is still checked exactly the way it
+        # always was; check_plan_step_id_guard itself is the single-step guard, its own docstring
+        # explains why (a Stop hook has no such incremental snapshot, and uses the batch wrapper
+        # check_plan_step_ids against a static ledger instead).
+        entry = _find(updated, step_id) if step_id else None
+        guard_problem = check_plan_step_id_guard(step_id, entry)
+        if guard_problem:
+            reasons.append(guard_problem)
             continue
         new_description = step.get("description", "")
         new_ac_ids = sorted(step.get("ac_ids") or [])
@@ -925,21 +923,10 @@ def gate_change_status(
     return "reopened" if reopened else "unchanged"
 
 
-def eligible_ac_ids(entries: list[dict[str, Any]], own_ac_ids: set[str]) -> list[str]:
-    """The work queue: this ticket's own ACs that are live and have never been delivered by a
-    healthy run (no coded_run_id -- stamps are written only by metrics_compute on a
-    regression-clean run, and cleared on spec approval when the requirement's wording really
-    changed). Completed ACs are deliberately absent: gates must never send delivered work back
-    for rework.
-    """
-    return [
-        e["id"]
-        for e in entries
-        if e.get("kind") == "acceptance_criterion"
-        and e.get("status") in ("active", "revised")
-        and e.get("id") in own_ac_ids
-        and not e.get("coded_run_id")
-    ]
+# eligible_ac_ids moved to gates/wireframe_linkage_checks.py (2026-09-30, Task 12, imported above
+# unchanged) -- same reasoning/re-export contract as own_ac_ids_from_specification above; every
+# existing `spec_ledger.eligible_ac_ids(...)` caller (diagram_gate.py, write_scope_gate.py) is
+# unaffected.
 
 
 def stamp_delivery(
