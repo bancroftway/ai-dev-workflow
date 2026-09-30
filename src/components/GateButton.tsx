@@ -116,7 +116,17 @@ export function GateButton({
   const { interrupt } = useOpenInterrupt();
   const [open, setOpen] = useState(false);
 
-  const views = stages.map((s) =>
+  // A tab can gate an optional stage (brownfield-spec on Specification) that most sessions never
+  // run; intake still creates its StageState as not_started. Once a sibling has progressed, an
+  // untouched stage is not part of this session -- listing it would show "Will run" forever and
+  // drag the tab's icon to "not run yet".
+  const untouched = (s: PipelineStage) => {
+    const st = state.stages?.[s.key];
+    return !st || (st.status === "not_started" && st.last_verification == null);
+  };
+  const shown = stages.some((s) => !untouched(s)) ? stages.filter((s) => !untouched(s)) : stages;
+
+  const views = shown.map((s) =>
     stageView(
       s,
       state,
@@ -130,7 +140,7 @@ export function GateButton({
   );
   const worst = views.reduce((a, b) => (STATUS_RANK.indexOf(b.status) > STATUS_RANK.indexOf(a.status) ? b : a));
   const look = STATUS_LOOK[worst.status];
-  const name = stages.length === 1 ? stages[0].label : label;
+  const name = shown.length === 1 ? shown[0].label : label;
   const policyText = [...new Set(views.map((v) => v.policy ?? "mode unknown"))].join("/");
   const aria = `${name} verification: ${policyText}, ${worst.statusText}`;
 
