@@ -55,6 +55,10 @@ if (stage !== "ac-to-tests") process.exit(0);
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 const AC_TO_TESTS_DRAFT_PATH = ".ai-dev-workflow/05-ac-to-tests.draft.json";
 const TECH_STACK_PATHS = [".ai-dev-workflow/02-tech-stack.approved.json", ".ai-dev-workflow/02-tech-stack.draft.json"];
+// Same path check-plan-citations-stop.mjs already reads for the identical reason (this ticket's
+// own approved AC ids) -- always present by the time ac-to-tests runs (plan cannot start, let
+// alone approve, before specification is approved).
+const SPECIFICATION_APPROVED_PATH = ".ai-dev-workflow/03-specification.approved.json";
 
 // Ported verbatim from tech_stack_signals.py's own UI_FRAMEWORK_MARKERS.
 const UI_FRAMEWORK_MARKERS = ["react", "vue", "angular", "blazor", "svelte", "next", "nuxt", "flutter", "swiftui", "jetpack compose"];
@@ -73,6 +77,14 @@ const TEST_FILE_LISTING =
 // once a repo grows past 60 test files, a same-turn hard-block for something the real (uncapped)
 // gate correctly allows. See ac_coverage_gate.py's own comment on this exact split.
 const TEST_FILE_LISTING_CAP = 60;
+
+// Node's execSync default maxBuffer is 1 MiB, which silently throws (caught below, previously
+// misread as "empty output") once a large repo's UNCAPPED test-file listing's combined stdout
+// crosses it -- item 7 (final-review Fix Round 2). Each line here is a bare repo-relative PATH
+// (tens of bytes), never file contents, so even an unusually large monorepo with, say, 100k test
+// files (~60 bytes/line) lands around 6 MiB -- 32 MiB leaves a wide, deliberately generous margin
+// above any realistic repo size without being large enough to mask a genuinely runaway command.
+const RESIDUE_LISTING_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
 let input = {};
 try {
@@ -97,11 +109,18 @@ function readJson(relPath) {
   }
 }
 
-function run(cmd) {
+// Returns `null` (a distinct FAILURE sentinel, never conflated with "") when the command itself
+// fails -- git not installed, not a repo, or (previously silently swallowed here, item 7) the
+// uncapped listing overflowing execSync's own maxBuffer on a large repo. `""` still means exactly
+// what it always meant: the command ran and genuinely produced no output. Every call site below
+// must check for `null` and skip whatever check depends on that data source (reportFailOpen +
+// omit), never treat a failure as an empty result -- silently reading "" is what turned a plain
+// infra hiccup into "every completed AC's regression test looks deleted," a mass false block.
+function run(cmd, options = {}) {
   try {
-    return execSync(cmd, { cwd, encoding: "utf8", shell: "/bin/bash" });
+    return execSync(cmd, { cwd, encoding: "utf8", shell: "/bin/bash", ...options });
   } catch {
-    return "";
+    return null;
   }
 }
 
@@ -111,11 +130,18 @@ function run(cmd) {
 // capped `head -60` listing (see that module's own comment: "head -60 is legitimate HERE").
 let testFiles = {};
 const listing = run(`(${TEST_FILE_LISTING}) | head -${TEST_FILE_LISTING_CAP}`);
-for (const path of listing.split("\n").map((l) => l.trim()).filter(Boolean)) {
-  try {
-    testFiles[path] = readFileSync(`${cwd}/${path}`, "utf8");
-  } catch {
-    // race with the model's own in-flight write -- not this hook's problem to report.
+if (listing === null) {
+  // Safe either way even without this guard (unattributed_tests/ui_relevant_missing_e2e both
+  // no-op on an empty test_files dict), but report it: a silent empty listing here is still an
+  // infra gap worth knowing about, not a genuine "no test files" turn.
+  reportFailOpen(HOOK_NAME, stage, "capped test-file listing command failed", cwd);
+} else {
+  for (const path of listing.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    try {
+      testFiles[path] = readFileSync(`${cwd}/${path}`, "utf8");
+    } catch {
+      // race with the model's own in-flight write -- not this hook's problem to report.
+    }
   }
 }
 
@@ -129,29 +155,60 @@ for (const path of listing.split("\n").map((l) => l.trim()).filter(Boolean)) {
 // didn't reach it -- that would same-turn hard-block something the real (uncapped) gate correctly
 // allows, exactly the asymmetry this split exists to prevent.
 let residueTestFiles = {};
-const uncappedListing = run(`(${TEST_FILE_LISTING})`);
-for (const path of uncappedListing.split("\n").map((l) => l.trim()).filter(Boolean)) {
-  try {
-    residueTestFiles[path] = readFileSync(`${cwd}/${path}`, "utf8");
-  } catch {
-    // race with the model's own in-flight write -- not this hook's problem to report.
+// residueListingFailed gates the three checks below that depend on this uncapped listing -- see
+// the `problems.push` guard further down. Regardless of what ac_residue_checks.py computes for
+// retired_residue/deferred_residue/completed_protection from whatever residueTestFiles ends up
+// being (here, `{}`, since the loop below never runs), this hook must never surface those three
+// specific results when the gathering itself failed -- completed_protection in particular is an
+// ABSENCE-IMPLIES-VIOLATION check, so an empty/wrong residueTestFiles from a swallowed failure
+// would read as "every completed AC's regression test was deleted," a mass false block (item 7).
+let residueListingFailed = false;
+const uncappedListing = run(`(${TEST_FILE_LISTING})`, { maxBuffer: RESIDUE_LISTING_MAX_BUFFER_BYTES });
+if (uncappedListing === null) {
+  residueListingFailed = true;
+  reportFailOpen(
+    HOOK_NAME, stage,
+    "uncapped test-file listing command failed (git unavailable, not a repo, or output exceeded " +
+      "the buffer) -- retired/deferred-residue and completed-AC-protection checks skipped this turn",
+    cwd,
+  );
+} else {
+  for (const path of uncappedListing.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    try {
+      residueTestFiles[path] = readFileSync(`${cwd}/${path}`, "utf8");
+    } catch {
+      // race with the model's own in-flight write -- not this hook's problem to report.
+    }
   }
 }
 
 // --- ledger: entries (residue/protection/attribution) + own uncommitted-diff (integrity) --------
 const ledgerDoc = readJson(LEDGER_PATH);
 const ledgerEntries = Array.isArray(ledgerDoc?.entries) ? ledgerDoc.entries : [];
-const ledgerDiff = run(`git diff --name-only -- ${LEDGER_PATH}`);
+const ledgerDiffRaw = run(`git diff --name-only -- ${LEDGER_PATH}`);
+if (ledgerDiffRaw === null) {
+  reportFailOpen(HOOK_NAME, stage, "ledger diff command failed -- ledger_integrity check skipped this turn", cwd);
+}
+// "" (command failure) reads to ledger_integrity_violations exactly like a genuine empty diff --
+// safe-direction fail-open (no tamper detected), never a false block, so no separate skip needed.
+const ledgerDiff = ledgerDiffRaw === null ? "" : ledgerDiffRaw;
 
 // --- playwright config: first match, content only (screenshot-mode check) -----------------------
 let playwrightConfig = null;
 const configListing = run("git ls-files -co --exclude-standard -- '*playwright.config.*'");
-const firstConfig = configListing.split("\n").map((l) => l.trim()).filter(Boolean)[0];
-if (firstConfig) {
-  try {
-    playwrightConfig = readFileSync(`${cwd}/${firstConfig}`, "utf8");
-  } catch {
-    playwrightConfig = null;
+if (configListing === null) {
+  // playwrightConfig stays null either way (failure vs. genuinely no config found) -- downstream
+  // ac_residue_checks.py already treats a null playwright_config as "skip screenshot_missing", so
+  // this is inherently safe without further guarding; still reported for visibility.
+  reportFailOpen(HOOK_NAME, stage, "playwright config listing command failed -- screenshot-mode check skipped this turn", cwd);
+} else {
+  const firstConfig = configListing.split("\n").map((l) => l.trim()).filter(Boolean)[0];
+  if (firstConfig) {
+    try {
+      playwrightConfig = readFileSync(`${cwd}/${firstConfig}`, "utf8");
+    } catch {
+      playwrightConfig = null;
+    }
   }
 }
 
@@ -176,13 +233,47 @@ for (const path of TECH_STACK_PATHS) {
   }
 }
 
-// --- no_eligible_work: every one of this ticket's own active/revised ACs already has a
-// coded_run_id (or there are none) -- mirrors verify_ac_to_tests's work-queue-scoping guard so a
-// legitimate deletion-only/all-delivered ticket isn't nagged to "write tests" for forbidden re-work.
-const activeAcEntries = ledgerEntries.filter(
-  (e) => e?.kind === "acceptance_criterion" && (e.status === "active" || e.status === "revised"),
-);
-const noEligibleWork = ledgerEntries.length > 0 && activeAcEntries.every((e) => e.coded_run_id);
+// --- no_eligible_work: mirrors verify_ac_to_tests's own work-queue-scoping guard (write_scope_gate.py)
+// so a legitimate deletion-only/all-delivered ticket isn't nagged to "write tests" for forbidden
+// re-work. Item 7 (final-review Fix Round 2): this used to scope "eligible work" over EVERY ledger
+// entry ever recorded, across every ticket this pipeline has ever run against this repo -- not just
+// THIS ticket's own ACs, the scope the real gate actually uses. The real gate's own two building
+// blocks (spec_ledger.own_ac_ids_from_specification / spec_ledger.eligible_ac_ids, both re-exported
+// from gates/wireframe_linkage_checks.py, which is where Task 12 actually moved them) are ported by
+// hand below -- KEEP IN SYNC BY HAND if either one's shape ever changes, same disclosed-duplication
+// precedent as this file's own UI_FRAMEWORK_MARKERS/TEST_FILE_LISTING above (both are 5-line pure
+// functions over a stable schema shape, not a business-rule surface worth a third python
+// subprocess call in this same file).
+const LIVE_AC_STATUSES = new Set(["active", "revised"]);
+
+function ownAcIdsFromSpecification(specification) {
+  const ids = new Set();
+  for (const story of (specification && specification.user_stories) || []) {
+    for (const ac of (story && story.acceptance_criteria) || []) {
+      if (ac && typeof ac.id === "string") ids.add(ac.id);
+    }
+  }
+  return ids;
+}
+
+function eligibleAcIds(entries, ownAcIds) {
+  return entries
+    .filter((e) => e?.kind === "acceptance_criterion" && LIVE_AC_STATUSES.has(e?.status) && ownAcIds.has(e?.id) && !e?.coded_run_id)
+    .map((e) => e.id);
+}
+
+// write_scope_gate.py's own condition is `raw_spec is not None and not eligible_ac_ids(...)` --
+// mirrored here via readJson's existing null-on-absent-or-malformed contract. One deliberate,
+// disclosed divergence: the real gate distinguishes "file absent" (no_eligible_work=False) from
+// "file present but malformed JSON" (no_eligible_work=True, own_ac_ids stays empty) via a
+// try/except around json.loads; readJson collapses both to `null` like every other read in this
+// file. The only practical difference is the rare malformed-approved-specification case, where
+// this hook falls back to running the checks normally instead of staying silent -- still the
+// safe direction (never a false block from unscoped-and-therefore-wrong data), just not a byte-
+// for-byte match of that one edge case.
+const approvedSpecDoc = readJson(SPECIFICATION_APPROVED_PATH);
+const noEligibleWork =
+  approvedSpecDoc !== null && eligibleAcIds(ledgerEntries, ownAcIdsFromSpecification(approvedSpecDoc)).length === 0;
 
 // --- changed_paths: untracked + diff against AIDW_BASELINE_COMMIT (Task 5) ----------------------
 // Shape-validated before it reaches an interpolated shell string -- an env var, however this
@@ -190,10 +281,23 @@ const noEligibleWork = ledgerEntries.length > 0 && activeAcEntries.every((e) => 
 // check-remediation-stop.mjs's identical use of this exact env var).
 const rawBaselineCommit = process.env.AIDW_BASELINE_COMMIT;
 const baselineCommit = rawBaselineCommit && /^[0-9a-f]{7,40}$/i.test(rawBaselineCommit) ? rawBaselineCommit : null;
+// Item 7: a 5th run() call site the brief's own citation didn't enumerate (it names 4) -- found by
+// re-reading the current file per this task's own instructions to verify every citation against
+// actual code. Same failure-sentinel contract applies: null must skip the write-scope checks
+// entirely (changedPathsFailed below), not silently proceed with an empty changedPaths, which
+// would misread as "wrote nothing" (write_scope_checks.py's own wrote_nothing_real) -- a false
+// block in the same direction this whole item exists to close, and previously also a crash
+// (`.split` on `null`) once run() started returning the failure sentinel instead of "".
 let changedPaths = [];
+let changedPathsFailed = false;
 if (baselineCommit) {
   const diffOut = run(`git diff --name-only ${baselineCommit} -- . && git ls-files --others --exclude-standard`);
-  changedPaths = [...new Set(diffOut.split("\n").map((l) => l.trim()).filter(Boolean))].sort();
+  if (diffOut === null) {
+    changedPathsFailed = true;
+    reportFailOpen(HOOK_NAME, stage, "changed-paths diff command failed -- write-scope/test-pyramid checks skipped this turn", cwd);
+  } else {
+    changedPaths = [...new Set(diffOut.split("\n").map((l) => l.trim()).filter(Boolean))].sort();
+  }
 }
 
 // --- shell out to both python check-hooks ---------------------------------------------------------
@@ -224,17 +328,22 @@ const residue = runCheckHook("ac_residue_checks.py", {
   coverage_plan: coveragePlan,
 });
 
-const scope = baselineCommit
+const scope = baselineCommit && !changedPathsFailed
   ? runCheckHook("write_scope_checks.py", { changed_paths: changedPaths, has_ui: hasUi, no_eligible_work: noEligibleWork })
-  : null; // no baseline captured -- nothing to diff against, same "fail open, not a false positive" contract check_write_scope itself uses for baseline_commit=None
+  : null; // no baseline captured, or the diff command itself failed -- nothing trustworthy to diff against, same "fail open, not a false positive" contract check_write_scope itself uses for baseline_commit=None
 
 const problems = [];
 
 if (residue) {
   problems.push(...(residue.ledger_integrity || []));
-  problems.push(...(residue.retired_residue || []));
-  problems.push(...(residue.deferred_residue || []));
-  problems.push(...(residue.completed_protection || []));
+  // Item 7: skipped entirely when the uncapped listing itself failed -- see residueListingFailed's
+  // own comment above. Whatever ac_residue_checks.py computed for these three from an empty/wrong
+  // residueTestFiles is not trustworthy and must never reach `problems`.
+  if (!residueListingFailed) {
+    problems.push(...(residue.retired_residue || []));
+    problems.push(...(residue.deferred_residue || []));
+    problems.push(...(residue.completed_protection || []));
+  }
 
   const orphanPaths = Object.keys(residue.unattributed_tests || {}).sort();
   if (orphanPaths.length > 0) {
