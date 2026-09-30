@@ -798,6 +798,36 @@ def _demo() -> None:
     assert result["passed"] is False
     assert any("test_command" in r for r in result["reasons"]), result
 
+    # Item 4 (final-review Fix Round 2): a real, non-empty `problems` entry the model's OWN report
+    # already correctly lists under blocking_reasons (with merge_ready already False) must NOT
+    # re-surface as a same-turn block -- verify_exit_readiness always force-corrects merge_ready/
+    # blocking_reasons to match `problems` regardless (passed=True, never gates), so a model whose
+    # report already says exactly that is getting told to do work that changes nothing.
+    already_reported_payload = {
+        **unresolvable_payload,
+        "report": {
+            "merge_ready": False,
+            "blocking_reasons": {
+                "status": "present",
+                "values": ["manifest.json has no test_command for this stack"],
+                "reason": "",
+            },
+        },
+    }
+    result = _run_check_hook(already_reported_payload)
+    assert result["passed"] is True, result  # problems is non-empty, but the model already said so
+    assert result["reasons"] == [], result
+
+    # Sanity: the SAME real problem, but the model claims merge_ready=True (about to be
+    # force-corrected to False) -- genuinely new information, must still nudge.
+    claims_ready_payload = {
+        **unresolvable_payload,
+        "report": {"merge_ready": True, "blocking_reasons": {"status": "absent", "values": [], "reason": "clean"}},
+    }
+    result = _run_check_hook(claims_ready_payload)
+    assert result["passed"] is False
+    assert any("test_command" in r for r in result["reasons"]), result
+
     # Missing AIDW_RUN_ID must never produce the "flip to merge_ready=True" nudge (Task 14 review
     # fix, minor #1): the model's own stale-looking gate-owned reason is UNVERIFIED here (the
     # run_id-gated half never ran), not confirmed clean -- telling it to flip to True would be a
@@ -879,7 +909,19 @@ def _run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
 
     verdict = evaluate_merge_readiness(problems, report.get("blocking_reasons"), report.get("merge_ready"))
 
-    reasons = list(problems)
+    # Only nudge on a problem the model's OWN report doesn't already correctly reflect -- same
+    # philosophy as the stale-reasons block below, generalized to this non-empty-`problems` branch.
+    # verify_exit_readiness (Round 1's territory, untouched) always returns passed=True regardless;
+    # its whole job is silently correcting merge_ready/blocking_reasons in the report, never gating.
+    # So a `problems` entry the model already listed under blocking_reasons (with merge_ready
+    # already False) is genuinely nothing new: the real gate is about to force exactly what the
+    # model's report already says, and re-surfacing it here as a same-turn block is pure noise, not
+    # a nudge -- nothing would change if the model did nothing. It's still new information, and
+    # still worth a nudge, when the model claims merge_ready=True (about to be force-corrected to
+    # False) or hasn't already named this specific problem string.
+    model_reasons_set = set(_presence_values(report.get("blocking_reasons")))
+    model_claims_ready = report.get("merge_ready") is True
+    reasons = [p for p in problems if model_claims_ready or p not in model_reasons_set]
     # Same-turn value of the stale-reason filter: nothing NEW to fix, but the model's own draft
     # claims a blocker this run's deterministic checks disprove -- worth a nudge to revise the
     # report text itself, even though the real gate will silently correct `merge_ready` regardless.
