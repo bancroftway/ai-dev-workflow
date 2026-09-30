@@ -1459,6 +1459,37 @@ def _demo() -> None:
     assert not revise_retire_ac_result.passed
     assert "cannot be both revised and retired" in revise_retire_ac_result.reasons[0]
 
+    # bug_affected_ac_ids: all 4 sub-checks, through this SAME rules_seed and the real sync_ledger()
+    # entry point (task review follow-up: these 4 branches already had coverage elsewhere in this
+    # file via an older, differently-shaped seed -- added here too for parity with the other 4 rule
+    # families just above, all exercised through one consistent seed/pattern).
+    unknown_bug_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", bug_affected_ac_ids=["US-9999.9"])
+    assert not unknown_bug_result.passed
+    assert "US-9999.9" in unknown_bug_result.reasons[0] and "does not exist" in unknown_bug_result.reasons[0]
+
+    wrong_kind_bug_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", bug_affected_ac_ids=["US-0001"])
+    assert not wrong_kind_bug_result.passed
+    assert "not an acceptance criterion id" in wrong_kind_bug_result.reasons[0]
+
+    not_live_bug_result = sync_ledger([dict(e) for e in rules_seed], [], "run-30", bug_affected_ac_ids=["US-0002.1"])
+    assert not not_live_bug_result.passed
+    assert "not a live criterion" in not_live_bug_result.reasons[0]
+
+    contradiction_bug_result = sync_ledger(
+        [dict(e) for e in rules_seed], [], "run-30",
+        retired_ac_ids=["US-0001.1"], bug_affected_ac_ids=["US-0001.1"],
+    )
+    assert not contradiction_bug_result.passed
+    # retired_ac_ids' own loop runs FIRST in sync_ledger and (successfully) flips this AC to
+    # "retired" before bug_affected_ac_ids ever evaluates it, so for this simple same-id-in-both-
+    # lists case the surfaced reason is "not a live criterion" (it's no longer live once retired),
+    # not check_bug_affected_ac_id's own dedicated "both reopened...removed" contradiction message
+    # -- that one only fires when the retired_ac_ids citation is ITSELF independently invalid (e.g.
+    # a simultaneous revise-and-retire contradiction) and so never mutates the entry, leaving it
+    # live when bug_affected_ac_ids evaluates the same id. Either way the sync correctly fails; this
+    # only pins WHICH reason surfaces for this straightforward case.
+    assert "not a live criterion" in contradiction_bug_result.reasons[0]
+
     # THE FIX: naming a story in retired_us_ids DOES retire it, and cascades to its own AC.
     result2 = sync_ledger([dict(e) for e in seed], [], "run-3", retired_us_ids=["US-0001"])
     assert result2.passed, result2.reasons

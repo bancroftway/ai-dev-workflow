@@ -57,7 +57,8 @@ is an acceptable second copy).
 CLI mode (`python3 ledger_sync_checks.py --check-hook`, stdin JSON: `{"ledger_entries": [...],
 "specification": {...}, "run_id": "..." | null}`, stdout JSON: `{"empty_draft_problems": [...],
 "open_questions": [...], "citation_problems": [...], "completeness_problems": [...]}`) is what the
-Stop hook actually invokes -- see `_run_check_hook_cli` below for the exact contract.
+Stop hook actually invokes -- see the `if __name__ == "__main__":` block below for the exact
+contract.
 """
 
 from __future__ import annotations
@@ -369,7 +370,7 @@ def check_ledger_sync_draft(
         touched_ids.add(resolved_us_id)
 
         for ac in story.get("acceptance_criteria") or []:
-            existing_ac_id = ac.get("existing_ac_id")
+            existing_ac_id = None if ledger_was_empty else ac.get("existing_ac_id")
             if existing_ac_id is not None:
                 problem = check_existing_ac_id_citation(existing_ac_id, ac.get("id"), resolved_us_id, shadow)
                 if problem:
@@ -564,13 +565,28 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert check_ledger_sync_draft(ledger, new_story) == []
     # Greenfield leniency: an EMPTY starting ledger never rejects any citation.
     assert check_ledger_sync_draft([], [{"existing_us_id": "US-1", "id": None, "acceptance_criteria": []}]) == []
+    # Greenfield leniency, AC LEVEL too (task review follow-up, 2026-09-29: this branch used to read
+    # `ac.get("existing_ac_id")` unguarded, diverging from sync_ledger's own explicit
+    # `ac["existing_ac_id"] = None` mutation on an empty ledger -- a new story's AC citing a
+    # nonexistent existing_ac_id on a truly empty ledger was wrongly REJECTED here while the real
+    # sync_ledger correctly passed it). A brand-new story with an AC citing an id that doesn't exist
+    # anywhere must still pass cleanly when the ledger starts empty.
+    assert check_ledger_sync_draft(
+        [],
+        [{
+            "id": None, "existing_us_id": None, "title": "Export CSV",
+            "acceptance_criteria": [
+                {"id": None, "existing_ac_id": "US-0001.1", "description": "Produces a .csv file."}
+            ],
+        }],
+    ) == [], "an AC citing a nonexistent existing_ac_id on an EMPTY ledger must never be rejected"
     # Retirement/bug-affected lists thread straight through to the per-item checks above.
     assert check_ledger_sync_draft(ledger, [], retired_us_ids=["US-9999"]) != []
     assert check_ledger_sync_draft(ledger, [], retired_ac_ids=["US-0001.1"], bug_affected_ac_ids=["US-0001.1"]) != [], (
         "reopen-and-retire contradiction must be caught even with no draft_user_stories at all"
     )
 
-    # --- run_ledger_sync_checks / _run_check_hook_cli: same shape the --check-hook CLI emits ---
+    # --- run_ledger_sync_checks: same shape the --check-hook CLI emits ---
     spec = {
         "user_stories": [], "questions": [{"id": "q-1", "status": "open", "question": "What timezone?"}],
     }

@@ -62,7 +62,6 @@ from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
 from .gates import adversarial_gate, remediation_gate, skill_gate
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
-from .gates.ledger_sync_checks import check_empty_draft, find_open_questions
 from .gates.diagram_gate import (
     DRAFT_DIAGRAMS_DIR,
     DRAFT_DIR,
@@ -73,6 +72,7 @@ from .gates.diagram_gate import (
     make_verify_plan_diagrams,
     verify_plan_diagrams,
 )
+from .gates.ledger_sync_checks import check_empty_draft, find_open_questions
 from .gates.test_coverage_gate import (
     MINIMAL_CODE_TO_GREEN_HARD_RULES,
     MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE,
