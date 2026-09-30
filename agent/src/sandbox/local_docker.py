@@ -359,6 +359,36 @@ class LocalDockerProvider(SandboxProvider):
                     # fleet in general.
                     "-e",
                     f"AIDW_IMAGE_REF={image or self._image}",
+                    # Final-review Fix Round 2, Item 5: these 8 are static, deploy-time operator
+                    # config (a coverage threshold, an auth-gate kill-switch, a diagram-error-summary
+                    # truncation size, ...) -- unlike AIDW_STAGE/AIDW_RUN_ID/AIDW_BASELINE_COMMIT,
+                    # which genuinely change per turn/stage and are threaded by the chat models' own
+                    # per-turn env prefix, these never change within a run, so container-boot
+                    # passthrough (here) is the right layer. Without this, every sandboxed Stop
+                    # hook's own `os.environ.get("AIDW_...", <default>)` read silently fell back to
+                    # its hardcoded default even when an operator DID set the host-side env var --
+                    # config.py's identically-named `os.environ.get(...)` calls worked correctly on
+                    # the host, but the override never reached the container at all. Each default
+                    # below is a literal copy of config.py's OWN default for the SAME env var name,
+                    # so an operator who sets nothing gets exactly the same fallback the host uses --
+                    # same "kept in sync by identity of the env var name, not by import" duplication
+                    # config.py's own comments already disclose for these exact names (see Item 6).
+                    "-e",
+                    f"MIN_COVERAGE_PERCENT={os.environ.get('MIN_COVERAGE_PERCENT', '95.0')}",
+                    "-e",
+                    f"AIDW_AUTH_GATE={os.environ.get('AIDW_AUTH_GATE', '1')}",
+                    "-e",
+                    f"AIDW_COVERAGE_COMMANDS_PATH={os.environ.get('AIDW_COVERAGE_COMMANDS_PATH', '.ai-dev-workflow/coverage-commands.json')}",
+                    "-e",
+                    f"AIDW_DIAGRAM_ERROR_SUMMARY_HEAD_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_HEAD_CHARS', '2000')}",
+                    "-e",
+                    f"AIDW_DIAGRAM_ERROR_SUMMARY_TAIL_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_TAIL_CHARS', '2000')}",
+                    "-e",
+                    f"AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX', '10')}",
+                    "-e",
+                    f"AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS', '700')}",
+                    "-e",
+                    f"AIDW_DIAGRAM_MAX_WIREFRAME_BYTES={os.environ.get('AIDW_DIAGRAM_MAX_WIREFRAME_BYTES', str(30 * 1024))}",
                 ]
                 if scaffold_new_repo:
                     # "+ New Project" case only (Part 3 plan, Ruling 6) -- entrypoint.sh reads

@@ -289,6 +289,19 @@ class AzureContainerInstanceProvider(SandboxProvider):
                 f"WORK_BRANCH={work_branch}",
                 f"AGENT_PROVIDER={provider}",
                 f"AIDW_IMAGE_REF={image or self._sandbox_image}",
+                # Final-review Fix Round 2, Item 5 -- mirrors local_docker.py's identical addition;
+                # see that file's own comment for the full reasoning. Static, deploy-time operator
+                # config (coverage threshold, auth-gate kill-switch, diagram-error-summary sizes),
+                # never per-turn/per-stage, so container-boot passthrough is the right layer. Each
+                # default is a literal copy of config.py's own default for the same env var name.
+                f"MIN_COVERAGE_PERCENT={os.environ.get('MIN_COVERAGE_PERCENT', '95.0')}",
+                f"AIDW_AUTH_GATE={os.environ.get('AIDW_AUTH_GATE', '1')}",
+                f"AIDW_COVERAGE_COMMANDS_PATH={os.environ.get('AIDW_COVERAGE_COMMANDS_PATH', '.ai-dev-workflow/coverage-commands.json')}",
+                f"AIDW_DIAGRAM_ERROR_SUMMARY_HEAD_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_HEAD_CHARS', '2000')}",
+                f"AIDW_DIAGRAM_ERROR_SUMMARY_TAIL_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_TAIL_CHARS', '2000')}",
+                f"AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX', '10')}",
+                f"AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS={os.environ.get('AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS', '700')}",
+                f"AIDW_DIAGRAM_MAX_WIREFRAME_BYTES={os.environ.get('AIDW_DIAGRAM_MAX_WIREFRAME_BYTES', str(30 * 1024))}",
             ]
             if scaffold_new_repo:
                 # "+ New Project" case only (Part 3 plan, Ruling 6) -- entrypoint.sh reads these to
