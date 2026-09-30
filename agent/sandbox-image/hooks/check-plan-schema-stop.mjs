@@ -24,21 +24,25 @@
 // ONE generic walker every schema file here is validated through -- no hook re-encodes a model's
 // field names as its own magic strings.
 //
-// WIREFRAME_FORBIDDEN/_SAFE_DIAGRAM_NAME_RE/MAX_WIREFRAME_BYTES below are PORTED from
-// gates/diagram_gate.py (check_wireframe, DIAGRAM_MAX_WIREFRAME_BYTES config constant), not
-// re-derived -- this half genuinely needs the wireframe's own HTML body (forbidden-pattern/byte
-// checks), which the wireframe_linkage_checks.py shared module below doesn't carry, so a Python
-// subprocess call isn't a clean fit here the way it is for the linkage checks below. KEEP THESE IN
-// SYNC WITH gates/diagram_gate.py BY HAND -- there is no automated drift guard for this half
-// (unlike the schema files above, which regenerate mechanically); re-read that module's own regex
-// list here whenever either changes. There is deliberately no wireframe COUNT cap (removed
-// 2026-09-24) -- a plan may cite as many wireframes as the work actually needs.
+// WIREFRAME-CONTENT CHECK (check_wireframe) and the MANIFEST-ORPHAN SWEEP below used to be hand-
+// ported from gates/diagram_gate.py (MAX_WIREFRAME_BYTES/SAFE_DIAGRAM_NAME_RE/WIREFRAME_FORBIDDEN/
+// check_wireframe, and _load_and_check_manifest's own disk-vs-manifest set-difference logic) --
+// "KEEP THESE IN SYNC WITH gates/diagram_gate.py BY HAND, no automated drift guard". Both now live
+// in gates/wireframe_linkage_checks.py (byte-identical staged copy at
+// /opt/aidw-hooks/wireframe_linkage_checks.py, same as the linkage checks
+// check-plan-citations-stop.mjs already shells out to), so this hook SHELLS OUT to the REAL
+// implementation instead of a second, independently-drifting copy (2026-09-29, Task 9). This hook
+// still does its own directory listing (readdirSync) and file reads -- the shared module has no
+// sandbox access by design; it only ever sees data this hook already read and handed over. There
+// is deliberately no wireframe COUNT cap (removed 2026-09-24) -- a plan may cite as many wireframes
+// as the work actually needs; do not reintroduce one.
 //
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs:
 // no AIDW_-prefixed env var gates this -- steps.json/manifest.json's own existence in the working
 // directory (always /workspace/repo) is the entire scope check. A turn for any other stage simply
 // never has these files, so this exits 0 immediately.
 import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { validate } from "./lib/json-schema-lite.mjs";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
 
@@ -61,50 +65,6 @@ function listStems(dir, ext) {
   } catch {
     return [];
   }
-}
-
-// Ported from config.py's DIAGRAM_MAX_WIREFRAME_BYTES (env-overridable there; a fixed value here
-// is fine -- this hook is a same-turn NUDGE, not the authoritative gate, and using a stale default
-// only means an operator-tuned cap takes one extra lap to be enforced here, never a false
-// rejection since diagram_gate.py's own check still runs after).
-const MAX_WIREFRAME_BYTES = 30 * 1024;
-const SAFE_DIAGRAM_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
-
-// Ported verbatim from gates/diagram_gate.py's `_WIREFRAME_FORBIDDEN` -- same order, same
-// messages, so a report from this hook reads identically to one from the real gate.
-const WIREFRAME_FORBIDDEN = [
-  [/<\s*script\b/i, "contains a <script> tag"],
-  [/<[a-zA-Z][^>]*\son\w+\s*=/i, "contains an inline on*= event handler"],
-  [/(?:src|href|action|data|xlink:href)\s*=\s*["']?\s*(?:https?:)?\/\//i, "references an external URL"],
-  [
-    /(?:src|href|action|data|xlink:href)\s*=\s*["']?\s*(?:javascript|vbscript|data|file)\s*:/i,
-    "uses a dangerous URL scheme (javascript:/vbscript:/data:/file:)",
-  ],
-  [/url\(\s*["']?\s*(?:https?:)?\/\//i, "references an external URL (css url())"],
-  [/@import\b/i, "uses @import (external stylesheet)"],
-  [/<\s*(?:iframe|object|embed|base|form)\b/i, "contains an embedding/navigation element (iframe/object/embed/base/form)"],
-  [/<\s*meta\b[^>]*http-equiv/i, "contains <meta http-equiv> (refresh/CSP override)"],
-];
-
-/** Ported from gates/diagram_gate.py's `check_wireframe` -- returns a reason string, or null if
- * acceptable. */
-function checkWireframe(screen, htmlSource) {
-  if (!SAFE_DIAGRAM_NAME_RE.test(screen || "")) {
-    return `screen name ${JSON.stringify(screen)} must match ${SAFE_DIAGRAM_NAME_RE.source} (letters, digits, _, - only)`;
-  }
-  if (Buffer.byteLength(htmlSource, "utf8") > MAX_WIREFRAME_BYTES) {
-    return `wireframe ${JSON.stringify(screen)} exceeds ${Math.floor(MAX_WIREFRAME_BYTES / 1024)} KB -- simplify it`;
-  }
-  const lowered = htmlSource.toLowerCase();
-  if (!lowered.includes("<html") && !lowered.includes("<body") && !lowered.includes("<div")) {
-    return `wireframe ${JSON.stringify(screen)} does not look like an HTML page`;
-  }
-  for (const [pattern, reason] of WIREFRAME_FORBIDDEN) {
-    if (pattern.test(htmlSource)) {
-      return `wireframe ${JSON.stringify(screen)} ${reason} -- wireframes must be fully self-contained (inline CSS only)`;
-    }
-  }
-  return null;
 }
 
 let input = {};
@@ -164,52 +124,57 @@ if (manifestDoc !== undefined) {
   const wireframes = Array.isArray(manifestDoc.wireframes) ? manifestDoc.wireframes : [];
   const diagrams = Array.isArray(manifestDoc.diagrams) ? manifestDoc.diagrams : [];
 
+  // Read each wireframe's real HTML body -- needed for the content check below (shelled out to
+  // Python, which has no sandbox access of its own). A wireframe manifest.json references but that
+  // doesn't exist on disk isn't reported HERE any more -- that's the orphan sweep's manifest->disk
+  // direction below, so this loop only SKIPS one it can't read rather than reporting anything of
+  // its own (avoids a duplicate message from two different checks for the same root cause).
+  const wireframeHtml = [];
   for (const wf of wireframes) {
     if (typeof wf?.screen !== "string") continue; // already reported by the schema check above
-    const htmlPath = `${WIREFRAMES_DIR}/${wf.screen}.html`;
-    if (!existsSync(`${cwd}/${htmlPath}`)) {
-      problems.push(`manifest.json lists wireframe ${JSON.stringify(wf.screen)} but ${htmlPath} does not exist -- create it.`);
-      continue;
-    }
-    let html;
+    const htmlPath = `${cwd}/${WIREFRAMES_DIR}/${wf.screen}.html`;
+    if (!existsSync(htmlPath)) continue;
     try {
-      html = readFileSync(`${cwd}/${htmlPath}`, "utf8");
+      wireframeHtml.push({ screen: wf.screen, html_source: readFileSync(htmlPath, "utf8") });
     } catch {
-      continue; // race with the model's own in-flight write -- not this hook's problem to report
-    }
-    const reason = checkWireframe(wf.screen, html);
-    if (reason) problems.push(reason);
-  }
-
-  for (const dg of diagrams) {
-    if (typeof dg?.name !== "string") continue; // already reported by the schema check above
-    const mmdPath = `${DIAGRAMS_DIR}/${dg.name}.mmd`;
-    if (!existsSync(`${cwd}/${mmdPath}`)) {
-      problems.push(`manifest.json lists diagram ${JSON.stringify(dg.name)} but ${mmdPath} does not exist -- create it.`);
+      // race with the model's own in-flight write -- not this hook's problem to report
     }
   }
 
-  // The OTHER direction, ported from gates/diagram_gate.py's `_load_and_check_manifest`
-  // (root-caused live 2026-09-19, income-investor session 598b633d, plan lap 1 --
-  // this hook originally only checked "manifest references a file that's missing," not "a file
-  // exists that manifest doesn't reference," and the SAME redraft the schema/existence checks
-  // above were built to prevent still cost a lap on this exact inverse case). A wireframe/diagram
-  // dropped from manifest.json without being named in retired_wireframe_screens/
-  // retired_diagram_names leaves an orphaned sidecar file on disk -- same "explicit retirement
-  // only, silence is not retirement" discipline the ledger itself enforces.
-  const manifestScreens = new Set(wireframes.filter((wf) => typeof wf?.screen === "string").map((wf) => wf.screen));
-  const retiredScreens = new Set(Array.isArray(manifestDoc.retired_wireframe_screens) ? manifestDoc.retired_wireframe_screens : []);
-  for (const screen of listStems(`${cwd}/${WIREFRAMES_DIR}`, ".html")) {
-    if (!manifestScreens.has(screen) && !retiredScreens.has(screen)) {
-      problems.push(`${WIREFRAMES_DIR}/${screen}.html exists on disk but is not listed in manifest.json's wireframes (or retired_wireframe_screens).`);
+  // WIREFRAME-CONTENT CHECK (check_wireframe) + MANIFEST-ORPHAN SWEEP (both directions, both
+  // artifact kinds -- root-caused live 2026-09-19, income-investor session 598b633d, plan lap 1: a
+  // wireframe/diagram dropped from manifest.json without being named in
+  // retired_wireframe_screens/retired_diagram_names leaves an orphaned sidecar file on disk, same
+  // "explicit retirement only, silence is not retirement" discipline the ledger itself enforces).
+  // SHELLS OUT to the REAL implementation, gates/wireframe_linkage_checks.py (see this file's own
+  // header), instead of a hand-ported JS copy.
+  try {
+    const proc = spawnSync(
+      "python3",
+      ["/opt/aidw-hooks/wireframe_linkage_checks.py", "--check-hook"],
+      {
+        input: JSON.stringify({
+          wireframe_html: wireframeHtml,
+          disk_wireframe_screens: listStems(`${cwd}/${WIREFRAMES_DIR}`, ".html"),
+          manifest_wireframe_screens: wireframes.filter((wf) => typeof wf?.screen === "string").map((wf) => wf.screen),
+          retired_wireframe_screens: Array.isArray(manifestDoc.retired_wireframe_screens) ? manifestDoc.retired_wireframe_screens : [],
+          disk_diagram_names: listStems(`${cwd}/${DIAGRAMS_DIR}`, ".mmd"),
+          manifest_diagram_names: diagrams.filter((d) => typeof d?.name === "string").map((d) => d.name),
+          retired_diagram_names: Array.isArray(manifestDoc.retired_diagram_names) ? manifestDoc.retired_diagram_names : [],
+        }),
+        encoding: "utf8",
+        timeout: 20000,
+      },
+    );
+    if (proc.status === 0 && proc.stdout) {
+      const result = JSON.parse(proc.stdout);
+      problems.push(...(result.wireframe_content_problems || []));
+      problems.push(...(result.manifest_orphan_problems || []));
+    } else {
+      reportFailOpen(HOOK_NAME, stage, "wireframe_linkage_checks.py subprocess failed, timed out, or produced no output", cwd);
     }
-  }
-  const manifestDiagramNames = new Set(diagrams.filter((d) => typeof d?.name === "string").map((d) => d.name));
-  const retiredDiagramNames = new Set(Array.isArray(manifestDoc.retired_diagram_names) ? manifestDoc.retired_diagram_names : []);
-  for (const name of listStems(`${cwd}/${DIAGRAMS_DIR}`, ".mmd")) {
-    if (!manifestDiagramNames.has(name) && !retiredDiagramNames.has(name)) {
-      problems.push(`${DIAGRAMS_DIR}/${name}.mmd exists on disk but is not listed in manifest.json's diagrams (or retired_diagram_names).`);
-    }
+  } catch {
+    reportFailOpen(HOOK_NAME, stage, "wireframe_linkage_checks.py subprocess failed, timed out, or returned unparsable output", cwd);
   }
 }
 

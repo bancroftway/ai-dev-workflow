@@ -29,8 +29,12 @@ from ..schemas import presence_values as _presence_values
 from ..text_truncate import truncate_middle
 from . import write_scope_gate
 from .wireframe_linkage_checks import (
+    MAX_WIREFRAME_BYTES,
+    SAFE_DIAGRAM_NAME_RE,
+    check_manifest_orphans,
     check_plan_step_wireframe_coverage,
     check_ui_wireframe_coverage,
+    check_wireframe,
     check_wireframe_ac_ids,
     check_wireframe_has_ac_ids,
 )
@@ -61,39 +65,12 @@ def wireframe_preview_url(owner: str, repo: str, branch: str, screen: str) -> st
         f"https://github.com/{owner}/{repo}/blob/{branch}/{WIREFRAMES_DIR}/{screen}.html"
     )
 
-MAX_WIREFRAME_BYTES = config.DIAGRAM_MAX_WIREFRAME_BYTES
+# MAX_WIREFRAME_BYTES/check_wireframe (wireframe byte-size/forbidden-pattern content check) moved
+# to gates/wireframe_linkage_checks.py (2026-09-29, Task 9) -- imported above, along with
+# SAFE_DIAGRAM_NAME_RE (also used by _render_one below for diagram names) -- so
+# check-plan-schema-stop.mjs can shell out to the REAL implementation instead of a hand-ported JS
+# copy. See that module's own docstring for the full reasoning.
 
-# Trust-boundary checks on model-emitted wireframe HTML. This denylist is hygiene for the
-# committed artifact, NOT the security boundary -- the frontend confines every wireframe (both
-# thumbnail and full-size) to an empty-`sandbox` iframe, whose null origin and script ban hold
-# even against markup these regexes miss. The on\w+= check is anchored inside a tag (after
-# `<tag ` and before its `>`) so prose like "conversion=..." never false-positives.
-_WIREFRAME_FORBIDDEN = (
-    (re.compile(r"<\s*script\b", re.IGNORECASE), "contains a <script> tag"),
-    (re.compile(r"<[a-zA-Z][^>]*\son\w+\s*=", re.IGNORECASE), "contains an inline on*= event handler"),
-    (re.compile(r"""(?:src|href|action|data|xlink:href)\s*=\s*["']?\s*(?:https?:)?//""", re.IGNORECASE), "references an external URL"),
-    (re.compile(r"""(?:src|href|action|data|xlink:href)\s*=\s*["']?\s*(?:javascript|vbscript|data|file)\s*:""", re.IGNORECASE), "uses a dangerous URL scheme (javascript:/vbscript:/data:/file:)"),
-    (re.compile(r"""url\(\s*["']?\s*(?:https?:)?//""", re.IGNORECASE), "references an external URL (css url())"),
-    (re.compile(r"@import\b", re.IGNORECASE), "uses @import (external stylesheet)"),
-    (re.compile(r"<\s*(?:iframe|object|embed|base|form)\b", re.IGNORECASE), "contains an embedding/navigation element (iframe/object/embed/base/form)"),
-    (re.compile(r"""<\s*meta\b[^>]*http-equiv""", re.IGNORECASE), "contains <meta http-equiv> (refresh/CSP override)"),
-)
-
-
-def check_wireframe(screen: str, html_source: str) -> str | None:
-    """Returns a rejection reason, or None if the wireframe is acceptable. Pure -- self-checkable
-    without a sandbox."""
-    if not _SAFE_DIAGRAM_NAME_RE.match(screen or ""):
-        return f"screen name {screen!r} must match {_SAFE_DIAGRAM_NAME_RE.pattern} (letters, digits, _, - only)"
-    if len(html_source.encode("utf-8")) > MAX_WIREFRAME_BYTES:
-        return f"wireframe {screen!r} exceeds {MAX_WIREFRAME_BYTES // 1024} KB -- simplify it"
-    lowered = html_source.lower()
-    if "<html" not in lowered and "<body" not in lowered and "<div" not in lowered:
-        return f"wireframe {screen!r} does not look like an HTML page"
-    for pattern, reason in _WIREFRAME_FORBIDDEN:
-        if pattern.search(html_source):
-            return f"wireframe {screen!r} {reason} -- wireframes must be fully self-contained (inline CSS only)"
-    return None
 
 def check_dangling_visual_retirement(
     wireframe_refs: list[dict[str, Any]],
@@ -384,12 +361,9 @@ def _mermaid_error_summary(output: str) -> str:
     return " | ".join(lines[:config.DIAGRAM_ERROR_SUMMARY_LINES_MAX])[:config.DIAGRAM_ERROR_SUMMARY_JOINED_CHARS]
 
 
-_SAFE_DIAGRAM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
 async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[str, Any]) -> DiagramRenderOutcome:
     name = diagram.get("name") or "diagram"
-    if not _SAFE_DIAGRAM_NAME_RE.match(name):
+    if not SAFE_DIAGRAM_NAME_RE.match(name):
         # diagram["name"] is model-reported (PlanDiagram.name) -- a real command-injection gap,
         # found by automated security review, if it were interpolated unquoted into the mmdc
         # shell command below without validation first. Rejected as a render failure (not a
@@ -399,7 +373,7 @@ async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[s
             name=name,
             ok=False,
             is_infra_failure=False,
-            stderr_tail=f"diagram name {name!r} must match {_SAFE_DIAGRAM_NAME_RE.pattern} (letters, digits, _, - only)",
+            stderr_tail=f"diagram name {name!r} must match {SAFE_DIAGRAM_NAME_RE.pattern} (letters, digits, _, - only)",
         )
 
     source = diagram.get("mermaid_source") or ""
@@ -689,13 +663,14 @@ def _demo() -> None:
 
 # Task 13b: one line per DISTINCT rejection reason inside verify_plan_diagrams below, including
 # every reason folded into check_plan_linkage/check_wireframe_ac_ids/check_ui_wireframe_coverage/
-# check_plan_step_wireframe_coverage/check_wireframe/_render_one -- check_plan_linkage/
-# check_wireframe/_render_one are defined in THIS file; the other three live in
-# gates/wireframe_linkage_checks.py (imported below) so the sandbox's same-turn Stop hook can run
-# them directly instead of a hand-ported JS copy -- still first-party pipeline code, not
-# out-of-scope delegation the way write_scope_gate.py's delegation to ac_coverage_gate.py is. The 8
-# _WIREFRAME_FORBIDDEN patterns are one rule ("must be self-contained/safe"), not eight -- same
-# granularity write_scope_gate.py's _is_test_path regex family gets. A render failure classified
+# check_plan_step_wireframe_coverage/check_wireframe/_render_one -- check_plan_linkage/_render_one
+# (minus the diagram-name regex it borrows) are defined in THIS file; check_wireframe and the other
+# three linkage checks live in gates/wireframe_linkage_checks.py (imported above, 2026-09-29) so the
+# sandbox's same-turn Stop hooks can run them directly instead of a hand-ported JS copy -- still
+# first-party pipeline code, not out-of-scope delegation the way write_scope_gate.py's delegation to
+# ac_coverage_gate.py is. The 8 WIREFRAME_FORBIDDEN patterns are one rule ("must be self-contained/
+# safe"), not eight -- same granularity write_scope_gate.py's _is_test_path regex family gets. A
+# render failure classified
 # as infrastructure (mmdc/Chromium broken, not a genuine Mermaid syntax error) is deliberately
 # NOT a rule here -- the model cannot fix its own sandbox's browser install, and the gate itself
 # never blames it for one (see _looks_like_infra_failure).
@@ -905,31 +880,29 @@ async def _load_and_check_manifest(
     retired_wireframe_screens = set(doc.get("retired_wireframe_screens") or [])
     retired_diagram_names = set(doc.get("retired_diagram_names") or [])
 
+    # Disk<->manifest.json orphan sweep (both directions, both artifact kinds): the listing itself
+    # needs sandbox access (this function has it; gates/wireframe_linkage_checks.py deliberately
+    # does not), but the pure set-difference/message logic moved there (2026-09-29, Task 9) so
+    # check-plan-schema-stop.mjs can shell out to the REAL implementation instead of a hand-ported
+    # JS copy. DRAFT_WIREFRAMES_DIR/DRAFT_DIAGRAMS_DIR here are the same values that module's own
+    # DRAFT_WIREFRAMES_DIR/DRAFT_DIAGRAMS_DIR constants hardcode -- no import between the two (see
+    # that module's own header for why), so its messages read identically to this function's own.
     wf_ls = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(DRAFT_WIREFRAMES_DIR)} 2>/dev/null")
     disk_wireframe_screens = {
         line.strip()[: -len(".html")] for line in (wf_ls.stdout or "").splitlines() if line.strip().endswith(".html")
     }
     manifest_wireframe_screens = {wf["screen"] for wf in wireframe_refs}
-    for screen in sorted(disk_wireframe_screens - manifest_wireframe_screens - retired_wireframe_screens):
-        problems.append(
-            f"{DRAFT_WIREFRAMES_DIR}/{screen}.html exists on disk but is not listed in "
-            "manifest.json's wireframes (or retired_wireframe_screens)"
-        )
-    for screen in sorted(manifest_wireframe_screens - disk_wireframe_screens):
-        problems.append(f"manifest.json lists wireframe {screen!r} but {DRAFT_WIREFRAMES_DIR}/{screen}.html does not exist -- create it")
 
     dg_ls = await provider.exec_in_sandbox(thread_id, f"ls {shlex.quote(DRAFT_DIAGRAMS_DIR)} 2>/dev/null")
     disk_diagram_names = {
         line.strip()[: -len(".mmd")] for line in (dg_ls.stdout or "").splitlines() if line.strip().endswith(".mmd")
     }
     manifest_diagram_names = {d["name"] for d in diagram_refs}
-    for name in sorted(disk_diagram_names - manifest_diagram_names - retired_diagram_names):
-        problems.append(
-            f"{DRAFT_DIAGRAMS_DIR}/{name}.mmd exists on disk but is not listed in manifest.json's "
-            "diagrams (or retired_diagram_names)"
-        )
-    for name in sorted(manifest_diagram_names - disk_diagram_names):
-        problems.append(f"manifest.json lists diagram {name!r} but {DRAFT_DIAGRAMS_DIR}/{name}.mmd does not exist -- create it")
+
+    problems += check_manifest_orphans(
+        disk_wireframe_screens, manifest_wireframe_screens, retired_wireframe_screens,
+        disk_diagram_names, manifest_diagram_names, retired_diagram_names,
+    )
 
     if problems:
         return None, problems

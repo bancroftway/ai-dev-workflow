@@ -28,6 +28,7 @@ _REAL_ID_RE = re.compile(r"^US-\d+(\.\d+)?$")
 
 from . import repo_files
 from .gates.narrative_format_checks import check_narrative_format
+from .gates.wireframe_linkage_checks import check_retired_step_ids
 from .sandbox.provider import SandboxProvider
 
 if TYPE_CHECKING:
@@ -826,21 +827,22 @@ def sync_plan_ledger(
                 entry["last_revised_run_id"] = run_id
         touched_ids.add(step_id)
 
-    for step_id in retired_step_ids or []:
+    # Validity (existence/kind/revise-or-retire contradiction) moved to
+    # gates/wireframe_linkage_checks.check_retired_step_ids (2026-09-29, Task 9) -- same messages,
+    # so check-plan-citations-stop.mjs can shell out to the REAL implementation instead of its own
+    # hand-ported copy. The mutation itself (flipping a validly-retired step's status) stays here:
+    # this function is the authoritative, stateful ledger writer that pure module has no business
+    # duplicating.
+    retired_ids = retired_step_ids or []
+    reasons.extend(check_retired_step_ids(retired_ids, updated, touched_ids))
+    for step_id in retired_ids:
         entry = _find(updated, step_id)
-        if entry is None:
-            reasons.append(f"retired_step_ids cites {step_id!r}, which does not exist in the ledger")
-            continue
-        if entry.get("kind") != "plan_step":
-            reasons.append(f"retired_step_ids cites {step_id!r}, which is not a plan step id")
-            continue
-        if step_id in touched_ids:
-            reasons.append(
-                f"retired_step_ids cites {step_id!r}, but this draft also revises it -- a step "
-                "cannot be both revised and retired in the same draft"
-            )
-            continue
-        if entry.get("status") in ("active", "revised"):
+        if (
+            entry is not None
+            and entry.get("kind") == "plan_step"
+            and step_id not in touched_ids
+            and entry.get("status") in ("active", "revised")
+        ):
             entry["status"] = "retired"
             entry["last_revised_run_id"] = run_id
 

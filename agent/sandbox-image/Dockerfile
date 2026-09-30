@@ -811,8 +811,10 @@ COPY hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-plan-citations-st
 # `_demo()` asserts this file matches its source on every self-check run); re-run `cp
 # ../src/gates/wireframe_linkage_checks.py hooks/wireframe_linkage_checks.py` (from
 # agent/sandbox-image) after editing the source and before rebuilding. Needs nothing beyond
-# python3's standard library. Shelled to by check-plan-citations-stop.mjs above, not a separate
-# Stop hook of its own.
+# python3's standard library. Shelled to by check-plan-citations-stop.mjs above AND
+# check-plan-schema-stop.mjs (extended 2026-09-29, Task 9, with check_wireframe/
+# check_manifest_orphans/check_ac_id_citation/check_retired_step_ids) -- not a separate Stop hook
+# of its own.
 COPY hooks/wireframe_linkage_checks.py /opt/aidw-hooks/wireframe_linkage_checks.py
 COPY hooks/check-diagram-staleness-stop.mjs /opt/aidw-hooks/check-diagram-staleness-stop.mjs
 COPY hooks/check-test-quality-stop.mjs /opt/aidw-hooks/check-test-quality-stop.mjs
