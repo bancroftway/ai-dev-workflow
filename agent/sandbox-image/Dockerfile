@@ -966,6 +966,13 @@ COPY hooks/check-ac-residue-stop.mjs /opt/aidw-hooks/check-ac-residue-stop.mjs
 # directory and this file runs standalone (no package context).
 COPY hooks/ac_residue_checks.py /opt/aidw-hooks/ac_residue_checks.py
 COPY hooks/write_scope_checks.py /opt/aidw-hooks/write_scope_checks.py
+COPY hooks/check-exit-readiness-stop.mjs /opt/aidw-hooks/check-exit-readiness-stop.mjs
+# Byte-identical staged copy of agent/src/gates/exit_readiness_checks.py -- same build-context
+# constraint and same drift-guard convention as every other staged .py file here (that module's own
+# `_demo()` asserts this file matches its source on every self-check run); re-run `cp
+# ../src/gates/exit_readiness_checks.py hooks/exit_readiness_checks.py` (from agent/sandbox-image)
+# after editing the source and before rebuilding. Needs nothing beyond python3's standard library.
+COPY hooks/exit_readiness_checks.py /opt/aidw-hooks/exit_readiness_checks.py
 COPY hooks/lib/ /opt/aidw-hooks/lib/
 COPY hooks/schemas/ /opt/aidw-hooks/schemas/
 RUN set -eux; \
@@ -989,7 +996,8 @@ RUN set -eux; \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs", "timeout": 30 } ] },' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-ac-residue-stop.mjs", "timeout": 30 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-ac-residue-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-exit-readiness-stop.mjs", "timeout": 30 } ] }' \
       '    ]' \
       '  }' \
       '}' \
@@ -1013,7 +1021,8 @@ RUN set -eux; \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs" },' \
-      '      { "type": "command", "command": "node /opt/aidw-hooks/check-ac-residue-stop.mjs" }' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-ac-residue-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-exit-readiness-stop.mjs" }' \
       '    ]' \
       '  }' \
       '}' \
@@ -1037,6 +1046,7 @@ RUN set -eux; \
       /opt/aidw-hooks/check-ledger-sync-stop.mjs /opt/aidw-hooks/ledger_sync_checks.py \
       /opt/aidw-hooks/check-ac-residue-stop.mjs /opt/aidw-hooks/ac_residue_checks.py \
       /opt/aidw-hooks/write_scope_checks.py \
+      /opt/aidw-hooks/check-exit-readiness-stop.mjs /opt/aidw-hooks/exit_readiness_checks.py \
       /opt/aidw-hooks/lib/*.mjs /opt/aidw-hooks/schemas/*.json; \
     chown -R vscode:vscode /home/vscode/.copilot; \
     chmod 0644 /home/vscode/.copilot/config.json
