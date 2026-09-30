@@ -56,11 +56,20 @@
 //     bounded, hand-ported subset of app_discovery.classify_candidates (see that module's own
 //     docstring for the exact, deliberately narrow scope -- only the marker names classify_candidates
 //     actually branches on). `test_command` completion only tries the small
-//     combined_test_command_from_apps fallback, never ac_coverage_gate.resolve_test_command's
-//     tech-stack-based guessing (that module pulls in chat_model/stack_runner/tech_stack_signals and
-//     is not reasonably portable here) -- `ponytail: at most a redundant "add a test_command" nudge
-//     on a field this stage's own docstring calls purely documentary; upgrade only if this proves
-//     noisy live.`
+//     combined_test_command_from_apps fallback for the actual STRING (never
+//     ac_coverage_gate.resolve_test_command's tech-stack-based command text -- that module pulls in
+//     chat_model/stack_runner/tech_stack_signals and is not reasonably portable here) -- but
+//     exit_readiness_checks.tech_stack_resolves_test_command DOES mirror resolve_test_command's own
+//     BOOLEAN branch structure (dotnet / typescript-or-javascript / python), specifically to close a
+//     real false-block bug a review caught: without it, every dotnet-stack repo's first
+//     metrics-exit turn hit a deterministic "no test_command" block, since nothing else in this
+//     codebase writes manifest.json's test_command before this completion step. See that function's
+//     own docstring for why a boolean mirror is sufficient (and safer than persisting a guessed
+//     string the model could copy verbatim into manifest.json by hand).
+//     `ponytail: a stack this boolean mirror doesn't recognize (anything outside
+//     dotnet/typescript/javascript/python) still gets the nudge even where a future
+//     resolve_test_command extension might resolve one -- upgrade the boolean mirror's own stack
+//     list if that ever proves noisy live.`
 //   - `is_ui` is a SEPARATE, minimal local read of the tech-stack file (just enough for one
 //     boolean), not tech_stack_signals.frameworks_have_ui itself (that module pulls in
 //     schemas.TechStack's pydantic validator chain) -- UI_FRAMEWORK_MARKERS is duplicated by hand
@@ -217,6 +226,11 @@ const payload = {
   screenshot_count: screenshotCount,
   metrics,
   targeted_fix: targetedFix,
+  // Whole parsed tech-stack doc, not just the frameworks slice `isUi` above already extracted --
+  // exit_readiness_checks.tech_stack_resolves_test_command (Task 14 review fix) needs
+  // dotnet/languages too, to avoid a false "no test_command" block on every dotnet-stack repo (see
+  // that function's own docstring for the full story).
+  tech_stack: techStack || {},
   run_id: runId,
   auth_gate_enabled: authGateEnabled,
   report: parsed.report,

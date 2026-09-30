@@ -640,5 +640,5 @@ node .claude/hooks/graph-diagram-check.mjs --stamp graph-source
 node .claude/hooks/graph-diagram-check.mjs --stamp gate-inventory
 ```
 
-<!-- graph-source-sha256: 6bd02fe3a8b6760234c7a87cfbc28ba006e4c7c3c71af19522657efcf272046b -->
-<!-- gate-inventory-sha256: 830bd625e1e00b4b5ecf08e92f50e7c056d43ece74cc0b301891b706e93cf4f7 -->
+<!-- graph-source-sha256: e1cebeb36c10908a06dd2846322c2ee1247693c937708a92ceb7e7d50a352434 -->
+<!-- gate-inventory-sha256: d66fbf84977e99b5a8d236d71aa98d183f18ee505439aed39b28edb232a444ea -->

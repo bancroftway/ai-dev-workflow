@@ -208,19 +208,77 @@ def apply_manifest_updates(manifest: dict[str, Any], updates: dict[str, Any]) ->
 # ---------------------------------------------------------------------------------------------
 
 
-def manifest_presence_problems(manifest: dict[str, Any]) -> list[str]:
+def manifest_presence_problems(
+    manifest: dict[str, Any], *, test_command_resolvable: bool = False
+) -> list[str]:
     """What a merge actually needs recorded: a runnable app, a test_command, coverage_commands.
     Operates on the manifest AFTER completion (resolve_manifest_updates/apply_manifest_updates) --
-    calling this on a raw, not-yet-completed manifest false-positives on every greenfield run."""
+    calling this on a raw, not-yet-completed manifest false-positives on every greenfield run.
+
+    `test_command_resolvable` (Task 14 review fix): True suppresses the "no test_command" problem
+    even though `manifest.get("test_command")` is still falsy -- for the same-turn HOOK only, which
+    can determine (via `tech_stack_resolves_test_command`) that
+    `ac_coverage_gate.resolve_test_command` WOULD resolve one at verify time, without being able to
+    compute (or wanting to persist) the exact resolved STRING itself. Writing a placeholder/guessed
+    string into the hook's own local preview risked the model copying a WRONG guessed value into
+    manifest.json by hand after seeing it in a nudge -- the "sticky wrong value" risk this parameter
+    exists to avoid; see `tech_stack_resolves_test_command`'s own docstring for the full reasoning.
+    The real gate never needs this (stays False, the default): by the time it calls this function,
+    `resolve_test_command` has already run for real and `manifest.get("test_command")` is already
+    set whenever this would have mattered, so the two branches can never disagree in practice."""
     problems: list[str] = []
     app_check = manifest.get("app_check") or {}
     if app_check.get("suitable") is not False and not (app_check.get("apps") or []):
         problems.append("manifest.json records no runnable app (app_check.apps is empty even after re-scan)")
-    if not manifest.get("test_command"):
+    if not manifest.get("test_command") and not test_command_resolvable:
         problems.append("manifest.json has no test_command for this stack")
     if not manifest.get("coverage_commands"):
         problems.append("manifest.json has no coverage_commands -- coverage is not replayable")
     return problems
+
+
+def tech_stack_resolves_test_command(tech_stack: dict[str, Any] | None) -> bool:
+    """Best-effort BOOLEAN mirror of `ac_coverage_gate.resolve_test_command`'s own branch
+    structure -- NOT a byte-faithful command-string port. This hook never needs the resolved
+    STRING (see `manifest_presence_problems`'s own docstring for why persisting a guess would be
+    unsafe); it only needs to know whether `resolve_test_command` would find SOMETHING at verify
+    time, to decide whether "no test_command" is a real gap the model must act on now, or something
+    the real gate's own resolution will silently fill in moments later.
+
+    Root-caused during task-14 review: the hook's own `combined_test_command_from_apps` fallback
+    only ever helps when `app_check.apps` is ALREADY populated with per-app `test_command` fields
+    (a narrow rescue-mechanism case, not this function's job) -- it never covers
+    `resolve_test_command`'s PRIMARY, tech-stack-driven resolution, whose FIRST branch is dotnet,
+    matched unconditionally whenever `dotnet_detected` is true. Without this function, EVERY
+    dotnet-stack repo's first metrics-exit draft turn (a stack this same module's own
+    `csproj_signals`/`Program.cs` branches explicitly support) hit a deterministic false "no
+    test_command" block, since manifest.json's `test_command` field is written nowhere else in this
+    codebase except this exact completion step (confirmed by review: grepped all of `agent/src` for
+    writers) -- so it is unconditionally unset on that very first turn.
+
+    `resolve_test_command`'s own branches (dotnet / typescript-or-javascript / python) each return
+    SOME command unconditionally once their language/stack test fires -- `testing_frameworks`
+    (vitest vs. jest vs. mocha) only picks WHICH exact command text, never whether one exists at
+    all -- so mirroring the OUTER branch structure alone (which this function does) is sufficient
+    to answer "would resolve_test_command return non-None", with no need to also replicate the
+    inner framework-specific command text or the `dotnet_root_prefix`/`ecosystem_root_prefix`
+    monorepo-root logic (`tech_stack_signals.py`), neither of which changes this boolean.
+
+    Reads the tech-stack JSON directly (both the CURRENT `dotnet: {status: ...}` shape and the
+    legacy pre-consolidation `dotnet_detected: bool` shape an older on-disk sidecar may still carry
+    -- see `tech_stack_signals.dotnet_detected`'s own docstring for that legacy shape's history),
+    tolerating a missing/malformed tech-stack file as "nothing detected" -- same pydantic-avoidance
+    simplification the hook's own `is_ui` read already uses, for the identical reason
+    (`ac_coverage_gate.resolve_test_command` needs `tech_stack_signals.dotnet_detected`/
+    `presence_values`, both pydantic-backed via `load_tech_stack`)."""
+    tech_stack = tech_stack or {}
+    dotnet = tech_stack.get("dotnet")
+    if isinstance(dotnet, dict) and dotnet.get("status") == "detected":
+        return True
+    if tech_stack.get("dotnet_detected") is True:  # legacy pre-consolidation shape
+        return True
+    languages = {str(lang).lower() for lang in _presence_values(tech_stack.get("languages"))}
+    return bool(languages & {"typescript", "javascript", "python"})
 
 
 def screenshot_problems(is_ui: bool, screenshot_count: int) -> list[str]:
@@ -586,6 +644,30 @@ def _demo() -> None:
     assert manifest_presence_problems(
         {"app_check": {"apps": [{"path": "."}]}, "test_command": "x", "coverage_commands": [{"command": "y"}]}
     ) == []
+    # test_command_resolvable (Task 14 review fix): suppresses ONLY the test_command problem, even
+    # with app_check/coverage_commands still genuinely missing.
+    suppressed = manifest_presence_problems({}, test_command_resolvable=True)
+    assert "manifest.json has no test_command for this stack" not in suppressed
+    assert "manifest.json records no runnable app (app_check.apps is empty even after re-scan)" in suppressed
+    assert "manifest.json has no coverage_commands -- coverage is not replayable" in suppressed
+    # An already-present test_command is untouched by the flag either way (nothing to suppress).
+    assert manifest_presence_problems({"test_command": "x"}, test_command_resolvable=True) == manifest_presence_problems(
+        {"test_command": "x"}, test_command_resolvable=False
+    )
+
+    # tech_stack_resolves_test_command (Task 14 review fix -- the false-block-on-every-dotnet-repo
+    # bug the task-14 review caught: resolve_test_command's FIRST, unconditional branch is dotnet,
+    # which the hook's own combined_test_command_from_apps fallback never covers).
+    assert tech_stack_resolves_test_command({"dotnet": {"status": "detected", "solution_root": "src"}}) is True
+    assert tech_stack_resolves_test_command({"dotnet": {"status": "not_detected"}}) is False
+    assert tech_stack_resolves_test_command({"dotnet_detected": True}) is True, "legacy pre-consolidation shape"
+    assert tech_stack_resolves_test_command(
+        {"languages": {"status": "present", "values": ["TypeScript"], "reason": ""}}
+    ) is True
+    assert tech_stack_resolves_test_command({"languages": ["Python"]}) is True, "legacy bare-list shape"
+    assert tech_stack_resolves_test_command({"languages": {"status": "present", "values": ["Rust"], "reason": ""}}) is False
+    assert tech_stack_resolves_test_command({}) is False
+    assert tech_stack_resolves_test_command(None) is False
 
     # screenshot_problems.
     assert screenshot_problems(True, 0) == ["UI application but no e2e screenshots were captured"]
@@ -689,6 +771,59 @@ def _demo() -> None:
     ]
     assert len(candidates_to_app_dicts(two_for_one_dir)) == 1
 
+    # --- _run_check_hook integration cases (Task 14 review fix regression coverage) ---
+
+    # A dotnet-stack repo, first metrics-exit turn: manifest has no test_command (nothing else in
+    # this codebase writes it before this completion step), app_check.apps not yet populated, and
+    # no per-app fallback available either -- exactly the shape that, before this fix, produced a
+    # deterministic false "no test_command" block on EVERY dotnet repo. tech_stack_resolves_test_command's
+    # dotnet branch must suppress it.
+    dotnet_payload = {
+        "manifest": {"app_check": {"suitable": True, "apps": [{"path": "."}]}, "coverage_commands": [{"command": "x"}]},
+        "scanned_files": {}, "coverage_entries": None, "is_ui": False, "screenshot_count": 0,
+        "metrics": {}, "targeted_fix": {}, "run_id": "",
+        "tech_stack": {"dotnet": {"status": "detected", "solution_root": ""}},
+        "auth_gate_enabled": True,
+        "report": {"merge_ready": True, "blocking_reasons": {"status": "absent", "values": [], "reason": "clean"}},
+    }
+    result = _run_check_hook(dotnet_payload)
+    assert result["passed"] is True, result  # would have been False (test_command problem) before this fix
+    assert not any("test_command" in r for r in result["reasons"]), result
+
+    # Same shape but tech-stack detects NEITHER dotnet nor node/python/typescript (e.g. a bare-Go
+    # repo this pipeline doesn't resolve a command for either) -- the problem correctly still fires,
+    # proving the suppression is stack-specific, not a blanket skip of the check.
+    unresolvable_payload = {**dotnet_payload, "tech_stack": {"languages": {"status": "present", "values": ["Go"], "reason": ""}}}
+    result = _run_check_hook(unresolvable_payload)
+    assert result["passed"] is False
+    assert any("test_command" in r for r in result["reasons"]), result
+
+    # Missing AIDW_RUN_ID must never produce the "flip to merge_ready=True" nudge (Task 14 review
+    # fix, minor #1): the model's own stale-looking gate-owned reason is UNVERIFIED here (the
+    # run_id-gated half never ran), not confirmed clean -- telling it to flip to True would be a
+    # false all-clear this hook has no basis for.
+    no_run_id_payload = {
+        "manifest": {"app_check": {"suitable": True, "apps": [{"path": "."}]}, "test_command": "x", "coverage_commands": [{"command": "y"}]},
+        "scanned_files": {}, "coverage_entries": None, "is_ui": False, "screenshot_count": 0,
+        "metrics": {}, "targeted_fix": {}, "run_id": "", "tech_stack": {}, "auth_gate_enabled": True,
+        "report": {
+            "merge_ready": False,
+            "blocking_reasons": {"status": "present", "values": ["coverage below threshold"], "reason": ""},
+        },
+    }
+    result = _run_check_hook(no_run_id_payload)
+    assert result["passed"] is True, result  # nothing the manifest-only half found -- no exit 2
+    assert result["reasons"] == [], (
+        "with no run_id, this hook must stay silent about the model's stale-looking reason instead "
+        "of confidently telling it to flip merge_ready to True -- it never actually checked", result,
+    )
+    # Sanity: the SAME stale reason, WITH a run_id, DOES get the flip-to-True nudge (already covered
+    # end-to-end in the fixture-repo test run; this is the unit-level confirmation of the guard's
+    # other side).
+    with_run_id_payload = {**no_run_id_payload, "run_id": "r1", "metrics": {"run_id": "r1", "regression_gate": {"reasons": []}, "readme": {"owned": True, "problems": []}}}
+    result = _run_check_hook(with_run_id_payload)
+    assert result["passed"] is False and "stale" in result["reasons"][0], result
+
     print("exit_readiness_checks self-check: all assertions passed")
 
 
@@ -706,6 +841,7 @@ def _run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
     screenshot_count = int(payload.get("screenshot_count") or 0)
     metrics = payload.get("metrics") or {}
     targeted_fix = payload.get("targeted_fix") or {}
+    tech_stack = payload.get("tech_stack") or {}
     report = payload.get("report") or {}
 
     resolved_apps = None
@@ -723,7 +859,9 @@ def _run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
     )
     completed_manifest = apply_manifest_updates(manifest, updates) if updates else manifest
 
-    problems = manifest_presence_problems(completed_manifest)
+    problems = manifest_presence_problems(
+        completed_manifest, test_command_resolvable=tech_stack_resolves_test_command(tech_stack)
+    )
 
     if run_id:
         # Screenshots are run_id-KEYED (history/<run_id>-screens/) -- without a real run_id the
@@ -745,7 +883,17 @@ def _run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
     # Same-turn value of the stale-reason filter: nothing NEW to fix, but the model's own draft
     # claims a blocker this run's deterministic checks disprove -- worth a nudge to revise the
     # report text itself, even though the real gate will silently correct `merge_ready` regardless.
-    if not problems and verdict["stale_reasons"] and verdict["merge_ready"] is True:
+    #
+    # Gated on `run_id` too (Task 14 review fix), not just `not problems`: without a real run_id,
+    # the ENTIRE run_id-scoped half above (screenshots/metrics/regression-gate/README/auth/
+    # targeted-fix) never ran at all -- `problems` is empty here because this hook COULDN'T check,
+    # not because it verified anything is clean. Telling the model "these reasons are definitely
+    # stale, flip to merge_ready=True" on that basis would be a confident, false all-clear -- worse
+    # than the same-turn hook simply staying silent (which is what happens now: `reasons` still
+    # only carries whatever `problems` found, i.e. nothing, from the manifest-only half that DID
+    # run). The real gate is unaffected either way: it always has a real run_id and always runs
+    # every check for real before its own `evaluate_merge_readiness` call.
+    if run_id and not problems and verdict["stale_reasons"] and verdict["merge_ready"] is True:
         stale_list = ", ".join(verdict["stale_reasons"])
         reasons.append(
             "Your draft's blocking_reasons/merge_ready=False is stale: every reason you listed "
