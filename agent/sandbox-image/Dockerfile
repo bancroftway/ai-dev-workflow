@@ -1041,6 +1041,7 @@ RUN set -eux; \
       /opt/aidw-hooks/check-test-quality-stop.mjs /opt/aidw-hooks/test_quality_checks.py \
       /opt/aidw-hooks/check-coverage-stop.mjs /opt/aidw-hooks/coverage_parsing.py \
       /opt/aidw-hooks/check-testid-locators-stop.mjs \
+      /opt/aidw-hooks/check-quick-scan-stop.mjs /opt/aidw-hooks/sast_parsers.py /opt/aidw-hooks/quick_scan.py \
       /opt/aidw-hooks/check-adversarial-stop.mjs /opt/aidw-hooks/adversarial_audit_checks.py \
       /opt/aidw-hooks/check-remediation-stop.mjs /opt/aidw-hooks/remediation_evaluate_checks.py \
       /opt/aidw-hooks/check-ledger-sync-stop.mjs /opt/aidw-hooks/ledger_sync_checks.py \
