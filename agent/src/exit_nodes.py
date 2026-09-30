@@ -132,12 +132,6 @@ HISTORY_DIR = ".ai-dev-workflow/history"
 # Stable, run-id-free location for the LATEST run's exit report, so a human landing on the delivered
 # branch can find it without knowing a run id. The per-run copy under HISTORY_DIR remains the archive.
 EXIT_REPORT_PATH = ".ai-dev-workflow/EXIT-REPORT.md"
-# Append-only JSONL log every Stop hook's `reportFailOpen` (agent/sandbox-image/hooks/lib/
-# report-fail-open.mjs) appends one `{ts, hook, stage, reason}` line to whenever it fails open
-# (missing tool, timeout, unparsable output) -- see that module's own docstring. Read here, not
-# written: this side only surfaces what already happened, one line per fail-open, most sessions
-# never create this file at all.
-HOOK_FAIL_OPENS_PATH = ".ai-dev-workflow/hook-fail-opens.jsonl"
 
 # No retention/pruning of history/ here anymore: that subsystem existed to bound growth across
 # MANY sessions dumping artifacts into one shared branch (WS0's single ai-dev-workflow branch).
@@ -246,7 +240,7 @@ def _render_skills_section(stages: dict[str, Any] | None) -> list[str]:
 
 
 def _parse_hook_fail_opens(raw: str | None) -> list[dict[str, Any]]:
-    """Parses `HOOK_FAIL_OPENS_PATH`'s content (a JSONL file -- one `{ts, hook, stage, reason}`
+    """Parses `repo_files.HOOK_FAIL_OPENS_PATH`'s content (a JSONL file -- one `{ts, hook, stage, reason}`
     object per line, written by every Stop hook's `reportFailOpen`) into a list of dicts.
 
     `raw` is `None` on the common case (file absent -- most sessions have zero fail-opens; see
@@ -1677,7 +1671,7 @@ async def exit_finalize_node(
         )
         raw_metrics = await repo_files.read_repo_file(provider, thread_id, ".ai-dev-workflow/metrics-latest.json")
         metrics_summary = json.loads(raw_metrics) if raw_metrics else {}
-        raw_hook_fail_opens = await repo_files.read_repo_file(provider, thread_id, HOOK_FAIL_OPENS_PATH)
+        raw_hook_fail_opens = await repo_files.read_repo_file(provider, thread_id, repo_files.HOOK_FAIL_OPENS_PATH)
         hook_fail_opens = _parse_hook_fail_opens(raw_hook_fail_opens)
         if metrics_summary.get("run_id") != run_id:
             # Stale file from a previous run (metrics_compute short-circuited this run) -- rendering

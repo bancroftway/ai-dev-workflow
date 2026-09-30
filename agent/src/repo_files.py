@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 
 LEDGER_PATH = ".ai-dev-workflow/ledger.jsonl"
 
+# Append-only log every Stop hook's `reportFailOpen` (agent/sandbox-image/hooks/lib/
+# report-fail-open.mjs) appends a `{ts, hook, stage, reason}` JSON line to whenever it fails open
+# (missing tool, timeout, unparsable output). Read host-side by exit_nodes.py's
+# `_parse_hook_fail_opens`/`_render_hook_fail_opens_section` to fold a plain-language summary into
+# the exit report. Lives here (not exit_nodes.py) for the same reason LEDGER_PATH does: this module
+# also owns the reset-per-run lifecycle (reset_hook_fail_opens below), same as reset_ledger/
+# LEDGER_PATH's pairing.
+HOOK_FAIL_OPENS_PATH = ".ai-dev-workflow/hook-fail-opens.jsonl"
+
 # Keep each exec's command line well under Windows' ~32K CreateProcess cap (WinError 206).
 _EXEC_CMD_BUDGET = 16000
 
@@ -136,14 +145,33 @@ async def write_repo_file(provider: SandboxProvider, thread_id: str, path: str, 
             raise RuntimeError(f"failed to write {path}: {result.stderr}")
 
 
+def _truncate_command(path: str) -> str:
+    """Shell command that truncates `path` to empty, creating its parent directory and the file
+    itself if neither exists yet -- shared by reset_ledger/reset_hook_fail_opens below (same
+    one-liner, two callers, same reasoning `_chunked_write_commands` above is shared by
+    write_repo_file/append_ledger_entry: one literal for one purpose, not two independently-typed
+    copies)."""
+    parent_dir = path.rsplit("/", 1)[0] if "/" in path else "."
+    return f"mkdir -p {shlex.quote(parent_dir)} && : > {shlex.quote(path)}"
+
+
 async def reset_ledger(provider: SandboxProvider, thread_id: str) -> None:
     """Truncates (or creates) the workflow action ledger -- called once, by the true entry-point
     node of a from-scratch run (scaffold_node), never by a gate-approval resume."""
-    parent_dir = LEDGER_PATH.rsplit("/", 1)[0]
-    command = f"mkdir -p {shlex.quote(parent_dir)} && : > {shlex.quote(LEDGER_PATH)}"
-    result = await provider.exec_in_sandbox(thread_id, command)
+    result = await provider.exec_in_sandbox(thread_id, _truncate_command(LEDGER_PATH))
     if not result.ok:
         raise RuntimeError(f"failed to reset {LEDGER_PATH}: {result.stderr}")
+
+
+async def reset_hook_fail_opens(provider: SandboxProvider, thread_id: str) -> None:
+    """Truncates (or creates) the Stop-hook fail-open log -- called once, by the true entry-point
+    node of a from-scratch run (scaffold_node), never by a gate-approval resume. Same lifecycle
+    contract as reset_ledger, same reason: without this, a resumed thread's sandbox filesystem
+    would carry a PRIOR run's fail-opens into this run's exit report, misattributing them (the
+    exit report's own "this session" framing would otherwise be false)."""
+    result = await provider.exec_in_sandbox(thread_id, _truncate_command(HOOK_FAIL_OPENS_PATH))
+    if not result.ok:
+        raise RuntimeError(f"failed to reset {HOOK_FAIL_OPENS_PATH}: {result.stderr}")
 
 
 async def append_ledger_entry(provider: SandboxProvider, thread_id: str, entry: dict[str, Any]) -> None:
@@ -179,6 +207,16 @@ async def append_ledger_entry(provider: SandboxProvider, thread_id: str, entry: 
 
 def _demo() -> None:
     """`cd agent && uv run python -m src.repo_files`."""
+    # _truncate_command: shared by reset_ledger/reset_hook_fail_opens -- mkdir -p the parent, then
+    # truncate-or-create the file itself. Same command shape for both paths, only the path differs.
+    assert _truncate_command(LEDGER_PATH) == (
+        "mkdir -p .ai-dev-workflow && : > .ai-dev-workflow/ledger.jsonl"
+    ), _truncate_command(LEDGER_PATH)
+    assert _truncate_command(HOOK_FAIL_OPENS_PATH) == (
+        "mkdir -p .ai-dev-workflow && : > .ai-dev-workflow/hook-fail-opens.jsonl"
+    ), _truncate_command(HOOK_FAIL_OPENS_PATH)
+    assert _truncate_command("no-slash.txt") == "mkdir -p . && : > no-slash.txt"
+
     # Legitimate in these repos: Next.js dynamic route segments and its build output both use
     # brackets. Rejecting them killed a stage on a real generated app.
     for ok in (

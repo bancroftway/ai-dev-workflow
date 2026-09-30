@@ -237,6 +237,10 @@ async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str
 
     provider = get_sandbox_provider()
     await repo_files.reset_ledger(provider, thread_id)
+    # Same from-scratch-run-only lifecycle as reset_ledger immediately above: without this, a
+    # resumed thread's sandbox filesystem would carry a PRIOR run's Stop-hook fail-opens into this
+    # run's exit report (see repo_files.reset_hook_fail_opens's own docstring).
+    await repo_files.reset_hook_fail_opens(provider, thread_id)
     await repo_files.append_ledger_entry(provider, thread_id, {"stage": "scaffold", "node": "scaffold", "action": "ran"})
 
     # Session row lives in SQL now (session_store.py) -- owner/repo/user_login/source_branch/
