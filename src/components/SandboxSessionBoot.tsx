@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { CodeGenModePicker, type CodeGenMode } from "@/components/CodeGenModePicker";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 
 /**
@@ -66,18 +67,68 @@ export function SandboxSessionBoot({
   // fetch one, so a session that started `skip`-true also never re-decides later.
   const decidedForRef = useRef<string | null>(null);
 
+  // Cosmetic pre-highlight only (CodeGenModePicker's own RadioGroup defaultValue) is unrelated to
+  // this -- null here just means "the picker hasn't been answered (or restored from storage) yet".
+  const [codeGenMode, setCodeGenMode] = useState<CodeGenMode | null>(null);
+  // True only once this mount has checked sessionStorage for an already-answered mode and come up
+  // empty. Gates the picker's RENDER, not just the fetch below: `codeGenMode === null` alone is
+  // true for one render on every mount (before the effect has had a chance to restore a stored
+  // answer), and without this second flag that render would flash the popup on screen for a
+  // session that's already answered -- exactly on refresh, the one case this must never happen.
+  const [storageChecked, setStorageChecked] = useState(false);
+  // The only signal available for "this session has never been asked before": ?projectId= is set
+  // in the URL solely for a genuinely brand-new session (see that prop's own doc above), and stays
+  // in the URL across a plain refresh of the same page -- sessionStorage (checked below), not this
+  // flag, is what actually prevents the popup from reappearing on that refresh.
+  const isNewSession = !skip && !resume && projectId !== undefined;
+
   useEffect(() => {
     if (decidedForRef.current === sessionId) return;
-    decidedForRef.current = sessionId;
+
     if (skip) {
+      decidedForRef.current = sessionId;
       setStatus("terminated");
       return;
     }
+
+    if (isNewSession && codeGenMode === null) {
+      // Deliberately NOT latching decidedForRef in this branch: with nothing stored, this effect
+      // must run again once the picker's onSelect (below, in the render) sets codeGenMode.
+      let stored: string | null = null;
+      try {
+        stored = sessionStorage.getItem(`aidw:code-gen-mode:${sessionId}`);
+      } catch {
+        stored = null;
+      }
+      if (stored === null) {
+        // One-time seed from an external, non-reactive source (sessionStorage) -- there's no
+        // dependency this could "react" to instead, same shape as RequirementsView.tsx's own
+        // sessionStorage-seed effects.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setStorageChecked(true);
+        return;
+      }
+      setCodeGenMode(stored as CodeGenMode);
+      return;
+    }
+
+    decidedForRef.current = sessionId;
     let cancelled = false;
     fetch("/api/sessions/provision", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, owner, repo, branch, resume: Boolean(resume), projectId }),
+      body: JSON.stringify({
+        sessionId,
+        owner,
+        repo,
+        branch,
+        resume: Boolean(resume),
+        projectId,
+        // Omitted (JSON.stringify drops an `undefined` value) for every session that never showed
+        // the picker -- resume, a plain reload, or `skip` -- so the agent falls back to this
+        // session's own already-pinned mode instead of overwriting it.
+        codeGenMode: codeGenMode ?? undefined,
+      }),
     })
       .then(async (res) => {
         if (cancelled) return;
@@ -95,9 +146,25 @@ export function SandboxSessionBoot({
     return () => {
       cancelled = true;
     };
-  }, [skip, sessionId, owner, repo, branch, resume, projectId, setStatus]);
+  }, [skip, sessionId, owner, repo, branch, resume, projectId, codeGenMode, isNewSession, setStatus]);
 
   if (skip || status === "ready") return null;
+
+  if (isNewSession && storageChecked && codeGenMode === null) {
+    return (
+      <CodeGenModePicker
+        onSelect={(mode) => {
+          try {
+            sessionStorage.setItem(`aidw:code-gen-mode:${sessionId}`, mode);
+          } catch {
+            // Storage blocked -- worst case a future refresh just asks again; this mount still
+            // proceeds either way once codeGenMode is set below.
+          }
+          setCodeGenMode(mode);
+        }}
+      />
+    );
+  }
 
   return (
     <div
