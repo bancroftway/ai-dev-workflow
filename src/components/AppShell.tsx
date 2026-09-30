@@ -22,7 +22,7 @@ import { SpecificationView } from "@/components/SpecificationView";
 import { TechStackView } from "@/components/TechStackView";
 import { RunningSpinner, Spinner } from "@/components/Spinner";
 import { terminateSession } from "@/lib/agent-client";
-import { InterruptProvider, useOpenInterrupt } from "@/lib/interrupt-context";
+import { InterruptProvider, useOpenInterrupt, type InterruptVerification } from "@/lib/interrupt-context";
 import { useCodeGenMode, usePipeline, type PipelineTab } from "@/lib/pipeline";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
@@ -80,7 +80,7 @@ function stageGroupDot(
  * review (ever_ready_for_review / clarifying questions), not merely while it's drafting -- the
  * durable fallback is current_stage having moved PAST the tab's last stage. Keyed by view (the
  * bespoke component), not by stage key. */
-const REVIEW_GATED_VIEWS = new Set(["specification", "plan"]);
+const REVIEW_GATED_VIEWS = new Set(["specification", "plan"]); // stage-literal-ok: review-gated bespoke views
 
 type ViewContext = {
   owner: string;
@@ -104,7 +104,7 @@ function GenericStageView(tab: PipelineTab, c: ViewContext) {
 
 /** Backend TabSpec.view -> the component that renders it. */
 const VIEWS: Record<string, (tab: PipelineTab, ctx: ViewContext) => ReactNode> = {
-  "tech-stack": () => <TechStackView />,
+  "tech-stack": () => <TechStackView />, // stage-literal-ok: VIEWS registry key (view id, not a stage list)
   requirements: (_tab, c) => <RequirementsView owner={c.owner} repo={c.repo} workBranch={c.workBranch} />,
   specification: () => <SpecificationView />,
   plan: () => <PlanView />,
@@ -728,7 +728,7 @@ export function AppShell({
                   onClick={() => setActiveView(tab.id)}
                 />
                 {/* Seam for the gate icon between this tab and the next (GateSlot.tsx). */}
-                <GateSlot tab={tab} codeGenMode={codeGenMode} />
+                <GateSlot tab={tab} codeGenMode={codeGenMode} owner={owner} repo={repo} />
               </Fragment>
             ))}
           </div>
@@ -903,6 +903,7 @@ function InterruptCard({
   const draft = (payload as Record<string, unknown>).draft;
   const draftMarkdown = (payload as Record<string, unknown>).markdown;
   const fileExisted = (payload as Record<string, unknown>).file_existed;
+  const verification = (payload as Record<string, unknown>).verification as InterruptVerification | null | undefined;
   // Why a Reject would send the draft back for revision (Ruling 3, graph.py make_gate_node) --
   // required so the redraft has something to act on. No explicit reset needed between gate
   // occurrences: useInterrupt's own `element` is null while a rejected stage is redrafting (real
@@ -922,6 +923,7 @@ function InterruptCard({
       draft,
       draftMarkdown: typeof draftMarkdown === "string" ? draftMarkdown : undefined,
       fileExisted: typeof fileExisted === "boolean" ? fileExisted : undefined,
+      verification: verification ?? null,
       resolve: done,
     });
     return () => setInterrupt({ open: false });
@@ -930,7 +932,7 @@ function InterruptCard({
 
   // The Tech Stack tab handles its own review entirely -- it reads {draftMarkdown, fileExisted,
   // resolve} from InterruptContext directly (set above) rather than rendering a sidebar card.
-  if (stageKey === "tech-stack") return null;
+  if (stageKey === "tech-stack") return null; // stage-literal-ok: Tech Stack handles its own gate
 
   if (payload.type) {
     const rest: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
@@ -971,9 +973,9 @@ function InterruptCard({
   // cascades through Specification first (Plan's own draft is built from the approved spec, not
   // raw requirements directly -- a plain loop-back-to-Plan's-own-draft would leave the revision
   // unreflected in what Plan actually reads); see make_route_after_gate's own docstring.
-  if (stageKey === "specification" || stageKey === "plan") {
+  if (stageKey === "specification" || stageKey === "plan") { // stage-literal-ok: InterruptCard source-of-truth copy
     const derivationCopy =
-      stageKey === "specification"
+      stageKey === "specification" // stage-literal-ok: InterruptCard source-of-truth copy
         ? "this specification — and every plan, test, and line of code after it — is derived from that document alone"
         : "this plan is derived from the approved Specification, which is itself derived from that document alone";
     return (
@@ -982,7 +984,7 @@ function InterruptCard({
           The <strong>{stageLabel}</strong> is ready for your review. Your{" "}
           <strong>Requirements document is the single source of truth</strong>: {derivationCopy}. Nothing
           you want will make it into the product unless it&apos;s written there. To change anything here,
-          don&apos;t comment — edit the document on the Requirements tab and resubmit; {stageKey === "plan" ? "the specification and this plan are" : "the specification is"}{" "}
+          don&apos;t comment — edit the document on the Requirements tab and resubmit; {stageKey === "plan" /* stage-literal-ok: InterruptCard source-of-truth copy */ ? "the specification and this plan are" : "the specification is"}{" "}
           redrafted from it, and every question it answers is traced back to your wording.
         </span>
         <button

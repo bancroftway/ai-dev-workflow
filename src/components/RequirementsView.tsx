@@ -44,7 +44,7 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
   const { consumeAttachments, processFiles } = attachmentsApi;
 
   const state = (agent.state ?? {}) as WorkflowState;
-  const rawRequirements = state.stages?.["raw-requirements"];
+  const rawRequirements = state.stages?.["raw-requirements"]; // stage-literal-ok: Requirements' own bespoke view
   // Requirements-delta pivot: at least one submission has ever been recorded for this thread, so
   // the maintained PRD (01-requirements-prd.md) exists to view/download -- see the panel below.
   const hasRequirementsPrd = rawRequirements?.status === "approved";
@@ -146,7 +146,7 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
   // "plan" on its own -- no extra field needed here) so the redraft cascades through
   // Specification first rather than redrafting Plan against its now-stale approved spec.
   const sourceOfTruthGateOpen =
-    openInterrupt.open && (openInterrupt.stage === "specification" || openInterrupt.stage === "plan");
+    openInterrupt.open && (openInterrupt.stage === "specification" || openInterrupt.stage === "plan"); // stage-literal-ok: source-of-truth resubmit flow (spec/plan gates)
   // Requirements-delta into an already-finished session is a supported flow (see runLocked's own
   // comment above) but must never fire silently from a stale tab that doesn't know the session
   // already finished elsewhere -- handleSubmit below confirms with the user first and tells the
@@ -176,7 +176,7 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
     if (sourceOfTruthGateOpen) {
       try {
         const feedback =
-          openInterrupt.stage === "plan"
+          openInterrupt.stage === "plan" // stage-literal-ok: source-of-truth resubmit copy
             ? "Requirements revised by the reviewer while reviewing the Plan — the Specification redrafts first, strictly from this correction; once it is re-approved, the Plan will redraft from it. " +
               "This correction is a DELTA, not the whole specification: only include what it actually adds or changes — a genuinely new story/criterion, or one you're revising (cite its existing id) or retiring (retired_us_ids/retired_ac_ids). Never re-emit anything this correction doesn't touch; leaving it out does not remove it."
             : "Requirements revised by the reviewer — redraft the Specification strictly from this correction. " +
@@ -264,7 +264,7 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
       </div>
 
       <ClarifyingQuestions
-        stageKey="raw-requirements"
+        stageKey="raw-requirements" // stage-literal-ok: Requirements' own bespoke view
         questions={rawRequirements?.clarifying_questions ?? []}
         hint="Answer by editing the requirements text below, then resubmit."
       />
@@ -303,11 +303,11 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
         )}
         {openInterrupt.open && (
           <span className="text-xs text-neutral-500">
-            {openInterrupt.stage === "tech-stack"
+            {openInterrupt.stage === "tech-stack" // stage-literal-ok: bespoke interrupt copy
               ? "Finish the Tech Stack tab first, then resubmit."
-              : openInterrupt.stage === "specification"
+              : openInterrupt.stage === "specification" // stage-literal-ok: bespoke interrupt copy
                 ? "The Specification is awaiting review — submitting here revises the requirements and redrafts it from the updated document."
-                : openInterrupt.stage === "plan"
+                : openInterrupt.stage === "plan" // stage-literal-ok: bespoke interrupt copy
                   ? "The Plan is awaiting review — submitting here revises the requirements and redrafts the Specification first, then the Plan."
                   : "A review is waiting — approve or reject it first, then edit and resubmit."}
           </span>

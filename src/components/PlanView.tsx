@@ -37,13 +37,13 @@ function PlanViewImpl() {
   const draft =
     parseImplementationPlan(plan?.draft) ??
     parseImplementationPlan(plan?.approved_content) ??
-    (interrupt.stage === "plan" ? parseImplementationPlan(interrupt.draft) : null);
+    (interrupt.stage === "plan" ? parseImplementationPlan(interrupt.draft) : null); // stage-literal-ok: Plan's own bespoke view
 
   // See stage-review-flags.ts for the isFinal/isProvisional rationale (shared with
   // SpecificationView -- the subtlety here has already caused two live bugs from hand-duplicating
   // this logic).
   const { isProvisional } = deriveStageReviewFlags({
-    stageKey: "plan",
+    stageKey: "plan", // stage-literal-ok: Plan's own bespoke view
     stageStatus: plan?.status,
     interruptOpen: interrupt.open,
     interruptStage: interrupt.stage,
@@ -68,7 +68,7 @@ function PlanViewImpl() {
 
       <AuditFindingsDetails findings={plan?.audit_findings ?? []} />
       <ClarifyingQuestions
-        stageKey="plan"
+        stageKey="plan" // stage-literal-ok: Plan's own bespoke view
         questions={plan?.clarifying_questions ?? []}
         hint="Answer by editing the requirements text on the Requirements tab, then resubmit."
       />
@@ -93,7 +93,7 @@ function PlanViewImpl() {
             fallback={
               draft ? (
                 <PlanSurfaceRenderer plan={draft} />
-              ) : stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("plan") ? (
+              ) : stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("plan") ? ( // stage-literal-ok: Plan's own bespoke view
                 // Empty-tabs fix (root-caused 2026-09-12): same durable fallback as
                 // SpecificationView -- see that file's identical comment.
                 <p className="text-sm text-neutral-500">Approved — waiting for full detail to sync…</p>

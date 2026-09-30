@@ -1,4 +1,5 @@
 // Mirrors agent/src/graph.py's GraphState/StageState shape (SPECIFICATION.md Section 4/5).
+import type { ReportedCheck } from "@/lib/gate-rows";
 
 export type StageStatus =
   | "not_started"
@@ -19,6 +20,9 @@ export interface StageVerification {
   feedback: string;
   report: unknown;
   cannot_verify?: boolean;
+  /** Per-check rows (agent/src/gates/checks.py CheckLog); absent on pre-feature verdicts. */
+  checks?: ReportedCheck[];
+  lap?: number;
 }
 
 export interface StageState {
@@ -56,7 +60,7 @@ export function buildStarted(state: WorkflowState, firstBuildStageKey: string | 
  * rename), while this file's typed stages map still carries the older "exit". */
 export function runEnded(state: WorkflowState): boolean {
   const stages = (state.stages ?? {}) as Record<string, StageState | undefined>;
-  return state.run_failure != null || stages["metrics-exit"]?.status === "approved" || stages["exit"]?.status === "approved";
+  return state.run_failure != null || stages["metrics-exit"]?.status === "approved" || stages["exit"]?.status === "approved"; // stage-literal-ok: runEnded: exit stage approved
 }
 
 /** Some stage is actively drafting server-side. Unlike agent.isRunning this survives a reload

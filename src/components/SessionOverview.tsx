@@ -595,7 +595,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
       const response = await fetch("/api/sessions/actions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: threadId, action: "rewind-to-stage", stageKey: "metrics-exit" }),
+        body: JSON.stringify({ sessionId: threadId, action: "rewind-to-stage", stageKey: "metrics-exit" }), // stage-literal-ok: rewind exit-report action
       });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
@@ -698,8 +698,8 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
   // successor (Adversarial Compliance) hasn't started yet -- exactly rebuildPhase's
   // prior-approved/next-not-started window, inlined here since e2e isn't a RebuildPlacement.
   const e2eCurrentlyRelevant =
-    state.stages?.["remediation"]?.status === "approved" &&
-    (state.stages?.["adversarial-compliance"]?.status ?? "not_started") === "not_started";
+    state.stages?.["remediation"]?.status === "approved" && // stage-literal-ok: e2e runs between remediation and compliance
+    (state.stages?.["adversarial-compliance"]?.status ?? "not_started") === "not_started"; // stage-literal-ok: e2e runs between remediation and compliance
   const e2eStuck = e2eCurrentlyRelevant && state.e2e?.status === "running" && runActivity?.runActive === false && !finishedWithVerdict;
   // "FE must show true live state" (user directive, 2026-09-13): a session-level active run
   // (runActivity.runActive === true, backed by the real heartbeat/container check -- see
@@ -1123,7 +1123,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
                   {note && <p className="mt-1 text-xs text-neutral-500">{note}</p>}
                   {!note && stage.audit_findings?.length > 0 && <AuditFindingsNote findings={stage.audit_findings} />}
                   {showPlainContinue && <ContinueAction restarting={restarting} onClick={() => void handleRestart(key)} />}
-                  {key === "metrics-exit" && finishedWithVerdict && runActivity?.mergeReady === false && (
+                  {key === "metrics-exit" && finishedWithVerdict && runActivity?.mergeReady === false && ( // stage-literal-ok: exit-report actions
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
                       <p className="text-xs text-neutral-500">
                         {"This run finished but is not ready to merge -- see the Report tab for why. " +
@@ -1149,7 +1149,7 @@ function SessionOverviewImpl({ owner, repo, branch }: { owner: string; repo: str
                       </div>
                     </div>
                   )}
-                  {key === "metrics-exit" && finishedWithVerdict && (
+                  {key === "metrics-exit" && finishedWithVerdict && ( // stage-literal-ok: exit-report actions
                     <div className="mt-2 flex items-start justify-between gap-3 border-t border-neutral-100 pt-2">
                       <p className="text-xs text-neutral-500">
                         {"Re-run E2E and Metrics & Exit against a fresh sandbox (e.g. after a sandbox-image "

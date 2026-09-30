@@ -5,7 +5,7 @@ import { memo, useEffect, useRef, useState } from "react";
 import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
-import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useOpenInterrupt, type InterruptVerification } from "@/lib/interrupt-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
@@ -32,7 +32,7 @@ function TechStackViewImpl() {
   const [runActivity] = useRunActivity();
   const { stageOrderIndex } = usePipeline();
 
-  const isOpen = interrupt.open && interrupt.stage === "tech-stack";
+  const isOpen = interrupt.open && interrupt.stage === "tech-stack"; // stage-literal-ok: Tech Stack's own bespoke view
   const showDropdown = isOpen && interrupt.fileExisted === false;
 
   const [text, setText] = useState("");
@@ -127,7 +127,7 @@ function TechStackViewImpl() {
   const disabled = !isOpen || text.trim().length === 0 || submitting || sandboxStatus !== "ready";
 
   const state = (agent.state ?? {}) as WorkflowState;
-  const stage = state.stages?.["tech-stack"];
+  const stage = state.stages?.["tech-stack"]; // stage-literal-ok: Tech Stack's own bespoke view
 
   return (
     <ViewContainer>
@@ -152,7 +152,7 @@ function TechStackViewImpl() {
           hadn't (re)arrived -- now the only way most sessions show anything at all, since nothing
           auto-fires a live snapshot anymore (this session's pivot). */}
       {!isOpen && stage?.status !== "approved" && (sandboxStatus === "provisioning" || sandboxStatus === "ready") && (
-        stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("tech-stack") ? (
+        stageOrderIndex(runActivity?.currentStage) > stageOrderIndex("tech-stack") ? ( // stage-literal-ok: Tech Stack's own bespoke view
           <p className="text-sm text-neutral-500">Approved — waiting for full detail to sync…</p>
         ) : (
           <p className="flex items-center gap-2 text-sm text-neutral-500">
@@ -191,6 +191,10 @@ function TechStackViewImpl() {
             </label>
           )}
 
+          {interrupt.verification && !interrupt.verification.passed && (
+            <SubmissionVerification verification={interrupt.verification} />
+          )}
+
           <AttachmentEditor
             value={text}
             onChange={updateText}
@@ -221,6 +225,36 @@ function TechStackViewImpl() {
 // No props -- memoized so AppShell's unrelated local-state re-renders don't also force this
 // while it's the hidden tab.
 export const TechStackView = memo(TechStackViewImpl);
+
+/** The after-submit gate sent the submission back: what failed, so the human can fix the text. */
+function SubmissionVerification({ verification }: { verification: InterruptVerification }) {
+  const { stage } = usePipeline();
+  const catalog = stage("tech-stack")?.gate?.checks ?? []; // stage-literal-ok: this view IS the tech-stack stage
+  const problems = (verification.checks ?? []).filter((c) => c.status === "failed" || c.status === "infra" || c.status === "advisory");
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-red-300 bg-red-50 p-3 text-sm">
+      <p className="font-medium text-red-900">
+        Your last submission didn’t pass verification (attempt {verification.attempts} of {verification.max_attempts}).
+        Edit the text below and submit again.
+      </p>
+      {problems.length > 0 ? (
+        <ul className="flex flex-col gap-1 text-xs">
+          {problems.map((c) => (
+            <li key={c.id} className={c.status === "failed" ? "text-red-800" : "text-amber-800"}>
+              <span className="font-medium">
+                {c.status === "failed" ? "Failed" : c.status === "infra" ? "Couldn’t check" : "Advisory"}:{" "}
+                {catalog.find((k) => k.id === c.id)?.label ?? c.id}
+              </span>
+              {c.detail && <> — {c.detail}</>}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        verification.feedback && <p className="text-xs whitespace-pre-wrap text-red-800">{verification.feedback}</p>
+      )}
+    </div>
+  );
+}
 
 function ConfirmedTechStackSummary({ content, threadId }: { content: unknown; threadId: string }) {
   const c = (content ?? {}) as {
