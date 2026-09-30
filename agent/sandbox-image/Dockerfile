@@ -761,6 +761,22 @@ RUN printf '%s\n' \
 #     two callers, drift-guarded by quick_scan.py's own _demo(). Dead-code detection deliberately
 #     left out of v1 (no existing tool covers it, auto-removal risk is real) -- extend the same
 #     way this hook itself was added, if it shows up in practice.
+#   - check-adversarial-stop.mjs (2026-09-29, Task 10): runs adversarial-compliance's own
+#     deterministic verdict logic (gates/adversarial_gate.evaluate_audit, now living in
+#     gates/adversarial_audit_checks.py -- see that module's own docstring for why it moved) against
+#     THIS turn's own report, for a same-turn signal instead of a full draft->verify round trip.
+#     This stage has no on-disk report artifact before the gate runs (content_field="report" means
+#     the model's FINAL turn message IS the report, same mechanism structured_output.ainvoke_
+#     structured always uses), so this hook reads the SAME transcript check-full-read-stop.mjs/
+#     require-skills-stop.mjs already rely on, via the new shared lib/read-final-json.mjs helper.
+#   - check-remediation-stop.mjs (2026-09-29, Task 10): the same same-turn signal for remediation's
+#     own gates/remediation_gate.evaluate_remediation (now living in
+#     gates/remediation_evaluate_checks.py), reading the already-on-disk repo-scan-latest.json
+#     (published pre-draft by remediation_scan_node) plus this turn's own final report (via
+#     lib/read-final-json.mjs, same mechanism as check-adversarial-stop.mjs) plus `git diff`/
+#     `git show` against AIDW_BASELINE_COMMIT for the changed-files/suppression/fabricated-id
+#     checks -- mirrors gates/remediation_gate.py's own `_stage_diff`/`_prior_finding_ids` exactly,
+#     without re-running the scan itself.
 #
 # BOTH PROVIDERS (user directive, 2026-09-17): baked into BOTH Claude Code's admin-managed
 # settings path AND GitHub Copilot CLI's own config, confirmed live via real docker-exec
@@ -859,6 +875,21 @@ COPY hooks/sast_parsers.py /opt/aidw-hooks/sast_parsers.py
 # ../src/gates/quick_scan.py hooks/quick_scan.py` (from agent/sandbox-image) after editing the
 # source and before rebuilding. Needs nothing beyond python3's standard library.
 COPY hooks/quick_scan.py /opt/aidw-hooks/quick_scan.py
+COPY hooks/check-adversarial-stop.mjs /opt/aidw-hooks/check-adversarial-stop.mjs
+# Byte-identical staged copy of agent/src/gates/adversarial_audit_checks.py -- same build-context
+# constraint and same drift-guard convention as coverage_parsing.py above (that module's own
+# _demo() asserts this file matches its source on every self-check run); re-run `cp
+# ../src/gates/adversarial_audit_checks.py hooks/adversarial_audit_checks.py` (from
+# agent/sandbox-image) after editing the source and before rebuilding. Needs nothing beyond
+# python3's standard library.
+COPY hooks/adversarial_audit_checks.py /opt/aidw-hooks/adversarial_audit_checks.py
+COPY hooks/check-remediation-stop.mjs /opt/aidw-hooks/check-remediation-stop.mjs
+# Byte-identical staged copy of agent/src/gates/remediation_evaluate_checks.py -- same build-context
+# constraint and drift-guard convention as every other staged .py file here; re-run `cp
+# ../src/gates/remediation_evaluate_checks.py hooks/remediation_evaluate_checks.py` (from
+# agent/sandbox-image) after editing the source and before rebuilding. Needs nothing beyond
+# python3's standard library.
+COPY hooks/remediation_evaluate_checks.py /opt/aidw-hooks/remediation_evaluate_checks.py
 COPY hooks/lib/ /opt/aidw-hooks/lib/
 COPY hooks/schemas/ /opt/aidw-hooks/schemas/
 RUN set -eux; \
@@ -877,7 +908,9 @@ RUN set -eux; \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs", "timeout": 300 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs", "timeout": 30 } ] },' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs", "timeout": 300 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs", "timeout": 300 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs", "timeout": 30 } ] }' \
       '    ]' \
       '  }' \
       '}' \
@@ -896,7 +929,9 @@ RUN set -eux; \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs" },' \
-      '      { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs" }' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs" }' \
       '    ]' \
       '  }' \
       '}' \
@@ -913,6 +948,8 @@ RUN set -eux; \
       /opt/aidw-hooks/check-test-quality-stop.mjs /opt/aidw-hooks/test_quality_checks.py \
       /opt/aidw-hooks/check-coverage-stop.mjs /opt/aidw-hooks/coverage_parsing.py \
       /opt/aidw-hooks/check-testid-locators-stop.mjs \
+      /opt/aidw-hooks/check-adversarial-stop.mjs /opt/aidw-hooks/adversarial_audit_checks.py \
+      /opt/aidw-hooks/check-remediation-stop.mjs /opt/aidw-hooks/remediation_evaluate_checks.py \
       /opt/aidw-hooks/lib/*.mjs /opt/aidw-hooks/schemas/*.json; \
     chown -R vscode:vscode /home/vscode/.copilot; \
     chmod 0644 /home/vscode/.copilot/config.json

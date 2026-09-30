@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any
 
 from .. import repo_files
 from ..chat_model import close_session, lap_role
 from ..schemas import presence_values as _presence_values
+# accounted_for is re-exported for metrics_nodes.py/exit_nodes.py, both of which do
+# `from .gates.remediation_gate import accounted_for` -- that keeps working unmodified since it is
+# now just this import binding the same function into this module's own namespace.
+from .remediation_evaluate_checks import accounted_for, evaluate_remediation
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
@@ -66,143 +69,6 @@ def _stuck_fixer_check(reasons: list[str], raw_prior_fingerprint: str | None) ->
         prior = []
     should_reset = bool(fingerprint) and fingerprint == prior
     return should_reset, fingerprint
-
-# Editing these is how you make a scanner quiet without making the code safe. Remediation has write
-# access, so this is a real temptation and not a hypothetical one: the deleted `security_nodes`
-# cluster carried the same never-suppress rule in its prompt, where nothing enforced it.
-SUPPRESSION_PATHS = (
-    ".trivyignore",
-    ".gitleaksignore",
-    ".semgrepignore",
-    ".osv-scanner-ignore",
-    "gitleaks.toml",
-    ".gitleaks.toml",
-    "trivy.yaml",
-    ".trivyignore.yaml",
-    "jscpd.json",
-    ".jscpd.json",
-)
-_SUPPRESSION_COMMENT_RE = re.compile(
-    r"(?:#\s*nosec|//\s*nosec|#\s*noqa(?!:\s*E\d)|trivy:ignore|gitleaks:allow|semgrep-disable|"
-    r"jscpd:ignore|eslint-disable(?!-next-line\s+@typescript)|#\s*type:\s*ignore)",
-    re.IGNORECASE,
-)
-
-
-def _mentions_id(text: str, finding_id: str) -> bool:
-    return finding_id.lower() in text.lower()
-
-
-def accounted_for(finding_id: str, known_gaps: list[str]) -> bool:
-    """A gap entry counts only if it names the finding id AND says something beyond the id.
-
-    Requiring more than the bare id is deliberate: `known_gaps: ["a1b2c3d4e5f6"]` is a list of
-    excuses with the excuses left out, and it would otherwise be the one-token way to pass this
-    gate for every finding at once.
-    """
-    for gap in known_gaps:
-        text = str(gap)
-        if _mentions_id(text, finding_id) and len(text.strip()) > len(finding_id) + 8:
-            return True
-    return False
-
-
-def evaluate_remediation(
-    content: dict[str, Any] | None,
-    scan: dict[str, Any] | None,
-    changed_files: list[str] | None = None,
-    added_lines: str = "",
-    prior_ids: frozenset[str] | None = None,
-) -> tuple[bool, list[str]]:
-    """(passed, reasons). Pure -- `scan` is the dashboard dict repo_scan already writes.
-
-    `scan` is the scan taken AFTER remediation ran; `prior_ids` are the finding ids from the scan it
-    was handed BEFORE it ran. Both are needed and they are not interchangeable: a finding that was
-    genuinely fixed is absent from the post-fix scan, so validating claimed ids against `scan` would
-    flag every real fix as a fabrication (it did -- the self-check below caught exactly that).
-    `prior_ids=None` means that pre-scan could not be read, and the fabrication check is then
-    skipped rather than guessed at.
-
-    A missing post-fix scan does NOT pass: this stage exists to act on findings, so "no findings
-    file" means the check could not run, and an unrunnable check must never read as a clean one.
-    """
-    if content is None:
-        return False, ["the remediation stage produced no report at all"]
-    if not scan:
-        return False, [
-            "no repo scan was available to verify remediation against -- the stage's claims about "
-            "which findings it fixed cannot be checked, and an unverifiable claim is not an approval"
-        ]
-
-    findings = scan.get("findings") or []
-    # The fix-everything contract: every `actionable` finding -- ANY severity, application code
-    # only, quality debt only when this pipeline introduced it (see repo_scan.to_dashboard_dict)
-    # -- must be gone from the post-fix scan or explained in known_gaps. Older scans (pre-v3)
-    # carry no `actionable` key; `gating` is the honest fallback there, never a silent pass.
-    actionable = [f for f in findings if f.get("actionable", f.get("gating"))]
-    known_gaps = [str(g) for g in _presence_values(content.get("known_gaps"))]
-    claimed = [str(c) for c in _presence_values(content.get("findings_addressed"))]
-    all_ids = {str(f.get("id")) for f in findings}
-
-    reasons: list[str] = []
-
-    # 1. Every actionable finding still open after this stage ran must be explained. This is the
-    #    check that actually blocks: it reads the CURRENT scan, so a claim that a finding was
-    #    fixed is worth exactly as much as the finding's absence from it.
-    unexplained: list[str] = []
-    for finding in actionable:
-        finding_id = str(finding.get("id"))
-        if accounted_for(finding_id, known_gaps):
-            continue
-        location = (finding.get("location") or {}).get("path") or "unknown path"
-        unexplained.append(
-            f"finding {finding_id} [{finding.get('severity')}/{finding.get('category')}] is still "
-            f"open after remediation and is not in known_gaps: "
-            f"{finding.get('title')} at {location}"
-            + (f" (fixed_version {finding['package'].get('fixed_version')})" if (finding.get("package") or {}).get("fixed_version") else "")
-        )
-    # Cap what the feedback carries -- 60 unexplained findings would drown the fix prompt, and the
-    # model reads repo-scan-latest.json itself (its own prompt says so). Named-not-counted still
-    # holds: the first 30 are named, the remainder is a pointer to the exact file/flag to read.
-    if len(unexplained) > 30:
-        reasons.extend(unexplained[:30])
-        reasons.append(
-            f"...and {len(unexplained) - 30} more -- every `actionable: true` entry in "
-            f"repo-scan-latest.json must be fixed or explained in known_gaps"
-        )
-    else:
-        reasons.extend(unexplained)
-
-    # 2. A claimed id that appears in NEITHER the scan it was handed nor the scan taken after is a
-    #    fabrication, not a fix. Both sets count: a fixed finding leaves the post-fix scan, and a
-    #    finding fixed non-gatingly stays in it. Union, not intersection.
-    if prior_ids is not None:
-        known_ids = all_ids | set(prior_ids)
-        for finding_id in claimed:
-            if finding_id not in known_ids:
-                reasons.append(
-                    f"findings_addressed names {finding_id!r}, which is not the id of any finding "
-                    f"in the scan -- ids must be copied verbatim from repo-scan-latest.json"
-                )
-
-    # 3. Silencing the scanner is not remediation.
-    for path in changed_files or []:
-        normalized = path.replace("\\", "/")
-        if any(normalized.endswith(candidate) for candidate in SUPPRESSION_PATHS):
-            reasons.append(
-                f"{path} is a scanner ignore/config file -- remediation must fix findings, never "
-                f"suppress them; revert this and address the finding itself"
-            )
-    suppressions = sorted(set(_SUPPRESSION_COMMENT_RE.findall(added_lines)))
-    if suppressions:
-        reasons.append(
-            "added inline scanner-suppression comment(s) "
-            + ", ".join(repr(s) for s in suppressions)
-            + " -- fix the finding instead of hiding it"
-        )
-
-    return not reasons, reasons
-
 
 async def scan_and_publish(provider: Any, thread_id: str) -> dict[str, Any]:
     """Run a full scan and write it to `repo-scan-latest.json`, returning the dashboard dict.
