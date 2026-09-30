@@ -211,19 +211,6 @@ REBUILD_OUTPUT_COMBINED_TAIL_CHARS = int(os.environ.get("AIDW_REBUILD_OUTPUT_COM
 # so effect-of-change is identical in shape everywhere: raising either HEAD or TAIL widens how
 # much of that end survives; the total (HEAD+TAIL) is the point below which nothing is cut at all.
 
-# gates/diagram_gate.py's _render_one: mmdc's own stdout/stderr for one diagram render. Read by
-# the draft node's next redraft as feedback. Was already fixed correctly (this is the reference
-# pattern) but hardcoded 2000/2000 (4000 total) -- relocated here, values unchanged.
-DIAGRAM_ERROR_SUMMARY_HEAD_CHARS = int(os.environ.get("AIDW_DIAGRAM_ERROR_SUMMARY_HEAD_CHARS", "2000"))
-DIAGRAM_ERROR_SUMMARY_TAIL_CHARS = int(os.environ.get("AIDW_DIAGRAM_ERROR_SUMMARY_TAIL_CHARS", "2000"))
-
-# gates/diagram_gate.py's plan-diagram cap: how large one wireframe's HTML may be, before the
-# deterministic_verify gate rejects the draft outright and asks for a smaller one. Purely a
-# plan-content ceiling, unrelated to the truncation pairs above -- relocated from a local module
-# constant of the same name, value unchanged. There is deliberately no wireframe COUNT cap
-# (removed 2026-09-24) -- a plan may cite as many wireframes as the work actually needs.
-DIAGRAM_MAX_WIREFRAME_BYTES = int(os.environ.get("AIDW_DIAGRAM_MAX_WIREFRAME_BYTES", str(30 * 1024)))
-
 # claude_chat_model.py's read_full_file_reads: the Claude CLI's own Read tool default read window
 # (line count returned when a call carries no explicit `limit`), used to compute the covered line
 # range of an unparameterized Read call when proving a session read a whole file. Matches the CLI's
@@ -520,13 +507,6 @@ E2E_BLANK_SCREENSHOTS_PREVIEW_MAX = int(os.environ.get("AIDW_E2E_BLANK_SCREENSHO
 # more/longer failing-audit detail to the e2e fix model at both stages.
 E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS = int(os.environ.get("AIDW_E2E_LIGHTHOUSE_AUDIT_TEXT_CHARS", "120"))
 E2E_LIGHTHOUSE_FAILING_AUDITS_MAX = int(os.environ.get("AIDW_E2E_LIGHTHOUSE_FAILING_AUDITS_MAX", "12"))
-
-# gates/diagram_gate.py's _mermaid_error_summary: companion to DIAGRAM_ERROR_SUMMARY_HEAD/TAIL_CHARS
-# above, but for the HEAD-lines extraction that pulls mmdc's actionable "Parse error on line N"
-# text out of its output before the head+tail raw capture even runs -- how many of the output's own
-# meaningful lines to keep, and the char cap on the joined result.
-DIAGRAM_ERROR_SUMMARY_LINES_MAX = int(os.environ.get("AIDW_DIAGRAM_ERROR_SUMMARY_LINES_MAX", "10"))
-DIAGRAM_ERROR_SUMMARY_JOINED_CHARS = int(os.environ.get("AIDW_DIAGRAM_ERROR_SUMMARY_JOINED_CHARS", "700"))
 
 # Bounded retry when a sandbox container starts but its CLI tool (whichever provider's --
 # `claude --version`/`copilot --version`, per sandbox/provider.py's wait_for_cli_ready) never
