@@ -135,6 +135,22 @@ def resolve_test_command(tech_stack: dict[str, Any]) -> str | None:
     (Task: Tickets View audit finding). Also applies `ecosystem_root_prefix` for node/python, the
     same monorepo-root fix `dotnet_root_prefix` already has below -- a bare command at the wrong
     directory fails immediately, same failure class as .NET's MSB1003.
+
+    KNOWN LIMITATION, tracked deliberately (Task 6 toolchain-command reuse, requirement 1): this
+    resolves exactly ONE stack (the first branch below that matches -- dotnet, else ts/js, else
+    python), never a genuine polyglot monorepo's SECOND stack (e.g. a dotnet backend + a separate
+    React frontend both have their own test suites; only the dotnet branch fires). Before Task 6,
+    that single-stack answer only ever reached a human-facing manifest field with zero execution
+    consequence (exit_nodes.py's `test_command`, informational only) -- Task 6 made it the default,
+    LLM-skipping answer `run_resolved_test_command` executes DIRECTLY at up to 4 execution sites
+    (`rebuild.py`'s TDD-red gate, `ac_coverage_gate.py`'s own ac-test-run, `test_hardening_nodes.py`'s
+    test-hardening-run) whose correctness this pipeline's TDD-red/coverage contracts actually rely
+    on. A dual-stack repo's second stack's tests are simply invisible to a resolved-path run -- the
+    zero-outcomes-triggers-rediscovery guard at each call site only protects against "nothing at
+    all", not "real but incomplete coverage of one stack out of two". This is a materially larger
+    blast radius than before Task 6, not a new bug introduced by it -- if a genuine polyglot repo's
+    red-gate/coverage correctness regresses, look here first before assuming the resolved command
+    itself is wrong.
     """
     languages = [str(l).lower() for l in tech_stack_signals.presence_values(tech_stack, "languages")]
     testing_frameworks = [str(t).lower() for t in tech_stack_signals.presence_values(tech_stack, "testing_frameworks")]

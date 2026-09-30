@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, run_failure, spec_ledger, stack_runner, test_results
+from . import git_ops, model_config, repo_files, run_failure, spec_ledger, stack_runner, test_results, workflow_persistence
 from .chat_model import ainvoke_structured, get_chat_model_for_thread, lap_role
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
 from .sandbox import registry as sandbox_registry
@@ -139,8 +139,7 @@ async def test_hardening_run_tests_node(state: dict[str, Any], config: RunnableC
     # parseable outcomes, does the real GHCP discovery turn below run at all -- a resolved command
     # that produces nothing must trigger that fresh discovery, not get silently read as "nothing to
     # harden" (the same guard requirement 1 also adds at rebuild.py/ac_coverage_gate.py).
-    from . import workflow_persistence
-    from .gates.ac_coverage_gate import resolve_test_report_format, with_test_reporter
+    from .gates.ac_coverage_gate import resolve_test_report_format, with_test_reporter  # local: same "avoids import at module load" precedent as rebuild.py's own ac_coverage_gate import
 
     outcomes: dict[str, list[str]] | None = None
     tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)

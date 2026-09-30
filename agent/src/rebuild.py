@@ -600,6 +600,19 @@ def make_rebuild_node(spec: RebuildSpec):
         if build_ok and not skip_toolchain_capture and not used_persisted_build_command and rb["build_commands"]:
             await preflight_nodes.persist_toolchain_value(provider, thread_id, "build_commands", rb["build_commands"])
 
+        # Deliberate asymmetry vs. e2e_nodes.py's start_command (Task 6 review, Important item):
+        # a persisted build_commands set that later FAILS a replay here is never invalidated. This
+        # is intentional, not an oversight: a build failure's own fix loop (make_fix_node, below)
+        # is written to FIX THE CODE so the SAME command succeeds -- that is what this whole
+        # placement's replay-then-fix cycle already did BEFORE Task 6 touched this file, persisted
+        # or not. A start_command, by contrast, can be genuinely WRONG in a way no code fix
+        # resolves (the app moved directories, needs a different port/flag) -- that asymmetry is
+        # why e2e's cache needs active forgetting and this one doesn't. The one real risk this
+        # accepts: a persisted build_commands set that becomes stale for a reason no code fix can
+        # repair (e.g. a later stage restructures the repo layout) will still burn a placement's
+        # fix cycles before escalating, same as a bad FRESH discovery already could pre-Task-6 --
+        # not a new failure mode, just not actively short-circuited either.
+
         # TDD-red gate, scaffold placement only: a green build is necessary but NOT sufficient --
         # the suite must also RUN with zero passing tests before the implementation stage may
         # start. A red-gate violation re-enters the same bounded fix loop (the fix prompt gets the

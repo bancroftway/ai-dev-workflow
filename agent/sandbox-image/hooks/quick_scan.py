@@ -88,7 +88,11 @@ def parse_bandit(raw: str) -> list[QuickFinding]:
     return [
         QuickFinding(
             tool=hit.tool, rule_id=hit.rule_id, file=hit.file, line=hit.line,
-            severity=hit.raw_severity or "UNKNOWN", message=hit.message,
+            severity=hit.raw_severity or "UNKNOWN",
+            # This hook's own exact original fallback chain (Task 6 review fix): issue_text, then
+            # test_name, then the literal "bandit finding" -- distinct from repo_scan.py's own
+            # chain (which never consults test_name and falls back to rule_id, not this string).
+            message=hit.raw_message or hit.test_name or "bandit finding",
         )
         for hit in _parse_bandit_hits(raw)
     ]
@@ -105,7 +109,11 @@ def parse_eslint_security(raw: str) -> list[QuickFinding]:
     return [
         QuickFinding(
             tool=hit.tool, rule_id=hit.rule_id, file=hit.file, line=hit.line,
-            severity=hit.derived_severity, message=hit.message,
+            severity=hit.derived_severity,
+            # raw_message is already `message.get("message") or rule_id` for an eslint hit (both
+            # original parsers agreed on this exact chain, so sast_parsers.py resolves it at parse
+            # time) -- never falls through to "bandit finding".
+            message=hit.raw_message,
         )
         for hit in _parse_eslint_hits(raw)
     ]
@@ -179,6 +187,26 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && python -m src.gates.qui
     )
     assert quick_bandit[0].file == gate_bandit[0].file == "apps/api/app.py"
     assert quick_bandit[0].rule_id == gate_bandit[0].rule_id == "B602"
+    assert gate_bandit[0].message == "subprocess call with shell=True identified.", gate_bandit[0].message
+    assert quick_bandit[0].message == "subprocess call with shell=True identified.", quick_bandit[0].message
+
+    # Task 6 REVIEW FIX regression: a bandit result missing BOTH issue_text and test_name -- the
+    # exact edge case where the two ORIGINAL parsers' fallback chains diverge. repo_scan.py's
+    # original never consulted test_name for `message` and fell back to rule_id (never the literal
+    # "bandit finding"); quick_scan.py's original tried test_name before "bandit finding". A prior
+    # version of sast_parsers.py collapsed both onto quick_scan's own chain, silently changing
+    # repo_scan.py's `message`/`title` for this exact shape -- this must not recur.
+    bare_bandit = json.dumps({"results": [
+        {"filename": "./apps/api/bare.py", "line_number": 9, "test_id": "B999", "issue_severity": "MEDIUM"},
+    ]})
+    quick_bare = parse_bandit(bare_bandit)
+    gate_bare, _ = repo_scan.parse_bandit(bare_bandit)
+    assert quick_bare[0].message == "bandit finding", (
+        "quick_scan.py's own original ultimate fallback, unchanged by the consolidation"
+    )
+    assert gate_bare[0].message == "B999" and gate_bare[0].title == "B999", (
+        f"repo_scan.py's own original fallback is rule_id, never the string 'bandit finding': {gate_bare[0]}"
+    )
 
     cross_eslint = json.dumps([
         {"filePath": "/workspace/repo/apps/web/src/lib/query.ts", "messages": [

@@ -55,8 +55,23 @@ class SastHit:
     decision (repo_scan.py's `normalize_tier`, quick_scan.py's raw passthrough), not one this parser
     can make for both.
     """
-    message: str = ""
-    title: str = ""
+    raw_message: str = ""
+    """The tool's own message text, UNRESOLVED for bandit (bare `issue_text`, "" if absent -- the
+    two original parsers fell back differently on absence, see below, so this parser must not decide
+    for them); for eslint, `message.get("message") or rule_id` (both original parsers already
+    resolved eslint's fallback identically, so it's safe to fold in here).
+
+    Regression fix (Task 6 review): the first version of this module pre-resolved bandit's fallback
+    chain to ONE shared string, using quick_scan.py's own convention (`issue_text or test_name or
+    "bandit finding"`) for BOTH callers' `message`/`title` -- but repo_scan.py's ORIGINAL
+    `parse_bandit` never consulted `test_name` for `message` at all (`issue_text or rule_id`, no
+    middle fallback) and its ultimate fallback was `rule_id`, not the string `"bandit finding"` --
+    a real, if narrow, divergence from "produces IDENTICAL output" for a result missing both
+    `issue_text` and `test_name`. Exposing the raw, unresolved piece here (plus `test_name` below)
+    lets each caller rebuild its own exact original fallback chain instead of this module guessing
+    one shared chain that fit only one of them.
+    """
+    test_name: str = ""  # bandit only (bare `test_name`, "" if absent); always "" for eslint.
     cwe_id: str | None = None  # bandit only (bare numeric id, e.g. "78"); always None for eslint.
 
 
@@ -117,8 +132,8 @@ def parse_bandit(raw: str) -> list[SastHit]:
                 file=norm_path(str(result.get("filename") or "unknown")),
                 line=line,
                 raw_severity=str(result.get("issue_severity") or ""),
-                message=str(result.get("issue_text") or result.get("test_name") or "bandit finding"),
-                title=str(result.get("test_name") or result.get("issue_text") or "bandit finding"),
+                raw_message=str(result.get("issue_text") or ""),
+                test_name=str(result.get("test_name") or ""),
                 cwe_id=str(cwe) if cwe else None,
             )
         )
@@ -146,7 +161,10 @@ def parse_eslint_security(raw: str) -> list[SastHit]:
             if not rule_id.startswith(ESLINT_SECURITY_PREFIXES):
                 continue
             line = message.get("line") if isinstance(message.get("line"), int) else None
-            text = str(message.get("message") or rule_id)
+            # Both original parsers already resolved eslint's own fallback identically
+            # (`message.get("message") or rule_id`), so folding it in here (unlike bandit's
+            # raw_message above, left unresolved) is safe -- see SastHit.raw_message's own
+            # docstring for why bandit and eslint are treated differently here.
             hits.append(
                 SastHit(
                     tool="eslint-security",
@@ -155,8 +173,7 @@ def parse_eslint_security(raw: str) -> list[SastHit]:
                     line=line,
                     raw_severity=str(message.get("severity") or ""),
                     derived_severity="medium" if rule_id.startswith("security/") else "low",
-                    message=text,
-                    title=text,
+                    raw_message=str(message.get("message") or rule_id),
                 )
             )
     return hits
@@ -182,13 +199,25 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
             {"filename": "./apps/api/util.py", "line_number": 3, "test_id": "B404",
              "test_name": "blacklist", "issue_severity": "LOW",
              "issue_text": "Consider possible security implications."},
+            # Task 6 review regression: a result missing BOTH issue_text and test_name -- the exact
+            # edge case where the two original parsers' fallback chains diverge (repo_scan.py:
+            # message=issue_text-or-rule_id, no test_name step at all; quick_scan.py: issue_text-or-
+            # test_name-or-"bandit finding"). raw_message/test_name must come back genuinely EMPTY
+            # here, not a pre-guessed fallback -- each caller's own wrapper decides what to show.
+            {"filename": "./apps/api/bare.py", "line_number": 9, "test_id": "B999", "issue_severity": "MEDIUM"},
         ],
     }))
-    assert len(hits) == 2, hits
+    assert len(hits) == 3, hits
     assert hits[0].file == "apps/api/app.py" and hits[0].raw_severity == "HIGH"
     assert hits[0].cwe_id == "78" and hits[0].tool == "bandit"
-    assert hits[0].title == "subprocess_popen_with_shell_equals_true"
+    assert hits[0].test_name == "subprocess_popen_with_shell_equals_true"
+    assert hits[0].raw_message == "subprocess call with shell=True identified."
     assert hits[1].cwe_id is None, "no issue_cwe on this result -- must not fabricate one"
+    assert hits[2].raw_message == "" and hits[2].test_name == "", (
+        "missing issue_text/test_name must come back empty, not a guessed fallback -- each "
+        "caller's own wrapper (repo_scan.py's rule_id fallback, quick_scan.py's \"bandit finding\") "
+        "decides what to show"
+    )
     assert parse_bandit("not json") == [] and parse_bandit("[]") == []
 
     # --- eslint-security: only security/* and sonarjs/* namespaces surface, derived tier shared ---

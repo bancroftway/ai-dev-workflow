@@ -1022,10 +1022,14 @@ def parse_bandit(raw: str) -> ParseResult:
                 raw_severity=hit.raw_severity,
                 file=hit.file,
                 line=hit.line,
-                message=hit.message,
+                # This gate's own exact original fallback chain (Task 6 review fix): message never
+                # consulted test_name at all (only issue_text/raw_message, then rule_id); title
+                # tries test_name FIRST. Neither falls back to a fabricated "bandit finding" string
+                # -- rule_id (always present) is the true last resort.
+                message=hit.raw_message or hit.rule_id,
                 cwe=f"CWE-{hit.cwe_id}" if hit.cwe_id else None,
                 category="sast",
-                title=hit.title,
+                title=hit.test_name or hit.raw_message or hit.rule_id,
                 severity_source="native" if tier else "defaulted",
                 sources=("bandit",),
             )
@@ -1052,9 +1056,13 @@ def parse_eslint(raw: str) -> ParseResult:
             raw_severity=hit.raw_severity,
             file=hit.file,
             line=hit.line,
-            message=hit.message,
+            # Same formula as parse_bandit above -- test_name is always "" for an eslint hit, so
+            # this reduces to `raw_message or rule_id` exactly as this gate's original did (eslint's
+            # own message/rule_id fallback was already identical between both original parsers, so
+            # sast_parsers.py folds it into raw_message directly -- see SastHit.raw_message).
+            message=hit.raw_message or hit.rule_id,
             category="sast",
-            title=hit.title,
+            title=hit.test_name or hit.raw_message or hit.rule_id,
             severity_source="derived",
             sources=("eslint-security",),
         )
