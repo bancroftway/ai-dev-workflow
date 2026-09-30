@@ -216,6 +216,52 @@ async def update_manifest(
     return manifest
 
 
+async def read_toolchain_value(provider: SandboxProvider, thread_id: str, key: str) -> Any | None:
+    """One key from manifest.json's shared `toolchain` section (record_toolchain's own
+    tools/available/security_tools/playwright_version/... -- see its docstring), or None when the
+    manifest, the section, or the key itself is absent/unreadable.
+
+    Task 6 (toolchain-command reuse): rebuild.py's build command and e2e_nodes.py's proven start
+    command are persisted into this same section (via `persist_toolchain_value` below) so a later
+    rebuild placement / a fresh e2e attempt can read a previously-proven value instead of
+    independently re-asking the model every time.
+    """
+    raw = await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH)
+    if not raw:
+        return None
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    toolchain = manifest.get("toolchain") if isinstance(manifest, dict) else None
+    return toolchain.get(key) if isinstance(toolchain, dict) else None
+
+
+async def persist_toolchain_value(provider: SandboxProvider, thread_id: str, key: str, value: Any) -> None:
+    """Read-modify-write ONE key into manifest.json's shared `toolchain` section without
+    disturbing its other co-owned fields (record_toolchain's tools/available/security_tools/...).
+
+    `update_manifest`'s own merge is shallow beyond `app_check` (see its docstring) -- a bare
+    `update_manifest(provider, thread_id, {"toolchain": {key: value}})` call would silently wipe
+    every sibling field record_toolchain already wrote (or a sibling key THIS function itself wrote
+    for a different key), so this reads the section fresh and merges in Python first. `value=None`
+    forgets a previously-persisted value (e.g. a proven command that just failed to boot again --
+    see e2e_nodes.py's own call site) rather than leaving a stale entry that would keep being read
+    back as though it were still good.
+    """
+    raw = await repo_files.read_repo_file(provider, thread_id, MANIFEST_PATH)
+    try:
+        manifest = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+    existing = manifest.get("toolchain") if isinstance(manifest.get("toolchain"), dict) else {}
+    if existing.get(key) == value:
+        return  # unchanged -- no commit-only-narration write
+    await update_manifest(provider, thread_id, {"toolchain": {**existing, key: value}})
+
+
 async def scaffold_node(state: "GraphState", config: RunnableConfig) -> dict[str, Any]:
     """The true entry point of a from-scratch run (graph.py's module docstring definition of a
     "run"), deliberately kept read-mostly: it resets the workflow action ledger (fresh per
@@ -906,7 +952,7 @@ async def probe_tech_stack_startability(
     boot_evidence: list[dict[str, Any]] = []
     first_failure_reason: str | None = None
     for candidate in unique:
-        started, reason = await e2e_nodes.probe_candidate_boot(
+        started, reason, launch_command, port = await e2e_nodes.probe_candidate_boot(
             provider, thread_id, candidate,
             timeout_seconds=workflow_config.AIDW_TECH_STACK_BOOT_PROBE_TIMEOUT_SECONDS,
             merged_env=merged_env,
@@ -916,6 +962,14 @@ async def probe_tech_stack_startability(
             "path": candidate.get("path"),
             "started": started,
             "reason": reason,
+            # Task 6 synergy: the exact, already port-bound command this probe just proved boots --
+            # e2e_nodes.py reads this (start_command + port together; the command has a specific
+            # port baked in via _with_port_env, so the two are read together, never separately) as
+            # its own first choice, ahead of its manifest-persisted proven-launch cache, since this
+            # is independently boot-proven by an earlier stage. None when this candidate did not
+            # start -- discovered separately for a future placement, never a stale guess.
+            "start_command": launch_command,
+            "port": port,
         })
         if not started and first_failure_reason is None:
             first_failure_reason = reason
@@ -1833,7 +1887,9 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     ):
         path = candidate.get("path")
         boot_calls.append(path)
-        return (False, f"{path} never answered") if path == "apps/api" else (True, None)
+        if path == "apps/api":
+            return False, f"{path} never answered", None, None
+        return True, None, f"cd {path} && {candidate.get('start_command')}", 4000
 
     _e2e_nodes_g.probe_candidate_boot = _fake_probe_candidate_boot
     try:
@@ -1864,6 +1920,12 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
         assert result_g["not_startable_reason"] == "apps/api never answered"
         assert [e["path"] for e in result_g["boot_evidence"]] == ["apps/api", "apps/web"]
         assert result_g["boot_evidence"][0]["started"] is False and result_g["boot_evidence"][1]["started"] is True
+        # Task 6 synergy: a failed candidate's start_command/port must be None (nothing was proven
+        # to work), while a started one carries the exact, already port-bound command/port that
+        # probe_candidate_boot just proved boots -- not the candidate's bare, unrunnable guess.
+        assert result_g["boot_evidence"][0]["start_command"] is None and result_g["boot_evidence"][0]["port"] is None
+        assert result_g["boot_evidence"][1]["start_command"] == "cd apps/web && npm run dev"
+        assert result_g["boot_evidence"][1]["port"] == 4000
 
         # Every candidate boots -> startable, no reason.
         boot_calls.clear()
@@ -1872,7 +1934,10 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
         ))
         assert result_g2 == {
             "startable": True, "not_startable_reason": None,
-            "boot_evidence": [{"candidate": "apps/web", "path": "apps/web", "started": True, "reason": None}],
+            "boot_evidence": [{
+                "candidate": "apps/web", "path": "apps/web", "started": True, "reason": None,
+                "start_command": "cd apps/web && npm run dev", "port": 4000,
+            }],
         }
     finally:
         _e2e_nodes_g.probe_candidate_boot = real_probe_candidate_boot

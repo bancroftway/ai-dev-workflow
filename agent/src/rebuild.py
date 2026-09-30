@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from .prompt_loader import load_prompt_pair, render_prompt
 
-from . import config, git_ops, model_config, repo_files, run_event_store, run_event_stream, run_failure, stack_runner, test_results, workflow_persistence
+from . import config, git_ops, model_config, preflight_nodes, repo_files, run_event_store, run_event_stream, run_failure, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from .run_events import RunEvent, RunEventType, encode_io_text
 from .chat_model import close_session, get_chat_model_for_thread, lap_role
 from .infra_retry import call_with_infra_retry
@@ -176,6 +176,26 @@ def eligible_red_verdict(outcomes: dict[str, str], eligible_ac_ids: set[str]) ->
     passed = sorted(name for name, outcome in scoped.items() if outcome == "pass")
     failed = sum(1 for outcome in scoped.values() if outcome == "fail")
     return (not passed and failed > 0), passed, failed
+
+
+def _should_skip_toolchain_capture(fix_scope: str, is_greenfield: bool) -> bool:
+    """True when this rebuild placement must neither READ NOR WRITE manifest.json's shared
+    `toolchain.build_commands` (Task 6, requirement 3's timing correction). Pure, so the
+    greenfield/brownfield gating is directly testable without a sandbox.
+
+    Only the ONE scaffold_only placement (r_ac_to_tests) on a GENUINELY greenfield first ticket is
+    excluded: scaffold_finalize_node writes no application scaffold at all for a greenfield repo,
+    so that placement's own build (against its own compile-enabling stubs, not the real app
+    minimal-code-to-green will later write) is not yet a build worth locking in for every later
+    placement to reuse. `is_greenfield` alone is not enough to gate this -- it is a fixed per-run
+    classification computed once from app_scan, still True for the rest of a fresh greenfield run
+    even after minimal-code-to-green has written the real app -- so `fix_scope` narrows it to just
+    the one placement this timing concern actually applies to; r_minimal_code_to_green
+    (fix_scope="full", the very next placement) is where "persist whichever placement discovers it
+    first" naturally lands instead, exactly as intended. A brownfield repo (or ticket 2+ on an
+    already-scaffolded one, where `is_greenfield` already reads False) is never excluded at all.
+    """
+    return fix_scope == "scaffold_only" and is_greenfield
 
 
 async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[str, Any]) -> list[str]:
@@ -372,25 +392,43 @@ async def _verify_all_red(
     `stage_key="red-gate"` literal -- indistinguishable from any other placement that might reuse
     this gate later. Placement-specific now (`f"red-gate-{spec_key}"`), matching the pattern
     already established at make_fix_node's `f"rebuild-{spec.key}"`. model_name is resolved
-    explicitly from the OLD literal "red-gate" key (not in model_config.py's Stage list today,
-    so this preserves the existing stack-run fallback exactly) -- stack_runner.run_and_report's
-    own internal fallback (`model_config.get_model_name(stage_key, ...)`) would otherwise silently
-    re-resolve against the new placement-specific key instead, which is absent from models.yaml."""
-    from .gates.ac_coverage_gate import AcTestRunReport  # local: avoids import at module load
+    explicitly from the "ac-test-run" model_config.Stage key (Task 6 naming fix) -- this turn runs
+    the identical `ac_test_run` prompt ac_coverage_gate.py's own ac-test-run stage does, so reusing
+    its already-registered Stage entry is the correct fit, not a new "red-gate" Stage literal for a
+    key nothing else needs. Previously resolved from the bare string "red-gate", which was never a
+    registered Stage (model_config.get_model_name silently returned None for it every time) and
+    fell through to the "stack-run" fallback below unconditionally -- "ac-test-run" resolves to the
+    exact same models.yaml tier (gpt-5.4/haiku) as that fallback already gave, so this is a pure
+    naming fix with no behavior change. stack_runner.run_and_report's own internal fallback
+    (`model_config.get_model_name(stage_key, ...)`) is still not what resolves this: passing
+    model_name explicitly here means it never re-resolves against the new placement-specific
+    `stage_key` (absent from models.yaml) instead."""
+    from .gates.ac_coverage_gate import AcTestRunReport, run_resolved_test_command  # local: avoids import at module load
 
     provider = get_sandbox_provider()
     await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(_RED_GATE_OUTPUT_PATH)}")
-    report = await stack_runner.run_and_report(
-        thread_id,
-        stage_key=f"red-gate-{spec_key}",
-        prompt_name="ac_test_run",
-        schema=AcTestRunReport,
-        provider=chat_provider,
-        run_id=run_id,
-        lap=lap,
-        output_path=_RED_GATE_OUTPUT_PATH,
-        model_name=model_config.get_model_name("red-gate", "draft", chat_provider) or model_config.get_model_name("stack-run", "draft", chat_provider),
+
+    # resolve_test_command() first, deterministically, before any LLM turn (Task 6): only when it
+    # produces nothing usable does a GHCP discovery session run at all. The correctness guard right
+    # below (`if not outcomes:`) is unchanged and now fires for EITHER path -- a resolved command
+    # that parses to zero outcomes falls straight through to the same discovery turn a stack with no
+    # resolver answer always used, rather than being silently read as "0 failed" (Task 6 requirement).
+    tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)
+    report = await run_resolved_test_command(
+        provider, thread_id, tech_stack, output_path_base="agent-work/red-gate-resolved"
     )
+    if report is None:
+        report = await stack_runner.run_and_report(
+            thread_id,
+            stage_key=f"red-gate-{spec_key}",
+            prompt_name="ac_test_run",
+            schema=AcTestRunReport,
+            provider=chat_provider,
+            run_id=run_id,
+            lap=lap,
+            output_path=_RED_GATE_OUTPUT_PATH,
+            model_name=model_config.get_model_name("ac-test-run", "draft", chat_provider) or model_config.get_model_name("stack-run", "draft", chat_provider),
+        )
     outcomes: dict[str, str] = {}
     for artifact in report.result_artifacts or []:
         rel = test_results.repo_relative(artifact)
@@ -495,7 +533,22 @@ def make_rebuild_node(spec: RebuildSpec):
         # command + root, Python runs `cd {root} && {command}` blindly" -- that guess was wrong on
         # every headless run (a greenfield monorepo has nothing buildable at the repo root, so
         # `dotnet build` died with MSB1003 in ~2s and this node silently escalated every time).
-        replayed = bool(rb["fix_cycle_count"] > 0 and rb.get("build_commands"))
+        #
+        # Toolchain reuse (Task 6, requirement 2/3): unlike the test command, the BUILD command has
+        # no resolver table at all -- persist whichever placement discovers it first into
+        # manifest.json's shared `toolchain` section (preflight_nodes.persist_toolchain_value, same
+        # `update_manifest` read-modify-write record_toolchain already uses), so later placements
+        # read it instead of independently re-asking the model. Timing correction (greenfield vs.
+        # brownfield): see _should_skip_toolchain_capture's own docstring.
+        skip_toolchain_capture = _should_skip_toolchain_capture(spec.fix_scope, tech_stack_signals.is_greenfield_repo(state))
+        used_persisted_build_command = False
+        if rb["fix_cycle_count"] == 0 and not rb.get("build_commands") and not skip_toolchain_capture:
+            persisted_build_commands = await preflight_nodes.read_toolchain_value(provider, thread_id, "build_commands")
+            if isinstance(persisted_build_commands, list) and persisted_build_commands:
+                rb["build_commands"] = persisted_build_commands
+                used_persisted_build_command = True
+
+        replayed = bool(rb["fix_cycle_count"] > 0 and rb.get("build_commands")) or used_persisted_build_command
         if replayed:
             # Fix laps re-run the contract the discovery turn established; the model is never
             # asked "does it build?" twice in one placement (see BuildVerifyReport.build_commands).
@@ -538,6 +591,14 @@ def make_rebuild_node(spec: RebuildSpec):
                 # already pays for the identical guarantee.
                 report = await _replay_build(provider, thread_id, rb["build_commands"])
         build_ok = report.success and report.ok
+
+        # Persist a FRESH discovery's build_commands (never a replay of an already-persisted one,
+        # and never at the greenfield scaffold-only placement -- see skip_toolchain_capture above)
+        # once it is actually proven green, so the NEXT rebuild placement this run -- or a future
+        # run's first placement, on a resumed/brownfield repo -- reads it instead of discovering it
+        # again (Task 6, requirement 2/3).
+        if build_ok and not skip_toolchain_capture and not used_persisted_build_command and rb["build_commands"]:
+            await preflight_nodes.persist_toolchain_value(provider, thread_id, "build_commands", rb["build_commands"])
 
         # TDD-red gate, scaffold placement only: a green build is necessary but NOT sufficient --
         # the suite must also RUN with zero passing tests before the implementation stage may
@@ -1039,6 +1100,99 @@ def _demo() -> None:
         get_sandbox_provider = original_get_sandbox_provider
         stack_runner = original_stack_runner
         sandbox_registry.pop(thread_id)
+
+    # Task 6, requirement 3: greenfield/brownfield toolchain-capture timing. Pure, directly
+    # testable without a sandbox.
+    assert _should_skip_toolchain_capture("scaffold_only", True) is True, (
+        "the ONE scaffold_only placement, on a genuinely greenfield first ticket, must be excluded"
+    )
+    assert _should_skip_toolchain_capture("scaffold_only", False) is False, (
+        "brownfield (or ticket 2+, already-scaffolded) -- capturing as early as the first "
+        "placement that runs this session is fine"
+    )
+    assert _should_skip_toolchain_capture("full", True) is False, (
+        "r_minimal_code_to_green (fix_scope='full') is where capture is meant to naturally land "
+        "on a fresh greenfield run -- greenfield-ness alone must never exclude it"
+    )
+    assert _should_skip_toolchain_capture("full", False) is False
+
+    # Task 6, requirement 1: resolve_test_command() wired in as the FIRST choice at the TDD-red
+    # gate, before any LLM discovery turn -- and the existing zero-outcomes guard just above
+    # ("could not verify a single test outcome") must fire identically regardless of which path
+    # produced the parse.
+    from .gates import ac_coverage_gate as _acg
+    from .gates.ac_coverage_gate import AcTestRunReport as _AcTestRunReport
+
+    trx_all_red = (
+        '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
+        '<Results><UnitTestResult testName="T1" outcome="Failed" /></Results></TestRun>'
+    )
+
+    class _RedGateProvider:
+        async def exec_in_sandbox(self, _thread_id: str, _command: str) -> _Result:
+            return _Result(0)
+
+    original_get_sandbox_provider = get_sandbox_provider
+    original_read_repo_file = repo_files.read_repo_file
+    original_resolved_fn = _acg.run_resolved_test_command
+    original_stack_runner = stack_runner
+    discovery_calls: list[Any] = []
+
+    async def _fake_read_repo_file(_provider: Any, _thread_id: str, path: str) -> str | None:
+        return trx_all_red if path == "agent-work/red-gate-resolved.trx" else None
+
+    async def _fake_run_resolved_ok(*_args: Any, **_kwargs: Any) -> _AcTestRunReport:
+        return _AcTestRunReport(
+            success=True, ready_for_next_stage=True, exit_ok=True,
+            result_artifacts=["agent-work/red-gate-resolved.trx"],
+        )
+
+    class _FakeStackRunnerTracks:
+        @staticmethod
+        async def run_and_report(*args: Any, **kwargs: Any) -> Any:
+            discovery_calls.append((args, kwargs))
+            raise AssertionError("resolve_test_command()'s own resolved path succeeded -- the LLM discovery turn must not run")
+
+    get_sandbox_provider = lambda: _RedGateProvider()  # noqa: E731
+    repo_files.read_repo_file = _fake_read_repo_file
+    _acg.run_resolved_test_command = _fake_run_resolved_ok
+    stack_runner = _FakeStackRunnerTracks()
+    try:
+        red_ok, detail = asyncio.run(_verify_all_red("t-red-gate-resolved-selfcheck", "claude", "selfcheck"))
+        assert red_ok is True, detail
+        assert not discovery_calls, "resolve_test_command()'s own resolved path must skip the LLM turn entirely"
+    finally:
+        get_sandbox_provider = original_get_sandbox_provider
+        repo_files.read_repo_file = original_read_repo_file
+        _acg.run_resolved_test_command = original_resolved_fn
+        stack_runner = original_stack_runner
+
+    # Same call, but the resolved path finds nothing usable -- must fall through to the LLM
+    # discovery turn exactly as it always did, and the SAME zero-outcomes guard must still fire if
+    # THAT also produces nothing (never silently read as "0 failed").
+    async def _fake_run_resolved_none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _fake_run_and_report_empty(*_args: Any, **_kwargs: Any) -> Any:
+        return _AcTestRunReport(
+            success=True, ready_for_next_stage=False, exit_ok=False,
+            result_artifacts=[], error="no result_artifacts reported",
+        )
+
+    class _FakeStackRunnerEmpty:
+        run_and_report = staticmethod(_fake_run_and_report_empty)
+
+    get_sandbox_provider = lambda: _RedGateProvider()  # noqa: E731
+    _acg.run_resolved_test_command = _fake_run_resolved_none
+    stack_runner = _FakeStackRunnerEmpty()
+    try:
+        red_ok2, detail2 = asyncio.run(_verify_all_red("t-red-gate-fallback-selfcheck", "claude", "selfcheck"))
+        assert red_ok2 is False, "zero outcomes from EITHER path must never read as '0 failed'"
+        assert "could not verify a single test outcome" in detail2, detail2
+    finally:
+        get_sandbox_provider = original_get_sandbox_provider
+        _acg.run_resolved_test_command = original_resolved_fn
+        stack_runner = original_stack_runner
 
     print("rebuild red-gate self-check: all assertions passed")
 
