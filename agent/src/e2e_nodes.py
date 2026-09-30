@@ -104,6 +104,16 @@ class E2EState(TypedDict):
     proven_port: int | None
     proven_routes: list[str]
     proven_api_routes: list[str]
+    # Task 6 fix-round (Bug B): tech-stack approval's boot_evidence (unlike proven_start_command
+    # above) has no in-process self-invalidation -- it lives in tech-stack.approved.json, a document
+    # this stage doesn't own, and _resolve_cold_start_hint unconditionally prefers it whenever it's
+    # present. Without this flag, a boot_evidence-sourced command that fails to boot under e2e's own
+    # stricter conditions (a missing secret, a different port, a slower cold start) would be
+    # re-hydrated and re-tried IDENTICALLY on every subsequent lap of the same attempt, never
+    # reaching real LLM discovery. Set True the moment a boot_evidence-sourced hydration fails its
+    # boot proof this attempt; checked before even reading boot_evidence again. Reset only at a
+    # genuine fresh stage entry (e2e_gate_check_node), same lifecycle as proven_start_command above.
+    boot_evidence_exhausted: bool
 
 
 class AppLaunchReport(StageReport):
@@ -148,6 +158,7 @@ def default_e2e_state() -> E2EState:
         "proven_port": None,
         "proven_routes": [],
         "proven_api_routes": [],
+        "boot_evidence_exhausted": False,
     }
 
 
@@ -458,6 +469,10 @@ async def e2e_gate_check_node(state: dict[str, Any], config: RunnableConfig) -> 
     # source. Explicit, not "start from default_e2e_state()" here: this function only re-derives
     # app_candidates fresh, same precedent -- everything else in `e2e` still carries forward.
     _clear_proven_launch(e2e)
+    # Same fresh-entry lifecycle as proven_start_command just above, but a SEPARATE reset point
+    # (not folded into _clear_proven_launch, which also fires on an ordinary same-attempt boot
+    # failure below -- that path must NOT forgive boot_evidence, or it would be re-tried forever).
+    e2e["boot_evidence_exhausted"] = False
 
     return {"e2e": e2e}
 
@@ -1059,9 +1074,22 @@ def _scanned_launch_command(candidate: dict[str, Any]) -> str:
     return f"cd {shlex.quote(path)} && {command}"
 
 
-async def _boot_evidence_start_command(provider: Any, thread_id: str) -> tuple[str, int] | None:
+async def _boot_evidence_start_command(provider: Any, thread_id: str, target_path: str) -> tuple[str, int] | None:
     """(start_command, port) tech-stack approval's own boot probe (preflight_nodes.
-    probe_tech_stack_startability, brownfield-only) already independently proved boots, or None.
+    probe_tech_stack_startability, brownfield-only) already independently proved boots FOR THE
+    CANDIDATE AT `target_path`, or None.
+
+    `target_path` must match the SPECIFIC candidate e2e_run_node itself selected as `app` (its own
+    "web class wins over API" selection, `_candidate_class(a) == "web"` above) -- `boot_evidence` is
+    built in alphabetical-path order by probe_tech_stack_startability, entirely independent of that
+    selection. Bug fix (Task 6 review): the first version of this function returned the first
+    STARTED entry regardless of which candidate it was, so a brownfield full-stack repo where BOTH
+    an API and a web candidate booted during tech-stack approval could hydrate the API's
+    command/port into the slot meant for the web app -- the supporting-services loop then boots the
+    API a second time on a different port while the real web app is never booted, and Playwright
+    ends up pointed at the wrong service. Matching on path (falling back to `candidate`/name when a
+    legacy boot_evidence entry has no path) ties the hydrated value to the exact candidate it was
+    proven for.
 
     Task 6 synergy: that probe used to keep only the `started` bool per candidate and discard
     which command string (and port -- it is already baked into the command via `_with_port_env`)
@@ -1080,8 +1108,12 @@ async def _boot_evidence_start_command(provider: Any, thread_id: str) -> tuple[s
         return None
     if not isinstance(approved, dict):
         return None
+    target = str(target_path or ".").strip()
     for entry in approved.get("boot_evidence") or []:
         if not isinstance(entry, dict) or not entry.get("started"):
+            continue
+        entry_path = str(entry.get("path") or entry.get("candidate") or "").strip()
+        if entry_path != target:
             continue
         command = str(entry.get("start_command") or "").strip()
         port = entry.get("port")
@@ -1397,18 +1429,24 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
     # command would still work -- hydrate it from a value proven OUTSIDE this attempt before
     # falling through to a real discovery turn, same "prefer known, discover on miss" shape as
     # requirement 1's test-command wiring. Two sources, most-proven first: tech-stack approval's
-    # own already-boot-proven candidate (brownfield only -- probe_tech_stack_startability never
-    # runs for a greenfield repo), then this stage's own manifest-persisted proven-launch cache (an
-    # earlier e2e attempt THIS run, or a past run's, that got as far as `_cache_proven_launch`
-    # below). Only when the in-memory cache is itself empty -- a lap that already proved something
-    # THIS attempt always wins, unchanged.
+    # own already-boot-proven candidate for THIS SPECIFIC selected `app` (brownfield only --
+    # probe_tech_stack_startability never runs for a greenfield repo -- and not if it already failed
+    # to boot earlier THIS attempt, see boot_evidence_exhausted), then this stage's own
+    # manifest-persisted proven-launch cache (an earlier e2e attempt THIS run, or a past run's, that
+    # got as far as `_cache_proven_launch` below). Only when the in-memory cache is itself empty --
+    # a lap that already proved something THIS attempt always wins, unchanged.
+    hydrated_via_boot_evidence = False
     if workflow_config.AIDW_E2E_REUSE_PROVEN_LAUNCH and not e2e.get("proven_start_command"):
-        boot_evidence_hint = None if is_greenfield_repo(state) else await _boot_evidence_start_command(provider, thread_id)
+        boot_evidence_hint = (
+            None if is_greenfield_repo(state) or e2e.get("boot_evidence_exhausted")
+            else await _boot_evidence_start_command(provider, thread_id, str(app.get("path") or "."))
+        )
         persisted_command = await read_toolchain_value(provider, thread_id, "start_command")
         hydrated = _resolve_cold_start_hint(boot_evidence_hint, persisted_command, requested_port)
         if hydrated is not None:
             command, port = hydrated
             _cache_proven_launch(e2e, command, port, [], [])
+            hydrated_via_boot_evidence = boot_evidence_hint is not None and hydrated == boot_evidence_hint
 
     # Skip the paid GHCP proving turn when a previous lap THIS stage attempt already proved a
     # start_command/port pair boots and answers (see the cache write at `ready` below, and its
@@ -1712,6 +1750,15 @@ async def e2e_run_node(state: dict[str, Any], config: RunnableConfig) -> dict[st
             # not a genuinely broken command) costs one extra discovery turn next time, the same
             # cost a same-attempt cache-clear already accepts.
             await persist_toolchain_value(provider, thread_id, "start_command", None)
+            if hydrated_via_boot_evidence:
+                # Bug fix (Task 6 review): boot_evidence itself has no self-invalidation -- it
+                # lives in tech-stack.approved.json, a document this stage doesn't own, and
+                # _resolve_cold_start_hint unconditionally prefers it whenever present. Without this
+                # flag the NEXT lap's hydration would read the exact same (command, port) out of
+                # boot_evidence again and retry it identically, up to E2E_MAX_FIX_CYCLES times,
+                # never reaching real LLM discovery -- exactly the loop the brief's "only fall
+                # through to discovery if the boot/curl check fails" line rules out.
+                e2e["boot_evidence_exhausted"] = True
             # Told to the fix model below, not just logged: without this, "app never answered"
             # reads identically to a fresh-discovery boot failure and burns a real fix-cycle
             # (E2E_MAX_FIX_CYCLES is capped) diagnosing what may just be a stale cache that
@@ -3089,9 +3136,9 @@ def _demo() -> None:
     assert _resolve_cold_start_hint(None, None, 9999) is None
     assert _resolve_cold_start_hint(None, "   ", 9999) is None, "a blank persisted command must not be used"
 
-    # _boot_evidence_start_command: reads tech-stack.approved.json's own boot_evidence, preferring
-    # the first entry that actually STARTED -- a failed candidate's leftover start_command/port
-    # (or one carrying no start_command at all) must never be returned.
+    # _boot_evidence_start_command: reads tech-stack.approved.json's own boot_evidence, MATCHING ON
+    # target_path -- a failed candidate's leftover start_command/port (or one carrying no
+    # start_command at all, or one for a DIFFERENT candidate) must never be returned.
     class _FakeReadOnlyProvider:
         def __init__(self, files: dict[str, str]) -> None:
             self.files = files
@@ -3107,17 +3154,47 @@ def _demo() -> None:
                     return _Result(True, content)
             return _Result(False, "", "No such file or directory")
 
+    # Bug fix (Task 6 review, Bug A): a brownfield full-stack repo where BOTH the API and the web
+    # candidate booted during tech-stack approval. e2e_run_node always selects the WEB candidate as
+    # `app` when one exists (its own "web class wins" rule) -- the API's own started=True entry,
+    # listed FIRST (boot_evidence is alphabetical by path, "apps/api" < "apps/web"), must never be
+    # returned for a web-targeted lookup just because it happens to come first.
     approved_doc = json.dumps({
+        "boot_evidence": [
+            {"candidate": "apps/api", "path": "apps/api", "started": True, "reason": None, "start_command": "cd apps/api && dotnet run", "port": 4090},
+            {"candidate": "apps/web", "path": "apps/web", "started": True, "reason": None, "start_command": "cd apps/web && npm run dev", "port": 4100},
+        ],
+    })
+    boot_evidence_provider = _FakeReadOnlyProvider({workflow_persistence.TECH_STACK_APPROVED_PATH: approved_doc})
+    web_hint = _asyncio.run(_boot_evidence_start_command(boot_evidence_provider, "t", "apps/web"))
+    assert web_hint == ("cd apps/web && npm run dev", 4100), (
+        f"a web-targeted lookup must return the WEB candidate's own proof, not the API's (got {web_hint})"
+    )
+    api_hint = _asyncio.run(_boot_evidence_start_command(boot_evidence_provider, "t", "apps/api"))
+    assert api_hint == ("cd apps/api && dotnet run", 4090), api_hint
+
+    # A candidate that failed to start (or one with no start_command at all) must never be
+    # returned, even though it's a real entry AT the requested path.
+    mixed_doc = json.dumps({
         "boot_evidence": [
             {"candidate": "apps/api", "path": "apps/api", "started": False, "reason": "boom", "start_command": None, "port": None},
             {"candidate": "apps/web", "path": "apps/web", "started": True, "reason": None, "start_command": "cd apps/web && npm run dev", "port": 4100},
         ],
     })
-    boot_evidence_provider = _FakeReadOnlyProvider({workflow_persistence.TECH_STACK_APPROVED_PATH: approved_doc})
-    hint = _asyncio.run(_boot_evidence_start_command(boot_evidence_provider, "t"))
-    assert hint == ("cd apps/web && npm run dev", 4100), hint
+    mixed_provider = _FakeReadOnlyProvider({workflow_persistence.TECH_STACK_APPROVED_PATH: mixed_doc})
+    assert _asyncio.run(_boot_evidence_start_command(mixed_provider, "t", "apps/api")) is None, (
+        "this candidate never started -- must not be returned even though its path matches"
+    )
+    assert _asyncio.run(_boot_evidence_start_command(mixed_provider, "t", "apps/web")) == (
+        "cd apps/web && npm run dev", 4100,
+    )
+    # No candidate at all for the requested path (e.g. a candidate app_discovery only found AFTER
+    # tech-stack approval ran) -- must not fall back to some OTHER candidate's proof.
+    assert _asyncio.run(_boot_evidence_start_command(mixed_provider, "t", "apps/mobile")) is None, (
+        "no boot_evidence entry for this candidate at all -- must not substitute a different one's"
+    )
 
-    assert _asyncio.run(_boot_evidence_start_command(_FakeReadOnlyProvider({}), "t")) is None, (
+    assert _asyncio.run(_boot_evidence_start_command(_FakeReadOnlyProvider({}), "t", "apps/web")) is None, (
         "no tech-stack.approved.json at all -- nothing to hydrate from"
     )
     all_failed_provider = _FakeReadOnlyProvider({
@@ -3125,8 +3202,22 @@ def _demo() -> None:
             "boot_evidence": [{"candidate": "apps/api", "path": "apps/api", "started": False, "reason": "boom"}],
         }),
     })
-    assert _asyncio.run(_boot_evidence_start_command(all_failed_provider, "t")) is None, (
+    assert _asyncio.run(_boot_evidence_start_command(all_failed_provider, "t", "apps/api")) is None, (
         "every candidate failed to start -- nothing proven to hydrate"
+    )
+
+    # Bug fix (Task 6 review, Bug B): boot_evidence_exhausted defaults False (a fresh attempt is
+    # allowed to try boot_evidence) and is a genuinely separate flag from proven_start_command/
+    # proven_port/... -- _clear_proven_launch (fired on every same-attempt boot failure, not just a
+    # fresh stage entry) must NOT also clear it, or a failed boot_evidence hint would be re-offered
+    # on the very next lap of the same attempt, defeating the whole point of the flag.
+    assert default_e2e_state()["boot_evidence_exhausted"] is False
+    exhausted_e2e = default_e2e_state()
+    exhausted_e2e["boot_evidence_exhausted"] = True
+    _clear_proven_launch(exhausted_e2e)
+    assert exhausted_e2e["boot_evidence_exhausted"] is True, (
+        "_clear_proven_launch must never reset boot_evidence_exhausted -- only a genuine fresh "
+        "stage entry (e2e_gate_check_node) may, or a failed hint would be retried every lap"
     )
 
     # --- traceability-matrix plan: e2e-fix's mechanical file-to-AC attribution -------------------
