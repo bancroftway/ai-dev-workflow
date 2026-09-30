@@ -135,7 +135,12 @@ class ProvisionRequest(BaseModel):
     # session's frontend call (Task 3's popup, a later task) sends one at all; a resume or an
     # incidental reprovision of an already-created session omits it and gets this session's own
     # stored dbo.sessions.code_gen_mode instead (see provision_session below).
-    code_gen_mode: str | None = None
+    # `Literal`, not `str` (final-review Fix Round 2, Item 8): an invalid value used to pass this
+    # model and only fail later at the DB's own CHECK constraint (migration
+    # 0020_add_sessions_code_gen_mode.sql: `CHECK (code_gen_mode IN ('yolo','draft_verify',
+    # 'mission_critical'))`), surfacing as a raw 500 instead of a normal Pydantic 422 -- the same
+    # trust-boundary validation this codebase applies everywhere else.
+    code_gen_mode: Literal["yolo", "draft_verify", "mission_critical"] | None = None
 
 
 class ProvisionResponse(BaseModel):
@@ -3425,6 +3430,21 @@ def _demo() -> None:
     finally:
         get_sandbox_provider = original_get_sandbox_provider_ca
         registry.pop("t-ca-selfcheck")
+
+    # Final-review Fix Round 2, Item 8: ProvisionRequest.code_gen_mode is now a closed Literal, not
+    # a bare `str` -- an invalid value must be rejected at the API boundary (422) instead of passing
+    # here and only failing later at the DB's own CHECK constraint (a raw 500).
+    from pydantic import ValidationError
+
+    _provision_base = {"thread_id": "t-1", "owner": "octocat", "repo": "demo", "branch": "main"}
+    for valid_mode in ("yolo", "draft_verify", "mission_critical", None):
+        ProvisionRequest(**_provision_base, code_gen_mode=valid_mode)
+    assert ProvisionRequest(**_provision_base).code_gen_mode is None, "omitted code_gen_mode must still default to None"
+    try:
+        ProvisionRequest(**_provision_base, code_gen_mode="some_garbage")
+        raise AssertionError("an invalid code_gen_mode must raise ValidationError, not pass silently")
+    except ValidationError:
+        pass
 
     print("sessions_api self-check: all assertions passed")
 
