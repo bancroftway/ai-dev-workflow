@@ -15,29 +15,39 @@ differently, but this distinction itself is unverified in practice.
 
 from __future__ import annotations
 
-import re
 import shlex
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 import json
 
-from .. import chat_model, config, git_ops, repo_files, spec_ledger, workflow_persistence
-from ..failure_classification import classify_failure
+from .. import chat_model, git_ops, repo_files, spec_ledger, workflow_persistence
 from ..sandbox.provider import SandboxProvider
 from ..schemas import presence_values as _presence_values
-from ..text_truncate import truncate_middle
 from . import write_scope_gate
+from .diagram_render_checks import (
+    MERMAID_PUPPETEER_CONFIG_PATH,
+    MERMAID_SYNTAX_MARKERS as _MERMAID_SYNTAX_MARKERS,
+    RenderOutcome as DiagramRenderOutcome,
+    build_mmdc_argv,
+    classify_render_output,
+    looks_like_infra_failure as _looks_like_infra_failure,
+    mermaid_error_summary as _mermaid_error_summary,
+)
 from .wireframe_linkage_checks import (
     MAX_WIREFRAME_BYTES,
     SAFE_DIAGRAM_NAME_RE,
     ac_id_existence_kind_problems,
+    check_dangling_visual_retirement,
     check_manifest_orphans,
+    check_plan_removal_demand,
+    check_plan_step_coverage_and_rework,
     check_plan_step_wireframe_coverage,
+    check_removes_ids_validity,
     check_ui_wireframe_coverage,
     check_wireframe,
     check_wireframe_ac_ids,
     check_wireframe_has_ac_ids,
+    reopened_or_changed_ac_ids as _reopened_or_changed_ac_ids,
 )
 
 if TYPE_CHECKING:
@@ -71,46 +81,10 @@ def wireframe_preview_url(owner: str, repo: str, branch: str, screen: str) -> st
 # SAFE_DIAGRAM_NAME_RE (also used by _render_one below for diagram names) -- so
 # check-plan-schema-stop.mjs can shell out to the REAL implementation instead of a hand-ported JS
 # copy. See that module's own docstring for the full reasoning.
-
-
-def check_dangling_visual_retirement(
-    wireframe_refs: list[dict[str, Any]],
-    diagram_refs: list[dict[str, Any]],
-    ledger_entries: list[dict[str, Any]],
-    retired_wireframe_screens: set[str],
-    retired_diagram_names: set[str],
-) -> list[str]:
-    """File-based-editing plan, Part 2 sect. 6 (gap found and closed, user-raised): a wireframe or
-    `user_flow` diagram whose every cited AC is now retired is a deleted feature's leftover and
-    must be named in retired_wireframe_screens/retired_diagram_names -- mirrors
-    check_plan_linkage's own removal side for plan steps ("a step whose every criterion this
-    Specification retires is a deleted feature's leftover and must be dropped"), applied to visual
-    artifacts instead. A wireframe/diagram with a live citation, or with NO citations at all
-    (caught separately by check_wireframe_has_ac_ids), is never flagged here. `er`/`architecture`
-    diagrams are exempt -- whole-system views, not retired this way (schemas.ImplementationPlan's
-    own retired_diagram_names docstring). Pure.
-    """
-    retired_ac_ids = {
-        e["id"] for e in ledger_entries if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
-    }
-    problems: list[str] = []
-    for wf in wireframe_refs:
-        ac_ids = wf.get("ac_ids") or []
-        if ac_ids and all(i in retired_ac_ids for i in ac_ids) and wf.get("screen") not in retired_wireframe_screens:
-            problems.append(
-                f"wireframe {wf.get('screen')!r} cites only retired criteria ({', '.join(ac_ids)}) -- "
-                "name it in retired_wireframe_screens or fix its citations"
-            )
-    for d in diagram_refs:
-        if d.get("kind") != "user_flow":
-            continue
-        ac_ids = d.get("ac_ids") or []
-        if ac_ids and all(i in retired_ac_ids for i in ac_ids) and d.get("name") not in retired_diagram_names:
-            problems.append(
-                f"diagram {d.get('name')!r} cites only retired criteria ({', '.join(ac_ids)}) -- "
-                "name it in retired_diagram_names or fix its citations"
-            )
-    return problems
+#
+# check_dangling_visual_retirement also moved there (2026-09-30, Task 12, imported above) --
+# check-plan-citations-stop.mjs now shells out to it too (a plain miss from hook coverage before,
+# not a deliberate exclusion).
 
 
 def _spec_changed_this_run(ledger_entries: list[dict[str, Any]], run_id: str) -> bool:
@@ -126,17 +100,11 @@ def _spec_changed_this_run(ledger_entries: list[dict[str, Any]], run_id: str) ->
     )
 
 
-def _reopened_or_changed_ac_ids(ledger_entries: list[dict[str, Any]], run_id: str, bug_affected_ac_ids: set[str]) -> set[str]:
-    """AC ids this run either genuinely changed (first-seen/last-revised this run_id) or reopened
-    via bug_affected_ac_ids (wording unchanged, §Part5's 'reopened' case) -- the citation-scoped
-    trigger set for wireframe/user_flow-diagram stale-review enforcement below."""
-    changed = {
-        e["id"]
-        for e in ledger_entries
-        if e.get("kind") == "acceptance_criterion"
-        and (e.get("first_seen_run_id") == run_id or e.get("last_revised_run_id") == run_id)
-    }
-    return changed | bug_affected_ac_ids
+# _reopened_or_changed_ac_ids moved to gates/wireframe_linkage_checks.py (2026-09-30, Task 12,
+# imported above as reopened_or_changed_ac_ids) so check-diagram-staleness-stop.mjs can compute
+# the exact same per-item trigger set now that AIDW_RUN_ID (Task 5) makes `run_id` available to a
+# Stop hook. _spec_changed_this_run above stays here, unchanged -- the BLANKET (er/architecture)
+# trigger stays graph-side only; see that hook's own header for why.
 
 
 def check_stale_visual_review(
@@ -225,47 +193,23 @@ def check_plan_linkage(
     almost certainly ac_ids/removes_ids swapped). A criterion retired before anything was ever
     built (greenfield: no coded_run_id) demands NO removal step -- there is nothing to remove.
     run_id=None skips the demand direction (self-checks/legacy callers), never the validation.
+
+    The removes_ids validity/demand halves and the coverage-side/rework-forbidden halves below are
+    delegated to gates/wireframe_linkage_checks.py (2026-09-30, Task 12) -- check-plan-citations-
+    stop.mjs shells out to the SAME functions, so this stays the one real implementation, not two
+    independently-maintained copies. Only the step-side structural/existence/liveness checks stay
+    inline here: they're already partly shared (ac_id_existence_kind_problems), and their OWN
+    liveness-branching messages ("every cited criterion...drop it from the plan" / "cites X...which
+    is/are retired or deferred") differ from what check_ac_id_citation reports for the same
+    condition, so keeping them here (not shelled to a hook) avoids a duplicate/conflicting message
+    for the identical root cause.
     """
     problems: list[str] = []
     by_id = {e.get("id"): e for e in ledger_entries}
-    cited_live: set[str] = set()
-    removed_ids: set[str] = set()
-    for step in plan_steps:
-        step_id = step.get("id") or "?"
-        for rid in step.get("removes_ids") or []:
-            entry = by_id.get(rid)
-            if entry is None:
-                problems.append(f"{step_id}: removes_ids cites {rid!r}, which does not exist in the ledger")
-                continue
-            if entry.get("status") != "retired":
-                problems.append(
-                    f"{step_id}: removes_ids cites {rid!r}, which is NOT retired -- removal steps "
-                    "only ever name retired scope (live work belongs in ac_ids)"
-                )
-                continue
-            removed_ids.add(rid)
-            # A story id in removes_ids covers all of its (retired) criteria.
-            if entry.get("kind") == "user_story":
-                removed_ids.update(
-                    e["id"] for e in ledger_entries
-                    if e.get("kind") == "acceptance_criterion" and e.get("parent_us_id") == rid
-                )
+    removal_problems, removed_ids = check_removes_ids_validity(plan_steps, ledger_entries)
+    problems.extend(removal_problems)
     if run_id is not None:
-        delivered_retired = [
-            e["id"]
-            for e in ledger_entries
-            if e.get("kind") == "acceptance_criterion"
-            and e.get("status") == "retired"
-            and e.get("last_revised_run_id") == run_id
-            and e.get("coded_run_id")
-        ]
-        for ac_id in delivered_retired:
-            if ac_id not in removed_ids:
-                problems.append(
-                    f"{ac_id}: this criterion was DELIVERED by an earlier run and retired this "
-                    "round -- its code/UI/navigation still exist, so a plan step must name it "
-                    "(or its parent story) in removes_ids and describe the removal work"
-                )
+        problems.extend(check_plan_removal_demand(ledger_entries, removed_ids, run_id))
     for step in plan_steps:
         step_id = step.get("id") or "?"
         ac_ids = step.get("ac_ids") or []
@@ -279,8 +223,7 @@ def check_plan_linkage(
         # Existence+kind validity: shared with check_ac_id_citation (gates/wireframe_linkage_checks.py)
         # via ac_id_existence_kind_problems (2026-09-29, Task 9 fix-review) -- was two independently
         # retyped copies of the identical one-liner/message; only THIS sub-check is shared. The
-        # liveness/carryover logic below stays here, unchanged -- it's genuinely entangled with
-        # coded_run_id/prior-step state check_ac_id_citation deliberately doesn't have.
+        # liveness logic below stays here, unchanged -- see this function's own docstring for why.
         existence_problems = ac_id_existence_kind_problems(step_id, ac_ids, by_id)
         if existence_problems:
             problems.extend(existence_problems)
@@ -307,61 +250,22 @@ def check_plan_linkage(
                 "planned at all"
             )
             continue
-        prior = prior_steps_by_id.get(step.get("id") or "")
-        carryover = prior is not None and prior.get("description") == step.get("description")
-        if not carryover:
-            undelivered = [i for i in live if not by_id[i].get("coded_run_id")]
-            if not undelivered:
-                problems.append(
-                    f"{step_id}: is new/changed but cites only already-delivered criteria "
-                    f"({', '.join(live)}) -- completed criteria are never re-planned; carry the "
-                    "prior step over verbatim or drop it"
-                )
-                continue
-        cited_live.update(live)
-    for ac_id in spec_ledger.eligible_ac_ids(ledger_entries, own_ac_ids):
-        if ac_id not in cited_live:
-            problems.append(
-                f"{ac_id}: this ticket's undelivered criterion is cited by no plan step -- every "
-                "criterion awaiting delivery needs at least one step (ac_ids) that fulfils it"
-            )
+    # Coverage-side + rework-forbidden: delegated to gates/wireframe_linkage_checks.py (Task 12) --
+    # see check_plan_step_coverage_and_rework's own docstring for why it silently (re-)walks
+    # plan_steps itself rather than reusing this loop's own `live`/existence computations above.
+    problems.extend(check_plan_step_coverage_and_rework(
+        plan_steps, ledger_entries, spec_ledger.eligible_ac_ids(ledger_entries, own_ac_ids), prior_steps_by_id,
+    ))
     return problems
 
 
-@dataclass(frozen=True)
-class DiagramRenderOutcome:
-    name: str
-    ok: bool
-    is_infra_failure: bool
-    stderr_tail: str
-
-
-def _looks_like_infra_failure(stderr: str) -> bool:
-    # Delegates to the repo-wide classifier (failure_classification.py) instead of a
-    # gate-local marker list, so this gate, the sandbox connect-handshake retry, and every
-    # escalate node's failure_type tagging agree on what "infra, not content" means.
-    return classify_failure(stderr) == "infra_transient"
-
-
-# mmdc names a genuine source problem in one of these shapes. Anything else it fails on -- a
-# missing puppeteer config, no browser binary, a crashed Chromium -- is environmental, and telling
-# the draft node to "fix your Mermaid" for it is unactionable: the model rewrites correct source
-# every lap until max_verify_cycles runs out. Observed live (blazor-dotnet s01): the config file
-# named by _render_one's own -p flag did not exist in the image, classify_failure called that
-# `gate_exhausted` rather than infra, and the plan stage thrashed on syntax feedback for diagrams
-# that rendered fine the moment the file was created.
-_MERMAID_SYNTAX_MARKERS = re.compile(
-    r"parse error|syntax error|expecting|unrecognized text|no diagram type detected", re.IGNORECASE
-)
-
-
-def _mermaid_error_summary(output: str) -> str:
-    """The actionable mermaid parse error ('Parse error on line N ... Expecting ...') is at the
-    TOP of mmdc's output; the tail is a useless puppeteer JS stack. Feeding the tail back to the
-    draft node burned three verify cycles live -- the model never saw what was wrong. Keep the
-    first meaningful lines, drop stack frames."""
-    lines = [l.strip() for l in output.splitlines() if l.strip() and not l.lstrip().startswith("at ")]
-    return " | ".join(lines[:config.DIAGRAM_ERROR_SUMMARY_LINES_MAX])[:config.DIAGRAM_ERROR_SUMMARY_JOINED_CHARS]
+# DiagramRenderOutcome/_looks_like_infra_failure/_MERMAID_SYNTAX_MARKERS/_mermaid_error_summary all
+# moved to gates/diagram_render_checks.py (2026-09-30, Task 12, imported above under their original
+# names) so check-diagram-render-stop.mjs -- a NEW same-turn Stop hook that shells out to that
+# module's own `render_diagram` -- calls the IDENTICAL classification this gate uses, instead of a
+# second, independently-drifting copy of the mmdc-output-reading logic. build_mmdc_argv/
+# classify_render_output (also imported above) are the two pieces _render_one below now delegates
+# to as well, for the same reason.
 
 
 async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[str, Any]) -> DiagramRenderOutcome:
@@ -392,28 +296,21 @@ async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[s
     # -p points mmdc at a bundled no-sandbox Puppeteer config (see the Dockerfile) -- required to
     # run headless Chromium as a non-root container user without --cap-add=SYS_ADMIN. Paths are
     # shell-quoted even though `name` is now validated above -- DIAGRAMS_DIR is a fixed constant,
-    # but quoting is cheap defense-in-depth against a future change to that constant.
-    command = (
-        f"npx --yes @mermaid-js/mermaid-cli -i {shlex.quote(mmd_path)} -o {shlex.quote(svg_path)} "
-        f"-p /opt/ai-dev-workflow-plugins/mermaid-puppeteer-config.json 2>&1"
-    )
+    # but quoting is cheap defense-in-depth against a future change to that constant. build_mmdc_argv
+    # (gates/diagram_render_checks.py) is the ONE source of truth for this invocation, shared with
+    # check-diagram-render-stop.mjs's own render call -- this gate shell-quotes it into a string
+    # because provider.exec_in_sandbox runs it through a REMOTE shell, unlike that hook's direct
+    # (no-shell) subprocess.run.
+    argv = build_mmdc_argv(mmd_path, svg_path, MERMAID_PUPPETEER_CONFIG_PATH)
+    command = " ".join(shlex.quote(a) for a in argv) + " 2>&1"
     result = await provider.exec_in_sandbox(thread_id, command)
-    # HEAD as well as tail. _mermaid_error_summary below takes the first meaningful lines because
-    # that is where mmdc puts the actionable "Parse error on line N ... Expecting ..." -- but a
-    # plain `[-2000:]` threw that away before the summariser ever ran, leaving it to summarise the
-    # puppeteer stack this file already documents as useless. Keeping both ends means the parse
-    # error survives on a long output AND the tail is still there for a failure that only shows up
-    # at the end (a crash, a non-zero exit message).
     raw_output = result.stdout or result.stderr or ""
-    stderr_tail = truncate_middle(
-        raw_output, config.DIAGRAM_ERROR_SUMMARY_HEAD_CHARS, config.DIAGRAM_ERROR_SUMMARY_TAIL_CHARS
-    )
-    # Infra unless mmdc actually named a source problem -- see _MERMAID_SYNTAX_MARKERS. The
-    # classify_failure call stays as the first test so this gate keeps agreeing with the rest of
-    # the pipeline on the transient failures it already recognizes.
-    is_infra = not result.ok and (
-        _looks_like_infra_failure(stderr_tail) or not _MERMAID_SYNTAX_MARKERS.search(stderr_tail)
-    )
+    # classify_render_output (gates/diagram_render_checks.py) is the ONE source of truth for
+    # infra-vs-syntax classification and stderr_tail trimming -- shared with that same hook's own
+    # render call. HEAD as well as tail: mmdc puts the actionable "Parse error on line N ...
+    # Expecting ..." at the TOP of its output; a plain tail-only slice would throw that away,
+    # leaving only the puppeteer stack this file already documents as useless.
+    is_infra, stderr_tail = classify_render_output(result.ok, raw_output)
     return DiagramRenderOutcome(
         name=name, ok=result.ok, is_infra_failure=is_infra, stderr_tail=stderr_tail
     )

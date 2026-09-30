@@ -715,13 +715,33 @@ RUN printf '%s\n' \
 #   - check-plan-citations-stop.mjs (2026-09-19): every Acceptance Criterion id steps.json/
 #     manifest.json cite must exist in the ledger, be the right kind, and (for plan steps) be
 #     live -- ported from gates/diagram_gate.py's check_plan_linkage/check_wireframe_ac_ids
-#     citation-validity checks (a narrower scope than those two -- see the hook's own header for
-#     what is deliberately NOT ported and why).
+#     citation-validity checks. Extended 2026-09-30 (Task 12) with check_plan_linkage's own
+#     coverage-side ("every eligible AC cited by some step") and rework-forbidden ("a new/changed
+#     step citing only already-delivered criteria") checks -- previously left un-ported on a
+#     re-derivation-risk concern this hook's own header quotes verbatim, resolved once the port
+#     shells out to the real Python function instead of hand-porting it -- plus three plain misses
+#     from hook coverage: check_dangling_visual_retirement, removes_ids existence/retired-status
+#     validity (+ its run_id-gated removal-demand half, via AIDW_RUN_ID/Task 5), and
+#     spec_ledger.py's plan-step id-missing/id-collision guard. See the hook's own header for the
+#     full accounting.
 #   - check-diagram-staleness-stop.mjs (2026-09-19): reminds the plan turn to explicitly review
 #     every er/architecture diagram whose specification appears to have moved on since the diagram
 #     was last touched (git commit ancestry, not the ledger's run_id stamps -- see the hook's own
 #     header for why those are structurally unavailable this early) -- observed costing a redraft
-#     lap in the SAME income-investor plan run above.
+#     lap in the SAME income-investor plan run above. Extended 2026-09-30 (Task 12) with the
+#     PER-ITEM (user_flow diagram/wireframe) half of the same real gate's trigger, now that
+#     AIDW_RUN_ID (Task 5) makes `run_id` available to compute the real (not git-proxied) set of
+#     ACs this run changed or bug-reopened -- still reuses the SAME git-ancestry proxy for
+#     "already reviewed", since the OTHER blocker (diagrams_reviewed/wireframes_reviewed living
+#     only in the model's own final structured response) is unchanged by Task 5 and unresolved.
+#   - check-diagram-render-stop.mjs (2026-09-30, Task 12): renders every _draft/manifest.json
+#     diagram's .mmd source through the SAME mermaid-cli invocation gates/diagram_gate.py's own
+#     real gate uses (gates/diagram_render_checks.py, shelled to, not a reimplementation) -- an
+#     earlier research pass's own "single most shovel-ready gap" finding: mmdc/puppeteer
+#     config/headless Chromium are already baked into this image, and the render needs only
+#     manifest.json + the .mmd files the model's own file edits already wrote this turn. Same
+#     infra-vs-syntax split as that gate (an environment failure never blocks); bumped ~300s
+#     timeout, same category as check-coverage-stop.mjs/check-quick-scan-stop.mjs below.
 #   - check-test-quality-stop.mjs (2026-09-19): fiat-failure stubs, absence-only tests, and
 #     near-duplicate test bodies, in the ac-to-tests draft/audit turn -- by shelling out to
 #     gates/test_quality_checks.py (COPY'd in below UNMODIFIED, stdlib-only), the real
@@ -844,6 +864,21 @@ COPY hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/check-plan-citations-st
 # of its own.
 COPY hooks/wireframe_linkage_checks.py /opt/aidw-hooks/wireframe_linkage_checks.py
 COPY hooks/check-diagram-staleness-stop.mjs /opt/aidw-hooks/check-diagram-staleness-stop.mjs
+COPY hooks/check-diagram-render-stop.mjs /opt/aidw-hooks/check-diagram-render-stop.mjs
+# Byte-identical staged copies of agent/src/gates/diagram_render_checks.py and its two own
+# dependencies, agent/src/failure_classification.py/agent/src/text_truncate.py -- same
+# build-context constraint and drift-guard convention as wireframe_linkage_checks.py above (that
+# module's own _demo() asserts the first of these three matches its source on every self-check
+# run); re-run `cp ../src/gates/diagram_render_checks.py hooks/diagram_render_checks.py && cp
+# ../src/failure_classification.py hooks/failure_classification.py && cp ../src/text_truncate.py
+# hooks/text_truncate.py` (from agent/sandbox-image) after editing any of the three sources and
+# before rebuilding. Needs nothing beyond python3's standard library (mmdc itself -- the ONE
+# non-stdlib dependency check-diagram-render-stop.mjs's render actually needs -- is already
+# installed globally above, not a Python package). Shelled to by check-diagram-render-stop.mjs
+# above, not a separate Stop hook of its own.
+COPY hooks/diagram_render_checks.py /opt/aidw-hooks/diagram_render_checks.py
+COPY hooks/failure_classification.py /opt/aidw-hooks/failure_classification.py
+COPY hooks/text_truncate.py /opt/aidw-hooks/text_truncate.py
 COPY hooks/check-test-quality-stop.mjs /opt/aidw-hooks/check-test-quality-stop.mjs
 # The REAL implementation, not a port -- see check-test-quality-stop.mjs's own header. This is a
 # byte-identical STAGED COPY of agent/src/gates/test_quality_checks.py: Docker's build context
@@ -923,6 +958,7 @@ RUN set -eux; \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-full-read-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-plan-citations-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-render-stop.mjs", "timeout": 300 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs", "timeout": 300 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs", "timeout": 30 } ] },' \
@@ -945,6 +981,7 @@ RUN set -eux; \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-full-read-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-plan-citations-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-staleness-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-diagram-render-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-test-quality-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-coverage-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs" },' \
@@ -965,6 +1002,8 @@ RUN set -eux; \
       /opt/aidw-hooks/full_read_checks.py \
       /opt/aidw-hooks/check-plan-citations-stop.mjs /opt/aidw-hooks/wireframe_linkage_checks.py \
       /opt/aidw-hooks/check-diagram-staleness-stop.mjs \
+      /opt/aidw-hooks/check-diagram-render-stop.mjs /opt/aidw-hooks/diagram_render_checks.py \
+      /opt/aidw-hooks/failure_classification.py /opt/aidw-hooks/text_truncate.py \
       /opt/aidw-hooks/check-test-quality-stop.mjs /opt/aidw-hooks/test_quality_checks.py \
       /opt/aidw-hooks/check-coverage-stop.mjs /opt/aidw-hooks/coverage_parsing.py \
       /opt/aidw-hooks/check-testid-locators-stop.mjs \
