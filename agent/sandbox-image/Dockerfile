@@ -808,6 +808,17 @@ RUN printf '%s\n' \
 #     plan's schema hook). Audit-turn only (piggybacking check-full-read-stop.mjs's own
 #     AIDW_AUDIT_FULL_READ_FILE gate), also runs the run_id-dependent fully_reviewed completeness
 #     sweep using AIDW_RUN_ID (Task 5) -- until this hook, that env var had no Stop-hook consumer.
+#   - check-ac-residue-stop.mjs (2026-09-30, Task 13): write_scope_gate.verify_ac_to_tests's OWN
+#     hard rules -- until now entirely graph-side, with zero same-turn coverage (only the test-
+#     *content*-quality axis above was hook-covered). Shells out to gates/ac_residue_checks.py
+#     (ledger-tamper detection, retired/deferred-AC test residue, completed-AC test protection, the
+#     unattributed-test attribution diagnostic, the per-AC ui_relevant-needs-e2e depth check, the
+#     playwright.config.ts screenshot-mode check) and gates/write_scope_checks.py (the write-scope
+#     violation check, the "wrote no real test files" check, the e2e-only/missing-e2e test-pyramid
+#     classifiers) -- both COPY'd in below UNMODIFIED, stdlib-only, the real implementations
+#     ac_coverage_gate.py/write_scope_gate.py import back, not a second JS port. AIDW_BASELINE_COMMIT
+#     (Task 5) is what unblocks the write-scope-gated half: those checks need this stage's own
+#     changed-paths set, which no same-turn hook could compute before that env var existed.
 #
 # BOTH PROVIDERS (user directive, 2026-09-17): baked into BOTH Claude Code's admin-managed
 # settings path AND GitHub Copilot CLI's own config, confirmed live via real docker-exec
@@ -943,6 +954,18 @@ COPY hooks/check-ledger-sync-stop.mjs /opt/aidw-hooks/check-ledger-sync-stop.mjs
 # ../src/gates/ledger_sync_checks.py hooks/ledger_sync_checks.py` (from agent/sandbox-image) after
 # editing the source and before rebuilding. Needs nothing beyond python3's standard library.
 COPY hooks/ledger_sync_checks.py /opt/aidw-hooks/ledger_sync_checks.py
+COPY hooks/check-ac-residue-stop.mjs /opt/aidw-hooks/check-ac-residue-stop.mjs
+# Byte-identical staged copies of agent/src/gates/ac_residue_checks.py and
+# agent/src/gates/write_scope_checks.py -- same build-context constraint and same drift-guard
+# convention as every other staged .py file here (each module's own `_demo()` asserts its file
+# matches its source on every self-check run); re-run `cp ../src/gates/ac_residue_checks.py
+# hooks/ac_residue_checks.py && cp ../src/gates/write_scope_checks.py hooks/write_scope_checks.py`
+# (from agent/sandbox-image) after editing either source and before rebuilding. Needs nothing
+# beyond python3's standard library -- ac_residue_checks.py imports test_quality_checks.py (already
+# staged above) via a try/relative-then-absolute import, since both land flat in this same
+# directory and this file runs standalone (no package context).
+COPY hooks/ac_residue_checks.py /opt/aidw-hooks/ac_residue_checks.py
+COPY hooks/write_scope_checks.py /opt/aidw-hooks/write_scope_checks.py
 COPY hooks/lib/ /opt/aidw-hooks/lib/
 COPY hooks/schemas/ /opt/aidw-hooks/schemas/
 RUN set -eux; \
@@ -965,7 +988,8 @@ RUN set -eux; \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs", "timeout": 300 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs", "timeout": 30 } ] },' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs", "timeout": 30 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-ac-residue-stop.mjs", "timeout": 30 } ] }' \
       '    ]' \
       '  }' \
       '}' \
@@ -988,7 +1012,8 @@ RUN set -eux; \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs" },' \
-      '      { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs" }' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-ac-residue-stop.mjs" }' \
       '    ]' \
       '  }' \
       '}' \
@@ -1010,6 +1035,8 @@ RUN set -eux; \
       /opt/aidw-hooks/check-adversarial-stop.mjs /opt/aidw-hooks/adversarial_audit_checks.py \
       /opt/aidw-hooks/check-remediation-stop.mjs /opt/aidw-hooks/remediation_evaluate_checks.py \
       /opt/aidw-hooks/check-ledger-sync-stop.mjs /opt/aidw-hooks/ledger_sync_checks.py \
+      /opt/aidw-hooks/check-ac-residue-stop.mjs /opt/aidw-hooks/ac_residue_checks.py \
+      /opt/aidw-hooks/write_scope_checks.py \
       /opt/aidw-hooks/lib/*.mjs /opt/aidw-hooks/schemas/*.json; \
     chown -R vscode:vscode /home/vscode/.copilot; \
     chmod 0644 /home/vscode/.copilot/config.json

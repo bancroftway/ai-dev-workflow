@@ -28,150 +28,38 @@ from .. import config as workflow_config
 from .. import repo_files, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
+from .ac_residue_checks import check_screenshot_capture_mode
+from .write_scope_checks import (
+    _is_pipeline_owned,
+    _is_test_path,
+    _classify_e2e_paths,
+    _has_non_e2e_test,
+    is_plan_pipeline_owned,
+    is_plan_scratch_path,
+)
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..graph import VerificationResult
 
-# Each pattern is matched against a repo-relative path with re.search (not fullmatch) -- deliberately
-# permissive about surrounding path segments, strict about the filename/directory shape itself.
-_DOTNET_TEST_PATTERNS = [
-    r"(^|/)[A-Za-z0-9_.]+\.Tests(/|$)",
-    r"(^|/)[A-Za-z0-9_.]+Tests\.csproj$",
-    r"(^|/)[A-Za-z0-9_.]*Tests?\.cs$",
-]
-_TS_TEST_PATTERNS = [
-    r"\.test\.tsx?$",
-    r"\.spec\.tsx?$",
-    r"(^|/)(tests|__tests__|test|e2e)/",
-    # [cm]?[jt]s covers the ESM/CJS flavours (`.mts`, `.mjs`, `.cts`, `.cjs`, plain `.js`) a
-    # package's own "type" field can REQUIRE -- observed live: legitimate `vitest.config.mts`
-    # files at apps/jobs and packages/db were silently reverted because only `.ts(x)` matched,
-    # while _E2E_PATH_RE below already accepted `playwright.config.[jt]sx?`. Configs the stage is
-    # explicitly told to write must never be deleted over their extension.
-    r"(^|/)playwright\.config\.[cm]?[jt]sx?$",
-    r"(^|/)vitest\.config\.[cm]?[jt]sx?$",
-    # The vitest/Angular setup file its config points at (setupFiles: ["src/test-setup.ts"]) --
-    # observed live (2026-08-30): quarantined every lap because the hyphenated name matches none
-    # of the patterns above, and the model (never told) rewrote it every lap.
-    r"(^|/)test-setup\.[cm]?[jt]s$",
-]
-_PY_TEST_PATTERNS = [
-    r"(^|/)test_[A-Za-z0-9_]+\.py$",
-    r"(^|/)[A-Za-z0-9_]+_test\.py$",
-    r"(^|/)tests?/",
-    r"(^|/)conftest\.py$",
-]
-
-_ALL_PATTERNS = [re.compile(p) for p in _DOTNET_TEST_PATTERNS + _TS_TEST_PATTERNS + _PY_TEST_PATTERNS]
-
-
-def _is_test_path(path: str) -> bool:
-    return any(pattern.search(path) for pattern in _ALL_PATTERNS)
-
-
-# Paths the PIPELINE ITSELF writes and commits between the baseline commit and this gate's diff
-# (stage artifacts, the action ledger, the spec id ledger). Observed live: every ac-to-tests
-# verify cycle flagged `.ai-dev-workflow/ac-to-tests.draft.json` etc. as scope violations the
-# model could never fix -- it didn't write them, workflow persistence did -- deadlocking the
-# stage at the verify cap. The scope rule is about the MODEL's writes only.
-_PIPELINE_OWNED_PREFIXES = (".ai-dev-workflow/", "APPROVALS.md", "AGENTS.md")
-
-
-# Artifacts the coverage gate's own test run produces (runner reports and Playwright's failure
-# dumps) at whatever depth the test roots live. They are the GATE's requested evidence, not model
-# writes -- quarantining them each lap deleted the very reports ac_coverage_gate prefers (observed
-# live 2026-08-30: apps/web/ac-run-playwright.json + test-results/ reverted every lap). The
-# coverage gate deletes them itself before each fresh run, so staleness is handled there.
-_RUNNER_ARTIFACT_RE = re.compile(r"(^|/)(ac-run-[^/]*\.json$|test-results/|TestResults/)|\.trx$")
-
-
-def _is_pipeline_owned(path: str) -> bool:
-    return path.startswith(_PIPELINE_OWNED_PREFIXES) or bool(_RUNNER_ARTIFACT_RE.search(path))
-
-
-# File-based-editing plan, Part 2 sect. 7: plan's own write-scope allowlist. Unlike ac-to-tests
-# (which has no legitimate reason to write anywhere under .ai-dev-workflow/), plan's model now
-# writes real content to its own scratch dir plus the resolved clean output tier (Part 2 sect. 1's
-# second file tier) -- everything else, including plan's own approved/draft snapshots and every
-# other stage's files, stays out of scope.
-def is_plan_scratch_path(path: str) -> bool:
-    return path.startswith((
-        ".ai-dev-workflow/plan/_draft/",
-        ".ai-dev-workflow/plan/diagrams/",
-        ".ai-dev-workflow/plan/wireframes/",
-    ))
-
-
-# Narrower than the default _is_pipeline_owned (ac-to-tests' own predicate): still exempts what
-# the pipeline's own code writes during a plan-stage run (ledger.jsonl, APPROVALS.md, AGENTS.md,
-# plan's own persisted snapshots), but deliberately does NOT blanket-exempt the whole
-# `.ai-dev-workflow/` prefix the way the default does -- that would silently let a plan-stage edit
-# to `.ai-dev-workflow/spec/ledger.json` or the approved specification through unflagged, exactly
-# the risk this write-scope guard exists to close. The specification stage has already finished
-# and committed before plan ever runs, so the pipeline itself has no reason to touch
-# `.ai-dev-workflow/spec/**` (the ledger/sketchpad) or `.ai-dev-workflow/03-specification.*` (the
-# numbered stage files workflow_persistence._stage_file writes -- NOT under spec/, a top-level
-# sibling) during a plan turn -- excluding both from the exemption costs nothing legitimate.
-def is_plan_pipeline_owned(path: str) -> bool:
-    if path.startswith(".ai-dev-workflow/spec/") or path.startswith(".ai-dev-workflow/03-specification"):
-        return False
-    return _is_pipeline_owned(path)
-
+# _is_test_path, _is_pipeline_owned, is_plan_scratch_path, is_plan_pipeline_owned, and
+# _classify_e2e_paths are imported from write_scope_checks above (Task 13) -- moved there unchanged
+# so the same-turn Stop hook (check-ac-residue-stop.mjs) can call the REAL classifiers instead of a
+# hand-ported JS copy. See that module's own docstring.
 
 # A Playwright end-to-end spec: either it sits in an e2e directory, or it's the playwright config
 # itself. Matched by LOCATION rather than by reading imports -- `tests/e2e/` is the convention this
 # stage's own prompt mandates, and the coverage gate relies on the same split to exclude browser
-# specs from a unit run.
+# specs from a unit run. Kept here (not moved) -- only `_classify_e2e_paths`/`_has_non_e2e_test`
+# (which close over it) needed to move for the hook; this module's own remaining e2e-content logic
+# below still needs the raw pattern.
 _E2E_PATH_RE = re.compile(r"(^|/)e2e(/|$)|(^|/)playwright\.config\.[jt]sx?$|\.e2e\.[jt]sx?$", re.IGNORECASE)
 
-# Just the config file itself, any changed path -- used to locate it for the content check below
-# (check_screenshot_capture_mode), separate from _E2E_PATH_RE's broader "is this an e2e-shaped
-# path at all" question.
+# Just the config file itself, any changed path -- used to locate it for the content check
+# (check_screenshot_capture_mode, imported from ac_residue_checks above), separate from
+# _E2E_PATH_RE's broader "is this an e2e-shaped path at all" question.
 _PLAYWRIGHT_CONFIG_RE = re.compile(r"(^|/)playwright\.config\.[cm]?[jt]sx?$", re.IGNORECASE)
-
-# `screenshot: 'on'` or `screenshot: "on"`, either quote style, whitespace-tolerant around the colon.
-_SCREENSHOT_ON_RE = re.compile(r"""screenshot\s*:\s*['"]on['"]""")
-
-
-def check_screenshot_capture_mode(config_source: str) -> bool:
-    """True if a playwright.config's `use` block sets `screenshot: 'on'` -- the setting this
-    stage's own prompt mandates (ac_to_tests_draft.md, ac_to_tests_greenfield_segment.md) so a
-    PASSING suite still yields visual evidence, not just failures (Playwright's own default is
-    only-on-failure). Until now this was only ever requested in prompt text, never verified
-    against the actual file -- read the real content, don't trust the model's compliance. Pure."""
-    return bool(_SCREENSHOT_ON_RE.search(config_source))
-
-
-def _classify_e2e_paths(changed_paths: list[str], resolved_root: str | None) -> tuple[bool, str]:
-    """(has_e2e, diagnosis) -- diagnosis is "present" exactly when has_e2e is True, else one of
-    "missing" (nothing e2e-ish changed at all) or "misplaced" (something e2e-ish changed but not
-    under `{resolved_root}/tests/e2e/`).
-
-    `resolved_root` is None for the genuinely-ambiguous case (see `_resolve_web_root`): with no
-    confidently known directory to be strict against, this falls back to the old location-only
-    regex a bare boolean used to return -- deliberately no stricter than before for that one case.
-    Otherwise (`resolved_root` is `""` for repo-root-is-web-app, or a real subdirectory) checks
-    membership under the exact directory the pipeline's own byte-for-byte-fixed
-    `playwright.config.ts` template hardcodes as `testDir` -- a config alone never counts (it runs
-    zero tests and yields no screenshots), and neither does an e2e-shaped file sitting anywhere
-    else: Playwright's `testDir` would never discover it, so crediting it as "present" would
-    silently under-report a UI story with zero real browser coverage."""
-    e2e_ish = [
-        p
-        for p in changed_paths
-        if _is_test_path(p)
-        and _E2E_PATH_RE.search(p)
-        and not _is_pipeline_owned(p)
-        and not p.endswith(("playwright.config.ts", "playwright.config.js"))
-    ]
-    if resolved_root is None:
-        return bool(e2e_ish), ("present" if e2e_ish else "missing")
-    expected_prefix = f"{resolved_root}/tests/e2e/" if resolved_root else "tests/e2e/"
-    if any(p.startswith(expected_prefix) for p in e2e_ish):
-        return True, "present"
-    return False, ("misplaced" if e2e_ish else "missing")
 
 
 async def _looks_greenfield_for_node(provider: SandboxProvider, thread_id: str) -> bool:
@@ -256,15 +144,6 @@ async def _stack_has_ui(provider: SandboxProvider, thread_id: str) -> bool:
         if frameworks:
             return frameworks_have_ui(frameworks)
     return False
-
-
-def _has_non_e2e_test(changed_paths: list[str]) -> bool:
-    """True when at least one written test lives below the browser layer (unit/integration/
-    subcutaneous). Pipeline artifacts never count as tests."""
-    return any(
-        _is_test_path(p) and not _E2E_PATH_RE.search(p) and not _is_pipeline_owned(p)
-        for p in changed_paths
-    )
 
 
 @dataclass(frozen=True)

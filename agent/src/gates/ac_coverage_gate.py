@@ -33,6 +33,16 @@ from typing import Any
 
 from .. import chat_model, repo_files, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from . import test_quality_checks
+from .ac_residue_checks import (
+    _TEST_FILE_LISTING,
+    check_completed_ac_protection,
+    check_deferred_ac_residue,
+    check_ledger_integrity,
+    check_retired_ac_residue,
+    ui_relevant_ac_ids as _ui_relevant_ac_ids,
+    ui_relevant_missing_e2e,
+    unattributed_tests,
+)
 from .test_quality_checks import (
     MAX_TEST_BODY_SIMILARITY,
     MIN_DISTINCT_ASSERTIONS_PER_AC,
@@ -47,7 +57,7 @@ from .test_quality_checks import (
     non_testid_locators,
     _tests_for_ac,
 )
-from .write_scope_gate import _is_pipeline_owned, _is_test_path
+from .write_scope_checks import _is_pipeline_owned, _is_test_path
 from ..sandbox.provider import SandboxProvider
 from ..schemas import StageReport
 from ..spec_ledger import LEDGER_PATH, own_ac_ids_from_specification
@@ -277,20 +287,6 @@ async def run_resolved_test_command(
 # below-browser tests at this phase.
 MIN_NON_E2E_TESTS_PER_AC_RED = int(os.environ.get("MIN_NON_E2E_TESTS_PER_AC_RED", "0"))
 
-# The subset that actually carries a test NAME: a `test(...)`/`it(...)`/`describe(...)` call, or a
-# method signature. A bare `[Fact]` / `[Theory]` attribute line matches _TEST_DECL_RE but names
-# nothing -- it is the line ABOVE the name in every generated .NET suite.
-_NAMED_TEST_DECL_RE = re.compile(
-    r"\b(?:test|it|describe)\s*\("
-    r"|\b(?:public|internal|private)\s+(?:async\s+)?[\w<>\[\],\s]+?\s+\w+\s*\(",
-    re.IGNORECASE,
-)
-
-# How each xUnit-family framework MARKS a method as a test. Used to tell a test from a helper:
-# without it, a constructor or a Dispose reads as an unnamed test.
-_TEST_ATTRIBUTE_RE = re.compile(r"^\s*\[\s*(Fact|Theory|Test|TestMethod|TestCase)\b", re.IGNORECASE)
-_JS_TEST_CALL_RE = re.compile(r"\b(?:test|it)\s*(?:\.\w+)?\s*\(\s*['\"`]", re.IGNORECASE)
-
 
 def duplicate_test_bodies(ac_id: str, test_files: dict[str, str]) -> int:
     """How many of this AC's tests are near-duplicates of an earlier one. Pure.
@@ -456,50 +452,6 @@ def status_from_structured_reports(
     return per_ac, tally
 
 
-def unattributed_tests(ac_ids: list[str], test_files: dict[str, str]) -> dict[str, int]:
-    """Per file, how many test declarations carry NO recognisable AC id. Pure.
-
-    The generic safety net for this whole class of defect. Attribution works by finding an AC id
-    inside a model-authored test name, and no pattern can cover a convention nobody controls -- four
-    spellings had to be added reactively, each discovered only after a run had already reported "0
-    tests" for criteria that were tested. The failure mode is what makes it dangerous: an unmatched
-    name is indistinguishable from an untested criterion, so the gate reports a confident zero.
-
-    A file full of test declarations where NOTHING matched is therefore reported as an attribution
-    problem, not as an absence of tests. That distinction is the whole point: "I could not read this"
-    and "there is nothing here" must never look the same.
-    """
-    out: dict[str, int] = {}
-    known = set(ac_ids)
-    for path, contents in (test_files or {}).items():
-        unmatched = 0
-        attributed_above = False
-        for line in contents.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if _TEST_ATTRIBUTE_RE.search(stripped):
-                attributed_above = True
-                continue
-            # _NAMED_TEST_DECL_RE, not _TEST_DECL_RE: a bare `[Fact]` attribute line matches the
-            # latter but carries no name -- it is the line ABOVE the name in every generated .NET
-            # suite, and counting it reported a phantom orphan per correctly-named test.
-            is_js_test = bool(_JS_TEST_CALL_RE.search(stripped))
-            is_attributed_method = attributed_above and bool(_NAMED_TEST_DECL_RE.search(stripped))
-            attributed_above = False
-            # A method signature with no test attribute above it is a HELPER -- a constructor, a
-            # Dispose, a CreateClient factory. Measured on a real suite: counting those reported 4
-            # orphans in a file where every actual test was correctly named, which would have sent a
-            # redraft chasing an attribution problem that did not exist.
-            if not (is_js_test or is_attributed_method):
-                continue
-            if not (set(test_results.ac_ids_in_name(stripped)) & known):
-                unmatched += 1
-        if unmatched:
-            out[path] = unmatched
-    return out
-
-
 def depth_shortfalls(
     counts: dict[str, dict[str, int]],
     ui_relevant: set[str],
@@ -522,8 +474,7 @@ def depth_shortfalls(
                 f"only {non_e2e} test(s) below the browser layer (need {min_non_e2e}: unit and/or "
                 f"integration -- a browser test cannot prove a rule beneath the UI)"
             )
-        if ac in ui_relevant and per_level["e2e"] < 1:
-            problems.append("no end-to-end test, and this criterion is user-facing")
+        problems.extend(ui_relevant_missing_e2e(ac, per_level, ui_relevant))
 
         # Fiat-failure stubs are named FIRST and directly: they are what the model actually writes
         # when it wants red without work, and letting them fall through to the near-duplicate check
@@ -603,161 +554,6 @@ def depth_shortfalls(
         if problems:
             shortfalls[ac] = problems
     return shortfalls
-
-
-def _ui_relevant_ac_ids(content_dict: dict[str, Any], active_ac_ids: list[str]) -> set[str]:
-    """ACs the stage itself marked user-facing, from its own coverage_plan.
-
-    The model's `ui_relevant` flag is used here rather than a guess from the AC text: it already has
-    to decide this to choose a test kind, and requiring an e2e test for a criterion nobody considers
-    user-facing would force browser tests onto pure calculation rules.
-    """
-    plan = ((content_dict or {}).get("test_suite") or {}).get("coverage_plan") or []
-    flagged = {str(entry.get("ac_id")) for entry in plan if entry.get("ui_relevant")}
-    return {ac for ac in active_ac_ids if ac in flagged}
-
-
-# One definition of "the test files in this tree" for every scan in this module. `test-?results`
-# with -i, not the old case-sensitive bare `TestResults`: that spelling is .NET's, and Playwright
-# writes its failure artifacts to `test-results/` (hyphen, lowercase) which sailed straight
-# through -- one e2e run's screenshots then crowded real sources out of the depth listing, and
-# reading a `test-failed-1.png` as source crashed the run outright. The binary-extension denylist
-# exists because artifacts can be named anything and still match (test|spec).
-_TEST_FILE_LISTING = (
-    "git ls-files -co --exclude-standard | grep -iE '(test|spec)' "
-    r"| grep -viE '(^|/)(node_modules|\.playwright-browsers|bin|obj|dist|build|\.next|\.venv|vendor|test-?results|coverage|\.ai-dev-workflow|agent-work)/' "
-    r"| grep -viE '\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|mp4|webm|woff2?|ttf|eot|dll|exe|so|dylib|pyc|class|jar)$'"
-)
-
-
-async def _grep_test_files_for_ids(
-    provider: SandboxProvider, thread_id: str, ac_ids: set[str]
-) -> dict[str, set[str]]:
-    """{test file path -> AC ids named on its lines}, for the given ids only.
-
-    Two-stage matching: `grep -F` with id_variants finds CANDIDATE lines cheaply, then
-    test_results.ac_ids_in_name re-parses each line boundary-aware -- a raw variant substring test
-    would credit US-0001.1 for a line naming only US-0001.12 (the `(?!\\d)` tail is what the
-    variants list cannot express in `grep -F`)."""
-    if not ac_ids:
-        return {}
-    patterns = " ".join(f"-e {shlex.quote(v)}" for ac in sorted(ac_ids) for v in id_variants(ac))
-    grep = await provider.exec_in_sandbox(
-        thread_id,
-        f"{_TEST_FILE_LISTING} | xargs -r -d '\\n' grep -H -n -F {patterns} -- 2>/dev/null || true",
-    )
-    hits: dict[str, set[str]] = {}
-    for line in (grep.stdout or "").splitlines():
-        path, _, rest = line.partition(":")
-        _lineno, _, text = rest.partition(":")
-        found = set(test_results.ac_ids_in_name(text)) & ac_ids
-        if found and path:
-            hits.setdefault(path, set()).update(found)
-    return hits
-
-
-async def check_retired_ac_residue(
-    provider: SandboxProvider, thread_id: str, entries: list[dict[str, Any]]
-) -> list[str]:
-    """Deletion propagation, test side: once a Specification retires an AC, no test file may still
-    reference its id. Runs at ac-to-tests verify AND again at the last rebuild gate before metrics
-    (rebuild._scan_regression_reasons) -- later stages can write tests too."""
-    retired = {
-        e["id"]
-        for e in entries
-        if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
-    }
-    hits = await _grep_test_files_for_ids(provider, thread_id, retired)
-    if not hits:
-        return []
-    detail = "; ".join(f"{path}: {', '.join(sorted(ids))}" for path, ids in sorted(hits.items()))
-    return [
-        "test files still reference retired AC ids -- these criteria were removed from the "
-        f"Specification, so delete those test cases (delete the file if it holds nothing else): {detail}"
-    ]
-
-
-async def check_deferred_ac_residue(
-    provider: SandboxProvider, thread_id: str, entries: list[dict[str, Any]]
-) -> list[str]:
-    """Deferral containment, test side (user requirement 2026-08-31): a NEVER-DELIVERED deferred
-    criterion must have no test naming it -- a red test citing a deferred id would drag the whole
-    parked feature into the build, because minimal-code-to-green's job is 'make every failing
-    test pass'. Delivered-then-deferred criteria (coded_run_id set) keep their tests on purpose:
-    the code stays in the tree, parked, and its regression tests with it. Runs at the same two
-    call sites as check_retired_ac_residue (ac-to-tests verify, last rebuild gate)."""
-    parked_unbuilt = {
-        e["id"]
-        for e in entries
-        if e.get("kind") == "acceptance_criterion"
-        and e.get("status") == "deferred"
-        and not e.get("coded_run_id")
-    }
-    hits = await _grep_test_files_for_ids(provider, thread_id, parked_unbuilt)
-    if not hits:
-        return []
-    detail = "; ".join(f"{path}: {', '.join(sorted(ids))}" for path, ids in sorted(hits.items()))
-    return [
-        "test files reference DEFERRED criteria that were never built -- deferred scope is parked, "
-        f"not in this ticket: delete those test cases (no code may be demanded for them): {detail}"
-    ]
-
-
-async def check_completed_ac_protection(
-    provider: SandboxProvider, thread_id: str, baseline_commit: str | None, entries: list[dict[str, Any]]
-) -> list[str]:
-    """Completed criteria (coded_run_id stamped by a healthy metrics run) are settled: their
-    regression tests must survive. Incidental shared-code/file edits are deliberately NOT policed
-    -- the regression suite guards behavior, and this stage's own tooling (create/edit, no delete)
-    routinely rewrites a whole test file to add new cases, which a line-level diff cannot tell
-    apart from genuine rework of the untouched ones sitting in the same file. An earlier
-    line-diff-based "no added line may mention a completed AC" check was removed after it fired on
-    exactly that: a normal whole-file rewrite for NEW work reads every pre-existing line as
-    "added," false-flagging every completed AC the file happens to also cover (observed live: one
-    rewritten controller test file alone false-flagged 8 already-delivered criteria). Presence is
-    the check that actually matters and cannot be fooled by reformatting.
-
-    Id-presence (does any test file still name the id), never runner-reported test-name grepping:
-    runner names are FQNs/joined titles that don't exist verbatim in source. An AC coded but with
-    no tests on disk at all is a deletion either way. `baseline_commit` is unused now (kept in the
-    signature -- callers already pass it, and a future precision check may want it again).
-    """
-    del baseline_commit
-    completed = {
-        e["id"]
-        for e in entries
-        if e.get("kind") == "acceptance_criterion"
-        and e.get("status") in ("active", "revised")
-        and e.get("coded_run_id")
-    }
-    if not completed:
-        return []
-    problems: list[str] = []
-
-    present = set()
-    for ids in (await _grep_test_files_for_ids(provider, thread_id, completed)).values():
-        present.update(ids)
-    for ac_id in sorted(completed - present):
-        problems.append(
-            f"no test file names completed criterion {ac_id} any more -- its regression tests were "
-            "deleted or renamed; restore them (completed criteria keep their tests)"
-        )
-    return problems
-
-
-async def check_ledger_integrity(provider: SandboxProvider, thread_id: str) -> list[str]:
-    """The spec ledger is pipeline-owned truth every gate reads, yet it sits inside the write-scope
-    whitelist (.ai-dev-workflow/) any agent can write to. Every pipeline writer commits its own
-    ledger writes, so an UNCOMMITTED diff on it at gate time is agent tampering: revert it and fail
-    the lap so the feedback says so."""
-    diff = await provider.exec_in_sandbox(thread_id, f"git diff --name-only -- {shlex.quote(LEDGER_PATH)}")
-    if not (diff.stdout or "").strip():
-        return []
-    await provider.exec_in_sandbox(thread_id, f"git checkout -- {shlex.quote(LEDGER_PATH)}")
-    return [
-        f"{LEDGER_PATH} was modified during this stage -- the spec ledger is pipeline-owned and "
-        "never writable by an agent; the change has been reverted. Do not touch it."
-    ]
 
 
 @dataclass(frozen=True)
