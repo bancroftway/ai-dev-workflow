@@ -197,8 +197,8 @@ Every LLM prompt in the pipeline is an editable markdown file under [agent/src/p
 ```mermaid
 flowchart LR
     d["DRAFT<br/>LLM produces the artifact.<br/>Optional short-circuits: hydrate from an<br/>existing repo file, or capture a baseline commit.<br/>The repo-file short-circuit is skipped on a<br/>REJECTED redraft, which always goes to a real LLM<br/>call so the feedback (below) can actually reach it<br/>(baseline-commit's own owning stages have no human<br/>gate, so they can never reach a rejected state).<br/>Optional reframing: adjust the draft prompt from a<br/>repo file check without skipping the draft itself<br/>(e.g. specification's ticket-mode baseline check).<br/>A prior human gate rejection's feedback is<br/>folded in the same way."]
-    a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan, ac-to-tests and<br/>minimal-code-to-green configure one; every<br/>other stage goes straight from draft to verify/gate."]
-    v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage."]
+    a["AUDIT<br/>A separately configured model revises<br/>the draft adversarially. Optional — only<br/>specification, plan, ac-to-tests and<br/>minimal-code-to-green configure one; every<br/>other stage goes straight from draft to verify/gate.<br/>Also skipped, even on a stage that configures one,<br/>whenever the session's code_gen_mode isn't<br/>mission_critical (yolo/draft_verify) — GraphState.<br/>code_gen_mode, routed by _wire_stage's conditional<br/>edges (Part 3 Task 2)."]
+    v["VERIFY<br/>A real script or parse.<br/>Never LLM self-attestation.<br/>Optional per stage.<br/>Also skipped entirely in yolo mode, regardless of<br/>whether the stage configures one."]
     g["GATE<br/>LangGraph interrupt() pauses<br/>here until a human approves<br/>or rejects with feedback.<br/>tech-stack, specification and plan set<br/>requires_human_gate — the greenfield<br/>stack picker is a separate, one-time<br/>interrupt outside this template."]
     aa["AUTO-APPROVE<br/>Clarification-cycle safety cap hit:<br/>skips the audit and the human gate —<br/>never the deterministic verify. Approval is<br/>persisted only after verify passes."]
     e["ESCALATE<br/>Verify cap exhausted. The run ENDs with<br/>run_failure recorded (ledger + commit + push).<br/>Never auto-approved past a failed<br/>deterministic gate. Counters reset for resubmit.<br/>Verify verdicts tagged infra_error (the platform<br/>could not measure, e.g. the coverage gate's test-run<br/>evidence missing) spend a separate small budget<br/>(VERIFY_INFRA_RETRY_CAP, default 2) instead of the<br/>stage's verify laps, and escalate as<br/>failure_type=infra_transient — resumable."]
@@ -206,11 +206,14 @@ flowchart LR
     ie["DRAFT-ESCALATE<br/>Copilot session failure survived infra_retry's<br/>own backoff attempts (quota/timeout/429) — never<br/>charged against cycle_count. run_failure tagged<br/>failure_type=infra_transient/quota_exhausted,<br/>not gate_exhausted. Wired for every stage,<br/>including tech-stack, the one with no verify."]
     q(["Not ready: emit clarifying questions, end the run"])
 
-    d -->|readiness| a
+    d -->|"readiness + mission_critical (stage has audit)"| a
+    d -->|"readiness + verify enabled, audit skipped or absent (stage has verify)"| v
+    d -->|"readiness, audit + verify both skipped or absent"| g
     d -->|cap reached| aa
     d -->|not ready| q
     d -.->|infra exhausted| ie
-    a --> v
+    a -->|"verify enabled (stage has verify)"| v
+    a -->|no verify| g
     v -->|passed| g
     v -.->|"passed, zero net delta (specification only)"| nw
     v -.->|failed, retries left| d
@@ -288,6 +291,8 @@ Bug-ticket conditionality comes from the specification stage's `work_kind` class
 ## Deterministic gates and hooks
 
 Every non-LLM check the pipeline enforces on generated apps, in pipeline order. One row group per stage; inside each, one group per phase. Blank Stage/Phase cell = same as the row above. Guarded by the same freshness hook as the graph diagram (see [Keeping this README current](#keeping-this-readme-current)).
+
+The audit/verify rows below describe each check's own logic — what runs when that phase is reached. Whether a stage's audit and/or verify phase is reached AT ALL is a separate, session-level decision: `GraphState.code_gen_mode` (`yolo`/`draft_verify`/`mission_critical`, `_wire_stage`'s conditional edges, Part 3 Task 2) skips audit unless the session is `mission_critical`, and skips verify entirely in `yolo`. Every session defaults to `mission_critical` today (Task 1's fallback), so this table's audit/verify rows are exactly what every existing session still runs; a future frontend choosing a different mode (Part 3 Task 3) is what would actually reach fewer of them.
 
 Two enforcement layers run against the same logic in several places:
 
@@ -620,5 +625,5 @@ node .claude/hooks/graph-diagram-check.mjs --stamp graph-source
 node .claude/hooks/graph-diagram-check.mjs --stamp gate-inventory
 ```
 
-<!-- graph-source-sha256: 9be471fe04c27de43fcde016f1146d5001ba23e917dab092ec4ce7f9b23bd391 -->
-<!-- gate-inventory-sha256: 7ecae6f75877866c94652a41f2146fed2a73d8ec236a0876b535bca43ec85801 -->
+<!-- graph-source-sha256: 2be44f888498a98ce0117560dbbe7afbc100764e580bd2a5a101b02a9254aff7 -->
+<!-- gate-inventory-sha256: f1fc8ae37b07034613f08233965819865b366499ebf6e62356892af198c8a163 -->

@@ -4923,6 +4923,25 @@ def make_no_new_work_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnab
     return no_new_work_node
 
 
+def _code_gen_mode_flags(state: GraphState) -> tuple[bool, bool]:
+    """Task 2 (Part 3, graph wiring): the one place `state["code_gen_mode"]` becomes the two
+    routing booleans every stage's audit/verify skip decision reads. `_wire_stage`'s two
+    conditional-edge decision points -- draft's outgoing edge (via make_route_after_draft below)
+    and the audit node's outgoing edge (built directly inside _wire_stage) -- both call this
+    instead of each re-deriving the mode->skip mapping on its own, so the two edges can never
+    drift out of sync with each other.
+
+    Default ("mission_critical" when code_gen_mode is absent) matches Task 1's own
+    _resolve_thread_code_gen_mode fallback exactly -- preserves today's exact behavior (audit AND
+    verify both always on) for any state that reaches routing without a resolved mode, which per
+    Task 1 should not normally happen but costs nothing to keep consistent.
+    """
+    mode = state.get("code_gen_mode", "mission_critical")
+    audit_enabled = mode == "mission_critical"
+    verify_enabled = mode in ("draft_verify", "mission_critical")
+    return audit_enabled, verify_enabled
+
+
 def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     def route(state: GraphState) -> str:
         stage = state["stages"][stage_spec.key]
@@ -4943,7 +4962,19 @@ def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]
         if stage["status"] == "approved":
             return "already_approved"
         if stage["readiness"]:
-            return "gate"
+            # Task 2 (Part 3): "gate" used to be one fixed outcome, mapped at wire-time to
+            # whichever of audit/verify/gate this stage_spec has. Now the session's code_gen_mode
+            # picks among three outcomes at ROUTE time instead -- see _wire_stage's
+            # add_conditional_edges map for draft_name, which only wires "gate_audit"/"gate_verify"
+            # as reachable keys when this stage_spec actually has that mechanism, so a stage
+            # without one (e.g. remediation has no audit_response_schema) can never produce an
+            # outcome with no corresponding edge.
+            audit_enabled, verify_enabled = _code_gen_mode_flags(state)
+            if stage_spec.audit_response_schema is not None and audit_enabled:
+                return "gate_audit"
+            if stage_spec.deterministic_verify is not None and verify_enabled:
+                return "gate_verify"
+            return "gate_direct"
         if stage["cycle_count"] >= stage_spec.max_cycles:
             return "auto_approve"
         # Headless: there is no human to answer, so a not-ready draft loops straight back into
@@ -5837,24 +5868,55 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
     # The adversarial audit leg is opt-in (specification/plan/ac-to-tests/minimal-code-to-green
     # only): a stage without audit config routes its ready draft straight to verify (when present)
     # or the gate. Everything else -- persistence, signing, hooks -- happens in the gate body either way.
-    if stage_spec.audit_response_schema is not None:
-        after_draft = f"{stage_spec.key}_audit"
-        builder.add_node(after_draft, make_audit_node(stage_spec))
-        builder.add_edge(after_draft, verify_name or gate_name)
-    else:
-        after_draft = verify_name or gate_name
+    #
+    # Task 2 (Part 3): whether audit/verify exist AT ALL is still decided here, at build time, from
+    # stage_spec -- unchanged. What's new is that the audit node's own outgoing edge, like draft's
+    # below, is now a conditional edge keyed on the session's code_gen_mode (_code_gen_mode_flags)
+    # instead of a fixed add_edge -- a mission_critical session (audit_enabled=True, the only mode
+    # that ever reaches this node -- see make_route_after_draft's "gate_audit" guard) always has
+    # verify_enabled=True too, so this resolves to verify_name today exactly like the old fixed
+    # edge did; it's written as a real branch (rather than inlining that always-true fact) so it
+    # stays correct if a future mode ever decouples the two.
+    audit_name = f"{stage_spec.key}_audit" if stage_spec.audit_response_schema is not None else None
+    if audit_name is not None:
+        builder.add_node(audit_name, make_audit_node(stage_spec))
+
+        def route_after_audit(state: GraphState) -> str:
+            _audit_enabled, verify_enabled = _code_gen_mode_flags(state)
+            return "verify" if verify_enabled else "gate"
+
+        builder.add_conditional_edges(
+            audit_name,
+            route_after_audit,
+            {"verify": verify_name or gate_name, "gate": gate_name},
+        )
+
+    # Task 2 (Part 3): "gate" used to be one outcome mapped to a single fixed target (whichever of
+    # audit_name/verify_name/gate_name this stage_spec has, computed once at wire time). It's now
+    # three outcomes -- "gate_audit"/"gate_verify"/"gate_direct" -- so a stage's own
+    # code_gen_mode-driven route() (make_route_after_draft) can
+    # send a ready draft into audit, straight into verify, or straight to the gate. "gate_audit"/
+    # "gate_verify" are only given as reachable keys when this stage_spec actually has that
+    # mechanism -- route() is guarded identically (stage_spec.audit_response_schema/
+    # deterministic_verify is not None), so a stage lacking one (e.g. remediation has no audit,
+    # tech-stack has neither) can never produce an outcome with no corresponding edge here.
+    draft_edges = {
+        "gate_direct": gate_name,
+        "auto_approve": auto_approve_name,
+        "needs_clarification": END,
+        "headless_redraft": draft_name,  # headless only: self-answer and redraft, no human exit
+        "already_approved": next_draft_name,
+        "escalate": draft_escalate_name,
+    }
+    if audit_name is not None:
+        draft_edges["gate_audit"] = audit_name
+    if verify_name is not None:
+        draft_edges["gate_verify"] = verify_name
 
     builder.add_conditional_edges(
         draft_name,
         make_route_after_draft(stage_spec),
-        {
-            "gate": after_draft,
-            "auto_approve": auto_approve_name,
-            "needs_clarification": END,
-            "headless_redraft": draft_name,  # headless only: self-answer and redraft, no human exit
-            "already_approved": next_draft_name,
-            "escalate": draft_escalate_name,
-        },
+        draft_edges,
     )
 
     if verify_name is not None:
@@ -6197,6 +6259,89 @@ def compile_graph():
 
 
 graph = compile_graph()
+
+
+def _demo_code_gen_mode_routing() -> None:
+    """Task 2 (Part 3): walks every one of the 8 STAGES' `{stage}_draft` conditional edges
+    (builder.branches, populated by add_conditional_edges -- see _wire_stage) across all three
+    code_gen_mode values, confirming audit/verify are entered or bypassed exactly as the mode
+    dictates, and that the 4 stages with no audit_response_schema (tech-stack, remediation,
+    adversarial-compliance, metrics-exit) never produce "gate_audit" in ANY mode -- including
+    mission_critical, where the other 4 stages (specification, plan, ac-to-tests,
+    minimal-code-to-green) MUST produce it, reproducing today's exact pre-Task-2 wiring (the
+    baseline mission_critical exists to preserve).
+
+    Calls the real wired route() closures via builder.branches[...].path.invoke(state) -- not a
+    re-typed copy of the mode->outcome formula -- so a regression in the actual _wire_stage/
+    make_route_after_draft code is what this would catch, not just a restatement of it.
+    """
+    builder = build_graph()
+    modes: tuple[Literal["yolo", "draft_verify", "mission_critical"], ...] = (
+        "yolo",
+        "draft_verify",
+        "mission_critical",
+    )
+
+    for stage_spec in STAGES:
+        draft_name = f"{stage_spec.key}_draft"
+        has_audit = stage_spec.audit_response_schema is not None
+        has_verify = stage_spec.deterministic_verify is not None
+        audit_name = f"{stage_spec.key}_audit"
+        verify_name = f"{stage_spec.key}_verify"
+        gate_name = f"{stage_spec.key}_gate"
+
+        (draft_branch,) = builder.branches[draft_name].values()
+        ends = draft_branch.ends
+        # Strongest form of "never produce gate_audit": a no-audit stage's map doesn't even offer
+        # it as a reachable key, so there is no edge for route() to send that outcome down.
+        if not has_audit:
+            assert "gate_audit" not in ends, (
+                f"{stage_spec.key}: has no audit_response_schema but draft's conditional edges "
+                f"still map 'gate_audit' -> {ends.get('gate_audit')!r}"
+            )
+
+        for mode in modes:
+            ready_state = {
+                "stages": {stage_spec.key: {**default_stage_state(), "readiness": True}},
+                "code_gen_mode": mode,
+            }
+            outcome = draft_branch.path.invoke(ready_state)  # type: ignore[arg-type]
+            audit_enabled = mode == "mission_critical"
+            verify_enabled = mode in ("draft_verify", "mission_critical")
+            if has_audit and audit_enabled:
+                expected_outcome, expected_target = "gate_audit", audit_name
+            elif has_verify and verify_enabled:
+                expected_outcome, expected_target = "gate_verify", verify_name
+            else:
+                expected_outcome, expected_target = "gate_direct", gate_name
+            assert outcome == expected_outcome, (
+                f"{stage_spec.key}/{mode}: draft route() returned {outcome!r}, expected "
+                f"{expected_outcome!r}"
+            )
+            assert ends[outcome] == expected_target, (
+                f"{stage_spec.key}/{mode}: {outcome!r} edge points at {ends[outcome]!r}, "
+                f"expected {expected_target!r}"
+            )
+
+        # Audit node's own outgoing edge (only wired for the 4 audit-bearing stages) -- reachable
+        # only when mode == "mission_critical" (the only mode "gate_audit" is ever produced for,
+        # confirmed above), where every one of those 4 stages also has deterministic_verify
+        # (checked here directly, not assumed) -- so it must route to verify_name, never straight
+        # to the gate.
+        if has_audit:
+            (audit_branch,) = builder.branches[audit_name].values()
+            mc_state = {
+                "stages": {stage_spec.key: {**default_stage_state(), "readiness": True}},
+                "code_gen_mode": "mission_critical",
+            }
+            audit_outcome = audit_branch.path.invoke(mc_state)  # type: ignore[arg-type]
+            expected_audit_target = verify_name if has_verify else gate_name
+            assert audit_branch.ends[audit_outcome] == expected_audit_target, (
+                f"{stage_spec.key}: audit node's outgoing edge in mission_critical routes to "
+                f"{audit_branch.ends[audit_outcome]!r}, expected {expected_audit_target!r}"
+            )
+
+    print("code_gen_mode routing self-check: all assertions passed")
 
 
 def _demo() -> None:
@@ -7281,6 +7426,7 @@ def _demo() -> None:
     _demo_open_audit_findings()
     _demo_targeted_fix_stuck_decision()
     _demo_reset_e2e_lever()
+    _demo_code_gen_mode_routing()
 
     print("graph self-check: all assertions passed")
 
