@@ -656,6 +656,99 @@ def _with_timeout(command: str, timeout_seconds: int | None) -> str:
     return f"timeout {timeout_seconds} sh -c {shlex.quote(command)}" if timeout_seconds else command
 
 
+def resolve_coverage_command(tech_stack: dict[str, Any]) -> tuple[str, str] | None:
+    """(ac_coverage_gate.resolve_test_command()'s resolved base command, coverage artifact format)
+    for a stack shape this module can deterministically augment with a coverage flag and locate the
+    resulting report -- `"cobertura"` (dotnet via coverlet) or `"istanbul-json-summary"`
+    (vitest/jest's json-summary reporter), the only two formats `_parse_cobertura_counts`/
+    `_parse_istanbul_counts` read -- else `None`.
+
+    Final-review gap-closure (Task 6 requirement 1 named this file's coverage-run site as one of
+    4 test-command call sites to wire; it was never actually done). Mirrors
+    `ac_coverage_gate.resolve_test_report_format`'s own exclusions exactly and for the identical
+    reasons: no detected stack, mocha (no coverage reporter this pipeline parses), python/pytest
+    (coverage.py's own report format isn't one of the two names above either), and the ambiguous
+    "vitest-or-jest" `||`-joined fallback (augmenting either half with a coverage flag would
+    silently drop the other).
+    """
+    from .ac_coverage_gate import resolve_test_command  # local: avoids import at module load, same precedent as rebuild.py's own ac_coverage_gate import
+
+    command = resolve_test_command(tech_stack)
+    if not command or " || " in command:
+        return None
+    if "dotnet test" in command:
+        return command, "cobertura"
+    if "vitest run" in command or ("jest" in command and "vitest" not in command):
+        return command, "istanbul-json-summary"
+    return None
+
+
+def with_coverage_reporter(command: str, fmt: str, output_dir: str) -> str:
+    """`command` (`resolve_coverage_command()`'s base command) augmented with the SAME coverage
+    flags `prompts/coverage_run.md` already instructs a discovery agent to use itself, writing into
+    `output_dir` (repo-relative), regardless of any `cd` prefix baked into `command` by
+    `dotnet_root_prefix`/`ecosystem_root_prefix` for a monorepo -- same `REPO_ROOT="$(pwd)"`
+    anchoring trick as `ac_coverage_gate.with_test_reporter`, captured before any such `cd`.
+
+    Does NOT pass a "skip the build" flag, per the prompt's own explicit instruction (a fresh build
+    is what makes the coverage report describe the code that's actually on disk right now).
+    """
+    if fmt == "cobertura":
+        # coverlet.collector (via dotnet test --collect) is the sandbox-supported route (see
+        # coverage_run.md); --results-directory sets the PARENT dir, coverlet still nests a
+        # run-specific GUID folder under it, which run_resolved_coverage_command globs for below.
+        flag = f'--collect:"XPlat Code Coverage" --results-directory "$REPO_ROOT/{output_dir}"'
+    elif "vitest run" in command:
+        flag = f'--coverage --coverage.reporter=json-summary --coverage.reportsDirectory="$REPO_ROOT/{output_dir}"'
+    else:  # jest
+        flag = f'--coverage --coverageReporters=json-summary --coverageDirectory="$REPO_ROOT/{output_dir}"'
+    return f'REPO_ROOT="$(pwd)"; {command} {flag}'
+
+
+async def run_resolved_coverage_command(
+    provider: SandboxProvider, thread_id: str, tech_stack: dict[str, Any], *, output_dir_base: str,
+) -> "list[CoverageEntry] | None":
+    """Deterministic SECOND choice, after contract replay and before any LLM discovery turn
+    (final-review gap-closure): run `resolve_coverage_command()`'s answer directly and locate the
+    resulting artifact, producing an entry shaped exactly like a real discovery turn's -- so the
+    caller's freshness/parse loop runs completely unchanged regardless of which path produced it.
+    Mirrors `ac_coverage_gate.run_resolved_test_command`'s contract exactly: returns `None` --
+    never a fabricated entry -- for anything this resolver isn't confident about, and the caller
+    MUST fall through to its existing LLM discovery turn in every such case.
+
+    The dotnet/cobertura case is the one genuine deviation from that mirrored shape: coverlet's
+    collector nests a run-specific GUID folder under `--results-directory` rather than writing a
+    predictable filename the way `with_test_reporter`'s trx/vitest-json flags do, so the artifact
+    path can only be known by globbing AFTER the run. Zero or more than one match is a shape this
+    resolver isn't confident about (a multi-test-project solution producing several reports, or a
+    run that produced nothing) and returns `None` rather than guessing which one is right --
+    the same "never decide zero-outcomes for the caller" contract as the mirrored function.
+    """
+    resolved = resolve_coverage_command(tech_stack)
+    if resolved is None:
+        return None
+    base_command, fmt = resolved
+    output_dir = f"{output_dir_base}-{'cobertura' if fmt == 'cobertura' else 'istanbul'}"
+    await provider.exec_in_sandbox(thread_id, f"rm -rf {shlex.quote(output_dir)}; mkdir -p {shlex.quote(output_dir)}")
+    await provider.exec_in_sandbox(
+        thread_id, _with_timeout(with_coverage_reporter(base_command, fmt, output_dir), _REPLAY_TIMEOUT_SECONDS)
+    )
+    if fmt == "cobertura":
+        find_result = await provider.exec_in_sandbox(
+            thread_id, f"find {shlex.quote(output_dir)} -name coverage.cobertura.xml"
+        )
+        candidates = [line.strip() for line in (find_result.stdout or "").splitlines() if line.strip()]
+        if len(candidates) != 1:
+            return None
+        artifact = candidates[0]
+    else:
+        artifact = f"{output_dir}/coverage-summary.json"
+    raw = await repo_files.read_repo_file(provider, thread_id, artifact)
+    if not raw:
+        return None
+    return [CoverageEntry(root="", command=base_command, artifact=artifact, format=fmt)]
+
+
 async def _run_coverage_via_ghcp(
     provider: SandboxProvider, thread_id: str, *, chat_provider: str, run_id: str = "unknown", lap: int = 0
 ) -> tuple[float | None, float | None, list[CoverageGap], str, list[dict[str, Any]]]:
@@ -721,6 +814,16 @@ async def _run_coverage_via_ghcp(
         return list(report.entries)
 
     if not entries:
+        # Deterministic second choice (final-review gap-closure, Task 6 requirement 1): only when
+        # this repo has no coverage-commands.json contract yet does resolve_coverage_command() get
+        # a turn -- a resolved command that produces nothing usable returns None here, same "never
+        # decide zero-outcomes for the caller" contract as ac_coverage_gate.run_resolved_test_command,
+        # and _discover() below is what actually pays for an LLM turn in that case.
+        tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)
+        entries = await run_resolved_coverage_command(
+            provider, thread_id, tech_stack, output_dir_base="agent-work/coverage-resolved",
+        ) or []
+    if not entries:
         entries = await _discover()
     if not entries:
         return None, None, [], REASON_RUNNER_ERROR, [{"error": "no coverage entries reported"}]
@@ -769,11 +872,18 @@ async def _run_coverage_via_ghcp(
 
     if not merged and replay_runs:
         # The replayed contract produced nothing usable -- the tree may have changed shape since it
-        # was written. One model-driven re-discovery, handed the replay's own errors.
+        # was written. Deterministic second choice first (final-review gap-closure, same as the
+        # no-contract-at-all path above), then a model-driven re-discovery, handed the replay's own
+        # errors, only if the resolver has no answer for this stack either.
         logger.warning("repo_scan coverage: contract replay produced no usable artifact -- re-discovering")
         replay_errors = "; ".join(str(d.get("error")) for d in entry_reports if d.get("error"))
         failure_detail = f"Contract replay failed: {failure_detail}. Artifact errors: {replay_errors}"
-        entries = await _discover()
+        tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)
+        entries = await run_resolved_coverage_command(
+            provider, thread_id, tech_stack, output_dir_base="agent-work/coverage-resolved-restale",
+        ) or []
+        if not entries:
+            entries = await _discover()
         replay_runs = []
         merged, entry_reports = [], []
         for entry in entries[:config.TEST_COVERAGE_CONTRACT_ENTRIES_MAX]:
@@ -1700,6 +1810,121 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert len(runs) == 2 and runs[0]["exit_code"] == 0, runs
     assert prov.commands[0].startswith("rm -f apps/api.Tests/TestResults/coverage.cobertura.xml; cd . && timeout"), prov.commands[0]
     assert "cd apps/web && timeout" in prov.commands[1] and "npx vitest run --coverage" in prov.commands[1], prov.commands[1]
+
+    # resolve_coverage_command/with_coverage_reporter/run_resolved_coverage_command (final-review
+    # gap-closure, Task 6 requirement 1's 4th, previously-unwired test-command site): mirrors
+    # ac_coverage_gate.py's own resolve_test_report_format/with_test_reporter/run_resolved_test_command
+    # self-check shape exactly.
+    def _ts(**overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "summary": "s",
+            "languages": {"status": "absent", "reason": "test fixture"},
+            "frameworks": {"status": "absent", "reason": "test fixture"},
+            "package_managers": {"status": "absent", "reason": "test fixture"},
+            "testing_frameworks": {"status": "absent", "reason": "test fixture"},
+            "conventions": {"status": "absent", "reason": "test fixture"},
+            "dotnet": {"status": "not_detected", "reason": "test fixture"},
+            "convention_roots": [],
+            "conventions_applied": [],
+            "auth_kind": "none",
+            "config_inventory": {"status": "absent", "reason": "test fixture"},
+        }
+        return {**base, **overrides}
+
+    assert resolve_coverage_command(_ts()) is None, "no detected stack -- no answer"
+    dotnet_ts = _ts(dotnet={"status": "detected", "reason": "test fixture"})
+    dotnet_resolved = resolve_coverage_command(dotnet_ts)
+    assert dotnet_resolved is not None and dotnet_resolved[1] == "cobertura", dotnet_resolved
+    assert dotnet_resolved[0] == "dotnet test --logger 'console;verbosity=normal'", dotnet_resolved
+    vitest_ts = _ts(
+        languages={"status": "present", "values": ["TypeScript"]},
+        testing_frameworks={"status": "present", "values": ["vitest"]},
+    )
+    vitest_resolved = resolve_coverage_command(vitest_ts)
+    assert vitest_resolved is not None and vitest_resolved[1] == "istanbul-json-summary", vitest_resolved
+    mocha_ts = _ts(
+        languages={"status": "present", "values": ["JavaScript"]},
+        testing_frameworks={"status": "present", "values": ["mocha"]},
+    )
+    assert resolve_coverage_command(mocha_ts) is None, "mocha has no coverage reporter this pipeline parses"
+    ambiguous_ts = _ts(languages={"status": "present", "values": ["TypeScript"]})
+    assert resolve_coverage_command(ambiguous_ts) is None, "ambiguous vitest-or-jest || fallback must not resolve"
+    python_ts = _ts(languages={"status": "present", "values": ["Python"]})
+    assert resolve_coverage_command(python_ts) is None, "coverage.py's own format isn't cobertura/istanbul"
+
+    dotnet_augmented = with_coverage_reporter(*dotnet_resolved, "agent-work/x-cobertura")
+    assert dotnet_augmented == (
+        'REPO_ROOT="$(pwd)"; dotnet test --logger \'console;verbosity=normal\' '
+        '--collect:"XPlat Code Coverage" --results-directory "$REPO_ROOT/agent-work/x-cobertura"'
+    ), dotnet_augmented
+    vitest_augmented = with_coverage_reporter(*vitest_resolved, "agent-work/x-istanbul")
+    assert vitest_augmented == (
+        'REPO_ROOT="$(pwd)"; npx --yes vitest run --reporter=verbose '
+        '--coverage --coverage.reporter=json-summary --coverage.reportsDirectory="$REPO_ROOT/agent-work/x-istanbul"'
+    ), vitest_augmented
+
+    class _CovRes:
+        def __init__(self, stdout: str = "", ok: bool = True) -> None:
+            self.returncode, self.stdout, self.stderr, self.ok = 0 if ok else 1, stdout, "", ok
+
+    class _CovProvider:
+        """Records every command; `files` seeds what `read_repo_file` (a `cat` exec) returns;
+        `find_output` seeds what the dotnet GUID-glob `find` command returns."""
+
+        def __init__(self, files: dict[str, str] | None = None, find_output: str = "") -> None:
+            self.files = dict(files or {})
+            self.find_output = find_output
+            self.commands: list[str] = []
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str) -> _CovRes:
+            self.commands.append(command)
+            if command.startswith("cat "):
+                path = command[len("cat "):].strip()
+                for candidate_path, content in self.files.items():
+                    if path == shlex.quote(candidate_path):
+                        return _CovRes(content) if content is not None else _CovRes(ok=False)
+                return _CovRes(ok=False)
+            if command.startswith("find "):
+                return _CovRes(self.find_output)
+            return _CovRes()
+
+    # Resolver answer, run produces a real artifact -> a synthesized [CoverageEntry], no discovery.
+    istanbul_summary = json.dumps({"total": {"lines": {"pct": 96}, "branches": {"pct": 100}}})
+    stub = _CovProvider(files={"agent-work/demo-cov-resolved-istanbul/coverage-summary.json": istanbul_summary})
+    resolved_entries = asyncio.run(run_resolved_coverage_command(
+        stub, "t", vitest_ts, output_dir_base="agent-work/demo-cov-resolved",
+    ))
+    assert resolved_entries is not None and len(resolved_entries) == 1
+    assert resolved_entries[0].format == "istanbul-json-summary"
+    assert resolved_entries[0].artifact == "agent-work/demo-cov-resolved-istanbul/coverage-summary.json"
+    assert any("--coverage.reporter=json-summary" in c for c in stub.commands), stub.commands
+
+    # No resolver answer at all -> None, never a fabricated entry.
+    assert asyncio.run(run_resolved_coverage_command(
+        _CovProvider(), "t", _ts(), output_dir_base="x",
+    )) is None
+
+    # Dotnet resolver answer, but the GUID-glob finds zero matches (run produced nothing, or the
+    # tool isn't installed) -> None, never guessed at -- the caller's _discover() fallback is what
+    # actually enforces "zero outcomes must trigger fresh discovery", same critical guard as
+    # ac_coverage_gate.run_resolved_test_command's own self-check documents.
+    assert asyncio.run(run_resolved_coverage_command(
+        _CovProvider(find_output=""), "t", dotnet_ts, output_dir_base="agent-work/never-found",
+    )) is None, "zero glob matches must not be treated as success"
+
+    # Dotnet resolver answer, but the GUID-glob finds MORE than one match (a multi-test-project
+    # solution) -> None, same "not confident about this shape" contract -- never guess which one.
+    assert asyncio.run(run_resolved_coverage_command(
+        _CovProvider(find_output="a/coverage.cobertura.xml\nb/coverage.cobertura.xml\n"),
+        "t", dotnet_ts, output_dir_base="agent-work/ambiguous-glob",
+    )) is None, "more than one glob match must not be treated as success"
+
+    # Dotnet resolver answer, exactly one glob match, but the artifact can't actually be read
+    # (race/permissions) -> None, never a fabricated entry.
+    assert asyncio.run(run_resolved_coverage_command(
+        _CovProvider(find_output="agent-work/never-read-cobertura/abc123/coverage.cobertura.xml\n"),
+        "t", dotnet_ts, output_dir_base="agent-work/never-read",
+    )) is None, "an unreadable artifact must not be treated as success"
 
     # Task 13b: MINIMAL_CODE_TO_GREEN_HARD_RULES -- one line per real rejection branch in
     # verify_coverage, with depth_shortfalls' 5 independently-triggered conditions unfolded (see
