@@ -20,16 +20,32 @@
 //   lap 1: a plan step id retired that was never a real ledger entry, ported from
 //   spec_ledger.py's `sync_plan_ledger`).
 //
-// Deliberately NOT ported at all, still hand-checked below (the "no ac_ids and not
-// kind='infrastructure'" structural check) or not checked here at all: the "every eligible AC must
-// be cited by SOME step" completeness sweep and the "already-delivered criteria only" carryover
-// check (gates/diagram_gate.py's own `check_plan_linkage`) -- both need `coded_run_id`/prior-step
-// state this hook would have to re-derive with real risk of getting a subtler rule wrong; the real
-// deterministic gate stays the authority for those two.
+// Task 12 (2026-09-30) ported the two checks the ABOVE paragraph used to leave un-ported, after
+// re-reading (not paraphrasing) that paragraph's own stated reason: "both need coded_run_id/
+// prior-step state this hook would have to re-derive with real risk of getting a subtler rule
+// wrong" -- a re-derivation/re-implementation-drift concern (the risk was always about this hook
+// having to independently RECOMPUTE that state in hand-ported JS, not about the state being stale
+// or unavailable at Stop time), which shelling out to the REAL Python function resolves exactly
+// the same way check_ac_id_citation/check_retired_step_ids already did above. So, now also ported,
+// both via `run_plan_linkage_checks`:
+// - COVERAGE-SIDE (`check_plan_step_coverage_and_rework`): every ELIGIBLE ac id (this ticket's own,
+//   live, never delivered by a healthy run) must be cited by >=1 step.
+// - REWORK-FORBIDDEN (same function): a NEW/CHANGED step (vs the prior approved plan, read from
+//   `PLAN_APPROVED_PATH` below) citing only already-delivered criteria is rework the pipeline
+//   forbids; verbatim carryovers are exempt.
+// Also added (plain misses, not deliberate exclusions -- confirmed pure-on-disk, no run_id needed):
+// - `check_dangling_visual_retirement`: a wireframe/user_flow diagram citing only retired ACs
+//   without being named retired itself.
+// - `check_removes_ids_validity` (+ its own run_id-gated demand half, `check_plan_removal_demand`,
+//   now wired via AIDW_RUN_ID/Task 5 -- see the removal side of `check_plan_linkage`'s own
+//   docstring in diagram_gate.py): removes_ids existence/retired-status validity.
+// - `check_plan_step_ids` (spec_ledger.py's `sync_plan_ledger`): the plan-step id-missing/
+//   id-collision guard.
 //
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as check-citation-drop-stop.mjs and
 // check-plan-schema-stop.mjs: no AIDW_-prefixed env var gates this -- steps.json's own existence
-// in the working directory is the entire scope check.
+// in the working directory is the entire scope check. AIDW_RUN_ID is read (Task 5) but only gates
+// the ONE removal-demand sub-check above, never this hook's own scope.
 import { readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
@@ -41,6 +57,7 @@ const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 const STEPS_PATH = ".ai-dev-workflow/plan/_draft/steps.json";
 const MANIFEST_PATH = ".ai-dev-workflow/plan/_draft/manifest.json";
 const SPECIFICATION_APPROVED_PATH = ".ai-dev-workflow/03-specification.approved.json";
+const PLAN_APPROVED_PATH = ".ai-dev-workflow/04-plan.approved.json";
 
 let input = {};
 try {
@@ -124,6 +141,20 @@ const wireframesForLinkageCheck = Array.isArray(manifestDoc?.wireframes) ? manif
 const planStepsForLinkageCheck = Array.isArray(stepsDoc?.plan_steps) ? stepsDoc.plan_steps : [];
 const diagramsForCitationCheck = Array.isArray(manifestDoc?.diagrams) ? manifestDoc.diagrams : [];
 const retiredStepIdsForCitationCheck = Array.isArray(stepsDoc?.retired_step_ids) ? stepsDoc.retired_step_ids : [];
+
+// Task 12's own additions -- retired_wireframe_screens/retired_diagram_names (already on
+// manifestDoc, just not read by this hook until now) for check_dangling_visual_retirement; the
+// PRIOR approved plan's own steps (absent on a first-ever plan -- no prior approval exists yet,
+// same defensive `undefined` handling as specDoc below) for check_plan_step_coverage_and_rework's
+// rework-forbidden carryover comparison; AIDW_RUN_ID (Task 5) for the removal-side demand
+// direction only (`run_id: null` skips just that one sub-check, same contract
+// diagram_gate.check_plan_linkage's own `run_id=None` already has).
+const retiredWireframeScreens = Array.isArray(manifestDoc?.retired_wireframe_screens) ? manifestDoc.retired_wireframe_screens : [];
+const retiredDiagramNames = Array.isArray(manifestDoc?.retired_diagram_names) ? manifestDoc.retired_diagram_names : [];
+const priorPlanDoc = readJson(PLAN_APPROVED_PATH);
+const priorPlanSteps = Array.isArray(priorPlanDoc?.plan_steps) ? priorPlanDoc.plan_steps : [];
+const runId = process.env.AIDW_RUN_ID || null;
+
 let checkResult;
 try {
   const proc = spawnSync(
@@ -137,6 +168,11 @@ try {
         plan_steps: planStepsForLinkageCheck,
         diagrams: diagramsForCitationCheck,
         retired_step_ids: retiredStepIdsForCitationCheck,
+        retired_wireframe_screens: retiredWireframeScreens,
+        retired_diagram_names: retiredDiagramNames,
+        specification: specDoc || null,
+        prior_plan_steps: priorPlanSteps,
+        run_id: runId,
       }),
       encoding: "utf8",
       timeout: 20000,
@@ -162,6 +198,12 @@ if (checkResult) {
     problems.push(...(checkResult.step_ac_id_problems || []));
     problems.push(...(checkResult.diagram_ac_id_problems || []));
     problems.push(...(checkResult.retired_step_id_problems || []));
+    // Task 12: all four also need a real ledger to mean anything (retired-AC lookups, coded_run_id
+    // delivery stamps, id-collision detection) -- same greenfield leniency as the four above.
+    problems.push(...(checkResult.dangling_visual_retirement_problems || []));
+    problems.push(...(checkResult.removes_ids_problems || []));
+    problems.push(...(checkResult.plan_step_coverage_rework_problems || []));
+    problems.push(...(checkResult.plan_step_id_problems || []));
   }
   problems.push(...(checkResult.wireframe_has_ac_ids || []));
   problems.push(...(checkResult.ui_wireframe_coverage || []));

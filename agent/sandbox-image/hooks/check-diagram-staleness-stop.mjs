@@ -35,19 +35,36 @@
 // (check-citation-drop-stop.mjs's own SUSPICIOUS_UNCITED_COUNT threshold exists for the identical
 // reason: cheap same-turn nudges are allowed to be imprecise, the deterministic gate stays exact).
 //
+// Task 12 (2026-09-30) ADDED the PER-ITEM (user_flow diagram/wireframe) half below, using AIDW_
+// RUN_ID (Task 5) -- previously graph-side only because a Stop hook had no way to know what
+// run_id string to compare the ledger's own first_seen_run_id/last_revised_run_id stamps against.
+// That specific blocker is what Task 5 resolves; it does NOT resolve the OTHER, separate blocker
+// documented above (diagrams_reviewed/wireframes_reviewed living only in the model's own final
+// structured response) -- so the per-item half below still cannot check that field directly, any
+// more than the blanket half above can. It reuses this file's OWN existing git-ancestry proxy
+// instead (lastCommitHash/isAtOrBefore, already established above), now precisely SCOPED to
+// user_flow diagrams/wireframes whose own ac_ids intersect the real (not proxied) trigger set --
+// `reopened_or_changed_ac_ids`, shelled out to gates/wireframe_linkage_checks.py (byte-identical
+// staged copy at /opt/aidw-hooks/wireframe_linkage_checks.py) -- rather than inventing a second,
+// new transcript-parsing mechanism.
+//
 // PROVIDER- AND STAGE-AGNOSTIC BY CONSTRUCTION, same reasoning as this image's other file-only
 // hooks: no AIDW_-prefixed env var gates this -- manifest.json's own existence, and git itself
 // being available (this pipeline's whole model is a git checkout), is the entire scope check.
+// AIDW_RUN_ID is read (Task 5) but only gates the per-item half below; its absence never disables
+// the blanket half above.
 import { readFileSync, existsSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { reportFailOpen } from "./lib/report-fail-open.mjs";
 
 const HOOK_NAME = "check-diagram-staleness-stop";
 const stage = process.env.AIDW_STAGE || "unknown";
 
 const SPECIFICATION_APPROVED_PATH = ".ai-dev-workflow/03-specification.approved.json";
+const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 const MANIFEST_PATH = ".ai-dev-workflow/plan/_draft/manifest.json";
 const DRAFT_DIAGRAMS_DIR = ".ai-dev-workflow/plan/_draft/diagrams";
+const DRAFT_WIREFRAMES_DIR = ".ai-dev-workflow/plan/_draft/wireframes";
 
 /** The hash of the most recent commit touching `relPath`, or null if it has never been committed
  * (a brand-new file this ticket, or git itself unavailable/failed). Never throws. */
@@ -95,6 +112,19 @@ if (input.stop_hook_active) process.exit(0);
 
 const cwd = input.cwd || ".";
 
+/** Task 12's own addition -- same "not this stage's turn" (undefined) vs "present but unreadable"
+ * (fail-open) contract as check-plan-citations-stop.mjs's own `readJson`. */
+function readJson(relPath) {
+  const path = `${cwd}/${relPath}`;
+  if (!existsSync(path)) return undefined;
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    reportFailOpen(HOOK_NAME, stage, `unreadable or invalid JSON: ${relPath}`, cwd);
+    return undefined;
+  }
+}
+
 const manifestPath = `${cwd}/${MANIFEST_PATH}`;
 if (!existsSync(manifestPath)) process.exit(0); // not this stage's turn, or file not written yet
 
@@ -108,27 +138,91 @@ try {
 }
 
 const diagrams = Array.isArray(manifestDoc?.diagrams) ? manifestDoc.diagrams : [];
+const wireframes = Array.isArray(manifestDoc?.wireframes) ? manifestDoc.wireframes : [];
 const staleTargets = diagrams.filter((d) => d?.kind === "er" || d?.kind === "architecture");
-if (staleTargets.length === 0) process.exit(0);
 
 const specCommit = lastCommitHash(cwd, SPECIFICATION_APPROVED_PATH);
-if (specCommit === null) process.exit(0); // spec never committed (or git unavailable) -- nothing to compare against
 
 const staleNames = [];
-for (const d of staleTargets) {
-  if (typeof d.name !== "string") continue; // malformed entry -- the schema hook's problem to report, not this one's
-  const diagramCommit = lastCommitHash(cwd, `${DRAFT_DIAGRAMS_DIR}/${d.name}.mmd`);
-  if (diagramCommit === null) continue; // brand new this ticket -- can't be stale by definition
-  if (isAtOrBefore(cwd, diagramCommit, specCommit)) staleNames.push(d.name);
+if (staleTargets.length > 0 && specCommit !== null) {
+  for (const d of staleTargets) {
+    if (typeof d.name !== "string") continue; // malformed entry -- the schema hook's problem to report, not this one's
+    const diagramCommit = lastCommitHash(cwd, `${DRAFT_DIAGRAMS_DIR}/${d.name}.mmd`);
+    if (diagramCommit === null) continue; // brand new this ticket -- can't be stale by definition
+    if (isAtOrBefore(cwd, diagramCommit, specCommit)) staleNames.push(d.name);
+  }
 }
 
-if (staleNames.length === 0) process.exit(0);
+// Task 12's own PER-ITEM half (user_flow diagrams + wireframes) -- see this file's own header for
+// why it reuses the SAME git-ancestry proxy above rather than checking diagrams_reviewed/
+// wireframes_reviewed directly. Gated on AIDW_RUN_ID actually being set: without a real run_id,
+// `reopened_or_changed_ac_ids` has nothing meaningful to compare the ledger's own
+// first_seen_run_id/last_revised_run_id stamps against.
+const staleWireframeScreens = [];
+const runId = process.env.AIDW_RUN_ID || null;
+if (runId && specCommit !== null) {
+  const ledgerDoc = readJson(LEDGER_PATH);
+  const ledgerEntries = Array.isArray(ledgerDoc?.entries) ? ledgerDoc.entries : [];
+  const specDoc = readJson(SPECIFICATION_APPROVED_PATH);
+  const bugAffectedAcIds = Array.isArray(specDoc?.bug_affected_ac_ids) ? specDoc.bug_affected_ac_ids : [];
 
+  let triggerAcIds = [];
+  try {
+    const proc = spawnSync(
+      "python3",
+      ["/opt/aidw-hooks/wireframe_linkage_checks.py", "--check-hook"],
+      {
+        input: JSON.stringify({ ledger_entries: ledgerEntries, run_id: runId, bug_affected_ac_ids: bugAffectedAcIds }),
+        encoding: "utf8",
+        timeout: 20000,
+      },
+    );
+    if (proc.status === 0 && proc.stdout) {
+      triggerAcIds = JSON.parse(proc.stdout).reopened_or_changed_ac_ids || [];
+    } else {
+      reportFailOpen(HOOK_NAME, stage, "wireframe_linkage_checks.py subprocess failed, timed out, or produced no output", cwd);
+    }
+  } catch {
+    reportFailOpen(HOOK_NAME, stage, "wireframe_linkage_checks.py subprocess failed, timed out, or returned unparsable output", cwd);
+  }
+  const triggerSet = new Set(triggerAcIds);
+
+  if (triggerSet.size > 0) {
+    const userFlowDiagrams = diagrams.filter((d) => d?.kind === "user_flow");
+    for (const d of userFlowDiagrams) {
+      if (typeof d.name !== "string" || staleNames.includes(d.name)) continue;
+      if (!(d.ac_ids || []).some((a) => triggerSet.has(a))) continue;
+      const diagramCommit = lastCommitHash(cwd, `${DRAFT_DIAGRAMS_DIR}/${d.name}.mmd`);
+      if (diagramCommit === null) continue; // brand new this ticket -- can't be stale by definition
+      if (isAtOrBefore(cwd, diagramCommit, specCommit)) staleNames.push(d.name);
+    }
+    for (const wf of wireframes) {
+      if (typeof wf?.screen !== "string") continue;
+      if (!(wf.ac_ids || []).some((a) => triggerSet.has(a))) continue;
+      const wireframeCommit = lastCommitHash(cwd, `${DRAFT_WIREFRAMES_DIR}/${wf.screen}.html`);
+      if (wireframeCommit === null) continue; // brand new this ticket -- can't be stale by definition
+      if (isAtOrBefore(cwd, wireframeCommit, specCommit)) staleWireframeScreens.push(wf.screen);
+    }
+  }
+}
+
+if (staleNames.length === 0 && staleWireframeScreens.length === 0) process.exit(0);
+
+const lines = [];
+if (staleNames.length > 0) {
+  lines.push(
+    ...staleNames.map((n) => `- diagram ${n}`),
+  );
+}
+if (staleWireframeScreens.length > 0) {
+  lines.push(...staleWireframeScreens.map((s) => `- wireframe ${s}`));
+}
 process.stderr.write(
-  "The approved specification was committed more recently than these er/architecture diagram(s) " +
-    "-- confirm each one is still accurate or revise it, and record your decision (action: " +
-    "'revised' or 'confirmed_current') in diagrams_reviewed before finishing this turn:\n" +
-    staleNames.map((n) => `- ${n}`).join("\n") +
+  "The approved specification was committed more recently than these diagram(s)/wireframe(s) (or " +
+    "they cite a criterion that changed this run) -- confirm each one is still accurate or revise " +
+    "it, and record your decision (action: 'revised' or 'confirmed_current') in " +
+    "diagrams_reviewed/wireframes_reviewed before finishing this turn:\n" +
+    lines.join("\n") +
     "\n",
 );
 process.exit(2);
