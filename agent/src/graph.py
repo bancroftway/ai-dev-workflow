@@ -22,7 +22,7 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -61,6 +61,7 @@ from . import telemetry
 from . import workflow_persistence
 from .custom_agent_loader import load_agent_for_stage
 from .gates import adversarial_gate, remediation_gate, skill_gate
+from .gates.checks import Gate, resolve_code_gen_mode
 from .gates.ac_coverage_gate import MAX_TEST_BODY_SIMILARITY
 from .gates.diagram_gate import (
     DRAFT_DIAGRAMS_DIR,
@@ -1999,35 +2000,11 @@ class StageSpec:
     Called with the stage's approved content, after persistence, and must be idempotent -- it runs
     on every single run, including pure no-op re-runs."""
 
-    deterministic_verify: (
-        Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int, bool], Awaitable[VerificationResult]] | None
-    ) = None
-    """A routing-capable check (thread_id, revised content dict, run_id, baseline_commit,
-    provider, chat_provider, lap, audit_ran_this_lap) -> VerificationResult, inserted between audit
-    and gate when set. `audit_ran_this_lap` is _code_gen_mode_flags' audit_enabled for this session:
-    False means the mode skipped audit this lap, so specification/plan's audit-transcript evidence
-    check must fail open rather than report a missing transcript as an infra fault. Every other
-    implementation accepts-and-ignores it.
-    `lap` (session-poisoning fix) is this stage's own verify_cycle_count -- the two implementations
-    that dispatch into stack_runner.run_and_report (verify_ac_to_tests, verify_coverage) thread it
-    straight through as run_and_report's own `lap` kwarg, the same fresh-session-per-lap fix
-    graph.py's draft/audit/fix nodes already apply. Every other implementation accepts-and-ignores
-    it, same as they already do for baseline_commit when it isn't relevant.
-    baseline_commit is the value StageSpec.capture_baseline_commit stored on this stage's
-    StageState (None if that flag is unset) -- write_scope_gate.py's write-scope check is the
-    reason this exists; ledger-/diagram-style checks that don't need it just ignore the argument.
-    `chat_provider` (added by Ruling 4/Task 5 fix round 2, docs/superpowers/plans/
-    part-4-org-settings-tasks.md) is this run's own pinned `state["provider"]` ("claude"/"copilot"),
-    threaded through because two real implementations (write_scope_gate.verify_ac_to_tests,
-    test_coverage_gate.verify_coverage) call into stack_runner.run_and_report, which now requires
-    it (Ruling 4) -- named distinctly from `provider` (the pre-existing SandboxProvider connection
-    object every implementation already takes) to avoid colliding with it, same disambiguation
-    chat_model.read_skill_invocations uses. Every OTHER implementation (ledger sync, diagram
-    render, remediation, adversarial-compliance, exit readiness) has no dispatch call of its own
-    and simply accepts-and-ignores this argument, the same way they already ignore baseline_commit
-    when it isn't relevant. Never LLM self-attestation -- a real script/parse. Failing routes back
-    to draft (with VerificationResult.feedback as context) up to max_verify_cycles, then to a
-    human-interrupt escalation node -- never auto-approved past a failed deterministic gate."""
+    gate: Gate | None = None
+    """This stage's deterministic verify, its declared checks and its per-code_gen_mode policy
+    (gates/checks.py). None = no verify at all (tech-stack, for now). Read the verify function
+    through the `deterministic_verify` property below, so an after_submit gate is never wired
+    as a pre-review verify node."""
 
     max_verify_cycles: Callable[[], int] = lambda: 3  # noqa: E731
     """Safety cap for the verify->draft retry loop, independent of max_cycles (the LLM's own
@@ -2138,6 +2115,47 @@ class StageSpec:
     enforces, spelled out for the model up front instead of only discovered after a rejection.
     None (the default) is zero behavior change; Tasks 7/8/13 wire real per-stage rules in."""
 
+    label: str = field(kw_only=True)
+    description: str = field(default="", kw_only=True)
+    """Human-facing name and one-liner, served to the frontend by pipeline_layout.PIPELINE."""
+
+    def __post_init__(self) -> None:
+        if self.gate is not None:
+            self.gate.stage_key = self.key
+
+    @property
+    def deterministic_verify(
+        self,
+    ) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int, bool], Awaitable[VerificationResult]] | None:
+        """A routing-capable check (thread_id, revised content dict, run_id, baseline_commit,
+        provider, chat_provider, lap, audit_ran_this_lap) -> VerificationResult, inserted between
+        audit and gate when set: this stage's gate.verify for a before_review gate, else None.
+        `audit_ran_this_lap` is _audit_enabled(state) for this session: False means the mode
+        skipped audit this lap, so specification/plan's audit-transcript evidence check must fail open rather than report a missing transcript as an infra fault. Every other
+        implementation accepts-and-ignores it.
+        `lap` (session-poisoning fix) is this stage's own verify_cycle_count -- the two implementations
+        that dispatch into stack_runner.run_and_report (verify_ac_to_tests, verify_coverage) thread it
+        straight through as run_and_report's own `lap` kwarg, the same fresh-session-per-lap fix
+        graph.py's draft/audit/fix nodes already apply. Every other implementation accepts-and-ignores
+        it, same as they already do for baseline_commit when it isn't relevant.
+        baseline_commit is the value StageSpec.capture_baseline_commit stored on this stage's
+        StageState (None if that flag is unset) -- write_scope_gate.py's write-scope check is the
+        reason this exists; ledger-/diagram-style checks that don't need it just ignore the argument.
+        `chat_provider` (added by Ruling 4/Task 5 fix round 2, docs/superpowers/plans/
+        part-4-org-settings-tasks.md) is this run's own pinned `state["provider"]` ("claude"/"copilot"),
+        threaded through because two real implementations (write_scope_gate.verify_ac_to_tests,
+        test_coverage_gate.verify_coverage) call into stack_runner.run_and_report, which now requires
+        it (Ruling 4) -- named distinctly from `provider` (the pre-existing SandboxProvider connection
+        object every implementation already takes) to avoid colliding with it, same disambiguation
+        chat_model.read_skill_invocations uses. Every OTHER implementation (ledger sync, diagram
+        render, remediation, adversarial-compliance, exit readiness) has no dispatch call of its own
+        and simply accepts-and-ignores this argument, the same way they already ignore baseline_commit
+        when it isn't relevant. Never LLM self-attestation -- a real script/parse. Failing routes back
+        to draft (with VerificationResult.feedback as context) up to max_verify_cycles, then to a
+        human-interrupt escalation node -- never auto-approved past a failed deterministic gate."""
+        gate = self.gate
+        return gate.verify if gate is not None and gate.timing == "before_review" else None
+
 
 def stages_missing_rules(stages: list[StageSpec]) -> list[str]:
     """Stage keys that have a deterministic_verify but no rules text arming the pass(es) that feed
@@ -2162,6 +2180,8 @@ def stages_missing_rules(stages: list[StageSpec]) -> list[str]:
 STAGES: list[StageSpec] = [
     StageSpec(
         key="tech-stack",
+        label="Tech Stack",
+        description="Detects or confirms the languages, package managers and test tooling every later stage builds on.",
         response_schema=TechStackDraftResponse,
         content_field="tech_stack",
         surface_tool_name="present_tech_stack",
@@ -2187,6 +2207,8 @@ STAGES: list[StageSpec] = [
     # Requirements tab, and exit's content hash keep working unchanged.
     StageSpec(
         key="specification",
+        label="Specification",
+        description="User stories and acceptance criteria drafted from the requirements.",
         response_schema=SpecificationDraftResponse,
         # File-based-editing plan, Part 1 sect. 2: content_field=None -- the response is
         # metadata-only now (story_changes/summary/skills_invoked); the actual Specification
@@ -2204,7 +2226,11 @@ STAGES: list[StageSpec] = [
         render_markdown=render_specification_markdown,
         draft_example=SPECIFICATION_DRAFT_EXAMPLE,
         audit_example=SPECIFICATION_AUDIT_EXAMPLE,
-        deterministic_verify=_verify_specification_ledger,
+        gate=Gate(
+            verify=_verify_specification_ledger,
+            policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=True,
+        ),
         # Task 13b: same rules text for both passes -- the audit overwrites stage["draft"] with
         # its revised_specification BEFORE this gate runs (graph.py's audit-then-verify
         # ordering), so one gate checks whichever pass produced the content, same mechanism
@@ -2243,6 +2269,8 @@ STAGES: list[StageSpec] = [
     ),
     StageSpec(
         key="plan",
+        label="Implementation Plan",
+        description="Implementation steps and architecture diagrams traced to the approved specification.",
         response_schema=PlanDraftResponse,
         # File-based-editing plan, Part 2 sect. 2: content_field=None -- same mechanism as
         # specification's redesign above. The actual plan content lives in
@@ -2259,7 +2287,11 @@ STAGES: list[StageSpec] = [
         draft_example=PLAN_DRAFT_EXAMPLE,
         audit_example=PLAN_AUDIT_EXAMPLE,
         sign_approval=True,
-        deterministic_verify=verify_plan_diagrams,
+        gate=Gate(
+            verify=verify_plan_diagrams,
+            policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=True,
+        ),
         # Task 13b: same rules text for both passes -- the audit overwrites stage["draft"] with
         # its revised_plan BEFORE this gate runs, same mechanism Task 8 confirmed for ac-to-tests.
         draft_rules="\n".join(f"- {r}" for r in PLAN_HARD_RULES),
@@ -2293,6 +2325,8 @@ STAGES: list[StageSpec] = [
     ),
     StageSpec(
         key="ac-to-tests",
+        label="Acceptance Criteria to Tests",
+        description="Failing tests written from the approved acceptance criteria.",
         response_schema=AcceptanceCriteriaTestsDraftResponse,
         content_field="test_suite",
         surface_tool_name="present_ac_to_tests",
@@ -2309,7 +2343,11 @@ STAGES: list[StageSpec] = [
         render_markdown=render_ac_to_tests_markdown,
         requires_human_gate=False,
         capture_baseline_commit=True,
-        deterministic_verify=verify_ac_to_tests,
+        gate=Gate(
+            verify=verify_ac_to_tests,
+            policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=False,
+        ),
         # Task 8: the same hard gates verify_ac_to_tests enforces, spelled out up front so the model
         # can avoid a rejection instead of only learning the rule from one. Threaded automatically
         # into the draft's ainvoke_structured call by make_draft_node's generic rules=stage_spec.
@@ -2409,6 +2447,8 @@ STAGES: list[StageSpec] = [
     ),
     StageSpec(
         key="minimal-code-to-green",
+        label="Minimal Code to Green",
+        description="The smallest implementation that makes those tests pass.",
         response_schema=MinimalCodeToGreenDraftResponse,
         content_field="iteration",
         surface_tool_name="present_minimal_code_to_green",
@@ -2421,7 +2461,11 @@ STAGES: list[StageSpec] = [
         render_markdown=render_minimal_code_to_green_markdown,
         draft_example=MINIMAL_CODE_TO_GREEN_DRAFT_EXAMPLE,
         audit_example=MINIMAL_CODE_TO_GREEN_AUDIT_EXAMPLE,
-        deterministic_verify=verify_coverage,
+        gate=Gate(
+            verify=verify_coverage,
+            policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=False,
+        ),
         # Task 13b: same rules text for both passes -- the audit overwrites stage["draft"] with
         # its revised_iteration BEFORE this gate runs, same mechanism Task 8 confirmed for
         # ac-to-tests. MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE (advisory, no gate backs it) rides
@@ -2470,6 +2514,8 @@ STAGES: list[StageSpec] = [
     ),
     StageSpec(
         key="remediation",
+        label="Remediation",
+        description="Fixes the quality and security findings the scanners reported.",
         response_schema=RemediationDraftResponse,
         content_field=None,  # the whole response is the report -- see _stage_content
         surface_tool_name="present_remediation",
@@ -2484,7 +2530,11 @@ STAGES: list[StageSpec] = [
         # not explain. capture_baseline_commit is what lets it diff the stage's own changes and
         # catch a scanner being silenced instead of a defect being fixed.
         capture_baseline_commit=True,
-        deterministic_verify=remediation_gate.verify_remediation,
+        gate=Gate(
+            verify=remediation_gate.verify_remediation,
+            policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=False,
+        ),
         # Task 13b: no audit_rules -- remediation has no audit pass (see StageSpec above).
         draft_rules="\n".join(f"- {r}" for r in remediation_gate.REMEDIATION_HARD_RULES),
         draft_prompt_context_from_repo_file=hydrate_remediation_ticket_mode_context,
@@ -2518,6 +2568,8 @@ STAGES: list[StageSpec] = [
     ),
     StageSpec(
         key="adversarial-compliance",
+        label="Adversarial Compliance",
+        description="Read-only audit of the built code against the approved specification and plan.",
         response_schema=AdversarialAuditDraftResponse,
         content_field="report",
         surface_tool_name="present_adversarial_compliance",
@@ -2534,7 +2586,11 @@ STAGES: list[StageSpec] = [
         session_options=lambda _state, _role: {
             "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
         },
-        deterministic_verify=adversarial_gate.verify_adversarial_compliance,
+        gate=Gate(
+            verify=adversarial_gate.verify_adversarial_compliance,
+            policy={"yolo": "off", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=False,
+        ),
         # Task 13b: no audit_rules -- adversarial-compliance has no audit pass of its own.
         draft_rules="\n".join(f"- {r}" for r in adversarial_gate.ADVERSARIAL_COMPLIANCE_HARD_RULES),
         # Tuning history/rationale lives on the constant itself (config.py's
@@ -2544,6 +2600,8 @@ STAGES: list[StageSpec] = [
     ),
     StageSpec(
         key="metrics-exit",
+        label="Metrics & Exit",
+        description="Health metrics and the signed merge-readiness verdict.",
         response_schema=ExitDraftResponse,
         content_field="report",
         surface_tool_name="present_exit",
@@ -2566,7 +2624,11 @@ STAGES: list[StageSpec] = [
         session_options=lambda _state, _role: {
             "available_tools": workflow_config.READ_ONLY_AVAILABLE_TOOLS
         },
-        deterministic_verify=exit_nodes.verify_exit_readiness,
+        gate=Gate(
+            verify=exit_nodes.verify_exit_readiness,
+            policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
+            persists=True,
+        ),
         # Task 13b: no audit_rules -- metrics-exit has no audit pass of its own.
         draft_rules="\n".join(f"- {r}" for r in exit_nodes.METRICS_EXIT_HARD_RULES),
         # Tuning history/rationale lives on the constant itself (config.py's EXIT_MAX_VERIFY_CYCLES).
@@ -4291,7 +4353,7 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         try:
             result = await stage_spec.deterministic_verify(
                 thread_id, stage["draft"] or {}, state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
-                state["provider"], stage.get("verify_cycle_count", 0), _code_gen_mode_flags(state)[0],
+                state["provider"], stage.get("verify_cycle_count", 0), _audit_enabled(state),
             )
         except Exception as exc:  # noqa: BLE001 -- convert to a routed infra verdict, never crash the node
             logger.exception("%s: deterministic_verify crashed", stage_spec.key)
@@ -4558,13 +4620,13 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
                 return "retry"
             return "escalate"
         if stage.get("verify_cycle_count", 0) < stage_spec.max_verify_cycles():
-            # YOLO still runs these stages' verify (for its persistence -- see
-            # _VERIFY_ALWAYS_RUNS_STAGE_KEYS) but keeps its "no deterministic check gates
-            # progression" promise: a content-level failure proceeds to the gate instead of
-            # redrafting. Infra/cannot_verify verdicts above are platform faults and stay unchanged.
-            if state.get("code_gen_mode") == "yolo" and stage_spec.key in _VERIFY_ALWAYS_RUNS_STAGE_KEYS:
+            # An advisory policy (e.g. spec/plan in YOLO, which still run verify for its
+            # persistence) keeps the "no deterministic check gates progression" promise: a
+            # content-level failure proceeds to the gate instead of redrafting. Infra/cannot_verify
+            # verdicts above are platform faults and route the same under every policy.
+            if _stage_verify_policy(state, stage_spec) == "advisory":
                 logger.warning(
-                    "%s: verify failed (%s) -- proceeding to gate anyway (YOLO mode, no redraft loop for this stage)",
+                    "%s: verify failed (%s) -- proceeding to gate anyway (advisory policy, no redraft loop for this stage)",
                     stage_spec.key,
                     " ".join((last.get("feedback") or "no feedback").split()),
                 )
@@ -4974,52 +5036,38 @@ def make_no_new_work_node(stage_spec: StageSpec) -> Callable[[GraphState, Runnab
     return no_new_work_node
 
 
-def _code_gen_mode_flags(state: GraphState) -> tuple[bool, bool]:
-    """Task 2 (Part 3, graph wiring): the one place `state["code_gen_mode"]` becomes the two
-    routing booleans every stage's audit/verify skip decision reads. `_wire_stage`'s two
-    conditional-edge decision points -- draft's outgoing edge (via make_route_after_draft below)
-    and the audit node's outgoing edge (built directly inside _wire_stage) -- both call this
-    instead of each re-deriving the mode->skip mapping on its own, so the two edges can never
-    drift out of sync with each other.
-
-    Default ("mission_critical" when code_gen_mode is absent) matches Task 1's own
-    _resolve_thread_code_gen_mode fallback exactly -- preserves today's exact behavior (audit AND
-    verify both always on) for any state that reaches routing without a resolved mode, which per
-    Task 1 should not normally happen but costs nothing to keep consistent.
-
-    Any OTHER unrecognized value (a bug upstream -- code_gen_mode is typed as a closed Literal, so
-    this should never happen either) is normalized to "mission_critical" too, same as the
-    missing-key case above -- Part 2.4's own rule is "never silently downgrade to a weaker mode
-    a caller never asked for," and an unrecognized value is exactly that: unknown intent, not a
-    signal to skip checks. Falling through to both-False (the earlier design here) got this
-    backwards -- it read "both True" as the risky direction, when for this system more
-    verification is always the safe direction and less is the one that needs an explicit,
-    validated request.
+def _audit_enabled(state: GraphState) -> bool:
+    """Task 2 (Part 3, graph wiring): whether this session's code_gen_mode runs the adversarial
+    audit leg -- mission_critical only. A missing or unrecognized mode resolves to
+    "mission_critical" (gates/checks.resolve_code_gen_mode, the same fallback as
+    _resolve_thread_code_gen_mode): for this system more verification is always the safe
+    direction, and less is the one that needs an explicit, validated request. Whether VERIFY runs
+    is per stage, not per mode -- see _stage_verify_policy.
     """
-    mode = state.get("code_gen_mode", "mission_critical")
-    if mode not in ("yolo", "draft_verify", "mission_critical"):
-        mode = "mission_critical"
-    audit_enabled = mode == "mission_critical"
-    verify_enabled = mode in ("draft_verify", "mission_critical")
-    return audit_enabled, verify_enabled
+    return resolve_code_gen_mode(state.get("code_gen_mode")) == "mission_critical"
 
 
-# Stages whose deterministic_verify is ALSO the only place required persistence happens, not just
-# a skippable check: specification's (and brownfield-spec's) ledger save + sketchpad write-back,
-# plan's (and brownfield-plan's) diagram render/commit + ledger save + content_dict["plan_steps"]
-# injection, metrics-exit's merge_ready/blocking_reasons correction. Their verify node runs in
-# EVERY code_gen_mode (never "gate_direct"); YOLO instead gets its "nothing gates progression"
-# promise from make_route_after_verify turning a content-level retry into "gate". Every other
-# verify-bearing stage (ac-to-tests, minimal-code-to-green, remediation, adversarial-compliance)
-# is a pure check with no persistence, so YOLO skipping it outright is the intended tradeoff.
-_VERIFY_ALWAYS_RUNS_STAGE_KEYS = frozenset(
-    {"specification", "plan", "metrics-exit", "brownfield-spec", "brownfield-plan"}
-)
+def _stage_verify_policy(state: GraphState, stage_spec: StageSpec) -> str:
+    """This stage's gate policy for the session's code_gen_mode ("off" when it has no pre-review
+    verify). The per-stage table lives on each StageSpec's Gate; what each value does:
+    - "off": make_route_after_draft (and the audit node's edge) skip verify entirely. Only for a
+      pure check with no persistence (ac-to-tests, minimal-code-to-green, remediation,
+      adversarial-compliance in yolo).
+    - "advisory": verify runs, but a content failure under max_verify_cycles proceeds to the gate
+      instead of redrafting (make_route_after_verify). Used where verify is ALSO the only place
+      required persistence happens (spec/plan ledger save, diagram commit, metrics-exit's
+      merge_ready correction), so it can never be "off" there (Gate.persists).
+    - "blocking": a content failure redrafts up to max_verify_cycles, then escalates.
+    Infra/cannot_verify/no_new_work and the at-cap escalation route identically for advisory and
+    blocking -- those are platform faults, not content verdicts.
+    """
+    if stage_spec.gate is None or stage_spec.deterministic_verify is None:
+        return "off"
+    return stage_spec.gate.policy_for(state.get("code_gen_mode"))
 
 
 def _stage_verify_enabled(state: GraphState, stage_spec: StageSpec) -> bool:
-    """_code_gen_mode_flags' verify_enabled, forced True for _VERIFY_ALWAYS_RUNS_STAGE_KEYS."""
-    return _code_gen_mode_flags(state)[1] or stage_spec.key in _VERIFY_ALWAYS_RUNS_STAGE_KEYS
+    return _stage_verify_policy(state, stage_spec) != "off"
 
 
 def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]:
@@ -5049,8 +5097,7 @@ def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]
             # as reachable keys when this stage_spec actually has that mechanism, so a stage
             # without one (e.g. remediation has no audit_response_schema) can never produce an
             # outcome with no corresponding edge.
-            audit_enabled, _verify_enabled = _code_gen_mode_flags(state)
-            if stage_spec.audit_response_schema is not None and audit_enabled:
+            if stage_spec.audit_response_schema is not None and _audit_enabled(state):
                 return "gate_audit"
             if stage_spec.deterministic_verify is not None and _stage_verify_enabled(state, stage_spec):
                 return "gate_verify"
@@ -5736,6 +5783,8 @@ _BROWNFIELD_SESSION_OPTIONS = lambda _state, _role: {  # noqa: E731
 
 BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
     key="brownfield-spec",
+    label="Baseline Specification",
+    description="Baseline specification reverse-engineered from the existing codebase.",
     response_schema=SpecificationDraftResponse,
     content_field=None,
     surface_tool_name="present_specification",
@@ -5744,7 +5793,11 @@ BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
     max_cycles=lambda: workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
     render_markdown=None,  # bespoke hook writes SPECIFICATION_MD_PATH directly -- see its own docstring
     draft_example=SPECIFICATION_DRAFT_EXAMPLE,
-    deterministic_verify=make_verify_specification_ledger("brownfield-spec", has_audit_role=False),
+    gate=Gate(
+        verify=make_verify_specification_ledger("brownfield-spec", has_audit_role=False),
+        policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
+        persists=True,
+    ),
     draft_rules="\n".join(f"- {r}" for r in SPECIFICATION_HARD_RULES),
     draft_prompt_context_from_repo_file=spec_ledger.hydrate_ticket_mode_context,
     post_approve_hook=_brownfield_spec_approve_hook,
@@ -5757,6 +5810,8 @@ BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
 
 BROWNFIELD_BASELINE_PLAN_STAGE = StageSpec(
     key="brownfield-plan",
+    label="Baseline Plan",
+    description="Baseline plan describing the existing codebase's structure.",
     response_schema=PlanDraftResponse,
     content_field=None,
     surface_tool_name="present_plan",
@@ -5765,7 +5820,11 @@ BROWNFIELD_BASELINE_PLAN_STAGE = StageSpec(
     max_cycles=lambda: workflow_config.PLAN_MAX_CLARIFICATION_CYCLES,
     render_markdown=None,  # bespoke hook writes PLAN_MD_PATH directly -- see its own docstring
     draft_example=PLAN_DRAFT_EXAMPLE,
-    deterministic_verify=make_verify_plan_diagrams("brownfield-plan", has_audit_role=False),
+    gate=Gate(
+        verify=make_verify_plan_diagrams("brownfield-plan", has_audit_role=False),
+        policy={"yolo": "advisory", "draft_verify": "blocking", "mission_critical": "blocking"},
+        persists=True,
+    ),
     draft_rules="\n".join(f"- {r}" for r in PLAN_HARD_RULES),
     draft_prompt_context_from_repo_file=hydrate_plan_ticket_mode_context,
     post_approve_hook=_brownfield_plan_approve_hook,
@@ -5951,7 +6010,7 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
     #
     # Task 2 (Part 3): whether audit/verify exist AT ALL is still decided here, at build time, from
     # stage_spec -- unchanged. What's new is that the audit node's own outgoing edge, like draft's
-    # below, is now a conditional edge keyed on the session's code_gen_mode (_code_gen_mode_flags)
+    # below, is now a conditional edge keyed on the session's code_gen_mode (_stage_verify_policy)
     # instead of a fixed add_edge -- a mission_critical session (audit_enabled=True, the only mode
     # that ever reaches this node -- see make_route_after_draft's "gate_audit" guard) always has
     # verify_enabled=True too, so this resolves to verify_name today exactly like the old fixed
@@ -6434,146 +6493,125 @@ def _demo_audit_ran_this_lap() -> None:
     print("audit_ran_this_lap self-check: all assertions passed")
 
 
+# Gate-policy table as (yolo, draft_verify, mission_critical, persists), re-typed literally here --
+# NOT read from the StageSpecs -- so an accidental edit to a Gate's policy fails this self-check.
+# metrics-exit is advisory only in yolo: in draft_verify/mission_critical a content failure (e.g.
+# its pre-exit skill gate) still redrafts today, and this table encodes today's routing exactly.
+_EXPECTED_GATE_POLICIES: dict[str, tuple[str, str, str, bool]] = {
+    "specification": ("advisory", "blocking", "blocking", True),
+    "plan": ("advisory", "blocking", "blocking", True),
+    "brownfield-spec": ("advisory", "blocking", "blocking", True),
+    "brownfield-plan": ("advisory", "blocking", "blocking", True),
+    "metrics-exit": ("advisory", "blocking", "blocking", True),
+    "ac-to-tests": ("off", "blocking", "blocking", False),
+    "minimal-code-to-green": ("off", "blocking", "blocking", False),
+    "remediation": ("off", "blocking", "blocking", False),
+    "adversarial-compliance": ("off", "blocking", "blocking", False),
+}
+
+
+def _demo_route_policy_matrix(specs: list[StageSpec]) -> int:
+    """Route matrix: every spec x {3 modes, missing, unrecognized} x {draft ready, pass, content
+    fail, content fail at cap, infra, infra at cap, cannot_verify, no_new_work}, each expected
+    outcome derived from the gate's policy semantics (see _stage_verify_policy) and checked against
+    the real make_route_after_draft/make_route_after_verify closures. Takes the specs as an
+    argument so pipeline_layout's acceptance flip can re-run it on a patched policy. Returns the
+    number of outcomes checked."""
+    checked = 0
+    for spec in specs:
+        route_d = make_route_after_draft(spec)
+        route_v = make_route_after_verify(spec) if spec.deterministic_verify is not None else None
+        cap = spec.max_verify_cycles()
+        for mode in ("yolo", "draft_verify", "mission_critical", None, "unrecognized"):
+            resolved = resolve_code_gen_mode(mode)
+            policy = spec.gate.policy_for(mode) if route_v is not None and spec.gate is not None else "off"
+
+            def _st(_key: str = spec.key, _mode: str | None = mode, **stage_extra: Any) -> dict[str, Any]:
+                st: dict[str, Any] = {"stages": {_key: {**default_stage_state(), **stage_extra}}}
+                if _mode is not None:
+                    st["code_gen_mode"] = _mode
+                return st
+
+            if spec.audit_response_schema is not None and resolved == "mission_critical":
+                expected_draft = "gate_audit"
+            elif policy != "off":
+                expected_draft = "gate_verify"
+            else:
+                expected_draft = "gate_direct"
+            got = route_d(_st(readiness=True))  # type: ignore[arg-type]
+            assert got == expected_draft, f"{spec.key}/{mode}: draft routed {got!r}, expected {expected_draft!r}"
+            checked += 1
+            if route_v is None:
+                continue
+            fail = {"passed": False, "report": {}}
+            infra = {"passed": False, "report": {"infra_error": "demo"}}
+            content_expected = "escalate" if cap <= 0 else ("gate" if policy == "advisory" else "retry")
+            cases: list[tuple[dict[str, Any], str]] = [
+                (_st(last_verification={"passed": True, "report": {}}), "gate"),
+                (_st(last_verification=fail, verify_cycle_count=0), content_expected),
+                (_st(last_verification=fail, verify_cycle_count=cap), "escalate"),
+                (_st(last_verification=infra, infra_retry_count=0), "retry"),
+                (_st(last_verification=infra, infra_retry_count=workflow_config.VERIFY_INFRA_RETRY_CAP), "escalate"),
+                (_st(last_verification={"passed": False, "cannot_verify": True}), "escalate"),
+                (_st(last_verification={"passed": False, "report": {"no_new_work": True}}), "no_new_work"),
+            ]
+            for i, (st, expected) in enumerate(cases):
+                got = route_v(st)  # type: ignore[arg-type]
+                assert got == expected, f"{spec.key}/{mode}/case {i} ({policy}): verify routed {got!r}, expected {expected!r}"
+                checked += 1
+    return checked
+
+
 def _demo_code_gen_mode_routing() -> None:
-    """Task 2 (Part 3): walks every one of the 8 STAGES' `{stage}_draft` conditional edges
-    (builder.branches, populated by add_conditional_edges -- see _wire_stage) across all three
-    code_gen_mode values, confirming audit/verify are entered or bypassed exactly as the mode
-    dictates, and that the 4 stages with no audit_response_schema (tech-stack, remediation,
-    adversarial-compliance, metrics-exit) never produce "gate_audit" in ANY mode -- including
-    mission_critical, where the other 4 stages (specification, plan, ac-to-tests,
-    minimal-code-to-green) MUST produce it, reproducing today's exact pre-Task-2 wiring (the
-    baseline mission_critical exists to preserve).
+    """Gate-policy table + route matrix (above) + the wired edges _wire_stage builds from them.
 
-    Calls the real wired route() closures via builder.branches[...].path.invoke(state) -- not a
-    re-typed copy of the mode->outcome formula -- so a regression in the actual _wire_stage/
-    make_route_after_draft code is what this would catch, not just a restatement of it. Also
-    directly invokes the audit node's own route_after_audit closure with a verify-disabled state
-    to cover its "gate" outcome, which no mode in the closed 3-mode domain can reach through real
-    graph traversal (Task 2 review, Important 2).
+    Walks every STAGES entry's real `{stage}_draft`/`{stage}_audit` conditional edges
+    (builder.branches) so a regression in the actual wiring is caught, not a restatement of the
+    formula; the audit node's "gate" outcome (unreachable through real traversal, since only
+    mission_critical enters audit) is invoked directly with a yolo state.
     """
+    for spec in _ALL_STAGE_SPECS:
+        if spec.gate is None:
+            continue
+        policy = tuple(spec.gate.policy_for(m) for m in ("yolo", "draft_verify", "mission_critical"))
+        assert _EXPECTED_GATE_POLICIES.get(spec.key) == (*policy, spec.gate.persists), (spec.key, policy)
+        assert set(spec.gate.policy) == {"yolo", "draft_verify", "mission_critical"}, spec.key
+        # verify IS the required-persistence step for these stages -- skipping it would lose data.
+        assert not (spec.gate.persists and "off" in policy), f"{spec.key}: persists=True gate is 'off' in some mode"
+        assert spec.gate.id == f"{spec.key}_verify"
+    assert set(_EXPECTED_GATE_POLICIES) == {s.key for s in _ALL_STAGE_SPECS if s.gate is not None}
+    checked = _demo_route_policy_matrix(_ALL_STAGE_SPECS)
+
     builder = build_graph()
-    modes: tuple[Literal["yolo", "draft_verify", "mission_critical"], ...] = (
-        "yolo",
-        "draft_verify",
-        "mission_critical",
-    )
-
-    # Final-fix round 1 (C2): re-typed literally here, NOT read from _VERIFY_ALWAYS_RUNS_STAGE_KEYS,
-    # so accidentally widening that set to a pure-check stage fails this self-check.
-    persistence_verify_keys = {"specification", "plan", "metrics-exit"}
-    pure_check_verify_keys = {"ac-to-tests", "minimal-code-to-green", "remediation", "adversarial-compliance"}
-    assert persistence_verify_keys <= _VERIFY_ALWAYS_RUNS_STAGE_KEYS
-    assert not (pure_check_verify_keys & _VERIFY_ALWAYS_RUNS_STAGE_KEYS)
-
     for stage_spec in STAGES:
         draft_name = f"{stage_spec.key}_draft"
-        has_audit = stage_spec.audit_response_schema is not None
-        has_verify = stage_spec.deterministic_verify is not None
         audit_name = f"{stage_spec.key}_audit"
         verify_name = f"{stage_spec.key}_verify"
         gate_name = f"{stage_spec.key}_gate"
+        has_audit = stage_spec.audit_response_schema is not None
+        has_verify = stage_spec.deterministic_verify is not None
 
         (draft_branch,) = builder.branches[draft_name].values()
         ends = draft_branch.ends
-        # Strongest form of "never produce gate_audit": a no-audit stage's map doesn't even offer
-        # it as a reachable key, so there is no edge for route() to send that outcome down.
-        if not has_audit:
-            assert "gate_audit" not in ends, (
-                f"{stage_spec.key}: has no audit_response_schema but draft's conditional edges "
-                f"still map 'gate_audit' -> {ends.get('gate_audit')!r}"
-            )
+        # A no-audit stage's map doesn't even offer "gate_audit" -- no edge for route() to take.
+        assert has_audit == ("gate_audit" in ends), stage_spec.key
+        assert has_verify == ("gate_verify" in ends), stage_spec.key
+        assert (ends["gate_direct"], ends.get("gate_audit", audit_name), ends.get("gate_verify", verify_name)) == (
+            gate_name, audit_name, verify_name
+        ), f"{stage_spec.key}: draft edges {ends!r}"
+        # auto_approve (clarification cap) always faces verify, even under an "off" policy.
+        if has_verify:
+            assert (f"{stage_spec.key}_auto_approve", verify_name) in builder.edges, stage_spec.key
 
-        for mode in modes:
-            ready_state = {
-                "stages": {stage_spec.key: {**default_stage_state(), "readiness": True}},
-                "code_gen_mode": mode,
-            }
-            outcome = draft_branch.path.invoke(ready_state)  # type: ignore[arg-type]
-            audit_enabled = mode == "mission_critical"
-            verify_enabled = mode in ("draft_verify", "mission_critical") or stage_spec.key in persistence_verify_keys
-            if stage_spec.key in pure_check_verify_keys and mode == "yolo":
-                # Explicit: these 4 stages' YOLO behavior must stay fully skippable.
-                assert outcome == "gate_direct", f"{stage_spec.key}/yolo must still skip verify, got {outcome!r}"
-            if has_audit and audit_enabled:
-                expected_outcome, expected_target = "gate_audit", audit_name
-            elif has_verify and verify_enabled:
-                expected_outcome, expected_target = "gate_verify", verify_name
-            else:
-                expected_outcome, expected_target = "gate_direct", gate_name
-            assert outcome == expected_outcome, (
-                f"{stage_spec.key}/{mode}: draft route() returned {outcome!r}, expected "
-                f"{expected_outcome!r}"
-            )
-            assert ends[outcome] == expected_target, (
-                f"{stage_spec.key}/{mode}: {outcome!r} edge points at {ends[outcome]!r}, "
-                f"expected {expected_target!r}"
-            )
-
-        # Audit node's own outgoing edge (only wired for the 4 audit-bearing stages) -- reachable
-        # only when mode == "mission_critical" (the only mode "gate_audit" is ever produced for,
-        # confirmed above), where every one of those 4 stages also has deterministic_verify
-        # (checked here directly, not assumed) -- so it must route to verify_name, never straight
-        # to the gate.
         if has_audit:
             (audit_branch,) = builder.branches[audit_name].values()
-            mc_state = {
-                "stages": {stage_spec.key: {**default_stage_state(), "readiness": True}},
-                "code_gen_mode": "mission_critical",
-            }
-            audit_outcome = audit_branch.path.invoke(mc_state)  # type: ignore[arg-type]
-            expected_audit_target = verify_name if has_verify else gate_name
-            assert audit_branch.ends[audit_outcome] == expected_audit_target, (
-                f"{stage_spec.key}: audit node's outgoing edge in mission_critical routes to "
-                f"{audit_branch.ends[audit_outcome]!r}, expected {expected_audit_target!r}"
-            )
+            for mode in ("yolo", "draft_verify", "mission_critical"):
+                target = audit_branch.ends[audit_branch.path.invoke({"code_gen_mode": mode})]  # type: ignore[arg-type]
+                expected = verify_name if _stage_verify_enabled({"code_gen_mode": mode}, stage_spec) else gate_name  # type: ignore[arg-type]
+                assert target == expected, f"{stage_spec.key}/{mode}: audit edge -> {target!r}, expected {expected!r}"
+            assert audit_branch.ends[audit_branch.path.invoke({"code_gen_mode": "mission_critical"})] == verify_name  # type: ignore[arg-type]
 
-            # Task 2 review (Important 2): under the current closed 3-mode domain this node is
-            # ONLY ever reached with mode == "mission_critical" (checked above), which always has
-            # verify_enabled=True too -- so route_after_audit's "gate" outcome has no real
-            # traversal path today and the mode loop above gives it zero coverage. Invoke the
-            # SAME wired closure directly with a state whose verify_enabled is False (any mode
-            # outside {"draft_verify", "mission_critical"} -- "yolo" here) to prove that branch is
-            # correct on its own terms, independent of whether real routing can currently reach
-            # it -- not just assumed correct from reading the formula.
-            # specification/plan's verify is never skippable (_VERIFY_ALWAYS_RUNS_STAGE_KEYS), so
-            # their "gate" outcome is unreachable by design -- only the pure-check stages get it.
-            gate_branch_outcome = audit_branch.path.invoke({"code_gen_mode": "yolo"})  # type: ignore[arg-type]
-            if stage_spec.key in persistence_verify_keys:
-                assert audit_branch.ends[gate_branch_outcome] == verify_name, (
-                    f"{stage_spec.key}: audit node must always route to verify, got {audit_branch.ends[gate_branch_outcome]!r}"
-                )
-                continue
-            assert audit_branch.ends[gate_branch_outcome] == gate_name, (
-                f"{stage_spec.key}: audit node's outgoing edge with verify disabled routes to "
-                f"{audit_branch.ends[gate_branch_outcome]!r}, expected {gate_name!r}"
-            )
-
-    # make_route_after_verify (final-fix round 1, C2): YOLO turns a content-level retry into "gate"
-    # for the persistence-verify stages only; infra/cannot_verify routing is unchanged in every
-    # mode; every other stage (and every other mode) still retries.
-    for stage_spec in STAGES:
-        if stage_spec.deterministic_verify is None:
-            continue
-        route_v = make_route_after_verify(stage_spec)
-        for mode in modes:
-            def _vstate(last: dict[str, Any], _key: str = stage_spec.key, _mode: str = mode, **extra: Any) -> dict[str, Any]:
-                return {
-                    "stages": {_key: {**default_stage_state(), "last_verification": last, **extra}},
-                    "code_gen_mode": _mode,
-                }
-
-            content_fail = route_v(_vstate({"passed": False, "report": {}}, verify_cycle_count=0))  # type: ignore[arg-type]
-            expected = "gate" if mode == "yolo" and stage_spec.key in persistence_verify_keys else "retry"
-            assert content_fail == expected, f"{stage_spec.key}/{mode}: content failure routed {content_fail!r}, expected {expected!r}"
-            assert route_v(_vstate({"passed": False, "cannot_verify": True})) == "escalate"  # type: ignore[arg-type]
-            infra = {"passed": False, "report": {"infra_error": "audit_transcript_unreadable"}}
-            assert route_v(_vstate(infra, infra_retry_count=0)) == "retry", f"{stage_spec.key}/{mode}"  # type: ignore[arg-type]
-            assert route_v(  # type: ignore[arg-type]
-                _vstate(infra, infra_retry_count=workflow_config.VERIFY_INFRA_RETRY_CAP)
-            ) == "escalate", f"{stage_spec.key}/{mode}"
-            assert route_v(_vstate({"passed": True, "report": {}})) == "gate"  # type: ignore[arg-type]
-
-    print("code_gen_mode routing self-check: all assertions passed")
+    print(f"code_gen_mode routing self-check: all assertions passed ({checked} route outcomes)")
 
 
 def _demo() -> None:
@@ -6694,6 +6732,10 @@ def _demo() -> None:
     repo_files.append_ledger_entry = _fake_append_ledger_entry
     git_ops.commit_all = _fake_commit_all
     globals()["close_session"] = _fake_close_session
+    def _with_verify(spec: StageSpec, fn: Any) -> StageSpec:
+        assert spec.gate is not None
+        return replace(spec, gate=replace(spec.gate, verify=fn))
+
     try:
         demo_verify_state = {
             "stages": {"minimal-code-to-green": {**default_stage_state(), "draft": {"x": 1}}},
@@ -6701,7 +6743,7 @@ def _demo() -> None:
         }
         demo_verify_cfg = {"configurable": {"thread_id": demo_verify_thread_id}}
 
-        verify_fn = make_verify_node(replace(by_key["minimal-code-to-green"], deterministic_verify=_fake_verify_fails))
+        verify_fn = make_verify_node(_with_verify(by_key["minimal-code-to-green"], _fake_verify_fails))
         out = asyncio.run(verify_fn(demo_verify_state, demo_verify_cfg))
         last = out["stages"]["minimal-code-to-green"]["last_verification"]
         assert not last["passed"]
@@ -6714,7 +6756,7 @@ def _demo() -> None:
 
         # Crash-safety: deterministic_verify raising must not crash the node, and the resulting
         # infra_error must survive the skill-gate merge (a genuine platform fault, not a draft one).
-        verify_crash_fn = make_verify_node(replace(by_key["minimal-code-to-green"], deterministic_verify=_fake_verify_crashes))
+        verify_crash_fn = make_verify_node(_with_verify(by_key["minimal-code-to-green"], _fake_verify_crashes))
         out2 = asyncio.run(verify_crash_fn(demo_verify_state, demo_verify_cfg))
         last2 = out2["stages"]["minimal-code-to-green"]["last_verification"]
         assert not last2["passed"]
@@ -6728,7 +6770,7 @@ def _demo() -> None:
         asyncio.run(verify_fn({**demo_verify_state, "code_gen_mode": "draft_verify"}, demo_verify_cfg))
         assert len(checkpoint_commits) == 3, "draft_verify must still checkpoint-commit minimal-code-to-green's source"
         # ...and only for that stage.
-        asyncio.run(make_verify_node(replace(by_key["ac-to-tests"], deterministic_verify=_fake_verify_fails))(
+        asyncio.run(make_verify_node(_with_verify(by_key["ac-to-tests"], _fake_verify_fails))(
             {"stages": {"ac-to-tests": {**default_stage_state(), "draft": {"x": 1}}}, "provider": "claude", "run_id": "demo"},
             demo_verify_cfg,
         ))
@@ -6793,6 +6835,7 @@ def _demo() -> None:
 
     demo_gate_spec = StageSpec(
         key="demo-gate",
+        label="Demo gate",
         response_schema=object,  # unused by gate_node
         content_field=None,
         surface_tool_name="demo",
@@ -7490,7 +7533,9 @@ def _demo() -> None:
             max_cycles=lambda: 1,
             render_markdown=lambda *a: "",
             audit_response_schema=object if audited else None,
-            deterministic_verify=(lambda *a: None) if has_verify else None,  # never called -- key is just "is it set"
+            # never called -- the key is just "is it set"
+            gate=Gate(verify=lambda *a: None, policy={}, persists=False) if has_verify else None,
+            label=key,
             draft_rules=draft_rules,
             audit_rules=audit_rules,
         )

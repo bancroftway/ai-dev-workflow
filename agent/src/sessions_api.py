@@ -59,6 +59,8 @@ from . import (
     session_store,
 )
 from .graph import graph
+from .gates.checks import resolve_code_gen_mode
+from .pipeline_layout import PIPELINE
 from .run_events import RunEvent, RunEventType
 from .sandbox import get_sandbox_provider, registry
 
@@ -564,6 +566,9 @@ class SessionResponse(BaseModel):
     # surfaces that need "is this thread actually done, whatever its status says" don't each
     # re-derive the same OR-condition.
     finished_with_verdict: bool = False
+    # The mode this session's gates run under: the stored dbo.sessions.code_gen_mode, or the same
+    # "mission_critical" fallback graph._resolve_thread_code_gen_mode applies when none is stored.
+    code_gen_mode: Literal["yolo", "draft_verify", "mission_critical"] = "mission_critical"
 
 
 async def _verified_container_alive(session_id: str) -> bool:
@@ -611,7 +616,7 @@ async def _row_to_response(row: dict[str, Any], *, container_alive: bool | None 
     if container_alive is None:
         container_alive = await _verified_container_alive(row["session_id"])
     return SessionResponse(
-        **row,
+        **{**row, "code_gen_mode": resolve_code_gen_mode(row.get("code_gen_mode"))},
         container_alive=container_alive,
         run_active=active,
         interrupted=interrupted,
@@ -2189,6 +2194,15 @@ async def get_tech_stack_catalog(request: Request) -> TechStackCatalogResponse:
     return TechStackCatalogResponse(stacks=app_discovery.load_stack_catalog())
 
 
+@catalog_router.get("/pipeline")
+async def get_pipeline(request: Request) -> dict[str, Any]:
+    """Tabs, stages, gates (checks + all three modes' policies), run order and mode descriptions
+    -- pipeline_layout.PIPELINE.describe(). Session-independent, so it lives beside
+    /tech-stack-catalog; under /sessions it would collide with /{session_id}."""
+    _check_shared_secret(request)
+    return PIPELINE.describe()
+
+
 # --- projects (Part 3: tickets/board -- docs/superpowers/plans/part-3-tickets-tasks.md) --------
 
 
@@ -2402,6 +2416,10 @@ def _demo() -> None:
     }
     resp = asyncio.run(_row_to_response(fake_row))
     assert resp.awaiting_gate is True, resp
+    # code_gen_mode: absent/NULL resolves to mission_critical; a stored value passes through.
+    assert resp.code_gen_mode == "mission_critical", resp.code_gen_mode
+    assert asyncio.run(_row_to_response({**fake_row, "code_gen_mode": None})).code_gen_mode == "mission_critical"
+    assert asyncio.run(_row_to_response({**fake_row, "code_gen_mode": "yolo"})).code_gen_mode == "yolo"
 
     # One open ticket per repo at a time (Task: Tickets View, Scope §3): _reject_if_another_ticket_
     # open must 409 when another session on the same (owner, repo) is still in_progress, must
