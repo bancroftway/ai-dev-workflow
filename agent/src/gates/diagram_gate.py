@@ -816,7 +816,7 @@ async def _load_and_check_manifest(
 
 def make_verify_plan_diagrams(
     stage_key: str = "plan", has_audit_role: bool = True
-) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int], Any]:
+) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int, bool], Any]:
     """Factory, not a bare function (file-based-editing plan, Part 6 audit fix): Part 6's
     brownfield plan-pass reuses this exact verification logic under a DIFFERENT stage-key (not the
     real "plan" key, so the graph's own linear stage-chain doesn't misroute -- see graph.py's
@@ -832,7 +832,7 @@ def make_verify_plan_diagrams(
 
     async def verify_plan_diagrams(
         thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None,
-        provider: SandboxProvider, chat_provider: str, lap: int = 0,
+        provider: SandboxProvider, chat_provider: str, lap: int = 0, audit_ran_this_lap: bool = True,
     ) -> "VerificationResult":
         from ..graph import VerificationResult  # local import: graph.py imports this module
 
@@ -918,8 +918,11 @@ def make_verify_plan_diagrams(
         # File-based-editing plan, Part 2 sect. 5/6: load+sync steps.json and manifest.json BEFORE
         # check_plan_linkage runs -- a new, earlier check, not a replacement (everything below this
         # point that already existed is unchanged).
+        # `audit_ran_this_lap=False` (the session's code_gen_mode skipped audit this lap, e.g.
+        # draft_verify) takes the exact has_audit_role=False path: no audit session exists to read,
+        # so a missing transcript is expected, not an infra fault (fail-open, fully_reviewed=None).
         resolved_steps, step_problems, ledger_entries, step_infra_error = await _load_and_sync_plan_steps(
-            provider, thread_id, run_id, stage_key, chat_provider, has_audit_role, lap,
+            provider, thread_id, run_id, stage_key, chat_provider, has_audit_role and audit_ran_this_lap, lap,
         )
         if step_infra_error is not None:
             # Platform could not evaluate a check (see _load_and_sync_plan_steps): infra verdict,

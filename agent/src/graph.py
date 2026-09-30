@@ -1233,7 +1233,7 @@ def _stamp_gate_change_and_check_delta(
 
 def make_verify_specification_ledger(
     stage_key: str = "specification", has_audit_role: bool = True
-) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int], Any]:
+) -> Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int, bool], Any]:
     """Factory, not a bare function (file-based-editing plan, Part 6 audit fix -- mirrors
     gates/diagram_gate.py's make_verify_plan_diagrams exactly, same reasoning): Part 6's brownfield
     spec-pass reuses this exact verification logic under a DIFFERENT stage-key (not the real
@@ -1249,7 +1249,7 @@ def make_verify_specification_ledger(
 
     async def _verify_specification_ledger(
         thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None,
-        provider: SandboxProvider, chat_provider: str, lap: int = 0,
+        provider: SandboxProvider, chat_provider: str, lap: int = 0, audit_ran_this_lap: bool = True,
     ) -> VerificationResult:
         """StageSpec.deterministic_verify for the specification stage: reads
         spec_ledger.DRAFT_SPEC_PATH (the model's own file-edited sketchpad -- file-based-editing
@@ -1308,9 +1308,11 @@ def make_verify_specification_ledger(
         # AUDIT session read the whole draft file this lap, threaded into sync_ledger below.
         # `has_audit_role=False` (Part 6's brownfield spec-pass, which has no audit at all) skips
         # this entirely -- see spec_ledger.sync_ledger's own `fully_reviewed` docstring for the
-        # three-state contract.
+        # three-state contract. `audit_ran_this_lap=False` (the session's code_gen_mode skipped
+        # audit this lap, e.g. draft_verify) takes that same path: no audit session exists to read,
+        # so a missing transcript is expected, not the infra fault below.
         fully_reviewed: bool | None = None
-        if has_audit_role:
+        if has_audit_role and audit_ran_this_lap:
             # The per-lap audit role key (`audit-{run_id}-{lap}`), NOT the bare "audit" label --
             # `lap` is the same pre-increment verify_cycle_count make_audit_node keyed this lap's
             # session with (make_verify_node passes it through; the increment happens after this
@@ -1975,10 +1977,14 @@ class StageSpec:
     on every single run, including pure no-op re-runs."""
 
     deterministic_verify: (
-        Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int], Awaitable[VerificationResult]] | None
+        Callable[[str, dict[str, Any], str, str | None, SandboxProvider, str, int, bool], Awaitable[VerificationResult]] | None
     ) = None
     """A routing-capable check (thread_id, revised content dict, run_id, baseline_commit,
-    provider, chat_provider, lap) -> VerificationResult, inserted between audit and gate when set.
+    provider, chat_provider, lap, audit_ran_this_lap) -> VerificationResult, inserted between audit
+    and gate when set. `audit_ran_this_lap` is _code_gen_mode_flags' audit_enabled for this session:
+    False means the mode skipped audit this lap, so specification/plan's audit-transcript evidence
+    check must fail open rather than report a missing transcript as an infra fault. Every other
+    implementation accepts-and-ignores it.
     `lap` (session-poisoning fix) is this stage's own verify_cycle_count -- the two implementations
     that dispatch into stack_runner.run_and_report (verify_ac_to_tests, verify_coverage) thread it
     straight through as run_and_report's own `lap` kwarg, the same fresh-session-per-lap fix
@@ -3863,22 +3869,9 @@ def make_audit_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             thread_id, state, stages, f"ai-dev-workflow: {stage_spec.key} draft revised (audit)"
         )
 
-        # minimal-code-to-green's own draft+audit turn is the single most expensive, highest-loss
-        # artifact in this pipeline (a multi-hour agentic code-writing session touching hundreds of
-        # files) -- but its verify_coverage gate is a deterministic check that can fail on an
-        # infra issue wholly unrelated to code quality. Every other commit site here only persists
-        # .ai-dev-workflow/ (see _persist_if_sandboxed); nothing previously committed the actual
-        # application source tree until the r_minimal_code_to_green rebuild stage, which never runs
-        # if verify fails. Observed live (session f0fef8ba): an unrelated coverage-gate bug failed
-        # verify, the run was then torn down (--discard-sandbox), and every uncommitted file the
-        # draft+audit had written was permanently lost, forcing a full from-scratch redo. Committing
-        # here, before verify_coverage runs, means a later gate failure only costs re-verification,
-        # never the code itself. commit_all is idempotent (a no-op if nothing changed since the
-        # last commit), so this is safe even on a redraft cycle that touched nothing new.
-        if stage_spec.key == "minimal-code-to-green" and sandbox_registry.get(thread_id) is not None:
-            await git_ops.commit_all(
-                get_sandbox_provider(), thread_id, f"ai-dev-workflow: {stage_spec.key} source changes (post-audit checkpoint)"
-            )
+        # minimal-code-to-green's source-tree checkpoint commit lives in make_verify_node (right
+        # before verify_coverage runs), not here: draft_verify mode skips this audit node entirely
+        # but still runs verify_coverage, which is exactly where the checkpoint is needed.
 
         if sandbox_registry.get(thread_id) is not None:
             await repo_files.append_ledger_entry(
@@ -4252,10 +4245,29 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
         # external/LLM call in this file (draft, audit) is already wrapped and routed as a graceful
         # failure rather than crashing the node; this call was the one outlier, only safe before
         # because the skill-gate early return kept it from ever seeing a malformed draft.
+        #
+        # minimal-code-to-green's own draft(+audit) turn is the single most expensive, highest-loss
+        # artifact in this pipeline (a multi-hour agentic code-writing session touching hundreds of
+        # files) -- but its verify_coverage gate is a deterministic check that can fail on an
+        # infra issue wholly unrelated to code quality. Every other commit site here only persists
+        # .ai-dev-workflow/ (see _persist_if_sandboxed); nothing previously committed the actual
+        # application source tree until the r_minimal_code_to_green rebuild stage, which never runs
+        # if verify fails. Observed live (session f0fef8ba): an unrelated coverage-gate bug failed
+        # verify, the run was then torn down (--discard-sandbox), and every uncommitted file the
+        # draft+audit had written was permanently lost, forcing a full from-scratch redo. Committing
+        # here, before verify_coverage runs, means a later gate failure only costs re-verification,
+        # never the code itself. Lives in verify (not audit, where it used to be) so it still fires
+        # when code_gen_mode skips audit (draft_verify). commit_all is idempotent (a no-op if
+        # nothing changed since the last commit), so this is safe even on a redraft cycle that
+        # touched nothing new.
+        if stage_spec.key == "minimal-code-to-green" and sandbox_registry.get(thread_id) is not None:
+            await git_ops.commit_all(
+                provider, thread_id, f"ai-dev-workflow: {stage_spec.key} source changes (post-audit checkpoint)"
+            )
         try:
             result = await stage_spec.deterministic_verify(
                 thread_id, stage["draft"] or {}, state.get("run_id", "unknown"), stage.get("baseline_commit"), provider,
-                state["provider"], stage.get("verify_cycle_count", 0),
+                state["provider"], stage.get("verify_cycle_count", 0), _code_gen_mode_flags(state)[0],
             )
         except Exception as exc:  # noqa: BLE001 -- convert to a routed infra verdict, never crash the node
             logger.exception("%s: deterministic_verify crashed", stage_spec.key)
@@ -4520,6 +4532,16 @@ def make_route_after_verify(stage_spec: StageSpec) -> Callable[[GraphState], str
                 return "retry"
             return "escalate"
         if stage.get("verify_cycle_count", 0) < stage_spec.max_verify_cycles:
+            # YOLO still runs these stages' verify (for its persistence -- see
+            # _VERIFY_ALWAYS_RUNS_STAGE_KEYS) but keeps its "no deterministic check gates
+            # progression" promise: a content-level failure proceeds to the gate instead of
+            # redrafting. Infra/cannot_verify verdicts above are platform faults and stay unchanged.
+            if state.get("code_gen_mode") == "yolo" and stage_spec.key in _VERIFY_ALWAYS_RUNS_STAGE_KEYS:
+                logger.warning(
+                    "%s: verify failed (%s) -- proceeding to gate anyway (YOLO mode, no redraft loop for this stage)",
+                    stage_spec.key, (last.get("feedback") or "")[:200],
+                )
+                return "gate"
             return "retry"
         return "escalate"
 
@@ -4948,6 +4970,24 @@ def _code_gen_mode_flags(state: GraphState) -> tuple[bool, bool]:
     return audit_enabled, verify_enabled
 
 
+# Stages whose deterministic_verify is ALSO the only place required persistence happens, not just
+# a skippable check: specification's (and brownfield-spec's) ledger save + sketchpad write-back,
+# plan's (and brownfield-plan's) diagram render/commit + ledger save + content_dict["plan_steps"]
+# injection, metrics-exit's merge_ready/blocking_reasons correction. Their verify node runs in
+# EVERY code_gen_mode (never "gate_direct"); YOLO instead gets its "nothing gates progression"
+# promise from make_route_after_verify turning a content-level retry into "gate". Every other
+# verify-bearing stage (ac-to-tests, minimal-code-to-green, remediation, adversarial-compliance)
+# is a pure check with no persistence, so YOLO skipping it outright is the intended tradeoff.
+_VERIFY_ALWAYS_RUNS_STAGE_KEYS = frozenset(
+    {"specification", "plan", "metrics-exit", "brownfield-spec", "brownfield-plan"}
+)
+
+
+def _stage_verify_enabled(state: GraphState, stage_spec: StageSpec) -> bool:
+    """_code_gen_mode_flags' verify_enabled, forced True for _VERIFY_ALWAYS_RUNS_STAGE_KEYS."""
+    return _code_gen_mode_flags(state)[1] or stage_spec.key in _VERIFY_ALWAYS_RUNS_STAGE_KEYS
+
+
 def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     def route(state: GraphState) -> str:
         stage = state["stages"][stage_spec.key]
@@ -4975,10 +5015,10 @@ def make_route_after_draft(stage_spec: StageSpec) -> Callable[[GraphState], str]
             # as reachable keys when this stage_spec actually has that mechanism, so a stage
             # without one (e.g. remediation has no audit_response_schema) can never produce an
             # outcome with no corresponding edge.
-            audit_enabled, verify_enabled = _code_gen_mode_flags(state)
+            audit_enabled, _verify_enabled = _code_gen_mode_flags(state)
             if stage_spec.audit_response_schema is not None and audit_enabled:
                 return "gate_audit"
-            if stage_spec.deterministic_verify is not None and verify_enabled:
+            if stage_spec.deterministic_verify is not None and _stage_verify_enabled(state, stage_spec):
                 return "gate_verify"
             return "gate_direct"
         if stage["cycle_count"] >= stage_spec.max_cycles:
@@ -5888,8 +5928,7 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
         builder.add_node(audit_name, make_audit_node(stage_spec))
 
         def route_after_audit(state: GraphState) -> str:
-            _audit_enabled, verify_enabled = _code_gen_mode_flags(state)
-            return "verify" if verify_enabled else "gate"
+            return "verify" if _stage_verify_enabled(state, stage_spec) else "gate"
 
         builder.add_conditional_edges(
             audit_name,
@@ -6267,6 +6306,92 @@ def compile_graph():
 graph = compile_graph()
 
 
+def _demo_audit_ran_this_lap() -> None:
+    """Final-fix round 1 (C1): specification/plan's audit-transcript evidence check must fail open
+    when code_gen_mode skipped audit this lap (audit_ran_this_lap=False) -- the same path as
+    has_audit_role=False -- and still report `audit_transcript_unreadable` when audit DID run but
+    left no readable session. Also proves the spec verify's persistence block (sketchpad write +
+    ledger save) runs on that audit-skipped path, i.e. what YOLO/draft_verify now execute."""
+    import asyncio
+
+    from .gates import diagram_gate as _dg
+
+    spec_json = json.dumps({
+        "title": "Demo", "summary": "Demo spec",
+        "user_stories": [{
+            "id": "story-a", "title": "Sign in",
+            "narrative": "As a shopper, I want to sign in, so that I can see my orders",
+            "acceptance_criteria": [{"id": "ac-a", "description": "Valid credentials land on the orders page"}],
+        }],
+        "assumptions": {"status": "absent", "reason": "none needed"},
+        "out_of_scope": {"status": "absent", "reason": "nothing excluded"},
+    })
+    written: list[str] = []
+    saved: list[Any] = []
+
+    async def _fake_read(_p, _t, path):  # noqa: ANN001, ANN202
+        return spec_json if path == spec_ledger.DRAFT_SPEC_PATH else None
+
+    async def _fake_write(_p, _t, path, _content):  # noqa: ANN001, ANN202
+        written.append(path)
+
+    async def _fake_load(_p, _t):  # noqa: ANN001, ANN202
+        return []
+
+    async def _fake_save(_p, _t, entries):  # noqa: ANN001, ANN202
+        saved.append(entries)
+
+    real = (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger,
+            spec_ledger.save_ledger, chat_model.get_session_id)
+    repo_files.read_repo_file, repo_files.write_repo_file = _fake_read, _fake_write
+    spec_ledger.load_ledger, spec_ledger.save_ledger = _fake_load, _fake_save
+    chat_model.get_session_id = lambda *_a, **_k: None  # no audit session cached this lap
+    try:
+        verify = make_verify_specification_ledger("specification")
+        # Audit should have run but left no session -> genuine infra fault, unchanged.
+        faulted = asyncio.run(verify("t", {}, "r", None, None, "claude", 0, True))  # type: ignore[arg-type]
+        assert faulted.report.get("infra_error") == "audit_transcript_unreadable", faulted.report
+        # Audit skipped by mode -> real content verdict, persistence runs.
+        skipped = asyncio.run(verify("t", {}, "r", None, None, "claude", 0, False))  # type: ignore[arg-type]
+        assert "infra_error" not in skipped.report, skipped.report
+        assert skipped.passed, skipped.feedback
+        assert written == [spec_ledger.DRAFT_SPEC_PATH] and len(saved) == 1, (written, saved)
+    finally:
+        (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger,
+         spec_ledger.save_ledger, chat_model.get_session_id) = real
+
+    # Plan: verify_plan_diagrams forwards `has_audit_role and audit_ran_this_lap` as the evidence
+    # flag _load_and_sync_plan_steps gates its transcript lookup on.
+    seen_flags: list[bool] = []
+
+    async def _fake_sync(_p, _t, _r, _k, _c, has_audit_role, _lap):  # noqa: ANN001, ANN202
+        seen_flags.append(has_audit_role)
+        return None, ["stop here"], [], "demo_short_circuit"
+
+    async def _noop(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        return None
+
+    async def _scope_ok(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        return _dg.write_scope_gate.WriteScopeOutcome(passed=True, violating_paths=[], changed_paths=[])
+
+    real_plan = (_dg._load_and_sync_plan_steps, _dg.git_ops.commit_paths, _dg.write_scope_gate.check_write_scope,
+                 _dg.repo_files.read_repo_file)
+    _dg._load_and_sync_plan_steps = _fake_sync
+    _dg.git_ops.commit_paths = _noop
+    _dg.write_scope_gate.check_write_scope = _scope_ok
+    _dg.repo_files.read_repo_file = _noop
+    try:
+        plan_verify = _dg.make_verify_plan_diagrams("plan")
+        for ran in (True, False):
+            asyncio.run(plan_verify("t", {"x": 1}, "r", None, None, "claude", 0, ran))  # type: ignore[arg-type]
+        assert seen_flags == [True, False], seen_flags
+    finally:
+        (_dg._load_and_sync_plan_steps, _dg.git_ops.commit_paths, _dg.write_scope_gate.check_write_scope,
+         _dg.repo_files.read_repo_file) = real_plan
+
+    print("audit_ran_this_lap self-check: all assertions passed")
+
+
 def _demo_code_gen_mode_routing() -> None:
     """Task 2 (Part 3): walks every one of the 8 STAGES' `{stage}_draft` conditional edges
     (builder.branches, populated by add_conditional_edges -- see _wire_stage) across all three
@@ -6290,6 +6415,13 @@ def _demo_code_gen_mode_routing() -> None:
         "draft_verify",
         "mission_critical",
     )
+
+    # Final-fix round 1 (C2): re-typed literally here, NOT read from _VERIFY_ALWAYS_RUNS_STAGE_KEYS,
+    # so accidentally widening that set to a pure-check stage fails this self-check.
+    persistence_verify_keys = {"specification", "plan", "metrics-exit"}
+    pure_check_verify_keys = {"ac-to-tests", "minimal-code-to-green", "remediation", "adversarial-compliance"}
+    assert persistence_verify_keys <= _VERIFY_ALWAYS_RUNS_STAGE_KEYS
+    assert not (pure_check_verify_keys & _VERIFY_ALWAYS_RUNS_STAGE_KEYS)
 
     for stage_spec in STAGES:
         draft_name = f"{stage_spec.key}_draft"
@@ -6316,7 +6448,10 @@ def _demo_code_gen_mode_routing() -> None:
             }
             outcome = draft_branch.path.invoke(ready_state)  # type: ignore[arg-type]
             audit_enabled = mode == "mission_critical"
-            verify_enabled = mode in ("draft_verify", "mission_critical")
+            verify_enabled = mode in ("draft_verify", "mission_critical") or stage_spec.key in persistence_verify_keys
+            if stage_spec.key in pure_check_verify_keys and mode == "yolo":
+                # Explicit: these 4 stages' YOLO behavior must stay fully skippable.
+                assert outcome == "gate_direct", f"{stage_spec.key}/yolo must still skip verify, got {outcome!r}"
             if has_audit and audit_enabled:
                 expected_outcome, expected_target = "gate_audit", audit_name
             elif has_verify and verify_enabled:
@@ -6358,11 +6493,43 @@ def _demo_code_gen_mode_routing() -> None:
             # outside {"draft_verify", "mission_critical"} -- "yolo" here) to prove that branch is
             # correct on its own terms, independent of whether real routing can currently reach
             # it -- not just assumed correct from reading the formula.
+            # specification/plan's verify is never skippable (_VERIFY_ALWAYS_RUNS_STAGE_KEYS), so
+            # their "gate" outcome is unreachable by design -- only the pure-check stages get it.
             gate_branch_outcome = audit_branch.path.invoke({"code_gen_mode": "yolo"})  # type: ignore[arg-type]
+            if stage_spec.key in persistence_verify_keys:
+                assert audit_branch.ends[gate_branch_outcome] == verify_name, (
+                    f"{stage_spec.key}: audit node must always route to verify, got {audit_branch.ends[gate_branch_outcome]!r}"
+                )
+                continue
             assert audit_branch.ends[gate_branch_outcome] == gate_name, (
                 f"{stage_spec.key}: audit node's outgoing edge with verify disabled routes to "
                 f"{audit_branch.ends[gate_branch_outcome]!r}, expected {gate_name!r}"
             )
+
+    # make_route_after_verify (final-fix round 1, C2): YOLO turns a content-level retry into "gate"
+    # for the persistence-verify stages only; infra/cannot_verify routing is unchanged in every
+    # mode; every other stage (and every other mode) still retries.
+    for stage_spec in STAGES:
+        if stage_spec.deterministic_verify is None:
+            continue
+        route_v = make_route_after_verify(stage_spec)
+        for mode in modes:
+            def _vstate(last: dict[str, Any], _key: str = stage_spec.key, _mode: str = mode, **extra: Any) -> dict[str, Any]:
+                return {
+                    "stages": {_key: {**default_stage_state(), "last_verification": last, **extra}},
+                    "code_gen_mode": _mode,
+                }
+
+            content_fail = route_v(_vstate({"passed": False, "report": {}}, verify_cycle_count=0))  # type: ignore[arg-type]
+            expected = "gate" if mode == "yolo" and stage_spec.key in persistence_verify_keys else "retry"
+            assert content_fail == expected, f"{stage_spec.key}/{mode}: content failure routed {content_fail!r}, expected {expected!r}"
+            assert route_v(_vstate({"passed": False, "cannot_verify": True})) == "escalate"  # type: ignore[arg-type]
+            infra = {"passed": False, "report": {"infra_error": "audit_transcript_unreadable"}}
+            assert route_v(_vstate(infra, infra_retry_count=0)) == "retry", f"{stage_spec.key}/{mode}"  # type: ignore[arg-type]
+            assert route_v(  # type: ignore[arg-type]
+                _vstate(infra, infra_retry_count=workflow_config.VERIFY_INFRA_RETRY_CAP)
+            ) == "escalate", f"{stage_spec.key}/{mode}"
+            assert route_v(_vstate({"passed": True, "report": {}})) == "gate"  # type: ignore[arg-type]
 
     print("code_gen_mode routing self-check: all assertions passed")
 
@@ -6472,11 +6639,18 @@ def _demo() -> None:
         demo_verify_thread_id,
         SandboxSession(session_id=demo_verify_thread_id, host="localhost", port=0, connection_token=""),
     )
+    checkpoint_commits: list[str] = []
+
+    async def _fake_commit_all(_provider, _thread_id, message):  # noqa: ANN001, ANN202
+        checkpoint_commits.append(message)
+
     real_check_required_skills = skill_gate.check_required_skills
     real_append_ledger_entry_2 = repo_files.append_ledger_entry
     real_close_session = close_session
+    real_commit_all = git_ops.commit_all
     skill_gate.check_required_skills = _fake_check_required_skills
     repo_files.append_ledger_entry = _fake_append_ledger_entry
+    git_ops.commit_all = _fake_commit_all
     globals()["close_session"] = _fake_close_session
     try:
         demo_verify_state = {
@@ -6503,9 +6677,24 @@ def _demo() -> None:
         last2 = out2["stages"]["minimal-code-to-green"]["last_verification"]
         assert not last2["passed"]
         assert last2["report"]["infra_error"] == "verify_crashed", last2["report"]
+
+        # Final-fix round 1 (Bug 3): minimal-code-to-green's source checkpoint commit fires from
+        # verify_node BEFORE deterministic_verify, in both modes that run verify -- the two runs
+        # above had no code_gen_mode (== mission_critical); draft_verify skips audit entirely, so
+        # this is the only place it can fire there.
+        assert len(checkpoint_commits) == 2 and all("post-audit checkpoint" in m for m in checkpoint_commits), checkpoint_commits
+        asyncio.run(verify_fn({**demo_verify_state, "code_gen_mode": "draft_verify"}, demo_verify_cfg))
+        assert len(checkpoint_commits) == 3, "draft_verify must still checkpoint-commit minimal-code-to-green's source"
+        # ...and only for that stage.
+        asyncio.run(make_verify_node(replace(by_key["ac-to-tests"], deterministic_verify=_fake_verify_fails))(
+            {"stages": {"ac-to-tests": {**default_stage_state(), "draft": {"x": 1}}}, "provider": "claude", "run_id": "demo"},
+            demo_verify_cfg,
+        ))
+        assert len(checkpoint_commits) == 3, "checkpoint commit must stay scoped to minimal-code-to-green"
     finally:
         skill_gate.check_required_skills = real_check_required_skills
         repo_files.append_ledger_entry = real_append_ledger_entry_2
+        git_ops.commit_all = real_commit_all
         globals()["close_session"] = real_close_session
 
     # make_route_after_gate (Part 2 Task 10): pure predicate, same convention as
@@ -7450,6 +7639,7 @@ def _demo() -> None:
     _demo_targeted_fix_stuck_decision()
     _demo_reset_e2e_lever()
     _demo_code_gen_mode_routing()
+    _demo_audit_ran_this_lap()
 
     print("graph self-check: all assertions passed")
 

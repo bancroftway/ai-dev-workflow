@@ -293,7 +293,7 @@ AC_TO_TESTS_HARD_RULES: tuple[str, ...] = (
 
 async def verify_ac_to_tests(
     thread_id: str, content_dict: dict[str, Any], run_id: str, baseline_commit: str | None, provider: SandboxProvider,
-    chat_provider: str, lap: int = 0,
+    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True,
 ) -> "VerificationResult":
     """Combines the write-scope check above with the AC-coverage check (ac_coverage_gate.py) into
     one VerificationResult, since both answer the same question -- "is P4's output acceptable" --

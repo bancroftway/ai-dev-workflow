@@ -1159,7 +1159,7 @@ MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE: tuple[str, ...] = (
 
 async def verify_coverage(
     thread_id: str, content_dict: dict[str, Any], run_id: str, _baseline_commit: str | None, provider: SandboxProvider,
-    chat_provider: str, lap: int = 0,
+    chat_provider: str, lap: int = 0, _audit_ran_this_lap: bool = True,
 ) -> "VerificationResult":
     """`chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
     through to measure_coverage below, which needs it for its own stack_runner.run_and_report
