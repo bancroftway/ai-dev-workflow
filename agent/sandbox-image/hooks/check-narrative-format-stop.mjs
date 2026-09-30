@@ -30,6 +30,8 @@ import { reportFailOpen } from "./lib/report-fail-open.mjs";
 const HOOK_NAME = "check-narrative-format-stop";
 const stage = process.env.AIDW_STAGE || "unknown";
 
+if (stage !== "specification" && stage !== "brownfield-spec") process.exit(0);
+
 const DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json";
 
 let input = {};

@@ -46,6 +46,8 @@ import { reportFailOpen } from "./lib/report-fail-open.mjs";
 const HOOK_NAME = "check-ledger-sync-stop";
 const stage = process.env.AIDW_STAGE || "unknown";
 
+if (stage !== "specification" && stage !== "brownfield-spec") process.exit(0);
+
 const DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json";
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 

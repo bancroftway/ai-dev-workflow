@@ -53,6 +53,8 @@ import { reportFailOpen } from "./lib/report-fail-open.mjs";
 const HOOK_NAME = "check-plan-citations-stop";
 const stage = process.env.AIDW_STAGE || "unknown";
 
+if (stage !== "plan" && stage !== "brownfield-plan") process.exit(0);
+
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 const STEPS_PATH = ".ai-dev-workflow/plan/_draft/steps.json";
 const MANIFEST_PATH = ".ai-dev-workflow/plan/_draft/manifest.json";

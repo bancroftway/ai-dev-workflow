@@ -49,6 +49,8 @@ import { reportFailOpen } from "./lib/report-fail-open.mjs";
 const HOOK_NAME = "check-plan-schema-stop";
 const stage = process.env.AIDW_STAGE || "unknown";
 
+if (stage !== "plan" && stage !== "brownfield-plan") process.exit(0);
+
 const STEPS_PATH = ".ai-dev-workflow/plan/_draft/steps.json";
 const MANIFEST_PATH = ".ai-dev-workflow/plan/_draft/manifest.json";
 const WIREFRAMES_DIR = ".ai-dev-workflow/plan/_draft/wireframes";
