@@ -92,9 +92,12 @@ if (result.passed) process.exit(0);
 
 process.stderr.write(
   "The adversarial audit's own report does NOT conform to the approved Plan and Specification -- " +
-    "the deterministic gate will reject this at verify time. Fix it now, in this same turn, before " +
-    "finishing (or, where the finding is demonstrably wrong about the Plan, say so with evidence " +
-    "rather than lowering its severity):\n" +
+    "the deterministic gate will reject this at verify time. THIS SESSION IS READ-ONLY: you cannot " +
+    "edit code right now, so the only action available in this same turn is to correct the audit's " +
+    "OWN report (severity/verdict) if a finding below is genuinely wrong about the Plan -- say so " +
+    "with evidence, do not just lower its severity to make this pass. If it's genuinely a " +
+    "compliance gap, leave it reported as-is; a separate, write-capable fix pass handles the actual " +
+    "code fix after this stage, not this turn:\n" +
     (result.reasons || []).map((r) => `- ${r}`).join("\n") +
     "\n",
 );
