@@ -20,10 +20,14 @@ re-exported by that same unchanged import.
 
 CLI mode (`python3 remediation_evaluate_checks.py --check-hook`, stdin: JSON `{"content":
 {...}|null, "scan": {...}|null, "changed_files": [str, ...], "added_lines": str, "prior_ids":
-[str, ...]|null}`, stdout: JSON `{"passed": bool, "reasons": [str, ...]}`) is what the Stop hook
-actually invokes. The hook gathers `scan` from the already-on-disk repo-scan-latest.json (written
-pre-draft by `remediation_scan_node`) and `changed_files`/`added_lines`/`prior_ids` via `git diff`/
-`git show` against `AIDW_BASELINE_COMMIT` -- it does not re-run the scan itself.
+[str, ...]|null, "scan_is_fresh": bool}`, stdout: JSON `{"passed": bool, "reasons": [str, ...]}`)
+is what the Stop hook actually invokes. The hook gathers `scan` from the already-on-disk
+repo-scan-latest.json (written pre-draft by `remediation_scan_node`) and `changed_files`/
+`added_lines`/`prior_ids` via `git diff`/`git show` against `AIDW_BASELINE_COMMIT` -- it does not
+re-run the scan itself. Since that pre-draft scan is stale by construction for THIS turn's own
+in-flight fixes, the hook always sends `scan_is_fresh: false` (see `evaluate_remediation`'s own
+docstring) -- `remediation_gate.py`'s host-side call site never sends this field at all and gets
+the function's default (`True`), since its own scan is always freshly taken.
 """
 
 from __future__ import annotations
@@ -90,6 +94,8 @@ def evaluate_remediation(
     changed_files: list[str] | None = None,
     added_lines: str = "",
     prior_ids: frozenset[str] | None = None,
+    *,
+    scan_is_fresh: bool = True,
 ) -> tuple[bool, list[str]]:
     """(passed, reasons). Pure -- `scan` is the dashboard dict repo_scan already writes.
 
@@ -102,6 +108,16 @@ def evaluate_remediation(
 
     A missing post-fix scan does NOT pass: this stage exists to act on findings, so "no findings
     file" means the check could not run, and an unrunnable check must never read as a clean one.
+
+    `scan_is_fresh` (default True, so `remediation_gate.py`'s own call site -- which always hands a
+    genuinely fresh, just-taken scan -- is completely unaffected): set to False by
+    check-remediation-stop.mjs, whose only available `scan` is the PRE-DRAFT
+    repo-scan-latest.json -- a snapshot of findings from BEFORE this same turn's fixes, by
+    construction stale for the "still open after remediation" question. When False, check 1 below
+    (unexplained-actionable-findings) is skipped entirely -- it would otherwise flag every finding
+    this very turn just fixed as still-open, since it can only ever see the pre-fix snapshot. Checks
+    2 (fabrication) and 3 (suppression) are unaffected: a claimed id's validity and a scanner-ignore
+    file/comment are both true or false regardless of which scan is on hand.
     """
     if content is None:
         return False, ["the remediation stage produced no report at all"]
@@ -125,30 +141,32 @@ def evaluate_remediation(
 
     # 1. Every actionable finding still open after this stage ran must be explained. This is the
     #    check that actually blocks: it reads the CURRENT scan, so a claim that a finding was
-    #    fixed is worth exactly as much as the finding's absence from it.
-    unexplained: list[str] = []
-    for finding in actionable:
-        finding_id = str(finding.get("id"))
-        if accounted_for(finding_id, known_gaps):
-            continue
-        location = (finding.get("location") or {}).get("path") or "unknown path"
-        unexplained.append(
-            f"finding {finding_id} [{finding.get('severity')}/{finding.get('category')}] is still "
-            f"open after remediation and is not in known_gaps: "
-            f"{finding.get('title')} at {location}"
-            + (f" (fixed_version {finding['package'].get('fixed_version')})" if (finding.get("package") or {}).get("fixed_version") else "")
-        )
-    # Cap what the feedback carries -- 60 unexplained findings would drown the fix prompt, and the
-    # model reads repo-scan-latest.json itself (its own prompt says so). Named-not-counted still
-    # holds: the first 30 are named, the remainder is a pointer to the exact file/flag to read.
-    if len(unexplained) > 30:
-        reasons.extend(unexplained[:30])
-        reasons.append(
-            f"...and {len(unexplained) - 30} more -- every `actionable: true` entry in "
-            f"repo-scan-latest.json must be fixed or explained in known_gaps"
-        )
-    else:
-        reasons.extend(unexplained)
+    #    fixed is worth exactly as much as the finding's absence from it. Skipped entirely when
+    #    `scan` is known to be stale (`scan_is_fresh=False`) -- see this function's own docstring.
+    if scan_is_fresh:
+        unexplained: list[str] = []
+        for finding in actionable:
+            finding_id = str(finding.get("id"))
+            if accounted_for(finding_id, known_gaps):
+                continue
+            location = (finding.get("location") or {}).get("path") or "unknown path"
+            unexplained.append(
+                f"finding {finding_id} [{finding.get('severity')}/{finding.get('category')}] is still "
+                f"open after remediation and is not in known_gaps: "
+                f"{finding.get('title')} at {location}"
+                + (f" (fixed_version {finding['package'].get('fixed_version')})" if (finding.get("package") or {}).get("fixed_version") else "")
+            )
+        # Cap what the feedback carries -- 60 unexplained findings would drown the fix prompt, and
+        # the model reads repo-scan-latest.json itself (its own prompt says so). Named-not-counted
+        # still holds: the first 30 are named, the remainder is a pointer to the exact file/flag.
+        if len(unexplained) > 30:
+            reasons.extend(unexplained[:30])
+            reasons.append(
+                f"...and {len(unexplained) - 30} more -- every `actionable: true` entry in "
+                f"repo-scan-latest.json must be fixed or explained in known_gaps"
+            )
+        else:
+            reasons.extend(unexplained)
 
     # 2. A claimed id that appears in NEITHER the scan it was handed nor the scan taken after is a
     #    fabrication, not a fix. Both sets count: a fixed finding leaves the post-fix scan, and a
@@ -261,6 +279,19 @@ def _demo() -> None:
     )
     assert not passed and "deadbeef" in reasons[0], reasons
 
+    # scan_is_fresh=False (check-remediation-stop.mjs's own posture, since its only `scan` is the
+    # PRE-DRAFT snapshot): a finding still open in that stale scan is NOT reported -- the hook
+    # cannot tell "genuinely still open" from "just fixed this turn, scan hasn't caught up yet".
+    # Fabrication and suppression checks are unaffected.
+    passed, reasons = evaluate_remediation({"findings_addressed": [], "known_gaps": []}, scan, scan_is_fresh=False)
+    assert passed and reasons == [], reasons
+    passed, reasons = evaluate_remediation(
+        {"findings_addressed": ["deadbeef"], "known_gaps": []}, scan, prior_ids=prior, scan_is_fresh=False
+    )
+    assert not passed and "deadbeef" in reasons[0] and len(reasons) == 1, reasons
+    passed, reasons = evaluate_remediation({"known_gaps": []}, scan, ["repo/.trivyignore"], scan_is_fresh=False)
+    assert not passed and "suppress" in reasons[0] and len(reasons) == 1, reasons
+
     # Without a readable pre-scan the fabrication check is SKIPPED rather than guessed -- blocking
     # on an id we cannot check would fail honest runs whose baseline file was unreadable.
     assert evaluate_remediation(
@@ -311,8 +342,10 @@ def _demo() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--check-hook":
         # The Stop hook's own entry point: JSON {"content", "scan", "changed_files", "added_lines",
-        # "prior_ids"} on stdin, JSON result on stdout. Deliberately the ONLY thing this branch
-        # does -- no sandbox access beyond what the hook already read and handed over as data.
+        # "prior_ids", "scan_is_fresh"} on stdin, JSON result on stdout. Deliberately the ONLY thing
+        # this branch does -- no sandbox access beyond what the hook already read and handed over as
+        # data. "scan_is_fresh" defaults to True (absent) to match evaluate_remediation's own
+        # default -- only check-remediation-stop.mjs ever sends it explicitly (as False).
         payload = json.loads(sys.stdin.read())
         prior_ids_raw = payload.get("prior_ids")
         passed, reasons = evaluate_remediation(
@@ -321,6 +354,7 @@ if __name__ == "__main__":
             payload.get("changed_files") or [],
             payload.get("added_lines") or "",
             frozenset(prior_ids_raw) if prior_ids_raw is not None else None,
+            scan_is_fresh=payload.get("scan_is_fresh", True),
         )
         json.dump({"passed": passed, "reasons": reasons}, sys.stdout)
     else:

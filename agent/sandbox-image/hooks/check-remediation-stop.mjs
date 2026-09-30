@@ -16,6 +16,15 @@
 //     pre-draft node) publishes it BEFORE the draft turn starts, so it is real by the time this
 //     hook runs. This hook does not re-run the scan itself; verify_remediation's own deterministic
 //     gate still does that at verify time with the full budget.
+//     NO RE-SCAN MEANS THIS `scan` IS STALE BY DESIGN, NOT JUST BY ACCIDENT: it's a snapshot from
+//     BEFORE this same turn's own fixes landed, so "still open in `scan`" cannot distinguish a
+//     genuinely-unaddressed finding from one this very turn just fixed. remediation_gate.py's own
+//     comment explains why it explicitly REFUSES this exact file and always re-scans fresh instead
+//     -- this hook structurally cannot do that (no exec-in-sandbox capability here, and a full
+//     re-scan inside a Stop hook would defeat the point of a fast, same-turn nudge). So this hook
+//     passes `scan_is_fresh: false` to evaluate_remediation below, which skips ONLY the "still open
+//     after remediation" check (item 1) that depends on scan freshness -- the fabrication (item 2)
+//     and scanner-suppression (item 3) checks don't need a fresh scan and still run normally.
 //   - `content` (the report itself: findings_addressed/known_gaps/...): like
 //     adversarial-compliance, this stage has no on-disk report artifact before the gate runs --
 //     content_field=None means the whole structured response IS the report (graph.py's
@@ -143,6 +152,7 @@ try {
       changed_files: changedFiles,
       added_lines: addedLines,
       prior_ids: priorIds,
+      scan_is_fresh: false,
     }),
     encoding: "utf8",
     timeout: 20000,
