@@ -4935,6 +4935,10 @@ def _code_gen_mode_flags(state: GraphState) -> tuple[bool, bool]:
     _resolve_thread_code_gen_mode fallback exactly -- preserves today's exact behavior (audit AND
     verify both always on) for any state that reaches routing without a resolved mode, which per
     Task 1 should not normally happen but costs nothing to keep consistent.
+
+    Any OTHER unrecognized value (a bug upstream -- code_gen_mode is typed as a closed Literal, so
+    this should never happen either) falls through the same way "yolo" does: both flags False,
+    same fail-safe direction as the missing-key case above, never a silent both-True.
     """
     mode = state.get("code_gen_mode", "mission_critical")
     audit_enabled = mode == "mission_critical"
@@ -6273,7 +6277,10 @@ def _demo_code_gen_mode_routing() -> None:
 
     Calls the real wired route() closures via builder.branches[...].path.invoke(state) -- not a
     re-typed copy of the mode->outcome formula -- so a regression in the actual _wire_stage/
-    make_route_after_draft code is what this would catch, not just a restatement of it.
+    make_route_after_draft code is what this would catch, not just a restatement of it. Also
+    directly invokes the audit node's own route_after_audit closure with a verify-disabled state
+    to cover its "gate" outcome, which no mode in the closed 3-mode domain can reach through real
+    graph traversal (Task 2 review, Important 2).
     """
     builder = build_graph()
     modes: tuple[Literal["yolo", "draft_verify", "mission_critical"], ...] = (
@@ -6339,6 +6346,20 @@ def _demo_code_gen_mode_routing() -> None:
             assert audit_branch.ends[audit_outcome] == expected_audit_target, (
                 f"{stage_spec.key}: audit node's outgoing edge in mission_critical routes to "
                 f"{audit_branch.ends[audit_outcome]!r}, expected {expected_audit_target!r}"
+            )
+
+            # Task 2 review (Important 2): under the current closed 3-mode domain this node is
+            # ONLY ever reached with mode == "mission_critical" (checked above), which always has
+            # verify_enabled=True too -- so route_after_audit's "gate" outcome has no real
+            # traversal path today and the mode loop above gives it zero coverage. Invoke the
+            # SAME wired closure directly with a state whose verify_enabled is False (any mode
+            # outside {"draft_verify", "mission_critical"} -- "yolo" here) to prove that branch is
+            # correct on its own terms, independent of whether real routing can currently reach
+            # it -- not just assumed correct from reading the formula.
+            gate_branch_outcome = audit_branch.path.invoke({"code_gen_mode": "yolo"})  # type: ignore[arg-type]
+            assert audit_branch.ends[gate_branch_outcome] == gate_name, (
+                f"{stage_spec.key}: audit node's outgoing edge with verify disabled routes to "
+                f"{audit_branch.ends[gate_branch_outcome]!r}, expected {gate_name!r}"
             )
 
     print("code_gen_mode routing self-check: all assertions passed")
