@@ -777,6 +777,17 @@ RUN printf '%s\n' \
 #     `git show` against AIDW_BASELINE_COMMIT for the changed-files/suppression/fabricated-id
 #     checks -- mirrors gates/remediation_gate.py's own `_stage_diff`/`_prior_finding_ids` exactly,
 #     without re-running the scan itself.
+#   - check-ledger-sync-stop.mjs (2026-09-29, Task 11): specification's OWN "dominant rejection
+#     mode" -- spec_ledger.sync_ledger's ~13 existing_us_id/existing_ac_id/retired_us_ids/
+#     retired_ac_ids/bug_affected_ac_ids citation-validity branches (13 of this gate's 17 hard
+#     rules) plus its exact-text citation-drop dedup check, the empty-draft rejection, and the
+#     open-clarifying-question backstop -- shells out to gates/ledger_sync_checks.py (COPY'd in
+#     below UNMODIFIED, stdlib-only), the real implementation spec_ledger.py itself imports, not a
+#     second JS port. Also validates draft-specification.json's SHAPE against a generated JSON
+#     Schema (schemas.HOOK_SCHEMAS["specification"], same lib/json-schema-lite.mjs walker as
+#     plan's schema hook). Audit-turn only (piggybacking check-full-read-stop.mjs's own
+#     AIDW_AUDIT_FULL_READ_FILE gate), also runs the run_id-dependent fully_reviewed completeness
+#     sweep using AIDW_RUN_ID (Task 5) -- until this hook, that env var had no Stop-hook consumer.
 #
 # BOTH PROVIDERS (user directive, 2026-09-17): baked into BOTH Claude Code's admin-managed
 # settings path AND GitHub Copilot CLI's own config, confirmed live via real docker-exec
@@ -890,6 +901,13 @@ COPY hooks/check-remediation-stop.mjs /opt/aidw-hooks/check-remediation-stop.mjs
 # agent/sandbox-image) after editing the source and before rebuilding. Needs nothing beyond
 # python3's standard library.
 COPY hooks/remediation_evaluate_checks.py /opt/aidw-hooks/remediation_evaluate_checks.py
+COPY hooks/check-ledger-sync-stop.mjs /opt/aidw-hooks/check-ledger-sync-stop.mjs
+# Byte-identical staged copy of agent/src/gates/ledger_sync_checks.py -- same build-context
+# constraint and same drift-guard convention as every other staged .py file here (that module's own
+# `_demo()` asserts this file matches its source on every self-check run); re-run `cp
+# ../src/gates/ledger_sync_checks.py hooks/ledger_sync_checks.py` (from agent/sandbox-image) after
+# editing the source and before rebuilding. Needs nothing beyond python3's standard library.
+COPY hooks/ledger_sync_checks.py /opt/aidw-hooks/ledger_sync_checks.py
 COPY hooks/lib/ /opt/aidw-hooks/lib/
 COPY hooks/schemas/ /opt/aidw-hooks/schemas/
 RUN set -eux; \
@@ -910,7 +928,8 @@ RUN set -eux; \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs", "timeout": 30 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs", "timeout": 300 } ] },' \
       '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs", "timeout": 30 } ] },' \
-      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs", "timeout": 30 } ] }' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs", "timeout": 30 } ] },' \
+      '      { "hooks": [ { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs", "timeout": 30 } ] }' \
       '    ]' \
       '  }' \
       '}' \
@@ -931,7 +950,8 @@ RUN set -eux; \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-testid-locators-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-quick-scan-stop.mjs" },' \
       '      { "type": "command", "command": "node /opt/aidw-hooks/check-adversarial-stop.mjs" },' \
-      '      { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs" }' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-remediation-stop.mjs" },' \
+      '      { "type": "command", "command": "node /opt/aidw-hooks/check-ledger-sync-stop.mjs" }' \
       '    ]' \
       '  }' \
       '}' \
@@ -950,6 +970,7 @@ RUN set -eux; \
       /opt/aidw-hooks/check-testid-locators-stop.mjs \
       /opt/aidw-hooks/check-adversarial-stop.mjs /opt/aidw-hooks/adversarial_audit_checks.py \
       /opt/aidw-hooks/check-remediation-stop.mjs /opt/aidw-hooks/remediation_evaluate_checks.py \
+      /opt/aidw-hooks/check-ledger-sync-stop.mjs /opt/aidw-hooks/ledger_sync_checks.py \
       /opt/aidw-hooks/lib/*.mjs /opt/aidw-hooks/schemas/*.json; \
     chown -R vscode:vscode /home/vscode/.copilot; \
     chmod 0644 /home/vscode/.copilot/config.json
