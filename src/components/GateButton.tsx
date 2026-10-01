@@ -233,8 +233,12 @@ function StageSection({
   insights: VerifyInsights | null;
 }) {
   const pipeline = usePipeline();
-  const [selected, setSelected] = useState<number | null>(null); // null = Latest
-  const attempt = selected != null ? attempts?.[selected] : undefined;
+  const [selected, setSelected] = useState<number | null>(null); // null = default below
+  // No live verdict (stage approved earlier, or reset by a rewind/new run): default to the newest
+  // recorded attempt rather than a table of "not re-verified" rows the user must click away from.
+  const hasLive = view.verdict != null;
+  const effective = selected ?? (!hasLive && attempts?.length ? attempts.length - 1 : null);
+  const attempt = effective != null ? attempts?.[effective] : undefined;
   const mode = attempt ? attempt.code_gen_mode : codeGenMode;
   const modeLabel = mode ? (pipeline.modes.find((m) => m.id === mode)?.label ?? mode) : null;
   const policy = attempt ? attempt.policy : view.policy;
@@ -268,11 +272,11 @@ function StageSection({
           Attempt
           <select
             className="rounded-md border border-neutral-300 px-2 py-1 text-sm"
-            value={selected ?? ""}
+            value={effective ?? ""}
             onChange={(e) => setSelected(e.target.value === "" ? null : Number(e.target.value))}
             disabled={!attempts?.length}
           >
-            <option value="">Latest</option>
+            {(hasLive || !attempts?.length) && <option value="">Latest</option>}
             {attempts?.map((a, i) => (
               <option key={`${a.run_id}:${a.attempt}`} value={i}>
                 {i + 1} · {a.stage_passed ? "passed" : "failed"} · {new Date(a.created_at).toLocaleString()}
