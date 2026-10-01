@@ -1,8 +1,36 @@
 import "server-only";
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
+import { auth, getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_MODE } from "@/lib/e2e";
+import { E2E_GITHUB_ID, E2E_MODE, githubAccessToken } from "@/lib/e2e";
+
+/** What the agent needs to (re)provision a session's sandbox, as its ProvisionRequest fields. */
+export interface SandboxCredentials {
+  /** Clones the repo and pushes the work branch. The browser never holds it -- read here, server-side. */
+  github_token: string;
+  /** Advisory only -- see session_store.py's module docstring. */
+  user_login: string;
+  /** Fresh Entra access token (the jwt callback refreshes it before this reads it) -- the agent
+   * exchanges it on-behalf-of for the session's Key Vault secrets at provision time, then
+   * discards it. Absent in E2E-bypass mode; the agent skips the vault fetch then. */
+  entra_assertion: string | null;
+}
+
+/** The caller's sandbox credentials, or null (-> 401) without a GitHub token and identity. Shared
+ * by the provision route and the review route (which reconnects a sandbox an agent restart
+ * dropped) so both forward exactly the same thing. E2E mode: the PAT fallback must have `repo`
+ * read on the target repo. */
+export async function sandboxCredentials(): Promise<SandboxCredentials | null> {
+  const token = await getServerAuthToken();
+  const accessToken = githubAccessToken(token);
+  const githubId = token?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
+  if (!accessToken || !githubId) return null;
+  return {
+    github_token: accessToken,
+    user_login: token?.login ?? (E2E_MODE ? E2E_GITHUB_ID : ""),
+    entra_assertion: token?.entraAccessToken ?? null,
+  };
+}
 import { getOctokit } from "@/lib/github";
 import type { Session } from "@/lib/session-types";
 

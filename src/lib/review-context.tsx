@@ -45,8 +45,10 @@ export interface ReviewView {
   body?: ReviewSegment[];
   details?: string | null;
   input?: { placeholder: string } | null;
-  /** Why the actions are disabled right now (a run owns the thread, or no sandbox yet). */
+  /** Why the actions are disabled right now (a run or another resolve owns the thread). */
   blocked?: string | null;
+  /** Informational line while the actions stay enabled (e.g. the workspace reconnects on continue). */
+  note?: string | null;
   actions?: ReviewAction[];
   tech_stack?: { subtitle: string; markdown: string; show_catalog: boolean; verification: ReviewVerification | null } | null;
   /** The Requirements tab while this review is open: the action its Submit posts (with the revised

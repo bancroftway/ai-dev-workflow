@@ -1004,26 +1004,32 @@ async def get_gate_screen(session_id: str, tab_id: str, request: Request, attemp
     return screen
 
 
-async def _open_review(session_id: str) -> dict[str, Any]:
+# Sessions whose POST /review is between its first check and start_resume -- which now spans a
+# sandbox reconnect (seconds to minutes). Check-and-add has no `await` in between, so a double
+# click or a second tab gets 409 instead of a second provision/resume; GET /review reads it as busy.
+# ponytail: process-local, same single-instance caveat as run_activity/registry.
+_REVIEW_RESOLVING: set[str] = set()
+
+
+async def _open_review(session_id: str, *, busy: bool) -> dict[str, Any]:
     """The checkpoint's pending interrupt as review_view's model. The checkpoint (not an AG-UI
     stream, not dbo.sessions.awaiting_gate) is the one place an open gate is durably true -- it
     survives agent restarts, reloads, other tabs and headless-driven runs alike."""
     snapshot = await graph.aget_state({"configurable": {"thread_id": session_id}})
     return review_view.build_review(
-        snapshot.interrupts or (),
-        sandbox_ready=registry.get(session_id) is not None,
-        busy=run_activity.is_driving(session_id),
+        snapshot.interrupts or (), sandbox_ready=registry.get(session_id) is not None, busy=busy,
     )
 
 
 @router.get("/{session_id}/review")
 async def get_review(session_id: str, request: Request) -> dict[str, Any]:
     """The open human review (review_view.build_review), or `{"open": false, ...}`. Same auth/404
-    shape as /tabs."""
+    shape as /tabs. Read-only: an unregistered sandbox is only noted -- POST reconnects it."""
     _check_shared_secret(request)
     if await session_store.get_session(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
-    return await _open_review(session_id)
+    busy = run_activity.is_driving(session_id) or session_id.lower() in _REVIEW_RESOLVING
+    return await _open_review(session_id, busy=busy)
 
 
 class ReviewActionRequest(BaseModel):
@@ -1033,30 +1039,69 @@ class ReviewActionRequest(BaseModel):
     action_id: str
     # Reject feedback / tech-stack markdown / resubmitted requirements; ignored by approve/retry.
     text: str | None = None
+    # Exactly what the Next.js provision route forwards (ProvisionRequest's same-named fields),
+    # used only when this session's sandbox must be reconnected first (_ensure_sandbox).
+    github_token: str = ""
+    user_login: str = ""
+    entra_assertion: str | None = None
+
+
+async def _ensure_sandbox(session_id: str, row: dict[str, Any], body: ReviewActionRequest, request: Request) -> None:
+    """Registers this session's sandbox when this process has none (an agent restart wipes the
+    registry): provision_session itself -- the call the page's SandboxSessionBoot makes -- for the
+    row's own owner/repo/source_branch, so it reattaches a surviving container (else boots a fresh
+    one on the persisted workspace volume) and reseeds the push token, vault secrets and
+    repo auth/test-user settings exactly as a page load would. Any failure -> 503 with the reason.
+    `session_id` is the caller's thread id, not row["session_id"] (lowercased on read): the
+    registry and checkpoint key on the id exactly as the page sent it."""
+    if registry.get(session_id) is not None:
+        return
+    req = ProvisionRequest(
+        thread_id=session_id, owner=row["owner"], repo=row["repo"], branch=row["source_branch"],
+        github_token=body.github_token, user_login=body.user_login, entra_assertion=body.entra_assertion,
+    )
+    try:
+        await provision_session(req, request)
+    except Exception as exc:  # noqa: BLE001 -- every failure is "can't resume", surfaced verbatim
+        detail = exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
+        logger.warning("review: sandbox reconnect failed for session_id=%s: %s", session_id, detail)
+        raise HTTPException(status_code=503, detail=review_view.REVIEW_TEXT["reconnect_failed"].format(detail=detail)) from None
+    logger.info("review: reconnected sandbox for session_id=%s", session_id)
 
 
 @router.post("/{session_id}/review", status_code=202)
 async def post_review(session_id: str, body: ReviewActionRequest, request: Request) -> dict[str, Any]:
     """Resolves the open review: maps the action to the resume value graph.make_gate_node expects
-    (review_view.resume_value) and resumes the graph server-side (run_activity.start_resume, the
-    same detached task an AG-UI run uses). 202: the run started -- attach to it to watch. 409:
-    nothing open for that stage, or blocked (no sandbox / a run already owns the thread -- a double
-    click or a second tab lands here, never a second resume). 400: an action this review doesn't
-    offer or one missing its text."""
+    (review_view.resume_value), reconnects the session's sandbox if this process has none
+    (_ensure_sandbox -- gate_node persists/signs with it, so never resume without one), and
+    resumes the graph server-side (run_activity.start_resume, the same detached task an AG-UI run
+    uses). 202: the run started -- attach to it to watch. 409: nothing open for that stage, or a
+    run / another resolve already owns the thread (double click, second tab: never a second
+    provision or resume). 400: an action this review doesn't offer or one missing its text. 503:
+    the sandbox couldn't be reconnected -- nothing resumed."""
     _check_shared_secret(request)
-    if await session_store.get_session(session_id) is None:
+    row = await session_store.get_session(session_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="session not found")
-    review = await _open_review(session_id)
-    if not review["open"] or review["stage"] != body.stage:
-        raise HTTPException(status_code=409, detail=f"no open review for stage {body.stage!r}")
-    if review["blocked"]:
-        raise HTTPException(status_code=409, detail=review["blocked"])
-    try:
-        value = review_view.resume_value(review, body.action_id, body.text)
-    except review_view.ReviewActionError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not run_activity.start_resume(session_id, value):
+    key = session_id.lower()
+    if key in _REVIEW_RESOLVING:
         raise HTTPException(status_code=409, detail=review_view.REVIEW_TEXT["busy"])
+    _REVIEW_RESOLVING.add(key)
+    try:
+        review = await _open_review(session_id, busy=run_activity.is_driving(session_id))
+        if not review["open"] or review["stage"] != body.stage:
+            raise HTTPException(status_code=409, detail=f"no open review for stage {body.stage!r}")
+        if review["blocked"]:
+            raise HTTPException(status_code=409, detail=review["blocked"])
+        try:
+            value = review_view.resume_value(review, body.action_id, body.text)
+        except review_view.ReviewActionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await _ensure_sandbox(session_id, row, body, request)
+        if not run_activity.start_resume(session_id, value):
+            raise HTTPException(status_code=409, detail=review_view.REVIEW_TEXT["busy"])
+    finally:
+        _REVIEW_RESOLVING.discard(key)
     logger.info("review resolved server-side: session_id=%s stage=%s action=%s", session_id, body.stage, body.action_id)
     return {"accepted": True, "stage": body.stage, "action_id": body.action_id}
 
@@ -3830,8 +3875,11 @@ def _demo() -> None:
 
 def _demo_review_endpoints() -> None:
     """GET/POST /sessions/{id}/review over a real ASGI round-trip: checkpoint, session row, sandbox
-    registry and the graph driver stubbed (no DB, no graph run) -- asserts the 404/409/400/202
-    contract and that the driver receives exactly the resume value make_gate_node expects."""
+    registry, provision_session and the graph driver stubbed (no DB, no graph run) -- asserts the
+    404/409/400/202/503 contract, that the driver receives exactly the resume value make_gate_node
+    expects, and that a missing sandbox is reconnected (once, with the forwarded credentials)
+    before any resume."""
+    import sys
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -3850,9 +3898,15 @@ def _demo_review_endpoints() -> None:
     sandboxes: set[str] = set()
     driven: list[tuple[str, Any]] = []
     tasks: list[_FakeTask] = []
+    provisioned: list[ProvisionRequest] = []
+    provision_fail: list[Exception] = []
+    provision_hold: list[asyncio.Event] = []
 
     async def fake_get_session(session_id: str) -> dict[str, Any] | None:
-        return None if session_id == "missing" else {"session_id": session_id, "status": "in_progress"}
+        if session_id == "missing":
+            return None
+        # session_store lowercases ids on read; the provision must still use the caller's id.
+        return {"session_id": session_id.lower(), "status": "in_progress", "owner": "o", "repo": "r", "source_branch": "main"}
 
     async def fake_aget_state(config: dict[str, Any]) -> Any:
         return SimpleNamespace(interrupts=pending.get(config["configurable"]["thread_id"], ()), values={}, tasks=())
@@ -3861,6 +3915,15 @@ def _demo_review_endpoints() -> None:
         driven.append((thread_id, value))
         tasks.append(_FakeTask())
         return tasks[-1]
+
+    async def fake_provision(req: ProvisionRequest, request: Request) -> ProvisionResponse:
+        provisioned.append(req)
+        if provision_hold:
+            await provision_hold[0].wait()
+        if provision_fail:
+            raise provision_fail[0]
+        sandboxes.add(req.thread_id)
+        return ProvisionResponse(status="ready")
 
     real_secret = os.environ.get("AIDW_AGENT_SHARED_SECRET")
     os.environ["AIDW_AGENT_SHARED_SECRET"] = ""
@@ -3874,6 +3937,7 @@ def _demo_review_endpoints() -> None:
             patch.object(session_store, "get_session", fake_get_session),
             patch.object(graph, "aget_state", fake_aget_state),
             patch.object(registry, "get", lambda sid: object() if sid in sandboxes else None),
+            patch.object(sys.modules[__name__], "provision_session", fake_provision),
         ):
             assert client.get("/sessions/missing/review").status_code == 404
             assert client.post("/sessions/missing/review", json={"stage": "specification", "action_id": "approve"}).status_code == 404
@@ -3881,11 +3945,9 @@ def _demo_review_endpoints() -> None:
             closed = client.get("/sessions/rev-1/review").json()
             assert closed["open"] is False, closed
             nothing = client.post("/sessions/rev-1/review", json={"stage": "specification", "action_id": "approve"})
-            assert nothing.status_code == 409 and not driven, nothing.text
+            assert nothing.status_code == 409 and not driven and not provisioned, nothing.text
 
             pending["rev-1"] = (Interrupt(value={"stage": "specification", "draft": {}}, id="int-1"),)
-            no_box = client.post("/sessions/rev-1/review", json={"stage": "specification", "action_id": "approve"})
-            assert no_box.status_code == 409 and "sandbox" in no_box.json()["detail"] and not driven, no_box.text
             sandboxes.add("rev-1")
             opened = client.get("/sessions/rev-1/review").json()
             assert opened["open"] and opened["id"] == "int-1" and opened["actions"][0]["enabled"], opened
@@ -3915,6 +3977,61 @@ def _demo_review_endpoints() -> None:
             ts = client.post("/sessions/rev-1/review", json={"stage": "tech-stack", "action_id": "submit", "text": "# Stack\n"})
             assert ts.status_code == 202 and driven[-1] == ("rev-1", {"markdown": "# Stack\n"}), (ts.text, driven[-1])
             run_activity.pop_task("rev-1")
+            assert not provisioned, "a registered sandbox must never be reprovisioned"
+
+            # Agent restart: the gate is open but this process has no sandbox. GET stays read-only
+            # and actionable (a note, not a blocker); validation still precedes any provisioning.
+            n = len(driven)
+            pending["Rev-2"] = (Interrupt(value={"stage": "specification", "draft": {}}, id="int-4"),)
+            cold = client.get("/sessions/Rev-2/review").json()
+            assert cold["blocked"] is None and cold["actions"][0]["enabled"], cold
+            assert cold["note"] == review_view.REVIEW_TEXT["reconnect_note"] and not provisioned, cold
+            assert client.post("/sessions/Rev-2/review", json={"stage": "specification", "action_id": "reject", "text": "x"}).status_code == 400
+            assert not provisioned
+
+            # Reconnect fails -> 503 with the provision path's reason, nothing resumed, slot released.
+            creds = {"github_token": "gh-tok", "user_login": "octo", "entra_assertion": "entra-jwt"}
+            approve = {"stage": "specification", "action_id": "approve", **creds}
+            provision_fail.append(HTTPException(status_code=502, detail="sandbox provisioning failed: RuntimeError: boom"))
+            down = client.post("/sessions/Rev-2/review", json=approve)
+            assert down.status_code == 503 and "boom" in down.json()["detail"], down.text
+            assert down.json()["detail"].startswith("Couldn't reconnect") and len(driven) == n and len(provisioned) == 1
+            assert "Rev-2" not in sandboxes and not _REVIEW_RESOLVING
+            provision_fail[:] = [RuntimeError("docker down")]
+            assert client.post("/sessions/Rev-2/review", json=approve).status_code == 503 and len(driven) == n
+            provision_fail.clear()
+            provisioned.clear()
+
+            # Double click / two tabs while the reconnect is in flight: exactly one provision (with
+            # the forwarded credentials, under the caller's id), one resume, the other 409; a GET
+            # meanwhile reads busy.
+            async def _double_post() -> tuple[httpx.Response, httpx.Response, dict[str, Any]]:
+                provision_hold.append(asyncio.Event())
+                try:
+                    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as ac:
+                        first = asyncio.create_task(ac.post("/sessions/Rev-2/review", json=approve))
+                        for _ in range(500):
+                            if provisioned:
+                                break
+                            await asyncio.sleep(0.01)
+                        # Bounded: without the in-flight guard this second POST would queue behind
+                        # the held provision instead of 409ing -- a hang must read as a failure.
+                        second = await asyncio.wait_for(ac.post("/sessions/Rev-2/review", json=approve), 5)
+                        during = (await ac.get("/sessions/Rev-2/review")).json()
+                        provision_hold[0].set()
+                        return await first, second, during
+                finally:
+                    provision_hold.clear()
+
+            first, second, during = asyncio.run(_double_post())
+            assert first.status_code == 202 and second.status_code == 409, (first.text, second.text)
+            assert second.json()["detail"] == review_view.REVIEW_TEXT["busy"] and during["blocked"] == review_view.REVIEW_TEXT["busy"]
+            assert len(provisioned) == 1 and len(driven) == n + 1 and driven[-1] == ("Rev-2", {"decision": "approved"}), driven
+            p = provisioned[0]
+            assert (p.thread_id, p.owner, p.repo, p.branch) == ("Rev-2", "o", "r", "main"), p
+            assert (p.github_token, p.user_login, p.entra_assertion, p.resume) == ("gh-tok", "octo", "entra-jwt", False), p
+            assert not _REVIEW_RESOLVING
+            run_activity.pop_task("Rev-2")
     finally:
         run_activity._resume_driver = real_driver
         if real_secret is None:

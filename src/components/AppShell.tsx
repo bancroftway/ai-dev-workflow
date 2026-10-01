@@ -805,7 +805,7 @@ function ReviewCard() {
   const [text, setText] = useState("");
   if (!review.open || !review.card) return null;
   const tone = REVIEW_TONE[review.tone ?? "review"];
-  const blocked = review.blocked ?? null;
+  const status = error ?? review.blocked ?? review.note ?? null;
   return (
     <div className={`mx-4 mt-3 space-y-2 rounded-lg border px-4 py-3 ${tone.box}`}>
       <div className="flex items-center justify-between gap-4">
@@ -847,7 +847,7 @@ function ReviewCard() {
           onChange={(event) => setText(event.target.value)}
         />
       )}
-      {(blocked || error) && <p className="text-xs text-neutral-600">{error ?? blocked}</p>}
+      {status && <p className="text-xs text-neutral-600">{status}</p>}
     </div>
   );
 }

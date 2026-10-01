@@ -207,8 +207,8 @@ function TechStackViewImpl() {
           />
 
           <div className="flex items-center justify-end gap-3">
-            {(reviewError ?? review.blocked) && (
-              <span className="text-xs text-neutral-500">{reviewError ?? review.blocked}</span>
+            {(reviewError ?? review.blocked ?? review.note) && (
+              <span className="text-xs text-neutral-500">{reviewError ?? review.blocked ?? review.note}</span>
             )}
             <button
               className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"

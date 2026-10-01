@@ -56,10 +56,12 @@ REVIEW_TEXT: dict[str, Any] = {
         None: "A review is waiting — approve or reject it first, then edit and resubmit.",
     },
     "busy": "Applying a decision on this review…",
-    # The page's own sandbox boot reprovisions on load; a tab left open across an agent restart
-    # has nothing that will, hence the reload hint.
-    "no_sandbox": "Waiting for this session's dev-tool sandbox to connect — if this doesn't clear in a few "
-    "seconds, reload the page.",
+    # No sandbox registered in this process (an agent restart wipes the registry): not a blocker --
+    # POST /sessions/{id}/review reconnects it (sessions_api._ensure_sandbox) before resuming.
+    "reconnect_note": "This session's workspace reconnects when you continue — that can take a minute.",
+    # POST's 503 when that reconnect fails; {detail} is the provision path's own reason.
+    "reconnect_failed": "Couldn't reconnect this session's workspace, so nothing was applied — try again in a "
+    "moment. ({detail})",
     "this_stage": "this stage",
 }
 
@@ -118,23 +120,22 @@ def _verification(v: Any) -> dict[str, Any] | None:
 def build_review(interrupts: Sequence[Any], *, sandbox_ready: bool, busy: bool) -> dict[str, Any]:
     """The open review for the FIRST pending interrupt (one gate is open at a time), or CLOSED.
 
-    `blocked` (actions disabled) when a run is already driving the thread -- a resolve is being
-    applied, or another tab got there first -- or when no sandbox is registered: gate_node only
-    persists/signs an approval (and tech-stack only verifies a submission) with a sandbox, so
-    resolving without one would approve unpersisted content. The page's own sandbox boot
-    reprovisions it after an agent restart."""
+    `blocked` (actions disabled) only when a run is already driving the thread -- a resolve is
+    being applied, or another tab got there first. A missing sandbox is NOT a blocker: gate_node
+    needs one to persist/sign an approval (tech-stack to verify a submission), but the resolve
+    endpoint reconnects it before resuming and refuses (503) when it can't -- `note` says so."""
     pending = next((i for i in interrupts if isinstance(getattr(i, "value", None), dict)), None)
     if pending is None:
         return dict(CLOSED)
     p: dict[str, Any] = pending.value
     stage = p.get("stage") if isinstance(p.get("stage"), str) else None
     label = _label(stage)
-    blocked = REVIEW_TEXT["busy"] if busy else None if sandbox_ready else REVIEW_TEXT["no_sandbox"]
-    ok = blocked is None
+    ok = not busy
     view: dict[str, Any] = {
         "open": True, "id": getattr(pending, "id", None), "stage": stage, "stage_label": label,
         "card": True, "tone": "review", "title": None, "body": [], "details": None, "input": None,
-        "blocked": blocked, "tech_stack": None,
+        "blocked": None if ok else REVIEW_TEXT["busy"],
+        "note": None if sandbox_ready or not ok else REVIEW_TEXT["reconnect_note"], "tech_stack": None,
         "requirements": {"resubmit_action": None, "note": REVIEW_TEXT["requirements_note"][None]},
     }
 
@@ -267,11 +268,21 @@ def _demo() -> None:
     assert esc["body"] == [{"text": "3 failed", "bold": False}] and '"report"' in esc["details"] and "huge" not in esc["details"]
     assert resume_value(esc, "retry", None) == "retry"
 
-    # Blocked: no sandbox / a run already driving -- actions disabled, resubmit withheld, reason given.
-    for kw, reason in (({"sandbox_ready": False, "busy": False}, "no_sandbox"), ({"sandbox_ready": True, "busy": True}, "busy")):
-        b = build_review([Interrupt(value={"stage": "specification", "draft": {}}, id="i")], **kw)
-        assert b["open"] and b["blocked"] == REVIEW_TEXT[reason] and not b["actions"][0]["enabled"]
-        assert b["requirements"]["resubmit_action"] is None
+    # Blocked only while a run drives the thread -- actions disabled, resubmit withheld, reason given.
+    b = build_review([Interrupt(value={"stage": "specification", "draft": {}}, id="i")], sandbox_ready=False, busy=True)
+    assert b["open"] and b["blocked"] == REVIEW_TEXT["busy"] and not b["actions"][0]["enabled"]
+    assert b["requirements"]["resubmit_action"] is None and b["note"] is None
+    # No sandbox in this process (agent restart): still actionable -- the POST reconnects it -- plus a note.
+    for st in ("specification", "brownfield-spec", TECH_STACK, "ac-to-tests"):
+        extra = {"type": "verification_cap_exceeded"} if st == "ac-to-tests" else {}
+        nb = build_review([Interrupt(value={"stage": st, "draft": {}, "markdown": "", **extra}, id="i")],
+                          sandbox_ready=False, busy=False)
+        assert nb["blocked"] is None and all(a["enabled"] for a in nb["actions"]), nb
+        assert nb["note"] == REVIEW_TEXT["reconnect_note"], nb
+    assert nb["kind"] == "escalation" and spec["note"] is None
+    assert build_review([Interrupt(value={"stage": "specification", "draft": {}})], sandbox_ready=False,
+                        busy=False)["requirements"]["resubmit_action"] == RESUBMIT_ACTION
+    assert "{detail}" in REVIEW_TEXT["reconnect_failed"]
     # A closed review offers nothing.
     try:
         resume_value(CLOSED, "approve", None)

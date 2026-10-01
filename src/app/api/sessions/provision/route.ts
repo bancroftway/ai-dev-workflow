@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import { getServerAuthToken } from "@/auth";
 import { agentFetch } from "@/lib/agent-client";
-import { E2E_GITHUB_ID, E2E_MODE, githubAccessToken } from "@/lib/e2e";
+import { sandboxCredentials } from "@/lib/session-access";
 
 /**
  * Server-to-server proxy into the agent's sandbox provisioning endpoint (architecture plan
@@ -16,15 +15,12 @@ import { E2E_GITHUB_ID, E2E_MODE, githubAccessToken } from "@/lib/e2e";
  * here, so this route does no session-existence checking of its own. Concurrency is fully open:
  * any number of sessions can be in-progress on the same repo at once, each on its own branch.
  *
- * E2E mode: the forwarded token is what the sandbox clones the target repo with, so the fallback
- * PAT must have `repo` read on that repo.
+ * Credentials (GitHub token, login, Entra assertion) come from sandboxCredentials -- shared with
+ * the review route, which reconnects a sandbox an agent restart dropped.
  */
 export async function POST(request: Request) {
-  const token = await getServerAuthToken();
-  const accessToken = githubAccessToken(token);
-  const githubId = token?.githubId ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
-  const userLogin = token?.login ?? (E2E_MODE ? E2E_GITHUB_ID : undefined);
-  if (!accessToken || !githubId) {
+  const credentials = await sandboxCredentials();
+  if (!credentials) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -70,16 +66,10 @@ export async function POST(request: Request) {
       owner,
       repo,
       branch,
-      github_token: accessToken,
-      // Advisory only -- see session_store.py's module docstring.
-      user_login: userLogin ?? "",
+      ...credentials,
       resume: Boolean(resume),
       confirm_reopen: Boolean(confirmReopen),
       code_gen_mode: codeGenMode,
-      // Fresh Entra access token (the jwt callback refreshes it before this route reads it) --
-      // the agent exchanges it on-behalf-of for the session's Key Vault secrets at provision
-      // time, then discards it. Absent in E2E-bypass mode; the agent skips the vault fetch then.
-      entra_assertion: token?.entraAccessToken ?? null,
     }),
   });
 
