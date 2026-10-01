@@ -33,11 +33,12 @@ import type { EscalationPayload, MergeReadinessReport, WorkflowState } from "@/l
 
 type DotState = "running" | "done" | "error" | "awaiting";
 
-const DOT_CLASS: Record<DotState, string> = {
-  running: "bg-blue-500 animate-pulse",
-  awaiting: "bg-amber-500 animate-pulse",
-  done: "bg-emerald-500",
-  error: "bg-red-500",
+// Stage status as the tab label's own colour (no separate dot); same green/red/amber as the gate
+// icons. Lighter tints on the active tab's dark background. "running" keeps its spinner instead.
+const LABEL_CLASS: Record<Exclude<DotState, "running">, { idle: string; active: string }> = {
+  awaiting: { idle: "text-amber-600", active: "text-amber-300" },
+  done: { idle: "text-emerald-600", active: "text-emerald-300" },
+  error: { idle: "text-red-600", active: "text-red-300" },
 };
 
 /** Dot for a tab, derived from its stages' ordinary StageStates. Green dots
@@ -718,7 +719,7 @@ export function AppShell({
           <MetricsBar thresholds={metricThresholds} trailing={<LiveCostChip />} onJumpToSection={jumpToQualitySection} />
         )}
         <nav className="flex items-center gap-1 overflow-x-auto border-b border-neutral-200 px-4 py-2">
-          <div role="tablist" className="flex items-center gap-1">
+          <div role="tablist" className="flex items-center gap-[6.8px]">
             {tabs.map((tab) => (
               <Fragment key={tab.id}>
                 <TabButton
@@ -1070,7 +1071,8 @@ function TabButton({
       aria-selected={active}
       className={[
         "flex shrink-0 items-center whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium",
-        active ? "bg-neutral-900 text-white" : "text-neutral-700 hover:bg-neutral-100",
+        active ? "bg-neutral-900" : "hover:bg-neutral-100",
+        dot && dot !== "running" ? LABEL_CLASS[dot][active ? "active" : "idle"] : active ? "text-white" : "text-neutral-700",
         disabled ? "cursor-not-allowed opacity-40 hover:bg-transparent" : "",
       ].join(" ")}
       disabled={disabled}
@@ -1082,9 +1084,7 @@ function TabButton({
         // "running" dot are too close in a quick glance at 8px (user feedback 2026-09-01: "unclear
         // which stage is running"). Shape + motion reads unambiguously where hue alone didn't.
         <RunningSpinner className="ml-1.5 h-2.5 w-2.5" />
-      ) : (
-        dot && <span aria-hidden className={`ml-1.5 inline-block h-2 w-2 rounded-full ${DOT_CLASS[dot]}`} />
-      )}
+      ) : null}
     </button>
   );
 }
