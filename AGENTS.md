@@ -109,3 +109,21 @@ Putting these in `config.py` anyway doesn't make them more configurable — it j
 internal protocol detail in a module whose entire contract is "safe for an operator to change."
 When in doubt: would a deploy operator ever plausibly want to override this via an env var,
 independent of a code change? If not, it isn't config.
+
+# Keep business logic on the server, not in the frontend
+
+The frontend (`src/**`) must do as little business-logic processing as possible; offload it to the
+server (`agent/src/**`). The server decides; the frontend renders what it is given.
+
+- Deciding a status, a verdict, a color/tone, whether something passed, what applies under a
+  code-gen mode, which items to show, or how stages/gates/checks relate is business logic. Compute
+  it in Python and send the frontend a ready-to-render shape (rows, cells, labels, tones), not raw
+  state for it to interpret.
+- The frontend may hold presentation only: layout, Tailwind classes, a tone→class map, icons, and
+  user interaction (selection, open/close, fetch-on-change).
+- User-visible copy comes from the server too. No pipeline facts (stage keys, labels, order,
+  policies, check lists) are hardcoded in `src/` — `scripts/check-no-stage-literals.mjs` enforces
+  the stage-key part.
+- When adding a feature that needs a rule, put the rule in the agent and expose it via an endpoint
+  or the pipeline descriptor; a rule duplicated in TypeScript will drift from the one the graph
+  actually runs.
