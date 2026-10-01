@@ -62,7 +62,7 @@ GATE_TEXT: dict[str, Any] = {
         "advisory_failure": "advisory failure",
         "approved_earlier": "approved earlier, not re-verified",
     },
-    "icon_badge": {"off": "", "unknown": "?", "not_run": "", "verifying": "…", "passed": "✓", "failed": "✕", "warn": "!"},
+    "icon_badge": {"off": "", "unknown": "?", "not_run": "", "verifying": "…", "passed": "", "failed": "✕", "warn": "!"},
     "icon_aria": "{name} verification: {policy}, {status}",
     "policy_unknown": "mode unknown",
     # The gate screen.
@@ -522,7 +522,7 @@ def _demo() -> None:
     by_tab = {g["tab_id"]: g["icon"] for g in summ["gates"]}
     gated_tabs = {t.id for t in p.tabs if any(p.stage(k) and p.stage(k).gate for k in t.stage_keys)}  # type: ignore[union-attr]
     assert set(by_tab) == gated_tabs and {"tech-stack", "specification", "plan", "tests", "code", "quality", "report"} <= gated_tabs, by_tab
-    assert by_tab["plan"]["tone"] == "passed" and by_tab["plan"]["badge"] == "✓"
+    assert by_tab["plan"]["tone"] == "passed" and by_tab["plan"]["badge"] == ""
     assert by_tab["specification"]["tone"] == "failed" and by_tab["specification"]["badge"] == "✕"
     # Untouched optional brownfield-spec is dropped: the label names the one shown stage.
     assert by_tab["specification"]["label"].startswith(p.stage("specification").label + " verification"), by_tab  # type: ignore[union-attr]
