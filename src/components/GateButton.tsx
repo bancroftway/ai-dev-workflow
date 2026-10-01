@@ -172,7 +172,7 @@ export function GateButton({
         active ? "bg-neutral-100 ring-2 ring-neutral-900" : ""
       }`}
     >
-      <GateArrowIcon className="h-4 w-6" />
+      <GateArrowIcon className="h-[18.4px] w-[27.6px]" />
       {look.badge && (
         <span aria-hidden className="absolute -right-0.5 -bottom-0.5 text-[9px] leading-none font-bold">
           {look.badge}
