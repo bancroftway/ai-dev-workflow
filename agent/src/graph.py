@@ -5561,6 +5561,7 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         approved = stages[stage_spec.key]
         content = approved["draft"]
         submit_gate = stage_spec.gate is not None and stage_spec.gate.timing == "after_submit"
+        passed_submit: dict[str, Any] | None = None  # set when an after_submit verify passed
         if stage_spec.resolve_from_interrupt is not None and sandbox_registry.get(thread_id) is not None:
             # An after_submit gate's verify runs inside resolve_from_interrupt -- bracket it with a
             # node="verify" span so the tab shows "Verifying" (use-run-events.ts NODE_PHASE_LABEL).
@@ -5576,11 +5577,12 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
             if isinstance(resolved, preflight_nodes.SubmitVerifyFailed):
                 return await _reopen_gate_after_failed_submit(stage_spec, state, config, stages, resolved)
             if isinstance(resolved, preflight_nodes.SubmitVerified):
-                # last_verification is cleared below on a passing submit; history still keeps it.
+                submit_lap = approved.get("tech_stack_verify_attempts", 0) + 1
                 await _append_verify_history(
-                    state, thread_id, stage_spec, approved.get("tech_stack_verify_attempts", 0) + 1, True,
+                    state, thread_id, stage_spec, submit_lap, True,
                     resolved.verification.report.get("checks") or [],
                 )
+                passed_submit = _submit_verification_record(resolved.verification, submit_lap)
                 resolved = resolved.content
             if resolved is not None:
                 content = resolved
@@ -5592,9 +5594,10 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
         # unrelated future redraft (e.g. a later escalate-and-revoke on a DIFFERENT gate).
         approved["reviewer_feedback"] = None
         if submit_gate:
-            # This submit passed: drop any earlier failed verdict (else should_skip_draft would
-            # refuse to skip this approved stage on resume) and the failed-attempt counter.
-            approved["last_verification"] = None
+            # This submit passed: replace any earlier failed verdict with the passing one (a failed
+            # verdict would make should_skip_draft refuse to skip this approved stage on resume; a
+            # passed one doesn't) so the gate dialog shows what ran, and reset the attempt counter.
+            approved["last_verification"] = passed_submit
             approved["tech_stack_verify_attempts"] = 0
         stages[stage_spec.key] = approved
 
