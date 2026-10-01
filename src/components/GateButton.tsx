@@ -1,7 +1,6 @@
 "use client";
 
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
-import { Shield, ShieldAlert, ShieldBan, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import { deriveGateRows, type GateRow, type GateVerdict, type ReportedCheck, type RowTone } from "@/lib/gate-rows";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
@@ -35,14 +34,28 @@ type GateStatus = "off" | "unknown" | "not_run" | "verifying" | "passed" | "fail
 // Worst-first across a tab's gated stages (Quality has two).
 const STATUS_RANK: GateStatus[] = ["off", "unknown", "not_run", "passed", "warn", "failed", "verifying"];
 
-const STATUS_LOOK: Record<GateStatus, { text: string; badge: string; className: string; Icon: typeof Shield }> = {
-  off: { text: "not enforced", badge: "", className: "text-neutral-400 opacity-50", Icon: ShieldBan },
-  unknown: { text: "mode not known yet", badge: "?", className: "text-neutral-500", Icon: Shield },
-  not_run: { text: "not run yet", badge: "–", className: "text-neutral-400", Icon: Shield },
-  verifying: { text: "verifying", badge: "…", className: "text-blue-600 animate-pulse", Icon: Shield },
-  passed: { text: "passed", badge: "✓", className: "text-green-600", Icon: ShieldCheck },
-  failed: { text: "failed", badge: "✕", className: "text-red-600", Icon: ShieldAlert },
-  warn: { text: "needs attention", badge: "!", className: "text-amber-600", Icon: ShieldAlert },
+/** An arrow passing through a slatted gate -- the work passing a stage's checks. Stroke uses
+ * currentColor, so the status colour classes below tint it. */
+function GateArrowIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 32 20" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinejoin="round" className={className} aria-hidden>
+      {/* arrow: shaft into a head */}
+      <path d="M1 8h17V4l13 6-13 6v-4H1z" />
+      {/* gate: a slanted frame with vertical slats, drawn over the shaft */}
+      <path d="M5 4.5 11 1.5v16L5 19.5z" />
+      <path d="M7 3.5v15M9 2.5v15" />
+    </svg>
+  );
+}
+
+const STATUS_LOOK: Record<GateStatus, { text: string; badge: string; className: string }> = {
+  off: { text: "not enforced", badge: "", className: "text-neutral-400 opacity-50" },
+  unknown: { text: "mode not known yet", badge: "?", className: "text-neutral-500" },
+  not_run: { text: "not run yet", badge: "–", className: "text-neutral-400" },
+  verifying: { text: "verifying", badge: "…", className: "text-blue-600 animate-pulse" },
+  passed: { text: "passed", badge: "✓", className: "text-green-600" },
+  failed: { text: "failed", badge: "✕", className: "text-red-600" },
+  warn: { text: "needs attention", badge: "!", className: "text-amber-600" },
 };
 
 const TONE_CLASS: Record<RowTone, string> = {
@@ -159,7 +172,7 @@ export function GateButton({
         active ? "bg-neutral-100 ring-2 ring-neutral-900" : ""
       }`}
     >
-      <look.Icon className="size-4" aria-hidden />
+      <GateArrowIcon className="h-4 w-6" />
       {look.badge && (
         <span aria-hidden className="absolute -right-0.5 -bottom-0.5 text-[9px] leading-none font-bold">
           {look.badge}
