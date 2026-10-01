@@ -28,8 +28,8 @@ CODE_GEN_MODES: tuple[str, ...] = ("yolo", "draft_verify", "mission_critical")
 DEFAULT_CODE_GEN_MODE = "mission_critical"
 
 
-# Modes that run the adversarial audit leg. Read by graph._audit_enabled and served per mode in
-# pipeline_layout.describe() so the frontend never re-derives it.
+# Modes that run the adversarial audit leg. Read by graph._audit_enabled and by gate_view (the
+# gate screen's "Skipped: no audit" rows) so the frontend never re-derives it.
 AUDIT_MODES = frozenset({"mission_critical"})
 
 

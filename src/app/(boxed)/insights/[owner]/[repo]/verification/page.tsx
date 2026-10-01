@@ -3,8 +3,13 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import type { VerifyInsights } from "@/components/GateButton";
 import { useFetchedPipeline } from "@/lib/pipeline";
+
+/** Mirrors verify_check_store.check_stats (GET /repos/{owner}/{repo}/verify-insights). */
+interface VerifyInsights {
+  checks: { check_id: string; stage: string; runs: number; fails: number; infra: number; fail_rate: number; last_failed: string | null }[];
+  stages: { stage: string; avg_attempts_to_pass: number | null; sessions: number }[];
+}
 
 /**
  * Repo-scoped verification insights (plan §4): which deterministic checks fail most across this

@@ -546,6 +546,14 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher keeps more of the detail's end in history/insights; head + tail must stay under ~1970 or the tail gets clipped.",
         "positive integer, characters; head + tail <= 1970",
     ),
+    # gate_view._detail_cell: a check row's Detail text at or under this length (and single-line)
+    # shows inline on the gate screen; anything longer collapses behind a disclosure.
+    "AIDW_GATE_DETAIL_INLINE_CHARS": _Setting(
+        "int", "AIDW_GATE_DETAIL_INLINE_CHARS", "160", "truncation",
+        "Longest single-line check detail the gate screen shows inline instead of collapsed.",
+        "Higher shows more details inline (wider rows); lower collapses more of them behind a click.",
+        "positive integer, characters",
+    ),
     "E2E_BOOT_FAILURE_LOG_HEAD_CHARS": _Setting(
         "int", "AIDW_E2E_BOOT_FAILURE_LOG_HEAD_CHARS", "1500", "truncation",
         "Head portion of the app-boot readiness failure description embedded in a failed e2e test's error field.",

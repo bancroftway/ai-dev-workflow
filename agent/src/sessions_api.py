@@ -40,6 +40,7 @@ from . import (
     chat_model,
     checkpoint,
     config,
+    gate_view,
     git_ops,
     github_link_store,
     keyvault,
@@ -924,14 +925,58 @@ async def stream_session_events(session_id: str, _row: dict[str, Any] = Depends(
         await asyncio.sleep(_SSE_EVENTS_POLL_SECONDS)
 
 
-@router.get("/{session_id}/verify-history")
-async def get_verify_history(session_id: str, request: Request, stage: str | None = None) -> dict[str, Any]:
-    """Every verify attempt this session has recorded (dbo.verify_check_results), oldest first,
-    each with its per-check rows. Same auth/404 shape as get_session_events."""
+async def _gate_inputs(session_id: str, request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(session row, gate_view kwargs) shared by the two /gates endpoints. Same auth/404 shape as
+    get_session_events. Graph state is the checkpoint peek get_checkpoint_state makes; pending
+    interrupt payloads (tech-stack's reopened-gate verdict) come off the same snapshot; the running
+    "verify" phase is the old frontend rule over dbo.run_events, gated on run_activity exactly as
+    the frontend gated it on SessionResponse.run_active (skips the event query when idle)."""
     _check_shared_secret(request)
-    if await session_store.get_session(session_id) is None:
+    row = await session_store.get_session(session_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="session not found")
-    return {"attempts": await verify_check_store.list_attempts(session_id, stage)}
+    snapshot = await graph.aget_state({"configurable": {"thread_id": session_id}})
+    values = snapshot.values or {}
+    active = run_activity.is_active(session_id)
+    running = gate_view.running_phases(await run_event_store.list_events_by_session(session_id), active) if active else {}
+    return row, {
+        "state": values,
+        "code_gen_mode": values.get("code_gen_mode") or resolve_code_gen_mode(row.get("code_gen_mode")),
+        "running": running,
+        "interrupts": [i.value for i in (snapshot.interrupts or ())],
+    }
+
+
+@router.get("/{session_id}/gates")
+async def get_gate_summaries(session_id: str, request: Request) -> dict[str, Any]:
+    """The tab-strip icon of every verification gate (gate_view.build_gate_summaries)."""
+    _row, inputs = await _gate_inputs(session_id, request)
+    return gate_view.build_gate_summaries(**inputs)
+
+
+@router.get("/{session_id}/gates/{tab_id}")
+async def get_gate_screen(session_id: str, tab_id: str, request: Request, attempt: str | None = None) -> dict[str, Any]:
+    """One gate's ready-to-render screen (gate_view.build_gate_screen); `attempt` is an option id
+    from a previous response. 404 for a tab that gates nothing."""
+    if not any(t.id == tab_id for t in PIPELINE.tabs):
+        raise HTTPException(status_code=404, detail="gate not found")
+    row, inputs = await _gate_inputs(session_id, request)
+    # History and insights are extras: a DB blip on either still renders the live gate.
+    attempts, insights = await asyncio.gather(
+        verify_check_store.list_attempts(session_id),
+        verify_check_store.check_stats(row["owner"], row["repo"]),
+        return_exceptions=True,
+    )
+    for failed in (x for x in (attempts, insights) if isinstance(x, Exception)):
+        logger.warning("gate screen extras unavailable for session_id=%s: %r", session_id, failed)
+    screen = gate_view.build_gate_screen(
+        **inputs, tab_id=tab_id, attempt=attempt,
+        attempts=[] if isinstance(attempts, Exception) else attempts,
+        insights=None if isinstance(insights, Exception) else insights,
+    )
+    if screen is None:
+        raise HTTPException(status_code=404, detail="gate not found")
+    return screen
 
 
 @router.get("/{session_id}/stream", response_class=EventSourceResponse)

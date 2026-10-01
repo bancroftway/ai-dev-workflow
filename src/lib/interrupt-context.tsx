@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
-import type { GateVerdict } from "@/lib/gate-rows";
+import type { ReportedCheck } from "@/lib/workflow-types";
 
 /** What the currently-open interrupt (approval gate or escalation) carries.
  *
@@ -17,7 +17,9 @@ import type { GateVerdict } from "@/lib/gate-rows";
  *   markdown, not just approve the draft verbatim. `draftMarkdown`/`fileExisted` are tech-stack-
  *   specific (graph.py's build_interrupt_extra for that stage); undefined for every other gate.
  */
-export interface InterruptVerification extends GateVerdict {
+export interface InterruptVerification {
+  passed: boolean;
+  checks?: ReportedCheck[];
   feedback: string;
   attempts: number;
   max_attempts: number;
@@ -30,7 +32,7 @@ interface InterruptInfo {
   draftMarkdown?: string;
   fileExisted?: boolean;
   /** Tech-stack only: the after-submit gate's verdict on the last submission (null = first
-   * showing). Rendered by TechStackView's review UI and the Tech Stack gate dialog. */
+   * showing). Rendered by TechStackView's review UI (the gate screen reads it server-side). */
   verification?: InterruptVerification | null;
   resolve?: (value: unknown) => void;
 }

@@ -10,7 +10,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "
 import { useRouter } from "next/navigation";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
-import { GatePanel, GateSlot, gateViewId } from "@/components/GateSlot";
+import { GateButton, GateView, gateViewId, useGateSummaries } from "@/components/GateButton";
 import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
@@ -213,6 +213,7 @@ export function AppShell({
   // Live state's own mode wins; the session row's is the fallback; null = not known yet.
   const codeGenMode = useCodeGenMode(state.code_gen_mode);
   const runEvents = useStructuralRunEvents();
+  const gates = useGateSummaries();
   const sharedRunningStages = useRunningStages();
   const runningStages = runActivity?.runActive === false ? EMPTY_STAGES : sharedRunningStages;
   // Always-fresh handle for effects below whose own deps intentionally exclude `state` (recreating
@@ -727,13 +728,15 @@ export function AppShell({
                   dot={dots[tab.id]}
                   onClick={() => setActiveView(tab.id)}
                 />
-                {/* The gate between this tab and the next is a tab too (GateSlot.tsx). */}
-                <GateSlot
-                  tab={tab}
-                  codeGenMode={codeGenMode}
-                  active={activeView === gateViewId(tab)}
-                  onSelect={() => setActiveView(gateViewId(tab))}
-                />
+                {/* The gate between this tab and the next is a tab too; the server says which tabs
+                    gate something (GateButton.tsx). */}
+                {gates.has(tab.id) && (
+                  <GateButton
+                    summary={gates.get(tab.id)!}
+                    active={activeView === gateViewId(tab.id)}
+                    onSelect={() => setActiveView(gateViewId(tab.id))}
+                  />
+                )}
               </Fragment>
             ))}
           </div>
@@ -889,9 +892,9 @@ export function AppShell({
           {/* Gate screens mount only while selected: they hold no live-run state to keep warm, and
               remounting re-fetches attempt history. */}
           {tabs.map((tab) =>
-            activeView === gateViewId(tab) ? (
-              <div key={gateViewId(tab)} role="tabpanel">
-                <GatePanel tab={tab} codeGenMode={codeGenMode} owner={owner} repo={repo} />
+            activeView === gateViewId(tab.id) && gates.has(tab.id) ? (
+              <div key={gateViewId(tab.id)} role="tabpanel">
+                <GateView tabId={tab.id} />
               </div>
             ) : null,
           )}

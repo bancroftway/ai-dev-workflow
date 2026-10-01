@@ -1,5 +1,13 @@
 // Mirrors agent/src/graph.py's GraphState/StageState shape (SPECIFICATION.md Section 4/5).
-import type { ReportedCheck } from "@/lib/gate-rows";
+
+/** One reported check row, as the agent's CheckLog records it (agent/src/gates/checks.py). */
+export interface ReportedCheck {
+  id: string;
+  status: "passed" | "failed" | "infra" | "skipped" | "advisory";
+  detail: string | null;
+  source: string;
+  uncatalogued?: boolean;
+}
 
 export type StageStatus =
   | "not_started"

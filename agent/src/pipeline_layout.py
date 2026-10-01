@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import graph
-from .gates.checks import AUDIT_MODES, CODE_GEN_MODES, WRAPPER_CHECKS, Check
+from .gates.checks import CODE_GEN_MODES, WRAPPER_CHECKS, Check
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,7 @@ class Pipeline:
         return {
             "key": key, "label": spec.label, "description": spec.description,
             "gate": None if gate is None else {
-                "id": gate.id, "timing": gate.timing, "persists": gate.persists,
+                "id": gate.id,
                 "policy": {m: gate.policy_for(m) for m in CODE_GEN_MODES},
                 "checks": [c.to_dict() for c in gate.checks],
             },
@@ -82,89 +82,12 @@ class Pipeline:
         return {
             "tabs": [t.describe(stages) for t in self.tabs],
             "order": list(self.order),
-            "modes": [{**m, "audit": m["id"] in AUDIT_MODES} for m in self.modes],
+            "modes": [dict(m) for m in self.modes],
             "rebuild_placements": [dict(p) for p in self.rebuild_placements],
             "failure_stage_map": dict(self.failure_stage_map),
             "legacy_labels": dict(self.legacy_labels),
             "wrapper_checks": [c.to_dict() for c in self.wrapper_checks],
-            "gate_text": GATE_TEXT,
         }
-
-
-# The gate screen's display copy (src/components/GateButton.tsx, src/lib/gate-rows.ts), served via
-# describe() so the frontend hardcodes none of it. Placeholders are `{name}` style, filled by the
-# frontend's fmt(). _demo asserts every key the frontend reads is present.
-GATE_TEXT: dict[str, Any] = {
-    # Status column of one check row, by row state (gate-rows.ts deriveGateRows).
-    "row_status": {
-        "passed": "Passed",
-        "failed": "Failed",
-        "infra": "Couldn't run (platform issue)",
-        "skipped": "Skipped",
-        "advisory": "Heads-up (doesn't block)",
-        "advisory_failed": "Heads-up (doesn't block)",  # a failed advisory-mode check
-        "no_sandbox": "Not run: no sandbox",
-        "no_detail_passed": "Passed, no per-check detail recorded",
-        "no_detail_failed": "Failed, no per-check detail recorded",
-        "audit_off": "Skipped: no audit",
-        "not_reached": "Not reached (an earlier check stopped it)",
-        "not_recorded": "Not recorded",
-        "policy_off": "Skipped: not enforced in {mode}",
-        "policy_off_mode_fallback": "this mode",
-        "approved_earlier": "Approved earlier, not re-verified this run",
-        "will_run": "Will run",
-        "lap_note": "lap {lap} (redraft in progress)",
-    },
-    # Effect column: Check.mode in plain words.
-    "check_effect": {
-        "blocking": "Stops the stage",
-        "collected": "Stops the stage (reported together)",
-        "advisory": "Informational only",
-    },
-    # The tab-strip gate icon's status (GateStatus) and its aria-label/title.
-    "icon_status": {
-        "off": "not enforced",
-        "unknown": "mode not known yet",
-        "not_run": "not run yet",
-        "verifying": "verifying",
-        "passed": "passed",
-        "failed": "failed",
-        "warn": "needs attention",
-        "no_sandbox": "cannot verify (no sandbox)",
-        "advisory_failure": "advisory failure",
-        "approved_earlier": "approved earlier, not re-verified",
-    },
-    "icon_aria": "{name} verification: {policy}, {status}",
-    "policy_unknown": "mode unknown",
-    # The gate screen.
-    "title": "{name} verification",
-    "subtitle": "Every deterministic check this gate runs, and what the latest (or a past) attempt recorded.",
-    "legend": [
-        {"text": "A check that ", "bold": False},
-        {"text": "stops the stage", "bold": True},
-        {"text": " sends the work back for another attempt when it fails. ", "bold": False},
-        {"text": "Informational", "bold": True},
-        {"text": " checks never block: a heads-up just flags something worth knowing, and needs nothing from you.", "bold": False},
-    ],
-    "mode": "Mode: {mode}",
-    "mode_unknown": "not known yet",
-    "policy": "Policy: {policy}",
-    "policy_none": "—",
-    "lap": "lap {lap} of {max}",
-    "verdict": "Verdict: {verdict}",
-    "verdict_values": {"none": "no verdict yet", "cannot_verify": "cannot verify", "passed": "passed", "failed": "failed"},
-    "attempt": "Attempt",
-    "attempt_latest": "Latest",
-    "attempt_option": "{n} · {result} · {when}",
-    "attempt_result": {"passed": "passed", "failed": "failed"},
-    "fail_rate": "fails in {pct}% of runs in this repo",
-    "columns": ["#", "Check", "What it verifies", "Effect", "When it runs", "Status", "Detail"],
-    "group_heading": {
-        "wrapper": "Platform checks around every verification",
-        "uncatalogued": "Reported but not in this gate's catalog",
-    },
-    "uncatalogued_badge": "uncatalogued",
-}
 
 
 # The real run sequence (build_graph): tech-stack -> manifest_branch -> [brownfield-spec ->
@@ -344,26 +267,6 @@ def _demo() -> None:
     described = p.describe()
     json.dumps(described)
 
-    # Every gate_text key the frontend (GateButton.tsx, gate-rows.ts) reads must be served.
-    gt = described["gate_text"]
-    frontend_keys = {
-        "row_status": {"passed", "failed", "infra", "skipped", "advisory", "advisory_failed", "no_sandbox",
-                       "no_detail_passed", "no_detail_failed", "audit_off", "not_reached", "not_recorded",
-                       "policy_off", "policy_off_mode_fallback", "approved_earlier", "will_run", "lap_note"},
-        "check_effect": {"blocking", "collected", "advisory"},
-        "icon_status": {"off", "unknown", "not_run", "verifying", "passed", "failed", "warn",
-                        "no_sandbox", "advisory_failure", "approved_earlier"},
-        "verdict_values": {"none", "cannot_verify", "passed", "failed"},
-        "attempt_result": {"passed", "failed"},
-        "group_heading": {"wrapper", "uncatalogued"},
-    }
-    flat_keys = {"icon_aria", "policy_unknown", "title", "subtitle", "legend", "mode", "mode_unknown", "policy",
-                 "policy_none", "lap", "verdict", "attempt", "attempt_latest", "attempt_option", "fail_rate",
-                 "columns", "uncatalogued_badge"}
-    assert set(gt) >= flat_keys | set(frontend_keys), sorted(flat_keys | set(frontend_keys) - set(gt))
-    for group, keys in frontend_keys.items():
-        assert set(gt[group]) >= keys, (group, sorted(keys - set(gt[group])))
-
     # Acceptance flip: Code blocking in yolo is a one-field edit that changes exactly one value.
     def _flip(s: graph.StageSpec) -> graph.StageSpec:
         if s.key != "minimal-code-to-green" or s.gate is None:
@@ -390,7 +293,6 @@ def _demo() -> None:
         assert len(ids) == len(set(ids)), f"{s.key}: duplicate check ids {ids}"
         assert not wrapper_ids & set(ids), f"{s.key}: check id collides with a wrapper check"
         all_checks += [c for c in s.gate.checks if c not in all_checks]
-    assert {c.mode for c in all_checks} <= set(gt["check_effect"]), "a check mode has no Effect text"
     unreferenced = _unreferenced_checks(all_checks)
     assert not unreferenced, f"declared but never recorded: {unreferenced}"
     probe = Check("demo." + "never_recorded", "x", "x", "blocking")  # split: no literal for the scan to find

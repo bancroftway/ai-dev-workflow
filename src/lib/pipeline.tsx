@@ -21,8 +21,6 @@ export interface PipelineCheck {
 
 export interface PipelineGate {
   id: string;
-  timing: "before_review" | "after_submit";
-  persists: boolean;
   /** Keyed by code-gen mode id (PipelineMode.id). */
   policy: Record<string, GatePolicy>;
   checks: PipelineCheck[];
@@ -53,8 +51,6 @@ export interface PipelineMode {
   id: string;
   label: string;
   default: boolean;
-  /** Whether this mode runs the adversarial audit leg (checks.AUDIT_MODES). */
-  audit: boolean;
   blurb: string;
   speed_cost: string;
   best_for: string;
@@ -72,44 +68,6 @@ export interface PipelineDescriptor {
   /** Pre-rename stage keys an old session's stored state may still carry. */
   legacy_labels: Record<string, string>;
   wrapper_checks: PipelineCheck[];
-  /** The gate screen's display copy (pipeline_layout.GATE_TEXT); `{name}` placeholders. */
-  gate_text: GateText;
-}
-
-/** Mirrors agent/src/pipeline_layout.py GATE_TEXT. */
-export interface GateText {
-  row_status: Record<
-    | "passed" | "failed" | "infra" | "skipped" | "advisory" | "advisory_failed" | "no_sandbox"
-    | "no_detail_passed" | "no_detail_failed" | "audit_off" | "not_reached" | "not_recorded"
-    | "policy_off" | "policy_off_mode_fallback" | "approved_earlier" | "will_run" | "lap_note",
-    string
-  >;
-  check_effect: Record<string, string>;
-  icon_status: Record<
-    | "off" | "unknown" | "not_run" | "verifying" | "passed" | "failed" | "warn"
-    | "no_sandbox" | "advisory_failure" | "approved_earlier",
-    string
-  >;
-  icon_aria: string;
-  policy_unknown: string;
-  title: string;
-  subtitle: string;
-  legend: { text: string; bold: boolean }[];
-  mode: string;
-  mode_unknown: string;
-  policy: string;
-  policy_none: string;
-  lap: string;
-  verdict: string;
-  verdict_values: Record<"none" | "cannot_verify" | "passed" | "failed", string>;
-  attempt: string;
-  attempt_latest: string;
-  attempt_option: string;
-  attempt_result: Record<"passed" | "failed", string>;
-  fail_rate: string;
-  columns: string[];
-  group_heading: Record<"wrapper" | "uncatalogued", string>;
-  uncatalogued_badge: string;
 }
 
 /** Pure lookups over one descriptor -- built once per descriptor (usePipeline memoises it). */
