@@ -55,7 +55,7 @@ export function CodeGenModePicker({ onSelect }: { onSelect: (mode: CodeGenMode) 
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent showCloseButton={false} className="max-h-[90vh] overflow-y-auto sm:max-w-[60vw]">
         <DialogHeader>
           <DialogTitle>Choose a code generation mode</DialogTitle>
           <DialogDescription>
