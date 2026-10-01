@@ -212,7 +212,7 @@ REM_FABRICATED = Check(
     _rc.CHECK_FABRICATED, "Claimed fixes are real findings",
     "Every finding id the stage claims to have addressed must exist in the scan it was given or the "
     "scan taken after. An invented id is a cheap way to look busy without fixing anything.", "blocking",
-    condition="the pre-remediation scan is readable at the stage's baseline commit",
+    condition="always",
 )
 REM_IGNORE_FILES = Check(
     _rc.CHECK_IGNORE_FILES, "Scanner ignore files untouched",

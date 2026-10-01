@@ -34,7 +34,7 @@ from typing import Any, TypeVar
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from . import model_config, repo_files, run_event_store, run_event_stream
-from .chat_model import ainvoke_structured, get_chat_model_for_thread, lap_role
+from .chat_model import ainvoke_structured, close_session, get_chat_model_for_thread, lap_role
 from .prompt_loader import load_prompt_pair, render_prompt
 from .run_events import RunEvent, RunEventType
 from .sandbox import registry as sandbox_registry
@@ -135,10 +135,18 @@ async def run_and_report(
 
     last_usage: dict[str, Any] | None = None
     try:
+        # Every call starts a FRESH session: its report must describe the tree as it is NOW, and a
+        # resumed one answers from memory. Observed live (run c2bbdca1, 2026-10-01): the TDD-red
+        # gate re-ran this stage_key each fix cycle without a new `lap`, so cycles 1-3 resumed
+        # cycle 0's session and re-reported its "suite never ran" with zero tool calls -- after the
+        # fix had already landed -- sending three fixers after an error that no longer existed.
+        # Enforced here, for every caller, instead of relying on each loop to remember `lap`.
+        role = lap_role("draft", run_id, lap)
+        await close_session(thread_id, stage_key, role, provider=provider)
         model = get_chat_model_for_thread(
             thread_id,
             stage_key,
-            lap_role("draft", run_id, lap),
+            role,
             provider=provider,
             run_id=run_id,
             model_name=model_name or model_config.get_model_name(stage_key, "draft", provider) or model_config.get_model_name("stack-run", "draft", provider),
@@ -220,3 +228,42 @@ async def _ledger(
         except Exception:  # noqa: BLE001 -- ledger write must never mask the report itself
             logger.warning("failed to ledger stage report for %s", stage_key, exc_info=True)
     return report
+
+
+def _demo() -> None:
+    """`cd agent && uv run python -m src.stack_runner`: every call closes its session first, so a
+    looping caller that never varies `lap` still gets a fresh session each time."""
+    import asyncio
+    from unittest.mock import patch
+
+    calls: list[tuple[str, ...]] = []
+
+    async def _close(thread_id: str, stage: str, role: str, *, provider: str) -> None:
+        calls.append(("close", stage, role))
+
+    def _model(thread_id: str, stage: str, role: str, **_kw: Any) -> Any:
+        calls.append(("model", stage, role))
+        raise RuntimeError("stop after the session setup")
+
+    async def _no_ledger(*_a: Any, **_k: Any) -> None:
+        return None
+
+    with patch.object(sandbox_registry, "get", lambda _t: object()), \
+            patch(f"{__name__}.close_session", _close), \
+            patch(f"{__name__}.get_chat_model_for_thread", _model), \
+            patch.object(repo_files, "append_ledger_entry", _no_ledger), \
+            patch("src.sandbox.factory.get_sandbox_provider", lambda: object()):
+        for _ in range(2):
+            report = asyncio.run(run_and_report(
+                "t", stage_key="red-gate-x", prompt_name="ac_test_run", schema=StageReport, provider="claude",
+                run_id="r1",
+            ))
+            assert report.success is False
+    # Two calls, same stage_key and lap: closed then built, twice -- never a resumed session.
+    assert [c[0] for c in calls] == ["close", "model", "close", "model"], calls
+    assert calls[0][1:] == calls[1][1:] == calls[2][1:], calls
+    print("stack_runner self-check: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

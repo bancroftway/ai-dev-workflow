@@ -576,6 +576,14 @@ class SessionResponse(BaseModel):
     # workflow page refetches GET /sessions/{id}/review when it changes, so a gate opening or
     # closing reaches the page with no AG-UI stream attached (agent restart, reload, other tab).
     review_id: str | None = None
+    # Derived: where a failed run stopped, ready to show (PIPELINE.stopped_at); None unless failed.
+    stopped_at: str | None = None
+    # Derived: the gate screen holding that failure's check and its recovery actions
+    # (PIPELINE.failure_gate: {tab_id, button}); None when no gate row records it.
+    failure_gate: dict[str, str] | None = None
+    # Derived: the notice above every tab for a stopped run (gate_view.run_notice) -- text, tone
+    # and the one action that gets it going; None while running, at a review, or done.
+    notice: dict[str, Any] | None = None
 
 
 async def _verified_container_alive(session_id: str) -> bool:
@@ -646,6 +654,12 @@ async def _row_to_response(
         interrupted=interrupted,
         finished_with_verdict=session_store.is_finished_with_verdict(row),
         review_id=review_id,
+        stopped_at=PIPELINE.stopped_at(row.get("failure_stage"), row.get("current_stage")) if row["status"] == "failed" else None,
+        failure_gate=PIPELINE.failure_gate(row.get("failure_stage")) if row["status"] == "failed" else None,
+        notice=gate_view.run_notice(
+            status=row["status"], interrupted=interrupted, failure_stage=row.get("failure_stage"),
+            current_stage=row.get("current_stage"),
+        ),
     )
 
 

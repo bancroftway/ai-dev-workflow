@@ -59,6 +59,8 @@ from .test_quality_checks import (
 )
 from .write_scope_checks import _is_pipeline_owned, _is_test_path
 from ..sandbox.provider import SandboxProvider
+from pydantic import BaseModel
+
 from ..schemas import StageReport
 from ..spec_ledger import LEDGER_PATH, own_ac_ids_from_specification
 
@@ -68,11 +70,33 @@ logger = logging.getLogger(__name__)
 AC_TEST_OUTPUT_PATH = "agent-work/ac-test-output.txt"
 
 
+# ac_test_run.md's <<planned_test_files>> for a run with no approved test plan to account for.
+NO_PLANNED_TEST_FILES = "   (no planned list for this run -- find every test root yourself; leave `files` empty)"
+
+
+class SuiteRun(BaseModel):
+    """One test root the run agent found and ran (or tried to)."""
+
+    root: str
+    files: list[str] = []
+    """The planned test files (as listed in the prompt) this root's runner covers."""
+    ran: bool = True
+    """False when the runner stopped before running a single test."""
+    reason: str = ""
+    """When `ran` is false: the runner's own error line, verbatim."""
+
+
 class AcTestRunReport(StageReport):
     """What the test-run agent must report (prompts/ac_test_run.md)."""
 
     output_artifact: str = ""
     exit_ok: bool = False
+    suites: list[SuiteRun] = []
+    """Every test root the agent found, the planned test files each covers, and whether its runner
+    ran any test. Stack-agnostic on purpose. A root that produced no results otherwise just vanished
+    from `result_artifacts` while the other roots' results read as the whole suite (2026-10-01: a
+    web suite whose config never loaded was silently absent from the TDD-red verdict) -- the red
+    gate now requires every planned test file under some suite, so a suite can't drop out unseen."""
     result_artifacts: list[str] = []
     """Machine-readable runner reports (.trx / vitest-json / playwright-json).
 
@@ -231,6 +255,23 @@ def with_test_reporter(command: str, fmt: str, output_path: str) -> str:
     else:  # jest
         flag = f"--json --outputFile=$REPO_ROOT/{output_path}"
     return f'REPO_ROOT="$(pwd)"; {command} {flag}'
+
+
+async def clear_runner_artifacts(provider: SandboxProvider, thread_id: str, tee_path: str) -> None:
+    """Fresh-lap evidence guard, run before every test run whose reports a gate then parses: the
+    write-scope gate treats runner artifacts (ac-run-*.json, test-results/, *.trx) as
+    pipeline-owned, so a PREVIOUS lap's reports survive on disk. Deletes them along with the tee --
+    stale evidence must never pass (or fail) a lap. Shared by this gate and rebuild's TDD-red gate,
+    whose model-run fallback once reported lap 1's agent-work/*.trx path on every later lap, so the
+    gate re-read lap 1's one passing test while the fresh run had all 25 failing (2026-10-01)."""
+    await provider.exec_in_sandbox(
+        thread_id,
+        f"rm -f {shlex.quote(tee_path)}; "
+        "find . \\( -name node_modules -o -name .git -o -name .playwright-browsers \\) -prune -o "
+        "-type f \\( -name 'ac-run-*.json' -o -name '*.trx' \\) -print0 | xargs -0 -r rm -f; "
+        "find . \\( -name node_modules -o -name .git \\) -prune -o "
+        "-type d \\( -name test-results -o -name TestResults \\) -print0 | xargs -0 -r rm -rf",
+    )
 
 
 async def run_resolved_test_command(
@@ -593,7 +634,7 @@ AC_DEPTH = Check(
     "ac_tests.depth", "Criteria tested in depth",
     "Each criterion gets enough distinct tests below the UI (and a browser test where it is "
     "user-facing), not a single happy-path check.",
-    "collected", condition="test files found in the repo",
+    "collected", condition="only when the repository has test files",
 )
 AC_TESTID_LOCATORS = Check(
     "ac_tests.testid_locators", "Browser tests use data-testid",
@@ -725,17 +766,7 @@ async def check_ac_coverage(
         )
     log.passed(AC_CRITERIA_TO_COVER, f"{len(active_ac_ids)} criteria await coverage")
 
-    # Fresh-lap evidence guard: the write-scope gate treats runner artifacts (ac-run-*.json,
-    # test-results/, *.trx) as pipeline-owned, so a PREVIOUS lap's reports survive on disk.
-    # Delete them along with the tee before this lap's run -- stale evidence must never pass a lap.
-    await provider.exec_in_sandbox(
-        thread_id,
-        f"rm -f {shlex.quote(AC_TEST_OUTPUT_PATH)}; "
-        "find . \\( -name node_modules -o -name .git -o -name .playwright-browsers \\) -prune -o "
-        "-type f \\( -name 'ac-run-*.json' -o -name '*.trx' \\) -print0 | xargs -0 -r rm -f; "
-        "find . \\( -name node_modules -o -name .git \\) -prune -o "
-        "-type d \\( -name test-results -o -name TestResults \\) -print0 | xargs -0 -r rm -rf",
-    )
+    await clear_runner_artifacts(provider, thread_id, AC_TEST_OUTPUT_PATH)
     # resolve_test_command() first, deterministically, before any LLM turn (Task 6): only when it
     # produces nothing usable (no answer for this stack, or its run's own artifact parses to zero
     # outcomes -- decided further down, uniformly for either path) does a GHCP session run at all.
@@ -758,6 +789,7 @@ async def check_ac_coverage(
             run_id=run_id,
             lap=lap,
             output_path=AC_TEST_OUTPUT_PATH,
+            planned_test_files=NO_PLANNED_TEST_FILES,
         )
     output = await repo_files.read_repo_file(provider, thread_id, AC_TEST_OUTPUT_PATH)
 

@@ -78,7 +78,7 @@ ADV_MINOR_SWEEP = Check(
     "adversarial.minor_sweep", "Minor divergences get one fix pass",
     "When the audit is otherwise clean but minor divergences remain, the stage gets exactly one extra "
     "lap to fix the easy ones. One lap only, because a hunt for zero minors never converges.",
-    "blocking", condition="once per run, when the audit is otherwise clean and minor findings remain",
+    "blocking", condition="once per run, when only minor divergences remain",
 )
 VERIFY_CHECKS: tuple[Check, ...] = (ADV_REPORT, ADV_VERDICT, ADV_BLOCKING_FINDINGS, ADV_MINOR_SWEEP)
 _CHECK_MAP = {c.id: c for c in VERIFY_CHECKS}

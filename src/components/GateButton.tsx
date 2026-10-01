@@ -1,7 +1,8 @@
 "use client";
 
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useRecovery } from "@/components/RecoveryPanel";
 import { usePipeline } from "@/lib/pipeline";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useOptionalSandboxStatus } from "@/lib/sandbox-status-context";
@@ -40,6 +41,15 @@ interface GateCell {
   tone: CellTone | null;
 }
 
+/** A recovery action the server put on the failed check's row (or its section). The frontend only
+ * dispatches on `id` (retry the failed check in place / redo its stage) -- what applies is decided
+ * server-side (gate_view._attach_recovery). */
+interface GateAction {
+  id: "retry" | "redo";
+  label: string;
+  style: "primary" | "link";
+}
+
 /** GET /sessions/{id}/gates/{tabId}. */
 interface GateScreen {
   title: string;
@@ -52,7 +62,8 @@ interface GateScreen {
     facts: string[];
     feedback: string | null;
     attempts: { label: string; disabled: boolean; options: { id: string; label: string; time: string | null; selected: boolean }[] };
-    groups: { heading: string | null; rows: { key: string; cells: Record<string, GateCell> }[] }[];
+    groups: { heading: string | null; rows: { key: string; cells: Record<string, GateCell>; actions: GateAction[] }[] }[];
+    actions: GateAction[];
   }[];
 }
 
@@ -74,6 +85,11 @@ const TONE_CLASS: Record<CellTone, string> = {
   fail: "text-red-700 font-medium",
   warn: "text-amber-700",
   muted: "text-neutral-500",
+};
+
+const ACTION_CLASS: Record<GateAction["style"], string> = {
+  primary: "rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40",
+  link: "text-xs text-red-700 underline underline-offset-2 disabled:opacity-40",
 };
 
 const COLUMN_CLASS: Record<string, string> = {
@@ -171,9 +187,17 @@ export function GateButton({ icon, active, onSelect }: { icon: GateIcon; active:
   );
 }
 
-/** A gate's screen, exactly as the server built it. */
-export function GateView({ tabId }: { tabId: string }) {
+/** A gate's screen, exactly as the server built it. A failed run's recovery actions run through
+ * the same useRecovery() as Overview's panel (same confirm dialogs, same restart calls). */
+export function GateView({ tabId, owner, repo, branch }: { tabId: string; owner: string; repo: string; branch: string }) {
   const { threadId } = useWorkflowThread();
+  const recovery = useRecovery(owner, repo, branch);
+  const runAction = (id: GateAction["id"]) => {
+    if (recovery.mappedFailureTarget) void recovery.handleRestart(recovery.mappedFailureTarget, id === "redo");
+  };
+  const actions = (list: GateAction[] | undefined) => (
+    <Actions actions={list} busy={recovery.restarting} onRun={runAction} />
+  );
   const [attempt, setAttempt] = useState<string | null>(null);
   const query = attempt ? `?attempt=${encodeURIComponent(attempt)}` : "";
   const screen = useGateFetch<GateScreen>(`/api/sessions/${encodeURIComponent(threadId)}/gates/${encodeURIComponent(tabId)}${query}`);
@@ -223,6 +247,7 @@ export function GateView({ tabId }: { tabId: string }) {
           {section.feedback && (
             <p className="rounded-md bg-neutral-50 p-2 text-xs whitespace-pre-wrap text-neutral-700">{section.feedback}</p>
           )}
+          {actions(section.actions)}
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="border-b border-neutral-200 text-neutral-500">
@@ -246,7 +271,9 @@ export function GateView({ tabId }: { tabId: string }) {
                   ...group.rows.map((row) => (
                     <tr key={`${g}-${row.key}`} className="border-b border-neutral-100 align-top">
                       {screen.columns.map((c) => (
-                        <Cell key={c.key} cell={row.cells[c.key]} className={COLUMN_CLASS[c.style] ?? ""} />
+                        <Cell key={c.key} cell={row.cells[c.key]} className={COLUMN_CLASS[c.style] ?? ""}>
+                          {c.key === "status" && actions(row.actions)}
+                        </Cell>
                       ))}
                     </tr>
                   )),
@@ -260,7 +287,20 @@ export function GateView({ tabId }: { tabId: string }) {
   );
 }
 
-function Cell({ cell, className }: { cell: GateCell | undefined; className: string }) {
+function Actions({ actions, busy, onRun }: { actions: GateAction[] | undefined; busy: boolean; onRun: (id: GateAction["id"]) => void }) {
+  if (!actions?.length) return null;
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+      {actions.map((a) => (
+        <button key={a.id} type="button" disabled={busy} className={ACTION_CLASS[a.style] ?? ""} onClick={() => onRun(a.id)}>
+          {busy && a.style === "primary" ? "Working…" : a.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Cell({ cell, className, children }: { cell: GateCell | undefined; className: string; children?: ReactNode }) {
   return (
     <td className={`px-2 py-1.5 ${className} ${cell?.tone ? TONE_CLASS[cell.tone] : ""}`}>
       {cell?.text &&
@@ -274,6 +314,7 @@ function Cell({ cell, className }: { cell: GateCell | undefined; className: stri
         ))}
       {cell?.badge && <span className="mt-0.5 block w-fit rounded bg-amber-100 px-1.5 text-[10px] text-amber-800">{cell.badge}</span>}
       {cell?.sub && <div className="text-[11px] font-normal text-neutral-500">{cell.sub}</div>}
+      {children}
     </td>
   );
 }

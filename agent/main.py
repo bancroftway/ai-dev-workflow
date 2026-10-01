@@ -216,10 +216,12 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
             return
 
         queue = run_activity.subscribe(thread_id)
+        keep = lambda _event: True  # noqa: E731 - the driving subscriber sees the run from its first event
         if existing is None or existing.done():
             task = asyncio.create_task(self._drive_graph(thread_id, input))
             run_activity.register_task(thread_id, task)
         else:
+            keep = run_activity.joined_stream_filter()
             # Reattach: a task is already driving this thread -- never call super().run() again
             # here (would double-invoke astream_events concurrently on the same graph thread).
             # Synthesize the RUN_STARTED + snapshot _drive_graph's own first iteration already
@@ -235,7 +237,8 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
                 item = await queue.get()
                 if item is run_activity.DONE:
                     return
-                yield item
+                if keep(item):
+                    yield item
         finally:
             run_activity.unsubscribe(thread_id, queue)
 

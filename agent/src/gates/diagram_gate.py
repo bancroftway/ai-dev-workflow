@@ -124,8 +124,10 @@ def check_stale_visual_review(
     by:
 
     - `er`/`architecture` (no ac_ids, whole-system view): BLANKET trigger -- if the spec changed
-      at all this run, every one must appear in `diagrams_reviewed`. Justified by count (typically
-      one or two per project).
+      at all this run, every PRE-EXISTING one must appear in `diagrams_reviewed`. Justified by
+      count (typically one or two per project). A brand-new one is exempt, same as below: a
+      ticket's first plan always "changed the spec" (every criterion is first seen this run), so
+      without the exemption every first plan's own fresh ER diagram was demanded a staleness review.
     - `user_flow` diagrams and wireframes (both ac_ids-scoped): PER-ITEM trigger -- only a
       PRE-EXISTING item (already in the prior approved manifest; a brand-new one is exempt, its
       existence already proves it isn't stale) whose own cited ac_ids include one this run changed
@@ -141,7 +143,11 @@ def check_stale_visual_review(
 
     if _spec_changed_this_run(ledger_entries, run_id):
         for d in diagram_refs:
-            if d.get("kind") in ("er", "architecture") and d.get("name") not in reviewed_diagram_names:
+            if (
+                d.get("kind") in ("er", "architecture")
+                and d.get("name") in prior_diagram_names
+                and d.get("name") not in reviewed_diagram_names
+            ):
                 problems.append(
                     f"diagram {d.get('name')!r} was not reviewed even though the specification "
                     "changed this ticket -- confirm it's still accurate or revise it"
@@ -526,6 +532,11 @@ def _demo() -> None:
             changed_ledger, "r9", set(), [], [],
         )
     )
+    # ...but a brand-new one (no prior approved plan has it, e.g. a ticket's first plan) is exempt.
+    assert check_stale_visual_review(
+        [{"name": "fresh-er", "kind": "er", "ac_ids": []}], [], set(), set(),
+        changed_ledger, "r9", set(), [], [],
+    ) == [], "an er diagram created THIS run can't be stale"
     # Confirmed current satisfies it.
     assert check_stale_visual_review(
         [{"name": "system-er", "kind": "er", "ac_ids": []}], [], {"system-er"}, set(),
@@ -643,7 +654,7 @@ def _demo_verify_checks() -> None:
         assert rows == [
             ("plan.content_nonempty", "passed"), ("plan.write_scope", "passed"), ("plan.steps_json", "passed"),
             ("plan.audit_full_read", "skipped"), ("plan.ledger_sync", "passed"), ("plan.manifest_json", "passed"),
-            ("plan.visual_retirement", "passed"), ("plan.visual_review_current", "passed"),
+            ("plan.visual_retirement", "passed"), ("plan.visual_review_current", "skipped"),
             ("plan.visual_files_readable", "passed"), ("plan.revised_claims", "passed"),
             ("plan.step_linkage", "passed"), ("plan.wireframe_ac_ids", "skipped"),
             ("plan.wireframe_has_ac_ids", "skipped"), ("plan.ui_wireframe_coverage", "passed"),
@@ -652,10 +663,25 @@ def _demo_verify_checks() -> None:
         ], rows
         assert [r.id for r in VERIFY_CHECKS] == [i for i, _ in rows]
         assert result.checks[3]["detail"] == "no audit role for this stage", result.checks[3]
+        # No audit, no diagrams_reviewed to read: the visual-review row is skipped, same reason.
+        assert result.checks[7]["detail"] == "no audit role for this stage", result.checks[7]
         # Plan stage whose mode skipped the audit this lap: a different skip reason.
         _reset(one_diagram)
         result, _ = _run(("plan",), {"x": 1}, ran=False)
         assert result.passed and result.checks[3]["detail"] == "audit did not run this lap", result.checks[3]
+        assert result.checks[7] == {**result.checks[7], "status": "skipped", "detail": "audit did not run this lap"}
+
+        # A pre-check failure still injects the resolved plan into the draft: an advisory (yolo)
+        # failure goes straight to the human gate, which must render steps/diagrams, not nothing.
+        _reset(one_diagram)
+        files[workflow_persistence.PLAN_APPROVED_PATH] = json.dumps({"diagrams": {"status": "present", "values": [
+            {"name": "arch", "mermaid_source": files[f"{DRAFT_DIAGRAMS_DIR}/arch.mmd"]}
+        ]}})
+        draft: dict[str, Any] = {"x": 1, "diagrams_reviewed": [{"name": "arch", "action": "revised", "reason": "r"}]}
+        result, rows = _run(("plan",), draft)
+        assert not result.passed and rows[-1] == ("plan.revised_claims", "failed"), rows
+        assert [s["id"] for s in draft["plan_steps"]] == ["PS-1"], draft
+        assert draft["diagrams"]["values"][0]["name"] == "arch", draft
 
         # Early returns record the failing id and nothing after it.
         _, rows = _run(("plan",), {})
@@ -774,91 +800,92 @@ PLAN_STEPS_JSON = Check(
     "plan.steps_json", "Plan steps file is well-formed",
     "Checks _draft/steps.json exists, is valid JSON and every step matches the plan-step shape. "
     "Every later check reads the steps from this file.",
-    "collected", "reported together with the manifest check",
+    "collected", "always",
 )
 PLAN_AUDIT_FULL_READ = Check(
     "plan.audit_full_read", "Audit read every plan step",
     "Checks the audit session's transcript proves it read the whole steps.json file, so a review "
     "can't sign off on steps it never looked at.",
-    "collected", "only when the stage has an audit role, the audit ran this lap and steps.json is valid",
+    "collected", "only when the audit runs",
     needs_audit=True,
 )
 PLAN_LEDGER_SYNC = Check(
     "plan.ledger_sync", "Plan steps recorded in the ledger",
     "Checks each step's id is new or matches an existing plan step, retired steps stay retired, and "
     "records the steps in the ledger so later stages can trace work back to its plan step.",
-    "collected", "only when steps.json is valid (and the audit transcript was readable)",
+    "collected", "always",
 )
 PLAN_MANIFEST_JSON = Check(
     "plan.manifest_json", "Wireframe and diagram manifest matches the files",
     "Checks _draft/manifest.json is valid and lists every wireframe and diagram file on disk, and "
     "only those, so nothing is silently dropped or left behind.",
-    "collected", "reported together with the steps check",
+    "collected", "always",
 )
 PLAN_VISUAL_RETIREMENT = Check(
     "plan.visual_retirement", "Retired screens and flows are retired",
     "Checks that a wireframe or user-flow diagram whose criteria were all retired is itself marked "
     "retired, instead of lingering as a picture of removed scope.",
-    "collected", "only when steps and manifest are valid",
+    "collected", "always",
 )
 PLAN_VISUAL_REVIEW_CURRENT = Check(
     "plan.visual_review_current", "Changed visuals were re-reviewed",
     "Checks that every existing diagram or wireframe affected by this run's specification changes "
     "was explicitly revised or confirmed current, so outdated pictures don't slip through.",
-    "collected", "only when steps and manifest are valid",
+    "collected", "only when the audit runs",
+    needs_audit=True,
 )
 PLAN_VISUAL_FILES_READABLE = Check(
     "plan.visual_files_readable", "Wireframe and diagram files readable",
     "Checks every wireframe and diagram listed in the manifest can actually be read from the draft "
     "folder.",
-    "collected", "only when steps and manifest are valid",
+    "collected", "always",
 )
 PLAN_REVISED_CLAIMS = Check(
     "plan.revised_claims", "Claimed revisions really changed",
     "Checks that a diagram or wireframe the plan says it 'revised' actually differs from the last "
     "approved version, rather than trusting the label.",
-    "collected", "only when steps and manifest are valid",
+    "collected", "always",
 )
 PLAN_STEP_LINKAGE = Check(
     "plan.step_linkage", "Steps trace to acceptance criteria",
     "Checks every plan step cites real, live acceptance criteria (or is infrastructure), removal "
     "steps name what they remove, and every open criterion of this ticket is covered by a step.",
-    "collected", "only when the pre-checks pass",
+    "collected", "always",
 )
 PLAN_WIREFRAME_AC_IDS = Check(
     "plan.wireframe_ac_ids", "Wireframe citations are real",
     "Checks every acceptance-criterion id a wireframe cites exists in the specification ledger, so "
     "a typo can't link a screen to nothing.",
-    "collected", "only when the pre-checks pass and the plan has wireframes",
+    "collected", "only when the plan has wireframes",
 )
 PLAN_WIREFRAME_HAS_AC_IDS = Check(
     "plan.wireframe_has_ac_ids", "Every wireframe cites a criterion",
     "Checks each wireframe cites at least one acceptance criterion, so end-to-end tests have "
     "something to match the screen against.",
-    "collected", "only when the pre-checks pass and the plan has wireframes",
+    "collected", "only when the plan has wireframes",
 )
 PLAN_UI_WIREFRAME_COVERAGE = Check(
     "plan.ui_wireframe_coverage", "UI criteria have wireframes",
     "Checks every user-interface acceptance criterion in the specification is shown by at least one "
     "wireframe.",
-    "collected", "only when the pre-checks pass",
+    "collected", "always",
 )
 PLAN_STEP_WIREFRAME_COVERAGE = Check(
     "plan.step_wireframe_coverage", "UI steps have wireframes",
     "Checks every plan step marked as user-interface work is shown by at least one wireframe.",
-    "collected", "only when the pre-checks pass",
+    "collected", "always",
 )
 PLAN_WIREFRAME_HTML = Check(
     "plan.wireframe_html", "Wireframes are safe, self-contained HTML",
     "Checks each wireframe has a safe file name, stays under the size limit, is real HTML and has "
     "no scripts, event handlers or external resources.",
-    "collected", "only when the pre-checks pass and the plan has wireframes",
+    "collected", "only when the plan has wireframes",
 )
 PLAN_MERMAID_RENDER = Check(
     "plan.mermaid_render", "Diagrams render",
     "Renders every Mermaid diagram with the real renderer; a syntax error fails the check. A broken "
     "renderer is reported as an infrastructure problem, not held against the plan.",
-    "collected", "only when the pre-checks pass and the plan has diagrams",
+    "collected", "only when the plan has diagrams",
 )
 VERIFY_CHECKS: tuple[Check, ...] = (
     PLAN_CONTENT_NONEMPTY, PLAN_WRITE_SCOPE, PLAN_STEPS_JSON, PLAN_AUDIT_FULL_READ, PLAN_LEDGER_SYNC,
@@ -1251,22 +1278,30 @@ def make_verify_plan_diagrams(
             log.failed(PLAN_VISUAL_RETIREMENT, "; ".join(pre_check_problems))
         else:
             log.passed(PLAN_VISUAL_RETIREMENT)
-        stale_problems = check_stale_visual_review(
-            diagram_refs, wireframe_refs, prior_diagram_names, prior_wireframe_screens,
-            ledger_entries, run_id, bug_affected_ac_ids,
-            content_dict.get("diagrams_reviewed") or [], content_dict.get("wireframes_reviewed") or [],
-        )
-        if stale_problems:
-            log.failed(PLAN_VISUAL_REVIEW_CURRENT, "; ".join(stale_problems))
+        # diagrams_reviewed/wireframes_reviewed exist only on PlanAuditResponse: with no audit this
+        # lap (yolo/draft_verify skip it; brownfield-plan has no audit role) nothing could ever
+        # report them, so the check is unsatisfiable rather than failed -- skipped, same as
+        # PLAN_AUDIT_FULL_READ.
+        stale_problems: list[str] = []
+        if has_audit_role and audit_ran_this_lap:
+            stale_problems = check_stale_visual_review(
+                diagram_refs, wireframe_refs, prior_diagram_names, prior_wireframe_screens,
+                ledger_entries, run_id, bug_affected_ac_ids,
+                content_dict.get("diagrams_reviewed") or [], content_dict.get("wireframes_reviewed") or [],
+            )
+            if stale_problems:
+                log.failed(PLAN_VISUAL_REVIEW_CURRENT, "; ".join(stale_problems))
+            else:
+                log.passed(PLAN_VISUAL_REVIEW_CURRENT)
         else:
-            log.passed(PLAN_VISUAL_REVIEW_CURRENT)
+            log.skipped(PLAN_VISUAL_REVIEW_CURRENT, audit_skip_reason)
         pre_check_problems += stale_problems
         unreadable_start = len(pre_check_problems)
 
         # Read every diagram/wireframe's real content from its sidecar file -- needed both to
         # mechanically verify a claimed "revised" action actually changed the content (below) and
-        # to inject the full ImplementationPlan-shaped content back into content_dict once
-        # everything passes (Part 2 sect. 2's "critical property": the persisted shape stays
+        # to inject the full ImplementationPlan-shaped content back into content_dict (Part 2
+        # sect. 2's "critical property": the persisted shape stays
         # byte-for-byte identical to today, so downstream code never needs to change).
         diagram_sources: dict[str, str] = {}
         for d in diagram_refs:
@@ -1318,20 +1353,17 @@ def make_verify_plan_diagrams(
         else:
             log.passed(PLAN_REVISED_CLAIMS)
 
-        if pre_check_problems:
-            return VerificationResult(
-                passed=False, feedback="\n\n".join(pre_check_problems), report={"pre_check_problems": pre_check_problems},
-                checks=_rows(),
-            )
-
         # Inject the file-resolved FULL content back into content_dict, matching today's
         # ImplementationPlan shape exactly, before any of the existing logic below (all of it
         # unchanged from before this rewrite) ever sees it -- Part 2 sect. 2's "critical property".
+        # Before the pre-check return, not after: content_dict IS stage["draft"], and an advisory
+        # policy (yolo) takes a failed verify straight to the human gate -- returning first left
+        # the reviewed draft with no steps/diagrams/wireframes ("No Plan draft yet").
         content_dict["plan_steps"] = resolved_steps
         content_dict["diagrams"] = {
             "status": "present" if diagram_refs else "absent",
             "values": [
-                {"name": d["name"], "kind": d["kind"], "ac_ids": d.get("ac_ids") or [], "mermaid_source": diagram_sources[d["name"]]}
+                {"name": d["name"], "kind": d["kind"], "ac_ids": d.get("ac_ids") or [], "mermaid_source": diagram_sources.get(d["name"], "")}
                 for d in diagram_refs
             ],
             "reason": "" if diagram_refs else "No diagrams in this plan.",
@@ -1339,13 +1371,19 @@ def make_verify_plan_diagrams(
         content_dict["wireframes"] = {
             "status": "present" if wireframe_refs else "absent",
             "values": [
-                {"screen": wf["screen"], "ac_ids": wf.get("ac_ids") or [], "html_source": wireframe_sources[wf["screen"]]}
+                {"screen": wf["screen"], "ac_ids": wf.get("ac_ids") or [], "html_source": wireframe_sources.get(wf["screen"], "")}
                 for wf in wireframe_refs
             ],
             "reason": "" if wireframe_refs else "No user-interface work in this plan.",
         }
         content_dict["retired_wireframe_screens"] = manifest["retired_wireframe_screens"]
         content_dict["retired_diagram_names"] = manifest["retired_diagram_names"]
+
+        if pre_check_problems:
+            return VerificationResult(
+                passed=False, feedback="\n\n".join(pre_check_problems), report={"pre_check_problems": pre_check_problems},
+                checks=_rows(),
+            )
 
         # Every LIVE (not deferred, not retired -- retired entries are absent from spec_doc's own
         # user_stories entirely; a deferred one stays present with deferred=true) ui_related

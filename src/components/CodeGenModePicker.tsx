@@ -15,6 +15,8 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { usePipeline, type GatePolicy, type Pipeline } from "@/lib/pipeline";
 
+const CARD_TONE: Record<string, string> = { danger: "border-destructive/60 bg-destructive/5" };
+
 /** A PipelineMode.id from the backend descriptor ("yolo" | "draft_verify" | "mission_critical"
  * today) -- matches agent/src/graph.py's GraphState.code_gen_mode wire values. Sent as-is in the
  * provision POST body (SandboxSessionBoot.tsx) as `codeGenMode`, which route.ts forwards as
@@ -68,23 +70,29 @@ export function CodeGenModePicker({ onSelect }: { onSelect: (mode: CodeGenMode) 
           onValueChange={(value) => setSelected(value as CodeGenMode)}
           className="gap-3"
         >
-          {pipeline.modes.map((info) => (
-            <Label key={info.id} className="block cursor-pointer font-normal">
-              <Card className="flex-row items-start gap-3 p-4">
-                <RadioGroupItem value={info.id} className="mt-1" />
-                <CardContent className="flex-1 p-0">
-                  <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
-                    {info.label}
-                    {info.badge && <Badge variant={info.badge.variant}>{info.badge.text}</Badge>}
-                  </CardTitle>
-                  <p className="mt-1 text-xs text-muted-foreground">{info.blurb}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">{info.speed_cost}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">{info.best_for}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">{checkedSummary(pipeline, info.id)}</p>
-                </CardContent>
-              </Card>
-            </Label>
-          ))}
+          {pipeline.modePicker.map((info) => {
+            const summary = checkedSummary(pipeline, info.id);
+            return (
+              <Label
+                key={info.id}
+                className={`block font-normal ${info.disabled ? "cursor-not-allowed" : "cursor-pointer"}`}
+              >
+                <Card className={`flex-row items-start gap-3 p-4 ${info.tone ? (CARD_TONE[info.tone] ?? "") : ""}`}>
+                  <RadioGroupItem value={info.id} disabled={info.disabled} className="mt-1" />
+                  <CardContent className="flex-1 p-0">
+                    <CardTitle className="flex flex-wrap items-center gap-2 text-sm">
+                      {info.label}
+                      {info.badge && <Badge variant={info.badge.variant}>{info.badge.text}</Badge>}
+                    </CardTitle>
+                    <p className="mt-1 text-xs text-muted-foreground">{info.blurb}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">{info.speed_cost}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">{info.best_for}</p>
+                    {summary && <p className="mt-1 text-xs text-muted-foreground">{summary}</p>}
+                  </CardContent>
+                </Card>
+              </Label>
+            );
+          })}
         </RadioGroup>
         <Button onClick={() => onSelect(selected)} className="w-full">
           Start session

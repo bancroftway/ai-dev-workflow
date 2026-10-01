@@ -488,9 +488,9 @@ function QualityViewImpl({
           {stageOrderIndex(runActivity?.currentStage) < stageOrderIndex("remediation") // stage-literal-ok: bespoke empty-state copy
             ? "Quality stages haven’t run yet — they start after the build stages complete."
             : runActivity?.status === "failed"
-              ? "This run stopped before Quality's detail synced — see the Overview tab for the failure and Resume."
+              ? "This run stopped before Quality's detail synced — see the recovery options at the top of this page."
               : runActivity?.interrupted
-                ? "This run appears to have stopped — see the Overview tab to Resume."
+                ? "This run appears to have stopped — see the notice at the top of this page."
                 : "Quality stages are running — details will appear here as they sync."}
         </p>
       )}

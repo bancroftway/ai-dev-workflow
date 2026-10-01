@@ -10,6 +10,7 @@ import { useRouter } from "next/navigation";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
 import { GateButton, GateView, gateViewId, useTabStrip, type TabTone } from "@/components/GateButton";
+import { useRecovery } from "@/components/RecoveryPanel";
 import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
@@ -84,6 +85,18 @@ const VIEWS: Record<string, (tab: PipelineTab, ctx: ViewContext) => ReactNode> =
     );
   },
   overview: (_tab, c) => <SessionOverview owner={c.owner} repo={c.repo} branch={c.workBranch} />,
+};
+
+/** sessions_api SessionResponse.notice: a stopped run's notice and its one action. */
+interface RunNotice {
+  tone: "error" | "warn";
+  text: string;
+  action: { id: "open_gate" | "open_overview" | "resume"; label: string; tab_id?: string };
+}
+
+const NOTICE_CLASS: Record<RunNotice["tone"], string> = {
+  error: "border-red-300 bg-red-50 text-red-900",
+  warn: "border-amber-300 bg-amber-50 text-amber-900",
 };
 
 export function AppShell({
@@ -288,12 +301,14 @@ export function AppShell({
     status: string;
     awaiting_gate: boolean | null;
     container_alive: boolean;
+    failure_gate: { tab_id: string; button: string } | null;
+    notice: RunNotice | null;
   } | null>(null);
-  // Exposes the durable-row stream's own reconnect-if-closed check to the Resume/Reattach button
-  // below (root-caused 2026-09-11): that stream's "done" handler closes it for good on a REAL
+  // Exposes the durable-row stream's own reconnect-if-closed check to the run-start effect below
+  // (root-caused 2026-09-11): that stream's "done" handler closes it for good on a REAL
   // terminal status, with no reopen logic of its own -- by design, since most "done"s (completed)
   // truly are final. But "failed" is also terminal-shaped here, and failed sessions CAN be
-  // resumed (this file's own canReattach/Resume button exists for exactly that) -- and once
+  // resumed (the run notice, a gate row's Retry/Redo, Overview) -- and once
   // resumed, the OLD closed EventSource never reopens itself. The only existing recovery was
   // indirect (onFocus, below) and only fires on an actual focus transition, which a tab the user
   // never alt-tabs away from may not see for a long time -- observed live, thread 8242ea6d: the
@@ -323,6 +338,8 @@ export function AppShell({
       failure_message?: string | null;
       merge_ready?: boolean | null;
       review_id?: string | null;
+      failure_gate?: { tab_id: string; button: string } | null;
+      notice?: RunNotice | null;
     }) {
       // A terminal session (completed/failed/rejected) has no container to be alive in the first
       // place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
@@ -344,6 +361,7 @@ export function AppShell({
       setDurableRow({
         current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate,
         container_alive: row.container_alive ?? false,
+        failure_gate: row.failure_gate ?? null, notice: row.notice ?? null,
       });
       // Same payload, lifted into context so BuildView/SessionOverview/SpecificationView/
       // PlanView/RequirementsView can read run_active/interrupted without a second fetch.
@@ -360,6 +378,7 @@ export function AppShell({
         failureMessage: row.failure_message ?? null,
         mergeReady: row.merge_ready ?? null,
         reviewId: row.review_id ?? null,
+        failureGate: row.failure_gate ?? null,
       });
     }
 
@@ -404,6 +423,14 @@ export function AppShell({
       reconnectDurableRowIfClosedRef.current = () => {};
     };
   }, [threadId, setSandboxStatus, setRunActivity]);
+
+  // A run starting is proof the durable row is no longer terminal: the "done" handler above closed
+  // the stream when the run failed, and only a window focus reopened it -- after a Retry/Redo the
+  // failure notice and Overview rows stayed stale until the user happened to alt-tab (2026-10-01).
+  // Whatever started the run (gate row action, Overview, review approve), reopen it right away.
+  useEffect(() => {
+    if (agent.isRunning) reconnectDurableRowIfClosedRef.current();
+  }, [agent.isRunning]);
 
   // Idle-session hydration (root-caused 2026-09-12, user-reported: every tab past Tech Stack
   // rendered as if the session had never run). `agent.state` only ever gets populated by an actual
@@ -498,22 +525,14 @@ export function AppShell({
       t.stages.every((st) => (state.stages?.[st.key]?.status ?? "not_started") === "not_started"),
   );
 
-  // Reattach vs Resume (root-caused 2026-09-11, same distinction as SessionHistory.tsx's own
-  // fix): a "failed" run always needs a real restart-from-checkpoint regardless of container
-  // state (its approval/counters were already revoked by make_escalate_node). An "interrupted"
-  // run (nothing attached, but not failed) only needs that if its sandbox is actually gone --
-  // container_alive is verified Docker truth (sessions_api._verified_container_alive), not the
-  // stale "is a stream attached in THIS process" signal `interrupted` itself is. When the
-  // container is alive, copilotkit.runAgent() alone reattaches for free. When it is not,
-  // runAgent() alone has nothing to exec into -- only a fresh mount (SandboxSessionBoot) actually
-  // reprovisions, so that case reloads the page instead.
-  const runFailed = durableRow?.status === "failed";
-  const canReattach = !runFailed && Boolean(durableRow?.container_alive);
+  // The run notice's actions run through the same recovery engine as Overview's panel and the
+  // gate rows (one confirm-and-restart implementation; ensureSandboxProvisioned covers a dead
+  // container before resuming).
+  const recovery = useRecovery(owner, repo, workBranch);
 
   // Requirement (root-caused 2026-09-12): "Resume picks up from the last checkpoint" named no
   // actual checkpoint -- a user had no way to tell what that even meant. Same lookup the reattach
   // banner just below already uses.
-  const failedStageLabel = durableRow?.current_stage ? stageLabel(durableRow.current_stage) : null;
 
   // Pivot (root-caused 2026-09-12, user requirement): the graph must NEVER advance except via one
   // explicit, visible action (SessionOverview's stage-anchored restart/continue button). This
@@ -693,38 +712,38 @@ export function AppShell({
           </div>
         </nav>
 
-        {/* Workflow Liveness Fix: a session can be `in_progress` (not yet a terminal DB status)
-            with nothing actually executing it (process died, container killed, agent restarted --
-            durable node events/persisted stage status all outlive the process, so nothing else in
-            this file could tell). `interrupted` is server-computed and definitive; `status ===
-            "failed"` is the other stopped-and-recoverable case.
-            Pivot (root-caused 2026-09-12, user requirement): this banner used to carry its own
-            Reattach/Resume button and a rewind-stage dropdown -- both fired the workflow directly,
-            which is no longer allowed anywhere except SessionOverview's one stage-anchored restart
-            button (that's the only place with the durable failure detail + real-stage mapping
-            needed to target it correctly anyway). This is now informational only, pointing there.
-            Hidden while already on Overview (root-caused 2026-09-12, user-reported): its whole
-            point is "go see Overview", which is meaningless noise sitting right above that exact
-            tab's own content. */}
-        {tabs.find((t) => t.id === activeView)?.view !== "overview" && ((runActivity?.interrupted && !isAwaitingFirstRequirements) || runFailed) && (
-          <div className="flex items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
-            <span>
-              {runFailed
-                ? `This run failed and stopped${failedStageLabel ? ` at ${failedStageLabel}` : ""}.`
-                : canReattach
-                  ? "This run is still active, but you're not viewing its live progress right now."
-                  : "This run appears to have stopped, and its progress can no longer be resumed."}{" "}
-              See Overview for details and to continue.
-            </span>
-            <button
-              type="button"
-              className="shrink-0 rounded-md border border-amber-400 bg-white px-3 py-1 text-xs font-medium text-amber-900"
-              onClick={() => setActiveView(tabs.find((t) => t.view === "overview")?.id ?? defaultTabId)}
-            >
-              Go to Overview
-            </button>
-          </div>
-        )}
+        {/* The run notice (server-built, sessions_api SessionResponse.notice / gate_view.run_notice):
+            what stopped and the ONE action that gets the run going -- open the gate whose failed row
+            carries Retry/Redo, open Overview, or resume an interrupted run (the same confirm-and-
+            resume Overview's row offers, via useRecovery). Shown on every tab except the place its
+            own action leads to. Replaced a banner that read "still active" whenever the container
+            was up, even with nothing executing the run (after an agent restart, 2026-10-01). */}
+        {(() => {
+          const notice = durableRow?.notice;
+          if (!notice) return null;
+          const { action } = notice;
+          const overviewId = tabs.find((t) => t.view === "overview")?.id ?? defaultTabId;
+          const target = action.id === "open_gate" && action.tab_id ? gateViewId(action.tab_id) : action.id === "open_overview" ? overviewId : null;
+          if (target != null && activeView === target) return null;
+          if (action.id === "resume" && isAwaitingFirstRequirements) return null;
+          const resumeAt = recovery.boundaryKey ?? durableRow?.current_stage ?? null;
+          return (
+            <div className={`flex items-center justify-between gap-3 border-b px-4 py-2 text-sm ${NOTICE_CLASS[notice.tone] ?? ""}`}>
+              <span>{notice.text}</span>
+              <button
+                type="button"
+                className="shrink-0 rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-40"
+                disabled={recovery.restarting || (action.id === "resume" && resumeAt == null)}
+                onClick={() => {
+                  if (target != null) setActiveView(target);
+                  else if (resumeAt != null) void recovery.handleRestart(resumeAt);
+                }}
+              >
+                {recovery.restarting ? "Working…" : action.label}
+              </button>
+            </div>
+          );
+        })()}
 
         {/* Mid-run reattach banner (fold-in fix, 2026-09-11: was a full-page bg-white/95 cover on
             <main> that blocked every tab's live content, the only absolute-inset-0 blocker in this
@@ -776,7 +795,7 @@ export function AppShell({
           {tabStrip.map((tab) =>
             activeView === gateViewId(tab.tab_id) && tab.gate ? (
               <div key={gateViewId(tab.tab_id)} role="tabpanel">
-                <GateView tabId={tab.tab_id} />
+                <GateView tabId={tab.tab_id} owner={owner} repo={repo} branch={workBranch} />
               </div>
             ) : null,
           )}

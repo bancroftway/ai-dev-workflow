@@ -38,6 +38,8 @@ from unittest.mock import patch
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
+from ag_ui.core import EventType
+
 from . import config
 
 _counts: dict[str, int] = {}
@@ -169,6 +171,49 @@ def subscribe(session_id: str) -> "asyncio.Queue[Any]":
     queue: "asyncio.Queue[Any]" = asyncio.Queue(maxsize=config.RUN_SUBSCRIBER_QUEUE_MAXSIZE)
     _subscribers.setdefault(session_id.lower(), []).append(queue)
     return queue
+
+
+# Opening event -> the id field its continuation events carry, and continuation -> its opener.
+# Only the pairs the AG-UI client's event verifier enforces and ag_ui_langgraph emits.
+_JOIN_OPENERS = {
+    EventType.STEP_STARTED: "step_name",
+    EventType.TEXT_MESSAGE_START: "message_id",
+    EventType.TOOL_CALL_START: "tool_call_id",
+}
+_JOIN_CONTINUATIONS = {
+    EventType.STEP_FINISHED: EventType.STEP_STARTED,
+    EventType.TEXT_MESSAGE_CONTENT: EventType.TEXT_MESSAGE_START,
+    EventType.TEXT_MESSAGE_END: EventType.TEXT_MESSAGE_START,
+    EventType.TOOL_CALL_ARGS: EventType.TOOL_CALL_START,
+    EventType.TOOL_CALL_END: EventType.TOOL_CALL_START,
+}
+
+
+def joined_stream_filter() -> Callable[[Any], bool]:
+    """Per-subscriber predicate for a tab that attaches to a run already in flight (main.py run()'s
+    reattach branch -- every review resolve, since POST /sessions/{id}/review starts the run before
+    the tab attaches). Joining mid-stream misses the opening half of whatever step/message/tool
+    call is open right then; the AG-UI client's verifier rejects the orphan closing half ("Cannot
+    send 'STEP_FINISHED' for step ... that was not started") and CopilotKit's runtime ends the run
+    INCOMPLETE_STREAM -- the "Agent connection lost" banner over a run that is fine. Keeps an event
+    only if its opener was seen on this stream, and only the first RUN_STARTED (run() synthesizes
+    the one this stream leads with; the task's own can still arrive if it hadn't published yet)."""
+    seen: set[tuple[Any, Any]] = set()
+
+    def keep(event: Any) -> bool:
+        kind = getattr(event, "type", None)
+        if kind == EventType.RUN_STARTED:
+            if (kind, None) in seen:
+                return False
+            seen.add((kind, None))
+            return True
+        if kind in _JOIN_OPENERS:
+            seen.add((kind, getattr(event, _JOIN_OPENERS[kind], None)))
+            return True
+        opener = _JOIN_CONTINUATIONS.get(kind)
+        return opener is None or (opener, getattr(event, _JOIN_OPENERS[opener], None)) in seen
+
+    return keep
 
 
 def unsubscribe(session_id: str, queue: "asyncio.Queue[Any]") -> None:
@@ -364,6 +409,32 @@ def _demo() -> None:
             unsubscribe("backpressure-check", queue)
 
     asyncio.run(_backpressure())
+
+    # joined_stream_filter: a mid-run joiner drops the orphan closing half of a step/message/tool
+    # call it never saw open and any RUN_STARTED after the first, keeps everything it saw open.
+    from ag_ui.core import (
+        RunFinishedEvent, RunStartedEvent, StepFinishedEvent, StepStartedEvent, TextMessageContentEvent,
+        TextMessageEndEvent, TextMessageStartEvent, ToolCallArgsEvent, ToolCallEndEvent,
+    )
+
+    joined = [
+        RunStartedEvent(thread_id="t", run_id="t"),  # main.py's synthesized one
+        RunStartedEvent(thread_id="t", run_id="real"),  # the task's own, published after the join
+        TextMessageContentEvent(message_id="m0", delta="x"),
+        TextMessageEndEvent(message_id="m0"),
+        ToolCallArgsEvent(tool_call_id="c0", delta="{}"),
+        ToolCallEndEvent(tool_call_id="c0"),
+        StepFinishedEvent(step_name="specification_gate"),  # opened before the join
+        StepStartedEvent(step_name="plan_draft"),
+        TextMessageStartEvent(message_id="m1"),
+        TextMessageContentEvent(message_id="m1", delta="y"),
+        TextMessageEndEvent(message_id="m1"),
+        StepFinishedEvent(step_name="plan_draft"),
+        RunFinishedEvent(thread_id="t", run_id="real"),
+    ]
+    keep = joined_stream_filter()
+    kept = [joined.index(e) for e in joined if keep(e)]
+    assert kept == [0, 7, 8, 9, 10, 11, 12], kept
 
     # DONE sentinel reaches every subscriber, same as any other published item.
     async def _done_propagates() -> None:

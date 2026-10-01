@@ -1231,7 +1231,7 @@ EXIT_SCREENSHOTS = Check(
     "exit.screenshots", "UI screenshots captured",
     "An app with a user interface must have at least one end-to-end screenshot. Passing tests alone "
     "don't show that a page actually renders, so a person needs the pictures.",
-    "advisory", condition="the tech stack includes a UI framework",
+    "advisory", condition="only for apps with a user interface",
 )
 EXIT_METRICS = Check(
     "exit.metrics", "No metrics regression",
@@ -1243,13 +1243,13 @@ EXIT_TARGETED_FIX = Check(
     "exit.targeted_fix", "Targeted fix resolved its issues",
     "If a targeted fix ran against this run's problems, every problem it was sent to fix must be "
     "independently confirmed closed. The fix's own claim of success isn't enough.",
-    "advisory", condition="a targeted-fix attempt was recorded for this run",
+    "advisory", condition="only after a targeted fix ran this run",
 )
 EXIT_AUTH = Check(
     "exit.auth", "Required authentication verified",
     "When the app is required to enforce sign-in, the end-to-end auth probe must have run and passed. "
     "Auth that was required but never tested counts as unverified.",
-    "advisory", condition="auth enforcement is required and metrics were recorded for this run",
+    "advisory", condition="only when the app must enforce sign-in",
 )
 VERIFY_CHECKS: tuple[Check, ...] = (EXIT_MANIFEST, EXIT_SCREENSHOTS, EXIT_METRICS, EXIT_TARGETED_FIX, EXIT_AUTH)
 

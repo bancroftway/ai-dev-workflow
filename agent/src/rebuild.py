@@ -14,7 +14,9 @@ after quality-remediation, after security-remediation, after audit-cluster), eac
 
 from __future__ import annotations
 
+import json
 import logging
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass
@@ -26,6 +28,7 @@ from .prompt_loader import load_prompt_pair, render_prompt
 
 from . import config, git_ops, model_config, preflight_nodes, repo_files, run_event_store, run_event_stream, run_failure, stack_runner, tech_stack_signals, test_results, workflow_persistence
 from .text_truncate import truncate_middle
+from .gates.checks import Check, CheckLog
 from .run_events import RunEvent, RunEventType, encode_io_text
 from .chat_model import close_session, get_chat_model_for_thread, lap_role
 from .infra_retry import call_with_infra_retry
@@ -65,13 +68,14 @@ class RebuildState(TypedDict):
     build_commands: list[dict[str, str]]  # discovery turn's contract, replayed on fix laps
     last_red_detail: str  # previous lap's TDD-red-gate finding, to detect a stuck fix session
     last_scan_fingerprint: frozenset[str]  # previous lap's scan-delta gating findings (line-number-free)
+    checks: list[dict[str, Any]]  # the latest lap's per-check rows (CheckResult.to_dict), for its gate screen
 
 
 def default_rebuild_state() -> RebuildState:
     return {
         "status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "",
         "last_exit_ok": False, "cannot_verify": False, "build_commands": [], "last_red_detail": "",
-        "last_scan_fingerprint": frozenset(),
+        "last_scan_fingerprint": frozenset(), "checks": [],
     }
 
 
@@ -154,9 +158,73 @@ class RebuildSpec:
     scan_delta_gate: bool = False
 
 
+# The checks a rebuild placement runs, shown as rows on the gate after the stage it follows
+# (gate_view) and recorded per lap into RebuildState.checks -- same Check/CheckLog vocabulary as a
+# stage's own verify, so a failed rebuild check reads (and is recovered) exactly like one.
+REBUILD_BUILD = Check(
+    "rebuild.build", "Builds cleanly",
+    "Every buildable project in the tree compiles after this stage's changes.", "blocking",
+)
+_RED_CONDITION = "only before any implementation exists"
+RED_SUITES_START = Check(
+    "rebuild.red_suites_start", "Every test suite starts",
+    "Each test suite compiles, loads its config and runs its tests -- a suite that crashes before "
+    "running any test proves nothing about them.", "blocking", _RED_CONDITION,
+)
+RED_PLANNED_FILES = Check(
+    "rebuild.red_planned_files", "Every planned test file runs",
+    "Each test file the approved test plan names is run by some suite, so a whole suite can't "
+    "silently drop out.", "blocking", _RED_CONDITION,
+)
+RED_NONE_PASS = Check(
+    "rebuild.red_none_pass", "No test passes before implementation",
+    "Every test fails at runtime against the stub-only scaffold -- a test that already passes proves "
+    "nothing about the code still to be written.", "blocking", _RED_CONDITION,
+)
+SCAN_DELTA = Check(
+    "rebuild.scan_delta", "No new scan regressions",
+    "A full re-scan finds nothing the final merge gate would refuse: duplication, gating findings, "
+    "unmeasurable coverage.", "blocking", "only on the last rebuild of the run",
+)
+_RED_CHECKS = (RED_SUITES_START, RED_PLANNED_FILES, RED_NONE_PASS)
+
+
+def rebuild_checks(spec: "RebuildSpec") -> tuple[Check, ...]:
+    """The ordered checks `spec`'s placement can record."""
+    return (
+        REBUILD_BUILD,
+        *(_RED_CHECKS if spec.fix_scope == "scaffold_only" else ()),
+        *((SCAN_DELTA,) if spec.scan_delta_gate else ()),
+    )
+
+
 # Where the TDD-red gate's suite run tees its console output (same convention as the AC gate's
 # AC_TEST_OUTPUT_PATH; separate file so the two runs never clobber each other's evidence).
 _RED_GATE_OUTPUT_PATH = "agent-work/red-gate-output.txt"
+
+
+def _accounted_files(suites: list[Any]) -> set[str | None]:
+    """Repo-relative paths of every file the run's suites account for. A file may be listed
+    repo-relative or relative to its suite's own root -- both resolve to the same path (observed
+    live: `NoteServiceTests.cs` under root `apps/api.Tests`, which an exact repo-relative match
+    read as "never run" for every planned file). Pure."""
+    out: set[str | None] = set()
+    for s in suites:
+        for f in s.files:
+            out.add(test_results.repo_relative(f))
+            out.add(test_results.repo_relative(posixpath.normpath(posixpath.join(s.root or ".", f))))
+    return out
+
+
+async def _planned_test_files(provider: Any, thread_id: str) -> list[str]:
+    """The approved test plan's test file paths (05-ac-to-tests.approved.json test_files[].path);
+    [] when there is no readable plan -- the red gate then just has no file list to hold the run to."""
+    raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.AC_TO_TESTS_APPROVED_PATH)
+    try:
+        files = (json.loads(raw) if raw else {}).get("test_files") or []
+    except (json.JSONDecodeError, AttributeError):
+        return []
+    return [f["path"] for f in files if isinstance(f, dict) and isinstance(f.get("path"), str) and f["path"]]
 
 
 def red_gate_verdict(outcomes: dict[str, str]) -> tuple[bool, list[str], int]:
@@ -378,84 +446,14 @@ async def _provenance_reasons(provider: Any, thread_id: str, state: dict[str, An
         return []
 
 
-async def _verify_all_red(
-    thread_id: str, chat_provider: str, spec_key: str, run_id: str = "unknown",
-    eligible_only: set[str] | None = None, lap: int = 0,
+def _red_outcome_verdict(
+    outcomes: dict[str, str], eligible_only: set[str] | None, report_error: str | None,
 ) -> tuple[bool, str]:
-    """Deterministic TDD-red gate: run the suite, parse the runners' own structured reports, and
-    require zero passing tests (and at least one failing). The scaffold fix node is INSTRUCTED to
-    keep tests failing at runtime; this is the check that stops an over-implemented scaffold --
-    an accidental green here means a test that will never have its "watch it fail" moment.
-
-    `eligible_only` switches to the ticket-mode contract (eligible_red_verdict): on a
-    second-or-later ticket, only tests attributing to those undelivered criteria must be red --
-    the earlier tickets' regression suite is legitimately green.
-
-    `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
-    through to stack_runner.run_and_report below, which now requires it itself. `run_id` (Phase E
-    known-bugs fix) is threaded the same way, defaulting to "unknown" -- this function has no
-    `state` of its own, same reasoning as chat_provider.
-
-    `spec_key` (Overview-tab rebuild-row fix, 2026-09-22): only caller today is
-    make_rebuild_node, gated on `spec.fix_scope == "scaffold_only"` (only r_ac_to_tests uses this
-    gate), but this turn's own events were still tagged with the bare, placement-blind
-    `stage_key="red-gate"` literal -- indistinguishable from any other placement that might reuse
-    this gate later. Placement-specific now (`f"red-gate-{spec_key}"`), matching the pattern
-    already established at make_fix_node's `f"rebuild-{spec.key}"`. model_name is resolved
-    explicitly from the "ac-test-run" model_config.Stage key (Task 6 naming fix) -- this turn runs
-    the identical `ac_test_run` prompt ac_coverage_gate.py's own ac-test-run stage does, so reusing
-    its already-registered Stage entry is the correct fit, not a new "red-gate" Stage literal for a
-    key nothing else needs. Previously resolved from the bare string "red-gate", which was never a
-    registered Stage (model_config.get_model_name silently returned None for it every time) and
-    fell through to the "stack-run" fallback below unconditionally -- "ac-test-run" resolves to the
-    exact same models.yaml tier (gpt-5.4/haiku) as that fallback already gave, so this is a pure
-    naming fix with no behavior change. stack_runner.run_and_report's own internal fallback
-    (`model_config.get_model_name(stage_key, ...)`) is still not what resolves this: passing
-    model_name explicitly here means it never re-resolves against the new placement-specific
-    `stage_key` (absent from models.yaml) instead."""
-    from .gates.ac_coverage_gate import AcTestRunReport, run_resolved_test_command  # local: avoids import at module load
-
-    provider = get_sandbox_provider()
-    await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(_RED_GATE_OUTPUT_PATH)}")
-
-    # resolve_test_command() first, deterministically, before any LLM turn (Task 6): only when it
-    # produces nothing usable does a GHCP discovery session run at all. The correctness guard right
-    # below (`if not outcomes:`) is unchanged and now fires for EITHER path -- a resolved command
-    # that parses to zero outcomes falls straight through to the same discovery turn a stack with no
-    # resolver answer always used, rather than being silently read as "0 failed" (Task 6 requirement).
-    tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)
-    report = await run_resolved_test_command(
-        provider, thread_id, tech_stack, output_path_base="agent-work/red-gate-resolved"
-    )
-    if report is None:
-        report = await stack_runner.run_and_report(
-            thread_id,
-            stage_key=f"red-gate-{spec_key}",
-            prompt_name="ac_test_run",
-            schema=AcTestRunReport,
-            provider=chat_provider,
-            run_id=run_id,
-            lap=lap,
-            output_path=_RED_GATE_OUTPUT_PATH,
-            model_name=model_config.get_model_name("ac-test-run", "draft", chat_provider) or model_config.get_model_name("stack-run", "draft", chat_provider),
-        )
-    outcomes: dict[str, str] = {}
-    for artifact in report.result_artifacts or []:
-        rel = test_results.repo_relative(artifact)
-        contents = await repo_files.read_repo_file(provider, thread_id, rel) if rel else None
-        if not contents:
-            continue
-        parsed = (
-            test_results.parse_trx(contents)
-            or test_results.parse_vitest_json(contents)
-            or test_results.playwright_outcomes(contents)
-        )
-        outcomes = test_results.merge_outcomes(outcomes, parsed)
-
+    """The TDD-red verdict on the parsed outcomes: nothing (in scope) passed, something failed. Pure."""
     if not outcomes:
         return False, (
             "TDD-red gate: could not verify a single test outcome -- the suite run produced no "
-            f"parseable runner report ({report.error or 'no result_artifacts reported'}). Re-run "
+            f"parseable runner report ({report_error or 'no result_artifacts reported'}). Re-run "
             "the suite with a machine-readable reporter (.trx / vitest-json / playwright-json); "
             "the pipeline does not proceed until every test demonstrably FAILS."
         )
@@ -496,6 +494,145 @@ async def _verify_all_red(
     return True, f"TDD-red verified: 0 passed / {failed} failed."
 
 
+async def _verify_all_red(
+    thread_id: str, chat_provider: str, spec_key: str, run_id: str = "unknown",
+    eligible_only: set[str] | None = None, lap: int = 0, log: CheckLog | None = None,
+) -> tuple[bool, str]:
+    """Deterministic TDD-red gate: run the suite, parse the runners' own structured reports, and
+    require zero passing tests (and at least one failing). The scaffold fix node is INSTRUCTED to
+    keep tests failing at runtime; this is the check that stops an over-implemented scaffold --
+    an accidental green here means a test that will never have its "watch it fail" moment.
+
+    `eligible_only` switches to the ticket-mode contract (eligible_red_verdict): on a
+    second-or-later ticket, only tests attributing to those undelivered criteria must be red --
+    the earlier tickets' regression suite is legitimately green.
+
+    `chat_provider` (this run's own pinned `state["provider"]`, Ruling 4) is threaded straight
+    through to stack_runner.run_and_report below, which now requires it itself. `run_id` (Phase E
+    known-bugs fix) is threaded the same way, defaulting to "unknown" -- this function has no
+    `state` of its own, same reasoning as chat_provider.
+
+    `spec_key` (Overview-tab rebuild-row fix, 2026-09-22): only caller today is
+    make_rebuild_node, gated on `spec.fix_scope == "scaffold_only"` (only r_ac_to_tests uses this
+    gate), but this turn's own events were still tagged with the bare, placement-blind
+    `stage_key="red-gate"` literal -- indistinguishable from any other placement that might reuse
+    this gate later. Placement-specific now (`f"red-gate-{spec_key}"`), matching the pattern
+    already established at make_fix_node's `f"rebuild-{spec.key}"`. model_name is resolved
+    explicitly from the "ac-test-run" model_config.Stage key (Task 6 naming fix) -- this turn runs
+    the identical `ac_test_run` prompt ac_coverage_gate.py's own ac-test-run stage does, so reusing
+    its already-registered Stage entry is the correct fit, not a new "red-gate" Stage literal for a
+    key nothing else needs. Previously resolved from the bare string "red-gate", which was never a
+    registered Stage (model_config.get_model_name silently returned None for it every time) and
+    fell through to the "stack-run" fallback below unconditionally -- "ac-test-run" resolves to the
+    exact same models.yaml tier (gpt-5.4/haiku) as that fallback already gave, so this is a pure
+    naming fix with no behavior change. stack_runner.run_and_report's own internal fallback
+    (`model_config.get_model_name(stage_key, ...)`) is still not what resolves this: passing
+    model_name explicitly here means it never re-resolves against the new placement-specific
+    `stage_key` (absent from models.yaml) instead."""
+    from .gates.ac_coverage_gate import (  # local: avoids import at module load
+        NO_PLANNED_TEST_FILES, AcTestRunReport, clear_runner_artifacts, run_resolved_test_command,
+    )
+
+    log = log if log is not None else CheckLog(f"red-gate-{spec_key}", _RED_CHECKS)
+    provider = get_sandbox_provider()
+    await clear_runner_artifacts(provider, thread_id, _RED_GATE_OUTPUT_PATH)
+
+    # resolve_test_command() first, deterministically, before any LLM turn (Task 6): only when it
+    # produces nothing usable does a GHCP discovery session run at all. The correctness guard right
+    # below (`if not outcomes:`) is unchanged and now fires for EITHER path -- a resolved command
+    # that parses to zero outcomes falls straight through to the same discovery turn a stack with no
+    # resolver answer always used, rather than being silently read as "0 failed" (Task 6 requirement).
+    # Every test file the approved test plan names must run (and fail) here. The run agent
+    # accounts for each one under the suite that ran it; the check below holds it to that list.
+    # With a plan, the resolved single-command shortcut is skipped: one runner command can't say
+    # which planned files it covered, so on a mixed stack a whole suite could silently not run.
+    planned = await _planned_test_files(provider, thread_id)
+    tech_stack = await workflow_persistence.read_tech_stack_json(provider, thread_id)
+    report = None if planned else await run_resolved_test_command(
+        provider, thread_id, tech_stack, output_path_base="agent-work/red-gate-resolved"
+    )
+    agent_run = report is None
+    # The tee was deleted before this run (clear_runner_artifacts): an agent run that leaves it
+    # empty ran nothing, so its suites/artifacts can't describe the tree. That is the run agent's
+    # failure, not the code's -- re-run it (each call is a fresh session, stack_runner) within the
+    # verify infra budget instead of handing a fixer a verdict about nothing.
+    silent = False
+    for _attempt in range(1 + config.VERIFY_INFRA_RETRY_CAP if agent_run else 0):
+        report = await stack_runner.run_and_report(
+            thread_id,
+            stage_key=f"red-gate-{spec_key}",
+            prompt_name="ac_test_run",
+            schema=AcTestRunReport,
+            provider=chat_provider,
+            run_id=run_id,
+            lap=lap,
+            output_path=_RED_GATE_OUTPUT_PATH,
+            model_name=model_config.get_model_name("ac-test-run", "draft", chat_provider) or model_config.get_model_name("stack-run", "draft", chat_provider),
+            planned_test_files="\n".join(f"   - {f}" for f in planned) or NO_PLANNED_TEST_FILES,
+        )
+        silent = not await repo_files.read_repo_file(provider, thread_id, _RED_GATE_OUTPUT_PATH)
+        if not silent:
+            break
+    assert report is not None
+    # After scaffolding every suite must at least LOAD: red means each test fails at runtime. A
+    # root whose runner stopped before running any test proves nothing about its tests, and its
+    # absence from result_artifacts would otherwise let the other roots' results pass for the
+    # whole suite. Stack-agnostic -- the run's own per-root report, no runner/error-text matching.
+    if silent:
+        log.infra(RED_SUITES_START, f"the test run captured no output ({_RED_GATE_OUTPUT_PATH}) -- nothing was run")
+        return False, (
+            f"TDD-red gate: the test run captured no output this lap ({_RED_GATE_OUTPUT_PATH} is empty or "
+            "missing), even after re-running it, so no suite was actually run and its report can't be "
+            "trusted. Nothing in the code needs to change for this -- the next check runs the suites again."
+        )
+    not_run = [s for s in report.suites if not s.ran]
+    if not_run:
+        listed = "; ".join(f"{s.root}: {s.reason}" for s in not_run)
+        log.failed(RED_SUITES_START, listed)
+        return False, (
+            f"TDD-red gate: {len(not_run)} test suite(s) never ran a single test after "
+            f"scaffolding -- {listed}. Scaffolding must leave every suite compiling and loading so "
+            "each test fails at RUNTIME; fix whatever stops the suite from starting (full runner "
+            f"output: {_RED_GATE_OUTPUT_PATH})."
+        )
+    # ...and no planned file may go unaccounted for: a suite the run agent left out entirely
+    # shows up here as its files, by path -- a set check, no runner or report-format knowledge.
+    # ponytail: a file listed under a root that ran is taken at its word (.trx records no source
+    # paths, so there is no format-agnostic way to confirm each file's own tests executed).
+    log.passed(RED_SUITES_START)
+    accounted = _accounted_files(report.suites)
+    missing = [f for f in planned if test_results.repo_relative(f) not in accounted]
+    if missing:
+        log.failed(RED_PLANNED_FILES, ", ".join(missing))
+        return False, (
+            f"TDD-red gate: {len(missing)} planned test file(s) were never run -- no test suite in "
+            f"the run covered them: {', '.join(missing)}. Every test file in the approved test "
+            "plan must run (and fail at runtime) before implementation starts; make sure each "
+            "one's suite builds, loads and actually picks the file up (full runner output: "
+            f"{_RED_GATE_OUTPUT_PATH})."
+        )
+    if planned:
+        log.passed(RED_PLANNED_FILES)
+    else:
+        log.skipped(RED_PLANNED_FILES, "no approved test plan to check the run against")
+    outcomes: dict[str, str] = {}
+    for artifact in report.result_artifacts or []:
+        rel = test_results.repo_relative(artifact)
+        contents = await repo_files.read_repo_file(provider, thread_id, rel) if rel else None
+        if not contents:
+            continue
+        parsed = (
+            test_results.parse_trx(contents)
+            or test_results.parse_vitest_json(contents)
+            or test_results.playwright_outcomes(contents)
+        )
+        outcomes = test_results.merge_outcomes(outcomes, parsed)
+
+    ok, detail = _red_outcome_verdict(outcomes, eligible_only, report.error)
+    (log.passed if ok else log.failed)(RED_NONE_PASS, detail)
+    return ok, detail
+
+
 def make_rebuild_node(spec: RebuildSpec):
     async def rebuild_node(state: dict[str, Any], run_config) -> dict[str, Any]:
         # Named run_config, not config -- config.py's module import above is used throughout this
@@ -520,6 +657,7 @@ def make_rebuild_node(spec: RebuildSpec):
         # Clear the sticky no-sandbox flag: it survives END-terminated runs in the checkpoint,
         # and the router checks it FIRST -- without this a healthy resubmit insta-fails.
         rb["cannot_verify"] = False
+        log = CheckLog(spec.key, rebuild_checks(spec))
 
         # Durable + live NODE_STARTED (root-caused 2026-09-11): a real build/red-gate check here
         # can run for minutes, but until now this node emitted no run_event at all, so
@@ -601,6 +739,11 @@ def make_rebuild_node(spec: RebuildSpec):
                 # already pays for the identical guarantee.
                 report = await _replay_build(provider, thread_id, rb["build_commands"])
         build_ok = report.success and report.ok
+        (log.passed if build_ok else log.failed)(
+            REBUILD_BUILD, None if build_ok else (report.error or "the build failed -- see its output")
+        )
+        built = build_ok
+        red_ran = False
 
         # Persist a FRESH discovery's build_commands (never a replay of an already-persisted one,
         # and never at the greenfield scaffold-only placement -- see skip_toolchain_capture above)
@@ -662,7 +805,10 @@ def make_rebuild_node(spec: RebuildSpec):
             and mctg_status == "not_started"
         )
         if build_ok and spec.fix_scope == "scaffold_only" and mctg_never_ran:
-            red_ok, red_detail = await _verify_all_red(thread_id, state["provider"], spec.key, run_id=state.get("run_id", "unknown"))
+            red_ran = True
+            red_ok, red_detail = await _verify_all_red(
+                thread_id, state["provider"], spec.key, run_id=state.get("run_id", "unknown"), log=log,
+            )
             if not red_ok:
                 build_ok = False
                 red_failed = True
@@ -677,12 +823,17 @@ def make_rebuild_node(spec: RebuildSpec):
             run_id = state.get("run_id", "unknown")
             eligible = await _eligible_ac_ids_for_run(provider, thread_id, run_id, new_or_modified_only=True)
             if mctg_status == "not_started" and eligible:
+                red_ran = True
                 red_ok, red_detail = await _verify_all_red(
-                    thread_id, state["provider"], spec.key, run_id=run_id, eligible_only=eligible
+                    thread_id, state["provider"], spec.key, run_id=run_id, eligible_only=eligible, log=log,
                 )
                 if not red_ok:
                     build_ok = False
                     red_failed = True
+
+        if built and spec.fix_scope == "scaffold_only" and not red_ran:
+            for check in _RED_CHECKS:
+                log.skipped(check, "not needed this run: the implementation already exists, or there are no new criteria")
 
         # Stuck-fixer detection: originally written when the fix session (f"rebuild-{spec.key}"/
         # "draft") was resumed across every fix cycle, so a fixer repeating the SAME red-gate
@@ -716,6 +867,7 @@ def make_rebuild_node(spec: RebuildSpec):
             scan_reasons = await _scan_regression_reasons(provider, thread_id, state)
             scan_reasons += await _provenance_reasons(provider, thread_id, state)
             if scan_reasons:
+                log.failed(SCAN_DELTA, "\n".join(scan_reasons))
                 build_ok = False
                 scan_detail = (
                     "The build is green, but a full re-scan of the tree you just modified reports "
@@ -742,10 +894,12 @@ def make_rebuild_node(spec: RebuildSpec):
                     )
                 rb["last_scan_fingerprint"] = scan_fingerprint
             else:
+                log.passed(SCAN_DELTA)
                 rb["last_scan_fingerprint"] = frozenset()
 
         rb["status"] = "clean" if build_ok else "failed"
         rb["last_exit_ok"] = build_ok
+        rb["checks"] = [r.to_dict() for r in log.results()]
         # 16000 total, matching _replay_build's own cap above -- this used to re-truncate to 4000 on
         # top of that, which quietly threw away most of what the wider cap just preserved (the
         # fix prompt below reads exactly these two fields, so THIS slice, not _replay_build's, is
@@ -817,10 +971,32 @@ _SCAFFOLD_ONLY_ADDENDUM = (
     "You may ONLY add minimal compile-enabling scaffolding: signatures, classes, and interfaces "
     "that don't yet exist, each throwing NotImplementedException (or the stack's equivalent) in "
     "every method body. Do NOT implement real behavior. Tests must remain failing at RUNTIME after "
-    "your change -- only the COMPILER's complaints are your job here. If a test fails to compile "
+    "your change -- only what stops a suite from compiling or starting (missing symbols, project or "
+    "test-runner config wiring, dependencies) is your job here. If a test fails to compile "
     "because it references a symbol that doesn't exist yet, add the minimal stub; do not make the "
     "test pass."
 )
+
+
+async def _snapshot_files(provider: Any, thread_id: str, paths: list[str]) -> dict[str, str]:
+    """Current content of each existing file in `paths`."""
+    snap = {}
+    for path in paths:
+        content = await repo_files.read_repo_file(provider, thread_id, path)
+        if content is not None:
+            snap[path] = content
+    return snap
+
+
+async def _restore_changed(provider: Any, thread_id: str, snapshot: dict[str, str]) -> list[str]:
+    """Rewrites every snapshotted file whose content changed (or that was deleted) since the
+    snapshot; returns those paths."""
+    restored = []
+    for path, content in snapshot.items():
+        if await repo_files.read_repo_file(provider, thread_id, path) != content:
+            await repo_files.write_repo_file(provider, thread_id, path, content)
+            restored.append(path)
+    return restored
 
 
 def make_fix_node(spec: RebuildSpec):
@@ -883,6 +1059,15 @@ def make_fix_node(spec: RebuildSpec):
             start_event = await run_event_store.append_event(start_event)
             await run_event_stream.emit_live(start_event, run_config)
 
+        # The scaffold-only fixer must never touch the approved tests -- they are the contract the
+        # red gate holds the scaffold to. Enforced, not just asked: the plan's test files are
+        # snapshotted before the turn and any it edited or deleted are put back after (observed
+        # live, run c2bbdca1: a fixer chasing a false red-gate verdict rewrote a Playwright spec).
+        test_snapshot: dict[str, str] = {}
+        if spec.fix_scope == "scaffold_only" and sandbox_registry.get(thread_id) is not None:
+            provider = get_sandbox_provider()
+            test_snapshot = await _snapshot_files(provider, thread_id, await _planned_test_files(provider, thread_id))
+
         fix_messages = [SystemMessage(content=system), HumanMessage(content=prompt)]
         fix_response = None
         try:
@@ -924,6 +1109,15 @@ def make_fix_node(spec: RebuildSpec):
             )
             finish_event = await run_event_store.append_event(finish_event)
             await run_event_stream.emit_live(finish_event, run_config)
+
+        if test_snapshot and sandbox_registry.get(thread_id) is not None:
+            restored = await _restore_changed(get_sandbox_provider(), thread_id, test_snapshot)
+            if restored:
+                logger.warning("rebuild %s: the fixer edited approved test files -- restored %s", spec.key, restored)
+                await repo_files.append_ledger_entry(
+                    get_sandbox_provider(), thread_id,
+                    {"stage": spec.key, "node": "fix", "restored_test_files": restored},
+                )
 
         rb["fix_cycle_count"] = rb["fix_cycle_count"] + 1
         rb["status"] = "fixing"
@@ -1154,8 +1348,11 @@ def _demo() -> None:
         '<Results><UnitTestResult testName="T1" outcome="Failed" /></Results></TestRun>'
     )
 
+    red_gate_commands: list[str] = []
+
     class _RedGateProvider:
-        async def exec_in_sandbox(self, _thread_id: str, _command: str) -> _Result:
+        async def exec_in_sandbox(self, _thread_id: str, command: str) -> _Result:
+            red_gate_commands.append(command)
             return _Result(0)
 
     original_get_sandbox_provider = get_sandbox_provider
@@ -1164,7 +1361,11 @@ def _demo() -> None:
     original_stack_runner = stack_runner
     discovery_calls: list[Any] = []
 
+    tee_written = ["[apps/x] $ test run output"]  # an agent run's captured console output
+
     async def _fake_read_repo_file(_provider: Any, _thread_id: str, path: str) -> str | None:
+        if path == _RED_GATE_OUTPUT_PATH:
+            return tee_written[0]
         return trx_all_red if path == "agent-work/red-gate-resolved.trx" else None
 
     async def _fake_run_resolved_ok(*_args: Any, **_kwargs: Any) -> _AcTestRunReport:
@@ -1187,6 +1388,8 @@ def _demo() -> None:
         red_ok, detail = asyncio.run(_verify_all_red("t-red-gate-resolved-selfcheck", "claude", "selfcheck"))
         assert red_ok is True, detail
         assert not discovery_calls, "resolve_test_command()'s own resolved path must skip the LLM turn entirely"
+        # Stale-evidence sweep runs first: a previous lap's *.trx must never be re-read as this lap's.
+        assert "'*.trx'" in red_gate_commands[0] and _RED_GATE_OUTPUT_PATH in red_gate_commands[0], red_gate_commands
     finally:
         get_sandbox_provider = original_get_sandbox_provider
         repo_files.read_repo_file = original_read_repo_file
@@ -1211,11 +1414,113 @@ def _demo() -> None:
     get_sandbox_provider = lambda: _RedGateProvider()  # noqa: E731
     _acg.run_resolved_test_command = _fake_run_resolved_none
     stack_runner = _FakeStackRunnerEmpty()
+    repo_files.read_repo_file = _fake_read_repo_file  # the run captured output, but no parseable report
     try:
         red_ok2, detail2 = asyncio.run(_verify_all_red("t-red-gate-fallback-selfcheck", "claude", "selfcheck"))
         assert red_ok2 is False, "zero outcomes from EITHER path must never read as '0 failed'"
         assert "could not verify a single test outcome" in detail2, detail2
+
+        # A root that never ran a test fails the gate even though another root's results are all
+        # red -- quoting the run's own root and reason, whatever the stack.
+        async def _fake_run_and_report_partial(*_args: Any, **_kwargs: Any) -> Any:
+            return _AcTestRunReport(
+                success=True, ready_for_next_stage=True, exit_ok=False,
+                result_artifacts=["agent-work/red-gate-resolved.trx"],
+                suites=[_acg.SuiteRun(root="apps/web", ran=False, reason="failed to load config")],
+            )
+
+        class _FakeStackRunnerPartial:
+            run_and_report = staticmethod(_fake_run_and_report_partial)
+
+        stack_runner = _FakeStackRunnerPartial()
+        repo_files.read_repo_file = _fake_read_repo_file  # the other root's report: all red
+        red_ok3, detail3 = asyncio.run(_verify_all_red("t-red-gate-partial-selfcheck", "claude", "selfcheck"))
+        assert red_ok3 is False and "apps/web: failed to load config" in detail3, detail3
+
+        # A suite the run agent leaves out ENTIRELY: the approved plan names a file no suite
+        # accounts for -- the gate names it even though every reported result is red. A plan also
+        # skips the resolved single-command shortcut (it can't account for files).
+        plan = json.dumps({"test_files": [{"path": "apps/api.Tests/A.cs"}, {"path": "apps/web/b.spec.ts"}]})
+
+        async def _read_with_plan(_provider: Any, _thread_id: str, path: str) -> str | None:
+            if path == workflow_persistence.AC_TO_TESTS_APPROVED_PATH:
+                return plan
+            return await _fake_read_repo_file(_provider, _thread_id, path)
+
+        agent_runs: list[int] = []
+
+        async def _fake_run_and_report_omits(*_args: Any, **kwargs: Any) -> Any:
+            agent_runs.append(1)
+            assert "apps/web/b.spec.ts" in kwargs["planned_test_files"], kwargs
+            return _AcTestRunReport(
+                success=True, ready_for_next_stage=True, exit_ok=False,
+                result_artifacts=["agent-work/red-gate-resolved.trx"],
+                suites=[_acg.SuiteRun(root="apps/api.Tests", files=["/workspace/repo/apps/api.Tests/A.cs"])],
+            )
+
+        class _FakeStackRunnerOmits:
+            run_and_report = staticmethod(_fake_run_and_report_omits)
+
+        async def _resolved_must_not_run(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("with a test plan the resolved single-command path must be skipped")
+
+        stack_runner = _FakeStackRunnerOmits()
+        repo_files.read_repo_file = _read_with_plan
+        _acg.run_resolved_test_command = _resolved_must_not_run
+        red_log = CheckLog("selfcheck", _RED_CHECKS, strict=True)
+        red_ok4, detail4 = asyncio.run(_verify_all_red("t-red-gate-omitted-selfcheck", "claude", "selfcheck", log=red_log))
+        assert red_ok4 is False and "apps/web/b.spec.ts" in detail4 and "A.cs" not in detail4, detail4
+        # ...and the gate screen's rows say exactly which check that was.
+        assert [(r.id, r.status) for r in red_log.results()] == [
+            (RED_SUITES_START.id, "passed"), (RED_PLANNED_FILES.id, "failed"),
+        ], red_log.results()
+        # An agent run that captured no output ran nothing this lap: its report is never acted on
+        # (observed live: a resumed session re-reported a stale failure with zero tool calls).
+        tee_written[0] = ""
+        agent_runs.clear()
+        silent_log = CheckLog("selfcheck", _RED_CHECKS, strict=True)
+        red_ok5, detail5 = asyncio.run(_verify_all_red("t-red-gate-silent-selfcheck", "claude", "selfcheck", log=silent_log))
+        assert red_ok5 is False and "captured no output" in detail5, detail5
+        assert len(agent_runs) == 1 + config.VERIFY_INFRA_RETRY_CAP, "a silent run is re-run before the verdict"
+        assert [(r.id, r.status) for r in silent_log.results()] == [(RED_SUITES_START.id, "infra")]
+        tee_written[0] = "[apps/x] $ test run output"
+        # Files may be listed repo-relative OR relative to their suite's root (incl. an absolute root).
+        suites = [
+            _acg.SuiteRun(root="apps/api.Tests", files=["NoteServiceTests.cs"]),
+            _acg.SuiteRun(root="/workspace/repo/apps/web", files=["src/a.spec.ts", "./tests/e2e/b.spec.ts"]),
+            _acg.SuiteRun(root="apps/web", files=["apps/web/src/c.spec.ts"]),
+        ]
+        assert {"apps/api.Tests/NoteServiceTests.cs", "apps/web/src/a.spec.ts", "apps/web/tests/e2e/b.spec.ts",
+                "apps/web/src/c.spec.ts"} <= _accounted_files(suites), _accounted_files(suites)
+        assert "apps/web/src/other.spec.ts" not in _accounted_files(suites)
+        # The approved tests are restored after a scaffold-only fix lap edits or deletes them.
+        disk = {"a.spec.ts": "contract", "b.cs": "contract-b"}
+
+        async def _disk_read(_p: Any, _t: str, path: str) -> str | None:
+            return disk.get(path)
+
+        async def _disk_write(_p: Any, _t: str, path: str, content: str) -> None:
+            disk[path] = content
+
+        real_write = repo_files.write_repo_file
+        repo_files.read_repo_file, repo_files.write_repo_file = _disk_read, _disk_write
+        try:
+            snap = asyncio.run(_snapshot_files(None, "t", ["a.spec.ts", "b.cs", "missing.ts"]))
+            disk["a.spec.ts"] = "edited by the fixer"
+            del disk["b.cs"]
+            assert asyncio.run(_restore_changed(None, "t", snap)) == ["a.spec.ts", "b.cs"]
+            assert disk == {"a.spec.ts": "contract", "b.cs": "contract-b"}, disk
+        finally:
+            repo_files.write_repo_file = real_write
+            repo_files.read_repo_file = _read_with_plan
+        assert [c.id for c in rebuild_checks(RebuildSpec("r", 1, "", "scaffold_only", "n"))] == [
+            REBUILD_BUILD.id, *(c.id for c in _RED_CHECKS)
+        ]
+        assert [c.id for c in rebuild_checks(RebuildSpec("r", 1, "", "full", "n", scan_delta_gate=True))] == [
+            REBUILD_BUILD.id, SCAN_DELTA.id
+        ]
     finally:
+        repo_files.read_repo_file = original_read_repo_file
         get_sandbox_provider = original_get_sandbox_provider
         _acg.run_resolved_test_command = original_resolved_fn
         stack_runner = original_stack_runner

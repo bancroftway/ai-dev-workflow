@@ -98,7 +98,7 @@ function StageCard({
           {verification.feedback}
           <p className="mt-1 font-medium">
             {failedHere
-              ? "This run ended here. See the Overview tab for details and Resume."
+              ? "This run ended here — see the recovery options at the top of this page."
               : "The pipeline retries this automatically — no action is needed unless the run ends in failure."}
           </p>
         </div>
@@ -129,7 +129,7 @@ export function RebuildConnector({
   isRedGate: boolean;
 }) {
   const label = failedHere
-    ? `${isRedGate ? "Red-gate" : "Rebuild"} check failed — see the Overview tab for details and Resume.`
+    ? `${isRedGate ? "Red-gate" : "Rebuild"} check failed — see the recovery options at the top of this page.`
     : running
       ? isRedGate
         ? "Confirming the new tests actually fail before implementation starts…"

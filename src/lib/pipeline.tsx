@@ -53,7 +53,14 @@ export interface PipelineMode {
   blurb: string;
   speed_cost: string;
   best_for: string;
-  badge: { text: string; variant: "default" | "secondary" } | null;
+  badge: { text: string; variant: "default" | "secondary" | "destructive" } | null;
+}
+
+/** One card in the new-session popup (descriptor `mode_picker`): the real modes plus a disabled
+ * warning card that is not a mode. Popup copy only -- use `modes` everywhere else. */
+export interface PipelinePickerMode extends PipelineMode {
+  disabled: boolean;
+  tone: "danger" | null;
 }
 
 export interface PipelineDescriptor {
@@ -61,9 +68,12 @@ export interface PipelineDescriptor {
   /** The real run sequence (separate from how tabs group stages). */
   order: string[];
   modes: PipelineMode[];
+  mode_picker: PipelinePickerMode[];
   rebuild_placements: { after_stage_key: string; rebuild_key: string; next_stage_key: string; label: string }[];
   /** Non-stage failure_stage values (rebuild keys, e2e, ...) -> the real stage a restart targets. */
   failure_stage_map: Record<string, string>;
+  /** failure_stage values a plain resume retries in place (only the failed check re-runs). */
+  retry_in_place_failures: string[];
   /** Pre-rename stage keys an old session's stored state may still carry. */
   legacy_labels: Record<string, string>;
   wrapper_checks: PipelineCheck[];
@@ -97,7 +107,10 @@ export function makePipeline(d: PipelineDescriptor) {
     tabs: d.tabs,
     order: d.order,
     modes: d.modes,
+    modePicker: d.mode_picker,
     rebuildPlacements,
+    retriesInPlace: (failureStage: string | null | undefined): boolean =>
+      failureStage != null && (d.retry_in_place_failures ?? []).includes(failureStage),
     stage: (key: string) => stages.get(key),
     stageLabel: (key: string | null | undefined): string =>
       key == null ? "" : (stages.get(key)?.label ?? d.legacy_labels[key] ?? key),

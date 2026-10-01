@@ -1339,52 +1339,52 @@ CHECK_FRONTEND_PRESENT = Check(
     "code.frontend_present", "Declared frontend is really built",
     "Checks the frontend framework the Tech Stack approved has real source files or a real "
     "package.json dependency, so a backend-only delivery can't pass as the approved app.",
-    "collected", "only when the Tech Stack declares a frontend framework",
+    "collected", "only when the tech stack has a frontend framework",
 )
 CHECK_BACKEND_HOSTED = Check(
     "code.backend_hosted", "Declared backend is a hosted service",
     "Checks the declared backend is a running HTTP service (web project plus an entry point that "
     "maps endpoints), not a class library nothing invokes -- a library can hit any coverage number "
     "while proving nothing about the product.",
-    "collected", "only when the Tech Stack declares a backend framework",
+    "collected", "only when the tech stack has a backend framework",
 )
 CHECK_OTEL = Check(
     "code.otel", "OpenTelemetry instrumentation present",
     "Checks every declared framework shows real OpenTelemetry setup, so a failure can be traced to "
     "the handler or call that actually broke instead of only a symptom.",
-    "collected", "only when the Tech Stack declares frameworks, once the backend-hosted check passes",
+    "collected", "only when the tech stack declares frameworks",
 )
 CHECK_FRONTEND_CALLS_BACKEND = Check(
     "code.frontend_calls_backend", "Frontend calls the backend",
     "Checks the frontend talks to the backend over HTTP instead of keeping all its state in browser "
     "storage, which would leave the two halves of the app disconnected.",
-    "collected", "only when a backend framework is declared, once the OpenTelemetry check passes",
+    "collected", "only when the tech stack has a backend framework",
 )
 CHECK_NO_DUPLICATE_BACKEND = Check(
     "code.no_duplicate_backend", "Frontend API routes forward to the backend",
     "Checks the frontend's own API route handlers proxy to the declared backend rather than "
     "re-implementing its logic, which would make the real backend dead code.",
-    "collected", "only when a backend framework is declared, once the frontend-calls-backend check passes",
+    "collected", "only when the tech stack has a backend framework",
 )
 CHECK_COVERAGE_MEASURED = Check(
     "code.coverage_measured", "Coverage report produced",
     "Checks the test suite really ran with coverage and produced a readable report; without one "
     "there is no number to judge, so it counts as an infrastructure failure.",
-    "blocking", "only once the application, frontend and integration checks pass",
+    "blocking", "always",
 )
 CHECK_EXCLUSION_GAMING = Check(
     "code.exclusion_gaming", "No coverage-exclusion gaming",
     "Checks coverage-exclusion config only skips known generated or vendor code, so the threshold "
     "can't be met by hiding real code from measurement.",
-    "blocking", "only once a coverage report is produced",
+    "blocking", "always",
 )
 CHECK_COVERAGE_THRESHOLD = Check(
     "code.coverage_threshold", "Line and branch coverage meet threshold",
     f"Checks both line and branch coverage reach {MIN_COVERAGE_PERCENT}%, so untested paths -- "
     "especially error and edge-case branches -- don't ship unnoticed.",
-    "blocking", "only once no exclusion gaming is found",
+    "blocking", "always",
 )
-_DEPTH_CONDITION = "only once coverage passes, when the spec ledger has live criteria and tests exist"
+_DEPTH_CONDITION = "only when there are live acceptance criteria and tests"
 CHECK_AC_DEPTH = Check(
     "code.ac_depth", "Each criterion tested below the browser",
     "Checks every live acceptance criterion has enough real unit/integration tests (no fiat "
@@ -1408,7 +1408,7 @@ CHECK_DESIGN_TOKENS = Check(
     "code.design_tokens", "Colors follow the design tokens",
     "Checks styles use the DESIGN.md palette rather than hardcoded off-palette colors, so the app "
     "matches its approved look.",
-    "blocking", "only once coverage and test-depth checks pass, when the session record is readable",
+    "blocking", "always",
 )
 VERIFY_CHECKS: tuple[Check, ...] = (
     CHECK_APP_SOURCE, CHECK_FRONTEND_PRESENT, CHECK_BACKEND_HOSTED, CHECK_OTEL,

@@ -33,6 +33,66 @@ DEFAULT_CODE_GEN_MODE = "mission_critical"
 AUDIT_MODES = frozenset({"mission_critical"})
 
 
+# Gate checks a sandbox Stop hook (agent/sandbox-image/hooks/*.mjs) ALSO enforces in-turn: the hook
+# runs the same helper while the model drafts and blocks the turn from ending until it passes. Hooks
+# are installed for every session and never look at code_gen_mode, so these still run when a mode
+# turns the stage's gate "off" -- the gate screen says so instead of a bare "Skipped" (gate_view).
+# "partial": the hook enforces only part of the check's rule. Audit-only hooks (full-read) are left
+# out -- no audit turn exists in a mode that turns a gate off. Mapped from each hook's own source
+# (2026-10-01); a hook change that alters what it enforces must update this table.
+# ponytail: Claude only -- a Stop hook's exit-2 block is unverified on Copilot (Dockerfile notes).
+IN_TURN_CHECKS: dict[str, tuple[Literal["full", "partial"], str]] = {
+    "spec.draft_file_parses": ("partial", "check-ledger-sync-stop"),
+    "spec.draft_not_empty": ("full", "check-ledger-sync-stop"),
+    "spec.no_open_questions": ("full", "check-ledger-sync-stop"),
+    "spec.story_narrative": ("full", "check-narrative-format-stop"),
+    "spec.ledger_citations": ("full", "check-ledger-sync-stop"),
+    "spec.ledger_duplicates": ("full", "check-ledger-sync-stop"),
+    "spec.ledger_retirements": ("full", "check-ledger-sync-stop"),
+    "spec.ledger_bug_affected": ("partial", "check-ledger-sync-stop"),
+    "plan.steps_json": ("partial", "check-plan-schema-stop"),
+    "plan.ledger_sync": ("partial", "check-plan-citations-stop"),
+    "plan.manifest_json": ("partial", "check-plan-schema-stop"),
+    "plan.visual_retirement": ("full", "check-plan-citations-stop"),
+    "plan.visual_review_current": ("partial", "check-diagram-staleness-stop"),
+    "plan.step_linkage": ("full", "check-plan-citations-stop"),
+    "plan.wireframe_ac_ids": ("full", "check-plan-citations-stop"),
+    "plan.wireframe_has_ac_ids": ("full", "check-plan-citations-stop"),
+    "plan.ui_wireframe_coverage": ("full", "check-plan-citations-stop"),
+    "plan.step_wireframe_coverage": ("full", "check-plan-citations-stop"),
+    "plan.wireframe_html": ("full", "check-plan-schema-stop"),
+    "plan.mermaid_render": ("full", "check-diagram-render-stop"),
+    "ac_tests.write_scope": ("partial", "check-ac-residue-stop"),
+    "ac_tests.ledger_integrity": ("full", "check-ac-residue-stop"),
+    "ac_tests.retired_residue": ("full", "check-ac-residue-stop"),
+    "ac_tests.deferred_residue": ("full", "check-ac-residue-stop"),
+    "ac_tests.completed_protection": ("full", "check-ac-residue-stop"),
+    "ac_tests.wrote_tests": ("full", "check-ac-residue-stop"),
+    "ac_tests.not_e2e_only": ("full", "check-ac-residue-stop"),
+    "ac_tests.e2e_spec_present": ("partial", "check-ac-residue-stop"),
+    "ac_tests.screenshot_on": ("full", "check-ac-residue-stop"),
+    "ac_tests.depth": ("partial", "check-test-quality-stop"),
+    "ac_tests.testid_locators": ("full", "check-testid-locators-stop"),
+    "ac_tests.nav_waits": ("full", "check-testid-locators-stop"),
+    "code.coverage_threshold": ("full", "check-coverage-stop"),
+    "code.ac_depth": ("partial", "check-coverage-stop"),
+    "code.testid_locators": ("full", "check-testid-locators-stop"),
+    "code.nav_waits": ("full", "check-testid-locators-stop"),
+    "remediation.fabricated_ids": ("full", "check-remediation-stop"),
+    "remediation.ignore_files": ("partial", "check-remediation-stop"),
+    "remediation.suppression_comments": ("partial", "check-remediation-stop"),
+    "adversarial.report": ("full", "check-adversarial-stop"),
+    "adversarial.verdict": ("full", "check-adversarial-stop"),
+    "adversarial.blocking_findings": ("full", "check-adversarial-stop"),
+    "exit.manifest": ("partial", "check-exit-readiness-stop"),
+    "exit.screenshots": ("full", "check-exit-readiness-stop"),
+    "exit.metrics": ("full", "check-exit-readiness-stop"),
+    "exit.targeted_fix": ("full", "check-exit-readiness-stop"),
+    "exit.auth": ("full", "check-exit-readiness-stop"),
+    "wrapper.skills": ("partial", "require-skills-stop"),
+}
+
+
 def resolve_code_gen_mode(mode: str | None) -> str:
     return mode if mode in CODE_GEN_MODES else DEFAULT_CODE_GEN_MODE
 
@@ -160,7 +220,7 @@ WRAPPER_VERIFY_CRASHED = Check(
 WRAPPER_AUDIT_FINDINGS = Check(
     "wrapper.audit_findings", "Audit findings resolved",
     "Every finding the second-opinion audit raised this lap was addressed.", "blocking",
-    "only for stages with an audit step, when the audit ran this lap or the draft admitted gaps",
+    "only when the audit runs or the draft admitted gaps",
     needs_audit=True,
 )
 WRAPPER_CHECKS: tuple[Check, ...] = (WRAPPER_SANDBOX, WRAPPER_SKILLS, WRAPPER_VERIFY_CRASHED, WRAPPER_AUDIT_FINDINGS)

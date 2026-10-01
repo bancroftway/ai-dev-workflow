@@ -1033,7 +1033,7 @@ TS_TEST_COMMAND = Check("tech_stack.test_command", "Test command resolves", "The
 TS_EXTRACTION = Check("tech_stack.extraction", "Extraction succeeded", "Structured extraction of the submitted markdown did not fall back to all-absent.", "blocking")
 TS_TOOLCHAIN = Check("tech_stack.toolchain", "Toolchain recorded", "The sandbox recorded its image and the tools available in it (manifest.json toolchain). Platform telemetry: a gap here never needs action from you.", "advisory")
 TS_TESTING_FRAMEWORKS = Check("tech_stack.testing_frameworks", "Testing frameworks detected", "At least one testing framework is recorded.", "advisory")
-TS_STARTABILITY = Check("tech_stack.startability", "Startability evaluated", "The boot probe recorded startable plus evidence or a reason.", "advisory", condition="brownfield")
+TS_STARTABILITY = Check("tech_stack.startability", "Startability evaluated", "The boot probe recorded startable plus evidence or a reason.", "advisory", condition="only for an existing codebase")
 TS_CONVENTION_ROOTS = Check("tech_stack.convention_roots", "Convention roots safe", "Every declared ecosystem root is a safe repo-relative path.", "advisory")
 TECH_STACK_CHECKS: tuple[Check, ...] = (
     TS_SCHEMA, TS_LANGUAGES, TS_PACKAGE_MANAGERS, TS_TEST_COMMAND, TS_EXTRACTION,

@@ -62,3 +62,4 @@ agent/sandbox-image/plugins/vendor/mattpocock-skills/
 
 .superpowers/
 agent/data/
+.gstack/claude-available.json

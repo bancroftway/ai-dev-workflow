@@ -59,6 +59,38 @@ class Pipeline:
     def stage(self, key: str) -> graph.StageSpec | None:
         return next((s for s in self.stages if s.key == key), None)
 
+    def label(self, key: str) -> str:
+        """A stage key's display label (plain and legacy keys too); the key itself when unknown."""
+        spec = self.stage(key)
+        if spec is not None:
+            return spec.label
+        return _PLAIN_STAGES[key][0] if key in _PLAIN_STAGES else self.legacy_labels.get(key, key)
+
+    def stopped_at(self, failure_stage: str | None, current_stage: str | None) -> str | None:
+        """Where a failed run stopped, in words. The recorded failure_stage, never current_stage
+        while there is one: the crash-report pass that runs after most failures pushes
+        current_stage to metrics-exit, so "stopped at Metrics & Exit" named the wrong stage. A check
+        or cluster that runs right after a real stage (a rebuild placement, e2e, ...) is named by
+        the stage it follows. current_stage only when nothing more specific was recorded (a run
+        that finished with a verdict records "exit")."""
+        if failure_stage in self.failure_stage_map:
+            after = self.label(self.failure_stage_map[failure_stage])
+            name = next((p["label"] for p in self.rebuild_placements if p["rebuild_key"] == failure_stage), None)
+            return f"{name} (after {after})" if name else f"the step after {after}"
+        if failure_stage and failure_stage in self.order:
+            return self.label(failure_stage)
+        return self.label(current_stage) if current_stage else None
+
+    def failure_gate(self, failure_stage: str | None) -> dict[str, str] | None:
+        """The gate screen that shows (and recovers) this failure: the gate after the tab holding
+        a failed rebuild check's stage, or a failed gated stage's own -- {tab_id, button}. None for
+        a failure no gate row records (e2e, a crash before any stage); Overview handles those."""
+        after = next((p["after_stage_key"] for p in self.rebuild_placements if p["rebuild_key"] == failure_stage), None)
+        spec = self.stage(failure_stage) if failure_stage else None
+        key = after or (failure_stage if spec is not None and spec.gate is not None else None)
+        tab = next((t for t in self.tabs if key in t.stage_keys), None) if key else None
+        return {"tab_id": tab.id, "button": f"Open {tab.label} gate"} if tab else None
+
     @property
     def verifiers(self) -> dict[str, Callable[..., Any]]:
         """`{"<stage>_verify": fn}` -- derived from each StageSpec's Gate, never hand-written."""
@@ -85,11 +117,41 @@ class Pipeline:
             "tabs": [t.describe(stages) for t in self.tabs],
             "order": list(self.order),
             "modes": [dict(m) for m in self.modes],
+            # The new-session popup's (CodeGenModePicker) own cards: a disabled warning card, then
+            # the real modes with popup-only label overrides. Copy only -- `modes` above (Insights
+            # filter, gate screens, every wire value) is untouched.
+            "mode_picker": [
+                dict(_MODE_PICKER_WARNING),
+                *({**m, "label": _MODE_PICKER_LABELS.get(m["id"], m["label"]), "disabled": False, "tone": None}
+                  for m in self.modes),
+            ],
             "rebuild_placements": [dict(p) for p in self.rebuild_placements],
+            # failure_stage values a plain resume retries IN PLACE: a rebuild placement's escalate
+            # resets its own fix_cycle_count and leaves the stage before it approved, so resuming
+            # replays that stage (no redraft) and re-runs just this check against the current tree.
+            # The recovery panel offers that cheap retry beside the full "redo the stage".
+            "retry_in_place_failures": [p["rebuild_key"] for p in self.rebuild_placements],
             "failure_stage_map": dict(self.failure_stage_map),
             "legacy_labels": dict(self.legacy_labels),
             "wrapper_checks": [c.to_dict() for c in self.wrapper_checks],
         }
+
+
+# Inert, never-selectable first card in the new-session popup: NOT a code-gen mode (no graph,
+# gate or provision support, and its id is no CODE_GEN_MODES value -- resolve_code_gen_mode would
+# map it to the strictest mode anyway). It only exists to show what running a coding agent with
+# zero deterministic checks would mean.
+_MODE_PICKER_WARNING: dict[str, Any] = {
+    "id": "shoot_me_in_the_foot", "label": "💀 Shoot me in the foot", "default": False,
+    "disabled": True, "tone": "danger",
+    "blurb": "Draft only — no verification, no hooks. Whatever the model writes goes straight through, unchecked.",
+    "speed_cost": "Very risky: a coding agent with no deterministic checks ships its mistakes silently — broken builds, missing tests, invented requirements.",
+    "best_for": "Not available. Shown only as a warning — every mode below keeps at least some deterministic checks in place.",
+    "badge": {"text": "Very risky · not available", "variant": "destructive"},
+}
+
+# Popup-only labels (the backend, every other screen and the wire value keep the mode's own label/id).
+_MODE_PICKER_LABELS = {"yolo": "🪂 YOLO (with a parachute)"}
 
 
 # The real run sequence (build_graph): tech-stack -> manifest_branch -> [brownfield-spec ->
@@ -140,7 +202,7 @@ PIPELINE = Pipeline(
             "blurb": "Draft only — no second-opinion audit, no deterministic check before advancing.",
             "speed_cost": "Instant · 1 LLM call per stage (draft only, pipeline-wide) — the cheapest and fastest option.",
             "best_for": "Best for quick prototypes, throwaway spikes, scratch scripts — anything you'll read and test yourself end-to-end before it matters.",
-            "badge": {"text": "Some checks still run in the background (not enforced)", "variant": "secondary"},
+            "badge": {"text": "Many checks still run while the model drafts; the gates don't re-verify", "variant": "secondary"},
         },
         {
             "id": "draft_verify", "label": "🪵 Draft & Verify", "default": True,
@@ -274,6 +336,24 @@ def _demo() -> None:
     described = p.describe()
     json.dumps(described)
 
+    # Popup cards: the inert warning card leads, disabled and never a real mode id; then every real
+    # mode, enabled, same order; YOLO's popup-only label leaves `modes` itself alone.
+    assert "r_ac_to_tests" in described["retry_in_place_failures"], described["retry_in_place_failures"]
+    # Where a failed run stopped: the failure, not the crash-report pass's current_stage.
+    tests_label = p.label("ac-to-tests")
+    assert p.stopped_at("r_ac_to_tests", "metrics-exit") == f"Red Gate (after {tests_label})"
+    assert p.stopped_at("plan", "metrics-exit") == p.label("plan")
+    assert p.stopped_at("e2e", "metrics-exit") == f"the step after {p.label('remediation')}"
+    assert p.stopped_at("exit", "metrics-exit") == p.label("metrics-exit") and p.stopped_at(None, None) is None
+    # The gate that shows a failure: the red gate's on the Tests tab's gate, a stage's on its own.
+    assert p.failure_gate("r_ac_to_tests") == {"tab_id": "tests", "button": "Open Tests gate"}
+    assert p.failure_gate("plan") == {"tab_id": "plan", "button": "Open Plan gate"}
+    assert p.failure_gate("e2e") is None and p.failure_gate("exit") is None and p.failure_gate(None) is None
+    warning, *picker = described["mode_picker"]
+    assert warning["disabled"] and not warning["default"] and warning["id"] not in CODE_GEN_MODES, warning
+    assert [m["id"] for m in picker] == [m["id"] for m in described["modes"]] and not any(m["disabled"] for m in picker)
+    assert picker[0]["label"] == _MODE_PICKER_LABELS["yolo"] != described["modes"][0]["label"], picker[0]
+
     # Acceptance flip: Code blocking in yolo is a one-field edit that changes exactly one value.
     def _flip(s: graph.StageSpec) -> graph.StageSpec:
         if s.key != "minimal-code-to-green" or s.gate is None:
@@ -302,6 +382,10 @@ def _demo() -> None:
         all_checks += [c for c in s.gate.checks if c not in all_checks]
     unreferenced = _unreferenced_checks(all_checks)
     assert not unreferenced, f"declared but never recorded: {unreferenced}"
+    # The in-turn (Stop hook) coverage table names only real checks.
+    from .gates.checks import IN_TURN_CHECKS
+    unknown_in_turn = set(IN_TURN_CHECKS) - {c.id for c in all_checks}
+    assert not unknown_in_turn, f"IN_TURN_CHECKS names unknown check ids: {sorted(unknown_in_turn)}"
     probe = Check("demo." + "never_recorded", "x", "x", "blocking")  # split: no literal for the scan to find
     assert _unreferenced_checks([probe]) == [probe.id]
 

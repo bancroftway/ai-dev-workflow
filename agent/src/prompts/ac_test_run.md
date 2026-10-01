@@ -16,7 +16,9 @@ Steps:
 1. FIRST, before running anything, create the output file so it exists no matter what happens
    later: `: > '<<output_path>>'` (create its parent directory if needed).
 2. Explore the tree (view/glob/bash) and find every place that has tests. A polyglot monorepo has
-   more than one; run each.
+   more than one; run each. These planned test files must ALL be run, each by whichever root's
+   runner it belongs to -- account for every one of them in `suites` (see below):
+<<planned_test_files>>
 3. **For every npm/yarn/pnpm-based test root, install its dependencies FIRST**: `npm ci` when a
    lockfile is present, else `npm install` (same idea for yarn/pnpm). Unlike `dotnet test` (which
    restores NuGet packages automatically), no npm-based runner resolves its own `node_modules` --
@@ -58,6 +60,19 @@ Then report:
 - `output_artifact`: `<<output_path>>`
 - `result_artifacts`: every machine-readable report path you produced, repo-relative.
 - `exit_ok`: whether the suite exited zero (usually false here -- that is fine and expected).
+- `suites`: one entry for EVERY test root you found.
+  - `root`: the repo-relative directory you ran it from.
+  - `files`: every planned test file from step 2 that this root's runner covers, exactly as listed
+    there. Name a file under a root that ran only if its tests really appear in that runner's
+    output -- a file the runner's own config never picked up was not run. A planned file you could
+    not run at all still goes under the root it belongs to, with that root marked as not run.
+  - `ran`: false when the runner stopped before running a single test -- it didn't compile or
+    build, its config failed to load, a dependency or referenced project was missing, the runner
+    itself crashed. Tests that ran and FAILED, or were all skipped, still count as ran.
+  - `reason`: when `ran` is false, the runner's own error line, verbatim.
+  Every planned file must appear under some root. A root that did not run is still a successful
+  run of yours (see `success`) -- but never leave one out: a root or file missing from `suites` is
+  invisible to everything after you.
 - `success`: true whenever you managed to invoke a runner and capture its output to
   `<<output_path>>` -- INCLUDING when that output is a compile/build failure or a missing
   referenced project, since that is real, captured diagnostic evidence, not a failure to run.

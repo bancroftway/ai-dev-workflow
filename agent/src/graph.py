@@ -4452,14 +4452,19 @@ def make_verify_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableCon
                 "verified": True,
             }
             stages[stage_spec.key] = stage
+        # Every row names the skills involved: what the stage required and what its sessions
+        # actually invoked (transcript evidence, including skills beyond the required ones).
+        skills_named = (
+            f"required: {', '.join(skill_check.required)}; invoked: {', '.join(skill_check.invoked) or 'none'}"
+        )
         if not skill_check.required:
             log.skipped(WRAPPER_SKILLS, "this stage requires no skills")
         elif not skill_check.passed:
-            log.failed(WRAPPER_SKILLS, f"missing: {', '.join(skill_check.missing)}")
+            log.failed(WRAPPER_SKILLS, f"missing: {', '.join(skill_check.missing)}; {skills_named}")
         elif not skill_check.verified:
-            log.skipped(WRAPPER_SKILLS, f"{state['provider']} transcripts can't be verified")
+            log.skipped(WRAPPER_SKILLS, f"{state['provider']} transcripts can't be verified; {skills_named}")
         else:
-            log.passed(WRAPPER_SKILLS)
+            log.passed(WRAPPER_SKILLS, skills_named)
         # A failing skill check no longer returns early here -- see the merge with `result` below,
         # right after stage_spec.deterministic_verify runs. The two checks are independent (whether
         # a skill was invoked has no bearing on whether the resulting artifact is itself correct),
@@ -7203,6 +7208,7 @@ def _demo() -> None:
             ("wrapper.sandbox", "passed"), ("wrapper.skills", "failed"), ("wrapper.verify_crashed", "passed"),
             ("wrapper.audit_findings", "passed"),
         ], last["checks"]
+        assert last["checks"][1]["detail"] == "missing: writing-plans; required: writing-plans; invoked: none", last["checks"][1]
         assert last["lap"] == 1 and last["attempt"] == 1
         assert history[-1]["checks"] == last["checks"] and history[-1]["stage"] == "minimal-code-to-green"
         assert history[-1]["attempt"] == 1 and history[-1]["timing"] == "before_review" and not history[-1]["stage_passed"]

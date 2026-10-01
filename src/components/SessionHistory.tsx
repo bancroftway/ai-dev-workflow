@@ -151,10 +151,11 @@ export function SessionHistory({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [owner, repo, sourceBranch]);
 
-  // "Resume" restarts a run that has genuinely stopped (failed) -- it fires ?resume=1, which
-  // AppShell.tsx turns into a blank runAgent() call re-entering the graph from intake (a real,
-  // if self-healing, cost: confirmed live 2026-09-01 to replay ~5 min of already-approved early
-  // stages before reaching the one that actually needs re-running). An in_progress session's
+  // Opens a run that has genuinely stopped (failed) with ?resume=1 -- which only tells
+  // SandboxSessionBoot to reprovision a dead container. It does NOT start the graph: since the
+  // 2026-09-12 pivot only the recovery panel's explicit Retry/Redo (RecoveryPanel.tsx, shown at
+  // the top of every tab for a failed run) advances it. This used to promise a resume and just
+  // opened the furthest tab, with nothing running (2026-10-01). An in_progress session's
   // agent process and container are typically still alive and streaming on their own -- opening
   // it needs no such call at all, just the plain URL, which reattaches for free (confirmed live
   // the same day: zero new graph activity, correct live state). Calling that "Resume" too read as
@@ -260,11 +261,11 @@ export function SessionHistory({
               {((s.status === "failed" && !s.finished_with_verdict) || (s.status === "in_progress" && !s.container_alive)) && (
                 <button
                   type="button"
-                  title="Resumes from the last approved stage, or restarts from intake if nothing was approved yet."
+                  title="Opens this run. Retry the failed check or redo a stage from the recovery panel at the top of the page."
                   className="self-start rounded-md bg-neutral-900 px-3 py-1 text-xs font-medium text-white"
                   onClick={() => resume(s)}
                 >
-                  Resume
+                  Open to resume
                 </button>
               )}
               {s.status === "failed" && s.finished_with_verdict && (

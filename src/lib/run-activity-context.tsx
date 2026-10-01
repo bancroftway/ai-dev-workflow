@@ -45,6 +45,9 @@ export type RunActivityInfo = {
    * is the signal to refetch the review view model, so an open gate reaches the page with no
    * AG-UI stream attached. */
   reviewId: string | null;
+  /** Server-built (sessions_api failure_gate): the gate screen that shows this failed run's check
+   * and its recovery actions, plus the button text that opens it; null when no gate records it. */
+  failureGate: { tab_id: string; button: string } | null;
 };
 
 const RunActivityContext = createContext<[RunActivityInfo | null, (v: RunActivityInfo | null) => void] | null>(null);

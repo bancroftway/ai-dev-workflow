@@ -99,13 +99,13 @@ SPEC_DRAFT_FILE_PARSES = Check(
     "spec.draft_file_parses", "Draft file matches the specification shape",
     "Checks the draft file is valid JSON and has the specification's structure: title, summary, user "
     "stories with their acceptance criteria, assumptions and so on.",
-    "blocking", "only when the draft file exists",
+    "blocking", "always",
 )
 SPEC_DRAFT_NOT_EMPTY = Check(
     "spec.draft_not_empty", "Draft proposes something",
     "Checks the draft adds, changes, retires or reopens at least one story or criterion. A completely "
     "empty draft means the model said it was done without writing anything.",
-    "blocking", "only when the draft file is valid",
+    "blocking", "always",
 )
 SPEC_AUDIT_FULL_READ = Check(
     "spec.audit_full_read", "Audit read the whole specification",
@@ -113,46 +113,45 @@ SPEC_AUDIT_FULL_READ = Check(
     "approve stories it never looked at. Once one lap of a run proves a full read, later laps of the "
     "same run don't have to repeat it.",
     "blocking",
-    "only when the stage has an audit role, the audit ran this lap and the AI provider's transcripts "
-    "can be checked",
+    "only when the audit runs",
     needs_audit=True,
 )
 SPEC_NO_OPEN_QUESTIONS = Check(
     "spec.no_open_questions", "No open clarifying questions",
     "Checks every clarifying question is either answered by the requirements or settled by an explicit "
     "assumption. An open question must never reach the human reviewer disguised as a finished spec.",
-    "blocking", "only when the draft is valid (and the audit transcript was readable)",
+    "blocking", "always",
 )
 SPEC_STORY_NARRATIVE = Check(
     "spec.story_narrative", "Stories follow the narrative template",
     "Checks every user story reads 'As a <role>, I want <capability>, so that <benefit>', with a real "
     "person or organisation as the role, never the system itself.",
-    "blocking", "only when there are no open questions",
+    "blocking", "always",
 )
 SPEC_LEDGER_CITATIONS = Check(
     "spec.ledger_citations", "Revised stories cite real ids",
     "Checks a story or criterion that says it revises an existing one points at an id that exists, "
     "isn't retired, sits under the right parent story and isn't being renumbered. Ids are permanent, so "
     "later stages can always trace work back to its requirement.",
-    "collected", "only when the narrative check passes",
+    "collected", "always",
 )
 SPEC_LEDGER_DUPLICATES = Check(
     "spec.ledger_duplicates", "No duplicate stories or criteria",
     "Checks a new story or criterion doesn't repeat the wording of one already in the ledger. That one "
     "should be cited and revised instead, so the same requirement isn't tracked twice.",
-    "collected", "only when the narrative check passes and the ledger already has entries",
+    "collected", "only when earlier tickets recorded stories or criteria",
 )
 SPEC_LEDGER_RETIREMENTS = Check(
     "spec.ledger_retirements", "Retirements name real, live ids",
     "Checks every story or criterion the draft retires exists, is the right kind and isn't also being "
     "revised in the same draft. Retiring is permanent, so a typo here must not silently drop scope.",
-    "collected", "only when the narrative check passes",
+    "collected", "always",
 )
 SPEC_LEDGER_BUG_AFFECTED = Check(
     "spec.ledger_bug_affected", "Bug-affected criteria are real",
     "Checks every criterion a bug ticket reopens exists, is live and isn't being retired in the same "
     "draft, so the fix is traced to the requirement it actually breaks.",
-    "collected", "only when the narrative check passes",
+    "collected", "always",
 )
 VERIFY_CHECKS: tuple[Check, ...] = (
     SPEC_DRAFT_FILE_EXISTS, SPEC_DRAFT_FILE_PARSES, SPEC_DRAFT_NOT_EMPTY, SPEC_AUDIT_FULL_READ,

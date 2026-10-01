@@ -124,6 +124,8 @@ E2E_FIX_FILE_ATTRIBUTION_PATH = f"{WORKFLOW_DIR}/e2e-fix-file-attribution.jsonl"
 # approved Implementation Plan for this same project, independent of whatever this run's own
 # in-memory stages["plan"] happens to hold.
 PLAN_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('plan', 'approved.json')}"
+# The approved test plan (test_files[].path) -- the TDD-red gate's list of files that must all run.
+AC_TO_TESTS_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('ac-to-tests', 'approved.json')}"
 
 # Same reasoning again -- agent/src/gates/ac_coverage_gate.py's check_ac_coverage (Ruling 7) reads
 # this to scope its own AC-coverage check down to THIS ticket's own ACs, since that gate has only
@@ -374,6 +376,7 @@ def _demo() -> None:
     assert TECH_STACK_APPROVED_PATH == f"{WORKFLOW_DIR}/02-tech-stack.approved.json"
     assert TECH_STACK_DRAFT_PATH == f"{WORKFLOW_DIR}/02-tech-stack.draft.json"
     assert PLAN_APPROVED_PATH == f"{WORKFLOW_DIR}/04-plan.approved.json"
+    assert AC_TO_TESTS_APPROVED_PATH == f"{WORKFLOW_DIR}/05-ac-to-tests.approved.json"
     assert SPECIFICATION_APPROVED_PATH == f"{WORKFLOW_DIR}/03-specification.approved.json"
     assert SPECIFICATION_MD_PATH == f"{WORKFLOW_DIR}/03-specification.md"
     assert PLAN_MD_PATH == f"{WORKFLOW_DIR}/04-plan.md"

@@ -327,25 +327,25 @@ AC_COMPLETED_PROTECTION = Check(
 AC_WROTE_TESTS = Check(
     "ac_tests.wrote_tests", "Test files written",
     "The model actually wrote test files to disk, rather than only describing them in its answer.",
-    "collected", condition="tickets with criteria still needing tests",
+    "collected", condition="only when some criteria still need tests",
 )
 AC_NOT_E2E_ONLY = Check(
     "ac_tests.not_e2e_only", "Tests below the UI",
     "The suite includes unit or integration tests, not only browser tests. Browser tests alone "
     "cannot prove the rules beneath the UI and are slow and brittle.",
-    "collected", condition="test files written and criteria still needing tests",
+    "collected", condition="only when some criteria still need tests",
 )
 AC_E2E_SPEC = Check(
     "ac_tests.e2e_spec_present", "Browser test present",
     "A project with a user interface has at least one Playwright end-to-end spec where Playwright "
     "will find it, so the running app is exercised through a real browser.",
-    "collected", condition="UI stacks with test files written and criteria still needing tests",
+    "collected", condition="only for apps with a user interface, when some criteria still need tests",
 )
 AC_SCREENSHOT_ON = Check(
     "ac_tests.screenshot_on", "Screenshots on every test",
     "The Playwright config sets screenshot: 'on', so passing tests still capture the screenshots "
     "the later visual review of each wireframed screen depends on.",
-    "collected", condition="a browser test is present and the Playwright config changed",
+    "collected", condition="only when the browser-test configuration changed",
 )
 VERIFY_CHECKS: tuple[Check, ...] = (
     AC_WRITE_SCOPE, AC_LEDGER_INTEGRITY, AC_RETIRED_RESIDUE, AC_DEFERRED_RESIDUE, AC_COMPLETED_PROTECTION,

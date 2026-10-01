@@ -20,9 +20,10 @@ import math
 from datetime import UTC, datetime
 from typing import Any
 
-from . import config
-from .gates.checks import AUDIT_MODES, Check
+from . import config, graph
+from .gates.checks import AUDIT_MODES, IN_TURN_CHECKS, Check
 from .pipeline_layout import PIPELINE, Pipeline, TabSpec
+from .rebuild import rebuild_checks
 
 # All of the gate screens' display copy. `{name}`-style placeholders, filled here.
 GATE_TEXT: dict[str, Any] = {
@@ -38,10 +39,13 @@ GATE_TEXT: dict[str, Any] = {
         "no_detail_passed": "Passed, no per-check detail recorded",
         "no_detail_failed": "Failed, no per-check detail recorded",
         "audit_off": "Skipped: no audit",
-        "not_reached": "Not reached (an earlier check stopped it)",
+        "not_reached": "Not reached: stopped by {check}",
         "not_recorded": "Not recorded",
         "policy_off": "Skipped: not enforced in {mode}",
         "policy_off_mode_fallback": "this mode",
+        # A gate that is off in this mode, for a check a Stop hook still runs while the model drafts.
+        "in_turn_full": "Checked while drafting (not re-verified in {mode})",
+        "in_turn_partial": "Partly checked while drafting (not re-verified in {mode})",
         "approved_earlier": "Approved earlier, not re-verified this run",
         "will_run": "Will run",
         "lap_note": "lap {lap} (redraft in progress)",
@@ -106,6 +110,20 @@ GATE_TEXT: dict[str, Any] = {
         "uncatalogued": "Reported but not in this gate's catalog",
     },
     "uncatalogued_badge": "uncatalogued",
+    "when_always": "every time this gate runs",
+    # The run notice above every tab (run_notice): text + the one action that gets the run going.
+    "notice_failed": "This run failed and stopped at {where}.",
+    "notice_failed_unknown": "This run failed.",
+    "notice_failed_overview": "See Overview for details and to continue.",
+    "notice_stopped": "This run stopped while {stage} was in progress -- nothing is running it now (for example, after the agent restarted).",
+    "notice_stopped_unknown": "This run stopped -- nothing is running it now (for example, after the agent restarted).",
+    "action_open_overview": "Go to Overview",
+    "action_resume": "Resume this run",
+    # Recovery actions the server puts on the failed check's row (or its section, when no row
+    # recorded the failure) of the gate the run failed at. Ids are what the frontend dispatches on.
+    "action_retry": "Retry this check",
+    "action_redo": "Redo {stage}",
+    "action_redo_link": "or redo {stage} from scratch",
 }
 
 # Worst-first across a tab's gated stages (Quality has two).
@@ -186,6 +204,10 @@ def _stage_view(spec: Any, state: dict[str, Any], mode: str | None, running: dic
     }
 
 
+def _untouched(st: dict[str, Any] | None) -> bool:
+    return not st or (st.get("status") == "not_started" and st.get("last_verification") is None)
+
+
 def _gate_views(tab: TabSpec, state: dict[str, Any], mode: str | None, running: dict[str, str], interrupts: list[Any], pipeline: Pipeline) -> tuple[list[dict[str, Any]], str] | None:
     """(per-stage views, display name) for a tab's gated stages; None when the tab gates nothing."""
     specs = [s for k in tab.stage_keys if (s := pipeline.stage(k)) is not None and s.gate is not None]
@@ -197,13 +219,44 @@ def _gate_views(tab: TabSpec, state: dict[str, Any], mode: str | None, running: 
     # run; intake still creates its StageState as not_started. Once a sibling has progressed, an
     # untouched stage is not part of this session -- listing it would show "Will run" forever and
     # drag the tab's icon to "not run yet".
-    def untouched(s: Any) -> bool:
-        st = stages.get(s.key)
-        return not st or (st.get("status") == "not_started" and st.get("last_verification") is None)
-
-    shown = [s for s in specs if not untouched(s)] or specs
+    shown = [s for s in specs if not _untouched(stages.get(s.key))] or specs
     views = [_stage_view(s, state, mode, running, interrupts) for s in shown]
     return views, (shown[0].label if len(shown) == 1 else tab.label)
+
+
+def _placement_views(tab: TabSpec, state: dict[str, Any], running: dict[str, str], pipeline: Pipeline) -> list[dict[str, Any]]:
+    """The rebuild checks that run right after this tab's stages (graph.POST_STAGE_REBUILD), as gate
+    views: they guard the same hand-off the icon after the tab stands for, so a failed red gate
+    shows -- and is recovered -- on the gate after Tests, not nowhere."""
+    rebuild_state = state.get("rebuild") or {}
+    labels = {p["rebuild_key"]: p["label"] for p in pipeline.rebuild_placements}
+    T = GATE_TEXT["icon_status"]
+    stages = state.get("stages") or {}
+    # Same "part of this run" rule as _gate_views: a check after an untouched sibling stage is not.
+    keys = [k for k in tab.stage_keys if not _untouched(stages.get(k))] or list(tab.stage_keys)
+    views = []
+    for key in keys:
+        spec = graph.POST_STAGE_REBUILD.get(key)
+        if spec is None:
+            continue
+        rb = rebuild_state.get(spec.key) or {}
+        rb_status = rb.get("status", "not_started")
+        verdict = None if rb_status == "not_started" else {
+            "passed": rb_status == "clean", "cannot_verify": bool(rb.get("cannot_verify")), "checks": rb.get("checks"),
+        }
+        if running.get(spec.key) or rb_status == "fixing":
+            status = "verifying"
+        elif verdict is None:
+            status = "not_run"
+        else:
+            status = "passed" if verdict["passed"] else "failed"
+        views.append({
+            "key": spec.key, "label": labels.get(spec.key, spec.key), "checks": rebuild_checks(spec),
+            "verdict": verdict, "policy": "blocking", "status": status, "status_text": T[status],
+            "lap": rb.get("fix_cycle_count", 0), "max_laps": spec.max_fix_cycles,
+            "feedback": (rb.get("last_stderr_tail") or None) if verdict and not verdict["passed"] else None,
+        })
+    return views
 
 
 def _gate_icon(tab: TabSpec, state: dict[str, Any], mode: str | None, running: dict[str, str], interrupts: list[Any], pipeline: Pipeline) -> dict[str, Any] | None:
@@ -212,8 +265,11 @@ def _gate_icon(tab: TabSpec, state: dict[str, Any], mode: str | None, running: d
     if built is None:
         return None
     views, name = built
-    worst = max(views, key=lambda v: _STATUS_RANK.index(v["status"]))  # first max wins
     policies = list(dict.fromkeys(v["policy"] or GATE_TEXT["policy_unknown"] for v in views))
+    # A rebuild check colours the icon once it has run (or is running) -- before that the stage's
+    # own status (incl. "mode unknown") says everything; its policy is always blocking, not a mode's.
+    ran = [v for v in _placement_views(tab, state, running, pipeline) if v["status"] != "not_run"]
+    worst = max(views + ran, key=lambda v: _STATUS_RANK.index(v["status"]))  # first max wins
     label = GATE_TEXT["icon_aria"].format(name=name, policy="/".join(policies), status=worst["status_text"])
     return {"icon": {"tone": worst["status"], "badge": GATE_TEXT["icon_badge"][worst["status"]], "label": label}}
 
@@ -242,6 +298,12 @@ def _tab_tone(tab: TabSpec, state: dict[str, Any], mode: str | None, running: di
         return "running"
     stages = state.get("stages") or {}
     present = [(k, stages[k]) for k in tab.stage_keys if stages.get(k) is not None]
+    # An untouched stage the run already went PAST is not part of this session (brownfield-spec/-plan
+    # on a new codebase: intake still creates them not_started, so "all approved" never held and the
+    # approved Specification/Plan tabs stayed uncoloured). One still AHEAD of a touched sibling is
+    # just pending (adversarial-compliance after remediation) and keeps the tab from reading done.
+    touched_at = [_order_index(k, pipeline) for k, s in present if not _untouched(s)]
+    present = [(k, s) for k, s in present if not (_untouched(s) and any(i > _order_index(k, pipeline) for i in touched_at))]
     if not present:
         return "none"
     statuses = [s.get("status") for _, s in present]
@@ -306,6 +368,31 @@ def _tab_enabled(tab: TabSpec, index: int, state: dict[str, Any], running: dict[
     )
 
 
+def run_notice(
+    *, status: str, interrupted: bool, failure_stage: str | None, current_stage: str | None,
+    pipeline: Pipeline = PIPELINE,
+) -> dict[str, Any] | None:
+    """The notice above every tab for a run that is stopped and needs the user: what happened and
+    the ONE action that gets it going -- {tone, text, action: {id, label, tab_id?}}; None while it's
+    running, waiting at a review, or done. Action ids the frontend dispatches on: "open_gate" (the
+    gate whose failed row carries Retry/Redo), "open_overview" (its recovery panel), "resume"
+    (continue from the frontier, Overview's same confirm-and-resume). `interrupted` is the session
+    row's server-computed "in progress, but nothing is executing it" -- never "still active": a
+    live container is not a live run (that copy misled after an agent restart, 2026-10-01)."""
+    T = GATE_TEXT
+    if status == "failed":
+        where = pipeline.stopped_at(failure_stage, current_stage)
+        text = T["notice_failed"].format(where=where) if where else T["notice_failed_unknown"]
+        gate = pipeline.failure_gate(failure_stage)
+        if gate:
+            return {"tone": "error", "text": text, "action": {"id": "open_gate", "label": gate["button"], "tab_id": gate["tab_id"]}}
+        return {"tone": "warn", "text": f"{text} {T['notice_failed_overview']}", "action": {"id": "open_overview", "label": T["action_open_overview"]}}
+    if status == "in_progress" and interrupted:
+        text = T["notice_stopped"].format(stage=pipeline.label(current_stage)) if current_stage else T["notice_stopped_unknown"]
+        return {"tone": "warn", "text": text, "action": {"id": "resume", "label": T["action_resume"]}}
+    return None
+
+
 def build_tab_strip(
     state: dict[str, Any], *, code_gen_mode: str | None, running: dict[str, str], interrupts: list[Any],
     current_stage: str | None, pipeline: Pipeline = PIPELINE,
@@ -328,7 +415,7 @@ def build_tab_strip(
 def _derive_rows(
     *, checks: tuple[Check, ...] | list[Check], wrapper_checks: tuple[Check, ...] | list[Check],
     verdict: dict[str, Any] | None, policy: str | None, mode_label: str | None, audit_on: bool | None,
-    stage_status: str | None, lap: int,
+    stage_status: str | None, lap: int, provider: str | None = None,
 ) -> list[dict[str, Any]]:
     """One row per catalog check (stage then wrapper), then one per reported id the catalog
     doesn't know. Each row: id/label/description/mode/condition/group/state/text/tone/detail/
@@ -340,13 +427,21 @@ def _derive_rows(
     redraft = verdict is not None and not verdict.get("passed") and stage_status == "drafting"
     lap_note = T["lap_note"].format(lap=lap) if redraft else None
 
-    # A reported blocking failure stops the chain: a wrapper failure stops every stage row; a stage
-    # failure stops the stage rows after it (catalog order).
-    blocking = [r for r in reported_checks if r["status"] in ("failed", "infra") and r["id"] in catalog and catalog[r["id"]].mode == "blocking"]
+    # A reported failure stops the chain: a wrapper failure stops every stage row; a stage failure
+    # stops the stage rows after it (catalog order). Collected checks count too -- a failed group
+    # (e.g. plan's pre-checks) still ends the verify before the rows that need it. Only an
+    # advisory-mode failure stops nothing.
+    stoppers = [r for r in reported_checks if r["status"] in ("failed", "infra") and r["id"] in catalog and catalog[r["id"]].mode != "advisory"]
     wrapper_ids = {c.id for c in wrapper_checks}
-    wrapper_stopped = any(r["id"] in wrapper_ids for r in blocking)
+    wrapper_stopped = any(r["id"] in wrapper_ids for r in stoppers)
     stage_index = {c.id: i for i, c in enumerate(checks)}
-    first_stage_stop = min((stage_index[r["id"]] for r in blocking if r["id"] in stage_index), default=math.inf)
+    first_stage_stop = min((stage_index[r["id"]] for r in stoppers if r["id"] in stage_index), default=math.inf)
+    # Named in the not-reached text, so the "When it runs" column never has to describe the chain.
+    # Stage rows are numbered per section (_render_row), so a stage stopper carries its "#n".
+    wrapper_stopper = next((catalog[r["id"]].label for r in stoppers if r["id"] in wrapper_ids), None)
+    stopped_by = wrapper_stopper or (
+        f"#{first_stage_stop + 1} {checks[first_stage_stop].label}" if first_stage_stop != math.inf else None
+    )
 
     def unreported(c: Check, index: int, group: str) -> tuple[str, str, str]:
         if verdict is not None:
@@ -358,10 +453,14 @@ def _derive_rows(
                 return "audit_off", T["audit_off"], "muted"
             reached = not wrapper_stopped and not index > first_stage_stop if group == "stage" else True
             if not reached:
-                return "not_reached", T["not_reached"], "muted"
+                return "not_reached", T["not_reached"].format(check=stopped_by), "muted"
             return "not_recorded", T["not_recorded"], "muted"
         if policy == "off":
-            return "policy_off", T["policy_off"].format(mode=mode_label or T["policy_off_mode_fallback"]), "muted"
+            mode = mode_label or T["policy_off_mode_fallback"]
+            in_turn = IN_TURN_CHECKS.get(c.id) if provider == "claude" else None
+            if in_turn:
+                return "in_turn", T[f"in_turn_{in_turn[0]}"].format(mode=mode), "muted"
+            return "policy_off", T["policy_off"].format(mode=mode), "muted"
         if stage_status == "approved":
             return "approved_earlier", T["approved_earlier"], "muted"
         if c.needs_audit and audit_on is False:
@@ -406,12 +505,15 @@ def _render_row(r: dict[str, Any], n: int, stats: dict[str, Any] | None) -> dict
         fail_rate = GATE_TEXT["fail_rate"].format(pct=math.floor(stats["fail_rate"] * 100 + 0.5))
     return {
         "key": r["id"],
+        "actions": [],
         "cells": {
             "n": _cell(str(n)),
             "check": _cell(r["label"], sub=fail_rate, badge=GATE_TEXT["uncatalogued_badge"] if r["uncatalogued"] else None),
             "what": _cell(r["description"]),
             "effect": _cell(GATE_TEXT["check_effect"].get(r["mode"], r["mode"])),
-            "when": _cell(r["condition"]),
+            # A Check's unconditional "always" means every run OF THIS GATE -- not every mode (a gate
+            # that's off in YOLO never runs at all); say so instead of the bare word.
+            "when": _cell(GATE_TEXT["when_always"] if r["condition"] == "always" else r["condition"]),
             "status": _cell(r["text"], sub=r["lap_note"], tone=r["tone"]),
             "detail": _cell(
                 detail or "",
@@ -432,7 +534,7 @@ def attempt_id(a: dict[str, Any]) -> str:
     return f"{a['stage']}:{a['run_id']}:{a['attempt']}"
 
 
-def _section(view: dict[str, Any], *, mode: str | None, attempts: list[dict[str, Any]], insights: dict[str, Any] | None, selected: str | None, pipeline: Pipeline) -> dict[str, Any]:
+def _section(view: dict[str, Any], *, mode: str | None, attempts: list[dict[str, Any]], insights: dict[str, Any] | None, selected: str | None, pipeline: Pipeline, provider: str | None = None) -> dict[str, Any]:
     gt = GATE_TEXT
     spec = view["spec"]
     mine = [a for a in attempts if a["stage"] == spec.key]
@@ -453,7 +555,7 @@ def _section(view: dict[str, Any], *, mode: str | None, attempts: list[dict[str,
         # checks inside the review gate instead, so they would only ever read "Not recorded" there.
         wrapper_checks=() if spec.gate.timing == "after_submit" else pipeline.wrapper_checks,
         verdict=verdict, policy=policy, mode_label=mode_label, audit_on=audit_on,
-        stage_status=None if attempt else view["stage_status"], lap=view["lap"],
+        stage_status=None if attempt else view["stage_status"], lap=view["lap"], provider=provider,
     )
     verdict_key = "none" if verdict is None else "cannot_verify" if verdict.get("cannot_verify") else "passed" if verdict.get("passed") else "failed"
     facts = [gt["mode"].format(mode=mode_label or gt["mode_unknown"]), gt["policy"].format(policy=policy or gt["policy_none"])]
@@ -487,7 +589,56 @@ def _section(view: dict[str, Any], *, mode: str | None, attempts: list[dict[str,
         "feedback": (live.get("feedback") or None) if not attempt and live is not None and not live.get("passed") else None,
         "attempts": {"label": gt["attempt"], "disabled": not mine, "options": options},
         "groups": groups,
+        "actions": [],
     }
+
+
+def _placement_section(view: dict[str, Any], *, mode: str | None, pipeline: Pipeline) -> dict[str, Any]:
+    """A rebuild placement's section: its latest lap's recorded rows (no attempt history)."""
+    gt = GATE_TEXT
+    mode_label, audit_on = _mode_facts(mode, pipeline)
+    verdict = view["verdict"]
+    rows = _derive_rows(
+        checks=view["checks"], wrapper_checks=(), verdict=verdict, policy=view["policy"], mode_label=mode_label,
+        audit_on=audit_on, stage_status=None, lap=view["lap"],
+    )
+    verdict_key = "none" if verdict is None else "cannot_verify" if verdict.get("cannot_verify") else "passed" if verdict.get("passed") else "failed"
+    facts = [gt["verdict"].format(verdict=gt["verdict_values"][verdict_key])]
+    # Fix laps only once one has run: an escalation resets the counter, so "lap 0" means nothing.
+    if view["max_laps"] > 0 and view["lap"] > 0:
+        facts.insert(0, gt["lap"].format(lap=view["lap"], max=view["max_laps"]))
+    return {
+        "key": view["key"],
+        "heading": view["label"],
+        "facts": facts,
+        "feedback": view["feedback"],
+        "attempts": {"label": gt["attempt"], "disabled": True, "options": [
+            {"id": "", "label": gt["attempt_latest"], "time": None, "selected": True},
+        ]},
+        "groups": [{"heading": None, "rows": [_render_row(r, i + 1, None) for i, r in enumerate(rows)]}],
+        "actions": [],
+    }
+
+
+def _attach_recovery(sections: list[dict[str, Any]], failure: dict[str, Any], pipeline: Pipeline) -> None:
+    """Puts the run failure's recovery actions on the failed check's row -- or, when no row
+    recorded it (a lap recorded before per-check rows existed), on its section. A rebuild check
+    (or a check that never ran for lack of a sandbox) can be retried in place: its stage stays
+    approved. The full redo of the stage is offered beside it, as the secondary choice."""
+    failed_at = failure.get("stage")
+    section = next((s for s in sections if s["key"] == failed_at), None)
+    if section is None:
+        return
+    stage = pipeline.label(pipeline.failure_stage_map.get(failed_at, failed_at))
+    retry = failed_at in {p["rebuild_key"] for p in pipeline.rebuild_placements} or failure.get("type") == "cannot_verify"
+    actions = (
+        [{"id": "retry", "label": GATE_TEXT["action_retry"], "style": "primary"},
+         {"id": "redo", "label": GATE_TEXT["action_redo_link"].format(stage=stage), "style": "link"}]
+        if retry else [{"id": "redo", "label": GATE_TEXT["action_redo"].format(stage=stage), "style": "primary"}]
+    )
+    rows = [r for g in section["groups"] for r in g["rows"]]
+    failed_row = next((r for r in rows if r["cells"]["status"]["tone"] == "fail"), None)
+    (failed_row if failed_row is not None else section)["actions"] = actions
 
 
 def build_gate_screen(
@@ -503,15 +654,19 @@ def build_gate_screen(
     if built is None:
         return None
     views, name = built
+    sections = [
+        _section(v, mode=code_gen_mode, attempts=attempts, insights=insights, selected=attempt, pipeline=pipeline,
+                 provider=state.get("provider"))
+        for v in views
+    ] + [_placement_section(v, mode=code_gen_mode, pipeline=pipeline) for v in _placement_views(tab, state, running, pipeline)]
+    if state.get("run_failure"):
+        _attach_recovery(sections, state["run_failure"], pipeline)
     return {
         "title": GATE_TEXT["title"].format(name=name),
         "subtitle": GATE_TEXT["subtitle"],
         "legend": GATE_TEXT["legend"],
         "columns": [{"key": c["key"], "label": c["label"], "style": c["style"]} for c in GATE_TEXT["columns"]],
-        "sections": [
-            _section(v, mode=code_gen_mode, attempts=attempts, insights=insights, selected=attempt, pipeline=pipeline)
-            for v in views
-        ],
+        "sections": sections,
     }
 
 
@@ -555,9 +710,17 @@ def _demo() -> None:
     assert states(verdict=failed_b, policy="off") == {"a": "passed", "b": "failed", "c": "not_reached", "aud": "not_reached", "wrapper.sandbox": "passed"}
     assert states(verdict={"passed": True, "checks": [rep("b", "passed")]}) == {
         "a": "not_recorded", "b": "passed", "c": "not_recorded", "aud": "not_recorded", "wrapper.sandbox": "not_recorded"}
-    # A blocking wrapper failure stops every stage row; a collected failure stops nothing.
+    # A wrapper failure stops every stage row; a collected failure stops the rows after it, never
+    # the ones before; an advisory-mode failure stops nothing.
     assert states(verdict={"passed": False, "checks": [rep("wrapper.sandbox", "failed")]})["a"] == "not_reached"
-    assert states(verdict={"passed": False, "checks": [rep("c", "failed")]})["a"] == "not_recorded"
+    collected_c = states(verdict={"passed": False, "checks": [rep("c", "failed")]})
+    assert (collected_c["a"], collected_c["aud"]) == ("not_recorded", "not_reached"), collected_c
+    # The not-reached text names the stopper: a stage row by its "#n", a wrapper row by label.
+    texts = {r["id"]: r["text"] for r in derive(verdict={"passed": False, "checks": [rep("c", "failed")]})}
+    assert texts["aud"] == T["not_reached"].format(check="#3 c"), texts
+    texts = {r["id"]: r["text"] for r in derive(verdict={"passed": False, "checks": [rep("wrapper.sandbox", "infra")]})}
+    assert texts["a"] == T["not_reached"].format(check="wrapper.sandbox"), texts
+    assert states(checks=[chk("adv", "advisory"), chk("z")], verdict={"passed": True, "checks": [rep("adv", "failed")]})["z"] == "not_recorded"
     # Pre-feature verdict (no checks key), cannot_verify.
     assert states(verdict={"passed": False})["a"] == "no_detail"
     assert derive(verdict={"passed": True})[0]["text"] == T["no_detail_passed"]
@@ -577,8 +740,14 @@ def _demo() -> None:
         assert by_id[id_]["text"] == T[s]
     for r in seen_rows:
         assert r["text"] and "{" not in r["text"], r
+    # A gate that's off in this mode, for a check a Stop hook still runs while drafting (Claude only).
+    hooked = next(iter(IN_TURN_CHECKS))
+    hook_rows = {r["id"]: r for r in derive(checks=[chk(hooked), chk("unhooked")], policy="off", provider="claude")}
+    assert hook_rows[hooked]["state"] == "in_turn" and "while drafting" in hook_rows[hooked]["text"], hook_rows[hooked]
+    assert hook_rows["unhooked"]["state"] == "policy_off"
+    assert {r["id"]: r["state"] for r in derive(checks=[chk(hooked)], policy="off", provider="copilot")}[hooked] == "policy_off"
     exercised = {r["state"] for r in seen_rows}
-    for s in ("will_run", "policy_off", "audit_off", "approved_earlier", "passed", "failed", "infra", "skipped",
+    for s in ("will_run", "policy_off", "in_turn", "audit_off", "approved_earlier", "passed", "failed", "infra", "skipped",
               "advisory", "not_reached", "not_recorded", "no_detail", "no_sandbox"):
         assert s in exercised, f"state {s} never exercised"
 
@@ -708,6 +877,10 @@ def _demo() -> None:
     # Quality is done only when every present stage is approved.
     q_half = {"stages": {"remediation": {"status": "approved"}, "adversarial-compliance": {"status": "not_started"}}}
     assert tones(st=q_half)["quality"] == "none"
+    # ...but an optional stage the run skipped (untouched, BEFORE its approved sibling) doesn't hold
+    # the tab back: a new codebase's approved Specification/Plan read done despite brownfield-*.
+    skipped = {"stages": {**pristine["stages"], "specification": {"status": "approved"}, "plan": {"status": "approved"}}}
+    assert tones(st=skipped)["specification"] == tones(st=skipped)["plan"] == "done", tones(st=skipped)
     assert tones(st={"stages": {"remediation": {"status": "approved"}}})["quality"] == "done", "absent stages don't count"
     # Running wins: over an approved stage, and with no stage state at all (mid-run reattach),
     # where it also opens an ordinary tab.
@@ -777,7 +950,52 @@ def _demo() -> None:
     # Quality: once one of its two stages has progressed, only the touched one is listed.
     q_state = {"stages": {"remediation": {"status": "approved", "last_verification": {"passed": True, "checks": []}}}}
     q = build_gate_screen(q_state, "quality", **kw)
-    assert q is not None and [s["key"] for s in q["sections"]] == ["remediation"]
+    assert q is not None and [s["key"] for s in q["sections"]] == ["remediation", "r_remediation"], [s["key"] for s in q["sections"]]
+
+    # A failed rebuild check (the red gate after Tests): its own section on the Tests gate, the
+    # icon goes red, and the failed ROW carries the recovery actions -- retry first, redo as a link.
+    red_rows = [
+        {"id": "rebuild.build", "status": "passed", "detail": None, "source": "s"},
+        {"id": "rebuild.red_suites_start", "status": "passed", "detail": None, "source": "s"},
+        {"id": "rebuild.red_planned_files", "status": "failed", "detail": "apps/web/b.spec.ts", "source": "s"},
+    ]
+    red_state = {
+        "stages": {"ac-to-tests": {"status": "approved", "last_verification": {"passed": True, "checks": []}}},
+        "rebuild": {"r_ac_to_tests": {"status": "failed", "fix_cycle_count": 0, "checks": red_rows, "last_stderr_tail": "x"}},
+        "run_failure": {"stage": "r_ac_to_tests", "type": "rebuild_cap_exceeded"},
+    }
+    assert strip(red_state)["tests"]["gate"]["icon"]["tone"] == "failed"
+    red_screen = build_gate_screen(red_state, "tests", **kw)
+    assert red_screen is not None and [s["key"] for s in red_screen["sections"]] == ["ac-to-tests", "r_ac_to_tests"]
+    red_sec = red_screen["sections"][1]
+    by_key = {r["key"]: r for r in red_sec["groups"][0]["rows"]}
+    assert [a["id"] for a in by_key["rebuild.red_planned_files"]["actions"]] == ["retry", "redo"], by_key
+    assert not by_key["rebuild.build"]["actions"] and not red_sec["actions"]
+    assert by_key["rebuild.red_none_pass"]["cells"]["status"]["text"].startswith("Not reached")
+    # "always" is shown as what it means -- every run of this gate, never "regardless of mode".
+    assert by_key["rebuild.build"]["cells"]["when"]["text"] == GATE_TEXT["when_always"]
+    # A lap recorded before per-check rows existed: the actions sit on the section instead.
+    legacy = {**red_state, "rebuild": {"r_ac_to_tests": {"status": "failed", "fix_cycle_count": 0}}}
+    legacy_sec = build_gate_screen(legacy, "tests", **kw)["sections"][1]  # type: ignore[index]
+    assert [a["id"] for a in legacy_sec["actions"]] == ["retry", "redo"], legacy_sec["actions"]
+    # A stage's own verify failure: only the redo, on its failed row.
+    stage_fail = {"stages": {"plan": {"status": "ready_for_review", "last_verification": {"passed": False, "checks": [
+        {"id": p.stage("plan").gate.checks[0].id, "status": "failed", "detail": "x", "source": "s"}]}}},  # type: ignore[union-attr]
+        "run_failure": {"stage": "plan", "type": "verification_cap_exceeded"}}
+    plan_rows = build_gate_screen(stage_fail, "plan", **{**kw, "attempts": []})["sections"][0]["groups"][0]["rows"]  # type: ignore[index]
+    assert [a["id"] for a in plan_rows[0]["actions"]] == ["redo"], plan_rows[0]
+
+    # The run notice: failed at a gate -> open it; failed elsewhere -> Overview; stopped -> resume.
+    n = run_notice(status="failed", interrupted=False, failure_stage="r_ac_to_tests", current_stage="metrics-exit")
+    assert n is not None and n["tone"] == "error" and n["action"] == {"id": "open_gate", "label": "Open Tests gate", "tab_id": "tests"}, n
+    assert "Red Gate" in n["text"], n
+    n = run_notice(status="failed", interrupted=False, failure_stage="e2e", current_stage="metrics-exit")
+    assert n is not None and n["action"]["id"] == "open_overview", n
+    n = run_notice(status="in_progress", interrupted=True, failure_stage=None, current_stage="minimal-code-to-green")
+    assert n is not None and n["action"]["id"] == "resume" and p.label("minimal-code-to-green") in n["text"], n
+    assert "still active" not in n["text"]
+    assert run_notice(status="in_progress", interrupted=False, failure_stage=None, current_stage="plan") is None
+    assert run_notice(status="completed", interrupted=False, failure_stage=None, current_stage="metrics-exit") is None
 
     # Every check mode / reported status has copy.
     all_checks = [*p.wrapper_checks, *(c for s in p.stages if s.gate for c in s.gate.checks)]
