@@ -51,7 +51,7 @@ function GateArrowIcon({ className }: { className?: string }) {
 const STATUS_LOOK: Record<GateStatus, { text: string; badge: string; className: string }> = {
   off: { text: "not enforced", badge: "", className: "text-neutral-400 opacity-50" },
   unknown: { text: "mode not known yet", badge: "?", className: "text-neutral-500" },
-  not_run: { text: "not run yet", badge: "–", className: "text-neutral-400" },
+  not_run: { text: "not run yet", badge: "", className: "text-neutral-400" },
   verifying: { text: "verifying", badge: "…", className: "text-blue-600 animate-pulse" },
   passed: { text: "passed", badge: "✓", className: "text-green-600" },
   failed: { text: "failed", badge: "✕", className: "text-red-600" },
