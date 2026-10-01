@@ -115,6 +115,11 @@ independent of a code change? If not, it isn't config.
 The frontend (`src/**`) must do as little business-logic processing as possible; offload it to the
 server (`agent/src/**`). The server decides; the frontend renders what it is given.
 
+**The server builds view models** — JSON shaped for the screen that paints it (sections, rows,
+cells, labels, tones, enabled/selected flags), ready to consume without interpretation. The
+frontend iterates and paints; it never reshapes raw graph state or looks up rules to decide what to
+show. `agent/src/gate_view.py` (gate screens) is the reference pattern.
+
 - Deciding a status, a verdict, a color/tone, whether something passed, what applies under a
   code-gen mode, which items to show, or how stages/gates/checks relate is business logic. Compute
   it in Python and send the frontend a ready-to-render shape (rows, cells, labels, tones), not raw
