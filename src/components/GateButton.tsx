@@ -100,7 +100,7 @@ function stageView(
   else if (verdict) [status, statusText] = policy === "advisory" ? ["warn", T.advisory_failure] : ["failed", undefined];
   else if (policy === "off") status = "off";
   else if (policy === undefined) status = "unknown";
-  else if (stageState?.status === "approved") [status, statusText] = ["not_run", T.approved_earlier];
+  else if (stageState?.status === "approved") [status, statusText] = ["passed", T.approved_earlier];
   else status = "not_run";
   return { stage, policy, stageState, verdict, lap, maxLaps, status, statusText: statusText ?? T[status] };
 }
@@ -370,7 +370,7 @@ function CheckRow({ row, n, stats }: { row: GateRow; n: number; stats: VerifyIns
         {row.uncatalogued && (
           <span className="mt-0.5 inline-block rounded bg-amber-100 px-1.5 text-[10px] text-amber-800">{gt.uncatalogued_badge}</span>
         )}
-        {stats && stats.runs > 0 && (
+        {stats && stats.fails > 0 && (
           <div className="text-[11px] text-neutral-500">{fmt(gt.fail_rate, { pct: Math.round(stats.fail_rate * 100) })}</div>
         )}
       </td>

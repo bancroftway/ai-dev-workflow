@@ -1031,7 +1031,7 @@ TS_LANGUAGES = Check("tech_stack.languages", "Languages detected", "At least one
 TS_PACKAGE_MANAGERS = Check("tech_stack.package_managers", "Package managers detected", "At least one package manager is recorded.", "blocking")
 TS_TEST_COMMAND = Check("tech_stack.test_command", "Test command resolves", "The stack maps to a test command the coverage gates can run.", "blocking")
 TS_EXTRACTION = Check("tech_stack.extraction", "Extraction succeeded", "Structured extraction of the submitted markdown did not fall back to all-absent.", "blocking")
-TS_TOOLCHAIN = Check("tech_stack.toolchain", "Toolchain recorded", "manifest.json's toolchain section has image, tools and available.", "advisory")
+TS_TOOLCHAIN = Check("tech_stack.toolchain", "Toolchain recorded", "The sandbox recorded its image and the tools available in it (manifest.json toolchain). Platform telemetry: a gap here never needs action from you.", "advisory")
 TS_TESTING_FRAMEWORKS = Check("tech_stack.testing_frameworks", "Testing frameworks detected", "At least one testing framework is recorded.", "advisory")
 TS_STARTABILITY = Check("tech_stack.startability", "Startability evaluated", "The boot probe recorded startable plus evidence or a reason.", "advisory", condition="brownfield")
 TS_CONVENTION_ROOTS = Check("tech_stack.convention_roots", "Convention roots safe", "Every declared ecosystem root is a safe repo-relative path.", "advisory")
