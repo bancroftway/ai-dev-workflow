@@ -46,6 +46,7 @@ from . import (
     keyvault,
     org_credential_vault,
     preflight_nodes,
+    review_view,
     repo_test_config,
     repo_design_settings,
     org_settings,
@@ -571,6 +572,10 @@ class SessionResponse(BaseModel):
     # The mode this session's gates run under: the stored dbo.sessions.code_gen_mode, or the same
     # "mission_critical" fallback graph._resolve_thread_code_gen_mode applies when none is stored.
     code_gen_mode: Literal["yolo", "draft_verify", "mission_critical"] = "mission_critical"
+    # Live, SSE row stream only (None elsewhere): the checkpoint's pending interrupt id -- the
+    # workflow page refetches GET /sessions/{id}/review when it changes, so a gate opening or
+    # closing reaches the page with no AG-UI stream attached (agent restart, reload, other tab).
+    review_id: str | None = None
 
 
 async def _verified_container_alive(session_id: str) -> bool:
@@ -609,12 +614,29 @@ async def _verified_container_alive(session_id: str) -> bool:
     return alive
 
 
-async def _row_to_response(row: dict[str, Any], *, container_alive: bool | None = None) -> "SessionResponse":
+async def _pending_interrupt_id(session_id: str) -> str | None:
+    """The checkpoint's pending interrupt id (a fresh id per gate opening), or None. Fail-soft: a
+    checkpoint read error just means "unknown" for this tick, never a broken row stream."""
+    try:
+        snapshot = await graph.aget_state({"configurable": {"thread_id": session_id}})
+    except Exception:  # noqa: BLE001
+        logger.warning("pending-interrupt read failed for session_id=%s", session_id, exc_info=True)
+        return None
+    return next((i.id for i in (snapshot.interrupts or ())), None)
+
+
+async def _row_to_response(
+    row: dict[str, Any], *, container_alive: bool | None = None, review_id: str | None = None,
+) -> "SessionResponse":
     """`container_alive`: pass a recently-probed value to skip the live sandbox check below --
     used by stream_session_row's SSE loop, which calls this every few seconds and can't afford to
-    hit the sandbox provider that often (see that function's own comment)."""
+    hit the sandbox provider that often (see that function's own comment). `review_id`: the
+    checkpoint's pending interrupt, when the caller read it (the SSE loop) -- an open gate is
+    waiting on a human, not interrupted, even when dbo.sessions.awaiting_gate never got set (it is
+    only written while a sandbox is registered)."""
     active = run_activity.is_active(row["session_id"])
-    interrupted = row["status"] == "in_progress" and not active and not bool(row.get("awaiting_gate"))
+    awaiting = bool(row.get("awaiting_gate")) or review_id is not None
+    interrupted = row["status"] == "in_progress" and not active and not awaiting
     if container_alive is None:
         container_alive = await _verified_container_alive(row["session_id"])
     return SessionResponse(
@@ -623,6 +645,7 @@ async def _row_to_response(row: dict[str, Any], *, container_alive: bool | None 
         run_active=active,
         interrupted=interrupted,
         finished_with_verdict=session_store.is_finished_with_verdict(row),
+        review_id=review_id,
     )
 
 
@@ -981,6 +1004,63 @@ async def get_gate_screen(session_id: str, tab_id: str, request: Request, attemp
     return screen
 
 
+async def _open_review(session_id: str) -> dict[str, Any]:
+    """The checkpoint's pending interrupt as review_view's model. The checkpoint (not an AG-UI
+    stream, not dbo.sessions.awaiting_gate) is the one place an open gate is durably true -- it
+    survives agent restarts, reloads, other tabs and headless-driven runs alike."""
+    snapshot = await graph.aget_state({"configurable": {"thread_id": session_id}})
+    return review_view.build_review(
+        snapshot.interrupts or (),
+        sandbox_ready=registry.get(session_id) is not None,
+        busy=run_activity.is_driving(session_id),
+    )
+
+
+@router.get("/{session_id}/review")
+async def get_review(session_id: str, request: Request) -> dict[str, Any]:
+    """The open human review (review_view.build_review), or `{"open": false, ...}`. Same auth/404
+    shape as /tabs."""
+    _check_shared_secret(request)
+    if await session_store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return await _open_review(session_id)
+
+
+class ReviewActionRequest(BaseModel):
+    # The stage the reviewer saw -- a stale tab acting on a review that has since moved on gets a
+    # 409 instead of resolving whatever gate happens to be open now.
+    stage: str
+    action_id: str
+    # Reject feedback / tech-stack markdown / resubmitted requirements; ignored by approve/retry.
+    text: str | None = None
+
+
+@router.post("/{session_id}/review", status_code=202)
+async def post_review(session_id: str, body: ReviewActionRequest, request: Request) -> dict[str, Any]:
+    """Resolves the open review: maps the action to the resume value graph.make_gate_node expects
+    (review_view.resume_value) and resumes the graph server-side (run_activity.start_resume, the
+    same detached task an AG-UI run uses). 202: the run started -- attach to it to watch. 409:
+    nothing open for that stage, or blocked (no sandbox / a run already owns the thread -- a double
+    click or a second tab lands here, never a second resume). 400: an action this review doesn't
+    offer or one missing its text."""
+    _check_shared_secret(request)
+    if await session_store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    review = await _open_review(session_id)
+    if not review["open"] or review["stage"] != body.stage:
+        raise HTTPException(status_code=409, detail=f"no open review for stage {body.stage!r}")
+    if review["blocked"]:
+        raise HTTPException(status_code=409, detail=review["blocked"])
+    try:
+        value = review_view.resume_value(review, body.action_id, body.text)
+    except review_view.ReviewActionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not run_activity.start_resume(session_id, value):
+        raise HTTPException(status_code=409, detail=review_view.REVIEW_TEXT["busy"])
+    logger.info("review resolved server-side: session_id=%s stage=%s action=%s", session_id, body.stage, body.action_id)
+    return {"accepted": True, "stage": body.stage, "action_id": body.action_id}
+
+
 @router.get("/{session_id}/stream", response_class=EventSourceResponse)
 async def stream_session_row(session_id: str, _row: dict[str, Any] = Depends(_existing_session_for_stream)):
     """SSE tail of get_session_row above -- this is where run_activity.heartbeat's cross-process
@@ -998,7 +1078,10 @@ async def stream_session_row(session_id: str, _row: dict[str, Any] = Depends(_ex
             return
         if tick % _SSE_CONTAINER_CHECK_EVERY == 0:
             container_alive = await _verified_container_alive(row["session_id"])
-        response = await _row_to_response(row, container_alive=container_alive)
+        # Skipped while a run is active: no gate is waiting on a human then, and a run's own
+        # end flips run_active, which ships a fresh row (and review_id) on the next tick anyway.
+        review_id = None if run_activity.is_active(row["session_id"]) else await _pending_interrupt_id(row["session_id"])
+        response = await _row_to_response(row, container_alive=container_alive, review_id=review_id)
         payload = response.model_dump_json()
         if payload != last_payload:
             last_payload = payload
@@ -3741,7 +3824,114 @@ def _demo() -> None:
         else:
             os.environ["AIDW_AGENT_SHARED_SECRET"] = rt_real_shared_secret_env
 
+    _demo_review_endpoints()
     print("sessions_api self-check: all assertions passed")
+
+
+def _demo_review_endpoints() -> None:
+    """GET/POST /sessions/{id}/review over a real ASGI round-trip: checkpoint, session row, sandbox
+    registry and the graph driver stubbed (no DB, no graph run) -- asserts the 404/409/400/202
+    contract and that the driver receives exactly the resume value make_gate_node expects."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from langgraph.types import Interrupt
+
+    class _FakeTask:
+        def __init__(self) -> None:
+            self.finished = False
+
+        def done(self) -> bool:
+            return self.finished
+
+    pending: dict[str, tuple[Any, ...]] = {}
+    sandboxes: set[str] = set()
+    driven: list[tuple[str, Any]] = []
+    tasks: list[_FakeTask] = []
+
+    async def fake_get_session(session_id: str) -> dict[str, Any] | None:
+        return None if session_id == "missing" else {"session_id": session_id, "status": "in_progress"}
+
+    async def fake_aget_state(config: dict[str, Any]) -> Any:
+        return SimpleNamespace(interrupts=pending.get(config["configurable"]["thread_id"], ()), values={}, tasks=())
+
+    def fake_driver(thread_id: str, value: Any) -> Any:
+        driven.append((thread_id, value))
+        tasks.append(_FakeTask())
+        return tasks[-1]
+
+    real_secret = os.environ.get("AIDW_AGENT_SHARED_SECRET")
+    os.environ["AIDW_AGENT_SHARED_SECRET"] = ""
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    real_driver = run_activity._resume_driver
+    run_activity.install_resume_driver(fake_driver)
+    try:
+        with (
+            patch.object(session_store, "get_session", fake_get_session),
+            patch.object(graph, "aget_state", fake_aget_state),
+            patch.object(registry, "get", lambda sid: object() if sid in sandboxes else None),
+        ):
+            assert client.get("/sessions/missing/review").status_code == 404
+            assert client.post("/sessions/missing/review", json={"stage": "specification", "action_id": "approve"}).status_code == 404
+
+            closed = client.get("/sessions/rev-1/review").json()
+            assert closed["open"] is False, closed
+            nothing = client.post("/sessions/rev-1/review", json={"stage": "specification", "action_id": "approve"})
+            assert nothing.status_code == 409 and not driven, nothing.text
+
+            pending["rev-1"] = (Interrupt(value={"stage": "specification", "draft": {}}, id="int-1"),)
+            no_box = client.post("/sessions/rev-1/review", json={"stage": "specification", "action_id": "approve"})
+            assert no_box.status_code == 409 and "sandbox" in no_box.json()["detail"] and not driven, no_box.text
+            sandboxes.add("rev-1")
+            opened = client.get("/sessions/rev-1/review").json()
+            assert opened["open"] and opened["id"] == "int-1" and opened["actions"][0]["enabled"], opened
+            assert client.post("/sessions/rev-1/review", json={"stage": "plan", "action_id": "approve"}).status_code == 409
+            assert client.post("/sessions/rev-1/review", json={"stage": "specification", "action_id": "reject", "text": "x"}).status_code == 400
+            assert not driven
+
+            ok = client.post("/sessions/rev-1/review", json={"stage": "specification", "action_id": "approve"})
+            assert ok.status_code == 202 and ok.json()["accepted"] is True, ok.text
+            assert driven == [("rev-1", {"decision": "approved"})], driven
+            # Double click / second tab: the first resolve's run owns the thread -- no second drive.
+            again = client.post("/sessions/rev-1/review", json={"stage": "specification", "action_id": "approve"})
+            assert again.status_code == 409 and len(driven) == 1, again.text
+            assert client.get("/sessions/rev-1/review").json()["blocked"] == review_view.REVIEW_TEXT["busy"]
+            tasks[-1].finished = True
+            run_activity.pop_task("rev-1")
+
+            # Plan gate, resubmitted from the Requirements tab: the revised doc rides along.
+            pending["rev-1"] = (Interrupt(value={"stage": "plan", "draft": {}}, id="int-2"),)
+            resub = client.post("/sessions/rev-1/review", json={"stage": "plan", "action_id": "resubmit_requirements", "text": " new reqs "})
+            assert resub.status_code == 202, resub.text
+            assert driven[-1][1]["decision"] == "rejected" and driven[-1][1]["revised_requirements"] == "new reqs", driven[-1]
+            run_activity.pop_task("rev-1")
+
+            # Tech-stack submit carries the editor's markdown verbatim.
+            pending["rev-1"] = (Interrupt(value={"stage": "tech-stack", "markdown": "m", "file_existed": True}, id="int-3"),)
+            ts = client.post("/sessions/rev-1/review", json={"stage": "tech-stack", "action_id": "submit", "text": "# Stack\n"})
+            assert ts.status_code == 202 and driven[-1] == ("rev-1", {"markdown": "# Stack\n"}), (ts.text, driven[-1])
+            run_activity.pop_task("rev-1")
+    finally:
+        run_activity._resume_driver = real_driver
+        if real_secret is None:
+            os.environ.pop("AIDW_AGENT_SHARED_SECRET", None)
+        else:
+            os.environ["AIDW_AGENT_SHARED_SECRET"] = real_secret
+
+    # An open gate the DB flag missed (awaiting_gate is only written while a sandbox is registered)
+    # is still "waiting on a human", never "interrupted", once the SSE loop read its review_id.
+    row = {
+        "session_id": "44444444-4444-4444-4444-444444444444", "owner": "o", "repo": "r", "user_login": "u",
+        "title": "t", "source_branch": "main", "work_branch": "w", "status": "in_progress",
+        "started_at": datetime(2026, 1, 1), "awaiting_gate": False,
+    }
+    assert asyncio.run(_row_to_response(row, container_alive=False)).interrupted is True
+    gated = asyncio.run(_row_to_response(row, container_alive=False, review_id="int-9"))
+    assert gated.interrupted is False and gated.review_id == "int-9", gated
 
 
 if __name__ == "__main__":  # pragma: no cover -- cd agent && uv run python -m src.sessions_api

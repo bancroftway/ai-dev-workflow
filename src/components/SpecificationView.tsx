@@ -9,7 +9,7 @@ import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { SPECIFICATION_SURFACE_ID } from "@/lib/a2ui-surface-ids";
-import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useReview } from "@/lib/review-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
@@ -20,7 +20,7 @@ function SpecificationViewImpl() {
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
-  const { interrupt } = useOpenInterrupt();
+  const { review } = useReview();
   const [runActivity] = useRunActivity();
   const { stageOrderIndex } = usePipeline();
   const state = (agent.state ?? {}) as WorkflowState;
@@ -28,21 +28,17 @@ function SpecificationViewImpl() {
 
   // Pre-approval fallback: the A2UI surface message only exists after deterministic verify, and
   // vanishes on reload -- render the streamed draft (current review target; approved_content is
-  // the PREVIOUS run's content) so the gate is never a blind approve. Last resort: the draft
-  // carried inside a re-emitted gate interrupt (the only data available after a reload while the
-  // gate is open).
-  const draft =
-    parseSpecification(stage?.draft) ??
-    parseSpecification(stage?.approved_content) ??
-    (interrupt.stage === "specification" ? parseSpecification(interrupt.draft) : null); // stage-literal-ok: Specification's own bespoke view
+  // the PREVIOUS run's content) so the gate is never a blind approve. After a reload with the
+  // gate open, AppShell hydrates the draft from the checkpoint (review-context.tsx).
+  const draft = parseSpecification(stage?.draft) ?? parseSpecification(stage?.approved_content);
 
   // See stage-review-flags.ts for the isFinal/isProvisional rationale (shared with PlanView --
   // the subtlety here has already caused two live bugs from hand-duplicating this logic).
   const { isProvisional } = deriveStageReviewFlags({
     stageKey: "specification", // stage-literal-ok: Specification's own bespoke view
     stageStatus: stage?.status,
-    interruptOpen: interrupt.open,
-    interruptStage: interrupt.stage,
+    interruptOpen: review.open,
+    interruptStage: review.stage ?? undefined,
     agentIsRunning: agent.isRunning,
     runActive: runActivity?.runActive,
   });

@@ -134,8 +134,8 @@ def running_phases(events: list[Any], run_active: bool | None) -> dict[str, str]
 
 def _interrupt_verification(interrupts: list[Any], stage_key: str) -> dict[str, Any] | None:
     """An after-submit gate's (tech-stack's) verdict on the last submission, from the pending
-    interrupt payload (graph._build_tech_stack_interrupt_extra) -- the same object the frontend's
-    InterruptCard reads."""
+    interrupt payload (graph._build_tech_stack_interrupt_extra) -- the same object review_view
+    builds the Tech Stack tab's review from."""
     for payload in interrupts:
         if isinstance(payload, dict) and payload.get("stage") == stage_key and payload.get("verification"):
             return payload["verification"]

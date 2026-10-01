@@ -130,7 +130,7 @@ export default async function WorkflowPage({
       <WorkflowProviders>
         <SandboxStatusProvider>
           <RunActivityProvider>
-            {/* Above AppShell (and so above its InterruptProvider) and SandboxSessionBoot's mode
+            {/* Above AppShell (and so above its ReviewProvider) and SandboxSessionBoot's mode
                 picker alike. */}
             <PipelineProvider descriptor={pipeline}>
                 {/* The page shell (header, frozen/scroll split) lives once in root layout now -- this

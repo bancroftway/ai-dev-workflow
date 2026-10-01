@@ -6,9 +6,9 @@ import { memo, useEffect, useRef, useState } from "react";
 import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { ViewContainer } from "@/components/ViewContainer";
-import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { takeHandoffAttachments } from "@/lib/new-ticket-attachment-handoff";
 import { rawProxyUrl } from "@/lib/raw-proxy";
+import { useReview } from "@/lib/review-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import { usePipeline } from "@/lib/pipeline";
@@ -127,10 +127,11 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
     }
   }
 
-  // A run submitted while an interrupt is pending is silently dropped server-side (the endpoint
+  // A run submitted while a review is open is silently dropped server-side (the endpoint
   // re-emits the stored interrupt and never starts the graph), so Submit must go down while a
-  // review is open -- an enabled button there is a lie.
-  const { interrupt: openInterrupt } = useOpenInterrupt();
+  // review is open -- an enabled button there is a lie -- unless the server says this review
+  // takes the revised document (review.requirements, agent/src/review_view.py).
+  const { review, submitting: reviewSubmitting, error: reviewError, submit: submitReview } = useReview();
   // State-derived run lock: agent.isRunning is stream attachment, which resets to false on a
   // page reload while the run keeps going server-side -- observed live: Submit sat enabled all
   // through ac-to-tests. Locked from build-start until the run ends (failure recorded or exit
@@ -139,14 +140,12 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
   const firstBuildStageKey = usePipeline().tabs.find((t) => t.view === "build")?.stages[0]?.key;
   const runLocked = (buildStarted(state, firstBuildStageKey) && !runEnded(state)) || anyStageDrafting(state);
   // Requirements-as-single-source-of-truth (user requirement 2026-08-31, extended to Plan
-  // 2026-08-31): while the SPECIFICATION or PLAN gate is open, this tab stays live -- submitting
-  // resolves whichever gate is open with the full revised document (graph.py make_gate_node's
-  // revised_requirements contract). For Plan, the SAME resolve shape also trips
-  // GraphState.restart_from_specification server-side (make_gate_node detects stage_spec.key ==
-  // "plan" on its own -- no extra field needed here) so the redraft cascades through
-  // Specification first rather than redrafting Plan against its now-stale approved spec.
-  const sourceOfTruthGateOpen =
-    openInterrupt.open && (openInterrupt.stage === "specification" || openInterrupt.stage === "plan"); // stage-literal-ok: source-of-truth resubmit flow (spec/plan gates)
+  // 2026-08-31): while the Specification or Plan gate is open, this tab stays live -- submitting
+  // resolves that gate with the full revised document (the server builds the redraft feedback and
+  // graph.py make_gate_node's revised_requirements resume value, incl. Plan's cascade through
+  // Specification).
+  const resubmitAction = review.open ? (review.requirements?.resubmit_action ?? null) : null;
+  const sourceOfTruthGateOpen = resubmitAction != null;
   // Requirements-delta into an already-finished session is a supported flow (see runLocked's own
   // comment above) but must never fire silently from a stale tab that doesn't know the session
   // already finished elsewhere -- handleSubmit below confirms with the user first and tells the
@@ -166,22 +165,17 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
     text.trim().length === 0 ||
     agent.isRunning ||
     submitting ||
-    (openInterrupt.open && !sourceOfTruthGateOpen) ||
+    reviewSubmitting ||
+    (review.open && !sourceOfTruthGateOpen) ||
     runLocked;
 
   async function handleSubmit() {
     const trimmed = text.trim();
     if (!trimmed) return;
     setSubmitting(true);
-    if (sourceOfTruthGateOpen) {
+    if (resubmitAction != null) {
       try {
-        const feedback =
-          openInterrupt.stage === "plan" // stage-literal-ok: source-of-truth resubmit copy
-            ? "Requirements revised by the reviewer while reviewing the Plan — the Specification redrafts first, strictly from this correction; once it is re-approved, the Plan will redraft from it. " +
-              "This correction is a DELTA, not the whole specification: only include what it actually adds or changes — a genuinely new story/criterion, or one you're revising (cite its existing id) or retiring (retired_us_ids/retired_ac_ids). Never re-emit anything this correction doesn't touch; leaving it out does not remove it."
-            : "Requirements revised by the reviewer — redraft the Specification strictly from this correction. " +
-              "This correction is a DELTA, not the whole specification: only include what it actually adds or changes — a genuinely new story/criterion, or one you're revising (cite its existing id) or retiring (retired_us_ids/retired_ac_ids). Never re-emit anything this correction doesn't touch; leaving it out does not remove it.";
-        openInterrupt.resolve?.({ decision: "rejected", feedback, revised_requirements: trimmed });
+        await submitReview(resubmitAction, trimmed);
       } finally {
         setSubmitting(false);
       }
@@ -283,7 +277,7 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
         {/* Workflow Liveness Fix: `runLocked` is pure persisted state (anyStageDrafting survives a
             reload on purpose) -- it stays a lock either way, but a genuinely dead run needs
             different copy and an actual way out, not an indefinite "in progress". */}
-        {runLocked && !openInterrupt.open && runActivity?.interrupted && (
+        {runLocked && !review.open && runActivity?.interrupted && (
           <span className="flex items-center gap-2 text-xs text-amber-700">
             This run appears to have stopped — Resume before submitting new requirements.
             <button
@@ -296,21 +290,13 @@ function RequirementsViewImpl({ owner, repo, workBranch }: RequirementsViewProps
             </button>
           </span>
         )}
-        {runLocked && !openInterrupt.open && !runActivity?.interrupted && (
+        {runLocked && !review.open && !runActivity?.interrupted && (
           <span className="text-xs text-neutral-500">
             A run is in progress — requirements are locked until it ends (resubmit afterwards for a delta).
           </span>
         )}
-        {openInterrupt.open && (
-          <span className="text-xs text-neutral-500">
-            {openInterrupt.stage === "tech-stack" // stage-literal-ok: bespoke interrupt copy
-              ? "Finish the Tech Stack tab first, then resubmit."
-              : openInterrupt.stage === "specification" // stage-literal-ok: bespoke interrupt copy
-                ? "The Specification is awaiting review — submitting here revises the requirements and redrafts it from the updated document."
-                : openInterrupt.stage === "plan" // stage-literal-ok: bespoke interrupt copy
-                  ? "The Plan is awaiting review — submitting here revises the requirements and redrafts the Specification first, then the Plan."
-                  : "A review is waiting — approve or reject it first, then edit and resubmit."}
-          </span>
+        {review.open && review.requirements && (
+          <span className="text-xs text-neutral-500">{reviewError ?? review.blocked ?? review.requirements.note}</span>
         )}
         <button
           className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"

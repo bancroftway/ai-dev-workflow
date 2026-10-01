@@ -24,6 +24,7 @@ node (`record_raw_requirements` in `src/graph.py`) and the specification stage d
 | `tech_stack_extract.md` | tech-stack | one-shot JSON extraction from the tab's saved/approved markdown |
 | `specification_draft.md` / `specification_audit.md` | specification | user stories + acceptance criteria |
 | `specification_ticket_mode_segment.md` | specification | ticket-mode: expand the existing ledger baseline, scoped to this ticket, instead of a from-scratch read |
+| `gate_resubmit_specification_segment.md` / `gate_resubmit_plan_segment.md` | specification / plan | reviewer feedback for a redraft when the Requirements tab resubmits while that gate is open (`src/review_view.py`) |
 | `plan_draft.md` / `plan_audit.md` | plan | implementation plan, diagrams, wireframes |
 | `plan_greenfield_segment.md` | plan | greenfield: scaffold-first milestone segment |
 | `plan_ticket_mode_segment.md` | plan | ticket-mode: extend the existing approved Plan baseline, scoped to this ticket, instead of a from-scratch read |

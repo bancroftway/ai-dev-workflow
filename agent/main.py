@@ -7,12 +7,15 @@ from src.env_bootstrap import bootstrap_env
 bootstrap_env()  # .env, then AZURE_CONFIG_VAULT_URI -- before any import that reads os.environ
 
 import asyncio
+import json
 import logging
 import os
+import uuid
 
 from contextlib import asynccontextmanager
+from typing import Any
 
-from ag_ui.core import EventType, RunStartedEvent, StateSnapshotEvent
+from ag_ui.core import EventType, RunAgentInput, RunFinishedEvent, RunStartedEvent, StateSnapshotEvent
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
 from copilotkit import LangGraphAGUIAgent
 from fastapi import FastAPI, Request
@@ -196,8 +199,23 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
                 yield event
             return
 
-        queue = run_activity.subscribe(thread_id)
         existing = run_activity.get_task(thread_id)
+        forwarded = input.forwarded_props or {}
+        if (existing is None or existing.done()) and (forwarded.get("attachOnly") or forwarded.get("attach_only")):
+            # The frontend's attach after resolving a review (POST /sessions/{id}/review): stream
+            # the run that resolve started, NEVER start one -- if that run already ended, a plain
+            # run here would kick the graph off again from intake with no human asking for it.
+            # Hand back the checkpoint's state (what get_checkpoint_state serves) and finish.
+            yield RunStartedEvent(thread_id=thread_id, run_id=thread_id)
+            values = (await self.graph.aget_state({"configurable": {"thread_id": thread_id}})).values or {}
+            if values:
+                yield StateSnapshotEvent(
+                    type=EventType.STATE_SNAPSHOT, snapshot={k: v for k, v in values.items() if k != "messages"}
+                )
+            yield RunFinishedEvent(thread_id=thread_id, run_id=thread_id)
+            return
+
+        queue = run_activity.subscribe(thread_id)
         if existing is None or existing.done():
             task = asyncio.create_task(self._drive_graph(thread_id, input))
             run_activity.register_task(thread_id, task)
@@ -233,11 +251,24 @@ class _ReattachStateAgent(LangGraphAGUIAgent):
 # this is just a generous ceiling against a genuine infinite loop, not a cost control.
 _RECURSION_LIMIT = 1000
 
-add_langgraph_fastapi_endpoint(
-    app=app,
-    agent=_ReattachStateAgent(name="workflow", graph=graph, config={"recursion_limit": _RECURSION_LIMIT}),
-    path="/",
-)
+_AGENT = _ReattachStateAgent(name="workflow", graph=graph, config={"recursion_limit": _RECURSION_LIMIT})
+add_langgraph_fastapi_endpoint(app=app, agent=_AGENT, path="/")
+
+
+def _drive_resume(thread_id: str, resume_value: Any) -> "asyncio.Task[None]":
+    """run_activity.start_resume's driver: resumes a pending interrupt with no browser involved,
+    through the exact path a CopilotKit useInterrupt resolve took -- a RunAgentInput whose
+    forwarded_props.command.resume ag_ui_langgraph turns into Command(resume=...) -- on a fresh
+    clone (per-run active_run state, same as endpoint.py's per-request clone). JSON-encoded because
+    ag_ui_langgraph json.loads a string resume and warns on a bare non-JSON one ("retry")."""
+    run_input = RunAgentInput(
+        thread_id=thread_id, run_id=str(uuid.uuid4()), state={}, messages=[], tools=[], context=[],
+        forwarded_props={"command": {"resume": json.dumps(resume_value)}},
+    )
+    return asyncio.create_task(_AGENT.clone()._drive_graph(thread_id, run_input))
+
+
+run_activity.install_resume_driver(_drive_resume)
 
 # After route registration is fine -- Starlette builds its middleware stack lazily at the first
 # request, and instrument_app only needs to run before serving starts.

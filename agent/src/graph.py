@@ -5369,8 +5369,8 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
     async def gate_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = config["configurable"]["thread_id"]
         stage = state["stages"][stage_spec.key]
-        # Pauses here (BR-4/Section 6 Gate) until the frontend's useInterrupt
-        # resolve(payload) resumes this exact node with that payload -- unless this stage is
+        # Pauses here (BR-4/Section 6 Gate) until a reviewer's action (POST /sessions/{id}/review ->
+        # review_view.resume_value) resumes this exact node with that payload -- unless this stage is
         # supporting infrastructure with no tab to review it in (requires_human_gate=False), in
         # which case it proceeds straight through to the same approved-marking body every other
         # stage already runs post-interrupt-resolve. The resume value is captured (previously
@@ -5447,7 +5447,7 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
 
         # Part 2 Task 10 (Ruling 3): the one resume shape that means a human REJECTION --
         # discriminated from every other resume_value this function has ever accepted (tech-
-        # stack's own {"markdown": ...} submit shape, the generic InterruptCard's
+        # stack's own {"markdown": ...} submit shape, the review card's Approve
         # {"decision": "approved"}, headless's bare `True`, and every non-gated stage's
         # resume_value of None) -- all of those fall through to the unchanged approval body below
         # exactly as before. Loops back to THIS stage's own draft node (make_route_after_gate,

@@ -9,7 +9,7 @@ import { ClarifyingQuestions } from "@/components/ClarifyingQuestions";
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
 import { PLAN_SURFACE_ID } from "@/lib/a2ui-surface-ids";
-import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useReview } from "@/lib/review-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
@@ -21,7 +21,7 @@ function PlanViewImpl() {
   // proxied agent, re-registering the same id throws.
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
-  const { interrupt } = useOpenInterrupt();
+  const { review } = useReview();
   const [runActivity] = useRunActivity();
   const { stageOrderIndex } = usePipeline();
   const state = (agent.state ?? {}) as WorkflowState;
@@ -32,12 +32,9 @@ function PlanViewImpl() {
   const isStale = plan?.ever_ready_for_review && plan.status === "not_started";
 
   // Pre-approval fallback: same rationale as SpecificationView -- the surface message only
-  // exists post-verify; the streamed draft is the current review target; the interrupt payload
-  // is the only source after a reload with the gate open.
-  const draft =
-    parseImplementationPlan(plan?.draft) ??
-    parseImplementationPlan(plan?.approved_content) ??
-    (interrupt.stage === "plan" ? parseImplementationPlan(interrupt.draft) : null); // stage-literal-ok: Plan's own bespoke view
+  // exists post-verify; the streamed draft is the current review target (hydrated from the
+  // checkpoint after a reload with the gate open -- AppShell).
+  const draft = parseImplementationPlan(plan?.draft) ?? parseImplementationPlan(plan?.approved_content);
 
   // See stage-review-flags.ts for the isFinal/isProvisional rationale (shared with
   // SpecificationView -- the subtlety here has already caused two live bugs from hand-duplicating
@@ -45,8 +42,8 @@ function PlanViewImpl() {
   const { isProvisional } = deriveStageReviewFlags({
     stageKey: "plan", // stage-literal-ok: Plan's own bespoke view
     stageStatus: plan?.status,
-    interruptOpen: interrupt.open,
-    interruptStage: interrupt.stage,
+    interruptOpen: review.open,
+    interruptStage: review.stage ?? undefined,
     agentIsRunning: agent.isRunning,
     runActive: runActivity?.runActive,
   });

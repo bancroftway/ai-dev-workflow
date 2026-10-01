@@ -36,7 +36,7 @@ import os
 import time
 from unittest.mock import patch
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from . import config
 
@@ -124,6 +124,39 @@ def cancel_run(session_id: str) -> bool:
     if task is None or task.done():
         return False
     task.cancel()
+    return True
+
+
+def is_driving(session_id: str) -> bool:
+    """A graph run owns this thread right now: a live in-process task (registered the instant it is
+    created, before its own incr() has run) or any process's run_active signal (is_active, which
+    also sees run_headless.py's heartbeat)."""
+    task = get_task(session_id)
+    return (task is not None and not task.done()) or is_active(session_id)
+
+
+# (thread_id, resume_value) -> the started background task driving that resume. Installed once by
+# main.py (_drive_resume) -- this module can't build the AG-UI agent itself without importing
+# main.py (circular), the same reason cancel_run lives here.
+_resume_driver: "Callable[[str, Any], asyncio.Task[None]] | None" = None
+
+
+def install_resume_driver(driver: "Callable[[str, Any], asyncio.Task[None]]") -> None:
+    global _resume_driver
+    _resume_driver = driver
+
+
+def start_resume(session_id: str, resume_value: Any) -> bool:
+    """Resolves this thread's pending interrupt server-side (sessions_api's POST
+    /sessions/{id}/review) by starting the same detached graph task an AG-UI run would. False --
+    nothing started -- when a run already owns the thread (double click, a second tab, a headless
+    process). Check-and-register has no `await` in between, so two concurrent callers can't both
+    start one. Browser tabs then attach to the task as plain subscribers (main.py run())."""
+    if is_driving(session_id):
+        return False
+    if _resume_driver is None:
+        raise RuntimeError("no resume driver installed -- main.py installs it at import")
+    register_task(session_id, _resume_driver(session_id, resume_value))
     return True
 
 
@@ -263,6 +296,35 @@ def _demo() -> None:
         assert get_task("task-2") is None
 
     asyncio.run(_task_registry())
+
+    # start_resume: starts exactly one driver task per thread; refuses while one is live, and
+    # again (no driver call) while another process's run is active.
+    async def _resume() -> None:
+        global _resume_driver
+        calls: list[tuple[str, Any]] = []
+        gate = asyncio.Event()
+
+        def _driver(thread_id: str, value: Any) -> "asyncio.Task[None]":
+            calls.append((thread_id, value))
+            return asyncio.create_task(gate.wait())
+
+        real = _resume_driver
+        install_resume_driver(_driver)
+        try:
+            assert start_resume("Resume-1", {"decision": "approved"}) is True
+            assert start_resume("resume-1", "retry") is False, "a second resolve must not double-drive"
+            assert calls == [("Resume-1", {"decision": "approved"})], calls
+            gate.set()
+            await pop_task("resume-1")
+            incr("resume-1")  # e.g. a reattach run still incr'd
+            assert start_resume("resume-1", "retry") is False
+            decr("resume-1")
+            assert start_resume("resume-1", "retry") is True and len(calls) == 2
+            await pop_task("resume-1")
+        finally:
+            _resume_driver = real
+
+    asyncio.run(_resume())
 
     # Subscriber fan-out: two subscribers on the same thread both see a published event; a
     # subscriber on a DIFFERENT thread sees nothing.

@@ -41,6 +41,10 @@ export type RunActivityInfo = {
    * (dbo.sessions.merge_ready is NULL for the entire in_progress lifetime -- see
    * `SessionResponse.merge_ready`, already exposed backend-side, just not threaded here before). */
   mergeReady: boolean | null;
+  /** The checkpoint's pending interrupt id (sessions_api's SessionResponse.review_id): a change
+   * is the signal to refetch the review view model, so an open gate reaches the page with no
+   * AG-UI stream attached. */
+  reviewId: string | null;
 };
 
 const RunActivityContext = createContext<[RunActivityInfo | null, (v: RunActivityInfo | null) => void] | null>(null);

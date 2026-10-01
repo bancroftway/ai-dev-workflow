@@ -5,7 +5,7 @@ import { memo, useEffect, useRef, useState } from "react";
 import { AttachmentEditor, SHARED_ATTACHMENTS_CONFIG } from "@/components/AttachmentEditor";
 import { Spinner } from "@/components/Spinner";
 import { ViewContainer } from "@/components/ViewContainer";
-import { useOpenInterrupt, type InterruptVerification } from "@/lib/interrupt-context";
+import { useReview, type ReviewVerification } from "@/lib/review-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
@@ -18,22 +18,25 @@ import type { CannedTechStack, TechStackCatalogResponse, WorkflowState } from "@
  * before the rest of the pipeline runs.
  *
  * Load/edit/submit shape mirrors RequirementsView, but the gate itself is real (tech-stack's
- * StageSpec is `requires_human_gate=True` now): Submit resolves the open interrupt with the
- * edited markdown via `useOpenInterrupt().resolve` rather than posting a chat message -- that
- * resolve is what agent/src/graph.py's make_gate_node/resolve_tech_stack_submission actually save,
- * extract into structured JSON, and commit.
+ * StageSpec is `requires_human_gate=True` now): Submit posts the edited markdown to the open review
+ * (POST /api/sessions/{id}/review, action "submit") -- the agent resumes the gate with it, and
+ * agent/src/graph.py's make_gate_node/resolve_tech_stack_submission save, extract into structured
+ * JSON, and commit it. The review itself (markdown, picker, last verdict, copy) is the server's
+ * view model (agent/src/review_view.py).
  */
 function TechStackViewImpl() {
   // agentId only -- AppShell already registered this proxied agent (see RequirementsView.tsx).
   const { localAgentId, threadId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
-  const { interrupt } = useOpenInterrupt();
+  const { review, submitting: reviewSubmitting, error: reviewError, submit } = useReview();
   const [sandboxStatus] = useSandboxStatus();
   const [runActivity] = useRunActivity();
   const { stageOrderIndex } = usePipeline();
 
-  const isOpen = interrupt.open && interrupt.stage === "tech-stack"; // stage-literal-ok: Tech Stack's own bespoke view
-  const showDropdown = isOpen && interrupt.fileExisted === false;
+  const techStack = review.open && review.kind === "tech_stack" ? review.tech_stack : null;
+  const isOpen = techStack != null;
+  const showDropdown = techStack?.show_catalog === true;
+  const submitAction = review.actions?.find((a) => a.id === "submit");
 
   const [text, setText] = useState("");
   const [catalog, setCatalog] = useState<CannedTechStack[]>([]);
@@ -65,10 +68,12 @@ function TechStackViewImpl() {
   // is ready -- before Task 10, Submit's only outcome (implicit approval) always advanced the
   // pipeline past tech-stack, so this gate could never reopen within one mount and the one-shot
   // guard below never needed resetting. Without this, a reject would leave the just-rejected text
-  // sitting in the editor forever instead of showing the fresh redraft.
+  // sitting in the editor forever instead of showing the fresh redraft. Keyed by the review's id:
+  // each gate opening is a new one (a failed after-submit verify re-opens with a new id too).
+  const openReviewId = isOpen ? review.id : null;
   useEffect(() => {
-    if (isOpen) syncedRef.current = false;
-  }, [isOpen]);
+    if (openReviewId != null) syncedRef.current = false;
+  }, [openReviewId]);
 
   // Prefill exactly once per gate occurrence from whatever the gate is showing -- never clobber
   // an active edit. A per-session draft copy (saved on every change below) takes precedence over
@@ -77,16 +82,16 @@ function TechStackViewImpl() {
   // live 2026-08-31: the greenfield stub got submitted and approved instead of the user's
   // Angular+.NET pick. Same sessionStorage-degrades-silently rules as RequirementsView.
   useEffect(() => {
-    if (syncedRef.current || !isOpen || typeof interrupt.draftMarkdown !== "string") return;
+    if (syncedRef.current || techStack == null) return;
     let saved: string | null = null;
     try {
       saved = sessionStorage.getItem(`aidw:techstack-draft:${threadId}`);
     } catch {
       saved = null;
     }
-    setText(saved || interrupt.draftMarkdown);
+    setText(saved || techStack.markdown);
     syncedRef.current = true;
-  }, [isOpen, interrupt.draftMarkdown, threadId]);
+  }, [techStack, threadId]);
 
   function updateText(value: string) {
     setText(value);
@@ -106,13 +111,14 @@ function TechStackViewImpl() {
   async function handleSubmit() {
     setSubmitting(true);
     try {
-      interrupt.resolve?.({ markdown: text });
       // The submitted text is the stack of record now -- a stale draft copy must not resurrect
-      // on the next session/gate against this thread.
-      try {
-        sessionStorage.removeItem(`aidw:techstack-draft:${threadId}`);
-      } catch {
-        // ignore
+      // on the next session/gate against this thread. Kept when the agent refused the submit.
+      if (await submit("submit", text)) {
+        try {
+          sessionStorage.removeItem(`aidw:techstack-draft:${threadId}`);
+        } catch {
+          // ignore
+        }
       }
     } finally {
       setSubmitting(false);
@@ -124,7 +130,7 @@ function TechStackViewImpl() {
   // is strictly worse than the user just editing the text and submitting. The gate's server-side
   // {decision, feedback} contract (graph.py make_gate_node) is untouched; this tab simply never
   // sends it.
-  const disabled = !isOpen || text.trim().length === 0 || submitting || sandboxStatus !== "ready";
+  const disabled = !submitAction?.enabled || text.trim().length === 0 || submitting || reviewSubmitting;
 
   const state = (agent.state ?? {}) as WorkflowState;
   const stage = state.stages?.["tech-stack"]; // stage-literal-ok: Tech Stack's own bespoke view
@@ -134,9 +140,7 @@ function TechStackViewImpl() {
       <div>
         <h1 className="text-lg font-semibold">Tech Stack</h1>
         <p className="text-sm text-neutral-500">
-          {isOpen
-            ? "Pick a starting stack or review what was detected — the text below is fully editable either way, and whatever you submit becomes the stack of record."
-            : "The technology stack this session builds against."}
+          {techStack?.subtitle ?? "The technology stack this session builds against."}
         </p>
       </div>
 
@@ -191,9 +195,7 @@ function TechStackViewImpl() {
             </label>
           )}
 
-          {interrupt.verification && !interrupt.verification.passed && (
-            <SubmissionVerification verification={interrupt.verification} />
-          )}
+          {techStack.verification && <SubmissionVerification verification={techStack.verification} />}
 
           <AttachmentEditor
             value={text}
@@ -205,15 +207,15 @@ function TechStackViewImpl() {
           />
 
           <div className="flex items-center justify-end gap-3">
-            {sandboxStatus !== "ready" && (
-              <span className="text-xs text-neutral-500">Waiting for the dev-tool sandbox to finish starting…</span>
+            {(reviewError ?? review.blocked) && (
+              <span className="text-xs text-neutral-500">{reviewError ?? review.blocked}</span>
             )}
             <button
               className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
               disabled={disabled}
               onClick={handleSubmit}
             >
-              {submitting ? "Saving…" : "Submit"}
+              {submitting || reviewSubmitting ? "Saving…" : (submitAction?.label ?? "Submit")}
             </button>
           </div>
         </>
@@ -226,25 +228,17 @@ function TechStackViewImpl() {
 // while it's the hidden tab.
 export const TechStackView = memo(TechStackViewImpl);
 
-/** The after-submit gate sent the submission back: what failed, so the human can fix the text. */
-function SubmissionVerification({ verification }: { verification: InterruptVerification }) {
-  const { stage } = usePipeline();
-  const catalog = stage("tech-stack")?.gate?.checks ?? []; // stage-literal-ok: this view IS the tech-stack stage
-  const problems = (verification.checks ?? []).filter((c) => c.status === "failed" || c.status === "infra" || c.status === "advisory");
+/** The after-submit gate sent the submission back: what failed (server-built rows), so the human
+ * can fix the text. */
+function SubmissionVerification({ verification }: { verification: ReviewVerification }) {
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-red-300 bg-red-50 p-3 text-sm">
-      <p className="font-medium text-red-900">
-        Your last submission didn’t pass verification (attempt {verification.attempts} of {verification.max_attempts}).
-        Edit the text below and submit again.
-      </p>
-      {problems.length > 0 ? (
+      <p className="font-medium text-red-900">{verification.title}</p>
+      {verification.items.length > 0 ? (
         <ul className="flex flex-col gap-1 text-xs">
-          {problems.map((c) => (
-            <li key={c.id} className={c.status === "failed" ? "text-red-800" : "text-amber-800"}>
-              <span className="font-medium">
-                {c.status === "failed" ? "Failed" : c.status === "infra" ? "Couldn’t check" : "Advisory"}:{" "}
-                {catalog.find((k) => k.id === c.id)?.label ?? c.id}
-              </span>
+          {verification.items.map((c) => (
+            <li key={c.key} className={c.tone === "fail" ? "text-red-800" : "text-amber-800"}>
+              <span className="font-medium">{c.label}</span>
               {c.detail && <> — {c.detail}</>}
             </li>
           ))}

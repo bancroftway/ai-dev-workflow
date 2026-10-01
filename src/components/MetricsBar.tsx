@@ -2,7 +2,7 @@
 
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import { HealthRing } from "@/components/HealthRing";
-import { useOpenInterrupt } from "@/lib/interrupt-context";
+import { useReview } from "@/lib/review-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { deriveStageReviewFlags } from "@/lib/stage-review-flags";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
@@ -193,7 +193,7 @@ export function MetricsBar({
   // agentId only -- AppShell already registered the proxied agent (see RequirementsView.tsx).
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
-  const { interrupt } = useOpenInterrupt();
+  const { review } = useReview();
   const [runActivity] = useRunActivity();
   const state = (agent.state ?? {}) as WorkflowState;
   const scan = state.repo_scan;
@@ -225,8 +225,8 @@ export function MetricsBar({
   const { isFinal: activeStageIsFinal } = deriveStageReviewFlags({
     stageKey: activeStage?.key ?? "",
     stageStatus: activeStageStatus,
-    interruptOpen: interrupt.open,
-    interruptStage: interrupt.stage,
+    interruptOpen: review.open,
+    interruptStage: review.stage ?? undefined,
     agentIsRunning: agent.isRunning,
     runActive: runActivity?.runActive,
   });

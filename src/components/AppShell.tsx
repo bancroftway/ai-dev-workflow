@@ -4,7 +4,6 @@ import {
   UseAgentUpdate,
   useAgent,
   useCopilotKit,
-  useInterrupt,
 } from "@copilotkit/react-core/v2";
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
@@ -22,14 +21,14 @@ import { SpecificationView } from "@/components/SpecificationView";
 import { TechStackView } from "@/components/TechStackView";
 import { RunningSpinner, Spinner } from "@/components/Spinner";
 import { terminateSession } from "@/lib/agent-client";
-import { InterruptProvider, useOpenInterrupt, type InterruptVerification } from "@/lib/interrupt-context";
 import { usePipeline, type PipelineTab } from "@/lib/pipeline";
 import { rawProxyUrl } from "@/lib/raw-proxy";
+import { ReviewProvider, useReview, useReviewModel } from "@/lib/review-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { EMPTY_STAGES, useRunningStages, useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
-import type { EscalationPayload, MergeReadinessReport, WorkflowState } from "@/lib/workflow-types";
+import type { MergeReadinessReport, WorkflowState } from "@/lib/workflow-types";
 
 // The server's tab tone (gate_view._tab_tone) as the tab label's own colour; same
 // green/red/amber as the gate icons. Lighter tints on the active tab's dark background.
@@ -171,6 +170,9 @@ export function AppShell({
   const runEvents = useStructuralRunEvents();
   // Each tab's label, enabled flag, status tone and gate icon -- decided server-side.
   const tabStrip = useTabStrip();
+  // The open human review, from the server (review-context.tsx) -- shared with every view below.
+  const reviewState = useReviewModel();
+  const review = reviewState.review;
   const enabled = useMemo(() => Object.fromEntries(tabStrip.map((t) => [t.tab_id, t.enabled])), [tabStrip]);
   const sharedRunningStages = useRunningStages();
   const runningStages = runActivity?.runActive === false ? EMPTY_STAGES : sharedRunningStages;
@@ -287,12 +289,6 @@ export function AppShell({
     awaiting_gate: boolean | null;
     container_alive: boolean;
   } | null>(null);
-  // One-shot, separate from the fresh-session auto-trigger's own ref below: that effect fires (or
-  // doesn't) once at mount and never retries, so a reattach whose gate wasn't open YET at mount
-  // never got a second chance -- found live 2026-08-31, right after Plan's gate genuinely opened,
-  // on a tab that had been sitting on the "Reconnecting…" banner since before that: the banner
-  // does not clear on its own, contradicting its own copy ("this page updates automatically").
-  const reattachTriggeredRef = useRef(false);
   // Exposes the durable-row stream's own reconnect-if-closed check to the Resume/Reattach button
   // below (root-caused 2026-09-11): that stream's "done" handler closes it for good on a REAL
   // terminal status, with no reopen logic of its own -- by design, since most "done"s (completed)
@@ -326,6 +322,7 @@ export function AppShell({
       failure_type?: string | null;
       failure_message?: string | null;
       merge_ready?: boolean | null;
+      review_id?: string | null;
     }) {
       // A terminal session (completed/failed/rejected) has no container to be alive in the first
       // place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
@@ -362,21 +359,8 @@ export function AppShell({
         failureType: row.failure_type ?? null,
         failureMessage: row.failure_message ?? null,
         mergeReady: row.merge_ready ?? null,
+        reviewId: row.review_id ?? null,
       });
-      // The moment the durable row reports the run PAUSED at its own gate, a blank run request
-      // hits ag_ui_langgraph's pending-interrupt short-circuit and main.py's
-      // _ReattachStateAgent injects a full STATE_SNAPSHOT into it -- exactly the mechanism a
-      // manual reload was relying on. Firing it here means this tab recovers on its own, no
-      // reload needed. Guarded so it only ever fires once per mount; a stages-non-empty client
-      // (the ordinary case) never reaches this branch at all.
-      if (
-        row.awaiting_gate &&
-        Object.keys(stateRef.current.stages ?? {}).length === 0 &&
-        !reattachTriggeredRef.current
-      ) {
-        reattachTriggeredRef.current = true;
-        void copilotkit.runAgent({ agent });
-      }
     }
 
     let source: EventSource | null = null;
@@ -419,7 +403,7 @@ export function AppShell({
       window.removeEventListener("focus", reconnectIfClosed);
       reconnectDurableRowIfClosedRef.current = () => {};
     };
-  }, [threadId, setSandboxStatus, setRunActivity, agent, copilotkit]);
+  }, [threadId, setSandboxStatus, setRunActivity]);
 
   // Idle-session hydration (root-caused 2026-09-12, user-reported: every tab past Tech Stack
   // rendered as if the session had never run). `agent.state` only ever gets populated by an actual
@@ -460,6 +444,22 @@ export function AppShell({
       }
     })();
   }, [threadId, agent, agentIsReady]);
+
+  // A review that opened while this tab wasn't attached to the run (agent restart, reload
+  // mid-run, another tab's action): the draft under review exists only in the checkpoint -- pull
+  // it, once per review. Skipped while a live run streams state into this tab anyway.
+  const hydratedReviewRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!agentIsReady || !review.open || review.id == null || agent.isRunning) return;
+    if (hydratedReviewRef.current === review.id) return;
+    hydratedReviewRef.current = review.id;
+    fetch(`/api/sessions/${encodeURIComponent(threadId)}/checkpoint-state`)
+      .then((res) => (res.ok ? (res.json() as Promise<Record<string, unknown>>) : null))
+      .then((snapshot) => {
+        if (snapshot && Object.keys(snapshot).length > 0 && !agent.isRunning) agent.setState(snapshot);
+      })
+      .catch(() => {});
+  }, [threadId, agent, agentIsReady, agent.isRunning, review.open, review.id]);
 
   // Mid-run reattach gap (backlog item 4; user found confusing live 2026-08-31): a client that
   // (re)connects while the graph is actively drafting/auditing -- no gate open, nothing to pause
@@ -541,31 +541,6 @@ export function AppShell({
     void copilotkit.runAgent({ agent });
   }, [sandboxStatus, agent, copilotkit, resume, durableRow, router]);
 
-  // Section 8: the interrupt UI must be reachable regardless of which view is open. Task 7 dropped
-  // the CopilotSidebar that renderInChat's default (true) used to publish into; renderInChat:
-  // false below gets the rendered element back directly instead, so this component can mount it
-  // itself (Task 10) -- see the banner rendered between the tab nav and <main> further down.
-  //
-  // The backend delivers the interrupt payload as a JSON *string* (ag_ui_langgraph's
-  // dump_json_safe) -- parsing it is what makes the gate/escalation distinction work at all.
-  // Discrimination is presence of `type`: the plain approval gate payload (graph.py
-  // make_gate_node) has none; every escalation carries one.
-  const interruptElement = useInterrupt<EscalationPayload, false>({
-    agentId: localAgentId,
-    renderInChat: false,
-    render: ({ resolve, event }) => {
-      const raw: unknown = event?.value;
-      let payload: EscalationPayload = {};
-      try {
-        payload = (typeof raw === "string" ? JSON.parse(raw) : raw) ?? {};
-      } catch {
-        payload = {};
-      }
-      if (typeof payload !== "object" || payload === null) payload = {};
-      return <InterruptCard payload={payload} resolve={resolve} />;
-    },
-  });
-
   const buildTab = tabs.find((t) => t.view === "build");
   const buildTabEnabled = buildTab != null && enabled[buildTab.id];
 
@@ -611,7 +586,7 @@ export function AppShell({
   };
 
   return (
-    <InterruptProvider>
+    <ReviewProvider value={reviewState}>
       <div className="flex min-h-full flex-1 flex-col">
         {sandboxStatus === "error" && (
           <div className="border-b border-red-300 bg-red-50 px-4 py-2 text-sm text-red-900">
@@ -667,7 +642,7 @@ export function AppShell({
                 instead of waiting for the stream. Suppressed while a review gate is open: the
                 stream stays attached during a LangGraph interrupt, but the pipeline is waiting on
                 the HUMAN then. */}
-            {interruptElement == null && (agent.isRunning || runActivity?.runActive) && (
+            {!review.open && (agent.isRunning || runActivity?.runActive) && (
               <span className="flex items-center gap-1.5 text-xs text-neutral-500">
                 <Spinner />
                 {(() => {
@@ -773,14 +748,11 @@ export function AppShell({
           </div>
         )}
 
-        {/* The Gate UI's new home (Task 10) -- rendered here so it's visible above whichever tab
-            is open, matching the comment on useInterrupt above. null for tech-stack's own gate
-            (InterruptCard returns null there; TechStackView renders its own controls instead) and
-            for the ordinary "nothing is paused right now" case, so this adds no dead space then. */}
-        {/* No wrapper div: InterruptCard renders null for tech-stack's own gate, and a padded
-            wrapper around that null was a 12px phantom gap above every view while that gate was
-            open (user, 2026-08-31). The card's non-null returns carry their own mx-4 mt-3. */}
-        {interruptElement}
+        {/* The open review's card, above whichever tab is open -- built server-side
+            (review_view.py), rendered as-is. Nothing when no review is open, or when the stage's
+            own tab renders it (Tech Stack: `card` false). No wrapper div: a padded wrapper around
+            nothing was a 12px phantom gap above every view (user, 2026-08-31). */}
+        <ReviewCard key={review.id ?? "closed"} />
 
         {/* Views stay MOUNTED and hide via [hidden] (backlog item 3, 2026-08-31): unmounting on
             tab switch reset unsaved editor text, dropdown picks, and scroll -- observed live.
@@ -810,152 +782,72 @@ export function AppShell({
           )}
         </main>
       </div>
-    </InterruptProvider>
+    </ReviewProvider>
   );
 }
 
-/** The chat-feed card for an open interrupt. A real component (not inline JSX in the render
- * prop) so hooks are legal: it publishes {open, stage, draft} into InterruptContext — Submit
- * gating and the post-reload draft fallback both hang off that. */
-function InterruptCard({
-  payload,
-  resolve,
-}: {
-  payload: EscalationPayload;
-  resolve: (value: unknown) => void;
-}) {
-  const { setInterrupt } = useOpenInterrupt();
-  const stageKey = typeof payload.stage === "string" ? payload.stage : undefined;
-  const stageLabel = usePipeline().stageLabel(stageKey) || "this stage";
-  const draft = (payload as Record<string, unknown>).draft;
-  const draftMarkdown = (payload as Record<string, unknown>).markdown;
-  const fileExisted = (payload as Record<string, unknown>).file_existed;
-  const verification = (payload as Record<string, unknown>).verification as InterruptVerification | null | undefined;
-  // Why a Reject would send the draft back for revision (Ruling 3, graph.py make_gate_node) --
-  // required so the redraft has something to act on. No explicit reset needed between gate
-  // occurrences: useInterrupt's own `element` is null while a rejected stage is redrafting (real
-  // async work in between), so this whole component unmounts and a fresh instance -- fresh
-  // useState("") included -- mounts for the next occurrence, same stage or not.
-  const [feedback, setFeedback] = useState("");
+const REVIEW_TONE = {
+  review: { box: "border-amber-300 bg-amber-50", text: "text-amber-900", input: "border-amber-300" },
+  error: { box: "border-red-300 bg-red-50", text: "text-red-900", input: "border-red-300" },
+} as const;
 
-  const done = (value: unknown) => {
-    setInterrupt({ open: false });
-    resolve(value);
-  };
+const ACTION_CLASS = {
+  primary: "bg-neutral-900 text-white",
+  danger: "border border-red-300 bg-white text-red-700",
+} as const;
 
-  useEffect(() => {
-    setInterrupt({
-      open: true,
-      stage: stageKey,
-      draft,
-      draftMarkdown: typeof draftMarkdown === "string" ? draftMarkdown : undefined,
-      fileExisted: typeof fileExisted === "boolean" ? fileExisted : undefined,
-      verification: verification ?? null,
-      resolve: done,
-    });
-    return () => setInterrupt({ open: false });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- payload identity churns per render; stage is the real key
-  }, [stageKey]);
-
-  // The Tech Stack tab handles its own review entirely -- it reads {draftMarkdown, fileExisted,
-  // resolve} from InterruptContext directly (set above) rather than rendering a sidebar card.
-  if (stageKey === "tech-stack") return null; // stage-literal-ok: Tech Stack handles its own gate
-
-  if (payload.type) {
-    const rest: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
-    delete rest.stage;
-    delete rest.type;
-    delete rest.draft; // huge; the views render it, not this card
-    const text = [rest.feedback, rest.reason].find((v) => typeof v === "string" && v) as string | undefined;
-    delete rest.feedback;
-    delete rest.reason;
-    return (
-      <div className="mx-4 mt-3 space-y-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
-        <p className="text-sm font-medium text-red-900">
-          {stageLabel}: {String(payload.type).replaceAll("_", " ")}
-        </p>
-        {text && <p className="text-xs text-red-800">{text}</p>}
-        {Object.keys(rest).length > 0 && (
-          <pre className="max-h-40 overflow-auto whitespace-pre-wrap text-xs text-red-800">
-            {JSON.stringify(rest, null, 2)}
-          </pre>
-        )}
-        {/* Scalar resume on purpose: an empty object is classified by LangGraph as an empty
-            resume MAP, delivering no value -- the interrupt would re-raise forever. */}
-        <button
-          className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
-          onClick={() => done("retry")}
-        >
-          Acknowledge &amp; retry
-        </button>
-      </div>
-    );
-  }
-
-  // Requirements-as-single-source-of-truth (user ruling 2026-08-31, extended to Plan 2026-08-31):
-  // neither the Specification nor the Plan gate has a Reject/feedback box -- change requests
-  // belong in the requirements document, and the Requirements tab's Submit (live while either
-  // gate is open) resolves the OPEN gate with the revised doc. For Plan specifically, that
-  // resolve also carries graph.py's GraphState.restart_from_specification signal so the redraft
-  // cascades through Specification first (Plan's own draft is built from the approved spec, not
-  // raw requirements directly -- a plain loop-back-to-Plan's-own-draft would leave the revision
-  // unreflected in what Plan actually reads); see make_route_after_gate's own docstring.
-  if (stageKey === "specification" || stageKey === "plan") { // stage-literal-ok: InterruptCard source-of-truth copy
-    const derivationCopy =
-      stageKey === "specification" // stage-literal-ok: InterruptCard source-of-truth copy
-        ? "this specification — and every plan, test, and line of code after it — is derived from that document alone"
-        : "this plan is derived from the approved Specification, which is itself derived from that document alone";
-    return (
-      <div className="mx-4 mt-3 flex items-center justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
-        <span className="text-sm text-amber-900">
-          The <strong>{stageLabel}</strong> is ready for your review. Your{" "}
-          <strong>Requirements document is the single source of truth</strong>: {derivationCopy}. Nothing
-          you want will make it into the product unless it&apos;s written there. To change anything here,
-          don&apos;t comment — edit the document on the Requirements tab and resubmit; {stageKey === "plan" /* stage-literal-ok: InterruptCard source-of-truth copy */ ? "the specification and this plan are" : "the specification is"}{" "}
-          redrafted from it, and every question it answers is traced back to your wording.
-        </span>
-        <button
-          className="shrink-0 rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
-          onClick={() => done({ decision: "approved" })}
-        >
-          Approve
-        </button>
-      </div>
-    );
-  }
-
+/** The open review's card (review_view.py builds title/body/actions; this paints them). Every
+ * button posts its action id; the server maps it to the graph's resume value. */
+function ReviewCard() {
+  const { review, submitting, error, submit } = useReview();
+  // The reviewer's text (reject feedback). AppShell keys this component by review id, so each
+  // review starts empty.
+  const [text, setText] = useState("");
+  if (!review.open || !review.card) return null;
+  const tone = REVIEW_TONE[review.tone ?? "review"];
+  const blocked = review.blocked ?? null;
   return (
-    <div className="mx-4 mt-3 space-y-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+    <div className={`mx-4 mt-3 space-y-2 rounded-lg border px-4 py-3 ${tone.box}`}>
       <div className="flex items-center justify-between gap-4">
-        <span className="text-sm text-amber-900">
-          The <strong>{stageLabel}</strong> is ready for your review.
-        </span>
+        <div className={`space-y-1 text-sm ${tone.text}`}>
+          {review.title && <p className="font-medium">{review.title}</p>}
+          {(review.body?.length ?? 0) > 0 && (
+            <p className={review.title ? "text-xs" : undefined}>
+              {review.body?.map((s, i) => (s.bold ? <strong key={i}>{s.text}</strong> : <Fragment key={i}>{s.text}</Fragment>))}
+            </p>
+          )}
+        </div>
         <div className="flex shrink-0 gap-2">
-          <button
-            className="rounded-lg bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white"
-            onClick={() => done({ decision: "approved" })}
-          >
-            Approve
-          </button>
-          <button
-            className="rounded-lg border border-red-300 bg-white px-4 py-1.5 text-sm font-medium text-red-700 disabled:cursor-not-allowed disabled:opacity-40"
-            disabled={!feedback.trim()}
-            title={feedback.trim() ? undefined : "Add feedback below to explain what should change"}
-            onClick={() => done({ decision: "rejected", feedback: feedback.trim() })}
-          >
-            Reject
-          </button>
+          {review.actions?.map((a) => {
+            const missingText = a.needs_text && !text.trim();
+            return (
+              <button
+                key={a.id}
+                type="button"
+                className={`rounded-lg px-4 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 ${ACTION_CLASS[a.style] ?? ACTION_CLASS.primary}`}
+                disabled={!a.enabled || submitting || missingText}
+                title={missingText ? (a.hint ?? undefined) : undefined}
+                onClick={() => void submit(a.id, a.needs_text ? text.trim() : undefined)}
+              >
+                {a.label}
+              </button>
+            );
+          })}
         </div>
       </div>
-      {/* Required to reject (Ruling 3) -- the redraft this feeds (graph.py's make_gate_node ->
-          the stage's own draft node) has nothing to act on otherwise. */}
-      <textarea
-        className="w-full rounded-md border border-amber-300 bg-white px-2 py-1 text-sm text-neutral-900 outline-none placeholder:text-neutral-400"
-        rows={2}
-        placeholder="What should change before this is approved? (required to reject)"
-        value={feedback}
-        onChange={(event) => setFeedback(event.target.value)}
-      />
+      {review.details && (
+        <pre className={`max-h-40 overflow-auto whitespace-pre-wrap text-xs ${tone.text}`}>{review.details}</pre>
+      )}
+      {review.input && (
+        <textarea
+          className={`w-full rounded-md border bg-white px-2 py-1 text-sm text-neutral-900 outline-none placeholder:text-neutral-400 ${tone.input}`}
+          rows={2}
+          placeholder={review.input.placeholder}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+        />
+      )}
+      {(blocked || error) && <p className="text-xs text-neutral-600">{error ?? blocked}</p>}
     </div>
   );
 }

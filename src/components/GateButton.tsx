@@ -4,6 +4,7 @@ import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import { useEffect, useMemo, useState } from "react";
 import { usePipeline } from "@/lib/pipeline";
 import { useRunActivity } from "@/lib/run-activity-context";
+import { useOptionalSandboxStatus } from "@/lib/sandbox-status-context";
 import { useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 
@@ -87,16 +88,19 @@ const COLUMN_CLASS: Record<string, string> = {
 const REFETCH_DEBOUNCE_MS = 300;
 
 /** Fetches `url` (JSON) and refetches, debounced, whenever the run changes: the AG-UI state
- * object, run status, run-event count or the durable row's run activity / current stage. Only
+ * object, run status, run-event count, the durable row's run activity / current stage / open
+ * review, or the sandbox status (a review's actions unblock once the sandbox is up). Only
  * identities/counts are used as change signals -- nothing here reads what the state contains.
- * Keeps the last good response. */
-function useGateFetch<T>(url: string): T | null {
+ * Keeps the last good response. Also backs the review view model (review-context.tsx). */
+export function useGateFetch<T>(url: string): T | null {
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const eventCount = useStructuralRunEvents().length;
   const [runActivity] = useRunActivity();
   const runActive = runActivity?.runActive;
   const currentStage = runActivity?.currentStage;
+  const reviewId = runActivity?.reviewId;
+  const sandboxStatus = useOptionalSandboxStatus()?.[0];
   const { state, isRunning } = agent;
   const [data, setData] = useState<T | null>(null);
   useEffect(() => {
@@ -113,7 +117,7 @@ function useGateFetch<T>(url: string): T | null {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [url, state, isRunning, eventCount, runActive, currentStage]);
+  }, [url, state, isRunning, eventCount, runActive, currentStage, reviewId, sandboxStatus]);
   return data;
 }
 
