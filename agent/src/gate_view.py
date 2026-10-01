@@ -64,6 +64,7 @@ GATE_TEXT: dict[str, Any] = {
         "no_sandbox": "cannot verify (no sandbox)",
         "advisory_failure": "advisory failure",
         "approved_earlier": "approved earlier, not re-verified",
+        "awaiting_approval": "checks passed, waiting for your approval",
     },
     "icon_badge": {"off": "", "unknown": "?", "not_run": "", "verifying": "…", "passed": "", "failed": "✕", "warn": "!"},
     "icon_aria": "{name} verification: {policy}, {status}",
@@ -163,7 +164,12 @@ def _stage_view(spec: Any, state: dict[str, Any], mode: str | None, running: dic
     elif verdict is not None and verdict.get("cannot_verify"):
         status, text = "warn", T["no_sandbox"]
     elif verdict is not None and verdict.get("passed"):
-        status = "passed"
+        # The icon shows work going THROUGH the gate: a human-gated stage whose checks passed but
+        # that the reviewer hasn't approved yet hasn't gone through -- amber, the reviewer's turn.
+        if spec.requires_human_gate and st.get("status") != "approved":
+            status, text = "warn", T["awaiting_approval"]
+        else:
+            status = "passed"
     elif verdict is not None:
         status, text = ("warn", T["advisory_failure"]) if policy == "advisory" else ("failed", None)
     elif policy == "off":
@@ -590,7 +596,10 @@ def _demo() -> None:
     assert icon(plan, {"status": "drafting"}, running={"plan": "verify"})[0] == "verifying"
     assert icon(plan, {"status": "drafting"}, running={"plan": "draft"})[0] == "not_run"
     assert icon(plan, {"last_verification": {"passed": False, "cannot_verify": True}}) == ("warn", I["no_sandbox"])
-    assert icon(plan, {"last_verification": {"passed": True}}) == ("passed", I["passed"])
+    assert icon(plan, {"status": "approved", "last_verification": {"passed": True}}) == ("passed", I["passed"])
+    assert icon(plan, {"status": "ready_for_review", "last_verification": {"passed": True}}) == ("warn", I["awaiting_approval"])
+    assert not code.gate is None and not code.requires_human_gate
+    assert icon(code, {"status": "ready_for_review", "last_verification": {"passed": True}})[0] == "passed"
     assert icon(plan, {"last_verification": {"passed": False}}) == ("failed", I["failed"])
     adv_spec, adv_mode = next((s, m) for s in p.stages if s.gate for m, pol in s.gate.policy.items() if pol == "advisory")
     assert icon(adv_spec, {"last_verification": {"passed": False}}, mode=adv_mode) == ("warn", I["advisory_failure"])
