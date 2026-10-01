@@ -114,12 +114,11 @@ export function useGateSummaries(): Map<string, GateSummary> {
  * currentColor, so the tone classes above tint it. */
 function GateArrowIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 38 20" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinejoin="round" className={className} aria-hidden>
+    <svg viewBox="0 -0.5 38 21.5" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinejoin="round" className={className} aria-hidden>
       {/* arrow: shaft into a head */}
       <path d="M1 8h23V4l13 6-13 6v-4H1z" />
-      {/* gate: a slanted frame with vertical slats, drawn over the shaft */}
-      <path d="M11 4.5 17 1.5v16L11 19.5z" />
-      <path d="M13 3.5v15M15 2.5v15" />
+      {/* gate: a solid slanted slab, drawn over (and hiding) the shaft where they cross */}
+      <path d="M11 3.75 17 0.7V18.3L11 20.25z" fill="currentColor" />
     </svg>
   );
 }
@@ -139,7 +138,7 @@ export function GateButton({ summary, active, onSelect }: { summary: GateSummary
         active ? "bg-neutral-100 ring-2 ring-neutral-900" : ""
       }`}
     >
-      <GateArrowIcon className="h-[18.4px] w-[35px]" />
+      <GateArrowIcon className="h-[19.8px] w-[35px]" />
       {badge && (
         <span aria-hidden className="absolute -right-0.5 -bottom-0.5 text-[9px] leading-none font-bold">
           {badge}
