@@ -3,7 +3,6 @@
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import { Shield, ShieldAlert, ShieldBan, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { deriveGateRows, type GateRow, type GateVerdict, type ReportedCheck, type RowTone } from "@/lib/gate-rows";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { usePipeline, type GatePolicy, type Pipeline, type PipelineStage } from "@/lib/pipeline";
@@ -91,30 +90,17 @@ function stageView(
   return { stage, policy, stageState, verdict, lap, maxLaps, status, statusText: statusText ?? STATUS_LOOK[status].text };
 }
 
-/** The gate icon between stage tabs, and its per-check dialog (plan §6). */
-export function GateButton({
-  stages,
-  codeGenMode,
-  label,
-  owner,
-  repo,
-}: {
-  stages: PipelineStage[];
-  codeGenMode: string | null;
-  /** The tab's label, used when the tab gates more than one stage. */
-  label: string;
-  owner: string;
-  repo: string;
-}) {
+/** Live per-stage gate state for a tab's gated stages, shared by the tab-strip icon and the gate
+ * screen so both always agree. */
+function useGateViews(stages: PipelineStage[], codeGenMode: string | null, label: string) {
   const pipeline = usePipeline();
-  const { localAgentId, threadId } = useWorkflowThread();
+  const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const state = (agent.state ?? {}) as WorkflowState;
   const [runActivity] = useRunActivity();
   const sharedPhases = useRunningPhases();
   const phases = runActivity?.runActive === false ? EMPTY_PHASES : sharedPhases;
   const { interrupt } = useOpenInterrupt();
-  const [open, setOpen] = useState(false);
 
   // A tab can gate an optional stage (brownfield-spec on Specification) that most sessions never
   // run; intake still creates its StageState as not_started. Once a sibling has progressed, an
@@ -139,56 +125,67 @@ export function GateButton({
     ),
   );
   const worst = views.reduce((a, b) => (STATUS_RANK.indexOf(b.status) > STATUS_RANK.indexOf(a.status) ? b : a));
-  const look = STATUS_LOOK[worst.status];
   const name = shown.length === 1 ? shown[0].label : label;
   const policyText = [...new Set(views.map((v) => v.policy ?? "mode unknown"))].join("/");
-  const aria = `${name} verification: ${policyText}, ${worst.statusText}`;
+  return { views, worst, name, aria: `${name} verification: ${policyText}, ${worst.statusText}` };
+}
 
+/** The gate between stage tabs: a tab in its own right -- selecting it shows GateView. */
+export function GateButton({
+  stages,
+  codeGenMode,
+  label,
+  active,
+  onSelect,
+}: {
+  stages: PipelineStage[];
+  codeGenMode: string | null;
+  /** The tab's label, used when the tab gates more than one stage. */
+  label: string;
+  active: boolean;
+  onSelect: () => void;
+}) {
+  const { worst, aria } = useGateViews(stages, codeGenMode, label);
+  const look = STATUS_LOOK[worst.status];
   return (
-    <>
-      <button
-        type="button"
-        aria-label={aria}
-        title={aria}
-        onClick={() => setOpen(true)}
-        className={`relative flex shrink-0 items-center rounded-md p-1 hover:bg-neutral-100 ${look.className}`}
-      >
-        <look.Icon className="size-4" aria-hidden />
-        {look.badge && (
-          <span aria-hidden className="absolute -right-0.5 -bottom-0.5 text-[9px] leading-none font-bold">
-            {look.badge}
-          </span>
-        )}
-      </button>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="sm:max-w-5xl max-h-[85vh] overflow-auto">
-          <DialogHeader>
-            <DialogTitle>{name} verification</DialogTitle>
-            <DialogDescription>
-              Every deterministic check this gate runs, and what the latest (or a past) attempt recorded.
-            </DialogDescription>
-          </DialogHeader>
-          {open && <GateDialogBody views={views} codeGenMode={codeGenMode} threadId={threadId} owner={owner} repo={repo} />}
-        </DialogContent>
-      </Dialog>
-    </>
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      aria-label={aria}
+      title={aria}
+      onClick={onSelect}
+      className={`relative flex shrink-0 items-center rounded-md p-1 hover:bg-neutral-100 ${look.className} ${
+        active ? "bg-neutral-100 ring-2 ring-neutral-900" : ""
+      }`}
+    >
+      <look.Icon className="size-4" aria-hidden />
+      {look.badge && (
+        <span aria-hidden className="absolute -right-0.5 -bottom-0.5 text-[9px] leading-none font-bold">
+          {look.badge}
+        </span>
+      )}
+    </button>
   );
 }
 
-/** Mounted only while the dialog is open, so history + insights are fetched once per open. */
-function GateDialogBody({
-  views,
+/** The gate's screen. Mounted only while its tab is selected, so attempt history and repo
+ * insights are re-fetched each time it is opened. */
+export function GateView({
+  stages,
   codeGenMode,
-  threadId,
+  label,
   owner,
   repo,
 }: {
-  views: StageView[];
+  stages: PipelineStage[];
   codeGenMode: string | null;
-  threadId: string;
+  label: string;
   owner: string;
   repo: string;
 }) {
+  const { views, name } = useGateViews(stages, codeGenMode, label);
+  const { threadId } = useWorkflowThread();
   const [history, setHistory] = useState<VerifyAttempt[] | null>(null);
   const [insights, setInsights] = useState<VerifyInsights | null>(null);
   useEffect(() => {
@@ -207,7 +204,13 @@ function GateDialogBody({
   }, [threadId, owner, repo]);
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-6 p-6">
+      <header>
+        <h2 className="text-lg font-semibold">{name} verification</h2>
+        <p className="text-sm text-neutral-600">
+          Every deterministic check this gate runs, and what the latest (or a past) attempt recorded.
+        </p>
+      </header>
       {views.map((v) => (
         <StageSection
           key={v.stage.key}

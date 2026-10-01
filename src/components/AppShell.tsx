@@ -10,7 +10,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "
 import { useRouter } from "next/navigation";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
-import { GateSlot } from "@/components/GateSlot";
+import { GatePanel, GateSlot, gateViewId } from "@/components/GateSlot";
 import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
@@ -727,8 +727,13 @@ export function AppShell({
                   dot={dots[tab.id]}
                   onClick={() => setActiveView(tab.id)}
                 />
-                {/* Seam for the gate icon between this tab and the next (GateSlot.tsx). */}
-                <GateSlot tab={tab} codeGenMode={codeGenMode} owner={owner} repo={repo} />
+                {/* The gate between this tab and the next is a tab too (GateSlot.tsx). */}
+                <GateSlot
+                  tab={tab}
+                  codeGenMode={codeGenMode}
+                  active={activeView === gateViewId(tab)}
+                  onSelect={() => setActiveView(gateViewId(tab))}
+                />
               </Fragment>
             ))}
           </div>
@@ -881,6 +886,15 @@ export function AppShell({
               {(VIEWS[tab.view] ?? GenericStageView)(tab, viewContext)}
             </div>
           ))}
+          {/* Gate screens mount only while selected: they hold no live-run state to keep warm, and
+              remounting re-fetches attempt history. */}
+          {tabs.map((tab) =>
+            activeView === gateViewId(tab) ? (
+              <div key={gateViewId(tab)} role="tabpanel">
+                <GatePanel tab={tab} codeGenMode={codeGenMode} owner={owner} repo={repo} />
+              </div>
+            ) : null,
+          )}
         </main>
       </div>
     </InterruptProvider>
