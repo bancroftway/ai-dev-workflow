@@ -2,21 +2,33 @@
 
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import { useEffect, useMemo, useState } from "react";
+import { usePipeline } from "@/lib/pipeline";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 
-// The verification gates are built server-side (agent/src/gate_view.py, GET
-// /sessions/{id}/gates[/{tabId}]). This file only renders what it receives: it knows no stage,
-// check or status -- the one thing it maps is a tone/style name to CSS classes.
+// The tab strip and the verification gates are built server-side (agent/src/gate_view.py, GET
+// /sessions/{id}/tabs and /gates/{tabId}). This file only renders what it receives: it knows no
+// stage, check or status -- the one thing it maps is a tone/style name to CSS classes.
 
 type IconTone = "passed" | "failed" | "warn" | "verifying" | "not_run" | "off" | "unknown";
 type CellTone = "pass" | "fail" | "warn" | "muted";
+export type TabTone = "done" | "error" | "awaiting" | "running" | "none";
 
-/** One entry of GET /sessions/{id}/gates. */
-export interface GateSummary {
+interface GateIcon {
+  tone: IconTone;
+  badge: string;
+  label: string;
+}
+
+/** One entry of GET /sessions/{id}/tabs, in the descriptor's tab order. */
+export interface StripTab {
   tab_id: string;
-  icon: { tone: IconTone; badge: string; label: string };
+  label: string;
+  enabled: boolean;
+  tone: TabTone;
+  /** The gate after this tab; null when it gates nothing. */
+  gate: { icon: GateIcon } | null;
 }
 
 interface GateCell {
@@ -75,14 +87,16 @@ const COLUMN_CLASS: Record<string, string> = {
 const REFETCH_DEBOUNCE_MS = 300;
 
 /** Fetches `url` (JSON) and refetches, debounced, whenever the run changes: the AG-UI state
- * object, run status, run-event count or run activity. Only identities/counts are used as change
- * signals -- nothing here reads what the state contains. Keeps the last good response. */
+ * object, run status, run-event count or the durable row's run activity / current stage. Only
+ * identities/counts are used as change signals -- nothing here reads what the state contains.
+ * Keeps the last good response. */
 function useGateFetch<T>(url: string): T | null {
   const { localAgentId } = useWorkflowThread();
   const { agent } = useAgent({ agentId: localAgentId, updates: [UseAgentUpdate.OnStateChanged, UseAgentUpdate.OnRunStatusChanged] });
   const eventCount = useStructuralRunEvents().length;
   const [runActivity] = useRunActivity();
   const runActive = runActivity?.runActive;
+  const currentStage = runActivity?.currentStage;
   const { state, isRunning } = agent;
   const [data, setData] = useState<T | null>(null);
   useEffect(() => {
@@ -99,15 +113,20 @@ function useGateFetch<T>(url: string): T | null {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [url, state, isRunning, eventCount, runActive]);
+  }, [url, state, isRunning, eventCount, runActive, currentStage]);
   return data;
 }
 
-/** Every gate's tab-strip icon, keyed by tab id; a tab missing from the map gates nothing. */
-export function useGateSummaries(): Map<string, GateSummary> {
+/** The tab strip as the server built it. Until the first response arrives: the descriptor's tabs,
+ * only the first one open, no tone and no gates -- never a guessed colour. */
+export function useTabStrip(): StripTab[] {
   const { threadId } = useWorkflowThread();
-  const body = useGateFetch<{ gates: GateSummary[] }>(`/api/sessions/${encodeURIComponent(threadId)}/gates`);
-  return useMemo(() => new Map((body?.gates ?? []).map((g) => [g.tab_id, g])), [body]);
+  const { tabs } = usePipeline();
+  const body = useGateFetch<{ tabs: StripTab[] }>(`/api/sessions/${encodeURIComponent(threadId)}/tabs`);
+  return useMemo(
+    () => body?.tabs ?? tabs.map((t, i): StripTab => ({ tab_id: t.id, label: t.label, enabled: i === 0, tone: "none", gate: null })),
+    [body, tabs],
+  );
 }
 
 /** An arrow passing through a slatted gate -- the work passing a stage's checks. Stroke uses
@@ -124,8 +143,8 @@ function GateArrowIcon({ className }: { className?: string }) {
 }
 
 /** The gate between stage tabs: a tab in its own right -- selecting it shows GateView. */
-export function GateButton({ summary, active, onSelect }: { summary: GateSummary; active: boolean; onSelect: () => void }) {
-  const { tone, badge, label } = summary.icon;
+export function GateButton({ icon, active, onSelect }: { icon: GateIcon; active: boolean; onSelect: () => void }) {
+  const { tone, badge, label } = icon;
   return (
     <button
       type="button"

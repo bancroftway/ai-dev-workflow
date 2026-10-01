@@ -6,7 +6,7 @@ const NO_STORE = { "Cache-Control": "no-store" };
 
 /**
  * One verification gate's ready-to-render screen (agent/src/gate_view.py), proxying the agent's
- * `GET /sessions/{session_id}/gates/{tab_id}?attempt=`. Same auth shape as the sibling gates
+ * `GET /sessions/{session_id}/gates/{tab_id}?attempt=`. Same auth shape as the sibling tabs
  * route; the agent's 404 (a tab that gates nothing) passes through as 404.
  */
 export async function GET(

@@ -38,10 +38,9 @@ export interface PipelineTab {
   /** View-registry key (AppShell's VIEWS); an unknown key renders the generic stage view. */
   view: string;
   label: string;
-  /** Stage keys that must all be approved before this tab opens. */
+  /** Stage keys that must all be approved before this tab opens (the server decides enabled;
+   * AppShell reads this only to tell "waiting on the human" from "interrupted"). */
   enable_after: string[];
-  /** Top-level WorkflowState keys whose presence opens this tab. */
-  enable_state_keys: string[];
   /** "<stage_key>:<status>" transitions that auto-focus this tab. */
   focus_on: string[];
   stages: PipelineStage[];
@@ -118,45 +117,22 @@ export function makePipeline(d: PipelineDescriptor) {
       if (stageOrderIndex(failureStage) >= 0) return failureStage;
       return d.failure_stage_map[failureStage] ?? null;
     },
-    /** This stage's gate policy under `mode`; undefined when the stage has no gate or the mode
-     * isn't known yet (render neutral then). */
-    gatePolicyFor: (stageKey: string, mode: string | null | undefined): GatePolicy | undefined =>
-      mode ? stages.get(stageKey)?.gate?.policy[mode] : undefined,
   };
 }
 
 export type Pipeline = ReturnType<typeof makePipeline>;
 
-const PipelineContext = createContext<{ pipeline: Pipeline; sessionCodeGenMode: string | null } | null>(null);
+const PipelineContext = createContext<Pipeline | null>(null);
 
-export function PipelineProvider({
-  descriptor,
-  codeGenMode,
-  children,
-}: {
-  descriptor: PipelineDescriptor;
-  /** The session row's code_gen_mode (null before the session exists) -- live state's own
-   * code_gen_mode wins over it (useCodeGenMode). */
-  codeGenMode: string | null;
-  children: ReactNode;
-}) {
-  const value = useMemo(
-    () => ({ pipeline: makePipeline(descriptor), sessionCodeGenMode: codeGenMode }),
-    [descriptor, codeGenMode],
-  );
-  return <PipelineContext.Provider value={value}>{children}</PipelineContext.Provider>;
+export function PipelineProvider({ descriptor, children }: { descriptor: PipelineDescriptor; children: ReactNode }) {
+  const pipeline = useMemo(() => makePipeline(descriptor), [descriptor]);
+  return <PipelineContext.Provider value={pipeline}>{children}</PipelineContext.Provider>;
 }
 
 export function usePipeline(): Pipeline {
-  const ctx = useContext(PipelineContext);
-  if (!ctx) throw new Error("usePipeline must be used inside <PipelineProvider>");
-  return ctx.pipeline;
-}
-
-/** Prefer the live graph state's mode, fall back to the session row's; null = not known yet. */
-export function useCodeGenMode(stateMode: string | null | undefined): string | null {
-  const sessionMode = useContext(PipelineContext)?.sessionCodeGenMode;
-  return stateMode ?? sessionMode ?? null;
+  const pipeline = useContext(PipelineContext);
+  if (!pipeline) throw new Error("usePipeline must be used inside <PipelineProvider>");
+  return pipeline;
 }
 
 // Client-only pages with no server parent to fetch for them (board, session lists): one shared

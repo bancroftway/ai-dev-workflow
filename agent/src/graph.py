@@ -187,9 +187,9 @@ class StageState(TypedDict):
     # own field, not a reuse of last_verification/last_verify_feedback above: those two belong to
     # the deterministic_verify retry/stall machinery (make_verify_node/make_route_after_verify/
     # should_skip_draft all read them for that purpose, for specification/plan too, which already
-    # have a deterministic_verify of their own), and AppShell's stageGroupDot paints a tab's dot
-    # red when last_verification says failed -- a human politely asking for a revision is not the
-    # same signal as a script-detected failure, and must not light that same error dot. Folded
+    # have a deterministic_verify of their own), and the tab strip (gate_view._tab_tone) paints a
+    # tab red when last_verification says failed -- a human politely asking for a revision is not the
+    # same signal as a script-detected failure, and must not light that same error colour. Folded
     # into the next draft prompt (_build_tech_stack_prompt/_build_specification_prompt/
     # _build_plan_prompt) as reviewer guidance; cleared back to None the moment the stage is
     # actually approved. Only ever set for the 3 requires_human_gate=True stages.
@@ -5511,7 +5511,7 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     spec_stage["status"] = "drafting"
                     stages["specification"] = spec_stage
                     # `rejected["status"]` was just set to "needs_clarification" above, which the
-                    # tab-pill dot (AppShell.tsx's stageGroupDot) renders identically to
+                    # tab strip's tone (gate_view._tab_tone) renders identically to
                     # "ready_for_review" -- amber, "awaiting a human". Wrong here: the human
                     # already resubmitted: Plan isn't waiting on anyone, it's stale and about to
                     # be redrafted once Specification re-approves. "not_started" is what

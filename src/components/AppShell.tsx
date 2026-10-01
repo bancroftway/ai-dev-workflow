@@ -10,7 +10,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "
 import { useRouter } from "next/navigation";
 import { BuildView } from "@/components/BuildView";
 import { ContainerStatusButton } from "@/components/ContainerStatus";
-import { GateButton, GateView, gateViewId, useGateSummaries } from "@/components/GateButton";
+import { GateButton, GateView, gateViewId, useTabStrip, type TabTone } from "@/components/GateButton";
 import { LiveCostChip } from "@/components/LiveCostChip";
 import { MetricsBar, type MetricThresholds } from "@/components/MetricsBar";
 import { PlanView } from "@/components/PlanView";
@@ -23,7 +23,7 @@ import { TechStackView } from "@/components/TechStackView";
 import { RunningSpinner, Spinner } from "@/components/Spinner";
 import { terminateSession } from "@/lib/agent-client";
 import { InterruptProvider, useOpenInterrupt, type InterruptVerification } from "@/lib/interrupt-context";
-import { useCodeGenMode, usePipeline, type PipelineTab } from "@/lib/pipeline";
+import { usePipeline, type PipelineTab } from "@/lib/pipeline";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 import { useRunActivity } from "@/lib/run-activity-context";
@@ -31,57 +31,14 @@ import { EMPTY_STAGES, useRunningStages, useStructuralRunEvents } from "@/lib/us
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { EscalationPayload, MergeReadinessReport, WorkflowState } from "@/lib/workflow-types";
 
-type DotState = "running" | "done" | "error" | "awaiting";
-
-// Stage status as the tab label's own colour (no separate dot); same green/red/amber as the gate
-// icons. Lighter tints on the active tab's dark background. "running" keeps its spinner instead.
-const LABEL_CLASS: Record<Exclude<DotState, "running">, { idle: string; active: string }> = {
+// The server's tab tone (gate_view._tab_tone) as the tab label's own colour; same
+// green/red/amber as the gate icons. Lighter tints on the active tab's dark background.
+// "running" shows a spinner instead; "none" keeps the default colour.
+const LABEL_CLASS: Partial<Record<TabTone, { idle: string; active: string }>> = {
   awaiting: { idle: "text-amber-600", active: "text-amber-300" },
   done: { idle: "text-emerald-600", active: "text-emerald-300" },
   error: { idle: "text-red-600", active: "text-red-300" },
 };
-
-/** Dot for a tab, derived from its stages' ordinary StageStates. Green dots
- * intentionally clear on resubmission: intake resets later stages to not_started on each fresh
- * run, and the dots simply reflect that.
- *
- * `runningStages` (computeRunningStages, use-run-events.ts) backstops `status === "drafting"`:
- * a non-gated stage (ac-to-tests, minimal-code-to-green, ...) cycles through "ready_for_review"
- * between verify attempts -- a generic status name the backend reuses for "draft phase done"
- * regardless of whether a human is involved -- so relying on `status` alone showed a stage that
- * was actively retrying as "awaiting" almost the entire time (user feedback 2026-09-01). Checked
- * FIRST: the live event stream is more current than state, which only pushes on a gate pause. */
-function stageGroupDot(
-  state: WorkflowState,
-  keys: string[],
-  runningStages: Set<string>,
-  // A failed verification under an ADVISORY gate policy (e.g. metrics-exit's in yolo) doesn't
-  // block the run, so it must not paint the tab red.
-  isAdvisory: (stageKey: string) => boolean,
-): DotState | undefined {
-  // Checked before the stages.length guard below: mid-run reattach (user feedback 2026-09-01)
-  // means `state.stages` can be completely empty for a while even though the run is genuinely
-  // active -- the event stream still knows, so this must not wait on stage state existing at all.
-  if (keys.some((k) => runningStages.has(k))) return "running";
-  const present = keys.filter((k) => state.stages?.[k] != null);
-  const stages = present.map((k) => state.stages![k]);
-  if (stages.length === 0) return undefined;
-  if (stages.some((s) => s.status === "drafting")) return "running";
-  if (stages.some((s) => s.status === "ready_for_review" || s.status === "needs_clarification")) return "awaiting";
-  const failed = (k: string) => {
-    const s = state.stages![k];
-    return Boolean(s.last_verification && !s.last_verification.passed && s.status !== "approved");
-  };
-  if (present.some((k) => failed(k) && !isAdvisory(k))) return "error";
-  if (stages.every((s) => s.status === "approved")) return "done";
-  return undefined;
-}
-
-/** Tabs whose content is a human-reviewed draft: they open once a draft is actually ready for
- * review (ever_ready_for_review / clarifying questions), not merely while it's drafting -- the
- * durable fallback is current_stage having moved PAST the tab's last stage. Keyed by view (the
- * bespoke component), not by stage key. */
-const REVIEW_GATED_VIEWS = new Set(["specification", "plan"]); // stage-literal-ok: review-gated bespoke views
 
 type ViewContext = {
   owner: string;
@@ -211,10 +168,10 @@ export function AppShell({
   };
 
   const state = (agent.state ?? {}) as WorkflowState;
-  // Live state's own mode wins; the session row's is the fallback; null = not known yet.
-  const codeGenMode = useCodeGenMode(state.code_gen_mode);
   const runEvents = useStructuralRunEvents();
-  const gates = useGateSummaries();
+  // Each tab's label, enabled flag, status tone and gate icon -- decided server-side.
+  const tabStrip = useTabStrip();
+  const enabled = useMemo(() => Object.fromEntries(tabStrip.map((t) => [t.tab_id, t.enabled])), [tabStrip]);
   const sharedRunningStages = useRunningStages();
   const runningStages = runActivity?.runActive === false ? EMPTY_STAGES : sharedRunningStages;
   // Always-fresh handle for effects below whose own deps intentionally exclude `state` (recreating
@@ -226,7 +183,7 @@ export function AppShell({
 
   // Focus follows the pipeline (user ask 2026-08-31): when a stage starts needing the user (a
   // gate opens) or a new phase begins, switch to its tab instead of making the user chase the
-  // amber dot. Two modes:
+  // amber tab label. Two modes:
   //  - TRANSITION: a stage's status changed this mount -> jump to the mapped tab.
   //  - FIRST LOAD (no previous statuses seen): land on the most relevant tab for the state as
   //    hydrated -- a returning user opens where the action is, not on the Tech Stack default.
@@ -553,20 +510,6 @@ export function AppShell({
   const runFailed = durableRow?.status === "failed";
   const canReattach = !runFailed && Boolean(durableRow?.container_alive);
 
-  // Requirement (root-caused 2026-09-12, non-negotiable): once a stage has ever executed, its tab
-  // must never become disabled again, regardless of the run's CURRENT status. Every durable-truth
-  // fallback in this file used to gate on `isReattaching`, which itself requires
-  // `durableRow?.status === "in_progress"` -- so every one of them went dead the instant status
-  // left "in_progress" (failed/completed), which is exactly what silently re-disabled every tab
-  // on this exact session after it stopped. `durableRow.current_stage` is a monotonic fact (only
-  // ever advances, on a stage's own approval) that stays true forever regardless of what the run
-  // is doing right now -- unlike isReattaching, which intentionally resets once status leaves
-  // in_progress and must keep doing so for its own (unrelated) "Reconnecting…" banner.
-  function durableStageAtLeast(target: string | undefined): boolean {
-    if (target == null) return false;
-    return stageOrderIndex(durableRow?.current_stage) >= stageOrderIndex(target);
-  }
-
   // Requirement (root-caused 2026-09-12): "Resume picks up from the last checkpoint" named no
   // actual checkpoint -- a user had no way to tell what that even meant. Same lookup the reattach
   // banner just below already uses.
@@ -623,38 +566,6 @@ export function AppShell({
     },
   });
 
-  // Tab enabled rule -- one generic rule over each backend tab's stages. Reattach relaxation
-  // (fold-in fixes 2026-09-11/12): each stage's own live fields are empty for the whole mid-run
-  // reattach gap, so `runningStages` (event stream, approval-independent) and the durable
-  // current_stage (monotonic, survives failed/completed) each open a tab on their own. Once a
-  // stage has ever executed, its tab must never become disabled again.
-  //  - the first (landing) tab and stage-less tabs (Overview) are always open;
-  //  - review-gated views (Specification, Plan) wait for a draft actually ready for review, or a
-  //    durable current_stage PAST the tab's last stage (current_stage == X can mean "X drafting");
-  //  - every other tab opens when any of its stages has a status past not_started (intake
-  //    pre-creates every stage at not_started), is running, or current_stage reached its first
-  //    stage; or once all of enable_after are approved (Requirements: tech-stack-first); or once
-  //    one of its bespoke enable_state_keys is present (Quality: test_hardening/metrics_report).
-  function tabEnabled(tab: PipelineTab, index: number): boolean {
-    if (index === 0 || tab.stages.length === 0) return true;
-    const keys = tab.stages.map((st) => st.key);
-    const stageOf = (k: string) => state.stages?.[k];
-    const readyForReview = keys.some(
-      (k) => Boolean(stageOf(k)?.ever_ready_for_review) || Boolean(stageOf(k)?.clarifying_questions?.length),
-    );
-    if (REVIEW_GATED_VIEWS.has(tab.view)) {
-      return readyForReview || durableStageAtLeast(pipeline.nextStageAfter(keys[keys.length - 1]));
-    }
-    return (
-      readyForReview ||
-      keys.some((k) => (stageOf(k)?.status ?? "not_started") !== "not_started") ||
-      keys.some((k) => runningStages.has(k)) ||
-      durableStageAtLeast(keys[0]) ||
-      (tab.enable_after.length > 0 && tab.enable_after.every((k) => stageOf(k)?.status === "approved")) ||
-      tab.enable_state_keys.some((k) => (state as Record<string, unknown>)[k] != null)
-    );
-  }
-  const enabled: Record<string, boolean> = Object.fromEntries(tabs.map((t, i) => [t.id, tabEnabled(t, i)]));
   const buildTab = tabs.find((t) => t.view === "build");
   const buildTabEnabled = buildTab != null && enabled[buildTab.id];
 
@@ -662,24 +573,26 @@ export function AppShell({
   // never fights a manual tab click made while that stage keeps running -- found live 2026-09-01:
   // landed on Plan while Build was active) switches to its tab, if that tab is open. Catches the
   // non-gated stages that spend most of their active time in "ready_for_review" between verify
-  // attempts rather than "drafting" (the status-cycling flaw stageGroupDot backstops too), so
-  // they win the landing race against a same-tick stale gate. Furthest newly-running stage wins.
-  const enabledRef = useRef(enabled);
-  useEffect(() => {
-    enabledRef.current = enabled;
-  });
+  // attempts rather than "drafting", so they win the landing race against a same-tick stale gate.
+  // Furthest newly-running stage wins. The server's tab strip trails the event stream by one
+  // refetch, so a newly-running stage whose tab isn't open YET stays pending until it opens (or
+  // the stage stops running) instead of the edge being lost.
   const prevRunningRef = useRef<Set<string>>(EMPTY_STAGES);
+  const pendingRunningRef = useRef<string[]>([]);
   useEffect(() => {
     const prev = prevRunningRef.current;
     prevRunningRef.current = runningStages;
-    const target = [...runningStages]
-      .filter((k) => !prev.has(k))
+    const pending = [...pendingRunningRef.current, ...[...runningStages].filter((k) => !prev.has(k))].filter((k) =>
+      runningStages.has(k),
+    );
+    const target = pending
       .sort((a, b) => stageOrderIndex(b) - stageOrderIndex(a))
       .map((k) => tabForStage(k))
-      .find((t) => t != null && enabledRef.current[t.id]);
+      .find((t) => t != null && enabled[t.id]);
+    pendingRunningRef.current = target ? [] : pending;
     // setState-in-effect: reacting to the live event stream (an external store).
     if (target) setActiveView(target.id);
-  }, [runningStages, stageOrderIndex, tabForStage]);
+  }, [runningStages, enabled, stageOrderIndex, tabForStage]);
 
   // Stable reference across unrelated re-renders (ReportView is React.memo'd) -- a plain inline
   // `.map()` in the JSX below would allocate a new array every AppShell render regardless of
@@ -689,10 +602,6 @@ export function AppShell({
     [state.e2e?.screenshots, owner, repo, workBranch],
   );
 
-  const isAdvisory = (k: string) => pipeline.gatePolicyFor(k, codeGenMode) === "advisory";
-  const dots: Record<string, DotState | undefined> = Object.fromEntries(
-    tabs.map((t) => [t.id, stageGroupDot(state, t.stages.map((st) => st.key), runningStages, isAdvisory)]),
-  );
   const stageKeys = useMemo(
     () => Object.fromEntries(tabs.map((t) => [t.id, t.stages.map((st) => st.key)])),
     [tabs],
@@ -720,22 +629,22 @@ export function AppShell({
         )}
         <nav className="flex items-center gap-1 overflow-x-auto border-b border-neutral-200 px-4 py-2">
           <div role="tablist" className="flex items-center gap-[6.8px]">
-            {tabs.map((tab) => (
-              <Fragment key={tab.id}>
+            {tabStrip.map((tab) => (
+              <Fragment key={tab.tab_id}>
                 <TabButton
                   label={tab.label}
-                  active={activeView === tab.id}
-                  disabled={!enabled[tab.id]}
-                  dot={dots[tab.id]}
-                  onClick={() => setActiveView(tab.id)}
+                  active={activeView === tab.tab_id}
+                  disabled={!tab.enabled}
+                  tone={tab.tone}
+                  onClick={() => setActiveView(tab.tab_id)}
                 />
                 {/* The gate between this tab and the next is a tab too; the server says which tabs
                     gate something (GateButton.tsx). */}
-                {gates.has(tab.id) && (
+                {tab.gate && (
                   <GateButton
-                    summary={gates.get(tab.id)!}
-                    active={activeView === gateViewId(tab.id)}
-                    onSelect={() => setActiveView(gateViewId(tab.id))}
+                    icon={tab.gate.icon}
+                    active={activeView === gateViewId(tab.tab_id)}
+                    onSelect={() => setActiveView(gateViewId(tab.tab_id))}
                   />
                 )}
               </Fragment>
@@ -892,10 +801,10 @@ export function AppShell({
           ))}
           {/* Gate screens mount only while selected: they hold no live-run state to keep warm, and
               remounting re-fetches attempt history. */}
-          {tabs.map((tab) =>
-            activeView === gateViewId(tab.id) && gates.has(tab.id) ? (
-              <div key={gateViewId(tab.id)} role="tabpanel">
-                <GateView tabId={tab.id} />
+          {tabStrip.map((tab) =>
+            activeView === gateViewId(tab.tab_id) && tab.gate ? (
+              <div key={gateViewId(tab.tab_id)} role="tabpanel">
+                <GateView tabId={tab.tab_id} />
               </div>
             ) : null,
           )}
@@ -1055,15 +964,16 @@ function TabButton({
   label,
   active,
   disabled,
-  dot,
+  tone,
   onClick,
 }: {
   label: string;
   active: boolean;
   disabled?: boolean;
-  dot?: DotState;
+  tone: TabTone;
   onClick: () => void;
 }) {
+  const toneClass = LABEL_CLASS[tone];
   return (
     <button
       type="button"
@@ -1072,14 +982,14 @@ function TabButton({
       className={[
         "flex shrink-0 items-center whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium",
         active ? "bg-neutral-900" : "hover:bg-neutral-100",
-        dot && dot !== "running" ? LABEL_CLASS[dot][active ? "active" : "idle"] : active ? "text-white" : "text-neutral-700",
+        toneClass ? toneClass[active ? "active" : "idle"] : active ? "text-white" : "text-neutral-700",
         disabled ? "cursor-not-allowed opacity-40 hover:bg-transparent" : "",
       ].join(" ")}
       disabled={disabled}
       onClick={onClick}
     >
       {label}
-      {dot === "running" ? (
+      {tone === "running" ? (
         // A spinning icon, not just another colored dot -- an amber "awaiting" dot and a blue
         // "running" dot are too close in a quick glance at 8px (user feedback 2026-09-01: "unclear
         // which stage is running"). Shape + motion reads unambiguously where hue alone didn't.

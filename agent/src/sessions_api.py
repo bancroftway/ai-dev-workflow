@@ -926,7 +926,7 @@ async def stream_session_events(session_id: str, _row: dict[str, Any] = Depends(
 
 
 async def _gate_inputs(session_id: str, request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
-    """(session row, gate_view kwargs) shared by the two /gates endpoints. Same auth/404 shape as
+    """(session row, gate_view kwargs) shared by /tabs and /gates/{tab_id}. Same auth/404 shape as
     get_session_events. Graph state is the checkpoint peek get_checkpoint_state makes; pending
     interrupt payloads (tech-stack's reopened-gate verdict) come off the same snapshot; the running
     "verify" phase is the old frontend rule over dbo.run_events, gated on run_activity exactly as
@@ -947,11 +947,13 @@ async def _gate_inputs(session_id: str, request: Request) -> tuple[dict[str, Any
     }
 
 
-@router.get("/{session_id}/gates")
-async def get_gate_summaries(session_id: str, request: Request) -> dict[str, Any]:
-    """The tab-strip icon of every verification gate (gate_view.build_gate_summaries)."""
-    _row, inputs = await _gate_inputs(session_id, request)
-    return gate_view.build_gate_summaries(**inputs)
+@router.get("/{session_id}/tabs")
+async def get_tab_strip(session_id: str, request: Request) -> dict[str, Any]:
+    """The stage tab strip -- each tab's enabled flag, status tone and gate icon
+    (gate_view.build_tab_strip). current_stage is the durable row's: it opens tabs during the
+    mid-run reattach gap and after a run stops."""
+    row, inputs = await _gate_inputs(session_id, request)
+    return gate_view.build_tab_strip(**inputs, current_stage=row.get("current_stage"))
 
 
 @router.get("/{session_id}/gates/{tab_id}")

@@ -1,12 +1,15 @@
-"""The gate screens' view model, built server-side so the frontend only renders it.
+"""The stage tab strip's and gate screens' view models, built server-side so the frontend only
+renders them.
 
-Every rule for what a verification gate shows -- the tab-strip icon's look and each check row's
-status/text/tone -- lives here (it used to live in src/lib/gate-rows.ts and GateButton.tsx). The
-frontend iterates columns/sections/groups/rows/cells and maps a `tone` to a CSS class; it knows
-nothing about stages, checks or statuses.
+Every rule for what the tab strip and a verification gate show -- whether a tab is open, its
+status tone, the gate icon's look and each check row's status/text/tone -- lives here (it used to
+live in AppShell.tsx, src/lib/gate-rows.ts and GateButton.tsx). The frontend iterates
+tabs/columns/sections/groups/rows/cells and maps a `tone` to a CSS class; it knows nothing about
+stages, checks or statuses.
 
-Pure: callers (sessions_api's /sessions/{id}/gates endpoints) gather the graph state, pending
-interrupt payloads, running phases, attempt history and repo insights and pass them in.
+Pure: callers (sessions_api's /sessions/{id}/tabs and /gates/{tab_id} endpoints) gather the graph
+state, the session row's current_stage, pending interrupt payloads, running phases, attempt
+history and repo insights and pass them in.
 
 `cd agent && uv run python -m src.gate_view`.
 """
@@ -197,25 +200,123 @@ def _gate_views(tab: TabSpec, state: dict[str, Any], mode: str | None, running: 
     return views, (shown[0].label if len(shown) == 1 else tab.label)
 
 
-def build_gate_summaries(
+def _gate_icon(tab: TabSpec, state: dict[str, Any], mode: str | None, running: dict[str, str], interrupts: list[Any], pipeline: Pipeline) -> dict[str, Any] | None:
+    """The tab-strip icon of the gate after `tab`; None when the tab gates nothing."""
+    built = _gate_views(tab, state, mode, running, interrupts, pipeline)
+    if built is None:
+        return None
+    views, name = built
+    worst = max(views, key=lambda v: _STATUS_RANK.index(v["status"]))  # first max wins
+    policies = list(dict.fromkeys(v["policy"] or GATE_TEXT["policy_unknown"] for v in views))
+    label = GATE_TEXT["icon_aria"].format(name=name, policy="/".join(policies), status=worst["status_text"])
+    return {"icon": {"tone": worst["status"], "badge": GATE_TEXT["icon_badge"][worst["status"]], "label": label}}
+
+
+def _order_index(key: str | None, pipeline: Pipeline) -> int:
+    """Position in run order; legacy keys sort after every real stage (an old session's "exit"
+    still reads as past metrics-exit); -1 for anything unknown. Purely ordinal."""
+    if not key:
+        return -1
+    if key in pipeline.order:
+        return pipeline.order.index(key)
+    legacy = list(pipeline.legacy_labels)
+    return len(pipeline.order) + legacy.index(key) if key in legacy else -1
+
+
+def _tab_tone(tab: TabSpec, state: dict[str, Any], mode: str | None, running: dict[str, str], pipeline: Pipeline) -> str:
+    """The tab label's status colour. Green clears on resubmission: intake resets later stages to
+    not_started on each fresh run.
+
+    Running (the event stream) is checked first, before any stage state need exist: a mid-run
+    reattach can leave `stages` empty while the run is genuinely active, and a non-gated stage
+    cycles through ready_for_review between verify attempts, so `status` alone would read
+    "awaiting" while it retries. A failed verdict under an advisory policy doesn't block the run,
+    so it doesn't paint the tab red."""
+    if any(k in running for k in tab.stage_keys):
+        return "running"
+    stages = state.get("stages") or {}
+    present = [(k, stages[k]) for k in tab.stage_keys if stages.get(k) is not None]
+    if not present:
+        return "none"
+    statuses = [s.get("status") for _, s in present]
+    if "drafting" in statuses:
+        return "running"
+    if any(st in ("ready_for_review", "needs_clarification") for st in statuses):
+        return "awaiting"
+
+    def blocking_failure(key: str, s: dict[str, Any]) -> bool:
+        verdict = s.get("last_verification")
+        if verdict is None or verdict.get("passed") or s.get("status") == "approved":
+            return False
+        spec = pipeline.stage(key)
+        return not (mode and spec is not None and spec.gate is not None and spec.gate.policy.get(mode) == "advisory")
+
+    if any(blocking_failure(k, s) for k, s in present):
+        return "error"
+    return "done" if all(st == "approved" for st in statuses) else "none"
+
+
+def _tab_enabled(tab: TabSpec, index: int, state: dict[str, Any], running: dict[str, str], current_stage: str | None, pipeline: Pipeline) -> bool:
+    """Whether the tab can be opened. Once a stage has ever executed its tab never closes again,
+    whatever the run is doing now: the durable current_stage (monotonic, survives failed/completed)
+    and the running phases (the event stream) each open a tab on their own, since a stage's own
+    state is empty for the whole mid-run reattach gap.
+     - the first (landing) tab and stage-less tabs (Overview) are always open;
+     - enable_on_review tabs wait for a draft actually ready for review (or clarifying questions),
+       or a current_stage PAST the tab's last stage (current_stage == X can mean "X drafting");
+     - every other tab opens on that same readiness, on any of its stages past not_started (intake
+       pre-creates every stage at not_started), running, or reached by current_stage; once all of
+       enable_after are approved (Requirements: tech stack first); or once one of its
+       enable_state_keys is present (Quality: test_hardening/metrics_report)."""
+    if index == 0 or not tab.stage_keys:
+        return True
+    keys = tab.stage_keys
+    stages = state.get("stages") or {}
+    reached = _order_index(current_stage, pipeline)
+
+    def stage(k: str) -> dict[str, Any]:
+        return stages.get(k) or {}
+
+    def durable_at_least(target: str | None) -> bool:
+        return target is not None and reached >= _order_index(target, pipeline)
+
+    ready = any(stage(k).get("ever_ready_for_review") or stage(k).get("clarifying_questions") for k in keys)
+    if tab.enable_on_review:
+        last = pipeline.order.index(keys[-1]) if keys[-1] in pipeline.order else -1
+        after_last = pipeline.order[last + 1] if 0 <= last < len(pipeline.order) - 1 else None
+        return bool(ready) or durable_at_least(after_last)
+
+    def started(k: str) -> bool:
+        status = stage(k).get("status")
+        return (status if status is not None else "not_started") != "not_started"
+
+    return bool(
+        ready
+        or any(started(k) for k in keys)
+        or any(k in running for k in keys)
+        or durable_at_least(keys[0])
+        or (tab.enable_after and all(stage(k).get("status") == "approved" for k in tab.enable_after))
+        or any(state.get(k) is not None for k in tab.enable_state_keys)
+    )
+
+
+def build_tab_strip(
     state: dict[str, Any], *, code_gen_mode: str | None, running: dict[str, str], interrupts: list[Any],
-    pipeline: Pipeline = PIPELINE,
+    current_stage: str | None, pipeline: Pipeline = PIPELINE,
 ) -> dict[str, Any]:
-    """The tab-strip icon of every tab that gates something."""
-    gates = []
-    for tab in pipeline.tabs:
-        built = _gate_views(tab, state, code_gen_mode, running, interrupts, pipeline)
-        if built is None:
-            continue
-        views, name = built
-        worst = max(views, key=lambda v: _STATUS_RANK.index(v["status"]))  # first max wins
-        policies = list(dict.fromkeys(v["policy"] or GATE_TEXT["policy_unknown"] for v in views))
-        label = GATE_TEXT["icon_aria"].format(name=name, policy="/".join(policies), status=worst["status_text"])
-        gates.append({
+    """The stage tab strip in descriptor order: each tab's label, whether it can be opened, its
+    status tone (done/error/awaiting/running/none) and the icon of the gate after it (None when it
+    gates nothing). `current_stage` is the durable session row's."""
+    return {"tabs": [
+        {
             "tab_id": tab.id,
-            "icon": {"tone": worst["status"], "badge": GATE_TEXT["icon_badge"][worst["status"]], "label": label},
-        })
-    return {"gates": gates}
+            "label": tab.label,
+            "enabled": _tab_enabled(tab, i, state, running, current_stage, pipeline),
+            "tone": _tab_tone(tab, state, code_gen_mode, running, pipeline),
+            "gate": _gate_icon(tab, state, code_gen_mode, running, interrupts, pipeline),
+        }
+        for i, tab in enumerate(pipeline.tabs)
+    ]}
 
 
 def _derive_rows(
@@ -512,27 +613,105 @@ def _demo() -> None:
     assert running_phases(events + [ev("r2", "plan", "verify", "node_finished")], None) == {"spec": "draft"}
     assert running_phases(events, False) == {}
 
-    # -- summaries --
+    # -- tab strip: gate icons --
     stages = {k: {"status": "not_started", "last_verification": None} for k in p.order}
     stages["plan"] = {"status": "approved", "last_verification": {"passed": True, "checks": []}}
     stages["specification"] = {"status": "drafting", "last_verification": {"passed": False, "checks": [], "feedback": "fix it"}, "verify_cycle_count": 2, "max_verify_cycles": 3}
     state = {"stages": stages}
-    summ = build_gate_summaries(state, code_gen_mode="draft_verify", running={}, interrupts=[])
-    json.dumps(summ)
-    by_tab = {g["tab_id"]: g["icon"] for g in summ["gates"]}
+
+    def strip(st: dict[str, Any], *, mode: str | None = "draft_verify", running: dict[str, str] | None = None,
+              current_stage: str | None = None) -> dict[str, dict[str, Any]]:
+        built = build_tab_strip(st, code_gen_mode=mode, running=running or {}, interrupts=[], current_stage=current_stage)
+        json.dumps(built)
+        assert [t["tab_id"] for t in built["tabs"]] == [t.id for t in p.tabs], "descriptor order"
+        assert all(set(t) == {"tab_id", "label", "enabled", "tone", "gate"} for t in built["tabs"])
+        return {t["tab_id"]: t for t in built["tabs"]}
+
+    summ = strip(state)
+    by_tab = {k: t["gate"]["icon"] for k, t in summ.items() if t["gate"] is not None}
     gated_tabs = {t.id for t in p.tabs if any(p.stage(k) and p.stage(k).gate for k in t.stage_keys)}  # type: ignore[union-attr]
     assert set(by_tab) == gated_tabs and {"tech-stack", "specification", "plan", "tests", "code", "quality", "report"} <= gated_tabs, by_tab
+    assert summ["requirements"]["gate"] is None and summ["overview"]["gate"] is None
+    assert summ["plan"]["label"] == "Plan"
     assert by_tab["plan"]["tone"] == "passed" and by_tab["plan"]["badge"] == ""
     assert by_tab["specification"]["tone"] == "failed" and by_tab["specification"]["badge"] == "✕"
     # Untouched optional brownfield-spec is dropped: the label names the one shown stage.
     assert by_tab["specification"]["label"].startswith(p.stage("specification").label + " verification"), by_tab  # type: ignore[union-attr]
     assert by_tab["tests"]["tone"] == "not_run"
-    busy = build_gate_summaries(state, code_gen_mode="draft_verify", running={"plan": "verify"}, interrupts=[])
-    assert next(g for g in busy["gates"] if g["tab_id"] == "plan")["icon"]["tone"] == "verifying"
+    assert strip(state, running={"plan": "verify"})["plan"]["gate"]["icon"]["tone"] == "verifying"
     # All stages untouched -> every gated stage listed (Quality's two stages -> the tab's label).
-    fresh = build_gate_summaries({"stages": {}}, code_gen_mode=None, running={}, interrupts=[])
-    quality = next(g for g in fresh["gates"] if g["tab_id"] == "quality")["icon"]
+    quality = strip({"stages": {}}, mode=None)["quality"]["gate"]["icon"]
     assert quality["tone"] == "unknown" and quality["label"].startswith("Quality verification: mode unknown,"), quality
+
+    # -- tab strip: enabled + tone (the frontend's old tabEnabled/stageGroupDot) --
+    def enabled(**kw: Any) -> set[str]:
+        return {k for k, t in strip(**kw).items() if t["enabled"]}
+
+    def tones(**kw: Any) -> dict[str, str]:
+        return {k: t["tone"] for k, t in strip(**kw).items()}
+
+    first, *_ = p.tabs
+    stageless = {t.id for t in p.tabs if not t.stage_keys}
+    # Fresh session: only the landing tab and stage-less tabs (Overview) open; no colours.
+    assert enabled(st={}) == {first.id} | stageless == {"tech-stack", "overview"}
+    assert set(tones(st={}).values()) == {"none"}
+    pristine = {"stages": {k: {"status": "not_started"} for k in p.order}}
+    assert enabled(st=pristine) == {first.id} | stageless and set(tones(st=pristine).values()) == {"none"}
+    # The first tab is open even when nothing about it says so.
+    assert "tech-stack" in enabled(st={"stages": {"tech-stack": {"status": "not_started"}}})
+    # Tech stack first: Requirements opens once tech-stack is approved (enable_after), not before.
+    ts_review = {"stages": {**pristine["stages"], "tech-stack": {"status": "ready_for_review"}}}
+    assert "requirements" not in enabled(st=ts_review) and tones(st=ts_review)["tech-stack"] == "awaiting"
+    ts_done = {"stages": {**pristine["stages"], "tech-stack": {"status": "approved", "last_verification": {"passed": True}}}}
+    assert "requirements" in enabled(st=ts_done)
+    assert tones(st=ts_done)["tech-stack"] == "done" and tones(st=ts_done)["requirements"] == "none"
+    # Spec/Plan (enable_on_review) wait for a draft ready for review: drafting alone keeps them
+    # shut (though running-toned), unlike an ordinary tab (Tests) which opens while drafting.
+    spec_drafting = {"stages": {**ts_done["stages"], "specification": {"status": "drafting"}}}
+    assert "specification" not in enabled(st=spec_drafting) and tones(st=spec_drafting)["specification"] == "running"
+    assert "specification" not in enabled(st=spec_drafting, running={"specification": "draft"})
+    assert "tests" in enabled(st={"stages": {"ac-to-tests": {"status": "drafting"}}})
+    spec_ready = {"stages": {**ts_done["stages"], "specification": {"status": "ready_for_review", "ever_ready_for_review": True}}}
+    assert "specification" in enabled(st=spec_ready) and tones(st=spec_ready)["specification"] == "awaiting"
+    # ...ever_ready_for_review survives a redraft; clarifying questions open it too (amber).
+    assert "specification" in enabled(st={"stages": {"specification": {"status": "drafting", "ever_ready_for_review": True}}})
+    clarify = {"stages": {"plan": {"status": "needs_clarification", "clarifying_questions": ["q?"]}}}
+    assert "plan" in enabled(st=clarify) and tones(st=clarify)["plan"] == "awaiting"
+    assert "plan" not in enabled(st={"stages": {"plan": {"status": "needs_clarification", "clarifying_questions": []}}})
+    # ...or current_stage PAST the tab's last stage (current_stage == plan can mean "plan drafting").
+    assert "specification" not in enabled(st={}, current_stage="specification")
+    assert {"specification"} <= enabled(st={}, current_stage="plan") and "plan" not in enabled(st={}, current_stage="plan")
+    # Quality/Report open on their enable_state_keys alone.
+    assert "quality" in enabled(st={"test_hardening": {}}) and "report" not in enabled(st={"test_hardening": {}})
+    assert {"quality", "report"} <= enabled(st={"metrics_report": {"x": 1}})
+    assert "quality" not in enabled(st={"test_hardening": None})
+    # Report: done only once approved; a failed verdict is red under a blocking policy, not under
+    # an advisory one, and never once approved.
+    report_key = next(t for t in p.tabs if t.id == "report").stage_keys[0]
+    adv_mode = next(m for m, pol in p.stage(report_key).gate.policy.items() if pol == "advisory")  # type: ignore[union-attr]
+    blk_mode = next(m for m, pol in p.stage(report_key).gate.policy.items() if pol == "blocking")  # type: ignore[union-attr]
+    failed_exit = {"stages": {report_key: {"status": "not_started", "last_verification": {"passed": False}}}}
+    assert tones(st=failed_exit, mode=blk_mode)["report"] == "error"
+    assert tones(st=failed_exit, mode=adv_mode)["report"] == "none"
+    assert tones(st=failed_exit, mode=None)["report"] == "error", "mode unknown -> not advisory"
+    assert tones(st={"stages": {report_key: {"status": "approved", "last_verification": {"passed": False}}}}, mode=blk_mode)["report"] == "done"
+    assert tones(st={"stages": {report_key: {"status": "approved"}}})["report"] == "done"
+    # Quality is done only when every present stage is approved.
+    q_half = {"stages": {"remediation": {"status": "approved"}, "adversarial-compliance": {"status": "not_started"}}}
+    assert tones(st=q_half)["quality"] == "none"
+    assert tones(st={"stages": {"remediation": {"status": "approved"}}})["quality"] == "done", "absent stages don't count"
+    # Running wins: over an approved stage, and with no stage state at all (mid-run reattach),
+    # where it also opens an ordinary tab.
+    assert tones(st=ts_done, running={"tech-stack": "verify"})["tech-stack"] == "running"
+    assert tones(st={}, running={"minimal-code-to-green": "draft"})["code"] == "running"
+    assert "code" in enabled(st={}, running={"minimal-code-to-green": "draft"})
+    assert tones(st={"stages": {"remediation": {"status": "approved"}, "adversarial-compliance": {"status": "drafting"}}})["quality"] == "running"
+    # Durable current_stage (reattach gap: no stage state yet) opens every tab it has reached,
+    # and a legacy "exit" sorts past every real stage.
+    reattached = enabled(st={}, current_stage="minimal-code-to-green")
+    assert {"requirements", "specification", "plan", "tests", "code"} <= reattached and not {"quality", "report"} & reattached, reattached
+    assert enabled(st={}, current_stage="exit") == {t.id for t in p.tabs}
+    assert enabled(st={}, current_stage="unknown-stage") == {first.id} | stageless
 
     # -- screens --
     assert build_gate_screen(state, "nope", code_gen_mode="draft_verify", running={}, interrupts=[], attempts=[], insights=None) is None

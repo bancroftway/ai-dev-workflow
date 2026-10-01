@@ -131,9 +131,8 @@ export default async function WorkflowPage({
         <SandboxStatusProvider>
           <RunActivityProvider>
             {/* Above AppShell (and so above its InterruptProvider) and SandboxSessionBoot's mode
-                picker alike. The session row's code_gen_mode is the fallback until live state
-                carries its own. */}
-            <PipelineProvider descriptor={pipeline} codeGenMode={sessionRow?.code_gen_mode ?? null}>
+                picker alike. */}
+            <PipelineProvider descriptor={pipeline}>
                 {/* The page shell (header, frozen/scroll split) lives once in root layout now -- this
                     is just this route's own content, filling whatever height that shell hands it. */}
                 <div className="flex h-full w-full flex-col">

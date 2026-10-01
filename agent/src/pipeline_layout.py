@@ -26,13 +26,15 @@ class TabSpec:
     stage_keys: tuple[str, ...]
     enable_after: tuple[str, ...] = ()  # stage keys that must be approved before the tab opens
     enable_state_keys: tuple[str, ...] = ()  # top-level state keys whose presence opens the tab
+    # A human-reviewed draft: the tab opens once a draft is ready for review (or current_stage has
+    # moved past its last stage), not merely while drafting (gate_view._tab_enabled).
+    enable_on_review: bool = False
     # "<stage_key>:<status>" transitions that auto-focus this tab (AppShell's old RULES table).
     focus_on: tuple[str, ...] = ()
 
     def describe(self, stages: dict[str, dict[str, Any]]) -> dict[str, Any]:
         return {
-            "id": self.id, "view": self.view, "label": self.label,
-            "enable_after": list(self.enable_after), "enable_state_keys": list(self.enable_state_keys),
+            "id": self.id, "view": self.view, "label": self.label, "enable_after": list(self.enable_after),
             "focus_on": list(self.focus_on), "stages": [stages[k] for k in self.stage_keys],
         }
 
@@ -120,8 +122,9 @@ PIPELINE = Pipeline(
         TabSpec("requirements", "requirements", "Requirements", ("raw-requirements",),
                 enable_after=("tech-stack",), focus_on=("tech-stack:approved",)),
         TabSpec("specification", "specification", "Specification", ("brownfield-spec", "specification"),
-                focus_on=("specification:ready_for_review",)),
-        TabSpec("plan", "plan", "Plan", ("brownfield-plan", "plan"), focus_on=("plan:ready_for_review",)),
+                enable_on_review=True, focus_on=("specification:ready_for_review",)),
+        TabSpec("plan", "plan", "Plan", ("brownfield-plan", "plan"), enable_on_review=True,
+                focus_on=("plan:ready_for_review",)),
         TabSpec("tests", "build", "Tests", ("ac-to-tests",), focus_on=("ac-to-tests:drafting",)),
         TabSpec("code", "build", "Code", ("minimal-code-to-green",)),
         TabSpec("quality", "quality", "Quality", ("remediation", "adversarial-compliance"),
@@ -243,6 +246,10 @@ def _demo() -> None:
     assert sorted(p.order) == sorted(all_keys), f"order must cover every stage once: {p.order}"
     for t in p.tabs:
         assert set(t.enable_after) <= all_keys, t.id
+        # Only a human-gated stage is ever "ready for review"; without one the tab would open
+        # solely on the durable current_stage fallback.
+        if t.enable_on_review:
+            assert any((s := p.stage(k)) and s.requires_human_gate for k in t.stage_keys), t.id
 
     for s in p.stages:
         assert s.label, f"{s.key}: StageSpec needs a label"
