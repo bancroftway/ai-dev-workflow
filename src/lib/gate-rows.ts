@@ -1,6 +1,12 @@
 // Pure row-state derivation for the gate dialog (GateButton.tsx, plan §6). No React, no runtime
 // imports -- scripts/check-gate-rows.mjs runs this file directly under Node's type stripping.
-import type { GatePolicy, PipelineCheck } from "@/lib/pipeline";
+// All user-visible copy comes from the backend descriptor (pipeline_layout.GATE_TEXT).
+import type { GatePolicy, GateText, PipelineCheck } from "@/lib/pipeline";
+
+/** Fills `{name}` placeholders in a descriptor gate_text template. */
+export function fmt(template: string, vars: Record<string, string | number>): string {
+  return template.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m));
+}
 
 /** One reported check row, as the agent's CheckLog records it (agent/src/gates/checks.py). */
 export interface ReportedCheck {
@@ -52,14 +58,16 @@ export interface GateRowInput {
   /** Live stage status; null when drawing a history attempt. */
   stageStatus: string | null;
   lap: number;
+  /** The descriptor's gate_text.row_status: the Status column's copy. */
+  text: GateText["row_status"];
 }
 
-const REPORTED: Record<ReportedCheck["status"], { text: string; tone: RowTone }> = {
-  passed: { text: "Passed", tone: "pass" },
-  failed: { text: "Failed", tone: "fail" },
-  infra: { text: "Couldn't run (platform issue)", tone: "warn" },
-  skipped: { text: "Skipped", tone: "muted" },
-  advisory: { text: "Heads-up (doesn't block)", tone: "warn" },
+const REPORTED_TONE: Record<ReportedCheck["status"], RowTone> = {
+  passed: "pass",
+  failed: "fail",
+  infra: "warn",
+  skipped: "muted",
+  advisory: "warn",
 };
 
 function isBlockingFailure(r: ReportedCheck, catalog: Map<string, PipelineCheck>): boolean {
@@ -67,11 +75,12 @@ function isBlockingFailure(r: ReportedCheck, catalog: Map<string, PipelineCheck>
 }
 
 export function deriveGateRows(input: GateRowInput): GateRow[] {
-  const { verdict, policy, modeLabel, auditOn, stageStatus, lap } = input;
+  const { verdict, policy, modeLabel, auditOn, stageStatus, lap, text: T } = input;
+  const reportedShown = (s: ReportedCheck["status"]) => ({ text: T[s], tone: REPORTED_TONE[s] });
   const reported = new Map((verdict?.checks ?? []).map((r) => [r.id, r] as const));
   const catalog = new Map([...input.wrapperChecks, ...input.checks].map((c) => [c.id, c] as const));
   const redraft = verdict != null && !verdict.passed && stageStatus === "drafting";
-  const lapNote = redraft ? `lap ${lap} (redraft in progress)` : null;
+  const lapNote = redraft ? fmt(T.lap_note, { lap }) : null;
 
   // A reported blocking failure stops the chain: a wrapper failure stops every stage row; a stage
   // failure stops the stage rows after it (catalog order).
@@ -83,24 +92,19 @@ export function deriveGateRows(input: GateRowInput): GateRow[] {
 
   function unreported(c: PipelineCheck, index: number, group: GateRow["group"]): Pick<GateRow, "state" | "text" | "tone"> {
     if (verdict) {
-      if (verdict.cannot_verify) return { state: "no_sandbox", text: "Not run: no sandbox", tone: "warn" };
+      if (verdict.cannot_verify) return { state: "no_sandbox", text: T.no_sandbox, tone: "warn" };
       if (!("checks" in verdict) || verdict.checks == null)
-        return {
-          state: "no_detail",
-          text: `${verdict.passed ? "Passed" : "Failed"}, no per-check detail recorded`,
-          tone: "muted",
-        };
-      if (c.needs_audit && auditOn === false) return { state: "audit_off", text: "Skipped: no audit", tone: "muted" };
+        return { state: "no_detail", text: verdict.passed ? T.no_detail_passed : T.no_detail_failed, tone: "muted" };
+      if (c.needs_audit && auditOn === false) return { state: "audit_off", text: T.audit_off, tone: "muted" };
       const reached = group === "stage" ? !wrapperStopped && !(index > firstStageStop) : true;
-      if (!reached) return { state: "not_reached", text: "Not reached (an earlier check stopped it)", tone: "muted" };
-      return { state: "not_recorded", text: "Not recorded", tone: "muted" };
+      if (!reached) return { state: "not_reached", text: T.not_reached, tone: "muted" };
+      return { state: "not_recorded", text: T.not_recorded, tone: "muted" };
     }
     if (policy === "off")
-      return { state: "policy_off", text: `Skipped: not enforced in ${modeLabel ?? "this mode"}`, tone: "muted" };
-    if (stageStatus === "approved")
-      return { state: "approved_earlier", text: "Approved earlier, not re-verified this run", tone: "muted" };
-    if (c.needs_audit && auditOn === false) return { state: "audit_off", text: "Skipped: no audit", tone: "muted" };
-    return { state: "will_run", text: "Will run", tone: "muted" };
+      return { state: "policy_off", text: fmt(T.policy_off, { mode: modeLabel ?? T.policy_off_mode_fallback }), tone: "muted" };
+    if (stageStatus === "approved") return { state: "approved_earlier", text: T.approved_earlier, tone: "muted" };
+    if (c.needs_audit && auditOn === false) return { state: "audit_off", text: T.audit_off, tone: "muted" };
+    return { state: "will_run", text: T.will_run, tone: "muted" };
   }
 
   function row(c: PipelineCheck, index: number, group: GateRow["group"]): GateRow {
@@ -108,7 +112,7 @@ export function deriveGateRows(input: GateRowInput): GateRow[] {
     const base = { id: c.id, label: c.label, description: c.description, mode: c.mode, condition: c.condition, group, lapNote };
     if (!r) return { ...base, ...unreported(c, index, group), detail: null, source: null, uncatalogued: false };
     // An advisory-mode check's failure doesn't block: amber, not red.
-    const shown = r.status === "failed" && c.mode === "advisory" ? { text: "Heads-up (doesn't block)", tone: "warn" as const } : REPORTED[r.status];
+    const shown = r.status === "failed" && c.mode === "advisory" ? { text: T.advisory_failed, tone: "warn" as const } : reportedShown(r.status);
     return { ...base, state: r.status, ...shown, detail: r.detail, source: r.source, uncatalogued: !!r.uncatalogued };
   }
 
@@ -121,7 +125,7 @@ export function deriveGateRows(input: GateRowInput): GateRow[] {
     if (catalog.has(r.id)) continue;
     rows.push({
       id: r.id, label: r.id, description: "", mode: "", condition: "", group: "uncatalogued", lapNote,
-      state: r.status, ...REPORTED[r.status], detail: r.detail, source: r.source, uncatalogued: true,
+      state: r.status, ...reportedShown(r.status), detail: r.detail, source: r.source, uncatalogued: true,
     });
   }
   return rows;

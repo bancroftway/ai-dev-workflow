@@ -2,7 +2,7 @@
 
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
 import { useEffect, useState } from "react";
-import { deriveGateRows, type GateRow, type GateVerdict, type ReportedCheck, type RowTone } from "@/lib/gate-rows";
+import { deriveGateRows, fmt, type GateRow, type GateVerdict, type ReportedCheck, type RowTone } from "@/lib/gate-rows";
 import { useOpenInterrupt } from "@/lib/interrupt-context";
 import { usePipeline, type GatePolicy, type Pipeline, type PipelineStage } from "@/lib/pipeline";
 import { useRunActivity } from "@/lib/run-activity-context";
@@ -48,14 +48,15 @@ function GateArrowIcon({ className }: { className?: string }) {
   );
 }
 
-const STATUS_LOOK: Record<GateStatus, { text: string; badge: string; className: string }> = {
-  off: { text: "not enforced", badge: "", className: "text-neutral-400 opacity-50" },
-  unknown: { text: "mode not known yet", badge: "?", className: "text-neutral-500" },
-  not_run: { text: "not run yet", badge: "", className: "text-neutral-400" },
-  verifying: { text: "verifying", badge: "…", className: "text-blue-600 animate-pulse" },
-  passed: { text: "passed", badge: "✓", className: "text-green-600" },
-  failed: { text: "failed", badge: "✕", className: "text-red-600" },
-  warn: { text: "needs attention", badge: "!", className: "text-amber-600" },
+// Status text comes from the descriptor's gate_text.icon_status; only glyphs and colours live here.
+const STATUS_LOOK: Record<GateStatus, { badge: string; className: string }> = {
+  off: { badge: "", className: "text-neutral-400 opacity-50" },
+  unknown: { badge: "?", className: "text-neutral-500" },
+  not_run: { badge: "", className: "text-neutral-400" },
+  verifying: { badge: "…", className: "text-blue-600 animate-pulse" },
+  passed: { badge: "✓", className: "text-green-600" },
+  failed: { badge: "✕", className: "text-red-600" },
+  warn: { badge: "!", className: "text-amber-600" },
 };
 
 const TONE_CLASS: Record<RowTone, string> = {
@@ -90,17 +91,18 @@ function stageView(
   const verdict = interruptVerdict?.verdict ?? stageState?.last_verification ?? null;
   const lap = interruptVerdict?.attempts ?? stageState?.verify_cycle_count ?? 0;
   const maxLaps = interruptVerdict?.max ?? stageState?.max_verify_cycles ?? 0;
+  const T = pipeline.descriptor.gate_text.icon_status;
   let status: GateStatus;
   let statusText: string | undefined;
   if (verifying) status = "verifying";
-  else if (verdict?.cannot_verify) [status, statusText] = ["warn", "cannot verify (no sandbox)"];
+  else if (verdict?.cannot_verify) [status, statusText] = ["warn", T.no_sandbox];
   else if (verdict?.passed) status = "passed";
-  else if (verdict) [status, statusText] = policy === "advisory" ? ["warn", "advisory failure"] : ["failed", undefined];
+  else if (verdict) [status, statusText] = policy === "advisory" ? ["warn", T.advisory_failure] : ["failed", undefined];
   else if (policy === "off") status = "off";
   else if (policy === undefined) status = "unknown";
-  else if (stageState?.status === "approved") [status, statusText] = ["not_run", "approved earlier, not re-verified"];
+  else if (stageState?.status === "approved") [status, statusText] = ["not_run", T.approved_earlier];
   else status = "not_run";
-  return { stage, policy, stageState, verdict, lap, maxLaps, status, statusText: statusText ?? STATUS_LOOK[status].text };
+  return { stage, policy, stageState, verdict, lap, maxLaps, status, statusText: statusText ?? T[status] };
 }
 
 /** Live per-stage gate state for a tab's gated stages, shared by the tab-strip icon and the gate
@@ -139,8 +141,9 @@ function useGateViews(stages: PipelineStage[], codeGenMode: string | null, label
   );
   const worst = views.reduce((a, b) => (STATUS_RANK.indexOf(b.status) > STATUS_RANK.indexOf(a.status) ? b : a));
   const name = shown.length === 1 ? shown[0].label : label;
-  const policyText = [...new Set(views.map((v) => v.policy ?? "mode unknown"))].join("/");
-  return { views, worst, name, aria: `${name} verification: ${policyText}, ${worst.statusText}` };
+  const gt = pipeline.descriptor.gate_text;
+  const policyText = [...new Set(views.map((v) => v.policy ?? gt.policy_unknown))].join("/");
+  return { views, worst, name, aria: fmt(gt.icon_aria, { name, policy: policyText, status: worst.statusText }) };
 }
 
 /** The gate between stage tabs: a tab in its own right -- selecting it shows GateView. */
@@ -198,6 +201,7 @@ export function GateView({
   repo: string;
 }) {
   const { views, name } = useGateViews(stages, codeGenMode, label);
+  const gt = usePipeline().descriptor.gate_text;
   const { threadId } = useWorkflowThread();
   const [history, setHistory] = useState<VerifyAttempt[] | null>(null);
   const [insights, setInsights] = useState<VerifyInsights | null>(null);
@@ -219,10 +223,8 @@ export function GateView({
   return (
     <div className="flex flex-col gap-6 p-6">
       <header>
-        <h2 className="text-lg font-semibold">{name} verification</h2>
-        <p className="text-sm text-neutral-600">
-          Every deterministic check this gate runs, and what the latest (or a past) attempt recorded.
-        </p>
+        <h2 className="text-lg font-semibold">{fmt(gt.title, { name })}</h2>
+        <p className="text-sm text-neutral-600">{gt.subtitle}</p>
       </header>
       {views.map((v) => (
         <StageSection
@@ -249,6 +251,7 @@ function StageSection({
   insights: VerifyInsights | null;
 }) {
   const pipeline = usePipeline();
+  const gt = pipeline.descriptor.gate_text;
   const [selected, setSelected] = useState<number | null>(null); // null = default below
   // No live verdict (stage approved earlier, or reset by a rewind/new run): default to the newest
   // recorded attempt rather than a table of "not re-verified" rows the user must click away from.
@@ -270,43 +273,53 @@ function StageSection({
     auditOn: mode ? pipeline.modes.find((m) => m.id === mode)?.audit : undefined,
     stageStatus: attempt ? null : (view.stageState?.status ?? null),
     lap: view.lap,
+    text: gt.row_status,
   });
-  const verdictText = verdict == null ? "no verdict yet" : verdict.cannot_verify ? "cannot verify" : verdict.passed ? "passed" : "failed";
+  const verdictText =
+    gt.verdict_values[verdict == null ? "none" : verdict.cannot_verify ? "cannot_verify" : verdict.passed ? "passed" : "failed"];
   const failRate = (id: string) => insights?.checks.find((c) => c.check_id === id && c.stage === view.stage.key);
 
   return (
     <section className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
         <h3 className="font-semibold">{view.stage.label}</h3>
-        <span className="text-neutral-600">Mode: {modeLabel ?? "not known yet"}</span>
-        <span className="text-neutral-600">Policy: {policy ?? "—"}</span>
+        <span className="text-neutral-600">{fmt(gt.mode, { mode: modeLabel ?? gt.mode_unknown })}</span>
+        <span className="text-neutral-600">{fmt(gt.policy, { policy: policy ?? gt.policy_none })}</span>
         {!attempt && view.maxLaps > 0 && (
-          <span className="text-neutral-600">
-            lap {view.lap} of {view.maxLaps}
-          </span>
+          <span className="text-neutral-600">{fmt(gt.lap, { lap: view.lap, max: view.maxLaps })}</span>
         )}
-        <span className="text-neutral-600">Verdict: {verdictText}</span>
+        <span className="text-neutral-600">{fmt(gt.verdict, { verdict: verdictText })}</span>
         <label className="ml-auto flex items-center gap-1.5 text-neutral-600">
-          Attempt
+          {gt.attempt}
           <select
             className="rounded-md border border-neutral-300 px-2 py-1 text-sm"
             value={effective ?? ""}
             onChange={(e) => setSelected(e.target.value === "" ? null : Number(e.target.value))}
             disabled={!attempts?.length}
           >
-            {(hasLive || !attempts?.length) && <option value="">Latest</option>}
+            {(hasLive || !attempts?.length) && <option value="">{gt.attempt_latest}</option>}
             {attempts?.map((a, i) => (
               <option key={`${a.run_id}:${a.attempt}`} value={i}>
-                {i + 1} · {a.stage_passed ? "passed" : "failed"} · {new Date(a.created_at).toLocaleString()}
+                {fmt(gt.attempt_option, {
+                  n: i + 1,
+                  result: gt.attempt_result[a.stage_passed ? "passed" : "failed"],
+                  when: new Date(a.created_at).toLocaleString(),
+                })}
               </option>
             ))}
           </select>
         </label>
       </div>
       <p className="text-xs text-neutral-500">
-        A check that <span className="font-medium">stops the stage</span> sends the work back for another attempt when it fails.{" "}
-        <span className="font-medium">Informational</span> checks never block: a heads-up just flags something worth knowing, and
-        needs nothing from you.
+        {gt.legend.map((seg, i) =>
+          seg.bold ? (
+            <span key={i} className="font-medium">
+              {seg.text}
+            </span>
+          ) : (
+            seg.text
+          ),
+        )}
       </p>
       {!attempt && view.verdict?.feedback && !view.verdict.passed && (
         <p className="rounded-md bg-neutral-50 p-2 text-xs whitespace-pre-wrap text-neutral-700">{view.verdict.feedback}</p>
@@ -315,7 +328,7 @@ function StageSection({
         <table className="w-full text-left text-xs">
           <thead className="border-b border-neutral-200 text-neutral-500">
             <tr>
-              {["#", "Check", "What it verifies", "Effect", "When it runs", "Status", "Detail"].map((h) => (
+              {gt.columns.map((h) => (
                 <th key={h} className="px-2 py-1.5 font-medium">
                   {h}
                 </th>
@@ -329,8 +342,8 @@ function StageSection({
               return [
                 group !== "stage" && (
                   <tr key={`${group}-heading`}>
-                    <td colSpan={7} className="px-2 pt-3 pb-1 font-medium text-neutral-600">
-                      {group === "wrapper" ? "Platform checks around every verification" : "Reported but not in this gate's catalog"}
+                    <td colSpan={gt.columns.length} className="px-2 pt-3 pb-1 font-medium text-neutral-600">
+                      {gt.group_heading[group]}
                     </td>
                   </tr>
                 ),
@@ -344,33 +357,25 @@ function StageSection({
   );
 }
 
-/** Check.mode in plain words: what a failure of this check does to the stage. */
-const MODE_TEXT: Record<string, string> = {
-  blocking: "Stops the stage",
-  collected: "Stops the stage (reported together)",
-  advisory: "Informational only",
-};
-
 /** Longer (or multi-line) details collapse behind a disclosure; shorter ones show inline. */
 const DETAIL_INLINE_CHARS = 160;
 
 function CheckRow({ row, n, stats }: { row: GateRow; n: number; stats: VerifyInsights["checks"][number] | undefined }) {
+  const gt = usePipeline().descriptor.gate_text;
   return (
     <tr className="border-b border-neutral-100 align-top">
       <td className="px-2 py-1.5 text-neutral-400">{n}</td>
       <td className="px-2 py-1.5">
         <div className="font-medium text-neutral-800">{row.label}</div>
         {row.uncatalogued && (
-          <span className="mt-0.5 inline-block rounded bg-amber-100 px-1.5 text-[10px] text-amber-800">uncatalogued</span>
+          <span className="mt-0.5 inline-block rounded bg-amber-100 px-1.5 text-[10px] text-amber-800">{gt.uncatalogued_badge}</span>
         )}
         {stats && stats.runs > 0 && (
-          <div className="text-[11px] text-neutral-500">
-            fails in {Math.round(stats.fail_rate * 100)}% of runs in this repo
-          </div>
+          <div className="text-[11px] text-neutral-500">{fmt(gt.fail_rate, { pct: Math.round(stats.fail_rate * 100) })}</div>
         )}
       </td>
       <td className="px-2 py-1.5 text-neutral-600">{row.description}</td>
-      <td className="px-2 py-1.5 text-neutral-600">{MODE_TEXT[row.mode] ?? row.mode}</td>
+      <td className="px-2 py-1.5 text-neutral-600">{gt.check_effect[row.mode] ?? row.mode}</td>
       <td className="px-2 py-1.5 text-neutral-600">{row.condition}</td>
       <td className={`px-2 py-1.5 whitespace-nowrap ${TONE_CLASS[row.tone]}`}>
         {row.text}
