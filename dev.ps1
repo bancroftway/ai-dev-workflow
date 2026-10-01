@@ -21,6 +21,19 @@ if (-not $NoRebuild) {
     }
 }
 
+# Free the ports first: a leftover agent/next dev (another console, a crashed run, an AI
+# session's background shell) otherwise makes the new one die with WinError 10048.
+# /T also takes down anything the listener spawned (next dev's workers).
+foreach ($port in 8123, 3000) {
+    $owners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($procId in $owners) {
+        $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        Write-Host "port $port in use by PID $procId ($($proc.ProcessName)) -- stopping it"
+        taskkill /PID $procId /T /F | Out-Null
+    }
+}
+
 $agent = Start-Process -FilePath "uv" -ArgumentList "run", "python", "main.py" `
     -WorkingDirectory "$PSScriptRoot\agent" -PassThru -NoNewWindow
 
