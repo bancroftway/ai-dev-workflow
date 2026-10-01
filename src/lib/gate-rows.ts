@@ -57,9 +57,9 @@ export interface GateRowInput {
 const REPORTED: Record<ReportedCheck["status"], { text: string; tone: RowTone }> = {
   passed: { text: "Passed", tone: "pass" },
   failed: { text: "Failed", tone: "fail" },
-  infra: { text: "Infra error", tone: "warn" },
+  infra: { text: "Couldn't run (platform issue)", tone: "warn" },
   skipped: { text: "Skipped", tone: "muted" },
-  advisory: { text: "Advisory", tone: "warn" },
+  advisory: { text: "Heads-up (doesn't block)", tone: "warn" },
 };
 
 function isBlockingFailure(r: ReportedCheck, catalog: Map<string, PipelineCheck>): boolean {
@@ -92,7 +92,7 @@ export function deriveGateRows(input: GateRowInput): GateRow[] {
         };
       if (c.needs_audit && auditOn === false) return { state: "audit_off", text: "Skipped: no audit", tone: "muted" };
       const reached = group === "stage" ? !wrapperStopped && !(index > firstStageStop) : true;
-      if (!reached) return { state: "not_reached", text: "Not reached", tone: "muted" };
+      if (!reached) return { state: "not_reached", text: "Not reached (an earlier check stopped it)", tone: "muted" };
       return { state: "not_recorded", text: "Not recorded", tone: "muted" };
     }
     if (policy === "off")
@@ -108,7 +108,7 @@ export function deriveGateRows(input: GateRowInput): GateRow[] {
     const base = { id: c.id, label: c.label, description: c.description, mode: c.mode, condition: c.condition, group, lapNote };
     if (!r) return { ...base, ...unreported(c, index, group), detail: null, source: null, uncatalogued: false };
     // An advisory-mode check's failure doesn't block: amber, not red.
-    const shown = r.status === "failed" && c.mode === "advisory" ? { text: "Failed (advisory)", tone: "warn" as const } : REPORTED[r.status];
+    const shown = r.status === "failed" && c.mode === "advisory" ? { text: "Heads-up (doesn't block)", tone: "warn" as const } : REPORTED[r.status];
     return { ...base, state: r.status, ...shown, detail: r.detail, source: r.source, uncatalogued: !!r.uncatalogued };
   }
 

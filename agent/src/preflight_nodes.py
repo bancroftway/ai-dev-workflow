@@ -1084,9 +1084,11 @@ def grade_tech_stack(tech_stack: dict[str, Any], toolchain: dict[str, Any], brow
     else:
         log.passed(TS_EXTRACTION)
 
-    missing = [k for k in _TOOLCHAIN_KEYS if not toolchain.get(k)]
+    # `tools` only lists what THIS repo asked mise/dotnet to install (bootstrap.sh section 2), so
+    # it is empty on a new repo by design -- only image + available say the sandbox was recorded.
+    missing = [k for k in _TOOLCHAIN_KEYS if k != "tools" and not toolchain.get(k)]
     if missing:
-        log.advisory(TS_TOOLCHAIN, f"missing: {', '.join(missing)}")
+        log.advisory(TS_TOOLCHAIN, f"sandbox toolchain report has no {' or '.join(missing)} (platform telemetry; nothing for you to fix)")
     else:
         log.passed(TS_TOOLCHAIN)
     if tech_stack_signals.presence_values(normalized, "testing_frameworks"):
@@ -2088,6 +2090,9 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.pre
     assert set(statuses) == {c.id for c in TECH_STACK_CHECKS}, statuses
     assert statuses["tech_stack.startability"] == "skipped"
     assert not any(r.get("uncatalogued") for r in graded.report["checks"])
+    # A new repo has declared no tools yet: empty `tools` is normal, not a heads-up.
+    fresh = grade_tech_stack(valid_stack, {**full_toolchain, "tools": {}}, brownfield=False)
+    assert {r["id"]: r["status"] for r in fresh.report["checks"]}["tech_stack.toolchain"] == "passed"
 
     no_langs = grade_tech_stack({**valid_stack, "languages": _langs()}, full_toolchain, brownfield=False)
     no_langs_status = {r["id"]: r["status"] for r in no_langs.report["checks"]}

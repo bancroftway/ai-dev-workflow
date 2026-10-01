@@ -261,7 +261,9 @@ function StageSection({
   const verdict: GateVerdict | null = attempt ? { passed: attempt.stage_passed, checks: attempt.checks } : view.verdict;
   const rows = deriveGateRows({
     checks: view.stage.gate?.checks ?? [],
-    wrapperChecks: pipeline.descriptor.wrapper_checks,
+    // The wrapper rows come from the verify node; an after-submit gate (tech-stack) runs its checks
+    // inside the review gate instead, so they would only ever read "Not recorded" there.
+    wrapperChecks: view.stage.gate?.timing === "after_submit" ? [] : pipeline.descriptor.wrapper_checks,
     verdict,
     policy,
     modeLabel,
@@ -301,6 +303,11 @@ function StageSection({
           </select>
         </label>
       </div>
+      <p className="text-xs text-neutral-500">
+        A check that <span className="font-medium">stops the stage</span> sends the work back for another attempt when it fails.{" "}
+        <span className="font-medium">Informational</span> checks never block: a heads-up just flags something worth knowing, and
+        needs nothing from you.
+      </p>
       {!attempt && view.verdict?.feedback && !view.verdict.passed && (
         <p className="rounded-md bg-neutral-50 p-2 text-xs whitespace-pre-wrap text-neutral-700">{view.verdict.feedback}</p>
       )}
@@ -308,7 +315,7 @@ function StageSection({
         <table className="w-full text-left text-xs">
           <thead className="border-b border-neutral-200 text-neutral-500">
             <tr>
-              {["#", "Check", "What it verifies", "Mode", "Condition", "Status", "Detail", "Source"].map((h) => (
+              {["#", "Check", "What it verifies", "Effect", "When it runs", "Status", "Detail"].map((h) => (
                 <th key={h} className="px-2 py-1.5 font-medium">
                   {h}
                 </th>
@@ -322,8 +329,8 @@ function StageSection({
               return [
                 group !== "stage" && (
                   <tr key={`${group}-heading`}>
-                    <td colSpan={8} className="px-2 pt-3 pb-1 font-medium text-neutral-600">
-                      {group === "wrapper" ? "Around every verify" : "Reported but not in this gate's catalog"}
+                    <td colSpan={7} className="px-2 pt-3 pb-1 font-medium text-neutral-600">
+                      {group === "wrapper" ? "Platform checks around every verification" : "Reported but not in this gate's catalog"}
                     </td>
                   </tr>
                 ),
@@ -336,6 +343,16 @@ function StageSection({
     </section>
   );
 }
+
+/** Check.mode in plain words: what a failure of this check does to the stage. */
+const MODE_TEXT: Record<string, string> = {
+  blocking: "Stops the stage",
+  collected: "Stops the stage (reported together)",
+  advisory: "Informational only",
+};
+
+/** Longer (or multi-line) details collapse behind a disclosure; shorter ones show inline. */
+const DETAIL_INLINE_CHARS = 160;
 
 function CheckRow({ row, n, stats }: { row: GateRow; n: number; stats: VerifyInsights["checks"][number] | undefined }) {
   return (
@@ -353,21 +370,23 @@ function CheckRow({ row, n, stats }: { row: GateRow; n: number; stats: VerifyIns
         )}
       </td>
       <td className="px-2 py-1.5 text-neutral-600">{row.description}</td>
-      <td className="px-2 py-1.5 text-neutral-600">{row.mode}</td>
+      <td className="px-2 py-1.5 text-neutral-600">{MODE_TEXT[row.mode] ?? row.mode}</td>
       <td className="px-2 py-1.5 text-neutral-600">{row.condition}</td>
       <td className={`px-2 py-1.5 whitespace-nowrap ${TONE_CLASS[row.tone]}`}>
         {row.text}
         {row.lapNote && <div className="text-[11px] font-normal text-neutral-500">{row.lapNote}</div>}
       </td>
       <td className="max-w-xs px-2 py-1.5 text-neutral-700">
-        {row.detail && (
-          <details>
-            <summary className="cursor-pointer truncate">{row.detail.split("\n")[0]}</summary>
-            <pre className="mt-1 whitespace-pre-wrap break-words font-sans">{row.detail}</pre>
-          </details>
-        )}
+        {row.detail &&
+          (row.detail.length <= DETAIL_INLINE_CHARS && !row.detail.includes("\n") ? (
+            <span className="break-words">{row.detail}</span>
+          ) : (
+            <details>
+              <summary className="cursor-pointer truncate">{row.detail.split("\n")[0]}</summary>
+              <pre className="mt-1 whitespace-pre-wrap break-words font-sans">{row.detail}</pre>
+            </details>
+          ))}
       </td>
-      <td className="px-2 py-1.5 text-[11px] break-all text-neutral-400">{row.source}</td>
     </tr>
   );
 }
