@@ -64,6 +64,8 @@ const APPROVED_SPEC_PATH = ".ai-dev-workflow/03-specification.approved.json";
 // This round's PRD changes ({changes: [{id: "PC-n", ...}]}), written by the host at every
 // specification draft start (spec_ledger.PRD_CHANGES_SCRATCH_PATH; literal guarded the same way).
 const PRD_CHANGES_SCRATCH_PATH = ".ai-dev-workflow/spec/prd-changes.json";
+// The approved spec as this ticket's round began (spec_ledger.ROUND_BASE_SPEC_PATH; guarded likewise).
+const ROUND_BASE_SPEC_PATH = ".ai-dev-workflow/spec/round-base-specification.json";
 
 let input = {};
 try {
@@ -133,17 +135,21 @@ const runId =
     : null;
 
 // story_decisions: the real specification stage only -- brownfield-spec builds the baseline and
-// never classifies one, and can run against a non-empty ledger after a lost manifest. Absent or
-// unreadable approved spec = no baseline yet, so the check is skipped (null), never guessed at.
-let approvedSpecification = null;
-const approvedSpecPath = `${cwd}/${APPROVED_SPEC_PATH}`;
-if (stage === "specification" && existsSync(approvedSpecPath)) {
+// never classifies one, and can run against a non-empty ledger after a lost manifest. The baseline
+// is the round-base snapshot (the approved spec as this ticket began), else the approved spec;
+// neither readable = no baseline yet, so the check is skipped (null), never guessed at.
+function readJsonObject(relPath) {
+  const full = `${cwd}/${relPath}`;
+  if (!existsSync(full)) return null;
   try {
-    approvedSpecification = JSON.parse(readFileSync(approvedSpecPath, "utf8"));
+    const doc = JSON.parse(readFileSync(full, "utf8"));
+    return doc && typeof doc === "object" && Object.keys(doc).length > 0 ? doc : null;
   } catch {
-    approvedSpecification = null;
+    return null;
   }
 }
+const approvedSpecification =
+  stage === "specification" ? readJsonObject(ROUND_BASE_SPEC_PATH) ?? readJsonObject(APPROVED_SPEC_PATH) : null;
 
 // Same stage scoping; absent or unreadable = no PRD changes to account for this round.
 let prdChangeIds = [];

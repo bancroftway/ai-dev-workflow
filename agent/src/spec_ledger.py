@@ -12,6 +12,7 @@ one result out. graph.py's own _verify_specification_ledger wraps this as a dete
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -55,9 +56,10 @@ SCHEMA_VERSION = 1
 # today, from the ledger-resolved content, not from this file directly).
 DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json"
 
-# Which submission DRAFT_SPEC_PATH was last seeded for ({"message_id": ...}). The sketchpad is
-# committed and survives across tickets, so without this a new ticket's draft started from the
-# previous ticket's delta (and, now, its story_decisions). See hydrate_specification_ticket_context.
+# Which round DRAFT_SPEC_PATH was last seeded for ({"message_id": ..., "approved_sha": ...}). The
+# sketchpad is committed and survives across tickets, so without this a new ticket's draft started
+# from the previous ticket's delta (and, now, its story_decisions). See
+# hydrate_specification_ticket_context for what a round is.
 SEED_SIDECAR_PATH = ".ai-dev-workflow/spec/draft-seed.json"
 
 # This round's PRD changes ({"changes": [{id: "PC-n", kind, basis, prior_text, ...}]}), copied from
@@ -65,6 +67,11 @@ SEED_SIDECAR_PATH = ".ai-dev-workflow/spec/draft-seed.json"
 # (which has no GraphState) and the in-turn hook both read the same, always-current list. An empty
 # list when there are none, so a committed stale file never leaks into the next round.
 PRD_CHANGES_SCRATCH_PATH = ".ai-dev-workflow/spec/prd-changes.json"
+
+# The approved specification as it stood when this ticket's round began, snapshotted when a new
+# round seeds DRAFT_SPEC_PATH (see hydrate_specification_ticket_context). Story decisions, change
+# badges and no-new-work are judged against it, not against an approval made mid-round.
+ROUND_BASE_SPEC_PATH = ".ai-dev-workflow/spec/round-base-specification.json"
 
 EntryStatus = Literal["active", "retired", "revised", "deferred"]
 # "plan_step" added for the file-based-editing plan's Part 2: one shared ledger, not a second
@@ -294,6 +301,18 @@ def _ticket_seed(approved: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def read_round_base_specification(provider: SandboxProvider, thread_id: str) -> dict[str, Any]:
+    """The approved specification as it stood when this ticket's round began (ROUND_BASE_SPEC_PATH)
+    -- what story decisions, change badges and no-new-work are judged against. Falls back to the
+    approved specification when no snapshot exists (a round seeded before snapshots existed)."""
+    raw = await repo_files.read_repo_file(provider, thread_id, ROUND_BASE_SPEC_PATH)
+    try:
+        base = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        base = None
+    return base if isinstance(base, dict) and base else await _read_approved_specification(provider, thread_id)
+
+
 async def hydrate_specification_ticket_context(
     thread_id: str, state: "GraphState", provider: SandboxProvider
 ) -> dict[str, Any] | None:
@@ -301,40 +320,59 @@ async def hydrate_specification_ticket_context(
     (brownfield-spec keeps the plain hydrate_ticket_mode_context: it builds the baseline, it never
     classifies one).
 
-    Two additions on top of hydrate_ticket_mode_context:
+    Additions on top of hydrate_ticket_mode_context:
 
-    - Re-seeds DRAFT_SPEC_PATH on each NEW submission. The sketchpad is committed and nothing used
-      to reset it, so ticket N+1 started from ticket N's delta. SEED_SIDECAR_PATH records which
-      `consumed_message_id` the file was seeded for; a different one means a new ticket. The same
-      message (a later lap, or a correction at the gate) keeps the model's own edits. With no
-      message id to key on, nothing is re-seeded.
+    - A round (one ticket) lasts until a Specification is approved. A new submission starts a new
+      round only when the approved specification has changed since this round was seeded --
+      SEED_SIDECAR_PATH records `{message_id, approved_sha}`. A clarification answer (a new
+      submission, nothing approved since) and a correction at the Specification or Plan gate (the
+      same submission) stay in the round and keep the model's edits. With no message id to key on,
+      nothing is re-seeded.
+    - A new round re-seeds DRAFT_SPEC_PATH (it is committed and used to carry ticket N's delta into
+      ticket N+1), with one `{us_id, decision: None, reason: ""}` story_decisions row per live
+      story, and snapshots the approved specification to ROUND_BASE_SPEC_PATH. Within the round
+      everything is judged against that snapshot -- after a Plan-gate correction the approved
+      specification is this ticket's own, which would make the ticket's own changes invisible.
     - Writes PRD_CHANGES_SCRATCH_PATH from the requirements-prd stage's approved content, every
       call (see that constant).
-    - The fresh seed carries one `{us_id, decision: None, reason: ""}` story_decisions row per live
-      story of the approved specification, and the returned prompt context carries the compact
-      `live_stories` list (id/title/deferred) the draft prompt shows -- so the model works through
-      every existing story instead of discovering the ids on its own.
+    - Returns the compact `live_stories` list (id/title/deferred) the draft prompt shows -- so the
+      model works through every existing story instead of discovering the ids on its own.
     """
     prd_content = ((state.get("stages") or {}).get("requirements-prd") or {}).get("approved_content") or {}
     await repo_files.write_repo_file(
-        provider, thread_id, PRD_CHANGES_SCRATCH_PATH, json.dumps({"changes": prd_content.get("changes") or []}, indent=2)
+        provider, thread_id, PRD_CHANGES_SCRATCH_PATH,
+        json.dumps({"changes": prd_content.get("changes") or [], "added": prd_content.get("added") or []}, indent=2),
     )
-    approved = await _read_approved_specification(provider, thread_id)
-    live = [s for s in approved.get("user_stories") or [] if s.get("id")]
+    from . import workflow_persistence
+
+    approved_raw = await repo_files.read_repo_file(
+        provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+    ) or ""
+    approved_sha = hashlib.sha256(approved_raw.encode("utf-8")).hexdigest()
     message_id = state.get("consumed_message_id")
     if message_id:
         raw_sidecar = await repo_files.read_repo_file(provider, thread_id, SEED_SIDECAR_PATH)
         try:
-            seeded_for = (json.loads(raw_sidecar) or {}).get("message_id") if raw_sidecar else None
-        except (json.JSONDecodeError, AttributeError):
-            seeded_for = None
-        if seeded_for != message_id:
+            sidecar = json.loads(raw_sidecar) if raw_sidecar else {}
+        except json.JSONDecodeError:
+            sidecar = {}
+        sidecar = sidecar if isinstance(sidecar, dict) else {}
+        same_round = bool(sidecar) and (
+            sidecar.get("message_id") == message_id or sidecar.get("approved_sha") == approved_sha
+        )
+        if not same_round:
+            approved = await _read_approved_specification(provider, thread_id)
             seed = _ticket_seed(approved)
-            seed["story_decisions"] = [{"us_id": s["id"], "decision": None, "reason": ""} for s in live]
+            seed["story_decisions"] = [
+                {"us_id": s["id"], "decision": None, "reason": ""}
+                for s in approved.get("user_stories") or [] if s.get("id")
+            ]
             await repo_files.write_repo_file(provider, thread_id, DRAFT_SPEC_PATH, json.dumps(seed, indent=2))
+            await repo_files.write_repo_file(provider, thread_id, ROUND_BASE_SPEC_PATH, approved_raw or "{}")
             await repo_files.write_repo_file(
-                provider, thread_id, SEED_SIDECAR_PATH, json.dumps({"message_id": message_id})
+                provider, thread_id, SEED_SIDECAR_PATH, json.dumps({"message_id": message_id, "approved_sha": approved_sha})
             )
+    live = [s for s in (await read_round_base_specification(provider, thread_id)).get("user_stories") or [] if s.get("id")]
     context = await hydrate_ticket_mode_context(thread_id, state, provider)
     if context is None:
         return None
@@ -2238,7 +2276,13 @@ def _demo() -> None:
         {"us_id": "US-0001", "decision": None, "reason": ""},
         {"us_id": "US-0002", "decision": None, "reason": ""},
     ], "one undecided row per live approved story, the deferred one included"
-    assert json.loads(reseed_provider.writes[SEED_SIDECAR_PATH]) == {"message_id": "msg-2"}
+    import hashlib as _hashlib
+
+    approved_two_sha = _hashlib.sha256(approved_two.encode("utf-8")).hexdigest()
+    assert json.loads(reseed_provider.writes[SEED_SIDECAR_PATH]) == {"message_id": "msg-2", "approved_sha": approved_two_sha}
+    assert reseed_provider.writes[ROUND_BASE_SPEC_PATH] == approved_two, (
+        "a new round snapshots the approved specification it is judged against"
+    )
     assert reseed_ctx is not None and reseed_ctx["ticket_mode_baseline"] is True
     assert reseed_ctx["live_stories"] == [
         {"id": "US-0001", "title": "Create a note", "deferred": False},
@@ -2252,6 +2296,33 @@ def _demo() -> None:
     })
     asyncio.run(hydrate_specification_ticket_context("t", ticket2, same_ticket_provider))
     assert DRAFT_SPEC_PATH not in same_ticket_provider.writes, "the same ticket's sketchpad is never re-seeded"
+
+    # Case D: a clarification answer is a new submission, but no Specification was approved since the
+    # round began -- same round, the draft (and its decisions) survive.
+    answer_provider = _FakeBootstrapProvider({
+        _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
+        SEED_SIDECAR_PATH: json.dumps({"message_id": "msg-1", "approved_sha": approved_two_sha}),
+    })
+    asyncio.run(hydrate_specification_ticket_context("t", ticket2, answer_provider))
+    assert DRAFT_SPEC_PATH not in answer_provider.writes, "a clarification answer keeps the round's draft"
+
+    # Case E: a correction at the Plan gate, after this ticket's own Specification approval -- same
+    # round, still judged against the specification as it stood BEFORE the ticket.
+    pre_ticket = json.dumps({"title": "Notes", "summary": "s", "user_stories": [
+        {"id": "US-0001", "title": "Create a note", "deferred": False, "acceptance_criteria": []},
+    ]})
+    restart_provider = _FakeBootstrapProvider({
+        _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
+        ROUND_BASE_SPEC_PATH: pre_ticket,
+        SEED_SIDECAR_PATH: json.dumps({"message_id": "msg-2", "approved_sha": "sha-before-this-ticket"}),
+    })
+    restart_ctx = asyncio.run(hydrate_specification_ticket_context("t", ticket2, restart_provider))
+    assert DRAFT_SPEC_PATH not in restart_provider.writes and ROUND_BASE_SPEC_PATH not in restart_provider.writes
+    assert [s["id"] for s in restart_ctx["live_stories"]] == ["US-0001"], "the round base, not this ticket's approval"
+    assert asyncio.run(read_round_base_specification(restart_provider, "t"))["user_stories"][0]["id"] == "US-0001"
+    assert asyncio.run(read_round_base_specification(_FakeBootstrapProvider({
+        _wp.SPECIFICATION_APPROVED_PATH: approved_two,
+    }), "t"))["title"] == "Notes", "no snapshot yet (a round seeded before it existed): the approved spec"
 
     # Case C: no message id to key on -- fall back to the plain hook (never clobber).
     no_id_provider = _FakeBootstrapProvider({
@@ -2296,18 +2367,22 @@ def _demo() -> None:
         {"id": "PC-3", "kind": "removed", "basis": "explicit", "prior_text": "- Export to CSV.",
          "new_text": "", "delta_quote": "drop CSV export"},
     ]
-    with_prd = {**ticket2, "stages": {"requirements-prd": {"approved_content": {"changes": prd_changes}}}}
+    with_prd = {**ticket2, "stages": {"requirements-prd": {"approved_content": {
+        "changes": prd_changes, "added": ["- Notes can be tagged."],
+    }}}}
     scratch_provider = _FakeBootstrapProvider({
         _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
         SEED_SIDECAR_PATH: json.dumps({"message_id": "msg-2"}),
     })
     asyncio.run(hydrate_specification_ticket_context("t", with_prd, scratch_provider))
-    assert json.loads(scratch_provider.writes[PRD_CHANGES_SCRATCH_PATH]) == {"changes": prd_changes}, (
+    assert json.loads(scratch_provider.writes[PRD_CHANGES_SCRATCH_PATH]) == {
+        "changes": prd_changes, "added": ["- Notes can be tagged."],
+    }, (
         "written on EVERY draft start, same ticket or not -- the hook and the gate read it"
     )
     no_prd_provider = _FakeBootstrapProvider({_wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two})
     asyncio.run(hydrate_specification_ticket_context("t", ticket2, no_prd_provider))
-    assert json.loads(no_prd_provider.writes[PRD_CHANGES_SCRATCH_PATH]) == {"changes": []}, (
+    assert json.loads(no_prd_provider.writes[PRD_CHANGES_SCRATCH_PATH]) == {"changes": [], "added": []}, (
         "an empty list, so a committed stale file can never leak into the next round"
     )
 

@@ -93,6 +93,9 @@ APPROVED_SPEC_PATH = ".ai-dev-workflow/03-specification.approved.json"
 # [{id, ...}]}), written by the host at every specification draft start; the hook hands the ids to
 # check_prd_changes_addressed. Guarded by `_demo()` the same way.
 PRD_CHANGES_SCRATCH_PATH = ".ai-dev-workflow/spec/prd-changes.json"
+# spec_ledger.ROUND_BASE_SPEC_PATH, duplicated likewise: the approved specification as this ticket's
+# round began -- what the hook hands check_story_decisions (falling back to APPROVED_SPEC_PATH).
+ROUND_BASE_SPEC_PATH = ".ai-dev-workflow/spec/round-base-specification.json"
 
 # What a REAL ledger id looks like -- moved verbatim from spec_ledger.py's own module-level
 # `_REAL_ID_RE` (used only by the two renumbering guards below, now living here with them). See
@@ -431,6 +434,8 @@ def check_ledger_sync_draft(
 
 
 STORY_DECISIONS = ("unchanged", "modified", "retired")
+# spec_ledger.PENDING_RESET_FIELD, duplicated (no project imports here); guarded in `_demo()`.
+_PENDING_RESET_FIELD = "pending_reset_run_id"
 
 
 def story_delta(
@@ -483,7 +488,52 @@ def story_delta(
     return "unchanged"
 
 
-def check_story_decisions(approved_specification: dict[str, Any], specification: dict[str, Any]) -> list[str]:
+def ledger_story_change(
+    prior_story: dict[str, Any], ledger_entries: list[dict[str, Any]], run_id: str | None = None
+) -> str:
+    """What the ledger already records for one approved story -- changes an EARLIER passing lap of
+    this ticket saved, which no later draft can undo (sync_ledger never un-retires, and a saved
+    rewording stays). Same vocabulary and rules as story_delta, read from ledger entries instead of
+    the draft. A pending tracking reset (a rewording or bug reopen) counts only when it is this
+    run's (`run_id`); None skips that signal rather than trust a marker from another run. Pure."""
+    story_id = prior_story.get("id")
+    story = next((e for e in ledger_entries if e.get("id") == story_id), None)
+    if story is None:
+        return "unchanged"
+    if story.get("status") == "retired":
+        return "retired"
+    if (
+        story.get("title", "") != prior_story.get("title", "")
+        or story.get("narrative", "") != prior_story.get("narrative", "")
+        or (story.get("status") == "deferred") != bool(prior_story.get("deferred"))
+    ):
+        return "modified"
+    prior_acs = {ac.get("id"): ac for ac in prior_story.get("acceptance_criteria") or []}
+    for entry in ledger_entries:
+        if entry.get("kind") != "acceptance_criterion" or entry.get("parent_us_id") != story_id:
+            continue
+        live = entry.get("status") in ("active", "revised", "deferred")
+        prior_ac = prior_acs.get(entry.get("id"))
+        if prior_ac is None:
+            if live:
+                return "modified"  # a criterion added earlier this ticket
+            continue
+        if (
+            not live
+            or entry.get("description", "") != prior_ac.get("description", "")
+            or (entry.get("status") == "deferred") != bool(prior_ac.get("deferred"))
+            or (run_id is not None and entry.get(_PENDING_RESET_FIELD) == run_id)
+        ):
+            return "modified"
+    return "unchanged"
+
+
+def check_story_decisions(
+    approved_specification: dict[str, Any],
+    specification: dict[str, Any],
+    ledger_entries: list[dict[str, Any]] | None = None,
+    run_id: str | None = None,
+) -> list[str]:
     """Every story in the last-approved specification must have exactly one `story_decisions` row
     in this ticket's draft -- `{us_id, decision: unchanged|modified|retired, reason}` -- and the
     declared decision must equal what the draft actually does to it (`story_delta` above).
@@ -495,6 +545,11 @@ def check_story_decisions(approved_specification: dict[str, Any], specification:
     per story makes the model weigh every story against the new requirements, and matching the
     label to the draft catches the second half of the failure: a model that noticed ("modified:
     notes are now capped") but never made the change.
+
+    The truth a decision is judged against is the draft's own delta (`story_delta`) combined with
+    what `ledger_entries` already records (`ledger_story_change`): a retirement or rewording saved by
+    an earlier passing lap of this ticket stays in effect even when a later draft drops it, so
+    declaring that story "unchanged" would put a contradiction in front of the human.
 
     Stories created during this ticket aren't in the approved specification, so they need no row.
     No approved specification (a first ticket) means nothing to classify. Returns one actionable
@@ -541,10 +596,19 @@ def check_story_decisions(approved_specification: dict[str, Any], specification:
                 f"story_decisions row for {us_id!r} has no reason -- say in one line why, weighed "
                 "against this ticket's requirements"
             )
-        actual = story_delta(prior_by_id[us_id], draft_by_id.get(us_id), retired_us, retired_ac, bug_ac)
+        drafted = story_delta(prior_by_id[us_id], draft_by_id.get(us_id), retired_us, retired_ac, bug_ac)
+        recorded = (
+            ledger_story_change(prior_by_id[us_id], ledger_entries, run_id) if ledger_entries is not None else "unchanged"
+        )
+        actual = next(c for c in ("retired", "modified", "unchanged") if c in (drafted, recorded))
         if declared == actual:
             continue
-        if actual == "retired":
+        if actual == "retired" and drafted != "retired":
+            problems.append(
+                f"{us_id!r} is declared {declared!r}, but it was already retired earlier in this ticket (the "
+                "ledger keeps a retirement -- it can't be undone here) -- set the decision to 'retired'"
+            )
+        elif actual == "retired":
             problems.append(
                 f"{us_id!r} is declared {declared!r}, but the draft retires it (it is in retired_us_ids) "
                 "-- set the decision to 'retired', or take it out of retired_us_ids"
@@ -559,6 +623,12 @@ def check_story_decisions(approved_specification: dict[str, Any], specification:
                 f"{us_id!r} is declared 'modified', but the draft changes nothing about it -- make the "
                 "change (re-emit it citing existing_us_id with the new wording or criteria, add a "
                 "criterion, or retire one of its criteria), or set the decision to 'unchanged'"
+            )
+        elif drafted != "modified":
+            problems.append(
+                f"{us_id!r} is declared 'unchanged', but it was already changed earlier in this ticket (its "
+                "wording, a criterion, a deferral, or a retired/reopened criterion -- the ledger keeps it) -- "
+                "set the decision to 'modified'"
             )
         else:
             problems.append(
@@ -667,7 +737,8 @@ def run_ledger_sync_checks(
         ),
         "completeness_problems": [completeness_problem] if completeness_problem else [],
         "decision_problems": (
-            check_story_decisions(approved_specification, specification) if approved_specification else []
+            check_story_decisions(approved_specification, specification, ledger_entries, run_id)
+            if approved_specification else []
         ),
         "prd_change_problems": check_prd_changes_addressed(specification, prd_change_ids or []),
     }
@@ -971,6 +1042,50 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     with_change = {**no_change, "user_stories": [new_ac]}
     assert check_story_decisions(approved, with_change) == [], "the same decision with the real change passes"
 
+    # --- what the ledger already did earlier this ticket counts too (it can't be undone) ---
+    # Lap 1 retired US-0002 and its sync passed (ledger saved). Lap 2 drops it from retired_us_ids,
+    # but the ledger keeps the retirement: "unchanged" would be a lie the gate then shows.
+    def ledger_from(stories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        entries = []
+        for s in stories:
+            entries.append({"id": s["id"], "kind": "user_story", "title": s["title"], "narrative": s["narrative"],
+                            "status": "deferred" if s["deferred"] else "active"})
+            entries += [{"id": ac["id"], "kind": "acceptance_criterion", "parent_us_id": s["id"],
+                         "description": ac["description"], "status": "deferred" if ac["deferred"] else "active"}
+                        for ac in s["acceptance_criteria"]]
+        return entries
+
+    lap1_ledger = ledger_from(approved["user_stories"])
+    next(e for e in lap1_ledger if e["id"] == "US-0002")["status"] = "retired"
+    next(e for e in lap1_ledger if e["id"] == "US-0002.1")["status"] = "retired"
+    walked_back = {**good, "retired_us_ids": [], "story_decisions": decided(
+        ("US-0001", "unchanged", "a"), ("US-0002", "unchanged", "kept after all"), ("US-0003", "unchanged", "c"),
+    )}
+    assert check_story_decisions(approved, walked_back) == [], "judged on the delta alone, the lie passes"
+    walked_problems = check_story_decisions(approved, walked_back, ledger_entries=lap1_ledger)
+    assert walked_problems and any("US-0002" in p and "already retired" in p for p in walked_problems), walked_problems
+    assert not any("take it out of retired_us_ids" in p for p in walked_problems), "never advise the impossible"
+    assert check_story_decisions(approved, good, ledger_entries=lap1_ledger) == [], "declared retired: consistent"
+
+    # Lap 1 reworded US-0001.1 (ledger saved, reset pending); lap 2 stops citing it.
+    reworded_ledger = ledger_from(approved["user_stories"])
+    reworded_entry = next(e for e in reworded_ledger if e["id"] == "US-0001.1")
+    reworded_entry.update(description="Saving stores the note, up to 500 chars.", pending_reset_run_id="run-1")
+    quiet = {**good, "story_decisions": decided(
+        ("US-0001", "unchanged", "a"), ("US-0002", "retired", "b"), ("US-0003", "unchanged", "c"),
+    )}
+    reword_problems = check_story_decisions(approved, quiet, ledger_entries=reworded_ledger)
+    assert reword_problems and any("US-0001" in p and "already changed" in p for p in reword_problems), reword_problems
+    # A bug reopen leaves the wording alone; only its pending reset marks it -- trusted for this run only.
+    reopened_ledger = ledger_from(approved["user_stories"])
+    next(e for e in reopened_ledger if e["id"] == "US-0001.1")["pending_reset_run_id"] = "run-1"
+    assert any("US-0001" in p for p in check_story_decisions(approved, quiet, ledger_entries=reopened_ledger, run_id="run-1"))
+    assert check_story_decisions(approved, quiet, ledger_entries=reopened_ledger, run_id="run-2") == [], (
+        "a stale marker from another run is not this ticket's change"
+    )
+    assert check_story_decisions(approved, quiet, ledger_entries=reopened_ledger) == [], "no run id: marker not trusted"
+    assert _PENDING_RESET_FIELD == spec_ledger.PENDING_RESET_FIELD
+
     # --- run_ledger_sync_checks threads the approved spec through to decision_problems ---
     assert run_ledger_sync_checks(ledger, {"user_stories": []}, run_id=None)["decision_problems"] == [], (
         "no approved specification handed over (brownfield-spec, or no baseline yet) -- check skipped"
@@ -1016,6 +1131,10 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     hook_js = Path(__file__).resolve().parents[2] / "sandbox-image" / "hooks" / "check-ledger-sync-stop.mjs"
     assert APPROVED_SPEC_PATH in hook_js.read_text(encoding="utf-8"), (
         f"check-ledger-sync-stop.mjs no longer reads {APPROVED_SPEC_PATH}"
+    )
+    assert ROUND_BASE_SPEC_PATH == spec_ledger.ROUND_BASE_SPEC_PATH
+    assert ROUND_BASE_SPEC_PATH in hook_js.read_text(encoding="utf-8"), (
+        f"check-ledger-sync-stop.mjs no longer reads {ROUND_BASE_SPEC_PATH}"
     )
     assert PRD_CHANGES_SCRATCH_PATH == spec_ledger.PRD_CHANGES_SCRATCH_PATH
     assert PRD_CHANGES_SCRATCH_PATH in hook_js.read_text(encoding="utf-8"), (

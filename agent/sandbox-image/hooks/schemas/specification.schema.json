@@ -158,7 +158,7 @@
             }
           ],
           "default": null,
-          "description": "'unchanged': this ticket's requirements leave the story as it is. 'modified': they change it -- you re-emit it citing existing_us_id with the new wording or criteria, add a criterion, or retire one of its criteria. 'retired': they remove it -- you list it in retired_us_ids. A new requirement that contradicts, narrows or replaces the story changes it even when it never names it. Seeded null; never leave it null.",
+          "description": "'unchanged': this ticket's requirements leave the story as it is. 'modified': they change it -- you re-emit it citing existing_us_id with the new wording or criteria, add a criterion, retire one of its criteria, or reopen one via bug_affected_ac_ids (a bug fix changes what must be delivered even with the wording untouched). 'retired': they remove it -- you list it in retired_us_ids. A new requirement that contradicts, narrows or replaces the story changes it even when it never names it. Seeded null; never leave it null.",
           "title": "Decision"
         },
         "prd_change_ids": {

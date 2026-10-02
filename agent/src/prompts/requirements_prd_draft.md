@@ -24,6 +24,8 @@ WHAT TO DO THIS ROUND:
 4. Declare in `changes.json` every requirement line of `base.md` you deleted or rewrote -- one entry
    per change:
    - `prior_lines`: the `base.md` line number(s) the change removes or rewrites, read off the file.
+     Each line belongs to exactly one change. Moving a requirement within its section, renumbering
+     a list or changing a bullet marker is not a change; a "None." placeholder is not a requirement.
    - `basis`: `explicit` when the requirements text says so outright; `implied` when a new
      requirement contradicts, narrows or replaces it without naming it. Calling out implied changes
      is the most important part of this job -- downstream stages remove or rework features based on

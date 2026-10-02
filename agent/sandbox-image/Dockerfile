@@ -201,7 +201,9 @@ ARG MERMAID_CLI_VERSION=11.16.0
 ARG JSCPD_VERSION=5.1.1
 # Compressed codebase map for draft turns (agent/src/codebase_map.py). Needs Node >= 22 (the image's
 # nodejs above satisfies it); --compress's tree-sitter grammars ship as wasm in the package, so it
-# runs offline.
+# runs offline. The install RUN below calls `repomix --version` so a broken install fails the build:
+# the TOOLS manifest swallows probe failures and the map fails soft at runtime, so it would
+# otherwise go unnoticed.
 ARG REPOMIX_VERSION=1.18.1
 ARG LIZARD_VERSION=1.24.0
 ARG SEMGREP_VERSION=1.175.0
@@ -410,6 +412,7 @@ RUN set -eux; \
 RUN set -eux; \
     npm install -g --allow-scripts=azure-functions-core-tools \
         "jscpd@${JSCPD_VERSION}" "repomix@${REPOMIX_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}"; \
+    repomix --version; \
     rm -rf /usr/lib/node_modules/azure-functions-core-tools/bin/workers/powershell \
            /usr/lib/node_modules/azure-functions-core-tools/bin/*/workers/powershell; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \

@@ -235,7 +235,8 @@ class StoryDecision(BaseModel):
         default=None,
         description="'unchanged': this ticket's requirements leave the story as it is. 'modified': "
         "they change it -- you re-emit it citing existing_us_id with the new wording or criteria, add "
-        "a criterion, or retire one of its criteria. 'retired': they remove it -- you list it in "
+        "a criterion, retire one of its criteria, or reopen one via bug_affected_ac_ids (a bug fix "
+        "changes what must be delivered even with the wording untouched). 'retired': they remove it -- you list it in "
         "retired_us_ids. A new requirement that contradicts, narrows or replaces the story changes it "
         "even when it never names it. Seeded null; never leave it null.",
     )
@@ -1814,6 +1815,9 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     assert _linked.story_decisions[0].prd_change_ids == ["PC-1"]
     assert _linked.prd_changes_without_story[0].change_id == "PC-2"
     assert _seeded.story_decisions[0].prd_change_ids == [] and _seeded.prd_changes_without_story == []
+    # A bug reopen leaves the wording alone but still modifies its story (story_delta) -- say so,
+    # or every reopen-only bug ticket fails a lap declaring "unchanged".
+    assert "bug_affected_ac_ids" in (StoryDecision.model_fields["decision"].description or "")
     assert "story_changes" not in SpecificationDraftResponse.model_fields, (
         "the draft's per-turn story_changes duplicated story_decisions in the file -- dropped"
     )

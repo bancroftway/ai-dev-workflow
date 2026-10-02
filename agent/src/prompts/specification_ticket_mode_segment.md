@@ -31,7 +31,8 @@ specification, seeded undecided (`decision: null`). Fill in every row, `decision
 `reason`:
 - `unchanged`: this ticket's requirements leave the story as it is.
 - `modified`: they change it -- re-emit it citing `existing_us_id` with the new wording or
-  criteria, add a criterion to it, or retire one of its criteria.
+  criteria, add a criterion to it, retire one of its criteria, or reopen one of its criteria via
+  `bug_affected_ac_ids` (a bug ticket modifies the story even with every word unchanged).
 - `retired`: they remove it -- name it in `retired_us_ids`.
 
 Weigh EVERY new requirement against EVERY existing story before deciding: does it contradict,
@@ -50,4 +51,5 @@ story is affected -- in `prd_changes_without_story` with a reason. A PRD change 
 If the prior run's exit report lists criteria as "carried over -- not delivered", re-cite them in
 this draft (unchanged wording, via `existing_ac_id`) so they re-enter the work queue -- an
 undelivered criterion left uncited stays undelivered with nothing scheduled to build it. Re-citing
-with unchanged wording leaves its story `unchanged`.
+with unchanged wording leaves its story `unchanged` (a bug reopen via `bug_affected_ac_ids` does
+not -- that is `modified`).

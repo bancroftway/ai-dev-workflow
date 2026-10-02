@@ -696,9 +696,11 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
             f"- {s['id']} — {s['title']}" + (" [deferred]" if s.get("deferred") else "") for s in stage["live_stories"]
         )
         messages.append(HumanMessage(content=render_prompt(SPEC_LIVE_STORIES_SEGMENT, stories=stories)))
-    # This round's PRD changes -- only against an existing baseline (a first ticket has none to weigh).
     prd_content = (state["stages"].get("requirements-prd") or {}).get("approved_content") or {}
-    if stage.get("ticket_mode_baseline") and (prd_content.get("changes") or prd_content.get("diff")):
+    # This round's PRD changes: shown whenever there are any (spec.prd_changes_addressed checks them
+    # whenever they exist); the bare diff only against an existing baseline -- a first ticket's diff
+    # is the whole PRD, nothing the requirements text doesn't already say.
+    if prd_content.get("changes") or (stage.get("ticket_mode_baseline") and prd_content.get("diff")):
         changes = "\n".join(
             f"- {c['id']} — {'Modified' if c.get('kind') == 'modified' else 'Removed'}"
             + (" (implied)" if c.get("basis") == "implied" else "")
@@ -1183,6 +1185,7 @@ async def _seed_baseline_prd(
 
 
 REQUIREMENTS_PRD_SYSTEM_PROMPT = load_prompt("requirements_prd_draft")
+REQUIREMENTS_PRD_FIRST_ROUND_SEGMENT = load_prompt("requirements_prd_first_round_segment")
 
 # Rules the requirements-prd verify enforces (requirements_prd.VERIFY_CHECKS), one line each.
 REQUIREMENTS_PRD_HARD_RULES: tuple[str, ...] = (
@@ -1192,7 +1195,7 @@ REQUIREMENTS_PRD_HARD_RULES: tuple[str, ...] = (
     "the pipeline appends it.",
     f"Every declared change names real requirement lines of {requirements_prd.BASE_PATH} (under Users / "
     "Personas, Functional Requirements, Non-Functional Requirements or Out of Scope) and quotes the exact "
-    "words of this round's requirements text that drive it.",
+    "words of this round's requirements text that drive it; a line declared in two changes is rejected.",
     f"Every requirement line of {requirements_prd.BASE_PATH} you deleted or rewrote must be declared, and "
     "nothing unchanged may be -- a silent drop or a phantom declaration is rejected.",
 )
@@ -1206,11 +1209,7 @@ def _build_requirements_prd_prompt(state: GraphState) -> list[BaseMessage]:
     ]
     # prd_first_round: only on the prompt-only stage copy from requirements_prd.hydrate_prd_round.
     if stage.get("prd_first_round"):
-        messages.append(HumanMessage(content=(
-            f"This is the project's first round: {requirements_prd.BASE_PATH} is empty and "
-            f"{requirements_prd.DRAFT_PATH} holds only the section skeleton. Write the PRD from the "
-            "requirements text; there is nothing to declare, so leave `changes` empty."
-        )))
+        messages.append(HumanMessage(content=REQUIREMENTS_PRD_FIRST_ROUND_SEGMENT))
     verify_feedback_message = _verification_feedback_message(stage)
     if verify_feedback_message is not None:
         messages.append(verify_feedback_message)
@@ -1585,6 +1584,14 @@ def make_verify_specification_ledger(
             # ticket, not a growing copy of the whole project. On failure (returns above),
             # deliberately not reached -- leaves the model's own edit exactly as submitted, next to
             # the feedback naming what's wrong.
+            #
+            # A story/criterion created this lap is written back CITING the id it was just given:
+            # left at existing_us_id: null, the next lap's sync would see a "new" story word-for-word
+            # identical to the ledger entry it created, and reject it as a dropped citation.
+            for story in content_dict.get("user_stories") or []:
+                story["existing_us_id"] = story.get("existing_us_id") or story.get("id")
+                for ac in story.get("acceptance_criteria") or []:
+                    ac["existing_ac_id"] = ac.get("existing_ac_id") or ac.get("id")
             await repo_files.write_repo_file(
                 provider, thread_id, spec_ledger.DRAFT_SPEC_PATH, json.dumps(content_dict, indent=2)
             )
@@ -1625,25 +1632,25 @@ def make_verify_specification_ledger(
             # Runs against the now-EXPANDED content_dict, so every live entry gets a real
             # classification (an untouched one's rendered text matches prior_by_id exactly, so it
             # comes back "unchanged" for free -- see gate_change_status's own contract).
-            raw_prior_spec = await repo_files.read_repo_file(
-                provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
+            #
+            # The baseline is the approved specification as this ticket's round BEGAN
+            # (spec_ledger.read_round_base_specification): after a correction at the Plan gate, the
+            # approved specification is this ticket's own, and judging against it made the ticket's
+            # own changes look like no new work.
+            prior_spec = (
+                await spec_ledger.read_round_base_specification(provider, thread_id)
+                if stage_key == "specification"
+                else await spec_ledger._read_approved_specification(provider, thread_id)
             )
             prior_by_id: dict[str, dict[str, Any]] = {}
-            prior_spec: dict[str, Any] = {}
-            if raw_prior_spec is not None:
-                try:
-                    loaded_prior = json.loads(raw_prior_spec)
-                    prior_spec = loaded_prior if isinstance(loaded_prior, dict) else {}
-                    for prior_story in prior_spec.get("user_stories") or []:
-                        prior_by_id[prior_story.get("id")] = {
-                            "text": prior_story.get("title", ""), "deferred": bool(prior_story.get("deferred")),
-                        }
-                        for prior_ac in prior_story.get("acceptance_criteria") or []:
-                            prior_by_id[prior_ac.get("id")] = {
-                                "text": prior_ac.get("description", ""), "deferred": bool(prior_ac.get("deferred")),
-                            }
-                except json.JSONDecodeError:
-                    pass
+            for prior_story in prior_spec.get("user_stories") or []:
+                prior_by_id[prior_story.get("id")] = {
+                    "text": prior_story.get("title", ""), "deferred": bool(prior_story.get("deferred")),
+                }
+                for prior_ac in prior_story.get("acceptance_criteria") or []:
+                    prior_by_id[prior_ac.get("id")] = {
+                        "text": prior_ac.get("description", ""), "deferred": bool(prior_ac.get("deferred")),
+                    }
             no_new_work = _stamp_gate_change_and_check_delta(content_dict, prior_by_id, updated_entries)
 
             content_dict["retired_user_stories"] = [
@@ -1658,7 +1665,8 @@ def make_verify_specification_ledger(
             ]
 
             # Story decisions (2026-10-02): every approved story declared unchanged/modified/
-            # retired, matching what this lap's delta does to it -- see
+            # retired, matching what this lap's delta AND the ledger (changes an earlier passing lap
+            # of this ticket already saved, which can't be undone) do to it -- see
             # gates/ledger_sync_checks.check_story_decisions. Its own row, run only here, after a
             # successful sync/save/render: inside sync_ledger, a YOLO advisory failure would skip
             # the save and the full-story render and put a delta-only spec in front of the human.
@@ -1667,7 +1675,7 @@ def make_verify_specification_ledger(
             elif not prior_spec.get("user_stories"):
                 log.skipped(spec_ledger.SPEC_STORY_DECISIONS, "no approved specification yet -- nothing to classify")
             else:
-                decision_problems = check_story_decisions(prior_spec, delta_specification)
+                decision_problems = check_story_decisions(prior_spec, delta_specification, updated_entries, run_id)
                 content_dict["story_decision_rows"] = spec_ledger.build_story_decision_rows(
                     prior_spec, content_dict.get("story_decisions") or []
                 )
@@ -1678,18 +1686,33 @@ def make_verify_specification_ledger(
 
             # This round's PRD changes (PC-n, from the requirements-prd stage, copied to the scratch
             # file at draft start) must each be accounted for -- check_prd_changes_addressed.
-            prd_changes: list[dict[str, Any]] = []
             raw_prd_changes = await repo_files.read_repo_file(provider, thread_id, spec_ledger.PRD_CHANGES_SCRATCH_PATH)
             try:
-                prd_changes = (json.loads(raw_prd_changes) or {}).get("changes") or [] if raw_prd_changes else []
-            except (json.JSONDecodeError, AttributeError):
-                prd_changes = []
+                prd_doc = json.loads(raw_prd_changes) if raw_prd_changes else {}
+            except json.JSONDecodeError:
+                prd_doc = {}
+            prd_doc = prd_doc if isinstance(prd_doc, dict) else {}
+            prd_changes: list[dict[str, Any]] = prd_doc.get("changes") or []
+            prd_added: list[str] = prd_doc.get("added") or []
+            # A draft holding nothing but decisions is a legitimate no-op ticket -- unless this
+            # round's PRD merge added requirements, which then went nowhere.
+            decisions_only = not (
+                delta_specification.get("user_stories") or delta_specification.get("retired_us_ids")
+                or delta_specification.get("retired_ac_ids") or delta_specification.get("bug_affected_ac_ids")
+            )
             if stage_key != "specification":
                 log.skipped(spec_ledger.SPEC_PRD_CHANGES_ADDRESSED, "the baseline pass builds the approved specification")
-            elif not prd_changes:
+            elif not prd_changes and not (prd_added and decisions_only):
                 log.skipped(spec_ledger.SPEC_PRD_CHANGES_ADDRESSED, "no PRD changes this round")
             else:
                 prd_problems = check_prd_changes_addressed(delta_specification, [c.get("id") for c in prd_changes])
+                if prd_added and decisions_only:
+                    prd_problems.append(
+                        "this round's PRD merge added requirement(s) the draft does nothing about: "
+                        + "; ".join(prd_added)
+                        + " -- add the stories or criteria that deliver them (or modify the existing story "
+                        "that should cover one)"
+                    )
                 decision_problems += prd_problems
                 content_dict["prd_change_rows"] = spec_ledger.build_prd_change_rows(
                     prd_changes, content_dict.get("story_decisions") or [],
@@ -3924,9 +3947,13 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         # in the sandbox, so the draft doesn't explore the repo cold every lap. Never inlined, never
         # blocking -- see codebase_map's module docstring.
         if sandbox_registry.get(thread_id) is not None:
-            map_message = await codebase_map.codebase_map_message(
-                get_sandbox_provider(), thread_id, stage_spec.key, state.get("run_id", "unknown")
-            )
+            try:
+                map_message = await codebase_map.codebase_map_message(
+                    get_sandbox_provider(), thread_id, stage_spec.key, state.get("run_id", "unknown")
+                )
+            except Exception:
+                logger.warning("codebase map failed for %s (thread %s) -- drafting without it", stage_spec.key, thread_id, exc_info=True)
+                map_message = None
             if map_message is not None:
                 prompt_messages.append(map_message)
         # Headless mode (run_headless.py): the runner cannot answer clarifying questions, so a
@@ -6371,7 +6398,9 @@ REQUIREMENTS_PRD_STAGE = StageSpec(
     surface_tool_name="present_requirements_prd",
     build_envelope=build_requirements_prd_envelope,
     build_prompt=_build_requirements_prd_prompt,
-    max_cycles=lambda: workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
+    # 0: a not-ready draft goes straight to verify (the auto-approve path), never to a clarification
+    # pause -- no screen shows this stage's questions, so that pause would just end the run.
+    max_cycles=lambda: 0,
     render_markdown=None,  # the post-approve hook writes 01-requirements-prd.md itself
     draft_example=REQUIREMENTS_PRD_DRAFT_EXAMPLE,
     gate=Gate(
@@ -7246,6 +7275,66 @@ def _demo_spec_story_decisions() -> None:
         assert "PC-1" in explained.feedback and "only the PRD wording changed" in explained.feedback, explained.feedback
 
         assert prd_row(run("brownfield-spec")[0])["status"] == "skipped"
+
+        # --- final-review fixes ---
+        files.pop(spec_ledger.PRD_CHANGES_SCRATCH_PATH)
+        # (C1) An earlier passing lap of this ticket retired US-0002 (the ledger keeps it). This lap
+        # drops the retirement and declares it unchanged -- the gate must not show a retired story
+        # labelled Unchanged.
+        ledger_before = [dict(e) for e in ledger]
+        for entry in ledger:
+            if entry["id"] in ("US-0002", "US-0002.1"):
+                entry["status"] = "retired"
+        draft([("US-0001", "unchanged"), ("US-0002", "unchanged")])
+        walked_back, _ = run()
+        assert not walked_back.passed and "already retired" in walked_back.feedback, walked_back.feedback
+        ledger[:] = ledger_before
+
+        # (I6) A correction at the Plan gate, after this ticket's own Specification approval: the
+        # approved spec now holds the ticket's new US-0003; the round base doesn't.
+        files[spec_ledger.ROUND_BASE_SPEC_PATH] = json.dumps(approved)
+        files[workflow_persistence.SPECIFICATION_APPROVED_PATH] = json.dumps({
+            **approved, "user_stories": approved["user_stories"] + [story("US-0003", "Tag a note", "to tag notes", "Tags save.")],
+        })
+        ledger.extend([
+            {"id": "US-0003", "kind": "user_story", "status": "active", "title": "Tag a note",
+             "narrative": "As a writer, I want to tag notes, so that I keep my thoughts", "first_seen_run_id": "r"},
+            {"id": "US-0003.1", "kind": "acceptance_criterion", "parent_us_id": "US-0003", "status": "active",
+             "description": "Tags save.", "first_seen_run_id": "r"},
+        ])
+        draft([("US-0001", "unchanged"), ("US-0002", "unchanged")])
+        restarted, _ = run()
+        assert restarted.passed, ("judged against the round base: US-0003 needs no row", restarted.feedback)
+        assert restarted.report["no_new_work"] is False, "the ticket's own new story is still this round's work"
+        files[workflow_persistence.SPECIFICATION_APPROVED_PATH] = json.dumps(approved)
+        files.pop(spec_ledger.ROUND_BASE_SPEC_PATH)
+        ledger[:] = ledger_before
+
+        # (I8) The PRD round added a requirement, but the draft is decisions only: not a no-op.
+        files[spec_ledger.PRD_CHANGES_SCRATCH_PATH] = json.dumps({"changes": [], "added": ["- Notes can be tagged."]})
+        draft([("US-0001", "unchanged"), ("US-0002", "unchanged")])
+        forgot_added, _ = run()
+        assert not forgot_added.passed and "Notes can be tagged" in forgot_added.feedback, forgot_added.feedback
+        assert forgot_added.report["no_new_work"] is False
+        files.pop(spec_ledger.PRD_CHANGES_SCRATCH_PATH)
+
+        # (I4) A story created on lap 1 is written back citing its new id, so lap 2 doesn't reject it
+        # as a word-for-word duplicate of itself.
+        written: dict[str, str] = {}
+
+        async def _capture(_p, _t, path, content):  # noqa: ANN001, ANN202
+            written[path] = content
+
+        repo_files.write_repo_file = _capture
+        new_story = story("draft-2", "Tag a note", "to tag notes", "Tags save.")
+        new_story["existing_us_id"] = None
+        new_story["acceptance_criteria"][0]["existing_ac_id"] = None
+        draft([("US-0001", "unchanged"), ("US-0002", "unchanged")], user_stories=[new_story])
+        assert run()[0].passed
+        written_back = json.loads(written[spec_ledger.DRAFT_SPEC_PATH])["user_stories"][0]
+        assert written_back["existing_us_id"] == written_back["id"] and written_back["id"].startswith("US-"), written_back
+        assert written_back["acceptance_criteria"][0]["existing_ac_id"] == written_back["acceptance_criteria"][0]["id"]
+        repo_files.write_repo_file = _noop
     finally:
         repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger, spec_ledger.save_ledger = real
 
@@ -7993,6 +8082,7 @@ def _demo() -> None:
         assert make_route_after_gate(by_key[gated])(restarting) == "restart", gated  # type: ignore[arg-type]
     prd_spec = next(s for s in _ALL_STAGE_SPECS if s.key == "requirements-prd")
     assert prd_spec.requires_human_gate is False and prd_spec.audit_response_schema is None
+    assert prd_spec.max_cycles() == 0, "a not-ready PRD draft goes to verify -- no screen shows its questions"
     assert prd_spec.gate is not None and set(prd_spec.gate.policy.values()) == {"blocking"}, (
         "no human gate behind it, so an advisory failure would be approved unseen"
     )
@@ -8769,6 +8859,7 @@ def _demo() -> None:
     draft_node_src = inspect.getsource(make_draft_node)
     # The codebase map pointer (2026-10-02) is appended for every configured stage's draft.
     assert "codebase_map.codebase_map_message(" in draft_node_src, "make_draft_node no longer offers the codebase map"
+    assert "drafting without it" in draft_node_src, "a codebase-map failure must never fail the draft"
     assert "example=stage_spec.draft_example" in draft_node_src and "rules=stage_spec.draft_rules" in draft_node_src, (
         "make_draft_node no longer threads draft_example/draft_rules into ainvoke_structured"
     )
@@ -8877,8 +8968,13 @@ def _demo() -> None:
                      "new_text": "", "delta_quote": "Notes are permanent once saved"}],
         "diff": "--- previous PRD\n+++ this round\n-- Users can delete a note.",
     }}
-    assert "PC-1" not in "\n".join(str(m.content) for m in _build_specification_prompt(prd_state)), (
-        "first ticket: no baseline to weigh PRD changes against"
+    # (I9) Shown whenever there are PRD changes -- spec.prd_changes_addressed checks them whenever
+    # they exist, so the model must always see what it is checked against.
+    assert "PC-1" in "\n".join(str(m.content) for m in _build_specification_prompt(prd_state))
+    diff_only = copy.deepcopy(prd_state)
+    diff_only["stages"]["requirements-prd"]["approved_content"]["changes"] = []
+    assert "PRD diff" not in "\n".join(str(m.content) for m in _build_specification_prompt(diff_only)), (
+        "a first ticket's diff (the whole PRD) adds nothing to the requirements text"
     )
     prd_state["stages"]["specification"]["ticket_mode_baseline"] = True
     prd_text = "\n".join(str(m.content) for m in _build_specification_prompt(prd_state))
