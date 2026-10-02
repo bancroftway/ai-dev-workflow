@@ -326,6 +326,43 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher enforces stricter accessibility (axe-backed, deterministic, fixable); lower lets weaker accessibility through.",
         "0-100",
     ),
+    "CODEBASE_MAP_STAGES": _Setting(
+        "frozenset_csv", "AIDW_CODEBASE_MAP_STAGES", "plan,minimal-code-to-green,remediation", "runtime_misc",
+        "Stage keys whose draft turn is pointed at a compressed codebase map (repomix signatures) written to agent-work/codebase-map.md.",
+        "Adding a stage gives its draft a head start instead of exploring the repo cold each lap (one repomix run per stage per run); removing one saves that run and the map read. Empty disables the map entirely.",
+        "comma-separated stage keys, e.g. \"plan,minimal-code-to-green\"",
+    ),
+    "CODEBASE_MAP_MAX_CHARS": _Setting(
+        "int", "AIDW_CODEBASE_MAP_MAX_CHARS", "80000", "truncation",
+        "Largest compressed codebase map kept; a bigger one is replaced by a plain file list.",
+        "Higher keeps signatures for bigger repos but may need more than one Read for the agent to take in; lower falls back to the file list sooner.",
+        "positive integer (characters)",
+    ),
+    "CODEBASE_MAP_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_CODEBASE_MAP_TIMEOUT_SECONDS", "120", "sandbox",
+        "Time limit for one repomix run inside the sandbox; the map is skipped (never blocking the stage) when it runs over.",
+        "Higher lets very large repos finish (the draft waits that long first); lower gives up sooner and the draft starts without a map.",
+        "positive integer (seconds)",
+    ),
+    "CODEBASE_MAP_INCLUDE": _Setting(
+        "csv", "AIDW_CODEBASE_MAP_INCLUDE",
+        "**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.mjs,**/*.cjs,**/*.py,**/*.cs,**/*.go,**/*.java,**/*.rb,**/*.php,"
+        "**/*.rs,**/*.vue,**/*.swift,**/*.dart,**/*.css",
+        "runtime_misc",
+        "File globs the codebase map covers. Only languages repomix can compress to signatures belong here -- anything else is copied in whole.",
+        "Adding a glob maps more of the repo (bigger map); removing one drops those files from it. Empty means repomix's own default: every file.",
+        "comma-separated globs, e.g. \"**/*.ts,**/*.py\"",
+    ),
+    "CODEBASE_MAP_IGNORE": _Setting(
+        "csv", "AIDW_CODEBASE_MAP_IGNORE",
+        ".git/**,agent-work/**,.ai-dev-workflow/**,**/node_modules/**,.playwright-browsers/**,**/bin/**,**/obj/**,"
+        "**/dist/**,**/build/**,**/out/**,**/.next/**,**/.nuxt/**,**/.angular/**,**/.venv/**,**/vendor/**,"
+        "**/TestResults/**,**/coverage/**",
+        "runtime_misc",
+        "Globs the codebase map always skips, on top of .gitignore (which a greenfield repo may not have yet).",
+        "Adding a glob keeps generated or vendored code out of the map; removing one lets it in. Mirrors repo_scan's scc exclusions.",
+        "comma-separated globs",
+    ),
     "LIGHTHOUSE_BLOCKING_AUDITS": _Setting(
         "frozenset_csv", "LIGHTHOUSE_BLOCKING_AUDITS", "color-contrast", "e2e",
         "Lighthouse audit ids that block the e2e gate on their own, whatever the aggregate accessibility score.",

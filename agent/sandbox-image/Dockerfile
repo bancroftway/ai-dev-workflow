@@ -199,6 +199,10 @@ ARG LIGHTHOUSE_VERSION=13.4.1
 # reasoning, even for the ones whose own output format is version-agnostic.
 ARG MERMAID_CLI_VERSION=11.16.0
 ARG JSCPD_VERSION=5.1.1
+# Compressed codebase map for draft turns (agent/src/codebase_map.py). Needs Node >= 22 (the image's
+# nodejs above satisfies it); --compress's tree-sitter grammars ship as wasm in the package, so it
+# runs offline.
+ARG REPOMIX_VERSION=1.18.1
 ARG LIZARD_VERSION=1.24.0
 ARG SEMGREP_VERSION=1.175.0
 ARG CHECKOV_VERSION=3.3.16
@@ -405,7 +409,7 @@ RUN set -eux; \
 # yet -- removed outright, `func` and its Node worker are untouched.
 RUN set -eux; \
     npm install -g --allow-scripts=azure-functions-core-tools \
-        "jscpd@${JSCPD_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}"; \
+        "jscpd@${JSCPD_VERSION}" "repomix@${REPOMIX_VERSION}" "azure-functions-core-tools@${FUNC_CORE_TOOLS_VERSION}"; \
     rm -rf /usr/lib/node_modules/azure-functions-core-tools/bin/workers/powershell \
            /usr/lib/node_modules/azure-functions-core-tools/bin/*/workers/powershell; \
     pip install --break-system-packages --no-cache-dir --default-timeout=120 --retries=5 \
@@ -1101,7 +1105,7 @@ import subprocess
 
 TOOLS = [
     "semgrep", "interrogate", "bandit", "checkov", "lizard",
-    "trivy", "osv-scanner", "gitleaks", "syft", "scc", "jscpd",
+    "trivy", "osv-scanner", "gitleaks", "syft", "scc", "jscpd", "repomix",
 ]
 manifest = {}
 for name in TOOLS:

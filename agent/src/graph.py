@@ -40,6 +40,7 @@ from langgraph.types import interrupt
 
 from . import app_discovery
 from . import approvals
+from . import codebase_map
 from . import config as workflow_config
 from . import git_ops
 from . import model_config
@@ -3911,6 +3912,15 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         )
 
         prompt_messages = stage_spec.build_prompt(prompt_state)
+        # Compressed codebase map (config.CODEBASE_MAP_STAGES): a pointer to a repomix signature map
+        # in the sandbox, so the draft doesn't explore the repo cold every lap. Never inlined, never
+        # blocking -- see codebase_map's module docstring.
+        if sandbox_registry.get(thread_id) is not None:
+            map_message = await codebase_map.codebase_map_message(
+                get_sandbox_provider(), thread_id, stage_spec.key, state.get("run_id", "unknown")
+            )
+            if map_message is not None:
+                prompt_messages.append(map_message)
         # Headless mode (run_headless.py): the runner cannot answer clarifying questions, so a
         # not-ready draft would dead-end the run at the needs_clarification END edge. Checked at
         # call time on purpose -- no import-order coupling. The injected message is never
@@ -8749,6 +8759,8 @@ def _demo() -> None:
     # is the same "wired, not just correct in isolation" proof already used above for the
     # retirement-cleanup/wireframe-scoping prompt segments, just aimed at code instead of a prompt.
     draft_node_src = inspect.getsource(make_draft_node)
+    # The codebase map pointer (2026-10-02) is appended for every configured stage's draft.
+    assert "codebase_map.codebase_map_message(" in draft_node_src, "make_draft_node no longer offers the codebase map"
     assert "example=stage_spec.draft_example" in draft_node_src and "rules=stage_spec.draft_rules" in draft_node_src, (
         "make_draft_node no longer threads draft_example/draft_rules into ainvoke_structured"
     )
