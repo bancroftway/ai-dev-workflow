@@ -2199,6 +2199,12 @@ class StageSpec:
     tech-stack detection) -- make_gate_node skips the interrupt() and proceeds straight to
     approved, same body that already runs post-interrupt-resolve for every other stage."""
 
+    redraft_every_attempt: bool = False
+    """True: an approval left by an EARLIER attempt never short-circuits this stage's draft, resume
+    or not -- should_skip_draft skips it only once its own verify has run in THIS attempt
+    (last_verification, which intake clears on every entry), and intake never carries it over as
+    skip-ahead eligible. metrics-exit sets it: its job is to judge the attempt that just ran."""
+
     post_audit_hook: Callable[[str, dict[str, Any], "GraphState", SandboxProvider], Awaitable[None]] | None = None
     """Fire-and-forget side effect called at the end of make_audit_node, right after persistence
     (thread_id, revised content dict, full GraphState, provider). Used for deterministic follow-up
@@ -2858,6 +2864,9 @@ STAGES: list[StageSpec] = [
         render_markdown=None,
         draft_example=EXIT_DRAFT_EXAMPLE,
         requires_human_gate=False,
+        # A resumed attempt re-judges itself: skipping this draft re-fired exit_finalize_node with
+        # the previous attempt's report and no model review of this one.
+        redraft_every_attempt=True,
         sign_approval=True,
         # Read-only tools, added because this stage SIGNS THE MERGE VERDICT. Its prompt is real and
         # it receives spec/plan/metrics JSON, so it was never a stub -- but with no tools it could
@@ -3390,6 +3399,9 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # so the first node touching e.g. stages["adversarial-audit"] would KeyError.
     for stage_spec in _ALL_STAGE_SPECS:
         stages.setdefault(stage_spec.key, default_stage_state())
+    # metrics-exit as the LAST attempt left it, before the reset below clears last_verification --
+    # the targeted-fix lever needs to know whether that attempt's report was really judged.
+    last_attempt_exit_stage = dict(stages["metrics-exit"])
 
     # AC-6.3: a Plan that had already advanced is reset to Not Started; its
     # last content stays visible (AC-8.4) but is no longer current/approved.
@@ -3414,14 +3426,11 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     resume = os.environ.get("AIDW_RESUME") == "1" or (resume_flag_popped and not is_new_submission)
     for stage_spec in STAGES[1:] + _STANDALONE_STAGE_SPECS:
         stage = stages[stage_spec.key]
-        # metrics-exit is NEVER skip-ahead eligible, resume or not: its whole job is to re-judge
-        # THIS run. A hydrated approved metrics-exit takes make_draft_node's short-circuit, which
-        # re-fires exit_finalize_node with the PREVIOUS run's approved content while bypassing
-        # verify_exit_readiness entirely -- so a thread whose last run escalated (merge_ready=False,
-        # "terminal pipeline failure" blocker) would stamp that stale failed verdict onto the
-        # resumed run's fresh exit report and re-close its session "failed" even when everything
-        # is now green.
-        stage_resume = resume and stage_spec.key != "metrics-exit"
+        # A redraft_every_attempt stage (metrics-exit) is NEVER skip-ahead eligible: its whole job
+        # is to re-judge THIS run. This only covers a fresh submission's reset below; a plain
+        # resume (no new submission) leaves its approval in place and should_skip_draft refuses
+        # to skip it instead, because this reset loop cleared its last_verification.
+        stage_resume = resume and not stage_spec.redraft_every_attempt
         # "drafting" (make_draft_node's start-of-turn mark) resets on a fresh submission like any
         # other per-run status, and is deliberately KEPT on a resume: it is the proof a killed
         # draft already touched the workspace (rebuild.py's TDD-red guard reads it).
@@ -3516,9 +3525,9 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # tokens"): a one-shot meta flag set by POST /api/sessions/actions {action: "targeted-fix"}
     # (sessions_api.py), popped here -- same one-shot contract as rewind_to_stage above. Unlike a
     # rewind, this is purely ADDITIVE: no stage's status/mechanics are reset by the flag itself.
-    # Seeds the fix pass from metrics-exit's own last approved_content (a MergeReadinessReport
-    # dict -- `merge_readiness = content` in exit_nodes.exit_finalize_node, i.e. no extra nesting),
-    # runs the fix, then resets ONLY metrics-exit's own stage (same reset rewind_to_stage already
+    # Seeds the fix pass from exit_nodes.targeted_fix_reasons -- the blockers exit finalize would
+    # write for the last attempt now, never a prior attempt's stored model prose (session c2bbdca1)
+    # -- runs the fix, then resets ONLY metrics-exit's own stage (same reset rewind_to_stage already
     # applies when targeting that stage) so the graph's normal sequential flow re-enters it for a
     # fresh verdict. Capped (config.TARGETED_FIX_MAX_ATTEMPTS) since nothing else bounds how many
     # times this lever could be invoked against the same closed run.
@@ -3530,8 +3539,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
                 thread_id, targeted_fix_attempts, workflow_config.TARGETED_FIX_MAX_ATTEMPTS,
             )
         else:
-            exit_report = (stages.get("metrics-exit") or {}).get("approved_content") or {}
-            reasons = [str(v) for v in _remediation_presence_values(exit_report.get("blocking_reasons"))]
+            reasons = await exit_nodes.targeted_fix_reasons(thread_id, last_attempt_exit_stage, state, get_sandbox_provider())
             if reasons:
                 # Stuck-fixer check (reused from remediation_gate.py's own _stuck_fixer_check,
                 # root-caused 2026-09-12 there for the identical "same reason(s) keep recurring
@@ -3584,8 +3592,8 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
                     )
             else:
                 logger.warning(
-                    "intake_node: targeted-fix requested for thread_id=%s but no blocking_reasons "
-                    "found on metrics-exit's approved_content -- nothing to do",
+                    "intake_node: targeted-fix requested for thread_id=%s but the last attempt "
+                    "has no current blocking reasons -- nothing to do",
                     thread_id,
                 )
 
@@ -3790,7 +3798,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
         # hook (tech-stack) keep firing their post_approve_hook on every run. On normal runs
         # intake resets every spec-onward stage to not_started, so this never triggers there.
         stage_now = state["stages"][stage_spec.key]
-        if should_skip_draft(stage_now):
+        if should_skip_draft(stage_now, redraft_every_attempt=stage_spec.redraft_every_attempt):
             logger.info("draft skipped for already-approved stage %s (resume)", stage_spec.key)
             # Skipping the LLM is right; skipping the hook is not. exit_finalize is what writes this
             # run's exit report, refreshes the manifest and closes the session, and it is idempotent
@@ -5924,8 +5932,11 @@ def assert_gates_have_self_checks() -> None:
         )
 
 
-def should_skip_draft(stage: dict[str, Any]) -> bool:
+def should_skip_draft(stage: dict[str, Any], *, redraft_every_attempt: bool = False) -> bool:
     """Whether a stage's LLM draft can be skipped because it is already approved. Pure.
+
+    `redraft_every_attempt` (StageSpec field): an approval with NO verification on record is one
+    an earlier attempt left (intake clears last_verification on every entry), so it never skips.
 
     A FAILED verification cancels the skip, and that clause is the whole reason this is a named
     function rather than an inline condition. Without it the verify-retry loop is a NO-OP for every
@@ -5942,9 +5953,9 @@ def should_skip_draft(stage: dict[str, Any]) -> bool:
     if stage.get("status") != "approved" or not stage.get("approved_content"):
         return False
     last_verification = stage.get("last_verification") or {}
-    if last_verification and not last_verification.get("passed"):
-        return False
-    return True
+    if not last_verification:
+        return not redraft_every_attempt
+    return bool(last_verification.get("passed"))
 
 
 def make_auto_approve_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfig], Any]:
@@ -7383,6 +7394,12 @@ def _demo_route_policy_matrix(specs: list[StageSpec]) -> int:
             got = route_d(_st(readiness=True))  # type: ignore[arg-type]
             assert got == expected_draft, f"{spec.key}/{mode}: draft routed {got!r}, expected {expected_draft!r}"
             checked += 1
+            if spec.redraft_every_attempt:
+                # Its per-attempt redraft (over an earlier approval) must face verify in every mode:
+                # verify's last_verification is what tells exit finalize the report is this attempt's.
+                got = route_d(_st(readiness=True, status="ready_for_review", approved_content={"x": 1}))  # type: ignore[arg-type]
+                assert got in ("gate_verify", "gate_audit"), f"{spec.key}/{mode}: redraft routed {got!r}, skipping verify"
+                checked += 1
             if route_v is None:
                 continue
             fail = {"passed": False, "report": {}}
@@ -7734,6 +7751,52 @@ def _demo() -> None:
             )
     finally:
         globals()["_persist_if_sandboxed"] = real_persist
+        globals()["_run_post_approve_hook"] = real_hook
+
+    # Resume of a redraft_every_attempt stage (metrics-exit): intake's per-run reset leaves an
+    # earlier attempt's approval with last_verification None. The REAL draft node must reach the
+    # model for it (its verify then sets last_verification for exit finalize), while an ordinary
+    # approved stage in the same shape still short-circuits and only re-fires its hook.
+    assert [s.key for s in _ALL_STAGE_SPECS if s.redraft_every_attempt] == ["metrics-exit"]
+    assert not should_skip_draft({"status": "approved", "approved_content": {"x": 1}}, redraft_every_attempt=True)
+    assert should_skip_draft(
+        {"status": "approved", "approved_content": {"x": 1}, "last_verification": {"passed": True}}, redraft_every_attempt=True
+    ), "approved AND verified in this attempt: skip like any other stage"
+
+    class _ReachedModel(Exception):
+        pass
+
+    def _model_reached(*_args: Any, **_kwargs: Any) -> Any:
+        raise _ReachedModel
+
+    hooked: list[str] = []
+
+    async def _record_hook(spec: StageSpec, *_args: Any) -> None:
+        hooked.append(spec.key)
+
+    real_model = get_chat_model_for_thread
+    globals()["get_chat_model_for_thread"] = _model_reached
+    globals()["_run_post_approve_hook"] = _record_hook
+    try:
+        all_specs = {spec.key: spec for spec in _ALL_STAGE_SPECS}
+        for key, expect_redraft in (("metrics-exit", True), ("plan", False)):
+            resumed_stage = {
+                **default_stage_state(), "status": "approved", "approved_content": {"x": 1},
+                "last_verification": {"passed": True}, "skills": {"provider": "claude"},
+            }
+            _reset_stage_mechanics(resumed_stage)  # what intake does on every entry
+            try:
+                asyncio.run(make_draft_node(all_specs[key])(
+                    {"stages": {key: resumed_stage}, "provider": "claude", "run_id": "demo"},  # type: ignore[arg-type]
+                    {"configurable": {"thread_id": "demo-resume-no-sandbox"}},
+                ))
+                redrafted = False
+            except _ReachedModel:
+                redrafted = True
+            assert redrafted is expect_redraft, f"{key}: resumed approved stage redrafted={redrafted}"
+        assert hooked == ["plan"], "metrics-exit must not re-fire exit finalize from a prior attempt's approval"
+    finally:
+        globals()["get_chat_model_for_thread"] = real_model
         globals()["_run_post_approve_hook"] = real_hook
 
     build_graph()  # runs assert_pipeline_nodes_registered + assert_no_dead_clusters

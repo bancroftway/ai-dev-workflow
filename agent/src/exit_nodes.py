@@ -10,6 +10,7 @@ this session.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -1435,8 +1436,9 @@ def metrics_exit_judged_this_attempt(state: dict[str, Any]) -> bool:
     _reset_stage_mechanics clears it on EVERY intake (resume or not, after hydration), and only
     metrics-exit's verify node sets it again -- which runs after every real draft of this stage in
     every mode (its Gate is persists=True, which graph._demo asserts is never "off"). The resume
-    short-circuit (make_draft_node's should_skip_draft branch) re-fires exit_finalize_node with the
-    previous attempt's approved_content without ever reaching verify, so it reads False here."""
+    short-circuit (make_draft_node's should_skip_draft branch) used to re-fire exit_finalize_node
+    with the previous attempt's approved_content without ever reaching verify; metrics-exit's
+    StageSpec.redraft_every_attempt now refuses that skip on exactly this False signal."""
     return ((state.get("stages") or {}).get("metrics-exit") or {}).get("last_verification") is not None
 
 
@@ -1524,6 +1526,29 @@ async def _final_merge_readiness(
             )
         merge_readiness["merge_ready"] = False
     return merge_readiness
+
+
+async def targeted_fix_reasons(
+    thread_id: str, exit_stage: dict[str, Any], state: dict[str, Any], provider: Any
+) -> list[str]:
+    """What the targeted-fix lever (graph.intake_node) sends the fixer: the blocking reasons exit
+    finalize would write for the last attempt NOW -- _final_merge_readiness itself, so a report
+    metrics-exit did not judge in that attempt contributes none of its prose, and gate-owned
+    phrases are re-checked against the current tree. `exit_stage` is metrics-exit as the last
+    attempt left it (before intake's reset clears last_verification). Recomputed rather than read
+    from manifest.json's merge_readiness: a session finalized before that seed existed (c2bbdca1)
+    still carries the stale "no main.ts"/"zero screenshots" prose there. NOT_RECHECKED_REASON is
+    dropped -- "the recheck could not run" is nothing a code fix can address."""
+    report = await _final_merge_readiness(
+        thread_id,
+        copy.deepcopy(exit_stage.get("approved_content") or {}),
+        {**state, "stages": {**(state.get("stages") or {}), "metrics-exit": exit_stage}},
+        provider,
+    )
+    return [
+        str(r) for r in _presence_values(report.get("blocking_reasons"))
+        if r != exit_readiness_checks.NOT_RECHECKED_REASON
+    ]
 
 
 def _baseline_refresh_payload(status: str, metrics_summary: dict[str, Any]) -> str | None:
@@ -2548,7 +2573,11 @@ def _demo() -> None:
     ui_tech_stack = {**TECH_STACK_DRAFT_EXAMPLE.tech_stack.model_dump(mode="json"), "frameworks": ["Angular"]}
     rebuild_failure = {"stage": "r_adversarial_compliance", "type": "rebuild_cap_exceeded", "feedback": "scan-delta gate"}
 
-    def _run_final(state: dict[str, Any], content: dict[str, Any], files: dict[str, Any], *, crash: bool = False) -> dict[str, Any]:
+    def _run_final(
+        state: dict[str, Any], content: dict[str, Any], files: dict[str, Any], *, crash: bool = False,
+        exit_stage: dict[str, Any] | None = None,
+    ) -> Any:
+        """_final_merge_readiness, or targeted_fix_reasons when `exit_stage` (pre-reset) is given."""
         async def _fake_read(_provider: Any, _thread_id: str, path: str) -> str | None:
             if crash:
                 raise RuntimeError("container gone")
@@ -2561,6 +2590,8 @@ def _demo() -> None:
         repo_files.read_repo_file = _fake_read  # type: ignore[assignment]
         globals()["_list_screenshots"] = _fake_screens
         try:
+            if exit_stage is not None:
+                return asyncio.run(targeted_fix_reasons("t-exit", {**exit_stage, "approved_content": content}, state, object()))
             return asyncio.run(_final_merge_readiness("t-exit", content, state, object()))
         finally:
             repo_files.read_repo_file = original_read  # type: ignore[assignment]
@@ -2591,6 +2622,19 @@ def _demo() -> None:
     # Not judged and the recompute itself can't run: never ready on an unverified seed.
     crashed = _run_final({**resumed, "run_failure": None}, prior_report, clean_files, crash=True)
     assert crashed["merge_ready"] is False and crashed["blocking_reasons"]["values"] == [erc.NOT_RECHECKED_REASON], crashed
+
+    # targeted_fix_reasons: what a targeted fix is sent to fix. `resumed` is the state AFTER the
+    # targeted-fix intake's reset (last_verification cleared); exit_stage is metrics-exit as the
+    # last attempt left it -- that, not the reset state, decides whether its prose counts.
+    unjudged_last = _run_final(resumed, prior_report, no_metrics_files, exit_stage={"last_verification": None})
+    assert unjudged_last == [_terminal_failure_reason(rebuild_failure), erc.metrics_problems({}, "r1")[0][0]], (
+        "session c2bbdca1: never chase a prior attempt's prose (no main.ts / zero screenshots)", unjudged_last
+    )
+    judged_last = _run_final(resumed, prior_report, no_metrics_files, exit_stage={"last_verification": {"passed": True}})
+    assert prior_prose in judged_last and erc.NO_SCREENSHOTS_REASON not in judged_last, judged_last
+    assert prior_report["blocking_reasons"]["values"] == [prior_prose, erc.NO_SCREENSHOTS_REASON], "stored content never mutated"
+    # Recheck could not run: the placeholder is not a code problem, so there is nothing to fix.
+    assert _run_final({**resumed, "run_failure": None}, prior_report, clean_files, crash=True, exit_stage={"last_verification": None}) == []
 
     # Every declared Check is recorded somewhere in verify_exit_readiness (text scan).
     import inspect
