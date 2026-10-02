@@ -288,6 +288,14 @@ def _failure_headline(run_failure: dict[str, Any]) -> str:
     return first[:workflow_config.EXIT_FAILURE_HEADLINE_CHARS]
 
 
+def _terminal_failure_reason(run_failure: dict[str, Any]) -> str:
+    """The blocking bullet exit_finalize_node injects for a terminal failure -- starts with
+    exit_readiness_checks.TERMINAL_FAILURE_MARKER, so a later attempt's stale filter owns it."""
+    reason = f"{exit_readiness_checks.TERMINAL_FAILURE_MARKER} {run_failure.get('stage')}: {run_failure.get('type')}"
+    detail_line = _failure_headline(run_failure)
+    return f"{reason} -- {detail_line}" if detail_line else reason
+
+
 def _render_terminal_failure(run_failure: dict[str, Any] | None) -> str:
     """'## Terminal failure' section: stage, type, failure_type and the recorded output tail
     verbatim in a code block, so the report itself names why the run died."""
@@ -1418,6 +1426,106 @@ async def verify_exit_readiness(
     )
 
 
+def metrics_exit_judged_this_attempt(state: dict[str, Any]) -> bool:
+    """Whether metrics-exit's own draft+verify ran in THIS attempt (since the last intake), i.e.
+    whether its approved_content was written about this attempt at all.
+
+    run_id can't answer this: a resume keeps it (intake_node's return), so yesterday's failed
+    attempt and today's resumed one share it. The signal is `last_verification`: intake_node's
+    _reset_stage_mechanics clears it on EVERY intake (resume or not, after hydration), and only
+    metrics-exit's verify node sets it again -- which runs after every real draft of this stage in
+    every mode (its Gate is persists=True, which graph._demo asserts is never "off"). The resume
+    short-circuit (make_draft_node's should_skip_draft branch) re-fires exit_finalize_node with the
+    previous attempt's approved_content without ever reaching verify, so it reads False here."""
+    return ((state.get("stages") or {}).get("metrics-exit") or {}).get("last_verification") is not None
+
+
+def _deterministic_only_report(run_id: str) -> dict[str, Any]:
+    """The MergeReadinessReport seed exit_finalize_node uses when metrics-exit did not judge this
+    attempt: none of the prior attempt's model-written prose (blocking reasons, risk notes, PR
+    title/description -- session c2bbdca1's said "scaffold only", "no main.ts", "zero e2e
+    screenshots" about a tree that had all of them by then). Pessimistic by construction:
+    NOT_RECHECKED_REASON keeps merge_ready False unless verify_exit_readiness actually runs, and is
+    gate-owned, so that run clears it and leaves only this attempt's real blockers."""
+    return {
+        "merge_ready": False,
+        "blocking_reasons": _presence_from_values(
+            [exit_readiness_checks.NOT_RECHECKED_REASON], empty_reason="unreachable: seeded non-empty"
+        ),
+        "pr_title": f"ai-dev-workflow: {run_id}",
+        "pr_description_markdown": (
+            "The merge-readiness review (metrics-exit) did not run in this attempt, so this report "
+            "carries no model-written assessment: the verdict below comes only from this attempt's "
+            "deterministic exit checks and any terminal pipeline failure."
+        ),
+        "risk_notes": _presence_from_values(
+            [], empty_reason="no model-written risk review in this attempt (metrics-exit did not run)"
+        ),
+    }
+
+
+async def _final_merge_readiness(
+    thread_id: str, content: dict[str, Any], state: dict[str, Any], provider: Any
+) -> dict[str, Any]:
+    """The merge_readiness every exit_finalize_node consumer reads (manifest.json, report.json, the
+    three exit markdowns, the PR title/body, close_session): `content` when metrics-exit judged
+    this attempt, otherwise _deterministic_only_report -- then the deterministic recompute, then
+    the terminal-failure injection. Mutates `content` in place on the judged path (as before)."""
+    run_id = state.get("run_id", "unknown")
+    if metrics_exit_judged_this_attempt(state):
+        merge_readiness = content
+    else:
+        logger.warning(
+            "exit finalize: metrics-exit did not run in this attempt (thread_id=%s, run_id=%s) -- "
+            "discarding its prior-attempt report text, building merge readiness from deterministic checks only",
+            thread_id, run_id,
+        )
+        merge_readiness = _deterministic_only_report(run_id)
+
+    # Re-run the deterministic merge-readiness recompute UNCONDITIONALLY, on every single call --
+    # not just a fresh approval. This is the fix for a real bug: on a RESUMED run whose metrics-exit
+    # stage was already "approved" from an earlier attempt, make_draft_node's resume short-circuit
+    # (graph.py's "Resume short-circuit" comment) re-fires this hook with the PREVIOUS run's frozen
+    # approved_content, never calling verify_exit_readiness again. Root-caused live (income-investor
+    # thread f0fef8ba): after the gitleaks/e2e failures that ORIGINALLY set blocking_reasons were
+    # fixed on a later resume, the exit report kept re-reporting all of them forever. That fix only
+    # dropped STALE gate-owned phrases; the model's own prose about the old attempt survived it
+    # (session c2bbdca1) -- hence the deterministic-only seed above. Calling it again is a no-op on
+    # the NORMAL (fresh-approval) path, where it already ran seconds earlier via make_verify_node --
+    # an idempotent recompute, not a redraft. It DOES mean a second round of live sandbox reads
+    # (manifest, tech-stack, coverage-commands, metrics-latest.json, a screenshot listing) on every
+    # run that reaches this stage -- an honest, deliberate cost, not free.
+    #
+    # Guarded, not left to propagate: verify_exit_readiness does live, unguarded sandbox I/O, and
+    # this codebase already documents provider.exec_in_sandbox raising RuntimeError against a
+    # torn-down container. Propagating would skip exit_finalize_node's guaranteed close_session. On
+    # failure, the content stays unrefreshed (judged path) or keeps NOT_RECHECKED_REASON (seed).
+    try:
+        await verify_exit_readiness(thread_id, merge_readiness, run_id, None, provider, "", 0)
+    except Exception:  # noqa: BLE001 -- degrade, never abort the report
+        logger.warning("exit finalize: verify_exit_readiness re-check failed for thread_id=%s", thread_id, exc_info=True)
+
+    terminal_failure = state.get("run_failure")
+    if terminal_failure:
+        # A terminal escalate (rebuild/e2e/test-hardening) routed into this stage so the report
+        # still gets written -- but the drafting model never sees run_failure, so without this the
+        # report blames whatever incidental gaps it found ("metrics were not recorded") and never
+        # names the actual killer. The bullet carries the error's first meaningful line -- a bare
+        # "rebuild_cap_exceeded" sent the drafting model guessing at a root cause (observed live,
+        # run d16959d3: it blamed a missing project reference; the real killer was an MSB4025
+        # XML-comment error that only the DB row and ledger named). The full tail lands in its own
+        # section of the report.
+        reason = _terminal_failure_reason(terminal_failure)
+        existing_reasons = _presence_values(merge_readiness.get("blocking_reasons"))
+        if reason not in existing_reasons:
+            merge_readiness["blocking_reasons"] = _presence_from_values(
+                [reason, *existing_reasons],
+                empty_reason="unreachable: reason is always appended in this branch",
+            )
+        merge_readiness["merge_ready"] = False
+    return merge_readiness
+
+
 def _baseline_refresh_payload(status: str, metrics_summary: dict[str, Any]) -> str | None:
     """The JSON to (over)write `repo_scan.BASELINE_PATH` with on this run's completion, or None to
     leave the baseline untouched.
@@ -1466,74 +1574,8 @@ async def exit_finalize_node(
     other (success in the try, or the degraded fallback in the except)."""
     run_id = state.get("run_id", "unknown")
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    merge_readiness = content
-
-    # Re-run the deterministic merge-readiness recompute UNCONDITIONALLY, on every single call --
-    # not just a fresh approval. This is the fix for a real bug: on a RESUMED run whose metrics-exit
-    # stage was already "approved" from an earlier attempt, make_draft_node's resume short-circuit
-    # (graph.py's "Resume short-circuit" comment) re-fires this hook with the PREVIOUS run's frozen
-    # approved_content, never calling verify_exit_readiness again -- graph.py's own comment on
-    # intake_node's stage_resume computation already names this exact bug ("metrics-exit is NEVER
-    # skip-ahead eligible, resume or not") but nothing ever closed it. Root-caused live
-    # (income-investor thread f0fef8ba): after the gitleaks/e2e failures that ORIGINALLY set
-    # blocking_reasons were fixed on a later resume, the exit report kept re-reporting all of them
-    # forever, keeping merge_ready permanently False on an otherwise-clean run. verify_exit_readiness
-    # already has a correct, tested stale-reason filter built in (exit_readiness_checks.
-    # GATE_OWNED_REASON_MARKERS) that would have caught and dropped all of them -- it simply never
-    # got invoked on this path. Calling
-    # it again here is a no-op on the NORMAL (fresh-approval) path too, where it already ran seconds
-    # earlier via make_verify_node -- an idempotent recompute (its own docstring: "always returns
-    # passed=True with the draft mutated in place"), not a redraft. It DOES mean a second round of
-    # live sandbox reads (manifest, tech-stack, coverage-commands, metrics-latest.json, a screenshot
-    # listing) on every run that reaches this stage, not just the buggy resume case -- an honest,
-    # deliberate cost, not free.
-    #
-    # Wrapped in its own try/except, NOT folded into the function's main try block below: this call
-    # sits BEFORE the terminal_failure injection and status/merge_ready derivation just below (both
-    # of which must see the REFRESHED content), which is itself before session_row is fetched and
-    # before the main try block that guarantees close_session always fires. verify_exit_readiness
-    # does live, unguarded sandbox I/O (repo_files.read_repo_file, app_discovery.collect_evidence)
-    # with no exception handling of its own -- and this codebase already documents
-    # provider.exec_in_sandbox raising RuntimeError against a torn-down container (run_headless.py's
-    # own comment: "metrics-exit_gate's own node tears the sandbox down as its LAST action once it
-    # finishes"). Letting that propagate here would skip EVERYTHING below, including the one
-    # guarantee this function's own docstring calls "structurally impossible" to skip:
-    # session_store.close_session always firing. Same degrade-not-abort pattern this function
-    # already uses further down for _files_changed/_list_screenshots/_load_ledger_rows -- on
-    # failure, proceed with content UNREFRESHED (today's existing behavior, not a new regression)
-    # rather than losing the whole finalize.
-    try:
-        await verify_exit_readiness(thread_id, content, run_id, None, provider, "", 0)
-    except Exception:  # noqa: BLE001 -- degrade to today's stale-content behavior, never abort the report
-        logger.warning("exit finalize: verify_exit_readiness re-check failed for thread_id=%s", thread_id, exc_info=True)
-
+    merge_readiness = await _final_merge_readiness(thread_id, content, state, provider)
     terminal_failure = state.get("run_failure")
-    if terminal_failure:
-        # A terminal escalate (rebuild/e2e/test-hardening) routed into this stage so the report
-        # still gets written -- but the drafting model never sees run_failure, so without this the
-        # report blames whatever incidental gaps it found ("metrics were not recorded") and never
-        # names the actual killer. Injected before update_manifest below so the manifest,
-        # report.json, both exit markdowns and the session close all carry it. Phrase is listed in
-        # exit_readiness_checks.GATE_OWNED_REASON_MARKERS -- see that tuple's comment.
-        # The bullet carries the error's first meaningful line -- the report is the artifact a human
-        # reads on the branch, and a bare "rebuild_cap_exceeded" sent the drafting model guessing at
-        # a root cause (observed live, run d16959d3: it blamed a missing project reference; the real
-        # killer was an MSB4025 XML-comment error that only the DB row and ledger named). The full
-        # tail lands in its own section below.
-        reason = (
-            f"terminal pipeline failure recorded at {terminal_failure.get('stage')}: "
-            f"{terminal_failure.get('type')}"
-        )
-        detail_line = _failure_headline(terminal_failure)
-        if detail_line:
-            reason = f"{reason} -- {detail_line}"
-        existing_reasons = _presence_values(merge_readiness.get("blocking_reasons"))
-        if reason not in existing_reasons:
-            merge_readiness["blocking_reasons"] = _presence_from_values(
-                [reason, *existing_reasons],
-                empty_reason="unreachable: reason is always appended in this branch",
-            )
-        merge_readiness["merge_ready"] = False
 
     # Status logic: merge_ready-aware, not just run_failure-aware -- a run that reaches exit but
     # fails a DETERMINISTIC gate (verify_exit_readiness forcing merge_ready=False: missing
@@ -1719,8 +1761,9 @@ async def exit_finalize_node(
         # Remediation's approved report: known_gaps become the findings table's "known gap: <reason>"
         # dispositions, findings_addressed the "fixed by remediation" count. {} when remediation never
         # approved (escalated runs) -- the renderer degrades to the deterministic disposition classes.
-        from . import metrics_nodes
-
+        # (No function-local `from . import metrics_nodes` here: it made the name local to this
+        # whole function, so the traceability-matrix block above raised UnboundLocalError -- caught
+        # by its own except -- and that section silently never rendered. The module import serves.)
         try:
             remediation_report = await metrics_nodes.read_remediation_report(provider, thread_id)
         except Exception:  # noqa: BLE001 -- report rendering must survive an unreadable artifact
@@ -2449,6 +2492,105 @@ def _demo() -> None:
         (EXIT_TARGETED_FIX.id, "advisory"), (EXIT_AUTH.id, "skipped"),
     ], api_clean.checks
     assert api_clean.report["blockers"] == ["coverage below threshold 60%"]
+
+    # Phrase audit (session c2bbdca1): EVERY deterministic phrase a blocker can carry -- produced by
+    # the REAL producers, not retyped here -- must be dropped by the stale filter when this run's
+    # checks no longer raise it. A new phrase nobody added to GATE_OWNED_REASON_MARKERS (or a
+    # manifest topic) fails here instead of silently re-blocking every later attempt. Targeted-fix
+    # reasons are deliberately absent: they are verbatim copies of earlier blocking reasons (no
+    # vocabulary of their own), owned by whichever phrase they copy.
+    from . import metrics_nodes as _metrics_nodes
+    from .gates import readme_gate
+
+    erc = exit_readiness_checks
+    critical_tool = workflow_config.AIDW_SECURITY_CRITICAL_TOOL_NAMES[0]
+    regressed = {"direction": "regressed", "delta": -50, "from": 90, "to": 40}
+    every_regression = dict(
+        delta_summ={"metrics": {"coverage_line_rate": regressed, "coverage_branch_rate": regressed, "health_score": regressed}},
+        baseline_has_findings=True, ac_verification={"total": 3}, ac_execution=None, is_ui_app=True,
+    )
+    dirty_scan = {"gating_count": 2, "severity_floor": "high", "degraded": [critical_tool], "measures": {"duplication_percent": 99.0}}
+    regression_phrases = [
+        *_metrics_nodes.regression_reasons(dirty_scan, coverage={"line_rate": 1.0, "branch_rate": 1.0}, **every_regression),
+        *_metrics_nodes.regression_reasons(dirty_scan, coverage={}, **every_regression),
+    ]
+    readme_phrases = [
+        *readme_gate.readme_problems(None),
+        *readme_gate.readme_problems("no title\n\n## License\n\n## Notes\n"),
+    ]
+    unverified_auth = {"app_auth": {"auth_mode": "required", "secrets_present": True}, "e2e": {"status": "failed"}}
+    deterministic_phrases = [
+        *erc.manifest_presence_problems({}),
+        *erc.screenshot_problems(True, 0),
+        *erc.metrics_problems({}, "r1")[0],
+        *erc.auth_problems(unverified_auth, True)[0],
+        *erc.auth_problems({**unverified_auth, "e2e": {"auth_check": {"passed": False}}}, True)[0],
+        *regression_phrases,
+        *readme_phrases,
+        _terminal_failure_reason({"stage": "r_x", "type": "rebuild_cap_exceeded", "feedback": "boom"}),
+        "exit report generation failed: boom",  # exit_finalize_node's degraded branch (f-string there)
+        erc.NOT_RECHECKED_REASON,
+    ]
+    assert len(regression_phrases) == 18 and len(readme_phrases) == 5, (regression_phrases, readme_phrases)
+    for phrase in deterministic_phrases:
+        verdict = erc.evaluate_merge_readiness([], {"status": "present", "values": [phrase], "reason": ""}, False)
+        assert verdict["stale_reasons"] == [phrase], f"deterministic phrase is not stale-filterable: {phrase!r}"
+
+    # _final_merge_readiness: prior-attempt report text vs this attempt's own (session c2bbdca1).
+    prior_prose = "No runnable application exists: apps/web has no main.ts"
+    prior_report = {
+        "merge_ready": False,
+        "blocking_reasons": {"status": "present", "values": [prior_prose, erc.NO_SCREENSHOTS_REASON], "reason": ""},
+        "pr_title": "WIP: scaffold only, NOT ready to merge",
+        "pr_description_markdown": "Build stopped mid-way.",
+        "risk_notes": {"status": "present", "values": ["zero e2e screenshots exist"], "reason": ""},
+    }
+    ui_tech_stack = {**TECH_STACK_DRAFT_EXAMPLE.tech_stack.model_dump(mode="json"), "frameworks": ["Angular"]}
+    rebuild_failure = {"stage": "r_adversarial_compliance", "type": "rebuild_cap_exceeded", "feedback": "scan-delta gate"}
+
+    def _run_final(state: dict[str, Any], content: dict[str, Any], files: dict[str, Any], *, crash: bool = False) -> dict[str, Any]:
+        async def _fake_read(_provider: Any, _thread_id: str, path: str) -> str | None:
+            if crash:
+                raise RuntimeError("container gone")
+            return json.dumps(files[path]) if path in files else None
+
+        async def _fake_screens(_provider: Any, _thread_id: str, _run_id: str) -> list[str]:
+            return [".ai-dev-workflow/history/r1-screens/001-home.png"]
+
+        original_read, original_screens = repo_files.read_repo_file, globals()["_list_screenshots"]
+        repo_files.read_repo_file = _fake_read  # type: ignore[assignment]
+        globals()["_list_screenshots"] = _fake_screens
+        try:
+            return asyncio.run(_final_merge_readiness("t-exit", content, state, object()))
+        finally:
+            repo_files.read_repo_file = original_read  # type: ignore[assignment]
+            globals()["_list_screenshots"] = original_screens
+
+    no_metrics_files = {MANIFEST_PATH: full_manifest, workflow_persistence.TECH_STACK_APPROVED_PATH: ui_tech_stack}
+    resumed = {"run_id": "r1", "run_failure": rebuild_failure, "stages": {"metrics-exit": {"last_verification": None}}}
+    judged = {**resumed, "stages": {"metrics-exit": {"last_verification": {"passed": True}}}}
+    assert not metrics_exit_judged_this_attempt(resumed) and metrics_exit_judged_this_attempt(judged)
+    assert not metrics_exit_judged_this_attempt({})
+
+    # Not judged this attempt: none of the prior prose survives -- only the terminal failure plus
+    # what this attempt's checks raised (metrics never recorded; screenshots exist now).
+    prior_copy = json.loads(json.dumps(prior_report))
+    stale = _run_final(resumed, prior_copy, no_metrics_files)
+    assert stale["blocking_reasons"]["values"] == [_terminal_failure_reason(rebuild_failure), erc.metrics_problems({}, "r1")[0][0]], stale
+    assert stale["merge_ready"] is False and stale["pr_title"] == "ai-dev-workflow: r1" and stale["risk_notes"]["status"] == "absent"
+    assert prior_copy == prior_report, "the prior approved_content itself is never mutated on the not-judged path"
+    # Judged this attempt: the model's own prose is this attempt's and stays; only the stale
+    # deterministic phrase (screenshots, now present) is dropped -- unchanged behaviour.
+    kept = _run_final(judged, json.loads(json.dumps(prior_report)), no_metrics_files)
+    assert prior_prose in kept["blocking_reasons"]["values"] and erc.NO_SCREENSHOTS_REASON not in kept["blocking_reasons"]["values"], kept
+    assert kept["pr_title"] == prior_report["pr_title"]
+    # Not judged, everything clean, no terminal failure: the seed's placeholder clears -> ready.
+    clean_files = {**no_metrics_files, ".ai-dev-workflow/metrics-latest.json": {"run_id": "r1", "regression_gate": {"reasons": []}}}
+    clean = _run_final({**resumed, "run_failure": None}, prior_report, clean_files)
+    assert clean["merge_ready"] is True and clean["blocking_reasons"]["status"] == "absent", clean
+    # Not judged and the recompute itself can't run: never ready on an unverified seed.
+    crashed = _run_final({**resumed, "run_failure": None}, prior_report, clean_files, crash=True)
+    assert crashed["merge_ready"] is False and crashed["blocking_reasons"]["values"] == [erc.NOT_RECHECKED_REASON], crashed
 
     # Every declared Check is recorded somewhere in verify_exit_readiness (text scan).
     import inspect

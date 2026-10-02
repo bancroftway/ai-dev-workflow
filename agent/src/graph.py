@@ -5989,6 +5989,49 @@ POST_STAGE_REBUILD: dict[str, rebuild.RebuildSpec] = {
 }
 
 
+async def _record_coverage_contract(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+    """Measure always, gate per mode (session c2bbdca1). coverage-commands.json -- the replayable
+    contract verify_exit_readiness backfills manifest.json's coverage_commands from, and blocks the
+    merge without -- is only written by test_coverage_gate.measure_coverage, which is reached from
+    minimal-code-to-green's verify. YOLO's policy turns that verify off, so a YOLO run could never
+    be merge_ready. This runs the SAME measurement (contract replay -> resolved command -> discovery)
+    once minimal-code-to-green's rebuild is green, only when that verify did not run this attempt
+    under an "off" policy, and never gates on it: the result lands on repo_scan.coverage (what the
+    metrics bar and metrics_compute read, same shape verify_node promotes) plus a run event, and the
+    run carries on whatever it says. A crash is recorded the same way, never raised. Coverage
+    thresholds stay where they already were in every mode (rebuild's scan-delta gate, the metrics
+    regression gate). draft_verify/mission_critical skip this -- their verify already measured --
+    as does YOLO's clarification-cap auto-approve, which faces verify even under "off"."""
+    mctg_spec = next(s for s in STAGES if s.key == "minimal-code-to-green")
+    if _stage_verify_enabled(state, mctg_spec) or state["stages"][mctg_spec.key].get("last_verification") is not None:
+        return {}
+    thread_id = config["configurable"]["thread_id"]
+    try:
+        line_rate, branch_rate, _gaps, reason, _entries = await test_coverage_gate.measure_coverage(
+            get_sandbox_provider(), thread_id, chat_provider=state["provider"], run_id=state.get("run_id", "unknown"),
+        )
+    except Exception:  # noqa: BLE001 -- fail-soft by contract: a YOLO run never stops over this
+        logger.warning("coverage record: measurement crashed for thread_id=%s", thread_id, exc_info=True)
+        line_rate, branch_rate, reason = None, None, test_coverage_gate.REASON_RUNNER_ERROR
+    coverage: dict[str, Any] = {"line_rate": line_rate, "branch_rate": branch_rate}
+    if isinstance(line_rate, (int, float)) and isinstance(branch_rate, (int, float)):
+        summary = f"coverage recorded, not gated: line {line_rate:.1f}%, branch {branch_rate:.1f}%"
+    else:
+        coverage["reason"] = reason
+        summary = f"coverage not measured, not gated: {reason}"
+    await _emit_run_event(
+        state, config, mctg_spec.key, RunEventType.NODE_FINISHED, "coverage_record", summary, {**coverage, "gated": False}
+    )
+    return {"repo_scan": {**(state.get("repo_scan") or {}), "coverage": coverage}}
+
+
+async def _remediation_scan_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
+    """REBUILD_AFTER_P6's next_node: _record_coverage_contract, then remediation's pre-scan. One
+    node, so the graph topology (and README's diagram) is unchanged."""
+    update = await _record_coverage_contract(state, config)
+    return {**update, **await remediation_gate.remediation_scan_node(state, config)}
+
+
 def _route_after_tech_stack(state: GraphState) -> str:
     """The brownfield branch: tech-stack detection runs before brownfield-baseline, so its
     approved content (dotnet_detected etc.) is available to brownfield-baseline's own draft.
@@ -6653,7 +6696,8 @@ def build_graph() -> StateGraph:
     # Deterministic pre-draft scan for remediation: REBUILD_AFTER_P6 routes here instead of
     # straight into remediation_draft, so the stage reads the findings of the code that was just
     # written rather than a scan file that did not exist yet. No LLM, no gate -- one scan, published.
-    builder.add_node("remediation_scan", remediation_gate.remediation_scan_node)
+    # Preceded by YOLO's ungated coverage-contract record (_record_coverage_contract).
+    builder.add_node("remediation_scan", _remediation_scan_node)
     builder.add_edge("remediation_scan", "remediation_draft")
 
     # R placements are registered BEFORE the stages that route into them, so each stage can be
@@ -7393,6 +7437,73 @@ def _demo_set_aside_interrupted_work() -> None:
     failure, stages = _run("c0ffee", elsewhere=True)
     assert failure is None and len(calls["set_aside"]) == attempts and stages["minimal-code-to-green"]["status"] == "not_started"
     print("set-aside interrupted work self-check: all assertions passed")
+
+
+def _demo_coverage_record() -> None:
+    """Session c2bbdca1: YOLO measures (and so writes the coverage contract) exactly once after
+    minimal-code-to-green and never gates on it; a mode whose verify already measured never
+    measures twice. Plus the attempt signal exit_finalize_node relies on (intake's reset)."""
+    import asyncio
+    import sys
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    me = sys.modules[__name__]
+    calls: dict[str, list[Any]] = {"measure": [], "events": []}
+
+    async def _emit(_state: Any, _config: Any, stage_key: str, _type: Any, node: str, summary: str, payload: Any = None) -> None:
+        calls["events"].append((stage_key, node, summary, payload))
+
+    def _run(mode: str, measured: Any, *, verified: bool = False) -> dict[str, Any]:
+        async def _measure(_provider: Any, _thread_id: str, **kwargs: Any) -> Any:
+            calls["measure"].append(kwargs)
+            if isinstance(measured, Exception):
+                raise measured
+            return measured
+
+        async def _scan(_state: Any, _config: Any) -> dict[str, Any]:
+            return {}
+
+        state = {
+            "code_gen_mode": mode, "provider": "claude", "run_id": "r1",
+            "repo_scan": {"baseline_summary": {"gating_count": 0}},
+            "stages": {"minimal-code-to-green": {**default_stage_state(), "last_verification": {"passed": True} if verified else None}},
+        }
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(me, "get_sandbox_provider", lambda: object()))
+            stack.enter_context(patch.object(me, "_emit_run_event", _emit))
+            stack.enter_context(patch.object(test_coverage_gate, "measure_coverage", _measure))
+            stack.enter_context(patch.object(remediation_gate, "remediation_scan_node", _scan))
+            return asyncio.run(_remediation_scan_node(state, {"configurable": {"thread_id": "t"}}))  # type: ignore[arg-type]
+
+    # YOLO: one measurement; recorded even far below MIN_COVERAGE_PERCENT, never a run_failure.
+    update = _run("yolo", (12.5, 3.0, [], "", []))
+    assert len(calls["measure"]) == 1 and calls["measure"][0]["chat_provider"] == "claude", calls["measure"]
+    assert update == {"repo_scan": {"baseline_summary": {"gating_count": 0}, "coverage": {"line_rate": 12.5, "branch_rate": 3.0}}}, update
+    stage_key, node, summary, payload = calls["events"][-1]
+    assert (stage_key, node) == ("minimal-code-to-green", "coverage_record") and payload["gated"] is False and "12.5%" in summary
+    # Fail-soft: an unmeasurable suite or a crash is recorded, never raised.
+    assert _run("yolo", (None, None, [], test_coverage_gate.REASON_TIMEOUT, []))["repo_scan"]["coverage"]["reason"] == "timeout"
+    crashed = _run("yolo", RuntimeError("container gone"))
+    assert crashed["repo_scan"]["coverage"] == {"line_rate": None, "branch_rate": None, "reason": test_coverage_gate.REASON_RUNNER_ERROR}
+    assert "not measured" in calls["events"][-1][2]
+    # Verify already measured this attempt: never a second run.
+    measured_before = len(calls["measure"])
+    assert _run("draft_verify", (90.0, 90.0, [], "", [])) == {}
+    assert _run("mission_critical", (90.0, 90.0, [], "", [])) == {}
+    assert _run("yolo", (90.0, 90.0, [], "", []), verified=True) == {}, "clarification-cap auto-approve already faced verify"
+    assert len(calls["measure"]) == measured_before
+
+    # exit_finalize_node's attempt signal: intake's per-run reset clears it on every intake, and
+    # metrics-exit's verify can never be policy-"off" (persists=True), so a real draft always sets it.
+    exit_stage = {**default_stage_state(), "last_verification": {"passed": True}}
+    assert exit_nodes.metrics_exit_judged_this_attempt({"stages": {"metrics-exit": exit_stage}})
+    _reset_stage_mechanics(exit_stage)
+    assert not exit_nodes.metrics_exit_judged_this_attempt({"stages": {"metrics-exit": exit_stage}})
+    exit_gate = next(s for s in STAGES if s.key == "metrics-exit").gate
+    assert exit_gate is not None and exit_gate.persists
+    assert all(exit_gate.policy_for(m) != "off" for m in ("yolo", "draft_verify", "mission_critical"))
+    print("coverage record self-check: all assertions passed")
 
 
 def _demo() -> None:
@@ -8590,6 +8701,7 @@ def _demo() -> None:
     _demo_targeted_fix_stuck_decision()
     _demo_reset_e2e_lever()
     _demo_set_aside_interrupted_work()
+    _demo_coverage_record()
     _demo_code_gen_mode_routing()
     _demo_audit_ran_this_lap()
 
