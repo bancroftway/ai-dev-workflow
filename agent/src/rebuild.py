@@ -396,6 +396,7 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
         None,  # no delta: this is an absolute check on the tree as it stands right now
         coverage,
         baseline_has_findings=bool((baseline.get("gating_count") or 0)),
+        coverage_gated=metrics_nodes.coverage_threshold_gated(state),
     )
     # NAME the gating findings, never just count them. "4 gating finding(s) open" with no
     # identities is an unfixable instruction: the fix agent changed real code for four straight

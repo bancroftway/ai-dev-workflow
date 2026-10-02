@@ -332,6 +332,18 @@ async def _sum_token_usage(provider: Any, thread_id: str) -> dict[str, Any]:
     return totals
 
 
+def coverage_threshold_gated(state: dict[str, Any]) -> bool:
+    """Whether this session's mode enforces the coverage threshold -- the same policy that decides
+    whether minimal-code-to-green's own coverage verify runs (pipeline gate policy, never a separate
+    mode list). YOLO turns that gate "off": coverage is still measured (graph's YOLO coverage
+    record) but must never block a YOLO run -- not at the final rebuild's re-scan, not at the merge
+    gate (user decision 2026-10-02: "measure always, gate per mode")."""
+    from .pipeline_layout import PIPELINE  # local: pipeline_layout imports graph, which imports this module
+
+    gate = PIPELINE.stage("minimal-code-to-green").gate
+    return gate is None or gate.policy_for(state.get("code_gen_mode")) != "off"
+
+
 def regression_reasons(
     latest_summary: dict[str, Any],
     delta_summ: dict[str, Any] | None,
@@ -345,6 +357,7 @@ def regression_reasons(
     ac_verification: dict[str, Any] | None = None,
     ac_execution: dict[str, Any] | None = None,
     is_ui_app: bool = False,
+    coverage_gated: bool = True,
 ) -> list[str]:
     """Pure decision half of the metrics regression gate (self-checked in _demo). Blocks on:
     open gating findings (severity-floored, introduced-aware -- greenfield's empty-repo baseline
@@ -385,8 +398,13 @@ def regression_reasons(
             f"as \"clean\": {', '.join(security_critical_degraded)}"
         )
 
+    # `coverage_gated` False (coverage_threshold_gated: the session's mode doesn't enforce Code's
+    # coverage gate -- YOLO) records coverage but never blocks on it: the measurement still lands in
+    # repo_scan.coverage / the coverage contract, it just isn't a merge or rebuild blocker there.
     line, branch = coverage.get("line_rate"), coverage.get("branch_rate")
-    if not isinstance(line, (int, float)) or not isinstance(branch, (int, float)):
+    if not coverage_gated:
+        pass
+    elif not isinstance(line, (int, float)) or not isinstance(branch, (int, float)):
         reasons.append("coverage unmeasured -- line/branch rate unavailable, which must never pass as '--%'")
     elif line < min_cov or branch < min_cov:
         reasons.append(f"coverage below threshold: line {line:.1f}%, branch {branch:.1f}% (minimum {min_cov:.0f}%)")
@@ -659,6 +677,7 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         ac_verification=scan_report.get("ac_verification"),
         ac_execution=scan_report.get("ac_execution"),
         is_ui_app=tech_stack_signals.tech_stack_has_ui_framework(state),
+        coverage_gated=coverage_threshold_gated(state),
     )
 
     # Loaded ONCE, mutated below by file-attribution collection and stamp_delivery (previously two
@@ -1140,6 +1159,12 @@ def _demo() -> None:
     # Coverage null -> blocks; below threshold -> blocks; the 81.8%-branch incident is caught.
     assert any("unmeasured" in r for r in regression_reasons(clean_summary, None, {"line_rate": None, "branch_rate": None}, baseline_has_findings=True, **kw))
     assert any("below threshold" in r for r in regression_reasons(clean_summary, None, {"line_rate": 96.8, "branch_rate": 81.8}, baseline_has_findings=True, **kw))
+    # A mode that doesn't enforce the coverage gate (YOLO): low or unmeasured coverage never blocks.
+    assert regression_reasons(clean_summary, None, {"line_rate": 87.1, "branch_rate": 76.1}, baseline_has_findings=True, coverage_gated=False, **kw) == []
+    assert regression_reasons(clean_summary, None, {"line_rate": None, "branch_rate": None}, baseline_has_findings=True, coverage_gated=False, **kw) == []
+    assert not coverage_threshold_gated({"code_gen_mode": "yolo"})
+    assert coverage_threshold_gated({"code_gen_mode": "draft_verify"}) and coverage_threshold_gated({"code_gen_mode": "mission_critical"})
+    assert coverage_threshold_gated({}), "unknown mode resolves to mission_critical -- enforced"
     # 99 -> 96 line drop: above the floor but beyond tolerance -> blocks.
     drop = {"metrics": {"coverage_line_rate": {"from": 99.0, "to": 96.0, "delta": -3.0, "direction": "regressed"}}}
     assert any("coverage_line_rate regressed" in r for r in regression_reasons(clean_summary, drop, good_cov, baseline_has_findings=True, **kw))
