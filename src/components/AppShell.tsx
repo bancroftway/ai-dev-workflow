@@ -637,6 +637,7 @@ export function AppShell({
                 {tab.gate && (
                   <GateButton
                     icon={tab.gate.icon}
+                    enabled={tab.gate.enabled}
                     active={activeView === gateViewId(tab.tab_id)}
                     onSelect={() => setActiveView(gateViewId(tab.tab_id))}
                   />

@@ -111,6 +111,13 @@ GATE_TEXT: dict[str, Any] = {
     },
     "uncatalogued_badge": "uncatalogued",
     "when_always": "every time this gate runs",
+    # Gate-screen section headings, numbered by the moment each runs: a stage's own checks on what
+    # it wrote, then the build check that runs after it (rebuild placements, every mode).
+    "section_numbered": "{n} · {heading}",
+    "section_stage": "{stage}: checks on what it wrote",
+    "section_red": "{name}: the tests run against a stub build, and every one must fail (every mode)",
+    "section_rebuild": "{name}: the project still builds after {stage} (every mode)",
+    "section_rebuild_scan": "{name}: the project still builds and re-scans clean after {stage} (every mode)",
     # The run notice above every tab (run_notice): text + the one action that gets the run going.
     "notice_failed": "This run failed and stopped at {where}.",
     "notice_failed_unknown": "This run failed.",
@@ -250,8 +257,11 @@ def _placement_views(tab: TabSpec, state: dict[str, Any], running: dict[str, str
             status = "not_run"
         else:
             status = "passed" if verdict["passed"] else "failed"
+        name = labels.get(spec.key, spec.key)
+        kind = "section_red" if spec.fix_scope == "scaffold_only" else "section_rebuild_scan" if spec.scan_delta_gate else "section_rebuild"
         views.append({
-            "key": spec.key, "label": labels.get(spec.key, spec.key), "checks": rebuild_checks(spec),
+            "key": spec.key, "after": key, "checks": rebuild_checks(spec),
+            "label": GATE_TEXT[kind].format(name=name, stage=pipeline.label(key)),
             "verdict": verdict, "policy": "blocking", "status": status, "status_text": T[status],
             "lap": rb.get("fix_cycle_count", 0), "max_laps": spec.max_fix_cycles,
             "feedback": (rb.get("last_stderr_tail") or None) if verdict and not verdict["passed"] else None,
@@ -399,17 +409,21 @@ def build_tab_strip(
 ) -> dict[str, Any]:
     """The stage tab strip in descriptor order: each tab's label, whether it can be opened, its
     status tone (done/error/awaiting/running/none) and the icon of the gate after it (None when it
-    gates nothing). `current_stage` is the durable session row's."""
-    return {"tabs": [
-        {
+    gates nothing). `current_stage` is the durable session row's. A gate opens exactly when its
+    tab does: its screen is that stage's checks, and "off in this mode" is something to read
+    about, not a reason to lock it -- only a stage the run hasn't reached locks both."""
+    tabs = []
+    for i, tab in enumerate(pipeline.tabs):
+        enabled = _tab_enabled(tab, i, state, running, current_stage, pipeline)
+        gate = _gate_icon(tab, state, code_gen_mode, running, interrupts, pipeline)
+        tabs.append({
             "tab_id": tab.id,
             "label": tab.label,
-            "enabled": _tab_enabled(tab, i, state, running, current_stage, pipeline),
+            "enabled": enabled,
             "tone": _tab_tone(tab, state, code_gen_mode, running, pipeline),
-            "gate": _gate_icon(tab, state, code_gen_mode, running, interrupts, pipeline),
-        }
-        for i, tab in enumerate(pipeline.tabs)
-    ]}
+            "gate": None if gate is None else {**gate, "enabled": enabled},
+        })
+    return {"tabs": tabs}
 
 
 def _derive_rows(
@@ -584,7 +598,7 @@ def _section(view: dict[str, Any], *, mode: str | None, attempts: list[dict[str,
     live = view["verdict"]
     return {
         "key": spec.key,
-        "heading": spec.label,
+        "heading": GATE_TEXT["section_stage"].format(stage=spec.label),
         "facts": facts,
         "feedback": (live.get("feedback") or None) if not attempt and live is not None and not live.get("passed") else None,
         "attempts": {"label": gt["attempt"], "disabled": not mine, "options": options},
@@ -654,11 +668,17 @@ def build_gate_screen(
     if built is None:
         return None
     views, name = built
-    sections = [
-        _section(v, mode=code_gen_mode, attempts=attempts, insights=insights, selected=attempt, pipeline=pipeline,
-                 provider=state.get("provider"))
-        for v in views
-    ] + [_placement_section(v, mode=code_gen_mode, pipeline=pipeline) for v in _placement_views(tab, state, running, pipeline)]
+    placements = _placement_views(tab, state, running, pipeline)
+    sections = []
+    for v in views:
+        sections.append(_section(
+            v, mode=code_gen_mode, attempts=attempts, insights=insights, selected=attempt, pipeline=pipeline,
+            provider=state.get("provider"),
+        ))
+        sections += [_placement_section(pv, mode=code_gen_mode, pipeline=pipeline) for pv in placements if pv["after"] == v["spec"].key]
+    if len(sections) > 1:
+        for n, s in enumerate(sections, start=1):
+            s["heading"] = GATE_TEXT["section_numbered"].format(n=n, heading=s["heading"])
     if state.get("run_failure"):
         _attach_recovery(sections, state["run_failure"], pipeline)
     return {
@@ -965,9 +985,15 @@ def _demo() -> None:
         "run_failure": {"stage": "r_ac_to_tests", "type": "rebuild_cap_exceeded"},
     }
     assert strip(red_state)["tests"]["gate"]["icon"]["tone"] == "failed"
+    # A gate opens exactly when its tab does (Tests reached: open; Quality not reached: locked).
+    assert strip(red_state)["tests"]["gate"]["enabled"] is True
+    assert strip(red_state)["quality"]["gate"]["enabled"] is False
     red_screen = build_gate_screen(red_state, "tests", **kw)
     assert red_screen is not None and [s["key"] for s in red_screen["sections"]] == ["ac-to-tests", "r_ac_to_tests"]
     red_sec = red_screen["sections"][1]
+    # Numbered by moment: what the stage wrote first, then the build check after it.
+    assert red_screen["sections"][0]["heading"].startswith("1 · ") and "what it wrote" in red_screen["sections"][0]["heading"]
+    assert red_sec["heading"].startswith("2 · Red Gate") and "every one must fail" in red_sec["heading"], red_sec["heading"]
     by_key = {r["key"]: r for r in red_sec["groups"][0]["rows"]}
     assert [a["id"] for a in by_key["rebuild.red_planned_files"]["actions"]] == ["retry", "redo"], by_key
     assert not by_key["rebuild.build"]["actions"] and not red_sec["actions"]

@@ -29,8 +29,9 @@ export interface StripTab {
   label: string;
   enabled: boolean;
   tone: TabTone;
-  /** The gate after this tab; null when it gates nothing. */
-  gate: { icon: GateIcon } | null;
+  /** The gate after this tab; null when it gates nothing. `enabled`: whether its screen can be
+   * opened (the server ties it to the tab's own). */
+  gate: { icon: GateIcon; enabled: boolean } | null;
 }
 
 interface GateCell {
@@ -71,7 +72,9 @@ interface GateScreen {
 export const gateViewId = (tabId: string) => `gate:${tabId}`;
 
 const ICON_CLASS: Record<IconTone, string> = {
-  off: "text-neutral-400 opacity-50",
+  // "Not enforced in this mode" is information, not "unavailable" -- no fade here; a gate that
+  // can't be opened gets that look from `enabled` instead.
+  off: "text-neutral-400",
   unknown: "text-neutral-500",
   not_run: "text-neutral-400",
   verifying: "text-blue-600 animate-pulse",
@@ -163,7 +166,7 @@ function GateArrowIcon({ className }: { className?: string }) {
 }
 
 /** The gate between stage tabs: a tab in its own right -- selecting it shows GateView. */
-export function GateButton({ icon, active, onSelect }: { icon: GateIcon; active: boolean; onSelect: () => void }) {
+export function GateButton({ icon, enabled, active, onSelect }: { icon: GateIcon; enabled: boolean; active: boolean; onSelect: () => void }) {
   const { tone, badge, label } = icon;
   return (
     <button
@@ -172,10 +175,11 @@ export function GateButton({ icon, active, onSelect }: { icon: GateIcon; active:
       aria-selected={active}
       aria-label={label}
       title={label}
+      disabled={!enabled}
       onClick={onSelect}
-      className={`relative flex shrink-0 items-center rounded-md p-1 hover:bg-neutral-100 ${ICON_CLASS[tone] ?? ""} ${
-        active ? "bg-neutral-100 ring-2 ring-neutral-900" : ""
-      }`}
+      className={`relative flex shrink-0 items-center rounded-md p-1 ${ICON_CLASS[tone] ?? ""} ${
+        enabled ? "hover:bg-neutral-100" : "cursor-not-allowed opacity-40"
+      } ${active ? "bg-neutral-100 ring-2 ring-neutral-900" : ""}`}
     >
       <GateArrowIcon className="h-[19.8px] w-[35px]" />
       {badge && (
