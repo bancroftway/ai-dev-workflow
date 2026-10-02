@@ -97,6 +97,41 @@ async def stage_started(provider: Any, thread_id: str, state: dict[str, Any], st
     return await repo_files.read_repo_file(provider, thread_id, workflow_persistence.stage_draft_path(stage_key)) is not None
 
 
+def _has_rates(coverage: dict[str, Any]) -> bool:
+    return isinstance(coverage.get("line_rate"), (int, float)) and isinstance(coverage.get("branch_rate"), (int, float))
+
+
+async def _remeasure_coverage(provider: Any, thread_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Fresh line/branch coverage of the tree as it stands (gates.test_coverage_gate.measure_coverage,
+    the measurement Code's own verify uses). {} when it can't produce numbers -- fail-soft, the caller
+    falls back to the stored value."""
+    from .gates import test_coverage_gate  # local: keeps rebuild's import graph as it was
+
+    try:
+        line_rate, branch_rate, _gaps, _reason, _entries = await test_coverage_gate.measure_coverage(
+            provider, thread_id, chat_provider=state["provider"], run_id=state.get("run_id", "unknown"),
+        )
+    except Exception:  # noqa: BLE001 -- fail-soft: never let a measurement crash read as a regression
+        logger.warning("rebuild scan: coverage re-measure crashed for thread_id=%s", thread_id, exc_info=True)
+        return {}
+    coverage = {"line_rate": line_rate, "branch_rate": branch_rate}
+    return coverage if _has_rates(coverage) else {}
+
+
+async def _coverage_for_scan(provider: Any, thread_id: str, state: dict[str, Any], *, remeasure: bool) -> dict[str, Any]:
+    """The coverage _scan_regression_reasons judges: a fresh measurement when asked (after a fix
+    lap), else -- or when that yields no numbers -- the value promoted onto state, else the
+    artifacts on disk."""
+    from . import metrics_nodes  # local: metrics_nodes imports this module's package siblings at load
+
+    coverage: dict[str, Any] = await _remeasure_coverage(provider, thread_id, state) if remeasure else {}
+    if not _has_rates(coverage):
+        coverage = (state.get("repo_scan") or {}).get("coverage") or {}
+    if not _has_rates(coverage):
+        coverage = await metrics_nodes._read_coverage_summary(provider, thread_id)  # noqa: SLF001 -- same package, one reader
+    return coverage
+
+
 def should_skip_rebuild(rb: dict[str, Any], run_id: str | None, next_stage_started: bool) -> bool:
     """A placement that already passed in THIS run, whose next stage has since started, is done:
     building again on a resume would judge the next stage's work (finished or interrupted) against
@@ -329,7 +364,9 @@ def _should_skip_toolchain_capture(fix_scope: str, is_greenfield: bool) -> bool:
     return fix_scope == "scaffold_only" and is_greenfield
 
 
-async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[str, Any]) -> list[str]:
+async def _scan_regression_reasons(
+    provider: Any, thread_id: str, state: dict[str, Any], *, remeasure_coverage: bool = False
+) -> list[str]:
     """What the TERMINAL metrics gate would block this tree on, evaluated now.
 
     Calls metrics_nodes.regression_reasons -- the same pure decision function the exit gate uses --
@@ -387,9 +424,14 @@ async def _scan_regression_reasons(provider: Any, thread_id: str, state: dict[st
     # apps/{api,web}.Tests/TestResults/. That is an unfixable instruction: the gate demanded the
     # agent repair a measurement that was already correct, and it burned fix laps on it while the
     # two genuine findings beside it were cleared in one.
-    coverage = (state.get("repo_scan") or {}).get("coverage") or {}
-    if not (isinstance(coverage.get("line_rate"), (int, float)) and isinstance(coverage.get("branch_rate"), (int, float))):
-        coverage = await metrics_nodes._read_coverage_summary(provider, thread_id)  # noqa: SLF001 -- same package, one reader
+    #
+    # After a fix lap (remeasure_coverage), the stored value is stale: it was measured BEFORE the
+    # fixer changed tests, so judging the new tree on it fails every lap no matter what the fixer
+    # does (session c2bbdca1: four laps of added tests, all judged on the same 87.1%/76.1% from
+    # before the first lap). Measure again -- the same measurement Code's verify uses -- and fall
+    # back to the stored/on-disk value only if that measurement can't produce numbers (an infra
+    # gap must not read as "coverage unmeasured", per the fallback rule above).
+    coverage = await _coverage_for_scan(provider, thread_id, state, remeasure=remeasure_coverage)
     baseline = (state.get("repo_scan") or {}).get("baseline_summary") or {}
     reasons = metrics_nodes.regression_reasons(
         latest_summary,
@@ -937,7 +979,14 @@ def make_rebuild_node(spec: RebuildSpec):
         # still actionable. See RebuildSpec.scan_delta_gate for why this placement exists.
         scan_detail = ""
         if build_ok and spec.scan_delta_gate:
-            scan_reasons = await _scan_regression_reasons(provider, thread_id, state)
+            # Re-measure coverage only when it can matter: a fix lap changed the tree since the
+            # stored value was taken, and this mode enforces the threshold (YOLO doesn't).
+            from . import metrics_nodes  # local, same as _scan_regression_reasons
+
+            scan_reasons = await _scan_regression_reasons(
+                provider, thread_id, state,
+                remeasure_coverage=rb["fix_cycle_count"] > 0 and metrics_nodes.coverage_threshold_gated(state),
+            )
             scan_reasons += await _provenance_reasons(provider, thread_id, state)
             if scan_reasons:
                 log.failed(SCAN_DELTA, "\n".join(scan_reasons))
@@ -1705,6 +1754,31 @@ def _demo_resume() -> None:
             assert out["run_failure"]["stage"] == "r_ac_to_tests" and changed_calls == [sha], out["run_failure"]
     finally:
         sandbox_registry.pop(thread_id)
+
+    # Coverage the re-scan judges: after a fix lap, a fresh measurement beats the stored value (which
+    # predates the fix -- session c2bbdca1 judged four laps of added tests on the same stale number);
+    # a measurement that can't produce numbers falls back to the stored value, never "unmeasured".
+    from unittest.mock import patch as _patch
+
+    from . import metrics_nodes
+
+    stored = {"repo_scan": {"coverage": {"line_rate": 87.1, "branch_rate": 76.1}}}
+
+    async def _fresh(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {"line_rate": 96.0, "branch_rate": 95.5}
+
+    async def _no_numbers(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {}
+
+    async def _disk(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise AssertionError("the stored value is numeric -- disk must not be consulted")
+
+    with _patch.object(metrics_nodes, "_read_coverage_summary", _disk):
+        with _patch(f"{__name__}._remeasure_coverage", _fresh):
+            assert asyncio.run(_coverage_for_scan(None, "t", stored, remeasure=True))["line_rate"] == 96.0
+            assert asyncio.run(_coverage_for_scan(None, "t", stored, remeasure=False))["line_rate"] == 87.1, "no fix lap: keep the stored value"
+        with _patch(f"{__name__}._remeasure_coverage", _no_numbers):
+            assert asyncio.run(_coverage_for_scan(None, "t", stored, remeasure=True))["line_rate"] == 87.1
     print("rebuild resume self-check: all assertions passed")
 
 
