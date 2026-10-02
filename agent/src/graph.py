@@ -3050,9 +3050,11 @@ async def _set_aside_interrupted_work(
     rebuild/verify placement: when the newest draft was interrupted (_interrupted_draft_stage),
     every uncommitted change outside the bookkeeping folder moves to a side ref
     (refs/aidw/interrupted/<stage>-<utc>, never the work branch, never pushed) and the tree goes
-    back to HEAD -- the redraft starts clean and nothing is thrown away. A stage whose work was set
-    aside is re-marked "drafting" (rebuild.stage_started reads it: that stage HAS touched the
-    workspace -- the killed draft node never returned that status to the checkpoint).
+    back to HEAD -- the redraft starts clean and nothing is thrown away. The stage's status is left
+    as the checkpoint has it: with its work set aside the workspace is exactly the pre-draft tree, so
+    "not started" is the truth -- rebuild placements judge it as such (e.g. the red gate's all-red
+    check applies again, as it did before the draft), and the UI doesn't show a stage as running
+    before it actually runs again (session c2bbdca1: Code looked active while Tests was still fixing).
 
     Returns a run_failure payload when the work could not be set aside -- the run must stop
     rather than build on that tree. Leaves a session another process (run_headless.py) is driving
@@ -3087,9 +3089,6 @@ async def _set_aside_interrupted_work(
             state.get("run_id"), keep_sandbox=True,
         )
     if commit is not None:
-        stage = stages.setdefault(stage_key, default_stage_state())
-        if stage.get("status", "not_started") == "not_started":
-            stage["status"] = "drafting"
         summary = f"set aside uncommitted work from the interrupted {stage_key} draft to {ref}"
         logger.warning("intake_node: thread_id=%s %s (%s)", thread_id, summary, commit)
         await _emit_run_event(
@@ -7211,9 +7210,9 @@ def _demo_set_aside_interrupted_work() -> None:
             result = asyncio.run(_set_aside_interrupted_work("t", {"run_id": "r1"}, {"configurable": {"thread_id": "t"}}, stages))
         return result, stages
 
-    # Dirty: set aside to a side ref, the event says where, the stage reads as started.
+    # Dirty: set aside to a side ref, the event says where; the stage is NOT re-marked as running.
     failure, stages = _run("c0ffee")
-    assert failure is None and stages["minimal-code-to-green"]["status"] == "drafting"
+    assert failure is None and stages["minimal-code-to-green"]["status"] == "not_started"
     assert re.fullmatch(r"refs/aidw/interrupted/minimal-code-to-green-\d{8}T\d{6}Z", calls["set_aside"][-1]), calls["set_aside"]
     stage_key, node, summary, payload = calls["events"][-1]
     assert stage_key == "minimal-code-to-green" and node == "set_aside" and payload["commit"] == "c0ffee", calls["events"]

@@ -83,8 +83,9 @@ def default_rebuild_state() -> RebuildState:
 
 async def stage_started(provider: Any, thread_id: str, state: dict[str, Any], stage_key: str) -> bool:
     """Whether `stage_key` has touched this workspace: a status other than "not_started" (a draft
-    marks "drafting" before its first model call; intake re-marks an interrupted one whose work it
-    set aside -- graph._set_aside_interrupted_work), or its completed draft artifact on the branch, which rides
+    marks "drafting" before its first model call; an interrupted draft whose work intake set aside
+    -- graph._set_aside_interrupted_work -- stays "not_started", since its tree is back to the
+    pre-draft state), or its completed draft artifact on the branch, which rides
     the workspace volume across container swaps and survives intake's status resets."""
     status = ((state.get("stages") or {}).get(stage_key) or {}).get("status", "not_started")
     if status != "not_started":
