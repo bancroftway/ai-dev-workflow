@@ -400,6 +400,12 @@ class GraphState(TypedDict):
     # same closed run. Durable (checkpoint-backed, not the in-memory sandbox_registry) so the cap
     # survives an agent restart. Read only via state.get() -- older checkpoints lack it.
     targeted_fix_attempts: int
+    # {"attempts": int, "reasons": [...]} when THIS attempt's intake refused a targeted fix as stuck
+    # (the same reasons survived 2 completed attempts), else None: every intake that starts an
+    # attempt rewrites it (its two early returns end the run), so it describes only that attempt. exit_nodes._final_merge_readiness injects it as a
+    # gate-owned blocking reason (a later attempt's stale filter drops a copied-forward bullet), and
+    # _build_exit_prompt shows it to metrics-exit's draft. Read only via state.get().
+    targeted_fix_refused: dict[str, Any] | None
     # Root-caused 2026-09-21: how many times POST /api/sessions/actions {action: "reset-e2e"} has
     # cleared e2e/metrics-exit/adversarial-compliance state against this thread (see intake_node's
     # own handling below) -- a narrower, purely-state-reset sibling of targeted_fix_attempts above
@@ -1964,6 +1970,10 @@ def _build_exit_prompt(state: GraphState, stage_key: str = "metrics-exit") -> li
     ]
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior report (JSON):\n{stage['draft']}"))
+    if state.get("targeted_fix_refused"):
+        messages.append(HumanMessage(
+            content=f"Targeted fix refused as stuck in this attempt (JSON):\n\n{json.dumps(state['targeted_fix_refused'])}"
+        ))
     verify_feedback_message = _verification_feedback_message(stage)
     if verify_feedback_message is not None:
         messages.append(verify_feedback_message)
@@ -3533,6 +3543,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
     # fresh verdict. Capped (config.TARGETED_FIX_MAX_ATTEMPTS) since nothing else bounds how many
     # times this lever could be invoked against the same closed run.
     targeted_fix_attempts = state.get("targeted_fix_attempts", 0)
+    targeted_fix_refused: dict[str, Any] | None = None
     if sandbox_registry.pop_meta_flag(thread_id, "targeted_fix"):
         if targeted_fix_attempts >= workflow_config.TARGETED_FIX_MAX_ATTEMPTS:
             logger.warning(
@@ -3563,19 +3574,9 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
                         "already survived a prior targeted-fix attempt",
                         thread_id,
                     )
-                    exit_stage = stages["metrics-exit"]
-                    exit_content = dict(exit_stage.get("approved_content") or {})
-                    existing_reasons = list(_remediation_presence_values(exit_content.get("blocking_reasons")))
-                    stuck_note = (
-                        "a targeted fix already tried and failed to resolve this once -- a further "
-                        "automated attempt is unlikely to help"
-                    )
-                    if stuck_note not in existing_reasons:
-                        exit_content["blocking_reasons"] = exit_nodes._presence_from_values(
-                            [*existing_reasons, stuck_note],
-                            empty_reason="unreachable: existing_reasons is non-empty in this branch",
-                        )
-                        exit_stage["approved_content"] = exit_content
+                    # Data, not a note in metrics-exit's stored approved_content: this attempt's
+                    # metrics-exit redraft replaces that, so exit finalize injects it from state.
+                    targeted_fix_refused = {"attempts": targeted_fix_attempts, "reasons": reasons}
                 else:
                     if is_stuck:
                         # Same reasons already survived one attempt -- the remedy half of
@@ -3676,6 +3677,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         "code_gen_mode": code_gen_mode,
         "e2e": e2e_state,
         "targeted_fix_attempts": targeted_fix_attempts,
+        "targeted_fix_refused": targeted_fix_refused,
         "e2e_reset_attempts": e2e_reset_attempts,
         # Only present when a rewind or a reset-e2e actually reset a placement's sub-state --
         # omitted otherwise so an ordinary intake call leaves this channel untouched, same as
@@ -8832,6 +8834,8 @@ def _demo() -> None:
         assert not any(_VERIFY_FEEDBACK_MARKER in str(m.content) for m in _build_fn(absent)), (
             f"{_label}: no last_verification present must inject nothing"
         )
+    refused_state = {**copy.deepcopy(verify_feedback_base_state), "targeted_fix_refused": {"attempts": 2, "reasons": ["r-stuck"]}}
+    assert any("r-stuck" in str(m.content) for m in _build_exit_prompt(refused_state)), "metrics-exit draft must see the refusal"
 
     # reviewer_feedback (human gate rejection) and last_verification (deterministic gate
     # rejection) are independent channels (StageState.reviewer_feedback's own comment,

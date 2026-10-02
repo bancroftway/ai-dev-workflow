@@ -283,10 +283,16 @@ def _failure_detail(run_failure: dict[str, Any]) -> str:
 
 
 def _failure_headline(run_failure: dict[str, Any]) -> str:
-    """First non-empty line of the failure detail, single-line, bounded -- for the blocking bullet."""
-    detail = _failure_detail(run_failure)
-    first = next((line.strip() for line in detail.splitlines() if line.strip()), "")
-    return first[:workflow_config.EXIT_FAILURE_HEADLINE_CHARS]
+    """First non-empty line of the failure detail, single-line, bounded -- for the blocking bullet.
+    A first line ending in ':' is only a lead-in ("...while this loop can still act on them:",
+    session c2bbdca1) that names nothing, so the next line (bullet stripped) is appended; when the
+    two overflow the cap, the lead-in is cut, never the item that names the problem."""
+    lines = [line.strip() for line in _failure_detail(run_failure).splitlines() if line.strip()]
+    cap = workflow_config.EXIT_FAILURE_HEADLINE_CHARS
+    if len(lines) > 1 and lines[0].endswith(":"):
+        item = lines[1].lstrip("-*• ")
+        return f"{lines[0][:max(cap - len(item) - 1, 0)]} {item}".strip()[:cap]
+    return (lines[0] if lines else "")[:cap]
 
 
 def _terminal_failure_reason(run_failure: dict[str, Any]) -> str:
@@ -295,6 +301,15 @@ def _terminal_failure_reason(run_failure: dict[str, Any]) -> str:
     reason = f"{exit_readiness_checks.TERMINAL_FAILURE_MARKER} {run_failure.get('stage')}: {run_failure.get('type')}"
     detail_line = _failure_headline(run_failure)
     return f"{reason} -- {detail_line}" if detail_line else reason
+
+
+def _targeted_fix_refused_reason(refusal: dict[str, Any]) -> str:
+    """The blocking bullet exit_finalize_node injects from state["targeted_fix_refused"] (graph
+    intake_node) -- starts with TARGETED_FIX_REFUSED_MARKER, so a later attempt's stale filter owns it."""
+    return (
+        f"{exit_readiness_checks.TARGETED_FIX_REFUSED_MARKER}: the same blocking reason(s) survived "
+        f"{refusal.get('attempts')} targeted-fix attempt(s) -- a further automated attempt is unlikely to help"
+    )
 
 
 def _render_terminal_failure(run_failure: dict[str, Any] | None) -> str:
@@ -1507,23 +1522,27 @@ async def _final_merge_readiness(
     except Exception:  # noqa: BLE001 -- degrade, never abort the report
         logger.warning("exit finalize: verify_exit_readiness re-check failed for thread_id=%s", thread_id, exc_info=True)
 
-    terminal_failure = state.get("run_failure")
-    if terminal_failure:
-        # A terminal escalate (rebuild/e2e/test-hardening) routed into this stage so the report
-        # still gets written -- but the drafting model never sees run_failure, so without this the
-        # report blames whatever incidental gaps it found ("metrics were not recorded") and never
-        # names the actual killer. The bullet carries the error's first meaningful line -- a bare
-        # "rebuild_cap_exceeded" sent the drafting model guessing at a root cause (observed live,
-        # run d16959d3: it blamed a missing project reference; the real killer was an MSB4025
-        # XML-comment error that only the DB row and ledger named). The full tail lands in its own
-        # section of the report.
-        reason = _terminal_failure_reason(terminal_failure)
+    # A terminal escalate (rebuild/e2e/test-hardening) routed into this stage so the report still
+    # gets written -- but the drafting model never sees run_failure, so without this the report
+    # blames whatever incidental gaps it found ("metrics were not recorded") and never names the
+    # actual killer. The bullet carries the error's first meaningful line -- a bare
+    # "rebuild_cap_exceeded" sent the drafting model guessing at a root cause (observed live, run
+    # d16959d3: it blamed a missing project reference; the real killer was an MSB4025 XML-comment
+    # error that only the DB row and ledger named). The full tail lands in its own section of the
+    # report. A targeted fix intake refused as stuck in this attempt is injected the same way: it
+    # used to be appended to metrics-exit's stored approved_content, which this attempt's redraft
+    # (or the deterministic-only seed above) never reads.
+    terminal_failure, refusal = state.get("run_failure"), state.get("targeted_fix_refused")
+    injected = [
+        *([_terminal_failure_reason(terminal_failure)] if terminal_failure else []),
+        *([_targeted_fix_refused_reason(refusal)] if refusal else []),
+    ]
+    if injected:
         existing_reasons = _presence_values(merge_readiness.get("blocking_reasons"))
-        if reason not in existing_reasons:
-            merge_readiness["blocking_reasons"] = _presence_from_values(
-                [reason, *existing_reasons],
-                empty_reason="unreachable: reason is always appended in this branch",
-            )
+        merge_readiness["blocking_reasons"] = _presence_from_values(
+            [*(r for r in injected if r not in existing_reasons), *existing_reasons],
+            empty_reason="unreachable: injected is non-empty in this branch",
+        )
         merge_readiness["merge_ready"] = False
     return merge_readiness
 
@@ -1537,18 +1556,18 @@ async def targeted_fix_reasons(
     phrases are re-checked against the current tree. `exit_stage` is metrics-exit as the last
     attempt left it (before intake's reset clears last_verification). Recomputed rather than read
     from manifest.json's merge_readiness: a session finalized before that seed existed (c2bbdca1)
-    still carries the stale "no main.ts"/"zero screenshots" prose there. NOT_RECHECKED_REASON is
-    dropped -- "the recheck could not run" is nothing a code fix can address."""
+    still carries the stale "no main.ts"/"zero screenshots" prose there. NOT_RECHECKED_REASON and a
+    prior refusal (TARGETED_FIX_REFUSED_MARKER) are dropped -- "the recheck could not run" / "the
+    fixer is stuck" are nothing a code fix can address, and the refusal would also spoil the stuck
+    fingerprint match that refuses the next attempt."""
     report = await _final_merge_readiness(
         thread_id,
         copy.deepcopy(exit_stage.get("approved_content") or {}),
         {**state, "stages": {**(state.get("stages") or {}), "metrics-exit": exit_stage}},
         provider,
     )
-    return [
-        str(r) for r in _presence_values(report.get("blocking_reasons"))
-        if r != exit_readiness_checks.NOT_RECHECKED_REASON
-    ]
+    not_code = (exit_readiness_checks.NOT_RECHECKED_REASON, exit_readiness_checks.TARGETED_FIX_REFUSED_MARKER)
+    return [str(r) for r in _presence_values(report.get("blocking_reasons")) if not str(r).startswith(not_code)]
 
 
 def _baseline_refresh_payload(status: str, metrics_summary: dict[str, Any]) -> str | None:
@@ -2244,6 +2263,23 @@ def _demo() -> None:
     assert "## Terminal failure" in section and "MSB4025" in section and "rebuild_cap_exceeded" in section, section
     assert _render_terminal_failure(None) == ""
     assert _failure_headline({"stage": "x", "type": "y"}) == ""
+    cap = workflow_config.EXIT_FAILURE_HEADLINE_CHARS
+    assert _failure_headline({"feedback": "x" * (cap * 3)}) == "x" * cap
+    assert _failure_headline({"feedback": "  single line: boom  "}) == "single line: boom", "self-contained line: unchanged"
+    assert _failure_headline({"feedback": "Fix these now:"}) == "Fix these now:", "lead-in with no item: unchanged"
+    # Session c2bbdca1's real dbo.sessions.failure_message: the first line is a lead-in ending at ':'
+    # -- the headline used to stop there and never name the problem (gitleaks).
+    c2bbdca1 = (
+        "The build is green, but a full re-scan of the tree you just modified reports problems the FINAL "
+        "metrics gate will refuse to merge on. Fix them now, while this loop can still act on them:\n"
+        "- security-critical tool(s) failed or are missing, so their findings cannot be trusted as \"clean\": gitleaks\n\n"
+        "These are regressions introduced by the fix work in this stage: the remediation stage earlier in this "
+        "run left the tree clean."
+    )
+    headline = _failure_headline({"stage": "r_adversarial_compliance", "type": "rebuild_cap_exceeded", "feedback": c2bbdca1})
+    assert headline.endswith("act on them: security-critical tool(s) failed or are missing, so their findings cannot be trusted as \"clean\": gitleaks"), headline
+    long_lead = _failure_headline({"feedback": "y" * (cap * 2) + ":\n- gitleaks degraded"})
+    assert len(long_lead) == cap and long_lead.endswith(" gitleaks degraded"), "over the cap: the lead-in is cut, not the item"
 
     # _divergence_ledger: deterministic dispositions from lap snapshots -- closed = absent from the
     # final lap (matched by plan_reference), open = still reported, first_seen tracked across laps.
@@ -2523,7 +2559,8 @@ def _demo() -> None:
     # checks no longer raise it. A new phrase nobody added to GATE_OWNED_REASON_MARKERS (or a
     # manifest topic) fails here instead of silently re-blocking every later attempt. Targeted-fix
     # reasons are deliberately absent: they are verbatim copies of earlier blocking reasons (no
-    # vocabulary of their own), owned by whichever phrase they copy.
+    # vocabulary of their own), owned by whichever phrase they copy. The targeted-fix REFUSAL is its
+    # own phrase (exit_finalize_node's injection) and is listed.
     from . import metrics_nodes as _metrics_nodes
     from .gates import readme_gate
 
@@ -2555,6 +2592,7 @@ def _demo() -> None:
         _terminal_failure_reason({"stage": "r_x", "type": "rebuild_cap_exceeded", "feedback": "boom"}),
         "exit report generation failed: boom",  # exit_finalize_node's degraded branch (f-string there)
         erc.NOT_RECHECKED_REASON,
+        _targeted_fix_refused_reason({"attempts": 2}),
     ]
     assert len(regression_phrases) == 18 and len(readme_phrases) == 5, (regression_phrases, readme_phrases)
     for phrase in deterministic_phrases:
@@ -2622,6 +2660,18 @@ def _demo() -> None:
     # Not judged and the recompute itself can't run: never ready on an unverified seed.
     crashed = _run_final({**resumed, "run_failure": None}, prior_report, clean_files, crash=True)
     assert crashed["merge_ready"] is False and crashed["blocking_reasons"]["values"] == [erc.NOT_RECHECKED_REASON], crashed
+    # Targeted fix refused as stuck (graph.intake_node sets state["targeted_fix_refused"] for that
+    # attempt): the report names it even though metrics-exit's redraft judged the tree clean -- the
+    # old note in stored approved_content never reached the report.
+    refusal = {"attempts": 2, "reasons": ["coverage below threshold 60%"]}
+    refused_reason = _targeted_fix_refused_reason(refusal)
+    clean_draft = {"merge_ready": True, "blocking_reasons": {"status": "absent", "values": [], "reason": "none"}}
+    refused = _run_final({**judged, "run_failure": None, "targeted_fix_refused": refusal}, clean_draft, clean_files)
+    assert refused["merge_ready"] is False and refused["blocking_reasons"]["values"] == [refused_reason], refused
+    # A later attempt (its intake cleared the field) whose model copied the bullet forward from the
+    # committed EXIT-REPORT.md: gate-owned, so the stale filter drops it and the verdict clears.
+    later = _run_final({**judged, "run_failure": None, "targeted_fix_refused": None}, json.loads(json.dumps(refused)), clean_files)
+    assert later["merge_ready"] is True and refused_reason not in later["blocking_reasons"]["values"], later
 
     # targeted_fix_reasons: what a targeted fix is sent to fix. `resumed` is the state AFTER the
     # targeted-fix intake's reset (last_verification cleared); exit_stage is metrics-exit as the
@@ -2635,6 +2685,11 @@ def _demo() -> None:
     assert prior_report["blocking_reasons"]["values"] == [prior_prose, erc.NO_SCREENSHOTS_REASON], "stored content never mutated"
     # Recheck could not run: the placeholder is not a code problem, so there is nothing to fix.
     assert _run_final({**resumed, "run_failure": None}, prior_report, clean_files, crash=True, exit_stage={"last_verification": None}) == []
+    # A prior attempt's refusal is no code problem either -- and sending it would break the stuck
+    # fingerprint match that refuses the next identical attempt.
+    assert _run_final(
+        {**resumed, "run_failure": None, "targeted_fix_refused": refusal}, prior_report, clean_files, exit_stage={"last_verification": None}
+    ) == []
 
     # Every declared Check is recorded somewhere in verify_exit_readiness (text scan).
     import inspect

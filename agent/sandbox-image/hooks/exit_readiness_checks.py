@@ -92,6 +92,9 @@ TERMINAL_FAILURE_MARKER = "terminal pipeline failure recorded at"
 # attempt: gate-owned, so the deterministic recompute clears it the moment it actually runs, and it
 # only survives (merge_ready stays False) when that recompute could not run at all.
 NOT_RECHECKED_REASON = "exit readiness was not re-checked in this attempt"
+# exit_nodes.exit_finalize_node's injection for an attempt whose intake refused a targeted fix as
+# stuck (graph state targeted_fix_refused, which only that attempt carries).
+TARGETED_FIX_REFUSED_MARKER = "targeted fix refused as stuck"
 
 # Phrases the deterministic exit checks OWN -- every one comes from metrics_nodes.regression_reasons,
 # readme_gate.readme_problems, this module's own checks, or exit_finalize_node, and from nowhere
@@ -125,6 +128,7 @@ GATE_OWNED_REASON_MARKERS = (
     TERMINAL_FAILURE_MARKER,
     "exit report generation failed",  # exit_finalize_node's degraded-report reason
     NOT_RECHECKED_REASON,
+    TARGETED_FIX_REFUSED_MARKER,
     # metrics_problems' own "metrics.get('run_id') == run_id" check -- this exact marker's own
     # absence was a real bug once (income-investor thread f0fef8ba, 2026-09-26): this phrase got
     # baked into metrics-exit's approved_content on a run whose metrics genuinely hadn't landed yet,
