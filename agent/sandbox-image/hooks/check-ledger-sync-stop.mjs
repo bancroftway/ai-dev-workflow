@@ -34,6 +34,9 @@
 //      transcript-evidence fact computed host-side; this only reports whether `ledger.json`
 //      ALREADY shows completeness for `AIDW_RUN_ID`, from an earlier lap of the same run). Reads
 //      `AIDW_RUN_ID` (Task 5) -- the ONE sub-check this task's brief calls out as needing it.
+//   4. Story decisions (`check_story_decisions`, 2026-10-02): every story in the last-approved
+//      specification has one `story_decisions` row whose decision matches what the draft does to
+//      it. `specification` stage only; skipped when no approved specification exists yet.
 //
 // STAGE-SCOPED VIA AIDW_STAGE (final-review fix, 2026-09-30): (1)/(2) used to rely solely on
 // draft-specification.json's own existence, on the mistaken belief that check-narrative-format-
@@ -53,6 +56,9 @@ if (stage !== "specification" && stage !== "brownfield-spec") process.exit(0);
 
 const DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json";
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
+// The last-approved specification: the baseline every live story's `story_decisions` row is judged
+// against (ledger_sync_checks.check_story_decisions). Literal value guarded by that module's _demo.
+const APPROVED_SPEC_PATH = ".ai-dev-workflow/03-specification.approved.json";
 
 let input = {};
 try {
@@ -121,10 +127,28 @@ const runId =
     ? process.env.AIDW_RUN_ID
     : null;
 
+// story_decisions: the real specification stage only -- brownfield-spec builds the baseline and
+// never classifies one, and can run against a non-empty ledger after a lost manifest. Absent or
+// unreadable approved spec = no baseline yet, so the check is skipped (null), never guessed at.
+let approvedSpecification = null;
+const approvedSpecPath = `${cwd}/${APPROVED_SPEC_PATH}`;
+if (stage === "specification" && existsSync(approvedSpecPath)) {
+  try {
+    approvedSpecification = JSON.parse(readFileSync(approvedSpecPath, "utf8"));
+  } catch {
+    approvedSpecification = null;
+  }
+}
+
 let result;
 try {
   const proc = spawnSync("python3", ["/opt/aidw-hooks/ledger_sync_checks.py", "--check-hook"], {
-    input: JSON.stringify({ ledger_entries: ledgerEntries, specification: draft, run_id: runId }),
+    input: JSON.stringify({
+      ledger_entries: ledgerEntries,
+      specification: draft,
+      run_id: runId,
+      approved_specification: approvedSpecification,
+    }),
     encoding: "utf8",
     timeout: 20000,
   });
@@ -141,6 +165,7 @@ try {
 problems.push(...(result.empty_draft_problems || []));
 problems.push(...(result.citation_problems || []));
 problems.push(...(result.completeness_problems || []));
+problems.push(...(result.decision_problems || []));
 
 const openQuestions = result.open_questions || [];
 if (openQuestions.length > 0) {

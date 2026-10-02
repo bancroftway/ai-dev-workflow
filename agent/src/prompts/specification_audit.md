@@ -41,6 +41,15 @@ list would silently un-retire something the draft meant to remove. If your own g
 something that no longer belongs and the draft missed it, add its id to the appropriate list
 yourself.
 
+When the file has `story_decisions` (the project already has an approved specification), audit
+every row as hard as the stories themselves. Keep the draft's decisions unless your own audit
+disagrees; scrutinize every `unchanged` story against each new requirement in the Raw Requirements
+Text -- a requirement that contradicts, narrows or replaces an existing story changes it even when
+it never names it, and a story the draft kept `unchanged` beside a new criterion that contradicts
+it is the gap this table exists to catch. If you change a decision, make the file match it
+(re-emit, add or retire criteria, or retire the story) -- a deterministic gate rejects any row
+whose decision disagrees with what the file does.
+
 Leave the file's `attachment_notes` as the draft left them unless you have good reason to revise
 the wording -- you never receive the original attachments yourself, only the draft's own
 distillation of them, so deleting this field would leave Plan with no way to know an attachment

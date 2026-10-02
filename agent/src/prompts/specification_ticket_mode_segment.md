@@ -5,9 +5,9 @@ specification -- every story and criterion from every earlier ticket, still live
 drafting so you know what already exists: don't propose something that's already there, and know
 the real ids you'll need to cite below.
 
-`.ai-dev-workflow/spec/draft-specification.json` (the file you edit) is seeded EMPTY of stories on
-purpose -- it is this ticket's delta sketchpad, not a copy of the whole project to maintain. Put
-only what THIS ticket actually adds or changes into it:
+`.ai-dev-workflow/spec/draft-specification.json` (the file you edit) is re-seeded for every new
+ticket EMPTY of stories on purpose -- it is this ticket's delta sketchpad, not a copy of the whole
+project to maintain. Put only what THIS ticket actually adds or changes into it:
 
 - A genuinely new story or criterion: write it with `existing_us_id`/`existing_ac_id: null`.
 - Something this ticket revises: cite its real id via `existing_us_id`/`existing_ac_id`, with the
@@ -26,6 +26,23 @@ requirement genuinely changed. Any edit to a criterion's description -- even a c
 tells the pipeline the REQUIREMENT changed, and its already-delivered code and tests are discarded
 and redone.
 
+STORY DECISIONS -- the file's `story_decisions` holds one row per story of the approved
+specification, seeded undecided (`decision: null`). Fill in every row, `decision` and a one-line
+`reason`:
+- `unchanged`: this ticket's requirements leave the story as it is.
+- `modified`: they change it -- re-emit it citing `existing_us_id` with the new wording or
+  criteria, add a criterion to it, or retire one of its criteria.
+- `retired`: they remove it -- name it in `retired_us_ids`.
+
+Weigh EVERY new requirement against EVERY existing story before deciding: does it contradict,
+narrow, extend or replace the story? A requirement changes a story even when it never names it --
+"notes are permanent once saved" retires "delete a note"; "notes are capped at 500 characters"
+modifies "create a note". The decision must match what the file actually does: a deterministic gate
+rejects a story declared `modified` that the file doesn't change, one declared `unchanged` that the
+file retires or changes, a missing or duplicate row, and a blank reason. Never add a row for a story
+created in this ticket.
+
 If the prior run's exit report lists criteria as "carried over -- not delivered", re-cite them in
 this draft (unchanged wording, via `existing_ac_id`) so they re-enter the work queue -- an
-undelivered criterion left uncited stays undelivered with nothing scheduled to build it.
+undelivered criterion left uncited stays undelivered with nothing scheduled to build it. Re-citing
+with unchanged wording leaves its story `unchanged`.

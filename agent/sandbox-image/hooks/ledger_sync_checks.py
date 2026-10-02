@@ -54,11 +54,16 @@ wireframe_linkage_checks.py's own `run_citation_validity_checks`/`check_ac_id_ci
 that module's own header has the full reasoning for why a shared loop-driver, unlike a shared rule,
 is an acceptable second copy).
 
+Plus `story_delta`/`check_story_decisions` (2026-10-02): every story in the last-approved
+specification must carry a declared decision (unchanged/modified/retired) that matches what the
+draft actually does to it -- see check_story_decisions' own docstring. Lives here, not in
+spec_ledger.py, so the gate and the Stop hook judge with the one rule.
+
 CLI mode (`python3 ledger_sync_checks.py --check-hook`, stdin JSON: `{"ledger_entries": [...],
-"specification": {...}, "run_id": "..." | null}`, stdout JSON: `{"empty_draft_problems": [...],
-"open_questions": [...], "citation_problems": [...], "completeness_problems": [...]}`) is what the
-Stop hook actually invokes -- see the `if __name__ == "__main__":` block below for the exact
-contract.
+"specification": {...}, "run_id": "..." | null, "approved_specification": {...} | null}`, stdout
+JSON: `{"empty_draft_problems": [...], "open_questions": [...], "citation_problems": [...],
+"completeness_problems": [...], "decision_problems": [...]}`) is what the Stop hook actually
+invokes -- see the `if __name__ == "__main__":` block below for the exact contract.
 """
 
 from __future__ import annotations
@@ -77,6 +82,11 @@ from typing import Any
 # loaded, so it introduces no cycle -- same trick claude_chat_model.py's own _demo() uses for
 # config.AUDIT_FULL_READ_FILE_BY_STAGE).
 DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json"
+
+# workflow_persistence.SPECIFICATION_APPROVED_PATH, duplicated for the same reason (this module may
+# import nothing project-local); `_demo()` guards it against the real constant AND against
+# check-ledger-sync-stop.mjs, which reads this file to hand `check_story_decisions` its baseline.
+APPROVED_SPEC_PATH = ".ai-dev-workflow/03-specification.approved.json"
 
 # What a REAL ledger id looks like -- moved verbatim from spec_ledger.py's own module-level
 # `_REAL_ID_RE` (used only by the two renumbering guards below, now living here with them). See
@@ -291,7 +301,7 @@ def check_fully_reviewed_completeness(entries: list[dict[str, Any]], run_id: str
 def check_empty_draft(specification: dict[str, Any]) -> str | None:
     """graph.py's `_verify_specification_ledger` empty-draft rejection, moved verbatim: reject only
     when EVERY field a real submission could touch is empty (user_stories, retired_us_ids,
-    retired_ac_ids, bug_affected_ac_ids) -- a deletion-only ticket (retire something, add nothing
+    retired_ac_ids, bug_affected_ac_ids, decided story_decisions rows) -- a deletion-only ticket (retire something, add nothing
     new) or a wording-unchanged bug-reopen ticket (bug_affected_ac_ids only) legitimately has no
     stories/criteria to submit. Returns the exact rejection message, or None if the draft has real
     content. Pure."""
@@ -300,11 +310,14 @@ def check_empty_draft(specification: dict[str, Any]) -> str | None:
         or specification.get("retired_us_ids")
         or specification.get("retired_ac_ids")
         or specification.get("bug_affected_ac_ids")
+        # A no-op ticket's whole answer is its story decisions ("every story unchanged") -- real
+        # content that must reach the no-new-work path. Seeded, still-undecided rows don't count.
+        or any(isinstance(row, dict) and row.get("decision") for row in specification.get("story_decisions") or [])
     ):
         return None
     return (
         f"{DRAFT_SPEC_PATH} has nothing in it -- no new/revised stories or "
-        "criteria, no retirements, no bug-affected ids. This response is metadata ABOUT "
+        "criteria, no retirements, no bug-affected ids, no decided story_decisions rows. This response is metadata ABOUT "
         "the specification, not the specification itself. Use your file tools to "
         "actually write this ticket's real delta, then resubmit."
     )
@@ -411,14 +424,168 @@ def check_ledger_sync_draft(
     return reasons
 
 
+STORY_DECISIONS = ("unchanged", "modified", "retired")
+
+
+def story_delta(
+    prior_story: dict[str, Any],
+    draft_story: dict[str, Any] | None,
+    retired_us_ids: set[str],
+    retired_ac_ids: set[str],
+    bug_affected_ac_ids: set[str],
+) -> str:
+    """What this ticket's draft actually does to one story of the last-APPROVED specification --
+    the single rule both the gate (graph.py's specification verify) and the same-turn Stop hook
+    judge a declared `story_decisions` row against, so the two can never disagree.
+
+    `prior_story` is the story as the approved specification holds it (SPECIFICATION_APPROVED_PATH,
+    the same stable baseline spec_ledger.gate_change_status uses -- never the ledger, which is
+    re-saved on every passing verify lap and would make a lap-1 change look "unchanged" on lap 2).
+    `draft_story` is the draft's own story citing it via `existing_us_id`, or None when the draft
+    doesn't cite it.
+
+    "retired" wins over everything (a retired story whose criteria are also listed in
+    retired_ac_ids is still just retired). "modified" means the requirement really changed: the
+    title or narrative text differs (raw comparison, matching sync_ledger, which writes either
+    change to the ledger), the story's or a criterion's deferred flag flipped, a criterion was
+    added or reworded, or one of its criteria is retired or bug-reopened (both change what has to
+    be delivered). Anything else -- including re-citing a carried-over story with its text
+    unchanged, or a `ui_related`-only change (metadata, never a requirement change in sync_ledger
+    either) -- is "unchanged". Pure."""
+    if prior_story.get("id") in retired_us_ids:
+        return "retired"
+    prior_acs = {ac.get("id"): ac for ac in prior_story.get("acceptance_criteria") or []}
+    if any(ac_id in retired_ac_ids or ac_id in bug_affected_ac_ids for ac_id in prior_acs):
+        return "modified"
+    if draft_story is None:
+        return "unchanged"
+    if (
+        draft_story.get("title", "") != prior_story.get("title", "")
+        or draft_story.get("narrative", "") != prior_story.get("narrative", "")
+        or bool(draft_story.get("deferred")) != bool(prior_story.get("deferred"))
+    ):
+        return "modified"
+    for ac in draft_story.get("acceptance_criteria") or []:
+        prior_ac = prior_acs.get(ac.get("existing_ac_id"))
+        if prior_ac is None:
+            return "modified"  # a new criterion (or one created earlier this ticket, never approved)
+        if (
+            ac.get("description", "") != prior_ac.get("description", "")
+            or bool(ac.get("deferred")) != bool(prior_ac.get("deferred"))
+        ):
+            return "modified"
+    return "unchanged"
+
+
+def check_story_decisions(approved_specification: dict[str, Any], specification: dict[str, Any]) -> list[str]:
+    """Every story in the last-approved specification must have exactly one `story_decisions` row
+    in this ticket's draft -- `{us_id, decision: unchanged|modified|retired, reason}` -- and the
+    declared decision must equal what the draft actually does to it (`story_delta` above).
+
+    Exists because a new requirement can contradict or change an existing story without naming
+    it ("notes are permanent once saved" retires "delete a note"; "notes are capped at 500
+    characters" modifies "create a note"). Before this check, silence meant "unchanged", so
+    whether such an implied change was ever noticed was pure model judgment. Forcing a decision
+    per story makes the model weigh every story against the new requirements, and matching the
+    label to the draft catches the second half of the failure: a model that noticed ("modified:
+    notes are now capped") but never made the change.
+
+    Stories created during this ticket aren't in the approved specification, so they need no row.
+    No approved specification (a first ticket) means nothing to classify. Returns one actionable
+    message per problem, empty when every row is present and consistent. Pure."""
+    prior_stories = [s for s in approved_specification.get("user_stories") or [] if s.get("id")]
+    if not prior_stories:
+        return []
+    prior_by_id = {s["id"]: s for s in prior_stories}
+    draft_by_id = {
+        s.get("existing_us_id"): s for s in specification.get("user_stories") or [] if s.get("existing_us_id")
+    }
+    retired_us = set(specification.get("retired_us_ids") or [])
+    retired_ac = set(specification.get("retired_ac_ids") or [])
+    bug_ac = set(specification.get("bug_affected_ac_ids") or [])
+
+    problems: list[str] = []
+    seen: set[str] = set()
+    for row in specification.get("story_decisions") or []:
+        us_id = row.get("us_id") if isinstance(row, dict) else None
+        if us_id not in prior_by_id:
+            problems.append(
+                f"story_decisions names {us_id!r}, which is not a live story in the approved "
+                f"specification ({APPROVED_SPEC_PATH}) -- only classify stories that already exist there"
+            )
+            continue
+        if us_id in seen:
+            problems.append(f"story_decisions lists {us_id!r} more than once -- one row per story")
+            continue
+        seen.add(us_id)
+        declared = row.get("decision")
+        if declared is None:
+            problems.append(
+                f"story_decisions row for {us_id!r} has no decision -- set 'unchanged', 'modified' or 'retired'"
+            )
+            continue
+        if declared not in STORY_DECISIONS:
+            problems.append(
+                f"story_decisions row for {us_id!r} has decision {declared!r} -- it must be one of "
+                "'unchanged', 'modified' or 'retired'"
+            )
+            continue
+        if not str(row.get("reason") or "").strip():
+            problems.append(
+                f"story_decisions row for {us_id!r} has no reason -- say in one line why, weighed "
+                "against this ticket's requirements"
+            )
+        actual = story_delta(prior_by_id[us_id], draft_by_id.get(us_id), retired_us, retired_ac, bug_ac)
+        if declared == actual:
+            continue
+        if actual == "retired":
+            problems.append(
+                f"{us_id!r} is declared {declared!r}, but the draft retires it (it is in retired_us_ids) "
+                "-- set the decision to 'retired', or take it out of retired_us_ids"
+            )
+        elif declared == "retired":
+            problems.append(
+                f"{us_id!r} is declared 'retired', but the draft never retires it -- add it to "
+                "retired_us_ids, or change the decision"
+            )
+        elif declared == "modified":
+            problems.append(
+                f"{us_id!r} is declared 'modified', but the draft changes nothing about it -- make the "
+                "change (re-emit it citing existing_us_id with the new wording or criteria, add a "
+                "criterion, or retire one of its criteria), or set the decision to 'unchanged'"
+            )
+        else:
+            problems.append(
+                f"{us_id!r} is declared 'unchanged', but the draft modifies it (its wording, a "
+                "criterion, a deferral, or a retired/bug-reopened criterion) -- set the decision to "
+                "'modified', or undo the change"
+            )
+
+    missing = [us_id for us_id in prior_by_id if us_id not in seen]
+    if missing:
+        problems.append(
+            f"story_decisions has no row for {', '.join(missing)} -- every story in the approved "
+            "specification needs exactly one: decide whether this ticket's requirements leave it "
+            "unchanged, modify it, or retire it. A new requirement that contradicts, narrows or "
+            "replaces an existing story is a change even when it never names that story."
+        )
+    return problems
+
+
 def run_ledger_sync_checks(
-    ledger_entries: list[dict[str, Any]], specification: dict[str, Any], run_id: str | None
+    ledger_entries: list[dict[str, Any]],
+    specification: dict[str, Any],
+    run_id: str | None,
+    approved_specification: dict[str, Any] | None = None,
 ) -> dict[str, list[Any]]:
     """Everything check-ledger-sync-stop.mjs's CLI mode reports, computed once over the same
     inputs -- same "no drift" contract as wireframe_linkage_checks.run_all_checks. `run_id` is
     None whenever the hook isn't confident this is genuinely the audit's own turn on the
     specification stage (see check_fully_reviewed_completeness's own caller in the CLI below) --
-    the completeness sweep is skipped entirely rather than guessed at."""
+    the completeness sweep is skipped entirely rather than guessed at. `approved_specification` is
+    None whenever the hook isn't on the real specification stage (brownfield-spec builds the
+    baseline, it never classifies one) or there is no approved specification yet -- the
+    story-decisions check is skipped then."""
     empty_draft = check_empty_draft(specification)
     completeness_problem = (
         check_fully_reviewed_completeness(ledger_entries, run_id) if run_id else None
@@ -434,6 +601,9 @@ def run_ledger_sync_checks(
             bug_affected_ac_ids=specification.get("bug_affected_ac_ids") or [],
         ),
         "completeness_problems": [completeness_problem] if completeness_problem else [],
+        "decision_problems": (
+            check_story_decisions(approved_specification, specification) if approved_specification else []
+        ),
     }
 
 
@@ -546,6 +716,11 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     assert check_empty_draft({"bug_affected_ac_ids": ["US-0001.1"]}) is None
     empty_msg = check_empty_draft({})
     assert empty_msg is not None and "nothing in it" in empty_msg
+    # A no-op ticket's whole draft is its story_decisions ("everything unchanged") -- that is a real
+    # answer that must reach the no-new-work path, not an empty draft. Only the seeded, still
+    # undecided rows mean nothing was done.
+    assert check_empty_draft({"story_decisions": [{"us_id": "US-0001", "decision": "unchanged", "reason": "r"}]}) is None
+    assert check_empty_draft({"story_decisions": [{"us_id": "US-0001", "decision": None, "reason": ""}]}) is not None
 
     # --- find_open_questions ---
     assert find_open_questions([]) == []
@@ -601,6 +776,154 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     result_stamped = run_ledger_sync_checks(stamped, {"user_stories": []}, run_id="run-1")
     assert result_stamped["completeness_problems"] == []
 
+    # --- story_delta: what the draft actually does to one approved story ---
+    approved = {"user_stories": [
+        {"id": "US-0001", "title": "Create a note", "narrative": "As a user, I want notes, so that I remember.",
+         "deferred": False, "acceptance_criteria": [
+             {"id": "US-0001.1", "description": "Saving stores the note.", "deferred": False, "ui_related": True},
+         ]},
+        {"id": "US-0002", "title": "Delete a note", "narrative": "As a user, I want to delete, so that I tidy.",
+         "deferred": False, "acceptance_criteria": [
+             {"id": "US-0002.1", "description": "Deleting removes the note.", "deferred": False},
+         ]},
+        {"id": "US-0003", "title": "Archive", "narrative": "As a user, I want archive, so that later.",
+         "deferred": True, "acceptance_criteria": [
+             {"id": "US-0003.1", "description": "Archived notes are hidden.", "deferred": True},
+         ]},
+    ]}
+    create, delete, archive = approved["user_stories"]
+
+    def recite(prior: dict[str, Any], **story_overrides: Any) -> dict[str, Any]:
+        """A draft story re-citing `prior` with its text copied verbatim, then overridden."""
+        story = {
+            "id": prior["id"], "existing_us_id": prior["id"], "title": prior["title"],
+            "narrative": prior["narrative"], "deferred": prior["deferred"],
+            "acceptance_criteria": [
+                {"id": ac["id"], "existing_ac_id": ac["id"], "description": ac["description"],
+                 "deferred": ac["deferred"], "ui_related": ac.get("ui_related", False)}
+                for ac in prior["acceptance_criteria"]
+            ],
+        }
+        story.update(story_overrides)
+        return story
+
+    none: set[str] = set()
+    assert story_delta(create, None, none, none, none) == "unchanged", "not cited, nothing named -- untouched"
+    assert story_delta(delete, None, {"US-0002"}, none, none) == "retired"
+    assert story_delta(delete, None, {"US-0002"}, {"US-0002.1"}, none) == "retired", (
+        "a retired story whose criteria are ALSO listed in retired_ac_ids is still 'retired', not 'modified'"
+    )
+    assert story_delta(create, recite(create), none, none, none) == "unchanged", (
+        "re-citing a carried-over story with its text unchanged is not a modification"
+    )
+    assert story_delta(create, recite(create, title="Create or edit a note"), none, none, none) == "modified"
+    assert story_delta(create, recite(create, narrative="As a user, I want notes, so that I recall."), none, none, none) == "modified", (
+        "a narrative-only change is a modification -- sync_ledger writes it to the ledger"
+    )
+    new_ac = recite(create)
+    new_ac["acceptance_criteria"].append({"id": "ac-new", "existing_ac_id": None, "description": "Max 500 chars."})
+    assert story_delta(create, new_ac, none, none, none) == "modified", "a new criterion under the story"
+    reworded = recite(create)
+    reworded["acceptance_criteria"][0]["description"] = "Saving stores the note, up to 500 chars."
+    assert story_delta(create, reworded, none, none, none) == "modified", "a reworded criterion"
+    ac_deferred = recite(create)
+    ac_deferred["acceptance_criteria"][0]["deferred"] = True
+    assert story_delta(create, ac_deferred, none, none, none) == "modified", "a criterion's deferred flag flipped"
+    ui_only = recite(create)
+    ui_only["acceptance_criteria"][0]["ui_related"] = False
+    assert story_delta(create, ui_only, none, none, none) == "unchanged", "ui_related is metadata, not a requirement change"
+    assert story_delta(create, None, none, {"US-0001.1"}, none) == "modified", (
+        "retiring one of its criteria modifies the story even when the story itself isn't cited"
+    )
+    assert story_delta(create, None, none, none, {"US-0001.1"}) == "modified", (
+        "a bug-reopened criterion modifies the story (its delivery stamps are cleared)"
+    )
+    assert story_delta(archive, recite(archive), none, none, none) == "unchanged", (
+        "a parked story re-cited still deferred is unchanged"
+    )
+    assert story_delta(archive, recite(archive, deferred=False), none, none, none) == "modified", (
+        "activating a deferred story flips its deferred flag"
+    )
+
+    # --- check_story_decisions: every live approved story declared, label matches the draft ---
+    def decided(*rows: tuple[str, str | None, str]) -> list[dict[str, Any]]:
+        return [{"us_id": us_id, "decision": decision, "reason": reason} for us_id, decision, reason in rows]
+
+    good = {
+        "user_stories": [], "retired_us_ids": ["US-0002"], "retired_ac_ids": [], "bug_affected_ac_ids": [],
+        "story_decisions": decided(
+            ("US-0001", "unchanged", "Creating notes is untouched by this ticket."),
+            ("US-0002", "retired", "Notes are now permanent once saved, so deletion goes."),
+            ("US-0003", "unchanged", "Archive stays parked."),
+        ),
+    }
+    assert check_story_decisions(approved, good) == []
+    assert check_story_decisions({"user_stories": []}, {"story_decisions": []}) == [], (
+        "no approved baseline (first ticket) -- nothing to classify"
+    )
+    assert check_story_decisions({}, {}) == []
+
+    missing = check_story_decisions(approved, {**good, "story_decisions": good["story_decisions"][:2]})
+    assert missing and any("US-0003" in p for p in missing), "an unclassified live story is named"
+    assert check_story_decisions(approved, {**good, "story_decisions": []}), "no decisions at all fails"
+
+    dup_rows = good["story_decisions"] + decided(("US-0001", "unchanged", "again"))
+    dup_problems = check_story_decisions(approved, {**good, "story_decisions": dup_rows})
+    assert dup_problems and any("US-0001" in p and "more than once" in p for p in dup_problems)
+
+    unknown_rows = good["story_decisions"] + decided(("US-0099", "unchanged", "?"))
+    unknown_problems = check_story_decisions(approved, {**good, "story_decisions": unknown_rows})
+    assert unknown_problems and any("US-0099" in p for p in unknown_problems)
+
+    null_rows = decided(("US-0001", None, "x"), ("US-0002", "retired", "y"), ("US-0003", "unchanged", "z"))
+    null_problems = check_story_decisions(approved, {**good, "story_decisions": null_rows})
+    assert null_problems and any("US-0001" in p and "no decision" in p for p in null_problems)
+
+    blank_rows = decided(("US-0001", "unchanged", "   "), ("US-0002", "retired", "y"), ("US-0003", "unchanged", "z"))
+    blank_problems = check_story_decisions(approved, {**good, "story_decisions": blank_rows})
+    assert blank_problems and any("US-0001" in p and "reason" in p for p in blank_problems)
+
+    # The implied-removal case this whole check exists for: the model noticed the contradiction in
+    # its reason but forgot to actually retire the story -- or declared it unchanged while retiring.
+    said_unchanged = decided(("US-0001", "unchanged", "a"), ("US-0002", "unchanged", "b"), ("US-0003", "unchanged", "c"))
+    lie = check_story_decisions(approved, {**good, "story_decisions": said_unchanged})
+    assert lie and any("US-0002" in p and "retired" in p for p in lie), "declared unchanged, draft retires it"
+
+    forgot = {**good, "retired_us_ids": []}
+    forgot_problems = check_story_decisions(approved, forgot)
+    assert forgot_problems and any("US-0002" in p and "retired" in p for p in forgot_problems), (
+        "declared retired, but the draft never retires it"
+    )
+
+    # The implied-modification case: declared modified, but the draft changes nothing about it.
+    no_change = {**good, "story_decisions": decided(
+        ("US-0001", "modified", "Notes are now capped at 500 chars."),
+        ("US-0002", "retired", "y"), ("US-0003", "unchanged", "z"),
+    )}
+    no_change_problems = check_story_decisions(approved, no_change)
+    assert no_change_problems and any("US-0001" in p and "changes nothing" in p for p in no_change_problems)
+    with_change = {**no_change, "user_stories": [new_ac]}
+    assert check_story_decisions(approved, with_change) == [], "the same decision with the real change passes"
+
+    # --- run_ledger_sync_checks threads the approved spec through to decision_problems ---
+    assert run_ledger_sync_checks(ledger, {"user_stories": []}, run_id=None)["decision_problems"] == [], (
+        "no approved specification handed over (brownfield-spec, or no baseline yet) -- check skipped"
+    )
+    hook_result = run_ledger_sync_checks(
+        ledger, {**good, "story_decisions": said_unchanged}, run_id=None, approved_specification=approved,
+    )
+    assert hook_result["decision_problems"], "the hook reports the same decision problems the gate does"
+
+    # Drift guard: the approved-spec path the hook reads must be the one persistence writes, and the
+    # .mjs must actually use this constant's literal value.
+    from .. import workflow_persistence
+
+    assert APPROVED_SPEC_PATH == workflow_persistence.SPECIFICATION_APPROVED_PATH
+    hook_js = Path(__file__).resolve().parents[2] / "sandbox-image" / "hooks" / "check-ledger-sync-stop.mjs"
+    assert APPROVED_SPEC_PATH in hook_js.read_text(encoding="utf-8"), (
+        f"check-ledger-sync-stop.mjs no longer reads {APPROVED_SPEC_PATH}"
+    )
+
     print("ledger_sync_checks self-check: all assertions passed")
 
 
@@ -614,6 +937,7 @@ if __name__ == "__main__":
             ledger_entries=payload.get("ledger_entries") or [],
             specification=payload.get("specification") or {},
             run_id=payload.get("run_id") or None,
+            approved_specification=payload.get("approved_specification") or None,
         )
         json.dump(result, sys.stdout)
     else:

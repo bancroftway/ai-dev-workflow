@@ -225,6 +225,27 @@ def presence_values(entry: Any) -> list[Any]:
     return []
 
 
+class StoryDecision(BaseModel):
+    """What this ticket does to one story of the last-approved specification -- see
+    gates/ledger_sync_checks.check_story_decisions, which requires one row per approved story and
+    checks the decision against what the draft actually does."""
+
+    us_id: str = Field(description="The approved story's id, copied character-for-character (e.g. 'US-0003').")
+    decision: Literal["unchanged", "modified", "retired"] | None = Field(
+        default=None,
+        description="'unchanged': this ticket's requirements leave the story as it is. 'modified': "
+        "they change it -- you re-emit it citing existing_us_id with the new wording or criteria, add "
+        "a criterion, or retire one of its criteria. 'retired': they remove it -- you list it in "
+        "retired_us_ids. A new requirement that contradicts, narrows or replaces the story changes it "
+        "even when it never names it. Seeded null; never leave it null.",
+    )
+    reason: str = Field(
+        default="",
+        description="One line: why, weighed against this ticket's requirements (for a change, which "
+        "requirement drives it).",
+    )
+
+
 class Specification(BaseModel):
     title: NonBlankStr
     summary: NonBlankStr
@@ -290,6 +311,12 @@ class Specification(BaseModel):
         "tested stamps on approval) without treating its wording as changed. Never name an id "
         "you're also retiring via retired_ac_ids in this same response -- reopening and removing "
         "are contradictory.",
+    )
+    story_decisions: list[StoryDecision] = Field(
+        default_factory=list,
+        description="Ticket mode only (the project already has an approved specification): exactly "
+        "one row per story in that approved specification -- seeded for you, one undecided row each. "
+        "Empty on a project's first ticket.",
     )
 
 
@@ -620,13 +647,6 @@ class SpecificationDraftResponse(BaseModel):
         description="True if the file is complete enough to present for human review."
     )
     clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
-    story_changes: list[SpecificationChangeTouchpoint] = Field(
-        default_factory=list,
-        description="One entry per User Story/Acceptance Criterion you added, revised, or "
-        "retired in the file THIS turn -- not a restatement of the whole document. Empty is valid "
-        "(e.g. a bug ticket that reopens a criterion via bug_affected_ac_ids in the file without "
-        "changing any wording, or readiness=false while still investigating).",
-    )
     summary: str = Field(default="", description="Short plain account of what you actually did this turn.")
     skills_invoked: list[str] = Field(
         default_factory=list,
@@ -699,16 +719,6 @@ carries this content directly)."""
 SPECIFICATION_DRAFT_EXAMPLE: SpecificationDraftResponse = SpecificationDraftResponse(
     readiness=True,
     clarifying_questions=[],
-    story_changes=[
-        SpecificationChangeTouchpoint(
-            ref="story-a", kind="user_story", change="added",
-            summary="Added the password-reset-request story.",
-        ),
-        SpecificationChangeTouchpoint(
-            ref="ac-b", kind="acceptance_criterion", change="added",
-            summary="Added the unregistered-email confirmation criterion.",
-        ),
-    ],
     summary="Drafted password reset via email: one story, two criteria.",
     skills_invoked=["test-driven-development"],
 )
@@ -1722,6 +1732,19 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     # bug_affected_ac_ids (Part 5) + PlanDiagram.ac_ids/ImplementationPlan retired-lists (Part 2
     # sect. 6) round-trip through the FILE examples.
     assert SPECIFICATION_FILE_EXAMPLE.bug_affected_ac_ids == []
+    # story_decisions (2026-10-02): the seeded, undecided rows must validate -- rejecting a null
+    # decision is gates/ledger_sync_checks.check_story_decisions' job, not the schema's.
+    _seeded = Specification.model_validate(
+        {**_spec_dumped, "story_decisions": [{"us_id": "US-0001", "decision": None}]}
+    )
+    assert _seeded.story_decisions[0].decision is None and _seeded.story_decisions[0].reason == ""
+    assert Specification.model_validate(_spec_dumped).story_decisions == [], "absent on a first ticket"
+    assert "story_changes" not in SpecificationDraftResponse.model_fields, (
+        "the draft's per-turn story_changes duplicated story_decisions in the file -- dropped"
+    )
+    assert "story_changes" in SpecificationAuditResponse.model_fields, (
+        "kept on the audit: it is the audit's only place to report gaps it fixed"
+    )
     assert PLAN_FILE_EXAMPLE.retired_wireframe_screens == [] and PLAN_FILE_EXAMPLE.retired_diagram_names == []
     _user_flow_diagram = PLAN_FILE_EXAMPLE.diagrams.values[0]
     assert _user_flow_diagram.kind == "user_flow" and _user_flow_diagram.ac_ids == ["US-0001.1"]

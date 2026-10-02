@@ -10,7 +10,8 @@ export { CATALOG_ID };
 // Field names are snake_case to match the Pydantic JSON dump verbatim.
 // Per-run scope lifecycle, stamped by the spec verify (graph.py) from the id ledger. Optional so
 // pre-stamp envelopes still parse.
-const ChangeSchema = z.enum(["new", "modified", "deleted", "unchanged", "deferred", "activated"]).optional();
+// "reopened": a bug ticket reopened this criterion (bug_affected_ac_ids) without rewording it.
+const ChangeSchema = z.enum(["new", "modified", "deleted", "unchanged", "deferred", "activated", "reopened"]).optional();
 
 const AcceptanceCriterionSchema = z.object({
   id: z.string(),
@@ -36,6 +37,17 @@ const UserStorySchema = z.object({
 
 const RetiredStorySchema = z.object({ id: z.string(), title: z.string() });
 const RetiredCriterionSchema = z.object({ id: z.string(), description: z.string(), parent_us_id: z.string() });
+
+// One row per story of the last-approved specification: what this ticket decided for it. Built by
+// the agent (spec_ledger.build_story_decision_rows) -- labels, tone and order are its call; this
+// only maps tone to a class. `tone` stays a plain string so a new tone never fails the whole parse.
+const StoryDecisionRowSchema = z.object({
+  us_id: z.string(),
+  title: z.string(),
+  decision_label: z.string(),
+  tone: z.string(),
+  reason: z.string().optional().default(""),
+});
 
 const SpecQuestionSchema = z.object({
   id: z.string(),
@@ -71,6 +83,8 @@ const SpecificationSchema = z.object({
   questions: z.array(SpecQuestionSchema).optional().default([]),
   retired_user_stories: z.array(RetiredStorySchema).optional().default([]),
   retired_acceptance_criteria: z.array(RetiredCriterionSchema).optional().default([]),
+  // Optional: absent on a first ticket and on envelopes from before story decisions existed.
+  story_decision_rows: z.array(StoryDecisionRowSchema).optional().default([]),
 });
 
 const PlanStepSchema = z.object({
@@ -164,7 +178,7 @@ function ChangeBadge({
   change,
   deferred,
 }: {
-  change?: "new" | "modified" | "deleted" | "unchanged" | "deferred" | "activated";
+  change?: "new" | "modified" | "deleted" | "unchanged" | "deferred" | "activated" | "reopened";
   deferred?: boolean;
 }) {
   if (deferred || change === "deferred") {
@@ -181,6 +195,9 @@ function ChangeBadge({
   if (change === "modified") {
     return <span className="ml-1.5 rounded-full bg-amber-100 px-1.5 text-xs font-normal text-amber-800">updated</span>;
   }
+  if (change === "reopened") {
+    return <span className="ml-1.5 rounded-full bg-rose-100 px-1.5 text-xs font-normal text-rose-800">reopened</span>;
+  }
   return <span className="ml-1.5 rounded-full bg-neutral-100 px-1.5 text-xs font-normal text-neutral-400">unchanged</span>;
 }
 
@@ -190,6 +207,13 @@ function ChangeBadge({
 function UiChip() {
   return <span className="ml-1.5 rounded-full bg-indigo-100 px-1.5 font-sans text-xs font-normal text-indigo-800">UI</span>;
 }
+
+const DECISION_TONE_CLASS: Record<string, string> = {
+  missing: "bg-rose-100 text-rose-800",
+  retired: "bg-slate-200 text-slate-800",
+  modified: "bg-amber-100 text-amber-800",
+  unchanged: "bg-neutral-100 text-neutral-500",
+};
 
 export function SpecificationSurfaceRenderer({
   specification: spec,
@@ -265,6 +289,33 @@ export function SpecificationSurfaceRenderer({
               </li>
             ))}
           </ul>
+        </details>
+      )}
+
+      {/* What this ticket decided for every existing story -- the place a reviewer spots an
+          implied change left undone ("Delete a note: unchanged" next to a new "notes are permanent"
+          criterion). Rows arrive sorted, the ones that need attention first. */}
+      {(spec.story_decision_rows ?? []).length > 0 && (
+        <details open className="rounded-lg border border-neutral-200 px-3 py-2 text-sm">
+          <summary className="cursor-pointer font-medium text-neutral-800">
+            Existing stories — what this ticket does to each ({spec.story_decision_rows.length})
+          </summary>
+          <table className="mt-1 w-full text-left text-sm">
+            <tbody>
+              {spec.story_decision_rows.map((row) => (
+                <tr key={row.us_id} className="border-t border-neutral-100 align-top">
+                  <td className="py-1 pr-2 font-mono text-xs text-neutral-500">{row.us_id}</td>
+                  <td className="py-1 pr-2 text-neutral-800">{row.title}</td>
+                  <td className="py-1 pr-2">
+                    <span className={`rounded-full px-1.5 text-xs ${DECISION_TONE_CLASS[row.tone] ?? "bg-neutral-100 text-neutral-600"}`}>
+                      {row.decision_label}
+                    </span>
+                  </td>
+                  <td className="py-1 text-xs text-neutral-600">{row.reason}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </details>
       )}
 

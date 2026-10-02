@@ -94,7 +94,7 @@ from .gates.diagram_gate import (
     verify_plan_diagrams,
 )
 from .gates.coverage_parsing import MIN_COVERAGE_PERCENT
-from .gates.ledger_sync_checks import check_empty_draft, find_open_questions
+from .gates.ledger_sync_checks import check_empty_draft, check_story_decisions, find_open_questions
 from .gates.test_coverage_gate import (
     MINIMAL_CODE_TO_GREEN_HARD_RULES,
     MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE,
@@ -501,6 +501,10 @@ SPECIFICATION_SHARED_SEGMENT = load_prompt("specification_shared_segment")
 # draft_prompt_context_from_repo_file) finds a non-empty ledger -- a second-or-later ticket
 # against a project that already has an approved baseline, vs. a from-scratch first pass.
 SPEC_TICKET_MODE_SEGMENT = load_prompt("specification_ticket_mode_segment")
+# The compact `US-id — title` list of the approved specification's stories, each owed one
+# story_decisions row -- only present on the prompt-only context
+# spec_ledger.hydrate_specification_ticket_context returns. `<<stories>>` is rendered here.
+SPEC_LIVE_STORIES_SEGMENT = load_prompt("specification_live_stories_segment")
 
 PLAN_SYSTEM_PROMPT = load_prompt("plan_draft")
 
@@ -668,6 +672,11 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
     # call path (including this function's own direct callers in tests).
     if stage.get("ticket_mode_baseline"):
         messages.append(HumanMessage(content=SPEC_TICKET_MODE_SEGMENT))
+    if stage.get("live_stories"):
+        stories = "\n".join(
+            f"- {s['id']} — {s['title']}" + (" [deferred]" if s.get("deferred") else "") for s in stage["live_stories"]
+        )
+        messages.append(HumanMessage(content=render_prompt(SPEC_LIVE_STORIES_SEGMENT, stories=stories)))
     # File-based-editing plan, Part 1 sect. 4/6: the specification lives in a real file now, not a
     # prompt-injected blob -- `spec_ledger.hydrate_ticket_mode_context` already seeded/bootstrapped
     # it before this prompt is even built (Part 1 sect. 7), so it always exists by the time drafting
@@ -1170,7 +1179,8 @@ async def merge_requirements_prd_node(state: GraphState, config: RunnableConfig)
 # (covers a new story OR AC identical to an already-tracked one, added 2026-09-17) and one more
 # from check_narrative_format (a sibling deterministic check, not inside sync_ledger itself, added
 # the same day) for the narrative-template shape -- 15 from sync_ledger-adjacent checks, plus the
-# 2 non-sync_ledger rules below (open-question, delta-only-scope) = 17 total.
+# 2 non-sync_ledger rules below (open-question, delta-only-scope) = 17, plus the ticket-mode
+# story-decisions rule (spec.story_decisions, 2026-10-02) = 18 total.
 SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "Never leave a clarifying question open -- every question you raised must be answered "
     "(status=answered, citing the wording that answers it) or explicitly assumed "
@@ -1215,6 +1225,11 @@ SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "<role> must be a real human or organizational stakeholder who can genuinely 'want' "
     "something, never the system itself, a module, a function, or a named system component; a "
     "narrative that doesn't match this shape is rejected.",
+    "In ticket mode (the project already has an approved specification), story_decisions must "
+    "hold exactly one row per approved story -- decision unchanged/modified/retired plus a reason "
+    "-- and each decision must match what the draft does to that story: a story declared modified "
+    "that the draft doesn't change, one declared unchanged that the draft changes or retires, a "
+    "missing or duplicate row, or a blank reason is rejected.",
 )
 
 
@@ -1252,21 +1267,25 @@ def _stamp_gate_change_and_check_delta(
     prompt is most likely to scan for "what's new", and "unchanged" would actively mislead them.
     """
     bug_affected_ac_ids = set(content_dict.get("bug_affected_ac_ids") or [])
-    for story in content_dict.get("user_stories") or []:
-        story["change"] = spec_ledger.gate_change_status(
-            prior_by_id.get(story.get("id")),
-            {"text": story.get("title", ""), "deferred": bool(story.get("deferred"))},
+    all_changes: list[str] = []
+
+    def _stamp(item: dict[str, Any], text: str, **kwargs: Any) -> None:
+        prior = prior_by_id.get(item.get("id"))
+        item["change"] = spec_ledger.gate_change_status(
+            prior, {"text": text, "deferred": bool(item.get("deferred"))}, **kwargs
         )
+        # Parked before the last approval, still parked, same wording: the badge says "deferred"
+        # for the reviewer, but it is no new work -- counting it used to keep any project with a
+        # parked story from ever reaching no_new_work.
+        still_parked = (
+            item["change"] == "deferred" and prior is not None and prior.get("deferred") and prior.get("text") == text
+        )
+        all_changes.append("unchanged" if still_parked else item["change"])
+
+    for story in content_dict.get("user_stories") or []:
+        _stamp(story, story.get("title", ""))
         for ac in story.get("acceptance_criteria") or []:
-            ac["change"] = spec_ledger.gate_change_status(
-                prior_by_id.get(ac.get("id")),
-                {"text": ac.get("description", ""), "deferred": bool(ac.get("deferred"))},
-                reopened=ac.get("id") in bug_affected_ac_ids,
-            )
-    all_changes = [s["change"] for s in content_dict.get("user_stories") or []]
-    all_changes += [
-        ac["change"] for s in content_dict.get("user_stories") or [] for ac in s.get("acceptance_criteria") or []
-    ]
+            _stamp(ac, ac.get("description", ""), reopened=ac.get("id") in bug_affected_ac_ids)
     newly_retired_ids = [
         e["id"]
         for e in updated_entries
@@ -1498,6 +1517,7 @@ def make_verify_specification_ledger(
         )
         _record_ledger_sync_rows(log, result, fully_reviewed)
         no_new_work = False
+        decision_problems: list[str] = []
         if result.passed:
             # File-based-editing plan, Part 1 sect. 5: write the ledger-resolved content back to
             # the sketchpad so the next lap's `view` shows resolved real ids, not the model's
@@ -1530,7 +1550,9 @@ def make_verify_specification_ledger(
             # the old completeness gate existed to provide (2026-08-31, two live incidents), now
             # backed by the ledger's own bookkeeping instead of model re-emission fidelity. Done
             # AFTER the sketchpad write above so the on-disk delta file the model edits next lap
-            # never balloons back to the whole project.
+            # never balloons back to the whole project. `delta_specification` keeps this lap's
+            # delta (ids already resolved) for the story-decisions check below.
+            delta_specification = dict(content_dict)
             content_dict["user_stories"] = spec_ledger.render_live_user_stories(updated_entries)
 
             # Scope-lifecycle stamps for the review UI (user requirement 2026-08-31): every live
@@ -1549,9 +1571,11 @@ def make_verify_specification_ledger(
                 provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
             )
             prior_by_id: dict[str, dict[str, Any]] = {}
+            prior_spec: dict[str, Any] = {}
             if raw_prior_spec is not None:
                 try:
-                    prior_spec = json.loads(raw_prior_spec)
+                    loaded_prior = json.loads(raw_prior_spec)
+                    prior_spec = loaded_prior if isinstance(loaded_prior, dict) else {}
                     for prior_story in prior_spec.get("user_stories") or []:
                         prior_by_id[prior_story.get("id")] = {
                             "text": prior_story.get("title", ""), "deferred": bool(prior_story.get("deferred")),
@@ -1574,13 +1598,35 @@ def make_verify_specification_ledger(
                 for e in updated_entries
                 if e.get("kind") == "acceptance_criterion" and e.get("status") == "retired"
             ]
+
+            # Story decisions (2026-10-02): every approved story declared unchanged/modified/
+            # retired, matching what this lap's delta does to it -- see
+            # gates/ledger_sync_checks.check_story_decisions. Its own row, run only here, after a
+            # successful sync/save/render: inside sync_ledger, a YOLO advisory failure would skip
+            # the save and the full-story render and put a delta-only spec in front of the human.
+            if stage_key != "specification":
+                log.skipped(spec_ledger.SPEC_STORY_DECISIONS, "the baseline pass builds the approved specification")
+            elif not prior_spec.get("user_stories"):
+                log.skipped(spec_ledger.SPEC_STORY_DECISIONS, "no approved specification yet -- nothing to classify")
+            else:
+                decision_problems = check_story_decisions(prior_spec, delta_specification)
+                content_dict["story_decision_rows"] = spec_ledger.build_story_decision_rows(
+                    prior_spec, content_dict.get("story_decisions") or []
+                )
+                if decision_problems:
+                    log.failed(spec_ledger.SPEC_STORY_DECISIONS, "\n".join(decision_problems))
+                else:
+                    log.passed(spec_ledger.SPEC_STORY_DECISIONS)
+        reasons = result.reasons + decision_problems
         return _verdict(
-            passed=result.passed,
-            feedback="; ".join(result.reasons) if result.reasons else "Ledger sync passed: every id resolved cleanly.",
+            passed=result.passed and not decision_problems,
+            feedback="; ".join(reasons) if reasons else "Ledger sync passed: every id resolved cleanly.",
             report={
-                "reasons": result.reasons,
+                "reasons": reasons,
                 "ledger_entry_count": len(result.updated_entries),
-                "no_new_work": no_new_work,
+                # make_route_after_verify reads no_new_work BEFORE passed: a failed decision check
+                # (say, "modified" declared but nothing changed) must never end the run unseen.
+                "no_new_work": no_new_work and not decision_problems,
             },
         )
 
@@ -2346,7 +2392,7 @@ STAGES: list[StageSpec] = [
         # Task 8 confirmed for ac-to-tests.
         draft_rules="\n".join(f"- {r}" for r in SPECIFICATION_HARD_RULES),
         audit_rules="\n".join(f"- {r}" for r in SPECIFICATION_HARD_RULES),
-        draft_prompt_context_from_repo_file=spec_ledger.hydrate_ticket_mode_context,
+        draft_prompt_context_from_repo_file=spec_ledger.hydrate_specification_ticket_context,
         # Second phase of the two-phase tracking reset (spec_ledger.PENDING_RESET_FIELD): the
         # destructive stamp clear for genuinely-reworded ACs runs only once a human (or headless
         # auto-approve) actually approved the Specification -- a rejected draft's markers stay
@@ -6875,6 +6921,115 @@ def _demo_spec_verify_checks(spec_json: str) -> None:
          spec_ledger.save_ledger, chat_model.get_session_id, chat_model.read_full_file_reads) = real
 
 
+def _demo_spec_story_decisions() -> None:
+    """spec.story_decisions (2026-10-02) on the real verify: judged against the approved
+    specification after a successful sync, its failure never masked by no_new_work (which routes
+    BEFORE `passed` -- see make_route_after_verify), skipped for brownfield-spec and before any
+    approval, and its review rows land on the content the gate shows."""
+    import asyncio
+
+    def story(us_id: str, title: str, capability: str, ac_text: str) -> dict[str, Any]:
+        return {
+            "id": us_id, "existing_us_id": us_id, "title": title, "deferred": False,
+            "narrative": f"As a writer, I want {capability}, so that I keep my thoughts",
+            "acceptance_criteria": [{"id": f"{us_id}.1", "existing_ac_id": f"{us_id}.1", "description": ac_text,
+                                     "deferred": False, "ui_related": False}],
+        }
+
+    presence = {"status": "absent", "reason": "none"}
+    approved = {
+        "title": "Notes", "summary": "s", "assumptions": presence, "out_of_scope": presence,
+        "user_stories": [
+            story("US-0001", "Create a note", "to create notes", "Saving stores the note."),
+            story("US-0002", "Delete a note", "to delete notes", "Deleting removes the note."),
+        ],
+    }
+    ledger = [
+        {"id": "US-0001", "kind": "user_story", "status": "active", "title": "Create a note",
+         "narrative": approved["user_stories"][0]["narrative"]},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "parent_us_id": "US-0001", "status": "active",
+         "description": "Saving stores the note."},
+        {"id": "US-0002", "kind": "user_story", "status": "active", "title": "Delete a note",
+         "narrative": approved["user_stories"][1]["narrative"]},
+        {"id": "US-0002.1", "kind": "acceptance_criterion", "parent_us_id": "US-0002", "status": "active",
+         "description": "Deleting removes the note."},
+    ]
+    files: dict[str, str] = {}
+
+    def draft(decisions: list[tuple[str, str]], **fields: Any) -> None:
+        files[spec_ledger.DRAFT_SPEC_PATH] = json.dumps({
+            "title": "Notes", "summary": "s", "assumptions": presence, "out_of_scope": presence,
+            "user_stories": [], **fields,
+            "story_decisions": [{"us_id": u, "decision": d, "reason": "weighed"} for u, d in decisions],
+        })
+
+    async def _read(_p, _t, path):  # noqa: ANN001, ANN202
+        return files.get(path)
+
+    async def _noop(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        return None
+
+    async def _load(_p, _t):  # noqa: ANN001, ANN202
+        return [dict(e) for e in ledger]
+
+    def run(stage_key: str = "specification") -> tuple[VerificationResult, dict[str, Any]]:
+        content: dict[str, Any] = {}
+        verify = make_verify_specification_ledger(stage_key, has_audit_role=stage_key == "specification")
+        return asyncio.run(verify("t", content, "r", None, None, "claude", 0, False)), content  # type: ignore[arg-type]
+
+    def row(result: VerificationResult) -> dict[str, Any]:
+        return next(r for r in result.checks if r["id"] == "spec.story_decisions")
+
+    real = (repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger, spec_ledger.save_ledger)
+    repo_files.read_repo_file, repo_files.write_repo_file = _read, _noop
+    spec_ledger.load_ledger, spec_ledger.save_ledger = _load, _noop
+    try:
+        # No approved specification yet (a first ticket): nothing to classify.
+        new_story = story("draft-1", "Write a journal", "to journal", "Saving stores the entry.")
+        new_story["existing_us_id"] = None
+        new_story["acceptance_criteria"][0]["existing_ac_id"] = None
+        draft([], user_stories=[new_story])
+        first, _ = run()
+        assert first.passed and row(first)["status"] == "skipped", first.checks
+
+        files[workflow_persistence.SPECIFICATION_APPROVED_PATH] = json.dumps(approved)
+
+        # The implied removal, done right: retired AND declared retired.
+        draft([("US-0001", "unchanged"), ("US-0002", "retired")], retired_us_ids=["US-0002"])
+        good, good_content = run()
+        assert good.passed and row(good)["status"] == "passed", good.checks
+        assert not good.report["no_new_work"]
+        assert [r["us_id"] for r in good_content["story_decision_rows"]] == ["US-0002", "US-0001"], (
+            "the review rows reach the gate's content, retired first"
+        )
+
+        # Declared unchanged, but the draft retires it.
+        draft([("US-0001", "unchanged"), ("US-0002", "unchanged")], retired_us_ids=["US-0002"])
+        lie, _ = run()
+        assert not lie.passed and row(lie)["status"] == "failed" and "US-0002" in lie.feedback, lie.feedback
+        assert not lie.report["no_new_work"]
+
+        # The implied modification the model noticed but never made: every story is textually
+        # unchanged, so no_new_work alone would end the run "rejected" with nobody seeing it.
+        draft([("US-0001", "modified"), ("US-0002", "unchanged")])
+        forgot, _ = run()
+        assert not forgot.passed and row(forgot)["status"] == "failed", forgot.checks
+        assert "changes nothing" in forgot.feedback, forgot.feedback
+        assert forgot.report["no_new_work"] is False, "a failed decision check must never be masked by no_new_work"
+
+        # A genuine no-op ticket: everything unchanged, said so -- the no_new_work path.
+        draft([("US-0001", "unchanged"), ("US-0002", "unchanged")])
+        noop, _ = run()
+        assert noop.passed and noop.report["no_new_work"] is True, (noop.feedback, noop.report)
+
+        # brownfield-spec builds the baseline; it never classifies one.
+        draft([("US-0001", "unchanged"), ("US-0002", "unchanged")], retired_us_ids=["US-0002"])
+        brownfield, _ = run("brownfield-spec")
+        assert brownfield.passed and row(brownfield)["status"] == "skipped", brownfield.checks
+    finally:
+        repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger, spec_ledger.save_ledger = real
+
+
 def _demo_audit_ran_this_lap() -> None:
     """Final-fix round 1 (C1): specification/plan's audit-transcript evidence check must fail open
     when code_gen_mode skipped audit this lap (audit_ran_this_lap=False) -- the same path as
@@ -6935,7 +7090,12 @@ def _demo_audit_ran_this_lap() -> None:
         assert set(skipped_rows) == {c.id for c in spec_ledger.VERIFY_CHECKS}, skipped_rows
         assert skipped_rows["spec.audit_full_read"]["status"] == "skipped"
         assert skipped_rows["spec.audit_full_read"]["detail"] == "audit did not run this lap"
-        assert all(r["status"] == "passed" for k, r in skipped_rows.items() if k != "spec.audit_full_read")
+        # No approved specification on disk in this fixture -- nothing to classify yet.
+        assert skipped_rows["spec.story_decisions"]["status"] == "skipped", skipped_rows["spec.story_decisions"]
+        assert all(
+            r["status"] == "passed" for k, r in skipped_rows.items()
+            if k not in ("spec.audit_full_read", "spec.story_decisions")
+        )
         brownfield = asyncio.run(make_verify_specification_ledger("brownfield-spec", has_audit_role=False)(
             "t", {}, "r", None, None, "claude", 0, True,  # type: ignore[arg-type]
         ))
@@ -8233,8 +8393,9 @@ def _demo() -> None:
     # (open-question, whole-spec-not-a-delta) + 13 from spec_ledger.sync_ledger's original
     # reasons.append(...) branches + 1 combined citation-drop rule (covers both story and AC in
     # one entry, added 2026-09-17) + 1 narrative-template rule from check_narrative_format (added
-    # the same day) = 17 (see the constant's own comment for the full breakdown).
-    assert len(SPECIFICATION_HARD_RULES) == 17, len(SPECIFICATION_HARD_RULES)
+    # the same day) = 17 (see the constant's own comment for the full breakdown), + 1 ticket-mode
+    # story-decisions rule (spec.story_decisions, 2026-10-02) = 18.
+    assert len(SPECIFICATION_HARD_RULES) == 18, len(SPECIFICATION_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in SPECIFICATION_HARD_RULES)
 
     # Task 6: draft_example/draft_rules/audit_example/audit_rules actually reach the two
@@ -8327,6 +8488,20 @@ def _demo() -> None:
         "reviewer_feedback alone must not fabricate a verification-feedback message"
     )
 
+    # Story decisions (2026-10-02): the compact live-story list reaches the draft prompt, but only
+    # through the prompt-only context spec_ledger.hydrate_specification_ticket_context returns.
+    live_state = copy.deepcopy(verify_feedback_base_state)
+    live_state["stages"]["specification"]["live_stories"] = [
+        {"id": "US-0001", "title": "Create a note", "deferred": False},
+        {"id": "US-0002", "title": "Archive", "deferred": True},
+    ]
+    live_text = "\n".join(str(m.content) for m in _build_specification_prompt(live_state))
+    assert "US-0001 — Create a note" in live_text and "US-0002 — Archive [deferred]" in live_text, live_text
+    assert "story_decisions" in live_text
+    assert "US-0001 — Create a note" not in "\n".join(
+        str(m.content) for m in _build_specification_prompt(verify_feedback_base_state)
+    ), "no live-story list without a ticket-mode baseline"
+
     # IMPECCABLE_CRITIQUE_SEGMENT: appended to minimal-code-to-green's AUDIT prompt only for a
     # UI-framework repo, same gate as the draft prompt's own UI segments. Monkeypatches the
     # module-level gate function directly rather than hand-building a valid TechStack fixture
@@ -8382,6 +8557,25 @@ def _demo() -> None:
     assert _stamp_gate_change_and_check_delta(copy.deepcopy(unchanged_draft), unchanged_prior, already_retired_updated), (
         "a retirement from BEFORE the last approval (not live in prior_by_id) is not a new delta"
     )
+
+    # A story parked before the last approval and still parked is no new work. Its badge says
+    # "deferred" (gate_change_status), which used to count as a change -- so any project with a
+    # parked story could never reach no_new_work.
+    parked_prior = {**unchanged_prior, "US-0004": {"text": "Archive", "deferred": True},
+                    "US-0004.1": {"text": "Hidden.", "deferred": True}}
+    parked_draft = copy.deepcopy(unchanged_draft)
+    parked_draft["user_stories"].append({"id": "US-0004", "title": "Archive", "deferred": True,
+                                         "acceptance_criteria": [{"id": "US-0004.1", "description": "Hidden.", "deferred": True}]})
+    assert _stamp_gate_change_and_check_delta(parked_draft, parked_prior, []), (
+        "a still-parked story is not a delta"
+    )
+    assert parked_draft["user_stories"][1]["change"] == "deferred", "its review badge still says deferred"
+    newly_parked = copy.deepcopy(parked_draft)
+    assert not _stamp_gate_change_and_check_delta(newly_parked, {**parked_prior, "US-0004": {"text": "Archive", "deferred": False}}, []), (
+        "parking a story that was live at the last approval IS a delta"
+    )
+
+    _demo_spec_story_decisions()
 
     route_spec = by_key["specification"]
     route = make_route_after_verify(route_spec)

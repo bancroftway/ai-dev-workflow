@@ -55,6 +55,11 @@ SCHEMA_VERSION = 1
 # today, from the ledger-resolved content, not from this file directly).
 DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json"
 
+# Which submission DRAFT_SPEC_PATH was last seeded for ({"message_id": ...}). The sketchpad is
+# committed and survives across tickets, so without this a new ticket's draft started from the
+# previous ticket's delta (and, now, its story_decisions). See hydrate_specification_ticket_context.
+SEED_SIDECAR_PATH = ".ai-dev-workflow/spec/draft-seed.json"
+
 EntryStatus = Literal["active", "retired", "revised", "deferred"]
 # "plan_step" added for the file-based-editing plan's Part 2: one shared ledger, not a second
 # implementation -- sync_plan_ledger below reuses load_ledger/save_ledger/_find/allocate_next_id's
@@ -153,10 +158,18 @@ SPEC_LEDGER_BUG_AFFECTED = Check(
     "draft, so the fix is traced to the requirement it actually breaks.",
     "collected", "always",
 )
+SPEC_STORY_DECISIONS = Check(
+    "spec.story_decisions", "Every existing story has a decision",
+    "Checks the draft says, for every story in the last approved specification, whether this ticket "
+    "leaves it unchanged, modifies it or retires it, with a reason, and that each decision matches "
+    "what the draft actually does. A new requirement can contradict or change an existing story "
+    "without naming it; this makes sure none is silently kept.",
+    "blocking", "only when an earlier ticket's specification was approved",
+)
 VERIFY_CHECKS: tuple[Check, ...] = (
     SPEC_DRAFT_FILE_EXISTS, SPEC_DRAFT_FILE_PARSES, SPEC_DRAFT_NOT_EMPTY, SPEC_AUDIT_FULL_READ,
     SPEC_NO_OPEN_QUESTIONS, SPEC_STORY_NARRATIVE, SPEC_LEDGER_CITATIONS, SPEC_LEDGER_DUPLICATES,
-    SPEC_LEDGER_RETIREMENTS, SPEC_LEDGER_BUG_AFFECTED,
+    SPEC_LEDGER_RETIREMENTS, SPEC_LEDGER_BUG_AFFECTED, SPEC_STORY_DECISIONS,
 )
 # The sub-checks sync_ledger tags its reasons with (its completeness sweep is the audit-read check).
 LEDGER_SYNC_CHECKS: tuple[Check, ...] = (
@@ -231,37 +244,122 @@ async def hydrate_ticket_mode_context(
     """
     entries = await load_ledger(provider, thread_id)
     if await repo_files.read_repo_file(provider, thread_id, DRAFT_SPEC_PATH) is None:
-        from . import workflow_persistence
-
         in_flight = ((state.get("stages") or {}).get("specification") or {}).get("draft")
         if isinstance(in_flight, dict) and in_flight.get("user_stories") is not None:
             seed: dict[str, Any] = in_flight
         else:
-            approved_raw = await repo_files.read_repo_file(
-                provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH
-            )
-            try:
-                approved: dict[str, Any] | None = json.loads(approved_raw) if approved_raw is not None else None
-            except json.JSONDecodeError:
-                approved = None
-            if not isinstance(approved, dict):
-                approved = {}
-            seed = {
-                "title": approved.get("title", ""),
-                "summary": approved.get("summary", ""),
-                "work_kind": approved.get("work_kind", "feature"),
-                "user_stories": [],
-                "assumptions": approved.get(
-                    "assumptions", {"status": "absent", "values": [], "reason": "Not yet drafted."}
-                ),
-                "out_of_scope": approved.get(
-                    "out_of_scope", {"status": "absent", "values": [], "reason": "Not yet drafted."}
-                ),
-                "questions": [], "attachment_notes": [], "retired_ac_ids": [], "retired_us_ids": [],
-                "bug_affected_ac_ids": [],
-            }
+            seed = _ticket_seed(await _read_approved_specification(provider, thread_id))
         await repo_files.write_repo_file(provider, thread_id, DRAFT_SPEC_PATH, json.dumps(seed, indent=2))
     return {"ticket_mode_baseline": True} if entries else None
+
+
+async def _read_approved_specification(provider: SandboxProvider, thread_id: str) -> dict[str, Any]:
+    """The last-approved specification (SPECIFICATION_APPROVED_PATH), or {} when absent/unreadable."""
+    from . import workflow_persistence
+
+    raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH)
+    try:
+        approved = json.loads(raw) if raw is not None else None
+    except json.JSONDecodeError:
+        approved = None
+    return approved if isinstance(approved, dict) else {}
+
+
+def _ticket_seed(approved: dict[str, Any]) -> dict[str, Any]:
+    """A new ticket's sketchpad: the approved specification's small scalar fields carried forward,
+    every per-ticket list empty (see hydrate_ticket_mode_context's docstring). Pure."""
+    return {
+        "title": approved.get("title", ""),
+        "summary": approved.get("summary", ""),
+        "work_kind": approved.get("work_kind", "feature"),
+        "user_stories": [],
+        "assumptions": approved.get("assumptions", {"status": "absent", "values": [], "reason": "Not yet drafted."}),
+        "out_of_scope": approved.get("out_of_scope", {"status": "absent", "values": [], "reason": "Not yet drafted."}),
+        "questions": [], "attachment_notes": [], "retired_ac_ids": [], "retired_us_ids": [],
+        "bug_affected_ac_ids": [],
+    }
+
+
+async def hydrate_specification_ticket_context(
+    thread_id: str, state: "GraphState", provider: SandboxProvider
+) -> dict[str, Any] | None:
+    """StageSpec.draft_prompt_context_from_repo_file for the real specification stage only
+    (brownfield-spec keeps the plain hydrate_ticket_mode_context: it builds the baseline, it never
+    classifies one).
+
+    Two additions on top of hydrate_ticket_mode_context:
+
+    - Re-seeds DRAFT_SPEC_PATH on each NEW submission. The sketchpad is committed and nothing used
+      to reset it, so ticket N+1 started from ticket N's delta. SEED_SIDECAR_PATH records which
+      `consumed_message_id` the file was seeded for; a different one means a new ticket. The same
+      message (a later lap, or a correction at the gate) keeps the model's own edits. With no
+      message id to key on, nothing is re-seeded.
+    - The fresh seed carries one `{us_id, decision: None, reason: ""}` story_decisions row per live
+      story of the approved specification, and the returned prompt context carries the compact
+      `live_stories` list (id/title/deferred) the draft prompt shows -- so the model works through
+      every existing story instead of discovering the ids on its own.
+    """
+    approved = await _read_approved_specification(provider, thread_id)
+    live = [s for s in approved.get("user_stories") or [] if s.get("id")]
+    message_id = state.get("consumed_message_id")
+    if message_id:
+        raw_sidecar = await repo_files.read_repo_file(provider, thread_id, SEED_SIDECAR_PATH)
+        try:
+            seeded_for = (json.loads(raw_sidecar) or {}).get("message_id") if raw_sidecar else None
+        except (json.JSONDecodeError, AttributeError):
+            seeded_for = None
+        if seeded_for != message_id:
+            seed = _ticket_seed(approved)
+            seed["story_decisions"] = [{"us_id": s["id"], "decision": None, "reason": ""} for s in live]
+            await repo_files.write_repo_file(provider, thread_id, DRAFT_SPEC_PATH, json.dumps(seed, indent=2))
+            await repo_files.write_repo_file(
+                provider, thread_id, SEED_SIDECAR_PATH, json.dumps({"message_id": message_id})
+            )
+    context = await hydrate_ticket_mode_context(thread_id, state, provider)
+    if context is None:
+        return None
+    return {
+        **context,
+        "live_stories": [
+            {"id": s["id"], "title": s.get("title", ""), "deferred": bool(s.get("deferred"))} for s in live
+        ],
+    }
+
+
+_DECISION_ROW_STYLE = {
+    # decision -> (label, tone, sort order). Unclassified first: it is what a reviewer must act on.
+    None: ("Not classified", "missing", 0),
+    "retired": ("Retired", "retired", 1),
+    "modified": ("Modified", "modified", 2),
+    "unchanged": ("Unchanged", "unchanged", 3),
+}
+
+
+def build_story_decision_rows(
+    approved_specification: dict[str, Any], story_decisions: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The Specification review screen's story-decision table, one row per story of the last
+    approved specification: `{us_id, title, decision_label, tone, reason}`, sorted so what needs a
+    reviewer's eye comes first (unclassified, retired, modified, then unchanged). A story with no
+    valid row still gets one ("Not classified") -- in YOLO a failed spec.story_decisions check is
+    advisory and still reaches the human. Server-built view model; the frontend only maps tone to a
+    class. Pure."""
+    declared = {
+        row.get("us_id"): row for row in story_decisions if isinstance(row, dict) and row.get("us_id")
+    }
+    rows = []
+    for story in approved_specification.get("user_stories") or []:
+        us_id = story.get("id")
+        if not us_id:
+            continue
+        row = declared.get(us_id) or {}
+        decision = row.get("decision") if row.get("decision") in _DECISION_ROW_STYLE else None
+        label, tone, order = _DECISION_ROW_STYLE[decision]
+        rows.append((order, {
+            "us_id": us_id, "title": story.get("title", ""), "decision_label": label, "tone": tone,
+            "reason": str(row.get("reason") or ""),
+        }))
+    return [row for _order, row in sorted(rows, key=lambda pair: pair[0])]
 
 
 # own_ac_ids_from_specification moved to gates/wireframe_linkage_checks.py (2026-09-30, Task 12,
@@ -2051,6 +2149,86 @@ def _demo() -> None:
     )
     asyncio.run(hydrate_ticket_mode_context("t", {"stages": {}}, bootstrap_provider4))
     assert DRAFT_SPEC_PATH not in bootstrap_provider4.writes, "an existing sketchpad must never be overwritten"
+
+    # --- hydrate_specification_ticket_context: per-ticket re-seed + story_decisions rows ---
+    approved_two = json.dumps({
+        "title": "Notes", "summary": "s", "work_kind": "feature",
+        "user_stories": [
+            {"id": "US-0001", "title": "Create a note", "deferred": False, "acceptance_criteria": []},
+            {"id": "US-0002", "title": "Delete a note", "deferred": True, "acceptance_criteria": []},
+        ],
+    })
+    ledger_two = json.dumps({"schema_version": 1, "entries": [
+        {"id": "US-0001", "kind": "user_story", "status": "active", "title": "Create a note"},
+        {"id": "US-0002", "kind": "user_story", "status": "deferred", "title": "Delete a note"},
+    ]})
+    stale_sketchpad = json.dumps({
+        "title": "Notes", "summary": "s", "user_stories": [{"id": "US-0001", "existing_us_id": "US-0001"}],
+        "retired_us_ids": ["US-0009"], "story_decisions": [{"us_id": "US-0001", "decision": "modified", "reason": "old"}],
+    })
+    ticket2 = {"stages": {}, "consumed_message_id": "msg-2"}
+
+    # Case A: the committed sketchpad still holds the PREVIOUS ticket's delta (no sidecar, or one
+    # naming another message) -- a new submission re-seeds it, with one undecided row per live story.
+    reseed_provider = _FakeBootstrapProvider({
+        _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
+        SEED_SIDECAR_PATH: json.dumps({"message_id": "msg-1"}),
+    })
+    reseed_ctx = asyncio.run(hydrate_specification_ticket_context("t", ticket2, reseed_provider))
+    assert DRAFT_SPEC_PATH in reseed_provider.writes, "a new submission must re-seed the previous ticket's sketchpad"
+    reseeded = json.loads(reseed_provider.writes[DRAFT_SPEC_PATH])
+    assert reseeded["user_stories"] == [] and reseeded["retired_us_ids"] == [], "per-ticket fields start empty"
+    assert reseeded["title"] == "Notes", "the approved scalar fields still carry forward"
+    assert reseeded["story_decisions"] == [
+        {"us_id": "US-0001", "decision": None, "reason": ""},
+        {"us_id": "US-0002", "decision": None, "reason": ""},
+    ], "one undecided row per live approved story, the deferred one included"
+    assert json.loads(reseed_provider.writes[SEED_SIDECAR_PATH]) == {"message_id": "msg-2"}
+    assert reseed_ctx is not None and reseed_ctx["ticket_mode_baseline"] is True
+    assert reseed_ctx["live_stories"] == [
+        {"id": "US-0001", "title": "Create a note", "deferred": False},
+        {"id": "US-0002", "title": "Delete a note", "deferred": True},
+    ], "the compact live-story list the draft prompt shows"
+
+    # Case B: same submission (a later lap, or a gate correction) -- the model's own edits survive.
+    same_ticket_provider = _FakeBootstrapProvider({
+        _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
+        SEED_SIDECAR_PATH: json.dumps({"message_id": "msg-2"}),
+    })
+    asyncio.run(hydrate_specification_ticket_context("t", ticket2, same_ticket_provider))
+    assert DRAFT_SPEC_PATH not in same_ticket_provider.writes, "the same ticket's sketchpad is never re-seeded"
+
+    # Case C: no message id to key on -- fall back to the plain hook (never clobber).
+    no_id_provider = _FakeBootstrapProvider({
+        _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
+    })
+    asyncio.run(hydrate_specification_ticket_context("t", {"stages": {}}, no_id_provider))
+    assert no_id_provider.writes == {}, "without a message id there is nothing to tell tickets apart by"
+
+    # --- the story-decisions gate row and its review rows ---
+    assert SPEC_STORY_DECISIONS in VERIFY_CHECKS and SPEC_STORY_DECISIONS not in LEDGER_SYNC_CHECKS, (
+        "its own row, evaluated after a successful sync -- never tagged inside sync_ledger"
+    )
+    rows = build_story_decision_rows(
+        json.loads(approved_two) | {"user_stories": [
+            {"id": "US-0001", "title": "Create a note"}, {"id": "US-0002", "title": "Delete a note"},
+            {"id": "US-0003", "title": "Export"},
+        ]},
+        [
+            {"us_id": "US-0001", "decision": "unchanged", "reason": "untouched"},
+            {"us_id": "US-0002", "decision": "retired", "reason": "notes are permanent"},
+        ],
+    )
+    assert [r["us_id"] for r in rows] == ["US-0003", "US-0002", "US-0001"], (
+        "unclassified first, then retired, then modified, then unchanged"
+    )
+    assert rows[0]["decision_label"] == "Not classified" and rows[0]["tone"] == "missing"
+    assert rows[1] == {
+        "us_id": "US-0002", "title": "Delete a note", "decision_label": "Retired", "tone": "retired",
+        "reason": "notes are permanent",
+    }
+    assert rows[2]["decision_label"] == "Unchanged" and rows[2]["tone"] == "unchanged"
+    assert build_story_decision_rows({}, []) == []
 
     # check_narrative_format (root-caused 2026-09-17, income-investor run 1352296c).
     valid_story = {"id": "US-0001", "narrative": "As an administrator, I want to configure the risk-free rate, so that Sharpe/Sortino calculations use a current value."}

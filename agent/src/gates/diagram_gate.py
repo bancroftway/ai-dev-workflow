@@ -323,6 +323,16 @@ async def _render_one(provider: SandboxProvider, thread_id: str, diagram: dict[s
     )
 
 
+_CHANGE_PRIORITY = ("activated", "new", "modified", "reopened", "deferred", "unchanged")
+
+
+def _step_change(ac_changes: set[str | None]) -> str | None:
+    """A plan step's review badge: the strongest change among the criteria it fulfils, in
+    _CHANGE_PRIORITY order ("reopened" -- a bug-reopened criterion -- is real work, ranked just
+    under a wording change). None when none of its criteria carries a known change. Pure."""
+    return next((c for c in _CHANGE_PRIORITY if c in ac_changes), None)
+
+
 def _demo() -> None:
     """Runnable check for the pure wireframe validator: `uv run python -m src.gates.diagram_gate`.
 
@@ -569,6 +579,15 @@ def _demo() -> None:
             changed_ledger, "r9", {"US-0007.2"}, [], [],
         )
     )
+
+    # A step inherits the strongest change of the criteria it fulfils. A bug-reopened criterion
+    # ("reopened", spec_ledger.gate_change_status) is real work -- a step citing only reopened
+    # criteria must not lose its badge and read as untouched.
+    assert _step_change({"reopened", "unchanged"}) == "reopened"
+    assert _step_change({"modified", "reopened"}) == "modified"
+    assert _step_change({"new", "activated"}) == "activated"
+    assert _step_change({"unchanged"}) == "unchanged"
+    assert _step_change({None}) is None
 
     _demo_verify_checks()
     print("diagram_gate wireframe self-check: all assertions passed")
@@ -1456,10 +1475,8 @@ def make_verify_plan_diagrams(
             for story in (spec_doc.get("user_stories") or [])
             for ac in (story.get("acceptance_criteria") or [])
         }
-        _CHANGE_PRIORITY = ["activated", "new", "modified", "deferred", "unchanged"]
         for step in content_dict.get("plan_steps") or []:
-            changes = {ac_change_by_id.get(i) for i in (step.get("ac_ids") or [])}
-            step["change"] = next((c for c in _CHANGE_PRIORITY if c in changes), None)
+            step["change"] = _step_change({ac_change_by_id.get(i) for i in (step.get("ac_ids") or [])})
 
         # diagrams is DiagramPresence-shaped (schemas.py, Task 10) -- same extraction as wireframes
         # above (already computed; re-used here, not re-fetched from content_dict).

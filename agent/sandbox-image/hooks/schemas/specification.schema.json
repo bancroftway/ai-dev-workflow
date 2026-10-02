@@ -119,6 +119,45 @@
       "title": "SpecQuestion",
       "type": "object"
     },
+    "StoryDecision": {
+      "description": "What this ticket does to one story of the last-approved specification -- see\ngates/ledger_sync_checks.check_story_decisions, which requires one row per approved story and\nchecks the decision against what the draft actually does.",
+      "properties": {
+        "decision": {
+          "anyOf": [
+            {
+              "enum": [
+                "unchanged",
+                "modified",
+                "retired"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "'unchanged': this ticket's requirements leave the story as it is. 'modified': they change it -- you re-emit it citing existing_us_id with the new wording or criteria, add a criterion, or retire one of its criteria. 'retired': they remove it -- you list it in retired_us_ids. A new requirement that contradicts, narrows or replaces the story changes it even when it never names it. Seeded null; never leave it null.",
+          "title": "Decision"
+        },
+        "reason": {
+          "default": "",
+          "description": "One line: why, weighed against this ticket's requirements (for a change, which requirement drives it).",
+          "title": "Reason",
+          "type": "string"
+        },
+        "us_id": {
+          "description": "The approved story's id, copied character-for-character (e.g. 'US-0003').",
+          "title": "Us Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "us_id"
+      ],
+      "title": "StoryDecision",
+      "type": "object"
+    },
     "UserStory": {
       "properties": {
         "acceptance_criteria": {
@@ -218,6 +257,14 @@
         "type": "string"
       },
       "title": "Retired Us Ids",
+      "type": "array"
+    },
+    "story_decisions": {
+      "description": "Ticket mode only (the project already has an approved specification): exactly one row per story in that approved specification -- seeded for you, one undecided row each. Empty on a project's first ticket.",
+      "items": {
+        "$ref": "#/$defs/StoryDecision"
+      },
+      "title": "Story Decisions",
       "type": "array"
     },
     "summary": {
