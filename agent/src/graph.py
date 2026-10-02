@@ -406,6 +406,11 @@ class GraphState(TypedDict):
     # gate-owned blocking reason (a later attempt's stale filter drops a copied-forward bullet), and
     # _build_exit_prompt shows it to metrics-exit's draft. Read only via state.get().
     targeted_fix_refused: dict[str, Any] | None
+    # When this run ATTEMPT started (UTC ISO, set by intake_node on every entry, resume included).
+    # run_id is reused across resumes, so this is what tells "recorded in this attempt" apart from
+    # "left over from an earlier one" -- rebuild placements stamp it on what they record, and the
+    # gate screen labels a result whose stamp differs (gate_view._placement_views).
+    attempt_started_at: str | None
     # Root-caused 2026-09-21: how many times POST /api/sessions/actions {action: "reset-e2e"} has
     # cleared e2e/metrics-exit/adversarial-compliance state against this thread (see intake_node's
     # own handling below) -- a narrower, purely-state-reset sibling of targeted_fix_attempts above
@@ -3678,6 +3683,7 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         "e2e": e2e_state,
         "targeted_fix_attempts": targeted_fix_attempts,
         "targeted_fix_refused": targeted_fix_refused,
+        "attempt_started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "e2e_reset_attempts": e2e_reset_attempts,
         # Only present when a rewind or a reset-e2e actually reset a placement's sub-state --
         # omitted otherwise so an ordinary intake call leaves this channel untouched, same as

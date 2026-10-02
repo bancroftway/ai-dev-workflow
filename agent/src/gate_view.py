@@ -88,6 +88,9 @@ GATE_TEXT: dict[str, Any] = {
     "policy": "Policy: {policy}",
     "policy_none": "—",
     "lap": "lap {lap} of {max}",
+    # A rebuild check's result recorded by an EARLIER run attempt (gate_view._placement_views).
+    "stale_attempt": "From a previous attempt{at} -- this check hasn't re-run yet in the current attempt",
+    "stale_attempt_at": " at {time} UTC",
     "verdict": "Verdict: {verdict}",
     "verdict_values": {"none": "no verdict yet", "cannot_verify": "cannot verify", "passed": "passed", "failed": "failed"},
     "attempt": "Attempt",
@@ -251,9 +254,12 @@ def _placement_views(tab: TabSpec, state: dict[str, Any], running: dict[str, str
         verdict = None if rb_status == "not_started" else {
             "passed": rb_status == "clean", "cannot_verify": bool(rb.get("cannot_verify")), "checks": rb.get("checks"),
         }
+        stale = _from_earlier_attempt(rb, state) and verdict is not None and not running.get(spec.key)
         if running.get(spec.key) or rb_status == "fixing":
             status = "verifying"
-        elif verdict is None:
+        elif verdict is None or stale:
+            # A result an earlier attempt recorded says nothing about this attempt yet: the section
+            # still shows it (labelled), but it must not colour the gate icon.
             status = "not_run"
         else:
             status = "passed" if verdict["passed"] else "failed"
@@ -265,8 +271,18 @@ def _placement_views(tab: TabSpec, state: dict[str, Any], running: dict[str, str
             "verdict": verdict, "policy": "blocking", "status": status, "status_text": T[status],
             "lap": rb.get("fix_cycle_count", 0), "max_laps": spec.max_fix_cycles,
             "feedback": (rb.get("last_stderr_tail") or None) if verdict and not verdict["passed"] else None,
+            "stale_at": (rb.get("checked_at") or "") if stale else None,
         })
     return views
+
+
+def _from_earlier_attempt(rb: dict[str, Any], state: dict[str, Any]) -> bool:
+    """Whether a rebuild placement's recorded result predates the current run attempt. A resume
+    reuses run_id, so the attempt stamp intake sets on every entry is the signal (GraphState.
+    attempt_started_at). A record with no stamp predates stamping, so it can only be earlier -- but
+    only once the thread itself is stamped; an unstamped (pre-stamping) session reads as before."""
+    current = state.get("attempt_started_at")
+    return bool(current) and rb.get("attempt_started_at") != current
 
 
 def _gate_icon(tab: TabSpec, state: dict[str, Any], mode: str | None, running: dict[str, str], interrupts: list[Any], pipeline: Pipeline) -> dict[str, Any] | None:
@@ -621,6 +637,9 @@ def _placement_section(view: dict[str, Any], *, mode: str | None, pipeline: Pipe
     # Fix laps only once one has run: an escalation resets the counter, so "lap 0" means nothing.
     if view["max_laps"] > 0 and view["lap"] > 0:
         facts.insert(0, gt["lap"].format(lap=view["lap"], max=view["max_laps"]))
+    if view.get("stale_at") is not None:
+        at = gt["stale_attempt_at"].format(time=view["stale_at"][11:16]) if len(view["stale_at"]) >= 16 else ""
+        facts.insert(0, gt["stale_attempt"].format(at=at))
     return {
         "key": view["key"],
         "heading": view["label"],
@@ -1003,6 +1022,24 @@ def _demo() -> None:
     # "always" is shown as what it means -- every run of this gate, never "regardless of mode".
     assert by_key["rebuild.build"]["cells"]["when"]["text"] == GATE_TEXT["when_always"]
     # A lap recorded before per-check rows existed: the actions sit on the section instead.
+    # A result from an EARLIER attempt (a resume reuses run_id; intake stamps each attempt): still
+    # shown, labelled with when it ran, but it no longer colours the gate icon.
+    earlier = {"status": "failed", "fix_cycle_count": 0, "checks": red_rows, "last_stderr_tail": "x",
+               "attempt_started_at": "2026-10-02T02:40:00+00:00", "checked_at": "2026-10-02T03:22:19+00:00"}
+    resumed = {**red_state, "run_failure": None, "attempt_started_at": "2026-10-02T16:45:00+00:00",
+               "rebuild": {"r_ac_to_tests": earlier}}
+    assert strip(resumed)["tests"]["gate"]["icon"]["tone"] != "failed", strip(resumed)["tests"]["gate"]
+    stale_facts = build_gate_screen(resumed, "tests", **kw)["sections"][1]["facts"]  # type: ignore[index]
+    assert stale_facts[0] == GATE_TEXT["stale_attempt"].format(at=GATE_TEXT["stale_attempt_at"].format(time="03:22")), stale_facts
+    # Recorded in THIS attempt: no label, and it colours the icon as before.
+    current = {**resumed, "rebuild": {"r_ac_to_tests": {**earlier, "attempt_started_at": "2026-10-02T16:45:00+00:00"}}}
+    assert strip(current)["tests"]["gate"]["icon"]["tone"] == "failed"
+    assert not any("previous attempt" in f for f in build_gate_screen(current, "tests", **kw)["sections"][1]["facts"])  # type: ignore[index]
+    # A record with no stamp on a stamped thread predates stamping, so it can only be earlier...
+    unstamped = {**resumed, "rebuild": {"r_ac_to_tests": {k: v for k, v in earlier.items() if k not in ("attempt_started_at", "checked_at")}}}
+    assert build_gate_screen(unstamped, "tests", **kw)["sections"][1]["facts"][0] == GATE_TEXT["stale_attempt"].format(at="")  # type: ignore[index]
+    # ...but a thread that was never stamped (pre-stamping session) reads exactly as before.
+    assert strip(red_state)["tests"]["gate"]["icon"]["tone"] == "failed"
     legacy = {**red_state, "rebuild": {"r_ac_to_tests": {"status": "failed", "fix_cycle_count": 0}}}
     legacy_sec = build_gate_screen(legacy, "tests", **kw)["sections"][1]  # type: ignore[index]
     assert [a["id"] for a in legacy_sec["actions"]] == ["retry", "redo"], legacy_sec["actions"]

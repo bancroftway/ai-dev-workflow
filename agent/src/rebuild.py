@@ -20,6 +20,7 @@ import posixpath
 import re
 import shlex
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Literal, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -71,6 +72,8 @@ class RebuildState(TypedDict):
     checks: list[dict[str, Any]]  # the latest lap's per-check rows (CheckResult.to_dict), for its gate screen
     passed_run_id: str  # the run this placement last passed in ("" = never) ...
     passed_commit: str  # ... and HEAD right after that pass's commit -- the tree proven to build
+    attempt_started_at: str  # the run attempt that last ran this placement (graph.GraphState) ...
+    checked_at: str  # ... and when (UTC ISO) -- the gate screen labels a result from an earlier attempt
 
 
 def default_rebuild_state() -> RebuildState:
@@ -78,6 +81,7 @@ def default_rebuild_state() -> RebuildState:
         "status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "",
         "last_exit_ok": False, "cannot_verify": False, "build_commands": [], "last_red_detail": "",
         "last_scan_fingerprint": frozenset(), "checks": [], "passed_run_id": "", "passed_commit": "",
+        "attempt_started_at": "", "checked_at": "",
     }
 
 
@@ -692,6 +696,10 @@ def make_rebuild_node(spec: RebuildSpec):
         thread_id = run_config["configurable"]["thread_id"]
         rebuild = {key: dict(value) for key, value in (state.get("rebuild") or {}).items()}
         rb = rebuild.get(spec.key, default_rebuild_state())
+        # Stamped on entry, so every path below (no sandbox, skip, pass, fail) records which attempt
+        # this result belongs to; the fix/escalate nodes carry it forward unchanged.
+        rb["attempt_started_at"] = state.get("attempt_started_at") or ""
+        rb["checked_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         if sandbox_registry.get(thread_id) is None:
             # No sandbox means the build never ran. Escalate rather than declare it clean
@@ -1281,7 +1289,7 @@ def _demo() -> None:
         def __init__(self, rc: int) -> None:
             self.rc, self.commands = rc, []
 
-        async def exec_in_sandbox(self, _thread_id: str, command: str) -> _Result:
+        async def exec_in_sandbox(self, _thread_id: str, command: str, **_kw: Any) -> _Result:
             self.commands.append(command)
             return _Result(self.rc, "built", "" if self.rc == 0 else "error CS0001")
 
@@ -1429,7 +1437,7 @@ def _demo() -> None:
     red_gate_commands: list[str] = []
 
     class _RedGateProvider:
-        async def exec_in_sandbox(self, _thread_id: str, command: str) -> _Result:
+        async def exec_in_sandbox(self, _thread_id: str, command: str, **_kw: Any) -> _Result:
             red_gate_commands.append(command)
             return _Result(0)
 
@@ -1665,7 +1673,10 @@ def _demo_resume() -> None:
                 "stages": {"minimal-code-to-green": {"status": "drafting"}},
             }
             result = asyncio.run(make_rebuild_node(spec)(state, run_config))
-            assert result["rebuild"][spec.key] == passed, "skipping keeps the pass as it was"
+            _stamps = ("attempt_started_at", "checked_at")
+            assert {k: v for k, v in result["rebuild"][spec.key].items() if k not in _stamps} == {
+                k: v for k, v in passed.items() if k not in _stamps
+            }, "skipping keeps the pass as it was (only the attempt stamp moves on)"
             assert make_route_after_rebuild(spec)({"rebuild": result["rebuild"]}) == "next"
             assert events[-1].summary == "skipped: already passed this run; minimal-code-to-green has since started"
             assert events[-1].payload == {"passed": True, "cycle": 0, "skipped": True}, events[-1].payload
