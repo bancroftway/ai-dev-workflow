@@ -808,6 +808,12 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher narrows what counts as a monster; lower widens it.",
         "positive integer, should stay above LIZARD_MAX_CCN",
     ),
+    "REPO_SCAN_TOOL_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_REPO_SCAN_TOOL_TIMEOUT_SECONDS", "900", "repo_scan",
+        "Wall-clock limit for ONE scanner tool run (semgrep, osv-scanner, trivy, lizard, ...) inside the sandbox -- repo_scan._run_one. Before this, tool runs inherited SANDBOX_DOCKER_TIMEOUT_SECONDS (30s, meant for docker admin calls) and osv-scanner was killed mid-scan.",
+        "Lower fails slow tools sooner (a timed-out tool is recorded as failed, and a security-critical one blocks merge); higher tolerates large repos at the cost of a longer scan when a tool genuinely hangs.",
+        "seconds, positive",
+    ),
     "CHURN_WINDOW_DAYS": _Setting(
         "int", "REPO_SCAN_CHURN_WINDOW_DAYS", "365", "repo_scan",
         "Lookback window (days) for the git churn/ownership measurement.",

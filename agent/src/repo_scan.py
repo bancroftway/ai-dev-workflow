@@ -2578,6 +2578,12 @@ class ToolSpec:
     # "completed cleanly" (0) -- a genuine crash (any other exit code) still fails, unchanged.
     # False (the default) leaves every other tool's contract exactly as it is today.
     empty_output_ok: bool = False
+    # The tool's own words for "there is nothing here for me to scan" (an empty repo, no package
+    # manifests). When the run produced no report and its output contains this, the run is
+    # recorded as not_applicable -- the tool said so itself, so it is a fact about the repo, not a
+    # degraded scan. Matching the tool's own message (not a find-probe of file names we guessed)
+    # means a manifest type we never listed can't silently skip a security-critical tool.
+    nothing_to_scan_marker: str | None = None
 
 
 # Applicability probes (ToolSpec.applies). `-print -quit | grep -q .` = exit 0 on first hit.
@@ -2764,6 +2770,9 @@ TOOLS: tuple[ToolSpec, ...] = (
         # that filter still has to stay, as the backstop for every OTHER unlisted vendor path).
         'lizard --csv -x "*/.angular/*" -x "*/.nuxt/*" . > agent-work/lizard.csv',
         "agent-work/lizard.csv", parse_lizard, "lizard --version",
+        # No source files (a fresh greenfield repo's baseline scan): lizard exits 0 and the
+        # redirect leaves an empty CSV -- zero functions measured, not a crash.
+        empty_output_ok=True,
     ),
     ToolSpec(
         "jscpd", "MIT", True,
@@ -2829,6 +2838,8 @@ TOOLS: tuple[ToolSpec, ...] = (
         f"osv-scanner scan source --recursive --offline-vulnerabilities --local-db-path {OSV_DB_DIR} "
         "--format json --output agent-work/osv.json .",
         "agent-work/osv.json", parse_osv, "osv-scanner --version",
+        # osv-scanner 2.0.2 on a repo with no lockfiles/manifests: exit 128, no report.
+        nothing_to_scan_marker="No package sources found",
     ),
     ToolSpec(
         # The one non-permissive dependency, kept deliberately and recorded as such in `tools[]`.
@@ -3244,8 +3255,24 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
         )
         return run, [], {}
 
-    result = await provider.exec_in_sandbox(thread_id, f"LC_ALL=C PYTHONNOUSERSITE=1 {spec.command} 2>&1")
+    # A previous scan's report must never stand in for this run's: if the tool dies before writing,
+    # the stale file would be read back and its findings counted as current (osv-scanner, killed at
+    # the old 30s limit, still "passed" with an earlier scan's 34 findings -- session c2bbdca1).
+    await provider.exec_in_sandbox(thread_id, f"rm -f -- {shlex.quote(spec.output_path)}")
+    timeout_s = workflow_config.REPO_SCAN_TOOL_TIMEOUT_SECONDS
+    result = await provider.exec_in_sandbox(
+        thread_id, f"LC_ALL=C PYTHONNOUSERSITE=1 {spec.command} 2>&1", timeout_seconds=timeout_s
+    )
     run["exit_code"] = result.returncode
+    if result.returncode == -1 and "timed out" in (result.stderr or ""):
+        # Killed by the time limit: whatever it left behind is partial at best -- never parse it.
+        run.update(
+            status="failed",
+            notes=f"timed out after {timeout_s}s (AIDW_REPO_SCAN_TOOL_TIMEOUT_SECONDS)",
+            duration_ms=_elapsed_ms(started),
+        )
+        logger.warning("repo_scan: tool %s timed out after %ss", spec.name, timeout_s)
+        return run, [], {}
 
     from . import repo_files
 
@@ -3272,6 +3299,9 @@ async def _run_one(provider: Any, thread_id: str, spec: ToolSpec) -> tuple[dict[
         # _probe_tool_version_with_retry's own failure branch already gives the missing-binary
         # case, just applied here too.
         tool_output = (result.stdout or result.stderr or "").strip() or "(no output)"
+        if spec.nothing_to_scan_marker and spec.nothing_to_scan_marker in tool_output:
+            run.update(status="not_applicable", notes=spec.nothing_to_scan_marker, duration_ms=_elapsed_ms(started))
+            return run, [], {}
         run.update(
             status="failed",
             notes=f"no readable output at {spec.output_path} (exit {result.returncode}) -- command output: {tool_output}",
@@ -4532,10 +4562,16 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     # genuine crash --------------------------------------------------------------------------------
     async def _run_one_empty_output_check() -> None:
         class _FakeProvider:
+            # Queue of results for every exec EXCEPT the pre-run `rm -f` of the tool's report,
+            # which is recorded (to prove it happens before the tool runs) and always succeeds.
             def __init__(self, results: list[Any]) -> None:
                 self._results = list(results)
+                self.commands: list[str] = []
 
-            async def exec_in_sandbox(self, thread_id: str, command: str) -> Any:
+            async def exec_in_sandbox(self, thread_id: str, command: str, **_kw: Any) -> Any:
+                self.commands.append(command)
+                if command.startswith("rm -f -- "):
+                    return types.SimpleNamespace(ok=True, returncode=0, stdout="", stderr="")
                 return self._results.pop(0)
 
         clean_spec = replace(
@@ -4559,6 +4595,38 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
             _FakeProvider([version_ok, crashed_exit, missing_file]), "t", clean_spec
         )
         assert run["status"] == "failed", "a genuine crash must not be read as a clean empty scan"
+
+        # The previous scan's report is deleted BEFORE the tool runs, so a tool that dies early can
+        # never be credited with a stale report's findings.
+        fake = _FakeProvider([version_ok, clean_exit, missing_file])
+        await _run_one(fake, "t", clean_spec)
+        rm_at = fake.commands.index("rm -f -- agent-work/gitleaks-test.json")
+        tool_at = next(i for i, c in enumerate(fake.commands) if "fake gitleaks command" in c)
+        assert rm_at < tool_at, fake.commands
+
+        # Killed by the time limit: failed, and whatever it left behind is never read back.
+        timed_out = types.SimpleNamespace(ok=False, returncode=-1, stdout="", stderr="docker exec x timed out after 900s")
+        fake = _FakeProvider([version_ok, timed_out])
+        run, findings, _ = await _run_one(fake, "t", clean_spec)
+        assert run["status"] == "failed" and "timed out" in run["notes"] and findings == [], run
+        assert not fake._results, "a timed-out tool's leftover report must not be read"
+
+        # The tool's own "nothing to scan" -> not_applicable (osv-scanner on a repo with no lockfiles).
+        osv_spec = replace(TOOLS_BY_NAME["osv-scanner"], command="fake osv", version_command="fake --version")
+        no_sources = types.SimpleNamespace(
+            ok=False, returncode=128, stdout="Scanning dir . No package sources found, --help for usage information.", stderr="",
+        )
+        run, _, _ = await _run_one(_FakeProvider([version_ok, no_sources, missing_file]), "t", osv_spec)
+        assert run["status"] == "not_applicable", run
+        # ...but any other crash of that security-critical tool still fails.
+        run, _, _ = await _run_one(_FakeProvider([version_ok, crashed_exit, missing_file]), "t", osv_spec)
+        assert run["status"] == "failed", run
+
+        # lizard with no source files: exit 0 + empty CSV = zero functions measured, not a crash.
+        lizard_spec = replace(TOOLS_BY_NAME["lizard"], command="fake lizard", version_command="fake --version")
+        empty_csv = types.SimpleNamespace(ok=True, returncode=0, stdout="", stderr="")
+        run, _, _ = await _run_one(_FakeProvider([version_ok, clean_exit, empty_csv]), "t", lizard_spec)
+        assert run["status"] == "ok" and run["findings"] == 0, run
 
     asyncio.run(_run_one_empty_output_check())
 
