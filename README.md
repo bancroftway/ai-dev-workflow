@@ -144,6 +144,7 @@ The image is immutable and deliberately small, so a repo needing a toolchain it 
 | `/workspace/repo` | the clone | the session. Never a mount target. |
 | `/opt/aidw/tools` | mise-installed SDKs and anything else on `PATH` | the session — an executable on `PATH` is what would carry an attack between two sessions, so it is never shared |
 | `/opt/aidw/cache` | npm / NuGet / pip / uv / mise download caches | a named Docker volume per repo **owner** (`aidw-cache-<owner>`) |
+| `/workspace/repo/agent-work/codebase-map.md` | a compressed codebase map -- repomix signatures, bodies elided (`agent/src/codebase_map.py`) -- generated once per stage per run for the stages in `AIDW_CODEBASE_MAP_STAGES` (default plan, minimal-code-to-green, remediation); their draft prompt points at it rather than inlining it (a retry resends the whole prompt; Copilot caps a prompt argument at 128 KiB). Over `AIDW_CODEBASE_MAP_MAX_CHARS` it becomes a plain file list; any failure just drafts without it | the stage (gitignored, like all of `agent-work/`) |
 
 Both `/opt/aidw` paths are created and declared in the image itself, so a container behaves identically with or without the volume attached — the mount is an accelerator, never a correctness dependency. On Azure ACI the cache is an Azure Files share and is **off unless `AIDW_CACHE_SHARE` is set**: SMB's many-small-file throughput is poor enough that the cache can be slower than re-downloading, so it gets enabled after measurement.
 
