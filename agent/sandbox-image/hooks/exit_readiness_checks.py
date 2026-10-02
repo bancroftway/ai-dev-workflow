@@ -80,18 +80,36 @@ def _presence_from_values(values: list[str], *, empty_reason: str) -> dict[str, 
 # Gate-owned reason vocabulary + manifest-completeness topics -- moved verbatim from exit_nodes.py.
 # ---------------------------------------------------------------------------------------------
 
-# Phrases the metrics regression gate OWNS -- every one of these comes from
-# metrics_nodes.regression_reasons and from nowhere else. A blocking reason containing one of them
-# is a claim about a deterministic measurement, so this run's gate output is the only authority on
-# whether it is true. Anything outside this vocabulary is the drafting model's own reasoning and is
-# never second-guessed here. Kept as substrings, not exact strings, because the gate interpolates
-# live numbers ("duplication 10.5% exceeds...") that will not match a previous run's text.
+# This module's own deterministic phrases, named once so the producer and the stale filter below
+# can't drift apart (session c2bbdca1: NO_SCREENSHOTS_REASON was produced here but never listed in
+# GATE_OWNED_REASON_MARKERS, so once a prior attempt baked it into a report it survived every later
+# attempt -- even one with 22 fresh screenshots on disk).
+NO_SCREENSHOTS_REASON = "UI application but no e2e screenshots were captured"
+METRICS_NOT_RECORDED_MARKER = "the regression gate never passed"
+AUTH_UNVERIFIED_MARKER = "authentication enforcement was required for this run"
+TERMINAL_FAILURE_MARKER = "terminal pipeline failure recorded at"
+# exit_nodes.exit_finalize_node's seed for a report it builds without metrics-exit having run this
+# attempt: gate-owned, so the deterministic recompute clears it the moment it actually runs, and it
+# only survives (merge_ready stays False) when that recompute could not run at all.
+NOT_RECHECKED_REASON = "exit readiness was not re-checked in this attempt"
+
+# Phrases the deterministic exit checks OWN -- every one comes from metrics_nodes.regression_reasons,
+# readme_gate.readme_problems, this module's own checks, or exit_finalize_node, and from nowhere
+# else. A blocking reason containing one of them is a claim about a deterministic measurement, so
+# this run's check output is the only authority on whether it is true. Anything outside this
+# vocabulary is the drafting model's own reasoning and is never second-guessed here. Kept as
+# substrings, not exact strings, because the gate interpolates live numbers ("duplication 10.5%
+# exceeds...") that will not match a previous run's text. exit_nodes._demo runs every real producer
+# and asserts each phrase is filterable, so a new phrase missing here fails that self-check.
 GATE_OWNED_REASON_MARKERS = (
     "gating finding(s) open",
+    "security-critical tool(s) failed or are missing",
     "coverage unmeasured",
     "coverage below threshold",
     "exceeds the",          # duplication threshold
     "regressed",            # coverage/health regression deltas
+    "AC verification unmeasured",
+    "accessibility/performance unmeasured",
     # Any NEW deterministic blocker vocabulary must be added here too, or a blocker fixed on run
     # N re-blocks every later run: the drafting model reads the committed EXIT-REPORT.md and
     # copies old blockers forward verbatim (see the stale-reason filter below).
@@ -99,17 +117,20 @@ GATE_OWNED_REASON_MARKERS = (
     "standard-readme requires it",
     "has no H1 title",
     "must be the LAST section",
-    "authentication enforcement was required for this run",  # this module's own blocker
+    AUTH_UNVERIFIED_MARKER,
+    NO_SCREENSHOTS_REASON,
     # exit_finalize_node's run_failure injection. Deliberately NOT "run failed at" -- that exact
     # phrase appears in git_ops's failure commit message and in ordinary model prose, so it would
     # both get copied forward and falsely filter legitimate reasons.
-    "terminal pipeline failure recorded at",
+    TERMINAL_FAILURE_MARKER,
+    "exit report generation failed",  # exit_finalize_node's degraded-report reason
+    NOT_RECHECKED_REASON,
     # metrics_problems' own "metrics.get('run_id') == run_id" check -- this exact marker's own
     # absence was a real bug once (income-investor thread f0fef8ba, 2026-09-26): this phrase got
     # baked into metrics-exit's approved_content on a run whose metrics genuinely hadn't landed yet,
     # then survived every later resume forever because it was never gate-owned by any existing
     # marker.
-    "the regression gate never passed",
+    METRICS_NOT_RECORDED_MARKER,
 )
 
 # Manifest-completeness topics manifest_presence_problems computes fresh on every call -- these
@@ -284,7 +305,7 @@ def tech_stack_resolves_test_command(tech_stack: dict[str, Any] | None) -> bool:
 def screenshot_problems(is_ui: bool, screenshot_count: int) -> list[str]:
     """Mandatory visual evidence for UI apps, whatever path e2e took."""
     if is_ui and screenshot_count == 0:
-        return ["UI application but no e2e screenshots were captured"]
+        return [NO_SCREENSHOTS_REASON]
     return []
 
 
@@ -298,7 +319,7 @@ def metrics_problems(metrics: dict[str, Any], run_id: str) -> tuple[list[str], b
     or absent metrics-latest.json) -- callers must skip the auth check too in that case, mirroring
     verify_exit_readiness's own two separate `if metrics.get("run_id") == run_id:` blocks."""
     if metrics.get("run_id") != run_id:
-        return ["metrics were not recorded for this run -- the regression gate never passed"], False
+        return [f"metrics were not recorded for this run -- {METRICS_NOT_RECORDED_MARKER}"], False
     problems = list((metrics.get("regression_gate") or {}).get("reasons") or [])
     # README leg (W7): hard standard-readme problems still open after the leg's own retry laps
     # block the merge -- but only when the leg OWNS the README (a human-authored brownfield README
@@ -325,7 +346,7 @@ def auth_problems(
         return [], None
     if not (e2e_snapshot.get("auth_check") or {}).get("passed"):
         return [
-            "authentication enforcement was required for this run but was not verified "
+            f"{AUTH_UNVERIFIED_MARKER} but was not verified "
             f"(e2e status: {e2e_snapshot.get('status') or 'never started'}; auth probe "
             f"{'failed' if e2e_snapshot.get('auth_check') else 'never ran'})"
         ], None
