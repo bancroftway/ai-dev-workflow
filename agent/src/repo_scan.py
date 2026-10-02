@@ -2667,11 +2667,15 @@ def _build_gitleaks_command(extra_stopwords: Sequence[str] = (), extra_allow_pat
     org's own extra allowlist entries merged in; called with no arguments, this returns exactly
     today's command, byte-for-byte."""
     config = _gitleaks_exclude_config(extra_stopwords, extra_allow_paths)
-    return (
-        f"sh -c {shlex.quote(f'''printf '%s' {shlex.quote(config)} > agent-work/gitleaks-exclude.toml && "
+    # Plain implicit concatenation of ordinary literals -- NOT one triple-quoted string: inside
+    # '''...''' the quote marks, line break and indentation between the pieces are literal text, which
+    # handed sh a command named newline+spaces+"gitleaks" (exit 127, see _demo).
+    inner = (
+        f"printf '%s' {shlex.quote(config)} > agent-work/gitleaks-exclude.toml && "
         "gitleaks dir --config agent-work/gitleaks-exclude.toml --report-format json "
-        f"--report-path agent-work/gitleaks.json --exit-code 0''')}"
+        "--report-path agent-work/gitleaks.json --exit-code 0"
     )
+    return f"sh -c {shlex.quote(inner)}"
 
 
 def _build_jscpd_command(max_duplication_percent: float | None = None) -> str:
@@ -4403,6 +4407,19 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert len(_with_extras["allowlist"]["paths"]) == len(_NON_APPLICATION_DIR_NAMES) + 1
     # _build_gitleaks_command called with no arguments is byte-for-byte today's ToolSpec command.
     assert _build_gitleaks_command() == TOOLS_BY_NAME["gitleaks"].command
+    # Parse it the way sh will: `sh -c <inner>`, and inside <inner> the word after `&&` must be the
+    # bare `gitleaks` binary. A triple-quoted f-string once swallowed the "..." "..." concatenation
+    # literally, so sh tried to run a command named newline+8 spaces+"gitleaks" -- exit 127 "not
+    # found" on every scan since
+    # 2026-09-28, and the security gate failed every run (session c2bbdca1). Shape-only: a regex or
+    # equality check against the builder itself can't see it.
+    for _cmd in (_build_gitleaks_command(), _build_gitleaks_command(("e2e-smoke",), ("**/e2e/**",))):
+        _outer = shlex.split(_cmd)
+        assert _outer[:2] == ["sh", "-c"] and len(_outer) == 3, _outer
+        _inner = shlex.split(_outer[2])
+        _after = _inner[_inner.index("&&") + 1:]
+        assert _after[:2] == ["gitleaks", "dir"], _after[:3]
+        assert "--report-path" in _after and _after[_after.index("--report-path") + 1] == "agent-work/gitleaks.json", _after
 
     # Non-application paths never gate. Each of these actually gated a real run.
     assert is_non_application_path("agent-work/gitleaks.json")          # 48 of that run's 68
