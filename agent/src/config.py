@@ -188,6 +188,12 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher gives a stuck-but-converging run more laps to resolve (more wall-clock/spend); lower escalates sooner on a run that might still converge.",
         "positive integer",
     ),
+    "PRD_MAX_VERIFY_CYCLES": _Setting(
+        "int", "AIDW_PRD_MAX_VERIFY_CYCLES", "3", "verify_cycles",
+        "Max draft<->verify retry laps for the Requirements PRD stage (merging a round's requirements and declaring every changed requirement) before it escalates as failed.",
+        "Higher gives a PRD merge that keeps missing an undeclared change more laps to fix it (more wall-clock/spend); lower escalates sooner. Escalating stops the run before the Specification drafts.",
+        "positive integer",
+    ),
     "PLAN_MAX_VERIFY_CYCLES": _Setting(
         "int", "AIDW_PLAN_MAX_VERIFY_CYCLES", "5", "verify_cycles",
         "Max draft<->verify retry laps for the Plan stage before it escalates as failed.",

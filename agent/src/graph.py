@@ -46,6 +46,7 @@ from . import model_config
 from . import preflight_nodes
 from . import repo_files
 from . import repo_scan
+from . import requirements_prd
 from . import tech_stack_signals
 from . import test_hardening_nodes
 from . import e2e_nodes
@@ -109,6 +110,7 @@ from .a2ui_tools import (
     build_exit_envelope,
     build_minimal_code_to_green_envelope,
     build_plan_envelope,
+    build_requirements_prd_envelope,
     build_specification_envelope,
     build_tech_stack_envelope,
     present_surface_messages,
@@ -132,10 +134,12 @@ from .sandbox.provider import SandboxProvider, SandboxSession
 from .schemas import (
     PLAN_AUDIT_EXAMPLE,
     PLAN_DRAFT_EXAMPLE,
+    REQUIREMENTS_PRD_DRAFT_EXAMPLE,
     SPECIFICATION_AUDIT_EXAMPLE,
     SPECIFICATION_DRAFT_EXAMPLE,
     PlanAuditResponse,
     PlanDraftResponse,
+    RequirementsPrdDraftResponse,
     Specification,
     SpecificationAuditResponse,
     SpecificationDraftResponse,
@@ -374,19 +378,14 @@ class GraphState(TypedDict):
     # Declared test users for THIS run: [{name, email, roles}]. Seeded beside app_auth from
     # repo_test_users' per-thread store; read via state.get("test_users"). Empty when none declared.
     test_users: list[dict[str, Any]]
-    # One-shot signal (user requirement 2026-08-31): the Plan gate carries no reject/feedback box
-    # -- like Specification, "Requirements is the sole source of truth" means a Plan change also
-    # flows through the Requirements tab, never a Plan-specific feedback string. Its own draft is
-    # built from the APPROVED SPECIFICATION though, not raw requirements directly, so simply
-    # looping Plan's rejection back to Plan's own draft node (Ruling 3's normal "rejected" edge)
-    # would redraft Plan against the UNCHANGED old spec -- the revised requirements would sit
-    # inert in raw-requirements text, never actually reflected in what Plan reads. Set True by
-    # make_gate_node's Plan-specific rejection branch, read by make_route_after_gate(plan_spec) to
-    # route to "specification_draft" instead of "plan_draft" so the full cascade (spec redrafts,
-    # human re-approves the new spec, THEN plan redrafts from it) actually happens. Cleared by
-    # every draft node's own return (see make_draft_node) the instant it's consumed. Read only via
-    # state.get() -- checkpoints written before this field shipped lack it.
-    restart_from_specification: bool
+    # One-shot signal: a Specification or Plan gate resolved by a requirements correction (the
+    # Requirements tab's Submit while that gate is open). The correction is a requirements delta,
+    # so it must re-enter at requirements-prd -- re-merged into the PRD from this round's base and
+    # re-verified -- before Specification redrafts (and, for Plan, before Plan redrafts from the new
+    # spec). Set by make_gate_node's rejection branch, read by make_route_after_gate to route
+    # "restart" to requirements-prd_draft, cleared by the next approval (requirements-prd's own).
+    # Read only via state.get() -- checkpoints written before this field shipped lack it.
+    restart_from_requirements: bool
     # Root-caused 2026-09-12: how many times POST /api/sessions/actions {action: "targeted-fix"}
     # has run its seeded fix pass against this thread (see intake_node's own handling and
     # _run_targeted_fix) -- a genuinely new, additive lever (never resets any stage), so unlike
@@ -1101,40 +1100,42 @@ async def record_raw_requirements_node(state: GraphState, config: RunnableConfig
     return {"stages": stages, "app_auth": app_auth, "test_users": repo_test_users.get_for_thread(thread_id)}
 
 
-REQUIREMENTS_PRD_MERGE_SYSTEM_PROMPT, REQUIREMENTS_PRD_MERGE_HUMAN_TEMPLATE = load_prompt_pair(
-    "requirements_prd_merge"
+# The brownfield baseline's first PRD only (_brownfield_spec_approve_hook): a one-shot free-text merge
+# of the approved baseline specification into an empty PRD, so brownfield and greenfield repos share
+# the same PRD artifact from then on. Every requirements round after that is the requirements-prd
+# stage below -- file-based, every changed requirement declared and verified.
+REQUIREMENTS_PRD_BASELINE_SYSTEM_PROMPT, REQUIREMENTS_PRD_BASELINE_HUMAN_TEMPLATE = load_prompt_pair(
+    "requirements_prd_baseline"
 )
 
 
-async def _merge_requirements_prd(
-    thread_id: str, state: "GraphState", provider: SandboxProvider, delta_text: str, *, role: str = "prd-merge",
+async def _seed_baseline_prd(
+    thread_id: str, state: "GraphState", provider: SandboxProvider, baseline_text: str
 ) -> None:
-    """Shared core of the requirements-PRD merge: reads whatever PRD already exists, merges
-    `delta_text` into it via `requirements_prd_merge.md`, writes and commits the result. Called
-    from `merge_requirements_prd_node` (a real human submission) and from
-    `_brownfield_spec_approve_hook` (the reverse-engineered baseline, once, so brownfield and
-    greenfield repos converge on the same PRD artifact from that point forward)."""
+    """Writes and commits the brownfield baseline's first PRD from `baseline_text` (the approved
+    baseline specification), via `requirements_prd_baseline.md`. First PRD only: brownfield-spec's
+    post-approve hook re-fires on a resume, and re-merging the baseline then would overwrite every
+    round merged since."""
     prior_prd = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.REQUIREMENTS_PRD_PATH)
+    if prior_prd and prior_prd.strip():
+        return
     model = get_chat_model_for_thread(
         thread_id,
-        "raw-requirements",
-        role,
+        "requirements-prd",
+        "prd-baseline",
         provider=state["provider"],
         run_id=state.get("run_id", "unknown"),
-        # Borrows the specification stage's own draft-tier model -- this is the same kind of job
-        # (turn requirements text into a well-structured document) and isn't a StageSpec of its own
-        # with a models.yaml entry to read.
-        model_name=model_config.get_model_name("specification", "draft", state["provider"]),
+        model_name=model_config.get_model_name("requirements-prd", "draft", state["provider"]),
         sandbox=sandbox_registry.get(thread_id),
     )
     rendered = render_prompt(
-        REQUIREMENTS_PRD_MERGE_HUMAN_TEMPLATE,
+        REQUIREMENTS_PRD_BASELINE_HUMAN_TEMPLATE,
         prior_prd=prior_prd or "(none yet -- this is the project's first round)",
-        delta_text=delta_text,
+        delta_text=baseline_text,
         today=datetime.now(timezone.utc).date().isoformat(),
     )
     response = await model.ainvoke(
-        [SystemMessage(content=REQUIREMENTS_PRD_MERGE_SYSTEM_PROMPT), HumanMessage(content=rendered)],
+        [SystemMessage(content=REQUIREMENTS_PRD_BASELINE_SYSTEM_PROMPT), HumanMessage(content=rendered)],
         config={"metadata": {"emit-messages": False}},
     )
     merged_prd = str(response.content).strip() + "\n"
@@ -1142,27 +1143,43 @@ async def _merge_requirements_prd(
     await git_ops.commit_paths(
         provider, thread_id,
         [workflow_persistence.REQUIREMENTS_PRD_PATH],
-        "ai-dev-workflow: requirements PRD merged",
+        "ai-dev-workflow: requirements PRD baseline",
     )
 
 
-async def merge_requirements_prd_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
-    """Requirements-delta pivot: maintains `.ai-dev-workflow/01-requirements-prd.md`, the
-    human-facing canonical PRD, by merging this round's raw delta text into whatever PRD already
-    exists. Purely additive next to `record_raw_requirements_node` above -- does not replace
-    `raw_requirements_text`/`stages["raw-requirements"]`, which stays the specification stage's own
-    input exactly as today. This node's only job is the document a human can open, read, and
-    download; nothing downstream reads it.
+REQUIREMENTS_PRD_SYSTEM_PROMPT = load_prompt("requirements_prd_draft")
 
-    Deterministic no-op on an empty submission (a blank reattach, same guard
-    `record_raw_requirements_node` uses) -- there is no delta to merge, and skipping avoids an
-    unnecessary LLM call and commit on every resume."""
-    thread_id = config["configurable"]["thread_id"]
-    text = (state.get("raw_requirements_text") or "").strip()
-    if not text:
-        return {}
-    await _merge_requirements_prd(thread_id, state, get_sandbox_provider(), text)
-    return {}
+# Rules the requirements-prd verify enforces (requirements_prd.VERIFY_CHECKS), one line each.
+REQUIREMENTS_PRD_HARD_RULES: tuple[str, ...] = (
+    f"Edit {requirements_prd.DRAFT_PATH} in place and fill {requirements_prd.CHANGES_PATH} with a "
+    "non-blank one-line summary -- an empty draft or an invalid change list is rejected.",
+    "Keep every required PRD section heading, in order, and never add a Revision History section -- "
+    "the pipeline appends it.",
+    f"Every declared change names real requirement lines of {requirements_prd.BASE_PATH} (under Users / "
+    "Personas, Functional Requirements, Non-Functional Requirements or Out of Scope) and quotes the exact "
+    "words of this round's requirements text that drive it.",
+    f"Every requirement line of {requirements_prd.BASE_PATH} you deleted or rewrote must be declared, and "
+    "nothing unchanged may be -- a silent drop or a phantom declaration is rejected.",
+)
+
+
+def _build_requirements_prd_prompt(state: GraphState) -> list[BaseMessage]:
+    stage = state["stages"]["requirements-prd"]
+    messages: list[BaseMessage] = [
+        SystemMessage(content=REQUIREMENTS_PRD_SYSTEM_PROMPT),
+        HumanMessage(content=f"This round's requirements text:\n\n{state['raw_requirements_text']}"),
+    ]
+    # prd_first_round: only on the prompt-only stage copy from requirements_prd.hydrate_prd_round.
+    if stage.get("prd_first_round"):
+        messages.append(HumanMessage(content=(
+            f"This is the project's first round: {requirements_prd.BASE_PATH} is empty and "
+            f"{requirements_prd.DRAFT_PATH} holds only the section skeleton. Write the PRD from the "
+            "requirements text; there is nothing to declare, so leave `changes` empty."
+        )))
+    verify_feedback_message = _verification_feedback_message(stage)
+    if verify_feedback_message is not None:
+        messages.append(verify_feedback_message)
+    return messages
 
 
 # Task 13b (revised on review): one line per DISTINCT rejection reason inside
@@ -2073,6 +2090,7 @@ class StageSpec:
         | type[AdversarialAuditDraftResponse]
         | type[ExitDraftResponse]
         | type[RemediationDraftResponse]
+        | type[RequirementsPrdDraftResponse]
     )
     content_field: str | None
     """Which response field becomes the stage's draft, or None for "the whole response".
@@ -5628,28 +5646,22 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     "use the updated document",
                     stage_spec.key, len(revised),
                 )
-                # Requirements-delta pivot: this correction never routes through
-                # record_raw_requirements_node/merge_requirements_prd_node (it resolves the open
-                # gate's interrupt directly, looping back to this stage's own draft node instead of
-                # re-entering the graph's normal requirements-intake edge) -- merge it into the
-                # maintained PRD here too, or a correction made while reviewing the gate would
-                # silently never reach `01-requirements-prd.md`.
-                try:
-                    await _merge_requirements_prd(
-                        thread_id, state, get_sandbox_provider(), revised, role="prd-merge-gate-correction"
-                    )
-                except Exception:
-                    logger.warning(
-                        "requirements PRD merge failed for gate-correction, thread_id=%s -- the "
-                        "redraft still uses the revised text, only the human-facing PRD doc is stale",
-                        thread_id, exc_info=True,
-                    )
+                # The correction is a requirements DELTA for this same round. Restart from the
+                # requirements-prd stage: it re-seeds its draft from the round's base.md (never from
+                # the live PRD, which already holds the first merge -- the old inline re-merge here
+                # stacked both deltas), re-verifies, and its approval flows into
+                # specification_draft as usual. Out of "approved", so should_skip_draft can't
+                # short-circuit it, with a fresh lap budget.
+                if stage_spec.key in _RESTART_FROM_REQUIREMENTS_GATES:
+                    prd_stage = dict(stages.get(REQUIREMENTS_PRD_STAGE.key) or default_stage_state())
+                    prd_stage["status"] = "drafting"
+                    prd_stage["verify_cycle_count"] = 0
+                    stages[REQUIREMENTS_PRD_STAGE.key] = prd_stage
+                    revised_update["restart_from_requirements"] = True
                 # Plan's own draft is built from the approved SPECIFICATION, not raw requirements
-                # directly (see GraphState.restart_from_specification's own docstring) -- looping
-                # back to Plan's own draft node here would redraft Plan against the UNCHANGED old
-                # spec, leaving the revised requirements inert. Force the real cascade instead:
-                # reset the (currently "approved") specification stage so should_skip_draft can't
-                # short-circuit it, and signal the router to send control there.
+                # directly -- the restart must redraft Specification too before Plan drafts again.
+                # Reset the (currently "approved") specification stage so should_skip_draft can't
+                # short-circuit it.
                 if stage_spec.key == "plan":
                     spec_stage = dict(stages.get("specification") or default_stage_state())
                     spec_stage["status"] = "drafting"
@@ -5662,7 +5674,6 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
                     # PlanView's own isStale banner already keys off for this exact cascade.
                     rejected["status"] = "not_started"
                     stages[stage_spec.key] = rejected
-                    revised_update["restart_from_specification"] = True
             # Mirrors the True-setting call above: this session is no longer sitting at a gate --
             # it is about to redraft. Never routes through _run_post_approve_hook/
             # update_current_stage (that would fire post_approve_hook, which is only correct for
@@ -5776,15 +5787,13 @@ def make_gate_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConfi
             )
 
         await _run_post_approve_hook(stage_spec, thread_id, approved["approved_content"], state)
-        # Clears GraphState.restart_from_specification the moment ANY stage is genuinely
-        # approved -- most relevantly Specification's own approval, the one place guaranteed to
-        # run before Plan's gate is ever reached again after a Plan-triggered restart (see the
-        # flag's own docstring and make_route_after_gate). Without this, the flag stays True
-        # forever (un-annotated GraphState keys are last-write-wins across the whole run) and a
-        # LATER, completely unrelated plain Approve on Plan's gate would incorrectly route back
-        # to specification_draft again. Harmless to clear unconditionally on every stage's
-        # approval; only Specification's clearing is ever load-bearing.
-        return {"stages": stages, "last_push": git_ops.get_last_push(thread_id), "restart_from_specification": False}
+        # Clears GraphState.restart_from_requirements the moment ANY stage is genuinely approved
+        # -- most relevantly requirements-prd's own (non-human) approval, the first thing a restart
+        # reaches. Without this, the flag stays True forever (un-annotated GraphState keys are
+        # last-write-wins across the whole run) and a LATER, unrelated plain Approve on the
+        # Specification or Plan gate would route back to requirements-prd_draft again. Harmless to
+        # clear unconditionally on every stage's approval.
+        return {"stages": stages, "last_push": git_ops.get_last_push(thread_id), "restart_from_requirements": False}
 
     return gate_node
 
@@ -5795,12 +5804,11 @@ def make_route_after_gate(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     reach "approved" -- proceeds to the next stage's draft, unchanged from the unconditional edge
     this replaced. "rejected" (Ruling 3) loops back to THIS stage's own draft node instead.
 
-    "restart" is Plan-only (GraphState.restart_from_specification's own docstring): a Plan
-    rejection carrying revised requirements needs the full upstream cascade (specification
-    redrafts and is re-approved before Plan ever drafts again), not a loop back to Plan's own
-    draft node against its now-stale approved specification. _wire_stage only wires this outcome
-    into Plan's own conditional-edges map, so it is unreachable (and would KeyError if it somehow
-    fired) for every other stage -- exactly why the flag is set only in that one branch.
+    "restart" is for the Specification and Plan gates only (_RESTART_FROM_REQUIREMENTS_GATES,
+    GraphState.restart_from_requirements): a rejection carrying revised requirements restarts at
+    requirements-prd, so the corrected text is re-merged into the PRD from this round's base and
+    re-verified before Specification (and then Plan) redraft. _wire_stage wires this outcome only
+    into those two gates' conditional-edges maps; the gate node sets the flag only for them.
 
     Reads state AFTER gate_node has already run: LangGraph evaluates a conditional edge's routing
     function against the state its source node just returned (the same reliance
@@ -5809,7 +5817,7 @@ def make_route_after_gate(stage_spec: StageSpec) -> Callable[[GraphState], str]:
     gate_node took."""
 
     def route(state: GraphState) -> str:
-        if stage_spec.key == "plan" and state.get("restart_from_specification"):
+        if stage_spec.key in _RESTART_FROM_REQUIREMENTS_GATES and state.get("restart_from_requirements"):
             return "restart"
         stage = state["stages"][stage_spec.key]
         if stage["status"] == "approved":
@@ -6148,7 +6156,8 @@ def _wire_tech_stack_intake(builder: StateGraph) -> None:
     )
     builder.add_edge("app_check_record", "repo_scan_baseline")
     builder.add_node("record_raw_requirements", record_raw_requirements_node)
-    builder.add_node("merge_requirements_prd", merge_requirements_prd_node)
+    # The requirements PRD round: draft -> verify -> (no human gate) approved -> Specification.
+    _wire_stage(builder, REQUIREMENTS_PRD_STAGE, f"{STAGES[1].key}_draft")
     # Tech-stack-first: a run that exists only to settle the stack ends here (see
     # _route_after_repo_scan_baseline) instead of drafting requirements from nothing.
     builder.add_conditional_edges(
@@ -6156,8 +6165,7 @@ def _wire_tech_stack_intake(builder: StateGraph) -> None:
         _route_after_repo_scan_baseline,
         {"record_raw_requirements": "record_raw_requirements", END: END},
     )
-    builder.add_edge("record_raw_requirements", "merge_requirements_prd")
-    builder.add_edge("merge_requirements_prd", f"{STAGES[1].key}_draft")
+    builder.add_edge("record_raw_requirements", f"{REQUIREMENTS_PRD_STAGE.key}_draft")
 
 
 async def _brownfield_spec_approve_hook(
@@ -6173,10 +6181,9 @@ async def _brownfield_spec_approve_hook(
     _brownfield_plan_approve_hook's own docstring for why it waits for the plan pass instead (the
     2026-09-16 timing fix).
 
-    Requirements-delta pivot: also seeds `01-requirements-prd.md` from this baseline, once, so a
-    brownfield repo gets the same canonical PRD artifact a greenfield repo's first ticket produces
-    (`merge_requirements_prd_node`) -- every session after this one, brownfield or greenfield,
-    merges into the same document the same way.
+    Also seeds `01-requirements-prd.md` from this baseline (_seed_baseline_prd, only when no PRD
+    exists yet), so a brownfield repo gets the same canonical PRD a greenfield repo's first round
+    produces -- the same run's requirements-prd round then merges the user's text into it.
     """
     await repo_files.write_repo_file(
         provider, thread_id, workflow_persistence.SPECIFICATION_APPROVED_PATH, json.dumps(content, indent=2)
@@ -6194,7 +6201,7 @@ async def _brownfield_spec_approve_hook(
         "describe what the application already does, in the standard PRD structure:\n\n"
         + json.dumps(content, indent=2)
     )
-    await _merge_requirements_prd(thread_id, state, provider, baseline_text, role="prd-merge-baseline")
+    await _seed_baseline_prd(thread_id, state, provider, baseline_text)
 
 
 async def _brownfield_plan_approve_hook(
@@ -6258,6 +6265,41 @@ _BROWNFIELD_SESSION_OPTIONS = lambda _state, _role: {  # noqa: E731
         "builtin:edit", "builtin:create", "builtin:apply_patch", "builtin:skill",
     ],
 }
+
+# The requirements PRD round (2026-10-02): first-class, file-based, no human gate -- its declared
+# changes are reviewed on the Specification screen, which every mode gates. Blocking in every mode
+# for the same reason: with no human behind it, an "advisory" failure would be approved unseen.
+REQUIREMENTS_PRD_STAGE = StageSpec(
+    key="requirements-prd",
+    label="Requirements PRD",
+    description="Merges this round's requirements into the PRD and declares every requirement it removes or changes.",
+    response_schema=RequirementsPrdDraftResponse,
+    content_field=None,  # file-based: verify fills the content from the round's files
+    surface_tool_name="present_requirements_prd",
+    build_envelope=build_requirements_prd_envelope,
+    build_prompt=_build_requirements_prd_prompt,
+    max_cycles=lambda: workflow_config.SPEC_MAX_CLARIFICATION_CYCLES,
+    render_markdown=None,  # the post-approve hook writes 01-requirements-prd.md itself
+    draft_example=REQUIREMENTS_PRD_DRAFT_EXAMPLE,
+    gate=Gate(
+        verify=requirements_prd.verify_requirements_prd,
+        checks=requirements_prd.VERIFY_CHECKS,
+        policy={"yolo": "blocking", "draft_verify": "blocking", "mission_critical": "blocking"},
+        persists=True,
+    ),
+    draft_rules="\n".join(f"- {r}" for r in REQUIREMENTS_PRD_HARD_RULES),
+    draft_prompt_context_from_repo_file=requirements_prd.hydrate_prd_round,
+    post_approve_hook=requirements_prd.write_approved_prd,
+    requires_human_gate=False,
+    use_custom_agent=False,
+    session_options=lambda _state, _role: {
+        "agent_mode": "autopilot",
+        "available_tools": ["builtin:view", "builtin:grep", "builtin:glob", "builtin:edit", "builtin:apply_patch"],
+    },
+    max_verify_cycles=lambda: workflow_config.PRD_MAX_VERIFY_CYCLES,
+)
+# Gates whose requirements correction restarts at REQUIREMENTS_PRD_STAGE (make_route_after_gate).
+_RESTART_FROM_REQUIREMENTS_GATES = frozenset({"specification", "plan"})
 
 BROWNFIELD_BASELINE_SPEC_STAGE = StageSpec(
     key="brownfield-spec",
@@ -6569,14 +6611,12 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
     # stage's gate_node always reaches "approved", so this is a no-op change for those 5 stages,
     # not a behavior change -- see make_route_after_gate's own docstring.
     #
-    # "restart" (user requirement 2026-08-31, Plan only): wired ONLY for Plan's own gate, always
-    # targeting "specification_draft" -- make_route_after_gate(plan_spec) is the only route
-    # function that can ever produce this outcome (guarded there on stage_spec.key == "plan"), so
-    # no other stage's map needs it and none is given it; that guard is what makes it safe to hard-
-    # code the target name here rather than threading it through as a parameter.
+    # "restart": a requirements correction at the Specification or Plan gate restarts at the
+    # requirements-prd stage (see make_route_after_gate) -- the only two gates whose route can
+    # produce it, so no other stage's map is given it.
     gate_edges = {"approved": next_draft_name, "rejected": draft_name}
-    if stage_spec.key == "plan":
-        gate_edges["restart"] = "specification_draft"
+    if stage_spec.key in _RESTART_FROM_REQUIREMENTS_GATES:
+        gate_edges["restart"] = f"{REQUIREMENTS_PRD_STAGE.key}_draft"
     # after_submit gate (tech-stack): "reverify" re-opens this same gate with the human's text and
     # the failed checks; "escalate" (infra verdict, or config.AIDW_TECH_STACK_VERIFY_MAX_ATTEMPTS
     # failed submits) ENDs the run with run_failure via the same escalate node a verify cap uses.
@@ -6602,6 +6642,7 @@ def _wire_stage(builder: StateGraph, stage_spec: StageSpec, next_draft_name: str
 _STANDALONE_STAGE_SPECS: list[StageSpec] = [
     BROWNFIELD_BASELINE_SPEC_STAGE,
     BROWNFIELD_BASELINE_PLAN_STAGE,
+    REQUIREMENTS_PRD_STAGE,
 ]
 _ALL_STAGE_SPECS: list[StageSpec] = STAGES + _STANDALONE_STAGE_SPECS
 # raw-requirements has no StageSpec (deterministic record node) but its stage KEY must stay in
@@ -7193,6 +7234,7 @@ _EXPECTED_GATE_POLICIES: dict[str, tuple[str, str, str, bool]] = {
     "plan": ("advisory", "blocking", "blocking", True),
     "brownfield-spec": ("advisory", "blocking", "blocking", True),
     "brownfield-plan": ("advisory", "blocking", "blocking", True),
+    "requirements-prd": ("blocking", "blocking", "blocking", True),
     "metrics-exit": ("advisory", "blocking", "blocking", True),
     "ac-to-tests": ("off", "blocking", "blocking", False),
     "minimal-code-to-green": ("off", "blocking", "blocking", False),
@@ -7746,6 +7788,27 @@ def _demo() -> None:
     # only ever reads status, which gate_node always sets to "approved" for those stages.
     route_after_gate_nongated = make_route_after_gate(by_key["ac-to-tests"])
     assert route_after_gate_nongated({"stages": {"ac-to-tests": {**default_stage_state(), "status": "approved"}}}) == "approved"
+
+    # Requirements PRD stage (2026-10-02): first-class, file-based, no human gate, between
+    # record_raw_requirements and the Specification draft. A corrected requirements text at the
+    # Specification or Plan gate restarts from it -- the old inline re-merge stacked the corrected
+    # delta onto a PRD that already held the first one.
+    prd_builder = build_graph()
+    assert ("record_raw_requirements", "requirements-prd_draft") in prd_builder.edges
+    assert "merge_requirements_prd" not in prd_builder.nodes
+    (prd_gate_branch,) = prd_builder.branches["requirements-prd_gate"].values()
+    assert prd_gate_branch.ends["approved"] == f"{STAGES[1].key}_draft"
+    for gated in ("specification", "plan"):
+        (gated_branch,) = prd_builder.branches[f"{gated}_gate"].values()
+        assert gated_branch.ends["restart"] == "requirements-prd_draft", (gated, gated_branch.ends)
+        restarting = {"restart_from_requirements": True, "stages": {gated: {**default_stage_state(), "status": "needs_clarification"}}}
+        assert make_route_after_gate(by_key[gated])(restarting) == "restart", gated  # type: ignore[arg-type]
+    prd_spec = next(s for s in _ALL_STAGE_SPECS if s.key == "requirements-prd")
+    assert prd_spec.requires_human_gate is False and prd_spec.audit_response_schema is None
+    assert prd_spec.gate is not None and set(prd_spec.gate.policy.values()) == {"blocking"}, (
+        "no human gate behind it, so an advisory failure would be approved unseen"
+    )
+    assert prd_spec.key in workflow_persistence._STAGE_ORDER[-1:], "appended last -- never renumber onboarded repos"
 
     # Multi-tab/completed-session hardening: reopen_blocked must win over EVERY other branch in
     # _route_after_intake, including one that would otherwise obviously route to "scaffold" (non-
@@ -8550,9 +8613,11 @@ def _demo() -> None:
         },
     }
     verify_feedback_base_state["stages"]["tech-stack"] = {**default_stage_state()}
+    verify_feedback_base_state["stages"]["requirements-prd"] = {**default_stage_state()}
     _verify_feedback_cases = [
         ("tech-stack draft", _build_tech_stack_prompt, "tech-stack"),
         ("specification draft", _build_specification_prompt, "specification"),
+        ("requirements-prd draft", _build_requirements_prd_prompt, "requirements-prd"),
         ("specification audit", _build_specification_audit_prompt, "specification"),
         ("plan draft", _build_plan_prompt, "plan"),
         ("plan audit", _build_plan_audit_prompt, "plan"),

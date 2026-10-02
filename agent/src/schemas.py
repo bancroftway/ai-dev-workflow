@@ -617,6 +617,54 @@ class ImplementationPlan(BaseModel):
     )
 
 
+class PrdChangeDeclaration(BaseModel):
+    """One prior requirement this round's delta removed or changed -- see
+    requirements_prd.evaluate_round, which checks the declaration against the actual edit."""
+
+    prior_lines: list[int] = Field(
+        description="Line numbers in .ai-dev-workflow/prd/base.md (the PRD as this round began) of the "
+        "requirement lines this change removes or rewrites -- read them off base.md, never guess."
+    )
+    basis: Literal["explicit", "implied"] = Field(
+        description="'explicit': this round's requirements text says so outright ('drop note deletion'). "
+        "'implied': a new requirement contradicts, narrows or replaces it without naming it ('notes are "
+        "permanent once saved' removes 'users can delete a note')."
+    )
+    delta_quote: str = Field(
+        description="The exact words of this round's requirements text that drive this change, copied verbatim."
+    )
+    note: str = Field(default="", description="Optional one line for the reviewer.")
+
+
+class PrdChangesFile(BaseModel):
+    """`.ai-dev-workflow/prd/changes.json`, written by the requirements-prd stage's model."""
+
+    summary: NonBlankStr = Field(description="One line: what changed in the requirements this round.")
+    changes: list[PrdChangeDeclaration] = Field(default_factory=list)
+
+
+class RequirementsPrdDraftResponse(BaseModel):
+    """Structured output of the requirements-prd draft. Metadata only: the PRD itself is edited in
+    .ai-dev-workflow/prd/draft-prd.md and the declared changes in .ai-dev-workflow/prd/changes.json
+    (content_field=None, the same file-based pattern as the specification stage)."""
+
+    readiness: bool = Field(description="True when draft-prd.md and changes.json are complete for this round.")
+    clarifying_questions: list[ClarifyingQuestion] = Field(default_factory=list)
+    summary: str = Field(default="", description="Short plain account of what you actually did this turn.")
+    skills_invoked: list[str] = Field(
+        default_factory=list,
+        description="Exact names of skills you invoked this turn. Only what you ACTUALLY invoked; an "
+        "empty list is a valid answer.",
+    )
+
+
+REQUIREMENTS_PRD_DRAFT_EXAMPLE = RequirementsPrdDraftResponse(
+    readiness=True, clarifying_questions=[],
+    summary="Merged this round: notes are now permanent; declared the removed deletion requirement as implied.",
+    skills_invoked=[],
+)
+
+
 class SpecificationChangeTouchpoint(BaseModel):
     """Metadata ABOUT one change made in the draft-specification.json file -- mirrors
     schemas_codegen.ChangedFile's contract exactly (path/change_kind/summary there; ref/kind/

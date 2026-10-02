@@ -53,6 +53,13 @@ tech-stack:
     draft_model: gpt-5.4-mini
   claude:
     draft_model: haiku
+# Requirements PRD round: merges each round's requirements into the PRD and declares every
+# requirement it removes or changes. Same kind of job as the specification draft, so the same tier.
+requirements-prd:
+  copilot:
+    draft_model: gpt-5.4-mini
+  claude:
+    draft_model: sonnet
 specification:
   copilot:
     draft_model: gpt-5.4-mini

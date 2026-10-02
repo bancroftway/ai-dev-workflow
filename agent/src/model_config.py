@@ -22,6 +22,7 @@ _CONFIG_PATH = Path(__file__).parent.parent / "config" / "models.yaml"
 
 Stage = Literal[
     "tech-stack",
+    "requirements-prd",
     "specification",
     "plan",
     "ac-to-tests",

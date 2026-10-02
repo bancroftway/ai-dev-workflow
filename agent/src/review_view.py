@@ -34,10 +34,11 @@ RESUBMIT_ACTION = "resubmit_requirements"
 REVIEW_TEXT: dict[str, Any] = {
     "ready": "is ready for your review.",
     "source_of_truth": [
-        " Your ", ("Requirements document is the single source of truth", True), ": {derivation}. Nothing you "
+        " Your ", ("requirements are the single source of truth", True), ": {derivation}. Nothing you "
         "want will make it into the product unless it's written there. To change anything here, don't comment "
-        "— edit the document on the Requirements tab and resubmit; {redrafted} redrafted from it, and every "
-        "question it answers is traced back to your wording.",
+        "— describe the change on the Requirements tab and resubmit: it is merged into your requirements "
+        "document (PRD), {redrafted} redrafted from it, and every question it answers is traced back to your "
+        "wording.",
     ],
     "redrafted": {"specification": "the specification is", "plan": "the specification and this plan are"},
     "reject_placeholder": "What should change before this is approved? (required to reject)",
@@ -49,10 +50,10 @@ REVIEW_TEXT: dict[str, Any] = {
     "check_status": {"failed": "Failed", "infra": "Couldn’t check", "advisory": "Advisory"},
     "requirements_note": {
         TECH_STACK: "Finish the Tech Stack tab first, then resubmit.",
-        "specification": "The Specification is awaiting review — submitting here revises the requirements and "
-        "redrafts it from the updated document.",
-        "plan": "The Plan is awaiting review — submitting here revises the requirements and redrafts the "
-        "Specification first, then the Plan.",
+        "specification": "The Specification is awaiting review — submitting here merges your change into the "
+        "requirements document (PRD) and redrafts the Specification from it.",
+        "plan": "The Plan is awaiting review — submitting here merges your change into the requirements "
+        "document (PRD), then redrafts the Specification, then the Plan.",
         None: "A review is waiting — approve or reject it first, then edit and resubmit.",
     },
     "busy": "Applying a decision on this review…",

@@ -829,7 +829,9 @@ def _demo() -> None:
     by_tab = {k: t["gate"]["icon"] for k, t in summ.items() if t["gate"] is not None}
     gated_tabs = {t.id for t in p.tabs if any(p.stage(k) and p.stage(k).gate for k in t.stage_keys)}  # type: ignore[union-attr]
     assert set(by_tab) == gated_tabs and {"tech-stack", "specification", "plan", "tests", "code", "quality", "report"} <= gated_tabs, by_tab
-    assert summ["requirements"]["gate"] is None and summ["overview"]["gate"] is None
+    assert summ["overview"]["gate"] is None
+    # The requirements-prd round's verify (2026-10-02) gives the Requirements tab a gate button.
+    assert "requirements" in by_tab and by_tab["requirements"]["label"].startswith("Requirements PRD verification"), by_tab
     assert summ["plan"]["label"] == "Plan"
     assert by_tab["plan"]["tone"] == "passed" and by_tab["plan"]["badge"] == ""
     assert by_tab["specification"]["tone"] == "failed" and by_tab["specification"]["badge"] == "✕"

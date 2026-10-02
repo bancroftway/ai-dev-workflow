@@ -155,8 +155,9 @@ _MODE_PICKER_LABELS = {"yolo": "🪂 YOLO (with a parachute)"}
 
 
 # The real run sequence (build_graph): tech-stack -> manifest_branch -> [brownfield-spec ->
-# brownfield-plan] -> app_check_record -> repo_scan_baseline -> raw-requirements -> STAGES[1:].
-_ORDER = ("tech-stack", "brownfield-spec", "brownfield-plan", "raw-requirements") + tuple(
+# brownfield-plan] -> app_check_record -> repo_scan_baseline -> raw-requirements -> requirements-prd ->
+# STAGES[1:].
+_ORDER = ("tech-stack", "brownfield-spec", "brownfield-plan", "raw-requirements", "requirements-prd") + tuple(
     s.key for s in graph.STAGES[1:]
 )
 
@@ -181,7 +182,7 @@ PIPELINE = Pipeline(
         TabSpec("tech-stack", "tech-stack", "Tech Stack", ("tech-stack",)),
         # focus_on "tech-stack:approved" only when raw-requirements is still not_started -- that
         # guard stays in the frontend (resumed/delta threads already carry requirements).
-        TabSpec("requirements", "requirements", "Requirements", ("raw-requirements",),
+        TabSpec("requirements", "requirements", "Requirements", ("raw-requirements", "requirements-prd"),
                 enable_after=("tech-stack",), focus_on=("tech-stack:approved",)),
         TabSpec("specification", "specification", "Specification", ("brownfield-spec", "specification"),
                 enable_on_review=True, focus_on=("specification:ready_for_review",)),

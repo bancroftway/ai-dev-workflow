@@ -70,6 +70,9 @@ _STAGE_ORDER: tuple[str, ...] = (
     "metrics-exit",
     "brownfield-spec",
     "brownfield-plan",
+    # Appended last on purpose: inserting it mid-tuple would renumber every later NN- file and
+    # break hydration of already-onboarded repos. Its deliverable is REQUIREMENTS_PRD_PATH below.
+    "requirements-prd",
 )
 
 
@@ -155,12 +158,15 @@ REMEDIATION_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('remediation', 'approv
 # so the hash was silently None on every run (the file it looked for was never written).
 RAW_REQUIREMENTS_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('raw-requirements', 'approved.json')}"
 
-# Requirements-delta pivot: the human-facing canonical PRD, maintained by merging each ticket's raw
-# delta text into whatever PRD already exists (graph.py's requirements-PRD-merge node). Deliberately
-# NOT derived from _stage_file/_STAGE_ORDER -- it isn't a StageSpec-tracked stage with its own
-# draft/audit/gate cycle, just a sibling artifact alongside 01-raw-requirements.approved.json that
-# the Requirements tab offers to view/download. Numbered to sort next to it in a directory listing.
+# The canonical PRD, merged each round by the requirements-prd stage (requirements_prd.py) and
+# written by its post-approve hook. Deliberately NOT derived from _stage_file/_STAGE_ORDER: that
+# stage's key is appended last there (12-requirements-prd.* scratch snapshots), but this deliverable
+# keeps the name the Requirements tab and every onboarded repo already know, sorted next to
+# 01-raw-requirements.approved.json.
 REQUIREMENTS_PRD_PATH = f"{WORKFLOW_DIR}/01-requirements-prd.md"
+# The approved round's declared changes (PC-n ids, kind, basis, prior/new text) and its diff -- the
+# record the Specification's prd_change_ids cite.
+REQUIREMENTS_PRD_CHANGES_PATH = f"{WORKFLOW_DIR}/01-requirements-prd.changes.json"
 
 # The FULL exit report (health table, findings dispositions, scanner tools). Written ONLY by
 # exit_nodes.exit_finalize_node -- metrics-exit's StageSpec sets render_markdown=None so the

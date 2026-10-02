@@ -35,6 +35,7 @@ AC_TO_TESTS_SURFACE_ID = "ac-to-tests"
 MINIMAL_CODE_TO_GREEN_SURFACE_ID = "minimal-code-to-green"
 ADVERSARIAL_AUDIT_SURFACE_ID = "adversarial-audit"
 EXIT_SURFACE_ID = "exit"
+REQUIREMENTS_PRD_SURFACE_ID = "requirements-prd"
 
 
 def _build_generic_envelope(surface_id: str, component_name: str, data_field: str, data: dict, audit_findings: list[str] | None = None) -> dict:
@@ -81,6 +82,12 @@ def build_ac_to_tests_envelope(test_suite: dict, audit_findings: list[str] | Non
     per the pipeline diagram's own design) -- emitted for parity with every other stage's audit/
     verify node, same rationale as build_tech_stack_envelope."""
     return _build_generic_envelope(AC_TO_TESTS_SURFACE_ID, "AcToTestsSurface", "test_suite", test_suite, audit_findings)
+
+
+def build_requirements_prd_envelope(prd: dict, audit_findings: list[str] | None = None) -> dict:
+    """No frontend renderer: requirements-prd has no human gate -- its changes are reviewed on the
+    Specification screen. Emitted for parity, same rationale as build_tech_stack_envelope."""
+    return _build_generic_envelope(REQUIREMENTS_PRD_SURFACE_ID, "RequirementsPrdSurface", "prd", prd, audit_findings)
 
 
 def build_minimal_code_to_green_envelope(iteration: dict, audit_findings: list[str] | None = None) -> dict:
