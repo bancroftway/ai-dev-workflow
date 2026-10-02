@@ -21,6 +21,7 @@ from . import config
 from .sandbox.provider import SandboxProvider
 
 from .repo_files import validate_repo_relative_path, write_repo_file
+from .workflow_persistence import WORKFLOW_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -669,6 +670,77 @@ async def commit_all(provider: SandboxProvider, thread_id: str, message: str) ->
     raise RuntimeError(f"git commit -A failed: {result.stderr or result.stdout}")
 
 
+# Everything except the pipeline's own bookkeeping (state.json, ledger, manifest): that folder is
+# written by the pipeline and committed by its next persist -- never a model's work in progress.
+_WORK_PATHSPEC = f". {shlex.quote(f':(exclude){WORKFLOW_DIR}')}"
+
+
+async def last_commit_subject(provider: SandboxProvider, thread_id: str, grep: str) -> str | None:
+    """Subject of the newest commit on HEAD whose message matches `grep` (a `git log --grep`
+    basic regex), or None."""
+    result = await provider.exec_in_sandbox(thread_id, f"git log -1 --format=%s --grep={shlex.quote(grep)}")
+    return (result.stdout.strip() or None) if result.ok else None
+
+
+async def head_commit(provider: SandboxProvider, thread_id: str) -> str | None:
+    result = await provider.exec_in_sandbox(thread_id, "git rev-parse HEAD")
+    return (result.stdout.strip() or None) if result.ok else None
+
+
+async def changed_since(provider: SandboxProvider, thread_id: str, commit: str) -> list[str]:
+    """Work paths (outside the pipeline's bookkeeping folder) that differ between `commit` and the
+    working tree now: committed since, modified, deleted, or new and not ignored. Empty when the
+    commit is unknown -- nothing can be attributed then."""
+    result = await provider.exec_in_sandbox(
+        thread_id,
+        f"git diff --name-only {shlex.quote(commit)} -- {_WORK_PATHSPEC} && "
+        f"git ls-files --others --exclude-standard -- {_WORK_PATHSPEC}",
+    )
+    return sorted({line.strip() for line in result.stdout.splitlines() if line.strip()}) if result.ok else []
+
+
+def _set_aside_script(ref: str, message: str) -> str:
+    """Pure: the shell that set_aside_uncommitted runs. Snapshots the dirty work tree through a
+    throwaway index (the real one is untouched until the snapshot is safely on `ref`), commits it
+    with HEAD as parent, points `ref` at it, then resets index + tree to HEAD -- tracked edits
+    reverted, staged and untracked files removed, ignored files (node_modules/, bin/) kept, the
+    bookkeeping folder untouched. `set -e`: any failure exits non-zero before the reset."""
+    ident = f"-c user.name={shlex.quote(_COMMIT_AUTHOR_NAME)} -c user.email={shlex.quote(_COMMIT_AUTHOR_EMAIL)}"
+    return (
+        # `st=$(...)` assignments, not `[ -z "$(...)" ]`: set -e catches a failing git status only
+        # in an assignment -- inside a test it would silently read as "clean".
+        f"set -e; st=$(git status --porcelain -- {_WORK_PATHSPEC}); "
+        'if [ -z "$st" ]; then echo aidw-set-aside=clean; exit 0; fi; '
+        'idx="$(git rev-parse --git-path aidw-set-aside.index)"; rm -f "$idx"; '
+        'cp "$(git rev-parse --git-path index)" "$idx"; '
+        f'GIT_INDEX_FILE="$idx" git add -A -- {_WORK_PATHSPEC}; '
+        'tree=$(GIT_INDEX_FILE="$idx" git write-tree); rm -f "$idx"; '
+        f'commit=$(git {ident} commit-tree "$tree" -p HEAD -m {shlex.quote(message)}); '
+        f'git update-ref {shlex.quote(ref)} "$commit"; '
+        f"git reset -q -- {_WORK_PATHSPEC}; "
+        f"git checkout -q HEAD -- {_WORK_PATHSPEC}; "
+        f"git clean -fdq -- {_WORK_PATHSPEC}; "
+        f'st=$(git status --porcelain -- {_WORK_PATHSPEC}); [ -z "$st" ]; '
+        'echo "aidw-set-aside=$commit"'
+    )
+
+
+async def set_aside_uncommitted(provider: SandboxProvider, thread_id: str, ref: str, message: str) -> str | None:
+    """Moves every uncommitted change outside the bookkeeping folder onto `ref` (one commit whose
+    parent is HEAD -- `git diff HEAD <ref>` shows exactly what was set aside, `git checkout <ref>
+    -- .` brings it back) and leaves the working tree and index at HEAD. Never touches the work
+    branch and is never pushed (push_head pushes HEAD only). Returns the commit, or None when there
+    was nothing to set aside. Raises RuntimeError on any failure: the caller must not go on to
+    build or draft on a tree it could not clean."""
+    async with _GIT_INDEX_LOCK:
+        result = await provider.exec_in_sandbox(thread_id, _set_aside_script(ref, message))
+    marker = next((line for line in result.stdout.splitlines() if line.startswith("aidw-set-aside=")), None)
+    if not result.ok or marker is None:
+        raise RuntimeError(f"could not set aside uncommitted work (exit {result.returncode}): {result.stderr or result.stdout}")
+    value = marker.split("=", 1)[1].strip()
+    return None if value == "clean" else value
+
+
 def _demo() -> None:
     """`cd agent && uv run python -m src.git_ops`."""
     # The exact wording git produced on a live run, which the old narrower check missed.
@@ -841,6 +913,100 @@ async def _demo_async() -> None:
     print("git_ops async self-check: all assertions passed")
 
 
+async def _demo_set_aside() -> None:
+    """set_aside_uncommitted / changed_since / last_commit_subject against a REAL throwaway git
+    repo (the same shell the sandbox runs, through a provider that execs `sh -c` locally): dirty ->
+    side ref + clean tree, clean -> no-op, failure -> raises with nothing lost."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    from .sandbox.provider import ExecResult
+
+    sh = shutil.which("sh")
+    if sh is None or shutil.which("git") is None:
+        print("git_ops set-aside self-check: skipped (no sh/git on PATH)")
+        return
+
+    class _ShellProvider:
+        def __init__(self, cwd: str) -> None:
+            self.cwd = cwd
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str, **_kwargs: Any) -> ExecResult:
+            proc = subprocess.run([sh, "-c", command], cwd=self.cwd, capture_output=True, text=True)
+            return ExecResult(proc.returncode, proc.stdout, proc.stderr)
+
+    with tempfile.TemporaryDirectory() as not_a_repo:
+        try:
+            await set_aside_uncommitted(_ShellProvider(not_a_repo), "t", "refs/aidw/x", "x")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a failing `git status` must raise, never read as a clean tree")
+
+    with tempfile.TemporaryDirectory() as repo:
+        provider = _ShellProvider(repo)
+
+        async def sh_(command: str) -> str:
+            result = await provider.exec_in_sandbox("t", command)
+            assert result.ok, (command, result.stderr)
+            return result.stdout.strip()
+
+        def write(path: str, text: str) -> None:
+            full = f"{repo}/{path}"
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "a", encoding="utf-8") as handle:
+                handle.write(text)
+
+        commit = "git -c user.name=t -c user.email=t@t commit -q"
+        await sh_("git init -q")
+        write(".gitignore", "node_modules/\n")
+        write("apps/web/a.ts", "one\n")
+        write(f"{WORKFLOW_DIR}/state.json", "{}\n")
+        await sh_(f"git add -A && {commit} -m 'ai-dev-workflow: r_ac_to_tests source changes (build green)'")
+        passed_at = await head_commit(provider, "t")
+        write(f"{WORKFLOW_DIR}/state.json", "drafting\n")
+        await sh_(f"git add -A && {commit} -m 'ai-dev-workflow: minimal-code-to-green drafting'")
+        write(f"{WORKFLOW_DIR}/state.json", "scaffold\n")
+        await sh_(f"{commit} -am 'ai-dev-workflow: scaffold'")
+        head = await head_commit(provider, "t")
+        assert await last_commit_subject(provider, "t", "^ai-dev-workflow: .* drafting$") == "ai-dev-workflow: minimal-code-to-green drafting"
+        assert await last_commit_subject(provider, "t", "^no such subject$") is None
+
+        # What an interrupted draft leaves: a tracked edit, a new file, a staged file, dependencies
+        # (ignored), plus a pipeline bookkeeping write.
+        write("apps/web/a.ts", "two\n")
+        write("apps/web/main.ts", "new\n")
+        write("apps/web/staged.ts", "staged\n")
+        await sh_("git add apps/web/staged.ts")
+        write("apps/web/node_modules/pkg/index.js", "dep\n")
+        write(f"{WORKFLOW_DIR}/state.json", "bookkeeping\n")
+        assert await changed_since(provider, "t", passed_at) == ["apps/web/a.ts", "apps/web/main.ts", "apps/web/staged.ts"]
+        assert await changed_since(provider, "t", "0" * 40) == [], "an unknown commit attributes nothing"
+
+        # Failure (git refuses the ref name): raises, and nothing was reset or lost.
+        try:
+            await set_aside_uncommitted(provider, "t", "refs/aidw/bad..name", "x")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a failed set-aside must raise")
+        assert "apps/web/main.ts" in await sh_("git status --porcelain"), "a failed set-aside must leave the work in place"
+
+        ref = "refs/aidw/interrupted/minimal-code-to-green-20261001T230654Z"
+        side = await set_aside_uncommitted(provider, "t", ref, "interrupted minimal-code-to-green set aside")
+        assert side and await sh_(f"git rev-parse {ref}") == side
+        assert await sh_(f"git diff --name-only HEAD {ref}") == "apps/web/a.ts\napps/web/main.ts\napps/web/staged.ts"
+        assert await head_commit(provider, "t") == head, "HEAD and the work branch never move"
+        assert await sh_("git status --porcelain") == f"M {WORKFLOW_DIR}/state.json", "only bookkeeping may stay dirty"
+        assert await sh_("cat apps/web/node_modules/pkg/index.js") == "dep", "ignored dependencies survive"
+        assert await set_aside_uncommitted(provider, "t", ref + "-2", "x") is None, "a clean tree is a no-op"
+
+    print("git_ops set-aside self-check: all assertions passed")
+
+
 if __name__ == "__main__":
     _demo()
     asyncio.run(_demo_async())
+    asyncio.run(_demo_set_aside())

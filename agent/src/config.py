@@ -596,6 +596,13 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher lists more test names inline; lower summarizes sooner as \"...and N more\".",
         "positive integer",
     ),
+    # rebuild.blame_downstream (make_escalate_node).
+    "REBUILD_BLAME_FILES_PREVIEW_MAX": _Setting(
+        "int", "AIDW_REBUILD_BLAME_FILES_PREVIEW_MAX", "10", "truncation",
+        "How many changed files a failed rebuild check names when it blames the stage after it (files changed since the check last passed this run).",
+        "Higher lists more of the changed files in the failure message; lower summarizes sooner as \"(+N more)\".",
+        "positive integer",
+    ),
     "GIT_OPS_HTTP_TIMEOUT_SECONDS": _Setting(
         "float", "AIDW_GIT_OPS_HTTP_TIMEOUT_SECONDS", "30.0", "truncation",
         "Shared httpx client timeout for short outbound GitHub/Anthropic API calls (open/update PR, delete branch, repo create, repo lookup, credential validation).",
@@ -705,6 +712,14 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher tolerates a slow image pull or large output read; lower risks cutting one off mid-operation.",
         "seconds, positive",
     ),
+    # cli_agent_exec.stop_cli_turns_command -- run by local_docker._try_reattach (a container that
+    # survived an agent restart) and main.py's lifespan shutdown.
+    "CLI_TURN_STOP_GRACE_SECONDS": _Setting(
+        "int", "AIDW_CLI_TURN_STOP_GRACE_SECONDS", "5", "sandbox",
+        "How long a leftover in-sandbox agent CLI turn (Claude Code / Copilot) gets to exit after SIGTERM before it is SIGKILLed -- on reattach to a surviving container, and at agent shutdown.",
+        "Higher lets the CLI flush and exit cleanly but delays reattach/shutdown by up to this long; lower kills sooner. Either way the orphaned turn stops writing into the workspace.",
+        "seconds, non-negative",
+    ),
 
     # -- Session/run activity ------------------------------------------------------------------------
     "RUN_SUBSCRIBER_QUEUE_MAXSIZE": _Setting(
@@ -712,6 +727,15 @@ _SETTINGS: dict[str, _Setting] = {
         "How many published graph events one attached SSE subscriber (a browser tab) may have queued before the oldest is dropped.",
         "Higher lets a briefly slow/backgrounded tab fall further behind before losing early events (more memory held per stalled subscriber); lower drops events sooner under load. Never affects the background graph task itself.",
         "positive integer",
+    ),
+    # main.py's _serve (the `python main.py` / dev.ps1 entrypoint) -- uvicorn's
+    # timeout_graceful_shutdown. Read once at process start, before any session is pinned, so it
+    # always resolves env/default, never a live DB override.
+    "GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS": _Setting(
+        "int", "AIDW_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", "5", "misc",
+        "On shutdown, how long the agent waits for open requests (attached browser SSE streams never finish on their own) before cancelling them and running its own shutdown: cancel graph runs, stop their in-sandbox CLI turns, close the checkpointer.",
+        "Higher gives in-flight requests longer to finish; lower reaches the cleanup sooner. Without a bound, one attached tab kept the agent from ever reaching that cleanup, so the dev script force-killed it and left CLI turns running in the sandbox. Process start only -- not live-editable.",
+        "seconds, positive",
     ),
 
     # -- Runtime/misc -------------------------------------------------------------------------------

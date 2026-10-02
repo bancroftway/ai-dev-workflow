@@ -97,12 +97,14 @@ def _stage_file(stage_key: str, kind: str) -> str:
 TECH_STACK_APPROVED_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'approved.json')}"
 TECH_STACK_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('tech-stack', 'draft.json')}"
 
-# Same derived-constant reasoning. rebuild.py reads this to answer "has the implementation stage
-# ever produced a draft in this workspace?" -- the precondition for its scaffold-only TDD-red gate.
-# Stage bookkeeping cannot answer that on a resume (intake's hydration reset returns every
-# unapproved stage to "not_started"), and this artifact can: it is written only by a real draft,
-# committed to the branch, and carried on the workspace volume across container swaps.
-MINIMAL_CODE_TO_GREEN_DRAFT_PATH = f"{WORKFLOW_DIR}/{_stage_file('minimal-code-to-green', 'draft.json')}"
+# Same derived-path reasoning. rebuild.stage_started reads this to answer "has the stage after a
+# rebuild placement ever produced a draft in this workspace?" (the TDD-red gate's precondition, and
+# whether a passed placement may be skipped on a resume). Stage bookkeeping cannot answer that on
+# a resume (intake's hydration reset returns every unapproved stage to "not_started"), and this
+# artifact can: it is written only by a real draft, committed to the branch, and carried on the
+# workspace volume across container swaps.
+def stage_draft_path(stage_key: str) -> str:
+    return f"{WORKFLOW_DIR}/{_stage_file(stage_key, 'draft.json')}"
 
 # Same "one truth, derived from the numbering" reasoning -- metrics_nodes.py's traceability-matrix
 # file-attribution collection reads this to recover the coding stage's own self-reported
@@ -375,6 +377,7 @@ def _demo() -> None:
     # name while persistence wrote the numbered one, so branches carried BOTH files.
     assert TECH_STACK_APPROVED_PATH == f"{WORKFLOW_DIR}/02-tech-stack.approved.json"
     assert TECH_STACK_DRAFT_PATH == f"{WORKFLOW_DIR}/02-tech-stack.draft.json"
+    assert stage_draft_path("minimal-code-to-green") == f"{WORKFLOW_DIR}/06-minimal-code-to-green.draft.json"
     assert PLAN_APPROVED_PATH == f"{WORKFLOW_DIR}/04-plan.approved.json"
     assert AC_TO_TESTS_APPROVED_PATH == f"{WORKFLOW_DIR}/05-ac-to-tests.approved.json"
     assert SPECIFICATION_APPROVED_PATH == f"{WORKFLOW_DIR}/03-specification.approved.json"

@@ -167,7 +167,7 @@ def _rebuild_placements() -> tuple[dict[str, str], ...]:
         out.append({
             "after_stage_key": after,
             "rebuild_key": spec.key,
-            "next_stage_key": _ORDER[_ORDER.index(after) + 1],
+            "next_stage_key": spec.next_stage_key,
             # ac-to-tests' placement is the TDD-red check, not a plain rebuild.
             "label": "Red Gate" if after == "ac-to-tests" else "Rebuild",
         })

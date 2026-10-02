@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import os
@@ -400,6 +401,61 @@ def _build_startup_command(
     return f"setsid nohup sh -c {shlex.quote(sh_script)} >/dev/null 2>&1 & echo $! > {shlex.quote(pid_path)}"
 
 
+def stop_cli_turns_command(grace_seconds: int) -> str:
+    """POSIX sh that stops every agent CLI turn running in this sandbox and prints
+    `aidw-stopped-turns=<n>`. Only for a moment when NO live turn may exist there: reattaching to a
+    container that outlived the agent process that started its turns (local_docker._try_reattach),
+    or that process shutting down (main.py's lifespan). Observed live (session c2bbdca1): the agent
+    restarted mid-turn and the in-container Claude CLI kept writing an implementation into the
+    workspace for another 50 minutes, which a later resume then built against.
+
+    A turn is recognized by its scratch path: every turn is launched (_build_startup_command) as a
+    setsid'd `sh -c '<cli> < /tmp/aidw-agent/<prefix> ...'`, so the process-group leader's own
+    command line names _SCRATCH_DIR; killing that group takes the CLI and its children with it.
+    Nothing else in the image mentions that path, so init, app servers and every other tool are
+    untouched. The grep pattern brackets its last character so this script's own command line
+    (which contains the pattern) never matches itself; $$ and its parent are skipped anyway.
+    No pkill in the image -- /proc is what there is (same as e2e_nodes._kill_stale_app_processes).
+    SIGTERM first, SIGKILL whatever is still alive (a zombie counts as gone) after grace_seconds."""
+    pattern = f"{_SCRATCH_DIR[:-1]}[{_SCRATCH_DIR[-1]}]/"
+    return (
+        "me=$$; parent=$(awk '{print $4}' /proc/$$/stat 2>/dev/null); victims=''; "
+        "for d in /proc/[0-9]*; do pid=${d#/proc/}; "
+        '[ "$pid" = "$me" ] && continue; [ "$pid" = "$parent" ] && continue; '
+        f"if tr '\\0' ' ' < $d/cmdline 2>/dev/null | grep -q {shlex.quote(pattern)}; then victims=\"$victims $pid\"; fi; done; "
+        "for p in $victims; do kill -s TERM -- -$p 2>/dev/null; kill -s TERM $p 2>/dev/null; done; "
+        f"alive=''; i=0; while [ $i -lt {int(grace_seconds)} ]; do alive=''; "
+        "for p in $victims; do st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); "
+        '[ -n "$st" ] && [ "$st" != Z ] && alive="$alive $p"; done; '
+        '[ -z "$alive" ] && break; sleep 1; i=$((i+1)); done; '
+        "for p in $alive; do kill -s KILL -- -$p 2>/dev/null; kill -s KILL $p 2>/dev/null; done; "
+        'set -- $victims; echo "aidw-stopped-turns=$#"'
+    )
+
+
+def parse_stopped_turns(stdout: str) -> int:
+    """The count stop_cli_turns_command printed, or -1 when it printed none (the exec failed)."""
+    for line in reversed((stdout or "").splitlines()):
+        if line.startswith("aidw-stopped-turns="):
+            return int(line.split("=", 1)[1] or 0)
+    return -1
+
+
+async def stop_cli_turns(provider: SandboxProvider, thread_id: str) -> int:
+    """Runs stop_cli_turns_command in this session's sandbox -- how many turn processes it
+    stopped, or -1 when it could not run. Fail-soft and idempotent (a second call finds nothing):
+    a sandbox that is already gone has nothing left to stop."""
+    try:
+        result = await provider.exec_in_sandbox(thread_id, stop_cli_turns_command(config.CLI_TURN_STOP_GRACE_SECONDS))
+    except Exception:  # noqa: BLE001 -- best-effort cleanup, never the reason a caller fails
+        logger.warning("could not stop leftover CLI turns for thread_id=%s", thread_id, exc_info=True)
+        return -1
+    stopped = parse_stopped_turns(result.stdout)
+    if stopped > 0:
+        logger.warning("stopped %d leftover agent CLI turn process(es) in the sandbox for thread_id=%s", stopped, thread_id)
+    return stopped
+
+
 def _pid_state_probe_script(pid_path: str) -> str:
     """POSIX sh expression: echoes DEAD if the pid in pid_path is confirmed dead
     (/proc/$pid/stat unreadable, or its 3rd field is Z -- zombie, since this sandbox's PID 1 has
@@ -541,6 +597,14 @@ async def run_turn(
     # Scoped to this one run_turn() call only -- nothing here survives past this function
     # returning or raising, and nothing needs to.
     streamer = _NarrationStreamer(classify_line) if classify_line is not None else None
+    # The turn's whole process group (the pid file holds the setsid'd leader -- see
+    # _pid_state_probe_script). Used on timeout below and by the `finally` on every other exit
+    # that is not a finished turn.
+    kill_cmd = (
+        f"kill -TERM -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; "
+        f"kill -KILL -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; true"
+    )
+    finished = False
 
     try:
         # Write prompt to scratch file.
@@ -561,10 +625,6 @@ async def run_turn(
             remaining = timeout_seconds - elapsed
             if remaining <= 0:
                 # Timeout: kill the process group, then raise.
-                kill_cmd = (
-                    f"kill -TERM -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; "
-                    f"kill -KILL -$(cat {shlex.quote(pid_path)} 2>/dev/null) 2>/dev/null; true"
-                )
                 await provider.exec_in_sandbox(thread_id, kill_cmd)
                 if streamer is not None:
                     # A killed turn has no terminal result line -- whatever's pending is genuine,
@@ -680,6 +740,7 @@ async def run_turn(
                     partial_stdout=partial.stdout if partial.ok else "",
                 )
 
+        finished = True  # the exit file exists: nothing left running to kill
         # Read results. Long timeout, not the fast-admin default: a 90-minute turn's stdout can
         # be megabytes of tool events (see the head -c 65536 comment above) and this reads it back
         # unbounded/untruncated.
@@ -737,7 +798,14 @@ async def run_turn(
         # try/except so a cleanup failure (e.g. the sandbox is already gone) can never replace
         # whatever real exception this function is in the middle of propagating -- same
         # "best-effort, result ignored" contract the success path already had.
+        #
+        # An unfinished turn is killed first. Without it, cancelling this coroutine (agent
+        # shutdown's run_activity.cancel_all_tasks, the Stop button) or any error mid-poll only
+        # abandoned the WAIT -- the backgrounded CLI kept running, and writing into the workspace,
+        # with nobody left to read its result (session c2bbdca1: 50 more minutes of edits).
         try:
+            if not finished:
+                await provider.exec_in_sandbox(thread_id, kill_cmd)
             await provider.exec_in_sandbox(thread_id, f"rm -f {shlex.quote(scratch_prefix)}*")
         except Exception:
             pass
@@ -935,6 +1003,66 @@ def _demo() -> None:
     finally:
         run_event_store.append_events = real_append_events
         run_event_stream.emit_live = real_emit_live
+
+    # --- Orphaned CLI turns (session c2bbdca1) ---
+    from .sandbox.provider import ExecResult
+
+    stop_cmd = stop_cli_turns_command(5)
+    assert _SCRATCH_DIR + "/" not in stop_cmd, "the sweep's own command line must never match its own pattern"
+    assert "'/tmp/aidw-agen[t]/'" in stop_cmd, stop_cmd
+    assert "kill -s TERM -- -$p" in stop_cmd and "kill -s KILL -- -$p" in stop_cmd, "must kill each turn's whole process group"
+    assert "-lt 5 ]" in stop_cmd
+    assert parse_stopped_turns("noise\naidw-stopped-turns=2") == 2 and parse_stopped_turns("") == -1
+
+    class _OrphanSandbox:
+        """Two orphaned turns the first time it is swept, none after."""
+
+        def __init__(self) -> None:
+            self.orphans = 2
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str, **_kwargs: Any) -> ExecResult:
+            assert command == stop_cmd
+            stopped, self.orphans = self.orphans, 0
+            return ExecResult(0, f"aidw-stopped-turns={stopped}", "")
+
+    class _GoneSandbox:
+        async def exec_in_sandbox(self, *_args: Any, **_kwargs: Any) -> ExecResult:
+            raise RuntimeError("no active sandbox")
+
+    orphan_sandbox = _OrphanSandbox()
+    assert asyncio.run(stop_cli_turns(orphan_sandbox, "t")) == 2
+    assert asyncio.run(stop_cli_turns(orphan_sandbox, "t")) == 0, "a second sweep must be a no-op"
+    assert asyncio.run(stop_cli_turns(_GoneSandbox(), "t")) == -1, "a missing sandbox must not raise"
+
+    class _TurnSandbox:
+        """Launch succeeds; the completion wait either reports DONE or blocks until cancelled."""
+
+        def __init__(self, done: bool) -> None:
+            self.done, self.commands = done, []
+
+        async def exec_in_sandbox(self, _thread_id: str, command: str, **_kwargs: Any) -> ExecResult:
+            self.commands.append(command)
+            if command.startswith("timeout ") and not self.done:
+                await asyncio.sleep(3600)
+            return ExecResult(0, "DONE" if command.startswith("timeout ") else "0", "")
+
+    async def _run_and_cancel(sandbox: _TurnSandbox) -> None:
+        task = asyncio.create_task(run_turn(sandbox, "t", "claude -p", "prompt", f"{_SCRATCH_DIR}/x", 60))
+        while not any(c.startswith("timeout ") for c in sandbox.commands):
+            await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    group_kill = f"kill -TERM -$(cat {_SCRATCH_DIR}/x.pid"
+    cancelled = _TurnSandbox(done=False)
+    asyncio.run(_run_and_cancel(cancelled))
+    kill_at = next(i for i, c in enumerate(cancelled.commands) if c.startswith(group_kill))
+    cleanup_at = next(i for i, c in enumerate(cancelled.commands) if c.startswith("rm -f"))
+    assert kill_at < cleanup_at, "a cancelled turn (agent shutdown) must kill the in-sandbox CLI before cleanup"
+    finished_turn = _TurnSandbox(done=True)
+    asyncio.run(run_turn(finished_turn, "t", "claude -p", "prompt", f"{_SCRATCH_DIR}/y", 60))
+    assert not any(c.startswith("kill ") for c in finished_turn.commands), "a finished turn has nothing to kill"
 
     print("cli_agent_exec self-check: all assertions passed")
 

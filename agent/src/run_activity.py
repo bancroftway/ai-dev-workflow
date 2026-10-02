@@ -58,6 +58,10 @@ DONE: object = object()
 
 _subscribers: dict[str, list["asyncio.Queue[Any]"]] = {}
 
+# Sessions THIS process keeps alive via heartbeat() -- how driven_elsewhere() tells its own beat
+# apart from another process's.
+_beating: set[str] = set()
+
 _HEARTBEAT_DIR = Path(__file__).resolve().parents[1] / "data" / "run_active"
 _BEAT_INTERVAL = 8  # seconds between touches
 _STALE_AFTER = 25  # seconds -- ~3 missed beats of margin before a marker reads as dead
@@ -93,6 +97,16 @@ def is_active(session_id: str) -> bool:
     with contextlib.suppress(FileNotFoundError):
         marker.unlink()
     return False
+
+
+def driven_elsewhere(session_id: str) -> bool:
+    """Another OS process (run_headless.py) is working this session right now: a fresh heartbeat
+    file that this process is not the one beating, and no run of this process's own. Guards the
+    two destructive resume-time cleanups -- stopping leftover CLI turns on reattach (local_docker)
+    and setting aside uncommitted work at intake (graph.py) -- from wrecking a live headless run
+    whose page someone just opened."""
+    key = session_id.lower()
+    return key not in _beating and _counts.get(key, 0) == 0 and is_active(key)
 
 
 def register_task(session_id: str, task: "asyncio.Task[None]") -> None:
@@ -248,19 +262,21 @@ def publish(session_id: str, item: Any) -> None:
                 queue.put_nowait(item)
 
 
-async def cancel_all_tasks() -> None:
+async def cancel_all_tasks() -> list[str]:
     """Called once, from main.py's _lifespan shutdown, BEFORE closing the checkpointer connection.
     After this fix, background graph tasks are orphaned from any HTTP request, so uvicorn's normal
     graceful-shutdown drain (which only waits for in-flight requests) no longer covers them -- left
     unhandled, a task could still be writing a checkpoint the instant the SQLite connection
     underneath it closes. return_exceptions=True: a task's own CancelledError (or any other
-    exception surfacing at cancellation) must not block the other tasks from being awaited too."""
-    tasks = [task for task in _tasks.values() if not task.done()]
-    if not tasks:
-        return
-    for task in tasks:
+    exception surfacing at cancellation) must not block the other tasks from being awaited too.
+
+    Returns the session ids it cancelled: cancelling ends only the asyncio side, so main.py then
+    stops whatever CLI turns those sessions may still have running in their sandboxes."""
+    live = {key: task for key, task in _tasks.items() if not task.done()}
+    for task in live.values():
         task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*live.values(), return_exceptions=True)
+    return list(live)
 
 
 @contextlib.asynccontextmanager
@@ -280,10 +296,12 @@ async def heartbeat(session_id: str) -> AsyncIterator[None]:
             await asyncio.sleep(_BEAT_INTERVAL)
 
     marker.touch()
+    _beating.add(key)
     task = asyncio.create_task(_beat())
     try:
         yield
     finally:
+        _beating.discard(key)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -457,7 +475,7 @@ def _demo() -> None:
             await finished
         register_task("cancel-all-1", asyncio.create_task(_never_ending()))
         register_task("cancel-all-2", finished)  # already done -- must be skipped, not re-awaited
-        await cancel_all_tasks()
+        assert await cancel_all_tasks() == ["cancel-all-1"], "returns only the sessions it cancelled"
         assert get_task("cancel-all-1").cancelled()
 
     asyncio.run(_cancel_all())
@@ -489,6 +507,21 @@ def _demo() -> None:
 
             asyncio.run(_uses_heartbeat())
             assert is_active("live-check") is False, "heartbeat() must remove its marker on exit"
+
+            # driven_elsewhere: another process's fresh beat counts; this process's own beat, its
+            # own in-process run, or no beat at all do not.
+            (_HEARTBEAT_DIR / "elsewhere-check.beat").touch()
+            assert driven_elsewhere("ELSEWHERE-check") is True
+            incr("elsewhere-check")
+            assert driven_elsewhere("elsewhere-check") is False, "this process is driving it"
+            decr("elsewhere-check")
+            assert driven_elsewhere("nobody-check") is False
+
+            async def _own_beat() -> None:
+                async with heartbeat("own-check"):
+                    assert driven_elsewhere("own-check") is False, "this process's own beat"
+
+            asyncio.run(_own_beat())
         finally:
             _HEARTBEAT_DIR, _BEAT_INTERVAL = real_dir, real_interval
 

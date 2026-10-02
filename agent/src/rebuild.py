@@ -69,13 +69,57 @@ class RebuildState(TypedDict):
     last_red_detail: str  # previous lap's TDD-red-gate finding, to detect a stuck fix session
     last_scan_fingerprint: frozenset[str]  # previous lap's scan-delta gating findings (line-number-free)
     checks: list[dict[str, Any]]  # the latest lap's per-check rows (CheckResult.to_dict), for its gate screen
+    passed_run_id: str  # the run this placement last passed in ("" = never) ...
+    passed_commit: str  # ... and HEAD right after that pass's commit -- the tree proven to build
 
 
 def default_rebuild_state() -> RebuildState:
     return {
         "status": "not_started", "fix_cycle_count": 0, "last_stdout_tail": "", "last_stderr_tail": "",
         "last_exit_ok": False, "cannot_verify": False, "build_commands": [], "last_red_detail": "",
-        "last_scan_fingerprint": frozenset(), "checks": [],
+        "last_scan_fingerprint": frozenset(), "checks": [], "passed_run_id": "", "passed_commit": "",
+    }
+
+
+async def stage_started(provider: Any, thread_id: str, state: dict[str, Any], stage_key: str) -> bool:
+    """Whether `stage_key` has touched this workspace: a status other than "not_started" (a draft
+    marks "drafting" before its first model call; intake re-marks an interrupted one whose work it
+    set aside -- graph._set_aside_interrupted_work), or its completed draft artifact on the branch, which rides
+    the workspace volume across container swaps and survives intake's status resets."""
+    status = ((state.get("stages") or {}).get(stage_key) or {}).get("status", "not_started")
+    if status != "not_started":
+        return True
+    return await repo_files.read_repo_file(provider, thread_id, workflow_persistence.stage_draft_path(stage_key)) is not None
+
+
+def should_skip_rebuild(rb: dict[str, Any], run_id: str | None, next_stage_started: bool) -> bool:
+    """A placement that already passed in THIS run, whose next stage has since started, is done:
+    building again on a resume would judge the next stage's work (finished or interrupted) against
+    this placement's contract -- session c2bbdca1's resume rebuilt ac-to-tests' check over an
+    interrupted implementation draft and burned its fix laps gutting the tests. Pure."""
+    return bool(
+        rb.get("status") == "clean" and run_id and rb.get("passed_run_id") == run_id and next_stage_started
+    )
+
+
+def blame_downstream(payload: dict[str, Any], spec: "RebuildSpec", passed_commit: str, changed: list[str]) -> dict[str, Any]:
+    """The escalation payload re-pointed at the stage after this placement: the check passed
+    earlier this run at `passed_commit`, so a failure now comes from the files changed since --
+    that stage's work, not the placement's own stage (session c2bbdca1 failed "at Tests" for code
+    an interrupted implementation draft left behind). Pure."""
+    shown = changed[: config.REBUILD_BLAME_FILES_PREVIEW_MAX]
+    more = f" (+{len(changed) - len(shown)} more)" if len(changed) > len(shown) else ""
+    note = (
+        f"Not a {spec.key} regression: this check passed earlier this run at {passed_commit[:12]}, and now "
+        f"fails on {len(changed)} file(s) changed since -- {spec.next_stage_key}'s work (an interrupted "
+        f"{spec.next_stage_key} draft leaves exactly this): {', '.join(shown)}{more}"
+    )
+    return {
+        **payload,
+        "stage": spec.next_stage_key,
+        "blamed_check": spec.key,
+        "changed_since_pass": shown,
+        "feedback": f"{note}\n\n{payload.get('feedback') or ''}".strip(),
     }
 
 
@@ -156,6 +200,10 @@ class RebuildSpec:
     # This closes that window: the same findings now fail the rebuild that caused them, while a fix
     # loop still exists and the feedback can name what regressed.
     scan_delta_gate: bool = False
+    # The real stage that runs after this placement (pipeline_layout's rebuild_placements reads it
+    # too). Once that stage has started, a re-run of this check on a resume would build against
+    # the next stage's work -- see should_skip_rebuild and blame_downstream.
+    next_stage_key: str = ""
 
 
 # The checks a rebuild placement runs, shown as rows on the gate after the stage it follows
@@ -676,6 +724,25 @@ def make_rebuild_node(spec: RebuildSpec):
         start_event = await run_event_store.append_event(start_event)
         await run_event_stream.emit_live(start_event, run_config)
 
+        # Already passed this run and the next stage has started: done (should_skip_rebuild).
+        # intake set aside any interrupted work first (graph._set_aside_interrupted_work), so the
+        # tree is clean either way.
+        next_started = bool(spec.next_stage_key) and rb.get("status") == "clean" and await stage_started(
+            provider, thread_id, state, spec.next_stage_key
+        )
+        if should_skip_rebuild(rb, state.get("run_id"), next_started):
+            summary = f"skipped: already passed this run; {spec.next_stage_key} has since started"
+            logger.info("rebuild %s %s", spec.key, summary)
+            skip_event = RunEvent(
+                run_id=run_id, session_id=thread_id, type=RunEventType.NODE_FINISHED,
+                stage=spec.key, node="rebuild", summary=summary,
+                payload={"passed": True, "cycle": rb["fix_cycle_count"], "skipped": True},
+            )
+            skip_event = await run_event_store.append_event(skip_event)
+            await run_event_stream.emit_live(skip_event, run_config)
+            rebuild[spec.key] = rb
+            return {"rebuild": rebuild}
+
         # GHCP finds every buildable project and builds it from the right directory, then reports
         # through a schema-validated terminal tool. Replaces "an audit model guesses a build
         # command + root, Python runs `cd {root} && {command}` blindly" -- that guess was wrong on
@@ -799,11 +866,7 @@ def make_rebuild_node(spec: RebuildSpec):
         # before its first model call and intake keeps it across resumes, so a draft killed
         # mid-turn (run d16959d3: three 40-minute timeouts, 200 tests already passing) no longer
         # reads as "codegen never ran" and gets its implementation stubbed back to red.
-        mctg_status = ((state.get("stages") or {}).get("minimal-code-to-green") or {}).get("status", "not_started")
-        mctg_never_ran = (
-            await repo_files.read_repo_file(provider, thread_id, workflow_persistence.MINIMAL_CODE_TO_GREEN_DRAFT_PATH) is None
-            and mctg_status == "not_started"
-        )
+        mctg_never_ran = not await stage_started(provider, thread_id, state, "minimal-code-to-green")
         if build_ok and spec.fix_scope == "scaffold_only" and mctg_never_ran:
             red_ran = True
             red_ok, red_detail = await _verify_all_red(
@@ -929,6 +992,9 @@ def make_rebuild_node(spec: RebuildSpec):
             # (codegen, fixes) become worth keeping -- the artifact-only commit sites never stage
             # source, so without this the pushed work branch would carry no code at all.
             await git_ops.commit_all(provider, thread_id, f"ai-dev-workflow: {spec.key} source changes (build green)")
+            # What should_skip_rebuild / blame_downstream compare against later in this run.
+            rb["passed_run_id"] = state.get("run_id") or ""
+            rb["passed_commit"] = await git_ops.head_commit(provider, thread_id) or ""
 
         # Durable + live NODE_FINISHED, closing the NODE_STARTED span above.
         finish_event = RunEvent(
@@ -1146,6 +1212,17 @@ def make_escalate_node(spec: RebuildSpec):
             # this the DB row's message is empty and the support/UI surfaces show a bare type.
             "feedback": (rb["last_stderr_tail"] or rb["last_stdout_tail"] or "")[-config.REBUILD_ESCALATE_FEEDBACK_CHARS:],
         }
+        # Passed earlier THIS run, failing now: the files changed since that pass broke it, and
+        # those belong to the stage after it (blame_downstream). An earlier run's pass proves
+        # nothing about this run's own redraft of the stage before it.
+        passed_commit = rb.get("passed_commit") or ""
+        if (
+            not rb.get("cannot_verify") and spec.next_stage_key and passed_commit
+            and rb.get("passed_run_id") and rb.get("passed_run_id") == state.get("run_id")
+        ):
+            changed = await git_ops.changed_since(get_sandbox_provider(), thread_id, passed_commit)
+            if changed:
+                payload = blame_downstream(payload, spec, passed_commit, changed)
         payload = await run_failure.record_run_failure_and_reset(
             thread_id, state.get("run_id"),
             payload=payload,
@@ -1526,6 +1603,96 @@ def _demo() -> None:
         stack_runner = original_stack_runner
 
     print("rebuild red-gate self-check: all assertions passed")
+    _demo_resume()
+
+
+def _demo_resume() -> None:
+    """Resume after an interrupted draft (session c2bbdca1): a placement that already passed this
+    run is skipped once the next stage has started, and a failure on files changed since its pass
+    is blamed on that next stage -- the pure rules, then both nodes end to end with stubs."""
+    import asyncio
+    import sys
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    spec = RebuildSpec(
+        "r_ac_to_tests", 3, "", "scaffold_only", "minimal-code-to-green_draft", next_stage_key="minimal-code-to-green",
+    )
+    sha = "3b9a9d7" + "0" * 33
+    passed = {**default_rebuild_state(), "status": "clean", "last_exit_ok": True, "passed_run_id": "r1", "passed_commit": sha}
+    assert should_skip_rebuild(passed, "r1", True)
+    assert not should_skip_rebuild(passed, "r1", False), "the next stage never started: just run it"
+    assert not should_skip_rebuild(passed, "r2", True), "an earlier run's pass proves nothing about this run"
+    assert not should_skip_rebuild({**passed, "status": "failed"}, "r1", True), "a failed check always re-runs"
+    assert not should_skip_rebuild(default_rebuild_state(), "", True)
+
+    changed = [f"apps/web/src/f{i}.ts" for i in range(12)]
+    with patch.object(config, "REBUILD_BLAME_FILES_PREVIEW_MAX", 10):
+        blamed = blame_downstream(
+            {"stage": "r_ac_to_tests", "type": "rebuild_cap_exceeded", "feedback": "TS2307"}, spec, sha, changed,
+        )
+    assert blamed["stage"] == "minimal-code-to-green" and blamed["blamed_check"] == "r_ac_to_tests", blamed
+    assert blamed["type"] == "rebuild_cap_exceeded", "WHICH ceiling was hit is unchanged -- only who caused it"
+    assert len(blamed["changed_since_pass"]) == 10 and "(+2 more)" in blamed["feedback"], blamed["feedback"]
+    assert sha[:12] in blamed["feedback"] and blamed["feedback"].endswith("TS2307"), "keeps the build's own error"
+
+    me = sys.modules[__name__]
+    events: list[RunEvent] = []
+
+    async def _append(event: RunEvent) -> RunEvent:
+        events.append(event)
+        return event
+
+    async def _emit(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    class _NoExecProvider:
+        async def exec_in_sandbox(self, _thread_id: str, command: str, **_kwargs: Any) -> Any:
+            raise AssertionError(f"a skipped check must not touch the sandbox: {command}")
+
+    thread_id = "t-rebuild-resume-selfcheck"
+    run_config = {"configurable": {"thread_id": thread_id}}
+    sandbox_registry.set(thread_id, object())
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(me, "get_sandbox_provider", lambda: _NoExecProvider()))
+            stack.enter_context(patch.object(run_event_store, "append_event", _append))
+            stack.enter_context(patch.object(run_event_stream, "emit_live", _emit))
+            state = {
+                "provider": "claude", "run_id": "r1", "rebuild": {spec.key: passed},
+                # intake re-marked the interrupted draft (graph._set_aside_interrupted_work)
+                "stages": {"minimal-code-to-green": {"status": "drafting"}},
+            }
+            result = asyncio.run(make_rebuild_node(spec)(state, run_config))
+            assert result["rebuild"][spec.key] == passed, "skipping keeps the pass as it was"
+            assert make_route_after_rebuild(spec)({"rebuild": result["rebuild"]}) == "next"
+            assert events[-1].summary == "skipped: already passed this run; minimal-code-to-green has since started"
+            assert events[-1].payload == {"passed": True, "cycle": 0, "skipped": True}, events[-1].payload
+
+        # Escalation after the check passed this run and then failed: blamed on the next stage.
+        changed_calls: list[str] = []
+
+        async def _changed(_provider: Any, _thread_id: str, commit: str) -> list[str]:
+            changed_calls.append(commit)
+            return ["apps/web/src/main.ts", "apps/web/angular.json"]
+
+        async def _record(_thread_id: str, _run_id: Any, *, payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            return payload
+
+        failed = {**passed, "status": "failed", "last_exit_ok": False, "fix_cycle_count": 3, "last_stderr_tail": "TS2307"}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(me, "get_sandbox_provider", lambda: _NoExecProvider()))
+            stack.enter_context(patch.object(git_ops, "changed_since", _changed))
+            stack.enter_context(patch.object(run_failure, "record_run_failure_and_reset", _record))
+            out = asyncio.run(make_escalate_node(spec)({"run_id": "r1", "rebuild": {spec.key: failed}}, run_config))
+            assert changed_calls == [sha] and out["run_failure"]["stage"] == "minimal-code-to-green", out["run_failure"]
+            assert "apps/web/src/main.ts" in out["run_failure"]["feedback"]
+            # Passed only in an EARLIER run: this run's own redraft may have caused it -- no blame.
+            out = asyncio.run(make_escalate_node(spec)({"run_id": "r2", "rebuild": {spec.key: failed}}, run_config))
+            assert out["run_failure"]["stage"] == "r_ac_to_tests" and changed_calls == [sha], out["run_failure"]
+    finally:
+        sandbox_registry.pop(thread_id)
+    print("rebuild resume self-check: all assertions passed")
 
 
 if __name__ == "__main__":

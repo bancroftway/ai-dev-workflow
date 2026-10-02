@@ -7,18 +7,21 @@ from src.env_bootstrap import bootstrap_env
 bootstrap_env()  # .env, then AZURE_CONFIG_VAULT_URI -- before any import that reads os.environ
 
 import asyncio
+import hmac
 import json
 import logging
 import os
+import secrets
 import uuid
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from ag_ui.core import EventType, RunAgentInput, RunFinishedEvent, RunStartedEvent, StateSnapshotEvent
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
 from copilotkit import LangGraphAGUIAgent
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -26,8 +29,10 @@ from fastapi.responses import JSONResponse
 # actually visible -- Python's root logger defaults to WARNING, which silently drops them.
 logging.basicConfig(level=logging.INFO)
 
-from src import checkpoint, run_activity, runtime_settings
+from src import checkpoint, cli_agent_exec, config, run_activity, runtime_settings
 from src.graph import graph
+from src.sandbox import get_sandbox_provider
+from src.sandbox import registry as sandbox_registry
 from src.health_report import reap_orphaned_jobs
 from src.health_report_api import router as health_reports_router
 from src.sessions_api import catalog_router as tech_stack_catalog_router
@@ -62,7 +67,15 @@ async def _lifespan(_app: FastAPI):
         # request, so uvicorn's own graceful-shutdown drain (in-flight requests only) never waits
         # for them -- cancel them explicitly before the checkpointer connection underneath them
         # closes, or a task can still be mid-write to an already-closed SQLite connection.
-        await run_activity.cancel_all_tasks()
+        cancelled = await run_activity.cancel_all_tasks()
+        # Cancelling ends only the asyncio side: a turn's CLI runs backgrounded INSIDE the sandbox
+        # and kept writing into the workspace with nobody waiting on it (session c2bbdca1).
+        # run_turn's own `finally` kills it on cancellation; this sweep is the backstop for a
+        # cancellation that never reached that `finally`.
+        for thread_id in cancelled:
+            if sandbox_registry.get(thread_id) is not None:
+                await cli_agent_exec.stop_cli_turns(get_sandbox_provider(), thread_id)
+        logging.getLogger(__name__).info("lifespan shutdown: cancelled %d graph run(s) %s", len(cancelled), cancelled)
         await checkpoint.close_checkpointer()
 
 
@@ -285,7 +298,58 @@ async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse
     logging.getLogger("app").exception("unhandled error on %s", request.url.path)
     return JSONResponse(status_code=500, content={"detail": "internal error"})
 
-if __name__ == "__main__":
+# Graceful local shutdown (dev.ps1). Ctrl+C reaches this process only from its own console, and
+# dev.ps1's force-kill (taskkill /F) skips _lifespan's shutdown entirely -- graph runs are never
+# cancelled and their CLI turns keep running inside the sandbox. dev.ps1 asks first: POST here,
+# then waits. Exists only under `python main.py` (_serve mints the token); the deployed
+# `uvicorn main:app` entrypoint never sets one, so there this route is a plain 404.
+_SHUTDOWN_HEADER = "x-aidw-shutdown-token"
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1")
+_server: Any = None  # the uvicorn.Server _serve runs
+_shutdown_token: str | None = None
+
+
+def shutdown_token_path(port: int) -> Path:
+    """Where _serve writes the shutdown token for the agent on `port` (agent/data/, gitignored):
+    only something with access to this checkout -- dev.ps1 -- can read it."""
+    return Path(__file__).resolve().parent / "data" / f"shutdown-{port}.token"
+
+
+@app.post("/admin/shutdown", status_code=202)
+async def _admin_shutdown(request: Request) -> dict[str, bool]:
+    if _server is None or not _shutdown_token:
+        raise HTTPException(status_code=404)
+    if request.client is None or request.client.host not in _LOOPBACK_HOSTS:
+        raise HTTPException(status_code=403, detail="loopback only")
+    if not hmac.compare_digest(request.headers.get(_SHUTDOWN_HEADER, ""), _shutdown_token):
+        raise HTTPException(status_code=401, detail="missing or invalid shutdown token")
+    # What a console Ctrl+C does -- stop accepting, give open requests
+    # GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, then run _lifespan's shutdown -- minus its two side effects:
+    # handle_exit() would re-raise the signal once serving ends (killing the process before _serve's
+    # `finally`), and a second SIGINT means "force quit", which skips that shutdown. Idempotent.
+    _server.should_exit = True
+    return {"shutting_down": True}
+
+
+def _serve() -> None:
+    global _server, _shutdown_token
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8123")))
+    port = int(os.environ.get("PORT", "8123"))
+    token_path = shutdown_token_path(port)
+    _shutdown_token = secrets.token_urlsafe(32)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(_shutdown_token, encoding="utf-8")
+    # timeout_graceful_shutdown: an attached tab's SSE stream never finishes on its own, and
+    # uvicorn otherwise waits on it forever -- so _lifespan's shutdown never ran.
+    _server = uvicorn.Server(uvicorn.Config(
+        app, host="0.0.0.0", port=port, timeout_graceful_shutdown=config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    ))
+    try:
+        _server.run()
+    finally:
+        token_path.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    _serve()

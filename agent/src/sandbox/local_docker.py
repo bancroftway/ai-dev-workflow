@@ -16,6 +16,7 @@ import os
 import tarfile
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from . import registry
 from .. import config as workflow_config
@@ -186,6 +187,29 @@ class _RunningSandbox:
     host_port: int
     connection_token: str
     last_active: float = field(default_factory=time.monotonic)
+
+
+async def _stop_orphaned_turns(session_id: str, exec_fn: Callable[[str], Awaitable[tuple[int, str, str]]]) -> None:
+    """A container that outlived the agent process can still be running that process's CLI turn
+    -- nothing in this process started it, so nothing will ever read its result, and it keeps
+    editing the workspace a resume is about to build on (session c2bbdca1). Stop it before this
+    session's first new turn. Skipped while another process (run_headless.py) is driving the
+    session: its turns are live, not orphaned. Fail-soft -- a failed sweep must not block reattach.
+    exec_fn, not exec_in_sandbox: provision() holds self._lock, which exec_in_sandbox takes too."""
+    from .. import run_activity  # local: run_activity is a leaf; keeps this module's imports flat
+    from ..cli_agent_exec import parse_stopped_turns, stop_cli_turns_command  # local: cli_agent_exec imports sandbox.provider
+
+    if run_activity.driven_elsewhere(session_id):
+        logger.info("reattach session_id=%s: another process is driving it -- leaving its CLI turns alone", session_id)
+        return
+    try:
+        _, out, _ = await exec_fn(stop_cli_turns_command(workflow_config.CLI_TURN_STOP_GRACE_SECONDS))
+    except Exception:  # noqa: BLE001 -- see docstring
+        logger.warning("reattach session_id=%s: could not stop leftover CLI turns", session_id, exc_info=True)
+        return
+    stopped = parse_stopped_turns(out)
+    if stopped:
+        logger.warning("reattach session_id=%s: stopped %s leftover agent CLI turn process(es)", session_id, stopped)
 
 
 class LocalDockerProvider(SandboxProvider):
@@ -512,6 +536,7 @@ class LocalDockerProvider(SandboxProvider):
             await wait_for_cli_ready(_exec, version_command=f"{provider} --version")
         except Exception:  # noqa: BLE001 -- liveness probe; any failure means "don't reattach"
             return None
+        await _stop_orphaned_turns(session_id, _exec)
         return _RunningSandbox(container_id, 0, "")
 
     async def touch(self, session_id: str) -> None:

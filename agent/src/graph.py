@@ -21,6 +21,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -54,6 +55,7 @@ from . import rebuild
 from . import run_event_store
 from . import run_event_stream
 from .run_events import RunEvent, RunEventType, encode_io_text
+from . import run_activity
 from . import run_failure
 from . import session_store
 from . import spec_ledger
@@ -3011,6 +3013,91 @@ def _reset_e2e_attempts_exhausted(attempts: int) -> bool:
     return attempts >= workflow_config.AIDW_E2E_RESET_MAX_ATTEMPTS
 
 
+# make_draft_node's start-of-draft commit (it persists "drafting" before the first model call).
+# _set_aside_interrupted_work reads the newest one back to learn which draft a resume interrupted:
+# the commit survives every later state.json rewrite, the "drafting" status itself does not (the
+# killed draft node never returned it to the checkpoint, and the resume's first persist overwrote
+# it -- session c2bbdca1).
+_DRAFTING_COMMIT = "ai-dev-workflow: {stage} drafting"
+_DRAFTING_COMMIT_GREP = "^ai-dev-workflow: .* drafting$"
+_DRAFTING_COMMIT_RE = re.compile(r"^ai-dev-workflow: (\S+) drafting$")
+# run_failure["type"] when intake could not set interrupted work aside: _route_after_intake ENDs
+# the run on it rather than build on a tree it could not clean, and the next intake retries.
+_SET_ASIDE_FAILED = "set_aside_failed"
+
+
+def _interrupted_draft_stage(stages: dict[str, Any], last_drafting_subject: str | None) -> str | None:
+    """The stage whose draft this re-entry finds interrupted: the newest drafting commit's stage,
+    when the checkpoint never saw that draft finish (still "not_started" -- the killed draft node
+    never returned -- or "drafting"). A finished draft moves its stage on (ready_for_review,
+    needs_clarification, approved), so whatever it left uncommitted is real, kept work -- e.g.
+    ac-to-tests' approved tests, which are only committed once its rebuild check passes. Pure."""
+    match = _DRAFTING_COMMIT_RE.match(last_drafting_subject or "")
+    if match is None:
+        return None
+    stage_key = match.group(1)
+    status = (stages.get(stage_key) or {}).get("status", "not_started")
+    return stage_key if status in ("not_started", "drafting") else None
+
+
+async def _set_aside_interrupted_work(
+    thread_id: str, state: GraphState, config: RunnableConfig, stages: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Session c2bbdca1: a minimal-code-to-green draft was interrupted (agent restart) while its
+    CLI kept writing an implementation into the workspace, uncommitted. The resume replayed from
+    intake and ac-to-tests' rebuild check built that half-written code, failed, and spent its fix
+    laps gutting the tests to compensate. Runs first thing on every graph re-entry, before any
+    rebuild/verify placement: when the newest draft was interrupted (_interrupted_draft_stage),
+    every uncommitted change outside the bookkeeping folder moves to a side ref
+    (refs/aidw/interrupted/<stage>-<utc>, never the work branch, never pushed) and the tree goes
+    back to HEAD -- the redraft starts clean and nothing is thrown away. A stage whose work was set
+    aside is re-marked "drafting" (rebuild.stage_started reads it: that stage HAS touched the
+    workspace -- the killed draft node never returned that status to the checkpoint).
+
+    Returns a run_failure payload when the work could not be set aside -- the run must stop
+    rather than build on that tree. Leaves a session another process (run_headless.py) is driving
+    alone: its draft is live, not interrupted."""
+    if sandbox_registry.get(thread_id) is None:
+        return None
+    if run_activity.driven_elsewhere(thread_id):
+        logger.warning("intake_node: thread_id=%s is being driven by another process -- not touching its workspace", thread_id)
+        return None
+    provider = get_sandbox_provider()
+    stage_key = _interrupted_draft_stage(
+        stages, await git_ops.last_commit_subject(provider, thread_id, _DRAFTING_COMMIT_GREP)
+    )
+    if stage_key is None:
+        return None
+    ref = f"refs/aidw/interrupted/{stage_key}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    try:
+        commit = await git_ops.set_aside_uncommitted(
+            provider, thread_id, ref, f"ai-dev-workflow: work left by the interrupted {stage_key} draft"
+        )
+    except RuntimeError as exc:
+        logger.error("intake_node: thread_id=%s could not set aside interrupted %s work: %s", thread_id, stage_key, exc)
+        return await git_ops.record_run_failure(
+            thread_id,
+            {
+                "stage": stage_key, "type": _SET_ASIDE_FAILED,
+                "feedback": (
+                    f"The interrupted {stage_key} draft left uncommitted changes that could not be "
+                    f"set aside, so the run stopped instead of building on them: {exc}"
+                ),
+            },
+            state.get("run_id"), keep_sandbox=True,
+        )
+    if commit is not None:
+        stage = stages.setdefault(stage_key, default_stage_state())
+        if stage.get("status", "not_started") == "not_started":
+            stage["status"] = "drafting"
+        summary = f"set aside uncommitted work from the interrupted {stage_key} draft to {ref}"
+        logger.warning("intake_node: thread_id=%s %s (%s)", thread_id, summary, commit)
+        await _emit_run_event(
+            state, config, stage_key, RunEventType.NODE_FINISHED, "set_aside", summary, {"ref": ref, "commit": commit}
+        )
+    return None
+
+
 async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
 
@@ -3163,6 +3250,11 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         if hydrated is not None:
             stages = hydrated
             logger.info("intake_node: hydrated prior workflow state for thread_id=%s", thread_id)
+
+    # Before anything below can persist over it, and before any rebuild/verify placement runs.
+    set_aside_failure = await _set_aside_interrupted_work(thread_id, state, config, stages)
+    if set_aside_failure is not None:
+        return {"run_failure": set_aside_failure}
 
     # _ALL_STAGE_SPECS (STAGES + every standalone StageSpec: adversarial-audit/b/d, exit, brownfield-baseline-brownfield) is
     # assigned near the bottom of this module, after all of them are defined -- referencing it
@@ -3453,6 +3545,8 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
         # omitted otherwise so an ordinary intake call leaves this channel untouched, same as
         # before this existed.
         **({"rebuild": rebuild_state_update} if rebuild_state_update is not None else {}),
+        # A previous intake's set-aside failure ended that run right here; this one got past it.
+        **({"run_failure": None} if (state.get("run_failure") or {}).get("type") == _SET_ASIDE_FAILED else {}),
     }
 
 
@@ -3745,7 +3839,7 @@ def make_draft_node(stage_spec: StageSpec) -> Callable[[GraphState, RunnableConf
             drafting_stages = {key: dict(value) for key, value in state["stages"].items()}
             drafting_stages[stage_spec.key]["status"] = "drafting"
             try:
-                await _persist_if_sandboxed(thread_id, state, drafting_stages, f"ai-dev-workflow: {stage_spec.key} drafting")
+                await _persist_if_sandboxed(thread_id, state, drafting_stages, _DRAFTING_COMMIT.format(stage=stage_spec.key))
             except Exception:  # noqa: BLE001 -- bookkeeping must never block the draft itself
                 logger.warning("could not persist %s drafting status", stage_spec.key, exc_info=True)
 
@@ -5787,6 +5881,7 @@ REBUILD_AFTER_AC_TO_TESTS = rebuild.RebuildSpec(
     fix_prompt_addendum="",  # unused for scaffold_only -- rebuild.py substitutes its own addendum
     fix_scope="scaffold_only",
     next_node="minimal-code-to-green_draft",
+    next_stage_key="minimal-code-to-green",
 )
 
 REBUILD_AFTER_P6 = rebuild.RebuildSpec(
@@ -5797,6 +5892,7 @@ REBUILD_AFTER_P6 = rebuild.RebuildSpec(
     # Into the pre-scan, not straight into the draft: remediation cannot act on findings nobody has
     # measured yet, and the scan of the code minimal-code-to-green just wrote is that measurement.
     next_node="remediation_scan",
+    next_stage_key="remediation",
 )
 
 # Stage 6 (remediation): rebuild after fixes applied
@@ -5808,6 +5904,7 @@ REBUILD_FOR_REMEDIATION = rebuild.RebuildSpec(
     # Into test-hardening, NOT adversarial-compliance: the audit was moved to the end of the back
     # half so it can judge the finished state. See REBUILD_FOR_ADVERSARIAL_COMPLIANCE below.
     next_node="test_hardening_run_tests",
+    next_stage_key="adversarial-compliance",
 )
 
 # Stage 7 (adversarial-compliance): rebuild after compliance checks
@@ -5834,6 +5931,7 @@ REBUILD_FOR_ADVERSARIAL_COMPLIANCE = rebuild.RebuildSpec(
     # successful path gets the README leg; failure/escalate paths route straight to
     # metrics-exit_draft and deliberately skip it.
     next_node="readme_write",
+    next_stage_key="metrics-exit",
 )
 
 # Maps a STAGES entry's key -> the R placement immediately after it, so build_graph()'s per-stage
@@ -5890,6 +5988,8 @@ def _route_after_intake(state: GraphState) -> str:
     # still wipe status/merge_ready/pr_url right back.
     if state.get("reopen_blocked"):
         return END
+    if (state.get("run_failure") or {}).get("type") == _SET_ASIDE_FAILED:
+        return END  # intake could not clean the tree an interrupted draft left -- never build on it
     if (state.get("raw_requirements_text") or "").strip():
         return "scaffold"
     raw_req = (state.get("stages") or {}).get("raw-requirements") or {}
@@ -7053,6 +7153,89 @@ def _demo_code_gen_mode_routing() -> None:
     print(f"code_gen_mode routing self-check: all assertions passed ({checked} route outcomes)")
 
 
+def _demo_set_aside_interrupted_work() -> None:
+    """intake's set-aside (session c2bbdca1): which draft counts as interrupted, and what intake
+    does with each outcome -- work set aside, nothing to set aside, set-aside failed (run stops),
+    another process driving (hands off). The git half runs against a real repo in git_ops' own
+    self-check; this drives the real _set_aside_interrupted_work with git_ops faked."""
+    import asyncio
+    import sys
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    drafting = _DRAFTING_COMMIT.format(stage="minimal-code-to-green")
+    assert _DRAFTING_COMMIT_RE.match(drafting) and re.search(_DRAFTING_COMMIT_GREP.replace(".*", ".+"), drafting)
+    mctg = lambda status: {"minimal-code-to-green": {"status": status}}  # noqa: E731
+    # The killed draft node never returned: the checkpoint still says not_started (c2bbdca1).
+    assert _interrupted_draft_stage(mctg("not_started"), drafting) == "minimal-code-to-green"
+    assert _interrupted_draft_stage(mctg("drafting"), drafting) == "minimal-code-to-green"
+    assert _interrupted_draft_stage({}, drafting) == "minimal-code-to-green", "lost checkpoint, nothing hydrated"
+    for finished in ("ready_for_review", "needs_clarification", "approved"):
+        assert _interrupted_draft_stage(mctg(finished), drafting) is None, finished
+    # Approved ac-to-tests: its tests stay uncommitted until its rebuild check passes -- keep them.
+    approved_tests = {"ac-to-tests": {"status": "approved"}}
+    assert _interrupted_draft_stage(approved_tests, _DRAFTING_COMMIT.format(stage="ac-to-tests")) is None
+    assert _interrupted_draft_stage(mctg("not_started"), None) is None
+    assert _interrupted_draft_stage(mctg("not_started"), "ai-dev-workflow: scaffold") is None
+
+    me = sys.modules[__name__]
+    calls: dict[str, list[Any]] = {"set_aside": [], "events": [], "failures": []}
+
+    async def _subject(_provider: Any, _thread_id: str, grep: str) -> str:
+        assert grep == _DRAFTING_COMMIT_GREP
+        return drafting
+
+    async def _record(thread_id: str, payload: dict[str, Any], run_id: Any = None, **_kwargs: Any) -> dict[str, Any]:
+        calls["failures"].append(payload)
+        return payload
+
+    async def _emit(_state: Any, _config: Any, stage_key: str, _type: Any, node: str, summary: str, payload: Any = None) -> None:
+        calls["events"].append((stage_key, node, summary, payload))
+
+    def _run(outcome: Any, *, elsewhere: bool = False) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        async def _set_aside(_provider: Any, _thread_id: str, ref: str, _message: str) -> str | None:
+            calls["set_aside"].append(ref)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        stages = mctg("not_started")
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(me, "get_sandbox_provider", lambda: object()))
+            stack.enter_context(patch.object(me, "_emit_run_event", _emit))
+            stack.enter_context(patch.object(sandbox_registry, "get", lambda _thread_id: object()))
+            stack.enter_context(patch.object(run_activity, "driven_elsewhere", lambda _thread_id: elsewhere))
+            stack.enter_context(patch.object(git_ops, "last_commit_subject", _subject))
+            stack.enter_context(patch.object(git_ops, "set_aside_uncommitted", _set_aside))
+            stack.enter_context(patch.object(git_ops, "record_run_failure", _record))
+            result = asyncio.run(_set_aside_interrupted_work("t", {"run_id": "r1"}, {"configurable": {"thread_id": "t"}}, stages))
+        return result, stages
+
+    # Dirty: set aside to a side ref, the event says where, the stage reads as started.
+    failure, stages = _run("c0ffee")
+    assert failure is None and stages["minimal-code-to-green"]["status"] == "drafting"
+    assert re.fullmatch(r"refs/aidw/interrupted/minimal-code-to-green-\d{8}T\d{6}Z", calls["set_aside"][-1]), calls["set_aside"]
+    stage_key, node, summary, payload = calls["events"][-1]
+    assert stage_key == "minimal-code-to-green" and node == "set_aside" and payload["commit"] == "c0ffee", calls["events"]
+    assert payload["ref"] in summary, "the run event must say where the work went"
+    # Clean: nothing to set aside -- no event, nothing re-marked.
+    events_before = len(calls["events"])
+    failure, stages = _run(None)
+    assert failure is None and stages["minimal-code-to-green"]["status"] == "not_started"
+    assert len(calls["events"]) == events_before
+    # Failure: a run_failure the router ENDs on -- never a build on that tree.
+    failure, _ = _run(RuntimeError("index.lock exists"))
+    assert failure is not None and failure["type"] == _SET_ASIDE_FAILED and failure["stage"] == "minimal-code-to-green"
+    assert "index.lock exists" in failure["feedback"] and calls["failures"][-1] is failure
+    assert _route_after_intake({"run_failure": failure, "raw_requirements_text": "build it"}) == END  # type: ignore[typeddict-item]
+    assert _route_after_intake({"run_failure": {"type": "rebuild_cap_exceeded"}, "raw_requirements_text": "x"}) == "scaffold"  # type: ignore[typeddict-item]
+    # Another process (run_headless) is driving it: hands off, git never consulted.
+    attempts = len(calls["set_aside"])
+    failure, stages = _run("c0ffee", elsewhere=True)
+    assert failure is None and len(calls["set_aside"]) == attempts and stages["minimal-code-to-green"]["status"] == "not_started"
+    print("set-aside interrupted work self-check: all assertions passed")
+
+
 def _demo() -> None:
     """`cd agent && uv run python -m src.graph`.
 
@@ -8213,6 +8396,7 @@ def _demo() -> None:
     _demo_open_audit_findings()
     _demo_targeted_fix_stuck_decision()
     _demo_reset_e2e_lever()
+    _demo_set_aside_interrupted_work()
     _demo_code_gen_mode_routing()
     _demo_audit_ran_this_lap()
 
