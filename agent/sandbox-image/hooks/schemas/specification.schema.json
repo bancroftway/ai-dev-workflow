@@ -45,6 +45,27 @@
       "title": "AcceptanceCriterion",
       "type": "object"
     },
+    "PrdChangeWithoutStory": {
+      "description": "A PRD change this round no story covers -- see check_prd_changes_addressed.",
+      "properties": {
+        "change_id": {
+          "description": "The PRD change id (`PC-n`), copied exactly.",
+          "title": "Change Id",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "description": "One line: why no story in the specification is affected.",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "change_id"
+      ],
+      "title": "PrdChangeWithoutStory",
+      "type": "object"
+    },
     "PresenceList": {
       "description": "Typed replacement for a bare `list[str]` field whenever an empty list is ambiguous: did the\ndetector look and find nothing, or did it never look? `status` makes that explicit instead of\nforcing every reader to guess from an empty list alone.",
       "properties": {
@@ -140,6 +161,14 @@
           "description": "'unchanged': this ticket's requirements leave the story as it is. 'modified': they change it -- you re-emit it citing existing_us_id with the new wording or criteria, add a criterion, or retire one of its criteria. 'retired': they remove it -- you list it in retired_us_ids. A new requirement that contradicts, narrows or replaces the story changes it even when it never names it. Seeded null; never leave it null.",
           "title": "Decision"
         },
+        "prd_change_ids": {
+          "description": "This round's PRD changes (`PC-n`, from the requirements PRD merge) this decision accounts for -- only on a 'modified' or 'retired' decision. Copy the ids exactly.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Prd Change Ids",
+          "type": "array"
+        },
         "reason": {
           "default": "",
           "description": "One line: why, weighed against this ticket's requirements (for a change, which requirement drives it).",
@@ -234,6 +263,14 @@
     "out_of_scope": {
       "$ref": "#/$defs/PresenceList",
       "description": "Things explicitly decided NOT to build for this ticket, or an explicit absent+reason when nothing was excluded."
+    },
+    "prd_changes_without_story": {
+      "description": "This round's PRD changes (`PC-n`) that no story covers -- e.g. a requirement the specification never had -- each with a reason. Every PRD change is either cited by a modified/retired story decision or listed here.",
+      "items": {
+        "$ref": "#/$defs/PrdChangeWithoutStory"
+      },
+      "title": "Prd Changes Without Story",
+      "type": "array"
     },
     "questions": {
       "description": "The COMPLETE question ledger -- every question ever raised across all drafts of this ticket with its current status, answered and assumed entries included. Any 'open' entry routes the draft to the clarification pause instead of the human gate.",

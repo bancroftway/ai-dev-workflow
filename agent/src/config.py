@@ -194,6 +194,18 @@ _SETTINGS: dict[str, _Setting] = {
         "Higher gives a PRD merge that keeps missing an undeclared change more laps to fix it (more wall-clock/spend); lower escalates sooner. Escalating stops the run before the Specification drafts.",
         "positive integer",
     ),
+    "PRD_DIFF_HEAD_CHARS": _Setting(
+        "int", "AIDW_PRD_DIFF_HEAD_CHARS", "6000", "truncation",
+        "Characters kept from the START of this round's PRD diff when it is shown to the Specification draft.",
+        "Higher shows more of a large requirements change verbatim (longer prompt); lower trims sooner. The declared PRD changes are always shown in full -- only the raw diff is capped.",
+        "positive integer",
+    ),
+    "PRD_DIFF_TAIL_CHARS": _Setting(
+        "int", "AIDW_PRD_DIFF_TAIL_CHARS", "2000", "truncation",
+        "Characters kept from the END of this round's PRD diff when it is shown to the Specification draft.",
+        "Same trade-off as PRD_DIFF_HEAD_CHARS, for the tail; the middle of an oversized diff is elided, never its ends.",
+        "positive integer",
+    ),
     "PLAN_MAX_VERIFY_CYCLES": _Setting(
         "int", "AIDW_PLAN_MAX_VERIFY_CYCLES", "5", "verify_cycles",
         "Max draft<->verify retry laps for the Plan stage before it escalates as failed.",

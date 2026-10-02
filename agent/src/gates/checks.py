@@ -51,6 +51,7 @@ IN_TURN_CHECKS: dict[str, tuple[Literal["full", "partial"], str]] = {
     "spec.ledger_retirements": ("full", "check-ledger-sync-stop"),
     "spec.ledger_bug_affected": ("partial", "check-ledger-sync-stop"),
     "spec.story_decisions": ("full", "check-ledger-sync-stop"),
+    "spec.prd_changes_addressed": ("full", "check-ledger-sync-stop"),
     "plan.steps_json": ("partial", "check-plan-schema-stop"),
     "plan.ledger_sync": ("partial", "check-plan-citations-stop"),
     "plan.manifest_json": ("partial", "check-plan-schema-stop"),

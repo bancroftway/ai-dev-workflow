@@ -95,7 +95,12 @@ from .gates.diagram_gate import (
     verify_plan_diagrams,
 )
 from .gates.coverage_parsing import MIN_COVERAGE_PERCENT
-from .gates.ledger_sync_checks import check_empty_draft, check_story_decisions, find_open_questions
+from .gates.ledger_sync_checks import (
+    check_empty_draft,
+    check_prd_changes_addressed,
+    check_story_decisions,
+    find_open_questions,
+)
 from .gates.test_coverage_gate import (
     MINIMAL_CODE_TO_GREEN_HARD_RULES,
     MINIMAL_CODE_TO_GREEN_QUALITY_GUIDANCE,
@@ -127,6 +132,7 @@ from .markdown_render import (
     render_tech_stack_markdown,
 )
 from .prompt_loader import load_prompt, load_prompt_pair, render_prompt
+from .text_truncate import truncate_middle
 from . import template_loader
 from .sandbox import registry as sandbox_registry
 from .sandbox.factory import get_sandbox_provider
@@ -504,6 +510,8 @@ SPEC_TICKET_MODE_SEGMENT = load_prompt("specification_ticket_mode_segment")
 # story_decisions row -- only present on the prompt-only context
 # spec_ledger.hydrate_specification_ticket_context returns. `<<stories>>` is rendered here.
 SPEC_LIVE_STORIES_SEGMENT = load_prompt("specification_live_stories_segment")
+# This round's PRD changes (PC-n) and diff, from the requirements-prd stage. `<<changes>>`/`<<diff>>`.
+SPEC_PRD_CHANGES_SEGMENT = load_prompt("specification_prd_changes_segment")
 
 PLAN_SYSTEM_PROMPT = load_prompt("plan_draft")
 
@@ -676,6 +684,21 @@ def _build_specification_prompt(state: GraphState) -> list[BaseMessage]:
             f"- {s['id']} — {s['title']}" + (" [deferred]" if s.get("deferred") else "") for s in stage["live_stories"]
         )
         messages.append(HumanMessage(content=render_prompt(SPEC_LIVE_STORIES_SEGMENT, stories=stories)))
+    # This round's PRD changes -- only against an existing baseline (a first ticket has none to weigh).
+    prd_content = (state["stages"].get("requirements-prd") or {}).get("approved_content") or {}
+    if stage.get("ticket_mode_baseline") and (prd_content.get("changes") or prd_content.get("diff")):
+        changes = "\n".join(
+            f"- {c['id']} — {'Modified' if c.get('kind') == 'modified' else 'Removed'}"
+            + (" (implied)" if c.get("basis") == "implied" else "")
+            + f": {c.get('prior_text', '')}"
+            + (f" → {c['new_text']}" if c.get("new_text") else "")
+            + f' (driven by: "{c.get("delta_quote", "")}")'
+            for c in prd_content.get("changes") or []
+        ) or "(none -- this round only added requirements)"
+        diff = truncate_middle(
+            prd_content.get("diff") or "", workflow_config.PRD_DIFF_HEAD_CHARS, workflow_config.PRD_DIFF_TAIL_CHARS
+        )
+        messages.append(HumanMessage(content=render_prompt(SPEC_PRD_CHANGES_SEGMENT, changes=changes, diff=diff)))
     # File-based-editing plan, Part 1 sect. 4/6: the specification lives in a real file now, not a
     # prompt-injected blob -- `spec_ledger.hydrate_ticket_mode_context` already seeded/bootstrapped
     # it before this prompt is even built (Part 1 sect. 7), so it always exists by the time drafting
@@ -1197,7 +1220,8 @@ def _build_requirements_prd_prompt(state: GraphState) -> list[BaseMessage]:
 # from check_narrative_format (a sibling deterministic check, not inside sync_ledger itself, added
 # the same day) for the narrative-template shape -- 15 from sync_ledger-adjacent checks, plus the
 # 2 non-sync_ledger rules below (open-question, delta-only-scope) = 17, plus the ticket-mode
-# story-decisions rule (spec.story_decisions, 2026-10-02) = 18 total.
+# story-decisions rule (spec.story_decisions, 2026-10-02) = 18, plus the PRD-change linkage rule
+# (spec.prd_changes_addressed, same day) = 19 total.
 SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "Never leave a clarifying question open -- every question you raised must be answered "
     "(status=answered, citing the wording that answers it) or explicitly assumed "
@@ -1247,6 +1271,10 @@ SPECIFICATION_HARD_RULES: tuple[str, ...] = (
     "-- and each decision must match what the draft does to that story: a story declared modified "
     "that the draft doesn't change, one declared unchanged that the draft changes or retires, a "
     "missing or duplicate row, or a blank reason is rejected.",
+    "Every PRD change this round (PC-n, from the requirements PRD merge) must be cited in the "
+    "prd_change_ids of a modified or retired story decision, or listed in prd_changes_without_story "
+    "with a reason -- an unaccounted change, one cited only by an unchanged story, or an unknown id is "
+    "rejected.",
 )
 
 
@@ -1535,6 +1563,7 @@ def make_verify_specification_ledger(
         _record_ledger_sync_rows(log, result, fully_reviewed)
         no_new_work = False
         decision_problems: list[str] = []
+        no_new_work_note = ""
         if result.passed:
             # File-based-editing plan, Part 1 sect. 5: write the ledger-resolved content back to
             # the sketchpad so the next lap's `view` shows resolved real ids, not the model's
@@ -1634,10 +1663,45 @@ def make_verify_specification_ledger(
                     log.failed(spec_ledger.SPEC_STORY_DECISIONS, "\n".join(decision_problems))
                 else:
                     log.passed(spec_ledger.SPEC_STORY_DECISIONS)
+
+            # This round's PRD changes (PC-n, from the requirements-prd stage, copied to the scratch
+            # file at draft start) must each be accounted for -- check_prd_changes_addressed.
+            prd_changes: list[dict[str, Any]] = []
+            raw_prd_changes = await repo_files.read_repo_file(provider, thread_id, spec_ledger.PRD_CHANGES_SCRATCH_PATH)
+            try:
+                prd_changes = (json.loads(raw_prd_changes) or {}).get("changes") or [] if raw_prd_changes else []
+            except (json.JSONDecodeError, AttributeError):
+                prd_changes = []
+            if stage_key != "specification":
+                log.skipped(spec_ledger.SPEC_PRD_CHANGES_ADDRESSED, "the baseline pass builds the approved specification")
+            elif not prd_changes:
+                log.skipped(spec_ledger.SPEC_PRD_CHANGES_ADDRESSED, "no PRD changes this round")
+            else:
+                prd_problems = check_prd_changes_addressed(delta_specification, [c.get("id") for c in prd_changes])
+                decision_problems += prd_problems
+                content_dict["prd_change_rows"] = spec_ledger.build_prd_change_rows(
+                    prd_changes, content_dict.get("story_decisions") or [],
+                    content_dict.get("prd_changes_without_story") or [],
+                )
+                if prd_problems:
+                    log.failed(spec_ledger.SPEC_PRD_CHANGES_ADDRESSED, "\n".join(prd_problems))
+                else:
+                    log.passed(spec_ledger.SPEC_PRD_CHANGES_ADDRESSED)
+                    explained = [
+                        f"{r.get('change_id')} ({r.get('reason')})"
+                        for r in content_dict.get("prd_changes_without_story") or [] if isinstance(r, dict)
+                    ]
+                    if no_new_work and explained:
+                        # The run ends here with nobody reviewing it -- the end message must say which
+                        # PRD changes were judged to need no specification work, and why.
+                        no_new_work_note = (
+                            "No new specification work this round. PRD changes judged to affect no story: "
+                            + "; ".join(explained)
+                        )
         reasons = result.reasons + decision_problems
         return _verdict(
             passed=result.passed and not decision_problems,
-            feedback="; ".join(reasons) if reasons else "Ledger sync passed: every id resolved cleanly.",
+            feedback="; ".join(reasons) if reasons else (no_new_work_note or "Ledger sync passed: every id resolved cleanly."),
             report={
                 "reasons": reasons,
                 "ledger_entry_count": len(result.updated_entries),
@@ -7111,6 +7175,48 @@ def _demo_spec_story_decisions() -> None:
         draft([("US-0001", "unchanged"), ("US-0002", "unchanged")], retired_us_ids=["US-0002"])
         brownfield, _ = run("brownfield-spec")
         assert brownfield.passed and row(brownfield)["status"] == "skipped", brownfield.checks
+
+        # Phase 3: this round's PRD changes (written to the scratch file at draft start) must each be
+        # accounted for -- the PRD merge's own conflict detection, binding on the specification.
+        def prd_row(result: VerificationResult) -> dict[str, Any]:
+            return next(r for r in result.checks if r["id"] == "spec.prd_changes_addressed")
+
+        assert prd_row(good)["status"] == "skipped", "no PRD changes this round"
+        files[spec_ledger.PRD_CHANGES_SCRATCH_PATH] = json.dumps({"changes": [
+            {"id": "PC-1", "kind": "removed", "basis": "implied", "prior_text": "- Users can delete a note.",
+             "new_text": "", "delta_quote": "Notes are permanent once saved"},
+        ]})
+
+        def draft_rows(rows: list[dict[str, Any]], **fields: Any) -> None:
+            files[spec_ledger.DRAFT_SPEC_PATH] = json.dumps({
+                "title": "Notes", "summary": "s", "assumptions": presence, "out_of_scope": presence,
+                "user_stories": [], "story_decisions": rows, **fields,
+            })
+
+        draft_rows([
+            {"us_id": "US-0001", "decision": "unchanged", "reason": "untouched"},
+            {"us_id": "US-0002", "decision": "retired", "reason": "permanent", "prd_change_ids": ["PC-1"]},
+        ], retired_us_ids=["US-0002"])
+        linked, linked_content = run()
+        assert linked.passed and prd_row(linked)["status"] == "passed", linked.checks
+        assert linked_content["prd_change_rows"][0]["addressed_by"] == "US-0002 (retired)"
+
+        # Retired the story, but never tied the PRD's change to it.
+        draft([("US-0001", "unchanged"), ("US-0002", "retired")], retired_us_ids=["US-0002"])
+        unlinked, _ = run()
+        assert not unlinked.passed and prd_row(unlinked)["status"] == "failed" and "PC-1" in unlinked.feedback
+
+        # Explained away with zero spec delta: still the no_new_work end, but its message names the
+        # PRD change and the reason, so a human sees what was judged to need no work.
+        draft_rows([
+            {"us_id": "US-0001", "decision": "unchanged", "reason": "untouched"},
+            {"us_id": "US-0002", "decision": "unchanged", "reason": "kept"},
+        ], prd_changes_without_story=[{"change_id": "PC-1", "reason": "only the PRD wording changed"}])
+        explained, _ = run()
+        assert explained.passed and explained.report["no_new_work"] is True, (explained.feedback, explained.report)
+        assert "PC-1" in explained.feedback and "only the PRD wording changed" in explained.feedback, explained.feedback
+
+        assert prd_row(run("brownfield-spec")[0])["status"] == "skipped"
     finally:
         repo_files.read_repo_file, repo_files.write_repo_file, spec_ledger.load_ledger, spec_ledger.save_ledger = real
 
@@ -7175,11 +7281,12 @@ def _demo_audit_ran_this_lap() -> None:
         assert set(skipped_rows) == {c.id for c in spec_ledger.VERIFY_CHECKS}, skipped_rows
         assert skipped_rows["spec.audit_full_read"]["status"] == "skipped"
         assert skipped_rows["spec.audit_full_read"]["detail"] == "audit did not run this lap"
-        # No approved specification on disk in this fixture -- nothing to classify yet.
+        # No approved specification and no PRD changes in this fixture -- nothing to classify yet.
         assert skipped_rows["spec.story_decisions"]["status"] == "skipped", skipped_rows["spec.story_decisions"]
+        assert skipped_rows["spec.prd_changes_addressed"]["status"] == "skipped"
         assert all(
             r["status"] == "passed" for k, r in skipped_rows.items()
-            if k not in ("spec.audit_full_read", "spec.story_decisions")
+            if k not in ("spec.audit_full_read", "spec.story_decisions", "spec.prd_changes_addressed")
         )
         brownfield = asyncio.run(make_verify_specification_ledger("brownfield-spec", has_audit_role=False)(
             "t", {}, "r", None, None, "claude", 0, True,  # type: ignore[arg-type]
@@ -8568,8 +8675,8 @@ def _demo() -> None:
     # reasons.append(...) branches + 1 combined citation-drop rule (covers both story and AC in
     # one entry, added 2026-09-17) + 1 narrative-template rule from check_narrative_format (added
     # the same day) = 17 (see the constant's own comment for the full breakdown), + 1 ticket-mode
-    # story-decisions rule (spec.story_decisions, 2026-10-02) = 18.
-    assert len(SPECIFICATION_HARD_RULES) == 18, len(SPECIFICATION_HARD_RULES)
+    # story-decisions rule (spec.story_decisions, 2026-10-02) = 18, + 1 PRD-change linkage rule = 19.
+    assert len(SPECIFICATION_HARD_RULES) == 19, len(SPECIFICATION_HARD_RULES)
     assert all(isinstance(r, str) and r.strip() for r in SPECIFICATION_HARD_RULES)
 
     # Task 6: draft_example/draft_rules/audit_example/audit_rules actually reach the two
@@ -8677,6 +8784,20 @@ def _demo() -> None:
     assert "US-0001 — Create a note" not in "\n".join(
         str(m.content) for m in _build_specification_prompt(verify_feedback_base_state)
     ), "no live-story list without a ticket-mode baseline"
+
+    # Phase 3: this round's PRD changes and diff reach the specification draft in ticket mode.
+    prd_state = copy.deepcopy(verify_feedback_base_state)
+    prd_state["stages"]["requirements-prd"] = {**default_stage_state(), "approved_content": {
+        "changes": [{"id": "PC-1", "kind": "removed", "basis": "implied", "prior_text": "- Users can delete a note.",
+                     "new_text": "", "delta_quote": "Notes are permanent once saved"}],
+        "diff": "--- previous PRD\n+++ this round\n-- Users can delete a note.",
+    }}
+    assert "PC-1" not in "\n".join(str(m.content) for m in _build_specification_prompt(prd_state)), (
+        "first ticket: no baseline to weigh PRD changes against"
+    )
+    prd_state["stages"]["specification"]["ticket_mode_baseline"] = True
+    prd_text = "\n".join(str(m.content) for m in _build_specification_prompt(prd_state))
+    assert "PC-1" in prd_text and "Removed (implied)" in prd_text and "-- Users can delete a note." in prd_text, prd_text
 
     # IMPECCABLE_CRITIQUE_SEGMENT: appended to minimal-code-to-green's AUDIT prompt only for a
     # UI-framework repo, same gate as the draft prompt's own UI segments. Monkeypatches the

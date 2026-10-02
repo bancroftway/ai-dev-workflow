@@ -36,7 +36,9 @@
 //      `AIDW_RUN_ID` (Task 5) -- the ONE sub-check this task's brief calls out as needing it.
 //   4. Story decisions (`check_story_decisions`, 2026-10-02): every story in the last-approved
 //      specification has one `story_decisions` row whose decision matches what the draft does to
-//      it. `specification` stage only; skipped when no approved specification exists yet.
+//      it. `specification` stage only; skipped when no approved specification exists yet. Plus
+//      `check_prd_changes_addressed`: every `PC-n` change this round's PRD merge declared is tied
+//      to a modified/retired story decision or explained in prd_changes_without_story.
 //
 // STAGE-SCOPED VIA AIDW_STAGE (final-review fix, 2026-09-30): (1)/(2) used to rely solely on
 // draft-specification.json's own existence, on the mistaken belief that check-narrative-format-
@@ -59,6 +61,9 @@ const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
 // The last-approved specification: the baseline every live story's `story_decisions` row is judged
 // against (ledger_sync_checks.check_story_decisions). Literal value guarded by that module's _demo.
 const APPROVED_SPEC_PATH = ".ai-dev-workflow/03-specification.approved.json";
+// This round's PRD changes ({changes: [{id: "PC-n", ...}]}), written by the host at every
+// specification draft start (spec_ledger.PRD_CHANGES_SCRATCH_PATH; literal guarded the same way).
+const PRD_CHANGES_SCRATCH_PATH = ".ai-dev-workflow/spec/prd-changes.json";
 
 let input = {};
 try {
@@ -140,6 +145,18 @@ if (stage === "specification" && existsSync(approvedSpecPath)) {
   }
 }
 
+// Same stage scoping; absent or unreadable = no PRD changes to account for this round.
+let prdChangeIds = [];
+const prdChangesPath = `${cwd}/${PRD_CHANGES_SCRATCH_PATH}`;
+if (stage === "specification" && existsSync(prdChangesPath)) {
+  try {
+    const doc = JSON.parse(readFileSync(prdChangesPath, "utf8"));
+    if (Array.isArray(doc?.changes)) prdChangeIds = doc.changes.map((c) => c?.id).filter(Boolean);
+  } catch {
+    prdChangeIds = [];
+  }
+}
+
 let result;
 try {
   const proc = spawnSync("python3", ["/opt/aidw-hooks/ledger_sync_checks.py", "--check-hook"], {
@@ -148,6 +165,7 @@ try {
       specification: draft,
       run_id: runId,
       approved_specification: approvedSpecification,
+      prd_change_ids: prdChangeIds,
     }),
     encoding: "utf8",
     timeout: 20000,
@@ -166,6 +184,7 @@ problems.push(...(result.empty_draft_problems || []));
 problems.push(...(result.citation_problems || []));
 problems.push(...(result.completeness_problems || []));
 problems.push(...(result.decision_problems || []));
+problems.push(...(result.prd_change_problems || []));
 
 const openQuestions = result.open_questions || [];
 if (openQuestions.length > 0) {

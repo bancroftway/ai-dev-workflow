@@ -244,6 +244,18 @@ class StoryDecision(BaseModel):
         description="One line: why, weighed against this ticket's requirements (for a change, which "
         "requirement drives it).",
     )
+    prd_change_ids: list[str] = Field(
+        default_factory=list,
+        description="This round's PRD changes (`PC-n`, from the requirements PRD merge) this decision "
+        "accounts for -- only on a 'modified' or 'retired' decision. Copy the ids exactly.",
+    )
+
+
+class PrdChangeWithoutStory(BaseModel):
+    """A PRD change this round no story covers -- see check_prd_changes_addressed."""
+
+    change_id: str = Field(description="The PRD change id (`PC-n`), copied exactly.")
+    reason: str = Field(default="", description="One line: why no story in the specification is affected.")
 
 
 class Specification(BaseModel):
@@ -317,6 +329,12 @@ class Specification(BaseModel):
         description="Ticket mode only (the project already has an approved specification): exactly "
         "one row per story in that approved specification -- seeded for you, one undecided row each. "
         "Empty on a project's first ticket.",
+    )
+    prd_changes_without_story: list[PrdChangeWithoutStory] = Field(
+        default_factory=list,
+        description="This round's PRD changes (`PC-n`) that no story covers -- e.g. a requirement the "
+        "specification never had -- each with a reason. Every PRD change is either cited by a modified/"
+        "retired story decision or listed here.",
     )
 
 
@@ -1787,6 +1805,15 @@ if __name__ == "__main__":  # pragma: no cover -- `cd agent && python -m src.sch
     )
     assert _seeded.story_decisions[0].decision is None and _seeded.story_decisions[0].reason == ""
     assert Specification.model_validate(_spec_dumped).story_decisions == [], "absent on a first ticket"
+    # Phase 3: a decision may cite this round's PRD changes; changes no story covers are explained.
+    _linked = Specification.model_validate({
+        **_spec_dumped,
+        "story_decisions": [{"us_id": "US-0001", "decision": "retired", "reason": "r", "prd_change_ids": ["PC-1"]}],
+        "prd_changes_without_story": [{"change_id": "PC-2", "reason": "the spec never had it"}],
+    })
+    assert _linked.story_decisions[0].prd_change_ids == ["PC-1"]
+    assert _linked.prd_changes_without_story[0].change_id == "PC-2"
+    assert _seeded.story_decisions[0].prd_change_ids == [] and _seeded.prd_changes_without_story == []
     assert "story_changes" not in SpecificationDraftResponse.model_fields, (
         "the draft's per-turn story_changes duplicated story_decisions in the file -- dropped"
     )

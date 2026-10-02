@@ -60,6 +60,12 @@ DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json"
 # previous ticket's delta (and, now, its story_decisions). See hydrate_specification_ticket_context.
 SEED_SIDECAR_PATH = ".ai-dev-workflow/spec/draft-seed.json"
 
+# This round's PRD changes ({"changes": [{id: "PC-n", kind, basis, prior_text, ...}]}), copied from
+# the requirements-prd stage's approved content at EVERY specification draft start, so the verify
+# (which has no GraphState) and the in-turn hook both read the same, always-current list. An empty
+# list when there are none, so a committed stale file never leaks into the next round.
+PRD_CHANGES_SCRATCH_PATH = ".ai-dev-workflow/spec/prd-changes.json"
+
 EntryStatus = Literal["active", "retired", "revised", "deferred"]
 # "plan_step" added for the file-based-editing plan's Part 2: one shared ledger, not a second
 # implementation -- sync_plan_ledger below reuses load_ledger/save_ledger/_find/allocate_next_id's
@@ -166,10 +172,18 @@ SPEC_STORY_DECISIONS = Check(
     "without naming it; this makes sure none is silently kept.",
     "blocking", "only when an earlier ticket's specification was approved",
 )
+SPEC_PRD_CHANGES_ADDRESSED = Check(
+    "spec.prd_changes_addressed", "Every PRD change is accounted for",
+    "Checks every requirement this round's PRD merge removed or changed (explicitly, or implied by a new "
+    "requirement that contradicts it) is tied to a story the draft modifies or retires, or explained as "
+    "affecting no story. The PRD merge is a separate check on the same requirements; this keeps the two "
+    "from disagreeing silently.",
+    "blocking", "only when this round's PRD merge declared changes",
+)
 VERIFY_CHECKS: tuple[Check, ...] = (
     SPEC_DRAFT_FILE_EXISTS, SPEC_DRAFT_FILE_PARSES, SPEC_DRAFT_NOT_EMPTY, SPEC_AUDIT_FULL_READ,
     SPEC_NO_OPEN_QUESTIONS, SPEC_STORY_NARRATIVE, SPEC_LEDGER_CITATIONS, SPEC_LEDGER_DUPLICATES,
-    SPEC_LEDGER_RETIREMENTS, SPEC_LEDGER_BUG_AFFECTED, SPEC_STORY_DECISIONS,
+    SPEC_LEDGER_RETIREMENTS, SPEC_LEDGER_BUG_AFFECTED, SPEC_STORY_DECISIONS, SPEC_PRD_CHANGES_ADDRESSED,
 )
 # The sub-checks sync_ledger tags its reasons with (its completeness sweep is the audit-read check).
 LEDGER_SYNC_CHECKS: tuple[Check, ...] = (
@@ -294,11 +308,17 @@ async def hydrate_specification_ticket_context(
       `consumed_message_id` the file was seeded for; a different one means a new ticket. The same
       message (a later lap, or a correction at the gate) keeps the model's own edits. With no
       message id to key on, nothing is re-seeded.
+    - Writes PRD_CHANGES_SCRATCH_PATH from the requirements-prd stage's approved content, every
+      call (see that constant).
     - The fresh seed carries one `{us_id, decision: None, reason: ""}` story_decisions row per live
       story of the approved specification, and the returned prompt context carries the compact
       `live_stories` list (id/title/deferred) the draft prompt shows -- so the model works through
       every existing story instead of discovering the ids on its own.
     """
+    prd_content = ((state.get("stages") or {}).get("requirements-prd") or {}).get("approved_content") or {}
+    await repo_files.write_repo_file(
+        provider, thread_id, PRD_CHANGES_SCRATCH_PATH, json.dumps({"changes": prd_content.get("changes") or []}, indent=2)
+    )
     approved = await _read_approved_specification(provider, thread_id)
     live = [s for s in approved.get("user_stories") or [] if s.get("id")]
     message_id = state.get("consumed_message_id")
@@ -357,7 +377,42 @@ def build_story_decision_rows(
         label, tone, order = _DECISION_ROW_STYLE[decision]
         rows.append((order, {
             "us_id": us_id, "title": story.get("title", ""), "decision_label": label, "tone": tone,
-            "reason": str(row.get("reason") or ""),
+            "reason": str(row.get("reason") or ""), "prd_change_ids": list(row.get("prd_change_ids") or []),
+        }))
+    return [row for _order, row in sorted(rows, key=lambda pair: pair[0])]
+
+
+def build_prd_change_rows(
+    changes: list[dict[str, Any]], story_decisions: list[dict[str, Any]], without_story: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The Specification review screen's PRD-change table, one row per `PC-n` change this round's
+    PRD merge declared: `{id, label, tone, prior_text, new_text, delta_quote, addressed_by}`, the
+    unaccounted ones first. "Accounted for" is the same rule spec.prd_changes_addressed enforces: a
+    modified/retired story decision citing it, or a prd_changes_without_story reason. Pure."""
+    by_change: dict[str, list[str]] = {}
+    for row in story_decisions:
+        if isinstance(row, dict) and row.get("decision") in ("modified", "retired"):
+            for change_id in row.get("prd_change_ids") or []:
+                by_change.setdefault(change_id, []).append(f"{row.get('us_id')} ({row.get('decision')})")
+    reasons = {
+        r.get("change_id"): str(r.get("reason") or "").strip() for r in without_story if isinstance(r, dict)
+    }
+    rows = []
+    for change in changes:
+        change_id = change.get("id")
+        if by_change.get(change_id):
+            addressed_by = ", ".join(by_change[change_id])
+        elif reasons.get(change_id):
+            addressed_by = f"No spec impact: {reasons[change_id]}"
+        else:
+            addressed_by = ""
+        kind = "Modified" if change.get("kind") == "modified" else "Removed"
+        rows.append((0 if not addressed_by else 1, {
+            "id": change_id,
+            "label": kind + (" (implied)" if change.get("basis") == "implied" else ""),
+            "tone": ("modified" if kind == "Modified" else "removed") if addressed_by else "missing",
+            "prior_text": change.get("prior_text", ""), "new_text": change.get("new_text", ""),
+            "delta_quote": change.get("delta_quote", ""), "addressed_by": addressed_by or "Not accounted for",
         }))
     return [row for _order, row in sorted(rows, key=lambda pair: pair[0])]
 
@@ -2203,7 +2258,9 @@ def _demo() -> None:
         _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
     })
     asyncio.run(hydrate_specification_ticket_context("t", {"stages": {}}, no_id_provider))
-    assert no_id_provider.writes == {}, "without a message id there is nothing to tell tickets apart by"
+    assert DRAFT_SPEC_PATH not in no_id_provider.writes and SEED_SIDECAR_PATH not in no_id_provider.writes, (
+        "without a message id there is nothing to tell tickets apart by"
+    )
 
     # --- the story-decisions gate row and its review rows ---
     assert SPEC_STORY_DECISIONS in VERIFY_CHECKS and SPEC_STORY_DECISIONS not in LEDGER_SYNC_CHECKS, (
@@ -2225,10 +2282,53 @@ def _demo() -> None:
     assert rows[0]["decision_label"] == "Not classified" and rows[0]["tone"] == "missing"
     assert rows[1] == {
         "us_id": "US-0002", "title": "Delete a note", "decision_label": "Retired", "tone": "retired",
-        "reason": "notes are permanent",
+        "reason": "notes are permanent", "prd_change_ids": [],
     }
     assert rows[2]["decision_label"] == "Unchanged" and rows[2]["tone"] == "unchanged"
     assert build_story_decision_rows({}, []) == []
+
+    # --- PRD changes (Phase 3): the scratch file the hook and gate read, and their review rows ---
+    prd_changes = [
+        {"id": "PC-1", "kind": "removed", "basis": "implied", "prior_text": "- Users can delete a note.",
+         "new_text": "", "delta_quote": "Notes are permanent once saved"},
+        {"id": "PC-2", "kind": "modified", "basis": "explicit", "prior_text": "- Users can create a note.",
+         "new_text": "- Users can create a note of up to 500 characters.", "delta_quote": "capped at 500"},
+        {"id": "PC-3", "kind": "removed", "basis": "explicit", "prior_text": "- Export to CSV.",
+         "new_text": "", "delta_quote": "drop CSV export"},
+    ]
+    with_prd = {**ticket2, "stages": {"requirements-prd": {"approved_content": {"changes": prd_changes}}}}
+    scratch_provider = _FakeBootstrapProvider({
+        _wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two, DRAFT_SPEC_PATH: stale_sketchpad,
+        SEED_SIDECAR_PATH: json.dumps({"message_id": "msg-2"}),
+    })
+    asyncio.run(hydrate_specification_ticket_context("t", with_prd, scratch_provider))
+    assert json.loads(scratch_provider.writes[PRD_CHANGES_SCRATCH_PATH]) == {"changes": prd_changes}, (
+        "written on EVERY draft start, same ticket or not -- the hook and the gate read it"
+    )
+    no_prd_provider = _FakeBootstrapProvider({_wp.SPECIFICATION_APPROVED_PATH: approved_two, LEDGER_PATH: ledger_two})
+    asyncio.run(hydrate_specification_ticket_context("t", ticket2, no_prd_provider))
+    assert json.loads(no_prd_provider.writes[PRD_CHANGES_SCRATCH_PATH]) == {"changes": []}, (
+        "an empty list, so a committed stale file can never leak into the next round"
+    )
+
+    assert SPEC_PRD_CHANGES_ADDRESSED in VERIFY_CHECKS and SPEC_PRD_CHANGES_ADDRESSED not in LEDGER_SYNC_CHECKS
+    linked_decisions = [
+        {"us_id": "US-0001", "decision": "unchanged", "reason": "r", "prd_change_ids": []},
+        {"us_id": "US-0002", "decision": "retired", "reason": "permanent", "prd_change_ids": ["PC-1"]},
+    ]
+    linked_rows = build_story_decision_rows(json.loads(approved_two), linked_decisions)
+    assert linked_rows[0]["us_id"] == "US-0002" and linked_rows[0]["prd_change_ids"] == ["PC-1"]
+    prd_rows = build_prd_change_rows(
+        prd_changes, linked_decisions, [{"change_id": "PC-3", "reason": "the spec never had CSV export"}],
+    )
+    assert [r["id"] for r in prd_rows] == ["PC-2", "PC-1", "PC-3"], "unaccounted first"
+    assert prd_rows[0]["addressed_by"] == "Not accounted for" and prd_rows[0]["tone"] == "missing"
+    assert prd_rows[1] == {
+        "id": "PC-1", "label": "Removed (implied)", "tone": "removed", "prior_text": "- Users can delete a note.",
+        "new_text": "", "delta_quote": "Notes are permanent once saved", "addressed_by": "US-0002 (retired)",
+    }
+    assert prd_rows[2]["addressed_by"] == "No spec impact: the spec never had CSV export"
+    assert build_prd_change_rows([], [], []) == []
 
     # check_narrative_format (root-caused 2026-09-17, income-investor run 1352296c).
     valid_story = {"id": "US-0001", "narrative": "As an administrator, I want to configure the risk-free rate, so that Sharpe/Sortino calculations use a current value."}

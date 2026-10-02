@@ -48,7 +48,8 @@ Text -- a requirement that contradicts, narrows or replaces an existing story ch
 it never names it, and a story the draft kept `unchanged` beside a new criterion that contradicts
 it is the gap this table exists to catch. If you change a decision, make the file match it
 (re-emit, add or retire criteria, or retire the story) -- a deterministic gate rejects any row
-whose decision disagrees with what the file does.
+whose decision disagrees with what the file does. Check every `PC-n` PRD change too: is it really
+tied to the story it modifies or retires, and is each `prd_changes_without_story` reason true?
 
 Leave the file's `attachment_notes` as the draft left them unless you have good reason to revise
 the wording -- you never receive the original attachments yourself, only the draft's own

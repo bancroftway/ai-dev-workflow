@@ -56,13 +56,15 @@ is an acceptable second copy).
 
 Plus `story_delta`/`check_story_decisions` (2026-10-02): every story in the last-approved
 specification must carry a declared decision (unchanged/modified/retired) that matches what the
-draft actually does to it -- see check_story_decisions' own docstring. Lives here, not in
-spec_ledger.py, so the gate and the Stop hook judge with the one rule.
+draft actually does to it -- see check_story_decisions' own docstring -- and
+`check_prd_changes_addressed`: every PRD change this round (`PC-n`) is accounted for by a decision.
+Live here, not in spec_ledger.py, so the gate and the Stop hook judge with the one rule.
 
 CLI mode (`python3 ledger_sync_checks.py --check-hook`, stdin JSON: `{"ledger_entries": [...],
 "specification": {...}, "run_id": "..." | null, "approved_specification": {...} | null}`, stdout
 JSON: `{"empty_draft_problems": [...], "open_questions": [...], "citation_problems": [...],
-"completeness_problems": [...], "decision_problems": [...]}`) is what the Stop hook actually
+"completeness_problems": [...], "decision_problems": [...], "prd_change_problems": [...]}`, with
+`"prd_change_ids": [...]` also accepted on stdin) is what the Stop hook actually
 invokes -- see the `if __name__ == "__main__":` block below for the exact contract.
 """
 
@@ -87,6 +89,10 @@ DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json"
 # import nothing project-local); `_demo()` guards it against the real constant AND against
 # check-ledger-sync-stop.mjs, which reads this file to hand `check_story_decisions` its baseline.
 APPROVED_SPEC_PATH = ".ai-dev-workflow/03-specification.approved.json"
+# spec_ledger.PRD_CHANGES_SCRATCH_PATH, duplicated likewise: this round's PRD changes ({"changes":
+# [{id, ...}]}), written by the host at every specification draft start; the hook hands the ids to
+# check_prd_changes_addressed. Guarded by `_demo()` the same way.
+PRD_CHANGES_SCRATCH_PATH = ".ai-dev-workflow/spec/prd-changes.json"
 
 # What a REAL ledger id looks like -- moved verbatim from spec_ledger.py's own module-level
 # `_REAL_ID_RE` (used only by the two renumbering guards below, now living here with them). See
@@ -572,11 +578,70 @@ def check_story_decisions(approved_specification: dict[str, Any], specification:
     return problems
 
 
+def check_prd_changes_addressed(specification: dict[str, Any], prd_change_ids: list[str]) -> list[str]:
+    """Every requirement the requirements-prd stage declared removed or modified this round (its
+    `PC-n` ids) must be accounted for by the Specification: cited in the `prd_change_ids` of a
+    story decision that is `modified` or `retired`, or listed in `prd_changes_without_story` with
+    a reason (a PRD change no story covers, e.g. a requirement the specification never had).
+
+    Binds the PRD's text-to-text conflict detection -- a separate model call from the one writing
+    the specification -- to the specification itself, so "the PRD says deletion was removed
+    (implied)" can't sit beside a "Delete a note: unchanged" decision. Citing a change only from an
+    `unchanged` story doesn't count: that is exactly the contradiction this check exists to catch.
+    Unknown ids are rejected. Returns one actionable message per problem. Pure."""
+    known = list(dict.fromkeys(prd_change_ids))
+    known_set = set(known)
+    problems: list[str] = []
+    addressed: set[str] = set()
+    cited_by_unchanged: dict[str, str] = {}
+    for row in specification.get("story_decisions") or []:
+        if not isinstance(row, dict):
+            continue
+        for change_id in row.get("prd_change_ids") or []:
+            if change_id not in known_set:
+                problems.append(
+                    f"story_decisions row for {row.get('us_id')!r} cites {change_id!r}, which is not one of this "
+                    f"round's PRD changes ({', '.join(known) or 'there are none'})"
+                )
+            elif row.get("decision") in ("modified", "retired"):
+                addressed.add(change_id)
+            else:
+                cited_by_unchanged.setdefault(change_id, row.get("us_id"))
+    for row in specification.get("prd_changes_without_story") or []:
+        change_id = row.get("change_id") if isinstance(row, dict) else None
+        if change_id not in known_set:
+            problems.append(
+                f"prd_changes_without_story names {change_id!r}, which is not one of this round's PRD changes "
+                f"({', '.join(known) or 'there are none'})"
+            )
+        elif not str(row.get("reason") or "").strip():
+            problems.append(f"prd_changes_without_story row for {change_id!r} has no reason -- say why no story is affected")
+        else:
+            addressed.add(change_id)
+    for change_id in known:
+        if change_id in addressed:
+            continue
+        if change_id in cited_by_unchanged:
+            problems.append(
+                f"{change_id} is cited only by {cited_by_unchanged[change_id]!r}, which is declared 'unchanged' -- "
+                "the PRD says this round removed or changed that requirement, so modify or retire the story it "
+                "belongs to, or move it to prd_changes_without_story with a reason if no story is affected"
+            )
+        else:
+            problems.append(
+                f"{change_id} (a requirement this round's PRD merge removed or changed) is not accounted for -- "
+                "cite it in the prd_change_ids of the story decision it modifies or retires, or list it in "
+                "prd_changes_without_story with a reason if no story is affected"
+            )
+    return problems
+
+
 def run_ledger_sync_checks(
     ledger_entries: list[dict[str, Any]],
     specification: dict[str, Any],
     run_id: str | None,
     approved_specification: dict[str, Any] | None = None,
+    prd_change_ids: list[str] | None = None,
 ) -> dict[str, list[Any]]:
     """Everything check-ledger-sync-stop.mjs's CLI mode reports, computed once over the same
     inputs -- same "no drift" contract as wireframe_linkage_checks.run_all_checks. `run_id` is
@@ -604,6 +669,7 @@ def run_ledger_sync_checks(
         "decision_problems": (
             check_story_decisions(approved_specification, specification) if approved_specification else []
         ),
+        "prd_change_problems": check_prd_changes_addressed(specification, prd_change_ids or []),
     }
 
 
@@ -914,6 +980,34 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     )
     assert hook_result["decision_problems"], "the hook reports the same decision problems the gate does"
 
+    # --- check_prd_changes_addressed: every PRD change this round is accounted for ---
+    linked = {
+        "story_decisions": [
+            {"us_id": "US-0001", "decision": "modified", "reason": "capped", "prd_change_ids": ["PC-2"]},
+            {"us_id": "US-0002", "decision": "retired", "reason": "permanent", "prd_change_ids": ["PC-1"]},
+        ],
+        "prd_changes_without_story": [{"change_id": "PC-3", "reason": "only reworded the overview"}],
+    }
+    assert check_prd_changes_addressed(linked, ["PC-1", "PC-2", "PC-3"]) == []
+    assert check_prd_changes_addressed({}, []) == [], "no PRD changes this round -- nothing to address"
+    unaddressed = check_prd_changes_addressed(linked, ["PC-1", "PC-2", "PC-3", "PC-4"])
+    assert unaddressed and any("PC-4" in p for p in unaddressed)
+    # The case this exists for: the PRD said "removed (implied)", the spec cites it on a story it
+    # keeps unchanged -- that is not addressing it.
+    kept = {"story_decisions": [{"us_id": "US-0002", "decision": "unchanged", "reason": "x", "prd_change_ids": ["PC-1"]}]}
+    kept_problems = check_prd_changes_addressed(kept, ["PC-1"])
+    assert kept_problems and any("PC-1" in p and "unchanged" in p for p in kept_problems), kept_problems
+    unknown_cited = check_prd_changes_addressed(
+        {"story_decisions": [{"us_id": "US-0001", "decision": "modified", "reason": "x", "prd_change_ids": ["PC-9"]}]}, [],
+    )
+    assert unknown_cited and any("PC-9" in p for p in unknown_cited), "citing a change that doesn't exist"
+    blank = check_prd_changes_addressed({"prd_changes_without_story": [{"change_id": "PC-1", "reason": " "}]}, ["PC-1"])
+    assert blank and any("PC-1" in p and "reason" in p for p in blank)
+    assert run_ledger_sync_checks(ledger, {"user_stories": []}, run_id=None, prd_change_ids=["PC-1"])["prd_change_problems"], (
+        "the hook reports the same linkage problems the gate does"
+    )
+    assert run_ledger_sync_checks(ledger, {"user_stories": []}, run_id=None)["prd_change_problems"] == []
+
     # Drift guard: the approved-spec path the hook reads must be the one persistence writes, and the
     # .mjs must actually use this constant's literal value.
     from .. import workflow_persistence
@@ -922,6 +1016,10 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.ga
     hook_js = Path(__file__).resolve().parents[2] / "sandbox-image" / "hooks" / "check-ledger-sync-stop.mjs"
     assert APPROVED_SPEC_PATH in hook_js.read_text(encoding="utf-8"), (
         f"check-ledger-sync-stop.mjs no longer reads {APPROVED_SPEC_PATH}"
+    )
+    assert PRD_CHANGES_SCRATCH_PATH == spec_ledger.PRD_CHANGES_SCRATCH_PATH
+    assert PRD_CHANGES_SCRATCH_PATH in hook_js.read_text(encoding="utf-8"), (
+        f"check-ledger-sync-stop.mjs no longer reads {PRD_CHANGES_SCRATCH_PATH}"
     )
 
     print("ledger_sync_checks self-check: all assertions passed")
@@ -938,6 +1036,7 @@ if __name__ == "__main__":
             specification=payload.get("specification") or {},
             run_id=payload.get("run_id") or None,
             approved_specification=payload.get("approved_specification") or None,
+            prd_change_ids=payload.get("prd_change_ids") or None,
         )
         json.dump(result, sys.stdout)
     else:

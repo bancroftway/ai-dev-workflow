@@ -47,6 +47,19 @@ const StoryDecisionRowSchema = z.object({
   decision_label: z.string(),
   tone: z.string(),
   reason: z.string().optional().default(""),
+  prd_change_ids: z.array(z.string()).optional().default([]),
+});
+
+// One row per requirement this round's PRD merge removed or changed (PC-n), and which story decision
+// accounts for it. Built by the agent (spec_ledger.build_prd_change_rows), same contract as above.
+const PrdChangeRowSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  tone: z.string(),
+  prior_text: z.string().optional().default(""),
+  new_text: z.string().optional().default(""),
+  delta_quote: z.string().optional().default(""),
+  addressed_by: z.string(),
 });
 
 const SpecQuestionSchema = z.object({
@@ -85,6 +98,7 @@ const SpecificationSchema = z.object({
   retired_acceptance_criteria: z.array(RetiredCriterionSchema).optional().default([]),
   // Optional: absent on a first ticket and on envelopes from before story decisions existed.
   story_decision_rows: z.array(StoryDecisionRowSchema).optional().default([]),
+  prd_change_rows: z.array(PrdChangeRowSchema).optional().default([]),
 });
 
 const PlanStepSchema = z.object({
@@ -212,6 +226,7 @@ const DECISION_TONE_CLASS: Record<string, string> = {
   missing: "bg-rose-100 text-rose-800",
   retired: "bg-slate-200 text-slate-800",
   modified: "bg-amber-100 text-amber-800",
+  removed: "bg-slate-200 text-slate-800",
   unchanged: "bg-neutral-100 text-neutral-500",
 };
 
@@ -292,6 +307,36 @@ export function SpecificationSurfaceRenderer({
         </details>
       )}
 
+      {/* Requirements this round's PRD merge removed or changed -- each must be tied to the story
+          decision it drives. "(implied)" means the new text never named it; that is the one to check. */}
+      {(spec.prd_change_rows ?? []).length > 0 && (
+        <details open className="rounded-lg border border-neutral-200 px-3 py-2 text-sm">
+          <summary className="cursor-pointer font-medium text-neutral-800">
+            Requirements this round changed ({spec.prd_change_rows.length})
+          </summary>
+          <table className="mt-1 w-full text-left text-sm">
+            <tbody>
+              {spec.prd_change_rows.map((row) => (
+                <tr key={row.id} className="border-t border-neutral-100 align-top">
+                  <td className="py-1 pr-2 font-mono text-xs text-neutral-500">{row.id}</td>
+                  <td className="py-1 pr-2">
+                    <span className={`rounded-full px-1.5 text-xs ${DECISION_TONE_CLASS[row.tone] ?? "bg-neutral-100 text-neutral-600"}`}>
+                      {row.label}
+                    </span>
+                  </td>
+                  <td className="py-1 pr-2 text-neutral-800">
+                    {row.prior_text}
+                    {row.new_text && <span className="text-neutral-500"> → {row.new_text}</span>}
+                    {row.delta_quote && <span className="block text-xs text-neutral-500">“{row.delta_quote}”</span>}
+                  </td>
+                  <td className="py-1 text-xs text-neutral-600">{row.addressed_by}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
+
       {/* What this ticket decided for every existing story -- the place a reviewer spots an
           implied change left undone ("Delete a note: unchanged" next to a new "notes are permanent"
           criterion). Rows arrive sorted, the ones that need attention first. */}
@@ -311,7 +356,14 @@ export function SpecificationSurfaceRenderer({
                       {row.decision_label}
                     </span>
                   </td>
-                  <td className="py-1 text-xs text-neutral-600">{row.reason}</td>
+                  <td className="py-1 text-xs text-neutral-600">
+                    {row.reason}
+                    {row.prd_change_ids.map((id) => (
+                      <span key={id} className="ml-1 rounded bg-indigo-50 px-1 font-mono text-[10px] text-indigo-700">
+                        {id}
+                      </span>
+                    ))}
+                  </td>
                 </tr>
               ))}
             </tbody>

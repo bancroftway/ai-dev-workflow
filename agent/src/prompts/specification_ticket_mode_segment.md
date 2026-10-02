@@ -42,6 +42,11 @@ rejects a story declared `modified` that the file doesn't change, one declared `
 file retires or changes, a missing or duplicate row, and a blank reason. Never add a row for a story
 created in this ticket.
 
+When this round's PRD merge changed existing requirements, you are shown them as `PC-n` changes.
+Put each `PC-n` in the `prd_change_ids` of the `modified`/`retired` row it drives, or -- only when no
+story is affected -- in `prd_changes_without_story` with a reason. A PRD change cited only by an
+`unchanged` story is a contradiction the gate rejects.
+
 If the prior run's exit report lists criteria as "carried over -- not delivered", re-cite them in
 this draft (unchanged wording, via `existing_ac_id`) so they re-enter the work queue -- an
 undelivered criterion left uncited stays undelivered with nothing scheduled to build it. Re-citing
