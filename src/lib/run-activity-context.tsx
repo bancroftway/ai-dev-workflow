@@ -48,7 +48,12 @@ export type RunActivityInfo = {
   /** Server-built (sessions_api failure_gate): the gate screen that shows this failed run's check
    * and its recovery actions, plus the button text that opens it; null when no gate records it. */
   failureGate: { tab_id: string; button: string } | null;
+  /** Server-built (sessions_api workspace_notice): an open session whose container was stopped
+   * while idle -- the copy and the Reconnect action SandboxSessionBoot shows; null otherwise. */
+  workspaceNotice: WorkspaceNotice | null;
 };
+
+export type WorkspaceNotice = { tone: "info"; text: string; action: { id: "reconnect"; label: string } };
 
 const RunActivityContext = createContext<[RunActivityInfo | null, (v: RunActivityInfo | null) => void] | null>(null);
 

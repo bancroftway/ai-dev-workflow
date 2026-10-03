@@ -2328,6 +2328,22 @@ PROFILE_MEASURES: dict[str, frozenset[str]] = {
 # (2026-08-24 audit).
 _E2E_SOURCED_MEASURES = frozenset({"lighthouse_performance", "accessibility_score"})
 
+# Metrics Bar 3-way split scores that live at the TOP level of the summary (not in `measures`) and
+# that a plain scan's summary() never produces: app/framework/hours need the ledger and test
+# results only metrics_compute_node has, and code_health_score is stamped only onto full-profile
+# summaries (see with_code_health). Same failure mode as _E2E_SOURCED_MEASURES: without carrying
+# them forward, the first background refresh after metrics-exit blanked all three rings.
+_CARRIED_SUMMARY_SCORES = frozenset({
+    "code_health_score", "app_health_score", "framework_effectiveness_score", "estimated_hours_saved",
+})
+
+
+def with_code_health(summary: dict[str, Any], report: "ScanReport") -> dict[str, Any]:
+    """Stamps the Code Health ring's score onto a FULL-profile scan's summary. Not done inside
+    summary() itself: static_only_summary on a partial-profile scan (quality/security remediation)
+    would score with half the health_report tools missing and come out wrong, not just stale."""
+    return {**summary, "code_health_score": static_only_summary(report)["code_health_score"]}
+
 
 def merge_measures(prior_summary: dict[str, Any] | None, new_summary: dict[str, Any], profile: str) -> dict[str, Any]:
     """Merges a partial-profile scan's `measures` onto the prior summary's (the previous latest,
@@ -2338,7 +2354,7 @@ def merge_measures(prior_summary: dict[str, Any] | None, new_summary: dict[str, 
 
     _E2E_SOURCED_MEASURES fall back to the prior value whenever this scan didn't carry them --
     on EVERY profile, "full" included, since no scanner ever measures them (see the constant's
-    own comment above).
+    own comment above). _CARRIED_SUMMARY_SCORES do the same at the top level.
     """
     if prior_summary is None:
         return new_summary
@@ -2350,9 +2366,14 @@ def merge_measures(prior_summary: dict[str, Any] | None, new_summary: dict[str, 
         e2e_gap = key in _E2E_SOURCED_MEASURES and new_measures.get(key) is None
         if scanner_gap or e2e_gap:
             new_measures[key] = prior_value
-    if new_measures == (new_summary.get("measures") or {}):
+    carried = {
+        key: prior_summary[key]
+        for key in _CARRIED_SUMMARY_SCORES
+        if new_summary.get(key) is None and prior_summary.get(key) is not None
+    }
+    if new_measures == (new_summary.get("measures") or {}) and not carried:
         return new_summary
-    return {**new_summary, "measures": new_measures}
+    return {**new_summary, **carried, "measures": new_measures}
 
 
 def _dashboard_finding(finding: Finding, *, gating: bool, actionable: bool = False) -> dict[str, Any]:
@@ -3552,6 +3573,9 @@ async def repo_scan_baseline_node(state: dict[str, Any], config: RunnableConfig)
         )
     report = replace(report, metrics={**report.metrics, "coverage": coverage})
     dashboard = report.to_dashboard_dict()
+    # Into the stored file too, so a later re-entry's _summary_from_stored (which prefers the
+    # stored summary block) keeps the Code Health ring.
+    dashboard["summary"] = with_code_health(dashboard["summary"], report)
     await repo_files.write_repo_file(
         provider, thread_id, BASELINE_PATH, json.dumps(dashboard, indent=2, default=str) + "\n"
     )
@@ -4224,6 +4248,18 @@ def _demo() -> None:  # pragma: no cover -- `cd agent && uv run python -m src.re
     assert merge_measures(None, quality_only_summary, "quality") == quality_only_summary
     # "full" (baseline/metrics-report) measures everything itself -- merge_measures is a no-op.
     assert merge_measures(prior_for_merge, quality_only_summary, "full") == quality_only_summary
+    # Metrics Bar split scores: a background refresh after metrics-exit must not blank the rings,
+    # but a fresh score (refresh's own code_health_score) still wins over the prior one.
+    prior_with_scores = {
+        **prior_for_merge, "code_health_score": 70, "app_health_score": 81.5,
+        "framework_effectiveness_score": 90.0, "estimated_hours_saved": 3.2,
+    }
+    refreshed = merge_measures(prior_with_scores, {**quality_only_summary, "code_health_score": 75}, "full")
+    assert refreshed["code_health_score"] == 75, refreshed
+    assert (refreshed["app_health_score"], refreshed["framework_effectiveness_score"], refreshed["estimated_hours_saved"]) == (81.5, 90.0, 3.2), refreshed
+    # with_code_health is the same number static_only_summary (and so metrics_compute_node) reports.
+    sample = ScanReport(findings=(_vuln("trivy", "CVE-2024-0", "x", "high"),), metrics={}, tools=(), repo={}, deduped_count=0)
+    assert with_code_health({}, sample)["code_health_score"] == static_only_summary(sample)["code_health_score"]
 
     # Trivy's NONE/NEGLIGIBLE severities normalize to "info" -- on a security category (here,
     # vulnerability) that must surface as "info", never clamped up to "low" or hidden as "none".

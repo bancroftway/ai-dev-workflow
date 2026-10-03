@@ -42,6 +42,9 @@ if (process.env.AIDW_STAGE !== "specification") process.exit(0);
 
 const DRAFT_SPEC_PATH = ".ai-dev-workflow/spec/draft-specification.json";
 const LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json";
+// Ticket-mode baseline: the same two files check-ledger-sync-stop.mjs reads (literals guarded there).
+const APPROVED_SPEC_PATH = ".ai-dev-workflow/03-specification.approved.json";
+const ROUND_BASE_SPEC_PATH = ".ai-dev-workflow/spec/round-base-specification.json";
 
 // Below this many uncited-but-already-tracked ids, this is indistinguishable from an ordinary
 // redraft touching a handful of entries -- only fire on the "mass reconstruction" shape the real
@@ -74,6 +77,17 @@ function readJson(relPath) {
     return null;
   }
 }
+
+// Ticket mode (an approved specification already exists): the draft is a delta sketchpad, seeded
+// empty of stories, that must NEVER re-emit stories/criteria this ticket leaves alone
+// (specification_ticket_mode_segment.md). Every untouched ledger id is legitimately uncited there,
+// so this count fired on every such draft -- session 62f6c78c, twice in one turn -- and pushed the
+// model to re-cite unchanged work back into the queue. Verify-time duplicate detection still covers it.
+const hasBaseline = [ROUND_BASE_SPEC_PATH, APPROVED_SPEC_PATH].some((p) => {
+  const doc = readJson(p);
+  return doc !== null && typeof doc === "object" && Object.keys(doc).length > 0;
+});
+if (hasBaseline) process.exit(0);
 
 const ledgerDoc = readJson(LEDGER_PATH);
 const ledgerEntries = Array.isArray(ledgerDoc?.entries) ? ledgerDoc.entries : [];

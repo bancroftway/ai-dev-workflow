@@ -427,7 +427,7 @@ async def provision_session(body: ProvisionRequest, request: Request) -> Provisi
         logger.exception("sandbox provisioning failed for thread_id=%s", body.thread_id)
         # Best-effort teardown of whatever half-created container the failure left behind --
         # without it, a partially-provisioned container holds the per-repo cap's slot until the
-        # idle reaper notices, blocking every retry on this repo for up to 30 minutes.
+        # idle reaper notices, blocking every retry on this repo for up to the idle timeout.
         try:
             await provider.terminate(body.thread_id)
         except Exception:  # noqa: BLE001 -- cleanup must never mask the original provision error
@@ -584,6 +584,9 @@ class SessionResponse(BaseModel):
     # Derived: the notice above every tab for a stopped run (gate_view.run_notice) -- text, tone
     # and the one action that gets it going; None while running, at a review, or done.
     notice: dict[str, Any] | None = None
+    # Derived: the "workspace paused" notice (gate_view.workspace_notice) for an open session whose
+    # container was stopped while idle -- text plus its Reconnect action; None otherwise.
+    workspace_notice: dict[str, Any] | None = None
 
 
 async def _verified_container_alive(session_id: str) -> bool:
@@ -659,6 +662,9 @@ async def _row_to_response(
         notice=gate_view.run_notice(
             status=row["status"], interrupted=interrupted, failure_stage=row.get("failure_stage"),
             current_stage=row.get("current_stage"),
+        ),
+        workspace_notice=gate_view.workspace_notice(
+            status=row["status"], container_alive=container_alive, run_active=active, interrupted=interrupted,
         ),
     )
 

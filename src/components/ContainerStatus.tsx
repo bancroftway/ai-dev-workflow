@@ -12,6 +12,7 @@ import type { SandboxStatus } from "@/lib/sandbox-status-context";
 const CONTAINER_STATUS_META: Record<SandboxStatus, { label: string; dot: string; pulse: boolean }> = {
   provisioning: { label: "Connecting…", dot: "bg-amber-400", pulse: true },
   ready: { label: "Connected", dot: "bg-green-500", pulse: true },
+  paused: { label: "Paused", dot: "bg-sky-400", pulse: false },
   error: { label: "Disconnected", dot: "bg-red-500", pulse: false },
   terminated: { label: "Stopped", dot: "bg-neutral-400", pulse: false },
 };

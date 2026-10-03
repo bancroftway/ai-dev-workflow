@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CodeGenModePicker, type CodeGenMode } from "@/components/CodeGenModePicker";
+import { useRunActivity } from "@/lib/run-activity-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
 
 /**
@@ -9,6 +10,9 @@ import { useSandboxStatus } from "@/lib/sandbox-status-context";
  * session opens. Non-blocking: graph.py falls back to local-stdio Copilot execution when no
  * sandbox is registered yet for a thread, so the rest of the page is fully usable while this is
  * still in flight -- this only surfaces a small status banner, it never blocks rendering.
+ *
+ * The one place every workspace banner lives: preparing, idle-paused (the server's
+ * workspace_notice + Reconnect) and a failed provision (its reason + Try again).
  *
  * Status lives in SandboxStatusProvider (not local state) so AppShell's auto-trigger effect can
  * gate on the same readiness signal without prop-drilling.
@@ -47,9 +51,8 @@ export function SandboxSessionBoot({
   skip?: boolean;
 }) {
   const [status, setStatus] = useSandboxStatus();
-  // Provision can fail with an explanatory message worth showing verbatim (e.g. the agent's
-  // 404/409 resume guards) -- falls back to the generic copy below when the response has no (or
-  // an unparseable) error body.
+  // A failed provision's reason, shown verbatim with a Try again button (e.g. the agent's 404/409
+  // resume guards, a docker failure) -- see `provision` below.
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   // One-shot latch (root-caused 2026-09-13, "container keeps dying" investigation): this
   // component's own name promises a boot-time decision, but `skip` sat in the effect's dependency
@@ -81,6 +84,41 @@ export function SandboxSessionBoot({
   // in the URL across a plain refresh of the same page -- sessionStorage (checked below), not this
   // flag, is what actually prevents the popup from reappearing on that refresh.
   const isNewSession = !skip && !resume && projectId !== undefined;
+  const [runActivity] = useRunActivity();
+  const workspaceNotice = runActivity?.workspaceNotice ?? null;
+
+  /** POST /api/sessions/provision; resolves null on success, else the server's reason -- the
+   * agent's own `detail` (every agent error, and agentFetch's "agent unreachable" 502) or the
+   * proxy's `error`. Reading only `error` used to hide every agent-side reason behind generic copy. */
+  const provision = useCallback(
+    async (resumeFlag: boolean): Promise<string | null> => {
+      try {
+        const res = await fetch("/api/sessions/provision", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId,
+            owner,
+            repo,
+            branch,
+            resume: resumeFlag,
+            projectId,
+            // Omitted (JSON.stringify drops an `undefined` value) for every session that never
+            // showed the picker -- resume, a plain reload, or `skip` -- so the agent falls back to
+            // this session's own already-pinned mode instead of overwriting it.
+            codeGenMode: codeGenMode ?? undefined,
+          }),
+        });
+        if (res.ok) return null;
+        const body = await res.json().catch(() => null);
+        const reason = body?.detail ?? body?.error;
+        return typeof reason === "string" && reason ? reason : `HTTP ${res.status}`;
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+    },
+    [sessionId, owner, repo, branch, projectId, codeGenMode],
+  );
 
   useEffect(() => {
     if (decidedForRef.current === sessionId) return;
@@ -114,41 +152,27 @@ export function SandboxSessionBoot({
 
     decidedForRef.current = sessionId;
     let cancelled = false;
-    fetch("/api/sessions/provision", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId,
-        owner,
-        repo,
-        branch,
-        resume: Boolean(resume),
-        projectId,
-        // Omitted (JSON.stringify drops an `undefined` value) for every session that never showed
-        // the picker -- resume, a plain reload, or `skip` -- so the agent falls back to this
-        // session's own already-pinned mode instead of overwriting it.
-        codeGenMode: codeGenMode ?? undefined,
-      }),
-    })
-      .then(async (res) => {
-        if (cancelled) return;
-        if (res.ok) {
-          setStatus("ready");
-          return;
-        }
-        const body = await res.json().catch(() => null);
-        setErrorMessage(typeof body?.error === "string" ? body.error : null);
-        setStatus("error");
-      })
-      .catch(() => {
-        if (!cancelled) setStatus("error");
-      });
+    void provision(Boolean(resume)).then((error) => {
+      if (cancelled) return;
+      setErrorMessage(error);
+      setStatus(error === null ? "ready" : "error");
+    });
     return () => {
       cancelled = true;
     };
-  }, [skip, sessionId, owner, repo, branch, resume, projectId, codeGenMode, isNewSession, setStatus]);
+  }, [skip, sessionId, resume, codeGenMode, isNewSession, provision, setStatus]);
 
-  if (skip || status === "ready") return null;
+  // Reconnect (an idle-paused workspace) and Retry (a failed provision) -- the same provision call
+  // as page-open, minus `resume`: that one-shot flag belongs to the Resume button's own open.
+  async function reconnect() {
+    setErrorMessage(null);
+    setStatus("provisioning");
+    const error = await provision(false);
+    setErrorMessage(error);
+    setStatus(error === null ? "ready" : "error");
+  }
+
+  if (skip || status === "ready" || status === "terminated") return null;
 
   if (isNewSession && storageChecked && codeGenMode === null) {
     return (
@@ -166,18 +190,41 @@ export function SandboxSessionBoot({
     );
   }
 
+  if (status === "paused") {
+    // No server notice = a stopped run whose own notice (AppShell's run notice, Resume) covers it.
+    if (workspaceNotice == null) return null;
+    return (
+      <div className="flex items-center gap-3 border-b border-sky-200 bg-sky-50 px-4 py-1.5 text-xs text-sky-900">
+        <span className="flex-1">{workspaceNotice.text}</span>
+        <button
+          type="button"
+          onClick={() => void reconnect()}
+          className="shrink-0 rounded-md border border-sky-300 bg-white px-2 py-0.5 font-medium text-sky-900 hover:bg-sky-100"
+        >
+          {workspaceNotice.action.label}
+        </button>
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div className="flex items-center gap-3 border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-xs text-amber-900">
+        <span className="flex-1">The workspace couldn&apos;t start: {errorMessage ?? "no reason was given"}</span>
+        <button
+          type="button"
+          onClick={() => void reconnect()}
+          className="shrink-0 rounded-md border border-amber-300 bg-white px-2 py-0.5 font-medium text-amber-900 hover:bg-amber-100"
+        >
+          Try again
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div
-      className={
-        status === "error"
-          ? "border-b border-red-200 bg-red-50 px-4 py-1.5 text-xs text-red-700"
-          : "border-b border-neutral-200 bg-neutral-50 px-4 py-1.5 text-xs text-neutral-500"
-      }
-    >
-      {status === "error"
-        ? (errorMessage ??
-          "Couldn't prepare a dev-tool sandbox for this session — chat still works, but the agent won't have repo/tool access yet.")
-        : "Preparing dev-tool sandbox…"}
+    <div className="border-b border-neutral-200 bg-neutral-50 px-4 py-1.5 text-xs text-neutral-500">
+      Preparing dev-tool sandbox…
     </div>
   );
 }

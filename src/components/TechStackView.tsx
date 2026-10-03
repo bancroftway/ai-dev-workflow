@@ -149,8 +149,8 @@ function TechStackViewImpl() {
           "Detecting" read as the app having lost the submission (user, 2026-08-31). ready_for_review
           with no open interrupt can only be the post-submit phase. */}
       {/* sandboxStatus check: a spinner with no failure signal of its own spun forever on a
-          provisioning failure (AppShell's "Sandbox provisioning failed" banner is the actual
-          error surface) or a stale reload of a terminated session -- neither is "detecting".
+          provisioning failure (SandboxSessionBoot's banner is the actual error surface), an
+          idle-paused workspace, or a stale reload of a terminated session -- none is "detecting".
           Empty-tabs fix (root-caused 2026-09-12): none of this ever checked durable truth, so a
           session long past tech-stack showed "Detecting…" forever whenever the live snapshot
           hadn't (re)arrived -- now the only way most sessions show anything at all, since nothing

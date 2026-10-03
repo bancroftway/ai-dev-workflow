@@ -42,7 +42,9 @@ export function HealthRing({
   ariaLabel,
   title,
 }: {
-  score: number;
+  /** null = not measured yet: renders an empty track with a dash (MetricsBar's 3-way split shows
+   * every ring from the start of a run, before metrics-exit has scored App Health/Effectiveness). */
+  score: number | null;
   baseline?: number | null;
   comparable?: boolean;
   size?: number;
@@ -52,27 +54,26 @@ export function HealthRing({
   ariaLabel?: string;
   title?: string;
 }) {
-  const color = healthColor(score);
   return (
     <svg
       width={size}
       height={size}
       viewBox="0 0 36 36"
       role="img"
-      aria-label={ariaLabel ?? `Health score ${score} out of 100`}
+      aria-label={ariaLabel ?? (score == null ? "Health score not measured" : `Health score ${score} out of 100`)}
       className="shrink-0"
     >
-      <title>{title ?? ringTitle(score, baseline, comparable)}</title>
+      <title>{title ?? (score == null ? "Not measured." : ringTitle(score, baseline, comparable))}</title>
       {/* currentColor at low opacity: inherits the surrounding text color, so the track and
           numeral stay legible on dark surfaces too (hardcoded #e5e7eb was invisible there). */}
       <circle cx="18" cy="18" r="15.915" fill="none" stroke="currentColor" opacity="0.15" strokeWidth="3.5" />
-      {score > 0 && (
+      {score != null && score > 0 && (
         <circle
           cx="18"
           cy="18"
           r="15.915"
           fill="none"
-          stroke={color}
+          stroke={healthColor(score)}
           strokeWidth="3.5"
           strokeLinecap="round"
           strokeDasharray={`${score} ${100 - score}`}
@@ -88,7 +89,7 @@ export function HealthRing({
         fontSize="12"
         fontWeight="600"
       >
-        {score}
+        {score ?? "—"}
       </text>
     </svg>
   );

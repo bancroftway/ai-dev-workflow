@@ -3273,6 +3273,18 @@ async def _set_aside_interrupted_work(
     return None
 
 
+def _may_hydrate_workspace_state(session_row: dict[str, Any] | None) -> bool:
+    """Whether intake may restore `stages` from the workspace's `.ai-dev-workflow/state.json`.
+
+    Not for a thread that has never started a run (its dbo.sessions row has no run_id yet --
+    scaffold's touch_run sets it on the first run): it has no state of its own to recover, so any
+    state.json in its workspace was committed by the EARLIER session whose branch this one was
+    started from. Session 3922779f (started on c2bbdca1's branch) hydrated that file and replayed
+    c2bbdca1's approvals and exit report as its own, skipping straight to the rebuild placements.
+    An unknown row (lookup failed, or no sessions DB) keeps the recovery path open."""
+    return session_row is None or session_row.get("run_id") is not None
+
+
 async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, Any]:
     thread_id = config["configurable"]["thread_id"]
 
@@ -3415,12 +3427,13 @@ async def intake_node(state: GraphState, config: RunnableConfig) -> dict[str, An
             raw_requirements_text, requirements_attachments = candidate_text, candidate_attachments
         consumed_message_id = latest_human_message.id
 
-    # Hydration (architecture plan Section B.2): only when this thread has never had any stage
-    # state in this process's memory yet -- i.e. genuinely the first invoke for this thread since
-    # the agent process started, whether because it's a returning session after a restart, or a
-    # different session picking up the same repo/branch/user. A thread already mid-session (any
-    # prior invoke populated `stages`) never re-hydrates; its in-memory checkpoint is authoritative.
-    if not stages and sandbox_registry.get(thread_id) is not None:
+    # Hydration (architecture plan Section B.2): only when this thread has no stage state in its
+    # checkpoint yet AND has run before -- a returning session whose checkpoint was lost. A new
+    # session started on an earlier session's branch starts fresh instead (see
+    # _may_hydrate_workspace_state); tech-stack still settles itself from the committed sidecar via
+    # its own hydrate_from_repo_file. A thread already mid-session (any prior invoke populated
+    # `stages`) never re-hydrates; its checkpoint is authoritative.
+    if not stages and _may_hydrate_workspace_state(existing_row) and sandbox_registry.get(thread_id) is not None:
         hydrated = await workflow_persistence.hydrate_state(get_sandbox_provider(), thread_id, _STAGE_KEYS)
         if hydrated is not None:
             stages = hydrated
@@ -9063,6 +9076,11 @@ def _demo() -> None:
     assert route(real_delta_state) == "gate"  # type: ignore[arg-type]
     failed_state = {"stages": {route_spec.key: {"last_verification": {"passed": False, "report": {}}, "verify_cycle_count": 0}}}
     assert route(failed_state) == "retry", "no_new_work must never mask a genuine verify failure"  # type: ignore[arg-type]
+
+    # A never-run thread must not adopt the state.json its source branch's session committed.
+    assert not _may_hydrate_workspace_state({"run_id": None})
+    assert _may_hydrate_workspace_state({"run_id": "e9f00a25"})
+    assert _may_hydrate_workspace_state(None)
 
     _demo_open_audit_findings()
     _demo_targeted_fix_stuck_decision()

@@ -313,7 +313,7 @@ async def close_session(
     fire-and-forgets the session's container teardown. This is THE choke point all ended
     sessions pass through (exit_nodes' completed/failed paths, git_ops' push-failure close,
     deploy_drain), so hooking here frees the repo's one-container slot in seconds instead of
-    the idle reaper's 30 minutes. Function-level import: the sandbox package transitively pulls
+    the idle reaper's timeout. Function-level import: the sandbox package transitively pulls
     chat_model, which a module-level import here would cycle. create_task, not await: ACI
     teardown shells `az container delete` (tens of seconds) and must not block the exit path;
     off-process callers (deploy_drain on a CI runner) no-op instantly inside the helper.

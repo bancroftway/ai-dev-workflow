@@ -129,6 +129,13 @@ GATE_TEXT: dict[str, Any] = {
     "notice_stopped_unknown": "This run stopped -- nothing is running it now (for example, after the agent restarted).",
     "action_open_overview": "Go to Overview",
     "action_resume": "Resume this run",
+    # The workspace notice (workspace_notice): an open session whose container isn't running.
+    "notice_workspace_paused": (
+        "This session's workspace is paused -- containers stop after {minutes} minutes without "
+        "activity to free up resources. Nothing is lost: your files and progress are saved, and the "
+        "workspace starts again on its own when you continue."
+    ),
+    "action_reconnect": "Reconnect now",
     # Recovery actions the server puts on the failed check's row (or its section, when no row
     # recorded the failure) of the gate the run failed at. Ids are what the frontend dispatches on.
     "action_retry": "Retry this check",
@@ -417,6 +424,24 @@ def run_notice(
         text = T["notice_stopped"].format(stage=pipeline.label(current_stage)) if current_stage else T["notice_stopped_unknown"]
         return {"tone": "warn", "text": text, "action": {"id": "resume", "label": T["action_resume"]}}
     return None
+
+
+def workspace_notice(*, status: str, container_alive: bool, run_active: bool, interrupted: bool) -> dict[str, Any] | None:
+    """The notice for an open session whose container isn't running while nothing needs it -- in
+    practice the idle reaper (config.SANDBOX_IDLE_TIMEOUT_SECONDS) stopping it while the session
+    waited at a review. A normal pause, not a failure: the workspace volume and branch keep
+    everything. {tone: "info", text, action: {id: "reconnect", label}}; None while the container
+    runs, a run is using it, the run itself stopped (run_notice's Resume reconnects too), or the
+    session is finished."""
+    if status != "in_progress" or container_alive or run_active or interrupted:
+        return None
+    T = GATE_TEXT
+    minutes = max(1, round(config.SANDBOX_IDLE_TIMEOUT_SECONDS / 60))
+    return {
+        "tone": "info",
+        "text": T["notice_workspace_paused"].format(minutes=minutes),
+        "action": {"id": "reconnect", "label": T["action_reconnect"]},
+    }
 
 
 def build_tab_strip(
@@ -1061,6 +1086,15 @@ def _demo() -> None:
     assert "still active" not in n["text"]
     assert run_notice(status="in_progress", interrupted=False, failure_stage=None, current_stage="plan") is None
     assert run_notice(status="completed", interrupted=False, failure_stage=None, current_stage="metrics-exit") is None
+
+    # The workspace notice: only an open session idling with no container -- never a stopped run
+    # (run_notice owns that), a live container, an attached run, or a finished session.
+    w = workspace_notice(status="in_progress", container_alive=False, run_active=False, interrupted=False)
+    assert w is not None and w["tone"] == "info" and w["action"]["id"] == "reconnect", w
+    assert f"{round(config.SANDBOX_IDLE_TIMEOUT_SECONDS / 60)} minutes" in w["text"], w
+    for kw_w in ({"container_alive": True}, {"run_active": True}, {"interrupted": True}, {"status": "failed"}):
+        args = {"status": "in_progress", "container_alive": False, "run_active": False, "interrupted": False, **kw_w}
+        assert workspace_notice(**args) is None, kw_w  # type: ignore[arg-type]
 
     # Every check mode / reported status has copy.
     all_checks = [*p.wrapper_checks, *(c for s in p.stages if s.gate for c in s.gate.checks)]

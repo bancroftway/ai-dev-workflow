@@ -749,6 +749,15 @@ _SETTINGS: dict[str, _Setting] = {
     ),
 
     # -- Sandbox/docker -----------------------------------------------------------------------------
+    # local_docker.py's / azure_aci.py's idle reaper, and the "workspace paused" notice that names
+    # it (gate_view.workspace_notice). Both run outside any pinned session (a background task, a
+    # plain HTTP route), so this always resolves env/default -- never a live DB override.
+    "SANDBOX_IDLE_TIMEOUT_SECONDS": _Setting(
+        "float", "AIDW_SANDBOX_IDLE_TIMEOUT", "600", "sandbox",
+        "How long a session's sandbox container may sit with no activity (no command, no agent turn) before it is stopped to free its resources.",
+        "Higher keeps an idle session's container warm longer (holds the per-repo slot and memory); lower frees them sooner. Work is never lost: the workspace volume survives and the container restarts when the session continues. Environment variable only -- not live-editable.",
+        "seconds; keep above 300 (a silent agent turn re-marks its container active every 5 minutes)",
+    ),
     "SANDBOX_PROVISION_RETRY_ATTEMPTS": _Setting(
         "int", "AIDW_SANDBOX_PROVISION_RETRY_ATTEMPTS", "2", "sandbox",
         "Retry count when a sandbox container starts but its CLI tool never responds within its own readiness deadline.",

@@ -26,7 +26,7 @@ import { usePipeline, type PipelineTab } from "@/lib/pipeline";
 import { rawProxyUrl } from "@/lib/raw-proxy";
 import { ReviewProvider, useReview, useReviewModel } from "@/lib/review-context";
 import { useSandboxStatus } from "@/lib/sandbox-status-context";
-import { useRunActivity } from "@/lib/run-activity-context";
+import { useRunActivity, type WorkspaceNotice } from "@/lib/run-activity-context";
 import { EMPTY_STAGES, useRunningStages, useStructuralRunEvents } from "@/lib/use-run-events";
 import { useWorkflowThread } from "@/lib/workflow-thread-context";
 import type { MergeReadinessReport, WorkflowState } from "@/lib/workflow-types";
@@ -340,6 +340,7 @@ export function AppShell({
       review_id?: string | null;
       failure_gate?: { tab_id: string; button: string } | null;
       notice?: RunNotice | null;
+      workspace_notice?: WorkspaceNotice | null;
     }) {
       // A terminal session (completed/failed/rejected) has no container to be alive in the first
       // place -- SandboxSessionBoot's `skip` never even asked for one. Calling that
@@ -355,8 +356,15 @@ export function AppShell({
       // observed live: sandboxStatus later reached "ready" via that separate path, but
       // runActivity.currentStage stayed null forever, so every durable-fallback tab (Tech Stack
       // included) rendered as if the session had never run.
-      if (sandboxStatusRef.current !== "provisioning") {
-        setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "error" : "terminated");
+      //
+      // No container on an open session is "paused" (the idle reaper stopped it while the session
+      // waited -- normal, SandboxSessionBoot offers Reconnect), never "error": that mapping turned
+      // every idle-reaped gate into a red "provisioning failed" banner although nothing had failed
+      // (session 62f6c78c, 2026-10-03). "error" now means only that a provision request failed, and
+      // stays up with its reason until a container is actually alive again.
+      const current = sandboxStatusRef.current;
+      if (current !== "provisioning" && !(current === "error" && !row.container_alive)) {
+        setSandboxStatus(row.container_alive ? "ready" : row.status === "in_progress" ? "paused" : "terminated");
       }
       setDurableRow({
         current_stage: row.current_stage, status: row.status, awaiting_gate: row.awaiting_gate,
@@ -379,6 +387,7 @@ export function AppShell({
         mergeReady: row.merge_ready ?? null,
         reviewId: row.review_id ?? null,
         failureGate: row.failure_gate ?? null,
+        workspaceNotice: row.workspace_notice ?? null,
       });
     }
 
@@ -607,11 +616,6 @@ export function AppShell({
   return (
     <ReviewProvider value={reviewState}>
       <div className="flex min-h-full flex-1 flex-col">
-        {sandboxStatus === "error" && (
-          <div className="border-b border-red-300 bg-red-50 px-4 py-2 text-sm text-red-900">
-            Sandbox provisioning failed — the workflow can’t run. Reload the page to retry.
-          </div>
-        )}
         {/* Pre-build the bar's own scan chips only show the empty-repo baseline scan (a
             meaningless 89/A/Pass on zero code) -- misleading, per user feedback 2026-08-31 --
             MetricsBar's own summary-gated `chips` still suppress those regardless of this

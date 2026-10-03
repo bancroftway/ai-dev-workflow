@@ -349,35 +349,40 @@ export function MetricsBar({
     // Metrics Bar 3-way split (metrics_nodes.metrics_compute_node): Code Health (static analysis
     // only, identical to the standalone Code Health Report), App Health (coverage + test pass
     // rate), AI Dev Workflow Framework Effectiveness (AC Resolution % + a separate, non-blended
-    // productivity/effort-saved estimate). Each guarded on its own score, independently of the
-    // others and of the legacy composite health_score -- a pre-migration stored baseline or a
-    // scan that predates this split simply omits the rings it has no number for.
-    const codeHealthRing = summary.code_health_score == null ? null : (
-      <HealthRing
-        key="code-health"
-        score={summary.code_health_score}
-        baseline={hasBaseline ? scan?.baseline_summary?.code_health_score : null}
-        ariaLabel={`Code Health score ${summary.code_health_score} out of 100`}
-        title="Code Health — static analysis only (security, dependencies, complexity, duplication, maintainability). No test coverage or live-app (DAST) scanning. Identical to the standalone Code Health Report for this commit."
-      />
+    // productivity/effort-saved estimate). Always rendered, each independently: an unscored ring
+    // (App Health/Effectiveness before metrics-exit, or a pre-split stored baseline) shows a dash
+    // placeholder instead of vanishing, so all three are visible for the whole run.
+    const codeHealthRing = (
+      <span key="code-health" className="flex items-center gap-1">
+        <HealthRing
+          score={summary.code_health_score ?? null}
+          baseline={hasBaseline ? scan?.baseline_summary?.code_health_score : null}
+          ariaLabel={summary.code_health_score == null ? "Code Health not measured yet" : `Code Health score ${summary.code_health_score} out of 100`}
+          title={`Code Health — static analysis only (security, dependencies, complexity, duplication, maintainability). No test coverage or live-app (DAST) scanning. Identical to the standalone Code Health Report for this commit.${summary.code_health_score == null ? " Not measured yet." : ""}`}
+        />
+        <span className="text-xs text-neutral-500">Code</span>
+      </span>
     );
-    const appHealthRing = summary.app_health_score == null ? null : (
-      <HealthRing
-        key="app-health"
-        score={summary.app_health_score}
-        baseline={hasBaseline ? scan?.baseline_summary?.app_health_score : null}
-        ariaLabel={`App Health score ${summary.app_health_score} out of 100`}
-        title="App Health — the health of the running app: test coverage and percent of tests passing, blended. DAST scanning is not yet part of this score."
-      />
+    const appHealthRing = (
+      <span key="app-health" className="flex items-center gap-1">
+        <HealthRing
+          score={summary.app_health_score ?? null}
+          baseline={hasBaseline ? scan?.baseline_summary?.app_health_score : null}
+          ariaLabel={summary.app_health_score == null ? "App Health not measured" : `App Health score ${summary.app_health_score} out of 100`}
+          title={`App Health — the health of the running app: test coverage and percent of tests passing, blended. DAST scanning is not yet part of this score.${summary.app_health_score == null ? " Not measured: scored at the metrics stage, and left blank when neither coverage nor a test pass rate was measured or the app could not start." : ""}`}
+        />
+        <span className="text-xs text-neutral-500">App</span>
+      </span>
     );
-    const frameworkEffectiveness = summary.framework_effectiveness_score == null ? null : (
+    const frameworkEffectiveness = (
       <span key="framework-effectiveness" className="flex items-center gap-1">
         <HealthRing
-          score={summary.framework_effectiveness_score}
+          score={summary.framework_effectiveness_score ?? null}
           baseline={hasBaseline ? scan?.baseline_summary?.framework_effectiveness_score : null}
-          ariaLabel={`AI Dev Workflow Framework Effectiveness score ${summary.framework_effectiveness_score} out of 100`}
-          title="AI Dev Workflow Framework Effectiveness — percent of acceptance criteria fully resolved by the pipeline. See the exit report for the full traceability matrix."
+          ariaLabel={summary.framework_effectiveness_score == null ? "AI Dev Workflow Framework Effectiveness not measured yet" : `AI Dev Workflow Framework Effectiveness score ${summary.framework_effectiveness_score} out of 100`}
+          title={`AI Dev Workflow Framework Effectiveness — percent of acceptance criteria fully resolved by the pipeline. See the exit report for the full traceability matrix.${summary.framework_effectiveness_score == null ? " Not measured yet: scored at the metrics stage." : ""}`}
         />
+        <span className="text-xs text-neutral-500">Framework</span>
         {summary.estimated_hours_saved != null && (
           <span
             className="text-xs text-neutral-500"

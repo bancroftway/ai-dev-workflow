@@ -45,7 +45,7 @@ def _llm_io_log_path() -> Path:
 
 # A single completion-wait exec blocks (via the remote `timeout`/`tail --pid` below) for up to
 # this long before returning to let the host loop re-check its own deadline and re-touch
-# last_active (see local_docker.py's DEFAULT_IDLE_TIMEOUT_SECONDS=1800 -- this is comfortably
+# last_active (config.SANDBOX_IDLE_TIMEOUT_SECONDS, 600 by default -- this is comfortably
 # under that with margin to spare). Replaces a fixed-interval host-side poll (2026-09-01: a
 # runaway stack of those, each issuing its own `docker exec` every few seconds, hammered Docker
 # Desktop's API into a VM reset). One exec call per chunk instead of one every few seconds cuts
@@ -58,7 +58,7 @@ _ACTIVITY_CHUNK_SECONDS = 300.0
 # models, as of this feature). classify_line=None skips this branch and the exec-call cadence
 # entirely, keeping _ACTIVITY_CHUNK_SECONDS's original ~18-calls-per-turn shape for anything that
 # doesn't need live narration. Env-overridable so an operator can dial this down without a code
-# change -- same override convention as AIDW_SANDBOX_IDLE_TIMEOUT (local_docker.py/azure_aci.py).
+# change -- same override convention as AIDW_SANDBOX_IDLE_TIMEOUT (config.py).
 #
 # ponytail: ~40x more host-side exec calls than the 300s cadence for a full-length turn (5400s/7s
 # ~= 771 vs 5400s/300s ~= 18) -- a real, accepted trade-off (deliberately NOT the same failure shape

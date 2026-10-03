@@ -2,7 +2,9 @@
 
 import { createContext, useContext, useState, type ReactNode } from "react";
 
-export type SandboxStatus = "provisioning" | "ready" | "error" | "terminated";
+/** "paused": an open session whose container isn't running (idle-stopped) -- normal, reconnects on
+ * demand. "error": a provision request itself failed. */
+export type SandboxStatus = "provisioning" | "ready" | "paused" | "error" | "terminated";
 
 const SandboxStatusContext = createContext<[SandboxStatus, (s: SandboxStatus) => void] | null>(null);
 

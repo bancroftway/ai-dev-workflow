@@ -25,7 +25,7 @@ async def end_session_container(thread_id: str) -> None:
 
     Called (fire-and-forget) from session_store.close_session -- the single choke point every
     terminal transition (failed OR completed) passes through -- so an errored/escalated/finished
-    run frees its per-repo cap slot in seconds instead of waiting on the 30-minute idle reaper.
+    run frees its per-repo cap slot in seconds instead of waiting on the idle reaper (10 minutes by default).
     No-ops harmlessly when the registry has no entry: off-process callers of close_session (the
     CI runner's deploy_drain) and already-torn-down sessions land here with nothing to do.
     terminate() itself routes through registry.pop, so no extra eviction is needed here."""

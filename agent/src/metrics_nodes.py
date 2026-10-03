@@ -522,7 +522,9 @@ async def collect_live_refresh(state: dict[str, Any], thread_id: str) -> dict[st
     provider = get_sandbox_provider()
     prior_summary = ((state.get("repo_scan") or {}).get("latest_summary")
                      or (state.get("repo_scan") or {}).get("baseline_summary"))
-    summary = repo_scan.merge_measures(prior_summary, report.to_dashboard_dict()["summary"], "full")
+    summary = repo_scan.merge_measures(
+        prior_summary, repo_scan.with_code_health(report.to_dashboard_dict()["summary"], report), "full"
+    )
     # A refresh scan measures a SMALLER subscore set than the gate scans (no coverage merge, no
     # lighthouse, no eval, no outdated), so its score is not directly comparable to what sat on
     # the strip before it. Stamp comparability against the summary being replaced so the ring can

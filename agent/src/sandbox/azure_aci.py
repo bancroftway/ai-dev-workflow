@@ -169,7 +169,7 @@ class AzureContainerInstanceProvider(SandboxProvider):
       AIDW_CACHE_SHARE, AIDW_CACHE_STORAGE_ACCOUNT, AIDW_CACHE_STORAGE_KEY
     """
 
-    def __init__(self, *, idle_timeout_seconds: float = 1800.0) -> None:
+    def __init__(self) -> None:
         self._resource_group = os.environ["AZURE_RESOURCE_GROUP"]
         self._sandbox_image = os.environ["AZURE_ACI_SANDBOX_IMAGE"]
         self._vnet_name = os.environ.get("AZURE_ACI_VNET_NAME")
@@ -182,14 +182,8 @@ class AzureContainerInstanceProvider(SandboxProvider):
         self._cache_share = os.environ.get("AIDW_CACHE_SHARE")
         self._cache_storage_account = os.environ.get("AIDW_CACHE_STORAGE_ACCOUNT")
         self._cache_storage_key = os.environ.get("AIDW_CACHE_STORAGE_KEY")
-        # Parity with LocalDockerProvider: same env var, same override semantics. The idle
-        # reaper's blind spot during a long silent turn is closed by run_turn's own polling loop
-        # (cli_agent_exec.py) plus exec_in_sandbox's `last_active` bump below, both of which fire
-        # repeatedly over the course of a single long turn for either provider; this env var
-        # remains an explicit override for a caller that wants a different idle window (e.g.
-        # run_headless.py's belt-and-suspenders 86400s).
-        env_timeout = os.environ.get("AIDW_SANDBOX_IDLE_TIMEOUT")
-        self._idle_timeout_seconds = float(env_timeout) if env_timeout else idle_timeout_seconds
+        # Idle window: config.SANDBOX_IDLE_TIMEOUT_SECONDS, read by the reaper each tick -- parity
+        # with LocalDockerProvider (see its __init__).
         self._sandboxes: dict[str, _RunningSandbox] = {}
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
@@ -507,12 +501,13 @@ class AzureContainerInstanceProvider(SandboxProvider):
     async def _reap_idle_sandboxes(self) -> None:
         while True:
             await asyncio.sleep(_REAP_POLL_SECONDS)
+            idle_timeout = workflow_config.SANDBOX_IDLE_TIMEOUT_SECONDS
             async with self._lock:
                 now = time.monotonic()
                 idle_session_ids = [
                     sid
                     for sid, sandbox in self._sandboxes.items()
-                    if now - sandbox.last_active > self._idle_timeout_seconds
+                    if now - sandbox.last_active > idle_timeout
                 ]
             for session_id in idle_session_ids:
                 logger.info("Reaping idle ACI sandbox session_id=%s", session_id)

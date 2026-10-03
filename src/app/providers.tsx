@@ -3,6 +3,7 @@
 import { SessionProvider } from "next-auth/react";
 import type { Session } from "next-auth";
 import type { ReactNode } from "react";
+import { ServerConnectionBanner } from "@/components/ServerConnectionBanner";
 
 // CopilotKit/A2UIProvider deliberately live in workflow/providers.tsx, not
 // here: mounting them app-wide made the client fetch runtime info from
@@ -16,5 +17,10 @@ export function Providers({
   children: ReactNode;
   session?: Session | null;
 }) {
-  return <SessionProvider session={session}>{children}</SessionProvider>;
+  return (
+    <SessionProvider session={session}>
+      <ServerConnectionBanner />
+      {children}
+    </SessionProvider>
+  );
 }

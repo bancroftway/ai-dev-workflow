@@ -98,8 +98,12 @@ ARG SYFT_VERSION=1.51.1
 # toolchain it doesn't ship -- Node 18, a second JDK, a Go version. See the /opt/aidw layout below
 # and bootstrap.sh for how it's driven. Pinned like every other tool here.
 ARG MISE_VERSION=2025.1.0
+# GitHub CLI -- fetched from GitHub releases, not GitHub's apt repo (cli.github.com/packages): that
+# repo keeps only the newest build, so every apt pin broke the rebuild the day gh shipped a new
+# release (2.100.0 on 2026-09-17, 2.101.0 on 2026-10-02). Release assets never age out.
+ARG GH_VERSION=2.101.0
 
-# ── fetch stage: the seven curl|tar binary installs, COPY'd into the final stage in one layer ───
+# ── fetch stage: the eight curl|tar binary installs, COPY'd into the final stage in one layer ───
 # Size win is ~0 (each RUN already deleted its tarball in-layer); the gains are parallel fetching
 # under BuildKit and seven layers collapsing to one. All fetches stay arch-aware via
 # `dpkg --print-architecture`, hence ${BASE_IMAGE} (cached anyway) rather than a smaller fetcher.
@@ -111,6 +115,7 @@ ARG TRIVY_VERSION
 ARG OSV_SCANNER_VERSION
 ARG MISE_VERSION
 ARG SYFT_VERSION
+ARG GH_VERSION
 RUN set -eux; \
     mkdir -p /out/bin; \
     arch="$(dpkg --print-architecture)"; \
@@ -145,8 +150,12 @@ RUN set -eux; \
     curl -fsSL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/${osv_asset}" -o /out/bin/osv-scanner; \
     curl -fsSL "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${syft_asset}" -o /tmp/syft.tar.gz; \
     tar -xzf /tmp/syft.tar.gz -C /out/bin syft; \
+    # gh's asset names use dpkg's own arch names (amd64/arm64), so no case entry needed.
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${arch}.tar.gz" -o /tmp/gh.tar.gz; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /out/bin/gh; \
     chmod +x /out/bin/copilot /out/bin/scc /out/bin/gitleaks /out/bin/trivy /out/bin/osv-scanner /out/bin/syft; \
-    rm -rf /tmp/copilot.tar.gz /tmp/mise /tmp/mise.tar.gz /tmp/scc.tar.gz /tmp/gitleaks.tar.gz /tmp/trivy.tar.gz /tmp/syft.tar.gz
+    rm -rf /tmp/copilot.tar.gz /tmp/mise /tmp/mise.tar.gz /tmp/scc.tar.gz /tmp/gitleaks.tar.gz /tmp/trivy.tar.gz /tmp/syft.tar.gz /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${arch}"
 
 # ── final stage ────────────────────────────────────────────────────────────────────────────────
 FROM ${BASE_IMAGE}
@@ -280,7 +289,8 @@ RUN set -eux; \
     mkdir -p /opt/aidw/tools/bin /opt/aidw/cache; \
     chmod -R a+rwX /opt/aidw
 
-# Node.js/npm (NodeSource) + Python + the GitHub CLI + the Claude Code CLI. dotnet, git, and curl
+# Node.js/npm (NodeSource) + Python + the Claude Code CLI (gh comes from the fetch stage, and the
+# `gh --version` below just smoke-checks it in the final image). dotnet, git, and curl
 # already come from the base dotnet/sdk image (verified: Ubuntu 24.04, git/curl preinstalled,
 # `dotnet --version` reports 10.0.x).
 #
@@ -312,18 +322,7 @@ RUN set -eux; \
     # `claude` unable to run at all ("Error: claude native binary not installed"), verified live
     # against a real rebuilt image. --allow-scripts is npm's own suggested fix for exactly this.
     npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION}"; \
-    curl -fsSL --retry 5 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
-    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg; \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list; \
-    apt-get update; \
-    # 2026-09-17: bumped 2.100.0 -> 2.101.0 -- the exact 2.100.0 build had aged out of GitHub's own
-    # apt repo entirely (confirmed live: `apt-cache policy gh` no longer lists it as a candidate at
-    # all, only 2.101.0 from cli.github.com plus Ubuntu's own older 2.45.0), breaking every rebuild
-    # regardless of anything else in this file. 2.101.0 was apt's only available candidate from
-    # this source as of this bump.
-    apt-get install -y --no-install-recommends gh=2.101.0; \
+    gh --version; \
     rm -rf /var/lib/apt/lists/*
 
 # Playwright MCP + its exact-matching browser build, baked at BUILD time into
@@ -383,7 +382,7 @@ RUN set -eux; \
         libxdamage1=1:1.1.6-1build1 \
         libxfixes3=1:6.0.0-2build1 \
         libxrandr2=2:1.5.2-2build1 \
-        libgbm1=25.2.8-0ubuntu0.24.04.2 \
+        libgbm1=25.2.8-0ubuntu0.24.04.4 \
         libasound2t64=1.2.11-1ubuntu0.3 \
         libpango-1.0-0=1.52.1+ds-1build1 \
         libcairo2=1.18.0-3build1; \

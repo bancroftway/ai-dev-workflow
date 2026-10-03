@@ -33,7 +33,6 @@ from .provider import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_IMAGE = "ai-dev-workflow-sandbox:latest"
-DEFAULT_IDLE_TIMEOUT_SECONDS = 1800.0
 _REAP_POLL_SECONDS = 60.0
 _CONTAINER_NAME_PREFIX = "ai-dev-workflow-sandbox-"
 # Matches entrypoint.sh's WORKSPACE_DIR -- the clone's own root, so persistence code can address
@@ -213,21 +212,12 @@ async def _stop_orphaned_turns(session_id: str, exec_fn: Callable[[str], Awaitab
 
 
 class LocalDockerProvider(SandboxProvider):
-    def __init__(
-        self,
-        *,
-        image: str = DEFAULT_IMAGE,
-        idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
-    ) -> None:
+    def __init__(self, *, image: str = DEFAULT_IMAGE) -> None:
         self._image = image
-        # The idle reaper's blind spot during a long silent turn used to be a real risk (all
-        # activity inside the container over Copilot's old TCP session, no agent-side exec) --
-        # closed now by run_turn's own polling loop (cli_agent_exec.py) plus exec_in_sandbox's
-        # `last_active` bump below, both of which fire repeatedly over the course of a single
-        # long turn for either provider. This env var remains an explicit override for a caller
-        # that wants a different idle window (e.g. run_headless.py's belt-and-suspenders 86400s).
-        env_timeout = os.environ.get("AIDW_SANDBOX_IDLE_TIMEOUT")
-        self._idle_timeout_seconds = float(env_timeout) if env_timeout else idle_timeout_seconds
+        # The idle window is config.SANDBOX_IDLE_TIMEOUT_SECONDS, read by the reaper each tick. The
+        # reaper's old blind spot during a long silent turn is closed by run_turn's own polling
+        # loop (cli_agent_exec.py) plus exec_in_sandbox's `last_active` bump below, both of which
+        # fire repeatedly over a single long turn for either provider.
         self._sandboxes: dict[str, _RunningSandbox] = {}
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
@@ -664,12 +654,13 @@ class LocalDockerProvider(SandboxProvider):
         exercised locally before it ever runs in production."""
         while True:
             await asyncio.sleep(_REAP_POLL_SECONDS)
+            idle_timeout = workflow_config.SANDBOX_IDLE_TIMEOUT_SECONDS
             async with self._lock:
                 now = time.monotonic()
                 idle_session_ids = [
                     sid
                     for sid, sandbox in self._sandboxes.items()
-                    if now - sandbox.last_active > self._idle_timeout_seconds
+                    if now - sandbox.last_active > idle_timeout
                 ]
             for session_id in idle_session_ids:
                 logger.info("Reaping idle sandbox session_id=%s", session_id)

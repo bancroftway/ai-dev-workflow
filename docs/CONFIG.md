@@ -53,7 +53,7 @@ E2E_GITHUB_TOKEN=
 
 AGENT_PROVIDER=claude             # claude | copilot — env fallback; DB org_settings wins when set
 SANDBOX_PROVIDER=local            # local (Docker) | aci (Azure Container Instances)
-AIDW_SANDBOX_IDLE_TIMEOUT=1800    # seconds before an idle sandbox container is reaped; headless
+AIDW_SANDBOX_IDLE_TIMEOUT=600     # seconds before an idle sandbox container is reaped; headless
                                   # runs export 86400 — export it yourself for long-paused UI runs
 AIDW_SANDBOX_PROVISION_RETRY_ATTEMPTS=2
 AIDW_TOOLCHAIN_LOG=agent/agent-work/toolchain.jsonl  # host-side "what did bootstrap install" log
