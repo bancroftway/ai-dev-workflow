@@ -25,7 +25,7 @@ from .prompt_loader import load_prompt_pair, render_prompt
 from langchain_core.runnables import RunnableConfig
 
 from . import config as workflow_config
-from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, tech_stack_signals, workflow_persistence
+from . import git_ops, model_config, repo_files, repo_scan, spec_ledger, tech_stack_signals, test_inventory, workflow_persistence
 from .gates import readme_gate
 from .gates.coverage_parsing import MIN_COVERAGE_PERCENT
 from .gates.remediation_gate import accounted_for
@@ -918,7 +918,22 @@ async def metrics_compute_node(state: dict[str, Any], config: RunnableConfig) ->
         delta_summary=delta_summ,
         metrics_gate={"reasons": gate_reasons, "attempt": attempt},
     )
-    return {"metrics_report": {"metrics": metrics}, "repo_scan": prior_repo_scan}
+    # End-of-run refresh of the Tests tab's inventory: implementation, e2e fixes and test hardening
+    # all edit tests after r_ac_to_tests first built it. Same stage, diffed against the run's own
+    # baseline (what the exit report's "Files changed" uses too).
+    prior_inventory = state.get("test_inventory") or {}
+    inventory = None
+    if prior_inventory.get("stage_key"):
+        stage_key = prior_inventory["stage_key"]
+        inventory = await test_inventory.build_test_inventory(
+            provider, thread_id,
+            state.get("run_baseline_commit") or ((state.get("stages") or {}).get(stage_key) or {}).get("baseline_commit"),
+            stage_key=stage_key, as_of_label="End of run",
+        )
+    return {
+        "metrics_report": {"metrics": metrics}, "repo_scan": prior_repo_scan,
+        **({"test_inventory": inventory} if inventory else {}),
+    }
 
 
 async def metrics_ponytail_gain_node(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:

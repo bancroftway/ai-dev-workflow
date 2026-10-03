@@ -82,9 +82,9 @@ repo-root/
   coverlet.msbuild`, and `dotnet sln add apps/api.Tests/Api.Tests.csproj`. Run with `dotnet test`.
 - **Web (Vitest)**: `cd apps/web && npm install -D vitest @vue/test-utils jsdom
   @vitest/coverage-v8`; add `test: { environment: "jsdom", globals: true, passWithNoTests: true }`
-  to `vite.config.ts` -- the last option matters: an AC-retirement fallback can legitimately leave
-  a file with a placeholder test only, and without it a file Vitest discovers but that registers
-  zero tests is a hard runner error, not a pass. Run with `npx vitest run`.
+  to `vite.config.ts` -- the last option matters: retiring a package's last criteria can delete its
+  last test file, and without it a package with no test file left is a hard runner error, not a
+  pass. Run with `npx vitest run`.
 
 **Coverage contract** (this pipeline's coverage gate replays `.ai-dev-workflow/coverage-commands.json`
 when present, INSTEAD of its own dotnet/js legacy fallback -- a partial contract silently exempts

@@ -270,17 +270,15 @@ identifier-safe/punctuation-stripped forms some tests still use (`US_0007_2`, `T
 and use your `edit`/`apply_patch` tool to remove exactly that test case. If other tests remain in
 the file afterward, that is a normal edit, nothing further to do. If it was the LAST test in the
 file, you have no delete tool and that is deliberate -- do not attempt to remove the file itself.
-Instead overwrite its content with ONE trivially-passing placeholder test naming the retired id
-(e.g. for JS/TS, `test("US-0007.2 retired -- tests removed", () => { expect(true).toBe(true); });`;
-for .NET, `[Fact] public void US_0007_2_Retired() { }`; for pytest,
-`def test_us_0007_2_retired(): pass`), never a bare comment with no test case at all. This matters
-mechanically, not just stylistically: under Vitest (this pipeline's baked JS/TS runner), a file
-that matches the runner's own file-discovery pattern but registers zero actual tests is a hard
-runner ERROR ("No test suite found in file"), not a pass -- confirmed live against the pinned
-version in `agent/sandbox-image/test/package.json` -- so a comment-only file would fail the NEXT
-stage's suite for a reason that has nothing to do with anything that stage did. A real, passing,
-named placeholder test is expected, disclosed residue, not a defect, and not something you need to
-solve any further than that.
+Instead delete every line of it, leaving the file completely empty: the pipeline deletes a test file
+you emptied before any test runner sees it. Never leave a placeholder test, a comment, or anything
+else naming the retired id -- a deterministic gate fails any test file that still names one.
+
+When a criterion's `change` in the Approved Specification is `"modified"`, its wording changed this
+run while the code still implements the old wording. Grep for its id: every existing test of it
+that asserts the old behaviour still passes, which is wrong for this stage. Rewrite each one to
+assert the revised wording, so it fails until the code changes, or remove a test whose behaviour no
+longer exists. A test of a reworded criterion that still passes is rejected.
 
 If you write or edit a `playwright.config.*`, its `use` block MUST set `screenshot: 'on'` -- a
 passing e2e suite must still capture visual evidence (the exit report requires screenshots for UI

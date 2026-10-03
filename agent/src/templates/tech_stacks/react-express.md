@@ -84,9 +84,9 @@ npm workspaces — one lockfile at the repo root covers both `apps/web` and `app
 
 - **API (Vitest)**: `npm install -D vitest supertest @types/supertest --workspace apps/api`. Export
   the Express `app` (don't call `.listen()` at import time) so tests can drive it with
-  `supertest(app)`. Add `test: { passWithNoTests: true }` to `apps/api`'s own vitest config -- an
-  AC-retirement fallback can legitimately leave a file with a placeholder test only, and without
-  this a file Vitest discovers but that registers zero tests is a hard runner error, not a pass.
+  `supertest(app)`. Add `test: { passWithNoTests: true }` to `apps/api`'s own vitest config -- retiring
+  a package's last criteria can delete its last test file, and without this a package with no test
+  file left is a hard runner error, not a pass.
   Run with `npm run test --workspace apps/api` (`vitest run`).
 - **Web (Vitest)**: `npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom
   @vitest/coverage-v8 --workspace apps/web`; add

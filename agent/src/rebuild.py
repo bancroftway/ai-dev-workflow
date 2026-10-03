@@ -244,6 +244,10 @@ class RebuildSpec:
     # too). Once that stage has started, a re-run of this check on a resume would build against
     # the next stage's work -- see should_skip_rebuild and blame_downstream.
     next_stage_key: str = ""
+    # The test-writing stage this placement follows, when it has one: the node then deletes test
+    # files that stage emptied (its verify does too, but verify is off in YOLO) and publishes the
+    # whole-repo test inventory (GraphState.test_inventory) diffed against that stage's baseline.
+    test_inventory_stage_key: str = ""
 
 
 # The checks a rebuild placement runs, shown as rows on the gate after the stage it follows
@@ -302,6 +306,31 @@ def _accounted_files(suites: list[Any]) -> set[str | None]:
             out.add(test_results.repo_relative(f))
             out.add(test_results.repo_relative(posixpath.normpath(posixpath.join(s.root or ".", f))))
     return out
+
+
+async def _prune_and_inventory(provider: Any, thread_id: str, state: dict[str, Any], stage_key: str) -> dict[str, Any] | None:
+    """Deletes the test files `stage_key` emptied, takes them off the approved test plan the red
+    gate reads (_planned_test_files), and returns the whole-repo test inventory (None if it could
+    not be built). Lazy imports: the gates package imports this module."""
+    from . import test_inventory
+    from .gates.write_scope_gate import prune_emptied_test_files
+
+    baseline = ((state.get("stages") or {}).get(stage_key) or {}).get("baseline_commit")
+    pruned = await prune_emptied_test_files(provider, thread_id, baseline)
+    if pruned:
+        raw = await repo_files.read_repo_file(provider, thread_id, workflow_persistence.AC_TO_TESTS_APPROVED_PATH)
+        try:
+            suite = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            suite = None
+        if isinstance(suite, dict) and isinstance(suite.get("test_files"), list):
+            suite["test_files"] = [f for f in suite["test_files"] if not (isinstance(f, dict) and f.get("path") in pruned)]
+            await repo_files.write_repo_file(
+                provider, thread_id, workflow_persistence.AC_TO_TESTS_APPROVED_PATH, json.dumps(suite, indent=2)
+            )
+    return await test_inventory.build_test_inventory(
+        provider, thread_id, baseline, stage_key=stage_key, as_of_label="As written, before implementation"
+    )
 
 
 async def _planned_test_files(provider: Any, thread_id: str) -> list[str]:
@@ -795,6 +824,12 @@ def make_rebuild_node(spec: RebuildSpec):
             rebuild[spec.key] = rb
             return {"rebuild": rebuild}
 
+        # Before the build: an emptied test file would crash its suite's runner.
+        inventory = (
+            await _prune_and_inventory(provider, thread_id, state, spec.test_inventory_stage_key)
+            if spec.test_inventory_stage_key else None
+        )
+
         # GHCP finds every buildable project and builds it from the right directory, then reports
         # through a schema-validated terminal tool. Replaces "an audit model guesses a build
         # command + root, Python runs `cd {root} && {command}` blindly" -- that guess was wrong on
@@ -1063,7 +1098,7 @@ def make_rebuild_node(spec: RebuildSpec):
         )
         finish_event = await run_event_store.append_event(finish_event)
         await run_event_stream.emit_live(finish_event, run_config)
-        return {"rebuild": rebuild}
+        return {"rebuild": rebuild, **({"test_inventory": inventory} if inventory else {})}
 
     return rebuild_node
 

@@ -188,11 +188,13 @@ function realIdOrNull(id: string): string | null {
  * every case -- this was a rendering choice, not a stamping bug. Every live item now always
  * carries a visible, low-contrast chip so the reviewer never has to wonder whether a blank space
  * means "unchanged" or "the tracking broke." */
-function ChangeBadge({
+export function ChangeBadge({
   change,
   deferred,
 }: {
-  change?: "new" | "modified" | "deleted" | "unchanged" | "deferred" | "activated" | "reopened";
+  // A plain string: the Tests tab's inventory (TestInventoryView) shares this chip and sends the
+  // server's own vocabulary; anything unrecognised reads as "unchanged".
+  change?: string;
   deferred?: boolean;
 }) {
   if (deferred || change === "deferred") {
@@ -211,6 +213,11 @@ function ChangeBadge({
   }
   if (change === "reopened") {
     return <span className="ml-1.5 rounded-full bg-rose-100 px-1.5 text-xs font-normal text-rose-800">reopened</span>;
+  }
+  // Spec/Plan never pass this (their removed items render crossed out instead); the Tests tab does,
+  // next to a crossed-out test, so a deletion reads as deliberate rather than as a rendering glitch.
+  if (change === "deleted") {
+    return <span className="ml-1.5 rounded-full bg-red-100 px-1.5 text-xs font-normal text-red-800">deleted</span>;
   }
   return <span className="ml-1.5 rounded-full bg-neutral-100 px-1.5 text-xs font-normal text-neutral-400">unchanged</span>;
 }

@@ -74,11 +74,14 @@ LEDGER_PATH = ".ai-dev-workflow/spec/ledger.json"
 # through -- one e2e run's screenshots then crowded real sources out of the depth listing, and
 # reading a `test-failed-1.png` as source crashed the run outright. The binary-extension denylist
 # exists because artifacts can be named anything and still match (test|spec).
-_TEST_FILE_LISTING = (
-    "git ls-files -co --exclude-standard | grep -iE '(test|spec)' "
+# The path filter is its own constant so a path list from somewhere other than `git ls-files` (the
+# test inventory's `git diff --name-status` against a baseline) is filtered by the exact same rules.
+_TEST_PATH_FILTER = (
+    "grep -iE '(test|spec)' "
     r"| grep -viE '(^|/)(node_modules|\.playwright-browsers|bin|obj|dist|build|\.next|\.venv|vendor|test-?results|coverage|\.ai-dev-workflow|agent-work)/' "
     r"| grep -viE '\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|mp4|webm|woff2?|ttf|eot|dll|exe|so|dylib|pyc|class|jar)$'"
 )
+_TEST_FILE_LISTING = f"git ls-files -co --exclude-standard | {_TEST_PATH_FILTER}"
 
 # The subset of a "test declaration" that carries a NAME (a `test(...)`/`it(...)`/`describe(...)`
 # call, or a method signature) -- a bare `[Fact]`/`[Theory]` attribute line matches neither alone,
@@ -91,6 +94,64 @@ _NAMED_TEST_DECL_RE = re.compile(
 )
 _TEST_ATTRIBUTE_RE = re.compile(r"^\s*\[\s*(Fact|Theory|Test|TestMethod|TestCase)\b", re.IGNORECASE)
 _JS_TEST_CALL_RE = re.compile(r"\b(?:test|it)\s*(?:\.\w+)?\s*\(\s*['\"`]", re.IGNORECASE)
+# Name-extraction halves of the declaration walk below (`test_declarations`): a JS test's title
+# string, a .NET test's DisplayName (where the generated suites put the `[US-0001.2]` id), the
+# method name otherwise, and a pytest function -- pytest is one of `schemas_codegen.TestFramework`'s
+# supported frameworks, so a walk that never saw it reported a pytest suite as "no tests here".
+_JS_TEST_TITLE_RE = re.compile(r"""\b(?:test|it)\s*(?:\.\w+)?\s*\(\s*(['"`])(.*?)\1""", re.IGNORECASE)
+_DISPLAY_NAME_RE = re.compile(r'DisplayName\s*=\s*@?"((?:[^"\\]|\\.)*)"')
+_METHOD_NAME_RE = re.compile(r"(\w+)\s*\(")
+_PYTEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(test_\w*)\s*\(")
+# A coarse ERE for `grep -E -i` that is a superset of every line `test_declarations` can act on
+# (attribute, JS call, method signature, pytest def) -- the grep only narrows what crosses the exec
+# boundary; `test_declarations` re-decides every candidate line exactly.
+TEST_DECL_CANDIDATE_ERE = (
+    r"(test|it)[[:space:]]*(\.[[:alnum:]_]+)?[[:space:]]*\("
+    r"|\[[[:space:]]*(Fact|Theory|Test|TestMethod|TestCase)"
+    r"|(public|internal|private)[[:space:]]"
+    r"|def[[:space:]]+test_"
+)
+
+
+def test_declarations(lines: list[tuple[int, str]]) -> list[tuple[int, str, list[str]]]:
+    """`(line number, test name, AC ids)` per test declaration in one file's `(line number, text)`
+    lines. Pure. The ONE definition of "this line declares a test", shared by `unattributed_tests`
+    below and the test inventory (test_inventory.py).
+
+    A test is a JS `test(...)`/`it(...)` call with a string title, a .NET method signature whose
+    previous non-blank line is a test attribute (`[Fact]`, `[Theory]`, ...), or a pytest
+    `def test_...`. A method signature with no test attribute above it is a HELPER -- a
+    constructor, a Dispose, a CreateClient factory. Measured on a real suite: counting those
+    reported 4 orphans in a file where every actual test was correctly named. A .NET test's AC ids
+    come from its attribute line too, since the generated suites put `[US-0001.2]` in DisplayName.
+
+    `lines` may be sparse (grep candidate lines plus context): a gap in line numbers means unseen
+    lines sat in between, so an attribute above the gap no longer counts as "directly above"."""
+    decls: list[tuple[int, str, list[str]]] = []
+    attribute: str | None = None
+    prev_no: int | None = None
+    for line_no, line in lines:
+        if prev_no is not None and line_no != prev_no + 1:
+            attribute = None
+        prev_no = line_no
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _TEST_ATTRIBUTE_RE.search(stripped):
+            attribute = stripped
+            continue
+        attr, attribute = attribute, None
+        if _JS_TEST_CALL_RE.search(stripped):
+            title = _JS_TEST_TITLE_RE.search(stripped)
+            decls.append((line_no, title.group(2) if title else stripped, sorted(set(ac_ids_in_name(stripped)))))
+        elif attr is not None and _NAMED_TEST_DECL_RE.search(stripped):
+            display = _DISPLAY_NAME_RE.search(attr)
+            method = _METHOD_NAME_RE.search(stripped)
+            name = display.group(1) if display else (method.group(1) if method else stripped)
+            decls.append((line_no, name, sorted(set(ac_ids_in_name(attr)) | set(ac_ids_in_name(stripped)))))
+        elif pytest_def := _PYTEST_DEF_RE.match(line):
+            decls.append((line_no, pytest_def.group(1), sorted(set(ac_ids_in_name(stripped)))))
+    return decls
 
 # `screenshot: 'on'` or `screenshot: "on"`, either quote style, whitespace-tolerant around the
 # colon. Ported verbatim from write_scope_gate.py.
@@ -190,7 +251,8 @@ def retired_ac_residue_violations(hits: dict[str, set[str]]) -> list[str]:
     detail = "; ".join(f"{path}: {', '.join(sorted(ids))}" for path, ids in sorted(hits.items()))
     return [
         "test files still reference retired AC ids -- these criteria were removed from the "
-        f"Specification, so delete those test cases (delete the file if it holds nothing else): {detail}"
+        "Specification, so remove those test cases (if a file is left with no other test, delete "
+        f"every line of it -- the pipeline deletes an emptied test file): {detail}"
     ]
 
 
@@ -258,11 +320,31 @@ def completed_ac_protection_violations(completed: set[str], present: set[str]) -
     return problems
 
 
+def completed_ac_ids(entries: list[dict[str, Any]]) -> set[str]:
+    """Live criteria whose regression tests are protected: delivered (`coded_run_id`) AND with the
+    runner-reported test names a healthy metrics run recorded (`test_ids`, spec_ledger.stamp_delivery).
+    Pure. Shared by `check_completed_ac_protection` and `run_check_hook` so both agree.
+
+    `test_ids` is the evidence that tests naming this id ever existed. The brownfield baseline
+    pre-stamps `coded_run_id` on every reverse-engineered criterion (graph.py's brownfield plan
+    approval) while the repo's existing tests carry none of those freshly minted ids -- without this
+    condition the first ticket's verify demanded "restore" tests that never existed, which no
+    redraft can satisfy. Such a criterion becomes protected once a clean run stamps real names."""
+    return {
+        e["id"]
+        for e in entries
+        if e.get("kind") == "acceptance_criterion"
+        and e.get("status") in ("active", "revised")
+        and e.get("coded_run_id")
+        and e.get("test_ids")
+    }
+
+
 async def check_completed_ac_protection(
     provider: Any, thread_id: str, baseline_commit: str | None, entries: list[dict[str, Any]]
 ) -> list[str]:
-    """Completed criteria (coded_run_id stamped by a healthy metrics run) are settled: their
-    regression tests must survive. Incidental shared-code/file edits are deliberately NOT policed
+    """Completed criteria (`completed_ac_ids`: coded_run_id and test_ids stamped by a healthy
+    metrics run) are settled: their regression tests must survive. Incidental shared-code/file edits are deliberately NOT policed
     -- the regression suite guards behavior, and this stage's own tooling (create/edit, no delete)
     routinely rewrites a whole test file to add new cases, which a line-level diff cannot tell
     apart from genuine rework of the untouched ones sitting in the same file. An earlier
@@ -280,13 +362,7 @@ async def check_completed_ac_protection(
     Moved here unchanged from ac_coverage_gate.py (that module imports it back), now delegating its
     message-building to `completed_ac_protection_violations` above."""
     del baseline_commit
-    completed = {
-        e["id"]
-        for e in entries
-        if e.get("kind") == "acceptance_criterion"
-        and e.get("status") in ("active", "revised")
-        and e.get("coded_run_id")
-    }
+    completed = completed_ac_ids(entries)
     if not completed:
         return []
     present: set[str] = set()
@@ -312,29 +388,8 @@ def unattributed_tests(ac_ids: list[str], test_files: dict[str, str]) -> dict[st
     out: dict[str, int] = {}
     known = set(ac_ids)
     for path, contents in (test_files or {}).items():
-        unmatched = 0
-        attributed_above = False
-        for line in contents.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if _TEST_ATTRIBUTE_RE.search(stripped):
-                attributed_above = True
-                continue
-            # _NAMED_TEST_DECL_RE, not a bare test-declaration regex: a bare `[Fact]` attribute line
-            # matches neither alone but carries no name -- it is the line ABOVE the name in every
-            # generated .NET suite.
-            is_js_test = bool(_JS_TEST_CALL_RE.search(stripped))
-            is_attributed_method = attributed_above and bool(_NAMED_TEST_DECL_RE.search(stripped))
-            attributed_above = False
-            # A method signature with no test attribute above it is a HELPER -- a constructor, a
-            # Dispose, a CreateClient factory. Measured on a real suite: counting those reported 4
-            # orphans in a file where every actual test was correctly named, which would have sent a
-            # redraft chasing an attribution problem that did not exist.
-            if not (is_js_test or is_attributed_method):
-                continue
-            if not (set(ac_ids_in_name(stripped)) & known):
-                unmatched += 1
+        decls = test_declarations(list(enumerate(contents.splitlines(), start=1)))
+        unmatched = sum(1 for _line_no, _name, ids in decls if not set(ids) & known)
         if unmatched:
             out[path] = unmatched
     return out
@@ -410,12 +465,7 @@ def run_check_hook(payload: dict[str, Any]) -> dict[str, Any]:
         and e.get("status") == "deferred"
         and not e.get("coded_run_id")
     }
-    completed = {
-        e["id"] for e in ledger_entries
-        if e.get("kind") == "acceptance_criterion"
-        and e.get("status") in ("active", "revised")
-        and e.get("coded_run_id")
-    }
+    completed = completed_ac_ids(ledger_entries)
     all_ledger_ac_ids = [e["id"] for e in ledger_entries if e.get("kind") == "acceptance_criterion"]
     active_ac_ids = [
         e["id"] for e in ledger_entries
@@ -490,6 +540,44 @@ def _demo() -> None:
     # is the whole check, and this is the shape that used to false-flag before protection-B's removal.
     assert completed_ac_protection_violations({"US-0001.1", "US-0003.1"}, {"US-0001.1", "US-0003.1"}) == []
 
+    # --- completed_ac_ids: protection needs recorded test names, not just a delivery stamp --------
+    # The brownfield baseline pre-stamps coded_run_id with no test_ids; the repo's existing tests
+    # never named those freshly minted ids, so protecting them demanded tests that never existed.
+    protected = completed_ac_ids([
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1", "test_ids": ["t"]},
+        {"id": "US-0001.2", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "brownfield"},
+        {"id": "US-0001.3", "kind": "acceptance_criterion", "status": "retired", "coded_run_id": "r1", "test_ids": ["t"]},
+        {"id": "US-0001.4", "kind": "acceptance_criterion", "status": "active", "test_ids": ["t"]},
+    ])
+    assert protected == {"US-0001.1"}, protected
+
+    # --- test_declarations: the one "this line declares a test" walk ------------------------------
+    def decls(text: str) -> list[tuple[int, str, list[str]]]:
+        return test_declarations(list(enumerate(text.splitlines(), start=1)))
+
+    assert decls("test('[US-0001.2] adds a note', async () => {});\ndescribe('suite', () => {});") == [
+        (1, "[US-0001.2] adds a note", ["US-0001.2"])
+    ], "JS title extracted; describe is not a test"
+    assert decls("it.only(\"[US-0001.3] x\", () => {});")[0][1] == "[US-0001.3] x"
+    dotnet = decls(
+        '[Fact(DisplayName = "[US-0002.1] rejects empty")]\n'
+        "public async Task Rejects_Empty()\n"
+        "{\n}\n"
+        "public void Helper() { }\n"
+        "[Theory]\n\n"
+        "public void TestUS00022Works(int x) { }\n"
+    )
+    assert dotnet == [
+        (2, "[US-0002.1] rejects empty", ["US-0002.1"]),
+        (8, "TestUS00022Works", ["US-0002.2"]),
+    ], dotnet
+    assert decls("class TestNotes:\n    def test_us_0003_1_lists(self):\n        pass\n    def helper(self): pass\n") == [
+        (2, "test_us_0003_1_lists", ["US-0003.1"])
+    ]
+    # Sparse grep output: an attribute separated from the method by unseen lines is not "above" it.
+    assert test_declarations([(1, "[Fact]"), (5, "public void Lonely() { }")]) == []
+    assert test_declarations([(4, "[Fact]"), (5, "public void Adjacent() { }")]) == [(5, "Adjacent", [])]
+
     # --- find_ac_id_hits: the hook's local equivalent of _grep_test_files_for_ids -----------------
     assert find_ac_id_hits({}, {"US-0001.1"}) == {}
     assert find_ac_id_hits({"t.spec.ts": "irrelevant"}, set()) == {}
@@ -538,7 +626,8 @@ def _demo() -> None:
     # --- run_check_hook: the CLI entry point's own shared function ---------------------------------
     ledger_entries = [
         {"id": "US-0001", "kind": "user_story", "status": "active"},
-        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1",
+         "test_ids": ["[US-0001.1] works"]},
         {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "retired"},
         {"id": "US-0003.1", "kind": "acceptance_criterion", "status": "deferred"},
     ]
@@ -573,7 +662,8 @@ def _demo() -> None:
     # deleted -- reproduced first, then shown fixed by the separate uncapped `residue_test_files`.
     past_cap_entries = [
         {"id": "US-0004", "kind": "user_story", "status": "active"},
-        {"id": "US-0004.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r2"},
+        {"id": "US-0004.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r2",
+         "test_ids": ["TestUS00041StillHere"]},
     ]
     past_cap_test_files = {
         "apps/api.Tests/UnrelatedTests.cs": "[Fact]\npublic void SomeUnrelatedTest(){ Assert.True(true); }\n",

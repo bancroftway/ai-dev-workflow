@@ -9,11 +9,12 @@ genuinely incompatible with what this ticket requires, and say so in `known_gaps
 
 If the approved Specification lists `retired_us_ids`/`retired_ac_ids`, those features are REMOVED
 from the product: delete the code paths that exist solely to serve them -- endpoints, handlers,
-UI elements, state, helpers used by nothing else. Their tests are already gone, and the surviving
-suite is your regression guard: it must stay green after the removal. List each removal in your
-`changed_files` with its reason.
+UI elements, state, helpers used by nothing else. The tests stage already removed their tests (the
+"Test changes this run" list, when present, names each one), and the surviving suite is your
+regression guard: it must stay green after the removal. List each removal in your `changed_files`
+with its reason.
 
 Criteria the ledger already marks delivered (coded/tested by earlier runs) are settled: do not
-rework their code beyond what your currently-failing tests require, and never touch their
-regression tests -- a deterministic gate rejects new or modified test lines naming a completed
-criterion.
+rework their code beyond what your currently-failing tests require, and never delete or rename
+their regression tests -- a deterministic gate fails the run when a delivered criterion's tests
+disappear.

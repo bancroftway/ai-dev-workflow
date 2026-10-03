@@ -29,7 +29,7 @@ from .. import repo_files, workflow_persistence
 from ..repo_files import validate_repo_relative_path
 from ..sandbox.provider import SandboxProvider
 from .ac_coverage_gate import AC_COVERAGE_CHECKS
-from .ac_residue_checks import check_screenshot_capture_mode
+from .ac_residue_checks import _TEST_PATH_FILTER, check_screenshot_capture_mode
 from .checks import Check, CheckLog
 from .write_scope_checks import (
     _is_pipeline_owned,
@@ -264,6 +264,50 @@ async def check_write_scope(
     )
 
 
+async def prune_emptied_test_files(
+    provider: SandboxProvider, thread_id: str, baseline_commit: str | None, content_dict: dict[str, Any] | None = None
+) -> list[str]:
+    """Deletes every test file this run emptied, and drops it from the suite's `test_files` list.
+    Returns the deleted paths.
+
+    The retired-criterion contract: remove the retired id's test cases, and when a file is left with
+    none, empty it. This stage deliberately has no delete tool and no shell (graph.py's ac-to-tests
+    session_options), and an emptied file cannot stay: a runner that discovers it errors on a file
+    with zero tests (Vitest: "No test suite found"). The prompt used to ask for a placeholder test
+    naming the retired id instead, which the retired-residue check then failed by construction.
+
+    "Emptied" means whitespace-only now and NOT whitespace-only at the baseline -- never "declares
+    no test our parser recognises", which would delete real tests written in a style the parser
+    doesn't know (`test.each(...)`, an unsupported framework). Helper files are never emptied by a
+    retirement, so they are never touched. Dropping the path from `test_files` keeps the red gate
+    from holding the run to a planned file that no longer exists (rebuild._planned_test_files)."""
+    if baseline_commit is None:
+        return []
+    base = shlex.quote(baseline_commit)
+    listed = await provider.exec_in_sandbox(
+        thread_id,
+        f"git diff --name-only --diff-filter=M {base} -- . | {_TEST_PATH_FILTER} | while IFS= read -r f; do "
+        "grep -q '[^[:space:]]' -- \"$f\" 2>/dev/null && continue; "
+        f"git show {base}:\"$f\" 2>/dev/null | grep -q '[^[:space:]]' && printf '%s\\n' \"$f\"; "
+        "done; true",
+    )
+    emptied = [p.strip() for p in (listed.stdout or "").splitlines() if p.strip() and _is_test_path(p.strip())]
+    if not emptied:
+        return []
+    for path in emptied:
+        validate_repo_relative_path(path)
+    removed = await provider.exec_in_sandbox(thread_id, "git rm -q -f -- " + " ".join(shlex.quote(p) for p in emptied))
+    if not removed.ok:
+        logger.warning("prune_emptied_test_files: git rm failed for %s (thread %s)", emptied, thread_id)
+        return []
+    logger.info("pruned emptied test files for thread_id=%s: %s", thread_id, emptied)
+    if content_dict is not None and isinstance(content_dict.get("test_files"), list):
+        content_dict["test_files"] = [
+            f for f in content_dict["test_files"] if not (isinstance(f, dict) and f.get("path") in emptied)
+        ]
+    return emptied
+
+
 # Task 8: one line per real rejection branch inside verify_ac_to_tests below, in plain English a
 # model can act on -- not a restatement of the Python. Nine distinct reasons, not five: the four
 # `check_*` provenance calls folded into one `protection_problems` list (~lines 292-297) are each
@@ -274,12 +318,15 @@ AC_TO_TESTS_HARD_RULES: tuple[str, ...] = (
     "reverted, and the stage fails outright on the rare case that revert itself cannot succeed.",
     "Never modify the spec ledger -- it is pipeline-owned truth, not yours to write; any change you "
     "make to it is treated as tampering, gets reverted, and fails this stage.",
-    "Delete the test cases for any acceptance criterion id that has been retired from the "
-    "Specification -- a retired criterion may not still be named by a test file.",
+    "Remove the test cases for any acceptance criterion id that has been retired from the "
+    "Specification -- a retired criterion may not still be named by a test file. If that leaves a "
+    "file with no other test, delete every line of it (leave it empty); the pipeline deletes an "
+    "emptied test file. Never leave a placeholder test that names the retired id.",
     "Delete the test cases for any acceptance criterion id that is deferred and was never actually "
     "built -- parked, undelivered scope may not be dragged in by a failing test that names it.",
     "Never delete or rename the tests for an acceptance criterion that is already completed (has a "
-    "coded_run_id) -- its regression tests must keep being named by some test file on disk.",
+    "coded_run_id and recorded test_ids in the ledger) -- its regression tests must keep being named "
+    "by some test file on disk.",
     "You must actually create/edit the test files with your file tools before you answer -- a "
     "structured response that only describes tests, with no matching write call, fails this stage.",
     "Do not write only Playwright end-to-end specs -- a suite made of e2e alone proves nothing below "
@@ -407,6 +454,9 @@ async def verify_ac_to_tests(
         AC_WRITE_SCOPE,
         "reverted out-of-scope: " + "; ".join(write_scope.reverted_paths) if write_scope.reverted_paths else None,
     )
+    # Before anything reads or runs the suite: an emptied file (retired criterion's last test
+    # removed) would otherwise error the runner. See prune_emptied_test_files.
+    await prune_emptied_test_files(provider, thread_id, baseline_commit, content_dict)
 
     # Provenance protections: the ledger must be untampered (it is the truth every check below
     # reads), retired criteria's tests must be gone, and completed criteria's tests must be
@@ -786,10 +836,17 @@ async def _demo_check_rows() -> None:
             self.returncode, self.stderr = (0, "") if ok else (1, "cat: x: No such file or directory")
 
     class _Fake:
-        def __init__(self, files: dict[str, str], changed: list[str], ledger_diff: str = "", revert_ok: bool = True) -> None:
+        def __init__(
+            self, files: dict[str, str], changed: list[str], ledger_diff: str = "", revert_ok: bool = True,
+            emptied: list[str] | None = None,
+        ) -> None:
             self.files, self.changed, self.ledger_diff, self.revert_ok = files, changed, ledger_diff, revert_ok
+            self.emptied, self.commands = emptied or [], []
 
         async def exec_in_sandbox(self, _thread_id: str, command: str) -> _R:
+            self.commands.append(command)
+            if "--diff-filter=M" in command:  # prune_emptied_test_files' listing loop
+                return _R(True, "\n".join(self.emptied))
             if command.startswith("git diff --name-only -- "):
                 return _R(True, self.ledger_diff)
             if command.startswith("git diff --name-only "):
@@ -842,9 +899,21 @@ async def _demo_check_rows() -> None:
         ok = await verify_ac_to_tests("t", {}, "r", "base", _Fake(files, healthy), "claude")  # type: ignore[arg-type]
         assert ok.passed, ok.feedback
         assert [i for i, _ in ids(ok)] == [c.id for c in VERIFY_CHECKS], ids(ok)
-        assert dict(ids(ok))["ac_tests.depth"] == "skipped" and {s for i, s in ids(ok) if i != "ac_tests.depth"} == {"passed"}, ok.checks
+        not_applicable = {"ac_tests.depth", "ac_tests.modified_tests_rewritten"}
+        assert {i for i, s in ids(ok) if s == "skipped"} == not_applicable, ok.checks
+        assert {s for i, s in ids(ok) if i not in not_applicable} == {"passed"}, ok.checks
     finally:
         stack_runner.run_and_report = original
+
+    # Prune: a test file this run emptied (its retired criterion's last test removed) is git-rm'd
+    # and dropped from the suite's test_files; a non-test path in the listing is never touched.
+    prune_fake = _Fake(files, healthy, emptied=["tests/unit/retired.test.ts", "src/app.ts"])
+    suite = {"test_files": [{"path": "tests/unit/retired.test.ts"}, {"path": "tests/unit/a.test.ts"}]}
+    assert await prune_emptied_test_files(prune_fake, "t", "base", suite) == ["tests/unit/retired.test.ts"]  # type: ignore[arg-type]
+    assert suite["test_files"] == [{"path": "tests/unit/a.test.ts"}], suite
+    rm = [c for c in prune_fake.commands if c.startswith("git rm ")]
+    assert rm == ["git rm -q -f -- tests/unit/retired.test.ts"], prune_fake.commands
+    assert await prune_emptied_test_files(prune_fake, "t", None, suite) == []  # type: ignore[arg-type]
 
     # Blocking early return: the revert of an out-of-scope file fails -- only write_scope is recorded.
     blocked = await verify_ac_to_tests("t", {}, "r", "base", _Fake(files, ["src/app.ts"], revert_ok=False), "claude")  # type: ignore[arg-type]

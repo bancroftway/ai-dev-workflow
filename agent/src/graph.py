@@ -50,6 +50,7 @@ from . import repo_scan
 from . import requirements_prd
 from . import tech_stack_signals
 from . import test_hardening_nodes
+from . import test_inventory
 from . import e2e_nodes
 from . import metrics_nodes
 from . import exit_nodes
@@ -361,6 +362,11 @@ class GraphState(TypedDict):
     metrics_report: dict[str, Any]
     # The baseline repo scan taken once at the top of the graph -- see agent/src/repo_scan.py.
     repo_scan: dict[str, Any]
+    # Whole-repo test inventory (agent/src/test_inventory.py): every test grouped under the approved
+    # Specification's stories/criteria, each stamped new/modified/deleted/unchanged for this run.
+    # Written by the r_ac_to_tests rebuild node and refreshed by metrics_compute; the Tests tab
+    # renders it as-is and the minimal-code-to-green prompt lists its changes. None until built.
+    test_inventory: dict[str, Any] | None
     # Outcome of the most recent push to the single, repo-shared `ai-dev-workflow` work branch
     # (git_ops.push_head): {ok, error, at}. Every session/user on this repo pushes that same
     # branch via --force-with-lease (WS0's single-branch migration retired the old per-branch
@@ -1919,6 +1925,8 @@ MINIMAL_CODE_TO_GREEN_AUDIT_SYSTEM_PROMPT = load_prompt("minimal_code_to_green_a
 # ac-to-tests both already frame the greenfield case, but nothing told minimal-code-to-green the
 # repo already has code and conventions worth extending on a brownfield/later-ticket run.
 MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT = load_prompt("minimal_code_to_green_brownfield_segment")
+# This run's new/updated/deleted tests from GraphState.test_inventory (test_inventory.changes_summary).
+MINIMAL_CODE_TO_GREEN_TEST_CHANGES_SEGMENT = load_prompt("minimal_code_to_green_test_changes_segment")
 
 
 def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
@@ -1953,6 +1961,11 @@ def _build_minimal_code_to_green_prompt(state: GraphState) -> list[BaseMessage]:
     ticket_has_retirements = bool(spec_approved.get("retired_ac_ids") or spec_approved.get("retired_us_ids"))
     if not tech_stack_signals.is_greenfield_repo(state) or ticket_has_retirements:
         messages.append(HumanMessage(content=MINIMAL_CODE_TO_GREEN_BROWNFIELD_SEGMENT))
+    # The real test changes on disk (git-derived, test_inventory.py) -- the approved suite above is
+    # only what the tests stage SAID it wrote, and says nothing about the tests it deleted.
+    test_changes = test_inventory.changes_summary(state.get("test_inventory"))
+    if test_changes:
+        messages.append(HumanMessage(content=render_prompt(MINIMAL_CODE_TO_GREEN_TEST_CHANGES_SEGMENT, test_changes=test_changes)))
     if stage["draft"] is not None:
         messages.append(HumanMessage(content=f"Your immediately-prior iteration (JSON):\n{stage['draft']}"))
     verify_feedback_message = _verification_feedback_message(stage)
@@ -2711,10 +2724,10 @@ STAGES: list[StageSpec] = [
                 # revert, read outside the repo, spawn processes. That is a categorically different risk
                 # than "can this tool's file writes be reverted," and the practical need (a retired AC's
                 # test stops running/blocking) is fully met without it: `edit`/`apply_patch` already
-                # remove one test case from a file with siblings, and empty a file down to nothing (or a
-                # one-line "intentionally retired" comment) when it was the last test in it -- the file
-                # lingers, inert, in the tree; Adversarial Review's dead-code scan is the intended
-                # backstop for that cosmetic residue, not a reason to grant shell execution here.
+                # remove one test case from a file with siblings, and empty a file down to nothing when
+                # it was the last test in it -- the pipeline then deletes the emptied file itself
+                # (write_scope_gate.prune_emptied_test_files, at verify and at r_ac_to_tests), so no
+                # delete tool or shell is needed here.
                 # No Playwright MCP here. It was attached for UI repos so the drafting model could
                 # drive a live browser while writing specs -- but this stage runs in the TDD RED
                 # phase, before any implementation exists, so on a greenfield run there is nothing
@@ -6068,6 +6081,7 @@ REBUILD_AFTER_AC_TO_TESTS = rebuild.RebuildSpec(
     fix_scope="scaffold_only",
     next_node="minimal-code-to-green_draft",
     next_stage_key="minimal-code-to-green",
+    test_inventory_stage_key="ac-to-tests",
 )
 
 REBUILD_AFTER_P6 = rebuild.RebuildSpec(

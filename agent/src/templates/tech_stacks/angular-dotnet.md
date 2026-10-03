@@ -96,9 +96,9 @@ repo-root/
   @analogjs/platform jsdom @vitest/coverage-v8`, add a `vite.config.ts` using the `angular()` plugin
   with `test: { globals: true, environment: "jsdom", setupFiles: ["src/test-setup.ts"],
   passWithNoTests: true }`, and a `src/test-setup.ts` that initializes Angular's TestBed
-  environment. `passWithNoTests` matters: an AC-retirement fallback can legitimately leave a file
-  with a placeholder test only, and without it a file Vitest discovers but that registers zero
-  tests is a hard runner error, not a pass. Run with `npx vitest run`.
+  environment. `passWithNoTests` matters: retiring a package's last criteria can delete its last
+  test file, and without it a package with no test file left is a hard runner error, not a pass. Run
+  with `npx vitest run`.
 
 **Coverage contract** (this pipeline's coverage gate replays `.ai-dev-workflow/coverage-commands.json`
 when present, INSTEAD of its own dotnet/js legacy fallback -- a partial contract silently exempts

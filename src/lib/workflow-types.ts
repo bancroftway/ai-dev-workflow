@@ -528,6 +528,9 @@ export interface WorkflowState {
   stages?: Record<string, StageState>;
   /** "yolo" | "draft_verify" | "mission_critical" -- the mode this thread's gates run under. */
   code_gen_mode?: string | null;
+  /** Whole-repo test inventory (agent/src/test_inventory.py), a ready-to-render view model --
+   * parsed by parseTestInventory in a2ui/catalog.tsx. */
+  test_inventory?: unknown;
 }
 
 /** Escalation interrupt payloads (graph.py make_escalate_node, security gate, audit exit gate).

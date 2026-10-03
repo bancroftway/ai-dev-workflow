@@ -62,7 +62,7 @@ from ..sandbox.provider import SandboxProvider
 from pydantic import BaseModel
 
 from ..schemas import StageReport
-from ..spec_ledger import LEDGER_PATH, own_ac_ids_from_specification
+from ..spec_ledger import LEDGER_PATH, change_status, own_ac_ids_from_specification
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +372,13 @@ AC_TO_TESTS_NAMING_RULES: tuple[str, ...] = (
     "must exist for the scenario to be meaningful (`toBeVisible()`, `Assert.NotNull`, a rendered "
     "element/text) -- this applies even to a 'does not show X'/'no longer renders Y' negative test: "
     "prove the page rendered, THEN prove X is absent.",
+    # Enforced by check_ac_coverage's AC_MODIFIED_TESTS_STALE check (not a naming rule, but the same
+    # one-physical-copy reason: draft and audit must read the rule the gate applies).
+    "A criterion the Specification marks `change: \"modified\"` was reworded this run, and its "
+    "existing tests (grep for its id) still assert the OLD wording against code that implements it. "
+    "Rewrite every one of them to assert the revised wording, so each fails until the code changes, "
+    "or remove a test whose behaviour no longer exists. A test of a reworded criterion that still "
+    "passes is rejected -- left in place, it would make the build stage stub out working code.",
 )
 
 # Same one-physical-copy strategy as AC_TO_TESTS_NAMING_RULES above, for a DIFFERENT reason: this
@@ -451,6 +458,31 @@ def category_spread(content_dict: dict[str, Any], ac_id: str) -> set[str]:
     return {c for c in categories if c}
 
 
+def _per_report_outcomes(reports: dict[str, str]) -> list[dict[str, str]]:
+    """`{test name -> 'pass'|'fail'}` per runner report, format chosen by extension (an
+    unrecognised file is skipped rather than guessed at). Pure."""
+    out: list[dict[str, str]] = []
+    for path, contents in (reports or {}).items():
+        lowered = path.lower()
+        if lowered.endswith(".trx"):
+            out.append(test_results.parse_trx(contents))
+        elif lowered.endswith(".json"):
+            # vitest/jest and playwright both emit JSON with different shapes; try both and take
+            # whichever actually parsed, rather than inferring intent from the filename.
+            out.append(test_results.parse_vitest_json(contents) or test_results.playwright_outcomes(contents))
+    return out
+
+
+def structured_report_outcomes(reports: dict[str, str]) -> dict[str, str]:
+    """Every runner-reported test's outcome across all reports, merged (a name failing in any
+    report is a fail). Pure."""
+    merged: dict[str, str] = {}
+    for outcomes in _per_report_outcomes(reports):
+        for name, result in outcomes.items():
+            merged[name] = "fail" if "fail" in (merged.get(name), result) else result
+    return merged
+
+
 def status_from_structured_reports(
     ac_ids: list[str], reports: dict[str, str]
 ) -> tuple[dict[str, str], dict[str, int]]:
@@ -470,16 +502,7 @@ def status_from_structured_reports(
     known = set(ac_ids)
     per_ac: dict[str, str] = {}
     tally = {"canonical": 0, "fallback": 0, "unattributed": 0}
-    for path, contents in (reports or {}).items():
-        lowered = path.lower()
-        if lowered.endswith(".trx"):
-            outcomes = test_results.parse_trx(contents)
-        elif lowered.endswith(".json"):
-            # vitest/jest and playwright both emit JSON with different shapes; try both and take
-            # whichever actually parsed, rather than inferring intent from the filename.
-            outcomes = test_results.parse_vitest_json(contents) or test_results.playwright_outcomes(contents)
-        else:
-            continue
+    for outcomes in _per_report_outcomes(reports):
         for name, result in outcomes.items():
             ids, mechanism = test_results.attributed_ac_ids(name)
             tally["unattributed" if mechanism == "none" else mechanism] += 1
@@ -630,6 +653,13 @@ AC_NOT_TAUTOLOGICAL = Check(
     "almost certainly asserts nothing real.",
     "collected",
 )
+AC_MODIFIED_TESTS_STALE = Check(
+    "ac_tests.modified_tests_rewritten", "Reworded criteria's tests rewritten",
+    "Every test of a criterion reworded this run fails before implementation. One that still "
+    "passes asserts the old behaviour, and the red gate would then stub the delivered code instead "
+    "of the stale test being rewritten.",
+    "collected", condition="only when a criterion was reworded this run and the runner wrote a structured report",
+)
 AC_DEPTH = Check(
     "ac_tests.depth", "Criteria tested in depth",
     "Each criterion gets enough distinct tests below the UI (and a browser test where it is "
@@ -649,7 +679,8 @@ AC_NAV_WAITS = Check(
     "collected",
 )
 AC_COVERAGE_CHECKS: tuple[Check, ...] = (
-    AC_CRITERIA_TO_COVER, AC_TEST_RUN, AC_COVERAGE, AC_NOT_TAUTOLOGICAL, AC_DEPTH, AC_TESTID_LOCATORS, AC_NAV_WAITS,
+    AC_CRITERIA_TO_COVER, AC_TEST_RUN, AC_COVERAGE, AC_NOT_TAUTOLOGICAL, AC_MODIFIED_TESTS_STALE, AC_DEPTH,
+    AC_TESTID_LOCATORS, AC_NAV_WAITS,
 )
 
 
@@ -938,6 +969,24 @@ async def check_ac_coverage(
 
     tautological = [ac for ac in active_ac_ids if ac_line_status.get(ac) == "pass"]
 
+    # Reworded criteria: an AC counts as red above when ANY of its tests fails, so a reworded
+    # criterion's old tests -- still asserting the old behaviour, still passing against the
+    # delivered code -- slip through next to one new failing test. The TDD-red gate then fails on
+    # every passing test of a new/modified criterion (rebuild.eligible_red_verdict) and its
+    # scaffold-only fixer stubs the DELIVERED code to turn them red, instead of the stale test being
+    # rewritten. Same function and same "modified" predicate the red gate uses, applied here where
+    # the tests can still be fixed. New criteria are left to the red gate (stubbing scaffold is fine).
+    entries_by_id = {e.get("id"): e for e in ledger_entries}
+    modified_ids = {
+        ac for ac in active_ac_ids
+        if ac in entries_by_id and change_status(entries_by_id[ac], run_id) == "modified"
+    }
+    stale_modified: list[str] = []
+    if modified_ids and structured_reports:
+        from ..rebuild import eligible_red_verdict  # lazy: rebuild imports the gates package
+
+        _red, stale_modified, _failed = eligible_red_verdict(structured_report_outcomes(structured_reports), modified_ids)
+
     # DEPTH: a criterion with one happy-path assertion is not a tested criterion. Read the test files
     # themselves rather than the runner output, because levels are decided by content (an integration
     # test is one that stands up a real host -- see _INTEGRATION_SYMBOLS) and .NET keeps every level
@@ -1004,6 +1053,18 @@ async def check_ac_coverage(
         log.failed(AC_NOT_TAUTOLOGICAL, "already passing pre-implementation: " + "; ".join(tautological))
     else:
         log.passed(AC_NOT_TAUTOLOGICAL)
+    preview_max = config.REBUILD_PASSED_TESTS_PREVIEW_MAX
+    stale_preview = ", ".join(stale_modified[:preview_max]) + (
+        f", and {len(stale_modified) - preview_max} more" if len(stale_modified) > preview_max else ""
+    )
+    if not modified_ids:
+        log.skipped(AC_MODIFIED_TESTS_STALE, "no criterion was reworded this run")
+    elif not structured_reports:
+        log.skipped(AC_MODIFIED_TESTS_STALE, "no structured runner report to read per-test outcomes from")
+    elif stale_modified:
+        log.failed(AC_MODIFIED_TESTS_STALE, f"still passing: {stale_preview}")
+    else:
+        log.passed(AC_MODIFIED_TESTS_STALE)
     if not test_files:
         log.skipped(AC_DEPTH, "no test files found to read")
     elif depth_shortfall:
@@ -1016,7 +1077,7 @@ async def check_ac_coverage(
         else:
             log.passed(check)
 
-    if missing or tautological or depth_shortfall or testid_violations or nav_wait_violations:
+    if missing or tautological or stale_modified or depth_shortfall or testid_violations or nav_wait_violations:
         reasons = []
         if depth_report.get("unattributed_tests") and missing:
             total_orphans = sum(depth_report["unattributed_tests"].values())
@@ -1039,6 +1100,13 @@ async def check_ac_coverage(
             reasons.append(
                 f"these ACs' tests are already PASSING with no implementation yet, which almost "
                 f"certainly means they're tautological (assertion-free or trivially true): {tautological}"
+            )
+        if stale_modified:
+            reasons.append(
+                f"these tests of reworded criteria ({', '.join(sorted(modified_ids))}) still PASS against "
+                f"the current code, so they assert the criterion's OLD behaviour: {stale_preview} -- "
+                "rewrite each to assert the revised wording (it must fail until the code changes), or "
+                "remove a test whose behaviour no longer exists"
             )
         if testid_violations:
             named = "; ".join(
@@ -1066,6 +1134,7 @@ async def check_ac_coverage(
             report={
                 "missing": missing,
                 "tautological": tautological,
+                "stale_modified_tests": stale_modified,
                 "depth": depth_report,
                 "depth_shortfall": depth_shortfall,
                 "testid_violations": testid_violations,
@@ -1705,7 +1774,8 @@ async def _demo_provenance_checks() -> None:
 
     entries = [
         {"id": "US-0001", "kind": "user_story", "status": "active"},
-        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1"},
+        {"id": "US-0001.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "r1",
+         "test_ids": ["[US-0001.1] works"]},
         {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "retired"},
     ]
 
@@ -1753,6 +1823,16 @@ async def _demo_provenance_checks() -> None:
         "t", "baseline-sha", entries,
     )
     assert deleted and "US-0001.1" in deleted[0], deleted
+
+    # Brownfield baseline: delivery pre-stamped, no recorded test names -- the repo's existing tests
+    # never carried the minted id, so there is nothing to "restore" and nothing is flagged.
+    brownfield_entries = [
+        {"id": "US-0005.1", "kind": "acceptance_criterion", "status": "active", "coded_run_id": "bf"},
+    ]
+    assert await check_completed_ac_protection(
+        _FakeGrepProvider({"tests/LegacyTests.cs": "[Fact]\npublic void Works() { }\n"}),
+        "t", "baseline-sha", brownfield_entries,
+    ) == []
 
 
 async def _demo_ticket_scoping() -> None:
@@ -1846,8 +1926,8 @@ async def _demo_ticket_scoping() -> None:
         )
         assert [(r.id, r.status) for r in pass_log.results()] == [
             ("ac_tests.criteria_to_cover", "passed"), ("ac_tests.test_run", "passed"), ("ac_tests.coverage", "passed"),
-            ("ac_tests.not_tautological", "passed"), ("ac_tests.depth", "skipped"),
-            ("ac_tests.testid_locators", "passed"), ("ac_tests.nav_waits", "passed"),
+            ("ac_tests.not_tautological", "passed"), ("ac_tests.modified_tests_rewritten", "skipped"),
+            ("ac_tests.depth", "skipped"), ("ac_tests.testid_locators", "passed"), ("ac_tests.nav_waits", "passed"),
         ], pass_log.results()
         assert outcome.report.get("active_ac_ids") == ["US-0002.1"], (
             "ticket #1's own already-shipped AC leaked into a scope that should be ticket #2-only: "
@@ -1942,6 +2022,47 @@ async def _demo_ticket_scoping() -> None:
         )
         assert not empty.passed
         assert [(r.id, r.status) for r in empty_log.results()] == [("ac_tests.criteria_to_cover", "failed")], empty_log.results()
+
+        # (d) Reworded criterion: US-0002.1 was revised THIS run (r2). One new test is correctly red,
+        # but the criterion's old test still passes against the delivered code -- the AC reads red
+        # overall (any-fail rule), so only the modified-tests check can catch the stale test before
+        # the red gate stubs working code over it.
+        reworded_ledger = json.dumps({"entries": [
+            {"id": "US-0002", "kind": "user_story", "status": "active"},
+            {"id": "US-0002.1", "kind": "acceptance_criterion", "status": "revised",
+             "first_seen_run_id": "r1", "last_revised_run_id": "r2"},
+        ]})
+
+        def _trx(old_outcome: str) -> str:
+            return (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results>'
+                '<UnitTestResult testName="[US-0002.1] new wording rejects blanks" outcome="Failed" />'
+                f'<UnitTestResult testName="[US-0002.1] old wording accepts blanks" outcome="{old_outcome}" />'
+                "</Results></TestRun>"
+            )
+
+        reworded_files = {**base_files, LEDGER_PATH: reworded_ledger, "TestResults/ac-run.trx": _trx("Passed")}
+        stale_log = CheckLog("ac-to-tests_verify", AC_COVERAGE_CHECKS, strict=True)
+        stale = await check_ac_coverage(
+            _FakeCoverageProvider(reworded_files), "t", {}, chat_provider="claude", run_id="r2", log=stale_log
+        )
+        stale_row = {r.id: r for r in stale_log.results()}["ac_tests.modified_tests_rewritten"]
+        assert stale_row.status == "failed" and "old wording accepts blanks" in (stale_row.detail or ""), stale_row
+        assert not stale.passed and stale.report.get("tautological") == [], stale.report
+        assert stale.report.get("stale_modified_tests") == ["[US-0002.1] old wording accepts blanks"], stale.report
+        # Same files, a later run: the criterion is no longer "modified" for that run, so not checked.
+        assert (await check_ac_coverage(
+            _FakeCoverageProvider(reworded_files), "t", {}, chat_provider="claude", run_id="r3"
+        )).passed
+        # Old test rewritten (now red too): passes.
+        rewritten_log = CheckLog("ac-to-tests_verify", AC_COVERAGE_CHECKS, strict=True)
+        rewritten = await check_ac_coverage(
+            _FakeCoverageProvider({**reworded_files, "TestResults/ac-run.trx": _trx("Failed")}),
+            "t", {}, chat_provider="claude", run_id="r2", log=rewritten_log,
+        )
+        assert rewritten.passed, rewritten.feedback
+        assert {r.id: r.status for r in rewritten_log.results()}["ac_tests.modified_tests_rewritten"] == "passed"
     finally:
         stack_runner.run_and_report = original_run_and_report
 

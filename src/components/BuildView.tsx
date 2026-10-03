@@ -1,8 +1,9 @@
 "use client";
 
 import { UseAgentUpdate, useAgent } from "@copilotkit/react-core/v2";
-import { Fragment, memo } from "react";
+import { Fragment, memo, useMemo } from "react";
 import { RunningSpinner } from "@/components/Spinner";
+import { parseTestInventory, TestInventoryView } from "@/components/TestInventoryView";
 import { ViewContainer } from "@/components/ViewContainer";
 import { useRunActivity } from "@/lib/run-activity-context";
 import { EMPTY_PHASES, NODE_PHASE_LABEL, useRunningPhases } from "@/lib/use-run-events";
@@ -165,6 +166,9 @@ function BuildViewImpl({ title, stageKeys }: { title: string; stageKeys: readonl
   // done" signal regardless of which of the two write sites produced it. Used only as a fallback
   // below, when neither `stage` nor `runningLabel` has data yet.
   const currentStageIdx = stageOrderIndex(runActivity?.currentStage);
+  // The server tags the inventory with the stage it inventories; it shows on whichever tab holds
+  // that stage, so no stage key is named here.
+  const inventory = useMemo(() => parseTestInventory(state.test_inventory), [state.test_inventory]);
   return (
     <ViewContainer>
       <div>
@@ -206,6 +210,12 @@ function BuildViewImpl({ title, stageKeys }: { title: string; stageKeys: readonl
           </Fragment>
         );
       })}
+      {inventory && stageKeys.includes(inventory.stage_key) && (
+        // Same bounded, internally scrolling box as the Specification/Plan tabs.
+        <div className="h-[75vh] overflow-y-auto rounded-lg border border-neutral-300 p-3">
+          <TestInventoryView inventory={inventory} />
+        </div>
+      )}
     </ViewContainer>
   );
 }
